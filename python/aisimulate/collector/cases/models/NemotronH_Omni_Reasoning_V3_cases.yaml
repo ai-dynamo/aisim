@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+architecture: NemotronH_Omni_Reasoning_V3
+model_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+include_base: true
+# The dense GEMMs of this export are static per-tensor FP8 (fp8_static), which needs the
+# compute-scale tables, as for Qwen/Qwen3-32B-FP8-Static-PerTensor.
+model_specific_base_ops:
+  nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4:
+    sglang:
+      - compute_scale
+    trtllm:
+      - compute_scale
+    vllm:
+      - compute_scale
+description: >
+  Nemotron-H vision-language checkpoint, text path only, model-centric collection plan.
+
+model_case_values:
+  moe:
+    # Latent MoE: the routed experts run at moe_latent_size=1024, the geometry of the
+    # nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 latent row. The SGLang runner comes
+    # from the nvfp4 map of cases/base_ops/moe.yaml.
+    - model_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+      hidden_size: 1024
+      inter_size: 2688
+      topk: 22
+      num_experts: 512
+      sglang_moe_activation: relu2
+      sglang_moe_is_gated: false
+      sglang_moe_scoring_func: sigmoid
+      sglang_moe_routing_method_type: DeepSeekV3
+      sglang_moe_routed_scaling_factor: 5.0
+      sglang_moe_renormalize: true
+      sglang_moe_has_correction_bias: true
+      sglang_moe_num_expert_group: 1
+      sglang_moe_topk_group: 1
+      framework_quantization:
+        sglang:
+          allowed_modes: [nvfp4]
+        trtllm:
+          allowed_modes: [nvfp4]
+        vllm:
+          # vLLM's pinned FlashInfer NVFP4 path is limited to top-k <= 10, and this
+          # checkpoint routes to 22 experts (as the Super rows of NemotronHForCausalLM).
+          allowed_modes: []
+  mamba2:
+    - model_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+      d_model: 4096
+      d_state: 128
+      d_conv: 4
+      nheads: 128
+      head_dim: 64
+      n_groups: 8
+      chunk_size: 128
+
+all_frameworks_op_cases:
+  moe:
+    cases: all
+
+framework_specific_model_case_values:
+  sglang:
+    attention:
+      # No sglang_backends map. SGLang 0.5.14 registers no NemotronH_Omni_Reasoning_V3
+      # class (python/sglang/srt/models/nano_nemotron_vl.py:387-391@v0.5.14), and its
+      # NemotronH hook runs for NemotronHForCausalLM and NemotronHPuzzleForCausalLM only
+      # (python/sglang/srt/server_args.py:4146-4151@v0.5.14). The generator default applies.
+      - id: nemotron_h_omni_super_vl_attention
+        architecture: NemotronH_Omni_Reasoning_V3
+        model_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+        num_attention_heads: 32
+        num_key_value_heads: 2
+        head_dim: 128
+        window_size: 0
+        tensor_parallel_sizes: [1, 2, 4, 8, 16, 32]
+
+framework_specific_op_cases:
+  trtllm:
+    # Only the TensorRT-LLM registry has a mamba2 op (collector/trtllm/registry.py:85).
+    mamba2:
+      cases: all

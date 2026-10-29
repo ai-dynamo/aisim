@@ -948,7 +948,9 @@ def test_cross_model_common_cases_expand_from_base_op_yaml_sweeps(monkeypatch):
     # is unaffected either way. Qwen3.8-Max contributes one 117-case base
     # row and one 117-case RadixArk NVFP4 row. GLM-5.3-Flash adds two 99-case
     # rows (zai-org FP8 and nvidia NVFP4 checkpoints, 288 experts x 4096/2048).
-    assert len(moe_cases) == 7152
+    # +117 for nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4's latent-MoE row
+    # (1024/2688, 512x22), the geometry of the Super NVFP4 latent row.
+    assert len(moe_cases) == 7269
 
     assert any(
         case.model_name == "nvidia/DeepSeek-V4-Flash-NVFP4"
@@ -1030,7 +1032,9 @@ def test_cross_model_common_cases_expand_from_base_op_yaml_sweeps(monkeypatch):
     assert len(get_context_mla_case_specs()) == 330
     assert len(get_generation_mla_case_specs()) == 543
     mamba_cases = get_common_mamba2_test_cases()
-    assert len(mamba_cases) == 12
+    # 2 generic rows and 5 model rows (+1 for nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4),
+    # one context and one generation case each.
+    assert len(mamba_cases) == 14
     assert {case.model_name for case in mamba_cases} >= {"MAMBA2_GENERIC_4K", "MAMBA2_GENERIC_1K"}
     # Qwen3.8-Max adds context/generation at TP 1/2/4/8/16.
     assert len(get_common_gdn_test_cases()) == 84
