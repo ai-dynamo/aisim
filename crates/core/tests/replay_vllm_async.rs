@@ -5,7 +5,9 @@
 
 use std::collections::VecDeque;
 
-use aisim_core::engine::{EngineConfig, PassLaunchConfig, TimingModelConfig};
+use aisim_core::engine::{
+    EngineConfig, G2Connector, NativeHostOffloadConfig, PassLaunchConfig, TimingModelConfig,
+};
 use aisim_core::replay::{
     CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayEngineConfig,
     ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer,
@@ -300,4 +302,109 @@ fn launch_needs_a_one_gpu_engine() {
         .run()
         .unwrap_err();
     assert!(error.to_string().contains("uniprocess executor"), "{error}");
+}
+
+/// `launch` with prefix caching and a rank-local `offloading_v0_32` CPU tier
+/// of 64 blocks: stores copy at once, and loads copy 16 B per token at
+/// `h2d_gbps`.
+fn polled_cpu_tier(num_gpu_blocks: usize, h2d_gbps: f64) -> EngineConfig {
+    let mut config = launch(engine(num_gpu_blocks), [2.0, 20.0, 50.0], 0.0);
+    config.enable_prefix_caching = true;
+    config.kv_cache_bytes_per_token = Some(16);
+    config.native_host_offload = Some(
+        NativeHostOffloadConfig::new(64)
+            .with_bandwidths(0.0, h2d_gbps)
+            .with_connector(G2Connector::OffloadingV032),
+    );
+    config
+}
+
+/// A request with `(id, tokens, outputs, arrival)`.
+fn tokens_request(id: u128, tokens: Vec<u32>, outputs: usize, arrival_ms: f64) -> DirectRequest {
+    DirectRequest {
+        tokens,
+        max_output_tokens: outputs,
+        uuid: Some(Uuid::from_u128(id)),
+        arrival_timestamp_ms: Some(arrival_ms),
+        ..Default::default()
+    }
+}
+
+fn run_tokens(engine: EngineConfig, requests: Vec<DirectRequest>) -> ReplayReport {
+    replay_requests(
+        ReplayEngineConfig {
+            rank: engine,
+            ..Default::default()
+        },
+        requests.into(),
+    )
+    .run()
+    .unwrap()
+}
+
+#[test]
+fn a_load_awaiting_vllms_poll_does_not_stall_an_engine_with_only_a_blocked_waiter() {
+    // Request 1 stores its five prompt blocks in the CPU tier, and request 2
+    // fills G1 and evicts them. R (request 3) prefills from 600 and decodes
+    // until 750. A (request 4) arrives at 605, joins R's first decode pass,
+    // which vLLM decides at 620 and replay forms at 700, and loads request 1's
+    // prefix: the copy waits for that pass's GPU work, until 710, and takes
+    // 300 ms, so it ends at 1010. B (request 5, 24 tokens) does not fit beside
+    // A's reservation in the 10-block G1. Once R finishes nothing runs, and
+    // vLLM takes empty steps that poll the connector: it sees A's copy at 1010
+    // and admits A then. A finishes at 1120, and B is admitted.
+    let five_blocks_in_300_ms = 320.0 / (300.0 * 1e6);
+    let report = run_tokens(
+        polled_cpu_tier(10, five_blocks_in_300_ms),
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..536).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 6, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 605.0),
+            tokens_request(5, (2000..2024).collect(), 2, 606.0),
+        ],
+    );
+    let a = record(&report, 4);
+    assert_eq!(
+        (a.first_admit_ms, a.first_admission_host_reused_input_tokens),
+        (Some(1010.0), Some(20))
+    );
+    assert_eq!(record(&report, 5).first_admit_ms, Some(1120.0));
+}
+
+#[test]
+fn a_request_sharing_a_load_waits_for_it_until_vllm_has_seen_the_copy() {
+    // As above with a 20-block G1, and five blocks copying in 50 ms: A
+    // (request 4) loads request 1's prefix from the pass formed at 700, and
+    // the copy runs from 710 to 760. C (request 5) shares that prefix and waits
+    // for A's load. R's decode passes start every 10 ms, and each polls 8 ms
+    // before it starts: it is decided at the previous pass's start and
+    // launched in 2 ms. The pass starting at 770 polls at 762, the first poll
+    // after the copy, so A is schedulable two decisions later, at 790. C waits
+    // until then too and reuses A's blocks from G1 instead of copying the
+    // prefix again.
+    let five_blocks_in_50_ms = 320.0 / (50.0 * 1e6);
+    let report = run_tokens(
+        polled_cpu_tier(20, five_blocks_in_50_ms),
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 12, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 605.0),
+            tokens_request(5, (0..20).chain(3000..3008).collect(), 2, 606.0),
+        ],
+    );
+    let [a, c] = [4, 5].map(|id| record(&report, id));
+    assert_eq!(
+        (a.first_admit_ms, a.first_admission_host_reused_input_tokens),
+        (Some(790.0), Some(20))
+    );
+    assert_eq!(
+        (
+            c.first_admit_ms,
+            c.first_admission_reused_input_tokens,
+            c.first_admission_host_reused_input_tokens
+        ),
+        (Some(790.0), 20, Some(0))
+    );
 }

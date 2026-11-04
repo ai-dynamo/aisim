@@ -1638,6 +1638,23 @@ impl HostTier {
         self.transfers.get(&transfer_id)?.deadline
     }
 
+    /// How long a private-lane load takes once its lane is free: the link's
+    /// first-byte latency plus its bytes at the lane's bandwidth. `None` for
+    /// a shared pool.
+    pub(crate) fn load_duration_ms(&self, transfer_id: TransferId) -> Option<f64> {
+        let transfer = self.transfers.get(&transfer_id)?;
+        let Transport::Fifo { h2d, .. } = &self.transport else {
+            return None;
+        };
+        let bytes = self.transfer_bytes(transfer.weight);
+        let copy_ms = if h2d.bytes_per_ms.is_infinite() {
+            0.0
+        } else {
+            bytes as f64 / h2d.bytes_per_ms
+        };
+        Some(self.clients[&transfer.client].link.latency_to_first_byte_ms + copy_ms)
+    }
+
     /// When the last submitted private-lane transfer of `client` completes.
     pub(crate) fn last_deadline(&self, client: u64) -> Option<f64> {
         self.transfers
