@@ -590,7 +590,8 @@ def test_resource_aware_candidates_are_checkpointed_then_reported_in_suggestion_
 def test_checkpoints_omit_runner_metadata_that_grows_with_the_trace(monkeypatch, tmp_path):
     branch = _branch(_pc())
     _stub(monkeypatch, branch)
-    snapshots = ["x" * 2**21]  # agentic snapshots outgrow the 1 MiB event cap on long traces
+    # Checkpoints omit runner metadata regardless of its size.
+    snapshots = ["x" * 2**21]
 
     class AgenticRunner(_FakeRunner):
         def run(self, spec):
