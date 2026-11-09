@@ -594,7 +594,7 @@ def estimate_kv_bytes_per_token(
         from aisim_core.sdk.common import KVCacheQuantMode
 
         try:
-            estimator.dtype_bytes = int(KVCacheQuantMode[kvcache_quant_mode].value.memory)
+            estimator.dtype_bytes = KVCacheQuantMode[kvcache_quant_mode].value.memory
         except KeyError as exc:
             raise ValueError(f"unsupported kvcache_quant_mode {kvcache_quant_mode!r}") from exc
     value = estimator.kv_bytes_per_token()
