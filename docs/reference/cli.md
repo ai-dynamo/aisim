@@ -80,7 +80,7 @@ usage, and `1` for revision, transfer, integrity or offline failures.
 |---|---|
 | `aisim init --all` | Download the whole op-latency database now and save `all`. |
 | `aisim init --hardware H` | Download op data for one hardware platform now and save `hardware`. |
-| `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the op data packaged with AISim. |
+| `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the default op data: the dataset revision pinned in the release (see [Default operation data](#default-operation-data)). |
 
 `--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. The choice is saved
 only after the download succeeds (`--all` and `--hardware` also save the repository and revision they downloaded, so
@@ -172,12 +172,12 @@ loads, the run fails with a missing-data error that names this variable; it neve
 A source saved by `aisim init` is a default for runs that read operation tables and name no roots. A
 configuration with `estimation_mode` `fpm_interpolation`, `fpm_regression` or `fpm_learned`, or one that sets its
 own `systems_paths` in any mode (`auto` reads FPM tables from them as a fallback), keeps its data. Roots set with
-`set_systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` count as your own too; only the packaged roots, which the
-Sweeper fills in when you set none, do not. Name the source with
+`set_systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` count as your own too; only the default root, which the
+Sweeper fills in when you set none, does not. Name the source with
 `AISIM_DATASET` or a pin to apply it to the configurations that keep their data.
 `AICONFIGURATOR_SYSTEMS_PATH` also supplies the root when `systems_paths` is unset or holds only the expanded
-packaged path. A literal `default` (the bundled data) and explicit custom `systems_paths` retain their precedence
-over the environment variable.
+default root. A literal `default` (the default operation data) and explicit custom `systems_paths` retain their
+precedence over the environment variable.
 
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation

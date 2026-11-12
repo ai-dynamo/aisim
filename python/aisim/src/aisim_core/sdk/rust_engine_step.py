@@ -1050,24 +1050,23 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     ``AICONFIGURATOR_SYSTEMS_PATH`` environment variable.
 
     Callers such as the Sweeper expand an unset ``systems_paths`` before construction, so the roots they hand over
-    may be that expansion rather than a choice. Only the packaged roots are a default: any other roots, however
+    may be that expansion rather than a choice. Only the default root is a default: any other roots, however
     they were set, outrank the source saved by ``aisim init``.
     """
     named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
-    # The literal ``default`` token is an explicit request for the bundled tables, not an unset value.
+    # The literal ``default`` token is an explicit request for the default tables, not an unset value.
     if any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in named or ()):
         return True
-    # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
+    # An unset value expands to ``set_systems_paths``, then the environment variable, then the default root.
     roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
-    packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
-    # Default setup never writes this variable, so even an explicit packaged path is a caller choice.
-    return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [packaged]
+    # Default setup never writes this variable, so even an explicit default-root path is a caller choice.
+    return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [_default_systems_root()]
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
     # ``to_dict`` already resolved a typed config's roots. Resolving them again would read an explicit ``default``
-    # (now the packaged path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
+    # (now the default root's path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
     if not isinstance(config, ForwardPassPerfModelConfig) and (
         payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths")
     ):
@@ -1112,23 +1111,30 @@ def _validate_worker_type(worker_type: str) -> str:
     return worker_type
 
 
+def _default_systems_root() -> str:
+    """The default systems root: composed from the pinned op-latency dataset on first use, never the packaged
+    ``aisim_core/systems`` directory (which no longer holds operation tables)."""
+    from aisim_core.data.default_systems import default_systems_path
+
+    return default_systems_path()
+
+
 def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
-    packaged = os.fspath(pkg_resources.files("aisim_core") / "systems")
     if not entries:
         from aisim_core.sdk.perf_database import get_systems_paths
 
         entries = tuple(get_systems_paths())
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-    # The packaged path alone can be a caller's expansion of unset roots; preserve the environment's choice. A literal
-    # ``default`` is an explicit request for the bundled data (the sweeper resolves it to the packaged path), so the
-    # environment variable never replaces it.
-    if env_root is not None and entries and all(entry == packaged for entry in entries):
+    # The default root alone can be a caller's expansion of unset roots; preserve the environment's choice. A literal
+    # ``default`` is an explicit request for the default data (the sweeper keeps the token), so the environment
+    # variable never replaces it.
+    if env_root is not None and entries and all(entry == _default_systems_root() for entry in entries):
         entries = (env_root,)
     resolved: list[str] = []
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
             raise ValueError("systems_paths entries must be nonempty strings")
-        path = packaged if entry.lower() == "default" else os.path.abspath(os.path.expanduser(entry))
+        path = _default_systems_root() if entry.lower() == "default" else os.path.abspath(os.path.expanduser(entry))
         if require_directories and not os.path.isdir(path):
             raise ValueError(f"forward-pass systems path is not a directory: {path}")
         if path not in resolved:
