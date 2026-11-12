@@ -4,8 +4,6 @@
 
 import argparse
 import hashlib
-import importlib
-import importlib.resources
 import json
 import sys
 import time
@@ -40,9 +38,11 @@ def predict(config_path, output):
         return {"outcome": "unsupported", "reason": "database_unavailable"}
     engine["backend_version"] = version
     try:
-        data_root = importlib.resources.files(runtime_module("aisim_core")) / "systems/data"
+        default_systems_path = runtime_module("aisim_core.data.default_systems").default_systems_path
     except ImportError:
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
+
+    data_root = Path(default_systems_path()) / "data"
     relative = (
         f"b300_sxm/sparse_attention/sglang/{version}/dsa_generation_module_perf.parquet"
         if engine["backend"] == "sglang"
