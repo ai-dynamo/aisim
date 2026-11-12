@@ -335,3 +335,20 @@ def test_ensure_rejects_a_manifest_changed_without_its_catalog_reference(tree, t
     manifest.write_bytes(manifest.read_bytes().replace(b'"provenance": {', b'"provenance": {"x": 1,', 1))
     with pytest.raises(MissingDataError, match="failed verification"):
         _ensure(out, tmp_path / "cache")
+
+
+def test_reuse_manifest_without_analysis_stats_round_trips():
+    doc = {
+        "groups": [
+            {"op_file": "g.parquet", "kernel_source": "k", "tier": "shared", "systems": ["s"], "frameworks": ["x"]},
+            {
+                "op_file": "h.parquet",
+                "kernel_source": "k",
+                "tier": "shared",
+                "systems": ["s"],
+                "frameworks": ["x"],
+                "total_raw_rows": 4,
+            },
+        ]
+    }
+    assert op.reuse_manifest_document(op.reuse_manifest_table(doc)) == doc

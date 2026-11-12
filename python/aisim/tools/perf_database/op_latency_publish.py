@@ -361,6 +361,9 @@ def _leading_comment(text: str) -> str:
     return "\n".join(lines)
 
 
+_OPTIONAL_REUSE_STATS = ("total_raw_rows", "within_framework_dedup_rows", "median_pct_divergence")
+
+
 def reuse_manifest_table(document: dict) -> pa.Table:
     if set(document) != {"groups"} or not isinstance(document["groups"], list):
         raise PublishError("perf_data_reuse_manifest.yaml must contain only a 'groups' list")
@@ -389,9 +392,10 @@ def reuse_manifest_document(table: pa.Table) -> dict:
     """Inverse of :func:`reuse_manifest_table` (absent optional keys stay absent)."""
     groups = []
     for row in table.to_pylist():
-        optional = ("total_raw_rows", "within_framework_dedup_rows", "median_pct_divergence")
-        group = {k: v for k, v in row.items() if k not in optional}
-        group.update({k: row[k] for k in optional if row[k] is not None})
+        group = {k: v for k, v in row.items() if k not in _OPTIONAL_REUSE_STATS}
+        for key in _OPTIONAL_REUSE_STATS:
+            if row[key] is not None:
+                group[key] = row[key]
         groups.append(group)
     return {"groups": groups}
 

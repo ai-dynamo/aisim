@@ -51,7 +51,8 @@ class OpReuseManifestRow(_OpRow):
     tier: str
     systems: list[str]
     frameworks: list[str]
-    total_raw_rows: int | None = None  # the generated manifest omits the counts
+    # Analysis statistics, not resolver contract: manifests generated since #649 omit them, so they are nullable.
+    total_raw_rows: int | None = None
     within_framework_dedup_rows: int | None = None
     median_pct_divergence: float | None = None
 
