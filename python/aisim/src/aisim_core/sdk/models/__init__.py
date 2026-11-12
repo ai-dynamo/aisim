@@ -221,6 +221,10 @@ def get_model(
     model_info["gemm_quant_mode_is_explicit"] = (
         model_config.gemm_quant_mode is not None if gemm_explicit is None else gemm_explicit
     )
+    moe_explicit = getattr(model_config, "_moe_quant_mode_is_explicit", None)
+    model_info["moe_quant_mode_is_explicit"] = (
+        model_config.moe_quant_mode is not None if moe_explicit is None else moe_explicit
+    )
     _apply_model_quant_defaults(model_config, raw_config, architecture, backend_name)
     # vLLM (nvfp4_ds_mla) and TRT-LLM store FP4 MLA caches in their own layouts, which nvfp4 doesn't model.
     language = raw_config.get(common.MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)) or raw_config
