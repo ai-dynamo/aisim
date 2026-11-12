@@ -6895,10 +6895,7 @@ mod tests {
         config.tp = 16;
         config.moe_tp_size = Some(4);
         config.moe_ep_size = Some(4);
-        config.systems_paths = vec![
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../python/aisim/src/aisim_core/systems"),
-        ];
+        config.systems_paths = vec![crate::test_systems::path("")];
         let mut native =
             AicTimingModel::build(&mut config, ForwardPassWorkerType::Aggregated, false).unwrap();
         native.diagnostic_model = None;
@@ -10797,10 +10794,7 @@ mod tests {
         }
         config.estimation_mode = Some(EstimationMode::OpLevel);
         config.kv_block_size = Some(16);
-        config.systems_paths = vec![
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../python/aisim/src/aisim_core/systems"),
-        ];
+        config.systems_paths = vec![crate::test_systems::path("")];
         let mut timing =
             AicTimingModel::build(&mut config, ForwardPassWorkerType::Aggregated, false).unwrap();
         timing.diagnostic_model = None;
@@ -11990,8 +11984,7 @@ mod tests {
         use crate::perfmodel::fpm::ForwardPassPerfOptions;
         pyo3::Python::initialize();
         let db = crate::perf_database::PerfDatabase::load(
-            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../python/aisim/src/aisim_core/systems"),
+            &crate::test_systems::path(""),
             "h200_sxm",
             "sglang",
             "0.5.6.post2",
