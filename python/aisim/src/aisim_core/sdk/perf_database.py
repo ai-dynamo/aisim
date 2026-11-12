@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import importlib.resources as pkg_resources
 import json
 import logging
 import os
@@ -25,7 +24,8 @@ from aisim_core.sdk.system_spec import SystemSpec
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
 
-_SYSTEMS_PATHS: list[str] = [os.fspath(pkg_resources.files("aisim_core") / "systems")]
+# ``None`` means "the default root", composed lazily from the pinned op-latency dataset on first use.
+_SYSTEMS_PATHS: list[str] | None = None
 # Until set_systems_paths is called, AICONFIGURATOR_SYSTEMS_PATH (for example the root exported by
 # materialize_systems_root) selects the one systems root, as it does for the Rust forward-pass path.
 _SYSTEMS_PATHS_EXPLICIT = False
@@ -94,20 +94,25 @@ _DATABASE_VERSION_METADATA_FILES = {
 }
 
 
+def _default_systems_path() -> str:
+    from aisim_core.data.default_systems import default_systems_path
+
+    return default_systems_path()
+
+
 def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]:
-    default_path = os.fspath(pkg_resources.files("aisim_core") / "systems")
     if raw_paths is None:
-        return [default_path]
+        return [_default_systems_path()]
     if isinstance(raw_paths, str):
         entries = [part.strip() for part in raw_paths.split(",") if part.strip()]
     else:
         entries = [os.fspath(entry) for entry in raw_paths if entry is not None]
     if not entries:
-        return [default_path]
+        return [_default_systems_path()]
     resolved: list[str] = []
     for entry in entries:
         if str(entry).lower() == "default":
-            resolved.append(default_path)
+            resolved.append(_default_systems_path())
         else:
             resolved.append(os.fspath(entry))
     return resolved
@@ -144,6 +149,9 @@ def get_systems_paths() -> list[str]:
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
     if not _SYSTEMS_PATHS_EXPLICIT and env_root and os.path.isdir(os.path.expanduser(env_root)):
         return [os.path.abspath(os.path.expanduser(env_root))]
+    global _SYSTEMS_PATHS
+    if _SYSTEMS_PATHS is None:
+        _SYSTEMS_PATHS = [_default_systems_path()]
     return list(_SYSTEMS_PATHS)
 
 
@@ -436,8 +444,9 @@ def build_no_databases_message() -> str:
     """Build a concise error message for systems path/db validation failures."""
     resolved_paths = get_systems_paths()
     resolved_display = ", ".join(resolved_paths) if resolved_paths else "<none>"
-    default_path = os.fspath(pkg_resources.files("aisim_core") / "systems")
-    has_default = default_path in resolved_paths
+    from aisim_core.data.default_systems import resolved_default_systems_path
+
+    has_default = resolved_default_systems_path() in resolved_paths
 
     lines = [
         "No loadable performance databases found under --systems-paths.",
