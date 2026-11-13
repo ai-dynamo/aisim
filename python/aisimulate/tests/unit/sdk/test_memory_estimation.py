@@ -1549,6 +1549,8 @@ def test_vllm_swa_capacity_uses_context_length_through_native_build(monkeypatch)
     num_global = model._num_layers - num_swa
     block_size = getattr(model.config, "kv_block_size", None) or 16
     max_batched = getattr(model.config, "max_num_batched_tokens", None) or context_length
+    assert block_size == 16
+    assert max_batched == common["max_num_tokens"]
 
     expected = calc_vllm_swa_batch_cap(
         model._GPTOSS_WINDOW_SIZE,
