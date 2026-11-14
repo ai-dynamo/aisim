@@ -1,5 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+
+// Modified block-mode semantics derived from vLLM v0.31.0 and v0.32.0:
+// https://github.com/vllm-project/vllm/tree/db9527a46873454610df6dbedf79a36d6bf1a7f6
+// https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+// Exact upstream source paths and Apache-2.0 attribution: THIRD_PARTY_NOTICES.md.
 
 //! Request-owned cache groups sharing one rank-local physical budget. Byte
 //! mode replays them cold. Block mode keeps the blocks of every group in one
@@ -57,16 +63,25 @@ impl GroupedLease {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GroupedBlockLease {
     pub(crate) groups: Vec<GroupLease>,
+    /// Whether the request has allocated once. The copy blocks of a partial
+    /// hit come with the first allocation only.
+    pub(crate) allocated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GroupLease {
     /// `copies[i]` holds logical block `i`. It is `None` for an expired
     /// window block or a null block below a sliding-window hit. Such blocks
-    /// lie below `first_live`.
+    /// lie below `first_live`. `finalized` counts the blocks that the request
+    /// had completed at its last finalization. The next finalization visits
+    /// only the full-attention blocks above it, as vLLM's `num_cached_block`
+    /// does, and only the sliding-window retention positions above
+    /// `finalized * block_size`. The window run that it publishes before such
+    /// a position can include blocks below `finalized`.
     Attention {
         copies: Vec<Option<BlockCopyId>>,
         first_live: usize,
+        finalized: usize,
     },
     State(GroupStateLease),
     /// One block for the whole request. A ring never caches it.
@@ -165,6 +180,11 @@ impl GroupedBlockPool {
 
     pub(crate) fn release(&mut self, id: BlockCopyId) {
         self.pool.release(id);
+    }
+
+    /// Whether `id` is a private block, which no key has published yet.
+    pub(crate) fn is_private(&self, id: BlockCopyId) -> bool {
+        self.pool.is_private(id)
     }
 
     /// Release in the given order, which is the eviction order of the cached
@@ -598,6 +618,7 @@ mod tests {
                     GroupLease::Attention {
                         copies: vec![None, Some(ids[0]), Some(ids[1])],
                         first_live: 1,
+                        finalized: 0,
                     },
                     GroupLease::Ring { copy: Some(ids[2]) },
                     GroupLease::State(GroupStateLease {
@@ -608,6 +629,7 @@ mod tests {
                         checkpoint: Some((ids[7], 8)),
                     }),
                 ],
+                allocated: true,
             }),
             ..GroupedLease::default()
         };
