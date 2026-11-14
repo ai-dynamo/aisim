@@ -472,7 +472,7 @@ impl SglangKvManager {
         };
         let keys = &lease.page_hashes[..prefix_tokens / self.cache.page_size()];
         let (_, anchor) = self.cache.match_prefix_hashes_and_lock(keys);
-        let pages = self.collect_path_pages(anchor);
+        let pages = self.collect_path_pages(anchor, keys.len());
         self.publish_stored_hashes(
             keys,
             &pages,
