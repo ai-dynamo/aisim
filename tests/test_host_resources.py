@@ -234,6 +234,133 @@ def test_session_estimate_charges_each_turn_once_and_history_per_active_session(
     assert uncapped.estimated_peak_bytes - estimate.estimated_peak_bytes == (6144 - 32) * carried
 
 
+def test_session_caches_retain_completed_sessions_across_workers():
+    workload = {"request_count": 6144, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    single = estimate_workload(workload, stack="engine")
+    replicated = estimate_workload({**workload, "session_cache_copies": 6}, stack="engine")
+    # Completed sessions can remain cached, so charge all sessions, not just
+    # the 32 active ones. Replication does not copy their live prompt buffers.
+    extra = 6144 * 10 * 32 * (4096 + 256) * 5
+    assert replicated.estimated_peak_bytes - single.estimated_peak_bytes == extra
+    assert replicated.input_token_bytes == single.input_token_bytes
+    serial = estimate_workload({**workload, "session_cache_copies": 6}, stack="engine", concurrency=1)
+    assert replicated.estimated_peak_bytes - serial.estimated_peak_bytes == 31 * (
+        32 * 9 * (4096 + 256) + 4 * (9 * (4096 + 256) + 4096)
+    )
+    # A session cannot visit more independent caches than it has turns.
+    capped = estimate_workload({**workload, "session_cache_copies": 10}, stack="engine")
+    assert capped == estimate_workload({**workload, "session_cache_copies": 1000}, stack="engine")
+    # Each turn visits both pools in P/D; do not cap their combined copies
+    # at the turn count of a single pool.
+    disagg = estimate_workload({**workload, "session_cache_copies": 1000, "session_cache_pools": 2}, stack="engine")
+    assert disagg.estimated_peak_bytes - capped.estimated_peak_bytes == 6144 * 10 * 32 * (4096 + 256) * 10
+    single_turn = {**workload, "turns_per_session": 1}
+    assert estimate_workload(single_turn, stack="engine") == estimate_workload(
+        {**single_turn, "session_cache_copies": 1000, "session_cache_pools": 2}, stack="engine"
+    )
+
+
+@pytest.mark.parametrize("disaggregated", [False, True])
+def test_session_replication_reaches_initial_replay_and_wave_admission(monkeypatch, host, disaggregated):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    raw = _config()
+    raw.pop("optimization")
+    raw.pop("optimizer")
+    raw["engine"]["context_length"] = 65536
+    raw["traffic"] = {
+        "source": {
+            "type": "synthetic-session",
+            "new_input_tokens_per_turn": 4096,
+            "output_tokens_per_turn": 256,
+            "session": {"turns": 10},
+        },
+        "load": {"type": "concurrency", "concurrency": 32},
+        "stop": {"sessions": 100},
+    }
+    if disaggregated:
+        raw["engine"]["mode"] = "disaggregated"
+        raw["engine"]["workers"] = {
+            "prefill": {"parallelism": {"replicas": 2}},
+            "decode": {"parallelism": {"replicas": 2, "attention_data": 2}},
+        }
+        deployment = BackendDeploymentSpec(
+            deployment_mode="disagg",
+            backend="vllm",
+            backend_version="test",
+            num_prefill_workers=2,
+            num_decode_workers=2,
+            prefill_engine_args={"aic_attention_dp_size": 1},
+            decode_engine_args={"dp_size": 2},
+        )
+    else:
+        raw["engine"]["workers"] = {"aggregated": {"parallelism": {"replicas": 3, "attention_data": 2}}}
+        deployment = BackendDeploymentSpec(
+            deployment_mode="agg",
+            backend="vllm",
+            backend_version="test",
+            num_workers=3,
+            agg_engine_args={"aic_attention_dp_size": 2},
+        )
+    config = CorePredictionConfig.model_validate(raw)
+    bounds = workload_bounds(config)
+    assert bounds["session_cache_copies"] == 6
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    expected = cli._resource_plan(SimpleNamespace(stack="engine"), config, None)
+    workload = {
+        key: value for key, value in bounds.items() if key not in {"session_cache_copies", "session_cache_pools"}
+    }
+    original = dict(workload)
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    assert guard_replay(spec, stack="engine")["estimate"] == expected["estimate"]
+    factory = GuardedRunnerFactory(object(), "engine", ResourceConfig())
+    assert factory.admit_wave([spec])["candidates"][0]["estimate"] == expected["estimate"]
+    assert spec.workload == original
+    # A budget between the single-cache and replicated estimates must refuse
+    # this candidate through both replay entry points before materialization.
+    single = estimate_workload(workload, stack="engine").estimated_peak_bytes
+    peak = expected["estimate"]["estimated_peak_bytes"]
+    factory = replace(factory, policy=ResourceConfig(memory_limit_gb=(single + peak) / 2 / GB))
+    assert build_plan(workload, stack="engine", host=host, policy=factory.policy)["status"] == "admitted"
+    with resources.resource_policy(factory.policy), pytest.raises(ResourceLimitError):
+        guard_replay(spec, stack="engine")
+    with pytest.raises(ResourceLimitError):
+        factory.admit_wave([spec])
+
+
+def test_session_recommendation_bounds_cache_replicas_by_gpu_budget():
+    raw = _config()
+    raw["traffic"]["source"] = {
+        "type": "synthetic-session",
+        "new_input_tokens_per_turn": 16,
+        "output_tokens_per_turn": 4,
+        "session": {"turns": 10},
+    }
+    raw["traffic"]["stop"] = {"sessions": 100}
+    bounds = workload_bounds(CoreRecommendationConfig.model_validate(raw))
+    assert bounds["session_cache_copies"] == 72
+    assert estimate_workload(bounds, stack="engine") == estimate_workload(
+        {**bounds, "session_cache_copies": 10}, stack="engine"
+    )
+    raw["engine"]["workers"]["aggregated"]["parallelism"] = {
+        "preset": False,
+        "replicas": {"choices": [1, 3]},
+        "attention_data": 2,
+    }
+    assert workload_bounds(CoreRecommendationConfig.model_validate(raw))["session_cache_copies"] == 6
+    raw["engine"]["workers"]["aggregated"]["parallelism"] = {
+        "preset": [{"replicas": 1, "tensor": 1, "pipeline": 1, "attention_data": 1, "moe_tensor": 1, "moe_expert": 1}],
+    }
+    pinned = workload_bounds(CoreRecommendationConfig.model_validate(raw))
+    assert pinned["session_cache_copies"] == 1
+    plan = build_plan(
+        {**pinned, "request_count": 6144, "isl": 4096, "osl": 256},
+        stack="engine",
+        host=HostResources(128 * GB, 93 * GB, 24),
+    )
+    assert plan["status"] == "admitted"
+
+
 def test_long_sessions_fit_a_workstation_budget():
     # This workload peaks near 2.2 GB RSS; v1 charged every turn for its
     # whole session and estimated 86 GB against this 83.7 GB budget.
@@ -261,6 +388,23 @@ def test_plugin_estimate_is_versioned(host):
 
     with pytest.raises(ResourceLimitError, match="incompatible"):
         build_plan({}, stack="custom", factory=BadFactory(), host=host)
+
+
+def test_session_cache_accounting_preserves_external_estimator_workload(host):
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 100, "osl": 5}
+
+    class Factory:
+        def estimate_host_resources(self, received, *, concurrency):
+            assert received == workload
+            return ResourceEstimate("adapter-session-v1", 100, 0, 0, resources.WORKER_BASELINE_BYTES)
+
+    plan = build_plan(
+        {**workload, "session_cache_copies": 6, "session_cache_pools": 2},
+        stack="dynamo",
+        host=host,
+        factory=Factory(),
+    )
+    assert plan["estimate"]["allocation_model"] == "adapter-session-v1"
 
 
 def test_execution_section_is_core_and_roundtrips():

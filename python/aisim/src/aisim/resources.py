@@ -254,6 +254,51 @@ def workload_bounds(config: Any) -> dict[str, Any]:
         # capacity. Ignoring prompt length deliberately overbounds concurrency.
         concurrency = max(1, math.ceil(max(capacities) * gpus.max_candidate_gpus * _upper(load["fraction"], 1)))
     count = count if count is not None else max(1, round(ratio * (concurrency or rate)))
+    cache_copies = 1
+    cache_pools = 1
+    if session:
+        cache_pools = max(
+            1, sum(getattr(config.engine.workers, role) is not None for role in ("aggregated", "prefill", "decode"))
+        )
+        optimization = getattr(config, "optimization", None)
+        if optimization is not None:
+            # A cache per physical GPU bounds every candidate's replicas and
+            # attention-DP ranks. Keep a tighter explicit topology domain so a
+            # large GPU budget cannot turn a pinned one-cache search quadratic.
+            gpu_bound = optimization.constraints.max_candidate_gpus
+            cache_copies = 0
+            for role in ("aggregated", "prefill", "decode"):
+                worker = getattr(config.engine.workers, role)
+                if worker is None:
+                    continue
+                parallel = getattr(worker, "parallelism", None)
+                if parallel is None:
+                    cache_copies += gpu_bound
+                    continue
+                domain = parallel.model_dump(mode="python", exclude_none=True)
+                preset = domain.get("preset", "default")
+                if isinstance(preset, list):
+                    cache_copies += max(item["replicas"] * item["attention_data"] for item in preset)
+                elif preset == "default":
+                    cache_copies += gpu_bound
+                else:
+                    cache_copies += int(_upper(domain.get("replicas"), gpu_bound)) * int(
+                        _upper(domain.get("attention_data"), gpu_bound)
+                    )
+            cache_copies = max(1, min(gpu_bound, cache_copies))
+        else:
+            cache_copies = 0
+            for role in ("aggregated", "prefill", "decode"):
+                worker = getattr(config.engine.workers, role)
+                if worker is not None:
+                    parallel = getattr(worker, "parallelism", None)
+                    if parallel is None:
+                        # AFD has its own topology. Each turn can add at most
+                        # one independent copy per pool.
+                        cache_copies += source["session"]["turns"]
+                    else:
+                        cache_copies += parallel.replicas * parallel.attention_data
+            cache_copies = max(1, cache_copies)
     return {
         "source_type": source["type"],
         "isl": source.get("new_input_tokens_per_turn" if session else "input_tokens", 1024),
@@ -261,6 +306,7 @@ def workload_bounds(config: Any) -> dict[str, Any]:
         "turns_per_session": source.get("session", {}).get("turns", 1),
         "concurrency": int(concurrency) if concurrency else None,
         "request_count": count,
+        **({"session_cache_copies": cache_copies, "session_cache_pools": cache_pools} if session else {}),
     }
 
 
@@ -934,12 +980,19 @@ def estimate_workload(
     elif stack == "engine":
         # Every turn retains only its own prompt delta or hash IDs, planned
         # output IDs and transcript share, which a one-token block prefix cache
-        # can index. Only an active session's request also carries its history.
+        # can index. Completed sessions' prefixes can remain in every cache a
+        # turn visited, even after they leave the active concurrency window.
+        pools = int(workload.get("session_cache_pools", 1))
+        copies = min(turns * pools, int(workload.get("session_cache_copies", 1))) if turns > 1 else 1
+        if min(copies, pools) < 1:
+            raise ValueError("session cache copies must be positive")
         history = (turns - 1) * (isl + osl)
         tokens = active * (history + isl) * 4
         lower = count * turns * osl * 4
         model = "engine-session-metadata-v2"
-        peak = WORKER_BASELINE_BYTES + count * turns * (4096 + 32 * (isl + osl)) + active * 32 * history + tokens
+        peak = (
+            WORKER_BASELINE_BYTES + count * turns * (4096 + copies * 32 * (isl + osl)) + active * 32 * history + tokens
+        )
     else:
         return ResourceEstimate("runner-unqualified-v1", count, 0, 0, None, "runner allocation model is unqualified")
     return ResourceEstimate(model, count, tokens, lower, peak)
@@ -974,6 +1027,12 @@ def build_plan(
         ),
     )
     estimator = getattr(factory, "estimate_host_resources", None)
+    if callable(estimator) and "session_cache_copies" in workload:
+        # These are built-in admission metadata, not part of an external
+        # adapter's workload contract.
+        workload = {
+            key: value for key, value in workload.items() if key not in {"session_cache_copies", "session_cache_pools"}
+        }
     estimate = (
         estimator(workload, concurrency=concurrency)
         if callable(estimator)
@@ -1039,8 +1098,28 @@ def resource_policy(policy: ResourceConfig):
         _POLICY.reset(token)
 
 
+def _replay_resource_workload(spec: Any, stack: str) -> Mapping[str, Any]:
+    """Attach concrete cache replication only to the built-in admission input."""
+    deployment = getattr(spec, "backend_deployment", None)
+    if stack != "engine" or deployment is None or spec.workload.get("turns_per_session", 1) == 1:
+        return spec.workload
+    copies = 0
+    pools = 0
+    for workers, args in (
+        (deployment.num_workers, deployment.agg_engine_args),
+        (deployment.num_prefill_workers, deployment.prefill_engine_args),
+        (deployment.num_decode_workers, deployment.decode_engine_args),
+    ):
+        if args is not None:
+            pools += 1
+            copies += workers * int(args.get("dp_size", args.get("aic_attention_dp_size", 1)))
+    return {**spec.workload, "session_cache_copies": max(1, copies), "session_cache_pools": max(1, pools)}
+
+
 def guard_replay(spec: Any, *, stack: str, factory: Any = None) -> dict[str, Any]:
-    plan = build_plan(spec.workload, stack=stack, concurrency=spec.concurrency, factory=factory)
+    plan = build_plan(
+        _replay_resource_workload(spec, stack), stack=stack, concurrency=spec.concurrency, factory=factory
+    )
     require_plan(plan)
     return plan
 
@@ -1162,7 +1241,7 @@ class GuardedRunnerFactory:
         reservations = []
         for spec in specs:
             plan = build_plan(
-                spec.workload,
+                _replay_resource_workload(spec, self.stack),
                 stack=self.stack,
                 policy=self.policy,
                 host=host,
