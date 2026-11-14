@@ -4,7 +4,7 @@
 //! Request-boundary snapshots, not physical engine checkpoints.
 //! The behavioral reference is AIPerf's trajectory_source.py at
 //! https://github.com/ai-dynamo/aiperf/tree/7db2ba37a62aa80c882bc90eaf61cc8073e2387b.
-//! Sampling and token allocation below are AISimulate-owned algorithms.
+//! Sampling and token allocation below are AISim-owned algorithms.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -329,6 +329,10 @@ impl AgenticReplayContext {
         self.initial_corpus_cursor
     }
 
+    pub(super) fn recorded_start_ms(&self, index: usize) -> f64 {
+        self.recorded_intervals[index].0
+    }
+
     /// Prepare a deterministic corpus-cycle instance. `None` samples an initial
     /// cut; `Some(cut_ms)` uses an absolute recorded timestamp, so `Some(0.0)`
     /// starts a play only when its recorded clock begins at zero. Use
@@ -593,6 +597,17 @@ impl AgenticPlaySnapshot {
                 .then(|| self.instance_request_id(&graph.nodes[play.root_nodes[0]].request_id)),
             parent_id: parent.map(|e| self.instance_request_id(&e.request_id)),
             cache_id: Some(self.evidence.cache_id.clone()),
+            lineage: graph.conversation_lineage[index].as_ref().map(|lineage| {
+                crate::replay::AgenticConversationLineage {
+                    schema: lineage.schema.clone(),
+                    root_conversation_id: self
+                        .instance_conversation_id(&lineage.root_conversation_id),
+                    parent_conversation_id: lineage
+                        .parent_conversation_id
+                        .as_ref()
+                        .map(|parent| self.instance_conversation_id(parent)),
+                }
+            }),
         }
     }
     pub(super) fn token_ids(&self, index: usize) -> Vec<u32> {
