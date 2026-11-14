@@ -63,6 +63,11 @@ class MeasurementFile:
     iteration_count: int | None = None
     rank_record_count: int | None = None
     grouping: Mapping[str, object] | None = None
+    storage_format: str | None = None
+    storage_schema: str | None = None
+    logical_row_count: int | None = None
+    source_layout: str | None = None
+    ordering_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +132,8 @@ class MeasurementObservation:
     source_row: int
     iteration: ForwardPassIteration
     event_time: str | None = None
+    # Protocol-normalized chronology; preserve original event_time for identity.
+    event_time_ms: int | float | None = None
 
     @property
     def scheduled(self) -> RequestMetrics:
@@ -172,6 +179,7 @@ class MeasurementCase:
     override_effects: tuple[str, ...]
     warnings: tuple[str, ...] = ()
     issues: tuple[MeasurementIssue, ...] = ()
+    collection_runs: tuple[Mapping[str, object], ...] = ()
     parser_policy_id: str | None = None
 
     @property

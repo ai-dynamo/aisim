@@ -111,12 +111,41 @@ pub(crate) fn op_sol_latency_ms(
             let ratio = f64::from(o.numerator) / f64::from(o.denominator);
             op_sol_latency_ms(&o.op, db, x * ratio, batch * ratio, s, prefix)
         }
+        Op::MeasuredComposite(_) => Err(AicError::InvalidEngineConfig(
+            "measured composite has no SOL model".into(),
+        )),
         Op::Gemm(o) => Ok(gemm_sol(o, spec, x)),
         Op::Embedding(o) => Ok(embedding_sol(o, spec, x)),
         Op::Elementwise(o) => Ok(elementwise_sol(o, spec, x)),
         Op::ContextAttention(o) => Ok(context_attention_sol(o, spec, batch, s, prefix)),
         Op::GenerationAttention(o) => Ok(generation_attention_sol(o, spec, batch, s)),
         Op::Dsv41Attention(o) => Ok(o.sol(spec, batch, s, prefix)?.latency_ms),
+        Op::Glm53Primitive(o) => {
+            o.validate()?;
+            let child_x = if o.token_selection == "last_per_request" {
+                batch
+            } else {
+                x
+            };
+            o.children.iter().try_fold(0.0, |sum, child| {
+                Ok(sum + op_sol_latency_ms(child, db, child_x, batch, s, prefix)?)
+            })
+        }
+        Op::Glm53Ffn(o) => {
+            o.validate()?;
+            o.children.iter().try_fold(0.0, |sum, child| {
+                Ok(sum
+                    + match child {
+                        Op::Moe(m) => {
+                            crate::operators::glm53flash::routed_moe_sol(m, spec, x)?.latency_ms
+                        }
+                        _ => op_sol_latency_ms(child, db, x, batch, s, prefix)?,
+                    })
+            })
+        }
+        Op::Glm53Attention(o) => Ok(o.sol(spec, batch, s, prefix)?.latency_ms),
+        Op::Glm53Mhc(o) => Ok(o.sol(spec, x)?.latency_ms),
+        Op::Glm53Router(o) => Ok(o.sol(spec, x)?.latency_ms),
         Op::Dsv41Linear(o) => Ok(o.sol(spec, x)?.latency_ms),
         Op::Dsv41Mhc(o) => Ok(o.sol(spec, x)?.latency_ms),
         Op::Dsv41Engram(o) => Ok(o.sol(spec, x)?.latency_ms),
@@ -134,8 +163,8 @@ pub(crate) fn op_sol_latency_ms(
             }
             Ok(total)
         }
-        Op::DsaContext(o) => dsa_context_module_sol(o, spec, batch, s, prefix),
-        Op::DsaGeneration(o) => dsa_generation_module_sol(o, spec, batch, s),
+        Op::DsaContext(o) => dsa_context_module_sol(o, db, batch, s, prefix),
+        Op::DsaGeneration(o) => dsa_generation_module_sol(o, db, batch, s),
         Op::Moe(o) => Ok(moe_sol(o, spec, x)),
         Op::MoeDispatch(o) => moe_dispatch_sol(o, spec, x),
         Op::CustomAllReduce(o) => Ok(custom_allreduce_op_sol(o, spec, x)),
@@ -360,7 +389,7 @@ fn generation_attention_sol(op: &GenerationAttentionOp, spec: &SystemSpec, b: f6
 /// outside `[0, 1]` a typed `InvalidEngineConfig`.
 fn dsa_context_module_sol(
     op: &DsaModuleOp,
-    spec: &SystemSpec,
+    db: &PerfDatabase,
     b: f64,
     s: f64,
     p: f64,
@@ -372,6 +401,7 @@ fn dsa_context_module_sol(
             op.cp_size, op.name
         )));
     }
+    let spec = &db.system_spec;
     let dims = dsa_dims(&op.architecture);
     let flops = dsa_context_sol_flops(spec, op.gemm_quant_mode, op.fmha_quant_mode)?;
     let (b, s, p) = (
@@ -392,6 +422,7 @@ fn dsa_context_module_sol(
             p,
             op.num_heads as i64,
             skip_indexer,
+            db.dsa.reuse_sol_policy,
             flops,
         )
     };
@@ -436,15 +467,16 @@ fn dsa_context_module_sol(
 }
 
 /// Whole-forward SOL leaf for the DSA generation module (`Op::DsaGeneration`): the
-/// op-level decode roofline (`dsa_generation_sol_ms`; the attention group is bf16 and
-/// the skip-indexer variant never enters the decode SOL, as in
-/// `operators::dsa::query_generation_table`), then `scale_factor`.
+/// op-level decode roofline (`dsa_generation_sol_ms`; the attention group is bf16),
+/// blended over full/reuse layers for vLLM/SGLang, then `scale_factor`. Other serving
+/// backends retain the legacy full-indexer approximation.
 fn dsa_generation_module_sol(
     op: &DsaModuleOp,
-    spec: &SystemSpec,
+    db: &PerfDatabase,
     b: f64,
     s: f64,
 ) -> Result<f64, AicError> {
+    let spec = &db.system_spec;
     let dims = dsa_dims(&op.architecture);
     let flops = dsa_generation_sol_flops(spec, op.gemm_quant_mode)?;
     // Decode CP geometry mirrors `DsaModuleOp::query_generation`: gathered
@@ -452,17 +484,39 @@ fn dsa_generation_module_sol(
     // `ceil(topk / dcp)` owned slots.
     let dcp = op.dcp_size.max(1) as f64;
     let s_local = if dcp > 1.0 { ceil_div(s, dcp) } else { s };
-    let ms = dsa_generation_sol_ms(
-        spec,
-        dims,
-        op.kv_cache_dtype,
-        op.gemm_quant_mode,
-        b.round().max(1.0) as i64,
-        s_local.round().max(1.0) as i64,
-        (op.num_heads as f64 * dcp) as i64,
-        dcp as i64,
-        flops,
-    );
+    // vLLM and SGLang use reuse-aware decode SOL; other serving backends retain
+    // the previous full-indexer approximation without an extra blend.
+    let w = if matches!(db.backend.as_str(), "vllm" | "sglang") {
+        op.full_frac
+    } else {
+        1.0
+    };
+    if !(0.0..=1.0).contains(&w) {
+        return Err(AicError::InvalidEngineConfig(format!(
+            "DSA generation op {} has dsa_full_layer_fraction={w}, which is not a fraction in [0, 1]",
+            op.name
+        )));
+    }
+    let sol = |skip_indexer| {
+        dsa_generation_sol_ms(
+            spec,
+            dims,
+            op.kv_cache_dtype,
+            op.gemm_quant_mode,
+            b.round().max(1.0) as i64,
+            s_local.round().max(1.0) as i64,
+            (op.num_heads as f64 * dcp) as i64,
+            dcp as i64,
+            skip_indexer,
+            db.dsa.reuse_sol_policy,
+            flops,
+        )
+    };
+    let ms = if w >= 1.0 {
+        sol(false)
+    } else {
+        w * sol(false) + (1.0 - w) * sol(true)
+    };
     Ok(ms.max(0.0) * op.scale_factor)
 }
 
@@ -700,13 +754,13 @@ mod tests {
     /// intra_node_bw 8.1e11, inter_node_bw 4e10 (systems/b200_sxm.yaml).
     fn spec() -> SystemSpec {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems/b200_sxm.yaml");
+            .join("../../python/aisim/src/aisim_core/systems/b200_sxm.yaml");
         SystemSpec::load(&root).expect("b200 spec")
     }
 
     fn db() -> PerfDatabase {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         PerfDatabase::load(&root, "b200_sxm", "vllm", "0.19.0").expect("db")
     }
 
@@ -722,7 +776,7 @@ mod tests {
         use crate::operators::{Dsv41MhcOp, Dsv41StageOp};
 
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems");
+            .join("../../python/aisim/src/aisim_core/systems");
         let db = PerfDatabase::load(&root, "gb200", "vllm", "0.19.0").expect("GB200 db");
         let leaf = Dsv41MhcOp {
             name: "mhc".into(),
@@ -765,8 +819,8 @@ mod tests {
 
     /// Python oracle:
     /// PYTHONPATH=aic-core/src python3 -c "
-    /// from aisimulate_core.sdk import perf_database, common
-    /// from aisimulate_core.sdk.operations.gemm import GEMM
+    /// from aisim_core.sdk import perf_database, common
+    /// from aisim_core.sdk.operations.gemm import GEMM
     /// view = perf_database.get_database_view('b200_sxm','vllm','0.19.0',database_mode='SOL',allow_missing_data=True)
     /// op = GEMM('qkv_gemm', 1.0, 4096, 4096, common.GEMMQuantMode.nvfp4)
     /// print(repr(float(op.query(view, x=8192.0, batch_size=4, beam_width=1, s=2048.0, prefix=0.0))))"
@@ -829,8 +883,8 @@ mod tests {
 
     /// Python oracle:
     /// PYTHONPATH=aic-core/src python3 -c "
-    /// from aisimulate_core.sdk import perf_database, common
-    /// from aisimulate_core.sdk.operations.attention import ContextAttention, GenerationAttention
+    /// from aisim_core.sdk import perf_database, common
+    /// from aisim_core.sdk.operations.attention import ContextAttention, GenerationAttention
     /// view = perf_database.get_database_view('b200_sxm','vllm','0.19.0',database_mode='SOL',allow_missing_data=True)
     /// op = ContextAttention('context_attention', 1.0, 48, 8, 128, kvcache_quant_mode=common.KVCacheQuantMode.fp8, fmha_quant_mode=common.FMHAQuantMode.bfloat16)
     /// print(repr(float(op.query(view, x=1, batch_size=4.0, beam_width=1, s=682.6666666666666, prefix=128.5))))"
@@ -933,7 +987,6 @@ mod tests {
             attention_dp_size: 1,
             quant_mode: MoeQuantMode::Nvfp4,
             workload_distribution: "uniform".into(),
-            require_exact_workload_distribution: false,
             is_gated: true,
             moe_backend: None,
             moe_kernel_source: None,
@@ -985,6 +1038,8 @@ mod tests {
             pp_size: 2,
             hidden_size: 6144,
             seq_split: 1,
+            span_gpus: None,
+            force_scale_out: false,
         };
         approx(
             p2p_sol(&p2p, &s, 8192.0),
@@ -1245,6 +1300,7 @@ mod tests {
             24576,
             64,
             false,
+            d.dsa.reuse_sol_policy,
             flops,
         );
         assert!(got.is_finite() && got > 0.0, "{got}");
@@ -1274,6 +1330,7 @@ mod tests {
                 65536,
                 64,
                 skip,
+                d.dsa.reuse_sol_policy,
                 flops,
             )
         };
@@ -1297,6 +1354,8 @@ mod tests {
             100000,
             64,
             1,
+            false,
+            d.dsa.reuse_sol_policy,
             flops,
         );
         assert!(got.is_finite() && got > 0.0, "{got}");
@@ -1364,6 +1423,55 @@ mod tests {
         approx(got, 0.019327371428571428);
     }
 
+    /// Same independent ledger as the full-only frozen case above, omitting
+    /// 9,371,648 indexer weight elements and all indexer-cache bytes on each
+    /// reuse layer: (150,339,584 * 9/16 + 7,077,888) / 7.7e12 * 1000
+    /// = 0.011901805714285714 ms, memory-bound. GLM-5.2 has 21 full and
+    /// 57 reuse layers, so its attention SOL is 1.0842777257142857 ms.
+    #[test]
+    fn dsa_generation_fpm_sol_reuse_layers_have_no_indexer_cost() {
+        let d = db();
+        let mut op = glm_dsa_op("generation_attention");
+        op.full_frac = 21.0 / 78.0;
+        op.scale_factor = 78.0;
+        let got = op_sol_latency_ms(&Op::DsaGeneration(op), &d, 6.0, 6.0, 65536.5, 0.0).unwrap();
+        approx(got, 1.0842777257142857);
+    }
+
+    /// SGLang uses the same reuse ledger as vLLM above; TRTLLM retains the
+    /// full-indexer ledger on every layer: 78 * 0.019327371428571428 ms.
+    /// The serving backend selects the policy even with an explicit reuse fraction.
+    #[test]
+    fn dsa_generation_fpm_sol_scopes_reuse_policy_by_backend() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../python/aisim/src/aisim_core/systems");
+        for (backend, version, expected) in [
+            ("sglang", "0.5.14", 1.0842777257142857),
+            ("trtllm", "1.3.0rc20", 78.0 * 0.019327371428571428),
+        ] {
+            let d = PerfDatabase::load(&root, "b200_sxm", backend, version).unwrap();
+            let mut op = glm_dsa_op("generation_attention");
+            op.full_frac = 21.0 / 78.0;
+            op.scale_factor = 78.0;
+            let got =
+                op_sol_latency_ms(&Op::DsaGeneration(op), &d, 6.0, 6.0, 65536.5, 0.0).unwrap();
+            approx(got, expected);
+        }
+    }
+
+    #[test]
+    fn dsa_generation_fpm_sol_rejects_invalid_layer_fractions() {
+        let d = db();
+        for fraction in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut op = glm_dsa_op("generation_attention");
+            op.full_frac = fraction;
+            assert!(matches!(
+                op_sol_latency_ms(&Op::DsaGeneration(op), &d, 1.0, 1.0, 8193.0, 0.0),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+        }
+    }
+
     /// `full_frac` domain. The two valid boundaries select the pure legs, and every
     /// value outside [0, 1] is a typed `InvalidEngineConfig` rather than an
     /// extrapolated blend (negative / > 1) or a silent 0 (NaN, -inf) — see the gate
@@ -1387,6 +1495,7 @@ mod tests {
                 65536,
                 64,
                 skip,
+                d.dsa.reuse_sol_policy,
                 flops,
             )
         };

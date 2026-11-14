@@ -114,7 +114,7 @@ BF16 GEMM, MoE, and collective data with **SOL** contributions for CSA2, Engram,
 single-pass mHC, and 32x32-block FP8 shared-expert projections; those new components are uncalibrated. SILICON fails for missing
 V4.1 data and never substitutes V4 attention or mHC tables. EMPIRICAL similarly
 requires a V4.1 anchor. The packaged
-[GB300 SILICON operator databases](../../../python/aisimulate/src/aisimulate_core/systems/profiles/dsv41/README.md)
+[GB300 SILICON operator databases](../../../python/aisim/src/aisim_core/systems/profiles/dsv41/README.md)
 provide separate `full` and `decoder_bounded` systems roots for the measured
 SGLang runtime. Select the root matching `decoder_replay`; the flag does not
 automatically select a table.
@@ -166,8 +166,8 @@ persistent main record. The exact layout is scoped to 512-wide, 64-RoPE,
 BF16 pool alternatives are outside this contract.
 
 Only four Full layers own compressed main/index pools; Reindex and Reuse share
-them. One ratio-one owner and three ratio-two owners yield 652*(1+3/2)=1630 bytes
-per token after the windows fill. At 131072 tokens, 40*128*584 window bytes plus
+them. One ratio-one owner and three ratio-two owners yield `652*(1+3/2)=1630` bytes
+per token after the windows fill. At 131072 tokens, `40*128*584` window bytes plus
 three ratio-two FP32 pair states plus compressed pools total 216662016 bytes
 (206.625 MiB). Odd/even publication boundaries are preserved by forward and
 inverse capacity APIs. This is physical **payload**, not allocator consumption:

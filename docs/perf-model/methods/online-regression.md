@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Recursive regression in the forward-pass performance model
 
-AISimulate updates centered sufficient statistics when a retained observation
+AISim updates centered sufficient statistics when a retained observation
 is inserted or evicted. By default it also solves the standardized, nonnegative
 linear regression after each accepted update transaction. Opt-in lazy updates
 defer coefficient publication while retaining every accepted statistical update.
@@ -19,7 +19,8 @@ and the plane's ability to describe a workload remain separate concerns. Periodi
 rebuilding is disabled by default (`None` in Rust/Python, `null` in JSON).
 Numerical recovery and conservative batch fallbacks remain enabled.
 The optional `fit.linear` controls support one to six fitted features, signed
-slopes, and lazy updates. Independently, `sampling.axes` and `bins_per_axis`
+slopes, and lazy updates; `fit.linear.feature_set: fpm5` instead fits the 17
+cross-rank aggregates of the learned `fpm5` preset. Independently, `sampling.axes` and `bins_per_axis`
 configure one to six retention dimensions. The defaults remain two A/M axes,
 a 4×4 grid, capacity 64 per store, nonnegative fitting, and eager updates.
 
@@ -27,6 +28,19 @@ The optional `fit.kind: spline` model learns two or three knots per feature axis
 It uses the same feature extraction, workload stores, and retained observations.
 The two-feature equations below describe the default linear model; the next
 section explains the spline's additional state.
+
+This page describes `estimation_mode: fpm_regression`. For the explicit
+`fpm_learned` estimator, a frozen forest can use hybrid calibration or an online
+forest can update binned trees from feedback. Its loss, historical evidence,
+retention and update rules are documented in the
+[online GBDT mathematics](../fpm_ml/online-gbdt-and-causal-selection.md#online-binned-tree-adaptation) and
+[canonical field reference](../fpm_ml/configuration.md#learned-forest-and-online-fitting-controls).
+The learned estimator also supports a
+[causal expert selector](../fpm_ml/online-gbdt-and-causal-selection.md#hybrid-calibration-with-a-causal-selector)
+between a frozen hybrid-calibrated forest and an online forest. Its EWMA errors
+and switch counters are separate from regression fitting and readiness.
+The worker-ownership and predict-before-feedback requirements below apply to
+both estimators; their fitting algorithms and readiness are separate.
 
 ## Learned-knot spline regression
 
@@ -90,9 +104,9 @@ records controls, not trained state.
 By default, an observation contains two finite, nonnegative raw features and
 a positive, finite observed latency in milliseconds:
 
-$$
+```math
 x = [x_0, x_1], \qquad y = \text{observed latency in ms}.
-$$
+```
 
 `RegressionIterationFeatures` computes $x_0$ as critical attention work: a
 maximum over attention-DP ranks after composing each rank's attention score.
@@ -136,37 +150,37 @@ Spline fitting and its retention grid remain restricted to the default A/M axes.
 For the current $n$ retained observations, the population mean and scale of
 feature $j$ are
 
-$$
+```math
 \mu_j = \frac{1}{n}\sum_i x_{ij}, \qquad
 s_j = \sqrt{\frac{1}{n}\sum_i (x_{ij}-\mu_j)^2}.
-$$
+```
 
 The denominator is $n$, not $n-1$. A feature is active only when its scale is
 finite and
 
-$$
+```math
 s_j > 10^{-12}\max(1, |\mu_j|).
-$$
+```
 
-An active feature is transformed to $u_j=(x_j-\mu_j)/s_j$. An inactive feature
+An active feature is transformed to $`u_j=(x_j-\mu_j)/s_j`$. An inactive feature
 has transformed value zero and fitted coefficient zero. The target stays in
 milliseconds; it is not divided by a target standard deviation.
 
 The fitted prediction is
 
-$$
+```math
 \widehat y = a + b_0 u_0 + b_1 u_1, \qquad b_j \ge 0.
-$$
+```
 
 The intercept $a$ is free, including negative values. The slopes are
 constrained to be nonnegative by default; `fit.linear.non_negative: false`
 permits signed slopes. For active axes, the corresponding raw plane
 has coefficients
 
-$$
+```math
 \theta_j = b_j/s_j, \qquad
 \theta_{\mathrm{intercept}} = a - \sum_{j\text{ active}} \theta_j\mu_j.
-$$
+```
 
 Thus nonnegative standardized slopes also mean nonnegative raw slopes.
 The stored intercept $a$ is the value at the retained feature means, not
@@ -178,59 +192,59 @@ uses a consistent snapshot.
 
 Combine the two raw features and target into a three-dimensional vector:
 
-$$
+```math
 z_i = [x_{i0}, x_{i1}, y_i]^\mathsf T.
-$$
+```
 
 `RecursiveFit` maintains a count $n$, mean vector $m$, and symmetric centered
 scatter matrix $C$:
 
-$$
+```math
 m = \frac{1}{n}\sum_i z_i, \qquad
 C = \sum_i (z_i-m)(z_i-m)^\mathsf T
   = \begin{bmatrix} C_{xx} & C_{xy} \\ C_{xy}^\mathsf T & C_{yy}\end{bmatrix}.
-$$
+```
 
-Here $C_{xx}$ is two-by-two, $C_{xy}$ has two entries, and $C_{yy}$ is a scalar.
+Here $`C_{xx}`$ is two-by-two, $`C_{xy}`$ has two entries, and $`C_{yy}`$ is a scalar.
 They contain everything needed to standardize the features, build the normal
 equations, and score a candidate's residual error. Keeping centered scatter
 avoids routinely subtracting two large raw quantities such as
-$\sum x_i^2-n\mu^2$ to recover a small variance. Floating-point roundoff is
+$`\sum x_i^2-n\mu^2`$ to recover a small variance. Floating-point roundoff is
 still possible, especially during removal.
 
 ### Adding one observation
 
-Let $z$ be the incoming observation and $\delta=z-m$ before insertion. Then
+Let $z$ be the incoming observation and $`\delta=z-m`$ before insertion. Then
 
-$$
+```math
 \begin{aligned}
 n' &= n+1,\\
 m' &= m + \frac{\delta}{n+1},\\
 C' &= C + \frac{n}{n+1}\delta\delta^\mathsf T.
 \end{aligned}
-$$
+```
 
 To see the scatter update, recenter the old points at $m'$. Their centered
-deviations sum to zero, leaving $C+n(m-m')(m-m')^\mathsf T$. Adding the new
-point's deviation $(z-m')(z-m')^\mathsf T$ gives the factor $n/(n+1)$ above.
+deviations sum to zero, leaving $`C+n(m-m')(m-m')^\mathsf T`$. Adding the new
+point's deviation $`(z-m')(z-m')^\mathsf T`$ gives the factor $n/(n+1)$ above.
 The first insertion initializes $m=z$ and $C=0$.
 
 The code uses the equivalent Welford expression
-$\delta(z-m')^\mathsf T$. For off-diagonal entries it averages the two
+$`\delta(z-m')^\mathsf T`$. For off-diagonal entries it averages the two
 coordinate orders and mirrors the result to retain symmetry.
 
 ### Removing one retained observation
 
-For $n>1$, let $z$ be the actual evicted observation and $\delta=z-m$ before
+For $`n>1`$, let $z$ be the actual evicted observation and $`\delta=z-m`$ before
 removal. Inverting the insertion identity gives
 
-$$
+```math
 \begin{aligned}
 n' &= n-1,\\
 m' &= m - \frac{\delta}{n-1},\\
 C' &= C - \frac{n}{n-1}\delta\delta^\mathsf T.
 \end{aligned}
-$$
+```
 
 Removing the last observation clears the count, mean, and scatter. A full
 store performs insertion followed by removal; the removal formula uses the
@@ -239,36 +253,36 @@ the update does not assume that the globally oldest observation was removed.
 
 For example, start with $(x_0,x_1,y)=(0,0,1)$ and $(2,0,5)$:
 
-$$
+```math
 n=2,\quad m=[1,0,3]^\mathsf T,\quad
 C=\begin{bmatrix}2&0&4\\0&0&0\\4&0&8\end{bmatrix}.
-$$
+```
 
-Inserting $(4,0,9)$ gives $m'=[2,0,5]^\mathsf T$ and
-$C'=\left[\begin{smallmatrix}8&0&16\\0&0&0\\16&0&32\end{smallmatrix}\right]$.
-Removing $(0,0,1)$ then gives mean $[3,0,7]^\mathsf T$ and the original
+Inserting $(4,0,9)$ gives $`m'=[2,0,5]^\mathsf T`$ and
+$`C'=\left[\begin{smallmatrix}8&0&16\\0&0&0\\16&0&32\end{smallmatrix}\right]`$.
+Removing $(0,0,1)$ then gives mean $`[3,0,7]^\mathsf T`$ and the original
 scatter matrix. The remaining points have feature scale $s_0=1$, so their
 line is $7+2(x_0-3)=1+2x_0$. This illustrates the statistics; with only two
 retained points, the default minimum of five still prevents a ready fit.
 
 ## Solving the constrained fit from the statistics
 
-For active axes, let $D=\operatorname{diag}(s_j)$ and define
+For active axes, let $`D=\mathrm{diag}(s_j)`$ and define
 
-$$
+```math
 G=D^{-1}C_{xx}D^{-1}, \qquad h=D^{-1}C_{xy}.
-$$
+```
 
 These are the standardized feature Gram matrix and feature-target cross
 products. Centered features have zero sum, so the intercept separates from
 the slopes. For a selected subset of fitted axes $S$, the normal equations are
 
-$$
+```math
 \begin{bmatrix}n&0\\0&G_{SS}\end{bmatrix}
 \begin{bmatrix}a\\b_S\end{bmatrix}
 =
 \begin{bmatrix}n m_y\\h_S\end{bmatrix}.
-$$
+```
 
 In exact arithmetic, the free intercept is $a=m_y$. Axes outside $S$ have
 coefficient zero. With two active features the implementation considers four
@@ -279,9 +293,9 @@ and chooses the smallest residual sum of squares (SSE). It does not simply
 clip a negative unconstrained coefficient to zero: the remaining coefficients
 must be refitted on that face.
 
-For a hand-derived example, take all nine combinations $x_0,x_1\in\{0,1,2\}$
+For a hand-derived example, take all nine combinations $`x_0,x_1\in\{0,1,2\}`$
 and labels $y=20-2x_0+3x_1$. The independent feature columns make the
-nonnegative optimum $\widehat y=18+3x_1$: the forbidden negative term is
+nonnegative optimum $`\widehat y=18+3x_1`$: the forbidden negative term is
 replaced by its mean $-2$. This plane predicts 30 at $(100,4)$, regardless of
 the first coordinate. A production test anchors this behavior independently
 of the batch comparator.
@@ -291,35 +305,35 @@ of the batch comparator.
 Each candidate first attempts an unregularized solve. Only a failed solve
 retries with a penalty on its fitted slopes:
 
-$$
-\left(H+\lambda\operatorname{diag}(0,1,\ldots,1)\right)c=r,
+```math
+\left(H+\lambda\,\mathrm{diag}(0,1,\ldots,1)\right)c=r,
 \qquad
 \lambda=\texttt{singular\_ridge\_scale}\,
 \max\!\left(1,\sum_k |H_{kk}|\right).
-$$
+```
 
 $H$ is that candidate's normal-equation matrix, including the intercept
-entry $n$. `singular_ridge_scale` defaults to $10^{-9}$. The intercept remains
+entry $n$. `singular_ridge_scale` defaults to $`10^{-9}`$. The intercept remains
 unpenalized, and the penalty applies in standardized feature coordinates.
 The configured scale also reaches every batch fallback.
 
 This preserves the existing algorithm: some candidates can use ridge and
 others can use ordinary least squares, and all are ranked by **unpenalized
 SSE**. It is not a single always-regularized ridge objective. The small linear
-solver treats a pivot below $10^{-12}$ in absolute magnitude as singular.
+solver treats a pivot below $`10^{-12}`$ in absolute magnitude as singular.
 
 ### Scoring without another pass over the observations
 
 For a candidate $a,b$, with omitted slopes filled with zeros, expansion of
-$\sum_i(y_i-a-b^\mathsf T u_i)^2$ yields
+$`\sum_i(y_i-a-b^\mathsf T u_i)^2`$ yields
 
-$$
-\operatorname{SSE}
+```math
+\mathrm{SSE}
 =C_{yy}-2b^\mathsf T h+b^\mathsf T G b+n(a-m_y)^2.
-$$
+```
 
-The centered cross terms disappear because $\sum_i u_i=0$ and
-$\sum_i(y_i-m_y)=0$. This avoids a residual scan for each face. Its terms can
+The centered cross terms disappear because $`\sum_i u_i=0`$ and
+$`\sum_i(y_i-m_y)=0`$. This avoids a residual scan for each face. Its terms can
 nearly cancel for a good fit, so the implementation checks negative/nonfinite
 scores and close candidate scores before trusting the selected face.
 
@@ -331,7 +345,7 @@ original batch fitter to handle decisions that are sensitive to that
 difference, including:
 
 - feature spread close to the active-axis threshold;
-- nearly collinear active features, including $1-\rho^2\le10^{-8}$;
+- nearly collinear active features, including $`1-\rho^2\le10^{-8}`$;
 - fitted slopes close to the zero constraint boundary;
 - failed or nonfinite solves, invalid SSE, and numerically tied candidate SSE.
 
@@ -355,7 +369,7 @@ risk but do not constitute a bound on roundoff for every possible stream.
 
 A new fit requires enough retained observations (five by default)
 and at least one varying feature. The default nonnegative fit also requires a
-positive slope, except for the existing low-observation case $n\le d$, where
+positive slope, except for the existing low-observation case $`n\le d`$, where
 $d$ is the number of varying axes. This count is not the rank of the feature
 matrix. With the default minimum, an intercept-only candidate cannot become the
 serving model, but rejection preserves any previous linear serving model. Signed
@@ -365,7 +379,7 @@ fails, such as having no varying features.
 
 For a valid nonempty query, a ready store transforms features using its fit
 snapshot. If transformation and evaluation are finite, it returns the prediction
-floored at $10^{-6}$ ms; otherwise it returns no prediction. The floor
+floored at $`10^{-6}`$ ms; otherwise it returns no prediction. The floor
 is applied after fitting; training SSE uses raw predictions. A valid iteration
 with no scheduled work returns zero through the outer model and adds no
 observation. A cold workload store returns no prediction even if another store
@@ -378,9 +392,9 @@ is ready.
 new target enters retention or statistics. For positive observed latency $y$,
 an error is excessive only when
 
-$$
+```math
 |\widehat y-y| > \max(\text{absolute\_tolerance\_ms},\;\text{relative\_tolerance}\,y).
-$$
+```
 
 Equality is acceptable. The monitor retains the most recent `window` accepted
 observation flags with finite prior predictions and requests a fit when its excessive count is at least
@@ -433,7 +447,7 @@ not per prediction query or elapsed time.
 Construct regression through the same public API as other estimators:
 
 ```python
-from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 config = ForwardPassPerfModelConfig(
     model="Qwen/Qwen3-32B",
@@ -457,7 +471,7 @@ on a newly constructed model. JSON uses `null` rather than Python's `None`.
 In Rust, set the same typed field before construction:
 
 ```rust
-use aisimulate_core::{
+use aisim_core::{
     BackendKind, EstimationMode, ForwardPassPerfModel, ForwardPassPerfModelConfig,
     ForwardPassWorkerType,
 };
@@ -478,14 +492,16 @@ for selection, diagnostics, migration, and saved-configuration behavior.
 
 ## Sample retention and total tuning cost
 
-The sampler uses $\log(1+x_j)$ of its selected retention coordinates to choose
+The sampler uses $`\log(1+x_j)`$ of its selected retention coordinates to choose
 cells. The independent fit uses its selected feature values. Grid bounds expand
 with incoming observations and do not
 shrink on eviction. If the store exceeds its capacity, it evicts the oldest
-observation in a most-populated cell. Hash-map ordering can affect tied
-choices. Each retained observation has weight one; an evicted observation
-has weight zero. This is spatially balanced retention, not a FIFO window or
-exponential forgetting.
+observation in a most-populated cell. Among equally populated cells it picks
+the lexicographically greatest cell index, and refits read cells in index
+order, so identical inputs retain and fit identical samples in every process.
+Each retained observation has weight one; an evicted observation has weight
+zero. This is spatially balanced retention, not a FIFO window or exponential
+forgetting.
 
 Let $M$ be retained capacity, $B$ the bucket-map storage scanned to select an
 eviction. With two fixed features:
@@ -522,13 +538,13 @@ well as a resource choice.
 
 ## Relationship to classic inverse-matrix RLS
 
-For fixed features $\phi=[1,x_0,x_1]^\mathsf T$, ordinary RLS often maintains
-the inverse normal matrix $P=(\sum_i\phi_i\phi_i^\mathsf T)^{-1}$. For one
+For fixed features $`\phi=[1,x_0,x_1]^\mathsf T`$, ordinary RLS often maintains
+the inverse normal matrix $`P=(\sum_i\phi_i\phi_i^\mathsf T)^{-1}`$. For one
 insertion, its rank-one update is
 
-$$
+```math
 P'=P-\frac{P\phi\phi^\mathsf T P}{1+\phi^\mathsf T P\phi}.
-$$
+```
 
 That is useful when the feature coordinates and fitting objective stay fixed.
 Our implementation uses recursive **sufficient statistics** instead. Means
@@ -549,7 +565,8 @@ allows signed slopes; the intercept is always unconstrained. Fitting and
 retention may select different ordered lists of one to six distinct axes.
 The supported names are `attention`, `moe`, `n`, `E`, `P`, `maxE`, `maxP`,
 `minP`, `P2`, `F`, `nE`, `logF`, `meanE`, `meanP`, `cvE2`, `cvP2`, `logN`,
-`n2`, and `logP`. Features use scheduled work only. Request-list features require
+`n2`, `logP`, `longest_split`, and `eager` (see
+[engine-constant axes](#engine-constant-axes)). Features use scheduled work only. Request-list features require
 the corresponding aligned request lengths; unavailable input is rejected, not
 reconstructed from aggregate counts. These controls do not change the workload
 store selected from all active attention-DP ranks.
@@ -622,10 +639,106 @@ duplicate axes, invalid grid shapes, and incompatible policy fields fail before
 estimator selection. `fit.linear` is rejected with `fit.kind: spline`;
 the spline fit and retention axes remain `[attention, moe]`.
 
+### Engine-constant axes
+
+Token and KV sums cannot tell a batch holding one very long sequence from a
+batch of equal contexts with the same totals, and a pass above the CUDA-graph
+capture limit runs eagerly. Two request-list axes model these effects, each
+with one positive constant in `fit.linear` that configuration requires
+whenever `feature_axes` or `sampling.axes` selects the axis:
+
+- `longest_split` is `max_i(past_i + extend_i) / max(1, floor(max_kv_splits / n))`
+  for a rank's `n` scheduled requests: the longest sequence over the KV splits
+  FlashInfer's TensorRT-LLM decode kernel gives each request
+  (`numCtasPerSeqKv` in
+  [`fmhaKernels.cuh`](https://github.com/flashinfer-ai/flashinfer/blob/946200de1ae94fc93fdd0926f0a13afd1fa7f0f1/include/flashinfer/trtllm/fmha/fmhaKernels.cuh),
+  v0.7.0.post1). `max_kv_splits` is the GPU's SM count over the kernel's CTAs
+  per request. `n` and the longest sequence count every scheduled request,
+  including prefill requests, which vLLM runs in the context kernel rather than
+  the decode kernel.
+- `eager` is 1 when a rank schedules more tokens, `sum_i extend_i`, than
+  `max_cudagraph_capture_size`, and 0 otherwise. vLLM runs such a pass without
+  a CUDA graph (`dispatch` in
+  [`cudagraph_utils.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/cudagraph_utils.py),
+  v0.32.0).
+
+Each attention-DP rank runs its own kernel and graph, so both axes are computed
+per rank and the iteration takes the largest value. The snapshot pins the
+constants with the rest of the estimator configuration:
+
+```yaml
+estimator_config:
+  fpm_regression:
+    fit:
+      linear:
+        feature_axes: [E, P2, F, logN, longest_split, eager]
+        max_kv_splits: 74                # for example, 148 SMs / 2 CTAs per request
+        max_cudagraph_capture_size: 512
+```
+
+### fpm5 aggregate features
+
+`fit.linear.feature_set: fpm5` replaces the fitted coordinates with the 17
+named aggregates of the learned `fpm5` preset
+(`aisim_core.sdk.fpm_learned.FEATURE_PRESETS["fpm5"]`), in this order:
+`num_active_ranks`, `num_prefill_requests`, `sum_prefill_tokens`,
+`sum_prefill_kv_tokens`, `num_decode_requests`, `sum_decode_kv_tokens`,
+`max_rank_prefill_tokens`, `max_rank_decode_kv_tokens`,
+`max_rank_num_decode_requests`, `mean_prefill_chunk`, `mean_prefill_kv`,
+`prefill_attention_pairs`, `mean_decode_kv`, and the `log1p` of
+`sum_prefill_tokens`, `sum_prefill_kv_tokens`, `sum_decode_kv_tokens` and
+`prefill_attention_pairs`. Sums and counts run over the active attention-DP
+ranks, the `max_rank_*` features take the heaviest rank, and the prefill
+attention proxy is the balanced-partition estimate used by the learned model.
+Rust computes them from the same code as the learned forest's aggregate block,
+using only scheduled scalar counters. The set does not require request lists
+and omits the variance-derived aggregates.
+
+```yaml
+estimator_config:
+  fpm_regression:
+    fit:
+      linear:
+        feature_set: fpm5
+```
+
+Seventeen features make the face enumeration and incremental statistics above
+impractical, so this fit does not use them. Whenever the update policy
+publishes coefficients, the store refits all of its retained rows, at most
+`sampling.max_observations`:
+
+1. Standardize each feature as above. A constant feature is inactive, and so
+   is a feature whose raw values exactly repeat an earlier feature on every
+   retained row. With one attention-DP rank, for example, `num_active_ranks`
+   is constant and each `max_rank_*` equals its sum.
+2. Center the standardized active columns and the target. The intercept is
+   free, so it separates from the slopes.
+3. Solve for the slopes with Lawson–Hanson active-set nonnegative least
+   squares, or with a direct solve when `non_negative: false`. The
+   `singular_ridge_scale` ridge, scaled as for the singular retry above, is
+   always added to the slopes so collinear aggregates have one solution; the
+   `fpm5` set therefore requires a positive `singular_ridge_scale`.
+
+A candidate needs at least `max(min_observations, active features + 1)`
+retained rows; until then the store is unready. With aggregated multi-rank
+traffic, all 17 features can vary, so a store needs 18 rows, and
+configuration requires `sampling.max_observations >= 18`. As for the other
+linear fits, a candidate with all slopes zero keeps the previous serving
+snapshot. A refit that cannot fit, because newly varying aggregates outnumber
+the retained rows, also keeps the previous serving fit, so a ready store stays
+ready. Predictions are floored at $`10^{-6}`$ ms.
+
+Retention still buckets rows by `sampling.axes`, and `update_policy` gates
+publication exactly as described above. `rebuild_interval` must stay `null`,
+because every fit already uses the exact retained rows. `feature_set` requires
+the default `feature_axes` and the `standardized_nnls` fit kind. Each fit costs
+$`O(Mk^2)`$ to accumulate the normal equations plus a small $`k \times k`$
+active-set solve, where $M$ is the retained-row count and $`k \le 17`$.
+
 ## Selecting linear or spline regression
 
 ```python
-from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
 config = ForwardPassPerfModelConfig(
     model="Qwen/Qwen3-32B", system="h200_sxm", backend="vllm",
@@ -646,7 +759,10 @@ axes, and no `fit.linear` block. Evaluate fit choice against deployment-specific
 observations; a nonlinear fit does not guarantee lower prediction error.
 
 Configuration serialization saves controls, not observations, knots, or fitted
-state. Reconstructing a saved configuration creates a cold model. Offline CLI,
+state. Reconstructing a saved configuration creates a cold model. To keep the
+retained samples, fits, statistics and search clocks, save a
+[state snapshot](../configuration.md#state-snapshots) with
+`save_state_snapshot`; restoring it predicts bit-identically and can continue tuning exactly. Offline CLI,
 Sweeper, and Replay reject an untrained regression even when its configuration
 parses successfully.
 
@@ -654,7 +770,7 @@ parses successfully.
 
 The authoritative implementation is
 [`fpm/`](../../../crates/core/src/perfmodel/fpm/); the
-[Python wrapper](../../../python/aisimulate/src/aisimulate_core/sdk/rust_engine_step.py)
+[Python wrapper](../../../python/aisim/src/aisim_core/sdk/rust_engine_step.py)
 normalizes telemetry and calls the same native estimator. Queued requests do
 not supply scheduled work, and timing observations must belong to the same
 worker/deployment identity. Regression cannot discover a changed backend,
@@ -677,20 +793,20 @@ $K_d$ is a sum over that rank's Decode requests. They are not per-request
 lengths. $N_d$ and $B_d$ are the corresponding per-rank request counts.
 
 The telemetry schema permits fully cached metadata with $P_d=0$ and
-$H_d>0$. Cached Prefill KV creates attention work only when fresh Prefill
+$`H_d>0`$. Cached Prefill KV creates attention work only when fresh Prefill
 work exists:
 
-$$
+```math
 \widetilde H_d=H_d\,\mathbf{1}[P_d>0].
-$$
+```
 
 The default aggregate A/M feature path estimates Prefill attention pairs using a
 balanced-request approximation. Under that approximation, each of the $N_d$
 requests has cached length $H_d/N_d$ and newly computed length $P_d/N_d$.
-For $P_d>0$, metric validation guarantees $N_d>0$, and the total
+For $`P_d>0`$, metric validation guarantees $`N_d>0`$, and the total
 attention-pair estimate for rank $d$ is
 
-$$
+```math
 \begin{aligned}
 Q_d
 &=N_d\left[
@@ -699,7 +815,7 @@ Q_d
 \right]\\
 &=\dfrac{H_dP_d}{N_d}+\dfrac{P_d^2}{2N_d}+\dfrac{P_d}{2}.
 \end{aligned}
-$$
+```
 
 When $P_d=0$, define $Q_d=0$. Thus $Q_d$ already includes the factor $N_d$:
 it estimates total Prefill attention-pair work on the rank, not work for one
@@ -709,46 +825,46 @@ reduced only by the role-specific maximum and sum below.
 
 All roles share the axis order
 
-$$
+```math
 x=[\text{critical attention},\ \text{global FFN/MoE}].
-$$
+```
 
-With $\alpha$ the KV-attention weight, $\beta$ the Prefill
-attention-pair weight, and $\gamma$ the tokenwise FFN/MoE weight, the exact
+With $`\alpha`$ the KV-attention weight, $`\beta`$ the Prefill
+attention-pair weight, and $`\gamma`$ the tokenwise FFN/MoE weight, the exact
 features are:
 
-$$
+```math
 x_P=
 \left[
 \max_d\left(\alpha\widetilde H_d+\beta Q_d\right),
 \ \gamma\sum_d P_d
 \right],
-$$
+```
 
-$$
+```math
 x_D=
 \left[
 \alpha\max_d K_d,
 \ \gamma\sum_d B_d
 \right],
-$$
+```
 
-$$
+```math
 x_A=
 \left[
 \max_d\left(\alpha(\widetilde H_d+K_d)+\beta Q_d\right),
 \ \gamma\sum_d(P_d+B_d)
 \right].
-$$
+```
 
 The reductions for one and multiple attention-DP ranks are shown below.
 Unsubscripted symbols in the `attention_dp = 1` column refer to the sole rank.
 
 | Worker | `attention_dp = 1` | `attention_dp > 1` |
 |---|---|---|
-| Prefill | $x[0]=\alpha\widetilde H+\beta Q$<br>$x[1]=\gamma P$ | $x[0]=\max_d(\alpha\widetilde H_d+\beta Q_d)$<br>$x[1]=\gamma\sum_d P_d$ |
-| Decode | $x[0]=\alpha K$<br>$x[1]=\gamma B$ | $x[0]=\alpha\max_d K_d$<br>$x[1]=\gamma\sum_d B_d$ |
-| Aggregated | $x[0]=\alpha(\widetilde H+K)+\beta Q$<br>$x[1]=\gamma(P+B)$ | $x[0]=\max_d[\alpha(\widetilde H_d+K_d)+\beta Q_d]$<br>$x[1]=\gamma\sum_d(P_d+B_d)$ |
+| Prefill | $`x[0]=\alpha\widetilde H+\beta Q`$<br>$`x[1]=\gamma P`$ | $`x[0]=\max_d(\alpha\widetilde H_d+\beta Q_d)`$<br>$`x[1]=\gamma\sum_d P_d`$ |
+| Decode | $`x[0]=\alpha K`$<br>$`x[1]=\gamma B`$ | $`x[0]=\alpha\max_d K_d`$<br>$`x[1]=\gamma\sum_d B_d`$ |
+| Aggregated | $`x[0]=\alpha(\widetilde H+K)+\beta Q`$<br>$`x[1]=\gamma(P+B)`$ | $`x[0]=\max_d[\alpha(\widetilde H_d+K_d)+\beta Q_d]`$<br>$`x[1]=\gamma\sum_d(P_d+B_d)`$ |
 
 The default regression remains two-dimensional at every attention-DP size. Critical
 attention uses a maximum across ranks, while global FFN/MoE work uses a sum.
@@ -762,16 +878,16 @@ The options are construction-time knobs and all default to `1.0`:
 
 | Formula | `estimator_config.features` field |
 |---|---|
-| $\alpha$ | `attention_kv_weight` |
-| $\beta$ | `prefill_attention_pair_weight` |
-| $\gamma$ | `ffn_token_weight` |
+| $`\alpha`$ | `attention_kv_weight` |
+| $`\beta`$ | `prefill_attention_pair_weight` |
+| $`\gamma`$ | `ffn_token_weight` |
 
-- $\alpha$ scales KV-token-related attention work for every role:
-  $\widetilde H$ for Prefill, $K$ for Decode, and $\widetilde H+K$ for
+- $`\alpha`$ scales KV-token-related attention work for every role:
+  $`\widetilde H`$ for Prefill, $K$ for Decode, and $`\widetilde H+K`$ for
   Aggregated. It is not a Prefill-only weight.
-- $\beta$ scales only the Prefill attention-pair estimate $Q$. It does not
+- $`\beta`$ scales only the Prefill attention-pair estimate $Q$. It does not
   represent Decode attention.
-- $\gamma$ scales global tokenwise FFN/MoE work: $P$ for Prefill, $B$ for
+- $`\gamma`$ scales global tokenwise FFN/MoE work: $P$ for Prefill, $B$ for
   Decode, and $P+B$ for Aggregated.
 
 They must be finite and strictly positive when regression is constructed. They

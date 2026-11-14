@@ -237,7 +237,6 @@ fn version_dir_data_stems(version_path: &Path) -> std::io::Result<BTreeSet<Strin
                     | COLLECTION_META_MARKER
                     | INCOMPLETE_MARKER
                     | SHARED_LAYER_REUSE_MARKER
-                    | super::prefill_graph::PROFILE_FILE
             )
             || !entry.path().is_file()
         {
@@ -554,8 +553,8 @@ pub(crate) fn resolve_op_data_path(
 /// Mirrors `_iter_backend_version_dirs`: family layout
 /// `<data_dir>/<family>/<backend>/<version>` (any first-level dir that is
 /// not a known backend dir) plus the deprecated legacy layout
-/// `<data_dir>/<backend>/<version>` (warns once per tree, deduped
-/// Python-side).
+/// `<data_dir>/<backend>/<version>` (warns for OP data, deduped Python-side).
+/// Backend-first directories containing only FPM tables are canonical.
 fn iter_backend_version_dirs(
     data_dir: &Path,
     backend: &str,
@@ -573,9 +572,15 @@ fn iter_backend_version_dirs(
             continue;
         }
         if name == backend {
-            // legacy layout
-            warnings.push(warn("legacy_layout", vec![data_dir.display().to_string()]));
+            // Canonical FPM or legacy OP layout; inspect only this backend's versions.
+            let start = out.len();
             iter_version_subdirs(&entry_path, &mut out);
+            if out[start..]
+                .iter()
+                .any(|(_, version_path)| has_legacy_op_layout(version_path))
+            {
+                warnings.push(warn("legacy_layout", vec![data_dir.display().to_string()]));
+            }
         } else if !KNOWN_BACKEND_DIRS.contains(&name.as_ref()) {
             // family dir
             let backend_path = entry_path.join(backend);
@@ -585,6 +590,22 @@ fn iter_backend_version_dirs(
         }
     }
     out
+}
+
+fn has_legacy_op_layout(version_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(version_path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        !name.starts_with('.')
+            && name != "fpm_forward_perf.parquet"
+            && (name.ends_with(".parquet")
+                || name.ends_with(".txt")
+                || matches!(name.as_ref(), REUSE_YAML_MARKER | COLLECTION_META_MARKER))
+            && entry.path().is_file()
+    })
 }
 
 fn iter_version_subdirs(backend_path: &Path, out: &mut Vec<(String, PathBuf)>) {
@@ -1437,23 +1458,6 @@ impl SourceResolver {
 mod tests {
     use super::*;
 
-    #[test]
-    fn only_known_graph_contract_is_exempt_from_table_coverage() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path()
-                .join("sglang_glm52_nvfp4_vr_nvl72_tp4_graph_v1.profile.json"),
-            "{}",
-        )
-        .unwrap();
-        assert!(version_dir_data_stems(root.path()).unwrap().is_empty());
-        std::fs::write(root.path().join("another.profile.json"), "{}").unwrap();
-        assert_eq!(
-            version_dir_data_stems(root.path()).unwrap(),
-            BTreeSet::from(["another.profile".to_owned()])
-        );
-    }
-
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
@@ -1476,6 +1480,62 @@ mod tests {
 
     fn versions(report: &ResolveReport) -> Vec<&str> {
         report.records.iter().map(|r| r.version.as_str()).collect()
+    }
+
+    #[test]
+    fn canonical_fpm_layout_keeps_sources_without_migration_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let data = root.join("data");
+        let fpm = data.join("vllm/0.29.0/fpm_forward_perf.parquet");
+        write(&fpm, "stub");
+        write(&fpm.with_extension("metadata.json"), "{}");
+        write(&data.join("gemm/vllm/0.29.0/gemm_perf.parquet"), "stub");
+        let report = resolve_one(
+            &ctx(root, "vllm", "0.29.0"),
+            "fpm_forward_perf.parquet",
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.records[0].path, fpm.to_string_lossy());
+        assert!(report.records[0].exists);
+        assert!(report.warnings.iter().all(|w| w.kind != "legacy_layout"));
+    }
+
+    #[test]
+    fn fpm_layout_does_not_hide_legacy_op_warning() {
+        for filename in [
+            "gemm_perf.parquet",
+            "gemm_perf.txt",
+            REUSE_YAML_MARKER,
+            COLLECTION_META_MARKER,
+            SHARED_LAYER_REUSE_MARKER,
+        ] {
+            for legacy_version in ["0.29.0", "0.28.0"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path();
+                write(&data.join("vllm/0.29.0/fpm_forward_perf.parquet"), "stub");
+                write(
+                    &data.join("vllm/0.29.0/fpm_forward_perf.metadata.json"),
+                    "{}",
+                );
+                write(
+                    &data.join(format!("vllm/{legacy_version}/{filename}")),
+                    "stub",
+                );
+                let mut warnings = Vec::new();
+                let dirs = iter_backend_version_dirs(data, "vllm", &mut warnings);
+                assert!(dirs.iter().any(|(version, _)| version == "0.29.0"));
+                assert!(dirs.iter().any(|(version, _)| version == legacy_version));
+                assert_eq!(
+                    warnings
+                        .iter()
+                        .filter(|w| w.kind == "legacy_layout")
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[test]

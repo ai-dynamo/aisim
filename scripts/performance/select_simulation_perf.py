@@ -13,18 +13,23 @@ FILES = {
     ".github/workflows/simulation-performance.yml",
     "scripts/performance/select_simulation_perf.py",
     "scripts/performance/simulation_perf_artifact.py",
+    "scripts/performance/build_simulation_dynamo.py",
+    "scripts/performance/check_dynamo_callback.py",
+    "scripts/performance/dynamo_callback_contract.rs",
+    "scripts/performance/simulation_dynamo_requirements.in",
+    "scripts/performance/simulation_dynamo_requirements.txt",
     "scripts/performance/select_forward_perf.py",
     "Cargo.toml",
     "Cargo.lock",
     "crates/core/Cargo.toml",
-    "python/aisimulate/pyproject.toml",
-    "python/aisimulate/uv.lock",
+    "python/aisim/pyproject.toml",
+    "python/aisim/uv.lock",
 }
 PREFIXES = (
     "crates/core/src/",
-    "python/aisimulate/src/aisimulate/",
-    "python/aisimulate/src/aisimulate_core/",
-    "python/aisimulate/tools/simulation_perf_gate/",
+    "python/aisim/src/aisim/",
+    "python/aisim/src/aisim_core/",
+    "python/aisim/tools/simulation_perf_gate/",
 )
 
 

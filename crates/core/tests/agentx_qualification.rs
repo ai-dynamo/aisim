@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use aisimulate_core::engine::{Backend, EngineConfig, NativeHostOffloadConfig, TimingModelConfig};
-use aisimulate_core::replay::loadgen::{
+use aisim_core::engine::{Backend, EngineConfig, NativeHostOffloadConfig, TimingModelConfig};
+use aisim_core::replay::loadgen::{
     AGENTIC_MOONCAKE_SCHEMA, AGENTIC_MOONCAKE_VERSION, AgenticDependency,
     AgenticDependencyRelation, AgenticDependencyTrigger, AgenticHashIdScope,
     AgenticLifecycleEventKind, AgenticMooncakeHeader, AgenticMooncakeRow, AgenticPlayStatus,
@@ -17,7 +17,7 @@ use aisimulate_core::replay::loadgen::{
     PreparedAgenticSnapshots, ValidatedAgenticGraph, WekaImporter, WorkloadDriver,
     load_agentic_mooncake, load_weka_agentic_graph,
 };
-use aisimulate_core::replay::{
+use aisim_core::replay::{
     PerRequestRecord, ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig,
     ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec, ReplayTerminalStatus,
     ReplayTopology, Replayer, WorkerPoolSpec,
@@ -53,6 +53,7 @@ fn run(
     let driver = WorkloadDriver::new_agentic_trace_with_lanes(graph, 4, 1).unwrap();
     let spec = ReplaySpec {
         version: 1,
+        encoder: None,
         topology: ReplayTopology::aggregated(1),
         engine: serde_json::to_value(ReplayEngineConfig {
             rank: EngineConfig {
@@ -309,6 +310,7 @@ fn g2_spec(disaggregated: bool, shared: bool, host_blocks: Option<usize>, h2d: f
         ..EngineConfig::for_backend(Backend::Vllm)
     };
     ReplaySpec {
+        encoder: None,
         version: 1,
         topology: if disaggregated {
             ReplayTopology::Disaggregated {
@@ -408,7 +410,7 @@ fn agentx_g2_restores_evicted_parent_after_tool_gap_and_join(
 
 fn g2_snapshot_driver(warmup: bool, from_start: bool) -> WorkloadDriver {
     let prepared = g2_graph()
-        .prepare_snapshots(1, AgenticSnapshotOptions { seed: 42 })
+        .prepare_snapshots(1, AgenticSnapshotOptions::seeded(42))
         .unwrap();
     let play = if from_start {
         prepared.context().prepare_play_from_start(0, 0).unwrap()
@@ -527,9 +529,10 @@ fn agentx_g2_profile_cancels_pending_host_restore_and_releases_server_resources(
     let mut driver = g2_snapshot_driver(false, true);
     driver
         .enable_agentic_profile(AgenticProfileOptions {
-            // The restored parent arrives at 200 ms; its two-block H2D needs
-            // another 200 ms. End profiling while it owns the G1 reservation.
-            duration_seconds: 0.3,
+            // The restored parent arrives 20 ms after its child completes, at
+            // 44 ms; its two-block H2D needs another 200 ms. End profiling
+            // while it owns the G1 reservation.
+            duration_seconds: 0.1,
             response_grace_seconds: 0.0,
             ..Default::default()
         })
@@ -541,10 +544,157 @@ fn agentx_g2_profile_cancels_pending_host_restore_and_releases_server_resources(
     assert_eq!(profile.canceled_requests, 1, "{profile:?}");
     assert_eq!(profile.client_in_flight_requests, 0);
     assert_eq!(profile.server_unsettled_requests, 0);
-    assert_eq!(profile.finished_at_ms, Some(300.0));
+    assert_eq!(profile.finished_at_ms, Some(100.0));
     let restore = g2_request(&report, "restore");
     assert_eq!(restore.terminal_status, ReplayTerminalStatus::Canceled);
     assert!(restore.dispatched_at_ms.is_some());
     assert_eq!(restore.first_admit_ms, None);
     assert_eq!(restore.output_length, 0);
+}
+
+fn snapshot_pin_report(
+    graph: &ValidatedAgenticGraph,
+    mode: &str,
+    disaggregated: bool,
+) -> ReplayReport {
+    let prepared = graph
+        .prepare_snapshots(3, AgenticSnapshotOptions::seeded(42))
+        .unwrap();
+    // "profile" profiles after warmup; "profile-cold" profiles straight from
+    // the snapshot without warmup's timer rebasing.
+    let mut driver = if mode == "snapshot" || mode == "profile-cold" {
+        WorkloadDriver::new_agentic_snapshots(prepared, 4, true, 1.0)
+    } else {
+        WorkloadDriver::new_agentic_warmup(prepared, 4, true, 1.0)
+    }
+    .unwrap();
+    if mode.starts_with("profile") {
+        driver
+            .enable_agentic_profile(AgenticProfileOptions {
+                duration_seconds: 1.0,
+                response_grace_seconds: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let rank = EngineConfig {
+        num_gpu_blocks: 64,
+        block_size: 4,
+        max_num_seqs: 4,
+        max_num_batched_tokens: 64,
+        // The pins cover snapshot plays, not async-scheduling admission.
+        async_scheduling: Some(false),
+        timing_model: TimingModelConfig::Fixed {
+            prefill_ms: 2.0,
+            decode_ms: 1.0,
+        },
+        ..EngineConfig::for_backend(Backend::Vllm)
+    };
+    let spec = ReplaySpec {
+        version: 1,
+        encoder: None,
+        topology: if disaggregated {
+            ReplayTopology::Disaggregated {
+                prefill: WorkerPoolSpec::default(),
+                decode: WorkerPoolSpec::default(),
+                handoff_latency_ms: 1.0,
+            }
+        } else {
+            ReplayTopology::aggregated(1)
+        },
+        engine: serde_json::to_value(ReplayEngineConfig {
+            rank,
+            ..Default::default()
+        })
+        .unwrap(),
+        adapters: Default::default(),
+        max_sim_time_ms: None,
+        max_in_flight: None,
+        record_per_request: true,
+        sla: Default::default(),
+        requests: Vec::new(),
+    };
+    run_g2(spec, driver)
+}
+
+// Lineage is additive; preserve every existing report field's golden pin.
+fn remove_lineage(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.remove("lineage");
+            fields.values_mut().for_each(remove_lineage);
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(remove_lineage),
+        _ => {}
+    }
+}
+
+/// Snapshot, warmup and recycling-profile replays must stay byte-identical
+/// across changes to how snapshot plays are built and retained.
+#[test]
+fn snapshot_warmup_and_profile_reports_are_pinned() {
+    let graphs = [
+        ("g2", g2_graph()),
+        (
+            "two-plays",
+            load_weka_agentic_graph(fixture("weka-two-plays.jsonl"), Some(4)).unwrap(),
+        ),
+    ];
+    let mut actual = Vec::new();
+    for (name, graph) in &graphs {
+        for mode in ["snapshot", "warmup", "profile", "profile-cold"] {
+            for disaggregated in [false, true] {
+                let report = snapshot_pin_report(graph, mode, disaggregated);
+                if mode.starts_with("profile") {
+                    let profile = report.agentic_profile.as_ref().unwrap();
+                    assert!(profile.plays_started >= 6, "{name}: {profile:?}");
+                }
+                let mut report_json =
+                    serde_json::to_value(report.clone().with_wall_time_ms(0.0)).unwrap();
+                let mut per_request = serde_json::to_value(&report.per_request).unwrap();
+                remove_lineage(&mut report_json);
+                remove_lineage(&mut per_request);
+                let lifecycle = report.agentic_lifecycle.as_ref().unwrap();
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(report_json.to_string().as_bytes());
+                hasher.update(per_request.to_string().as_bytes());
+                hasher.update(&lifecycle.to_jsonl().unwrap());
+                let topology = if disaggregated { "disagg" } else { "agg" };
+                actual.push(format!(
+                    "{name} {mode} {topology}: {} {}",
+                    report.per_request.len(),
+                    &hasher.finalize().to_hex()[..16]
+                ));
+            }
+        }
+    }
+    // To re-pin, run this test and copy the `left:` list from the failure. A
+    // mismatch the change did not intend must first be diffed semantically
+    // against the previous report, per-request and lifecycle output.
+    // The AISim rename deliberately changes lifecycle and Weka source digests.
+    // A three-domain-only before/after comparison recovered every old pin;
+    // complete per-request records and lifecycle event streams were identical.
+    // See benchmarks/evidence/pr796-rename/agentx-domain-comparison.json.
+    let expected = [
+        "g2 snapshot agg: 5 6cbb612c534c4835",
+        "g2 snapshot disagg: 5 223e5df120da3b73",
+        "g2 warmup agg: 5 4a868a5c33ea746b",
+        "g2 warmup disagg: 5 727e03e2b6458069",
+        "g2 profile agg: 168 3836acf6cc08fea7",
+        "g2 profile disagg: 151 5a87dfb36cf47921",
+        "g2 profile-cold agg: 168 4d3fe50afc4f2048",
+        "g2 profile-cold disagg: 151 e2916a8f8909348f",
+        "two-plays snapshot agg: 3 f32d45662c04076b",
+        "two-plays snapshot disagg: 3 46193e1206325680",
+        "two-plays warmup agg: 3 8a40174c1b270569",
+        "two-plays warmup disagg: 3 35307eb4e477fbd3",
+        "two-plays profile agg: 821 b4ee47cad4b96929",
+        "two-plays profile disagg: 667 b25bb6287a94ebd6",
+        "two-plays profile-cold agg: 820 1c2fdbee5fa71dcf",
+        // Same-timestamp arrivals now join the synchronous prefill pass: the
+        // first affected recycled request admits at 13 ms instead of 15 ms,
+        // allowing 667 requests to issue before the 1 s profiling cutoff.
+        "two-plays profile-cold disagg: 667 03b6b577866b0ec4",
+    ];
+    assert_eq!(actual, expected);
 }
