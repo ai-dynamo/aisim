@@ -1540,7 +1540,7 @@ mod tests {
     fn hicache_leaf_does_not_reserve_unusable_tail_capacity() {
         let mut cache = RadixCache::new(100, 4);
         cache.enable_hicache();
-        cache.insert(&[1, 2, 3, 4], &[0]);
+        cache.insert(&[1, 2, 3, 4], &[0, 1, 2, 3]);
         let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
         cache.inc_lock_ref(tail);
         let capacities = (
@@ -1558,7 +1558,12 @@ mod tests {
             capacities,
             "HiCache inserts create children instead of extending leaf edges"
         );
-        let extended = cache.insert_from_node(tail, 4, &[1, 2, 3, 4, 5, 6, 7, 8], &[0, 1]);
+        let extended = cache.insert_from_node(
+            tail,
+            4,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+        );
         assert_ne!(extended, tail);
         cache.dec_lock_ref(tail);
         assert_eq!(cache.protected_size, 0);
