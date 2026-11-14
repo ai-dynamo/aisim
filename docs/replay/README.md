@@ -25,7 +25,8 @@ The native runtime executes in process without a network plane or asynchronous
 worker tasks. At each meaningful timestamp it settles engine completions,
 worker readiness, transfers and admission, then telemetry and scaling. A
 logical worker can contain multiple attention-DP rank schedulers; the grouped
-pass completes at the slowest rank's latency.
+pass completes at the slowest rank's latency, priced once for all ranks when
+the timing provider supports it.
 
 The built-in `engine` stack provides offline execution with round-robin
 placement and fixed worker pools. Dynamo supplies its own Router and Planner
@@ -39,11 +40,19 @@ Agentic results explicitly retain `functional_only` qualification.
 ## Read by task
 
 - [Feature support](features.md): backend, topology, workload and composition limits.
-- [Workloads](workloads.md): public traffic YAML, trace formats, sessions and stopping rules.
-- [Topology and scheduling](topology-and-scheduling.md): worker pools, DP, P/D handoff and backend cadence.
-- [Cache](cache.md): G1 prefix reuse, G2/G3 ownership, grouped caches and eviction.
+- [Workloads](workloads.md): the `traffic` block, trace formats, sessions, stopping rules and
+  [agentic lanes, snapshots, warmup and profiles](workloads.md#agentic-load-controls).
+- [Agentic warmup](agentic/warmup.md) and [continuous profiles](agentic/continuous-profiles.md):
+  detailed preparation, barrier, lane-recycling and reporting contracts.
+- [Engine](engine/README.md): the `engine` block, with pages for
+  [workers](engine/workers.md), [KV cache](engine/kv-cache.md),
+  [P/D KV transfer](engine/kv-transfer.md),
+  [speculative decoding](engine/speculation.md) and
+  [analytical AFD/EPD](engine/analytical.md).
+- [SGLang VL host loop](engine/sglang-vl-host-loop.md): native vision-language
+  replay on SGLang: frontend stages, overlap-scheduler iterations, the vision
+  encoder and native encoder pools.
 - [Agentic quickstart](agentic/quickstart.md): run a reproducible Weka simulation.
-- [Warmup](agentic/warmup.md) and [continuous profiles](agentic/continuous-profiles.md): snapshots, preparation, duration and reporting.
 - [Dynamo integration](dynamo.md): install matching dependencies and enable Router/Planner.
 - [Python API](api/python.md) and [Rust API](api/rust.md): inputs, reports and execution contracts.
 - [Extending Replay](extending.md): internal ownership and validation requirements.

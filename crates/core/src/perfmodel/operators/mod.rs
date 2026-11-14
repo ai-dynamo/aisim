@@ -13,6 +13,7 @@
 //! algorithm-free; this layer is where Python's `_query_*_table` static
 //! methods live.
 
+pub mod afd_comm;
 pub mod attention;
 pub mod base;
 pub mod communication;
@@ -25,6 +26,7 @@ pub mod fpm_forward;
 pub(crate) mod fpm_sol;
 pub mod gemm;
 pub mod mamba;
+pub mod measured_composite;
 pub mod mhc;
 pub mod mla;
 pub mod moe;
@@ -35,11 +37,11 @@ mod moe_ll_monte_carlo;
 pub mod msa;
 pub mod op;
 pub mod overlap;
-pub mod prefill_graph;
 pub mod util_empirical;
 pub mod vision;
 pub mod wideep_mla;
 
+pub use afd_comm::{AfdCombineOp, AfdFCollectiveOp, AfdRankMapping, AfdTransferOp};
 pub use attention::{ContextAttentionOp, EncoderAttentionOp, GenerationAttentionOp};
 pub use base::{PerformanceResult, Source};
 pub use communication::{CustomAllReduceOp, NcclOp, P2POp};
@@ -63,3 +65,6 @@ pub use msa::MsaModuleOp;
 pub use op::{FallbackOp, Op, OverlapOp, RuntimeContext};
 pub use vision::VisionEncoderOp;
 pub use wideep_mla::{WideEpContextMlaOp, WideEpGenerationMlaOp};
+
+pub mod glm53flash;
+pub use glm53flash::{Glm53AttentionOp, Glm53FfnOp, Glm53MhcOp, Glm53PrimitiveOp, Glm53RouterOp};

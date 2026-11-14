@@ -200,7 +200,6 @@ impl MoeExpertComputeOp {
                     attention_dp_size: 1,
                     quant_mode: self.quant_mode,
                     workload_distribution: self.workload_distribution.clone(),
-                    require_exact_workload_distribution: false,
                     is_gated: self.is_gated,
                     moe_backend: None,
                     moe_kernel_source: None,
@@ -308,8 +307,7 @@ mod tests {
     use std::sync::Arc;
 
     fn systems_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisimulate/src/aisimulate_core/systems")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/aisim/src/aisim_core/systems")
     }
 
     fn write_column<T: parquet::data_type::DataType>(

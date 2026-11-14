@@ -22,7 +22,7 @@ def identity(row: dict[str, str]) -> tuple[str, str, str]:
     return row["dependency_type"], row["name"], row["version"]
 
 
-def inventory(directory: Path) -> list[dict[str, str]]:
+def inventory(directory: Path, *, include_bundled: bool = False) -> list[dict[str, str]]:
     rows = []
     for filename in sorted((directory / "python").glob("*.csv")):
         with filename.open(newline="") as stream:
@@ -37,6 +37,20 @@ def inventory(directory: Path) -> list[dict[str, str]]:
                 )
     if not rows:
         raise ValueError("missing Python dependency inventories")
+    if include_bundled:
+        bundled = sorted((directory / "bundled").rglob("bundled-deps.csv"))
+        expected = [
+            directory / "bundled" / f"bundled-configs-nightly-{arch}" / "bundled-deps.csv"
+            for arch in ("amd64", "arm64")
+        ]
+        if bundled != expected:
+            raise SystemExit("missing or duplicate architecture-specific bundled configuration inventories")
+        for filename in bundled:
+            with filename.open(newline="") as stream:
+                entries = list(csv.DictReader(stream))
+            if not entries or any(row["dependency_type"] != "bundled_model_config" for row in entries):
+                raise SystemExit("invalid bundled configuration inventory")
+            rows.extend(entries)
     with (directory / "cargo-metadata.json").open() as stream:
         metadata = json.load(stream)
     workspace = set(metadata.get("workspace_members") or [])
@@ -143,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-sha", default="")
     parser.add_argument("--source-ref", default="")
     args = parser.parse_args(argv)
-    rows = inventory(args.directory)
+    rows = inventory(args.directory, include_bundled=args.previous_nightly)
     prior = []
     baseline_status = "not_requested"
     if args.base_dir:

@@ -13,7 +13,7 @@ not the [`SmartSearchConfig` SDK schema](../sweeper/sdk.md).
 
 ## Configuration Model
 
-Jump to [traffic](../replay/workloads.md), [engine](../perf-model/configuration.md),
+Jump to [traffic](../replay/workloads.md), [engine](../replay/engine/README.md),
 [search domains](../sweeper/search-space.md#recommendation-domains), [presets](../sweeper/search-space.md#presets-and-default-ranges),
 [optimization goals](../sweeper/optimization-goals.md#optimization-goal), [search controls](../sweeper/search-space.md#optimizer-controls), or [outputs](cli.md#outputs).
 
@@ -74,9 +74,8 @@ apply. See [override semantics](cli.md#override-semantics).
 | Fields | Canonical guide |
 |---|---|
 | `traffic.source`, `traffic.load`, `traffic.stop` | [Replay workloads](../replay/workloads.md) |
-| `engine.model`, hardware/backend identity, estimator policy and worker controls | [Performance-model configuration](../perf-model/configuration.md) |
-| Worker roles, parallel execution and transfer | [Replay topology](../replay/topology-and-scheduling.md) |
-| Prefix caching, host and storage offload | [Replay cache](../replay/cache.md) |
+| `engine` deployment fields, worker roles, parallelism, scheduler, KV cache, P/D transfer, speculation | [Replay engine](../replay/engine/README.md) |
+| `engine.workers.<role>.timing`, estimator policy, precision and kernel selectors | [Performance-model configuration](../perf-model/configuration.md) |
 | `router`, `planner` | [Dynamo integration](../replay/dynamo.md) |
 | `execution.resources` | [Local execution resources](local-resources.md) |
 | `optimization` | [Optimization goals](../sweeper/optimization-goals.md) |
@@ -119,13 +118,15 @@ The `optimization` section is required, even when its target uses a default.
 
 | Knob | Default | Default Range | Preset | Rules |
 |---|---:|---|---|---|
-| `optimization.target` | `throughput` | `x` | `-` | Maximize `throughput`, `throughput_per_gpu`, `throughput_per_user`, `goodput`, or `goodput_per_gpu`; minimize `ttft`, `e2e_latency`, or `min_gpus`; or compute `pareto`. |
+| `optimization.target` | `throughput` | `x` | `-` | Maximize `throughput`, `throughput_per_gpu`, `throughput_per_user`, `goodput`, or `goodput_per_gpu`; minimize `ttft`, `e2e_latency`, or `min_gpus`; or compute `pareto`. Also accepts the [AIPerf metric selectors](../sweeper/optimization-goals.md#aiperf-metric-selectors). With `--stack dynamo`, `min_gpus` accepts `router` and rejects `planner`. |
 | `optimization.hardware` | `null` | `x` | `-` | One nonempty hardware identifier; required for `engine.hardware: auto`. |
-| `optimization.strict_sla` | `false` | `x` | `-` | When true, reject candidates whose aggregate mean metrics exceed any configured SLA bound before ranking or Pareto analysis. |
+| `optimization.max_topology_candidates` | `10000` | `x` | `-` | Positive integer. Limits each AFD role domain and complete legal compositions in branches containing AFD; overflow is an error, never truncation. Ordinary branches retain their current search behavior. |
+| `optimization.strict_sla` | `false` | `x` | `-` | When true, enforce the configured mean SLA bounds and `constraints.metrics` before ranking or Pareto analysis. |
+| `optimization.constraints.metrics` | `[]` | `x` | `-` | Aggregate constraints on the [AIPerf metric selectors](../sweeper/optimization-goals.md#aiperf-metric-selectors), with `metric`, `operator` (`lte` or `gte`), and nonnegative `threshold`. Enforced only when `strict_sla` is true. |
 | `optimization.constraints.min_candidate_gpus` | `null` | `x` | `-` | Positive when set and no greater than the maximum. |
 | `optimization.constraints.max_candidate_gpus` | `32` | `x` | `-` | Positive. |
-| `optimization.constraints.min_goodput_rps` | `null` | `x` | `-` | Positive finite SLA-compliant requests/s floor for `min_gpus` only; required with request-rate traffic and cannot exceed the offered rate. Optional with fixed concurrency. |
+| `optimization.constraints.min_goodput_rps` | `null` | `x` | `-` | Positive finite SLA-compliant requests/s floor for `min_gpus` only; required with open-loop traffic (a request or session rate, or `trace_timestamps` without `agentic_lanes`). It cannot exceed the offered request rate, which for sessions is `sessions_per_second` times `session.turns`; a trace's timestamp rate is not checked. Optional with fixed concurrency or agentic lanes. |
 
 `optimization.hardware` is one fallback SKU, never a list or inventory.
-Concrete P/D role SKUs can override it. `optimizer` controls execution of the
+Concrete P/D role SKUs can override it. `max_topology_candidates` bounds topology preparation for AFD branches, separately from `optimizer.max_trials`, which bounds evaluated trials. `optimizer` controls execution of the
 search and is described in [search space](../sweeper/search-space.md#optimizer-controls).
