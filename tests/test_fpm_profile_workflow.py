@@ -840,9 +840,9 @@ def test_profile_kv_load_cache_keeps_resource_identity_without_model_constructio
 
 @pytest.mark.parametrize("decode_context", [1024, 512])
 def test_linear_pd_kv_load_sizes_each_role_with_its_own_context_length(profile, decode_context):
-    from aisimulate.sweeper import kv_load
-    from aisimulate.sweeper.config import Workload
-    from aisimulate.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper import kv_load
+    from aisim.sweeper.config import Workload
+    from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
 
     prefill = deepcopy(profile["deployments"][0])
     decode = deepcopy(prefill)

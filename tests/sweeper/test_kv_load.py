@@ -197,7 +197,7 @@ def test_disagg_kv_capacity_sizes_each_role_with_its_own_context_length(monkeypa
         seen[worker_type] = context_length
         return 100_000
 
-    monkeypatch.setattr("aisimulate.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
+    monkeypatch.setattr("aisim.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
     resolve_kv_load(
         sample,
         workload=Workload(isl=1000, osl=1000, kv_load_ratio=1.0, num_request_ratio=10),
@@ -229,7 +229,7 @@ def test_kv_capacity_reads_the_role_context_before_the_global_one(monkeypatch, m
         seen[worker_type] = context_length
         return 100_000
 
-    monkeypatch.setattr("aisimulate.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
+    monkeypatch.setattr("aisim.sweeper.kv_load._per_rank_capacity_tokens", fake_capacity)
     resolve_kv_load(
         sample,
         workload=Workload(isl=1000, osl=1000, kv_load_ratio=1.0, num_request_ratio=10),
