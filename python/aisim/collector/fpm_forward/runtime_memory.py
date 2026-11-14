@@ -36,6 +36,9 @@ from .types import ParallelTopology
 _CELL_EXECUTION_FIELDS = frozenset({"execution_identity", "input_text_sha256"})
 # The spec classes that the shared class table maps to FPM cache kinds, and the uniform wrapper of their inner specs.
 _SPEC_TYPES = frozenset({*(_SPEC_MODULE + name for name in SPEC_KINDS), _UNIFORM_SPEC})
+# The vLLM 0.33.0 spec classes whose groups take no part in prefix caching (kv_cache_interface.py:998-1000). A
+# SlidingWindowMLASpec group takes part unless it replays a bounded window (:1015, :1027-1029), which no record holds.
+_NO_PREFIX_CACHING_SPECS = frozenset({_SPEC_MODULE + "CircularBufferSpec"})
 # vLLM 0.33.0 cache settings that follow the prefix-caching mode (models/config.py:763-787), the
 # user prefix-match unit, and the block size that the engine core resolves in its own process
 # (engine/core.py:347-351). Importers record the mode per phase instead of comparing them.
@@ -695,6 +698,13 @@ def _normalized_groups(cache: dict[str, Any], scheduler_cache: dict[str, Any], p
                 raise ValueError(f"runtime state cache group blocks_per_request contradicts its spec: {names}")
             normalized["blocks_per_request"] = blocks
             normalized.update(checkpoint_fields)
+        # A spec takes part in prefix caching unless its class says otherwise, and a uniform group takes part only when
+        # every inner spec does (kv_cache_interface.py:236-239, :1305-1307). Of the classes of SPEC_KINDS, the ring
+        # never takes part (:998-1000), and a SlidingWindowMLASpec takes part unless it replays a bounded window
+        # (:1027-1029), which no record holds, so the marker of such a group stays out. Only a vLLM 0.33.0 record
+        # gets the marker.
+        if hybrid and _SPEC_MODULE + "SlidingWindowMLASpec" not in spec_classes:
+            normalized["prefix_cacheable"] = not any(value in _NO_PREFIX_CACHING_SPECS for value in spec_classes)
         groups.append(normalized)
     return groups
 

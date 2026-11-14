@@ -446,6 +446,69 @@ def test_import_refuses_inconsistent_checkpoint_evidence(count, alignment, error
         runtime_memory._normalized_groups(cache, scheduler, PAGE)
 
 
+_IMPORTED_PREFIX_FIELDS = {"prefix_cacheable", "transfer_bytes_per_block"}
+
+
+def _with_layer_classes(groups, layer_class="vllm.model_executor.layers.attention.Attention"):
+    for group in groups:
+        group["layer_classes"] = dict.fromkeys(group["layer_names"], layer_class)
+    return groups
+
+
+def test_import_marks_prefix_cacheable_groups():
+    # A vLLM 0.33.0 record of the GLM-5.3-Flash shape: an MLA group, a uniform group of tail rings, each a
+    # CircularBufferSpec (glm5next/common/attention.py:170-179), and a KDA group.
+    latent = _spec("MLAAttentionSpec", block_size=2176, page_size_bytes=PAGE, sliding_window=None, dtype="torch.uint8")
+    names = ["layers.3.tail", "layers.4.tail"]
+    tails = [_spec("CircularBufferSpec", block_size=4, page_size_bytes=2048, dtype="torch.bfloat16") for _name in names]
+    ring = _spec(
+        "UniformTypeKVCacheSpecs",
+        block_size=4,
+        page_size_bytes=2 * 2048,
+        kv_cache_specs=dict(zip(names, tails, strict=True)),
+    )
+    config = SimpleNamespace(
+        kv_cache_groups=[_group(["mla.0"], latent), _group(names, ring), _group(["kda.0", "kda.1"], _mamba())]
+    )
+    cache = {"groups": _with_layer_classes(observer.cache_groups(config, hybrid_evidence=True))}
+    scheduled = {"groups": [runtime_memory._scheduler_copy(group) for group in cache["groups"]]}
+    groups = runtime_memory._normalized_groups(cache, scheduled, PAGE)
+    # The ring takes no part in prefix caching, and a uniform group takes part only when every inner spec does
+    # (vLLM 0.33.0 kv_cache_interface.py:998-1000, :1305-1307).
+    assert [group["prefix_cacheable"] for group in groups] == [True, False, True]
+    # The group import writes no transfer bytes.
+    assert all(set(group) & _IMPORTED_PREFIX_FIELDS == {"prefix_cacheable"} for group in groups)
+    # A vLLM 0.27.0 record has none of the new keys.
+    worker, scheduler, cache_config = _initialized()
+    legacy = observer.worker_memory(worker)
+    page = legacy["allocated_cache_bytes"] // legacy["num_blocks"]
+    groups = runtime_memory._normalized_groups(legacy, observer.scheduler_memory(scheduler, cache_config), page)
+    assert [group["kind"] for group in groups] == ["attention", "attention", "convolution"]
+    assert not any(set(group) & _IMPORTED_PREFIX_FIELDS for group in groups)
+
+
+def test_import_leaves_the_prefix_marker_of_a_sliding_window_mla_group_out():
+    # A SlidingWindowMLASpec group takes part in prefix caching unless it replays a bounded window (vLLM 0.33.0
+    # kv_cache_interface.py:1015, :1027-1029), and no record holds that.
+    full = _spec("FullAttentionSpec", block_size=16, page_size_bytes=8192, sliding_window=None, dtype="torch.bfloat16")
+    swa = _spec("SlidingWindowMLASpec", block_size=16, page_size_bytes=8192, sliding_window=128, dtype="torch.bfloat16")
+    tail = _spec("CircularBufferSpec", block_size=4, page_size_bytes=2048, dtype="torch.bfloat16")
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            _group(["attn.0"], full),
+            _group(["swa.0"], swa),
+            _group(["tail.0"], tail),
+            _group(["kda.0"], _mamba()),
+        ]
+    )
+    cache = {"groups": _with_layer_classes(observer.cache_groups(config, hybrid_evidence=True))}
+    scheduled = {"groups": [runtime_memory._scheduler_copy(group) for group in cache["groups"]]}
+    groups = runtime_memory._normalized_groups(cache, scheduled, PAGE)
+    assert [group["sliding_window"] for group in groups] == [None, 128, None, None]
+    assert "prefix_cacheable" not in groups[1]
+    assert [groups[index]["prefix_cacheable"] for index in (0, 2, 3)] == [True, False, True]
+
+
 def test_uniform_type_groups_record_their_inner_specs():
     role = Enum("SparseCacheRole", {"SPARSE": "sparse", "INDEXER": "indexer"}, type=str)
     latent, indexer = (

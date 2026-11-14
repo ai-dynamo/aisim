@@ -978,11 +978,6 @@ def _prefix_caching_settings(cache: dict[str, Any], *, scheduler: bool, hybrid: 
     return value
 
 
-# The vLLM 0.33.0 spec classes whose groups take no part in prefix caching (kv_cache_interface.py:998-1000). A
-# SlidingWindowMLASpec group takes part unless it replays a bounded window (:1015, :1027-1029), which no record holds.
-_NO_PREFIX_CACHING_SPECS = frozenset({_SPEC_MODULE + "CircularBufferSpec"})
-
-
 def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
     """The hash block sizes that vLLM 0.33.0 can derive for a scheduler from its cache groups and cache settings.
 
@@ -1011,7 +1006,7 @@ def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
     caching = [
         block
         for block, group in zip(blocks, groups, strict=True)
-        if group["spec_type"] not in {*_NO_PREFIX_CACHING_SPECS, unknown}
+        if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
     ]
     # Start from the GCD of the blocks of the groups that surely take part, which is 0 without such a group. Each
     # SlidingWindowMLASpec group may add its block to every GCD so far, so the set holds the GCD of every choice of
@@ -1072,7 +1067,9 @@ def _scheduler_hash_block_size_fits(record: dict[str, Any]) -> bool:
         )
 
     unknown = _SPEC_MODULE + "SlidingWindowMLASpec"
-    caching = [group for group in groups if group["spec_type"] not in {*_NO_PREFIX_CACHING_SPECS, unknown}]
+    caching = [
+        group for group in groups if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
+    ]
     sliding = [group["block_size_tokens"] for group in groups if group["spec_type"] == unknown and can_take_part(group)]
     unit = settings.get("prefix_match_unit") is not None
     if caching:
@@ -1479,6 +1476,14 @@ def _configuration(
             "gpu_memory_utilization": float(collection["gpu_memory_utilization"]),
             "max_model_len": collection["max_model_len"],
             **(prefix_caching[record_phase] or {}),
+            # The prefix-caching evidence and the cache groups that it describes hold for this vLLM version, which can
+            # differ from the dataset label of the launch. Records without hybrid evidence, of vLLM 0.27.0, 0.28.0
+            # and 0.32.0, keep their bytes.
+            **(
+                {"runtime_framework_version": bundle.manifest["runtime"]["version"]}
+                if prefix_caching[record_phase] is not None
+                else {}
+            ),
             "provenance": canonical_json(provenance),
         },
         "provenance": "Validated runtime shared-pool observations; minimum usable capacity across compatible phases "

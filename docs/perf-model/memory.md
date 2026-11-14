@@ -136,6 +136,18 @@ yet. The simulated deployment decides prefix caching. The vLLM 0.33.0 runtime
 probe fills these fields from the prefill phase of an aggregated or prefill
 role. A decode role takes them from its decode phase.
 
+The import of a vLLM 0.33.0 runtime probe record also writes
+`runtime_framework_version`: the version of the runtime that observed the cache
+groups and the prefix-caching settings, such as `0.33.0`. It is optional,
+nonempty text, and an absent field is left out of the serialized record. It
+can differ from the deployment's `backend_version`, because
+`onboard probe-runtime` keeps an explicit dataset label and probes the runtime
+of the image. The import of a record without hybrid evidence, a vLLM 0.27.0,
+0.28.0 or 0.32.0 record, does not write it,
+and the linear layout of a measured cache leaves it out with the groups.
+Sizing does not read it. A profile imported before this field existed has
+none; see the [migration guide](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals).
+
 Each group has a unique `name`, `kind` (`attention`, `convolution` or `state`),
 positive `num_layers`, `block_size_tokens`, and `page_size_bytes`, and an optional
 positive `sliding_window`. An omitted or null window retains full history;
@@ -196,6 +208,57 @@ read them yet.
   [`kda.py:168-176`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/models/glm5next/common/kda.py#L168-L176)
   and
   [`kda_checkpoint.py:9-10`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/mamba/kda_checkpoint.py#L9-L10).
+
+Every group can also hold two more optional fields. A profile imported before
+these fields existed has neither of them, and an absent field is left out of
+the serialized group. Sizing and replay do not read them yet.
+
+- `prefix_cacheable` tells whether vLLM's manager for the group takes part in
+  prefix caching. A ring spec (`CircularBufferSpec`) does not, and a uniform
+  group takes part only when every inner spec does. Import writes it for every
+  group except a group that holds a `SlidingWindowMLASpec` layer. Such a group
+  takes no part if it replays a bounded window, and the probe does not record
+  that setting. See vLLM v0.33.0
+  [`kv_cache_interface.py:998-1000`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L998-L1000),
+  [`:1027-1029`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1027-L1029)
+  and
+  [`:1305-1307`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1305-L1307).
+- `transfer_bytes_per_block` is the bytes that vLLM's P/D connector (NIXL)
+  reads for one block of the group in a transfer on one TP rank, for the vLLM
+  version of the deployment. It is positive and at most 2^53, and it can be larger than
+  `page_size_bytes`, because the connector reads a block in regions that layers
+  of other groups can share. A hand-made profile states it for each group. To
+  measure it for a deployment, send two prompts of different length through a
+  P/D pair, one at a time, and read the change of
+  `vllm:nixl_bytes_transferred_sum` on the decode server for each. Divide each
+  change by the change of `vllm:nixl_bytes_transferred_count`, because each TP
+  rank makes its own transfer and the field holds the bytes of one rank. The
+  difference between the two results, divided by the difference in
+  full-attention blocks that move, is the value of the full-attention group. The rest of one transfer is the sum of
+  the values of the other groups when each of them moves one block, as a state
+  group does. The probe import of a vLLM 0.33.0 record writes it for no group,
+  because what the P/D connector of vLLM 0.33.0 reads for a block depends on
+  facts that the record does not hold. The connector registers one
+  region per layer address and lets layers of different groups share a region.
+  In a model with Mamba layers, it reads a block of an attention group, other
+  than the ring, in every region. The length of a region of a layer that is not
+  a Mamba layer depends on the layout: the padded page divided by a
+  kernel-block ratio that the connector chooses at start, or the whole storage
+  row of a block. A Mamba layer moves its state without padding, and a
+  `tp_replicated` Mamba layer moves its whole page. The record holds neither the
+  ratio nor `tp_replicated`. See vLLM v0.33.0
+  [`base_worker.py:1744-1756`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1756),
+  [`:194-249`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L194-L249),
+  [`:1598-1603`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1598-L1603),
+  [`:1693-1719`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1693-L1719),
+  [`:1063-1082`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1063-L1082),
+  [`:2013-2033`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L2013-L2033)
+  and
+  [`:1774-1779`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1779).
+  A P/D model of a grouped profile for vLLM 0.33.0 needs these facts from the
+  runtime observer first. A claim in `resource_overrides.cache_groups` that
+  states this field is refused, because the probe evidence holds no value to
+  compare it with.
 
 Use `RustForwardPassPerfModel.estimate_cache_budget(config, budget)` with the
 same canonical `ForwardPassPerfModelConfig` used for timing. Rust exposes

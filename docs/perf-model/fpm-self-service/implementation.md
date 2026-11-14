@@ -884,10 +884,12 @@ Import checks each kind of claim against the measured groups:
   kinds, layer counts, block sizes, page sizes and windows. Import does not
   compare group names or order. A group without a `sliding_window` has a null
   window. A state group also compares its `blocks_per_request`. Only import
-  writes `prefill_checkpoint_blocks` and `prefill_checkpoint_alignment`. If a
-  claimed group states one of these fields, import compares that field in every
-  group, so it must equal the probe's measurement. A claim that states neither
-  field compares the geometry only and still matches.
+  writes `prefix_cacheable`, `prefill_checkpoint_blocks` and
+  `prefill_checkpoint_alignment`. If a claimed group states one of these
+  fields, import compares that field in every group, so it must equal the
+  probe's measurement. A claim that states none of these fields compares the
+  geometry only and still matches. The probe import writes no
+  `transfer_bytes_per_block`, so a claim that states it is refused.
 - A `cache_layout: grouped` claim matches the grouped measurement.
 - A `cache_layout: linear` claim needs every measured group to be an attention
   group without a window.

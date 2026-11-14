@@ -1336,6 +1336,9 @@ def glm_tp4_cache_groups():
 
     The four KDA groups come first, each with one prefill checkpoint block aligned to 16 tokens, then the attention
     group and the tail group. Every page is one 13,516,800-byte pool block.
+
+    Only the tail ring takes no part in prefix caching. No group holds transfer bytes, which the record does not
+    decide.
     """
     page = 13_516_800
     return [
@@ -1350,6 +1353,7 @@ def glm_tp4_cache_groups():
                 "blocks_per_request": 1,
                 "prefill_checkpoint_blocks": 1,
                 "prefill_checkpoint_alignment": 16,
+                "prefix_cacheable": True,
             }
             for index, layers in enumerate((9, 9, 8, 8))
         ),
@@ -1360,6 +1364,7 @@ def glm_tp4_cache_groups():
             "block_size_tokens": 2176,
             "page_size_bytes": page,
             "sliding_window": None,
+            "prefix_cacheable": True,
         },
         {
             "name": "runtime_group_5",
@@ -1369,6 +1374,7 @@ def glm_tp4_cache_groups():
             "page_size_bytes": page,
             "sliding_window": None,
             "blocks_per_request": 1,
+            "prefix_cacheable": False,
         },
     ]
 
@@ -1652,6 +1658,7 @@ def test_mamba_hybrid_observations_import_state_groups(tmp_path):
             "block_size_tokens": 64,
             "page_size_bytes": 16_384,
             "sliding_window": None,
+            "prefix_cacheable": True,
         },
         *(
             {
@@ -1663,10 +1670,12 @@ def test_mamba_hybrid_observations_import_state_groups(tmp_path):
                 "sliding_window": None,
                 "blocks_per_request": 1,
                 "prefill_checkpoint_blocks": 0,
+                "prefix_cacheable": True,
             }
             for index in (1, 2)
         ),
     ]
+    # Each Mamba page is padded (8,000 of 8,192 bytes), and no group holds transfer bytes: equality pins the absence.
     assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 16_384
 
 
@@ -3356,3 +3365,60 @@ def test_import_refuses_the_live_glm53flash_record_declared_with_bfloat16_attent
         str(error.value)
         == "FMHA precision 'bfloat16' differs from the checkpoint-native 'fp8' for KV-cache dtype 'fp8'"
     )
+
+
+# The group of the live record that takes no part in prefix caching: the ring of the 11 indexer tail layers, a
+# CircularBufferSpec group.
+LIVE_RING_GROUP = "runtime_group_5"
+
+
+def test_import_marks_the_ring_group_of_vllm_0330_as_not_prefix_cacheable(tmp_path):
+    groups = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"][
+        "cache_groups"
+    ]
+    ring = next(group for group in groups if group["name"] == LIVE_RING_GROUP)
+    assert ring["prefix_cacheable"] is False  # CircularBufferSpec, vLLM 0.33.0 kv_cache_interface.py:999-1000
+
+
+def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
+    from aisim.support.config_profile import linear_runtime_resources
+
+    resources = _import(_campaign_from_fixture(tmp_path / "live", FIXTURES / "glm53flash_vllm_0330_probe"))["resources"]
+    assert resources["runtime_memory"]["runtime_framework_version"] == "0.33.0"
+    # The import of a vLLM 0.28.0 record holds no prefix-caching evidence, and its result keeps its bytes.
+    path, launches = observation_fixture(tmp_path / "attention", layout="attention")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    assert "runtime_framework_version" not in result["resources"]["runtime_memory"]
+    # A vLLM 0.33.0 record of one attention group has a linear layout. That layout has no cache groups, so it does not
+    # hold the version of their evidence.
+    path, launches = observation_fixture(tmp_path / "kernel", layout="kernel_view")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["resources"]["runtime_memory"]["runtime_framework_version"] == "0.33.0"
+    linear = linear_runtime_resources(result["resources"])
+    assert linear is not None and "cache_groups" not in linear
+    assert "runtime_framework_version" not in linear["runtime_memory"]
+
+
+def test_import_writes_no_transfer_bytes_for_a_record_of_vllm_0330(tmp_path):
+    groups = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"][
+        "cache_groups"
+    ]
+    # What the P/D connector of vLLM 0.33.0 moves for one block depends on facts that the record does not hold, so no
+    # group holds the key. The marker of every group: the four KDA groups and the attention group take part in prefix
+    # caching, the ring does not.
+    assert [(group["name"], group["prefix_cacheable"], "transfer_bytes_per_block" in group) for group in groups] == [
+        *((f"runtime_group_{index}", True, False) for index in range(5)),
+        (LIVE_RING_GROUP, False, False),
+    ]
+
+
+def test_import_writes_no_transfer_bytes_for_a_padded_page_of_an_attention_layer(tmp_path):
+    # The latent layer views 64 x 28 bf16 values of its 3,840-byte page, so 256 bytes of the page are padding.
+    path, launches = observation_fixture(tmp_path, layout="kernel_view")
+    _edit_view(path, "latent.0", shape=[8, 64, 28])
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    (group,) = result["resources"]["cache_groups"]
+    assert group["prefix_cacheable"] is True
+    assert "transfer_bytes_per_block" not in group
