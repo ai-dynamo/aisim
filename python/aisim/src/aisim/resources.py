@@ -1105,14 +1105,31 @@ def _replay_resource_workload(spec: Any, stack: str) -> Mapping[str, Any]:
         return spec.workload
     copies = 0
     pools = 0
-    for workers, args in (
-        (deployment.num_workers, deployment.agg_engine_args),
-        (deployment.num_prefill_workers, deployment.prefill_engine_args),
-        (deployment.num_decode_workers, deployment.decode_engine_args),
+    for role, workers, args in (
+        ("aggregated", deployment.num_workers, deployment.agg_engine_args),
+        ("prefill", deployment.num_prefill_workers, deployment.prefill_engine_args),
+        ("decode", deployment.num_decode_workers, deployment.decode_engine_args),
     ):
         if args is not None:
             pools += 1
-            copies += workers * int(args.get("dp_size", args.get("aic_attention_dp_size", 1)))
+            if role in deployment.afd_roles:
+                # AFD resolves its attention replicas from separate pool
+                # metadata. The turn count bounds every possible destination.
+                copies += spec.workload["turns_per_session"]
+                continue
+            rank = args.get("rank") or args
+            timing = rank.get("timing_model") or {}
+            identity = (timing.get("config") or {}) if timing.get("provider") == "aic" else {}
+            prefix = "" if role == "aggregated" else f"{role}_"
+            widths = (
+                args.get("dp_size"),
+                args.get("aic_attention_dp_size"),
+                deployment.parallel_config.get(f"{prefix}attention_dp"),
+                identity.get("attention_dp", identity.get("attention_dp_size")),
+            )
+            # The runner validates conflicting declarations. Admission must
+            # also cover DP inferred from a canonical timing identity.
+            copies += workers * max((value for value in widths if type(value) is int and value > 0), default=1)
     return {**spec.workload, "session_cache_copies": max(1, copies), "session_cache_pools": max(1, pools)}
 
 

@@ -361,6 +361,30 @@ def test_session_recommendation_bounds_cache_replicas_by_gpu_budget():
     assert plan["status"] == "admitted"
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("identity_field", ["attention_dp", "attention_dp_size"])
+def test_session_admission_counts_dp_inferred_from_timing_identity(monkeypatch, host, nested, identity_field):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    rank = {"timing_model": {"type": "external", "provider": "aic", "config": {identity_field: 3}}}
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg",
+        backend="vllm",
+        backend_version="test",
+        num_workers=2,
+        agg_engine_args={"rank": rank} if nested else rank,
+    )
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    expected = estimate_workload({**workload, "session_cache_copies": 6}, stack="engine")
+    plan = guard_replay(spec, stack="engine")
+    assert plan["estimate"]["estimated_peak_bytes"] == expected.estimated_peak_bytes
+    # Inferred DP reserves the same memory as an explicitly authored width.
+    explicit = replace(deployment, agg_engine_args={**deployment.agg_engine_args, "dp_size": 3})
+    assert guard_replay(replace(spec, backend_deployment=explicit), stack="engine") == plan
+
+
 def test_long_sessions_fit_a_workstation_budget():
     # This workload peaks near 2.2 GB RSS; v1 charged every turn for its
     # whole session and estimated 86 GB against this 83.7 GB budget.
