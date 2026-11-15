@@ -78,8 +78,13 @@ group's own `block_size_tokens`. The bytes of one block come from the profile's
 `transfer_bytes_per_block`. `bytes_per_full_block` adds them up over the
 full-attention groups. With `destination_missing`, a decode worker that already
 caches a prefix of the prompt does not receive the full-attention blocks of
-that prefix again. The state moves with every transfer that moves at least one
-token. `transfer_bytes_per_block` is the bytes that vLLM's NIXL connector
+that prefix again. If a full-attention group is not prefix-cacheable, the
+decode worker receives every full-attention block, as one transfer unit holds
+a block of each full-attention group. No full-attention spec of vLLM 0.31.0 or
+0.32.0 opts out of prefix caching. Only a profile that describes no deployment
+of these versions has such a group. The state moves with every transfer that
+moves at least one token. `transfer_bytes_per_block` is the bytes that
+vLLM's NIXL connector
 reads for one block of the group on one TP rank, on vLLM 0.31.0 or vLLM
 0.32.0. So the result is the bytes that the connector reads for the request on
 one rank. A live run of GLM-5.3-Flash measured the bytes of whole transfers on
@@ -112,6 +117,14 @@ Replay differs from vLLM in these known ways for a grouped profile:
   window, whatever the decode worker caches. vLLM moves only the window blocks
   that the decode worker does not cache. GLM-5.3-Flash has no sliding-window
   group.
+- When one full-attention group is prefix-cacheable and another is not, replay
+  moves every full-attention block of both groups. vLLM moves only the blocks
+  that the decode worker does not hold, so it does not move the cached hit
+  blocks of the prefix-cacheable group. No full-attention spec of vLLM 0.31.0
+  or 0.32.0 opts out of prefix caching. So no deployment of these versions has
+  this shape. Only a profile that describes no such deployment reaches it.
+  GLM-5.3-Flash has one full-attention group. The live run did not measure
+  this case.
 
 The decode-side differences under
 [grouped caches](kv-cache.md#other-cache-modes) can also change the
