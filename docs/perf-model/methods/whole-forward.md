@@ -480,8 +480,23 @@ Every non-null `power_w` must be finite and greater than zero. Null records
 measured latency with unknown power; the Rust loader represents that power as
 NaN rather than inventing a zero-watt measurement. Schema 6 and 7 remain
 latency-only and do not read `power_w`. Fake-KV healing retains the selected
-anchor's power, including unknown power. Operators do not yet consume the
-loaded schema-8 power values.
+anchor's power, including unknown power.
+
+With SOL interpolation, FPM forward operators return operation energy in
+watt-milliseconds from schema-8 row power and resolved latency. Latency and
+power use the same interpolation weight; a prefill latency clamp also scales
+energy. If any selected anchor lacks power, the operation returns zero energy
+as the uncovered-data sentinel. Direct interpolation stays latency-only.
+
+Python static summaries expose this energy through
+`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`, which
+can now return nonzero FPM energy for schema-8 pairs. SDK publication gating is
+the separate PR 3b step of the FPM power rollout. Mixed steps suppress both FPM
+prefill and marginal-decode energy (decision D10, AISIM-2001), while retaining
+draft-operation energy. The multi-rank iteration query and native Replay's FPM
+timing provider remain latency-only: replay and unified prediction reports keep
+`power_w` and `power_coverage` null even for a fully powered schema-8 pair. See
+the [power output contract](../power.md#publication-gate).
 
 The accuracy dataset gate validates the schema-8 policy, row binding, DOUBLE
 column, and power values before admitting a pair. Its Gym worker adapter still

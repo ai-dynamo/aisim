@@ -1658,6 +1658,71 @@ def test_fpm_detail_distinguishes_memory_budget_from_runtime_capacity(external_f
     assert sections["time"]["serving_metrics"]["mean_ttft_ms"] > 0
 
 
+def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(external_fpm_config, tmp_path, capsys):
+    config, systems_root = external_fpm_config
+    original = Path(config.engine.workers.aggregated.timing.fpm_parquet_path)
+    rows = pq.read_table(original).to_pylist()
+    policy = "dynamo_native_single_sample_power_window_v1"
+    for row in rows:
+        row.update(
+            model_config_sha256="",
+            execution_profile="full",
+            engram_residency="none",
+            input_modality="text",
+            measurement_policy=policy,
+            measurement_repeats=1,
+            power_w=500.0,
+        )
+    powered = _write_pair(
+        str(tmp_path / "powered"), rows, sidecar_overrides={"schema_version": 8, "measurement_policy": policy}
+    )
+    raw = config.model_dump(mode="json", exclude_none=True)
+    raw["engine"]["workers"]["aggregated"]["timing"]["fpm_parquet_path"] = powered
+    config = CorePredictionConfig.model_validate(raw)
+
+    # Prove that the same pair supplies real native operation energy:
+    # the synthetic anchors cost 22/6 ms at 500 W, or 11000/3000 W*ms.
+    handle = EngineHandle.compile(
+        "Qwen/Qwen3-0.6B",
+        SYSTEM,
+        BACKEND,
+        backend_version=VERSION,
+        forward_model="fpm",
+        fpm_parquet_path=powered,
+        systems_path=str(systems_root),
+    )
+    assert handle.evaluate_context_ops([0], batch_size=1, s=512)[0][1:3] == pytest.approx((22.0, 11000.0))
+    assert handle.evaluate_generation_ops([0], batch_size=1, s=513)[0][1:3] == pytest.approx((6.0, 3000.0))
+
+    runner = EngineReplayRunnerFactory().create(0)
+    try:
+        report = runner.run(
+            prediction_to_replay_spec(config),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True),
+        )
+    finally:
+        runner.close()
+    assert report.metrics["completed_requests"] == 1
+    for result in (report.metrics, report.metadata["native_report"]):
+        assert result["power_w"] is None
+        assert result["power_coverage"] is None
+
+    path = tmp_path / "powered.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    output_dir = tmp_path / "out"
+    assert (
+        main(["predict", "-c", str(path), "--detail", "energy", "--format", "json", "--output-dir", str(output_dir)])
+        == 0
+    )
+    prediction = json.loads(capsys.readouterr().out)
+    assert prediction["summary"]["power_w"] is None
+    assert prediction["summary"]["power_coverage"] is None
+    energy = prediction["details"]["sections"]["energy"]
+    assert energy["status"] == "unsupported"
+    assert energy["diagnostics"]["power_w"] is None
+    assert energy["diagnostics"]["power_coverage"] is None
+
+
 def test_fpm_selector_allows_fallback_to_untrained_regression(tmp_path):
     systems = tmp_path / "systems"
     systems.mkdir()
