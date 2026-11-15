@@ -13,6 +13,7 @@ use crate::engine::{
     TimingModelConfig, TimingOperationEvidence, TimingPhaseEvidence, ValidatedTimingPhase,
     VisionShape,
 };
+use crate::memo::{Memo, OnThread};
 use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdTimingConfig};
 use crate::perfmodel::engine::runtime::{
     IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
@@ -663,7 +664,7 @@ impl AicTimingConfig {
                     speculation.kind
                 ),
             }
-            return Ok(crate::py::speculation_replay_depth(speculation)?);
+            return Ok(speculation.replay_depth()?);
         }
         Ok(self.nextn)
     }
@@ -824,10 +825,12 @@ struct IterationPricing {
     /// when every name belongs to one pass. Attributes a mixed rank's
     /// operations to prefill and decode evidence.
     mix_step_passes: Option<std::collections::HashMap<String, MixedPass>>,
-    /// Priced iterations keyed by the complete ordered rank list. Absent while
-    /// the model collects lookup coverage, which counts every invocation, and
-    /// when the estimator reads per-request detail the key does not hold.
-    cache: Option<quick_cache::sync::Cache<IterationKey, Arc<PricedIteration>>>,
+    /// Priced iterations keyed by the complete ordered rank list. Diagnostics
+    /// capture is fixed when the model is built, so the key leaves it out, as
+    /// the phase memo's does. Absent while the model collects lookup coverage,
+    /// which counts every invocation, and when the estimator reads
+    /// per-request detail the key does not hold.
+    memo: Option<Memo<IterationKey, Arc<PricedIteration>>>,
     /// How a mixed operation-graph rank's operations split into prefill and
     /// decode evidence, per operation-name list the model reports.
     mixed_splits: Mutex<Vec<Arc<MixedSplit>>>,
@@ -935,10 +938,10 @@ impl IterationPricing {
             model: Arc::clone(model),
             query: IterationQuery::Native(dispatch),
             mix_step_passes: native.mix_step_passes(),
-            cache: model
+            memo: model
                 .fpm_query_coverage()?
                 .is_none()
-                .then(|| quick_cache::sync::Cache::new(256)),
+                .then(|| Memo::clock(256)),
             mixed_splits: Mutex::default(),
         }))
     }
@@ -961,6 +964,7 @@ impl IterationPricing {
 }
 
 /// One priced group iteration and the evidence each invocation records.
+#[derive(Debug)]
 struct PricedIteration {
     total_ms: f64,
     /// The detailed whole-model FPM estimate, when diagnostics are captured.
@@ -990,7 +994,7 @@ struct AicTimingModel {
     /// Capture-only history of group iterations priced as one forward.
     fpm_iteration_evidence:
         Mutex<std::collections::BTreeMap<FpmIterationKey, crate::FpmEstimateEvidence>>,
-    phase_cache: quick_cache::sync::Cache<PhaseEvidenceKey, Arc<ValidatedTimingPhase>>,
+    phase_memo: Memo<PhaseEvidenceKey, Arc<ValidatedTimingPhase>>,
     /// Present when the rank hosts the vision tower.
     vision: Option<VisionTimer>,
     /// `None` keeps the per-rank phase pricing for every pass.
@@ -1002,7 +1006,7 @@ struct AicTimingModel {
 /// replay drops when no evidence capture was requested.
 struct VisionTimer {
     model: Arc<ForwardPassPerfModel>,
-    cache: quick_cache::sync::Cache<VisionShape, Arc<ValidatedTimingPhase>>,
+    memo: Memo<VisionShape, Arc<ValidatedTimingPhase>>,
 }
 
 impl AicTimingModel {
@@ -1088,7 +1092,7 @@ impl AicTimingModel {
         }
         let vision = vision.then(|| VisionTimer {
             model: Arc::clone(&model),
-            cache: quick_cache::sync::Cache::new(64),
+            memo: Memo::clock(64),
         });
         let phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
         let iteration = IterationPricing::for_replay(
@@ -1119,7 +1123,7 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_cache: quick_cache::sync::Cache::new(128),
+            phase_memo: Memo::clock(128),
             vision,
             iteration,
         })
@@ -1194,7 +1198,7 @@ impl AicTimingModel {
             model: Arc::clone(&model),
             query: IterationQuery::Fitted { detail },
             mix_step_passes: None,
-            cache: (!detail).then(|| quick_cache::sync::Cache::new(256)),
+            memo: (!detail).then(|| Memo::clock(256)),
             // Fitted estimators report no operation evidence.
             mixed_splits: Mutex::default(),
         };
@@ -1210,7 +1214,7 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_cache: quick_cache::sync::Cache::new(1),
+            phase_memo: Memo::clock(1),
             vision: None,
             iteration: Some(iteration),
         })
@@ -1237,27 +1241,24 @@ impl AicTimingModel {
             .vision
             .as_ref()
             .context("this rank does not host the vision encoder")?;
-        if let Some(phase) = timer.cache.get(&shape) {
-            return Ok(phase);
-        }
-        let entries = timer
-            .model
-            .vision_operations(&[crate::EncoderImageShape {
-                sequences: shape.encoder.sequences,
-                patch_tokens: shape.encoder.patch_tokens,
-                transformer_tokens: shape.encoder.transformer_tokens,
-                output_tokens: shape.encoder.output_tokens,
-                images: shape.count,
-            }])
-            .map_err(|error| anyhow!("AIC vision evaluation failed: {error}"))?;
-        ensure!(
-            !entries.is_empty(),
-            "AIC vision encoder returned no operation evidence for {} image(s)",
-            shape.count
-        );
-        let phase = Arc::new(phase_evidence_from_native_entries(entries)?);
-        timer.cache.insert(shape, Arc::clone(&phase));
-        Ok(phase)
+        timer.memo.get_or_price(&OnThread, shape, || {
+            let entries = timer
+                .model
+                .vision_operations(&[crate::EncoderImageShape {
+                    sequences: shape.encoder.sequences,
+                    patch_tokens: shape.encoder.patch_tokens,
+                    transformer_tokens: shape.encoder.transformer_tokens,
+                    output_tokens: shape.encoder.output_tokens,
+                    images: shape.count,
+                }])
+                .map_err(|error| anyhow!("AIC vision evaluation failed: {error}"))?;
+            ensure!(
+                !entries.is_empty(),
+                "AIC vision encoder returned no operation evidence for {} image(s)",
+                shape.count
+            );
+            Ok(Arc::new(phase_evidence_from_native_entries(entries)?))
+        })
     }
 
     fn predict_phase_evidence(
@@ -1274,10 +1275,23 @@ impl AicTimingModel {
                 std::sync::OnceLock::new();
             return Ok(Arc::clone(EMPTY.get_or_init(Default::default)));
         }
-        let key = (batch_size, isl, osl, prefix, prefill);
-        if let Some(phase) = self.phase_cache.get(&key) {
-            return Ok(phase);
-        }
+        self.phase_memo
+            .get_or_price(&OnThread, (batch_size, isl, osl, prefix, prefill), || {
+                self.phase_evidence_uncached(batch_size, isl, osl, prefix, mode, prefill)
+                    .map(Arc::new)
+            })
+    }
+
+    /// [`Self::predict_phase_evidence`] of nonzero work, priced by the model.
+    fn phase_evidence_uncached(
+        &self,
+        batch_size: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        mode: &str,
+        prefill: bool,
+    ) -> Result<ValidatedTimingPhase> {
         if let Some(model) = &self.diagnostic_model {
             let entries = model.static_phase_diagnostics(batch_size, isl, prefix, prefill)?;
             ensure!(
@@ -1298,13 +1312,9 @@ impl AicTimingModel {
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Diagnostics are name-folded in first-encounter order.
-            let phase = Arc::new(ValidatedTimingPhase::from_name_folded_operations(
-                operations,
-            )?);
-            self.phase_cache.insert(key, Arc::clone(&phase));
-            return Ok(phase);
+            return ValidatedTimingPhase::from_name_folded_operations(operations);
         }
-        let phase = match &self.phase_provider {
+        Ok(match &self.phase_provider {
             AicPhaseProvider::Fitted => {
                 return Err(anyhow!(
                     "a regression or learned estimator has no {mode} operation evidence"
@@ -1358,10 +1368,7 @@ impl AicTimingModel {
                 );
                 phase_evidence_from_entries(entries)?
             }
-        };
-        let phase = Arc::new(phase);
-        self.phase_cache.insert(key, Arc::clone(&phase));
-        Ok(phase)
+        })
     }
 
     #[cfg(test)]
@@ -2369,30 +2376,20 @@ impl TimingModel for AicTimingModel {
             _ => {}
         }
         let capture = self.diagnostic_model.is_some();
-        let whole_model = matches!(
-            pricing.query,
-            IterationQuery::Native(IterationDispatch::WholeModel { .. })
-        );
-        let cached = pricing
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.get(&queries))
-            .filter(|priced| !(capture && whole_model && priced.estimate.is_none()));
-        let (priced, hit) = match cached {
-            Some(priced) => (priced, true),
-            None => (
-                Arc::new(self.price_iteration(pricing, &queries, ranks, capture)?),
-                false,
-            ),
+        let price = || {
+            self.price_iteration(pricing, &queries, ranks, capture)
+                .map(Arc::new)
+        };
+        let priced = match &pricing.memo {
+            Some(memo) => {
+                memo.get_or_price_by(&OnThread, queries.as_slice(), <[RankQuery]>::to_vec, price)?
+            }
+            None => price()?,
         };
         self.record_iteration(&priced, &queries)?;
-        let iteration = IterationMs {
+        Ok(Some(IterationMs {
             total_ms: priced.total_ms,
-        };
-        if let Some(cache) = pricing.cache.as_ref().filter(|_| !hit) {
-            cache.insert(queries, priced);
-        }
-        Ok(Some(iteration))
+        }))
     }
 
     fn predict_vision_ms(&self, shapes: &[VisionShape]) -> Result<Option<f64>> {
@@ -2959,14 +2956,15 @@ fn materialize_aic_capacity(
     capacity_is_explicit: bool,
     estimate: impl FnOnce(&AicTimingConfig, &ReplayRoleConfig) -> Result<usize>,
 ) -> Result<()> {
-    ensure!(
-        capacity_is_explicit
-            || config
-                .speculation
-                .as_ref()
-                .is_none_or(|spec| matches!(spec.kind.as_str(), "none" | "ngram")),
-        "speculative replay requires explicit num_gpu_blocks including draft memory"
-    );
+    if let Some(speculation) = &config.speculation
+        && let Some(message) = crate::engine::speculation::speculative_capacity_mismatch(
+            &speculation.kind,
+            capacity_is_explicit,
+            role.rank.num_gpu_blocks,
+        )
+    {
+        anyhow::bail!(message);
+    }
     config.validate_parallel_shape()?;
     let engine_backend = match role.rank.backend {
         Backend::Vllm => "vllm",
@@ -3231,6 +3229,9 @@ fn timing_provenance(timing: &TimingModelConfig) -> serde_json::Value {
                 "estimator": estimator,
                 "timing_source": provider,
                 "data_version": data_version,
+                "database_mode": matches!(estimator, Some("op_level" | "fpm_interpolation"))
+                    .then(|| config.get("database_mode").cloned())
+                    .flatten(),
                 "data_identity": data_identity,
                 "data_version_unavailable_reason": data_version.is_none().then_some(
                     "selected estimator does not expose a data version"
@@ -3255,19 +3256,6 @@ fn timing_provenance(timing: &TimingModelConfig) -> serde_json::Value {
             })
         }
     }
-}
-
-/// vLLM turns async scheduling off by default for prompt-lookup (ngram)
-/// drafts and rejects an explicit request for it.
-fn resolve_ngram_async_scheduling(rank: &mut EngineConfig, speculation_kind: &str) -> Result<()> {
-    if speculation_kind == "ngram" && rank.backend == Backend::Vllm {
-        ensure!(
-            rank.async_scheduling != Some(true),
-            "vLLM does not support async scheduling with ngram speculative decoding"
-        );
-        rank.async_scheduling = Some(false);
-    }
-    Ok(())
 }
 
 /// Normalize old provider payloads at the boundary. Rank identity is authoritative;
@@ -3516,23 +3504,13 @@ fn resolve_role_timing(
         require_unit_decode_speedup(&pricing.model, role.rank.decode_speedup_ratio)?;
     }
     if let Some(speculation) = &config.speculation {
-        ensure!(
-            speculation.kind == "ngram"
-                || role
-                    .rank
-                    .aic_nextn_accept_rates
-                    .as_deref()
-                    .is_some_and(|rates| !rates.trim().is_empty()),
-            "generic speculative replay requires explicit aic_nextn_accept_rates; \
-             configure expected_accepted_tokens in engine.speculation"
-        );
-        let depth = config.speculative_depth()? as usize;
-        ensure!(
-            role.rank.aic_nextn.is_none_or(|value| value == depth),
-            "aic_nextn conflicts with resolved speculative depth {depth}"
-        );
-        role.rank.aic_nextn = (depth > 0).then_some(depth);
-        resolve_ngram_async_scheduling(&mut role.rank, &speculation.kind)?;
+        crate::engine::speculation::resolve_speculative_role(
+            &mut role.rank,
+            &speculation.kind,
+            &config.backend,
+            config.speculative_depth()?,
+            capacity_is_explicit,
+        )?;
     }
     if let Some(model) = &timing.fpm_model
         && model.fpm_query_coverage()?.is_some()
@@ -5466,7 +5444,11 @@ fn engine_launch_from_replay_role_json(
     startup_time: Option<f64>,
 ) -> PyResult<String> {
     let convert = || -> anyhow::Result<String> {
-        let role: crate::replay::ReplayRoleConfig = serde_json::from_str(payload)?;
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        let depth_is_omitted = value
+            .pointer("/rank/aic_nextn")
+            .is_none_or(serde_json::Value::is_null);
+        let role: crate::replay::ReplayRoleConfig = serde_json::from_value(value)?;
         let mut launch = crate::engine::EngineLaunchConfig {
             engine: role.rank,
             dp_size: role.dp_size,
@@ -5490,6 +5472,9 @@ fn engine_launch_from_replay_role_json(
                 provider: "ais".into(),
                 config: serde_json::to_value(canonical)?,
             };
+        }
+        if depth_is_omitted {
+            launch.derive_speculative_depth()?;
         }
         Ok(serde_json::to_string(&launch.normalized()?)?)
     };
@@ -5556,6 +5541,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn timing_provenance_reports_the_database_mode_only_for_database_estimators() {
+        let external = |estimation_mode: &str| TimingModelConfig::External {
+            provider: "aic".into(),
+            config: serde_json::json!({
+                "estimation_mode": estimation_mode,
+                "backend_version": "0.24.0",
+                "database_mode": "HYBRID",
+            }),
+        };
+        let op_level = timing_provenance(&external("op_level"));
+        assert_eq!(op_level["estimator"], "op_level");
+        assert_eq!(op_level["data_version"], "0.24.0");
+        assert_eq!(op_level["database_mode"], "HYBRID");
+        // The resolved request always carries a database mode; a whole-forward
+        // estimator uses no database, so its provenance reports none.
+        let regression = timing_provenance(&external("fpm_regression"));
+        assert_eq!(regression["estimator"], "fpm_regression");
+        assert!(regression["data_version"].is_null());
+        assert!(regression["database_mode"].is_null());
+        let fixed = timing_provenance(&TimingModelConfig::Fixed {
+            prefill_ms: 1.0,
+            decode_ms: 1.0,
+        });
+        assert_eq!(fixed["estimator"], "fixed");
+        assert!(fixed.get("database_mode").is_none());
+    }
 
     #[test]
     fn replay_coverage_errors_preserve_the_original_chain() {
@@ -6874,7 +6887,7 @@ mod tests {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_cache: quick_cache::sync::Cache::new(128),
+            phase_memo: Memo::clock(128),
             vision: None,
             iteration: None,
         }
@@ -6992,7 +7005,7 @@ mod tests {
             } else {
                 (batch as u32, length as u32 - 1, 2, 0, false)
             };
-            let cached = native.phase_cache.get(&key);
+            let cached = native.phase_memo.peek(&key).map(|(phase, _)| phase);
             let predict = |timing: &AicTimingModel| {
                 if prefill {
                     timing.predict_prefill_ms(batch, length, prefix)
@@ -7003,7 +7016,10 @@ mod tests {
             };
             assert_eq!(predict(&native).to_bits(), predict(&bridge).to_bits());
             if let Some(cached) = cached {
-                assert!(Arc::ptr_eq(&cached, &native.phase_cache.get(&key).unwrap()));
+                assert!(Arc::ptr_eq(
+                    &cached,
+                    &native.phase_memo.peek(&key).unwrap().0
+                ));
             }
             let actual = native.evidence_summary().unwrap();
             let expected = bridge.evidence_summary().unwrap();
@@ -7832,7 +7848,7 @@ mod tests {
                 AicTimingModel::build(&mut config, ForwardPassWorkerType::Decode, false).unwrap();
             let pricing = timing.iteration.as_ref().unwrap();
             assert_eq!(pricing.query, IterationQuery::Fitted { detail: true });
-            assert!(pricing.cache.is_none());
+            assert!(pricing.memo.is_none());
             for i in [3, 8, 21] {
                 let rank = ranks(i);
                 let query = AicTimingModel::fitted_rank_query(&rank).unwrap();
@@ -8416,18 +8432,73 @@ mod tests {
     }
 
     #[test]
-    fn ngram_drafts_turn_vllm_async_scheduling_off() {
-        let mut rank = EngineConfig::default();
-        resolve_ngram_async_scheduling(&mut rank, "mtp").unwrap();
-        assert_eq!(rank.async_scheduling, None);
-        resolve_ngram_async_scheduling(&mut rank, "ngram").unwrap();
-        assert_eq!(rank.async_scheduling, Some(false));
-        rank.async_scheduling = Some(true);
-        let error = resolve_ngram_async_scheduling(&mut rank, "ngram").unwrap_err();
-        assert!(error.to_string().contains("async scheduling"), "{error}");
-        let mut sglang = EngineConfig::for_backend(Backend::Sglang);
-        resolve_ngram_async_scheduling(&mut sglang, "ngram").unwrap();
-        assert_eq!(sglang.async_scheduling, None);
+    fn native_ngram_role_derives_missing_or_null_depth_and_default_acceptance() {
+        pyo3::prepare_freethreaded_python();
+        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+            assert!(
+                std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_none(),
+                "embedded SDK is required: {error}"
+            );
+            eprintln!("native_ngram_role: SKIP — embedded SDK is not importable: {error}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "num_hidden_layers": 4, "hidden_size": 2048,
+                "intermediate_size": 5632, "num_attention_heads": 16,
+                "num_key_value_heads": 4, "head_dim": 128,
+                "vocab_size": 32000, "max_position_embeddings": 2048
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for depth in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(3)),
+        ] {
+            let mut value = serde_json::json!({
+                "rank": {
+                    "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
+                    "timing_model": {"type": "external", "provider": "aic", "config": {
+                        "model": dir.path(), "system": "h200_sxm", "backend": "vllm",
+                        "backend_version": "0.24.0", "estimation_mode": "op_level",
+                        "speculation": {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
+                    }}
+                }
+            });
+            if let Some(depth) = depth {
+                value["rank"]["aic_nextn"] = depth;
+            }
+            let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
+            assert!(
+                resolve_role_timing(
+                    &mut role,
+                    true,
+                    ForwardPassWorkerType::Aggregated,
+                    None,
+                    false,
+                    &mut Vec::new(),
+                    &mut serde_json::Map::new(),
+                )
+                .unwrap()
+                .0
+                .is_some()
+            );
+            assert_eq!(role.rank.aic_nextn, Some(3));
+            assert_eq!(role.rank.async_scheduling, Some(false));
+            assert_eq!(
+                crate::engine::normalize_conditional_accept_rates(
+                    3,
+                    role.rank.aic_nextn_accept_rates.as_deref(),
+                )
+                .unwrap(),
+                [0.85, 0.3, 0.0],
+            );
+        }
     }
 
     #[test]
@@ -8532,7 +8603,7 @@ mod tests {
             materialize_aic_capacity(&config, &mut role, false, |_, _| unreachable!())
                 .unwrap_err()
                 .to_string()
-                .contains("explicit num_gpu_blocks")
+                .contains("explicitly configured positive num_gpu_blocks")
         );
         role.rank.aic_nextn = Some(3);
         materialize_aic_capacity(&config, &mut role, true, |_, _| unreachable!()).unwrap();
@@ -9732,6 +9803,10 @@ mod tests {
                 if capture {
                     phase.diagnostic_model = Some(Arc::clone(&model));
                     iteration.diagnostic_model = Some(Arc::clone(&model));
+                    // Replay fixes capture at construction, so the memo does
+                    // not key on it.
+                    let pricing = iteration.iteration.as_ref().unwrap();
+                    pricing.memo.as_ref().unwrap().clear();
                 }
                 let expected = phase.predict_prefill_totals_ms(batch, new, prefix).unwrap();
                 let actual = iteration_ms(&iteration, &[prefill_work(0, batch, new, prefix)]);
@@ -9933,7 +10008,7 @@ mod tests {
                 .iteration
                 .as_ref()
                 .unwrap()
-                .cache
+                .memo
                 .as_ref()
                 .unwrap()
                 .len()
@@ -10155,9 +10230,9 @@ mod tests {
             // Replay fixes capture at construction; each mode prices and
             // caches its own evidence.
             timing.diagnostic_model = capture.then(|| Arc::clone(&model));
-            timing.phase_cache.clear();
+            timing.phase_memo.clear();
             let pricing = timing.iteration.as_ref().unwrap();
-            pricing.cache.as_ref().unwrap().clear();
+            pricing.memo.as_ref().unwrap().clear();
             let timing = &timing;
             // Pure passes whose per-request means divide exactly: the
             // canonical query prices the same static phase, and the rank's
@@ -10424,7 +10499,7 @@ mod tests {
             .collect();
         tuned.tune_with_fpms(&iterations).unwrap();
         let model = Arc::clone(&pricing.model);
-        pricing.cache.as_ref().unwrap().clear();
+        pricing.memo.as_ref().unwrap().clear();
         timing.corrections = Some(Arc::clone(&model));
         let factor = |query: [u32; 5]| {
             model
@@ -10552,7 +10627,7 @@ mod tests {
             .collect();
         tuned.tune_with_fpms(&iterations).unwrap();
         let model = Arc::clone(&pricing.model);
-        pricing.cache.as_ref().unwrap().clear();
+        pricing.memo.as_ref().unwrap().clear();
         assert!(model.corrects_native_estimates());
         timing.corrections = Some(Arc::clone(&model));
 
@@ -10653,7 +10728,7 @@ mod tests {
                 .iteration
                 .as_ref()
                 .unwrap()
-                .cache
+                .memo
                 .as_ref()
                 .unwrap()
                 .clear();
@@ -10905,8 +10980,8 @@ mod tests {
             timing.evidence_summary().unwrap().decode.energy_wms,
             Some(1_600_000.0)
         );
-        let cached = timing.phase_cache.get(&(2, 127, 2, 0, false)).unwrap();
-        let again = timing.phase_cache.get(&(2, 127, 2, 0, false)).unwrap();
+        let cached = timing.phase_memo.peek(&(2, 127, 2, 0, false)).unwrap().0;
+        let again = timing.phase_memo.peek(&(2, 127, 2, 0, false)).unwrap().0;
         assert!(Arc::ptr_eq(&cached, &again));
         assert_eq!(cached.to_phase().energy_wms, Some(1_600.0));
         // Distinct coordinates must never reuse the preceding shape's result.
@@ -11143,7 +11218,7 @@ mod tests {
         let mut timing = Python::with_gil(|py| python_timing_model(py.None(), false));
         timing.phase_provider = AicPhaseProvider::NativeEntries(vec![row("seed", 1.0, 2.0, "sol")]);
         timing.predict_decode_ms(1, 65, 64, 1024).unwrap();
-        let cached = timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap();
+        let cached = timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0;
         let before = timing.evidence_summary().unwrap();
         timing.phase_provider = AicPhaseProvider::NativeEntries(Vec::new());
         for _ in 0..2 {
@@ -11152,10 +11227,10 @@ mod tests {
                 error.to_string(),
                 "AIC static_gen returned empty operation evidence for nonzero work"
             );
-            assert!(timing.phase_cache.get(&(1, 127, 2, 0, false)).is_none());
+            assert!(timing.phase_memo.peek(&(1, 127, 2, 0, false)).is_none());
             assert!(Arc::ptr_eq(
                 &cached,
-                &timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap()
+                &timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0
             ));
             let after = timing.evidence_summary().unwrap();
             assert_bits(&after.prefill, &before.prefill);
@@ -11179,10 +11254,10 @@ mod tests {
                     for _ in 0..2 {
                         let error = timing.predict_decode_ms(1, 129, 128, 1024).unwrap_err();
                         assert_eq!(error.to_string(), checked.to_string());
-                        assert!(timing.phase_cache.get(&(1, 127, 2, 0, false)).is_none());
+                        assert!(timing.phase_memo.peek(&(1, 127, 2, 0, false)).is_none());
                         assert!(Arc::ptr_eq(
                             &cached,
-                            &timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap()
+                            &timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0
                         ));
                         let after = timing.evidence_summary().unwrap();
                         assert_bits(&after.prefill, &before.prefill);
