@@ -1731,9 +1731,17 @@ def test_schema8_fpm_static_summary_energy(schema8_fpm_database, context_energy,
     assert summary.get_generation_latency_dict() == {"fpm_forward_decode": pytest.approx(6.0)}
     assert summary.get_context_energy_wms_dict() == {"fpm_forward_prefill": pytest.approx(context_energy)}
     assert summary.get_generation_energy_wms_dict() == {"fpm_forward_decode": pytest.approx(generation_energy)}
-    assert summary.get_result_dict()["power_w"] == pytest.approx((context_energy + generation_energy) / 28.0)
     covered_ms = (22.0 if context_energy else 0.0) + (6.0 if generation_energy else 0.0)
     assert summary.get_power_data_coverage() == pytest.approx(covered_ms / 28.0)
+    # The SDK publication gate withholds watts below 90% coverage, while
+    # retaining the exact operation energy and latency above for diagnostics.
+    if covered_ms / 28.0 < 0.9:
+        assert summary.get_result_dict()["power_w"] is None
+        assert summary.get_e2e_power_avg() is None
+    else:
+        watts = (context_energy + generation_energy) / 28.0
+        assert summary.get_result_dict()["power_w"] == pytest.approx(watts)
+        assert summary.get_e2e_power_avg() == pytest.approx(watts)
 
 
 @pytest.mark.parametrize(
@@ -1757,7 +1765,12 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
     )
     # D10 suppresses the 22 ms mixed prefill. Only the (osl - 1) pure
     # decode passes supply energy: 6 ms * 500 W per powered decode.
-    assert summary.get_result_dict()["power_w"] == pytest.approx(energy_wms / (22 + (osl - 1) * 6))
+    groups = summary.get_aggregate_energy_breakdown()
+    assert sum(group.energy_wms for group in groups.values()) == pytest.approx(energy_wms)
+    assert sum(group.latency_ms for group in groups.values()) == pytest.approx(22 + (osl - 1) * 6)
+    # Aggregate FPM power is withheld even when diagnostic coverage exceeds 90%.
+    assert summary.get_result_dict()["power_w"] is None
+    assert summary.get_e2e_power_avg() is None
     assert summary.get_power_data_coverage() == pytest.approx(coverage)
     task = Task(
         model_path=model.model_path,
@@ -1771,7 +1784,7 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
         osl=osl,
     )
     result = task.run_single_agg(tp=1, batch_size=1, ctx_tokens=512)
-    assert result["power_w"] == pytest.approx(summary.get_result_dict()["power_w"])
+    assert result["power_w"] is None
     assert result["power_coverage"] == pytest.approx(coverage)
 
 
@@ -1784,7 +1797,7 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
         (None, "agg", 2, None, 6 / 28),
         ("prefill", "agg", 2, None, 6 / 28),
         ("decode", "agg", 2, None, 0.0),
-        (None, "agg", 64, 472.5, 378 / 400),
+        (None, "agg", 64, None, 378 / 400),
         (None, "disagg", 2, 500.0, 1.0),
         # Legacy disagg scales prefill by 1.1 and decode by 1.08 before
         # weighting coverage. The correction scales energy with latency.
