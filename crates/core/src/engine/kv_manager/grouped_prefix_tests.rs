@@ -1114,6 +1114,118 @@ fn sliding_window_admission_after_a_hit_is_vllms_whole_prompt_count() {
 }
 
 #[test]
+fn remaining_blocks_follow_vllm_for_every_group_kind() {
+    // GLM at 4,352 of 10,000 tokens: full attention 5 - 2 = 3, the ring 0,
+    // and each KDA group 1, or 2 with a valid checkpoint at 8,704.
+    // The checkpoint passes the five conditions of V32 `iface:1125-1146`
+    // for the query 4,352..10,000 at 9,999 / 2,176 * 2,176 = 8,704, and
+    // vLLM counts min(5 - 2, 1 + 1) = 2 per KDA group (V32
+    // `single:1724-1773`).
+    for (version, checkpoint, expected) in [
+        (VllmRuleVersion::V0_31_0, false, 7),
+        (VllmRuleVersion::V0_32_0, false, 7),
+        (VllmRuleVersion::V0_32_0, true, 11),
+    ] {
+        let groups = groups_glm(checkpoint);
+        let mut coordinator = with_limits(rules_glm(version, checkpoint));
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut lease = coordinator.new_lease();
+        assert!(coordinator.allocate(pool, &mut lease, 10_000, 0, 4_352, 1));
+        assert_eq!(
+            coordinator.remaining_blocks(&lease, 10_000, 4_352, 10_000),
+            expected
+        );
+    }
+    // A 16-token window at 64 of 65 tokens: 5 blocks. One batch of 32 tokens
+    // caps it at cdiv(15 + 32, 16) + 1 = 4, equal to the 4 held, so 0.
+    // One batch of 8,192 tokens caps it at 514, so 5 - 4 = 1 (V31
+    // `single:216-238`, `iface:859-866`).
+    let groups = [attention("window", 16, Some(16))];
+    let limits = AdmissionLimits {
+        max_in_flight_tokens: 32,
+        max_model_len: usize::MAX,
+    };
+    for (mut coordinator, expected) in [
+        (GroupedPrefixCoordinator::new(rules(&groups, 16), limits), 0),
+        (with_limits(rules(&groups, 16)), 1),
+    ] {
+        let mut kv = kv_pool(&groups, 16);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut lease = coordinator.new_lease();
+        assert!(coordinator.allocate(pool, &mut lease, 65, 0, 64, 1));
+        assert_eq!(coordinator.remaining_blocks(&lease, 65, 64, 65), expected);
+    }
+}
+
+#[test]
+fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
+    // Attention and state blocks of 64, hash block 4, a cold prompt of 50.
+    // vLLM's whole-prompt test counts 2 blocks. The split stops at the tail
+    // 48, where the state is published inside its block, and the write
+    // 48..50 takes a third block for the copy. Until then vLLM counts that
+    // block in what the request still needs: the request is a producer in
+    // `_partial_hit_reqs` (V31 single:1770-1777, V32 single:1732-1739), and
+    // `_request_remaining_blocks` counts through the same function (V31
+    // sched:3003-3017, V32 sched:3060-3076).
+    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        let groups = [attention("full", 64, None), state("s", 64, true, false)];
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        let mut kv = kv_pool(&groups, 3);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(50, 4);
+        let hit = coordinator.find_longest_hit(pool, &request, 50);
+        assert_eq!(
+            coordinator.admission_blocks(pool, &hit, 50),
+            2,
+            "{version:?}"
+        );
+        let mut block_lease = coordinator.new_lease();
+        assert_eq!(
+            coordinator.remaining_blocks(&block_lease, 50, 0, 50),
+            2,
+            "{version:?}"
+        );
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 1));
+        coordinator.finalize(pool, &mut block_lease, &request, 50, 48, &hit, 1);
+        assert!(
+            state_lease(&block_lease, 1).published.is_some(),
+            "{version:?}"
+        );
+        assert_eq!(
+            coordinator.remaining_blocks(&block_lease, 50, 48, 50),
+            1,
+            "{version:?}"
+        );
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 2));
+        assert_eq!(pool.active_blocks(), 3, "{version:?}");
+        assert_eq!(
+            coordinator.remaining_blocks(&block_lease, 50, 50, 50),
+            0,
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut block_lease);
+    }
+}
+
+#[test]
+fn remaining_bytes_saturate_without_limits() {
+    // A window of 1-token blocks with no model length and no budget: the cap
+    // saturates at usize::MAX and does not bind, so 12 - 10 = 2 blocks.
+    let window = FpmCacheGroup {
+        page_size_bytes: 10,
+        ..attention("w", 1, Some(4))
+    };
+    let limits = AdmissionLimits {
+        max_in_flight_tokens: usize::MAX,
+        max_model_len: usize::MAX,
+    };
+    assert_eq!(remaining_bytes(&[window], 10, 12, limits), 20);
+}
+
+#[test]
 fn state_group_hits_only_at_a_kept_boundary() {
     // single:1487-1564 scans aligned ends right to left for one cached
     // state block. pool:198-224: every group of the spec group must hold
@@ -2017,7 +2129,16 @@ fn the_plan_of_an_allocation_counts_the_producer_copy() {
             state_lease(&block_lease, 1).published.is_some(),
             "{version:?}"
         );
-        let planned = coordinator.allocation_blocks(&block_lease, 50, 48, 50, 3);
+        let planned = GroupedPrefixCoordinator::plan_allocation(
+            &coordinator.rules,
+            &mut block_lease.clone(),
+            50,
+            48,
+            50,
+            3,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(planned, 1, "{version:?}");
         let active = pool.active_blocks();
         coordinator.begin_step();
