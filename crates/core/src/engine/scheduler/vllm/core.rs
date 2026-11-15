@@ -734,6 +734,13 @@ pub(crate) struct VllmCore {
     /// The grouped prefix coordinator's published epoch after the last
     /// destination retry.
     grouped_retry_published_epoch: u64,
+    /// The local prefills in flight of a grouped decode rank: the requests
+    /// whose last scheduled chunk ended before their known tokens, such as a
+    /// local prompt or the recompute of a preempted request. A KV load keeps
+    /// free what they still need, as vLLM keeps it free for its prefills in
+    /// flight (V31 `sched:1194-1204`, `:3032-3036`, V32 `sched:1241-1251`,
+    /// `:3088-3092`). Empty on every other rank.
+    grouped_local_prefills: FxHashSet<Uuid>,
     #[cfg(test)]
     destination_reservation_attempts: usize,
     lifecycle_events: Vec<SchedulerLifecycleEvent>,
@@ -1159,6 +1166,7 @@ impl VllmCore {
             grouped_retry_epoch,
             grouped_retry_inflight_need: 0,
             grouped_retry_published_epoch: 0,
+            grouped_local_prefills: FxHashSet::default(),
             #[cfg(test)]
             destination_reservation_attempts: 0,
             lifecycle_events: Vec::new(),
@@ -1591,6 +1599,22 @@ impl VllmCore {
             }
         };
 
+        // What the local prefills in flight still need. vLLM sums it with
+        // what the loads in flight need (V31 `sched:3032-3036`, V32
+        // `sched:3088-3092`), and counts at most `max_model_len` tokens of
+        // each request (V31 `sched:3005`, V32 `sched:3062`).
+        let max_model_len = self.args.max_model_len.unwrap_or(usize::MAX);
+        let local_prefill_need = self
+            .grouped_local_prefills
+            .iter()
+            .filter_map(|uuid| self.state.requests.get(uuid))
+            .map(|request| {
+                self.kv_manager.grouped_remaining_need(
+                    &request.sequence.lease,
+                    request.sequence.len().min(max_model_len),
+                )
+            })
+            .fold(0, u64::saturating_add);
         let Some((_, request_id, request)) = self.pending_destinations.front_due_mut(generation)
         else {
             return Vec::new();
@@ -1605,6 +1629,7 @@ impl VllmCore {
             &request.sequence.lease,
             reservation_mode,
             mutation_now_ms,
+            local_prefill_need,
         );
         let kv = match reservation {
             // Never receive handoff KV into capacity whose previous contents
@@ -1901,6 +1926,9 @@ impl VllmCore {
             .state
             .take_completed(&uuid)
             .expect("completed request must remain scheduler-owned");
+        // vLLM drops a finished request from its prefills in flight (V31
+        // `sched:2657`, V32 `sched:2721`).
+        self.grouped_local_prefills.remove(&uuid);
         // vLLM frees a finished request's blocks when it processes the pass's
         // outputs; with async scheduling that comes after it has formed the
         // next pass (V31 `engine/core.py:697`, `:740-755`, V32
@@ -2397,6 +2425,13 @@ impl VllmCore {
             .capacity_generation
             .checked_add(1)
             .expect("destination capacity generation overflow");
+    }
+
+    /// The local prefills in flight of a grouped decode rank, for tests
+    /// that check when a request leaves the set.
+    #[cfg(test)]
+    pub(crate) fn grouped_local_prefills(&self) -> &FxHashSet<Uuid> {
+        &self.grouped_local_prefills
     }
 
     /// Read-only view of the scheduler state for policy tests that assert on
@@ -3512,6 +3547,9 @@ impl VllmCore {
             .state
             .take_completed(&uuid)
             .expect("request drop must remove the scheduler-owned request");
+        // A dropped request leaves the prefills in flight, as a finished one
+        // does (V31 `sched:2657`, V32 `sched:2721`).
+        self.grouped_local_prefills.remove(&uuid);
         self.finish_host_request(uuid, &mut request);
         self.kv_manager.finish_native(uuid, request.sequence.lease);
         if capacity_improved {
@@ -3615,6 +3653,9 @@ impl VllmCore {
         {
             self.kv_manager
                 .preempt_native(preempted.uuid, &mut request.sequence.lease);
+            // vLLM drops a preempted request from its prefills in flight
+            // (V31 `sched:1558`, V32 `sched:1591`).
+            self.grouped_local_prefills.remove(&preempted.uuid);
         }
         if let Some(preempted) = preempted.as_ref() {
             debug_assert_eq!(
@@ -4187,6 +4228,19 @@ impl VllmCore {
                 sequence_len,
             },
         );
+        // A grouped decode rank tracks its local prefills in flight. A request
+        // joins when its chunk ends before its known tokens and leaves when a
+        // chunk reaches them (V31 `sched:1322-1324`, `:1607-1609`, V32
+        // `sched:1376-1378`, `:1640-1642`).
+        if self.args.worker_type == WorkerType::Decode
+            && self.kv_manager.grouped_transfer().is_some()
+        {
+            if actual_computed_after < sequence_len {
+                self.grouped_local_prefills.insert(uuid);
+            } else {
+                self.grouped_local_prefills.remove(&uuid);
+            }
+        }
         if prompt_tokens > 0 && self.args.worker_type != WorkerType::Decode {
             *batch_count += 1;
             *batch_total_isl += prompt_before
