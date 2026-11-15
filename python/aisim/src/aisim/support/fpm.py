@@ -107,6 +107,8 @@ def fpm_cli_args(
         command.extend(("--fpm-gpu-memory-utilization", str(request.collection.gpu_memory_utilization)))
     if not request.collection.measure_power:
         command.append("--no-fpm-measure-power")
+    if request.collection.warmup_iterations is not None:
+        command.extend(("--fpm-warmup-iterations", str(request.collection.warmup_iterations)))
     if profile is not None:
         command.extend(
             (

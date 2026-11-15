@@ -351,8 +351,12 @@ def test_legacy_collection_policy_round_trip_retains_identity_and_launch_argumen
 
 
 @pytest.mark.parametrize("measure_power", [None, True, False])
-def test_collection_power_window_opt_out_reaches_the_collector_command(tmp_path, measure_power):
-    request = _request(collection={} if measure_power is None else {"measure_power": measure_power})
+@pytest.mark.parametrize("warmup_iterations", [None, 0, 5])
+def test_collection_power_window_opt_out_reaches_the_collector_command(tmp_path, measure_power, warmup_iterations):
+    collection = {} if measure_power is None else {"measure_power": measure_power}
+    if warmup_iterations is not None:
+        collection["warmup_iterations"] = warmup_iterations
+    request = _request(collection=collection)
     serialized = request.model_dump(mode="json", exclude_none=True)
     # The default keeps existing request identities; only the opt-out is saved.
     assert ("measure_power" in serialized["collection"]) is (measure_power is False)
@@ -360,8 +364,13 @@ def test_collection_power_window_opt_out_reaches_the_collector_command(tmp_path,
     saved = SupportRequest.from_yaml(tmp_path / "plan/request.yaml")
     assert request_id(saved) == request_id(request)
     assert saved.collection.measure_power is (measure_power is not False)
+    assert saved.collection.warmup_iterations == warmup_iterations
     command = plan["fpm"]["plan_command"]
     assert ("--no-fpm-measure-power" in command) is (measure_power is False)
+    if warmup_iterations is None:
+        assert "--fpm-warmup-iterations" not in command
+    else:
+        assert command[command.index("--fpm-warmup-iterations") + 1] == str(warmup_iterations)
 
 
 def test_onboarding_plan_and_preview_do_not_import_estimator_runtime(tmp_path):
