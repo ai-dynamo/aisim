@@ -1731,9 +1731,13 @@ def test_schema8_fpm_static_summary_energy(schema8_fpm_database, context_energy,
     assert summary.get_generation_latency_dict() == {"fpm_forward_decode": pytest.approx(6.0)}
     assert summary.get_context_energy_wms_dict() == {"fpm_forward_prefill": pytest.approx(context_energy)}
     assert summary.get_generation_energy_wms_dict() == {"fpm_forward_decode": pytest.approx(generation_energy)}
-    assert summary.get_result_dict()["power_w"] == pytest.approx((context_energy + generation_energy) / 28.0)
     covered_ms = (22.0 if context_energy else 0.0) + (6.0 if generation_energy else 0.0)
     assert summary.get_power_data_coverage() == pytest.approx(covered_ms / 28.0)
+    # Watts publish only at 0.9 coverage; the energy dicts above stay either way.
+    if covered_ms / 28.0 >= 0.9:
+        assert summary.get_result_dict()["power_w"] == pytest.approx((context_energy + generation_energy) / 28.0)
+    else:
+        assert summary.get_result_dict()["power_w"] is None
 
 
 @pytest.mark.parametrize(
@@ -1756,8 +1760,10 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
         sdk_config.RuntimeConfig(batch_size=1, isl=512, osl=osl), ctx_tokens=512
     )
     # D10 suppresses the 22 ms mixed prefill. Only the (osl - 1) pure
-    # decode passes supply energy: 6 ms * 500 W per powered decode.
-    assert summary.get_result_dict()["power_w"] == pytest.approx(energy_wms / (22 + (osl - 1) * 6))
+    # decode passes supply energy: 6 ms * 500 W per powered decode. Watts
+    # are total energy over total active latency, published at 0.9 coverage.
+    expected = energy_wms / (22 + (osl - 1) * 6) if coverage >= 0.9 else None
+    assert summary.get_result_dict()["power_w"] == (expected if expected is None else pytest.approx(expected))
     assert summary.get_power_data_coverage() == pytest.approx(coverage)
     task = Task(
         model_path=model.model_path,
@@ -1771,7 +1777,7 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
         osl=osl,
     )
     result = task.run_single_agg(tp=1, batch_size=1, ctx_tokens=512)
-    assert result["power_w"] == pytest.approx(summary.get_result_dict()["power_w"])
+    assert result["power_w"] == (expected if expected is None else pytest.approx(expected))
     assert result["power_coverage"] == pytest.approx(coverage)
 
 
@@ -2189,32 +2195,45 @@ class TestFPMPowerPublication:
         assert summary.get_context_energy_wms_dict()["fpm_forward_prefill"] == pytest.approx(40.0 * 300.0)
         assert summary.get_power_data_coverage() > 0.9
 
-    def test_aggregate_run_withholds_watts_above_coverage_threshold(self, fpm_power_root):
+    def test_aggregate_run_gates_watts_on_coverage(self, fpm_power_root):
+        from aisim.legacy_cli.estimate_detail_report import _format_aggregate_energy_section
         from aisim.sdk.config import RuntimeConfig
         from aisim.sdk.inference_session import InferenceSession
 
         model = _qwen_fpm()
 
-        def run(power_w):
+        def run(power_w, osl):
             database = fpm_power_root(model, power_w, rows=_agg_rows(model))
-            rc = RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=512)
+            rc = RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=osl)
             return InferenceSession(model, database, get_backend(BACKEND)).run_agg(rc, ctx_tokens=512)
 
-        summary = run(_full_power)
+        # Mixed steps carry no FPM energy (D10), but at osl 512 the powered
+        # pure decode steps cover more than 0.9 of the active latency. The
+        # watts are total energy over total active latency, uncovered mixed
+        # latency included.
+        summary = run(_full_power, osl=512)
         result = summary.get_result_dict()
-        assert result["power_w"] is None
-        assert summary.get_e2e_power_avg() is None
-        # Pure decode steps carry powered FPM energy, so coverage passes 0.9.
-        assert summary.get_power_data_coverage() > 0.9
-        assert sum(group.energy_wms for group in summary.get_aggregate_energy_breakdown().values()) > 0
-        # The CLI energy detail keeps the evidence but prints no group watts.
-        from aisim.legacy_cli.estimate_detail_report import _format_aggregate_energy_section
-
+        groups = summary.get_aggregate_energy_breakdown().values()
+        assert summary.get_power_data_coverage() >= 0.9
+        expected = sum(group.energy_wms for group in groups) / sum(group.latency_ms for group in groups)
+        assert expected > 0
+        assert result["power_w"] == pytest.approx(expected)
+        assert summary.get_e2e_power_avg() == pytest.approx(expected)
+        # The CLI energy detail prints decode watts and no mixed-step watts.
         detail = "\n".join(_format_aggregate_energy_section(summary, bar_width=20, top_n=3))
         assert "Decode-only steps energy" in detail and "coverage = 100.0%" in detail
-        assert " W)" not in detail and "avg P = unavailable" in detail
-        latency_only = run(None).get_result_dict()
+        assert "Mixed steps energy" in detail and "avg P = unavailable" in detail
+        latency_only = run(None, osl=512).get_result_dict()
         assert (result["ttft"], result["tpot"]) == (latency_only["ttft"], latency_only["tpot"])
+
+        # A short output leaves the unpowered mixed steps dominant: below the
+        # gate the watts are withheld, and the evidence stays for diagnostics.
+        short = run(_full_power, osl=2)
+        assert short.get_power_data_coverage() < 0.9
+        assert short.get_result_dict()["power_w"] is None
+        assert short.get_e2e_power_avg() is None
+        short_detail = "\n".join(_format_aggregate_energy_section(short, bar_width=20, top_n=3))
+        assert " W)" not in short_detail
 
     @pytest.mark.parametrize("forward_model", ["fpm", "op_level"])
     def test_epd_disagg_estimate_withholds_watts(self, fpm_power_root, cli_parser, monkeypatch, capfd, forward_model):

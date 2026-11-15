@@ -391,7 +391,7 @@ def _format_aggregate_energy_section(summary: InferenceSummary, bar_width: int, 
         return ["Energy Breakdown", "  <no energy data>"]
     titles = {"mix_step": "Mixed steps", "genonly_step": "Decode-only steps", "encoder": "Encoder"}
     lines = ["Energy Breakdown (scheduled active work per GPU)"]
-    # run_agg withholds FPM watts (raw power_w None) whatever the coverage;
+    # When run_agg withholds FPM watts (raw power_w None, below the 0.9 gate),
     # keep the energy evidence but publish no per-group watts either.
     raw = summary.get_result_dict() or {}
     withheld = "power_w" in raw and raw["power_w"] is None

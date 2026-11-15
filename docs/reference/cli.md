@@ -180,13 +180,12 @@ FPM, fixed, polynomial, and analytical EPD energy unavailable; their `power_w`
 and `power_coverage` summary fields are explicit nulls where unsupported. This
 includes fully powered schema-8 FPM pairs. Separately, Python static FPM
 `get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()` can return
-nonzero operation energy with SOL interpolation. SDK static and disaggregated
-results expose average FPM power, while aggregated results retain pure-decode
-energy and suppress mixed-step energy. Legacy `aiconfigurator cli estimate`
-(`cli_estimate()`) publishes `power_w` for static, aggregated, and disaggregated
-schema-8 FPM results when their latency-weighted coverage reaches 90%; below
-that gate it returns null power with numeric `power_coverage`. Stricter SDK
-publication gating is the separate PR 3b step of the FPM power rollout. See
+nonzero operation energy with SOL interpolation. Aggregated results retain
+pure-decode energy and suppress mixed-step energy. The SDK and legacy
+`aiconfigurator cli estimate` (`cli_estimate()`) publish `power_w` for static,
+aggregated, and disaggregated schema-8 FPM results when their latency-weighted
+coverage reaches 90%; below that gate they return null power with numeric
+`power_coverage`. See
 [FPM power](../perf-model/power.md).
 
 <a id="prediction-directory"></a>
