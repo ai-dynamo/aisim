@@ -41,6 +41,86 @@ WORKFLOW_ROOT = REPOSITORY_ROOT / ".github" / "workflows"
 ACTION_ROOT = REPOSITORY_ROOT / ".github" / "actions"
 
 
+@pytest.mark.parametrize("pool", ["amd64", "arm64"])
+@pytest.mark.parametrize("failed_probe", [None, "machine", "workspace", "scratch"])
+def test_runner_canary_probes_survive_container_home_override(tmp_path, pool, failed_probe):
+    job = _workflow("runner-canary.yml")["jobs"]["canary"]
+    entry = next(item for item in job["strategy"]["matrix"]["include"] if item["pool"] == pool)
+    step = next(item for item in job["steps"] if "run" in item)
+    assert job["container"]["env"]["USER"] == "runner"
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    log = tmp_path / "probes.log"
+    log.touch()
+    # Model the runner replacing container HOME, then applying the job and step
+    # environments. Only host paths and architecture are controlled here; the
+    # exact canary run block still performs its HOME and source assertions.
+    env = {
+        **os.environ,
+        **job["container"]["env"],
+        "HOME": "/github/home",
+        **job.get("env", {}),
+        "EXPECTED_MACHINE": entry["machine"],
+        "REPORTED_MACHINE": "incompatible-machine" if failed_probe == "machine" else entry["machine"],
+        "EXPECT_SCRATCH": str(entry["scratch"]).lower(),
+        "GITHUB_REPOSITORY": "ai-dynamo/aisim",
+        "GITHUB_SHA": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPOSITORY_ROOT, text=True).strip(),
+        "RUNNER_NAME": f"controlled-{pool}",
+        "PROBE_WORKSPACE": str(workspace),
+        "PROBE_SCRATCH": str(scratch),
+        "PROBE_WORKSPACE_WRITABLE": str(failed_probe != "workspace").lower(),
+        "PROBE_SCRATCH_WRITABLE": str(failed_probe != "scratch").lower(),
+        "PROBE_LOG": str(log),
+    }
+    controls = r"""
+pwd() { printf '/__w/aisim/aisim\n'; }
+uname() { printf 'architecture\n' >> "$PROBE_LOG"; printf '%s\n' "$REPORTED_MACHINE"; }
+test() {
+  if [[ "$1" == -w && "$2" == /__w/aisim/aisim ]]; then
+    [[ "$PROBE_WORKSPACE_WRITABLE" == true ]] && builtin test -w "$PROBE_WORKSPACE"
+  elif [[ "$1" == -w && "$2" == /scratch ]]; then
+    [[ "$PROBE_SCRATCH_WRITABLE" == true ]] && builtin test -w "$PROBE_SCRATCH"
+  else
+    builtin test "$@"
+  fi
+}
+mktemp() {
+  printf '%s\n' "$1" >> "$PROBE_LOG"
+  case "$1" in
+    /__w/aisim/aisim/*) command mktemp "$PROBE_WORKSPACE/${1##*/}" ;;
+    /scratch/*) command mktemp "$PROBE_SCRATCH/${1##*/}" ;;
+    *) return 1 ;;
+  esac
+}
+"""
+    result = subprocess.run(
+        ["bash", "-euc", controls + step["run"]],
+        cwd=REPOSITORY_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    probes = [
+        "architecture",
+        "/__w/aisim/aisim/.runner-canary.XXXXXX",
+        "/scratch/runner-canary.XXXXXX",
+    ]
+    if failed_probe is None:
+        assert result.returncode == 0, result.stderr
+        assert f"({entry['machine']}) with writable HOME=/__w/aisim/aisim" in result.stdout
+        assert log.read_text().splitlines() == probes
+    else:
+        assert result.returncode != 0
+        assert "Verified source" not in result.stdout
+        completed = {"workspace": 0, "machine": 1, "scratch": 2}[failed_probe]
+        assert log.read_text().splitlines() == probes[:completed]
+    assert not list(workspace.iterdir())
+    assert not list(scratch.iterdir())
+
+
 def test_documented_active_runner_labels_match_workflow_selectors():
     labels = set()
     for path in WORKFLOW_ROOT.glob("*.yml"):
