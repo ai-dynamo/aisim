@@ -59,6 +59,10 @@ pub(crate) struct RadixRequestLease {
     /// Prompt length, when the scheduler knows it, for the SWA page kept at finish.
     prompt_tokens: Option<usize>,
     last_node: Option<NodeId>,
+    /// Physical pages at the bounded completion target (prompt plus planned output).
+    /// Waiting-queue admission sizes the page list; chunked prefill reserves extendable
+    /// private radix tails. Destination handoffs retain amortized page-list growth.
+    completion_pages: usize,
     pub(crate) session_id: Option<String>,
     pub(crate) request_id: Uuid,
 
@@ -100,14 +104,22 @@ impl RadixRequestLease {
         &self.page_hashes
     }
 
-    pub(crate) fn reserve_page_hashes(&mut self, complete_pages: usize) {
+    /// Reserve complete-page hashes and record the physical-page target for waiting-queue
+    /// admission. Destination activation takes ownership of the transferred prompt's vector.
+    pub(crate) fn reserve_completion(&mut self, tokens: usize, page_size: usize) {
+        self.completion_pages = tokens.div_ceil(page_size);
         self.page_hashes
-            .reserve_exact(complete_pages.saturating_sub(self.page_hashes.len()));
+            .reserve_exact((tokens / page_size).saturating_sub(self.page_hashes.len()));
     }
 
     #[cfg(test)]
     pub(crate) fn page_hash_capacity(&self) -> usize {
         self.page_hashes.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_capacity(&self) -> usize {
+        self.pages.capacity()
     }
 
     pub(crate) fn ensure_page_hashes(&mut self, token_ids: &[u32], page_size: usize) {
@@ -166,6 +178,7 @@ impl RadixRequestLease {
             swa_fork_pages: None,
             prompt_tokens: None,
             last_node: Some(last_node),
+            completion_pages: 0,
             session_id: None,
             request_id: Uuid::nil(),
 
@@ -533,7 +546,7 @@ impl SglangKvManager {
         };
         let keys = &lease.page_hashes[..prefix_tokens / self.cache.page_size()];
         let (_, anchor) = self.cache.match_prefix_hashes_and_lock(keys);
-        let pages = self.collect_path_pages(anchor);
+        let pages = self.collect_path_pages(anchor, keys.len());
         self.publish_stored_hashes(
             keys,
             &pages,
@@ -659,7 +672,10 @@ impl SglangKvManager {
         if required_tokens > available {
             self.evict(required_tokens - available);
         }
-        let mut pages = self.collect_path_pages_through(last_node, prefix_len);
+        let capacity = lease
+            .completion_pages
+            .max(token_ids.len().div_ceil(page_size));
+        let mut pages = self.collect_path_pages_through(last_node, prefix_len, capacity);
 
         let available_before = self.cache.available_tokens();
         let Some(mut new_pages) = self.cache.page_pool.allocate_pages(required_pages) else {
@@ -758,6 +774,13 @@ impl SglangKvManager {
             lease.len()
         );
         let last_node = lease.last_node();
+        // Reserve only when later cache updates can extend this request's tail in place.
+        self.cache.reserve_leaf_extension(
+            last_node,
+            lease
+                .completion_pages
+                .saturating_sub(lease.cached_tokens / self.cache.page_size()),
+        );
         let complete_pages = complete_len / self.cache.page_size();
         let page_hashes = &lease.page_hashes[..complete_pages];
         let pages = &mut lease.pages[..complete_pages];
@@ -1006,7 +1029,7 @@ impl SglangKvManager {
         token_count: usize,
     ) -> Option<SglangDestinationReservation> {
         let (prefix_len, last_node) = self.match_prefix_hashes_and_lock(page_hashes);
-        let prefix_pages = self.collect_path_pages_through(last_node, prefix_len);
+        let prefix_pages = self.collect_path_pages_through(last_node, prefix_len, 0);
 
         let allocated_tokens = if token_count == 0 {
             0
@@ -1043,6 +1066,8 @@ impl SglangKvManager {
     /// Hand the transferred prompt to its request without caching it: SGLang
     /// inserts it into the radix tree only when the request is selected into a
     /// running batch, so until then only the matched prefix stays locked.
+    /// This path has no chunked prefill: it keeps the transfer's page vector and
+    /// amortized decode growth rather than reserving for the completion target.
     pub(crate) fn activate_destination_lease(
         &mut self,
         reservation: SglangDestinationReservation,
@@ -1122,10 +1147,11 @@ impl SglangKvManager {
         }
     }
 
-    /// Collect physical pages from the matched prefix path by walking root→last_node.
-    fn collect_path_pages(&self, last_node: NodeId) -> Vec<KvPageId> {
+    /// Collect physical pages from the matched prefix path by walking root→last_node,
+    /// into a vector with room for `capacity` pages.
+    fn collect_path_pages(&self, last_node: NodeId, capacity: usize) -> Vec<KvPageId> {
         if last_node == self.cache.root() {
-            return Vec::new();
+            return Vec::with_capacity(capacity);
         }
 
         // Walk from last_node to root, collecting node IDs
@@ -1141,21 +1167,26 @@ impl SglangKvManager {
         }
         path.reverse();
 
-        let mut pages = Vec::new();
+        let mut pages = Vec::with_capacity(capacity);
         for node_id in path {
             pages.extend_from_slice(&self.cache.node(node_id).value);
         }
         pages
     }
 
-    fn collect_path_pages_through(&self, last_node: NodeId, prefix_len: usize) -> Vec<KvPageId> {
+    fn collect_path_pages_through(
+        &self,
+        last_node: NodeId,
+        prefix_len: usize,
+        capacity: usize,
+    ) -> Vec<KvPageId> {
         assert_eq!(
             prefix_len % self.cache.page_size(),
             0,
             "matched SGLang prefix must be page-aligned"
         );
         let expected_pages = prefix_len / self.cache.page_size();
-        let mut pages = self.collect_path_pages(last_node);
+        let mut pages = self.collect_path_pages(last_node, capacity);
         assert!(
             pages.len() >= expected_pages,
             "SGLang radix path returned {} pages for a {expected_pages}-page prefix",
@@ -1939,6 +1970,84 @@ mod tests {
         assert_eq!(mgr.cache().available_tokens(), 0);
     }
 
+    #[rstest::rstest]
+    #[case::token_pages(1, 64, 8)]
+    #[case::partial_final_page(4, 16, 14)]
+    fn chunked_prefill_extends_lease_pages_and_radix_tail_in_place(
+        #[case] page_size: usize,
+        #[case] prompt_len: usize,
+        #[case] output_len: usize,
+        #[values(false, true)] cancel: bool,
+        #[values(false, true)] decode: bool,
+    ) {
+        // A prompt prefilled a chunk at a time, as SGLang does under attention DP. Sized for
+        // completion, partial final page included, the request's page list and radix tail
+        // then grow without reallocating. Cover both stopping after prefill and decoding through
+        // the partial final page. Cleanup keeps cached pages and releases unused tail capacity.
+        let prompt: Vec<u32> = (0..prompt_len as u32).collect();
+        let completion_pages = (prompt_len + output_len).div_ceil(page_size);
+        let chunk = 2 * page_size;
+        let mut mgr = SglangKvManager::new(256, page_size, KvEventPublishers::default(), 0);
+        let mut lease = RadixRequestLease::default();
+        lease.reserve_completion(prompt_len + output_len, page_size);
+        lease.ensure_page_hashes(&prompt, page_size);
+
+        assert_eq!(
+            mgr.allocate_for_request_lease(&prompt[..chunk], &mut lease),
+            Some(0)
+        );
+        assert_eq!(lease.pages.capacity(), completion_pages);
+        mgr.extend_cached_prefix(&prompt[..chunk], &mut lease);
+        let tail = lease.last_node();
+        for end in (2 * chunk..=prompt_len).step_by(chunk) {
+            assert!(mgr.extend_allocation(&prompt[..end], &mut lease).is_some());
+            mgr.extend_cached_prefix(&prompt[..end], &mut lease);
+            assert_eq!(
+                lease.last_node(),
+                tail,
+                "a chunk extends the request's own tail"
+            );
+            let node = mgr.cache().node(tail);
+            assert_eq!(node.key.len(), end / page_size);
+            assert_eq!(
+                (node.key.capacity(), node.value.capacity()),
+                (completion_pages, completion_pages)
+            );
+            assert_eq!(lease.pages.capacity(), completion_pages);
+        }
+        let mut tokens = prompt.clone();
+        if decode {
+            let mut reservation = mgr
+                .reserve_decode_pages(completion_pages - lease.page_count())
+                .unwrap();
+            for token in prompt_len..prompt_len + output_len {
+                tokens.push(token as u32);
+                lease.ensure_page_hashes(&tokens, page_size);
+                mgr.extend_decode(&mut lease, &mut reservation);
+                assert_eq!(lease.pages.capacity(), completion_pages);
+                assert_eq!(lease.page_count(), tokens.len().div_ceil(page_size));
+            }
+            mgr.release_decode_reservation(reservation);
+        }
+        if cancel {
+            assert!(mgr.abort(lease));
+        } else {
+            mgr.finish(&tokens, lease);
+        }
+        let cached_len = if cancel {
+            prompt_len
+        } else {
+            tokens.len() / page_size * page_size
+        };
+        assert_eq!(mgr.cache().evictable_size, cached_len);
+        let node = mgr.cache().node(tail);
+        let cached_pages = cached_len / page_size;
+        assert_eq!(
+            (node.key.capacity(), node.value.capacity()),
+            (cached_pages, cached_pages)
+        );
+    }
+
     #[test]
     fn active_partial_page_owns_full_capacity_and_extends_in_place() {
         let mut mgr = SglangKvManager::new(12, 4, KvEventPublishers::default(), 0);
@@ -2121,6 +2230,54 @@ mod tests {
             assert_eq!(mgr.cache().prefix_match_len(&tokens), 4);
             mgr.abort(lease);
         }
+    }
+
+    #[rstest::rstest]
+    fn destination_decode_preserves_transferred_pages_and_partial_final_page(
+        #[values(false, true)] reuse_prefix: bool,
+    ) {
+        let page_size = 4;
+        let mut mgr = SglangKvManager::new(64, page_size, KvEventPublishers::default(), 0);
+        let mut tokens: Vec<u32> = (0..16).collect();
+        if reuse_prefix {
+            let cached = mgr.allocate_for_request(&tokens[..8]).unwrap();
+            mgr.finish(&tokens[..8], cached.lease);
+        }
+        let mut lease = RadixRequestLease::default();
+        lease.reserve_completion(30, page_size);
+        lease.ensure_page_hashes(&tokens, page_size);
+        let reservation = mgr
+            .reserve_destination_lease(lease.page_hashes(), tokens.len())
+            .unwrap();
+        let mut prompt_pages = reservation.prefix_pages.clone();
+        prompt_pages.extend_from_slice(&reservation.unpublished_pages);
+        assert_eq!(
+            mgr.activate_destination_lease(reservation, &tokens, &mut lease),
+            if reuse_prefix { 8 } else { 0 }
+        );
+        assert_eq!(lease.pages(), prompt_pages);
+        // Running admission publishes the transferred prompt. Ordinary decode does not
+        // extend the radix tail until terminal cleanup, and its page list grows amortized.
+        mgr.extend_cached_prefix(&tokens, &mut lease);
+        let tail = lease.last_node();
+        let mut decode = mgr.reserve_decode_pages(4).unwrap();
+        for token in 16..30 {
+            tokens.push(token);
+            lease.ensure_page_hashes(&tokens, page_size);
+            mgr.extend_decode(&mut lease, &mut decode);
+            assert_eq!(&lease.pages()[..prompt_pages.len()], prompt_pages);
+            assert_eq!(lease.page_count(), tokens.len().div_ceil(page_size));
+            assert_eq!(lease.cached_tokens(), 16);
+            assert_eq!(mgr.cache().node(tail).key.len(), 4);
+        }
+        assert_eq!(lease.page_count(), 8);
+        mgr.release_decode_reservation(decode);
+        mgr.finish(&tokens, lease);
+        assert_eq!(mgr.cache().protected_size, 0);
+        assert_eq!(mgr.cache().evictable_size, 28);
+        assert_eq!(mgr.cache().prefix_match_len(&tokens), 28);
+        mgr.evict(28);
+        assert_eq!(mgr.cache().available_tokens(), 64);
     }
 
     #[test]
