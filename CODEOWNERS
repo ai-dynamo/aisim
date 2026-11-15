@@ -124,6 +124,7 @@
 /tests/test_e2e_accuracy_ui.mjs                        @ai-dynamo/aisim-infra-codeowners
 /tests/test_source_compliance.py                       @ai-dynamo/aisim-infra-codeowners
 /tests/test_benchmark_features.py                      @ai-dynamo/aisim-infra-codeowners
+/tests/test_cloud_agent_install.py                     @ai-dynamo/aisim-infra-codeowners
 /tests/test_e2e_hf_measurements.py                     @ai-dynamo/aisim-infra-codeowners
 /tests/test_simulation_features.py                     @ai-dynamo/aisim-infra-codeowners
 /tests/test_e2e_accuracy_nightly.py                    @ai-dynamo/aisim-infra-codeowners
