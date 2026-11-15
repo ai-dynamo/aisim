@@ -30,8 +30,12 @@ from aisim.sweeper.forward_pass_estimator import (
 from aisim.sweeper.model_hw import parallel_configs_for
 from aisim.sweeper.replay import ReplaySpec
 from aisim.sweeper.sample import unroll_sample
+from aisim_core.ais_perf_model import AisPerfModelDeprecationWarning
 
 pytestmark = pytest.mark.unit
+
+# AISim still writes the old estimator fields into the configs it saves, so reading one back warns.
+reads_saved_config = pytest.mark.filterwarnings("ignore::aisim_core.ais_perf_model.AisPerfModelDeprecationWarning")
 
 
 @pytest.fixture
@@ -834,6 +838,54 @@ def test_profile_kv_load_cache_keeps_resource_identity_without_model_constructio
         kv_load._per_rank_capacity_tokens.cache_clear()
 
 
+@pytest.mark.parametrize("decode_context", [1024, 512])
+def test_linear_pd_kv_load_sizes_each_role_with_its_own_context_length(profile, decode_context):
+    from aisim.sweeper import kv_load
+    from aisim.sweeper.config import Workload
+    from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+
+    prefill = deepcopy(profile["deployments"][0])
+    decode = deepcopy(prefill)
+    prefill["worker_type"] = "prefill"
+    decode["worker_type"] = "decode"
+    profile["deployments"] = [prefill, decode]
+    _observed_profile(profile, context=1024)
+    sample = {
+        "deployment_mode": "disagg",
+        "model_name": profile["model"],
+        "hardware_sku": "h200_sxm",
+        "backend": "vllm",
+        "fpm_profile": profile,
+        "context_length": 2048,
+        "prefill_context_length": 1024,
+        "decode_context_length": decode_context,
+    }
+    for role in ("prefill", "decode"):
+        sample.update(
+            {
+                f"{role}_block_size": 64,
+                f"{role}_max_num_batched_tokens": 1024,
+                f"{role}_max_num_seqs": 4,
+                f"{role}_gpu_memory_utilization": 0.9,
+            }
+        )
+    role = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1)
+    kv_load._per_rank_capacity_tokens.cache_clear()
+    try:
+        result = kv_load.resolve_kv_load(
+            sample,
+            workload=Workload(isl=256, osl=4, kv_load_ratio=1.0, request_count=1),
+            parallel_config=DisaggParallelConfig(prefill=role, decode=role),
+            ratio=1.0,
+            backend_version="0.25.1",
+        )
+    finally:
+        kv_load._per_rank_capacity_tokens.cache_clear()
+
+    assert result.role_capacity_tokens["prefill"] > 0
+    assert result.role_capacity_tokens["decode"] > 0
+
+
 @pytest.mark.parametrize("method", ["auto", "direct"])
 @pytest.mark.parametrize("backend_version", ["0.25.1", {"vllm": " 0.25.1 "}])
 def test_recommendation_preserves_profile_in_exported_prediction(
@@ -1161,7 +1213,8 @@ def test_public_linear_runtime_kv_load_preserves_selected_context(profile, timin
     monkeypatch.setattr("aisim.recommend.run_recommendation", _run_recommendation)
     output = tmp_path / "recommendation"
     assert cli.main(["recommend", "--config", str(path), "--output-dir", str(output)]) == 0
-    exported = CorePredictionConfig.from_yaml(output / "recommendations/0001.yaml")
+    with pytest.warns(AisPerfModelDeprecationWarning):
+        exported = CorePredictionConfig.from_yaml(output / "recommendations/0001.yaml")
     assert exported.engine.context_length == 1024
     assert all(item.resources.runtime_memory.max_model_len == 2048 for item in exported.engine.fpm_profile.deployments)
 
@@ -1257,6 +1310,7 @@ def test_invalid_profile_predictions_fail_before_runtime(profile, update, error)
         CorePredictionConfig.model_validate({"engine": {**_engine(profile), **update}})
 
 
+@reads_saved_config
 def test_onboard_dep_keeps_full_identity_and_checks_resources_before_collection(profile, tmp_path, monkeypatch):
     from aisim_core.sdk import RustForwardPassPerfModel
 
@@ -1309,6 +1363,7 @@ def test_onboard_dep_keeps_full_identity_and_checks_resources_before_collection(
     assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
 
 
+@reads_saved_config
 @pytest.mark.parametrize(
     "preset,max_tokens,max_sequences,moe_backend",
     [
@@ -1432,6 +1487,7 @@ def test_onboard_rejects_profile_below_collector_minimum_token_axis(profile, tmp
     assert not output.exists()
 
 
+@reads_saved_config
 @pytest.mark.parametrize(
     "tp,dp,moe_tp,moe_ep,preset", [(2, 1, 2, 1, "pure_tp"), (1, 2, 1, 2, "dep"), (2, 1, 1, 2, "tep")]
 )
