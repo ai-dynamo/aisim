@@ -3377,6 +3377,52 @@ mod destination_lifecycle {
 mod scheduling {
     use super::*;
 
+    #[rstest::rstest]
+    fn request_completion_reserves_partial_physical_page_through_decode(
+        #[values(false, true)] reuse_prefix: bool,
+    ) {
+        let page_size = 4;
+        let prompt: Vec<u32> = (0..16).collect();
+        let mut manager = SglangKvManager::new(64, page_size, KvEventPublishers::default(), 0);
+        if reuse_prefix {
+            let cached = manager.allocate_for_request(&prompt[..8]).unwrap();
+            manager.finish(&prompt[..8], cached.lease);
+        }
+        // Use the scheduler's constructor so this covers the token-to-page sizing boundary,
+        // rather than setting a reservation directly on a test lease.
+        let mut request = SglangRequest::new(direct_request(prompt, 14), page_size, usize::MAX);
+        assert_eq!(request.kv_lease.page_hash_capacity(), 7);
+        assert_eq!(
+            manager.allocate_for_request_lease(&request.sequence_tokens, &mut request.kv_lease),
+            Some(if reuse_prefix { 8 } else { 0 })
+        );
+        assert_eq!(request.kv_lease.page_capacity(), 8);
+        manager.extend_cached_prefix(&request.sequence_tokens, &mut request.kv_lease);
+
+        let mut reservation = manager.reserve_decode_pages(4).unwrap();
+        for token in 16..30 {
+            request.append_output_token(token, page_size);
+            manager.extend_decode(&mut request.kv_lease, &mut reservation);
+            assert_eq!(request.kv_lease.page_capacity(), 8);
+            assert_eq!(request.kv_lease.page_hash_capacity(), 7);
+            assert_eq!(
+                request.kv_lease.page_count(),
+                request.current_sequence_len().div_ceil(page_size)
+            );
+        }
+        assert_eq!(request.kv_lease.page_count(), 8);
+        manager.release_decode_reservation(reservation);
+        manager.finish(&request.sequence_tokens, request.kv_lease);
+        assert_eq!(manager.cache().protected_size, 0);
+        assert_eq!(manager.cache().evictable_size, 28);
+        assert_eq!(
+            manager.cache().prefix_match_len(&request.sequence_tokens),
+            28
+        );
+        manager.evict(28);
+        assert_eq!(manager.cache().available_tokens(), 64);
+    }
+
     #[test]
     fn cache_salt_namespaces_lpm_scores_and_in_batch_deduplication() {
         let tokens = (0..32).collect::<Vec<_>>();

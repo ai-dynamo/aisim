@@ -1514,7 +1514,7 @@ mod tests {
         let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
         cache.inc_lock_ref(tail);
         // Its first holder made room to extend it before another request locked it.
-        cache.reserve_leaf_extension(tail, 4);
+        cache.reserve_leaf_extension(tail, 65_536);
         assert!(cache.node(tail).key.capacity() > cache.node(tail).key.len());
         cache.inc_lock_ref(tail);
         let nodes_before = cache.num_nodes();
@@ -1531,9 +1531,34 @@ mod tests {
         assert_eq!(*cache.node(tail).key, cache.page_hashes(&[1, 2, 3, 4]));
         assert_eq!(*cache.node(extended).key, cache.page_hashes(&[5, 6, 7, 8]));
         // With a child the leaf no longer extends in place, so it gives the room back.
-        let tail = cache.node(tail);
-        assert_eq!(tail.key.capacity(), tail.key.len());
-        assert_eq!(tail.value.capacity(), tail.value.len());
+        assert_eq!(cache.node(tail).key.capacity(), cache.node(tail).key.len());
+        assert_eq!(
+            cache.node(tail).value.capacity(),
+            cache.node(tail).value.len()
+        );
+
+        // The other holder finishes with a different output. Both completions stay cached,
+        // but the now-internal prompt edge must not regain the completion reservation.
+        cache.dec_lock_ref(tail);
+        cache.reserve_leaf_extension(tail, 65_536);
+        let other = cache.insert_from_node(
+            tail,
+            4,
+            &[1, 2, 3, 4, 9, 10, 11, 12],
+            &[0, 1, 2, 3, 8, 9, 10, 11],
+        );
+        assert_ne!(other, tail);
+        assert_ne!(other, extended);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 12);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 9, 10, 11, 12]).0, 8);
+        assert_eq!(cache.node(tail).key.capacity(), cache.node(tail).key.len());
+        assert_eq!(
+            cache.node(tail).value.capacity(),
+            cache.node(tail).value.len()
+        );
     }
 
     #[test]

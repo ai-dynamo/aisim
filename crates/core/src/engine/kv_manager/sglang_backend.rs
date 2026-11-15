@@ -107,6 +107,11 @@ impl RadixRequestLease {
         self.page_hashes.capacity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn page_capacity(&self) -> usize {
+        self.pages.capacity()
+    }
+
     pub(crate) fn ensure_page_hashes(&mut self, token_ids: &[u32], page_size: usize) {
         let complete_pages = token_ids.len() / page_size;
         if self.page_hashes.len() >= complete_pages {
