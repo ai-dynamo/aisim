@@ -1253,8 +1253,9 @@ fn load_pair(
             real_kv_anchor,
         });
     }
-    // Arrow also uses the file-level footer count to cap its batch size.
-    // A corrupt zero total can end iteration despite nonempty row groups.
+    // The footer's counts are metadata, not the pages: Arrow caps its batch
+    // size with the file-level total (a zero total decodes nothing), and a
+    // row group can claim more rows than its pages hold.
     if rows.len() as u64 != actual_row_count {
         return Err(structural(format!(
             "FPM parquet row-group count {actual_row_count} disagrees with {} decoded rows: {}",
@@ -3242,42 +3243,42 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("row_count mismatch"), "{err}");
     }
 
+    /// The sidecar check trusts the footer's row-group counts; a row group
+    /// that claims more rows than its pages hold must not load short.
     #[test]
-    fn zero_file_row_count_cannot_hide_nonempty_row_groups() {
+    fn row_group_count_above_decoded_rows_is_rejected() {
+        use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataWriter};
         use parquet::file::reader::{FileReader, SerializedFileReader};
 
         let tmp = tempfile::tempdir().expect("tmpdir");
         let path = write_pair(tmp.path(), &default_rows());
-        let mut bytes = std::fs::read(&path).unwrap();
-        let footer_end = bytes.len() - 8;
-        let footer_len =
-            u32::from_le_bytes(bytes[footer_end..footer_end + 4].try_into().unwrap()) as usize;
-        let footer = &mut bytes[footer_end - footer_len..footer_end];
-        // This nine-row fixture encodes FileMetaData field 3 (num_rows) as
-        // compact i64 header 0x16, zigzag value 18, then field 4's list header.
-        // Change only that value, leaving the row groups and pages untouched.
-        let positions: Vec<_> = footer
-            .windows(3)
-            .enumerate()
-            .filter_map(|(i, window)| (window == [0x16, 18, 0x19]).then_some(i + 1))
-            .collect();
-        assert_eq!(positions.len(), 1);
-        footer[positions[0]] = 0;
-        std::fs::write(&path, bytes).unwrap();
-        let file = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
-        assert_eq!(file.metadata().file_metadata().num_rows(), 0);
-        assert_eq!(file.metadata().row_group(0).num_rows(), 9);
+        // Rewrite only the footer: the nine-row group now claims twelve.
+        let bytes = std::fs::read(&path).unwrap();
+        let footer_len = u32::from_le_bytes(bytes[bytes.len() - 8..][..4].try_into().unwrap());
+        let mut forged = bytes[..bytes.len() - 8 - footer_len as usize].to_vec();
+        let metadata = SerializedFileReader::new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .metadata()
+            .clone();
+        let group = metadata.row_group(0).clone().into_builder();
+        let group = group.set_num_rows(12).build().unwrap();
+        let metadata = ParquetMetaData::new(metadata.file_metadata().clone(), vec![group]);
+        ParquetMetaDataWriter::new(&mut forged, &metadata)
+            .finish()
+            .unwrap();
+        std::fs::write(&path, forged).unwrap();
 
-        // Keep the sidecar digest valid: this must reach the decoding guard.
+        // Keep the sidecar digest and count valid: this must reach the decoding guard.
         let sidecar_path = path.with_extension("metadata.json");
         let mut sidecar: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
         sidecar["parquet_sha256"] = sha256_file(&path).unwrap().into();
+        sidecar["row_count"] = 12.into();
         std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
         let err = loaded_table(tmp.path()).cells().unwrap_err();
         assert!(
             err.to_string()
-                .contains("row-group count 9 disagrees with 0 decoded rows"),
+                .contains("row-group count 12 disagrees with 9 decoded rows"),
             "{err}"
         );
         assert!(

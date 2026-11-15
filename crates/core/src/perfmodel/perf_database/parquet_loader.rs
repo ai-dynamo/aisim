@@ -171,12 +171,12 @@ impl PerfReader {
                 if let Some(batch) = &batch
                     && row < batch.columns.num_rows()
                 {
+                    let item = PerfRow {
+                        batch: Rc::clone(batch),
+                        row,
+                    };
                     row += 1;
-                    let batch = Rc::clone(batch);
-                    return Some(Ok(PerfRow {
-                        batch,
-                        row: row - 1,
-                    }));
+                    return Some(Ok(item));
                 }
                 match batches.as_mut()?.next()? {
                     Ok(columns) => {
@@ -292,6 +292,9 @@ impl PerfRow {
             DataType::Int64 => Cell::Long(array.as_primitive::<Int64Type>().value(row)),
             DataType::Float64 => Cell::Double(array.as_primitive::<Float64Type>().value(row)),
             DataType::Utf8 => Cell::Str(array.as_string::<i32>().value(row)),
+            // A null-typed column (pyarrow writes one for an all-None
+            // column) has no null buffer, so `is_null` is false for it.
+            DataType::Null => Cell::Null,
             other => Cell::Other(other),
         })
     }
@@ -505,15 +508,17 @@ mod tests {
 
     /// Two row groups of `ROWS` rows: OPTIONAL columns (nulls on different
     /// rows per column), a REQUIRED string, annotations the accessors read
-    /// (INT_64, nanosecond timestamp, JSON, ENUM) and types they do not
-    /// (INT32, TIMESTAMP_MICROS, raw BYTE_ARRAY, REPEATED).
+    /// (INT_64, nanosecond timestamp, JSON, ENUM), types they do not
+    /// (INT32, TIMESTAMP_MICROS, raw BYTE_ARRAY, REPEATED) and an all-null
+    /// UNKNOWN column, which is what pyarrow writes for an all-None column.
     fn write_fixture(path: &Path) {
         let schema = "message fixture { OPTIONAL BYTE_ARRAY s (UTF8); REQUIRED BYTE_ARRAY r (UTF8); \
              OPTIONAL INT64 i; OPTIONAL DOUBLE d; OPTIONAL BOOLEAN b; OPTIONAL INT32 x; \
              OPTIONAL INT64 a (INT_64); OPTIONAL INT64 ts (TIMESTAMP_MICROS); \
              OPTIONAL INT64 ns (TIMESTAMP(NANOS,true)); \
              OPTIONAL BYTE_ARRAY raw; OPTIONAL BYTE_ARRAY j (JSON); \
-             OPTIONAL BYTE_ARRAY e (ENUM); REPEATED INT64 rep; }";
+             OPTIONAL BYTE_ARRAY e (ENUM); OPTIONAL INT32 u (UNKNOWN); \
+             REPEATED INT64 rep; }";
         write_file(path, schema, 2, |rg| {
             let bytes = |s: String| ByteArray::from(s.into_bytes());
             let required: Vec<_> = (0..ROWS).map(|r| bytes(format!("k{r}"))).collect();
@@ -530,6 +535,7 @@ mod tests {
             optional::<ByteArrayType>(rg, 23, |r| bytes(format!("b{r}")));
             optional::<ByteArrayType>(rg, 29, |r| bytes(format!("{{\"r\":{r}}}")));
             optional::<ByteArrayType>(rg, 31, |r| bytes(format!("E{}", r % 3)));
+            optional::<Int32Type>(rg, 1, |r| r as i32); // null on every row
             // One element per row: present (def 1), each starting a record (rep 0).
             column::<Int64Type>(rg, &repeated, Some(&[1; ROWS]), Some(&[0; ROWS]));
         });
@@ -551,8 +557,8 @@ mod tests {
         assert_eq!(rows.len(), 2 * ROWS);
         assert_eq!(rows.len(), oracle.len());
         assert_eq!(reader.num_rows().unwrap(), oracle.len() as u64);
+        assert_eq!(oracle[0].len(), reader.column_names.len());
         for (index, (row, expected)) in rows.iter().zip(&oracle).enumerate() {
-            assert_eq!(expected.len(), reader.column_names.len());
             for (col, (_, field)) in expected.get_column_iter().enumerate() {
                 let want = match field {
                     Field::Null => Some(Cell::Null),
