@@ -1606,6 +1606,10 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
         raise ValueError("engine.backend_version does not match any FPM profile deployment")
     if isinstance(engine.context_length, int) and engine.context_length > profile.context_length:
         raise ValueError("engine.context_length exceeds the FPM profile context_length")
+    # A prefill or decode worker is a P/D rank only in a disaggregated prediction with both workers, where the P/D rule
+    # below runs. Any other set of roles fails the role check, and its text must come before a P/D text.
+    pd_pair = "disaggregated" in modes and None not in (engine.workers.prefill, engine.workers.decode)
+    selected = {}
     for role in ("aggregated", "prefill", "decode"):
         worker = getattr(engine.workers, role)
         if worker is None or is_afd_worker(worker):
@@ -1613,7 +1617,7 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
         if worker.timing.type != "default":
             raise ValueError("engine.fpm_profile requires default timing for every worker")
         if isinstance(worker, WorkerPredictionConfig):
-            deployment = fpm_profile_deployment(engine, worker, role)
+            deployment = selected[role] = fpm_profile_deployment(engine, worker, role)
             deployment.resources.validate_envelope(
                 max_num_tokens=worker.scheduler.max_batched_tokens,
                 max_batch_size=worker.scheduler.max_sequences,
@@ -1629,8 +1633,8 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                 if cache.block_size != deployment.resources.mamba_cache.block_size_tokens:
                     raise ValueError("kv_cache.block_size must match measured Mamba geometry")
             if deployment.resources.cache_layout == "grouped":
-                if role != "aggregated" or engine.nextn or engine.speculation is not None:
-                    raise ValueError("grouped FPM cache supports only aggregated vLLM without speculative decoding")
+                if engine.nextn or engine.speculation is not None:
+                    raise ValueError("grouped FPM cache supports only vLLM without speculative decoding")
                 cache = worker.kv_cache
                 if cache.prefix_caching:
                     grouped_prefix_caching_requirements(
@@ -1639,6 +1643,7 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                         architecture=profile.architecture,
                         prefix_match_unit=cache.prefix_match_unit,
                         max_batched_tokens=worker.scheduler.max_batched_tokens,
+                        pd_rank=pd_pair and role != "aggregated",
                     )
                     # Only a prediction states the interval. The search space and the onboarding plan run with 1.
                     if backend_version == "0.33.0" and worker.scheduler.prefill_schedule_interval != 1:
@@ -1658,6 +1663,32 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
             raise ValueError("Mamba FPM cache requires a concrete prediction; recommendation search is unsupported")
         # Recommendation topology domains and the GPU budget are resolved by
         # lowering to SearchSpace, which validates reachable grouped workers.
+    if (
+        "disaggregated" in modes
+        and {"prefill", "decode"} <= selected.keys()
+        and any(selected[role].resources.cache_layout == "grouped" for role in ("prefill", "decode"))
+    ):
+        grouped_pd_requirements(
+            selected["prefill"],
+            selected["decode"],
+            backend_version=backend_version,
+            kv_transfer=engine.kv_transfer,
+        )
+
+
+def require_runtime_version(memory, *, backend_version: str | None, feature: str) -> None:
+    """Refuse grouped evidence that a runtime of another vLLM version recorded.
+
+    Replay applies the grouped rules of the label, so the runtime memory must not record another version than the
+    deployment's backend_version. A profile imported before the field existed passes as before. ``feature`` names the
+    grouped feature in the message.
+    """
+    recorded = None if memory is None else memory.runtime_framework_version
+    if recorded is not None and recorded != backend_version:
+        raise ValueError(
+            f"grouped FPM cache {feature} requires runtime_memory.runtime_framework_version ({recorded}) to equal "
+            f"the deployment's backend_version ({backend_version})"
+        )
 
 
 # The vLLM versions whose grouped prefix-caching rules the Rust rule table holds.
@@ -1672,27 +1703,34 @@ def grouped_prefix_caching_requirements(
     prefix_match_unit: int | None,
     max_batched_tokens: int,
     field: str = "kv_cache.prefix_caching",
+    pd_rank: bool = False,
 ) -> int:
     """Check one grouped FPM deployment for prefix caching and return the hash block of its rank.
 
     The prediction and the sweeper share this rule, and planning turns prefix caching on only when it passes.
     ``field`` names the setting that turns prefix caching off. The Rust gate also checks the cache group geometry
-    and the pool capacity.
+    and the pool capacity. ``pd_rank`` marks a prefill or decode rank. There the Rust gate checks the transfer
+    rules first, so a version that P/D does not model and a bounded replay window get the P/D texts first, whose
+    remedies hold on such a rank.
     """
+    groups = deployment.resources.cache_groups
+    # A prefill or decode rank checks its transfer rules first, as the Rust gate does. A version that P/D does not
+    # model and a bounded replay window fail there with prefix caching off too, so their texts must not point to it.
+    if pd_rank:
+        if backend_version not in GROUPED_PD_VERSIONS:
+            raise ValueError(GROUPED_PD_VERSION_TEXT)
+        if any(
+            group.kind == "attention" and group.sliding_window is not None and group.prefix_cacheable is False
+            for group in groups
+        ):
+            raise ValueError(GROUPED_PD_REPLAY_WINDOW_TEXT)
     memory = deployment.resources.runtime_memory
     # The evidence: the runtime memory records prefix caching on and the hash block that replay must follow.
     if memory is None or memory.enable_prefix_caching is not True or memory.hash_block_size_tokens is None:
         raise ValueError(f"grouped FPM cache requires {field}=false for cold replay")
     if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
         raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
-    # Replay applies the grouped rules of the label, so evidence that a runtime of another version recorded is refused.
-    # A profile imported before the field existed passes as before.
-    if memory.runtime_framework_version is not None and memory.runtime_framework_version != backend_version:
-        raise ValueError(
-            "grouped FPM cache prefix caching requires runtime_memory.runtime_framework_version "
-            f"({memory.runtime_framework_version}) to equal the deployment's backend_version ({backend_version})"
-        )
-    groups = deployment.resources.cache_groups
+    require_runtime_version(memory, backend_version=backend_version, feature="prefix caching")
     if any(group.prefix_cacheable is None for group in groups):
         raise ValueError(
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
@@ -1705,7 +1743,7 @@ def grouped_prefix_caching_requirements(
             "them cold"
         )
     # The Rust rule table models no sliding-window attention group that opts out of prefix caching, and refuses it
-    # with this text at native startup.
+    # with this text at native startup on an aggregated rank. A prefill or decode rank refused it above.
     if any(
         group.kind == "attention" and group.sliding_window is not None and group.prefix_cacheable is False
         for group in groups
@@ -1733,6 +1771,70 @@ def grouped_prefix_caching_requirements(
             "GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4"
         )
     return hash_block
+
+
+GROUPED_PD_VERSIONS = ("0.31.0", "0.32.0")
+GROUPED_PD_VERSION_TEXT = "grouped FPM cache P/D is modeled for vLLM 0.31.0 and 0.32.0 only"
+GROUPED_PD_REPLAY_WINDOW_TEXT = (
+    "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with "
+    "prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and "
+    "prefix_cacheable: false, and replay a bounded replay window on an aggregated rank with prefix caching off"
+)
+
+
+def grouped_pd_pairable(prefill_deployment, decode_deployment) -> bool:
+    """Whether a prefill and a decode FPM deployment can run as a P/D pair.
+
+    Two linear deployments always can. Replay moves each cache group into the same group of the decode rank, so a
+    pair with a grouped deployment needs two grouped deployments with equal tensor parallelism and identical groups.
+    """
+    prefill, decode = prefill_deployment.resources, decode_deployment.resources
+    if prefill.cache_layout != "grouped" and decode.cache_layout != "grouped":
+        return True
+    return (
+        prefill.cache_layout == decode.cache_layout
+        and prefill_deployment.tp == decode_deployment.tp
+        and prefill.cache_groups == decode.cache_groups
+    )
+
+
+def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer) -> None:
+    """Check a prefill and a decode FPM deployment with a grouped cache for P/D replay.
+
+    The prediction and the sweeper share this rule. The sweeper enumerates only pairs that pass
+    ``grouped_pd_pairable``. ``kv_transfer`` is the prediction's transfer configuration, or None. The Rust gate checks
+    the markers, the version and the full-attention block of each rank again.
+    """
+    if not grouped_pd_pairable(prefill_deployment, decode_deployment):
+        raise ValueError(
+            "grouped FPM cache P/D requires prefill and decode deployments with equal tensor parallelism and "
+            "identical cache groups"
+        )
+    # The versions come first, as in the Rust gate and the prefix-caching rule: no marker makes P/D of another
+    # version run.
+    if backend_version not in GROUPED_PD_VERSIONS:
+        raise ValueError(GROUPED_PD_VERSION_TEXT)
+    for deployment in (prefill_deployment, decode_deployment):
+        require_runtime_version(deployment.resources.runtime_memory, backend_version=backend_version, feature="P/D")
+    # The transfer rules read both markers. The pair's groups are identical, so the prefill groups stand for both.
+    if any(
+        group.prefix_cacheable is None or group.transfer_bytes_per_block is None
+        for group in prefill_deployment.resources.cache_groups
+    ):
+        raise ValueError(
+            "grouped FPM cache P/D requires every cache group to declare prefix_cacheable and "
+            "transfer_bytes_per_block; set both on each cache group of the profile, with the transfer_bytes_per_block "
+            "from evidence for each group, for the deployment's vLLM version"
+        )
+    # A sliding-window attention group that opts out of prefix caching is a bounded replay window, whose transfer the
+    # Rust rules do not model. The Rust gate refuses it with this text, with prefix caching on or off.
+    if any(
+        group.kind == "attention" and group.sliding_window is not None and group.prefix_cacheable is False
+        for group in prefill_deployment.resources.cache_groups
+    ):
+        raise ValueError(GROUPED_PD_REPLAY_WINDOW_TEXT)
+    if kv_transfer is not None and kv_transfer.bytes_per_token != "auto":
+        raise ValueError("grouped FPM cache derives kv_transfer.bytes_per_token from its cache groups; set it to auto")
 
 
 def _validate_prediction_prefix_match_unit(engine: EnginePredictionConfig) -> None:
