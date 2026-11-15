@@ -31,6 +31,10 @@ from aisim.support.fpm import run_fpm
 from aisim.support.plan import check_plan, create_plan, plan_lock, request_id, validation_id
 from aisim.support.schema import SupportRequest
 
+from .test_support_serving_validation import materialized_workload  # noqa: F401
+from .test_support_validation import validation_case  # noqa: F401
+from .test_support_validation_workflow import quality_case  # noqa: F401
+
 pytestmark = [
     pytest.mark.unit,
     # Onboarding still writes the old estimator fields into its replay configs, so reading one back warns.
@@ -371,6 +375,37 @@ def test_collection_power_window_opt_out_reaches_the_collector_command(tmp_path,
         assert "--fpm-warmup-iterations" not in command
     else:
         assert command[command.index("--fpm-warmup-iterations") + 1] == str(warmup_iterations)
+
+
+@pytest.mark.parametrize("quality_case", [{"measure_power": False}], indirect=True, ids=["latency-only-archive"])
+def test_archived_latency_only_campaign_requires_explicit_power_opt_out(quality_case):  # noqa: F811
+    from collector.fpm_forward.repeatability import load_repeatability_source
+
+    from aisim.support.collection_readiness import assess_readiness
+
+    case = quality_case
+    before = _file_contents(case["root"])
+    # Historical latency-only plans omit this option. Exercise the real saved
+    # loader and readiness boundary with synthetic native timing artifacts.
+    archived = json.loads((case["campaign"] / "collection-plan.json").read_text())
+    assert "measure_power" not in archived["options"]
+    assert load_repeatability_source(case["campaign"]).options.measure_power is False
+
+    payload = case["request"].model_dump(mode="json")
+    payload["collection"].pop("measure_power")
+    request = SupportRequest.model_validate(payload)
+    assert request.collection.measure_power is True
+    report = assess_readiness(request, case["root"], case["checkpoint"].parent)
+    assert report["status"] == "blocked"
+    assert not report["ready_for_full_collection"]
+    assert report["campaigns"][0]["errors"] == ["saved collection differs from the reviewed onboarding request"]
+
+    payload["collection"]["measure_power"] = False
+    opted_out = SupportRequest.model_validate(payload)
+    report = assess_readiness(opted_out, case["root"], case["checkpoint"].parent)
+    assert report["ready_for_full_collection"], report["blockers"]
+    assert {item["cell"]["workload_kind"] for item in report["selected_cells"]} == {"prefill", "decode"}
+    assert _file_contents(case["root"]) == before
 
 
 def test_onboarding_plan_and_preview_do_not_import_estimator_runtime(tmp_path):

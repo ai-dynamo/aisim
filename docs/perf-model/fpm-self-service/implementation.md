@@ -632,9 +632,17 @@ These settings define the runtime envelope used for profile sizing, collection a
 | `--gpu-memory-utilization` | Finite fraction of total GPU memory in `(0, 1]`, initially `0.90`. Used consistently for topology/resource admission, collection and generated prediction/recommendation/replay memory budgets. Saved as `collection.gpu_memory_utilization`; it does not establish fit or reserve GPUs. |
 | `--prefill-cudagraph-policy` | `runtime` for new initialization: leave prefill compilation settings to the pinned runtime and resolve actual captures at engine initialization. `explicit` selects a reviewed capture extension. Saved as `collection.prefill_cudagraph_policy`. |
 | `--max-prefill-cudagraph-size` | Positive prefill capture limit for `explicit` policy. Supplying a number selects `explicit` unless a contradictory `runtime` policy was also supplied. Choosing `explicit` without a number uses 2,048. Saved as `collection.max_prefill_cudagraph_size`; match the target serving configuration. |
+| `collection.measure_power` | Defaults to `true`, including when omitted from an older request. Set `false` explicitly to reuse an archived latency-only campaign or collect with an image that predates power windows. Readiness requires the request and archived campaign to agree. |
 | `collection.warmup_iterations` | Native global warm-up count of the runtime probe and of collection. Without a value, the collector keeps its default of 5. `onboard init` has no flag for it. Set it in the request YAML, or as the checkpoint input `inputs.warmup_iterations` with `aisim onboard checkpoint --update`. Formal collection refuses a count that differs from the accepted probe, so set it before the probe. GLM-5.3-Flash collection requires 0, because its producer runs its own warm-ups. |
 
 For example, add `--gpu-memory-utilization 0.92 --prefill-cudagraph-policy runtime` to review a different memory fraction while retaining engine-selected graphs, or `--max-prefill-cudagraph-size 2048` for the explicit extension. Runtime policy with a numeric capture size is rejected. Old saved requests that omit `collection.prefill_cudagraph_policy` retain the prior explicit policy and 2,048-token default; they are not reinterpreted as runtime-policy requests. An omitted legacy memory fraction retains the prior collector-argument omission and the existing 0.90 simulation budget. Review changes in a new request/collection directory.
+
+To reuse an archived latency-only campaign, explicitly set
+`collection.measure_power: false` in its onboarding request. An omitted field
+means `true`, even for a request saved before power collection was introduced;
+readiness rejects that request against the latency-only campaign. The request
+does not record when the field was omitted, so AISim cannot infer a historical
+opt-out. To retain `true`, collect a new campaign with power enabled instead.
 
 ### Serving roles and CUDA graph settings
 
