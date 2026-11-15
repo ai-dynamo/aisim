@@ -108,6 +108,7 @@ areas:
       - scripts/
       - benchmarks/
       - tests/test_aic_sync.py
+      - tests/test_cloud_agent_install.py
       - tests/test_ci_workflow_contracts.py
       - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
@@ -156,6 +157,10 @@ shared:
     owners: [replay, mocker, maintainers]
   - glob: .claude/skills/aisim-replay-performance
     owners: [replay, mocker, maintainers]
+  - glob: .agents/skills/aisim-agentx-collect/
+    owners: [replay, forward-pass-engine, infra, maintainers]
+  - glob: .claude/skills/aisim-agentx-collect
+    owners: [replay, forward-pass-engine, infra, maintainers]
   - glob: .agents/skills/aisim-agentx-gap-debug/
     owners: [replay, forward-pass-engine, maintainers]
   - glob: .claude/skills/aisim-agentx-gap-debug
@@ -361,6 +366,8 @@ shared:
   - glob: deny.toml
     owners: [infra, maintainers]
   - glob: pytest.ini
+    owners: [infra, maintainers]
+  - glob: .cursor/
     owners: [infra, maintainers]
   - glob: scripts/
     owners: [infra, maintainers]

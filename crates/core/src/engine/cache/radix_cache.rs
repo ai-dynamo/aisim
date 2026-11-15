@@ -1069,6 +1069,21 @@ impl RadixCache {
         }
     }
 
+    /// Make room on `node`'s edge for `pages` more pages if the next insert from it extends the
+    /// edge in place: a non-root leaf that no request but the caller holds (see
+    /// [`Self::insert_page_hash_suffix`]). Pages beyond the reservation still grow amortized. The
+    /// leaf gives unused room back when it gains a child or its last holder unlocks it.
+    pub(crate) fn reserve_leaf_extension(&mut self, node: NodeId, pages: usize) {
+        if node == self.root || self.hicache.is_some() || self.is_swa_boundary(node) {
+            return;
+        }
+        let edge = &mut self.nodes[node];
+        if edge.children.is_empty() && edge.lock_ref <= 1 {
+            edge.key.reserve(pages);
+            edge.value.reserve(pages);
+        }
+    }
+
     fn extend_leaf(
         &mut self,
         node_id: NodeId,
@@ -1179,7 +1194,13 @@ impl RadixCache {
 
         self.remove_evictable_leaf(parent_id);
 
-        self.nodes[parent_id].children.insert(ck, new_id);
+        // A leaf that gains a child no longer extends in place; release room reserved for that.
+        let parent = &mut self.nodes[parent_id];
+        if parent.children.is_empty() {
+            parent.key.shrink_to_fit();
+            parent.value.shrink_to_fit();
+        }
+        parent.children.insert(ck, new_id);
 
         self.insert_evictable_leaf(new_id);
         self.evictable_size += key.len() * self.page_size;
@@ -1243,6 +1264,12 @@ impl RadixCache {
                 let tokens = node.value.len() * self.page_size;
                 self.protected_size -= tokens;
                 self.evictable_size += tokens;
+                if self.is_leaf(id) {
+                    // Its last holder is gone; release room reserved for that holder's tail.
+                    let leaf = &mut self.nodes[id];
+                    leaf.key.shrink_to_fit();
+                    leaf.value.shrink_to_fit();
+                }
                 if self.is_evictable_leaf(id) {
                     self.insert_evictable_leaf(id);
                 }
@@ -1758,6 +1785,9 @@ mod tests {
         cache.insert(&[1, 2, 3, 4], &[0, 1, 2, 3]);
         let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
         cache.inc_lock_ref(tail);
+        // Its first holder made room to extend it before another request locked it.
+        cache.reserve_leaf_extension(tail, 65_536);
+        assert!(cache.node(tail).key.capacity() > cache.node(tail).key.len());
         cache.inc_lock_ref(tail);
         let nodes_before = cache.num_nodes();
 
@@ -1772,6 +1802,103 @@ mod tests {
         assert_eq!(cache.num_nodes(), nodes_before + 1);
         assert_eq!(*cache.node(tail).key, cache.page_hashes(&[1, 2, 3, 4]));
         assert_eq!(*cache.node(extended).key, cache.page_hashes(&[5, 6, 7, 8]));
+        // With a child the leaf no longer extends in place, so it gives the room back.
+        assert_eq!(cache.node(tail).key.capacity(), cache.node(tail).key.len());
+        assert_eq!(
+            cache.node(tail).value.capacity(),
+            cache.node(tail).value.len()
+        );
+
+        // The other holder finishes with a different output. Both completions stay cached,
+        // but the now-internal prompt edge must not regain the completion reservation.
+        cache.dec_lock_ref(tail);
+        cache.reserve_leaf_extension(tail, 65_536);
+        let other = cache.insert_from_node(
+            tail,
+            4,
+            &[1, 2, 3, 4, 9, 10, 11, 12],
+            &[0, 1, 2, 3, 8, 9, 10, 11],
+        );
+        assert_ne!(other, tail);
+        assert_ne!(other, extended);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 12);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
+        assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 9, 10, 11, 12]).0, 8);
+        assert_eq!(cache.node(tail).key.capacity(), cache.node(tail).key.len());
+        assert_eq!(
+            cache.node(tail).value.capacity(),
+            cache.node(tail).value.len()
+        );
+    }
+
+    #[test]
+    fn swa_boundary_does_not_reserve_unusable_tail_capacity() {
+        let mut cache = RadixCache::new(32, 1);
+        cache.enable_swa_prefix(4, 2);
+        let mut pages = insert_with_window(&mut cache, &[1, 2, 3, 4], 0);
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
+        assert!(cache.is_swa_boundary(tail));
+        cache.inc_lock_ref(tail);
+        let capacities = (
+            cache.node(tail).key.capacity(),
+            cache.node(tail).value.capacity(),
+        );
+
+        cache.reserve_leaf_extension(tail, 65_536);
+
+        assert_eq!(
+            (
+                cache.node(tail).key.capacity(),
+                cache.node(tail).value.capacity()
+            ),
+            capacities,
+            "an SWA boundary cannot move when the request grows"
+        );
+        pages.extend(cache.page_pool.allocate(2).unwrap());
+        let tokens = [1, 2, 3, 4, 5, 6];
+        let extended = cache.insert_from_node(tail, 4, &tokens, &pages);
+        assert_ne!(extended, tail);
+        assert_eq!(cache.prefix_match_len(&tokens), 6);
+        assert_eq!(swa_reusable(&cache, &tokens), 4);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 6);
+    }
+
+    #[test]
+    fn hicache_leaf_does_not_reserve_unusable_tail_capacity() {
+        let mut cache = RadixCache::new(100, 4);
+        cache.enable_hicache();
+        cache.insert(&[1, 2, 3, 4], &[0, 1, 2, 3]);
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4]);
+        cache.inc_lock_ref(tail);
+        let capacities = (
+            cache.node(tail).key.capacity(),
+            cache.node(tail).value.capacity(),
+        );
+
+        cache.reserve_leaf_extension(tail, 65_536);
+
+        assert_eq!(
+            (
+                cache.node(tail).key.capacity(),
+                cache.node(tail).value.capacity()
+            ),
+            capacities,
+            "HiCache inserts create children instead of extending leaf edges"
+        );
+        let extended = cache.insert_from_node(
+            tail,
+            4,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+        );
+        assert_ne!(extended, tail);
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 8);
     }
 
     #[test]
