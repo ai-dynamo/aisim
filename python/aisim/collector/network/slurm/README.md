@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# 1.nccl-test collection step by step 
+# 1.nccl-test collection step by step
 
 ## 1.1 Replace the "/path/to" in the sctipt with actual path
 
