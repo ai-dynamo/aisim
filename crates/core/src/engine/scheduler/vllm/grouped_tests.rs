@@ -2586,20 +2586,28 @@ fn grouped_destination_retries_when_the_loads_in_flight_need_less() {
         output,
     };
     let arrivals = [
-        arrival(0, true, 1, 80, 71, 3),
-        arrival(3, false, 2, 64, 84, 13),
-        arrival(7, true, 3, 0, 49, 11),
-        arrival(7, false, 4, 96, 78, 19),
-        // A load of the first 55 tokens of the shared prefix. It waits.
-        arrival(7, true, 5, 64, 55, 20),
+        arrival(4, true, 1, 96, 87, 10),
+        arrival(9, true, 2, 0, 40, 25),
+        arrival(10, true, 3, 64, 46, 12),
+        arrival(15, true, 4, 0, 72, 17),
+        arrival(19, true, 5, 96, 69, 24),
+        arrival(22, true, 6, 64, 65, 20),
+        arrival(25, true, 7, 80, 70, 12),
+        arrival(25, true, 8, 64, 65, 27),
+        arrival(29, true, 9, 80, 78, 25),
+        // A load of the first 73 tokens of the shared prefix. It waits.
+        arrival(29, true, 10, 96, 73, 25),
+        arrival(29, true, 11, 80, 65, 10),
+        arrival(32, true, 12, 0, 97, 23),
+        arrival(33, true, 13, 0, 63, 21),
     ];
-    let mut core = scripted_decode_rank(&arrivals, 8);
-    let head = HandoffId::new(Uuid::from_u128(1_000_005));
-    // Load 5 waits after its arrival, while load 3, which arrived just before
-    // it, is in flight with a need of 2 blocks. The last pass is the first
-    // pass of load 3. It releases no block and publishes and evicts no key,
-    // so the retry epoch stays, and the need of the loads in flight falls
-    // from 2 blocks to 0. Load 5 then fits. vLLM sums that need again at each
+    let mut core = scripted_decode_rank(&arrivals, 35);
+    let head = HandoffId::new(Uuid::from_u128(1_000_010));
+    // Load 10 waits while the loads in flight need 2 blocks. The last pass
+    // releases no block, publishes and evicts no key and leaves the published
+    // epoch, so the retry epoch stays. It is the first pass of a load in
+    // flight, which takes that load out of the need: the need falls from 2
+    // blocks to 0. Load 10 then fits. vLLM sums that need again at each
     // attempt (V32 `sched:1241-1251`, `:3088-3092`), so the retry after this
     // pass reserves it.
     assert_eq!(
@@ -2671,11 +2679,10 @@ fn grouped_destination_retries_when_a_pass_evicts_a_key() {
     // Load 12 waits after its arrival. The last pass releases no block and
     // publishes no key. It takes two of the five inactive cached blocks, and
     // one of them holds the last copy of a key, which moves the generation of
-    // the resident keys. The decode-side finder reads the keys of every
-    // group, so that eviction can change the local prefix of load 12 and
-    // what it counts.
-    // The need of the loads in flight stays 0, and the published epoch
-    // stays. Load 12 now fits, so the retry after this pass reserves it.
+    // the resident keys. A decode rank counts each state group's own hit, so
+    // that eviction can change what load 12 counts. The need of the loads in
+    // flight stays 0, and the published epoch stays. Load 12 now fits, so
+    // the retry after this pass reserves it.
     assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
     assert_eq!(
         reserved_units(&core.retry_pending_destinations(), head),
@@ -3143,6 +3150,41 @@ fn grouped_destination_without_state_layers_loads_past_the_hit_every_group_agree
         ..pd_request(1762, 0, 2)
     };
     assert_eq!(reserve_grouped(&mut core, second, request), Some(7));
+}
+
+#[test]
+fn grouped_destination_waits_for_the_cached_block_of_a_lagging_state_hit() {
+    let mut args = prefix_core(full_and_state_transfer_groups(), 600, 8192, 16, "0.31.0").args;
+    args.worker_type = WorkerType::Decode;
+    let mut core = VllmCore::new(args);
+    let mut trace = TraceCollector::default();
+    let mut step = 0;
+    // A caches full attention at 16 and 32 and its state at 32, its replay boundary.
+    let a = HandoffId::new(Uuid::from_u128(1771));
+    assert_eq!(
+        reserve_grouped(&mut core, a, pd_request(1770, 33, 1)),
+        Some(2)
+    );
+    activate(&mut core, a);
+    drain_pd(&mut core, &mut trace, &mut step, 5);
+    // B adds full attention at 48. Its state after 54 tokens sits at no boundary.
+    // B also counts the state hit of A at 32: its whole prompt needs
+    // 2 + 2 + 1 + 1 = 6 blocks of 6 free, so B still gets 2 units.
+    let b = HandoffId::new(Uuid::from_u128(1773));
+    assert_eq!(
+        reserve_grouped(&mut core, b, pd_request(1772, 55, 1)),
+        Some(2)
+    );
+    activate(&mut core, b);
+    drain_pd(&mut core, &mut trace, &mut step, 5);
+    assert_eq!(block_pool(&core).inactive_cached_blocks(), 4);
+    // C: local prefix 48, state hit 32. Whole prompt 7 > 6 free blocks.
+    let c = HandoffId::new(Uuid::from_u128(1775));
+    let request = DirectRequest {
+        tokens: (0..48).chain(1_000..1_017).collect(),
+        ..pd_request(1774, 0, 2)
+    };
+    assert_eq!(reserve_grouped(&mut core, c, request), None);
 }
 
 #[test]
