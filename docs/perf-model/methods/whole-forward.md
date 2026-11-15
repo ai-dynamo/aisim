@@ -490,11 +490,22 @@ as the uncovered-data sentinel. Direct interpolation stays latency-only.
 
 Python static summaries expose this energy through
 `get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`, which
-can now return nonzero FPM energy for schema-8 pairs. SDK publication gating is
-the separate PR 3b step of the FPM power rollout. Mixed steps suppress both FPM
+can now return nonzero FPM energy for schema-8 pairs. SDK static and
+disaggregated result dictionaries also expose the resulting average `power_w`.
+Aggregated SDK results combine zero-energy mixed steps with powered pure-decode
+steps, so their average power and coverage can be partial. `Task.run_single_agg()`
+and `Task.run_single_disagg()` include numeric `power_coverage`; raw
+`InferenceSession` summaries expose coverage through `get_power_data_coverage()`.
+Legacy `cli_estimate()` static, aggregated, and disaggregated results publish
+`power_w` when coverage reaches 90%, and otherwise return null power with numeric
+`power_coverage`. The separate PR 3b step tightens SDK publication gating; this
+operator change already affects these outputs for powered schema-8 pairs.
+Mixed steps suppress both FPM
 prefill and marginal-decode energy (decision D10, AISIM-2001), while retaining
-draft-operation energy. The multi-rank iteration query and native Replay's FPM
-timing provider remain latency-only: replay and unified prediction reports keep
+draft-operation energy. `FpmForwardOp::query_totals` returns SOL-based operation
+energy. `estimate_forward_pass_time_ms(metrics_by_rank)` returns latency only;
+its `ForwardPassMetrics` rank dispatch discards FPM energy. Native Replay's FPM
+timing provider also remains latency-only: replay and unified prediction reports keep
 `power_w` and `power_coverage` null even for a fully powered schema-8 pair. See
 the [power output contract](../power.md#publication-gate).
 

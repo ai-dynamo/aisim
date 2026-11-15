@@ -1664,6 +1664,9 @@ def schema8_fpm_config(external_fpm_config, tmp_path, request):
     unpowered_phase = getattr(request, "param", None)
     original = Path(config.engine.workers.aggregated.timing.fpm_parquet_path)
     rows = pq.read_table(original).to_pylist()
+    # Exact representative agg decode lengths: isl + osl // 2 + 1 for
+    # 2 and 64 output tokens. Keep the synthetic 6 ms latency.
+    rows.extend({**rows[1], "total_kv_read_tokens": kv} for kv in (514, 545))
     policy = "dynamo_native_single_sample_power_window_v1"
     for row in rows:
         row.update(
@@ -1684,25 +1687,36 @@ def schema8_fpm_config(external_fpm_config, tmp_path, request):
     return config, systems_root
 
 
+@pytest.fixture
+def schema8_fpm_database(schema8_fpm_config):
+    from aisim.sdk.perf_database import get_systems_paths, set_systems_paths
+
+    config, systems_root = schema8_fpm_config
+    # SDK and legacy CLI sessions discover the same pair through PerfDatabase.
+    parquet = Path(config.engine.workers.aggregated.timing.fpm_parquet_path)
+    data_dir = systems_root / "data" / SYSTEM / BACKEND / VERSION
+    data_dir.mkdir(parents=True)
+    shutil.copy(parquet, data_dir)
+    shutil.copy(parquet.with_suffix(".metadata.json"), data_dir)
+    previous_paths = get_systems_paths()
+    set_systems_paths([str(systems_root)])
+    try:
+        yield PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(systems_root))
+    finally:
+        set_systems_paths(previous_paths)
+
+
 @pytest.mark.parametrize(
     "schema8_fpm_config,context_energy,generation_energy",
     [(None, 11000.0, 3000.0), ("prefill", 0.0, 3000.0), ("decode", 11000.0, 0.0)],
     indirect=["schema8_fpm_config"],
     ids=["powered", "unpowered-prefill", "unpowered-decode"],
 )
-def test_schema8_fpm_static_summary_energy(schema8_fpm_config, context_energy, generation_energy):
+def test_schema8_fpm_static_summary_energy(schema8_fpm_database, context_energy, generation_energy):
     from aisim.sdk.inference_session import InferenceSession
 
-    config, systems_root = schema8_fpm_config
-    # The legacy static session reads the pair through its PerfDatabase layout.
-    parquet = Path(config.engine.workers.aggregated.timing.fpm_parquet_path)
-    data_dir = systems_root / "data" / SYSTEM / BACKEND / VERSION
-    data_dir.mkdir(parents=True)
-    shutil.copy(parquet, data_dir)
-    shutil.copy(parquet.with_suffix(".metadata.json"), data_dir)
     model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
-    database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(systems_root))
-    summary = InferenceSession(model, database, get_backend(BACKEND)).run_static(
+    summary = InferenceSession(model, schema8_fpm_database, get_backend(BACKEND)).run_static(
         sdk_config.RuntimeConfig(batch_size=1, isl=512, osl=2), mode="static"
     )
     # Synthetic 22/6 ms anchors at 500 W yield 11000/3000 W*ms. Missing
@@ -1711,6 +1725,112 @@ def test_schema8_fpm_static_summary_energy(schema8_fpm_config, context_energy, g
     assert summary.get_generation_latency_dict() == {"fpm_forward_decode": pytest.approx(6.0)}
     assert summary.get_context_energy_wms_dict() == {"fpm_forward_prefill": pytest.approx(context_energy)}
     assert summary.get_generation_energy_wms_dict() == {"fpm_forward_decode": pytest.approx(generation_energy)}
+    assert summary.get_result_dict()["power_w"] == pytest.approx((context_energy + generation_energy) / 28.0)
+    covered_ms = (22.0 if context_energy else 0.0) + (6.0 if generation_energy else 0.0)
+    assert summary.get_power_data_coverage() == pytest.approx(covered_ms / 28.0)
+
+
+@pytest.mark.parametrize(
+    "schema8_fpm_config,osl,energy_wms,coverage",
+    [
+        (None, 2, 3000.0, 6 / 28),
+        ("prefill", 2, 3000.0, 6 / 28),
+        ("decode", 2, 0.0, 0.0),
+        (None, 64, 63 * 3000.0, 378 / 400),
+    ],
+    indirect=["schema8_fpm_config"],
+    ids=["powered", "unpowered-prefill", "unpowered-decode", "sufficient-coverage"],
+)
+def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, coverage):
+    from aisim.sdk.inference_session import InferenceSession
+    from aisim.sdk.task_v2 import Task
+
+    model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
+    summary = InferenceSession(model, schema8_fpm_database, get_backend(BACKEND)).run_agg(
+        sdk_config.RuntimeConfig(batch_size=1, isl=512, osl=osl), ctx_tokens=512
+    )
+    # D10 suppresses the 22 ms mixed prefill. Only the (osl - 1) pure
+    # decode passes supply energy: 6 ms * 500 W per powered decode.
+    assert summary.get_result_dict()["power_w"] == pytest.approx(energy_wms / (22 + (osl - 1) * 6))
+    assert summary.get_power_data_coverage() == pytest.approx(coverage)
+    task = Task(
+        model_path=model.model_path,
+        system_name=SYSTEM,
+        backend_name=BACKEND,
+        backend_version=VERSION,
+        forward_model="fpm",
+        gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+        kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        isl=512,
+        osl=osl,
+    )
+    result = task.run_single_agg(tp=1, batch_size=1, ctx_tokens=512)
+    assert result["power_w"] == pytest.approx(summary.get_result_dict()["power_w"])
+    assert result["power_coverage"] == pytest.approx(coverage)
+
+
+@pytest.mark.parametrize(
+    "schema8_fpm_config,mode,osl,power_w,coverage",
+    [
+        (None, "static", 2, 500.0, 1.0),
+        ("prefill", "static", 2, None, 6 / 28),
+        ("decode", "static", 2, None, 22 / 28),
+        (None, "agg", 2, None, 6 / 28),
+        ("prefill", "agg", 2, None, 6 / 28),
+        ("decode", "agg", 2, None, 0.0),
+        (None, "agg", 64, 472.5, 378 / 400),
+        (None, "disagg", 2, 500.0, 1.0),
+        # Legacy disagg scales prefill by 1.1 and decode by 1.08 before
+        # weighting coverage. The correction scales energy with latency.
+        ("prefill", "disagg", 2, None, (6 * 1.08) / (22 * 1.1 + 6 * 1.08)),
+        ("decode", "disagg", 2, None, (22 * 1.1) / (22 * 1.1 + 6 * 1.08)),
+    ],
+    indirect=["schema8_fpm_config"],
+    ids=[
+        "static-powered",
+        "static-unpowered-prefill",
+        "static-unpowered-decode",
+        "agg-low-coverage",
+        "agg-unpowered-prefill",
+        "agg-unpowered-decode",
+        "agg-sufficient-coverage",
+        "disagg-powered",
+        "disagg-unpowered-prefill",
+        "disagg-unpowered-decode",
+    ],
+)
+def test_schema8_fpm_legacy_estimate_power(schema8_fpm_database, mode, osl, power_w, coverage):
+    from aisim.legacy_cli.api import cli_estimate
+
+    result = cli_estimate(
+        model_path="Qwen/Qwen3-0.6B",
+        system_name=SYSTEM,
+        backend_name=BACKEND,
+        backend_version=VERSION,
+        forward_model="fpm",
+        gemm_quant_mode="bfloat16",
+        kvcache_quant_mode="bfloat16",
+        isl=512,
+        osl=osl,
+        batch_size=1,
+        mode=mode,
+        prefill_batch_size=1,
+        prefill_num_workers=1,
+        decode_batch_size=1,
+        decode_num_workers=1,
+    )
+    assert result.mode == mode
+    assert result.power_coverage == pytest.approx(coverage)
+    assert result.raw["power_coverage"] == pytest.approx(coverage)
+    assert result.get()["power_coverage"] == pytest.approx(coverage)
+    if power_w is None:
+        assert result.power_w is None
+        assert result.raw["power_w"] is None
+        assert result.get()["power_w"] is None
+    else:
+        assert result.power_w == pytest.approx(power_w)
+        assert result.raw["power_w"] == pytest.approx(power_w)
+        assert result.get()["power_w"] == pytest.approx(power_w)
 
 
 def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(schema8_fpm_config, tmp_path, capsys):

@@ -18,7 +18,15 @@ interpolation and powered schema-8 rows, `get_context_energy_wms_dict()` and
 `get_generation_energy_wms_dict()` return nonzero FPM energy. Direct
 interpolation stays latency-only. Mixed steps report zero FPM prefill and
 marginal-decode energy (D10, AISIM-2001), while retaining draft-operation energy.
-SDK publication gating is the separate PR 3b step of the FPM power rollout;
+SDK static and disaggregated result dictionaries expose the resulting average
+`power_w`. Aggregated SDK results can contain partial power because mixed-step
+energy is suppressed while pure-decode energy is retained. Raw
+`InferenceSession` summaries provide coverage through `get_power_data_coverage()`;
+`Task.run_single_agg()` and `Task.run_single_disagg()` include `power_coverage`
+in their rows. Legacy `cli_estimate()` applies the existing 90% coverage gate to
+static, aggregated, and disaggregated results: it can publish numeric `power_w`
+for powered schema-8 pairs, or null power with numeric coverage below the gate.
+Stricter SDK publication gating is the separate PR 3b step of the FPM power rollout;
 static operation energy does not enable replay or unified `power_w` publication.
 See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
 
