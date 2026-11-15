@@ -156,11 +156,19 @@ def test_enabled_does_not_claim_exercised_and_missing_is_unknown():
     assert validate(json.loads(json.dumps(value))) == value
 
 
-@pytest.mark.parametrize("bad", ["/Users/private/file", "Bearer secret", "hf_secret", {"token_ids": [1]}])
-def test_private_parameters_rejected(bad):
+@pytest.mark.parametrize(
+    "bad,error",
+    [
+        ("/Users/private/file", "Private or unsafe feature parameter"),
+        ("Bearer secret", "Private or unsafe feature parameter"),
+        ("hf_secret", "Private or unsafe feature parameter"),
+        ({"token_ids": [1]}, "Feature parameters must be scalar"),
+    ],
+)
+def test_private_parameters_rejected(bad, error):
     value = metadata()
     value["features"][0]["parameters"] = [{"name": "implementation", "value": bad}]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=f"^{error}$"):
         validate(value)
 
 
