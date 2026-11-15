@@ -2080,6 +2080,29 @@ def _run_disagg(database, model_config):
 class TestFPMPowerPublication:
     """Public SDK watts for FPM models are published only where V1 supports them."""
 
+    def test_aggregate_cache_separates_op_level_and_fpm_models(self, fpm_power_root):
+        from aisim.sdk.predict import predict_agg_worker
+
+        fpm_model = _qwen_fpm()
+        op_model = models.get_model("Qwen/Qwen3-0.6B", _model_config(), BACKEND)
+        database = fpm_power_root(fpm_model, _full_power, rows=_agg_rows(fpm_model))
+        backend = get_backend(BACKEND)
+        runtime = sdk_config.RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=512)
+
+        def run(model):
+            return predict_agg_worker(
+                model=model, backend=backend, database=database, runtime_config=runtime, ctx_tokens=512
+            )
+
+        op_summary = run(op_model)
+        assert op_summary.get_result_dict()["power_w"] > 0
+        fpm_summary = run(fpm_model)
+        assert fpm_summary is not op_summary
+        assert fpm_summary.get_result_dict()["power_w"] is None
+        assert fpm_summary.get_power_data_coverage() > 0.9
+        assert run(op_model) is op_summary
+        assert run(fpm_model) is fpm_summary
+
     def test_fully_powered_static_run_keeps_numeric_watts(self, fpm_power_root):
         model = _qwen_fpm()
         summary = _run_static(model, fpm_power_root(model, _full_power))

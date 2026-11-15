@@ -1407,6 +1407,21 @@ def test_vllm_032_kernel_block_subdivision_keeps_manager_block_stride(tmp_path, 
     assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 93 * 2 * 256
 
 
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC", "LHBNC"])
+def test_vllm_032_layer_outer_aliases_allow_a_smaller_last_group(tmp_path, layout):
+    groups = (*_TWO_GROUPS, ("layer4",))
+    path, launch = _strided_fixture(tmp_path, layout=layout, groups=groups)
+
+    result = validate_observations(path, launch)["tp2"]
+
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = FpmResourceProfile.model_validate(result["resources"])
+    assert [group.num_layers for group in resources.cache_groups] == [2, 2, 1]
+    # The smaller alias uses only part of the two-layer backing pool; it does
+    # not add storage or change which block owns any shared byte.
+    assert resources.runtime_memory.kv_cache_bytes == 93 * 2 * 256
+
+
 def _legacy_field(cache):
     cache["tensor_allocations"][0]["shared_by"] = cache["tensor_allocations"][0]["layers"]
 

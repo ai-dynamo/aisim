@@ -439,6 +439,31 @@ def _validate_kv_seed_classification(metadata: dict[str, Any], rows: list[dict[s
         raise ValueError("FPM KV seed classification policy differs from published rows")
 
 
+def _validate_power_schema(metadata: dict[str, Any], schema: Any) -> None:
+    """Check a sealed schema-8 pair before interpreting or republishing rows."""
+    if metadata.get("schema_version") != 8:
+        return
+    import pyarrow as pa
+
+    if metadata.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY:
+        raise ValueError("schema-8 FPM sidecar measurement_policy must be the power-window policy")
+    if not pa.types.is_float64(schema.field("power_w").type):
+        raise ValueError("schema-8 FPM power_w must be a nullable Parquet DOUBLE column")
+
+
+def _validate_power_rows(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if row.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY:
+            raise ValueError(
+                f"schema-8 FPM database has rows without measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}"
+            )
+        power = row.get("power_w")
+        if power is not None and (
+            isinstance(power, bool) or not isinstance(power, int | float) or not math.isfinite(power) or power <= 0
+        ):
+            raise ValueError("schema-8 FPM power_w must be null or finite and greater than zero")
+
+
 def validate_formal_database_commit(
     parquet_path: Path,
     metadata_path: Path,
@@ -497,6 +522,7 @@ def validate_formal_database_commit(
     missing = sorted(required - set(parquet.schema_arrow.names))
     if missing:
         raise ValueError(f"committed FPM database is missing schema-v{payload['schema_version']} columns: {missing}")
+    _validate_power_schema(payload, parquet.schema_arrow)
     row_count = payload.get("row_count")
     if not isinstance(row_count, int) or row_count < 1 or parquet.metadata.num_rows != row_count:
         raise ValueError(
@@ -504,13 +530,8 @@ def validate_formal_database_commit(
             f"parquet={parquet.metadata.num_rows}, metadata={row_count!r}"
         )
     rows = parquet.read().to_pylist()
-    if payload["schema_version"] == 8 and any(
-        row.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY for row in rows
-    ):
-        raise ValueError(
-            f"committed schema-8 FPM database has rows without measurement_policy="
-            f"{POWER_WINDOW_MEASUREMENT_POLICY!r}: {parquet_path}"
-        )
+    if payload["schema_version"] == 8:
+        _validate_power_rows(rows)
     _validate_kv_seed_classification(payload, rows)
     identities = _run_identities_by_cell(rows, source="committed")
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -785,7 +806,10 @@ def write_formal_database(
                     "existing FPM database does not satisfy the attempt-bound schema-v7/v8 row-key "
                     f"contract (missing columns: {missing}); publish to a clean destination: {parquet_path}"
                 )
+            _validate_power_schema(committed, table.schema)
             existing_rows = table.to_pylist()
+            if committed.get("schema_version") == 8:
+                _validate_power_rows(existing_rows)
             _validate_kv_seed_classification(committed, existing_rows)
             if committed.get("schema_version") == 6:
                 for row in existing_rows:
@@ -833,6 +857,7 @@ def write_formal_database(
         if powered:
             for row in [*merged, *rows]:
                 row.setdefault("power_w", None)
+            _validate_power_rows(rows)
         index = {tuple(row[key] for key in _ROW_KEY): row for row in merged}
         if len(index) != len(merged):
             raise ValueError(f"existing FPM database contains duplicate physical keys: {parquet_path}")
@@ -869,9 +894,12 @@ def write_formal_database(
             if powered:
                 # The loader requires a DOUBLE column; an all-null column would infer the null type.
                 column = table.schema.get_field_index("power_w")
-                table = table.set_column(
-                    column, pa.field("power_w", pa.float64()), table.column(column).cast(pa.float64())
-                )
+                if pa.types.is_null(table.schema.field(column).type):
+                    table = table.set_column(
+                        column, pa.field("power_w", pa.float64()), pa.nulls(table.num_rows, type=pa.float64())
+                    )
+                elif not pa.types.is_float64(table.schema.field(column).type):
+                    raise ValueError("schema-8 FPM power_w must be a nullable Parquet DOUBLE column")
             pq.write_table(table, temporary, compression="zstd")
             metadata = {
                 "schema_name": "aic_fpm_forward_perf",

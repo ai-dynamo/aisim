@@ -500,6 +500,7 @@ def _validate_alias_ownership(views: list[tuple[dict[str, Any], int, int]], coun
     the same number, unless a vLLM 0.33.0 kernel-block view has a larger stride.
     """
     ownership, block_span = None, 0
+    periodic = True
     for view, ratio, pages in views:
         axis = view["block_axis"]
         strides = view["stride_bytes"]
@@ -523,8 +524,18 @@ def _validate_alias_ownership(views: list[tuple[dict[str, Any], int, int]], coun
         # permutations, before comparing which pool ID owns a byte. Matching
         # tensor-local bounds alone cannot establish this cross-layer property.
         mapping = (step, planes)
-        if ownership is not None and mapping != ownership:
+        # When outer planes start at whole-pool periods, a byte's owner is
+        # floor((byte % (count * step)) / step), regardless of how many layers
+        # a view covers. Smaller same-offset aliases can omit outer planes.
+        # Keep the exact mapping proof for layouts without this periodicity.
+        view_periodic = step > 0 and all(stride % (count * step) == 0 for stride, _dimension in planes)
+        if (
+            ownership is not None
+            and mapping != ownership
+            and (step != ownership[0] or not periodic or not view_periodic)
+        ):
             raise ValueError("aliased tensors have incompatible pool block ownership")
+        periodic = periodic and view_periodic
         ownership = mapping
         block_span = max(block_span, within)
     step, planes = ownership

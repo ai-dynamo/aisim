@@ -681,6 +681,90 @@ def test_commit_validation_requires_the_power_column_in_schema_eight(tmp_path):
         write_formal_database(plan, incoming, systems_root=tmp_path / "systems")
 
 
+def _rewrite_published_power(tmp_path, values, arrow_type):
+    plan, cell, cell_dir = _tp2_decode(tmp_path)
+    (row,) = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    rows = [dict(row, cell_id=cell.cell_id if index == 0 else f"extra-{index}") for index in range(len(values))]
+    root = tmp_path / "systems"
+    parquet, metadata, _ = write_formal_database(plan, rows, systems_root=root)
+    table = pq.read_table(parquet)
+    # Publication sorts physical rows by cell ID; bind requested values to
+    # their cells instead of relying on the input list's original order.
+    by_cell = {row["cell_id"]: value for row, value in zip(rows, values, strict=True)}
+    power = pa.array([by_cell[cell_id] for cell_id in table.column("cell_id").to_pylist()], type=arrow_type)
+    table = table.set_column(table.schema.get_field_index("power_w"), "power_w", power)
+    pq.write_table(table, parquet)
+    sidecar = json.loads(metadata.read_text())
+    sidecar["parquet_sha256"] = hashlib.sha256(parquet.read_bytes()).hexdigest()
+    metadata.write_text(json.dumps(sidecar))
+    return plan, [dict(row, cell_id="incoming")], root, parquet, metadata
+
+
+@pytest.mark.parametrize(
+    "values,arrow_type",
+    [
+        (["300"], pa.string()),
+        ([300], pa.int64()),
+        ([300.0], pa.float32()),
+        ([None], pa.null()),
+        ([-1.0], pa.float64()),
+        ([0.0], pa.float64()),
+        ([float("nan")], pa.float64()),
+        ([float("inf")], pa.float64()),
+        ([float("-inf")], pa.float64()),
+    ],
+)
+def test_schema_eight_rejects_invalid_existing_power_without_changing_the_pair(tmp_path, values, arrow_type):
+    plan, incoming, root, parquet, metadata = _rewrite_published_power(tmp_path, values, arrow_type)
+    before = _sealed(metadata, parquet)
+
+    with pytest.raises(ValueError, match="power_w"):
+        validate_formal_database_commit(parquet, metadata, plan)
+    with pytest.raises(ValueError, match="power_w"):
+        write_formal_database(plan, incoming, systems_root=root)
+    assert _sealed(metadata, parquet) == before
+
+
+@pytest.mark.parametrize("values", [[None, None], [None, 300.0], [200.0, 300.0]])
+def test_schema_eight_accepts_nullable_double_power_at_both_boundaries(tmp_path, values):
+    plan, incoming, root, parquet, metadata = _rewrite_published_power(tmp_path, values, pa.float64())
+
+    assert validate_formal_database_commit(parquet, metadata, plan)["schema_version"] == 8
+    write_formal_database(plan, incoming, systems_root=root)
+    assert validate_formal_database_commit(parquet, metadata, plan)["schema_version"] == 8
+    rows = {row["cell_id"]: row["power_w"] for row in pq.read_table(parquet).to_pylist()}
+    assert rows[plan.cells[0].cell_id] == values[0]
+    assert rows["extra-1"] == values[1]
+    assert rows["incoming"] == incoming[0]["power_w"]
+    assert pq.read_schema(parquet).field("power_w").type == pa.float64()
+
+
+@pytest.mark.parametrize("policy", [None, SINGLE_SAMPLE_MEASUREMENT_POLICY, "unknown"])
+def test_schema_eight_rejects_a_sidecar_only_policy_change(tmp_path, policy):
+    plan, incoming, root, parquet, metadata = _rewrite_published_power(tmp_path, [300.0], pa.float64())
+    sidecar = json.loads(metadata.read_text())
+    sidecar["measurement_policy"] = policy
+    metadata.write_text(json.dumps(sidecar))
+    before = _sealed(metadata, parquet)
+
+    with pytest.raises(ValueError, match="sidecar measurement_policy"):
+        validate_formal_database_commit(parquet, metadata, plan)
+    with pytest.raises(ValueError, match="sidecar measurement_policy"):
+        write_formal_database(plan, incoming, systems_root=root)
+    assert _sealed(metadata, parquet) == before
+
+
+@pytest.mark.parametrize("value", ["300", True, -1.0, 0.0, float("nan"), float("inf")])
+def test_power_publication_rejects_invalid_incoming_values(tmp_path, value):
+    plan, cell, cell_dir = _tp2_decode(tmp_path)
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    rows[0]["power_w"] = value
+
+    with pytest.raises(ValueError, match="power_w"):
+        write_formal_database(plan, rows, systems_root=tmp_path / "systems")
+    assert not list((tmp_path / "systems").rglob("fpm_forward_perf.parquet"))
+
+
 def _fpm_args(**overrides):
     parser = argparse.ArgumentParser()
     add_fpm_arguments(parser)
