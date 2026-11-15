@@ -43,6 +43,11 @@ python3 components/gates.py grade --sm sm100 --op <op> --results <job result dir
 python3 components/run_diff.py tables <packaged tables> --base <shipped data> --sibling <system>   # leads to explain before integrating
 ```
 
+`grade` prints one verdict per gate. It also exits 0 when no gate is in scope
+or every verdict is `platform-floor`, which proves nothing about a path:
+`paths` shows which paths have a gate, and the verdict lines show which gates
+were graded.
+
 Steps that need judgment (the source check, triage, a deviation note) are
 prose in the .md and land where the collector reads them: a
 `collector/skips.py` entry, the op plan's `dispatch`, a note at the code, a
@@ -53,6 +58,14 @@ when a test or script reads it; otherwise cite the run at the code.
 
 Everything runs from one control machine; GPU work goes through the collection
 pipeline (the `aic-auto-collect` skill). Nothing generated is committed.
+
+- **What needs a GPU.** The source check, `gates.py paths` and both `run_diff.py`
+  views need none: they read two framework releases, the op plans, and tables or
+  result directories that already exist (a data PR under review, for one). A path
+  gate is one small job per (backend, release, SM) in the framework image, and an
+  upgrade is a collection on every system with shipped data. Those jobs have run
+  through the maintainers' collection pipeline only; the shard plans have not been
+  run on a single GPU box (`tools/perf_database/collect_campaign.py`).
 
 - **Workspace.** `AIS_PROBE_WORKSPACE` (default `collector/opharness/workspace/`,
   git-ignored) holds `configs/`, `dummy_models/`, `campaigns/<name>/` and `results/`.
@@ -115,7 +128,9 @@ pipeline (the `aic-auto-collect` skill). Nothing generated is committed.
   shard's failed tasks, their share and their most frequent messages, the failed tasks that
   still wrote rows (`partial`: some points of a multi-point task failed or were refused), and
   with `--base` the failed tasks that are new, gone and unchanged against the previous run of
-  the same shards. Every lead is explained (in the commit or the PR) or fixed before the
+  the same shards. A vLLM or TensorRT-LLM series that loses exactly one point re-raises that
+  point's error without a count, so it is not listed as `partial`: read its error and its rows.
+  Every lead is explained (in the commit or the PR) or fixed before the
   table is integrated.
 - **SM.** A campaign's SM is its system's (`src/aisim_core/systems/<system>.yaml`);
   a record's is the one its raw reports. Records keep every kernel the taxonomy labels, so

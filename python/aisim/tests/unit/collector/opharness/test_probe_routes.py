@@ -188,6 +188,27 @@ def test_the_serving_probe_runs_the_spec_script_on_the_unpacked_bundle(monkeypat
     assert seen["offline"] == "1" and os.path.exists(tmp_path / "raw_r1.json")
 
 
+def test_the_serving_probe_does_not_report_the_raw_of_an_earlier_attempt(monkeypatch, tmp_path):
+    """A retry runs in the same shard dir: the raw an earlier attempt left there is not this run's result."""
+    sys.path.insert(0, str(COMPONENTS.parents[2]))
+    from collector.probes import serving
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz"):
+        pass
+    spec = {"run_id": "r1", "backend": "vllm", "script": "probe_vllm.py", "bundle": "u/b.tgz", "args": []}
+    blobs = {"u/spec.json": json.dumps(spec).encode(), "u/b.tgz": buf.getvalue()}
+    monkeypatch.setattr(serving, "_fetch", lambda url: blobs[url])
+    (tmp_path / "raw_r1.json").write_text("{}")
+
+    def timed_out(cmd, env, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    out = serving.run({"spec": "u/spec.json"}, tmp_path)
+    assert out["failed"] is True and out["raw"] is None and out["returncode"] is None
+
+
 def test_a_gate_campaign_probes_what_each_gate_reads(pd, monkeypatch, capsys):
     """--gates: per gate, its repo at its kv class, prompt length and release. vLLM gemm is
     pinned to 0.31.0 apart from the 0.30.0 default; the DSA s512 gate reads a 512-token record;

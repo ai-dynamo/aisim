@@ -198,6 +198,16 @@ def test_a_campaign_renders_and_identifies_by_its_system(pd, tmp_path, monkeypat
     assert pd.system_sm("b300_sxm") == "sm103" and pd.system_sm("rtx_pro_6000_server") == "sm120"
 
 
+def test_each_backend_is_probed_at_its_own_default_release(pd, tmp_path, monkeypatch):
+    """Without --version every backend runs at its own default, not at the first backend's."""
+    monkeypatch.setattr(pd, "ROOT", tmp_path)
+    (tmp_path / "dummy_models" / "generic" / "M__rep").mkdir(parents=True)
+    targets = _targets_for("org/M", ["rep"])
+    targets["backends"]["sglang"] = {"default_version": "0.5.9", "versions": ["0.5.9"], "images": {"0.5.9": "img"}}
+    runs = [r for r in pd.enumerate_runs(targets, "h200_sxm", False, ["vllm", "sglang"]) if "skip" not in r]
+    assert {(r["backend"], r["version"]) for r in runs} == {("vllm", "0.29.0"), ("sglang", "0.5.9")}
+
+
 def test_the_representative_cut_is_the_first_variant_unless_overridden(pd, tmp_path, monkeypatch):
     monkeypatch.setattr(pd, "ROOT", tmp_path)
     for v in ("depth8", "depth4"):

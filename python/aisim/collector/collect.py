@@ -6473,6 +6473,8 @@ def main():
         # directory (the pipeline's shard dir). It runs alone; exit 0 marks the shard done.
         if len(args.ops) != 1:
             parser.error(f"a {PROBE_PREFIX}<name> op runs alone")
+        if args.plan_only:  # --plan-only promises that nothing runs; a probe would fetch a bundle and use the GPU
+            parser.error(f"a {PROBE_PREFIX}<name> op has no plan; --plan-only does not apply")
         forced = os.environ.get("AIS_SM") or os.environ.get("AIC_SM")
         if forced:  # a probe plans and runs on this GPU; a forced SM would label it as another
             parser.error(f"AIS_SM/AIC_SM={forced} is a case-inventory override; unset it to run a probe")

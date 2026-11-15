@@ -17,4 +17,4 @@ execution path is proven aligned with serving, producing sane rows.
 The one law: the collector may execute a case or raise — it never silently
 skips, and it never substitutes a backend to keep collecting.
 
-`components/gates.py plan --sm <sm> --family <family>` schedules the family's gates and `gates.py grade --sm <sm> --op <op> --results <job dirs>` exits 0 when they are aligned.
+`components/gates.py plan --sm <sm> --family <family> --serving <campaign dir> --out <dir>` schedules the family's gates and `gates.py grade --sm <sm> --op <op> --results <job dirs>` exits 0 when they are aligned.

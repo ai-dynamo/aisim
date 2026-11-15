@@ -861,6 +861,8 @@ def main() -> int:
             caveats: list[str] = []
             _provision_aux_files(out_dir, repo, args.configs, args.out, edits, caveats)
             _dtp = args.configs / "dsv4_expert_dtypes.json"
+            if not _dtp.exists():  # the tracked table; a workspace copy (a refetch) wins
+                _dtp = Path(__file__).resolve().parents[1] / "configs" / "dsv4_expert_dtypes.json"
             if _dtp.exists():
                 _dt = json.loads(_dtp.read_text()).get(repo)
                 if _dt and _dt.get("dtype"):

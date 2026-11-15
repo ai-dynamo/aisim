@@ -45,6 +45,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     argv = [a.replace("{BUNDLE}", str(bundle)).replace("{OUT}", str(out_dir)) for a in spec["args"]]
     env = {**os.environ, "HF_HUB_OFFLINE": "1", **spec.get("env", {})}
     raw = Path(out_dir) / f"raw_{spec['run_id']}.json"
+    raw.unlink(missing_ok=True)  # an earlier attempt's raw in the same shard dir is not this run's result
     try:
         proc = subprocess.run(
             [sys.executable, str(_PROBES / spec["script"]), *argv],

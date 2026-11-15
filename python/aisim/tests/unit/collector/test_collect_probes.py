@@ -7,6 +7,7 @@ profiler, the collector side of an opharness path gate."""
 import json
 import os
 import re
+import subprocess
 import sys
 import types
 from contextlib import contextmanager
@@ -133,6 +134,23 @@ def test_trace_case_runs_the_planned_row_with_its_perf_file_discarded(monkeypatc
     monkeypatch.setattr(trace_case, "_resolve", lambda backend, op: (entry, broken))
     out = trace_case.run({"backend": "vllm", "op": "gemm", "m": "1"}, tmp_path)
     assert out["failed"] is True and out["error"] == "RuntimeError: bad shape"
+
+
+def test_plan_only_refuses_a_probe_op():
+    """--plan-only promises that nothing runs; a probe has no plan and would fetch its bundle and use the GPU."""
+    pkg = Path(__file__).resolve().parents[3]
+    argv = [
+        "--backend",
+        "vllm",
+        "--ops",
+        "probe.serving",
+        "--plan-only",
+        "--case-filter",
+        "spec=http://share.invalid/s",
+    ]
+    cmd = [sys.executable, str(pkg / "collector" / "collect.py"), *argv]
+    proc = subprocess.run(cmd, cwd=pkg, capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 2 and "--plan-only does not apply" in proc.stderr
 
 
 def test_run_probe_passes_collects_backend(monkeypatch, tmp_path):

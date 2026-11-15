@@ -408,7 +408,7 @@ def enumerate_runs(
                     if vdir is None:
                         runs.append({"skip": why, "repo": ck["repo"], "variant": variant, "backend": backend})
                         continue
-                    for version in versions:
+                    for release in versions:  # not ``version``: the next backend reads the argument again
                         for topo in _topos_for(ck["repo"], backend):
                             # kv-cache dtype is a first-class serving-config axis the collector
                             # sweeps; the golden sglang CLI for fp8 profiles renders no kv dtype,
@@ -417,7 +417,7 @@ def enumerate_runs(
                             for kv in kv_variants.get(backend, [None]):
                                 runs.append(
                                     {
-                                        "id": _run_id(ck, variant, backend, version, topo["tp"], kv, system, isl),
+                                        "id": _run_id(ck, variant, backend, release, topo["tp"], kv, system, isl),
                                         "family": fam_name,
                                         "repo": ck["repo"],
                                         "profile": ck["profile"],
@@ -425,8 +425,8 @@ def enumerate_runs(
                                         "sm": sm,
                                         "variant": variant,
                                         "backend": backend,
-                                        "version": version,
-                                        "image": be["images"][version],
+                                        "version": release,
+                                        "image": be["images"][release],
                                         "tp": topo["tp"],
                                         "kv_dtype": kv,
                                         "isl": isl,
