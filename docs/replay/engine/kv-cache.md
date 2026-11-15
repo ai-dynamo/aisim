@@ -355,7 +355,8 @@ aisim predict --stack engine --config host-offload-prediction.yaml --capture-per
   time adds to TTFT.
 - G1 blocks that are still being copied to G2 are not overwritten.
 - A decode rank with G2 admits requests whose P/D handoff has arrived before
-  other waiting requests, as vLLM's FCFS scheduler does.
+  other waiting requests, as vLLM's FCFS scheduler does. A decode rank with
+  [grouped caches](#other-cache-modes) does the same without G2.
 
 <a id="g2-connector-profiles"></a>
 
@@ -872,12 +873,13 @@ sub-block matching without an explicit full-state scratch count.
 - **Grouped caches.** Some whole-forward (FPM) profiles describe several KV
   groups, such as sliding-window and full attention, sharing one byte budget.
   Replay then allocates each group separately. A `state` group holds a fixed
-  number of blocks for each running request. Grouped caches require aggregated
-  vLLM, no offload, no P/D and default capacity. They run cold with
-  `prefix_caching: false`. No offload means no `host_offload`, `g3_offload` or
-  `kvcr`, with prefix caching on or off. A `sliding_window` group or a `state`
-  group of a grouped cache is not the sliding-window [state cache](#state-cache)
-  whose checkpoints [G2](#host-offload-g2) keeps. See
+  number of blocks for each running request. Grouped caches require vLLM, no
+  offload and default capacity. They run cold with `prefix_caching: false`. No
+  offload means no `host_offload`, `g3_offload` or `kvcr` on an aggregated,
+  prefill or decode rank, with prefix caching on or off. A `sliding_window`
+  group or a `state` group of a grouped cache is not the sliding-window
+  [state cache](#state-cache) whose checkpoints [G2](#host-offload-g2) keeps.
+  See
   [memory accounting](../../perf-model/memory.md).
 
   Grouped caches run with prefix caching on only under these conditions,
@@ -1129,6 +1131,170 @@ sub-block matching without an explicit full-state scratch count.
     [`:1600-1604`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1600-L1604)
     and
     [`block_pool.py:281-284`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py#L281-L284).
+
+  In `mode: disaggregated`, the prefill and decode deployments need equal
+  tensor parallelism and identical cache groups. `engine.backend_version` must
+  be `0.31.0` or `0.32.0`. Grouped P/D is refused for `0.33.0`, with prefix
+  caching on or off, because replay has no transfer rules for that version.
+  Every group must declare `prefix_cacheable` and
+  `transfer_bytes_per_block`. When the runtime memory records
+  `runtime_framework_version`, that version equals the `backend_version`, as
+  for prefix caching. The runtime probe import writes no
+  `transfer_bytes_per_block` and records vLLM 0.33.0 as the version of its
+  evidence, so a profile from the runtime probe cannot run P/D. P/D needs a
+  hand-made profile of vLLM 0.31.0 or 0.32.0 that sets both fields on each
+  group. Set `transfer_bytes_per_block` only from evidence that identifies the
+  bytes of that group for that vLLM version, as
+  [memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
+  describes. So a model with several state groups can run P/D only with such
+  evidence for each of these groups. Their combined transfer size does not
+  give the value of one group. On a prefill or decode rank, the full-attention
+  groups also share one `block_size_tokens`, and native replay refuses the rank
+  otherwise. Grouped P/D refuses a bounded replay window, an attention group
+  with a `sliding_window` and `prefix_cacheable: false`, with prefix caching
+  on or off. Replay does not model its transfer: vLLM 0.32.0 also stops the
+  prefill one token short for it, and vLLM 0.31.0 computes its window again
+  after the load. A ring must be a `state` group with `blocks_per_request: 1`
+  and `prefix_cacheable: false`. For a native pair, replay checks that the prefill and decode
+  roles have identical `kv_cache_groups` and the same `vllm_version`, and
+  it runs the gate of each rank. It does not check equal tensor
+  parallelism, or the version that the profile records. P/D moves whole blocks of
+  full-attention groups, the last blocks of window groups and one block of
+  each state group. The prefill of a model with recurrent state layers stops
+  one token short, and the decode worker recomputes that token. The prefill
+  of a one-token prompt computes that token, and the decode worker computes
+  it again. A `state` group with `prefix_cacheable: true` marks such layers.
+  [KV transfer](kv-transfer.md) gives the transferred bytes.
+
+  As in vLLM, a decode worker makes two tests to reserve a transferred
+  request. Its whole prompt must fit the free capacity. Its transferred blocks
+  must also leave free what the first steps of the other transferred requests
+  in flight still take. A request is in flight from its reservation until its
+  first step allocates. vLLM also keeps free what a local prefill in progress
+  still needs, such as the recompute of a preempted request, but replay does
+  not. For a sliding-window group, vLLM applies its admission cap to what a
+  first step takes, and replay counts every block of that step. The first
+  step of a transferred request of one prompt token on vLLM 0.31.0 with a
+  hash block of 1 token also takes a block for the copy of its loaded state.
+  When two such requests fill the pool, neither can run, and replay stops
+  with the error "offline disagg replay encountered an effect-free
+  zero-duration pass with 2 in-flight requests remaining". vLLM waits there
+  without end.
+
+  A decode worker prices a recompute after a preemption at 0 ms, with or
+  without prefix caching. So a request can preempt itself twice at one time,
+  at the same point of its sequence. Replay then compares the worker at both
+  times: the bytes and the number of blocks in use, the number of cached
+  blocks, the set of cached keys and the number of running requests. If all
+  of them are the same, replay waits for the next event. vLLM repeats that
+  recompute until a transfer finishes.
+
+  Each worker can run prefix caching under the conditions above. A decode
+  worker with prefix caching takes its full-attention hit as the local prefix.
+  vLLM's NIXL connector does the same for a model with recurrent state layers.
+  For a profile without such layers vLLM takes the hit that every group agrees
+  on, and replay still takes the full-attention hit.
+  The hit stops before the last prompt token and ends on a full-attention block
+  boundary. If that hit covers all transferred tokens but not their state, vLLM
+  computes the prompt again from the hit that every group agrees on. Replay
+  computes one token. The decode worker keeps the cached blocks of that hit and
+  takes new blocks for the rest. The other groups get no hit, and their blocks
+  arrive with the transfer.
+
+  The known differences above also apply to prefill and decode workers with
+  prefix caching. A decode worker also differs from vLLM in these ways:
+
+  - Replay caches no output-token blocks, so in a multi-turn run a decode
+    worker's hit can be shorter than in vLLM. This also holds with a state
+    group, because the decode worker's hit reads only the full-attention
+    groups.
+  - vLLM also looks up each other group's own hit. If a state group's own
+    hit is shorter than the full-attention hit and no request holds its
+    cached block, vLLM's admission check counts that block. For
+    GLM-5.3-Flash, vLLM then drops the block without holding it. Replay gives
+    the group no hit and does not count the block. So replay's admission
+    check can need one block less for each such state group. vLLM keeps a
+    sliding-window group's cached hit blocks inside the window. Replay takes
+    new blocks there, so its block count there is equal or higher.
+  - When another group's hit is deeper than the full-attention hit, vLLM
+    falls back to the hit that every group agrees on. That needs a
+    full-attention block that was evicted while the other group's block
+    stayed cached. Replay keeps the full-attention hit, so it can transfer
+    fewer full-attention blocks than vLLM.
+  - A decode worker of vLLM runs its connector in the role `kv_consumer` or
+    `kv_both`. With async scheduling vLLM then defers the free of blocks that
+    a step in flight may still write: it does not preempt a request that the
+    step in flight runs, and it frees a request that is cancelled, or that
+    stops on a stop token while a later step runs it, only after that step
+    ends. See vLLM v0.31.0
+    [`scheduler.py:175-181`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L175-L181),
+    [`:773-775`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L773-L775)
+    and
+    [`:2694-2710`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L2694-L2710),
+    and vLLM v0.32.0
+    [`scheduler.py:186-192`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L186-L192),
+    [`:804-806`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L804-L806)
+    and
+    [`:2759-2775`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2759-L2775).
+    Replay does not model this rule on a grouped decode worker. It can
+    preempt such a request, and it frees a cancelled request at once. A
+    request that ends at its output limit is not run by a later step, so
+    vLLM frees it when it processes the outputs, as replay does. Under the
+    same rule vLLM also holds the copy sources of a hit inside a block until
+    it processes the outputs of the step that took the copy. Replay releases
+    them at the end of the scheduling pass on a decode worker too. See vLLM
+    v0.31.0
+    [`scheduler.py:2712-2721`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L2712-L2721)
+    and vLLM v0.32.0
+    [`scheduler.py:2777-2786`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2777-L2786).
+    vLLM applies the same rule to a prefill worker whose connector runs in
+    the role `kv_both`. vLLM counts `kv_both` as a consumer role. See vLLM
+    v0.31.0
+    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/kv_transfer.py#L11-L12)
+    and vLLM v0.32.0
+    [`kv_transfer.py:11-12`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/kv_transfer.py#L11-L12).
+    Replay does not model the rule on a grouped prefill worker either, and it
+    releases the copy sources there at the end of the scheduling pass too.
+  - Replay tests a waiting transferred request again between two passes: at
+    the end of the forward of a pass, before it schedules the next pass. P/D
+    replay does this for every KV cache type. vLLM tests such a request in
+    the waiting loop of a `schedule()` call that preempted no request, after
+    the running loop, in which each running request first frees the blocks
+    that it skips. See
+    vLLM v0.31.0
+    [`scheduler.py:628-630`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L628-L630),
+    [`:873`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L873)
+    and
+    [`kv_cache_manager.py:552-556`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L552-L556),
+    and vLLM v0.32.0
+    [`scheduler.py:657-659`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L657-L659),
+    [`:900`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L900)
+    and
+    [`kv_cache_manager.py:555-559`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L555-L559).
+    So room that a running request frees inside a pass serves the waiting
+    request one forward pass later than vLLM reserves it. Such room includes,
+    among other blocks, the previous state block, a checkpoint block and the
+    cached block of a hit on a block boundary. With async scheduling vLLM's
+    worker starts the load one batch after the reservation, so the transfer
+    starts at the same time as in replay. With `async_scheduling: false` the
+    transfer starts one forward pass later in replay. See vLLM v0.31.0
+    [`core.py:697`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/core.py#L697),
+    [`:740-755`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/core.py#L740-L755),
+    [`kv_connector_model_runner_mixin.py:77`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/worker/kv_connector_model_runner_mixin.py#L77),
+    [`:83-90`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/worker/kv_connector_model_runner_mixin.py#L83-L90)
+    and
+    [`pull_worker.py:47-51`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L47-L51),
+    and vLLM v0.32.0
+    [`core.py:725`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L725),
+    [`:768-783`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L768-L783),
+    [`kv_connector_model_runner_mixin.py:77`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/kv_connector_model_runner_mixin.py#L77),
+    [`:83-90`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/kv_connector_model_runner_mixin.py#L83-L90)
+    and
+    [`pull_worker.py:47-51`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L47-L51).
+    The difference also goes the other way. Replay tests the waiting request
+    before the running requests of the next pass take their new blocks, and
+    vLLM tests it after them. Replay can then reserve the load one pass before
+    vLLM does and preempt a running request that vLLM keeps.
 
 - **Belady eviction.** The native ReplaySpec field
   `engine.kv_eviction_policy: belady` evicts the block whose next use in the

@@ -239,7 +239,10 @@ the serialized group. The [migration guide](../aic-backward-compatibility/migrat
 says how a session that was imported before them keeps working. Sizing does
 not read them, and aggregated replay with prefix caching off reads neither.
 Grouped prefix caching reads `prefix_cacheable`. Aggregated replay does not
-read `transfer_bytes_per_block`.
+read `transfer_bytes_per_block`. The grouped P/D transfer rules read both
+fields, so a prefill or decode rank refuses a group that leaves either unset.
+So a model with several state groups can run grouped P/D only with evidence
+for the transfer bytes of each of these groups.
 
 - `prefix_cacheable` tells whether vLLM's manager for the group takes part in
   prefix caching. A ring spec (`CircularBufferSpec`) does not, and a uniform
@@ -357,8 +360,8 @@ legacy Rust scalar `KvCacheEstimate` transport reject grouped profiles; use the
 groups and shared byte budget instead. Existing complete linear declarations
 keep their budget calculation and serialized shape.
 
-Grouped native execution supports aggregated vLLM, PP1/CP1, HBM-only cache and
-non-speculative decoding, cold or with prefix caching. Grouped prefix caching
+Grouped native execution supports aggregated and P/D vLLM, PP1/CP1, HBM-only
+cache and non-speculative decoding, cold or with prefix caching. Grouped prefix caching
 follows the rules of vLLM 0.31.0, 0.32.0 and 0.33.0. It needs a profile deployment whose
 `backend_version` is one of these versions, with prefix-caching evidence and
 equal `page_size_bytes` across groups, whose recorded evidence version, when
@@ -367,8 +370,15 @@ only from a vLLM 0.33.0 record and records that version, so the plan of a
 profile from the runtime probe with the label `0.33.0` replays with prefix
 caching when it meets the conditions. [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes)
 gives the case of a profile imported before the version was recorded.
+Grouped P/D follows the transfer rules of vLLM 0.31.0 and 0.32.0 only, so it
+refuses a profile of vLLM 0.33.0. It needs a profile deployment of one of
+these versions whose groups all state
+`prefix_cacheable` and `transfer_bytes_per_block`, and a prefill and a decode
+deployment with equal tensor parallelism and identical cache groups. The probe
+import writes no `transfer_bytes_per_block` and records vLLM 0.33.0, so P/D
+needs a hand-made profile.
 [Replay KV cache](../replay/engine/kv-cache.md#other-cache-modes) lists the conditions. Host/G3
-offload, disaggregation and fixed scalar cache capacity are rejected. With
+offload and fixed scalar cache capacity are rejected. With
 prefix caching off, allocation is atomic across all groups against one shared
 rank-local byte budget. A window
 of `W` keeps the blocks covering the last `W - 1` computed tokens and all tokens
