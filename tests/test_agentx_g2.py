@@ -248,6 +248,93 @@ def test_weka_shared_g2_contract_across_replicas() -> None:
     assert disabled_report["committed_prefill_tokens"] == private_report["committed_prefill_tokens"]
 
 
+def test_shared_g2_capacity_and_cross_role_restores(tmp_path) -> None:
+    config = _config("agentx-g2-shared-pd.yaml")
+    a, f, b, c, d, e = ([base, base + 1, base + 2] for base in (1, 11, 21, 31, 41, 51))
+    # Independent AgentX requests let prefill run ahead of slower decode.
+    # Both prefill replicas store six two-block prefixes in one eight-block
+    # G2, evicting A/F. Their queued returns must miss the host cache.
+    # Decode later republishes B/C after prefill pressure evicts them, so C
+    # can restore on P0 from D1, and B on P1 from D0. Neither reader has the
+    # prefix in G1. Disabling decode offload must remove both host hits.
+    waves = [(0, a), (1, f), (10, b), (11, c), (20, d), (21, e), (110, a), (111, f), (500, c), (501, b)]
+    header = {
+        "schema": "dynamo.agentic_mooncake",
+        "version": 2,
+        "block_size": 4,
+        "hash_id_scope": "local",
+        "source": {"format": "synthetic-test", "digest": "cross-role-pressure"},
+    }
+    requests = [
+        {
+            "request_id": str(index),
+            "play_id": "pressure",
+            "session_id": str(index),
+            "model": "synthetic-model",
+            "input_length": 9,
+            "output_length": 2,
+            "hash_ids": hashes,
+            "not_before_ms": at_ms,
+            "dependencies": [],
+        }
+        for index, (at_ms, hashes) in enumerate(waves)
+    ]
+    path = tmp_path / "cross-role-pressure.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in [header, *requests]) + "\n")
+    config["traffic"]["source"].update(format="agentic_mooncake", paths=[str(path)])
+    config["traffic"]["source"].pop("nested_timestamp_basis")
+    workers = config["engine"]["workers"]
+    # Detach the example's YAML alias before setting role-specific controls.
+    workers["decode"] = copy.deepcopy(workers["decode"])
+    for role, worker in workers.items():
+        worker["parallelism"]["replicas"] = 2
+        worker["kv_cache"]["capacity"]["blocks"] = 7 if role == "prefill" else 3
+        worker["timing"]["decode_ms"] = 100 if role == "decode" else 1
+
+    def run(candidate):
+        report = _run(candidate)
+        assert report["completed_requests"] == len(waves)
+        return report, {int(row["request_id"]): row for row in report["per_request"]}
+
+    shared, rows = run(config)
+    assert [domain["capacity_blocks"] for domain in shared["g2_domains"]] == [8]
+    for index, replica in ((2, 0), (3, 1), (8, 0), (9, 1)):
+        assert [(route["pool"], route["logical_worker_id"]) for route in rows[index]["routing_history"]] == [
+            ("prefill", replica),
+            ("decode", replica),
+        ]
+    for index in (6, 7):
+        assert rows[index]["first_admission_g1_reused_input_tokens"] == 4
+        assert rows[index]["first_admission_host_reused_input_tokens"] == 0
+    for index in (8, 9):
+        assert rows[index]["first_admission_g1_reused_input_tokens"] == 0
+        assert rows[index]["first_admission_host_reused_input_tokens"] == 8
+
+    no_decode = copy.deepcopy(config)
+    no_decode["engine"]["workers"]["decode"]["kv_cache"].pop("host_offload")
+    _, no_decode_rows = run(no_decode)
+    for index in (8, 9):
+        assert no_decode_rows[index]["first_admission_g1_reused_input_tokens"] == 0
+        assert no_decode_rows[index]["first_admission_host_reused_input_tokens"] == 0
+
+    larger, private = copy.deepcopy(config), copy.deepcopy(config)
+    for worker in larger["engine"]["workers"].values():
+        worker["kv_cache"]["host_offload"]["num_host_blocks"] = 16
+    for worker in private["engine"]["workers"].values():
+        worker["kv_cache"]["host_offload"]["scope"] = "dp_rank_local"
+    _, larger_rows = run(larger)
+    _, private_rows = run(private)
+    for control_rows in (larger_rows, private_rows):
+        # Extra capacity, including accidentally private eight-block pools,
+        # retains A/F: this must differ from the shared pool's earlier misses.
+        for index in (6, 7):
+            assert control_rows[index]["first_admission_g1_reused_input_tokens"] == 4
+            assert control_rows[index]["first_admission_host_reused_input_tokens"] == 4
+    for index in (8, 9):
+        assert private_rows[index]["first_admission_g1_reused_input_tokens"] == 0
+        assert private_rows[index]["first_admission_host_reused_input_tokens"] == 0
+
+
 @pytest.mark.parametrize("field,value", [("num_host_blocks", 16), ("shared_h2d_bandwidth_gbps", 2)])
 def test_weka_g2_rejects_inconsistent_shared_pool(field, value) -> None:
     config = _config("agentx-g2-shared-pd.yaml")

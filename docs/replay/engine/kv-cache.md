@@ -672,21 +672,26 @@ aggregated or prefill/decode pools with any positive integer worker count, all
 with `attention_data: 1` and static workers. Without speculation, either G2 scope
 works. Canonical MTP additionally supports a single aggregated worker with local
 G2 and prefix caching, within the [combined scope](#supported) above. Other
-speculation and G3 are not supported. Each worker publishes its G2 residency as
-native `HostPinned` KV events, so a KV-aware placement policy can follow a G2-resident prefix to its
-owner, or to any replica of a `cluster_shared` pool. Snapshot and profile plays
+speculation and G3 are not supported. When the replay composition captures engine
+KV events, each worker publishes its G2 residency as native `HostPinned` events,
+so a KV-aware placement policy can follow a G2-resident prefix to its owner, or
+to any replica of a `cluster_shared` pool. The built-in round-robin composition
+leaves this capture disabled by default. Snapshot and profile plays
 use play-local token identities, so G1 and G2 hits never cross a recycled play.
-`kvcr` is accepted but never pulls, because agentic traffic carries no router
-hint. Results are qualified `functional_only`.
+`kvcr` requires `dp_rank_local` G2 and the other [KVCR constraints](#kvcr-peer-fetch);
+it is rejected with `cluster_shared`. In supported AgentX configurations it
+never pulls, because agentic traffic carries no router hint. Results are
+qualified `functional_only`.
 
 A `cluster_shared` pool under AgentX follows this contract:
 
 - **Ownership and discovery.** The replay deployment owns one pool. Every
   participating rank, across replicas and P/D roles, joins it; the first
   participant fixes layout, capacity, and shared bandwidth, and capacity is
-  counted once in `g2_domains`. A block becomes visible when its D2H store
-  completes, and the pool publishes a `HostPinned` store to every subscribed
-  rank. Pool-wide LRU eviction publishes the matching removal to every rank.
+  counted once in `g2_domains`. A block becomes resident when its D2H store
+  completes. With engine KV-event capture enabled, the pool publishes a
+  `HostPinned` store to every subscribed rank. Pool-wide LRU eviction publishes
+  the matching removal to those subscribers.
 - **Identity.** Conversations of one play share G2 prefixes. Snapshot and
   profile plays use play-local token identities and a distinct `cache_id`, so
   equal source prompts in recycled plays occupy separate entries and never hit
