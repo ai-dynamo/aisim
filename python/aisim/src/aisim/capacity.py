@@ -593,6 +593,10 @@ def estimate_kv_bytes_per_token(
     if kvcache_quant_mode is not None:
         from aisim_core.sdk.common import KVCacheQuantMode
 
+        # V4 is refused above; V4.1's compressed cache has no kv_lora_rank.
+        latent = estimator.geometry.get("kv_lora_rank") or estimator.architecture == "DeepseekV41ForCausalLM"
+        if kvcache_quant_mode == "nvfp4" and latent:
+            raise ValueError(f"{model_name}: an nvfp4 KV cache is modeled only for standard K/V attention")
         try:
             estimator.dtype_bytes = KVCacheQuantMode[kvcache_quant_mode].value.memory
         except KeyError as exc:

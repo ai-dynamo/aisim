@@ -1883,8 +1883,8 @@ def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
         kv_cache_scheme = quant_cfg.get("kv_cache_scheme")
         modelopt = str(quant_cfg.get("quant_method", "")).lower().startswith("modelopt")
         if isinstance(kv_cache_scheme, str) and modelopt:
-            # As vLLM's MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP; other strings stay unset.
-            kv_cache_algo = {"fp8": "fp8", "nvfp4": "nvfp4"}.get(kv_cache_scheme.lower())
+            # ModelOpt writes non-FP8 KV formats as a string; unknown ones fail as unsupported.
+            kv_cache_algo = _normalize_kv_cache_algo(kv_cache_scheme)
         elif isinstance(kv_cache_scheme, dict):
             scheme_type = str(kv_cache_scheme.get("type", "")).lower()
             num_bits = kv_cache_scheme.get("num_bits")

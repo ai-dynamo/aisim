@@ -1612,7 +1612,7 @@ recorded `kv_cache_dtype`. Otherwise, the first matching rule below applies:
 
 | Checkpoint metadata | Inferred KV precision |
 |---|---|
-| `kv_cache_quant_algo` is not missing/null, `fp8`, `nvfp4`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
+| `kv_cache_quant_algo`, or a ModelOpt `kv_cache_scheme` string, is not missing/null, `fp8`, `nvfp4`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
 | DeepSeek V4/V4.1 architecture | FP8 |
 | `kv_cache_quant_algo: fp8`, or ModelOpt `kv_cache_scheme: FP8` | FP8 |
 | `kv_cache_quant_algo: nvfp4`, or ModelOpt `kv_cache_scheme: NVFP4` or a 4-bit float scheme (`quant_method: modelopt`) | NVFP4 |
@@ -1644,8 +1644,9 @@ vLLM's `--kv-cache-dtype nvfp4` and TRT-LLM's `kv_cache_config.dtype: nvfp4`
 store K and V. No attention data is collected at NVFP4 KV yet, so op-level
 timing refuses it at construction in `SILICON`, `HYBRID` and `EMPIRICAL` modes,
 and `estimation_mode: auto` moves on to measured FPM data. `SOL` evaluates the
-speed-of-light bound at the NVFP4 width. vLLM does not accept `nvfp4` for MLA
-latent caches; AISimulate does not check this and applies the same width.
+speed-of-light bound at the NVFP4 width. Models with an MLA latent or compressed
+KV cache (DeepSeek, Kimi K2.5, GLM-5) reject `nvfp4`: vLLM (`nvfp4_ds_mla`) and
+TRT-LLM store FP4 MLA caches in their own layouts, which `nvfp4` does not model.
 
 AFD preserves supported controls, including explicit `attention_backend` and
 `moe_kernel_source`, through prediction, recommendation, saved replay specifications,

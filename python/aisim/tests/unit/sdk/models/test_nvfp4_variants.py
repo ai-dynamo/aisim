@@ -813,3 +813,12 @@ def test_nemotron_super_omni_preserves_backend_and_explicit_moe_modes(backend, e
     _apply_model_quant_defaults(model_config, raw_config, "NemotronH_Omni_Reasoning_V3", backend)
     expected = common.MoEQuantMode.nvfp4 if backend == "vllm" and not explicit else common.MoEQuantMode.w4a16_nvfp4
     assert model_config.moe_quant_mode == expected
+
+
+@pytest.mark.parametrize(
+    "model_path", ["deepseek-ai/DeepSeek-V3", "moonshotai/Kimi-K2.5", "deepseek-ai/DeepSeek-V4.1-Flash"]
+)
+def test_nvfp4_kv_cache_is_rejected_for_latent_caches(model_path):
+    model_config = config.ModelConfig(kvcache_quant_mode=common.KVCacheQuantMode.nvfp4)
+    with pytest.raises(ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"):
+        get_model(model_path, model_config, "vllm")
