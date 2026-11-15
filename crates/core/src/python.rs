@@ -13,6 +13,7 @@ use crate::engine::{
     TimingModelConfig, TimingOperationEvidence, TimingPhaseEvidence, ValidatedTimingPhase,
     VisionShape,
 };
+use crate::memo::{Memo, OnThread};
 use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdTimingConfig};
 use crate::perfmodel::engine::runtime::{
     IterationDispatch, MixedPass, PerOpSlotValue, RankDetail, RankPricing,
@@ -42,27 +43,156 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule};
 use serde::Deserialize;
 
+/// The top-level keys of a payload, read without buffering the document:
+/// every value is skipped unread. The sequence form of a legacy `ReplaySpec`
+/// has no keys.
+struct PayloadKeys {
+    /// How many `spec` keys (also `null` ones) the payload has.
+    specs: usize,
+    /// Whether the payload has a configured key other than `spec`, such as
+    /// `capture_telemetry` or `traffic`.
+    configured: bool,
+}
+
+impl<'de> Deserialize<'de> for PayloadKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeysVisitor(&'static [&'static str]);
+        impl<'de> serde::de::Visitor<'de> for KeysVisitor {
+            type Value = PayloadKeys;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an AISim execution payload")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<PayloadKeys, A::Error> {
+                let mut keys = PayloadKeys {
+                    specs: 0,
+                    configured: false,
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    keys.specs += usize::from(key == "spec");
+                    keys.configured |= key != "spec" && self.0.contains(&key.as_str());
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(keys)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<PayloadKeys, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(PayloadKeys {
+                    specs: 0,
+                    configured: false,
+                })
+            }
+        }
+        deserializer.deserialize_any(KeysVisitor(
+            serde_struct_fields::<ConfiguredExecutionPayload>(),
+        ))
+    }
+}
+
+/// The field names that serde reads for struct `T`, so the configured keys
+/// cannot drift from `ConfiguredExecutionPayload`.
+fn serde_struct_fields<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    struct FieldNames<'a>(&'a mut &'static [&'static str]);
+    impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("field names only"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            self.deserialize_any(visitor)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+    let mut fields: &'static [&'static str] = &[];
+    let _ = T::deserialize(FieldNames(&mut fields));
+    fields
+}
+
+/// Whether any of the repeated `spec` keys holds a replay, which makes the
+/// payload an ambiguous configured envelope rather than legacy metadata.
+/// Only the `spec` values are buffered; the rest is skipped unread.
+struct RepeatedSpecHoldsReplay(bool);
+
+impl<'de> Deserialize<'de> for RepeatedSpecHoldsReplay {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ReplayVisitor;
+        impl<'de> serde::de::Visitor<'de> for ReplayVisitor {
+            type Value = RepeatedSpecHoldsReplay;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an AISim execution payload")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<RepeatedSpecHoldsReplay, A::Error> {
+                let mut holds_replay = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "spec" {
+                        let value = map.next_value::<serde_json::Value>()?;
+                        holds_replay |= serde_json::from_value::<ReplaySpec>(value).is_ok();
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(RepeatedSpecHoldsReplay(holds_replay))
+            }
+        }
+        deserializer.deserialize_map(ReplayVisitor)
+    }
+}
+
+/// Parses only the `spec` key of a payload, to tell whether it holds a replay.
+#[derive(Deserialize)]
+struct ConfiguredSpecOnly {
+    #[allow(dead_code)]
+    spec: ReplaySpec,
+}
+
+/// The configured execution payload. It is parsed directly, not through an
+/// untagged enum, so a malformed field reports its own error.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ExecutionPayload {
-    Configured {
-        spec: ReplaySpec,
-        #[serde(default)]
-        traffic: Option<Box<RuntimeTraffic>>,
-        #[serde(default)]
-        capture_performance_diagnostics: bool,
-        #[serde(default)]
-        capture_telemetry: bool,
-        #[serde(default = "default_telemetry_sample_interval_ms")]
-        telemetry_sample_interval_ms: f64,
-        #[serde(default)]
-        determinism: ReplayDeterminism,
-        #[serde(default)]
-        tokenization: Option<TokenizationPayload>,
-        #[serde(default)]
-        detokenization: Option<DetokenizationPayload>,
-    },
-    Legacy(ReplaySpec),
+struct ConfiguredExecutionPayload {
+    spec: ReplaySpec,
+    #[serde(default)]
+    traffic: Option<Box<RuntimeTraffic>>,
+    #[serde(default)]
+    capture_performance_diagnostics: bool,
+    #[serde(default)]
+    capture_telemetry: bool,
+    #[serde(default = "default_telemetry_sample_interval_ms")]
+    telemetry_sample_interval_ms: f64,
+    #[serde(default)]
+    determinism: ReplayDeterminism,
+    #[serde(default)]
+    tokenization: Option<TokenizationPayload>,
+    #[serde(default)]
+    detokenization: Option<DetokenizationPayload>,
 }
 
 fn default_telemetry_sample_interval_ms() -> f64 {
@@ -261,26 +391,8 @@ fn validate_public_agentic_engine(
         .iter()
         .any(|role| role.rank.native_host_offload.is_some())
     {
-        let qualified_workers = match &spec.topology {
-            // Each aggregated worker owns a private G2, and the warm-up
-            // barrier waits on every worker's G2 work. A shared pool and P/D
-            // keep one worker per role.
-            ReplayTopology::Aggregated { workers } => {
-                workers.initial_workers == 1
-                    || roles[0]
-                        .rank
-                        .native_host_offload
-                        .as_ref()
-                        .is_some_and(|host| host.scope == crate::engine::G2Scope::DpRankLocal)
-            }
-            ReplayTopology::Disaggregated {
-                prefill, decode, ..
-            } => prefill.initial_workers == 1 && decode.initial_workers == 1,
-        };
-        ensure!(
-            qualified_workers,
-            "agentic host offload requires one aggregated worker or one prefill and one decode worker, or static aggregated workers with scope=dp_rank_local"
-        );
+        // Without speculation, placement consumes each worker's native
+        // G2 KV events, and per-play token namespaces keep G2 identities play-local.
         ensure!(
             spec.adapters.scaling.provider == "none",
             "agentic host offload requires static worker pools without a scaling policy"
@@ -288,7 +400,7 @@ fn validate_public_agentic_engine(
         for role in &roles {
             ensure!(
                 role.rank.aic_nextn.is_none()
-                    || (matches!(&spec.topology, ReplayTopology::Aggregated { .. })
+                    || (matches!(&spec.topology, ReplayTopology::Aggregated { workers } if workers.initial_workers == 1)
                         && role.rank.has_canonical_mtp_timing()),
                 "agentic host offload requires speculative decoding disabled except canonical MTP on an aggregated worker"
             );
@@ -534,7 +646,7 @@ impl AicTimingConfig {
                     speculation.kind
                 ),
             }
-            return Ok(crate::py::speculation_replay_depth(speculation)?);
+            return Ok(speculation.replay_depth()?);
         }
         Ok(self.nextn)
     }
@@ -695,20 +807,20 @@ struct IterationPricing {
     /// when every name belongs to one pass. Attributes a mixed rank's
     /// operations to prefill and decode evidence.
     mix_step_passes: Option<std::collections::HashMap<String, MixedPass>>,
-    /// Priced iterations keyed by the complete ordered rank list. Absent while
-    /// the model collects lookup coverage, which counts every invocation, and
-    /// when the estimator reads per-request detail the key does not hold.
-    cache: Option<quick_cache::sync::Cache<IterationKey, Arc<PricedIteration>>>,
+    /// Priced iterations keyed by the complete ordered rank list. Diagnostics
+    /// capture is fixed when the model is built, so the key leaves it out, as
+    /// the phase memo's does. Absent while the model collects lookup coverage,
+    /// which counts every invocation, and when the estimator reads
+    /// per-request detail the key does not hold.
+    memo: Option<Memo<IterationKey, Arc<PricedIteration>>>,
     /// How a mixed operation-graph rank's operations split into prefill and
     /// decode evidence, per operation-name list the model reports.
     mixed_splits: Mutex<Vec<Arc<MixedSplit>>>,
-    /// Each working operation-graph rank's evidence before correction, by
-    /// its query and whether diagnostics are captured.
-    rank_evidence: quick_cache::sync::Cache<(RankQuery, bool), Arc<RankEvidence>>,
 }
 
 /// One working rank's operation evidence before correction, each part with
 /// whether it is prefill: one part for a pure rank, up to two for a mixed one.
+/// The rank's memo entry keeps it ([`AicTimingModel::native_rank_evidence`]).
 type RankEvidence = Vec<(Arc<ValidatedTimingPhase>, bool)>;
 
 /// The prefill and decode parts of a mixed operation-graph rank with the
@@ -808,12 +920,11 @@ impl IterationPricing {
             model: Arc::clone(model),
             query: IterationQuery::Native(dispatch),
             mix_step_passes: native.mix_step_passes(),
-            cache: model
+            memo: model
                 .fpm_query_coverage()?
                 .is_none()
-                .then(|| quick_cache::sync::Cache::new(256)),
+                .then(|| Memo::clock(256)),
             mixed_splits: Mutex::default(),
-            rank_evidence: quick_cache::sync::Cache::new(1024),
         }))
     }
 
@@ -835,6 +946,7 @@ impl IterationPricing {
 }
 
 /// One priced group iteration and the evidence each invocation records.
+#[derive(Debug)]
 struct PricedIteration {
     total_ms: f64,
     /// The detailed whole-model FPM estimate, when diagnostics are captured.
@@ -864,7 +976,7 @@ struct AicTimingModel {
     /// Capture-only history of group iterations priced as one forward.
     fpm_iteration_evidence:
         Mutex<std::collections::BTreeMap<FpmIterationKey, crate::FpmEstimateEvidence>>,
-    phase_cache: quick_cache::sync::Cache<PhaseEvidenceKey, Arc<ValidatedTimingPhase>>,
+    phase_memo: Memo<PhaseEvidenceKey, Arc<ValidatedTimingPhase>>,
     /// Present when the rank hosts the vision tower.
     vision: Option<VisionTimer>,
     /// `None` keeps the per-rank phase pricing for every pass.
@@ -876,7 +988,7 @@ struct AicTimingModel {
 /// replay drops when no evidence capture was requested.
 struct VisionTimer {
     model: Arc<ForwardPassPerfModel>,
-    cache: quick_cache::sync::Cache<VisionShape, Arc<ValidatedTimingPhase>>,
+    memo: Memo<VisionShape, Arc<ValidatedTimingPhase>>,
 }
 
 impl AicTimingModel {
@@ -962,7 +1074,7 @@ impl AicTimingModel {
         }
         let vision = vision.then(|| VisionTimer {
             model: Arc::clone(&model),
-            cache: quick_cache::sync::Cache::new(64),
+            memo: Memo::clock(64),
         });
         let phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
         let iteration = IterationPricing::for_replay(
@@ -993,7 +1105,7 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_cache: quick_cache::sync::Cache::new(128),
+            phase_memo: Memo::clock(128),
             vision,
             iteration,
         })
@@ -1068,10 +1180,9 @@ impl AicTimingModel {
             model: Arc::clone(&model),
             query: IterationQuery::Fitted { detail },
             mix_step_passes: None,
-            cache: (!detail).then(|| quick_cache::sync::Cache::new(256)),
+            memo: (!detail).then(|| Memo::clock(256)),
             // Fitted estimators report no operation evidence.
             mixed_splits: Mutex::default(),
-            rank_evidence: quick_cache::sync::Cache::new(1),
         };
         Ok(Self {
             engine: Python::with_gil(|py| py.None()),
@@ -1085,7 +1196,7 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_cache: quick_cache::sync::Cache::new(1),
+            phase_memo: Memo::clock(1),
             vision: None,
             iteration: Some(iteration),
         })
@@ -1112,27 +1223,24 @@ impl AicTimingModel {
             .vision
             .as_ref()
             .context("this rank does not host the vision encoder")?;
-        if let Some(phase) = timer.cache.get(&shape) {
-            return Ok(phase);
-        }
-        let entries = timer
-            .model
-            .vision_operations(&[crate::EncoderImageShape {
-                sequences: shape.encoder.sequences,
-                patch_tokens: shape.encoder.patch_tokens,
-                transformer_tokens: shape.encoder.transformer_tokens,
-                output_tokens: shape.encoder.output_tokens,
-                images: shape.count,
-            }])
-            .map_err(|error| anyhow!("AIC vision evaluation failed: {error}"))?;
-        ensure!(
-            !entries.is_empty(),
-            "AIC vision encoder returned no operation evidence for {} image(s)",
-            shape.count
-        );
-        let phase = Arc::new(phase_evidence_from_native_entries(entries)?);
-        timer.cache.insert(shape, Arc::clone(&phase));
-        Ok(phase)
+        timer.memo.get_or_price(&OnThread, shape, || {
+            let entries = timer
+                .model
+                .vision_operations(&[crate::EncoderImageShape {
+                    sequences: shape.encoder.sequences,
+                    patch_tokens: shape.encoder.patch_tokens,
+                    transformer_tokens: shape.encoder.transformer_tokens,
+                    output_tokens: shape.encoder.output_tokens,
+                    images: shape.count,
+                }])
+                .map_err(|error| anyhow!("AIC vision evaluation failed: {error}"))?;
+            ensure!(
+                !entries.is_empty(),
+                "AIC vision encoder returned no operation evidence for {} image(s)",
+                shape.count
+            );
+            Ok(Arc::new(phase_evidence_from_native_entries(entries)?))
+        })
     }
 
     fn predict_phase_evidence(
@@ -1149,10 +1257,23 @@ impl AicTimingModel {
                 std::sync::OnceLock::new();
             return Ok(Arc::clone(EMPTY.get_or_init(Default::default)));
         }
-        let key = (batch_size, isl, osl, prefix, prefill);
-        if let Some(phase) = self.phase_cache.get(&key) {
-            return Ok(phase);
-        }
+        self.phase_memo
+            .get_or_price(&OnThread, (batch_size, isl, osl, prefix, prefill), || {
+                self.phase_evidence_uncached(batch_size, isl, osl, prefix, mode, prefill)
+                    .map(Arc::new)
+            })
+    }
+
+    /// [`Self::predict_phase_evidence`] of nonzero work, priced by the model.
+    fn phase_evidence_uncached(
+        &self,
+        batch_size: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        mode: &str,
+        prefill: bool,
+    ) -> Result<ValidatedTimingPhase> {
         if let Some(model) = &self.diagnostic_model {
             let entries = model.static_phase_diagnostics(batch_size, isl, prefix, prefill)?;
             ensure!(
@@ -1173,13 +1294,9 @@ impl AicTimingModel {
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Diagnostics are name-folded in first-encounter order.
-            let phase = Arc::new(ValidatedTimingPhase::from_name_folded_operations(
-                operations,
-            )?);
-            self.phase_cache.insert(key, Arc::clone(&phase));
-            return Ok(phase);
+            return ValidatedTimingPhase::from_name_folded_operations(operations);
         }
-        let phase = match &self.phase_provider {
+        Ok(match &self.phase_provider {
             AicPhaseProvider::Fitted => {
                 return Err(anyhow!(
                     "a regression or learned estimator has no {mode} operation evidence"
@@ -1233,10 +1350,7 @@ impl AicTimingModel {
                 );
                 phase_evidence_from_entries(entries)?
             }
-        };
-        let phase = Arc::new(phase);
-        self.phase_cache.insert(key, Arc::clone(&phase));
-        Ok(phase)
+        })
     }
 
     #[cfg(test)]
@@ -1816,7 +1930,8 @@ impl AicTimingModel {
     /// operations and values form the same phase evidence; values form it
     /// under name lists that every rank with the same operations shares, a
     /// pure rank's or each part of a mixed rank's. A rank's evidence before
-    /// correction depends only on its query, so it is built once per query.
+    /// correction depends only on its pricing and query, so it is built once
+    /// per rank-memo entry and returned with every hit.
     fn native_rank_evidence(
         &self,
         pricing: &IterationPricing,
@@ -1834,19 +1949,14 @@ impl AicTimingModel {
             let Some(kind) = IterationKind::of(query) else {
                 continue;
             };
-            let key = (*query, capture);
-            let parts = match pricing.rank_evidence.get(&key) {
-                Some(parts) => parts,
-                None => {
-                    let parts = Arc::new(if capture {
-                        self.rank_diagnostics_parts(pricing, index, kind, query, rank)?
-                    } else {
-                        Self::rank_value_parts(pricing, index, kind, query, rank)?
-                    });
-                    pricing.rank_evidence.insert(key, Arc::clone(&parts));
-                    parts
+            // The memo keys `rank` by this query and the detail `capture` selects.
+            let parts = rank.derived(|rank| -> Result<RankEvidence> {
+                if capture {
+                    self.rank_diagnostics_parts(pricing, index, kind, query, rank)
+                } else {
+                    Self::rank_value_parts(pricing, index, kind, query, rank)
                 }
-            };
+            })?;
             for (phase, prefill) in parts.iter() {
                 evidence.push((
                     Self::corrected_phase(Arc::clone(phase), correction)?,
@@ -2248,30 +2358,20 @@ impl TimingModel for AicTimingModel {
             _ => {}
         }
         let capture = self.diagnostic_model.is_some();
-        let whole_model = matches!(
-            pricing.query,
-            IterationQuery::Native(IterationDispatch::WholeModel { .. })
-        );
-        let cached = pricing
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.get(&queries))
-            .filter(|priced| !(capture && whole_model && priced.estimate.is_none()));
-        let (priced, hit) = match cached {
-            Some(priced) => (priced, true),
-            None => (
-                Arc::new(self.price_iteration(pricing, &queries, ranks, capture)?),
-                false,
-            ),
+        let price = || {
+            self.price_iteration(pricing, &queries, ranks, capture)
+                .map(Arc::new)
+        };
+        let priced = match &pricing.memo {
+            Some(memo) => {
+                memo.get_or_price_by(&OnThread, queries.as_slice(), <[RankQuery]>::to_vec, price)?
+            }
+            None => price()?,
         };
         self.record_iteration(&priced, &queries)?;
-        let iteration = IterationMs {
+        Ok(Some(IterationMs {
             total_ms: priced.total_ms,
-        };
-        if let Some(cache) = pricing.cache.as_ref().filter(|_| !hit) {
-            cache.insert(queries, priced);
-        }
-        Ok(Some(iteration))
+        }))
     }
 
     fn predict_vision_ms(&self, shapes: &[VisionShape]) -> Result<Option<f64>> {
@@ -2838,14 +2938,15 @@ fn materialize_aic_capacity(
     capacity_is_explicit: bool,
     estimate: impl FnOnce(&AicTimingConfig, &ReplayRoleConfig) -> Result<usize>,
 ) -> Result<()> {
-    ensure!(
-        capacity_is_explicit
-            || config
-                .speculation
-                .as_ref()
-                .is_none_or(|spec| matches!(spec.kind.as_str(), "none" | "ngram")),
-        "speculative replay requires explicit num_gpu_blocks including draft memory"
-    );
+    if let Some(speculation) = &config.speculation
+        && let Some(message) = crate::engine::speculation::speculative_capacity_mismatch(
+            &speculation.kind,
+            capacity_is_explicit,
+            role.rank.num_gpu_blocks,
+        )
+    {
+        anyhow::bail!(message);
+    }
     config.validate_parallel_shape()?;
     let engine_backend = match role.rank.backend {
         Backend::Vllm => "vllm",
@@ -3110,6 +3211,9 @@ fn timing_provenance(timing: &TimingModelConfig) -> serde_json::Value {
                 "estimator": estimator,
                 "timing_source": provider,
                 "data_version": data_version,
+                "database_mode": matches!(estimator, Some("op_level" | "fpm_interpolation"))
+                    .then(|| config.get("database_mode").cloned())
+                    .flatten(),
                 "data_identity": data_identity,
                 "data_version_unavailable_reason": data_version.is_none().then_some(
                     "selected estimator does not expose a data version"
@@ -3134,19 +3238,6 @@ fn timing_provenance(timing: &TimingModelConfig) -> serde_json::Value {
             })
         }
     }
-}
-
-/// vLLM turns async scheduling off by default for prompt-lookup (ngram)
-/// drafts and rejects an explicit request for it.
-fn resolve_ngram_async_scheduling(rank: &mut EngineConfig, speculation_kind: &str) -> Result<()> {
-    if speculation_kind == "ngram" && rank.backend == Backend::Vllm {
-        ensure!(
-            rank.async_scheduling != Some(true),
-            "vLLM does not support async scheduling with ngram speculative decoding"
-        );
-        rank.async_scheduling = Some(false);
-    }
-    Ok(())
 }
 
 /// Normalize old provider payloads at the boundary. Rank identity is authoritative;
@@ -3395,23 +3486,13 @@ fn resolve_role_timing(
         require_unit_decode_speedup(&pricing.model, role.rank.decode_speedup_ratio)?;
     }
     if let Some(speculation) = &config.speculation {
-        ensure!(
-            speculation.kind == "ngram"
-                || role
-                    .rank
-                    .aic_nextn_accept_rates
-                    .as_deref()
-                    .is_some_and(|rates| !rates.trim().is_empty()),
-            "generic speculative replay requires explicit aic_nextn_accept_rates; \
-             configure expected_accepted_tokens in engine.speculation"
-        );
-        let depth = config.speculative_depth()? as usize;
-        ensure!(
-            role.rank.aic_nextn.is_none_or(|value| value == depth),
-            "aic_nextn conflicts with resolved speculative depth {depth}"
-        );
-        role.rank.aic_nextn = (depth > 0).then_some(depth);
-        resolve_ngram_async_scheduling(&mut role.rank, &speculation.kind)?;
+        crate::engine::speculation::resolve_speculative_role(
+            &mut role.rank,
+            &speculation.kind,
+            &config.backend,
+            config.speculative_depth()?,
+            capacity_is_explicit,
+        )?;
     }
     if let Some(model) = &timing.fpm_model
         && model.fpm_query_coverage()?.is_some()
@@ -4711,35 +4792,82 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
         determinism,
         serving_path,
         telemetry_sample_interval_ms,
-    ) = match serde_json::from_str(payload).context("invalid AISim execution ReplaySpec")? {
-        ExecutionPayload::Configured {
-            spec,
-            traffic,
-            capture_performance_diagnostics,
-            capture_telemetry,
-            telemetry_sample_interval_ms,
-            determinism,
-            tokenization,
-            detokenization,
-        } => (
-            spec,
-            traffic.map(|t| *t),
-            capture_performance_diagnostics,
-            determinism,
-            ServingPath {
-                tokenization,
-                detokenization,
-            },
-            capture_telemetry.then_some(telemetry_sample_interval_ms),
-        ),
-        ExecutionPayload::Legacy(spec) => (
-            spec,
-            None,
-            false,
-            ReplayDeterminism::default(),
-            ServingPath::default(),
-            None,
-        ),
+    ) = {
+        let legacy = |spec: ReplaySpec| {
+            (
+                spec,
+                None,
+                false,
+                ReplayDeterminism::default(),
+                ServingPath::default(),
+                None,
+            )
+        };
+        let keys = serde_json::from_str::<PayloadKeys>(payload)
+            .context("invalid AISim execution payload")?;
+        // Repeated `spec` keys are legacy metadata only when none holds a
+        // replay; otherwise the configured envelope is ambiguous. A probe
+        // error (for example, too deep to buffer) counts as ambiguous.
+        ensure!(
+            keys.specs < 2
+                || matches!(
+                    serde_json::from_str::<RepeatedSpecHoldsReplay>(payload),
+                    Ok(RepeatedSpecHoldsReplay(false))
+                ),
+            "invalid AISim execution payload: duplicate field `spec`"
+        );
+        // A configured key makes the payload a configured one: a bare
+        // ReplaySpec would drop that setting without a word.
+        if keys.specs != 1 && !keys.configured {
+            let parsed = serde_json::from_str::<ReplaySpec>(payload);
+            // Repeated `spec` keys mark a configured payload, so report its
+            // field error rather than the legacy ReplaySpec one.
+            if keys.specs >= 2
+                && parsed.is_err()
+                && let Err(error) = serde_json::from_str::<ConfiguredExecutionPayload>(payload)
+            {
+                return Err(error).context("invalid AISim execution payload");
+            }
+            legacy(parsed.context("invalid AISim execution ReplaySpec")?)
+        } else {
+            match serde_json::from_str::<ConfiguredExecutionPayload>(payload) {
+                Ok(ConfiguredExecutionPayload {
+                    spec,
+                    traffic,
+                    capture_performance_diagnostics,
+                    capture_telemetry,
+                    telemetry_sample_interval_ms,
+                    determinism,
+                    tokenization,
+                    detokenization,
+                }) => (
+                    spec,
+                    traffic.map(|t| *t),
+                    capture_performance_diagnostics,
+                    determinism,
+                    ServingPath {
+                        tokenization,
+                        detokenization,
+                    },
+                    capture_telemetry.then_some(telemetry_sample_interval_ms),
+                ),
+                // A bare ReplaySpec ignores unknown keys, so it may carry its
+                // own `spec` key. Fall back to it only when `spec` holds no
+                // replay and no configured key is present: otherwise the
+                // payload is a configured one, and its field error must not
+                // run the top-level replay instead.
+                Err(error) => {
+                    if !keys.configured
+                        && serde_json::from_str::<ConfiguredSpecOnly>(payload).is_err()
+                        && let Ok(spec) = serde_json::from_str::<ReplaySpec>(payload)
+                    {
+                        legacy(spec)
+                    } else {
+                        return Err(error).context("invalid AISim execution payload");
+                    }
+                }
+            }
+        }
     };
     if let Some(interval_ms) = telemetry_sample_interval_ms {
         ensure!(
@@ -5300,7 +5428,11 @@ fn engine_launch_from_replay_role_json(
     startup_time: Option<f64>,
 ) -> PyResult<String> {
     let convert = || -> anyhow::Result<String> {
-        let role: crate::replay::ReplayRoleConfig = serde_json::from_str(payload)?;
+        let value: serde_json::Value = serde_json::from_str(payload)?;
+        let depth_is_omitted = value
+            .pointer("/rank/aic_nextn")
+            .is_none_or(serde_json::Value::is_null);
+        let role: crate::replay::ReplayRoleConfig = serde_json::from_value(value)?;
         let mut launch = crate::engine::EngineLaunchConfig {
             engine: role.rank,
             dp_size: role.dp_size,
@@ -5324,6 +5456,9 @@ fn engine_launch_from_replay_role_json(
                 provider: "ais".into(),
                 config: serde_json::to_value(canonical)?,
             };
+        }
+        if depth_is_omitted {
+            launch.derive_speculative_depth()?;
         }
         Ok(serde_json::to_string(&launch.normalized()?)?)
     };
@@ -5390,6 +5525,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn timing_provenance_reports_the_database_mode_only_for_database_estimators() {
+        let external = |estimation_mode: &str| TimingModelConfig::External {
+            provider: "aic".into(),
+            config: serde_json::json!({
+                "estimation_mode": estimation_mode,
+                "backend_version": "0.24.0",
+                "database_mode": "HYBRID",
+            }),
+        };
+        let op_level = timing_provenance(&external("op_level"));
+        assert_eq!(op_level["estimator"], "op_level");
+        assert_eq!(op_level["data_version"], "0.24.0");
+        assert_eq!(op_level["database_mode"], "HYBRID");
+        // The resolved request always carries a database mode; a whole-forward
+        // estimator uses no database, so its provenance reports none.
+        let regression = timing_provenance(&external("fpm_regression"));
+        assert_eq!(regression["estimator"], "fpm_regression");
+        assert!(regression["data_version"].is_null());
+        assert!(regression["database_mode"].is_null());
+        let fixed = timing_provenance(&TimingModelConfig::Fixed {
+            prefill_ms: 1.0,
+            decode_ms: 1.0,
+        });
+        assert_eq!(fixed["estimator"], "fixed");
+        assert!(fixed.get("database_mode").is_none());
+    }
 
     #[test]
     fn replay_coverage_errors_preserve_the_original_chain() {
@@ -6018,17 +6181,16 @@ mod tests {
                 if scope.is_none() && other.is_none() {
                     continue;
                 }
+                let mut multi_replica = pd.clone();
+                for pointer in [
+                    "/spec/topology/prefill/initial_workers",
+                    "/spec/topology/decode/initial_workers",
+                ] {
+                    *multi_replica.pointer_mut(pointer).unwrap() = serde_json::json!(2);
+                }
+                let report = run(&multi_replica);
+                assert_eq!(report["completed_requests"], 1, "{scope:?}/{other:?}");
                 for (pointer, value, message) in [
-                    (
-                        "/spec/topology/prefill/initial_workers",
-                        serde_json::json!(2),
-                        "one aggregated worker or one prefill and one decode worker",
-                    ),
-                    (
-                        "/spec/topology/decode/initial_workers",
-                        serde_json::json!(2),
-                        "one aggregated worker or one prefill and one decode worker",
-                    ),
                     ("/spec/engine/prefill/dp_size", serde_json::json!(2), "DP=1"),
                     ("/spec/engine/decode/dp_size", serde_json::json!(2), "DP=1"),
                     (
@@ -6708,7 +6870,7 @@ mod tests {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_cache: quick_cache::sync::Cache::new(128),
+            phase_memo: Memo::clock(128),
             vision: None,
             iteration: None,
         }
@@ -6826,7 +6988,7 @@ mod tests {
             } else {
                 (batch as u32, length as u32 - 1, 2, 0, false)
             };
-            let cached = native.phase_cache.get(&key);
+            let cached = native.phase_memo.peek(&key).map(|(phase, _)| phase);
             let predict = |timing: &AicTimingModel| {
                 if prefill {
                     timing.predict_prefill_ms(batch, length, prefix)
@@ -6837,7 +6999,10 @@ mod tests {
             };
             assert_eq!(predict(&native).to_bits(), predict(&bridge).to_bits());
             if let Some(cached) = cached {
-                assert!(Arc::ptr_eq(&cached, &native.phase_cache.get(&key).unwrap()));
+                assert!(Arc::ptr_eq(
+                    &cached,
+                    &native.phase_memo.peek(&key).unwrap().0
+                ));
             }
             let actual = native.evidence_summary().unwrap();
             let expected = bridge.evidence_summary().unwrap();
@@ -7666,7 +7831,7 @@ mod tests {
                 AicTimingModel::build(&mut config, ForwardPassWorkerType::Decode, false).unwrap();
             let pricing = timing.iteration.as_ref().unwrap();
             assert_eq!(pricing.query, IterationQuery::Fitted { detail: true });
-            assert!(pricing.cache.is_none());
+            assert!(pricing.memo.is_none());
             for i in [3, 8, 21] {
                 let rank = ranks(i);
                 let query = AicTimingModel::fitted_rank_query(&rank).unwrap();
@@ -8250,18 +8415,73 @@ mod tests {
     }
 
     #[test]
-    fn ngram_drafts_turn_vllm_async_scheduling_off() {
-        let mut rank = EngineConfig::default();
-        resolve_ngram_async_scheduling(&mut rank, "mtp").unwrap();
-        assert_eq!(rank.async_scheduling, None);
-        resolve_ngram_async_scheduling(&mut rank, "ngram").unwrap();
-        assert_eq!(rank.async_scheduling, Some(false));
-        rank.async_scheduling = Some(true);
-        let error = resolve_ngram_async_scheduling(&mut rank, "ngram").unwrap_err();
-        assert!(error.to_string().contains("async scheduling"), "{error}");
-        let mut sglang = EngineConfig::for_backend(Backend::Sglang);
-        resolve_ngram_async_scheduling(&mut sglang, "ngram").unwrap();
-        assert_eq!(sglang.async_scheduling, None);
+    fn native_ngram_role_derives_missing_or_null_depth_and_default_acceptance() {
+        pyo3::prepare_freethreaded_python();
+        if let Err(error) = Python::with_gil(|py| py.import("aisim_core.sdk.engine").map(|_| ())) {
+            assert!(
+                std::env::var_os("AIC_REQUIRE_EMBEDDED_ROUND_TRIP").is_none(),
+                "embedded SDK is required: {error}"
+            );
+            eprintln!("native_ngram_role: SKIP — embedded SDK is not importable: {error}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "num_hidden_layers": 4, "hidden_size": 2048,
+                "intermediate_size": 5632, "num_attention_heads": 16,
+                "num_key_value_heads": 4, "head_dim": 128,
+                "vocab_size": 32000, "max_position_embeddings": 2048
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for depth in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(3)),
+        ] {
+            let mut value = serde_json::json!({
+                "rank": {
+                    "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
+                    "timing_model": {"type": "external", "provider": "aic", "config": {
+                        "model": dir.path(), "system": "h200_sxm", "backend": "vllm",
+                        "backend_version": "0.24.0", "estimation_mode": "op_level",
+                        "speculation": {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
+                    }}
+                }
+            });
+            if let Some(depth) = depth {
+                value["rank"]["aic_nextn"] = depth;
+            }
+            let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
+            assert!(
+                resolve_role_timing(
+                    &mut role,
+                    true,
+                    ForwardPassWorkerType::Aggregated,
+                    None,
+                    false,
+                    &mut Vec::new(),
+                    &mut serde_json::Map::new(),
+                )
+                .unwrap()
+                .0
+                .is_some()
+            );
+            assert_eq!(role.rank.aic_nextn, Some(3));
+            assert_eq!(role.rank.async_scheduling, Some(false));
+            assert_eq!(
+                crate::engine::normalize_conditional_accept_rates(
+                    3,
+                    role.rank.aic_nextn_accept_rates.as_deref(),
+                )
+                .unwrap(),
+                [0.85, 0.3, 0.0],
+            );
+        }
     }
 
     #[test]
@@ -8366,7 +8586,7 @@ mod tests {
             materialize_aic_capacity(&config, &mut role, false, |_, _| unreachable!())
                 .unwrap_err()
                 .to_string()
-                .contains("explicit num_gpu_blocks")
+                .contains("explicitly configured positive num_gpu_blocks")
         );
         role.rank.aic_nextn = Some(3);
         materialize_aic_capacity(&config, &mut role, true, |_, _| unreachable!()).unwrap();
@@ -9566,6 +9786,10 @@ mod tests {
                 if capture {
                     phase.diagnostic_model = Some(Arc::clone(&model));
                     iteration.diagnostic_model = Some(Arc::clone(&model));
+                    // Replay fixes capture at construction, so the memo does
+                    // not key on it.
+                    let pricing = iteration.iteration.as_ref().unwrap();
+                    pricing.memo.as_ref().unwrap().clear();
                 }
                 let expected = phase.predict_prefill_totals_ms(batch, new, prefix).unwrap();
                 let actual = iteration_ms(&iteration, &[prefill_work(0, batch, new, prefix)]);
@@ -9767,7 +9991,7 @@ mod tests {
                 .iteration
                 .as_ref()
                 .unwrap()
-                .cache
+                .memo
                 .as_ref()
                 .unwrap()
                 .len()
@@ -9989,9 +10213,9 @@ mod tests {
             // Replay fixes capture at construction; each mode prices and
             // caches its own evidence.
             timing.diagnostic_model = capture.then(|| Arc::clone(&model));
-            timing.phase_cache.clear();
+            timing.phase_memo.clear();
             let pricing = timing.iteration.as_ref().unwrap();
-            pricing.cache.as_ref().unwrap().clear();
+            pricing.memo.as_ref().unwrap().clear();
             let timing = &timing;
             // Pure passes whose per-request means divide exactly: the
             // canonical query prices the same static phase, and the rank's
@@ -10258,7 +10482,7 @@ mod tests {
             .collect();
         tuned.tune_with_fpms(&iterations).unwrap();
         let model = Arc::clone(&pricing.model);
-        pricing.cache.as_ref().unwrap().clear();
+        pricing.memo.as_ref().unwrap().clear();
         timing.corrections = Some(Arc::clone(&model));
         let factor = |query: [u32; 5]| {
             model
@@ -10386,7 +10610,7 @@ mod tests {
             .collect();
         tuned.tune_with_fpms(&iterations).unwrap();
         let model = Arc::clone(&pricing.model);
-        pricing.cache.as_ref().unwrap().clear();
+        pricing.memo.as_ref().unwrap().clear();
         assert!(model.corrects_native_estimates());
         timing.corrections = Some(Arc::clone(&model));
 
@@ -10451,7 +10675,9 @@ mod tests {
             )
         };
         // DP=3 passes mixing pure, mixed and idle ranks, each priced twice so
-        // that cached iterations and rank evidence are recorded too.
+        // that cached iterations are recorded too. The last pass moves the
+        // first pass's work to other DP ranks, so its rank evidence comes
+        // from the rank memo's entries.
         let groups = [
             vec![
                 prefill_work(0, 4, 4096, 1024),
@@ -10473,6 +10699,11 @@ mod tests {
                 mixed(1, 1, 128, 1, 1025),
                 decode_work(2, 2, 2 * 700, 1 << 20),
             ],
+            vec![
+                mixed(0, 1, 512, 8, 1025),
+                prefill_work(1, 4, 4096, 1024),
+                decode_work(2, 32, 32 * 1025, 1 << 20),
+            ],
         ];
         for capture in [false, true] {
             timing.diagnostic_model = capture.then(|| Arc::clone(&model));
@@ -10480,7 +10711,7 @@ mod tests {
                 .iteration
                 .as_ref()
                 .unwrap()
-                .cache
+                .memo
                 .as_ref()
                 .unwrap()
                 .clear();
@@ -10554,6 +10785,53 @@ mod tests {
             assert!(prefill_layouts >= 2, "{prefill_layouts}");
             assert!(decode_layouts >= 2, "{decode_layouts}");
         }
+    }
+
+    #[test]
+    fn rank_memo_entries_keep_their_rank_evidence() {
+        pyo3::prepare_freethreaded_python();
+        let Some(mut timing) =
+            packaged_op_level_timing("rank_memo_entries_keep_their_rank_evidence", true)
+        else {
+            return;
+        };
+        let model = Arc::clone(&timing.iteration.as_ref().unwrap().model);
+        let ranks = [
+            prefill_work(0, 1, 512, 0),
+            decode_work(1, 8, 8 * 1025, 1 << 20),
+        ];
+        let mut kept = Vec::new();
+        for (capture, detail) in [(false, RankDetail::Values), (true, RankDetail::Diagnostics)] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            let pricing = timing.iteration.as_ref().unwrap();
+            let IterationQuery::Native(dispatch) = pricing.query else {
+                panic!("a packaged operation graph prices natively");
+            };
+            let queries: Vec<_> = ranks
+                .iter()
+                .map(|rank| AicTimingModel::rank_query(dispatch, rank).unwrap().unwrap())
+                .collect();
+            let evidence = timing
+                .price_iteration(pricing, &queries, &ranks, capture)
+                .unwrap()
+                .evidence;
+            // One part per pure rank, in rank order; each rank's memo entry
+            // keeps the part its pricing recorded.
+            assert_eq!(evidence.len(), ranks.len());
+            for (query, (phase, _)) in queries.iter().zip(&evidence) {
+                let entry = model
+                    .estimate_native_iteration(&[AicTimingModel::rank_metrics(query)], detail)
+                    .unwrap()
+                    .unwrap();
+                let parts = entry.ranks[0]
+                    .derived(|_| -> Result<RankEvidence> { bail!("the entry keeps no evidence") })
+                    .unwrap();
+                assert!(Arc::ptr_eq(&parts[0].0, phase));
+            }
+            kept.push(Arc::clone(&evidence[0].0));
+        }
+        // Values and diagnostics are kept on separate entries.
+        assert!(!Arc::ptr_eq(&kept[0], &kept[1]));
     }
 
     #[test]
@@ -10685,8 +10963,8 @@ mod tests {
             timing.evidence_summary().unwrap().decode.energy_wms,
             Some(1_600_000.0)
         );
-        let cached = timing.phase_cache.get(&(2, 127, 2, 0, false)).unwrap();
-        let again = timing.phase_cache.get(&(2, 127, 2, 0, false)).unwrap();
+        let cached = timing.phase_memo.peek(&(2, 127, 2, 0, false)).unwrap().0;
+        let again = timing.phase_memo.peek(&(2, 127, 2, 0, false)).unwrap().0;
         assert!(Arc::ptr_eq(&cached, &again));
         assert_eq!(cached.to_phase().energy_wms, Some(1_600.0));
         // Distinct coordinates must never reuse the preceding shape's result.
@@ -10923,7 +11201,7 @@ mod tests {
         let mut timing = Python::with_gil(|py| python_timing_model(py.None(), false));
         timing.phase_provider = AicPhaseProvider::NativeEntries(vec![row("seed", 1.0, 2.0, "sol")]);
         timing.predict_decode_ms(1, 65, 64, 1024).unwrap();
-        let cached = timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap();
+        let cached = timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0;
         let before = timing.evidence_summary().unwrap();
         timing.phase_provider = AicPhaseProvider::NativeEntries(Vec::new());
         for _ in 0..2 {
@@ -10932,10 +11210,10 @@ mod tests {
                 error.to_string(),
                 "AIC static_gen returned empty operation evidence for nonzero work"
             );
-            assert!(timing.phase_cache.get(&(1, 127, 2, 0, false)).is_none());
+            assert!(timing.phase_memo.peek(&(1, 127, 2, 0, false)).is_none());
             assert!(Arc::ptr_eq(
                 &cached,
-                &timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap()
+                &timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0
             ));
             let after = timing.evidence_summary().unwrap();
             assert_bits(&after.prefill, &before.prefill);
@@ -10959,10 +11237,10 @@ mod tests {
                     for _ in 0..2 {
                         let error = timing.predict_decode_ms(1, 129, 128, 1024).unwrap_err();
                         assert_eq!(error.to_string(), checked.to_string());
-                        assert!(timing.phase_cache.get(&(1, 127, 2, 0, false)).is_none());
+                        assert!(timing.phase_memo.peek(&(1, 127, 2, 0, false)).is_none());
                         assert!(Arc::ptr_eq(
                             &cached,
-                            &timing.phase_cache.get(&(1, 63, 2, 0, false)).unwrap()
+                            &timing.phase_memo.peek(&(1, 63, 2, 0, false)).unwrap().0
                         ));
                         let after = timing.evidence_summary().unwrap();
                         assert_bits(&after.prefill, &before.prefill);
@@ -11115,6 +11393,173 @@ mod tests {
                     .contains("telemetry_sample_interval_ms must be finite and positive")
             );
         }
+        for (field, value, expected) in [
+            (
+                "tokenization",
+                serde_json::json!({"workers": 1, "unknown": true}),
+                "unknown field `unknown`",
+            ),
+            (
+                "capture_telemetry",
+                serde_json::json!("yes"),
+                "invalid type",
+            ),
+        ] {
+            let payload = serde_json::json!({"spec": spec, field: value});
+            let error = format!(
+                "{:#}",
+                execute_json(&payload.to_string(), false).unwrap_err()
+            );
+            assert!(error.contains(expected), "{field}: {error}");
+        }
+        // A bare ReplaySpec ignores unknown keys, also one named `spec`.
+        for extra in [serde_json::json!("metadata"), serde_json::Value::Null] {
+            let mut bare = serde_json::to_value(&spec).unwrap();
+            bare["spec"] = extra.clone();
+            let output: serde_json::Value =
+                serde_json::from_str(&execute_json(&bare.to_string(), false).unwrap()).unwrap();
+            assert_eq!(
+                output["completed_requests"], report["completed_requests"],
+                "{extra}"
+            );
+        }
+        let payload = serde_json::json!({"spec": null, "capture_telemetry": true});
+        let error = format!(
+            "{:#}",
+            execute_json(&payload.to_string(), false).unwrap_err()
+        );
+        assert!(
+            error.contains("invalid AISim execution payload: invalid type: null"),
+            "{error}"
+        );
+        // The sequence form of a legacy ReplaySpec (fields in declaration order) still runs.
+        let sequence = serde_json::json!([
+            spec.version,
+            &spec.topology,
+            &spec.engine,
+            &spec.adapters,
+            spec.max_sim_time_ms,
+            spec.max_in_flight,
+            spec.record_per_request,
+            &spec.sla,
+            &spec.encoder,
+            &spec.requests,
+        ]);
+        let output: serde_json::Value =
+            serde_json::from_str(&execute_json(&sequence.to_string(), false).unwrap()).unwrap();
+        assert_eq!(output["completed_requests"], report["completed_requests"]);
+        assert_eq!(output["per_request"][0]["request_id"], "authored-id");
+        // Malformed JSON names the payload and the parse position.
+        let error = format!("{:#}", execute_json("{\"spec\": ", false).unwrap_err());
+        assert!(
+            error.starts_with("invalid AISim execution payload: EOF while parsing"),
+            "{error}"
+        );
+        // Repeated `spec` metadata on a bare ReplaySpec: the legacy form still runs.
+        let bare = serde_json::to_string(&spec).unwrap();
+        let repeated = format!(r#"{{"spec": 1, "spec": 2, {}"#, &bare[1..]);
+        let output: serde_json::Value =
+            serde_json::from_str(&execute_json(&repeated, false).unwrap()).unwrap();
+        assert_eq!(output["completed_requests"], report["completed_requests"]);
+        // A nested replay with two requests next to a one-request top-level
+        // replay: one `spec` key runs the nested replay; a repeated
+        // replay-valued `spec` key is ambiguous and must not run either.
+        let mut nested = spec.clone();
+        let mut second = nested.requests[0].clone();
+        second.id = "second-id".into();
+        second.session_id = None;
+        second.turn_index = None;
+        nested.requests.push(second);
+        let nested = serde_json::to_string(&nested).unwrap();
+        let once = format!(
+            r#"{{"spec": {nested}, "capture_telemetry": true, {}"#,
+            &bare[1..]
+        );
+        let twice = format!(
+            r#"{{"spec": {nested}, "spec": {nested}, "capture_telemetry": true, {}"#,
+            &bare[1..]
+        );
+        for capture_artifacts in [false, true] {
+            let output: serde_json::Value =
+                serde_json::from_str(&execute_json(&once, capture_artifacts).unwrap()).unwrap();
+            let report = if capture_artifacts {
+                &output["report"]
+            } else {
+                &output
+            };
+            assert_eq!(report["completed_requests"], 2);
+            assert!(report["telemetry"].is_object());
+            let error = format!("{:#}", execute_json(&twice, capture_artifacts).unwrap_err());
+            assert!(error.contains("duplicate field `spec`"), "{error}");
+        }
+        // A repeated `spec` too deep for the probe to buffer is refused, not
+        // treated as metadata, when another `spec` holds a replay.
+        let (open, close) = ("[".repeat(200), "]".repeat(200));
+        let deep = format!(
+            r#"{{"spec": {nested}, "spec": {open}{close}, {}"#,
+            &bare[1..]
+        );
+        let error = format!("{:#}", execute_json(&deep, false).unwrap_err());
+        assert!(error.contains("duplicate field `spec`"), "{error}");
+        // A configured key makes the payload a configured one, even when the
+        // top-level keys form a replay: its settings must not be dropped.
+        for (prefix, expected) in [
+            (
+                r#""spec": null, "#,
+                "invalid type: null, expected struct ReplaySpec",
+            ),
+            (
+                r#""spec": 1, "spec": 2, "#,
+                "invalid type: integer `1`, expected struct ReplaySpec",
+            ),
+            ("", "missing field `spec`"),
+        ] {
+            let payload = format!(r#"{{{prefix}"capture_telemetry": true, {}"#, &bare[1..]);
+            let error = format!("{:#}", execute_json(&payload, false).unwrap_err());
+            assert!(
+                error.starts_with("invalid AISim execution payload") && error.contains(expected),
+                "{prefix}: {error}"
+            );
+        }
+        // Repeated non-replay `spec` keys on an invalid payload report the
+        // configured-payload error; without any key, the legacy one.
+        let error = format!(
+            "{:#}",
+            execute_json(
+                r#"{"spec": 1, "spec": 2, "capture_telemetry": true}"#,
+                false
+            )
+            .unwrap_err()
+        );
+        assert!(
+            error.starts_with("invalid AISim execution payload"),
+            "{error}"
+        );
+        assert!(
+            error.contains("invalid type: integer `1`, expected struct ReplaySpec"),
+            "{error}"
+        );
+        let error = format!(
+            "{:#}",
+            execute_json(r#"{"version": 1}"#, false).unwrap_err()
+        );
+        assert!(
+            error.starts_with("invalid AISim execution ReplaySpec"),
+            "{error}"
+        );
+        // The configured keys follow `ConfiguredExecutionPayload`.
+        let fields = serde_struct_fields::<ConfiguredExecutionPayload>();
+        assert!(fields.contains(&"spec") && fields.contains(&"capture_telemetry"));
+        // When `spec` holds a replay, a bad field is reported even if the
+        // top-level keys also form a replay.
+        let mut ambiguous = serde_json::to_value(&spec).unwrap();
+        ambiguous["spec"] = serde_json::to_value(&spec).unwrap();
+        ambiguous["tokenization"] = serde_json::json!({"unknown": true});
+        let error = format!(
+            "{:#}",
+            execute_json(&ambiguous.to_string(), false).unwrap_err()
+        );
+        assert!(error.contains("unknown field `unknown`"), "{error}");
 
         spec.requests.clear();
         for record_per_request in [false, true] {

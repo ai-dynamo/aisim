@@ -22,6 +22,7 @@ from pydantic import (
 
 from aisim.fpm_profile import FpmModelProfile
 
+from .ais_perf_model import lower_engine
 from .common import (
     AFD_UNSUPPORTED_MODEL_CONTROLS,
     ENGINE_MODEL_CONTROL_FIELDS,
@@ -162,6 +163,13 @@ class SchedulerPredictionConfig(StrictModel):
             "vLLM only: model vLLM's --async-scheduling, under which an arrival at a busy engine misses the "
             "batch vLLM has already queued. Unset uses vLLM's default: on, except with ngram drafts "
             "or MTP with G2 host offload."
+        ),
+    )
+    load_balance_method: Literal["round_robin", "total_tokens"] = Field(
+        default="round_robin",
+        description=(
+            "SGLang PD decode only: how a request picks its attention-DP rank (SGLang --load-balance-method). "
+            "total_tokens sends it to the rank holding the fewest tokens; round_robin takes ranks in turn."
         ),
     )
 
@@ -330,6 +338,7 @@ class KvCachePredictionConfig(StrictModel):
     prefix_match_unit: PositiveU64 | None = None
     prefix_caching: bool = True
     decode_radix_cache: bool = False
+    swa_prefix_tails: PositiveInt | Literal["auto"] | None = "auto"
     bytes_per_token: KvBytesPerToken = "auto"
     capacity: KvCapacityPredictionConfig = Field(default_factory=KvCapacityPredictionConfig)
     host_offload: HostOffloadConfig | None = None
@@ -500,8 +509,8 @@ class TimingConfig(StrictModel):
                 value.setdefault("fallback_policy", "deny")
         return value
 
-    prefill_ms: float | None = Field(default=None, ge=0.0)
-    decode_ms: float | None = Field(default=None, ge=0.0)
+    prefill_ms: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    decode_ms: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_timing(self) -> TimingConfig:
@@ -971,6 +980,17 @@ class EstimatorPolicyConfig(StrictModel):
     estimation_mode: ReplayEstimationMode = "auto"
     fallback_policy: Literal["deny", "allow"] = "deny"
     estimator_config: dict[str, Any] = Field(default_factory=dict)
+    # Another spelling of the estimator fields above. It is rewritten into them
+    # before validation and is never dumped.
+    # It is left out of repr() too, so the repr of an existing config stays what it was before this field.
+    ais_perf_model: dict[str, Any] | list[dict[str, Any]] | None = Field(default=None, exclude=True, repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lower_ais_perf_model(cls, value: Any) -> Any:
+        # This must stay the first validator that runs, so every other
+        # validator sees the estimator fields it already reads.
+        return lower_engine(value, "recommend" if issubclass(cls, EngineRecommendationConfig) else "predict")
 
     @model_validator(mode="after")
     def _migrate_systems_path(self):
@@ -1576,9 +1596,16 @@ def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> No
             ("prefill_schedule_interval", "vllm", 1),
             ("prefill_decode_interval", "sglang", 0),
             ("async_scheduling", "vllm", None),
+            ("load_balance_method", "sglang", "round_robin"),
         ):
             if engine.backend != backend and getattr(worker.scheduler, field) != default:
                 raise ValueError(f"workers.{role}.scheduler.{field} is supported only for backend={backend}")
+        if worker.scheduler.load_balance_method != "round_robin" and (
+            role != "decode" or engine.mode != "disaggregated"
+        ):
+            raise ValueError(
+                f"workers.{role}.scheduler.load_balance_method is supported only for the disaggregated decode role"
+            )
 
 
 def _validate_decode_radix_cache(*, backends: set[str], workers, speculative: bool) -> None:
