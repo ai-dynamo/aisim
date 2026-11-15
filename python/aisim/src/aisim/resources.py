@@ -257,6 +257,9 @@ def workload_bounds(config: Any) -> dict[str, Any]:
     cache_copies = 1
     cache_pools = 1
     if session:
+        # A session visits at most one cache per turn in each pool. Apply
+        # that bound before combining differently sized pools.
+        turns = source["session"]["turns"]
         cache_pools = max(
             1, sum(getattr(config.engine.workers, role) is not None for role in ("aggregated", "prefill", "decode"))
         )
@@ -273,18 +276,19 @@ def workload_bounds(config: Any) -> dict[str, Any]:
                     continue
                 parallel = getattr(worker, "parallelism", None)
                 if parallel is None:
-                    cache_copies += gpu_bound
+                    cache_copies += min(turns, gpu_bound)
                     continue
                 domain = parallel.model_dump(mode="python", exclude_none=True)
                 preset = domain.get("preset", "default")
                 if isinstance(preset, list):
-                    cache_copies += max(item["replicas"] * item["attention_data"] for item in preset)
+                    copies = max(item["replicas"] * item["attention_data"] for item in preset)
                 elif preset == "default":
-                    cache_copies += gpu_bound
+                    copies = gpu_bound
                 else:
-                    cache_copies += int(_upper(domain.get("replicas"), gpu_bound)) * int(
+                    copies = int(_upper(domain.get("replicas"), gpu_bound)) * int(
                         _upper(domain.get("attention_data"), gpu_bound)
                     )
+                cache_copies += min(turns, copies)
             cache_copies = max(1, min(gpu_bound, cache_copies))
         else:
             cache_copies = 0
@@ -295,9 +299,9 @@ def workload_bounds(config: Any) -> dict[str, Any]:
                     if parallel is None:
                         # AFD has its own topology. Each turn can add at most
                         # one independent copy per pool.
-                        cache_copies += source["session"]["turns"]
+                        cache_copies += turns
                     else:
-                        cache_copies += parallel.replicas * parallel.attention_data
+                        cache_copies += min(turns, parallel.replicas * parallel.attention_data)
             cache_copies = max(1, cache_copies)
     return {
         "source_type": source["type"],
@@ -982,6 +986,8 @@ def estimate_workload(
         # output IDs and transcript share, which a one-token block prefix cache
         # can index. Completed sessions' prefixes can remain in every cache a
         # turn visited, even after they leave the active concurrency window.
+        # Producers cap each pool separately before summing its copies. The
+        # final cap also bounds callers without concrete pool topology.
         pools = int(workload.get("session_cache_pools", 1))
         copies = min(turns * pools, int(workload.get("session_cache_copies", 1))) if turns > 1 else 1
         if min(copies, pools) < 1:
@@ -1105,6 +1111,7 @@ def _replay_resource_workload(spec: Any, stack: str) -> Mapping[str, Any]:
         return spec.workload
     copies = 0
     pools = 0
+    turns = spec.workload["turns_per_session"]
     for role, workers, args in (
         ("aggregated", deployment.num_workers, deployment.agg_engine_args),
         ("prefill", deployment.num_prefill_workers, deployment.prefill_engine_args),
@@ -1115,7 +1122,7 @@ def _replay_resource_workload(spec: Any, stack: str) -> Mapping[str, Any]:
             if role in deployment.afd_roles:
                 # AFD resolves its attention replicas from separate pool
                 # metadata. The turn count bounds every possible destination.
-                copies += spec.workload["turns_per_session"]
+                copies += turns
                 continue
             rank = args.get("rank") or args
             timing = rank.get("timing_model") or {}
@@ -1129,7 +1136,8 @@ def _replay_resource_workload(spec: Any, stack: str) -> Mapping[str, Any]:
             )
             # The runner validates conflicting declarations. Admission must
             # also cover DP inferred from a canonical timing identity.
-            copies += workers * max((value for value in widths if type(value) is int and value > 0), default=1)
+            ranks = max((value for value in widths if type(value) is int and value > 0), default=1)
+            copies += min(turns, workers * ranks)
     return {**spec.workload, "session_cache_copies": max(1, copies), "session_cache_pools": max(1, pools)}
 
 

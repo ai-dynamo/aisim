@@ -138,12 +138,16 @@ its own tokens. The 32-byte token allowance is multiplied by the number of
 independent worker/attention-DP caches, capped at the number of turns per pool
 (prefill and decode can each retain a copy of every turn): session
 history can remain cached on multiple workers even after a session completes.
+The cap applies before summing pools: one prefill cache and 32 decode caches
+with 10 turns contribute `min(10, 1) + min(10, 32) = 11` copies.
 This bounds placement without session affinity and assumes no eviction or
 prefix sharing. With a fixed cache count, the retained-token charge grows
 linearly with turns. Prediction uses the configured replicas and attention-DP
-ranks across decoder roles; initial recommendation admission bounds their total
-by the declared topology domain and GPU budget, and candidate admission uses the
-concrete deployment.
+ranks across the aggregated, prefill, and decode roles; initial recommendation
+admission bounds their total by the declared topology domain and GPU budget,
+and candidate admission uses the concrete deployment. AFD roles use their separate
+topology; admission conservatively bounds their cache copies by the number of
+turns per pool.
 Active sessions also carry their earlier turns in a request: 32 bytes per
 earlier-turn token, plus 4 bytes per cumulative prompt token. Without a
 concurrency cap, every session counts as active. The Dynamo compatibility model

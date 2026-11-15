@@ -328,6 +328,136 @@ def test_session_replication_reaches_initial_replay_and_wave_admission(monkeypat
         factory.admit_wave([spec])
 
 
+@pytest.mark.parametrize("recommendation", [False, True])
+@pytest.mark.parametrize("wide_role", ["prefill", "decode"])
+def test_session_admission_caps_asymmetric_cache_pools_separately(monkeypatch, recommendation, wide_role):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    raw = _config()
+    raw["engine"].update(mode="disaggregated", context_length=65536)
+    raw["engine"]["workers"] = {
+        "prefill": {"parallelism": {"replicas": 1, "attention_data": 1}},
+        "decode": {"parallelism": {"replicas": 1, "attention_data": 1}},
+    }
+    raw["traffic"] = {
+        "source": {
+            "type": "synthetic-session",
+            "new_input_tokens_per_turn": 4096,
+            "output_tokens_per_turn": 256,
+            "session": {"turns": 10},
+        },
+        "load": {"type": "concurrency", "concurrency": 32},
+        "stop": {"sessions": 1000},
+    }
+    raw["execution"] = {"resources": {"memory_limit_gb": 20}}
+    if recommendation:
+        for worker in raw["engine"]["workers"].values():
+            worker["parallelism"]["preset"] = False
+        shape = {"replicas": 1, "tensor": 1, "pipeline": 1, "attention_data": 1, "moe_tensor": 1, "moe_expert": 1}
+        raw["engine"]["workers"][wide_role]["parallelism"] = {
+            "preset": [shape, {**shape, "replicas": 16, "attention_data": 2}]
+        }
+        config = CoreRecommendationConfig.model_validate(raw)
+    else:
+        raw.pop("optimization")
+        raw.pop("optimizer")
+        raw["engine"]["workers"][wide_role]["parallelism"] = {"replicas": 16, "attention_data": 2}
+        config = CorePredictionConfig.model_validate(raw)
+    host = HostResources(128 * GB, 93 * GB, 24)
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    bounds = workload_bounds(config)
+    assert bounds["session_cache_copies"] == 11  # min(10, 1) + min(10, 32)
+    assert bounds["session_cache_pools"] == 2
+    deployment = BackendDeploymentSpec(
+        deployment_mode="disagg",
+        backend="vllm",
+        backend_version="test",
+        num_prefill_workers=16 if wide_role == "prefill" else 1,
+        num_decode_workers=16 if wide_role == "decode" else 1,
+        prefill_engine_args={"dp_size": 2 if wide_role == "prefill" else 1},
+        decode_engine_args={"dp_size": 2 if wide_role == "decode" else 1},
+    )
+    workload = {
+        key: value for key, value in bounds.items() if key not in {"session_cache_copies", "session_cache_pools"}
+    }
+    original = deepcopy(workload)
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    # The 11-copy policy estimate fits a 20 GB budget; capping the combined
+    # 33-cache fleet at 20 copies incorrectly rejects this workload.
+    expected_peak = (
+        resources.WORKER_BASELINE_BYTES
+        + 1000 * 10 * (4096 + 11 * 32 * 4352)
+        + 32 * (32 * 9 * 4352 + 4 * (9 * 4352 + 4096))
+    )
+    policy = ResourceConfig(memory_limit_gb=20)
+    with resources.resource_policy(policy):
+        initial = cli._resource_plan(SimpleNamespace(stack="engine"), config, None)
+        replay = guard_replay(spec, stack="engine")
+    wave = GuardedRunnerFactory(object(), "engine", policy).admit_wave([spec])
+    assert initial["status"] == replay["status"] == wave["status"] == "admitted"
+    assert initial["estimate"] == replay["estimate"] == wave["candidates"][0]["estimate"]
+    assert initial["estimate"]["estimated_peak_bytes"] == expected_peak
+    assert spec.workload == original
+
+
+@pytest.mark.parametrize("afd_role", ["aggregated", "prefill", "decode"])
+def test_session_afd_turn_bound_reaches_initial_and_candidate_admission(monkeypatch, host, afd_role):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    raw = _config()
+    raw.pop("optimization")
+    raw.pop("optimizer")
+    raw["engine"]["backend"] = "sglang"
+    workers = {afd_role: {"type": "afd", "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}}
+    args = {"agg_engine_args" if afd_role == "aggregated" else f"{afd_role}_engine_args": {"afd": {}}}
+    if afd_role != "aggregated":
+        raw["engine"]["mode"] = "disaggregated"
+        companion = "decode" if afd_role == "prefill" else "prefill"
+        workers[companion] = {"parallelism": {"replicas": 1}}
+        args[f"{companion}_engine_args"] = {"dp_size": 1}
+    raw["engine"]["workers"] = workers
+    raw["traffic"] = {
+        "source": {
+            "type": "synthetic-session",
+            "new_input_tokens_per_turn": 16,
+            "output_tokens_per_turn": 4,
+            "session": {"turns": 10},
+        },
+        "load": {"type": "concurrency", "concurrency": 32},
+        "stop": {"sessions": 100},
+    }
+    config = CorePredictionConfig.model_validate(raw)
+    bounds = workload_bounds(config)
+    copies = 10 if afd_role == "aggregated" else 11
+    assert bounds["session_cache_copies"] == copies
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg" if afd_role == "aggregated" else "disagg",
+        backend="sglang",
+        backend_version="test",
+        num_workers=1 if afd_role == "aggregated" else 0,
+        num_prefill_workers=0 if afd_role == "aggregated" else 1,
+        num_decode_workers=0 if afd_role == "aggregated" else 1,
+        **args,
+    )
+    workload = {
+        key: value for key, value in bounds.items() if key not in {"session_cache_copies", "session_cache_pools"}
+    }
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    assert resources._replay_resource_workload(spec, "engine")["session_cache_copies"] == copies
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    initial = cli._resource_plan(SimpleNamespace(stack="engine"), config, None)
+    replay = guard_replay(spec, stack="engine")
+    wave = GuardedRunnerFactory(object(), "engine", ResourceConfig()).admit_wave([spec])
+    assert initial["status"] == replay["status"] == wave["status"] == "admitted"
+    assert initial["estimate"] == replay["estimate"] == wave["candidates"][0]["estimate"]
+    expected = estimate_workload(
+        {**workload, "session_cache_copies": copies, "session_cache_pools": len(workers)}, stack="engine"
+    )
+    assert initial["estimate"]["estimated_peak_bytes"] == expected.estimated_peak_bytes
+
+
 def test_session_recommendation_bounds_cache_replicas_by_gpu_budget():
     raw = _config()
     raw["traffic"]["source"] = {
@@ -338,10 +468,12 @@ def test_session_recommendation_bounds_cache_replicas_by_gpu_budget():
     }
     raw["traffic"]["stop"] = {"sessions": 100}
     bounds = workload_bounds(CoreRecommendationConfig.model_validate(raw))
-    assert bounds["session_cache_copies"] == 72
+    assert bounds["session_cache_copies"] == 10
     assert estimate_workload(bounds, stack="engine") == estimate_workload(
         {**bounds, "session_cache_copies": 10}, stack="engine"
     )
+    raw["optimization"]["constraints"] = {"min_candidate_gpus": 8, "max_candidate_gpus": 8}
+    assert workload_bounds(CoreRecommendationConfig.model_validate(raw))["session_cache_copies"] == 8
     raw["engine"]["workers"]["aggregated"]["parallelism"] = {
         "preset": False,
         "replicas": {"choices": [1, 3]},
