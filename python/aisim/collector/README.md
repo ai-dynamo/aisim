@@ -249,7 +249,8 @@ a Collector-side text patch. `--fpm-measure-power` (default on; never run by
 `--smoke`) requests the per-point power window and publishes `power_w`; see the
 [onboarding guide](../../../docs/perf-model/fpm-self-service/implementation.md#how-the-collection-grid-is-determined)
 for its requirements and publication rules. Formal
-`fpm_forward_perf.parquet` output uses metadata schema v6 and records
+`fpm_forward_perf.parquet` output uses metadata schema 7 for latency-only pairs
+and schema 8 for power-window pairs, and records
 `collector_attempt_id`, `runtime_run_id`, `runtime_grid_digest`, and
 `kv_seed_regime` on every row. The seed regime is `real_kv`, `fake_fallback`,
 an approved `skip:<reason>`, `legacy`, or `n/a`; non-benign warm-up skips
