@@ -2508,14 +2508,28 @@ struct Arrival {
 /// waiting loads, as replay does at a pass boundary. A load that reserves is
 /// activated at once. Returns the core before the retry after the last pass.
 fn scripted_decode_rank(arrivals: &[Arrival], passes: usize) -> VllmCore {
+    scripted_decode_rank_with(arrivals, passes, 1)
+}
+
+/// `scripted_decode_rank` with `max_concurrent_batches` batches. With more
+/// than one, each pass ends at its boundary and the next pass starts at that
+/// end, so each pass that follows a pass with work is formed while that pass
+/// is in flight, as a rank does.
+fn scripted_decode_rank_with(
+    arrivals: &[Arrival],
+    passes: usize,
+    max_concurrent_batches: usize,
+) -> VllmCore {
     let mut groups = full_and_state_transfer_groups();
     groups[1].prefill_checkpoint_blocks = Some(0);
     let mut args = prefix_core(groups, 1_600, 8192, 16, "0.32.0").args;
     args.worker_type = WorkerType::Decode;
     args.max_num_seqs = Some(8);
+    args.max_concurrent_batches = max_concurrent_batches;
     let mut core = VllmCore::new(args);
     let mut trace = TraceCollector::default();
     let mut step = 0;
+    let mut now = 0.0;
     for pass in 0..passes {
         for arrival in arrivals.iter().filter(|arrival| arrival.pass == pass) {
             let id = arrival.id;
@@ -2541,7 +2555,14 @@ fn scripted_decode_rank(arrivals: &[Arrival], passes: usize) -> VllmCore {
                 submit_tokens(&mut core, id, tokens, arrival.output);
             }
         }
-        step_pd(&mut core, &mut trace, &mut step);
+        if max_concurrent_batches > 1 {
+            let result = core.execute_pass(&mut trace, now);
+            assert!(result.output_signals.iter().all(|output| !output.rejected));
+            core.complete_engine_boundary(result.end_ms);
+            now = result.end_ms;
+        } else {
+            step_pd(&mut core, &mut trace, &mut step);
+        }
         if pass + 1 == passes {
             break;
         }
@@ -2581,6 +2602,122 @@ fn grouped_destination_retries_when_the_loads_in_flight_need_less() {
     // from 2 blocks to 0. Load 5 then fits. vLLM sums that need again at each
     // attempt (V32 `sched:1241-1251`, `:3088-3092`), so the retry after this
     // pass reserves it.
+    assert_eq!(
+        reserved_units(&core.retry_pending_destinations(), head),
+        Some(1)
+    );
+}
+
+#[test]
+fn grouped_destination_retries_when_a_step_start_makes_a_state_key_a_hit() {
+    let arrival = |pass, load, id, shared, prompt, output| Arrival {
+        pass,
+        load,
+        id,
+        shared,
+        prompt,
+        output,
+    };
+    let arrivals = [
+        arrival(3, true, 1, 80, 62, 23),
+        arrival(3, false, 2, 64, 76, 1),
+        arrival(4, true, 3, 96, 63, 6),
+        arrival(9, false, 4, 80, 49, 14),
+        // A load of 93 tokens with 64 shared ones. It waits.
+        arrival(10, true, 5, 64, 93, 27),
+    ];
+    let mut core = scripted_decode_rank(&arrivals, 11);
+    let head = HandoffId::new(Uuid::from_u128(1_000_005));
+    // The state keys that the step before the last one published are no hit
+    // in that step, as in vLLM (V31 `single:1726-1734`, V32
+    // `single:1688-1696`), and load 5 waits. The step start of the last pass
+    // makes them hits (V32 `sched:632`, `single:2008-2009`). The last pass
+    // releases no block, publishes and evicts no key and leaves the need of
+    // the loads in flight at 0. Only the published epoch of the coordinator
+    // moves, and load 5 now fits, so the retry after this pass reserves it.
+    assert_eq!(
+        reserved_units(&core.retry_pending_destinations(), head),
+        Some(3)
+    );
+}
+
+#[test]
+fn grouped_destination_retries_when_a_pass_evicts_a_key() {
+    let arrival = |pass, load, id, shared, prompt, output| Arrival {
+        pass,
+        load,
+        id,
+        shared,
+        prompt,
+        output,
+    };
+    let arrivals = [
+        arrival(2, false, 1, 0, 80, 3),
+        arrival(7, false, 2, 64, 41, 16),
+        arrival(8, false, 3, 0, 54, 18),
+        arrival(10, false, 4, 80, 75, 8),
+        arrival(12, false, 5, 96, 99, 24),
+        arrival(12, false, 6, 0, 61, 2),
+        arrival(15, true, 7, 64, 74, 27),
+        arrival(20, false, 8, 80, 66, 17),
+        arrival(23, true, 9, 96, 59, 11),
+        arrival(24, true, 10, 0, 76, 26),
+        arrival(28, false, 11, 64, 39, 1),
+        // A load of the first 71 tokens of the shared prefix. It waits.
+        arrival(29, true, 12, 80, 71, 15),
+    ];
+    let mut core = scripted_decode_rank(&arrivals, 30);
+    let head = HandoffId::new(Uuid::from_u128(1_000_012));
+    // Load 12 waits after its arrival. The last pass releases no block and
+    // publishes no key. It takes two of the five inactive cached blocks, and
+    // one of them holds the last copy of a key, which moves the generation of
+    // the resident keys. The decode-side finder reads the keys of every
+    // group, so that eviction can change the local prefix of load 12 and
+    // what it counts.
+    // The need of the loads in flight stays 0, and the published epoch
+    // stays. Load 12 now fits, so the retry after this pass reserves it.
+    assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+    assert_eq!(
+        reserved_units(&core.retry_pending_destinations(), head),
+        Some(2)
+    );
+}
+
+#[test]
+fn grouped_destination_retries_when_a_pass_evicts_a_key_with_async_scheduling() {
+    let arrival = |pass, load, id, shared, prompt, output| Arrival {
+        pass,
+        load,
+        id,
+        shared,
+        prompt,
+        output,
+    };
+    let arrivals = [
+        arrival(5, false, 1, 80, 86, 5),
+        arrival(5, false, 2, 64, 91, 2),
+        arrival(9, true, 3, 96, 42, 11),
+        arrival(10, false, 4, 64, 52, 19),
+        arrival(12, false, 5, 80, 99, 13),
+        arrival(17, false, 6, 0, 47, 11),
+        arrival(17, false, 7, 64, 45, 4),
+        arrival(17, true, 8, 0, 86, 4),
+        arrival(19, false, 9, 80, 93, 5),
+        arrival(20, false, 10, 0, 56, 20),
+        arrival(22, true, 11, 96, 69, 25),
+        arrival(22, true, 12, 96, 81, 15),
+    ];
+    let mut core = scripted_decode_rank_with(&arrivals, 27, 2);
+    let head = HandoffId::new(Uuid::from_u128(1_000_012));
+    // With async scheduling. Load 12 waits after its arrival. The last pass
+    // releases no block and publishes no key, so the pool's own epoch stays.
+    // It takes two of the six inactive cached blocks, and both hold the last
+    // copy of a key, which moves the generation of the resident keys by 2.
+    // The need of the loads in flight stays 0, and the published epoch
+    // stays. Load 12 now fits, so the retry after this pass reserves it with
+    // one transfer unit. Without the key generation in the retry epoch, that
+    // retry skips it.
+    assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
     assert_eq!(
         reserved_units(&core.retry_pending_destinations(), head),
         Some(1)
@@ -2957,6 +3094,55 @@ fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
             }
         }
     }
+}
+
+/// A full-attention group and a 17-token sliding window, both of 16-token
+/// blocks at 100 bytes a page, with the transfer fields set.
+fn full_and_window_transfer_groups() -> Vec<FpmCacheGroup> {
+    let mut full = group("full", 16, 100, None);
+    full.prefix_cacheable = Some(true);
+    full.transfer_bytes_per_block = Some(100);
+    let mut window = group("window", 16, 100, Some(17));
+    window.prefix_cacheable = Some(true);
+    window.transfer_bytes_per_block = Some(100);
+    vec![full, window]
+}
+
+#[test]
+fn grouped_destination_without_state_layers_loads_past_the_hit_every_group_agrees_on() {
+    let mut args = prefix_core(full_and_window_transfer_groups(), 4_000, 8192, 16, "0.31.0").args;
+    args.worker_type = WorkerType::Decode;
+    let mut core = VllmCore::new(args);
+    let mut trace = TraceCollector::default();
+    let mut step = 0;
+    // Without a state group the load is the whole prompt: cdiv(100, 16) = 7 units.
+    let first = HandoffId::new(Uuid::from_u128(1761));
+    assert_eq!(
+        reserve_grouped(&mut core, first, pd_request(1760, 100, 2)),
+        Some(7)
+    );
+    activate(&mut core, first);
+    // 7 full-attention blocks and the 2 window blocks inside the window of 100.
+    drain_pd(&mut core, &mut trace, &mut step, 9);
+    // The first request cached one window block, the one that ends at its
+    // replay boundary 96, and the full-attention block that ends at 64.
+    let mut shared = BlockRequestLease::new(Uuid::nil(), Vec::new());
+    shared.configure_prefix_hashes(&(0..64).collect::<Vec<u32>>(), 16);
+    assert!(
+        block_pool(&core)
+            .key_hit(0, shared.prefix_hash_at(64).unwrap())
+            .is_some()
+    );
+    // The second prompt shares 64 tokens. Its full-attention hit is 64, but
+    // the window has no cached block before 64, so the hit that every group
+    // agrees on is 0 (`vllm/v1/core/kv_cache_manager.py:346-351`) and all 7
+    // units move.
+    let second = HandoffId::new(Uuid::from_u128(1763));
+    let request = DirectRequest {
+        tokens: (0..64).chain(1_000..1_036).collect(),
+        ..pd_request(1762, 0, 2)
+    };
+    assert_eq!(reserve_grouped(&mut core, second, request), Some(7));
 }
 
 #[test]

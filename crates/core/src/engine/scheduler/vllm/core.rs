@@ -731,6 +731,9 @@ pub(crate) struct VllmCore {
     grouped_retry_epoch: Option<u64>,
     /// What the loads in flight needed after the last destination retry.
     grouped_retry_inflight_need: u64,
+    /// The grouped prefix coordinator's published epoch after the last
+    /// destination retry.
+    grouped_retry_published_epoch: u64,
     #[cfg(test)]
     destination_reservation_attempts: usize,
     lifecycle_events: Vec<SchedulerLifecycleEvent>,
@@ -1149,6 +1152,7 @@ impl VllmCore {
             capacity_generation: 0,
             grouped_retry_epoch,
             grouped_retry_inflight_need: 0,
+            grouped_retry_published_epoch: 0,
             #[cfg(test)]
             destination_reservation_attempts: 0,
             lifecycle_events: Vec::new(),
@@ -1510,18 +1514,24 @@ impl VllmCore {
         &mut self,
         mutation_now_ms: Option<f64>,
     ) -> Vec<SchedulerLifecycleEvent> {
-        // A grouped pool frees blocks inside a pass and publishes the blocks
-        // of an activation without a generation bump. Each can let the head
-        // reserve, so a change since the last retry makes it due.
+        // A grouped pool frees blocks inside a pass, publishes the blocks of
+        // an activation and evicts keys without a generation bump. Each can
+        // let the head reserve, so a change since the last retry makes it due.
         // vLLM also sums what the loads in flight need again at each attempt
         // (V31 `sched:1194-1204`, `:3032-3036`, V32 `sched:1241-1251`,
         // `:3088-3092`). The first pass of a load takes it out of that need
         // with no move of the epoch, and the head can then fit. So a need
         // below the one of the last retry makes the head due too. A higher
-        // need can only keep the head waiting.
+        // need can only keep the head waiting. A state key that a step
+        // publishes is no hit in that step, and the next step start makes it
+        // a hit (V31 `single:1726-1734`, `sched:603` with `single:2044-2045`,
+        // V32 `single:1688-1696`, `sched:632` with `single:2008-2009`). That
+        // can let the head fit with no other change, so a move of the
+        // coordinator's published epoch makes the head due too.
         let epoch = self.kv_manager.grouped().map(GroupedKvPool::retry_epoch);
         if epoch != self.grouped_retry_epoch
             || self.kv_manager.grouped_inflight_need() < self.grouped_retry_inflight_need
+            || self.kv_manager.grouped_published_epoch() != self.grouped_retry_published_epoch
         {
             self.bump_capacity_generation();
         }
@@ -1529,6 +1539,7 @@ impl VllmCore {
         // The changes of the attempt itself do not make the next retry due.
         self.grouped_retry_epoch = self.kv_manager.grouped().map(GroupedKvPool::retry_epoch);
         self.grouped_retry_inflight_need = self.kv_manager.grouped_inflight_need();
+        self.grouped_retry_published_epoch = self.kv_manager.grouped_published_epoch();
         events
     }
 
