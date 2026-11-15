@@ -439,14 +439,17 @@ impl GroupedKvPool {
         }
     }
 
-    /// Grows whenever the pool frees capacity, publishes a key or, in block
-    /// mode, evicts the last copy of a key, the changes that can let a
-    /// waiting reservation succeed. A pass frees blocks without completing a
+    /// Grows whenever the pool releases a block, a request's held bytes
+    /// fall, the pool publishes a key or, in block mode, it evicts the last
+    /// copy of a key. These are the pool's changes that can let a waiting
+    /// reservation succeed. A pass frees blocks without completing a
     /// request, and an activation publishes blocks that it keeps, so the
     /// active count alone misses both. An eviction can change the hit of a
     /// waiting load and lower the blocks that its tests count, so block mode
-    /// adds the generation of the resident keys. The scheduler also retries a
-    /// waiting reservation when the loads in flight need less.
+    /// adds the generation of the resident keys. In byte mode, a request
+    /// whose bytes grow can still free a window page, with no move of this
+    /// count. The scheduler also retries a waiting reservation when the
+    /// local prefills or the loads in flight need less.
     pub(crate) fn retry_epoch(&self) -> u64 {
         match &self.mode {
             GroupedMode::Bytes => self.retry_epoch,
