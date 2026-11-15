@@ -511,7 +511,7 @@ def test_public_runner_infers_canonical_depth_without_duplicate_rank_input(backe
     assert inferred.metrics["total_output_tokens"] == 16
     for metric in ("mean_e2e_latency_ms", "mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s"):
         assert inferred.metrics[metric] == explicit.metrics[metric]
-    with pytest.raises(RuntimeError, match="aic_nextn conflicts with resolved speculative depth 2"):
+    with pytest.raises(RuntimeError, match="canonical speculative depth conflicts with scheduler aic_nextn"):
         runner.run(replace(spec, backend_deployment=replace(deployment, agg_engine_args={**args, "aic_nextn": 1})))
 
 
@@ -3301,6 +3301,7 @@ def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tm
         "estimator": "op_level",
         "timing_source": "aic",
         "data_version": expected,
+        "database_mode": "SILICON",
         "data_identity": None,
         "data_version_unavailable_reason": None,
     }
