@@ -1913,6 +1913,9 @@ impl VllmKvManager {
         );
     }
 
+    /// `local_prefill_need` is what the local prefills in flight still need,
+    /// as `grouped_remaining_need` counts it. A grouped destination keeps it
+    /// free, and the linear path ignores it.
     pub(crate) fn reserve_destination_lease(
         &mut self,
         owner: Uuid,
@@ -1920,6 +1923,7 @@ impl VllmKvManager {
         lease: &BlockRequestLease,
         mode: super::DestinationReservationMode,
         _eviction_now_ms: Option<f64>,
+        local_prefill_need: u64,
     ) -> VllmAcquire<DestinationReservation> {
         lease.debug_assert_owner(owner);
         assert_eq!(
@@ -1928,7 +1932,13 @@ impl VllmKvManager {
             "destination request already owns physical blocks"
         );
         if self.grouped.is_some() {
-            return self.reserve_grouped_destination(owner, sequence, lease, mode);
+            return self.reserve_grouped_destination(
+                owner,
+                sequence,
+                lease,
+                mode,
+                local_prefill_need,
+            );
         }
         let prompt_blocks = sequence
             .num_input_tokens()
@@ -1974,12 +1984,15 @@ impl VllmKvManager {
     /// load (V32 `vllm/v1/core/kv_cache_manager.py:522-539`, `:561-579`, V31
     /// `:519-536`, `:558-576`). The whole prompt, with the loaded tokens
     /// computed, must fit the free capacity. The loaded tokens must fit the
-    /// free capacity less what the other loads in flight still need, as vLLM
-    /// counts it (`first_pass_need`). That count caps a window group at its
-    /// admission blocks, so it can leave out the window block that a first
-    /// pass opens (V32 `vllm/v1/core/single_type_kv_cache_manager.py:213-235`,
-    /// V31 `:216-238`). So, as in vLLM, a load admitted past the cap can wait
-    /// for its first pass, and with no request running the rank stops.
+    /// free capacity less what the prefills in flight still need, as vLLM
+    /// counts it. These are the other loads in flight (`first_pass_need`)
+    /// and the local prefills in flight (`local_prefill_need`), such as a
+    /// local prompt or the recompute of a preempted request. That count caps
+    /// a window group at its admission blocks, so it can leave out the window
+    /// block that a first pass opens (V32
+    /// `vllm/v1/core/single_type_kv_cache_manager.py:213-235`, V31
+    /// `:216-238`). So, as in vLLM, a load admitted past the cap can wait for
+    /// its first pass, and with no request running the rank stops.
     /// Byte mode charges the projected bytes. Block mode pins the hit blocks
     /// of the local prefix that vLLM's connector path takes, when the mode
     /// reuses the resident prefix (`find_destination_hit`). Only the
@@ -1995,6 +2008,7 @@ impl VllmKvManager {
         sequence: &RequestSequence,
         lease: &BlockRequestLease,
         mode: super::DestinationReservationMode,
+        local_prefill_need: u64,
     ) -> VllmAcquire<DestinationReservation> {
         let grouped = self.grouped.as_mut().expect("grouped cache");
         let rules = self
@@ -2019,6 +2033,7 @@ impl VllmKvManager {
                 if coordinator.destination_admission_blocks(pool, &hit, transfer, prompt) > free
                     || (coordinator.destination_load_blocks(pool, &hit, transfer, prompt) as u64)
                         .saturating_add(self.grouped_inflight_need)
+                        .saturating_add(local_prefill_need)
                         > free as u64
                 {
                     return VllmAcquire::CapacityExhausted;
@@ -2067,7 +2082,10 @@ impl VllmKvManager {
                     return VllmAcquire::CapacityExhausted;
                 };
                 if prompt_bytes > free
-                    || load_bytes.saturating_add(self.grouped_inflight_need) > free
+                    || load_bytes
+                        .saturating_add(self.grouped_inflight_need)
+                        .saturating_add(local_prefill_need)
+                        > free
                 {
                     return VllmAcquire::CapacityExhausted;
                 }
@@ -2104,6 +2122,35 @@ impl VllmKvManager {
                 transfer_units,
             })),
         })
+    }
+
+    /// What a request with `lease` still needs to hold its `tokens` tokens,
+    /// as vLLM's `_request_remaining_blocks` counts it (V31
+    /// `sched:3003-3017`, V32 `sched:3060-3076`): blocks in block mode, bytes
+    /// in byte mode. A lease without grouped blocks gives 0. Byte mode needs
+    /// the admission limits that come with the transfer rules of a decode
+    /// rank.
+    pub(crate) fn grouped_remaining_need(&self, lease: &BlockRequestLease, tokens: usize) -> u64 {
+        let (Some(grouped), Some(grouped_lease)) = (&self.grouped, &lease.grouped) else {
+            return 0;
+        };
+        match &self.grouped_prefix {
+            Some(coordinator) => grouped_lease.block_lease.as_ref().map_or(0, |block_lease| {
+                coordinator.remaining_blocks(
+                    block_lease,
+                    // vLLM's prefill end (V32 `sched:3075`).
+                    lease.prompt_tokens.max(tokens.saturating_sub(1)),
+                    lease.allocated_tokens,
+                    tokens,
+                ) as u64
+            }),
+            None => {
+                let limits = self
+                    .grouped_limits
+                    .expect("the limits come with the transfer rules");
+                remaining_bytes(grouped.groups(), lease.allocated_tokens, tokens, limits)
+            }
+        }
     }
 
     /// The bytes that a grouped destination of `prompt_tokens` needs, with no
