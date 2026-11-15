@@ -1694,14 +1694,13 @@ def test_schema8_fpm_static_summary_energy(schema8_fpm_config, context_energy, g
     from aisim.sdk.inference_session import InferenceSession
 
     config, systems_root = schema8_fpm_config
-    model = models.get_model(
-        "Qwen/Qwen3-0.6B",
-        _model_config(
-            forward_model="fpm",
-            fpm_config=FpmCompileConfig({"fpm_parquet_path": config.engine.workers.aggregated.timing.fpm_parquet_path}),
-        ),
-        BACKEND,
-    )
+    # The legacy static session reads the pair through its PerfDatabase layout.
+    parquet = Path(config.engine.workers.aggregated.timing.fpm_parquet_path)
+    data_dir = systems_root / "data" / SYSTEM / BACKEND / VERSION
+    data_dir.mkdir(parents=True)
+    shutil.copy(parquet, data_dir)
+    shutil.copy(parquet.with_suffix(".metadata.json"), data_dir)
+    model = models.get_model("Qwen/Qwen3-0.6B", _model_config(forward_model="fpm"), BACKEND)
     database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(systems_root))
     summary = InferenceSession(model, database, get_backend(BACKEND)).run_static(
         sdk_config.RuntimeConfig(batch_size=1, isl=512, osl=2), mode="static"
