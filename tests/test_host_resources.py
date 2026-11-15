@@ -234,6 +234,13 @@ def test_session_estimate_charges_each_turn_once_and_history_per_active_session(
     assert uncapped.estimated_peak_bytes - estimate.estimated_peak_bytes == (6144 - 32) * carried
 
 
+@pytest.mark.parametrize("field", ["session_cache_copies", "session_cache_pools"])
+def test_session_cache_estimates_reject_zero_counts(field):
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 100, "osl": 5, field: 0}
+    with pytest.raises(ValueError, match="session cache copies must be positive"):
+        estimate_workload(workload, stack="engine")
+
+
 def test_session_caches_retain_completed_sessions_across_workers():
     workload = {"request_count": 6144, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
     single = estimate_workload(workload, stack="engine")
@@ -401,20 +408,37 @@ def test_session_admission_caps_asymmetric_cache_pools_separately(monkeypatch, r
     assert spec.workload == original
 
 
+@pytest.mark.parametrize("recommendation", [False, True])
+@pytest.mark.parametrize("explicit_parallelism", [False, True])
 @pytest.mark.parametrize("afd_role", ["aggregated", "prefill", "decode"])
-def test_session_afd_turn_bound_reaches_initial_and_candidate_admission(monkeypatch, host, afd_role):
+def test_session_afd_turn_bound_reaches_initial_and_candidate_admission(
+    monkeypatch, host, afd_role, explicit_parallelism, recommendation
+):
     from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
 
     raw = _config()
-    raw.pop("optimization")
-    raw.pop("optimizer")
+    if recommendation:
+        # AFD uses its own attention topology. Even a GPU budget below the
+        # turn count must preserve the replay guard's per-pool turn bound.
+        gpus = 2 if afd_role == "aggregated" else 3
+        raw["optimization"]["constraints"] = {"min_candidate_gpus": gpus, "max_candidate_gpus": gpus}
+    else:
+        raw.pop("optimization")
+        raw.pop("optimizer")
     raw["engine"]["backend"] = "sglang"
-    workers = {afd_role: {"type": "afd", "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}}
+    topology = {"tp_a": 1, "a_batch_size": 8}
+    if not recommendation:
+        topology.update(n_a_nodes=1, n_f_nodes=1)
+    workers = {afd_role: {"type": "afd", "afd": topology}}
+    if explicit_parallelism:
+        workers[afd_role]["parallelism"] = {"replicas": 1, **({"preset": False} if recommendation else {})}
     args = {"agg_engine_args" if afd_role == "aggregated" else f"{afd_role}_engine_args": {"afd": {}}}
     if afd_role != "aggregated":
         raw["engine"]["mode"] = "disaggregated"
         companion = "decode" if afd_role == "prefill" else "prefill"
         workers[companion] = {"parallelism": {"replicas": 1}}
+        if recommendation:
+            workers[companion]["parallelism"].update(preset=False, attention_data=1)
         args[f"{companion}_engine_args"] = {"dp_size": 1}
     raw["engine"]["workers"] = workers
     raw["traffic"] = {
@@ -427,7 +451,10 @@ def test_session_afd_turn_bound_reaches_initial_and_candidate_admission(monkeypa
         "load": {"type": "concurrency", "concurrency": 32},
         "stop": {"sessions": 100},
     }
-    config = CorePredictionConfig.model_validate(raw)
+    config_type = CoreRecommendationConfig if recommendation else CorePredictionConfig
+    config = config_type.model_validate(raw)
+    if not explicit_parallelism:
+        assert getattr(config.engine.workers, afd_role).parallelism is None
     bounds = workload_bounds(config)
     copies = 10 if afd_role == "aggregated" else 11
     assert bounds["session_cache_copies"] == copies
@@ -515,6 +542,51 @@ def test_session_admission_counts_dp_inferred_from_timing_identity(monkeypatch, 
     # Inferred DP reserves the same memory as an explicitly authored width.
     explicit = replace(deployment, agg_engine_args={**deployment.agg_engine_args, "dp_size": 3})
     assert guard_replay(replace(spec, backend_deployment=explicit), stack="engine") == plan
+
+
+@pytest.mark.parametrize("wide_role", ["aggregated", "prefill", "decode"])
+def test_session_admission_counts_wider_dp_from_parallel_config(monkeypatch, host, wide_role):
+    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+
+    aggregated = wide_role == "aggregated"
+    args = (
+        {"agg_engine_args": {"dp_size": 1}}
+        if aggregated
+        else {
+            "prefill_engine_args": {"dp_size": 1},
+            "decode_engine_args": {"dp_size": 1},
+        }
+    )
+    prefix = "" if aggregated else f"{wide_role}_"
+    deployment = BackendDeploymentSpec(
+        deployment_mode="agg" if aggregated else "disagg",
+        backend="vllm",
+        backend_version="test",
+        num_workers=2 if aggregated else 0,
+        num_prefill_workers=0 if aggregated else (2 if wide_role == "prefill" else 1),
+        num_decode_workers=0 if aggregated else (2 if wide_role == "decode" else 1),
+        parallel_config={f"{prefix}attention_dp": 3},
+        **args,
+    )
+    workload = {"request_count": 100, "turns_per_session": 10, "isl": 4096, "osl": 256, "concurrency": 32}
+    spec = ReplaySpec(backend_deployment=deployment, workload=workload, goal={}, concurrency=32)
+    original = dict(workload)
+    copies, pools = (6, 1) if aggregated else (7, 2)
+    assert resources._replay_resource_workload(spec, "engine")["session_cache_copies"] == copies
+    expected = estimate_workload(
+        {**workload, "session_cache_copies": copies, "session_cache_pools": pools}, stack="engine"
+    )
+    monkeypatch.setattr(resources, "discover_host", lambda: host)
+    monkeypatch.setattr(resources, "_child_memory_bytes", lambda: 0)
+    replay = guard_replay(spec, stack="engine")
+    wave = GuardedRunnerFactory(object(), "engine", ResourceConfig()).admit_wave([spec])
+    assert replay["status"] == wave["status"] == "admitted"
+    assert replay["estimate"] == wave["candidates"][0]["estimate"]
+    assert replay["estimate"]["estimated_peak_bytes"] == expected.estimated_peak_bytes
+    narrow = replace(deployment, parallel_config={})
+    narrow_plan = guard_replay(replace(spec, backend_deployment=narrow), stack="engine")
+    assert narrow_plan["estimate"]["estimated_peak_bytes"] < expected.estimated_peak_bytes
+    assert spec.workload == original
 
 
 def test_long_sessions_fit_a_workstation_budget():

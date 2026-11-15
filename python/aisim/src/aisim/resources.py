@@ -265,14 +265,18 @@ def workload_bounds(config: Any) -> dict[str, Any]:
         )
         optimization = getattr(config, "optimization", None)
         if optimization is not None:
-            # A cache per physical GPU bounds every candidate's replicas and
-            # attention-DP ranks. Keep a tighter explicit topology domain so a
-            # large GPU budget cannot turn a pinned one-cache search quadratic.
+            # A cache per physical GPU bounds monolithic replicas and
+            # attention-DP ranks. AFD has separate topology metadata, so keep
+            # its replay-compatible per-pool turn bound outside that cap.
             gpu_bound = optimization.constraints.max_candidate_gpus
             cache_copies = 0
+            afd_copies = 0
             for role in ("aggregated", "prefill", "decode"):
                 worker = getattr(config.engine.workers, role)
                 if worker is None:
+                    continue
+                if getattr(worker, "type", None) == "afd":
+                    afd_copies += turns
                     continue
                 parallel = getattr(worker, "parallelism", None)
                 if parallel is None:
@@ -289,14 +293,14 @@ def workload_bounds(config: Any) -> dict[str, Any]:
                         _upper(domain.get("attention_data"), gpu_bound)
                     )
                 cache_copies += min(turns, copies)
-            cache_copies = max(1, min(gpu_bound, cache_copies))
+            cache_copies = max(1, min(gpu_bound, cache_copies) + afd_copies)
         else:
             cache_copies = 0
             for role in ("aggregated", "prefill", "decode"):
                 worker = getattr(config.engine.workers, role)
                 if worker is not None:
                     parallel = getattr(worker, "parallelism", None)
-                    if parallel is None:
+                    if parallel is None or getattr(worker, "type", None) == "afd":
                         # AFD has its own topology. Each turn can add at most
                         # one independent copy per pool.
                         cache_copies += turns

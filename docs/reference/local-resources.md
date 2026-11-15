@@ -144,10 +144,11 @@ This bounds placement without session affinity and assumes no eviction or
 prefix sharing. With a fixed cache count, the retained-token charge grows
 linearly with turns. Prediction uses the configured replicas and attention-DP
 ranks across the aggregated, prefill, and decode roles; initial recommendation
-admission bounds their total by the declared topology domain and GPU budget,
-and candidate admission uses the concrete deployment. AFD roles use their separate
-topology; admission conservatively bounds their cache copies by the number of
-turns per pool.
+admission bounds monolithic cache copies by the declared topology domain and GPU
+budget, and candidate admission uses the concrete deployment. AFD roles use their
+separate topology; both prediction and recommendation admission conservatively
+bound their cache copies by the number of turns per pool, independently of the
+worker's `parallelism` mapping or the recommendation GPU budget.
 Active sessions also carry their earlier turns in a request: 32 bytes per
 earlier-turn token, plus 4 bytes per cumulative prompt token. Without a
 concurrency cap, every session counts as active. The Dynamo compatibility model
