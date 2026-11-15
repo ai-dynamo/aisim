@@ -83,6 +83,7 @@ areas:
       - tests/test_runner.py
       - tests/test_aiperf_metrics.py
       - tests/fixtures/aiperf_0.13.0_request_metrics.json
+      - tests/test_sglang_pd_replay.py
       - tests/test_traffic.py
       - tests/e2e/
   - label: mocker
@@ -108,6 +109,7 @@ areas:
       - benchmarks/
       - tests/test_aic_sync.py
       - tests/test_ci_workflow_contracts.py
+      - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
       - tests/test_pages_site.py
       - tests/test_release_fpe.py
@@ -326,6 +328,8 @@ shared:
     owners: [replay, sweeper, maintainers]
   - glob: tests/fixtures/aiperf_0.13.0_request_metrics.json
     owners: [replay, sweeper, maintainers]
+  - glob: tests/test_sglang_pd_replay.py
+    owners: [replay, maintainers]
   - glob: tests/test_traffic.py
     owners: [replay, maintainers]
   - glob: tests/e2e/
