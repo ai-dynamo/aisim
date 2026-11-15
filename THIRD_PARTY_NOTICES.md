@@ -2717,3 +2717,83 @@ https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6
 
 Modified for AISim's current layout and contracts; source links are
 preserved beside the adapted content.
+
+## Dynamo vLLM self-benchmark rules in the SGLang self-benchmark producer core
+
+Repository-root files `python/aisim/collector/fpm_forward/runtime/sglbench_grid.py` and
+`python/aisim/collector/fpm_forward/runtime/sglbench_artifact.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{grid,artifact,producer}.py`,
+re-implement rules of NVIDIA Dynamo's vLLM self-benchmark for an SGLang engine. They are
+modified re-implementations: no upstream function or block of source is copied; the flag,
+key and reason names and two short error-message phrases are upstream's.
+`python/aisim/collector/fpm_forward/runtime/sglbench_content.py` takes no code: its
+docstring names Dynamo's content-seed variable and its default, and the caller passes the
+value in.
+
+Source: https://github.com/ai-dynamo/dynamo/tree/b20fe6fe94021b854597965c7305931175e8f482
+
+Original paths and what follows them:
+
+- `components/src/dynamo/vllm/instrumented_scheduler.py`: the uniform axis cut
+  (`_uniformly_limit_axis`), the tail-protecting cut (`_limit_cudagraph_axis`), the
+  candidates of a graph-driven axis (`_cudagraph_axis_points`), the doubling ladder
+  (`_powers_of_two_up_to`), the composition, numbering and digest of the grid
+  (`_bench_build_grid`), its order (`_bench_generate_prefill_grid`,
+  `_kvwarm_order_decode_points`), the text of the infeasible-point error
+  (`_bench_raise_explicit_infeasible`), the key names and the status rule of the result
+  envelope, the upper median of the kept decode steps, the text of the failed-point
+  error (`_bench_skip_point`), the name and default of the content seed
+  (`ENV_BENCH_CONTENT_SEED`) and, in the simulated driver of
+  `test_fpm_sglbench_producer.py`, the seed, warm shot, measured shot and single re-stage
+  procedure (`_bench_realseed_stage_point`, `_bench_realseed_pending_step`) with two of
+  its failure reason strings.
+- `components/src/dynamo/vllm/backend_args.py`: the names and defaults of the five
+  sample-cap flags and of `--benchmark-max-batch-size`, and the bounds of the caps
+  (`_validate_benchmark_sampling`).
+- `components/src/dynamo/vllm/benchmark_points.py`: the benchmark modes, the points
+  manifest schema and the point checks (`validate_totals`).
+- `components/src/dynamo/vllm/worker_factory.py`: the merged result file
+  (`_merge_benchmark_rank_results`).
+- `components/src/dynamo/common/forward_pass_metrics.py`: the field names of a
+  forward-pass record.
+
+Closest to the upstream code are `limit_uniform`, `limit_graph_axis`, `_doubling`,
+`SampleCaps.__post_init__` and the digest expression in `sglbench_grid.py`, and the two
+error-message phrases.
+Changes: the cached-token axis is page aligned, decode contexts start at four tokens per
+request, a generated point that does not fit raises instead of being skipped, manifest
+totals that do not divide by the batch size are refused, a decode record keeps its six
+raw step times, and the modules use the standard library only.
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. Licensed
+under Apache-2.0. No upstream root NOTICE exists. Upstream license:
+https://github.com/ai-dynamo/dynamo/blob/b20fe6fe94021b854597965c7305931175e8f482/LICENSE
+
+## SGLang v0.5.22 and v0.5.23 admission rules in the SGLang self-benchmark producer core
+
+The feasibility rules in repository-root
+`python/aisim/collector/fpm_forward/runtime/sglbench_grid.py`, the admission and
+graph-size models in `python/aisim/tests/unit/collector/test_fpm_sglbench_grid.py`, and
+the prefix-cache model `PageCacheModel` in
+`python/aisim/tests/unit/collector/test_fpm_sglbench_content.py`, which
+`python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py` also uses, are modified
+behavioral adaptations of SGLang v0.5.22 at commit
+`baa9befa381511cd4d56f83980951e5a45fffc6d` and SGLang v0.5.23 at commit
+`297e54fd105e974cdf401e5b4d20253a22c16f90`:
+https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
+https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
+
+Upstream paths, under `python/sglang/srt/`:
+`managers/{tp_worker.py,utils.py,scheduler.py,schedule_policy.py,schedule_batch.py}`,
+`mem_cache/{prefill_budget.py,allocator/base.py,radix_cache.py,kv_cache_configurator.py,common.py}`,
+`model_executor/pool_configurator.py` and
+`arg_groups/{validation_hook.py,cuda_graph_hook.py}`.
+Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0. No upstream root NOTICE
+exists. The upstream license is at
+https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
+
+Modified: the admission arithmetic is restated as closed forms over a record of engine
+limits, and the tests model one admission pass, the graph-size ladders and whole-page
+prefix matching. Nothing is imported from SGLang, no upstream function or block of source
+is copied and no serving implementation is vendored. `sglbench_content.py` and
+`sglbench_artifact.py` name SGLang functions in comments and docstrings only.

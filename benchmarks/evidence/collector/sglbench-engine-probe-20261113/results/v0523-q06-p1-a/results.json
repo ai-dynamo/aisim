@@ -1,0 +1,160 @@
+{
+  "argv": [
+    "--out",
+    "/work/out/v0523-q06-p1-a",
+    "--checks",
+    "1,2,3",
+    "--",
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
+  ],
+  "sglang_argv": [
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
+  ],
+  "recorder_dir": "/work/out/v0523-q06-p1-a/recorder/20261114-035605",
+  "headers": [
+    {
+      "file": "sched-827.jsonl",
+      "type": "header",
+      "pid": 827,
+      "sglang_version": "0.5.23",
+      "class": "RecorderScheduler",
+      "mro": [
+        "RecorderScheduler",
+        "Scheduler",
+        "SchedulerDisaggregationDecodeMixin"
+      ],
+      "install": "hook",
+      "ranks": {
+        "attn_tp_rank": 0,
+        "attn_dp_rank": 0,
+        "attn_cp_rank": 0,
+        "pp_rank": 0,
+        "tp_size": 1,
+        "attn_dp_enabled": false
+      },
+      "page_size": 1,
+      "enable_overlap": true,
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 16384,
+      "max_running_requests": 4096,
+      "max_total_num_tokens": 1160904,
+      "max_req_input_len": 40954,
+      "input_blocker": false
+    }
+  ],
+  "check_1": {
+    "name": "recorder headers",
+    "pass": true,
+    "scheduler_processes": 1,
+    "expected": 1,
+    "classes": [
+      "RecorderScheduler"
+    ],
+    "install": [
+      "hook"
+    ],
+    "sglang_version": [
+      "0.5.23"
+    ],
+    "page_size": 1,
+    "enable_overlap": true,
+    "faults": [],
+    "seconds": 0.0
+  },
+  "check_2": {
+    "name": "one batch call, one extend batch",
+    "pass": true,
+    "cases": [
+      {
+        "batch": 2,
+        "pass": true,
+        "extend_batches": [
+          [
+            6,
+            2
+          ]
+        ],
+        "modes": [
+          "EXTEND"
+        ]
+      },
+      {
+        "batch": 32,
+        "pass": true,
+        "extend_batches": [
+          [
+            7,
+            32
+          ]
+        ],
+        "modes": [
+          "EXTEND"
+        ]
+      }
+    ],
+    "seconds": 0.13
+  },
+  "check_3": {
+    "name": "page-size formulas",
+    "page_size": 1,
+    "cases": [
+      {
+        "case": "prefill aligned prefix, warm shot",
+        "cached_tokens": [
+          128,
+          128
+        ],
+        "expected": 128,
+        "pass": true
+      },
+      {
+        "case": "prefill aligned prefix, measured shot",
+        "cached_tokens": [
+          128,
+          128
+        ],
+        "expected": 128,
+        "pass": true
+      },
+      {
+        "case": "prefill unaligned prefix",
+        "cached_tokens": [
+          135,
+          135
+        ],
+        "expected": 135,
+        "pass": true
+      },
+      {
+        "case": "decode seed (cold)",
+        "cached_tokens": [
+          0,
+          0
+        ],
+        "expected": 0,
+        "pass": true
+      },
+      {
+        "case": "decode measured run",
+        "cached_tokens": [
+          1020,
+          1020
+        ],
+        "expected": 1020,
+        "pass": true
+      }
+    ],
+    "decode_prompt_tokens": [
+      1021,
+      1021
+    ],
+    "decode_extend_tokens": [
+      2
+    ],
+    "pass": true,
+    "seconds": 0.59
+  },
+  "faults": []
+}

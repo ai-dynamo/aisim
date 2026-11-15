@@ -1,0 +1,583 @@
+{
+  "argv": [
+    "--out",
+    "/work/out/v0523-q06-p64",
+    "--checks",
+    "1,2,3,4,5,6",
+    "--max-batch",
+    "128",
+    "--",
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "--page-size",
+    "64"
+  ],
+  "sglang_argv": [
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "--page-size",
+    "64"
+  ],
+  "recorder_dir": "/work/out/v0523-q06-p64/recorder/20261114-035840",
+  "headers": [
+    {
+      "file": "sched-1904.jsonl",
+      "type": "header",
+      "pid": 1904,
+      "sglang_version": "0.5.23",
+      "class": "RecorderScheduler",
+      "mro": [
+        "RecorderScheduler",
+        "Scheduler",
+        "SchedulerDisaggregationDecodeMixin"
+      ],
+      "install": "hook",
+      "ranks": {
+        "attn_tp_rank": 0,
+        "attn_dp_rank": 0,
+        "attn_cp_rank": 0,
+        "pp_rank": 0,
+        "tp_size": 1,
+        "attn_dp_enabled": false
+      },
+      "page_size": 64,
+      "enable_overlap": true,
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 16384,
+      "max_running_requests": 4096,
+      "max_total_num_tokens": 1160896,
+      "max_req_input_len": 40954,
+      "input_blocker": false
+    }
+  ],
+  "check_1": {
+    "name": "recorder headers",
+    "pass": true,
+    "scheduler_processes": 1,
+    "expected": 1,
+    "classes": [
+      "RecorderScheduler"
+    ],
+    "install": [
+      "hook"
+    ],
+    "sglang_version": [
+      "0.5.23"
+    ],
+    "page_size": 64,
+    "enable_overlap": true,
+    "faults": [],
+    "seconds": 0.0
+  },
+  "check_2": {
+    "name": "one batch call, one extend batch",
+    "pass": true,
+    "cases": [
+      {
+        "batch": 2,
+        "pass": true,
+        "extend_batches": [
+          [
+            6,
+            2
+          ]
+        ],
+        "modes": [
+          "EXTEND"
+        ]
+      },
+      {
+        "batch": 128,
+        "pass": true,
+        "extend_batches": [
+          [
+            7,
+            128
+          ]
+        ],
+        "modes": [
+          "EXTEND"
+        ]
+      }
+    ],
+    "seconds": 0.48
+  },
+  "check_3": {
+    "name": "page-size formulas",
+    "page_size": 64,
+    "cases": [
+      {
+        "case": "prefill aligned prefix, warm shot",
+        "cached_tokens": [
+          512,
+          512
+        ],
+        "expected": 512,
+        "pass": true
+      },
+      {
+        "case": "prefill aligned prefix, measured shot",
+        "cached_tokens": [
+          512,
+          512
+        ],
+        "expected": 512,
+        "pass": true
+      },
+      {
+        "case": "prefill unaligned prefix",
+        "cached_tokens": [
+          512,
+          512
+        ],
+        "expected": 512,
+        "pass": true
+      },
+      {
+        "case": "decode seed (cold)",
+        "cached_tokens": [
+          0,
+          0
+        ],
+        "expected": 0,
+        "pass": true
+      },
+      {
+        "case": "decode measured run",
+        "cached_tokens": [
+          960,
+          960
+        ],
+        "expected": 960,
+        "pass": true
+      }
+    ],
+    "decode_prompt_tokens": [
+      1021,
+      1021
+    ],
+    "decode_extend_tokens": [
+      122
+    ],
+    "pass": true,
+    "seconds": 0.5
+  },
+  "check_4": {
+    "name": "decode steps",
+    "pass": true,
+    "cases": [
+      {
+        "batch": 2,
+        "context": 1024,
+        "pass": true,
+        "modes_seen": [
+          "EXTEND DECODE DECODE DECODE DECODE DECODE DECODE"
+        ],
+        "median_inter_output_ms_by_step": [
+          2.207,
+          1.593,
+          1.611,
+          1.569,
+          1.575,
+          1.186
+        ],
+        "median_launch_to_output_ms_by_step": [
+          3.26,
+          2.654,
+          2.62,
+          2.61,
+          2.591,
+          2.191
+        ],
+        "median_kept_ms": 1.575
+      },
+      {
+        "batch": 8,
+        "context": 1024,
+        "pass": true,
+        "modes_seen": [
+          "EXTEND DECODE DECODE DECODE DECODE DECODE DECODE"
+        ],
+        "median_inter_output_ms_by_step": [
+          2.748,
+          1.599,
+          1.619,
+          1.604,
+          1.615,
+          1.567
+        ],
+        "median_launch_to_output_ms_by_step": [
+          3.891,
+          2.677,
+          2.635,
+          2.656,
+          2.623,
+          2.59
+        ],
+        "median_kept_ms": 1.615
+      }
+    ],
+    "seconds": 1.58
+  },
+  "check_5": {
+    "name": "seed reuse",
+    "pass": true,
+    "points": 20,
+    "seed_tokens_with_reuse": 19108,
+    "seed_tokens_without_reuse": 56484,
+    "elapsed_s": 2.916,
+    "seconds_per_point": 0.1458,
+    "rows": [
+      {
+        "batch": 4,
+        "context": 4096,
+        "seed_computed_tokens": [
+          4093,
+          4093,
+          4093,
+          4093
+        ],
+        "seed_was_cached": [
+          false,
+          false,
+          false,
+          false
+        ],
+        "seed_wall_s": 0.0493,
+        "run_wall_s": 0.2318,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 2048,
+        "seed_computed_tokens": [
+          61,
+          61,
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0119,
+        "run_wall_s": 0.0235,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 1024,
+        "seed_computed_tokens": [
+          61,
+          61,
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0106,
+        "run_wall_s": 0.0234,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 512,
+        "seed_computed_tokens": [
+          61,
+          61,
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0106,
+        "run_wall_s": 0.0251,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 256,
+        "seed_computed_tokens": [
+          61,
+          61,
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0108,
+        "run_wall_s": 0.0229,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 128,
+        "seed_computed_tokens": [
+          61,
+          61,
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0109,
+        "run_wall_s": 0.0216,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 64,
+        "seed_computed_tokens": [
+          61,
+          61,
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0096,
+        "run_wall_s": 0.0211,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 4,
+        "context": 32,
+        "seed_computed_tokens": [
+          29,
+          29,
+          29,
+          29
+        ],
+        "seed_was_cached": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0094,
+        "run_wall_s": 0.0213,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 4096,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.01,
+        "run_wall_s": 0.0219,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 2048,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0094,
+        "run_wall_s": 0.0216,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 1024,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0092,
+        "run_wall_s": 0.021,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 512,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0104,
+        "run_wall_s": 0.0208,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 256,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0094,
+        "run_wall_s": 0.0216,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 128,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0092,
+        "run_wall_s": 0.0222,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 64,
+        "seed_computed_tokens": [
+          61,
+          61
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0092,
+        "run_wall_s": 0.02,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 2,
+        "context": 32,
+        "seed_computed_tokens": [
+          29,
+          29
+        ],
+        "seed_was_cached": [
+          true,
+          true
+        ],
+        "seed_wall_s": 0.0095,
+        "run_wall_s": 0.0207,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 1,
+        "context": 4096,
+        "seed_computed_tokens": [
+          61
+        ],
+        "seed_was_cached": [
+          true
+        ],
+        "seed_wall_s": 0.0095,
+        "run_wall_s": 0.0217,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 1,
+        "context": 2048,
+        "seed_computed_tokens": [
+          61
+        ],
+        "seed_was_cached": [
+          true
+        ],
+        "seed_wall_s": 0.0103,
+        "run_wall_s": 0.0211,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 1,
+        "context": 1024,
+        "seed_computed_tokens": [
+          61
+        ],
+        "seed_was_cached": [
+          true
+        ],
+        "seed_wall_s": 0.0101,
+        "run_wall_s": 0.0217,
+        "run_sequence_ok": true
+      },
+      {
+        "batch": 1,
+        "context": 512,
+        "seed_computed_tokens": [
+          61
+        ],
+        "seed_was_cached": [
+          true
+        ],
+        "seed_wall_s": 0.0102,
+        "run_wall_s": 0.0204,
+        "run_sequence_ok": true
+      }
+    ],
+    "seconds": 2.92
+  },
+  "check_6": {
+    "name": "streaming off and on",
+    "pass": null,
+    "batch": 8,
+    "context": 1024,
+    "kept_ms_stream_off": [
+      1.7755907028913498,
+      1.7508156597614288,
+      1.8304558470845222,
+      1.6012401320040226,
+      1.7049689777195454
+    ],
+    "kept_ms_stream_on": [
+      1.6847308725118637,
+      1.880719792097807,
+      1.6907518729567528,
+      1.7748251557350159,
+      1.7524100840091705
+    ],
+    "median_off_ms": 1.751,
+    "median_on_ms": 1.752,
+    "on_over_off": 1.0006,
+    "seconds": 1.4
+  },
+  "faults": []
+}
