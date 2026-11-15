@@ -386,6 +386,31 @@ also differs from vLLM v0.32.0 here:
 - After a preemption, `simple_cpu_v0_32` loads only prompt blocks from G2 and
   recomputes the request's output blocks, which vLLM reloads.
 
+<a id="hybrid-g2"></a>
+
+### Hybrid models (state cache)
+
+With [`state_cache`](#state-cache), the two v0.32.0 profiles also keep recurrent
+states, so a follow-up whose state left G1 can resume from host memory. This
+needs `prefix_match_unit` equal to `block_size`.
+
+- A state goes to G2 when G1 publishes it, before the pass's blocks, as one key
+  per state block, for example one per Mamba group. `offloading_v0_32` stores
+  only states inside the prompt, each key on its own. `simple_cpu_v0_32` stores
+  a state only when all its keys fit, and otherwise drops it without a retry;
+  vLLM stores each group's block while room remains.
+- A lookup resumes at the deepest block boundary within the prompt, at most
+  `(len - 1) // block_size` blocks, where G1 and G2 hold the attention prefix
+  and G2 holds every key of the state there. A state missing one key is not a
+  hit. The load restores both, and the restored state is the first pass's
+  input.
+- `offloading_v0_32` re-ranks the states a finishing request stored, offered or
+  loaded together with its blocks.
+- G1 keeps the blocks a hybrid G2 is copying until the copy completes, as
+  SimpleCPU does. For `offloading_v0_32` this is a simplification: vLLM fences
+  the copied blocks' reuse instead, and replay does not fence state blocks.
+  Replay then frees them tail first, as vLLM frees a finished request's blocks.
+
 <a id="g2-scope"></a>
 <a id="g2-ownership"></a>
 
@@ -417,8 +442,9 @@ and shared bandwidths; otherwise the run is rejected. In `recommend` with
 ### Supported
 
 G2 supports vLLM aggregated and token-only disaggregated workers with prefix
-caching and any `attention_data`. It is rejected with SGLang, TensorRT-LLM,
-ngram speculation, `state_cache`, and Belady eviction.
+caching and any `attention_data`. A `state_cache` needs a v0.32.0 profile; see
+[hybrid models](#hybrid-g2). G2 is rejected with SGLang, TensorRT-LLM, ngram
+speculation and Belady eviction.
 
 Canonical `engine.speculation.kind: mtp` can combine with G2 only on an
 aggregated vLLM worker with `attention_data: 1`, `scope: dp_rank_local`, prefix
@@ -426,6 +452,9 @@ caching and no G3. Use explicit fixed KV capacity and default timing. This
 models synchronous single-module MTP with one uniform shared FullAttention
 cache; separate draft models and grouped caches are unsupported. See
 [speculation](speculation.md#registered-schemes) for the complete composition.
+A hybrid G2 takes MTP only with [`disable_eagle_block_drop`](speculation.md#prefix-caching):
+replay does not model the EAGLE block drop hiding the last block, and the state,
+that a G2 load restored.
 
 This combined behavior is adapted and modified from the
 [vLLM v0.32.0 scheduler](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py)
@@ -625,6 +654,9 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 | Knob | Default | Rules |
 |---|---|---|
 | `state_cache.bytes_per_request` | Inferred | State bytes per request per rank. When set, `block_size` and numeric `bytes_per_token` must also be set. |
+| `state_cache.num_speculative_states` | Unset | Explicit full-state scratch copies per request. Must match the draft depth, from positive `nextn` or `engine.speculation`. Requires numeric state bytes and token geometry. Under MTP it also applies vLLM's [EAGLE block drop](speculation.md#prefix-caching) to state lookups. |
+| `state_cache.prefill_checkpoint` | `false` | vLLM's internal prefill checkpoint; see [below](#opt-in-align-rules). Needs `prefix_match_unit` equal to `block_size`. |
+| `state_cache.junction_checkpoints` | `false` | vLLM v0.29.0's shared-prefix junction states; see [below](#opt-in-align-rules). Needs an explicit `prefix_match_unit`. |
 | `state_cache.mamba_cache_dtype` | `auto` | Kimi K3 only. `auto` (model dtype), `float16` or `float32`. Used when bytes are inferred. |
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `state_cache.retention_interval` | Unset (every block boundary) | DeepSeek V4 with inferred bytes only. vLLM's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: `0` or a multiple of the resolved `block_size`. DeepSeek V4 rejects `prefix_match_unit`. |
@@ -679,7 +711,11 @@ DeepSeek V4 falls back to one recurrent-style checkpoint per request.
 Kimi K3's recurrent state resumes only from a stored snapshot, so it does not
 land on every matching token. With `block_size: 1536` and `prefix_match_unit: 128`, a cold
 24,300-token prompt keeps snapshots at 23,040 and 24,192 tokens. A later request
-sharing 23,700 tokens resumes at 23,040. This follows vLLM v0.29.0 align mode.
+sharing 23,700 tokens resumes at 23,040. This follows vLLM v0.29.0 align mode,
+with one difference: when a prompt ends on a block boundary, replay also keeps
+the state one block earlier (two under the EAGLE block drop), so an identical
+resend resumes there. vLLM keeps a state there only if a prefill chunk ended
+there.
 
 ### State pool from recorded runtime memory
 
@@ -711,17 +747,46 @@ than the padded `bytes_per_request` for Kimi K3 at TP8), transfers it after all
 but the last prompt token and recomputes that token on the decode worker. Replay
 transfers the state for the whole prompt and does not model the recompute.
 
+<a id="opt-in-align-rules"></a>
+
+Two align-mode behaviors of vLLM are opt-in and off by default:
+
+- **`prefill_checkpoint`** is vLLM's `num_prefill_checkpoint_blocks = 1`, which
+  vLLM 43b4aaea sets for Mamba2 layers. When the final prefill chunk starts on a
+  block boundary and spans at least one block before
+  `c = (P - 1) // block_size * block_size`, the chunk runs to the prompt end and
+  its forward exports the state at `c` into one extra state reserved for that
+  pass. Without it the chunk stops at `c`, which costs one more pass.
+- **`junction_checkpoints`** is vLLM's default at v0.29.0, the revision the
+  align model follows. When a lookup's attention
+  hit runs deeper than its deepest state (`shared_prefix_boundary`), the
+  prefill stops at that block-aligned position and keeps the state there; a
+  sibling sharing the prefix then resumes from it.
+  A lookup that would resume from a state published in the same pass waits one
+  pass, as vLLM's allocation does. Without the switch, such states stay hidden
+  and the lookup falls back to an older state.
+
 Supported: aggregated and P/D vLLM, fixed `capacity` (or the
 [recorded pool](#state-pool-from-recorded-runtime-memory) of an FPM profile), `predict --stack engine`;
 inferred geometry for Kimi K3 and DeepSeek V4 at PP=1.
 Speculative decoding supports `prefix_match_unit` equal to `block_size`.
-Sub-block matching with speculation remains unsupported.
+For sub-block matching, supply `state_cache.num_speculative_states` equal to
+the draft depth, from positive `nextn` or `engine.speculation`.
+Each scratch copy consumes the same padded pages as the
+working state. The pool must fit these copies plus one token page.
+Without the field, MTP reserves no scratch copies and state lookups skip the
+EAGLE block drop.
+This explicit mode models full-state scratch storage, not ReplaySSM or
+RecoverSSM rings or temporary records.
 
-Rejected: `recommend`, G2/G3 offload, and speculative decoding with sub-block
-`prefix_match_unit`.
+Rejected: `recommend`, G3 offload, G2 except as a [hybrid G2](#hybrid-g2), and
+speculative sub-block matching without an explicit full-state scratch count.
 
 ## Other cache modes
 
+- **Observed Mamba pools.** An FPM profile with `cache_layout: mamba_align`
+  supplies the shared pool and state reservations for aggregated vLLM; see
+  [memory accounting](../../perf-model/memory.md#observed-mamba-align-pools).
 - **Grouped caches.** Some whole-forward (FPM) profiles describe several KV
   groups, such as sliding-window and full attention, sharing one byte budget.
   Replay then allocates each group separately. A `state` group holds a fixed
@@ -742,8 +807,8 @@ AgentX snapshot, warmup and continuous-profile traffic supports G2 on vLLM with
 aggregated or prefill/decode pools with any positive integer worker count, all
 with `attention_data: 1` and static workers. Without speculation, either G2 scope
 works. Canonical MTP additionally supports a single aggregated worker with local
-G2 and prefix caching, within the [combined scope](#supported) above. Other
-speculation and G3 are not supported. When the replay composition captures engine
+G2 and prefix caching, within the [combined scope](#supported) above, and MTP
+runs on a [hybrid G2](#hybrid-g2). Other speculation and G3 are not supported. When the replay composition captures engine
 KV events, each worker publishes its G2 residency as native `HostPinned` events,
 so a KV-aware placement policy can follow a G2-resident prefix to its owner, or
 to any replica of a `cluster_shared` pool. The built-in round-robin composition

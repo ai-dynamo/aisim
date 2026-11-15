@@ -100,7 +100,9 @@ not enable it.
 execution. AgentX G2 additionally requires offline vLLM, static worker
 pools with any positive integer worker count, and DP1 on every role. G3 cannot
 be combined with AgentX G2. Speculation is limited to canonical MTP on a single
-aggregated worker with local G2, prefix caching and synchronous scheduling.
+aggregated worker with local G2, prefix caching and synchronous scheduling, and
+to MTP on a [hybrid G2](../replay/engine/kv-cache.md#hybrid-g2) with
+`disable_eagle_block_drop`.
 The [feature matrix](../replay/features.md) records the built-in
 stack's actual boundary, including limitations stricter than a capability flag.
 

@@ -406,11 +406,25 @@ def _require_agentic_g2_scope(spec: ReplaySpec, roles: list[tuple[str, Mapping[s
             for name in names
         ):
             raise ValueError("agentic host offload requires backend=vllm on every role")
+        speculation = rank.get("speculation")
+        # With a state cache, MTP takes G2 only with the EAGLE block drop off.
+        hybrid_mtp = (
+            rank.get("state_cache") is not None
+            and (
+                rank.get("disable_eagle_block_drop") is True
+                or (isinstance(speculation, Mapping) and speculation.get("disable_eagle_block_drop") is True)
+            )
+            and all(
+                isinstance(selection, Mapping) and selection.get("kind") == "mtp"
+                for selection in (speculation, identity.get("speculation"))
+                if selection is not None
+            )
+        )
         if (
             any(rank.get(name) is not None for name in ("aic_nextn", "nextn", "speculation"))
             or any(identity.get(name) is not None for name in ("aic_nextn", "speculation"))
             or identity.get("nextn") not in (None, 0)
-        ):
+        ) and not hybrid_mtp:
             selections = [
                 selection
                 for selection in (rank.get("speculation"), identity.get("speculation"))
@@ -432,7 +446,8 @@ def _require_agentic_g2_scope(spec: ReplaySpec, roles: list[tuple[str, Mapping[s
             ):
                 raise ValueError(
                     "agentic G2 replay requires speculative decoding disabled except canonical MTP "
-                    "on an aggregated worker with prefix caching and scope=dp_rank_local"
+                    "on an aggregated worker with prefix caching and scope=dp_rank_local, or MTP with "
+                    "state_cache and disable_eagle_block_drop"
                 )
         prefix = "" if role == "aggregated" else f"{role}_"
         # A fitted snapshot's identity may spell its width unknown; as in the
