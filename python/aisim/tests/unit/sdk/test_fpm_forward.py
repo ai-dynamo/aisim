@@ -1658,8 +1658,10 @@ def test_fpm_detail_distinguishes_memory_budget_from_runtime_capacity(external_f
     assert sections["time"]["serving_metrics"]["mean_ttft_ms"] > 0
 
 
-def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(external_fpm_config, tmp_path, capsys):
+@pytest.fixture
+def schema8_fpm_config(external_fpm_config, tmp_path, request):
     config, systems_root = external_fpm_config
+    unpowered_phase = getattr(request, "param", None)
     original = Path(config.engine.workers.aggregated.timing.fpm_parquet_path)
     rows = pq.read_table(original).to_pylist()
     policy = "dynamo_native_single_sample_power_window_v1"
@@ -1671,7 +1673,7 @@ def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(external
             input_modality="text",
             measurement_policy=policy,
             measurement_repeats=1,
-            power_w=500.0,
+            power_w=None if row["workload_kind"] == unpowered_phase else 500.0,
         )
     powered = _write_pair(
         str(tmp_path / "powered"), rows, sidecar_overrides={"schema_version": 8, "measurement_policy": policy}
@@ -1679,6 +1681,43 @@ def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(external
     raw = config.model_dump(mode="json", exclude_none=True)
     raw["engine"]["workers"]["aggregated"]["timing"]["fpm_parquet_path"] = powered
     config = CorePredictionConfig.model_validate(raw)
+    return config, systems_root
+
+
+@pytest.mark.parametrize(
+    "schema8_fpm_config,context_energy,generation_energy",
+    [(None, 11000.0, 3000.0), ("prefill", 0.0, 3000.0), ("decode", 11000.0, 0.0)],
+    indirect=["schema8_fpm_config"],
+    ids=["powered", "unpowered-prefill", "unpowered-decode"],
+)
+def test_schema8_fpm_static_summary_energy(schema8_fpm_config, context_energy, generation_energy):
+    from aisim.sdk.inference_session import InferenceSession
+
+    config, systems_root = schema8_fpm_config
+    model = models.get_model(
+        "Qwen/Qwen3-0.6B",
+        _model_config(
+            forward_model="fpm",
+            fpm_config=FpmCompileConfig({"fpm_parquet_path": config.engine.workers.aggregated.timing.fpm_parquet_path}),
+        ),
+        BACKEND,
+    )
+    database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(systems_root))
+    summary = InferenceSession(model, database, get_backend(BACKEND)).run_static(
+        sdk_config.RuntimeConfig(batch_size=1, isl=512, osl=2), mode="static"
+    )
+    # Synthetic 22/6 ms anchors at 500 W yield 11000/3000 W*ms. Missing
+    # selected power keeps the latency and operation key, with zero energy.
+    assert summary.get_context_latency_dict() == {"fpm_forward_prefill": pytest.approx(22.0)}
+    assert summary.get_generation_latency_dict() == {"fpm_forward_decode": pytest.approx(6.0)}
+    assert summary.get_context_energy_wms_dict() == {"fpm_forward_prefill": pytest.approx(context_energy)}
+    assert summary.get_generation_energy_wms_dict() == {"fpm_forward_decode": pytest.approx(generation_energy)}
+
+
+def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(schema8_fpm_config, tmp_path, capsys):
+    config, systems_root = schema8_fpm_config
+    powered = config.engine.workers.aggregated.timing.fpm_parquet_path
+    raw = config.model_dump(mode="json", exclude_none=True)
 
     # Prove that the same pair supplies real native operation energy:
     # the synthetic anchors cost 22/6 ms at 500 W, or 11000/3000 W*ms.
