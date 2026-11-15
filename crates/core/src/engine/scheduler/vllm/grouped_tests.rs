@@ -3334,6 +3334,94 @@ fn grouped_destination_waits_for_the_cached_block_of_a_lagging_state_hit() {
     assert_eq!(reserve_grouped(&mut core, c, request), None);
 }
 
+#[test]
+fn grouped_destination_transfers_every_block_of_an_uncacheable_full_attention_group() {
+    // A full-attention group that is not prefix-cacheable and a cacheable
+    // state group, both of 16-token blocks, in block mode on 20 pages. The
+    // full-attention group never caches a block (V31 and V32
+    // `vllm/v1/core/single_type_kv_cache_manager.py:498-499`). vLLM pulls
+    // the blocks without a hash (`nixl/pull_scheduler.py:149-156`, the same
+    // in V31 and V32), so a decode rank pulls every block of that group.
+    let mut groups = full_and_state_transfer_groups();
+    groups[0].prefix_cacheable = Some(false);
+    let mut args = prefix_core(groups, 2_000, 32, 16, "0.31.0").args;
+    args.worker_type = WorkerType::Decode;
+    let mut core = VllmCore::new(args);
+    let mut trace = TraceCollector::default();
+    let mut step = 0;
+    // A load of 33 tokens loads 32, as the state group backs off one token:
+    // cdiv(32, 16) = 2 units. Its first pass computes token 32, so it opens a
+    // third full-attention block and a new state block, and the previous
+    // state block stays for one step: 5 blocks. Of its blocks, only the state
+    // at its replay boundary 32 stays cached.
+    let first = HandoffId::new(Uuid::from_u128(1901));
+    assert_eq!(
+        reserve_grouped(&mut core, first, pd_request(1900, 33, 2)),
+        Some(2)
+    );
+    activate(&mut core, first);
+    assert_eq!(step_pd(&mut core, &mut trace, &mut step), 1);
+    assert_eq!(block_pool(&core).active_blocks(), 5);
+    assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 5), 1);
+    assert_eq!(block_pool(&core).inactive_cached_blocks(), 1);
+    // A prompt of 49 tokens that shares those 33 tokens loads 48: cdiv(48,
+    // 16) = 3 units. Without a cacheable full-attention group, its local
+    // prefix is the hit that every group agrees on, the state hit at 32. That
+    // hit keeps no full-attention block, so all 3 units move.
+    let second = HandoffId::new(Uuid::from_u128(1903));
+    assert_eq!(
+        reserve_grouped(&mut core, second, pd_request(1902, 49, 2)),
+        Some(3)
+    );
+}
+
+#[test]
+fn grouped_destination_transfers_every_unit_when_one_of_two_full_attention_groups_is_uncacheable() {
+    // Two full-attention groups of 16-token blocks at 100 bytes a page, one
+    // prefix-cacheable and one not, in block mode on 20 pages. A transfer
+    // unit is one block of every full-attention group, and the group that is
+    // not prefix-cacheable keeps no hit block. So every unit moves, whatever
+    // the cacheable group keeps.
+    let mut groups = full_transfer_group();
+    let mut uncached = group("uncached", 16, 100, None);
+    uncached.prefix_cacheable = Some(false);
+    uncached.transfer_bytes_per_block = Some(100);
+    groups.push(uncached);
+    let mut args = prefix_core(groups, 2_000, 8192, 16, "0.31.0").args;
+    args.worker_type = WorkerType::Decode;
+    let mut core = VllmCore::new(args);
+    let mut trace = TraceCollector::default();
+    let mut step = 0;
+    // Without a state group the load is the whole prompt: cdiv(33, 16) = 3
+    // units. The request holds 3 blocks in each group.
+    let first = HandoffId::new(Uuid::from_u128(1951));
+    assert_eq!(
+        reserve_grouped(&mut core, first, pd_request(1950, 33, 2)),
+        Some(3)
+    );
+    activate(&mut core, first);
+    drain_pd(&mut core, &mut trace, &mut step, 6);
+    // The cacheable group keeps its blocks that end at 16 and 32.
+    let mut shared = BlockRequestLease::new(Uuid::nil(), Vec::new());
+    shared.configure_prefix_hashes(&(0..32).collect::<Vec<u32>>(), 16);
+    for end in [16, 32] {
+        assert!(
+            block_pool(&core)
+                .key_hit(0, shared.prefix_hash_at(end).unwrap())
+                .is_some()
+        );
+    }
+    // A prompt of 49 tokens that shares those 33 tokens loads cdiv(49, 16) =
+    // 4 units. Its local prefix is the hit of 32 tokens of the cacheable
+    // group, which keeps 2 blocks. The other group keeps none, so all 4
+    // units move, not 4 - 32 / 16 = 2.
+    let second = HandoffId::new(Uuid::from_u128(1953));
+    assert_eq!(
+        reserve_grouped(&mut core, second, pd_request(1952, 49, 2)),
+        Some(4)
+    );
+}
+
 /// One full-attention group of 16-token blocks at 100 bytes a page, with
 /// the transfer fields set. No state group, so a load is the whole prompt.
 fn full_transfer_group() -> Vec<FpmCacheGroup> {
