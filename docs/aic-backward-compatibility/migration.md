@@ -592,10 +592,11 @@ metadata does not load the native extension.
 
 ### SDK power results and accessors
 
-SDK static and disaggregated schema-6 and schema-7 FPM results now publish
-`power_w: null` (`None` in Python), previously `0.0`. The row and
-`get_e2e_power_avg()`, `get_context_power_avg()`, and
-`get_generation_power_avg()` preserve unavailable power as `None`. Handle it
+SDK static, aggregate, and disaggregated schema-6 and schema-7 FPM results now
+publish `power_w: null` (`None` in Python), previously `0.0`. The row and
+`get_e2e_power_avg()` preserve unavailable power as `None`. For static and
+disaggregated summaries, `get_context_power_avg()` and
+`get_generation_power_avg()` also return `None`. Handle unavailable power
 before arithmetic or numeric formatting; do not interpret it as zero watts.
 Latency and available operation energy are unchanged, and true coverage remains
 available through `get_power_data_coverage()`.
@@ -612,8 +613,8 @@ the power values and accessor behavior change as described above.
 
 The synthetic SDK regressions in
 [`TestFPMPowerPublication`](../../python/aisim/tests/unit/sdk/test_fpm_forward.py)
-cover schema-6/schema-7 static and disaggregated nulls, the three getters, and
-op-level row/accessor agreement. The optimization regressions in
+cover schema-6/schema-7 static, aggregate, and disaggregated nulls, the three
+getters, and op-level row/accessor agreement. The optimization regressions in
 [`test_inference_session.py`](../../python/aisim/tests/unit/sdk/test_inference_session.py)
 cover selected, withheld, NaN, and empty results. These tests establish output
 contracts, not measured power accuracy.

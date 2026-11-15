@@ -2083,20 +2083,33 @@ class TestFPMPowerPublication:
     """Public SDK watts for FPM models are published only where V1 supports them."""
 
     @pytest.mark.parametrize("schema_version", [6, 7])
-    @pytest.mark.parametrize("mode", ["static", "disagg"])
+    @pytest.mark.parametrize("mode", ["static", "agg", "disagg"])
     def test_legacy_schema_power_migration(self, fpm_power_root, schema_version, mode):
         """Pin the SDK power migration in docs/aic-backward-compatibility/migration.md."""
         model = _qwen_fpm()
-        database = fpm_power_root(model, None, schema_version=schema_version)
-        summary = (
-            _run_static(model, database)
-            if mode == "static"
-            else _run_disagg(database, lambda: _model_config(forward_model="fpm"))
+        database = fpm_power_root(
+            model, None, rows=_agg_rows(model) if mode == "agg" else None, schema_version=schema_version
         )
+        if mode == "agg":
+            from aisim.sdk.config import RuntimeConfig
+            from aisim.sdk.inference_session import InferenceSession
+
+            summary = InferenceSession(model, database, get_backend(BACKEND)).run_agg(
+                RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=512), ctx_tokens=512
+            )
+            assert summary.get_result_dict()["power_w"] is None
+            groups = summary.get_aggregate_energy_breakdown().values()
+            assert sum(group.latency_ms for group in groups) > 0.0
+            assert sum(group.energy_wms for group in groups) == 0.0
+        elif mode == "static":
+            summary = _run_static(model, database)
+        else:
+            summary = _run_disagg(database, lambda: _model_config(forward_model="fpm"))
         assert summary.get_summary_df()["power_w"].iloc[0] is None
         assert summary.get_e2e_power_avg() is None
-        assert summary.get_context_power_avg() is None
-        assert summary.get_generation_power_avg() is None
+        if mode != "agg":
+            assert summary.get_context_power_avg() is None
+            assert summary.get_generation_power_avg() is None
         assert summary.get_power_data_coverage() == 0.0
 
     @pytest.mark.parametrize("mode", ["agg", "disagg"])
