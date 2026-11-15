@@ -24,6 +24,8 @@ powered schema-8 pairs at or above the gate, and null power with numeric
 coverage below it. Aggregated coverage counts mixed-step latency as uncovered,
 because mixed-step FPM energy is suppressed while pure-decode energy is
 retained; the published `power_w` divides total energy by total active latency.
+Non-schema-8 FPM runs (schema 6 and 7) have no row-power evidence and publish
+null `power_w` (`None` in Python), rather than the previous `0.0` sentinel.
 A disaggregated result withholds power when either worker withholds it. FPM
 watts are also withheld for draft speculation schemes, models with encoder
 operations, and language-only EPD workers. Raw `InferenceSession` summaries

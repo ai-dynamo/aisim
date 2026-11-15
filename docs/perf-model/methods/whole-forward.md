@@ -487,6 +487,7 @@ watt-milliseconds from schema-8 row power and resolved latency. Latency and
 power use the same interpolation weight; a prefill latency clamp also scales
 energy. If any selected anchor lacks power, the operation returns zero energy
 as the uncovered-data sentinel. Direct interpolation stays latency-only.
+For example, a 500 W, 7 ms SOL result carries 3500 W·ms of operation energy.
 
 Python static summaries expose this energy through
 `get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`, which

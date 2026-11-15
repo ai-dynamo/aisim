@@ -1978,7 +1978,7 @@ def fpm_power_root(tmp_path):
 
     Returns ``write(model, power_w, rows=None)``. It writes ``rows`` (default
     :func:`_power_rows`) as schema 8 with ``power_w(row)`` watts, or as
-    schema 6 when ``power_w`` is None, into a fresh systems root (the native
+    latency-only schema 6 or 7 when ``power_w`` is None, into a fresh systems root (the native
     loader caches pairs by path) and returns its ``PerfDatabase``.
     """
     from aisim_core.sdk.rust_engine_step import _engine_handle_cache_clear
@@ -1998,12 +1998,21 @@ def fpm_power_root(tmp_path):
     shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", template / f"{SYSTEM}.yaml")
     roots = itertools.count()
 
-    def write(model, power_w, *, rows=None):
+    def write(model, power_w, *, rows=None, schema_version=6):
         rows = _power_rows(model) if rows is None else rows
         root = shutil.copytree(template, tmp_path / f"systems{next(roots)}")
         data_dir = str(root / "data" / SYSTEM / BACKEND / _POWER_VERSION)
         if power_w is None:
-            _write_pair(data_dir, rows, sidecar_overrides={"backend_version": _POWER_VERSION})
+            if schema_version == 7:
+                from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
+
+                execution = dict(zip(EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY, strict=True))
+                rows = [dict(row, **execution) for row in rows]
+            _write_pair(
+                data_dir,
+                rows,
+                sidecar_overrides={"backend_version": _POWER_VERSION, "schema_version": schema_version},
+            )
         else:
             _write_power_pair(data_dir, rows, [power_w(row) for row in rows])
         _engine_handle_cache_clear()
@@ -2072,6 +2081,39 @@ def _run_disagg(database, model_config):
 
 class TestFPMPowerPublication:
     """Public SDK watts for FPM models are published only where V1 supports them."""
+
+    @pytest.mark.parametrize("schema_version", [6, 7])
+    @pytest.mark.parametrize("mode", ["static", "disagg"])
+    def test_legacy_schema_power_migration(self, fpm_power_root, schema_version, mode):
+        """Pin the SDK power migration in docs/aic-backward-compatibility/migration.md."""
+        model = _qwen_fpm()
+        database = fpm_power_root(model, None, schema_version=schema_version)
+        summary = (
+            _run_static(model, database)
+            if mode == "static"
+            else _run_disagg(database, lambda: _model_config(forward_model="fpm"))
+        )
+        assert summary.get_summary_df()["power_w"].iloc[0] is None
+        assert summary.get_e2e_power_avg() is None
+        assert summary.get_context_power_avg() is None
+        assert summary.get_generation_power_avg() is None
+        assert summary.get_power_data_coverage() == 0.0
+
+    @pytest.mark.parametrize("mode", ["agg", "disagg"])
+    def test_op_level_e2e_accessor_migration(self, fpm_power_root, mode):
+        from aisim.sdk.config import RuntimeConfig
+        from aisim.sdk.inference_session import InferenceSession
+
+        database = fpm_power_root(_qwen_fpm(), _full_power)
+        if mode == "agg":
+            model = models.get_model("Qwen/Qwen3-0.6B", _model_config(), BACKEND)
+            summary = InferenceSession(model, database, get_backend(BACKEND)).run_agg(
+                RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=2), ctx_tokens=512
+            )
+        else:
+            summary = _run_disagg(database, _model_config)
+        assert summary.get_e2e_power_avg() > 0.0
+        assert summary.get_e2e_power_avg() == pytest.approx(summary.get_summary_df()["power_w"].iloc[0], abs=1e-3)
 
     def test_fully_powered_static_run_keeps_numeric_watts(self, fpm_power_root):
         model = _qwen_fpm()
