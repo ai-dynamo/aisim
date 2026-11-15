@@ -96,6 +96,10 @@ impl G1Manager {
         self.inner.grouped_inflight_need()
     }
 
+    pub(crate) fn grouped_published_epoch(&self) -> u64 {
+        self.inner.grouped_published_epoch()
+    }
+
     pub(crate) fn set_grouped_prefix_rules(
         &mut self,
         rules: GroupedPrefixRules,
