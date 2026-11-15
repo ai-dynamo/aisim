@@ -42,7 +42,8 @@ ACTION_ROOT = REPOSITORY_ROOT / ".github" / "actions"
 
 
 @pytest.mark.parametrize("pool", ["amd64", "arm64"])
-def test_runner_canary_probes_survive_container_home_override(tmp_path, pool):
+@pytest.mark.parametrize("failed_probe", [None, "machine", "workspace", "scratch"])
+def test_runner_canary_probes_survive_container_home_override(tmp_path, pool, failed_probe):
     job = _workflow("runner-canary.yml")["jobs"]["canary"]
     entry = next(item for item in job["strategy"]["matrix"]["include"] if item["pool"] == pool)
     step = next(item for item in job["steps"] if "run" in item)
@@ -52,6 +53,7 @@ def test_runner_canary_probes_survive_container_home_override(tmp_path, pool):
     workspace.mkdir()
     scratch.mkdir()
     log = tmp_path / "probes.log"
+    log.touch()
     # Model the runner replacing container HOME, then applying the job and step
     # environments. Only host paths and architecture are controlled here; the
     # exact canary run block still performs its HOME and source assertions.
@@ -61,22 +63,25 @@ def test_runner_canary_probes_survive_container_home_override(tmp_path, pool):
         "HOME": "/github/home",
         **job.get("env", {}),
         "EXPECTED_MACHINE": entry["machine"],
+        "REPORTED_MACHINE": "incompatible-machine" if failed_probe == "machine" else entry["machine"],
         "EXPECT_SCRATCH": str(entry["scratch"]).lower(),
         "GITHUB_REPOSITORY": "ai-dynamo/aisim",
         "GITHUB_SHA": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPOSITORY_ROOT, text=True).strip(),
         "RUNNER_NAME": f"controlled-{pool}",
         "PROBE_WORKSPACE": str(workspace),
         "PROBE_SCRATCH": str(scratch),
+        "PROBE_WORKSPACE_WRITABLE": str(failed_probe != "workspace").lower(),
+        "PROBE_SCRATCH_WRITABLE": str(failed_probe != "scratch").lower(),
         "PROBE_LOG": str(log),
     }
     controls = r"""
 pwd() { printf '/__w/aisim/aisim\n'; }
-uname() { printf 'architecture\n' >> "$PROBE_LOG"; printf '%s\n' "$EXPECTED_MACHINE"; }
+uname() { printf 'architecture\n' >> "$PROBE_LOG"; printf '%s\n' "$REPORTED_MACHINE"; }
 test() {
   if [[ "$1" == -w && "$2" == /__w/aisim/aisim ]]; then
-    builtin test -w "$PROBE_WORKSPACE"
+    [[ "$PROBE_WORKSPACE_WRITABLE" == true ]] && builtin test -w "$PROBE_WORKSPACE"
   elif [[ "$1" == -w && "$2" == /scratch ]]; then
-    builtin test -w "$PROBE_SCRATCH"
+    [[ "$PROBE_SCRATCH_WRITABLE" == true ]] && builtin test -w "$PROBE_SCRATCH"
   else
     builtin test "$@"
   fi
@@ -96,16 +101,45 @@ mktemp() {
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
-    assert f"({entry['machine']}) with writable HOME=/__w/aisim/aisim" in result.stdout
-    assert log.read_text().splitlines() == [
+    probes = [
         "architecture",
         "/__w/aisim/aisim/.runner-canary.XXXXXX",
         "/scratch/runner-canary.XXXXXX",
     ]
+    if failed_probe is None:
+        assert result.returncode == 0, result.stderr
+        assert f"({entry['machine']}) with writable HOME=/__w/aisim/aisim" in result.stdout
+        assert log.read_text().splitlines() == probes
+    else:
+        assert result.returncode != 0
+        assert "Verified source" not in result.stdout
+        completed = {"workspace": 0, "machine": 1, "scratch": 2}[failed_probe]
+        assert log.read_text().splitlines() == probes[:completed]
     assert not list(workspace.iterdir())
     assert not list(scratch.iterdir())
+
+
+def test_documented_active_runner_labels_match_workflow_selectors():
+    labels = set()
+    for path in WORKFLOW_ROOT.glob("*.yml"):
+        for job in _workflow(path.name)["jobs"].values():
+            selector = job.get("runs-on", "")
+            matrix = job.get("strategy", {}).get("matrix", {})
+            if selector == "${{ matrix.runner }}":
+                selectors = [entry["runner"] for entry in matrix["include"]]
+            elif isinstance(selector, str) and "${{ matrix.arch }}" in selector:
+                arches = matrix["arch"] if "arch" in matrix else [entry["arch"] for entry in matrix["include"]]
+                selectors = [selector.replace("${{ matrix.arch }}", arch) for arch in arches]
+            else:
+                selectors = selector if isinstance(selector, list) else [selector]
+            labels.update(label for label in selectors if isinstance(label, str) and label.startswith("prod-aisim"))
+    assert labels
+    documentation = (REPOSITORY_ROOT / "docs/ci/README.md").read_text()
+    assert set(re.findall(r"`(prod-aisim[^`]+)`", documentation)) == labels
+    lint_labels = yaml.safe_load((REPOSITORY_ROOT / ".github/actionlint.yaml").read_text())
+    assert {label for label in lint_labels["self-hosted-runner"]["labels"] if label.startswith("prod-aisim")} == labels
 
 
 def test_stable_release_migrations_require_reviewed_clearance(tmp_path):
@@ -1340,7 +1374,7 @@ def _run_pr_target(
 def test_full_ci_trusted_copy_validates_the_stacked_pr_base(tmp_path: Path) -> None:
     result, output = _run_pr_target(tmp_path, "a" * 40, "d" * 40)
     assert result.returncode == 0, result.stderr
-    assert output == {"base": "d" * 40}
+    assert output == {"base": "d" * 40, "number": "121"}
 
 
 @pytest.mark.parametrize("pr_base", ["d" * 40, "", "main", "d" * 39])
@@ -2236,7 +2270,11 @@ def test_release_artifact_handoffs_cannot_mix_versions():
         "fpe-release-probes.json",
     }
     for name in ("generate", "qualify"):
-        download = next(s for s in jobs[name]["steps"] if s.get("uses", "").startswith("actions/download-artifact@"))
+        download = next(
+            s
+            for s in jobs[name]["steps"]
+            if s.get("uses", "").endswith("/wheel-storage") and s["with"]["mode"] == "download"
+        )
         assert download["with"]["name"] == wheel
     assert wheel == "fpe-release-wheel-${{ inputs.release }}"
     upload = jobs["generate"]["steps"][-1]["with"]["name"]
@@ -2251,6 +2289,22 @@ def test_release_artifact_handoffs_cannot_mix_versions():
                 .replace("${{ matrix.shard.backend }}", "vllm")
             )
             assert fnmatch.fnmatchcase(name, selected_pattern) == (version == selected)
+
+
+def test_release_reproduction_documents_manifest_artifact_instead_of_wheel_payload():
+    jobs = _workflow("fpe-release-qualify.yml")["jobs"]
+    handoff = jobs["prepare"]["steps"][-1]["with"]
+    action = yaml.safe_load((ACTION_ROOT / "wheel-storage/action.yml").read_text())
+    upload = next(
+        step["with"] for step in action["runs"]["steps"] if "actions/upload-artifact@" in step.get("uses", "")
+    )
+    artifact = upload["name"].replace("${{ inputs.name }}", handoff["name"])
+    artifact = artifact.replace("${{ inputs.release }}", "<version>")
+    documentation = (REPOSITORY_ROOT / "docs/ci/accuracy.md").read_text()
+    reproduction = documentation.split("To reproduce a release result,", 1)[1].split("\nThe deployed", 1)[0]
+    assert f"`{artifact}`" in reproduction
+    assert "`fpe-release-wheel-<version>`" not in reproduction
+    assert "`wheel-manifest.json`" in reproduction
 
 
 def test_main_fpe_preserves_discovered_probe_plan_when_packaging(tmp_path):
@@ -3009,13 +3063,17 @@ def test_nightly_artifact_handoff_matches_fpe_and_accuracy_consumers():
     upload = steps[names.index("Upload verified nightly artifacts")]["with"]
     assert upload["name"] == "nightly-dist-${{ matrix.arch }}"
     assert upload["path"] == "${{ runner.temp }}/nightly-dist/*"
-    assert upload["overwrite"] == "true"
+    assert upload["mode"] == "upload"
     artifact = upload["name"].replace("${{ matrix.arch }}", "amd64")
     assert jobs["fpe-support-matrix"]["with"]["wheel_artifact"] == artifact
     resolver = _workflow("e2e-accuracy.yml")["jobs"]["resolve"]["steps"][0]["with"]["script"]
-    assert f"artifact.name === '{artifact}'" in resolver
+    assert f"artifact.name === '{artifact}-manifest'" in resolver
     consumer = _workflow("e2e-accuracy-branch.yml")["jobs"]["wheel"]["steps"]
-    download = next(step for step in consumer if "download-artifact@" in step.get("uses", ""))
+    download = next(
+        step
+        for step in consumer
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "download"
+    )
     assert download["with"]["name"] == artifact
 
 
@@ -3369,7 +3427,9 @@ def test_simulation_performance_rollout_and_revision_contract():
     )
     assert '"${RUNNER_TEMP}/callback-venv/bin/python"' in build_commands
     downloads = [
-        step["with"]["name"] for step in comparison["steps"] if "actions/download-artifact@" in step.get("uses", "")
+        step["with"]["name"]
+        for step in comparison["steps"]
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "download"
     ]
     assert downloads == [
         "simulation-wheel-base-${{ needs.select.outputs.base_sha }}",
@@ -4146,6 +4206,7 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
     assert "disaggregation_decode_enable_radix_cache: false," in adapter.read_text()
     assert "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
     assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
+    assert "swa_prefix_tails: None," in adapter.read_text()
     assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
 
