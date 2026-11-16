@@ -236,7 +236,12 @@ the serialized group. Sizing and replay do not read them yet.
   difference between the two results, divided by the difference in
   full-attention blocks that move, is the value of the full-attention group. The rest of one transfer is the sum of
   the values of the other groups when each of them moves one block, as a state
-  group does. The probe import of a vLLM 0.33.0 record writes it for no group,
+  group does. With multiple state groups, this determines only their combined
+  transfer size; it cannot identify each group's `transfer_bytes_per_block`.
+  Before populating those fields, require per-group transfer measurements or
+  additional runtime-observer evidence that identifies the bytes read for each
+  group on one TP rank. Do not split the combined size evenly or use the page
+  sizes as substitutes. The probe import of a vLLM 0.33.0 record writes it for no group,
   because what the P/D connector of vLLM 0.33.0 reads for a block depends on
   facts that the record does not hold. The connector registers one
   region per layer address and lets layers of different groups share a region.

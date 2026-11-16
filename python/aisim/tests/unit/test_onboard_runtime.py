@@ -2715,23 +2715,60 @@ def test_the_draft_and_the_finalized_profile_keep_the_evidence_version(tmp_path,
     assert verify_runtime_profile(final) is None
 
 
-def test_a_saved_draft_with_another_evidence_version_is_refused(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("saved_version", [None, "0.32.0"], ids=["legacy", "mismatched_evidence"])
+def test_reimport_of_the_same_observations_can_be_accepted_and_reverified(tmp_path, capsys, monkeypatch, saved_version):
     from collector.fpm_forward import runtime_observations
 
+    from aisim.support.plan import request_id
     from aisim.support.runtime import verify_runtime_profile
 
+    # Hybrid probe imports use vLLM 0.33.0. Before this change, their saved groups lacked the marks and their
+    # runtime memory lacked the evidence version. Such drafts still verify; a stated, wrong version must not.
+    _save_as(monkeypatch, _without_marks)
     configuration = runtime_observations._configuration
 
     def saved(*args, **kwargs):
         result = configuration(*args, **kwargs)
-        result["resources"]["runtime_memory"]["runtime_framework_version"] = "0.32.0"
+        memory = result["resources"]["runtime_memory"]
+        if saved_version is None:
+            memory.pop("runtime_framework_version", None)
+        else:
+            memory["runtime_framework_version"] = saved_version
         return result
 
     monkeypatch.setattr(runtime_observations, "_configuration", saved)
-    _, _, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
+    checkpoint, index, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
     monkeypatch.undo()
-    with pytest.raises(ValueError, match="saved observed resources differ from immutable runtime evidence"):
-        verify_runtime_profile(request)
+    assert not {"prefix_cacheable", "transfer_bytes_per_block"} & _saved_group_keys(request)
+    state = _load(checkpoint)
+    if saved_version is None:
+        assert "runtime_framework_version" not in _saved_memory_keys(request)
+        assert verify_runtime_profile(request) is not None
+        state, _ = save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+        assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
+    else:
+        with pytest.raises(ValueError, match="saved observed resources differ from immutable runtime evidence"):
+            verify_runtime_profile(request)
+
+    # Re-import the exact same evidence through the public CLI, then accept and verify its new draft.
+    before = {path: path.read_bytes() for path in index.parent.rglob("*") if path.is_file()}
+    assert _import(checkpoint, index, tmp_path / "upgraded-drafts", configurations=["tp2"]) == 0
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    upgraded = SupportRequest.from_yaml(result["request"])
+    assert result["status"] == "complete"
+    assert request_id(upgraded) != request_id(request)
+    groups = upgraded.profile_deployment().resources.cache_groups
+    assert all(group.prefix_cacheable is not None for group in groups)
+    assert all(group.transfer_bytes_per_block is None for group in groups)
+    assert upgraded.profile_deployment().resources.runtime_memory.runtime_framework_version == "0.33.0"
+    state = _load(checkpoint)
+    assert state.configurations["tp2"].acceptance is None
+    state, _ = save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
+    assert verify_runtime_profile(SupportRequest.model_validate(state.configurations["tp2"].draft_request)) is not None
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+    if saved_version is None:
+        assert verify_runtime_profile(request) is not None
 
 
 def _flip_marker(group):
