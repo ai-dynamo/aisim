@@ -7,6 +7,7 @@ pub(crate) mod belady;
 mod cache;
 mod common;
 mod config;
+pub(crate) mod fitted_timing;
 pub(crate) mod g3_offload;
 pub mod generalized;
 mod handoff;
@@ -47,6 +48,7 @@ pub use config::{
     StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
 };
 pub(crate) use config::{MAX_PIPELINE_FILL_PASSES, afd_total_gpus};
+pub use fitted_timing::FittedIterationTiming;
 pub use g3_offload::{G3IoStats, G3Stats};
 pub use handoff::{
     HandoffId, HandoffTransferTiming, TransferTimingMode, prefill_handoff_delay_ms,

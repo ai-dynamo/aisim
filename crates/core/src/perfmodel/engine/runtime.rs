@@ -149,6 +149,23 @@ pub(crate) type PerOpValueWithMetadata = (
     Option<MoeCommFallbackValues>,
 );
 
+/// Static `(context, generation)` per-op values plus each phase's
+/// power-covered latency `(context_covered_ms, generation_covered_ms)`.
+///
+/// A result is covered when its own `energy_wms > 0`, the rule the aggregate
+/// `covered_latency_ms` evidence uses. It is decided before results enter
+/// the name fold: a folded entry with any positive energy no longer shows how
+/// much of its latency had power, because decode steps that resolve powered
+/// and unpowered rows all fold into one `fpm_forward_decode`. A generation
+/// result is one stride step's (folded only within that step, which queries
+/// each FPM operation once), weighted by its `repeat_count`.
+pub(crate) type StaticPerOpValuesWithCoverage = (
+    Vec<PerOpValueWithMetadata>,
+    Vec<PerOpValueWithMetadata>,
+    f64,
+    f64,
+);
+
 /// Per-op values for the shared, context-attention, and decode-attention
 /// buckets returned by the metadata-bearing mixed-step evaluation.
 pub(crate) type MixedStepPerOpValuesWithMetadata = (
@@ -2570,6 +2587,10 @@ impl Engine {
                     batch as f64 * prefix as f64,
                 ],
             )?;
+            // Aggregate FPM energy is out of V1 (AISIM-1973 D10, AISIM-2001):
+            // the marginal decode below subtracts an unpowered KV-floor
+            // baseline, so the mixed step reports no whole-model FPM energy.
+            result.energy_wms = 0.0;
             on_op(
                 MixedPass::SharedNonAttention,
                 &self.context_ops[0],
@@ -2656,6 +2677,9 @@ impl Engine {
                     .query_pass_baseline(&self.db, baseline_batch, baseline_kv)?
                     .latency_ms;
                 target.latency_ms = (target.latency_ms - baseline_ms).max(0.0);
+                // D10 (AISIM-2001): no marginal FPM energy over an uncovered
+                // baseline. Draft work keeps its op-level energy.
+                target.energy_wms = 0.0;
             }
             // Draft work has no twin in the prefill pass and must survive
             // even when the target's marginal cost clamps to zero.
@@ -2802,7 +2826,7 @@ impl Engine {
         mode: StaticMode,
         stride: u32,
     ) -> Result<(Vec<PerOpValue>, Vec<PerOpValue>), AicError> {
-        let (context, generation) = self.run_static_per_op_impl(runtime, mode, stride)?;
+        let (context, generation, _, _) = self.run_static_per_op_impl(runtime, mode, stride)?;
         Ok((
             strip_per_op_metadata(context),
             strip_per_op_metadata(generation),
@@ -2818,6 +2842,19 @@ impl Engine {
         mode: StaticMode,
         stride: u32,
     ) -> Result<(Vec<PerOpValueWithMetadata>, Vec<PerOpValueWithMetadata>), AicError> {
+        let (context, generation, _, _) = self.run_static_per_op_impl(runtime, mode, stride)?;
+        Ok((context, generation))
+    }
+
+    /// [`Self::run_static_per_op_with_metadata`] plus each phase's
+    /// power-covered latency (see [`StaticPerOpValuesWithCoverage`]), for the
+    /// private PyO3 endpoint behind the SDK's FPM power-coverage gate.
+    pub(crate) fn run_static_per_op_with_coverage(
+        &self,
+        runtime: &RuntimeConfig,
+        mode: StaticMode,
+        stride: u32,
+    ) -> Result<StaticPerOpValuesWithCoverage, AicError> {
         self.run_static_per_op_impl(runtime, mode, stride)
     }
 
@@ -2826,17 +2863,31 @@ impl Engine {
         runtime: &RuntimeConfig,
         mode: StaticMode,
         stride: u32,
-    ) -> Result<(Vec<PerOpValueWithMetadata>, Vec<PerOpValueWithMetadata>), AicError> {
+    ) -> Result<StaticPerOpValuesWithCoverage, AicError> {
         let mut context = PerOpFold::for_plan("context", &self.context_plan);
         let mut generation = PerOpFold::for_plan("generation", &self.generation_plan);
+        let (mut context_covered_ms, mut generation_covered_ms) = (0.0_f64, 0.0_f64);
         self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, op, r| {
+            // Decide coverage per result, before the name fold below.
+            let covered_ms = if r.energy_wms > 0.0 {
+                r.latency_ms
+            } else {
+                0.0
+            };
             if is_context {
+                context_covered_ms += covered_ms;
                 context.add_slot(slot, op, r)
             } else {
+                generation_covered_ms += covered_ms;
                 generation.add_slot(slot, op, r)
             }
         })?;
-        Ok((context.into_values(), generation.into_values()))
+        Ok((
+            context.into_values(),
+            generation.into_values(),
+            context_covered_ms,
+            generation_covered_ms,
+        ))
     }
 
     /// The phase of [`Self::run_static_per_op`] that a static timing query
@@ -6975,15 +7026,22 @@ pub(crate) mod tests {
         tmp: &std::path::Path,
         rows: &[crate::perf_database::fpm_forward::tests::RowSpec],
     ) -> Result<Engine, AicError> {
-        use crate::perf_database::fpm_forward::tests::{default_identity, write_pair};
-        write_pair(tmp, rows);
-        let mut db = PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.24.0").unwrap();
-        db.set_fpm_forward_for_test(crate::perf_database::FpmForwardTable::new(
+        crate::perf_database::fpm_forward::tests::write_pair(tmp, rows);
+        build_fpm_engine_over(crate::perf_database::FpmForwardTable::new(
             tmp.to_path_buf(),
             "b200_sxm",
             "vllm",
             "0.25.1",
-        ));
+        ))
+    }
+
+    /// [`build_fpm_engine_with_rows`] over an already-written table.
+    pub(crate) fn build_fpm_engine_over(
+        table: crate::perf_database::FpmForwardTable,
+    ) -> Result<Engine, AicError> {
+        use crate::perf_database::fpm_forward::tests::default_identity;
+        let mut db = PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.24.0").unwrap();
+        db.set_fpm_forward_for_test(table);
         let fpm_op = |phase: FpmPhase| {
             Op::FpmForward(FpmForwardOp {
                 interpolation: Default::default(),
@@ -8468,6 +8526,172 @@ pub(crate) mod tests {
         assert!((draft.1 - expected).abs() < 1e-12);
         assert_eq!(draft.3, "empirical");
         assert_eq!(target.1, 0.0);
+    }
+
+    /// AISIM-1973 D10 (aggregate FPM power is AISIM-2001): on a fully powered
+    /// v8 pair the operator prices energy, but the mixed step reports energy 0
+    /// for its FPM prefill and marginal-decode components. Every per-op value
+    /// matches the latency-only v6 pair bit for bit, so latencies are
+    /// unchanged and the draft tails keep their op-level energy.
+    #[test]
+    fn fpm_mixed_step_zeroes_fpm_energy_and_keeps_draft_energy() {
+        use crate::perf_database::fpm_forward::tests::{
+            PowerCell, RowSpec, default_rows, write_pair,
+        };
+        let run = |powered: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let (spec, _) = fpm_hybrid_spec(
+                tmp.path(),
+                Some(7),
+                8,
+                generation_ops()
+                    .into_iter()
+                    .filter(Op::is_generation_attention)
+                    .collect(),
+                context_ops()
+                    .into_iter()
+                    .filter(Op::is_context_attention)
+                    .collect(),
+            );
+            // The b200 vLLM 0.22.0 attention tables carry measured power, so
+            // the draft tails have nonzero op-level energy.
+            let mut db = PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.22.0").unwrap();
+            db.set_fpm_forward_for_test(crate::perf_database::FpmForwardTable::new(
+                tmp.path().to_path_buf(),
+                "b200_sxm",
+                "vllm",
+                "0.25.1",
+            ));
+            if powered {
+                let rows: Vec<RowSpec> = default_rows()
+                    .into_iter()
+                    .map(|row| RowSpec {
+                        measurement: Some((
+                            crate::perf_database::fpm_forward::FPM_FORWARD_POWER_MEASUREMENT_POLICY,
+                            1,
+                        )),
+                        power_w: Some(PowerCell::Double(Some(500.0))),
+                        ..row
+                    })
+                    .collect();
+                write_pair(tmp.path(), &rows);
+            }
+            let engine = Engine::build(spec, Arc::new(db)).unwrap();
+            // The step's whole-model prefill query: (1, 2048 + 8 widened
+            // decode tokens, 0).
+            let Op::FpmForward(prefill) = &engine.context_ops[0] else {
+                unreachable!()
+            };
+            let query = prefill
+                .query_totals(&engine.db, &[1.0, 2056.0, 0.0])
+                .unwrap();
+            let (shared, _, decode) = engine
+                .mixed_step_breakdown_per_op(2048, 1, 2048, 2, 0, 1.0, 1.0)
+                .unwrap();
+            let values: Vec<_> = shared
+                .into_iter()
+                .chain(decode)
+                .map(|(name, latency, energy, source)| {
+                    (name, latency.to_bits(), energy.to_bits(), source)
+                })
+                .collect();
+            (query, values)
+        };
+        let (legacy_query, legacy) = run(false);
+        let (query, values) = run(true);
+        assert_eq!(legacy_query.energy_wms, 0.0);
+        assert_eq!(
+            query.latency_ms.to_bits(),
+            legacy_query.latency_ms.to_bits()
+        );
+        // Fixture power 500 W on both lerp anchors.
+        assert_eq!(query.energy_wms, 500.0 * query.latency_ms);
+        assert_eq!(values, legacy);
+        let names: Vec<&str> = values.iter().map(|value| value.0.as_str()).collect();
+        for name in ["fpm_forward_prefill", "fpm_forward_decode"] {
+            let value = values.iter().find(|value| value.0 == name).unwrap();
+            assert_eq!(f64::from_bits(value.2), 0.0, "{name}: {names:?}");
+        }
+        let drafts: Vec<f64> = values
+            .iter()
+            .filter(|value| value.0.starts_with("draft_"))
+            .map(|value| f64::from_bits(value.2))
+            .collect();
+        // Both draft tails keep their op-level (measured) energy.
+        assert!(
+            drafts.len() == 2 && drafts.iter().all(|&energy| energy > 0.0),
+            "{names:?} {drafts:?}"
+        );
+    }
+
+    /// AISIM-1973 PR 3b: static power coverage is decided per stride-step
+    /// result, before the name fold. One unpowered and one powered decode step
+    /// fold into a single `fpm_forward_decode` entry with positive energy,
+    /// yet only the powered step's latency is covered.
+    #[test]
+    fn static_per_op_coverage_counts_only_powered_decode_steps() {
+        use crate::perf_database::fpm_forward::tests::{
+            PowerCell, RowSpec, default_rows, write_pair,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (spec, db) = fpm_hybrid_spec(tmp.path(), None, 1, vec![], vec![]);
+        // Batch 8, isl 1024, osl 66, stride 32: steps at s = 1025 (repeat 32)
+        // and s = 1057 (repeat 32) and s = 1089 (repeat 1), each an exact
+        // decode row at kv = 8 * s.
+        let decode = |s: u32, latency_ms: f64, watts: Option<f64>| RowSpec {
+            workload_kind: "decode",
+            batch_size: 8,
+            total_prefill_tokens: 0,
+            total_kv_read_tokens: 8 * s,
+            latency_ms,
+            power_w: Some(PowerCell::Double(watts)),
+            ..RowSpec::default()
+        };
+        let mut rows: Vec<RowSpec> = default_rows()
+            .into_iter()
+            .filter(|row| row.workload_kind == "prefill")
+            .map(|row| RowSpec {
+                power_w: Some(PowerCell::Double(Some(300.0))),
+                ..row
+            })
+            .collect();
+        rows.extend([
+            decode(1025, 6.0, None),
+            decode(1057, 8.0, Some(450.0)),
+            decode(1089, 10.0, Some(450.0)),
+        ]);
+        // Schema 8 binds every row to the sidecar policy.
+        for row in &mut rows {
+            row.measurement = Some((
+                crate::perf_database::fpm_forward::FPM_FORWARD_POWER_MEASUREMENT_POLICY,
+                1,
+            ));
+        }
+        write_pair(tmp.path(), &rows);
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        let rt = RuntimeConfig {
+            batch_size: 8,
+            isl: 1024,
+            osl: 66,
+            ..Default::default()
+        };
+        let (context, generation, context_covered, generation_covered) = engine
+            .run_static_per_op_with_coverage(&rt, StaticMode::Generation, 32)
+            .unwrap();
+        assert!(context.is_empty());
+        assert_eq!(context_covered, 0.0);
+        assert_eq!(generation.len(), 1, "one folded fpm_forward_decode entry");
+        let (name, latency, energy, _, _) = &generation[0];
+        assert_eq!(name, "fpm_forward_decode");
+        assert_eq!(*latency, 32.0 * 6.0 + 32.0 * 8.0 + 10.0);
+        assert_eq!(*energy, 450.0 * (32.0 * 8.0 + 10.0));
+        // The unpowered step's 192 ms stays uncovered despite folded energy.
+        assert_eq!(generation_covered, 32.0 * 8.0 + 10.0);
+        // The metadata endpoint returns the same values without coverage.
+        let (_, metadata) = engine
+            .run_static_per_op_with_metadata(&rt, StaticMode::Generation, 32)
+            .unwrap();
+        assert_eq!(per_op_bits(&metadata), per_op_bits(&generation));
     }
 
     #[test]
