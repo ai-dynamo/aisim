@@ -74,7 +74,22 @@ def build_selection(args: argparse.Namespace) -> Selection:
     return selection
 
 
+def run_check_names(args: argparse.Namespace) -> int:
+    from aisim_core.data.names_check import check_names
+
+    findings, errors = check_names(Path(args.path))
+    payload = {
+        "ok": not findings and not errors,
+        "findings": [f.to_dict() for f in findings],
+        "errors": errors,
+    }
+    sys.stdout.write(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    return 0 if payload["ok"] else EXIT_FAILURE
+
+
 def run_data_command(args: argparse.Namespace) -> int:
+    if args.data_command == "check-names":
+        return run_check_names(args)
     try:
         selection = build_selection(args)
         cache = Cache(Path(args.cache_dir) if args.cache_dir else None)

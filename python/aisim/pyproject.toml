@@ -161,6 +161,7 @@ include = [
     "src/aisim_core/sdk/**/*.md",
     "src/aisim_core/data/schema_snapshots/*.json",
     "src/aisim_core/data/names_registry.json",
+    "src/aisim_core/data/dataset_files/*.md",
     "src/aisim_core/systems/*.yaml",
     "src/aisim_core/systems/*.csv",
     "src/aisim_core/systems/**/*.csv",

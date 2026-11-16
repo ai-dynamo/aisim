@@ -153,6 +153,16 @@
           "aliases": [
             "TileRT"
           ]
+        },
+        "nccl": {
+          "aliases": [],
+          "note": "communication library; op-latency only"
+        },
+        "oneccl": {
+          "aliases": [
+            "oneCCL"
+          ],
+          "note": "communication library; op-latency only"
         }
       }
     },
@@ -238,15 +248,17 @@
     },
     "precision": {
       "closed": true,
+      "description": "Weight and KV-cache formats, spelled as the published FPM and op-latency identities spell them.",
       "entries": {
-        "bf16": {
+        "bfloat16": {
           "aliases": [
-            "bfloat16"
+            "bf16"
           ]
         },
-        "fp16": {
+        "float16": {
           "aliases": [
-            "float16"
+            "fp16",
+            "half"
           ]
         },
         "fp8": {
@@ -254,11 +266,30 @@
             "float8"
           ]
         },
-        "fp4": {
+        "fp8_e4m3": {
           "aliases": [
-            "nvfp4",
-            "float4"
+            "e4m3"
           ]
+        },
+        "fp8_block": {
+          "aliases": [
+            "fp8-block",
+            "block_fp8"
+          ]
+        },
+        "nvfp4": {
+          "aliases": [
+            "nv_fp4"
+          ]
+        },
+        "mxfp4": {
+          "aliases": [
+            "mx_fp4"
+          ]
+        },
+        "fp4": {
+          "aliases": [],
+          "note": "InferenceX umbrella spelling; the 4-bit format is not specified by the source"
         },
         "int4": {
           "aliases": [

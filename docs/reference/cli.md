@@ -59,6 +59,24 @@ download. Repeating a fetch reuses verified cache entries and downloads nothing.
 on success, `2` for an invalid or unsupported selection, and `1` for revision, transfer, integrity
 or offline failures.
 
+<a id="check-canonical-names"></a>
+
+### Check canonical names
+
+`aisim data check-names PATH` checks a dataset directory (or one `manifest.json`) for stored names that are not
+the canonical spelling, for every category: the identity of each configuration manifest (hardware, framework,
+precision, deployment) and, for e2e, every table value (metric, statistic, phase, status, observer). It
+rewrites nothing and prints one JSON object:
+
+```bash
+aisim data check-names ./my-contribution
+# {"ok": false, "findings": [{"path": "...", "kind": "hardware", "location": "identity.hardware",
+#                              "value": "B300", "canonical": "b300_sxm"}], "errors": []}
+```
+
+Exit status is `0` when clean and `1` when there are findings or unreadable manifests. A `canonical` of `null`
+means the registry does not know the name. See [e2e schema](e2e-schema.md#canonical-names) for the naming rule.
+
 ### Air-gapped and offline use
 
 Prepare on a connected machine, then move the cache; the disconnected machine makes no

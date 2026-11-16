@@ -52,3 +52,13 @@ def add_data_parser(subparsers: Any) -> None:
         "--dry-run", action="store_true", help="print the plan; downloads only the small catalog and manifest files"
     )
     fetch_parser.add_argument("--offline", action="store_true", help="make no network requests")
+    check_names_parser = data_commands.add_parser(
+        "check-names",
+        help="Report stored names that are not canonical (hardware, framework, metric, ...).",
+        description=(
+            "Check a dataset directory (or one manifest) for names that are not the canonical spelling, for every "
+            "category. Prints one JSON object with the findings and the canonical name to use. Nothing is "
+            "rewritten. Exit status is 0 when clean, 1 when there are findings or unreadable manifests."
+        ),
+    )
+    check_names_parser.add_argument("path", help="dataset root, a category directory, or one manifest.json")

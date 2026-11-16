@@ -46,7 +46,7 @@ def _body(**over):
         framework_version="0.31.0",
         parallelism={"aggregated": {"tp": 8}},
         parallelism_complete=True,
-        precision={"weights": "bf16"},
+        precision={"weights": "bfloat16"},
         source_kind="developer",
     )
     fields.update(over)
