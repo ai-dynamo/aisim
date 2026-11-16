@@ -37,10 +37,12 @@ class _CanonicalPackageFacade(ModuleType):
     def __dict__(self) -> dict[str, object]:
         """Expose delegated attributes to tools that inspect before patching.
 
-        In particular, pytest 9.2 saves the original value from this mapping.
-        Hiding canonical names makes its undo delete the real attribute.
+        Patching tools may save the original value from this mapping.
+        Hiding canonical names can make their undo delete the real attribute.
         Build a fresh view so canonical updates remain visible, while import
         metadata continues to describe this compatibility package.
+        Mutating this snapshot does not update either module; use attribute
+        assignment to change delegated names.
         """
         namespace = super().__dict__
         canonical = namespace.get("_canonical_module")

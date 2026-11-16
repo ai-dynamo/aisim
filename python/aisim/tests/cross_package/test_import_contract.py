@@ -351,7 +351,14 @@ def test_legacy_package_patch_updates_canonical_package(package_suffix: str, att
 
 @pytest.mark.parametrize(
     ("package_suffix", "attribute"),
-    [("models", "get_model"), ("operations", "clear_all_op_caches"), ("speculation", "NullScheme")],
+    [
+        ("memory", "estimate_state_cache"),
+        ("models", "get_model"),
+        ("models.blocks", "MoEBlockShape"),
+        ("operations", "clear_all_op_caches"),
+        ("speculation", "NullScheme"),
+        ("work_delta", "solve_cell"),
+    ],
 )
 def test_legacy_package_monkeypatch_restores_canonical_attribute(package_suffix: str, attribute: str) -> None:
     """Patch teardown must preserve the API for subsequent SDK consumers."""
@@ -360,7 +367,16 @@ def test_legacy_package_monkeypatch_restores_canonical_attribute(package_suffix:
     original = getattr(canonical, attribute)
     assert vars(legacy)[attribute] is original
     assert vars(legacy)["__name__"] == legacy.__name__
+    assert legacy.__name__ != canonical.__name__
     assert vars(legacy)["__path__"] == legacy.__path__
+
+    # Introspection returns a detached snapshot, with local metadata winning.
+    namespace = vars(legacy)
+    namespace[attribute] = object()
+    namespace["__name__"] = "snapshot_only"
+    assert getattr(legacy, attribute) is original
+    assert getattr(canonical, attribute) is original
+    assert vars(legacy)["__name__"] == legacy.__name__
 
     replacement = object()
     with pytest.MonkeyPatch.context() as monkeypatch:
