@@ -2730,6 +2730,22 @@ key and reason names and two short error-message phrases are upstream's.
 docstring names Dynamo's content-seed variable and its default, and the caller passes the
 value in.
 
+`python/aisim/collector/fpm_forward/runtime/sglbench_driver.py` and
+`python/aisim/collector/fpm_forward/runtime/sglbench_launcher.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{driver,launcher}.py`, re-implement
+further parts of the same source at the same revision. From `instrumented_scheduler.py`:
+the run lifecycle and the point procedures of the driver (`_bench_step_warmup`,
+`_bench_realseed_stage_point`, `_bench_realseed_pending_step`,
+`_bench_stop_at_timeout_boundary`, `_bench_fpm_validation_failure`,
+`_bench_start_timing`) with five failure reason strings, and the environment variables
+the launcher reads (`_bench_init`, `_kvwarm_flag_on`, `_bench_realseed_on`). From
+`backend_args.py`: the names, defaults and `DYN_*` variables of the benchmark flags. No
+upstream function or block of source is copied. Changes: the driver stages every point
+through engine requests and takes batch times from a recorder log, where upstream steps
+its own scheduler; it also looks at the soft deadline before the first point; the
+launcher requires a benchmark mode and refuses the options this producer does not
+implement.
+
 Source: https://github.com/ai-dynamo/dynamo/tree/b20fe6fe94021b854597965c7305931175e8f482
 
 Original paths and what follows them:
@@ -2797,3 +2813,48 @@ limits, and the tests model one admission pass, the graph-size ladders and whole
 prefix matching. Nothing is imported from SGLang, no upstream function or block of source
 is copied and no serving implementation is vendored. `sglbench_content.py` and
 `sglbench_artifact.py` name SGLang functions in comments and docstrings only.
+
+## SGLang v0.5.22 and v0.5.23 interfaces used by the SGLang self-benchmark launcher
+
+Repository-root files `python/aisim/collector/fpm_forward/runtime/sglbench_recorder.py`,
+`python/aisim/collector/fpm_forward/runtime/sglbench_compat.py`,
+`python/aisim/collector/fpm_forward/runtime/sglbench_driver.py` and
+`python/aisim/collector/fpm_forward/runtime/sglbench_launcher.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{recorder,compat,driver,launcher}.py`,
+are written against the interfaces of SGLang v0.5.22 at commit
+`baa9befa381511cd4d56f83980951e5a45fffc6d` and SGLang v0.5.23 at commit
+`297e54fd105e974cdf401e5b4d20253a22c16f90`:
+https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
+https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
+
+What follows SGLang: `sglbench_recorder.py` subclasses SGLang's `Scheduler` at run time,
+wraps `run_batch` and `process_batch_result`, and reads batch, limit and rank attributes
+under SGLang's names. `sglbench_compat.py` imports SGLang inside its functions and calls
+its argument parser, engine, tokenizer and plugin loader; it follows the layout of the
+streamed response chunks. `sglbench_driver.py` checks the batch sequences SGLang's
+scheduler produces for one call, and `sglbench_launcher.py` tests SGLang's resolved
+arguments and environment variables under their upstream names; these two import no
+SGLang. The tests model those interfaces with fakes.
+
+Upstream paths, under `python/sglang/`: `__init__.py`, `version.py` and, under `srt/`,
+`server_args.py`, `environ.py`, `runtime_context.py`,
+`arg_groups/{arg_utils.py,kv_cache_hook.py,model_override_base.py,overrides.py,parallel_hook.py,serving_hook.py,validation_hook.py}`,
+`arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,parallel.py,schedule.py,serving.py,spec.py}`,
+`configs/{model_config.py,step3_vl.py}`, `entrypoints/engine.py`,
+`managers/{data_parallel_controller.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
+`managers/async_d2h_copy_worker.py` (v0.5.23 only),
+`managers/scheduler_components/{batch_result_processor.py,dp_attn.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
+`mem_cache/{common.py,kv_cache_builder.py,registry.py}`,
+`model_executor/{forward_batch_info.py,model_runner.py}`,
+`model_executor/runner/{decode_cuda_graph_runner.py,eager_runner.py,prefill_cuda_graph_runner.py}`,
+`model_loader/utils.py`, `models/{dbrx.py,step3_vl.py}`,
+`plugins/{__init__.py,hook_registry.py}`,
+`sampling/{sampling_params.py,watermarking/core.py}` and
+`utils/{common.py,watchdog.py,hf_transformers/common.py}`.
+Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0. No upstream root NOTICE
+exists. The upstream license is at
+https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
+
+No upstream function or block of source is copied and nothing is vendored. SGLang is not
+a dependency of AISim: these files run inside an SGLang container, where SGLang is
+already installed.
