@@ -27,8 +27,9 @@ while retaining pure-decode energy and suppressing mixed-step energy. Raw
 `Task.run_single_agg()` and `Task.run_single_disagg()` include `power_coverage`
 in their rows. Legacy `cli_estimate()` preserves these SDK publication gates:
 static and disaggregated results can publish numeric `power_w` for powered
-schema-8 pairs, while aggregate FPM watts remain null even above 90% coverage.
-Static operation energy does not enable replay or unified `power_w` publication.
+schema-8 pairs, while aggregate FPM watts remain null even above 90% coverage. In
+all modes, static operation energy does not enable replay or unified `power_w`
+publication.
 See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
 
 The current producers and consumers are
