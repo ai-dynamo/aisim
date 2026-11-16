@@ -668,9 +668,12 @@ explains the retained workload routing and feature mathematics.
   and convolution groups. Exhaustive matches on `FpmCacheKind` must handle
   `State`. Serialized groups that omit the field still deserialize, and `None`
   is not serialized. Literals must also supply `prefix_cacheable` and
-  `transfer_bytes_per_block`. Use `None` unless a runtime probe import recorded
-  the value. Serialized groups that omit these fields still deserialize, and
-  `None` is not serialized.
+  `transfer_bytes_per_block`. Use `None` for unknown values. A hand-made
+  `transfer_bytes_per_block` requires a measurement for that specific group;
+  aggregate transfer sizes for multiple state groups cannot populate it. See
+  the [transfer measurement limits](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets).
+  Serialized groups that omit these fields still deserialize, and `None` is
+  not serialized.
 - A vLLM 0.33.0 runtime probe import now writes `prefix_cacheable` for each
   cache group, except a group that holds a `SlidingWindowMLASpec` layer. It
   writes `transfer_bytes_per_block` for no group. An onboarding session whose

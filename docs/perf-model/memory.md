@@ -225,24 +225,32 @@ the serialized group. Sizing and replay do not read them yet.
   [`:1305-1307`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L1305-L1307).
 - `transfer_bytes_per_block` is the bytes that vLLM's P/D connector (NIXL)
   reads for one block of the group in a transfer on one TP rank, for the vLLM
-  version of the deployment. It is positive and at most 2^53, and it can be larger than
-  `page_size_bytes`, because the connector reads a block in regions that layers
-  of other groups can share. A hand-made profile states it for each group. To
-  measure it for a deployment, send two prompts of different length through a
-  P/D pair, one at a time, and read the change of
+  version of the deployment. It is positive and at most 2^53, and it can be
+  larger than `page_size_bytes`, because the connector reads a block in regions
+  that layers of other groups can share. A hand-made profile may state it only
+  for a group whose transfer size has been measured.
+
+  To measure the full-attention value and the combined transfer size of the
+  other groups, send two prompts of different length through a P/D pair, one at
+  a time, and read the change of
   `vllm:nixl_bytes_transferred_sum` on the decode server for each. Divide each
   change by the change of `vllm:nixl_bytes_transferred_count`, because each TP
   rank makes its own transfer and the field holds the bytes of one rank. The
   difference between the two results, divided by the difference in
-  full-attention blocks that move, is the value of the full-attention group. The rest of one transfer is the sum of
-  the values of the other groups when each of them moves one block, as a state
-  group does. With multiple state groups, this determines only their combined
-  transfer size; it cannot identify each group's `transfer_bytes_per_block`.
-  Before populating those fields, require per-group transfer measurements or
-  additional runtime-observer evidence that identifies the bytes read for each
-  group on one TP rank. Do not split the combined size evenly or use the page
-  sizes as substitutes. The probe import of a vLLM 0.33.0 record writes it for no group,
-  because what the P/D connector of vLLM 0.33.0 reads for a block depends on
+  full-attention blocks that move, is the value of the full-attention group.
+  The rest of one transfer is the sum of the values of the other groups when
+  each of them moves one block, as a state group does. With multiple state
+  groups, this determines only their combined transfer size.
+
+  Per-group values for models with several state groups are not supported by
+  this procedure or the current runtime probe. Leave `transfer_bytes_per_block`
+  unset for those groups until per-group transfer measurements or additional
+  runtime-observer evidence identifies the bytes read for each group on one TP
+  rank. Do not split the combined size evenly or use the page sizes as
+  substitutes.
+
+  The probe import of a vLLM 0.33.0 record writes it for no group, because what
+  the P/D connector of vLLM 0.33.0 reads for a block depends on
   facts that the record does not hold. The connector registers one
   region per layer address and lets layers of different groups share a region.
   In a model with Mamba layers, it reads a block of an attention group, other
