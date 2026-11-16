@@ -1012,7 +1012,9 @@ def build_record(run: dict, f: dict, imported_at: float) -> dict:
             **{k: run.get(k) for k in ("backend", "version", "image", "tp", "system")},
             "sm": sm,
             "engine_cli": run.get("engine_cli"),
-            "unknown_args": f.get("engine_cli_unknown_args") or None,
+            # rendered arguments the release did not accept: SGLang's parser names them, the
+            # TensorRT-LLM probe drops them to build the engine
+            "unknown_args": f.get("engine_cli_unknown_args") or f.get("engine_yaml_unknown_args") or None,
             # the collector sweeps fp8-KV, so path_diff compares against the SAME-kv record
             "kv_cache_dtype": (
                 f.get("probe_kv_cache_dtype")

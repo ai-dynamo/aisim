@@ -173,6 +173,25 @@ def write_dtype_probe_safetensors(out_dir: Path, key: str, dtype: str, edits: li
     edits.append(f"dtype_probe.safetensors written: {key}={dtype} (real header signal)")
 
 
+def provision_dtype_probe(
+    out_dir: Path, repo: str, family: str, configs: Path, edits: list[str], caveats: list[str]
+) -> None:
+    """Write the dtype probe of ``repo`` from the expert-dtype table: the workspace copy (a
+    refetch) when there is one, else the tracked table. A DSV4 repo the table does not list
+    gets no probe, and the dummy says so: SGLang then falls back to its FP4 default."""
+    table = configs / "dsv4_expert_dtypes.json"
+    if not table.exists():
+        table = Path(__file__).resolve().parents[1] / "configs" / "dsv4_expert_dtypes.json"
+    entry = json.loads(table.read_text()).get(repo) if table.exists() else None
+    if entry and entry.get("dtype"):
+        write_dtype_probe_safetensors(out_dir, entry["key"], entry["dtype"], edits)
+    elif family == "dsv4":
+        caveats.append(
+            f"no expert dtype for {repo} in {table.name}: no dtype probe written, "
+            "SGLang reads the experts as FP4 (wrong for a converted-FP8 checkpoint)"
+        )
+
+
 _LAYER_REF_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|\*|$)")
 
 
@@ -860,13 +879,7 @@ def main() -> int:
             (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
             caveats: list[str] = []
             _provision_aux_files(out_dir, repo, args.configs, args.out, edits, caveats)
-            _dtp = args.configs / "dsv4_expert_dtypes.json"
-            if not _dtp.exists():  # the tracked table; a workspace copy (a refetch) wins
-                _dtp = Path(__file__).resolve().parents[1] / "configs" / "dsv4_expert_dtypes.json"
-            if _dtp.exists():
-                _dt = json.loads(_dtp.read_text()).get(repo)
-                if _dt and _dt.get("dtype"):
-                    write_dtype_probe_safetensors(out_dir, _dt["key"], _dt["dtype"], edits)
+            provision_dtype_probe(out_dir, repo, family, args.configs, edits, caveats)
             # modelopt/NVFP4 repos carry the authoritative quant description in
             # a SEPARATE hf_quant_config.json; without it the framework loads
             # the checkpoint as unquantized (looked like a silent-downgrade bug

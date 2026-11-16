@@ -348,3 +348,12 @@ def test_a_roster_repo_without_a_dummy_needs_no_config(pd, tmp_path, monkeypatch
     monkeypatch.setattr(pd, "derive_profile", lambda repo, configs: "bf16")
     cks = {ck["repo"]: ck for ck in pd.derive_roster_checkpoints({}, {})}
     assert cks["org/built"]["variants"] == ["rep"] and cks["org/unbuilt"]["variants"] == []
+
+
+@pytest.mark.parametrize("raw_key", ["engine_cli_unknown_args", "engine_yaml_unknown_args"])
+def test_a_record_names_the_rendered_arguments_the_release_did_not_accept(pd, raw_key):
+    """SGLang's parser reports them and the TensorRT-LLM probe drops them to build the
+    engine; either way the record of the run carries them."""
+    run = {"id": "r1", "sm": "sm100", "backend": "trtllm", "version": "1.0", "repo": "org/m"}
+    assert pd.build_record(run, {raw_key: ["kv_cache_tier"]}, 0.0)["runtime"]["unknown_args"] == ["kv_cache_tier"]
+    assert pd.build_record(run, {raw_key: []}, 0.0)["runtime"]["unknown_args"] is None

@@ -151,3 +151,38 @@ def test_stale_check_uses_nested_sub_config_depth():
     assert d._check_no_stale_layer_refs(cfg, 2) == []
     cfg["mtp_config"]["local_layer_ids"].append(9)
     assert d._check_no_stale_layer_refs(cfg, 2) != []
+
+
+def test_a_dsv4_repo_without_an_expert_dtype_gets_a_caveat_instead_of_a_probe(tmp_path):
+    """SGLang reads the expert dtype from a safetensors header; a dummy without the
+    probe file is loaded with the FP4 default, so the dummy has to say it has none."""
+    d = _load()
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "dsv4_expert_dtypes.json").write_text(
+        '{"org/listed": {"key": "layers.0.ffn.experts.0.w1.weight", "dtype": "F8_E4M3"}}'
+    )
+
+    listed, edits, caveats = tmp_path / "listed", [], []
+    listed.mkdir()
+    d.provision_dtype_probe(listed, "org/listed", "dsv4", configs, edits, caveats)
+    assert (listed / "dtype_probe.safetensors").exists() and caveats == []
+
+    missing, edits, caveats = tmp_path / "missing", [], []
+    missing.mkdir()
+    d.provision_dtype_probe(missing, "org/missing", "dsv4", configs, edits, caveats)
+    assert not (missing / "dtype_probe.safetensors").exists() and edits == []
+    assert len(caveats) == 1 and "org/missing" in caveats[0]
+
+    other, edits, caveats = tmp_path / "other", [], []
+    other.mkdir()
+    d.provision_dtype_probe(other, "org/dense", "generic", configs, edits, caveats)
+    assert caveats == [] and not (other / "dtype_probe.safetensors").exists()
+
+
+def test_the_tracked_expert_dtype_table_backs_a_workspace_without_one(tmp_path):
+    d = _load()
+    out, edits, caveats = tmp_path / "out", [], []
+    out.mkdir()
+    d.provision_dtype_probe(out, "sgl-project/DeepSeek-V4-Flash-FP8", "dsv4", tmp_path, edits, caveats)
+    assert (out / "dtype_probe.safetensors").exists() and caveats == []

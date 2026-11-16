@@ -39,14 +39,15 @@ whether a step is done:
 
 ```
 python3 components/gates.py paths --sm sm100 --op <op>                               # no GPU: each planned path and its gate
-python3 components/gates.py grade --sm sm100 --op <op> --results <job result dirs>   # exit 0: every gate in scope aligned
+python3 components/gates.py grade --sm sm100 --op <op> --results <job result dirs>   # exit 0: no gate in scope diverged
 python3 components/run_diff.py tables <packaged tables> --base <shipped data> --sibling <system>   # leads to explain before integrating
 ```
 
-`grade` prints one verdict per gate. It also exits 0 when no gate is in scope
-or every verdict is `platform-floor`, which proves nothing about a path:
-`paths` shows which paths have a gate, and the verdict lines show which gates
-were graded.
+`grade` prints one verdict per gate. Exit 0 means each verdict is `aligned` or
+`platform-floor`, and it is also the exit code when no gate is in scope. A
+`platform-floor` verdict proves nothing about a path, so read the verdict
+lines: on an SM with serving records a step is done when each gate `paths`
+lists for the op printed `aligned`.
 
 Steps that need judgment (the source check, triage, a deviation note) are
 prose in the .md and land where the collector reads them: a
