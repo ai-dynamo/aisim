@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 from collections.abc import Iterable, Mapping
@@ -23,6 +24,21 @@ _RECOMMENDATION_NAME = re.compile(r"^[0-9]{4}\.yaml$")
 _COMPACT_JSON = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
 
 
+def _resolve_input_path(path: Path) -> Path:
+    """Allow not-yet-created inputs, but reject unresolved symbolic-link loops."""
+
+    try:
+        try:
+            # Non-strict resolution no longer reports symlink loops on Python 3.13.
+            return path.resolve(strict=True)
+        except FileNotFoundError:
+            return path.resolve()
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+            raise
+        raise ValueError(f"--overwrite cannot resolve input path {path}; refusing to replace outputs") from exc
+
+
 def _input_path_entries(sources: Iterable[Path]) -> set[Path]:
     """Keep every directory entry needed to reopen the original input paths."""
 
@@ -33,7 +49,7 @@ def _input_path_entries(sources: Iterable[Path]) -> set[Path]:
         for path in (source, *source.parents):
             # Resolve only the parent: the final entry may itself be a symlink
             # that cleanup would unlink, even when its destination is safe.
-            entry = path.parent.resolve() / path.name
+            entry = _resolve_input_path(path.parent) / path.name
             if entry in entries:
                 continue
             entries.add(entry)
@@ -47,7 +63,7 @@ def _check_input_collisions(targets: Iterable[Path], input_paths: Iterable[str |
     """Reject output replacements that would remove an input or its path entries."""
 
     sources = [Path(input_path).absolute() for input_path in input_paths]
-    inputs = {source.resolve() for source in sources}
+    inputs = {_resolve_input_path(source) for source in sources}
     input_entries = _input_path_entries(sources)
     input_directories = [source for source in inputs if source.is_dir()]
     for target in targets:
@@ -105,7 +121,9 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool, input_paths: 
         targets = [target for target in targets if target.is_file() or target.is_symlink()]
         _check_input_collisions(targets, input_paths)
         for target in targets:
-            target.unlink()
+            # An earlier directory symlink may make a snapshotted child unreachable.
+            if target.is_file() or target.is_symlink():
+                target.unlink(missing_ok=True)
     return root
 
 

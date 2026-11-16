@@ -257,6 +257,8 @@ the original paths. Resource-plan and runtime diagnostics apply the same check b
 existing file, so an input created after preflight remains protected. A conflicting diagnostic is not
 saved, and the command retains its original exit status. Use a separate output directory when
 predicting a configuration saved under the previous run's `recommendations/` directory.
+An input path containing a symbolic-link loop is rejected before cleanup or replacement of an
+existing resource report. Inputs that do not exist yet remain allowed.
 
 <a id="standard-output"></a>
 
