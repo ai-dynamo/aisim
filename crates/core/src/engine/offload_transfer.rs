@@ -309,17 +309,50 @@ pub(crate) struct ClientEvent {
     pub(crate) at: f64,
 }
 
+/// A job waiting for its first byte, with its submission number.
+struct Waiter {
+    order: u64,
+    job: Job,
+}
+
+impl PartialEq for Waiter {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Waiter {}
+
+impl Ord for Waiter {
+    /// The heap pops the earliest first byte first.
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.job.ready.total_cmp(&self.job.ready)
+    }
+}
+
+impl PartialOrd for Waiter {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct FairTransfers {
     now: f64,
-    /// Submission order; completions in one step are reported in this order.
+    /// Jobs past their first byte, in submission order; completions in one
+    /// step are reported in this order.
     jobs: Vec<Job>,
+    /// Submission number of each job in `jobs`.
+    order: Vec<u64>,
+    /// Jobs waiting for their first byte. They hold no share, so they stay
+    /// out of `jobs` and no pass over it visits them.
+    waiters: BinaryHeap<Waiter>,
+    submitted: u64,
     /// Boxed so an idle tier stays small.
     scratch: Box<RefCell<RateScratch>>,
     rates: RefCell<Vec<f64>>,
     /// `rates` hold the current jobs' rates while the clock is before this
-    /// first-byte time. A new waiter appends a zero rate and can lower it; any
-    /// other job set change resets it.
+    /// time. `jobs` has no waiter, so that is until the job set changes.
     rates_valid_until: Cell<f64>,
     /// `next_event`, kept until the clock or the job set changes; every client
     /// of a shared pool asks between changes.
@@ -337,31 +370,45 @@ impl FairTransfers {
         self.now
     }
 
+    /// Moving jobs in submission order, then waiters in no particular order.
+    fn all_jobs(&self) -> impl Iterator<Item = &Job> {
+        self.jobs
+            .iter()
+            .chain(self.waiters.iter().map(|waiter| &waiter.job))
+    }
+
     /// Whether any job names `link` in its first slot.
     pub(crate) fn has_link_jobs(&self, link: u64) -> bool {
-        self.jobs.iter().any(|job| job.links[0].id == link)
+        self.all_jobs().any(|job| job.links[0].id == link)
     }
 
     /// Caller must first advance to the submission time.
     pub(crate) fn submit(&mut self, job: Job) {
         debug_assert!(job.ready >= self.now);
-        if job.ready > self.now && self.now < self.rates_valid_until.get() {
+        let order = self.submitted;
+        self.submitted += 1;
+        if job.ready > self.now {
             // A waiter holds no share before its first byte, so the other
             // jobs keep their rates.
-            self.rates.get_mut().push(0.0);
-            let valid_until = self.rates_valid_until.get_mut();
-            *valid_until = valid_until.min(job.ready);
             *self.cached_event.get_mut() = None;
+            self.waiters.push(Waiter { order, job });
         } else {
             self.invalidate();
+            self.jobs.push(job);
+            self.order.push(order);
         }
-        self.jobs.push(job);
     }
 
     pub(crate) fn cancel(&mut self, id: u64) -> bool {
-        let before = self.jobs.len();
-        self.jobs.retain(|job| job.id != id);
-        let canceled = self.jobs.len() != before;
+        let canceled = if let Some(index) = self.jobs.iter().position(|job| job.id == id) {
+            self.jobs.remove(index);
+            self.order.remove(index);
+            true
+        } else {
+            let before = self.waiters.len();
+            self.waiters.retain(|waiter| waiter.job.id != id);
+            self.waiters.len() != before
+        };
         if canceled {
             self.invalidate();
         }
@@ -374,19 +421,33 @@ impl FairTransfers {
         *self.cached_event.get_mut() = None;
     }
 
-    fn event_time(&self, job: &Job, rate: f64) -> f64 {
-        if job.ready > self.now {
-            job.ready
-        } else {
-            self.now + job.bytes / rate
+    /// Earliest first byte still to come.
+    fn first_byte(&self) -> Option<f64> {
+        self.waiters.peek().map(|waiter| waiter.job.ready)
+    }
+
+    /// Move the waiters whose first byte is due into `jobs`, each at its
+    /// place in submission order.
+    fn start_waiters(&mut self) {
+        while self
+            .waiters
+            .peek()
+            .is_some_and(|waiter| waiter.job.ready <= self.now)
+        {
+            let Waiter { order, job } = self.waiters.pop().expect("a waiter is due");
+            let index = self.order.partition_point(|&earlier| earlier < order);
+            self.order.insert(index, order);
+            self.jobs.insert(index, job);
+            self.invalidate();
         }
     }
 
+    /// Completion times of `jobs` at their current `rates`.
     fn event_times<'a>(&'a self, rates: &'a [f64]) -> impl Iterator<Item = f64> + 'a {
         self.jobs
             .iter()
             .zip(rates)
-            .map(|(job, &rate)| self.event_time(job, rate))
+            .map(|(job, &rate)| self.now + job.bytes / rate)
     }
 
     /// Recompute `rates` unless they still hold at the current instant.
@@ -414,6 +475,7 @@ impl FairTransfers {
         self.refresh_rates();
         let event = self
             .event_times(&self.rates.borrow())
+            .chain(self.first_byte())
             .min_by(f64::total_cmp);
         self.cached_event.set(Some(event));
         event
@@ -432,7 +494,7 @@ impl FairTransfers {
     /// so no other client's event can move its event earlier.
     pub(crate) fn next_client_events(&self, events: &mut FxHashMap<u64, ClientEvent>) {
         events.clear();
-        for job in &self.jobs {
+        for job in self.all_jobs() {
             debug_assert!(job.links[1].rate.is_infinite());
             let event = events.entry(job.links[0].id).or_insert(ClientEvent {
                 ready: [0; 2],
@@ -442,7 +504,7 @@ impl FairTransfers {
                 event.ready[job.direction as usize] += 1;
             }
         }
-        for job in &self.jobs {
+        for job in self.all_jobs() {
             let event = events
                 .get_mut(&job.links[0].id)
                 .expect("the first pass counts every client");
@@ -485,7 +547,11 @@ impl FairTransfers {
             self.refresh_rates();
             events.clear();
             events.extend(self.event_times(&self.rates.borrow()));
-            let event = events.iter().copied().min_by(f64::total_cmp);
+            let event = events
+                .iter()
+                .copied()
+                .chain(self.first_byte())
+                .min_by(f64::total_cmp);
             if self.now == target && event.is_none_or(|time| time > target) {
                 // Nothing moves or becomes due at `target`, including waiters
                 // a step to it made eligible; keep the event for the next poll.
@@ -494,12 +560,8 @@ impl FairTransfers {
             }
             let next = event.unwrap_or(target).min(target);
             let elapsed = next - self.now;
-            let now = self.now;
             let rates = self.rates.get_mut();
             for ((job, &rate), &event) in self.jobs.iter_mut().zip(rates.iter()).zip(&events) {
-                if job.ready > now {
-                    continue;
-                }
                 // The selected completion boundary is authoritative. Repeated
                 // byte subtraction at a large timestamp can leave a residual
                 // whose duration is below one clock ULP and would never drain.
@@ -510,10 +572,16 @@ impl FairTransfers {
                 };
             }
             self.now = next;
+            // A waiter starts after the step that reaches its first byte, so
+            // it moves no bytes in that step.
+            self.start_waiters();
             let before = completed.len();
             let now = self.now;
+            let mut done = self.jobs.iter().map(|job| job.bytes == 0.0);
+            self.order
+                .retain(|_| !done.next().expect("every job has a submission number"));
             self.jobs.retain(|job| {
-                let done = job.ready <= now && job.bytes == 0.0;
+                let done = job.bytes == 0.0;
                 if done {
                     completed.push((job.id, now));
                 }
@@ -602,6 +670,31 @@ mod tests {
             ]),
             [(1, 1.0), (0, 1.0)]
         );
+    }
+
+    #[test]
+    fn waiters_start_at_their_place_in_submission_order() {
+        // Job 1 moves from the start; job 2's first byte comes before job
+        // 0's. All three land in one step, reported in submission order.
+        let rates = (1.0, 0.0);
+        let mut moving = job(1, 1, Direction::Write, 0.0, rates);
+        moving.bytes = 2.0 * MB;
+        let mut early = job(2, 2, Direction::Write, 0.5, rates);
+        early.bytes = 1.5 * MB;
+        assert_eq!(
+            run(vec![job(0, 0, Direction::Write, 1.0, rates), moving, early]),
+            [(0, 2.0), (1, 2.0), (2, 2.0)]
+        );
+    }
+
+    #[test]
+    fn a_waiter_holds_its_link_and_can_be_canceled() {
+        let mut transfers = FairTransfers::default();
+        transfers.submit(job(0, 0, Direction::Read, 1.0, (1.0, 0.0)));
+        assert!(transfers.has_link_jobs(0));
+        assert_eq!(transfers.next_event(), Some(1.0));
+        assert!(transfers.cancel(0) && !transfers.cancel(0));
+        assert!(!transfers.has_link_jobs(0) && transfers.next_event().is_none());
     }
 
     #[test]
