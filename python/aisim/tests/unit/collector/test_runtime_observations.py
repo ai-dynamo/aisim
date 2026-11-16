@@ -867,6 +867,117 @@ def test_import_recomputes_storage_and_pool_capacity_and_keeps_every_rank(tmp_pa
     assert len(result["provenance"]["artifacts"]) == 12
 
 
+def _shared_stride_fixture(root, *, stride=8, offsets=(0, 32), storage_bytes=64, independent=False):
+    """Four synthetic blocks, 8-byte declared pages and 4-byte tensor payloads.
+
+    layer0 and layer1 explicitly alias across groups; layer2 needs its own pages.
+    The default layer-outer placement fills one 64-byte storage exactly, even
+    though its block stride is 8 rather than storage_bytes // num_blocks (16).
+    """
+    path, launches = observation_fixture(root, packed=True)
+
+    def place(record):
+        cache = record["cache"]
+        cache["num_blocks"] = 4
+        for group in cache["groups"]:
+            group["spec_page_size_bytes"] = 8
+        if record["kind"] != "worker":
+            cache["initial_free_blocks"] = 2
+            return
+        cache["storages"][0]["size_bytes"] = storage_bytes
+        if independent:
+            cache["storages"].append(
+                {"storage_id": "s1", "device": "cuda:0", "pointer": 2048, "size_bytes": storage_bytes}
+            )
+        cache["allocated_cache_bytes"] = storage_bytes * len(cache["storages"])
+        cache["available_cache_bytes"] = cache["allocated_cache_bytes"] + 256
+        for index, allocation in enumerate(cache["tensor_allocations"]):
+            storage_id = f"s{index}" if independent else "s0"
+            allocation.update(storage_id=storage_id, size=storage_bytes, block_stride=stride, offset=offsets[index])
+            for name in allocation["shared_by"]:
+                cache["layer_tensors"][name].update(
+                    storage_id=storage_id,
+                    storage_offset_bytes=offsets[index],
+                    shape=[4, 2],
+                    stride_bytes=[stride, 2],
+                )
+
+    _mutate(path, place)
+    return path, launches
+
+
+@pytest.mark.parametrize(
+    "stride,offsets,storage_bytes,independent,pool_page",
+    [
+        (8, (0, 32), 64, False, 16),
+        (8, (32, 0), 64, False, 16),
+        (12, (0, 48), 96, False, 24),
+        (8, (0, 0), 64, True, 32),
+    ],
+    ids=["layer-outer", "reversed-offsets", "padded-stride", "independent-storages"],
+)
+def test_shared_by_explicit_stride_imports_and_round_trips(
+    tmp_path, stride, offsets, storage_bytes, independent, pool_page
+):
+    path, launches = _shared_stride_fixture(
+        tmp_path, stride=stride, offsets=offsets, storage_bytes=storage_bytes, independent=independent
+    )
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = FpmResourceProfile.model_validate(result["resources"])
+    # Physical storage, including page/stride padding, is charged once despite
+    # the declared alias; the scheduler reserves two of the four pool blocks.
+    assert resources.runtime_memory.kv_cache_bytes == 2 * pool_page
+    assert [group.page_size_bytes for group in resources.cache_groups] == [pool_page, pool_page]
+    assert [group.num_layers for group in resources.cache_groups] == [2, 1]
+    assert len(result["provenance"]["rank_capacities"]) == 8
+    assert FpmResourceProfile.model_validate_json(resources.model_dump_json()) == resources
+
+
+@pytest.mark.parametrize(
+    "offsets,diagnostic",
+    [
+        ((0, 0), "packed allocation page intervals overlap"),
+        ((0, 4), "packed allocation page intervals overlap"),
+        ((0, 8), "packed allocation page intervals overlap"),
+        ((8, 0), "packed allocation page intervals overlap"),
+        ((0, 36), "allocation page bounds exceed the backing storage"),
+    ],
+    ids=["same-block", "page-padding", "cross-block", "reversed-cross-block", "final-page-padding"],
+)
+def test_shared_by_explicit_stride_refuses_overlapping_or_out_of_bounds_pages(tmp_path, offsets, diagnostic):
+    path, launches = _shared_stride_fixture(tmp_path, offsets=offsets)
+    # Every tensor fits: four blocks at stride 8 with a 4-byte payload. In the
+    # final-page case the last tensor ends at 64, but its 8-byte page ends at 68.
+    assert all(offset + 3 * 8 + 4 <= 64 for offset in offsets)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    assert diagnostic in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("inconsistent", [False, True], ids=["page-wider-than-stride", "inconsistent-strides"])
+def test_shared_by_explicit_stride_refuses_invalid_strides(tmp_path, inconsistent):
+    path, launches = _shared_stride_fixture(tmp_path, stride=8 if inconsistent else 6)
+    if inconsistent:
+
+        def change_stride(record):
+            if record["kind"] == "worker":
+                record["cache"]["tensor_allocations"][1]["block_stride"] = 6
+                record["cache"]["layer_tensors"]["layer2"]["stride_bytes"][0] = 6
+
+        _mutate(path, change_stride)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    diagnostic = (
+        "packed and unpacked allocations alias one storage"
+        if inconsistent
+        else "allocation page bytes exceed the physical storage slot"
+    )
+    assert diagnostic in str(result["diagnostics"])
+
+
 @pytest.mark.parametrize("kernel_subdivision", [False, True])
 def test_aliased_layers_cannot_assign_same_bytes_to_different_pool_blocks(tmp_path, kernel_subdivision):
     path, launch = observation_fixture(tmp_path)
