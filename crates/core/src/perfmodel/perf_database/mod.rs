@@ -23,11 +23,11 @@ use crate::operators::util_empirical::{DeltaLookupCache, ProvenanceTier, UtilGri
 
 /// The five known legacy/framework-agnostic backend directory names. Mirrors the
 /// SDK loader's `KNOWN_BACKEND_DIRS`
-/// (`python/aisimulate/src/aisimulate_core/sdk/perf_database.py`): any other
+/// (`python/aisim/src/aisim_core/sdk/perf_database.py`): any other
 /// first-level directory under a system's data dir is a family dir containing
 /// `<backend>/<version>` subtrees.
 /// Keep textually identical to the CANONICAL `_KNOWN_BACKEND_DIRS` in
-/// `python/aisimulate/src/aisimulate_core/sdk/operations/base.py`, which lists
+/// `python/aisim/src/aisim_core/sdk/operations/base.py`, which lists
 /// every copy that must stay in sync (Rust cannot import the Python set).
 const KNOWN_BACKEND_DIRS: [&str; 5] = ["trtllm", "sglang", "vllm", "nccl", "oneccl"];
 
@@ -340,6 +340,8 @@ pub struct PerfDatabase {
     /// notes made through a derived view land on the run's accumulator. The
     /// engine FFI resets it per `run_static`/step call and reads the worst
     /// tier back for the Python bridge / support-matrix HYBRID labelling.
+    /// Memo entries attribute tiers on the noting thread instead
+    /// ([`crate::memo`]), so they never read or clear this cell.
     provenance: Arc<AtomicU8>,
 }
 
@@ -365,7 +367,7 @@ impl PerfDatabase {
     /// Resolve and parse the system YAML, locate the per-version data
     /// directory, and construct lazy table owners.
     ///
-    /// `systems_root` points at `python/aisimulate/src/aisimulate_core/systems`. `system` is a
+    /// `systems_root` points at `python/aisim/src/aisim_core/systems`. `system` is a
     /// basename like `b200_sxm`. `backend` is `vllm` / `sglang` / `trtllm`.
     /// `version` is the backend version directory name (e.g. `0.24.0`).
     pub fn load(
@@ -813,20 +815,11 @@ impl PerfDatabase {
     /// successful `util_empirical::estimate` with the tier the site knows
     /// (own-data "empirical", attention head_size ref grid "xshape", the MoE
     /// ladder's `reference_provenance`, communication rank-overflow "xshape",
-    /// MSA cross-op "xop", ...).
+    /// MSA cross-op "xop", ...). The tier also counts toward the memo miss
+    /// open on this thread ([`crate::memo`]).
     pub fn note_provenance(&self, tier: ProvenanceTier) {
         self.provenance.fetch_max(tier as u8, Ordering::Relaxed);
-    }
-
-    /// Clear the accumulator back to `Silicon`, returning the tier it held.
-    /// Noting that tier again afterwards leaves the accumulator as if it had
-    /// never been cleared, so a caller can observe the tiers one computation
-    /// fires.
-    pub(crate) fn take_provenance(&self) -> ProvenanceTier {
-        ProvenanceTier::from_rank(
-            self.provenance
-                .swap(ProvenanceTier::Silicon as u8, Ordering::Relaxed),
-        )
+        crate::memo::note_on_thread(tier);
     }
 
     /// Clear the accumulator back to `Silicon` (start of a run).
@@ -911,8 +904,8 @@ impl PerfDatabase {
 /// ```text
 /// cd <repo> && uv run python - <<'PY'
 /// import pandas as pd, yaml, tempfile, os
-/// from aisimulate_core.sdk.perf_database import PerfDatabase
-/// from aisimulate_core.sdk import common
+/// from aisim_core.sdk.perf_database import PerfDatabase
+/// from aisim_core.sdk import common
 /// root = tempfile.mkdtemp(); data = os.path.join(root, "data", "vllm", "1.0")
 /// os.makedirs(data)
 /// yaml.safe_dump({...the testsys spec below...},
@@ -1061,7 +1054,7 @@ mod tests {
     fn systems_root() -> PathBuf {
         PathBuf::from(REPO_ROOT_HINT)
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems")
+            .join("python/aisim/src/aisim_core/systems")
     }
 
     #[test]

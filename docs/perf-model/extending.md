@@ -9,10 +9,10 @@ https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6
 
 # Extend performance models
 
-AISimulate owns the application, model definitions, performance data, and native
+AISim owns the application, model definitions, performance data, and native
 estimator. Start from the [development environment](../../DEVELOPMENT.md).
 All paths below are relative to the repository root unless linked otherwise.
-The `aisimulate_core` source namespace is retained inside the `aisimulate`
+The `aisim_core` source namespace is retained inside the `aisim`
 wheel; installing or rebuilding a separate AIConfigurator package is unnecessary.
 
 For whole-forward FPM onboarding, start with the [self-service config/profile workflow](fpm-self-service/implementation.md#onboard-with-an-agent),
@@ -25,8 +25,8 @@ model for `method: sol`. Neither FPM route requires per-operation GPU timing col
 
 | What changed? | Start here |
 |---|---|
-| A new architecture name with an existing operation pipeline | Map the architecture to an existing family in `python/aisimulate/src/aisimulate_core/sdk/common.py`. |
-| A new layer composition or model family | Add a registered class under `python/aisimulate/src/aisimulate_core/sdk/models/` and map its architecture. |
+| A new architecture name with an existing operation pipeline | Map the architecture to an existing family in `python/aisim/src/aisim_core/sdk/common.py`. |
+| A new layer composition or model family | Add a registered class under `python/aisim/src/aisim_core/sdk/models/` and map its architecture. |
 | Existing operations need additional measured shapes or a backend version | Add collector cases and collect the missing performance-data cells. |
 | A genuinely new operation or execution contract | Extend the native operator and wire contract, then the Python model description and collection path. |
 
@@ -36,21 +36,21 @@ specific model/backend/hardware cell and the public workflow it will serve.
 
 ## 1. Resolve and register the model
 
-The [models package](../../python/aisimulate/src/aisimulate_core/sdk/models/README.md) owns
+The [models package](../../python/aisim/src/aisim_core/sdk/models/README.md) owns
 registry-based model construction. Resolution reads model configuration,
 resolves the architecture to a family, then selects the `@register_model`
 class. `models/blocks/` contains reusable composition helpers and must not
 register model classes.
 
-Edit implementations under `python/aisimulate/src/aisimulate_core/sdk/models/`
+Edit implementations under `python/aisim/src/aisim_core/sdk/models/`
 and `sdk/operations/`. Their counterparts under
-`python/aisimulate/src/aisimulate/sdk/` are compatibility aliases to those
+`python/aisim/src/aisim/sdk/` are compatibility aliases to those
 canonical modules; adding a class only to an alias does not extend the canonical
 registry. Use the model and operation packages, rather than the retired
 `models.py` or `operations.py` layout.
 
 For an existing family, inspect
-[`common.py`](../../python/aisimulate/src/aisimulate_core/sdk/common.py) and the selected model
+[`common.py`](../../python/aisim/src/aisim_core/sdk/common.py) and the selected model
 class before adding `ARCHITECTURE_TO_MODEL_FAMILY` entries. Verify layer counts,
 attention/KV heads, head dimensions, quantization defaults, and any custom
 Hugging Face configuration fields. A model name resembling another model is
@@ -58,13 +58,13 @@ not sufficient evidence that their operation pipelines match.
 
 For a new family, implement `BaseModel.create(...)`, register the family, and
 build its context/generation operations using the existing family-specific
-examples. See the [registry extension examples](../../python/aisimulate/src/aisimulate_core/sdk/models/README.md#adding-a-new-model).
+examples. See the [registry extension examples](../../python/aisim/src/aisim_core/sdk/models/README.md#adding-a-new-model).
 Reuse the shared MoE block builder where its contract applies, including the
 separate large-EP registration described there.
 
 Mamba2 kernels and NemotronH hybrid model descriptions already exist in
-[`operations/mamba.py`](../../python/aisimulate/src/aisimulate_core/sdk/operations/mamba.py) and
-[`models/nemotron_h.py`](../../python/aisimulate/src/aisimulate_core/sdk/models/nemotron_h.py).
+[`operations/mamba.py`](../../python/aisim/src/aisim_core/sdk/operations/mamba.py) and
+[`models/nemotron_h.py`](../../python/aisim/src/aisim_core/sdk/models/nemotron_h.py).
 They are useful references, not evidence that every Mamba variant or topology
 is supported. In particular, AFD partitioning has separate restrictions below.
 
@@ -80,7 +80,7 @@ and SOL values. Keep that single-oracle boundary when adding an operation:
    Add an independently justified numerical test, including unsupported and
    missing-data behavior.
 2. Add the typed Python operation in
-   [`sdk/operations/`](../../python/aisimulate/src/aisimulate_core/sdk/operations). Follow its
+   [`sdk/operations/`](../../python/aisim/src/aisim_core/sdk/operations). Follow its
    existing construction, weight-sizing, and engine-backed table-view
    conventions. Do not add a Python interpolation or performance-query oracle.
 3. Extend the native [`Op` representation](../../crates/core/src/perfmodel/operators/op.rs),
@@ -89,7 +89,7 @@ and SOL values. Keep that single-oracle boundary when adding an operation:
    Ordinary Python operation shells inherit a Rust `Operation` subclass and
    serialize through `_spec_json` / `ops_json_from_ops`; there is no Python
    `_to_opspec` branch to add. Inspect `_as_engine_op` in
-   [`sdk/engine.py`](../../python/aisimulate/src/aisimulate_core/sdk/engine.py)
+   [`sdk/engine.py`](../../python/aisim/src/aisim_core/sdk/engine.py)
    for the existing whole-forward FPM adapter, rather than introducing a second
    serialization or performance oracle. Supply the original phase's `sol_ops`
    list to `FPMForwardOp`; every nested operation must also be convertible by
@@ -100,8 +100,8 @@ and SOL values. Keep that single-oracle boundary when adding an operation:
    and consumer updates.
 4. Wire the operation into the model pipeline and validate its parameter
    conversion. Run the existing
-   [OpSpec coverage test](../../python/aisimulate/tests/unit/sdk/test_opspec_coverage.py) and
-   [single-oracle contract](../../python/aisimulate/tests/cross_package/test_single_oracle_contract.py).
+   [OpSpec coverage test](../../python/aisim/tests/unit/sdk/test_opspec_coverage.py) and
+   [single-oracle contract](../../python/aisim/tests/cross_package/test_single_oracle_contract.py).
 5. Add a representative estimator parity case when a model reaches the new
    path. Follow the [parity README](../../crates/core/parity_tests/perfmodel/README.md)
    and review the numerical evidence before updating goldens.
@@ -112,18 +112,18 @@ this page use the unified repository layout.
 
 ## 3. Collect only the missing data
 
-Use the [Collector README](../../python/aisimulate/collector/README.md) and the collector rules
-required by `AGENTS.md`. Cases live under `python/aisimulate/collector/cases/`;
+Use the [Collector README](../../python/aisim/collector/README.md) and the collector rules
+required by `AGENTS.md`. Cases live under `python/aisim/collector/cases/`;
 model-specific cases belong under `models/`, and reusable operation shapes
 under `base_ops/`. For a new collector operation, follow the
-[collector operation runbook](../../python/aisimulate/.claude/skills/aic-collector-op-development/SKILL.md).
+[collector operation runbook](../../python/aisim/.claude/skills/aic-collector-op-development/SKILL.md).
 
 Run the intended backend/runtime on the intended hardware, retain the effective
 model and runtime identity, and finalize accepted staging output as Parquet
 with the required collection/reuse metadata. The canonical data root is:
 
 ```text
-python/aisimulate/src/aisimulate_core/systems/data/<system>/<family>/<backend>/<version>/
+python/aisim/src/aisim_core/systems/data/<system>/<family>/<backend>/<version>/
 ```
 
 Do not relabel another backend version's data as newly measured. Update query
@@ -136,16 +136,16 @@ consumer contracts. For whole-forward profiles, use the separate
 Rebuild the editable package after native or packaging changes:
 
 ```bash
-uv sync --project python/aisimulate --extra dev
-source python/aisimulate/.venv/bin/activate
-python -m pytest -c python/aisimulate/pytest.ini   python/aisimulate/tests/unit/sdk/test_opspec_coverage.py   python/aisimulate/tests/cross_package/test_single_oracle_contract.py
+uv sync --project python/aisim --extra dev
+source python/aisim/.venv/bin/activate
+python -m pytest -c python/aisim/pytest.ini   python/aisim/tests/unit/sdk/test_opspec_coverage.py   python/aisim/tests/cross_package/test_single_oracle_contract.py
 ```
 
 Also run the focused tests for the changed model, collector, and native
 operator. On macOS, use the local pytest guidance in `AGENTS.md`.
 
 Check the exact model/system/backend/version with `aiconfigurator cli support`
-from this environment, then run the intended `aisimulate predict` or
+from this environment, then run the intended `aisim predict` or
 `recommend` configuration. Keep model revision, precision, topology, workload,
 performance-data identity, and reports with the test results. If deployment
 artifacts are in scope, exercise their generator path too.
@@ -158,7 +158,7 @@ alone does not prove end-to-end predictive accuracy.
 ### AFD execution-plan compatibility
 
 AFD compiles pool-specific operations and a source-ordered layer plan through
-the canonical FPM constructor. [`models/afd.py`](../../python/aisimulate/src/aisimulate_core/sdk/models/afd.py)
+the canonical FPM constructor. [`models/afd.py`](../../python/aisim/src/aisim_core/sdk/models/afd.py)
 composes the graph; [native validation](../../crates/core/src/perfmodel/afd/validation.rs)
 and the execution-plan validator reject unsupported architectures and invalid
 pool/layer/op coverage before prediction.
