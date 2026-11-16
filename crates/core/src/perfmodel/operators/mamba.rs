@@ -177,7 +177,7 @@ impl GdnOp {
         // every kernel/phase slice), fall back to a per-kernel SOL formula.
         // The op's arg-style SOL is threaded into the table query for
         // beyond-range util-hold (mirrors Python's engine record sol_fn).
-        match db.state_space.try_query_gdn(
+        match db.state_space.query_gdn(
             &self.kernel_source,
             &self.phase,
             batch_size,
@@ -198,8 +198,6 @@ impl GdnOp {
                         .scaled(self.scale_factor),
                 )
             }
-            // A slice the perf DB doesn't ship misses on every query, so the
-            // miss carries no message here.
             Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
@@ -398,7 +396,7 @@ impl KdaOp {
             }
             kernel_source = "kda_fused_decode";
         }
-        match db.state_space.try_query_kda(
+        match db.state_space.query_kda(
             kernel_source,
             &self.phase,
             batch_size,
@@ -418,8 +416,6 @@ impl KdaOp {
                         .scaled(self.scale_factor),
                 )
             }
-            // A model the perf DB has no KDA rows for misses on every query,
-            // so the miss carries no message here.
             Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency =
                     self.sol_latency_ms_with(db, kernel_source, batch_size as f64, seq_len as f64);
