@@ -888,6 +888,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/fpe-support-matrix.yml
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     with:
       expected_sha: ${{ needs.changes-guard.outputs.target-sha }}
       source_branch: ${{ needs.changes-guard.outputs.target-ref }}
