@@ -892,10 +892,12 @@ Import checks each kind of claim against the measured groups:
   kinds, layer counts, block sizes, page sizes and windows. Import does not
   compare group names or order. A group without a `sliding_window` has a null
   window. A state group also compares its `blocks_per_request`. Only import
-  writes `prefill_checkpoint_blocks` and `prefill_checkpoint_alignment`. If a
-  claimed group states one of these fields, import compares that field in every
-  group, so it must equal the probe's measurement. A claim that states neither
-  field compares the geometry only and still matches.
+  writes `prefix_cacheable`, `prefill_checkpoint_blocks` and
+  `prefill_checkpoint_alignment`. If a claimed group states one of these
+  fields, import compares that field in every group, so it must equal the
+  probe's measurement. A claim that states none of these fields compares the
+  geometry only and still matches. The probe import writes no
+  `transfer_bytes_per_block`, so a claim that states it is refused.
 - A `cache_layout: grouped` claim matches the grouped measurement.
 - A `cache_layout: linear` claim needs every measured group to be an attention
   group without a window.
@@ -1256,6 +1258,8 @@ Execution saves `fpm-readiness.json` in the onboarding output directory and retu
 Zero-KV prefill can retain a native `real_prefix` path stamp while its formal seed regime is `n/a`; the stamp alone does not establish that cached tokens were read. Keep the native provenance and use the validated phase/token counts and formal regime when interpreting readiness.
 
 Dense decode can be synthetic by design only when the producer reports enabled warm-up with `warm_eligible: false` and `skip_reason: dense_model_content_insensitive`, and the pinned native evidence corroborates a dense full-attention model and its exact runtime/topology. The supported case is single-rank or attention TP with PP1, DP1, MoE TP1/EP1, and prefill and decode context parallelism both equal to 1. Initialized cache groups must be causal full attention, with no sliding window, attention chunking, convolution or recurrent state; a `FullAttentionSpec` type name alone is insufficient. Matching model and runtime identities and every expected native rank are required. Consistent qualifying points publish as `skip:dense_model_content_insensitive` under the explicit `dense_full_attention_v1` metadata policy. This retains their measured samples and raw provenance; it does not establish real KV content or serving accuracy. Other `fake_fallback` points remain ineligible for direct timing.
+
+Dynamo can report this deliberate dense skip either with the historical `kvwarm_fake_fallback` point stamp or with an explicit per-point `kv_seed_regime: skip:dense_model_content_insensitive` and no fallback stamp. Both formats require the same engine evidence above. A configuration-level skip reason alone does not qualify an unstamped point. Worker-probe sidecars are separate provenance artifacts, not rank timing results, and do not replace the required engine snapshot.
 
 Readiness counts describe the current reaggregation of verified native artifacts. They do not relabel an existing formal pair. Historical publications without the dense classification marker retain their recorded regimes during verification, finalization and validation; any revised publication needs a fresh output tree while preserving the original pair.
 

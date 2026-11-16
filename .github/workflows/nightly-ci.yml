@@ -816,11 +816,12 @@ jobs:
   # share a process or filesystem with the GitHub token used for the prior diff.
   license-evidence:
     name: License compliance evidence
-    needs: [build-artifacts, python-compliance]
+    needs: [changes-guard, build-artifacts, python-compliance]
     # !cancelled(): the implicit success() also inspects the transitively
     # needed manual-approval job, which is skipped on scheduled runs.
     if: >-
       !cancelled() &&
+      needs.changes-guard.outputs.should-build == 'true' &&
       needs.build-artifacts.result == 'success' &&
       needs.python-compliance.result == 'success'
     runs-on: ubuntu-24.04
@@ -843,135 +844,18 @@ jobs:
           pattern: bundled-configs-nightly-*
           merge-multiple: false
           path: ${{ runner.temp }}/license-artifacts/bundled
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
       - name: Generate license compliance evidence
         env:
           GH_API_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.changes-guard.outputs.target-sha }}
+          SOURCE_REF: ${{ needs.changes-guard.outputs.target-ref }}
         run: |
-          set -euo pipefail
-          outdir="${RUNNER_TEMP}/license-artifacts"
-          mkdir -p "${outdir}"
-          python3 - "${outdir}" <<'EOF'
-          import csv, glob, io, json, os, sys, urllib.request, zipfile
-
-          outdir = sys.argv[1]
-          rows = []
-          for filename in sorted(glob.glob(f"{outdir}/python/*.csv")):
-              with open(filename, newline="") as f:
-                  for r in csv.DictReader(f):
-                      rows.append({"dependency_type": "python", "name": r["Name"],
-                                   "version": r["Version"], "spdx_license": r["License"]})
-          if not rows:
-              raise SystemExit("missing Python dependency inventories")
-          bundled = sorted(glob.glob(f"{outdir}/bundled/**/bundled-deps.csv", recursive=True))
-          expected_bundled = [
-              f"{outdir}/bundled/bundled-configs-nightly-{arch}/bundled-deps.csv"
-              for arch in ("amd64", "arm64")
-          ]
-          if bundled != expected_bundled:
-              raise SystemExit("missing or duplicate architecture-specific bundled configuration inventories")
-          for filename in bundled:
-              with open(filename, newline="") as f:
-                  inventory = list(csv.DictReader(f))
-              if not inventory or any(r["dependency_type"] != "bundled_model_config" for r in inventory):
-                  raise SystemExit("invalid bundled configuration inventory")
-              rows.extend(inventory)
-          with open(f"{outdir}/cargo-metadata.json") as f:
-              meta = json.load(f)
-          workspace = set(meta.get("workspace_members") or [])
-          for p in meta["packages"]:
-              if p.get("id") in workspace:
-                  continue
-              rows.append({"dependency_type": "crate", "name": p["name"],
-                           "version": p["version"],
-                           "spdx_license": p.get("license") or "UNKNOWN"})
-          def identity(row):
-              return row["dependency_type"], row["name"], row["version"]
-
-          inventory = {}
-          for row in rows:
-              key = identity(row)
-              if key in inventory and inventory[key] != row:
-                  raise SystemExit("conflicting license metadata for one dependency version")
-              inventory[key] = row
-          rows = [inventory[key] for key in sorted(inventory)]
-          fields = ["dependency_type", "name", "version", "spdx_license"]
-          with open(f"{outdir}/deps.csv", "w", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=fields)
-              w.writeheader()
-              w.writerows(rows)
-
-          def prior_deps():
-              token = os.environ["GH_API_TOKEN"]
-              repo = os.environ["GITHUB_REPOSITORY"]
-              current = os.environ["GITHUB_RUN_ID"]
-              def get(url):
-                  req = urllib.request.Request(url, headers={
-                      "Accept": "application/vnd.github+json"})
-                  # Signed artifact URLs authenticate with their query string.
-                  # Forwarding the GitHub bearer token to storage causes HTTP 401.
-                  req.add_unredirected_header("Authorization", f"Bearer {token}")
-                  return urllib.request.urlopen(req, timeout=30)
-              with get(
-                  f"https://api.github.com/repos/{repo}/actions/workflows/"
-                  "nightly-ci.yml/runs?branch=main&event=schedule&status=success&per_page=10") as response:
-                  runs = json.load(response)
-              for run in runs.get("workflow_runs", []):
-                  if str(run["id"]) == current:
-                      continue
-                  page = 1
-                  while True:
-                      with get(f"{run['artifacts_url']}?per_page=100&page={page}") as response:
-                          arts = json.load(response)
-                      artifacts = arts.get("artifacts", [])
-                      for a in artifacts:
-                          if a["name"] != "license-artifacts" or a.get("expired"):
-                              continue
-                          with get(a["archive_download_url"]) as response:
-                              data = response.read()
-                          with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                              for n in zf.namelist():
-                                  if os.path.basename(n) == "deps.csv":
-                                      with io.TextIOWrapper(zf.open(n)) as stream:
-                                          reader = csv.DictReader(stream)
-                                          return {identity(r): r for r in reader}
-                          raise RuntimeError("prior license-artifacts is missing deps.csv")
-                      if len(artifacts) < 100:
-                          break
-                      page += 1
-              return None
-
-          # A missing baseline is valid for the first run; lookup failures must
-          # fail this required job instead of inventing an all-added diff.
-          prior = prior_deps()
-          if prior is None:
-              print("No prior scheduled license evidence; using an empty baseline")
-              prior = {}
-          current = {identity(r): r for r in rows}
-          dfields = ["change"] + fields + ["prior_version", "prior_spdx_license"]
-          drows = []
-          for key in sorted(set(current) | set(prior)):
-              c, p = current.get(key), prior.get(key)
-              if c and not p:
-                  drows.append({"change": "added", **c,
-                                "prior_version": "", "prior_spdx_license": ""})
-              elif p and not c:
-                  drows.append({"change": "removed",
-                                "dependency_type": p["dependency_type"],
-                                "name": p["name"], "version": "",
-                                "spdx_license": "",
-                                "prior_version": p["version"],
-                                "prior_spdx_license": p["spdx_license"]})
-              elif (c["version"] != p["version"]
-                    or c["spdx_license"] != p["spdx_license"]):
-                  drows.append({"change": "changed", **c,
-                                "prior_version": p["version"],
-                                "prior_spdx_license": p["spdx_license"]})
-          with open(f"{outdir}/deps-diff.csv", "w", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=dfields)
-              w.writeheader()
-              w.writerows(drows)
-          print(f"deps.csv: {len(rows)} rows; deps-diff.csv: {len(drows)} rows")
-          EOF
+          python3 scripts/ci/generate_license_evidence.py "${RUNNER_TEMP}/license-artifacts" \
+            --previous-nightly --source-sha "${SOURCE_SHA}" --source-ref "${SOURCE_REF}"
 
       # Constant name + overwrite so a re-run replaces the evidence instead
       # of failing on a duplicate (or, across a UTC midnight, leaving two
@@ -980,7 +864,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: license-artifacts
-          path: ${{ runner.temp }}/license-artifacts/deps*.csv
+          path: |
+            ${{ runner.temp }}/license-artifacts/deps*.csv
+            ${{ runner.temp }}/license-artifacts/evidence.json
           retention-days: 30
           if-no-files-found: error
           overwrite: true

@@ -2301,10 +2301,8 @@ class BaseBackend:
             "backend": database.backend,
             "version": database.version,
             "system": database.system,
-            # Aggregate FPM power is out of V1 (AISIM-1973 D10, AISIM-2001):
-            # publish no watts whatever the coverage. Operation energy and
-            # the true coverage stay on the summary for diagnostics.
-            "power_w": None if getattr(model, "forward_model", "op_level") == "fpm" else agg_power_avg_w,
+            # FPM watts are gated below, once the coverage evidence is set.
+            "power_w": agg_power_avg_w,
         }
         summary = InferenceSummary(RuntimeConfig(isl=isl, osl=osl))
         summary.set_memory_and_check_oom(
@@ -2317,7 +2315,6 @@ class BaseBackend:
         summary.set_encoder_power_avg(encoder_energy_wms / encoder_latency_ms if encoder_latency_ms > 0 else 0.0)
         summary.set_encoder_source_dict(encoder_source_dict)
         summary.set_result_dict(result_dict)
-        summary.set_e2e_power_avg(result_dict["power_w"])  # mirrors the row; None when withheld
 
         # Retain operation evidence using exactly the scheduling weights used
         # for total energy and active latency above. Mixed steps include both
@@ -2350,6 +2347,13 @@ class BaseBackend:
                 per_op_source=dict(encoder_source_dict),
             )
         summary.set_aggregate_energy_breakdown(energy_groups)
+        # Mixed steps carry no FPM energy (AISIM-1973 D10, AISIM-2001), so
+        # their latency stays uncovered. Aggregate FPM watts follow the same
+        # 0.9 coverage gate as static runs; when the watts are withheld, the
+        # energy and coverage stay on the summary for diagnostics.
+        if self._withholds_fpm_power(model, summary):
+            result_dict["power_w"] = None
+        summary.set_e2e_power_avg(result_dict["power_w"])  # mirrors the row; None when withheld
         if encoder_memory:
             summary.set_encoder_memory(encoder_memory)
 

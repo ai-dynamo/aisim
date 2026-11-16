@@ -201,6 +201,10 @@ def test_public_docs_keep_availability_separate_from_semantics() -> None:
     ) in contract
     assert "Direct interpolation stays latency-only." in contract
     assert "static operation energy does not enable replay or unified `power_w` publication." in contract
+    assert (
+        "SDK and legacy `cli_estimate()` static, aggregated, and disaggregated results apply the 90% coverage "
+        "gate to FPM watts"
+    ) in contract
     assert "Below the threshold, JSON output keeps numeric `power_coverage` and sets `power_w` to `null`" in contract
     assert "fixtures/power-contract-v1.json" in contract
     assert "[modeled-power contract](../perf-model/power.md)" in migration

@@ -18,18 +18,21 @@ interpolation and powered schema-8 rows, `get_context_energy_wms_dict()` and
 `get_generation_energy_wms_dict()` return nonzero FPM energy. Direct
 interpolation stays latency-only. Mixed steps report zero FPM prefill and
 marginal-decode energy (D10, AISIM-2001), while retaining draft-operation energy.
-SDK static and disaggregated result dictionaries expose the resulting average
-`power_w` only at 90% or greater latency-weighted coverage. The SDK also withholds
-FPM watts for multimodal models, draft-enabled models, and language-only EPD
-workers. Aggregated FPM results withhold average watts regardless of coverage,
-while retaining pure-decode energy and suppressing mixed-step energy. Raw
-`InferenceSession` summaries provide coverage through `get_power_data_coverage()`;
-`Task.run_single_agg()` and `Task.run_single_disagg()` include `power_coverage`
-in their rows. Legacy `cli_estimate()` preserves these SDK publication gates:
-static and disaggregated results can publish numeric `power_w` for powered
-schema-8 pairs, while aggregate FPM watts remain null even above 90% coverage. In
-all modes, static operation energy does not enable replay or unified `power_w`
-publication.
+SDK and legacy `cli_estimate()` static, aggregated, and disaggregated results
+apply the 90% coverage gate to FPM watts: they publish numeric `power_w` for
+powered schema-8 pairs at or above the gate, and null power with numeric
+coverage below it. Aggregated coverage counts mixed-step latency as uncovered,
+because mixed-step FPM energy is suppressed while pure-decode energy is
+retained; the published `power_w` divides total energy by total active latency.
+Non-schema-8 FPM runs (schema 6 and 7) have no row-power evidence and publish
+null `power_w` (`None` in Python), rather than the previous `0.0` sentinel.
+A disaggregated result withholds power when either worker withholds it. FPM
+watts are also withheld for draft speculation schemes, models with encoder
+operations, and language-only EPD workers. Raw `InferenceSession` summaries
+provide coverage through `get_power_data_coverage()`; `Task.run_single_agg()`
+and `Task.run_single_disagg()` include `power_coverage` in their rows. The
+operation energy stays available below the gate, and static operation energy
+does not enable replay or unified `power_w` publication.
 See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
 
 The current producers and consumers are

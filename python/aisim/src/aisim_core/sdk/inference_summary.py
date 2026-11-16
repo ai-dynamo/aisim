@@ -511,10 +511,15 @@ class InferenceSummary:
         return perf_info, mem_info, encoder_info, context_info, generation_info
 
     def set_summary_df(self, summary_df: pd.DataFrame) -> None:
-        """
-        Set summary dataframe.
+        """Set the ranked results and mirror the first row's published power.
+
+        Optimization summaries have no phase-energy state of their own. Their
+        end-to-end power comes from the selected row, including withheld watts.
+        An empty table or a legacy table without power has no published value.
         """
         self._summary_df = summary_df
+        power_w = summary_df["power_w"].iloc[0] if not summary_df.empty and "power_w" in summary_df else None
+        self._e2e_power_avg = None if pd.isna(power_w) else float(power_w)
 
     def set_deferred_row(self, data: list, columns: list) -> None:
         """Store raw row data for lazy DataFrame construction."""

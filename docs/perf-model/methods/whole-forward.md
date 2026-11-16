@@ -487,19 +487,21 @@ watt-milliseconds from schema-8 row power and resolved latency. Latency and
 power use the same interpolation weight; a prefill latency clamp also scales
 energy. If any selected anchor lacks power, the operation returns zero energy
 as the uncovered-data sentinel. Direct interpolation stays latency-only.
+For example, a 500 W, 7 ms SOL result carries 3500 W·ms of operation energy.
 
 Python static summaries expose this energy through
 `get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`, which
-can now return nonzero FPM energy for schema-8 pairs. SDK static and
-disaggregated result dictionaries publish the resulting average `power_w`
-only when at least 90% of the active latency has power evidence. Coverage is
-measured before decode results are folded by operation name, so a powered
-step cannot cover another step with unknown power. Aggregated FPM runs keep
-operation energy and coverage for diagnostics but withhold average watts.
-`Task.run_single_agg()` and `Task.run_single_disagg()` include numeric
-`power_coverage`; raw `InferenceSession` summaries expose coverage through
-`get_power_data_coverage()`. Legacy `cli_estimate()` preserves these publication
-gates, including null aggregate FPM power. Mixed steps suppress both FPM
+can now return nonzero FPM energy for schema-8 pairs. SDK and legacy
+`cli_estimate()` static, aggregated, and disaggregated results publish the
+resulting average `power_w` when coverage reaches 90%, and otherwise return null
+power with numeric `power_coverage`. Aggregated results combine zero-energy mixed
+steps with powered pure-decode steps, so their coverage counts mixed-step latency
+as uncovered. `Task.run_single_agg()` and `Task.run_single_disagg()` include
+numeric `power_coverage`; raw `InferenceSession` summaries expose coverage
+through `get_power_data_coverage()`. See the
+[power output contract](../power.md) for the other withholding rules; this
+operator change already affects these outputs for powered schema-8 pairs.
+Mixed steps suppress both FPM
 prefill and marginal-decode energy (decision D10, AISIM-2001), while retaining
 draft-operation energy. `FpmForwardOp::query_totals` returns SOL-based operation
 energy. `estimate_forward_pass_time_ms(metrics_by_rank)` returns latency only;

@@ -273,10 +273,15 @@ def _finalized_resources(
     profile that has runtime-probe evidence stays linear, so the merged groups are returned in the linear layout.
     Every other profile, such as a config-derived one, gets the merged grouped measurements, as before.
     """
-    from .runtime import runtime_probe_manifest
+    from .runtime import as_saved_resources, runtime_probe_manifest
 
+    probe = runtime_probe_manifest(source)
+    if probe is not None:
+        # A source imported before the later cache group fields existed keeps them out of its finalized groups and of
+        # the cell observations that its provenance records.
+        observations = [as_saved_resources(probe["observed_resources"], item) for item in observations]
     merged = _merge_resources(observations, manifest, source_references=source_references)
-    if source.profile_deployment().resources.cache_layout != "linear" or runtime_probe_manifest(source) is None:
+    if source.profile_deployment().resources.cache_layout != "linear" or probe is None:
         return merged, merged
     linear = linear_runtime_resources(merged)
     if linear is None:
