@@ -1356,7 +1356,10 @@ def test_supervisor_entry_point_groups_match_their_resolvers():
 
 @pytest.mark.parametrize("command", ["predict", "recommend"])
 @pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
-def test_worker_cleanup_preserves_trace_created_after_parent_preflight(tmp_path, monkeypatch, command, input_kind):
+@pytest.mark.parametrize("cleanup_name", ["requests.jsonl", "resource-runtime.json"])
+def test_worker_cleanup_preserves_trace_created_after_parent_preflight(
+    tmp_path, monkeypatch, command, input_kind, cleanup_name
+):
     import subprocess
 
     from aisimulate import supervision
@@ -1366,7 +1369,7 @@ def test_worker_cleanup_preserves_trace_created_after_parent_preflight(tmp_path,
     config = _small_cli_config(tmp_path, command)
     output = tmp_path / "output"
     output.mkdir()
-    cleanup = output / "requests.jsonl"
+    cleanup = output / cleanup_name
     if input_kind == "directory_alias":
         inputs = tmp_path / "inputs"
         inputs.mkdir()
