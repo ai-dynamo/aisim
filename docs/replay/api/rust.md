@@ -166,6 +166,14 @@ settled interval samples, and a final tail when needed. A sample coinciding
 with a scaling tick observes settled pre-scaling state. Grouped cache byte
 occupancy is available here. Telemetry neither extends the time cap nor prevents deadlock.
 
+Each observer sample also carries `completion_feedback`, measured outcomes for
+closed-loop scaling policies: the SLA thresholds, cumulative terminal,
+completed and SLA-satisfying request counts, cumulative provisioned
+GPU-seconds, and up to 64 `(TTFT, mean ITL)` pairs from requests completed
+since the previous sample. `good_requests_strict_itl` excludes single-token
+outputs when an ITL threshold is set. The counters match the final report's
+goodput and GPU-hours. Telemetry capture does not export this block.
+
 `with_telemetry_capture(interval_ms)` retains native telemetry in
 `ReplayReport.telemetry`, including preparation and profiling requests, periodic
 samples, and agentic lifecycle events. It enables internal request capture while

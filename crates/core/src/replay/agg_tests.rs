@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::engine::{EngineConfig, G3Scope, TimingModelConfig};
@@ -82,6 +83,54 @@ fn telemetry_only_timestamps_do_not_enter_the_agg_semantic_drain() {
         observed_stats.semantic_drain_count, baseline_stats.semantic_drain_count,
         "telemetry-only heartbeats must not wake aggregate semantic replay work"
     );
+}
+
+#[test]
+fn aggregate_completion_feedback_matches_final_slo_and_gpu_accounting() {
+    struct Capture(Arc<Mutex<Vec<ReplayTelemetrySnapshot>>>);
+    impl ReplayTelemetryObserver for Capture {
+        fn on_sample(&mut self, sample: ReplayTelemetrySnapshot) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(sample);
+            Ok(())
+        }
+    }
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let sla = crate::replay::SlaThresholds {
+        ttft_ms: Some(10.0),
+        itl_ms: Some(5.0),
+        e2e_ms: None,
+    };
+    let report = runtime(VecDeque::from([request(1, 0.0), request(2, 10.0)]))
+        .with_sla_thresholds(sla)
+        .with_telemetry_observer(1.0, Box::new(Capture(samples.clone())))
+        .run()
+        .unwrap()
+        .0
+        .finish();
+    let samples = samples.lock().unwrap();
+    let baseline = samples
+        .first()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    let final_sample = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(baseline.terminal_requests, 0);
+    assert_eq!(final_sample.sla, sla);
+    assert_eq!(final_sample.completed_requests, 2);
+    assert_eq!(
+        final_sample.good_requests,
+        report.goodput.unwrap().completed_requests as u64
+    );
+    assert_eq!(final_sample.good_requests_strict_itl, 0); // Both outputs have one token.
+    assert!((final_sample.gpu_seconds - report.throughput.gpu_hours * 3600.0).abs() < 1e-9);
+    let encoded = serde_json::to_value(samples.last().unwrap()).unwrap();
+    assert_eq!(encoded["completion_feedback"]["schema_version"], 1);
 }
 
 struct MismatchedPlacement;

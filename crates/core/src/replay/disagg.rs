@@ -1381,13 +1381,23 @@ where
         sink: ReplayTelemetryCaptureSink,
     ) -> Self {
         sink.set_preparing(self.admission.is_agentic_preparing());
-        let mut runtime = self.with_telemetry_observer(interval_ms, Box::new(sink.clone()));
+        let mut runtime = self.with_telemetry_runtime(interval_ms, Box::new(sink.clone()));
         runtime.telemetry_capture = Some(sink);
         runtime.collector.set_capture_per_request(true);
         runtime
     }
 
     pub(crate) fn with_telemetry_observer(
+        mut self,
+        sample_interval_ms: f64,
+        observer: Box<dyn ReplayTelemetryObserver>,
+    ) -> Self {
+        // Observers can drive closed-loop policies; capture exports stay unchanged.
+        self.collector.enable_completion_feedback();
+        self.with_telemetry_runtime(sample_interval_ms, observer)
+    }
+
+    fn with_telemetry_runtime(
         mut self,
         sample_interval_ms: f64,
         observer: Box<dyn ReplayTelemetryObserver>,
@@ -3385,6 +3395,7 @@ where
                 }),
         );
         let snapshot = ReplayTelemetrySnapshot {
+            completion_feedback: self.collector.completion_feedback_snapshot(),
             host_caches,
             sample_ordinal,
             kind,
