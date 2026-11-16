@@ -39,24 +39,24 @@ def _fetch(url: str) -> bytes:
 
 def run(args: dict[str, str], out_dir: Path) -> dict:
     spec = json.loads(_fetch(args["spec"]))
-    bundle = Path(tempfile.mkdtemp(prefix="serving_probe_"))
-    with tarfile.open(fileobj=io.BytesIO(_fetch(spec["bundle"])), mode="r:gz") as tar:
-        tar.extractall(bundle, filter="data")
-    argv = [a.replace("{BUNDLE}", str(bundle)).replace("{OUT}", str(out_dir)) for a in spec["args"]]
-    env = {**os.environ, "HF_HUB_OFFLINE": "1", **spec.get("env", {})}
-    raw = Path(out_dir) / f"raw_{spec['run_id']}.json"
-    raw.unlink(missing_ok=True)  # an earlier attempt's raw in the same shard dir is not this run's result
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(_PROBES / spec["script"]), *argv],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT_S,
-        )
-        returncode, output = proc.returncode, proc.stdout + proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        returncode, output = None, f"timeout after {_TIMEOUT_S}s: {exc.output or ''}"
+    with tempfile.TemporaryDirectory(prefix="serving_probe_") as bundle:  # removed when the probe ends
+        with tarfile.open(fileobj=io.BytesIO(_fetch(spec["bundle"])), mode="r:gz") as tar:
+            tar.extractall(bundle, filter="data")
+        argv = [a.replace("{BUNDLE}", str(bundle)).replace("{OUT}", str(out_dir)) for a in spec["args"]]
+        env = {**os.environ, "HF_HUB_OFFLINE": "1", **spec.get("env", {})}
+        raw = Path(out_dir) / f"raw_{spec['run_id']}.json"
+        raw.unlink(missing_ok=True)  # an earlier attempt's raw in the same shard dir is not this run's result
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(_PROBES / spec["script"]), *argv],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT_S,
+            )
+            returncode, output = proc.returncode, proc.stdout + proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            returncode, output = None, f"timeout after {_TIMEOUT_S}s: {exc.output or ''}"
     print(output[-4000:], flush=True)
     return {
         "run_id": spec["run_id"],

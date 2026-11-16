@@ -357,3 +357,16 @@ def test_a_record_names_the_rendered_arguments_the_release_did_not_accept(pd, ra
     run = {"id": "r1", "sm": "sm100", "backend": "trtllm", "version": "1.0", "repo": "org/m"}
     assert pd.build_record(run, {raw_key: ["kv_cache_tier"]}, 0.0)["runtime"]["unknown_args"] == ["kv_cache_tier"]
     assert pd.build_record(run, {raw_key: []}, 0.0)["runtime"]["unknown_args"] is None
+
+
+def test_the_engine_cli_lifted_from_a_render_survives_a_second_split(pd, tmp_path):
+    """The probe splits the engine CLI again, so a quoted JSON argument must keep its quoting."""
+    import shlex
+
+    run_sh = tmp_path / "run_0.sh"
+    run_sh.write_text(
+        "python3 -m dynamo.sglang --model-path $MODEL_PATH --host 0.0.0.0 \\\n"
+        '  --tp-size 2 --json-model-override-args \'{"expert_dtype": "fp8"}\' --enable-metrics 2>&1 | tee log\n'
+    )
+    cli = pd.extract_sglang_cli_from_run_sh(run_sh)
+    assert shlex.split(cli) == ["--tp-size", "2", "--json-model-override-args", '{"expert_dtype": "fp8"}']

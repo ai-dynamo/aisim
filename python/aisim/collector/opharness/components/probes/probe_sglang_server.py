@@ -195,6 +195,9 @@ def main() -> None:
         gen = {"input_ids": prompt, "sampling_params": {"max_new_tokens": 2, "temperature": 0}}
         _http("POST", f"{base}/generate", gen, timeout=900)  # warm-up (JIT, graph capture already done at startup)
         pid = "aic"
+        for stale in os.listdir(out_dir):  # a retry reuses the output dir: its traces must be this run's
+            if stale.startswith(f"{pid}-TP-"):
+                os.remove(os.path.join(out_dir, stale))
         # sglang names the device activity "GPU" (ProfileReq.activities -> ProfilerActivity.CUDA);
         # profile_by_stage + num_steps auto-stops after one step per stage and exports
         # <profile_id>-TP-<r>-<STAGE>.trace.json.gz with STAGE = ForwardMode names (EXTEND,

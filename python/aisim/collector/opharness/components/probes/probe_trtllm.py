@@ -75,6 +75,7 @@ _orig_walk = pkgutil.walk_packages
 def _safe_walk(*a, **k):
     global _WALKING
     it = _orig_walk(*a, **k)
+    outer = _WALKING  # walk_packages recurses through this wrapper: a nested walk restores, not clears
     _WALKING = True  # the cutlass walk-guard blocks only inside a walk
     try:
         while True:
@@ -85,7 +86,7 @@ def _safe_walk(*a, **k):
             except Exception:
                 return
     finally:
-        _WALKING = False
+        _WALKING = outer
 
 
 pkgutil.walk_packages = _safe_walk

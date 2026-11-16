@@ -103,7 +103,8 @@ def fetch(repo: str, configs: Path, token: str | None) -> dict:
     configs.mkdir(parents=True, exist_ok=True)
     try:
         info = json.loads(_get(f"https://huggingface.co/api/models/{repo}", token))
-    except Exception as e:  # 401/403/404/offline: fall back to the bundled config if there is one
+    except OSError as e:  # 401/403/404/offline (urllib errors are OSErrors): fall back to the bundled config
+        # if there is one; a response that is not JSON is not an access failure and fails the fetch
         got = _bundled_fallback(repo, configs, f"hub api failed: {type(e).__name__}")
         if got:
             return got

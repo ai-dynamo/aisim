@@ -177,6 +177,7 @@ def test_the_serving_probe_runs_the_spec_script_on_the_unpacked_bundle(monkeypat
     def fake_run(cmd, env, capture_output, text, timeout):
         seen.update(cmd=cmd, x=env.get("X"), offline=env.get("HF_HUB_OFFLINE"))
         model = Path(cmd[cmd.index("--model-override") + 1])
+        seen["bundle"] = model.parents[1]
         assert (model / "config.json").read_text() == "{}"
         Path(cmd[cmd.index("--out") + 1]).write_text("{}")
         return types.SimpleNamespace(returncode=0, stdout="WROTE", stderr="")
@@ -186,6 +187,7 @@ def test_the_serving_probe_runs_the_spec_script_on_the_unpacked_bundle(monkeypat
     assert out["raw"] == "raw_r1.json" and out["failed"] is False
     assert seen["cmd"][1].endswith("opharness/components/probes/probe_vllm.py") and seen["x"] == "1"
     assert seen["offline"] == "1" and os.path.exists(tmp_path / "raw_r1.json")
+    assert not seen["bundle"].exists()  # the unpacked bundle does not outlive the probe
 
 
 def test_the_serving_probe_does_not_report_the_raw_of_an_earlier_attempt(monkeypatch, tmp_path):

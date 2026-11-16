@@ -48,3 +48,15 @@ def test_hub_failure_without_bundled_copy_is_still_an_owner_decision(tmp_path, m
     monkeypatch.setattr(fi, "_get", boom)
     with pytest.raises(SystemExit, match="OWNER DECISION"):
         fi.fetch("nobody/NoSuchModel", tmp_path, token=None)
+
+
+def test_a_hub_response_that_is_not_json_fails_instead_of_falling_back(tmp_path, monkeypatch):
+    """The bundled config stands in for a repo the Hub refuses or cannot reach, not for a
+    corrupt response: Meta-Llama-3.1-8B has a bundled copy and the fetch still fails."""
+    fi = _load()
+    monkeypatch.setattr(fi, "_get", lambda url, token, binary=False: "<html>rate limited</html>")
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    with pytest.raises(json.JSONDecodeError):
+        fi.fetch("meta-llama/Meta-Llama-3.1-8B", configs, token=None)
+    assert not (configs / "aux_files").exists()

@@ -167,7 +167,7 @@ def extract_sglang_cli_from_run_sh(run_sh: Path) -> str:
         if tk in flag_drop:
             continue
         out.append(tk)
-    return " ".join(out)
+    return shlex.join(out)  # the probe splits it again: a quoted JSON argument has to survive
 
 
 def _cea(v, sm: str):

@@ -16,6 +16,7 @@ the workflow you are on (`collector/opharness/workflows/<workflow>.md`).
 | `AIS_PROBE_WORKSPACE` | every component | workspace on the control machine: `configs/`, `dummy_models/`, `campaigns/<name>/`, `results/`. Default `collector/opharness/workspace/` (git-ignored). |
 | `AIS_GENERATOR_CLI` | probe_driver.render_golden | the `aiconfigurator` CLI for golden renders (default `<ws>/venv_ais/bin/aiconfigurator`, built with `uv sync`). |
 | `AIS_GENERATOR_SRC` | probe_driver | generator source tree the renders run (default this checkout's `src`). |
+| `HF_TOKEN` | fetch_inputs | Hugging Face token for gated repos; without it the cached `~/.cache/huggingface/token` is used, and a gated repo with neither falls back to the bundled config. |
 | `AIS_KDA_DECODE_PATHS` | collector/vllm/collect_kda.py (capture-only) | `fused,packed` default; the kda decode gate passes `env.AIS_KDA_DECODE_PATHS=fused` to probe.trace_case because the serving probe is non-spec. |
 | `AIS_DEBUG_IDXMETA` | collector/vllm/collect_mla_module.py (DSA debugging) | developer switch, off by default. |
 
