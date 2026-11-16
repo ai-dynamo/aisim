@@ -563,7 +563,9 @@ def test_agentic_canonical_mtp_executes_on_static_local_g2_fleets(replicas, atte
     trace.write_text(Path(source["paths"][0]).read_text().replace('"out":1', '"out":6'))
     source["paths"] = [str(trace)]
     worker = config["engine"]["workers"]["aggregated"]
-    worker["kv_cache"]["capacity"]["blocks"] = 4
+    # The last draft burst reserves 9 prompt + 5 emitted + 3 lookahead tokens:
+    # ceil(17 / 4) = 5 blocks, even though only one output token remains.
+    worker["kv_cache"]["capacity"]["blocks"] = 5
     worker["parallelism"].update(replicas=replicas, attention_data=attention_dp)
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
     lowered = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)["spec"]
