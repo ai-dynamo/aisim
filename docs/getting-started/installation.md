@@ -177,7 +177,7 @@ The [artifact contract](../ci/release.md) describes wheel/crate versioning.
 The engine stack does not require Dynamo. For `--stack dynamo`, install a
 Dynamo distribution that supplies the required runner and adapters into the
 same environment. The root [README](../../README.md#with-dynamo) records a validated pair: `ai-dynamo==1.7.0.dev20261028` and
-`aisim==0.13.0.dev202610240000000082`, from the NVIDIA prerelease index.
+`aisimulate==0.13.0.dev202610240000000082`, from the NVIDIA prerelease index.
 Installation, `pip check`, CPU prediction, an eight-trial recommendation, and
 prediction of the best candidate pass with Python 3.12 on Linux.
 
@@ -188,6 +188,17 @@ The Dynamo wheel is the October 28 nightly build.
 This is a README simulation qualification, not a claim that Dynamo's entire
 nightly pipeline passed. Full CI README checks retest the installed artifacts
 when relevant files change.
+
+A validated AISim 0.14.0 pair is still pending. As of November 16, 2026,
+`ai-dynamo==1.7.0.dev20261116` still declares
+`aisimulate==0.13.0.dev202610290000000087`, rather than the renamed `aisim`
+distribution used by AISim 0.14. The [source dependency declaration](https://github.com/ai-dynamo/dynamo/blob/64da7324dca0a44398f392d77f867dee02198baa/pyproject.toml#L17)
+records the same old distribution pin. A compatible Dynamo build must migrate
+that dependency before replacing the historical pair. Then validate the exact
+installed wheels with `pip check`, prediction, recommendation, and prediction
+of the best candidate before updating the README pins. Installing overlapping
+`aisim` and `aisimulate` distributions is not a compatible upgrade path, even
+if the dependency resolver accepts both names.
 
 Keep this environment separate from a current AISim source checkout.
 Dynamo pins an exact AISim nightly; substituting TOT violates that package

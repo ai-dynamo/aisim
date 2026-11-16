@@ -103,7 +103,21 @@ Use `aisim` and `aisim_core` for new Python imports; `aisimulate` and `aisimulat
 > validated together; it does not establish compatibility with AISim tip
 > of tree. Do not upgrade AISim independently of Dynamo's declared dependency.
 
-Install this pair on Linux with Python 3.12 in a **separate environment**:
+**AISim 0.14.0 pairing is pending Dynamo dependency migration.** As of
+November 16, 2026, the latest published Dynamo nightly,
+`ai-dynamo==1.7.0.dev20261116`, still requires
+`aisimulate==0.13.0.dev202610290000000087`. AISim 0.14 uses the renamed `aisim`
+distribution. Installing both names can overwrite shared package files; a
+successful dependency resolution alone does not make that combination compatible.
+Dynamo's [source dependency declaration](https://github.com/ai-dynamo/dynamo/blob/64da7324dca0a44398f392d77f867dee02198baa/pyproject.toml#L17)
+also still selects `aisimulate`.
+
+Keep the previously validated pair below until a Dynamo build declares a
+matching `aisim` dependency and passes installation, `pip check`, Dynamo
+prediction, recommendation, and prediction of the best candidate together.
+The 0.14.0 branch does not yet have a validated 0.14.0 Dynamo pair.
+
+Install the historical pair on Linux with Python 3.12 in a **separate environment**:
 
 The Dynamo command examples below use this historical pair's `aisimulate` executable. Current source-built AISim environments use `aisim`.
 
