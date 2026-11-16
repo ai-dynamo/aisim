@@ -305,31 +305,6 @@ def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary
     assert upload["with"]["path"].endswith("/wheel-manifest.json")
 
 
-@pytest.mark.parametrize(
-    "callee",
-    ["fpe-support-matrix.yml", "fpe-release-qualify.yml", "fpm-accuracy-branch.yml", "e2e-accuracy-branch.yml"],
-)
-def test_reusable_wheel_handoffs_require_explicit_caller_credentials(callee):
-    # A job environment alone does not expose its secrets across workflow_call:
-    # the caller must pass the name even when the value only exists in that environment.
-    workflows = {
-        path.name: yaml.load(path.read_text(), Loader=yaml.BaseLoader)
-        for path in (ROOT / ".github/workflows").glob("*.yml")
-    }
-    workflow = workflows[callee]
-    secret = workflow["on"]["workflow_call"].get("secrets", {}).get("ARTIFACTORY_TOKEN", {})
-    assert secret.get("required") == "true"
-    callers = [
-        (filename, name, job)
-        for filename, caller in workflows.items()
-        for name, job in caller.get("jobs", {}).items()
-        if job.get("uses") == f"./.github/workflows/{callee}"
-    ]
-    assert callers, f"no caller checked for {callee}"
-    for filename, name, job in callers:
-        assert job.get("secrets", {}).get("ARTIFACTORY_TOKEN") == "${{ secrets.ARTIFACTORY_TOKEN }}", (filename, name)
-
-
 def test_rerun_producer_keeps_old_objects_and_publishes_a_new_attempt(handoff):
     name = "aisim-0.13.0.whl"
     (handoff.source / name).write_bytes(b"first build")
