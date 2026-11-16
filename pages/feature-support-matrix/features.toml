@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Feature Support Matrix: serving techniques AISimulate simulates for each engine.
+# Feature Support Matrix: serving techniques AISim simulates for each engine.
 #
 # Update a cell in the pull request that changes the feature, and keep the
 # composition boundaries in docs/replay/features.md in step. A cell reflects
@@ -137,7 +137,7 @@ note = "Linear 1–5 token drafts with a supplied acceptance rate; no tree draft
 [[sections.rows]]
 name = "DFlash, draft model"
 doc = "replay/engine/speculation.md#registered-schemes"
-# aisimulate_core/sdk/speculation/{dflash,draft_model}.py: _SUPPORTED_BACKENDS = ("vllm",).
+# aisim_core/sdk/speculation/{dflash,draft_model}.py: _SUPPORTED_BACKENDS = ("vllm",).
 cells = ["limited", "not_supported", "not_supported"]
 note = "Linear 1–5 token drafts from a draft checkpoint; DFlash covers Llama and DeepSeek V4."
 
@@ -262,7 +262,7 @@ name = "G2 host offload"
 doc = "replay/engine/kv-cache.md#agentic-g2"
 # crates/core/src/python.rs agentic host-offload checks.
 cells = ["limited", "not_supported", "not_supported"]
-note = "One aggregated worker, several aggregated workers each with local G2, or 1P1D; attention DP 1 on every role, static pools, no speculation."
+note = "Aggregated or P/D with any positive integer worker count; attention DP 1 on every role; static pools; each role may omit G2 or use local/shared scope without speculation. Canonical MTP only for a single aggregated worker with local G2 and prefix caching; no other speculation or G3."
 
 [[sections.rows]]
 name = "G3 offload, KVCR"

@@ -261,7 +261,7 @@ For a single positive inter-token latency, `TPOT_ms <= limit_ms` is equivalent t
 boundary, and feasible points are at or to the right of that threshold when the
 x-axis is the reciprocal of the same TPOT value.
 
-Native Replay and analytical AFD Replay both calculate the Sweeper's
+Native Replay, including AFD Replay, calculates the Sweeper's
 `throughput_per_user` objective as the **mean of per-request reciprocal TPOTs**,
 `mean(1000 / request_tpot_ms)`, using requests with a positive TPOT. This is not
 generally `1000 / mean_tpot_ms`: averaging and reciprocation do not commute.

@@ -6,9 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Runner ABI
 
 Source contracts:
-[`sweeper/replay.py`](../../python/aisimulate/src/aisimulate/sweeper/replay.py),
-[stack discovery](../../python/aisimulate/src/aisimulate/stack.py), and the
-[built-in runner](../../python/aisimulate/src/aisimulate/runner.py).
+[`sweeper/replay.py`](../../python/aisim/src/aisim/sweeper/replay.py),
+[stack discovery](../../python/aisim/src/aisim/stack.py), and the
+[built-in runner](../../python/aisim/src/aisim/runner.py).
 
 ## Required interface
 
@@ -33,7 +33,7 @@ one candidate's requests or caches into another. `close()` releases resources.
 The engine factory lazily imports the compiled runtime in its worker.
 
 Optional factories are selected by entry-point name in
-`aisimulate.runner_factories` (`--stack`). Resolution validates `capabilities`
+`aisim.runner_factories` (`--stack`). Resolution validates `capabilities`
 and `create`; unavailable, duplicate or unloadable optional stacks raise
 `StackNotFoundError`, `DuplicateStackError` or `StackLoadError`. A factory's
 coarse capabilities are checked before runner creation; execution must still
@@ -97,11 +97,11 @@ support the same composition. Generic speculation or G2 support alone does
 not enable it.
 
 `require_compatible(spec)` checks versions and coarse combinations before
-execution. AgentX G2 additionally requires offline vLLM, static workers (one
-aggregated worker, 1P1D, or several aggregated workers with a `dp_rank_local`
-G2 each), and DP1 on every role. G3 cannot be combined with AgentX G2.
-Speculation is limited to canonical MTP on a single aggregated worker with
-local G2, prefix caching and synchronous scheduling. The [feature matrix](../replay/features.md) records the built-in
+execution. AgentX G2 additionally requires offline vLLM, static worker
+pools with any positive integer worker count, and DP1 on every role. G3 cannot
+be combined with AgentX G2. Speculation is limited to canonical MTP on a single
+aggregated worker with local G2, prefix caching and synchronous scheduling.
+The [feature matrix](../replay/features.md) records the built-in
 stack's actual boundary, including limitations stricter than a capability flag.
 
 If every backend/topology pair fails Sweeper preflight, `RunnerIncompatibleError`
