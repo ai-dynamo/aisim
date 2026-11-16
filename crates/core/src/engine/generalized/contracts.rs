@@ -416,8 +416,9 @@ pub trait RankEngine: Sized {
 
     /// Earliest time at which outputs held past their pass's completion leave
     /// the rank. Unlike internal deadlines it is not masked by a pass in flight:
-    /// vLLM returns a pass's outputs while the next pass runs. The default
-    /// holds none.
+    /// vLLM returns a pass's outputs while the next pass runs. A command can set
+    /// an emission at its own time, so drivers read this after commands too.
+    /// The default holds none.
     fn next_emission_ms(&self) -> Option<f64> {
         None
     }
