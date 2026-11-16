@@ -8,6 +8,12 @@ sliding-window or fixed-state groups. Runtime mappings are evidence: the importe
 rechecks raw geometry, configuration, physical views, and pool accounting itself.
 
 vLLM 0.27/0.28 name the layers sharing each allocation slot (``shared_by``).
+An explicit nonzero ``block_stride`` can place projected layer allocations in
+one backing buffer. The declared page width, including padding, must fit the
+stride, and ``offset + (num_blocks - 1) * block_stride + page_width`` must fit
+the storage. Allocations on one storage must use the same stride; their repeated
+page intervals must not overlap, except for aliases within one ``shared_by``.
+Zero stride retains the unpacked, zero-offset, single-allocation storage rules.
 vLLM 0.32 places a group's layers in one backing buffer at
 ``offset + layer * layer_stride + block * block_stride``; vLLM 0.33 uses its
 separate audited hybrid mapping.
