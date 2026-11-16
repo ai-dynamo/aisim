@@ -28,6 +28,7 @@ from aisim_core.data.e2e import (
     read_snapshot,
 )
 from aisim_core.data.migrate_infx import PRODUCER_URL, SNAPSHOT_DIR, InfxCache, _sha, canonical
+from aisim_core.data.names import normalize, split_framework
 
 VALUE_REL_TOL = 1e-12
 PARALLELISM_KEY = re.compile(r"(?:(?:prefill|decode)_)?(?:pp|pcp_size|dcp_size)")
@@ -167,8 +168,16 @@ def compare_cache_to_dataset(cache: InfxCache, root: Path | str) -> dict[str, An
 
     # ---- membership ---------------------------------------------------------------------------
     old_part = Counter(cache.partition_of[o] for o in old_obs)
+    # The cache partitions by the source spellings; the new dataset stores canonical names and keeps the
+    # source spelling in ``source_ids``, so membership is compared through it.
     new_part = Counter(
-        (raw_of[o]["model"], body_of[o].body.hardware, body_of[o].body.framework) for o in new_obs if o in raw_of
+        (
+            body_of[o].body.source_ids["inferencex"]["model"],
+            body_of[o].body.source_ids["inferencex"]["hardware"],
+            body_of[o].body.source_ids["inferencex"]["framework"],
+        )
+        for o in new_obs
+        if o in raw_of
     )
     for key in sorted(set(old_part) | set(new_part)):
         if old_part.get(key, 0) != new_part.get(key, 0):
@@ -179,7 +188,9 @@ def compare_cache_to_dataset(cache: InfxCache, root: Path | str) -> dict[str, An
         body = body_of[o].body
         raw = raw_of.get(o)
         if raw and (
-            body.model_id != raw["model"] or body.hardware != raw["hardware"] or body.framework != raw["framework"]
+            body.model_id != normalize("model", raw["model"])
+            or body.hardware != normalize("hardware", raw["hardware"])
+            or body.framework != split_framework(raw["framework"])["framework"]
         ):
             membership.add("body_identity_differs_from_record", o)
     snapshots = sorted((root / SNAPSHOT_DIR).glob("*/snapshot.json"))

@@ -1,6 +1,6 @@
 {
   "$id": "aisim-e2e-observations/v1",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "properties": {
     "arrival_policy": {
       "anyOf": [
@@ -13,6 +13,18 @@
       ],
       "default": null,
       "title": "Arrival Policy"
+    },
+    "attrs": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Attrs"
     },
     "benchmark_tool": {
       "anyOf": [
@@ -179,6 +191,18 @@
       "title": "Observation Id",
       "type": "string"
     },
+    "observer": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Observer"
+    },
     "outcome": {
       "default": "unknown",
       "enum": [
@@ -250,6 +274,18 @@
       ],
       "default": null,
       "title": "Producer Revision"
+    },
+    "qualification": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Qualification"
     },
     "raw_artifact_id": {
       "anyOf": [
@@ -397,6 +433,18 @@
       "default": null,
       "title": "Source Observation Id"
     },
+    "time_origin": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Time Origin"
+    },
     "unmapped_metrics_json": {
       "anyOf": [
         {
@@ -408,6 +456,18 @@
       ],
       "default": null,
       "title": "Unmapped Metrics Json"
+    },
+    "valid_for_submission": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid For Submission"
     }
   },
   "required": [

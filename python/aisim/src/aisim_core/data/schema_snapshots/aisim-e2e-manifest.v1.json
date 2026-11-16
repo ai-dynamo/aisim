@@ -2,7 +2,7 @@
   "$defs": {
     "JsonValue": {},
     "ProvenanceInfo": {
-      "additionalProperties": false,
+      "additionalProperties": true,
       "description": "Tier-3 evidence file linked from the manifest by artifact ID and hash.",
       "properties": {
         "artifact_id": {
@@ -98,7 +98,7 @@
       "type": "object"
     },
     "Setting": {
-      "additionalProperties": false,
+      "additionalProperties": true,
       "description": "One effective setting with the authority of its value.",
       "properties": {
         "authority": {
@@ -123,7 +123,7 @@
       "type": "object"
     },
     "WorkerGroup": {
-      "additionalProperties": false,
+      "additionalProperties": true,
       "description": "Workers of one role; ``None`` means unknown, never a default.",
       "properties": {
         "gpus_per_worker": {
@@ -168,10 +168,169 @@
       },
       "title": "WorkerGroup",
       "type": "object"
+    },
+    "Workload": {
+      "additionalProperties": true,
+      "description": "What was run against the server. Only ``kind`` is required; everything else is optional.",
+      "properties": {
+        "arrival_policy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Arrival Policy"
+        },
+        "boundary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Boundary"
+        },
+        "cache_state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache State"
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Concurrency"
+        },
+        "dataset": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dataset"
+        },
+        "duration_s": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration S"
+        },
+        "grace_s": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Grace S"
+        },
+        "input_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Input Tokens"
+        },
+        "kind": {
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        },
+        "output_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Tokens"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seed"
+        },
+        "warmup": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Warmup"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Workload",
+      "type": "object"
     }
   },
   "$id": "aisim-e2e-manifest/v1",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "description": "E2E specialization stored in ``provenance[\"e2e\"]`` of the shared envelope.",
   "properties": {
     "cohort_group_id": {
@@ -219,6 +378,13 @@
       "title": "Evidence Gaps",
       "type": "array"
     },
+    "ext": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "title": "Ext",
+      "type": "object"
+    },
     "framework": {
       "minLength": 1,
       "title": "Framework",
@@ -239,6 +405,13 @@
         "$ref": "#/$defs/JsonValue"
       },
       "title": "Identity Settings",
+      "type": "object"
+    },
+    "implementation": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "title": "Implementation",
       "type": "object"
     },
     "model_id": {
@@ -281,6 +454,26 @@
       ],
       "default": null,
       "title": "Offload Mode"
+    },
+    "orchestrator": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Orchestrator"
+    },
+    "origin": {
+      "enum": [
+        "official",
+        "self-collected"
+      ],
+      "title": "Origin",
+      "type": "string"
     },
     "parallelism": {
       "additionalProperties": {
@@ -325,6 +518,12 @@
       "default": null,
       "title": "Requested Settings"
     },
+    "schema_minor": {
+      "default": 1,
+      "minimum": 0,
+      "title": "Schema Minor",
+      "type": "integer"
+    },
     "schema_version": {
       "const": "aisim-e2e-manifest/v1",
       "default": "aisim-e2e-manifest/v1",
@@ -357,10 +556,32 @@
       "title": "Source Fields",
       "type": "object"
     },
+    "source_ids": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "title": "Source Ids",
+      "type": "object"
+    },
     "source_kind": {
       "minLength": 1,
       "title": "Source Kind",
       "type": "string"
+    },
+    "speculation": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Speculation"
     },
     "workers": {
       "additionalProperties": {
@@ -368,9 +589,21 @@
       },
       "title": "Workers",
       "type": "object"
+    },
+    "workload": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Workload"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [
+    "origin",
     "model_id",
     "deployment",
     "hardware",

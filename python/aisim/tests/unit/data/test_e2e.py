@@ -44,7 +44,7 @@ def _infx_record(**over):
     # Same shape as the InferenceX cache fixture in tests/test_e2e_hf_measurements.py.
     rec = dict(
         model="test-model",
-        hardware="h100",
+        hardware="h100_sxm",
         framework="vllm",
         precision="fp8",
         spec_method="none",
@@ -87,9 +87,10 @@ def _infx_record(**over):
 
 def _dev_body():
     return E2eManifestBody(
+        origin="self-collected",
         model_id="test-model",
         deployment="aggregated",
-        hardware="h100",
+        hardware="h100_sxm",
         framework="vllm",
         framework_version="0.11.0",
         parallelism={"aggregated": {"tp": 8, "ep": 1}},

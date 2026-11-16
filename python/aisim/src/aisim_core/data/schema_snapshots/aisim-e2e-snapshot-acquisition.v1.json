@@ -1,6 +1,6 @@
 {
   "$id": "aisim-e2e-snapshot-acquisition/v1",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "description": "How an input reached the snapshot; no measured data.",
   "properties": {
     "acquired_at": {

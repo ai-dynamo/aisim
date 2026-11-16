@@ -1,7 +1,19 @@
 {
   "$id": "aisim-e2e-metrics/v1",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "properties": {
+    "attrs": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Attrs"
+    },
     "device_count": {
       "anyOf": [
         {
@@ -35,6 +47,18 @@
       "minLength": 1,
       "title": "Observation Id",
       "type": "string"
+    },
+    "observer": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Observer"
     },
     "scope": {
       "default": "run",

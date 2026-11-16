@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``aisim-e2e/v1`` schema family: one E2E layout for InferenceX and developer data.
+"""``aisim-e2e/v1`` schema family: one E2E layout for InferenceX, AgentX and self-collected data.
+
+**Evolution contract.** The ``/v1`` in each schema ID is the major version; additive changes bump
+:data:`SCHEMA_MINOR` and never break an older reader. Models accept unknown fields (``extra="allow"``) and
+keep them, tables are matched by column name (a missing optional column reads as null, an unknown column is
+carried through), and consumers read only known fields. Stored names are canonical
+(:mod:`aisim_core.data.names`); a non-canonical name is reported by :func:`name_findings`, never translated
+by a reader. Must-have fields are the few every source can fill; everything else is optional.
 
 Source adapters normalize; evaluators never branch on source. The family
 specializes the shared envelope (``aisim-artifact-manifest/v1``, category
@@ -46,6 +53,9 @@ import hashlib
 import json
 import math
 import re
+import types
+import typing
+import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,17 +66,22 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity, Manifest, _file, _verify, configuration_id
 from aisim_core.data.loaders import E2eLoader, E2eTables, LoaderError
+from aisim_core.data.names import NameFinding, canonical_name, canonical_unit, name_findings, normalize, split_framework
 from aisim_core.data.parquet import read_parquet, write_parquet
 
 MANIFEST_BODY_SCHEMA = "aisim-e2e-manifest/v1"
 OBSERVATIONS_SCHEMA = "aisim-e2e-observations/v1"
 METRICS_SCHEMA = "aisim-e2e-metrics/v1"
 REQUESTS_SCHEMA = "aisim-e2e-requests/v1"
+SERIES_SCHEMA = "aisim-e2e-series/v1"
 SNAPSHOT_SCHEMA = "aisim-e2e-input-snapshot/v1"
 SNAPSHOT_MEMBERS_SCHEMA = "aisim-e2e-snapshot-members/v1"
 SNAPSHOT_ACQUISITION_SCHEMA = "aisim-e2e-snapshot-acquisition/v1"
-E2E_TABLE_SCHEMAS = (OBSERVATIONS_SCHEMA, METRICS_SCHEMA, REQUESTS_SCHEMA)
+E2E_TABLE_SCHEMAS = (OBSERVATIONS_SCHEMA, METRICS_SCHEMA, REQUESTS_SCHEMA, SERIES_SCHEMA)
 PURPOSE = "e2e-configuration"
+# Minor version of the /v1 family. Bump when an optional field, column or registered name is added; a reader
+# of the same major accepts any minor and warns when a file is newer than it knows.
+SCHEMA_MINOR = 1
 
 # Canonical units. Latency statistics are milliseconds, throughput tokens/s.
 UNIT_MS = "ms"
@@ -98,13 +113,16 @@ BUNDLE_CAP_BYTES = 256 * 1024 * 1024
 TRUNCATION_MARKER = b"\n...[truncated by aisim-e2e size cap; full SHA-256 in manifest]...\n"
 
 Authority = Literal["observed", "producer_declared", "source_verified_default", "unknown"]
+Origin = Literal["official", "self-collected"]
 Status = Literal["valid", "missing", "invalid"]
 Normalization = Literal["none", "per_device", "per_user", "total"]
 Outcome = Literal["complete", "partial", "failed", "unknown"]
 
 
 class _Record(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    """Core fields are strict; unknown fields are kept (``model_extra``) and written back unchanged."""
+
+    model_config = ConfigDict(extra="allow", strict=True, populate_by_name=True)
 
 
 def _canonical(value: Any) -> bytes:
@@ -205,15 +223,34 @@ class ProvenanceInfo(_Record):
     source_tool: str | None = None
 
 
+class Workload(_Record):
+    """What was run against the server. Only ``kind`` is required; everything else is optional."""
+
+    kind: str = Field(min_length=1)  # canonical workload_kind: single_turn, agentic_trace, synthetic, trace_replay
+    concurrency: int | None = Field(default=None, ge=0)  # client concurrency, or lanes for agentic traces
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    dataset: dict[str, JsonValue] | None = None  # {repo, revision, sha256, filter}
+    duration_s: float | None = Field(default=None, ge=0)  # profile span
+    grace_s: float | None = Field(default=None, ge=0)
+    warmup: dict[str, JsonValue] | None = None
+    boundary: str | None = None  # canonical workload_boundary
+    cache_state: str | None = None
+    arrival_policy: str | None = None
+    seed: int | None = None
+
+
 class E2eManifestBody(_Record):
     """E2E specialization stored in ``provenance["e2e"]`` of the shared envelope."""
 
     schema_version: Literal["aisim-e2e-manifest/v1"] = MANIFEST_BODY_SCHEMA
+    schema_minor: int = Field(default=SCHEMA_MINOR, ge=0)
+    origin: Origin  # official (InferenceX, AgentX official) or self-collected; the producing tool is in source_kind
     # Fixed identity core (mirrored into the envelope Identity).
     model_id: str = Field(min_length=1)
     model_revision: str | None = None
     deployment: Literal["aggregated", "disaggregated"]
-    hardware: str = Field(min_length=1)
+    hardware: str = Field(min_length=1)  # canonical system name, e.g. b300_sxm
     framework: str = Field(min_length=1)
     framework_version: str = Field(min_length=1)
     parallelism: dict[str, dict[str, int]]
@@ -223,6 +260,8 @@ class E2eManifestBody(_Record):
     dp_attention: dict[str, bool] | None = None  # per worker role; a boolean, never a degree
     multinode: bool | None = None
     offload_mode: str | None = None
+    orchestrator: str | None = None  # canonical orchestrator (dynamo, llm-d, none); hashed when set and not none
+    speculation: dict[str, JsonValue] | None = None  # method, draft length, acceptance mode
     # Identity-relevant open settings (versioned identity rule); changes the config ID.
     identity_settings: dict[str, JsonValue] = Field(default_factory=dict)
     # Open effective settings; a new runtime option is a new key, never a schema change.
@@ -235,17 +274,27 @@ class E2eManifestBody(_Record):
     cohort_group_id: str | None = None
     # Source fields with no mapping yet, kept verbatim (e.g. dp_attention booleans).
     source_fields: dict[str, JsonValue] = Field(default_factory=dict)
+    workload: Workload | None = None
+    # Image digest, git SHAs, model and config revisions: what the numbers were measured on.
+    implementation: dict[str, JsonValue] = Field(default_factory=dict)
+    # Spellings the source used (InferenceX key, AgentX point ID, system name); aliases, never identity.
+    source_ids: dict[str, JsonValue] = Field(default_factory=dict)
+    # Namespaced extensions, ``{namespace: {schema, ...}}`` (agentx/1, inferencex/1). Core readers ignore them.
+    ext: dict[str, JsonValue] = Field(default_factory=dict)
     provenance_artifacts: list[ProvenanceInfo] = Field(default_factory=list)
     evidence_gaps: list[dict[str, JsonValue]] = Field(default_factory=list)
 
     def identity(self) -> Identity:
+        effective = dict(self.identity_settings)
+        if self.orchestrator and self.orchestrator != "none":
+            effective["orchestrator"] = self.orchestrator
         return Identity(
             hardware=self.hardware,
             framework=self.framework,
             framework_version=self.framework_version,
             operation_family=None,
             model=self.model_id,
-            effective_settings=dict(sorted(self.identity_settings.items())),
+            effective_settings=dict(sorted(effective.items())),
             unresolved_identity=None,
             parallelism=self.parallelism,
             parallelism_complete=self.parallelism_complete,
@@ -318,6 +367,14 @@ class ObservationRow(_Record):
     recipe_fingerprint: str | None = None
     source_config_json: str | None = None
     unmapped_metrics_json: str | None = None
+    # Added in minor 1, all optional. ``observer`` says who timed the observation's metrics (client or server),
+    # ``time_origin`` what request times count from, ``attrs`` is canonical JSON text for scalars with no column
+    # yet (a promoted attr becomes a column in a later minor).
+    valid_for_submission: bool | None = None
+    qualification: str | None = None
+    observer: str | None = None
+    time_origin: str | None = None
+    attrs: str | None = None
 
 
 class MetricRow(_Record):
@@ -334,6 +391,8 @@ class MetricRow(_Record):
     source_name: str | None = None  # the tool's own name, kept for audit
     source_unit: str | None = None
     source_value: float | None = None  # as reported, before conversion
+    observer: str | None = None  # client or server: who timed it (never mixed, e.g. client vs engine TTFT)
+    attrs: str | None = None  # canonical JSON text for fields with no column yet
 
     @model_validator(mode="after")
     def status_matches_value(self):
@@ -345,19 +404,50 @@ class MetricRow(_Record):
 
 
 class RequestRow(_Record):
-    """Per-request developer-collector row; latencies in ms, null when not measured."""
+    """Per-request row; latencies in ms, null when not measured. Times count from ``time_origin``."""
 
     observation_id: str = Field(min_length=1)
     request_id: str = Field(min_length=1)
-    status: Literal["ok", "error", "cancelled"] = "ok"
-    start_offset_ms: float | None = None
+    status: Literal["completed", "failed", "cancelled"] = "completed"
+    phase: str | None = None  # canonical phase: warmup, kernel_warmup, profile
+    start_ms: float | None = None
+    end_ms: float | None = None
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
+    cached_tokens: int | None = Field(default=None, ge=0)
     ttft_ms: float | None = None
     tpot_ms: float | None = None
     itl_ms: float | None = None
     e2el_ms: float | None = None
+    queue_ms: float | None = None
     error: str | None = None
+    identity_valid: bool | None = None  # False when the request cannot be matched to its trace position
+    # Lineage keys for agentic traces; all optional.
+    conversation_id: str | None = None
+    turn_index: int | None = Field(default=None, ge=0)
+    parent_request_id: str | None = None
+    source_trace_id: str | None = None
+    source_outer_idx: int | None = Field(default=None, ge=0)
+    source_inner_idx: int | None = Field(default=None, ge=0)
+    agent_depth: int | None = Field(default=None, ge=0)
+    attrs: str | None = None  # canonical JSON text: think time, dependency IDs, worker ID, ...
+
+
+class SeriesRow(_Record):
+    """One interval of a server-side time series (running requests, KV use, ...).
+
+    An absent series means unavailable; an observed zero is a row with value 0. ``source`` names the one
+    reporting rank or pool: replicas of a tensor-parallel group are never summed.
+    """
+
+    observation_id: str = Field(min_length=1)
+    metric: str = Field(min_length=1)
+    start_ms: float
+    end_ms: float
+    value: float | None = None
+    coverage: float | None = Field(default=None, ge=0, le=1)  # fraction of the interval with samples
+    unit: str | None = None
+    source: str | None = None
 
 
 class SnapshotMember(_Record):
@@ -390,13 +480,19 @@ class E2eInputSnapshot(_Record):
 
 
 def _arrow_type(annotation: Any) -> pa.DataType:
-    text = str(annotation)
-    if "list[str]" in text:
+    """Arrow column type of a model field annotation (``X | None`` is ``X``; unknown shapes are strings)."""
+    origin = typing.get_origin(annotation)
+    args = [a for a in typing.get_args(annotation) if a is not type(None)]
+    if origin in (typing.Union, types.UnionType):
+        return _arrow_type(args[0]) if len(args) == 1 else pa.string()
+    if origin is list and args == [str]:
         return pa.list_(pa.string())
-    if "float" in text:
-        return pa.float64()
-    if "int" in text:
+    if annotation is bool:
+        return pa.bool_()
+    if annotation is int:
         return pa.int64()
+    if annotation is float:
+        return pa.float64()
     return pa.string()
 
 
@@ -404,35 +500,73 @@ def _arrow_schema(model: type[BaseModel]) -> pa.Schema:
     return pa.schema([pa.field(name, _arrow_type(f.annotation)) for name, f in model.model_fields.items()])
 
 
+def _required_columns(model: type[BaseModel]) -> set[str]:
+    return {name for name, f in model.model_fields.items() if f.is_required()}
+
+
 OBSERVATIONS_ARROW = _arrow_schema(ObservationRow)
 METRICS_ARROW = _arrow_schema(MetricRow)
 REQUESTS_ARROW = _arrow_schema(RequestRow)
+SERIES_ARROW = _arrow_schema(SeriesRow)
 MEMBERS_ARROW = _arrow_schema(SnapshotMember)
 ACQUISITION_ARROW = _arrow_schema(SnapshotAcquisition)
 _TABLES = {
     OBSERVATIONS_SCHEMA: (ObservationRow, OBSERVATIONS_ARROW),
     METRICS_SCHEMA: (MetricRow, METRICS_ARROW),
     REQUESTS_SCHEMA: (RequestRow, REQUESTS_ARROW),
+    SERIES_SCHEMA: (SeriesRow, SERIES_ARROW),
     SNAPSHOT_MEMBERS_SCHEMA: (SnapshotMember, MEMBERS_ARROW),
     SNAPSHOT_ACQUISITION_SCHEMA: (SnapshotAcquisition, ACQUISITION_ARROW),
 }
+MINOR_METADATA_KEY = b"aisim.schema_minor"
+
+
+def _extra_column(values: list[Any]) -> pa.Array:
+    """Arrow column for an unknown field: its inferred type, or a string column when it has none yet."""
+    column = pa.array(values)
+    return column.cast(pa.string()) if pa.types.is_null(column.type) else column
 
 
 def rows_to_table(schema_id: str, rows: Iterable[BaseModel]) -> pa.Table:
+    """Rows to a table with every known column plus the unknown fields the rows carry."""
     model, arrow = _TABLES[schema_id]
     dumped = []
     for row in rows:
         if not isinstance(row, model):
             raise TypeError(f"{schema_id} rows must be {model.__name__}")
         dumped.append(row.model_dump())
-    return pa.Table.from_pylist(dumped, schema=arrow)
+    table = pa.Table.from_pylist(dumped, schema=arrow)
+    extras = [name for name in dict.fromkeys(k for row in dumped for k in row) if name not in arrow.names]
+    for name in extras:
+        table = table.append_column(name, _extra_column([row.get(name) for row in dumped]))
+    return table
 
 
 def table_to_rows(schema_id: str, table: pa.Table) -> list[Any]:
-    model, arrow = _TABLES[schema_id]
-    if table.schema.names != arrow.names:
-        raise ValueError(f"{schema_id}: columns {table.schema.names} differ from {arrow.names}")
+    """Typed rows from a table matched by column name.
+
+    A missing optional column reads as null, an unknown column is kept on the row (``model_extra``), and a
+    missing required column is an error. A table written by a newer minor still loads, with a warning.
+    """
+    model, _arrow = _TABLES[schema_id]
+    missing = _required_columns(model) - set(table.schema.names)
+    if missing:
+        raise ValueError(f"{schema_id}: missing required columns {sorted(missing)}")
+    _warn_if_newer(schema_id, (table.schema.metadata or {}).get(MINOR_METADATA_KEY))
     return [model.model_validate(row) for row in table.to_pylist()]
+
+
+def _warn_if_newer(what: str, minor: bytes | int | str | None) -> None:
+    try:
+        value = int(minor) if minor is not None else 0
+    except ValueError:
+        return
+    if value > SCHEMA_MINOR:
+        warnings.warn(
+            f"{what} was written by e2e schema minor {value}, newer than this reader's {SCHEMA_MINOR}; "
+            "fields it does not know are kept and ignored",
+            stacklevel=3,
+        )
 
 
 # --------------------------------------------------------------------------- metric helpers
@@ -450,13 +584,21 @@ def make_metric(
     scope: str = "run",
     timing_boundary: str | None = None,
     source_name: str | None = None,
+    observer: str | None = None,
 ) -> MetricRow:
     """Build one metric row, converting ``value`` from ``unit`` to the canonical unit.
 
     ``None`` becomes ``missing`` (never zero); NaN/inf, booleans, non-numbers and
     negative latencies/throughputs become ``invalid``. A genuine 0 stays a valid 0.
     """
-    canonical = CANONICAL_UNIT[metric]
+    # A registered metric has one canonical unit; an unregistered one keeps the unit it was reported in
+    # (it is flagged non-canonical by name_findings until it is registered).
+    registered = CANONICAL_UNIT.get(metric) or canonical_unit(metric)
+    if registered is not None:
+        canonical = registered
+    else:
+        short = _UNIT_ALIASES.get((unit or "").strip().lower(), unit or "")
+        canonical = UNIT_MS if short in _TO_CANONICAL else short
     base = dict(
         observation_id=observation_id,
         metric=metric,
@@ -468,6 +610,7 @@ def make_metric(
         timing_boundary=timing_boundary,
         source_name=source_name,
         source_unit=unit,
+        observer=observer,
     )
     if value is None:
         return MetricRow(**base, status="missing")
@@ -476,7 +619,10 @@ def make_metric(
         return MetricRow(
             **base, status="invalid", source_value=source if source is not None and math.isfinite(source) else None
         )
-    converted = to_canonical(float(value), unit or canonical, canonical)
+    if registered is None and (unit or "").strip().lower() not in _UNIT_ALIASES:
+        converted = float(value)  # a unit the registry does not know is kept as reported
+    else:
+        converted = to_canonical(float(value), unit or canonical, canonical)
     return MetricRow(**base, status="valid", value=converted, source_value=float(value))
 
 
@@ -664,6 +810,7 @@ class E2eConfigurationData:
     metrics: list[MetricRow]
     requests: list[RequestRow] = field(default_factory=list)
     provenance: list[ProvenanceFile] = field(default_factory=list)
+    series: list[SeriesRow] = field(default_factory=list)
 
 
 def _slug(text: str) -> str:
@@ -696,7 +843,12 @@ def configuration_dir(body: E2eManifestBody) -> str:
 
 def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Sequence[BaseModel], role: str):
     relative = f"{directory}/{name}.parquet" if directory not in ("", ".") else f"{name}.parquet"
-    write_parquet(rows_to_table(schema_id, rows), Path(root) / relative, schema_id)
+    write_parquet(
+        rows_to_table(schema_id, rows),
+        Path(root) / relative,
+        schema_id,
+        extra_metadata={MINOR_METADATA_KEY.decode(): str(SCHEMA_MINOR)},
+    )
     path = Path(root) / relative
     return Artifact(
         artifact_id=name,
@@ -726,7 +878,7 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     for o in data.observations:
         if o.configuration_id != cid:
             raise ValueError(f"observation {o.observation_id} belongs to a different configuration")
-    for rows in (data.metrics, data.requests):
+    for rows in (data.metrics, data.requests, data.series):
         stray = {r.observation_id for r in rows} - known
         if stray:
             raise ValueError(f"rows reference unknown observations: {sorted(stray)}")
@@ -736,6 +888,8 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     ]
     if data.requests:
         artifacts.append(_write_table(root, directory, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests"))
+    if data.series:
+        artifacts.append(_write_table(root, directory, "series", SERIES_SCHEMA, data.series, "e2e-series"))
     infos = list(body.provenance_artifacts)
     for item in data.provenance:
         artifact, info = store_provenance(root, directory, item)
@@ -765,6 +919,7 @@ def body_from_manifest(manifest: Manifest) -> E2eManifestBody:
     if not isinstance(raw, dict):
         raise LoaderError("manifest lacks the e2e manifest body")
     body = E2eManifestBody.model_validate(raw)
+    _warn_if_newer("e2e manifest", body.schema_minor)
     if body.identity() != manifest.identity:
         raise LoaderError("e2e manifest body disagrees with the envelope identity")
     return body
@@ -779,6 +934,7 @@ class E2eDataset:
     observations: list[ObservationRow]
     metrics: list[MetricRow]
     requests: list[RequestRow]
+    series: list[SeriesRow] = field(default_factory=list)
 
     @property
     def manifest(self) -> Manifest:
@@ -798,6 +954,7 @@ def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None
     requests = (
         table_to_rows(REQUESTS_SCHEMA, tables[by_schema[REQUESTS_SCHEMA]]) if REQUESTS_SCHEMA in by_schema else []
     )
+    series = table_to_rows(SERIES_SCHEMA, tables[by_schema[SERIES_SCHEMA]]) if SERIES_SCHEMA in by_schema else []
     known = {o.observation_id for o in observations}
     if len(known) != len(observations):
         raise LoaderError("duplicate observation_id")
@@ -808,13 +965,13 @@ def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None
         for ref in (o.raw_artifact_id, o.log_artifact_id, *o.evidence_refs):
             if ref is not None and ref not in artifact_ids:
                 raise LoaderError(f"observation {o.observation_id} references unknown artifact {ref}")
-    for rows in (metrics, requests):
+    for rows in (metrics, requests, series):
         if {r.observation_id for r in rows} - known:
             raise LoaderError("rows reference unknown observations")
     info_ids = {p.artifact_id for p in body.provenance_artifacts}
     if info_ids - artifact_ids or {a.artifact_id for a in tables.manifest.artifacts if a.format == "gzip"} - info_ids:
         raise LoaderError("provenance artifacts and manifest body disagree")
-    return E2eDataset(tables, body, observations, metrics, requests)
+    return E2eDataset(tables, body, observations, metrics, requests, series)
 
 
 # --------------------------------------------------------------------------- evaluator view
@@ -846,6 +1003,10 @@ def evaluation_points(dataset: E2eDataset) -> list[EvaluationPoint]:
         values, unavailable, device = {}, set(), {}
         for row in metrics.get(obs.observation_id, []):
             if row.scope != "run":
+                continue
+            # Consumers read canonical names only: a known alias (``p50``) or a stored spelling the registry
+            # rejects is ignored until the dataset is fixed (see name_findings_for).
+            if name_findings("metric", "", row.metric) or name_findings("statistic", "", row.statistic):
                 continue
             key = (row.metric, row.statistic)
             if row.status != "valid":
@@ -1065,6 +1226,11 @@ def inferencex_metric_parallelism(raw: Mapping[str, Any]) -> dict[str, dict[str,
     return out
 
 
+def _canonical_kind(value: Any) -> str | None:
+    """Canonical workload kind of a source ``benchmark_type`` (unknown spellings stay as reported)."""
+    return None if value is None else (canonical_name("workload_kind", str(value)) or str(value))
+
+
 def _ifx_body(
     config: Mapping[str, Any], gaps: list[dict], metric_parallelism: Mapping[str, Mapping[str, int]] | None = None
 ) -> E2eManifestBody:
@@ -1105,15 +1271,25 @@ def _ifx_body(
     settings = {"spec_method": Setting(value=config["spec_method"], authority="producer_declared")}
     if "workers" in config:
         settings["workers"] = Setting(value=config["workers"], authority="producer_declared")
+    # Stored names are canonical (see aisim_core.data.names): the source spellings are kept under source_ids.
+    engine = split_framework(config["framework"])
+    for name, value in engine.get("settings", {}).items():
+        settings[name] = Setting(value=value, authority="producer_declared")
     return E2eManifestBody(
-        model_id=config["model"],
+        origin="official",
+        model_id=normalize("model", config["model"]),
         deployment="disaggregated" if disagg else "aggregated",
-        hardware=config["hardware"],
-        framework=config["framework"],
+        hardware=normalize("hardware", config["hardware"]),
+        framework=engine["framework"],
+        orchestrator=engine.get("orchestrator"),
+        speculation={"method": config["spec_method"]},
         framework_version="unknown",
         parallelism=parallelism,
         parallelism_complete=False,
-        precision={"weights": config["precision"]},
+        precision={"weights": normalize("precision", config["precision"])},
+        source_ids={
+            "inferencex": {k: config[k] for k in ("model", "hardware", "framework") if k in config},
+        },
         # Every source field that distinguishes upstream deployments is identity, so distinct source
         # configurations never share a configuration ID: attention DP (a boolean, never a degree),
         # multinode and KV offload are first-class identity fields (hash v3); the speculation method
@@ -1201,7 +1377,7 @@ def inferencex_to_configurations(
                     benchmark_tool="inferencex",
                     collected_at=raw.get("date"),
                     image=raw.get("image"),
-                    benchmark_type=raw.get("benchmark_type"),
+                    benchmark_type=_canonical_kind(raw.get("benchmark_type")),
                     input_tokens=raw.get("isl"),
                     output_tokens=raw.get("osl"),
                     concurrency=raw.get("conc"),
@@ -1318,6 +1494,7 @@ def aiperf_to_configuration(
                     device_count=device_count if normalization == "total" else None,
                     scope=scope,
                     source_name=f"{name}.{stat_name}",
+                    observer="client",
                 )
             )
     rows.extend(missing_required_metrics(observation_id, rows))
@@ -1340,7 +1517,7 @@ def aiperf_to_configuration(
             RequestRow(
                 observation_id=observation_id,
                 request_id=str(record.get("request_id", index)),
-                status="error" if failed else "ok",
+                status="failed" if failed else "completed",
                 input_tokens=tokens("input_sequence_length"),
                 output_tokens=tokens("output_sequence_length"),
                 ttft_ms=ms("time_to_first_token"),
@@ -1368,6 +1545,7 @@ def aiperf_to_configuration(
         record_sha256=_sha(summary_bytes),
         source_kind="developer",
         producer_kind="aiperf",
+        observer="client",
         producer_id=producer_id,
         benchmark_tool="aiperf",
         benchmark_tool_version=tool_version,
@@ -1389,3 +1567,68 @@ def aiperf_to_configuration(
 def _mean_int(requests: Sequence[RequestRow], name: str) -> int | None:
     values = {getattr(r, name) for r in requests if getattr(r, name) is not None}
     return values.pop() if len(values) == 1 else None
+
+
+# --------------------------------------------------------------------------- canonical-name validation
+
+
+def name_findings_for(
+    body: E2eManifestBody,
+    observations: Sequence[ObservationRow] = (),
+    metrics: Sequence[MetricRow] = (),
+    requests: Sequence[RequestRow] = (),
+    series: Sequence[SeriesRow] = (),
+) -> list[NameFinding]:
+    """Stored names that are not canonical, with the spelling to use.
+
+    Readers never translate; this is the check contributors (and their agents) run before a pull request.
+    Consumers such as the dashboard and gym ignore a non-canonical name until it is registered.
+    """
+    out: list[NameFinding] = []
+    out += name_findings("origin", "manifest.origin", body.origin)
+    out += name_findings("model", "manifest.model_id", body.model_id)
+    out += name_findings("hardware", "manifest.hardware", body.hardware)
+    out += name_findings("framework", "manifest.framework", body.framework)
+    out += name_findings("deployment", "manifest.deployment", body.deployment)
+    out += name_findings("orchestrator", "manifest.orchestrator", body.orchestrator)
+    for key, value in body.precision.items():
+        out += name_findings("precision", f"manifest.precision.{key}", value)
+    if body.workload is not None:
+        out += name_findings("workload_kind", "manifest.workload.kind", body.workload.kind)
+        out += name_findings("workload_boundary", "manifest.workload.boundary", body.workload.boundary)
+    for i, obs in enumerate(observations):
+        out += name_findings("workload_kind", f"observations[{i}].benchmark_type", obs.benchmark_type)
+        out += name_findings("observer", f"observations[{i}].observer", obs.observer)
+    seen: set[tuple[str, str, str]] = set()
+    for i, row in enumerate(metrics):
+        for kind, field_name, value in (
+            ("metric", "metric", row.metric),
+            ("statistic", "statistic", row.statistic),
+            ("observer", "observer", row.observer),
+        ):
+            if (kind, field_name, value) in seen:
+                continue
+            found = name_findings(kind, f"metrics[{i}].{field_name}", value)
+            if found:
+                seen.add((kind, field_name, value))
+                out += found
+    for i, req in enumerate(requests):
+        for kind, field_name, value in (("request_status", "status", req.status), ("phase", "phase", req.phase)):
+            if (kind, field_name, value) in seen:
+                continue
+            found = name_findings(kind, f"requests[{i}].{field_name}", value)
+            if found:
+                seen.add((kind, field_name, value))
+                out += found
+    for i, point in enumerate(series):
+        if ("metric", "series", point.metric) in seen:
+            continue
+        found = name_findings("metric", f"series[{i}].metric", point.metric)
+        if found:
+            seen.add(("metric", "series", point.metric))
+            out += found
+    return out
+
+
+def name_findings_for_dataset(dataset: E2eDataset) -> list[NameFinding]:
+    return name_findings_for(dataset.body, dataset.observations, dataset.metrics, dataset.requests, dataset.series)

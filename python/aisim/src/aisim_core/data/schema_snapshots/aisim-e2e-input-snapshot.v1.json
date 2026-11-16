@@ -78,7 +78,7 @@
     "JsonValue": {}
   },
   "$id": "aisim-e2e-input-snapshot/v1",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "description": "Frozen input selection. Contains inputs only (membership and acquisition).",
   "properties": {
     "acquisition": {

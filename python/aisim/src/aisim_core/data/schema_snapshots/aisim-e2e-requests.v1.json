@@ -1,8 +1,58 @@
 {
   "$id": "aisim-e2e-requests/v1",
-  "additionalProperties": false,
-  "description": "Per-request developer-collector row; latencies in ms, null when not measured.",
+  "additionalProperties": true,
+  "description": "Per-request row; latencies in ms, null when not measured. Times count from ``time_origin``.",
   "properties": {
+    "agent_depth": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Agent Depth"
+    },
+    "attrs": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Attrs"
+    },
+    "cached_tokens": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cached Tokens"
+    },
+    "conversation_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Conversation Id"
+    },
     "e2el_ms": {
       "anyOf": [
         {
@@ -15,6 +65,18 @@
       "default": null,
       "title": "E2El Ms"
     },
+    "end_ms": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "End Ms"
+    },
     "error": {
       "anyOf": [
         {
@@ -26,6 +88,18 @@
       ],
       "default": null,
       "title": "Error"
+    },
+    "identity_valid": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Identity Valid"
     },
     "input_tokens": {
       "anyOf": [
@@ -70,12 +144,31 @@
       "default": null,
       "title": "Output Tokens"
     },
-    "request_id": {
-      "minLength": 1,
-      "title": "Request Id",
-      "type": "string"
+    "parent_request_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Request Id"
     },
-    "start_offset_ms": {
+    "phase": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Phase"
+    },
+    "queue_ms": {
       "anyOf": [
         {
           "type": "number"
@@ -85,13 +178,68 @@
         }
       ],
       "default": null,
-      "title": "Start Offset Ms"
+      "title": "Queue Ms"
+    },
+    "request_id": {
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    },
+    "source_inner_idx": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Inner Idx"
+    },
+    "source_outer_idx": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Outer Idx"
+    },
+    "source_trace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Trace Id"
+    },
+    "start_ms": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Start Ms"
     },
     "status": {
-      "default": "ok",
+      "default": "completed",
       "enum": [
-        "ok",
-        "error",
+        "completed",
+        "failed",
         "cancelled"
       ],
       "title": "Status",
@@ -120,6 +268,19 @@
       ],
       "default": null,
       "title": "Ttft Ms"
+    },
+    "turn_index": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Turn Index"
     }
   },
   "required": [

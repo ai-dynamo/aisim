@@ -62,9 +62,10 @@ CLEAN = {"producer_id": None, "image": None, "raw_artifact_id": None, "log_artif
 
 def _body(model="synthetic/model-a", source="developer"):
     return E2eManifestBody(
+        origin="self-collected",
         model_id=model,
         deployment="aggregated",
-        hardware="h100",
+        hardware="h100_sxm",
         framework="vllm",
         framework_version="0.11.0",
         parallelism={"aggregated": {"tp": 8}},
@@ -117,7 +118,7 @@ def _eval(root, configuration_ids, *, case_ids=5):
     rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, case_ids + 1)]
     art = write_truth_table(root / "truth.parquet", rows)
     ident = Identity(
-        hardware="h100", framework="vllm", framework_version="0.11.0", operation_family=None,
+        hardware="h100_sxm", framework="vllm", framework_version="0.11.0", operation_family=None,
         model="synthetic/model-a", effective_settings={}, unresolved_identity=None,
         parallelism={"aggregated": {"tp": 8}}, parallelism_complete=True, deployment="aggregated",
     )  # fmt: skip
@@ -303,7 +304,7 @@ def test_inferencex_derived_is_aggregates_only_by_default(tmp_path):
 
 def _infx():
     return dict(
-        model="synthetic/model-a", hardware="h100", framework="vllm", precision="fp8", spec_method="none",
+        model="synthetic/model-a", hardware="h100_sxm", framework="vllm", precision="fp8", spec_method="none",
         disagg=False, is_multinode=False, prefill_tp=1, prefill_ep=1, prefill_dp_attention=False,
         prefill_num_workers=0, decode_tp=8, decode_ep=1, decode_dp_attention=False, decode_num_workers=1,
         num_prefill_gpu=0, num_decode_gpu=8, id=1, date="2026-10-17", isl=1024, osl=128, conc=32,

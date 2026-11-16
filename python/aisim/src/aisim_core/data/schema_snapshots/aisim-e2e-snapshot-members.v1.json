@@ -1,6 +1,6 @@
 {
   "$id": "aisim-e2e-snapshot-members/v1",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "properties": {
     "configuration_id": {
       "pattern": "^cfg-[0-9a-f]{64}$",

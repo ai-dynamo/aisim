@@ -27,6 +27,7 @@ from aisim_core.data.e2e import (
     MetricRow,
     ObservationRow,
     RequestRow,
+    SeriesRow,
     SnapshotAcquisition,
     SnapshotMember,
 )
@@ -53,6 +54,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "aisim-e2e-metrics/v1": MetricRow,
     "aisim-e2e-observations/v1": ObservationRow,
     "aisim-e2e-requests/v1": RequestRow,
+    "aisim-e2e-series/v1": SeriesRow,
     "aisim-e2e-snapshot-acquisition/v1": SnapshotAcquisition,
     "aisim-e2e-snapshot-members/v1": SnapshotMember,
     "aisim-eval/v1": EvalRecord,
