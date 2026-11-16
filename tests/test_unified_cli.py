@@ -2121,6 +2121,7 @@ def test_recommendation_writes_an_empty_result_before_returning_failure(
     status = cli._recommend(
         SimpleNamespace(
             stack="engine",
+            config=str(tmp_path / "config.yaml"),
             format="json",
             output_dir=str(output),
             overwrite=False,
