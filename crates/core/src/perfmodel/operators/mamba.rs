@@ -54,7 +54,9 @@ impl Mamba2Op {
         // on perf-DB miss. The op's arg-style SOL is threaded into the table
         // query so the perf_interp engine can util-hold beyond-range queries
         // (mirroring how Python passes `get_sol` into the engine record).
-        match db.state_space.query_mamba2(
+        // A per-shard shape misses on every query, so the miss carries no
+        // message here.
+        match db.state_space.try_query_mamba2(
             &self.kernel_source,
             &self.phase,
             batch_size,
@@ -68,14 +70,14 @@ impl Mamba2Op {
             self.chunk_size,
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
                     .clamp_non_negative()

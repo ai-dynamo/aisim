@@ -313,16 +313,50 @@ impl StateSpaceTable {
         let aliases = self
             .gdn_alias_profile
             .mamba2_aliases(key.kernel_source.as_str(), key.phase.as_str());
-        let own_physical = aliases.iter().find_map(|alias| {
-            let mut alias_key = key.clone();
-            alias_key.kernel_source = (*alias).to_string();
-            grids.by_keys.get(&alias_key)
-        });
-        let node = match own_physical.or_else(|| grids.by_keys.get(&key)) {
+        let node = match mamba2_node(grids, &key, aliases) {
             Some(node) => node,
             None => return Err(mamba2_shape_miss(&self.data_root, grids, &key, aliases)),
         };
         engine_query(node, phase, batch_size, seq_len, sol)
+    }
+
+    /// [`Self::query_mamba2`] for the operator, which prices a miss at SOL
+    /// and never reads its message: a missing table or per-shard row is
+    /// `Ok(None)`, with nothing formatted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_query_mamba2(
+        &self,
+        kernel_source: &str,
+        phase: &str,
+        batch_size: u32,
+        seq_len: u32,
+        d_model: u32,
+        d_state: u32,
+        d_conv: u32,
+        nheads: u32,
+        head_dim: u32,
+        n_groups: u32,
+        chunk_size: u32,
+        sol: &dyn Fn(f64, f64) -> f64,
+    ) -> Result<Option<LeafValue>, AicError> {
+        let Ok(grids) = self.mamba2_cell() else {
+            return Ok(None);
+        };
+        let key = Mamba2Key {
+            kernel_source: kernel_source.to_string(),
+            phase: phase.to_string(),
+            d_model,
+            d_state,
+            d_conv,
+            nheads,
+            head_dim,
+            n_groups,
+            chunk_size,
+        };
+        let aliases = self.gdn_alias_profile.mamba2_aliases(kernel_source, phase);
+        mamba2_node(grids, &key, aliases)
+            .map(|node| engine_query(node, phase, batch_size, seq_len, sol))
+            .transpose()
     }
 
     /// GDN latency for a layer instance. Same engine resolution as Mamba2
@@ -531,11 +565,13 @@ impl StateSpaceTable {
         engine_query(node, phase, batch_size, seq_len, sol)
     }
 
+    fn mamba2_cell(&self) -> &Result<Mamba2Grids, AicError> {
+        self.mamba2
+            .get_or_init(|| load_mamba2_parquet(&self.mamba2_sources))
+    }
+
     fn load_mamba2(&self) -> Result<&Mamba2Grids, AicError> {
-        let cell = self
-            .mamba2
-            .get_or_init(|| load_mamba2_parquet(&self.mamba2_sources));
-        cell.as_ref().map_err(clone_err)
+        self.mamba2_cell().as_ref().map_err(clone_err)
     }
 
     fn load_gdn(&self) -> Result<&GdnGrids, AicError> {
@@ -983,6 +1019,21 @@ fn missing(table: &str, data_root: &Path, descriptor: String) -> AicError {
         "{table} data missing for {descriptor} at {}",
         data_root.display()
     ))
+}
+
+/// The grid for `key`: the backend's own physical label under `aliases`
+/// first, then the logical lane.
+fn mamba2_node<'a>(
+    grids: &'a Mamba2Grids,
+    key: &Mamba2Key,
+    aliases: &[&str],
+) -> Option<&'a PreparedGrid> {
+    let own_physical = aliases.iter().find_map(|alias| {
+        let mut alias_key = key.clone();
+        alias_key.kernel_source = (*alias).to_string();
+        grids.by_keys.get(&alias_key)
+    });
+    own_physical.or_else(|| grids.by_keys.get(key))
 }
 
 /// The typed Mamba2 miss. Rows that share `(kernel_source, phase, d_model)`
@@ -2419,6 +2470,46 @@ mod tests {
             }
             other => panic!("expected a typed miss, got {other:?}"),
         }
+    }
+
+    /// The operator's lookup reads the row `query_mamba2` reads on a hit, and
+    /// answers `None` where `query_mamba2` errors: a per-shard shape without a
+    /// row, and a data root without a Mamba2 table.
+    #[test]
+    fn try_query_mamba2_reports_a_miss_as_none() {
+        let try_query = |table: &StateSpaceTable, nheads: u32, n_groups: u32| {
+            table
+                .try_query_mamba2(
+                    "causal_conv1d_fn",
+                    "context",
+                    1,
+                    1024,
+                    8192,
+                    128,
+                    4,
+                    nheads,
+                    64,
+                    n_groups,
+                    256,
+                    &dummy_sol,
+                )
+                .unwrap()
+                .map(|v| v.latency)
+        };
+        let table = in_memory_mamba2_table(
+            "trtllm",
+            "1.3.0rc29",
+            &[
+                ("causal_conv1d_fn", 1.0),
+                ("causal_conv1d_fn_token_major", 2.0),
+            ],
+        );
+        assert_eq!(try_query(&table, 128, 8), Some(2.0));
+        assert!(query_mamba2_conv_shape(&table, 8192, 64, 4).is_err());
+        assert_eq!(try_query(&table, 64, 4), None);
+        let no_table = StateSpaceTable::new(PathBuf::from("test-data"), "trtllm", "1.3.0rc29");
+        assert!(query_mamba2_conv_shape(&no_table, 8192, 128, 8).is_err());
+        assert_eq!(try_query(&no_table, 128, 8), None);
     }
 
     /// Packaged TRT-LLM rows hold the TP 1 geometry of each model. The TP 1
