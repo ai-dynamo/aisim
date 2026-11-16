@@ -265,9 +265,12 @@ def aggregate_cell(
         and _dense_synthetic_kv_eligible(plan, cell, cell_dir / "raw", collection)
     )
 
-    def _kv_seed_regime(point: dict[str, Any], phase: str) -> str:
+    def _kv_seed_regime(point: dict[str, Any], phase: str, native_regime: str | None) -> str:
         if phase == "prefill" and (not cell.execution_identity[0] or int(point["total_kv_read_tokens"]) == 0):
             return "n/a"
+        # New producers report deliberate skips without a fake-fallback stamp.
+        if native_regime == "skip:dense_model_content_insensitive":
+            return native_regime if dense_synthetic else "fake_fallback"
         reasons = point.get("sample_reasons") or []
         # A cached prefill states in its point stamps how the engine seeded its prefix, and the warm-up block, which
         # describes the decode protocol, cannot classify it. A prefix that real forward passes computed is real KV,
@@ -303,7 +306,7 @@ def aggregate_cell(
         batch = int(point["batch_size"])
         total_prefill = int(point["total_prefill_tokens"])
         total_kv = int(point["total_kv_read_tokens"])
-        regime = _kv_seed_regime(point, phase)
+        regime = _kv_seed_regime(point, phase, measurement.kv_seed_regime)
         if cell.execution_identity[0] and (phase == "decode" or total_kv > 0) and regime != "real_kv":
             raise ValueError(
                 f"execution-identity cells require real KV measurements for cached prefill and decode, got {regime}"

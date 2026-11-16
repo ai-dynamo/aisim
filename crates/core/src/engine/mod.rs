@@ -40,7 +40,6 @@ pub(crate) use common::hashing::{
 pub(crate) use common::protocols::{DirectRequest, MockEngineArgs};
 pub use common::running_mean::RunningMean;
 pub use common::speculative::normalize_conditional_accept_rates;
-pub(crate) use config::afd_total_gpus;
 pub use config::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
 pub use config::{
     Backend, EngineConfig, FrontendConfig, FrontendStage, G2Connector, G2Scope, G3OffloadConfig,
@@ -48,6 +47,7 @@ pub use config::{
     SglangHiCacheConfig, SglangHiCacheWritePolicy, SglangSchedulePolicy, SlidingWindowStateConfig,
     StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
 };
+pub(crate) use config::{MAX_PIPELINE_FILL_PASSES, afd_total_gpus};
 pub use fitted_timing::FittedIterationTiming;
 pub use g3_offload::{G3IoStats, G3Stats};
 pub use handoff::{
