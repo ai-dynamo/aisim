@@ -43,6 +43,31 @@ def _input_path_entries(sources: Iterable[Path]) -> set[Path]:
     return entries
 
 
+def _check_input_collisions(targets: Iterable[Path], input_paths: Iterable[str | Path]) -> None:
+    """Reject output replacements that would remove an input or its path entries."""
+
+    sources = [Path(input_path).absolute() for input_path in input_paths]
+    inputs = {source.resolve() for source in sources}
+    input_entries = _input_path_entries(sources)
+    input_directories = [source for source in inputs if source.is_dir()]
+    for target in targets:
+        try:
+            resolved = target.resolve()
+        except RuntimeError:
+            # Python 3.11/3.12 cannot resolve a stale symlink loop, but
+            # removing that directory entry still requires no traversal.
+            resolved = target.absolute()
+        entry = target.parent.resolve() / target.name
+        if (
+            entry in input_entries
+            or resolved in inputs
+            or any(
+                resolved.is_relative_to(directory) or entry.is_relative_to(directory) for directory in input_directories
+            )
+        ):
+            raise ValueError(f"--overwrite would remove input file {target}; choose a different output directory")
+
+
 def prepare_output_directory(path: str | Path, *, overwrite: bool, input_paths: Iterable[str | Path] = ()) -> Path:
     """Create an output directory without deleting unrelated user files."""
 
@@ -78,27 +103,7 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool, input_paths: 
                 target for target in recommendations.iterdir() if _RECOMMENDATION_NAME.fullmatch(target.name)
             )
         targets = [target for target in targets if target.is_file() or target.is_symlink()]
-        sources = [Path(input_path).absolute() for input_path in input_paths]
-        inputs = {source.resolve() for source in sources}
-        input_entries = _input_path_entries(sources)
-        input_directories = [source for source in inputs if source.is_dir()]
-        for target in targets:
-            try:
-                resolved = target.resolve()
-            except RuntimeError:
-                # Python 3.11/3.12 cannot resolve a stale symlink loop, but
-                # removing that directory entry still requires no traversal.
-                resolved = target.absolute()
-            entry = target.parent.resolve() / target.name
-            if (
-                entry in input_entries
-                or resolved in inputs
-                or any(
-                    resolved.is_relative_to(directory) or entry.is_relative_to(directory)
-                    for directory in input_directories
-                )
-            ):
-                raise ValueError(f"--overwrite would remove input file {target}; choose a different output directory")
+        _check_input_collisions(targets, input_paths)
         for target in targets:
             target.unlink()
     return root
