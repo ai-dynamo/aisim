@@ -54,9 +54,7 @@ impl Mamba2Op {
         // on perf-DB miss. The op's arg-style SOL is threaded into the table
         // query so the perf_interp engine can util-hold beyond-range queries
         // (mirroring how Python passes `get_sol` into the engine record).
-        // A per-shard shape misses on every query, so the miss carries no
-        // message here.
-        match db.state_space.try_query_mamba2(
+        match db.state_space.query_mamba2(
             &self.kernel_source,
             &self.phase,
             batch_size,
