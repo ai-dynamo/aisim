@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
 // Cache-salt behavior follows SGLang v0.5.22 (baa9befa381511cd4d56f83980951e5a45fffc6d); see THIRD_PARTY_NOTICES.md.
+// SWA prefix reuse adapts v0.5.21 (e00930c5489053f26d86b179cee0d087f846acbb); see THIRD_PARTY_NOTICES.md.
 
 // Admission and ratio lifecycle follow SGLang v0.5.22 (baa9befa381511cd4d56f83980951e5a45fffc6d); see THIRD_PARTY_NOTICES.md.
 // Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
@@ -1584,6 +1585,86 @@ fn destination_rejects_prompt_at_or_above_max_model_len(#[values(8, 9)] prompt_l
 }
 
 #[test]
+fn dsv4_swa_reuse_ends_on_a_cached_swa_page_and_learns_the_fork() {
+    // DeepSeek-V4 on SGLang keeps a cached sequence's SWA KV only on the 256-token pages
+    // before each insert end: two pages at a page-aligned end, one otherwise. A request forking
+    // elsewhere recomputes from the last such page; its recompute inserts at the fork point,
+    // so the next request forking there reuses it.
+    let reused = |swa_prefix_tails| {
+        let mut args = test_args(64, 64, 4096);
+        args.sglang.as_mut().unwrap().swa_prefix_tails = swa_prefix_tails;
+        let mut core = SglangCore::new(args);
+        let mut collector = crate::engine::trace::TraceCollector::default();
+        let mut now = 0.0;
+        let mut fork = |tail: std::ops::Range<u32>, prefix: u32| {
+            let mut tokens = (0..prefix).collect::<Vec<_>>();
+            tokens.extend(tail);
+            core.receive(direct_request(tokens, 0));
+            let pass = core.execute_pass(&mut collector, now);
+            now = pass.end_ms;
+            assert!(core.is_empty());
+            pass.admissions[0].reused_input_tokens
+        };
+        [
+            fork(0..0, 1024),
+            fork(10_000..10_064, 1024),
+            fork(20_000..20_064, 768),
+            fork(30_000..30_128, 448),
+            fork(40_000..40_064, 448),
+            fork(50_000..50_064, 192),
+        ]
+    };
+    assert_eq!(reused(Some(8)), [0, 1024, 768, 0, 256, 0]);
+    assert_eq!(
+        reused(None),
+        [0, 1024, 768, 448, 448, 192],
+        "full attention reuses any cached page"
+    );
+}
+
+#[test]
+fn dsv4_swa_continuation_after_generated_output_reuses_the_prompt() {
+    // Replay's generated tokens are not the next prompt's, so the next turn diverges where
+    // the previous output began; the SWA page replay keeps before the prompt end lets it
+    // reuse the prompt up to that page, as SGLang reuses it through the real output.
+    let mut args = test_args(64, 64, 4096);
+    args.sglang.as_mut().unwrap().swa_prefix_tails = Some(8);
+    let mut core = SglangCore::new(args);
+    let mut collector = crate::engine::trace::TraceCollector::default();
+    core.receive(direct_request((0..600).collect(), 6));
+    let mut now = 0.0;
+    while !core.is_empty() {
+        now = core.execute_pass(&mut collector, now).end_ms;
+    }
+    core.receive(direct_request((0..600).chain(5000..5128).collect(), 0));
+    let pass = core.execute_pass(&mut collector, now);
+    assert_eq!(pass.admissions[0].reused_input_tokens, 512);
+}
+
+#[test]
+fn dsv4_swa_continuation_reuses_an_exact_output_through_its_tail() {
+    // A request replaying its exact output tokens ends in the same sequence the next turn
+    // carries, so the continuation reaches the SWA page at the tail of the output.
+    let mut args = test_args(64, 64, 4096);
+    args.sglang.as_mut().unwrap().swa_prefix_tails = Some(8);
+    let mut core = SglangCore::new(args);
+    let mut collector = crate::engine::trace::TraceCollector::default();
+    let output: Vec<u32> = (6000..6169).collect();
+    core.receive(DirectRequest {
+        output_token_ids: Some(output.clone()),
+        ..direct_request((0..600).collect(), output.len())
+    });
+    let mut now = 0.0;
+    while !core.is_empty() {
+        now = core.execute_pass(&mut collector, now).end_ms;
+    }
+    let next = (0..600).chain(output).chain(7000..7100).collect();
+    core.receive(direct_request(next, 0));
+    let pass = core.execute_pass(&mut collector, now);
+    assert_eq!(pass.admissions[0].reused_input_tokens, 768);
+}
+
+#[test]
 fn belady_retires_whole_prompt_once_on_first_chunk_and_includes_full_hits() {
     let tokens = (0..8).collect::<Vec<_>>();
     let hashes = compute_seq_hash_for_block(&compute_block_hash_for_seq(&tokens, 4));
@@ -2420,6 +2501,210 @@ mod source_holds {
     }
 
     #[test]
+    fn pp_prefill_handoff_waits_for_the_remaining_stages() {
+        // A PP4 prefill worker retires passes at the per-stage rate; the
+        // prompt's last forward still crosses three more stages before its KV
+        // can leave, each stage behind the chunk ahead of it.
+        let mut filled = args();
+        filled.speedup_ratio = 1.0;
+        filled.pipeline_fill_passes = 3.0;
+        let mut core = SglangCore::new(filled);
+        let request_id = Uuid::from_u128(311);
+        let handoff_id = HandoffId::from(Uuid::from_u128(411));
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id,
+            request: request(request_id),
+        })
+        .unwrap();
+
+        let first = execute(&mut core, 0.0);
+        assert!(
+            first.lifecycle_events.is_empty(),
+            "an unfinished prompt holds no source"
+        );
+        let first_ms = core.last_forward_ms().unwrap();
+        let terminal = execute(&mut core, first.end_ms);
+        let forward_ms = terminal.end_ms - first.end_ms;
+        assert!(forward_ms > 0.0);
+        let [
+            SchedulerLifecycleEvent::SourceHeld {
+                transfer_timing, ..
+            },
+        ] = terminal.lifecycle_events.as_slice()
+        else {
+            panic!("expected one held source: {:?}", terminal.lifecycle_events);
+        };
+        assert!((transfer_timing.pipeline_fill_ms - 3.0 * first_ms.max(forward_ms)).abs() < 1e-9);
+
+        // Without later stages the handoff carries no fill.
+        let mut core = SglangCore::new(MockEngineArgs {
+            speedup_ratio: 1.0,
+            ..args()
+        });
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id,
+            request: request(request_id),
+        })
+        .unwrap();
+        let first = execute(&mut core, 0.0);
+        let terminal = execute(&mut core, first.end_ms);
+        let [
+            SchedulerLifecycleEvent::SourceHeld {
+                transfer_timing, ..
+            },
+        ] = terminal.lifecycle_events.as_slice()
+        else {
+            panic!("expected one held source: {:?}", terminal.lifecycle_events);
+        };
+        assert_eq!(transfer_timing.pipeline_fill_ms, 0.0);
+    }
+
+    #[test]
+    fn host_loop_pp_prefill_handoff_waits_for_the_observed_forward() {
+        // Under the host loop the hold follows the observation one iteration later;
+        // its fill is counted in the forward that finished the prompt, not the
+        // forward running when it is observed.
+        let mut core = SglangCore::new(
+            MockEngineArgs::builder()
+                .engine_type(EngineType::Sglang)
+                .num_gpu_blocks(16)
+                .block_size(4)
+                .max_num_seqs(Some(2))
+                .worker_type(crate::engine::common::protocols::WorkerType::Prefill)
+                .speedup_ratio(1.0)
+                .pipeline_fill_passes(3.0)
+                .sglang(Some(SglangArgs {
+                    page_size: Some(4),
+                    chunked_prefill_size: Some(16),
+                    host_loop: true,
+                    ..Default::default()
+                }))
+                .build()
+                .unwrap(),
+        );
+        let request_id = Uuid::from_u128(312);
+        let handoff_id = HandoffId::from(Uuid::from_u128(412));
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id,
+            request: DirectRequest {
+                max_output_tokens: 1,
+                ..request(request_id)
+            },
+        })
+        .unwrap();
+
+        let launched = execute(&mut core, 0.0);
+        let forward_ms = core.last_forward_ms().unwrap();
+        assert!(forward_ms > 0.0);
+        let observed = execute(&mut core, launched.end_ms);
+        let held = observed
+            .lifecycle_events
+            .iter()
+            .find_map(|event| match event {
+                SchedulerLifecycleEvent::SourceHeld {
+                    request_id: held,
+                    transfer_timing,
+                    ..
+                } if *held == request_id => Some(transfer_timing),
+                _ => None,
+            })
+            .expect("the observed extend holds its source");
+        assert!((held.pipeline_fill_ms - 3.0 * forward_ms).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pp_prefill_fill_runs_each_chunk_through_the_stages_in_order() {
+        // A 20-token prompt runs as a 16-token chunk and a 4-token chunk on PP4. The short
+        // chunk leaves stage 0 soon after the long one but cannot overtake it in the three
+        // later stages, so the KV is ready later than three of the short chunk's forwards.
+        for host_loop in [false, true] {
+            let mut core = SglangCore::new(
+                MockEngineArgs::builder()
+                    .engine_type(EngineType::Sglang)
+                    .num_gpu_blocks(16)
+                    .block_size(4)
+                    .max_num_seqs(Some(2))
+                    .worker_type(crate::engine::common::protocols::WorkerType::Prefill)
+                    .speedup_ratio(1.0)
+                    .pipeline_fill_passes(3.0)
+                    .sglang(Some(SglangArgs {
+                        page_size: Some(4),
+                        chunked_prefill_size: Some(16),
+                        host_loop,
+                        ..Default::default()
+                    }))
+                    .build()
+                    .unwrap(),
+            );
+            let request_id = Uuid::from_u128(313);
+            core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id: HandoffId::from(Uuid::from_u128(413)),
+                request: DirectRequest {
+                    tokens: (0..20).collect(),
+                    max_output_tokens: 1,
+                    ..request(request_id)
+                },
+            })
+            .unwrap();
+
+            // Each pass: when it ended and how long the forward it ran or launched took.
+            let mut passes = Vec::new();
+            let held = loop {
+                assert!(passes.len() < 8, "the prompt never held its source");
+                let pass = execute(&mut core, passes.last().map_or(0.0, |&(end_ms, _)| end_ms));
+                passes.push((pass.end_ms, core.last_forward_ms().unwrap_or(0.0)));
+                let held = pass.lifecycle_events.iter().find_map(|event| match event {
+                    SchedulerLifecycleEvent::SourceHeld {
+                        request_id: held,
+                        transfer_timing,
+                        ..
+                    } if *held == request_id => Some(*transfer_timing),
+                    _ => None,
+                });
+                if let Some(held) = held {
+                    break held;
+                }
+            };
+            // When each forward left stage 0: the host loop observes it one pass later.
+            let forwards: Vec<(f64, f64)> = if host_loop {
+                passes
+                    .windows(2)
+                    .map(|pair| (pair[1].0, pair[0].1))
+                    .collect()
+            } else {
+                passes.clone()
+            };
+            let [(first_end_ms, first_ms), (last_end_ms, last_ms)] = forwards.as_slice() else {
+                panic!("expected two chunk forwards: {passes:?}");
+            };
+            assert!(first_ms > last_ms && *last_ms > 0.0, "{forwards:?}");
+            let mut stage_free_ms = [0.0_f64; 3];
+            let mut ready_ms = 0.0;
+            for &(end_ms, stage_ms) in &forwards {
+                ready_ms = end_ms;
+                for free_ms in &mut stage_free_ms {
+                    ready_ms = ready_ms.max(*free_ms) + stage_ms;
+                    *free_ms = ready_ms;
+                }
+            }
+            // The last stage finishes the long chunk, then the short one.
+            assert!((ready_ms - (first_end_ms + 3.0 * first_ms + last_ms)).abs() < 1e-9);
+            let held_ms = passes.last().unwrap().0;
+            assert!(
+                (held_ms - last_end_ms).abs() < 1e-9,
+                "host_loop {host_loop}"
+            );
+            assert!(
+                (held.pipeline_fill_ms - (ready_ms - held_ms)).abs() < 1e-9,
+                "host_loop {host_loop}: {} vs {}",
+                held.pipeline_fill_ms,
+                ready_ms - held_ms
+            );
+            assert!(held.pipeline_fill_ms > 3.0 * last_ms + 1e-9);
+        }
+    }
+
+    #[test]
     fn host_loop_prefill_rank_hands_off_when_the_next_iteration_observes_the_extend() {
         // Replay caps a prefill-rank request at one output token; under the host
         // loop the finished extend joins SGLang's inflight queue instead of the
@@ -2713,6 +2998,7 @@ mod destination_lifecycle {
         let mut core = SglangCore::new(args);
         let held_handoff = HandoffId::from(Uuid::from_u128(33_001));
         let held_uuid = Uuid::from_u128(33_002);
+        assert_eq!(core.decode_load(), (0, 0));
         let held = core
             .apply_command_effects(
                 SchedulerCommand::ReserveDestination {
@@ -2724,6 +3010,7 @@ mod destination_lifecycle {
             .unwrap();
         assert_eq!(held.lifecycle_events.len(), 1);
         assert_eq!(core.mocker_metrics().waiting_requests, 1);
+        assert_eq!(core.decode_load(), (4, 1), "allocated transfers count once");
         let held_snapshot = execute(&mut core, 0.0).fpm.unwrap();
         assert_eq!(held_snapshot.num_queued_decode, 1);
         assert_eq!(held_snapshot.sum_queued_decode_kv_tokens, 4);
@@ -2741,6 +3028,7 @@ mod destination_lifecycle {
             .unwrap();
         assert!(pending.lifecycle_events.is_empty());
         assert_eq!(core.mocker_metrics().waiting_requests, 2);
+        assert_eq!(core.decode_load(), (28, 2), "unallocated prompts add load");
         let mixed_snapshot = execute(&mut core, 0.0).fpm.unwrap();
         assert_eq!(mixed_snapshot.num_queued_decode, 2);
         assert_eq!(mixed_snapshot.sum_queued_decode_kv_tokens, 28);
@@ -2754,6 +3042,11 @@ mod destination_lifecycle {
             SchedulerCommandResult::Applied
         );
         assert_eq!(core.mocker_metrics().waiting_requests, 1);
+        assert_eq!(
+            core.decode_load(),
+            (4, 1),
+            "cancellation clears queued load"
+        );
 
         core.receive(request(Uuid::from_u128(33_005), vec![3; 4], 2));
         let blocker = execute(&mut core, 1.0);
@@ -2777,6 +3070,11 @@ mod destination_lifecycle {
         assert_eq!(completed.num_queued_decode, 0);
         assert_eq!(completed.sum_queued_decode_kv_tokens, 0);
         assert_eq!(core.mocker_metrics().waiting_requests, 0);
+        assert_eq!(
+            core.decode_load(),
+            (0, 0),
+            "evictable cache is not active load"
+        );
     }
 
     #[test]
@@ -3376,6 +3674,52 @@ mod destination_lifecycle {
 
 mod scheduling {
     use super::*;
+
+    #[rstest::rstest]
+    fn request_completion_reserves_partial_physical_page_through_decode(
+        #[values(false, true)] reuse_prefix: bool,
+    ) {
+        let page_size = 4;
+        let prompt: Vec<u32> = (0..16).collect();
+        let mut manager = SglangKvManager::new(64, page_size, KvEventPublishers::default(), 0);
+        if reuse_prefix {
+            let cached = manager.allocate_for_request(&prompt[..8]).unwrap();
+            manager.finish(&prompt[..8], cached.lease);
+        }
+        // Use the scheduler's constructor so this covers the token-to-page sizing boundary,
+        // rather than setting a reservation directly on a test lease.
+        let mut request = SglangRequest::new(direct_request(prompt, 14), page_size, usize::MAX);
+        assert_eq!(request.kv_lease.page_hash_capacity(), 7);
+        assert_eq!(
+            manager.allocate_for_request_lease(&request.sequence_tokens, &mut request.kv_lease),
+            Some(if reuse_prefix { 8 } else { 0 })
+        );
+        assert_eq!(request.kv_lease.page_capacity(), 8);
+        manager.extend_cached_prefix(&request.sequence_tokens, &mut request.kv_lease);
+
+        let mut reservation = manager.reserve_decode_pages(4).unwrap();
+        for token in 16..30 {
+            request.append_output_token(token, page_size);
+            manager.extend_decode(&mut request.kv_lease, &mut reservation);
+            assert_eq!(request.kv_lease.page_capacity(), 8);
+            assert_eq!(request.kv_lease.page_hash_capacity(), 7);
+            assert_eq!(
+                request.kv_lease.page_count(),
+                request.current_sequence_len().div_ceil(page_size)
+            );
+        }
+        assert_eq!(request.kv_lease.page_count(), 8);
+        manager.release_decode_reservation(reservation);
+        manager.finish(&request.sequence_tokens, request.kv_lease);
+        assert_eq!(manager.cache().protected_size, 0);
+        assert_eq!(manager.cache().evictable_size, 28);
+        assert_eq!(
+            manager.cache().prefix_match_len(&request.sequence_tokens),
+            28
+        );
+        manager.evict(28);
+        assert_eq!(manager.cache().available_tokens(), 64);
+    }
 
     #[test]
     fn cache_salt_namespaces_lpm_scores_and_in_batch_deduplication() {
