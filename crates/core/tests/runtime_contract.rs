@@ -6,11 +6,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use aisimulate_core::engine::{
-    Backend, EngineConfig, SglangConfig, TimingModel, TimingModelConfig,
-};
-use aisimulate_core::replay::loadgen::ReplayRequestPayload;
-use aisimulate_core::replay::{
+use aisim_core::engine::{Backend, EngineConfig, SglangConfig, TimingModel, TimingModelConfig};
+use aisim_core::replay::loadgen::ReplayRequestPayload;
+use aisim_core::replay::{
     AggregatedRoundRobinPlacement, AuthoredKvHints, NoEngineEvents, NoReplayMetadata, Placement,
     PlacementEffects, PlacementPolicy, PoolRoundRobinPlacement, ProviderSpec, ReplayAdapters,
     ReplayCaptureOptions, ReplayComposition, ReplayDeterminism, ReplayEngineConfig,
@@ -349,7 +347,7 @@ fn replay_accept_length_ignores_overlapping_prefill_and_rejection() {
             .per_request
             .iter()
             .filter(|request| request.terminal_status
-                == aisimulate_core::replay::ReplayTerminalStatus::Rejected)
+                == aisim_core::replay::ReplayTerminalStatus::Rejected)
             .count(),
         1
     );
@@ -712,10 +710,10 @@ impl PlacementPolicy<ReplayRequestPayload> for FailingPlacement {
         };
         let decision = if self.selected && (!self.committed || self.queue_on_clock) {
             self.pending.push(placement);
-            aisimulate_core::replay::PlacementDecision::Queued
+            aisim_core::replay::PlacementDecision::Queued
         } else {
             self.selected = true;
-            aisimulate_core::replay::PlacementDecision::Immediate(placement)
+            aisim_core::replay::PlacementDecision::Immediate(placement)
         };
         Ok(PlacementEffects {
             decision,
@@ -1253,14 +1251,14 @@ impl PlacementPolicy<ReplayRequestPayload> for ReleaseOnTopologyCallbacks {
             .push_back(request.metadata().uuid.expect("test request UUID"));
         if self.place_immediately {
             return Ok(PlacementEffects {
-                decision: aisimulate_core::replay::PlacementDecision::Immediate(
+                decision: aisim_core::replay::PlacementDecision::Immediate(
                     self.release_next(self.stable_scheduler_id).pop().unwrap(),
                 ),
                 released: Vec::new(),
             });
         }
         Ok(PlacementEffects {
-            decision: aisimulate_core::replay::PlacementDecision::Queued,
+            decision: aisim_core::replay::PlacementDecision::Queued,
             released: Vec::new(),
         })
     }
@@ -1713,6 +1711,47 @@ fn round_robin_session_affinity_routes_turns_through_the_public_replayer() {
         assert_eq!(report.request_counts.completed_requests, 3);
         let workers: Vec<_> = report
             .per_request
+            .iter()
+            .map(|record| record.decode_worker_idx)
+            .collect();
+        assert_eq!(workers, expected);
+    }
+}
+
+#[test]
+fn total_tokens_placement_balances_the_decode_pool_through_the_public_replayer() {
+    // One long request and two short ones overlap. Round-robin alternates decode
+    // workers; `total_tokens` keeps both short requests off the loaded worker.
+    for (config, expected) in [
+        (serde_json::Value::Null, vec![Some(0), Some(1), Some(0)]),
+        (
+            serde_json::json!({"load_balance_method": "total_tokens"}),
+            vec![Some(0), Some(1), Some(1)],
+        ),
+    ] {
+        let requests = vec![
+            request("long", 0.0, 32, 16),
+            request("short-1", 1.0, 4, 2),
+            request("short-2", 2.0, 4, 2),
+        ];
+        let mut spec = aggregated_spec(Backend::Sglang, 1, 0.0, requests);
+        spec.topology = ReplayTopology::Disaggregated {
+            prefill: WorkerPoolSpec::default(),
+            decode: WorkerPoolSpec {
+                initial_workers: 2,
+                startup_delay_ms: 0.0,
+            },
+            handoff_latency_ms: 0.0,
+        };
+        spec.adapters.placement.config = config;
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 3);
+        let mut records: Vec<_> = report.per_request.iter().collect();
+        records.sort_by(|a, b| a.arrival_time_ms.total_cmp(&b.arrival_time_ms));
+        let workers: Vec<_> = records
             .iter()
             .map(|record| record.decode_worker_idx)
             .collect();

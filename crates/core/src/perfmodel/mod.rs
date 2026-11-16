@@ -35,6 +35,7 @@ pub mod engine;
 pub mod execution_profile;
 pub(crate) mod fpm;
 pub(crate) mod kd_tree;
+pub(crate) mod memo;
 pub mod memory;
 pub(crate) mod operators;
 pub(crate) mod perf_database;
@@ -127,7 +128,7 @@ pub(crate) fn repo_relative(rel: &str) -> Option<PathBuf> {
 }
 
 /// Register the compatibility AIConfigurator API on the unified native
-/// `aisimulate._runtime` extension module.
+/// `aisim._runtime` extension module.
 #[cfg(feature = "python")]
 pub fn register_python(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     py::register(module)
