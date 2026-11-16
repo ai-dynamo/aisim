@@ -345,8 +345,9 @@ pub(crate) struct FairTransfers {
     /// Submission number of each job in `jobs`.
     order: Vec<u64>,
     /// Jobs waiting for their first byte. They hold no share, so they stay
-    /// out of `jobs` and no pass over it visits them.
+    /// out of `jobs`.
     waiters: BinaryHeap<Waiter>,
+    /// Jobs submitted so far; the next job's submission number.
     submitted: u64,
     /// Boxed so an idle tier stays small.
     scratch: Box<RefCell<RateScratch>>,
@@ -429,11 +430,7 @@ impl FairTransfers {
     /// Move the waiters whose first byte is due into `jobs`, each at its
     /// place in submission order.
     fn start_waiters(&mut self) {
-        while self
-            .waiters
-            .peek()
-            .is_some_and(|waiter| waiter.job.ready <= self.now)
-        {
+        while self.first_byte().is_some_and(|ready| ready <= self.now) {
             let Waiter { order, job } = self.waiters.pop().expect("a waiter is due");
             let index = self.order.partition_point(|&earlier| earlier < order);
             self.order.insert(index, order);
@@ -577,15 +574,15 @@ impl FairTransfers {
             self.start_waiters();
             let before = completed.len();
             let now = self.now;
-            let mut done = self.jobs.iter().map(|job| job.bytes == 0.0);
+            let done = |job: &Job| job.bytes == 0.0;
+            let mut jobs = self.jobs.iter();
             self.order
-                .retain(|_| !done.next().expect("every job has a submission number"));
+                .retain(|_| !done(jobs.next().expect("every job has a submission number")));
             self.jobs.retain(|job| {
-                let done = job.bytes == 0.0;
-                if done {
+                if done(job) {
                     completed.push((job.id, now));
                 }
-                !done
+                !done(job)
             });
             if completed.len() != before {
                 self.invalidate();
@@ -688,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn a_waiter_holds_its_link_and_can_be_canceled() {
+    fn a_waiter_counts_as_a_link_job_and_can_be_canceled() {
         let mut transfers = FairTransfers::default();
         transfers.submit(job(0, 0, Direction::Read, 1.0, (1.0, 0.0)));
         assert!(transfers.has_link_jobs(0));
