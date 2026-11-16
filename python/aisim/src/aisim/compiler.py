@@ -7,11 +7,15 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import replace
 from typing import Any
 
 from aisim_core._native import validate_afd_attention_tp, validate_afd_routing_location
+from aisim_core.sdk.common import DefaultHFModels
 from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
+from aisim_core.sdk.utils import _load_local_config, _load_pre_downloaded_hf_config
 
 from .capacity import (
     estimate_kv_bytes_per_token,
@@ -19,6 +23,7 @@ from .capacity import (
     reject_pipeline_parallelism,
     resolve_model_context_length,
 )
+from .config.ais_perf_model import check_entry_identity
 from .config.cli import CorePredictionConfig
 from .config.common import ENGINE_MODEL_CONTROL_FIELDS, omit_inactive_moe_controls
 from .config.engine import (
@@ -276,7 +281,12 @@ def _deployment(
     for role in ("aggregated",) if mode == "agg" else ("prefill", "decode"):
         worker = getattr(engine.workers, role)
         if worker is not None:
-            reject_pipeline_parallelism(role, worker.parallelism.pipeline)
+            reject_pipeline_parallelism(role, worker.parallelism.pipeline, backend=engine.backend)
+            # Only AIC timing reads a pipeline width; fixed and polynomial timing price one stage.
+            if worker.parallelism.pipeline > 1 and worker.timing.type != "default":
+                raise ValueError(
+                    f"pipeline parallelism on {role} requires an AIC timing model, not {worker.timing.type!r} timing"
+                )
     if mode == "disagg":
         from aisim_core.sdk.perf_database import load_system_spec
 
@@ -1054,6 +1064,9 @@ def _worker_engine_args(
             # Restoration compares the saved identity exactly, including how
             # it spells unset context parallelism, MoE and model controls.
             timing_config.update(spell_as_saved(saved, timing_config))
+        # The unified key may restate what this config already fixes. A value
+        # that says something else would be ignored, so it is an error.
+        check_entry_identity(engine.ais_perf_model, role, timing_config)
         if timing.fpm_parquet_path is not None:
             interpolation = timing_config["estimator_config"].setdefault("fpm_interpolation", {})
             if interpolation.get("fpm_parquet_path", timing.fpm_parquet_path) != timing.fpm_parquet_path:
@@ -1108,9 +1121,75 @@ def _worker_engine_args(
                 frontend=worker.frontend,
             )
         )
+    # After the host arguments, which replace the `sglang` entry.
+    swa_prefix_tails = _swa_prefix_tails(engine, worker, role)
+    if swa_prefix_tails is not None:
+        sglang = payload.setdefault("sglang", {})
+        assert isinstance(sglang, dict)
+        sglang["swa_prefix_tails"] = swa_prefix_tails
     if cache.hicache is not None:
         payload.setdefault("sglang", {})["hicache"] = cache.hicache.model_dump(mode="json")
+    if worker.scheduler.load_balance_method != "round_robin":
+        if role != "decode":
+            raise ValueError(f"workers.{role}.scheduler.load_balance_method is supported only for the decode role")
+        # Replay-only: the runner moves it to the decode pool's placement.
+        payload["load_balance_method"] = worker.scheduler.load_balance_method
+    if backend == "sglang":
+        # SGLang chunks a prefill at `--chunked-prefill-size`, the public `max_batched_tokens`. Without it
+        # the scheduler keeps its 8192 default, and a PD prefill or aggregate worker launched with a smaller
+        # chunk is priced on passes several times larger than any it runs. Replay chunks whole pages,
+        # so an unaligned budget rounds down to one, on the host-aware path too.
+        sglang = payload.get("sglang")
+        if role != "decode":
+            sglang = payload.setdefault("sglang", {})
+            assert isinstance(sglang, dict)
+            sglang.setdefault("chunked_prefill_size", worker.scheduler.max_batched_tokens)
+        if isinstance(sglang, dict) and isinstance(chunk := sglang.get("chunked_prefill_size"), int):
+            sglang["chunked_prefill_size"] = max(block_size, chunk // block_size * block_size)
     return payload
+
+
+_SWA_PREFIX_ARCHITECTURES = frozenset({"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"})
+
+
+def _swa_prefix_tails(engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str) -> int | None:
+    """SGLang keeps a DeepSeek-V4 sequence's sliding-window KV only at its tail, so a prefix hit ends
+    where a whole window is still cached. `auto` turns this on for a DeepSeek-V4 checkpoint whose
+    config is available offline, with SGLang's default of four tails per running request."""
+    configured = worker.kv_cache.swa_prefix_tails
+    if configured is None:
+        return None
+    if engine.backend != "sglang":
+        if configured == "auto":
+            return None
+        raise ValueError(f"workers.{role}.kv_cache.swa_prefix_tails is supported only for backend=sglang")
+    if role == "decode" or not worker.kv_cache.prefix_caching:
+        return None
+    if configured != "auto":
+        return configured
+    # Bundled or local configs only: resolving any other model path would download it. Only the
+    # raw architecture is read, so a model without a performance model keeps SWA reuse off.
+    try:
+        if os.path.isdir(engine.model):
+            raw = _load_local_config(engine.model)
+        elif engine.model in DefaultHFModels:
+            raw = _load_pre_downloaded_hf_config(engine.model)
+        else:
+            return None
+    except json.JSONDecodeError as error:
+        # A config that is present but corrupt is invalid input, not a model without SWA reuse.
+        raise ValueError(f"{engine.model} config is not valid JSON: {error}") from error
+    except (OSError, ValueError):
+        # A missing or unreadable config is not a DeepSeek-V4 checkpoint `auto` can recognize.
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{engine.model} config must be a JSON object")
+    architectures = raw.get("architectures") or []
+    if not isinstance(architectures, list) or not all(isinstance(name, str) for name in architectures):
+        raise ValueError(f"{engine.model} config architectures must be a list of strings")
+    if not _SWA_PREFIX_ARCHITECTURES.intersection(architectures[:1]):
+        return None
+    return 4 * worker.scheduler.max_sequences
 
 
 def _resolve_kv_bytes_per_token(

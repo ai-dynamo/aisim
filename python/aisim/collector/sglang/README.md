@@ -156,7 +156,7 @@ SGLANG_LOAD_FORMAT=dummy SGLANG_TEST_NUM_LAYERS=2 \
 ```
 
 #### Environment Variables
-- `DEEPSEEK_MODEL_PATH`: Path to DeepSeek model 
+- `DEEPSEEK_MODEL_PATH`: Path to DeepSeek model
 - `SGLANG_LOAD_FORMAT`: Load format, set to `dummy` to skip weight loading
 - `SGLANG_TEST_NUM_LAYERS`: Load only specified number of layers (with dummy mode)
 - `SGLANG_TEST_LAYER`: Layer index to test (default: 0)

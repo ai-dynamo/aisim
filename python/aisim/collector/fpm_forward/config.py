@@ -391,8 +391,16 @@ class FPMCollectionOptions:
     max_decode_batch_size: int | None = None
     decoder_replay: bool = False
     enforce_eager: bool = False
+    # Request Dynamo's per-point power window (never rendered for smoke runs,
+    # which share the formal plan). False preserves legacy saved-plan
+    # identity; fresh CLI plans enable it unless --no-fpm-measure-power.
+    measure_power: bool = False
     benchmark_points_json: str | None = None
     benchmark_points_sha256: str | None = None
+    # Names the generator of a list that the planner froze. None for a user point file, which keeps its meaning.
+    benchmark_points_origin: str | None = None
+    # The points that each rule of that generator dropped, as JSON. None for a user point file.
+    benchmark_points_dropped_json: str | None = None
     executor: str = "kubernetes"
     slurm_container_image: str = ""
     slurm_container_mounts: tuple[str, ...] = ()
@@ -638,6 +646,7 @@ class FPMCollectionOptions:
             if getattr(args, "smoke", False):
                 raise ValueError("--fpm-benchmark-points-file cannot be combined with --smoke")
             points_json, points_sha256 = _freeze_benchmark_points(points_path)
+        measure_power = getattr(args, "fpm_measure_power", None)
 
         return cls(
             benchmark_points_json=points_json,
@@ -688,6 +697,7 @@ class FPMCollectionOptions:
             gpu_memory_utilization=getattr(args, "fpm_gpu_memory_utilization", None),
             decoder_replay=bool(getattr(args, "fpm_decoder_replay", False)),
             enforce_eager=bool(getattr(args, "fpm_enforce_eager", False)),
+            measure_power=measure_power is not False,
             executor=executor,
             slurm_container_image=image,
             slurm_container_mounts=mounts,
@@ -746,11 +756,17 @@ class FPMCollectionOptions:
             result["gpu_memory_utilization"] = self.gpu_memory_utilization
         if self.enforce_eager:
             result["enforce_eager"] = True
+        if self.measure_power:
+            result["measure_power"] = True
         if self.benchmark_points_json is not None:
             result["benchmark_points"] = {
                 "payload": json.loads(self.benchmark_points_json),
                 "sha256": self.benchmark_points_sha256,
             }
+            if self.benchmark_points_origin is not None:
+                result["benchmark_points"]["origin"] = self.benchmark_points_origin
+            if self.benchmark_points_dropped_json is not None:
+                result["benchmark_points"]["dropped"] = json.loads(self.benchmark_points_dropped_json)
         return result
 
 
@@ -803,6 +819,15 @@ def add_fpm_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=None,
         help="Disable both CUDA graphs and torch.compile via worker --enforce-eager; included in the frozen plan.",
+    )
+    group.add_argument(
+        "--fpm-measure-power",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Measure each point's GPU power over a separate window after its latency sample (Dynamo "
+            "--benchmark-power-window-s); on by default, included in the frozen plan, never run by --smoke."
+        ),
     )
     group.add_argument(
         "--fpm-benchmark-points-file",
@@ -1130,6 +1155,7 @@ def reject_fpm_arguments_without_fpm(args: argparse.Namespace) -> None:
         "fpm_max_decode_batch_size",
         "fpm_decoder_replay",
         "fpm_enforce_eager",
+        "fpm_measure_power",
         "fpm_benchmark_points_file",
         "fpm_executor",
         "fpm_slurm_container_image",
