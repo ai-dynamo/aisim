@@ -442,6 +442,15 @@ Systems trace of the engine core: the time from `schedule()` to the end of
 has got when that launch ends. They depend mostly on the model, the engine
 version and the host CPU; the values above are only an illustration.
 
+FPM records from Dynamo's current vLLM producer already hold the part of the
+next pass's launch that a pass did not hide (see
+[collecting the FPM stream](../../perf-model/fpm_ml/learned-forward-pass-model.md#1-collect-the-fpm-stream)),
+so timing fitted on them counts those launches twice with `launch` on, until
+the producer times passes with CUDA events. When the timing fit sets
+`estimator_config.fpm_regression.fit.linear.max_cudagraph_capture_size`, it
+must equal `launch.max_cudagraph_capture_size`; replay rejects the role
+otherwise.
+
 `launch` needs aggregated vLLM workers with async scheduling and one GPU each
 (`tensor`, `pipeline`, `attention_data` and `prefill_context` of 1): only then
 does vLLM run its uniprocess executor, which launches a pass inside the engine

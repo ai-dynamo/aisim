@@ -57,8 +57,8 @@ One record = one FPM event from one engine worker:
 - **vLLM** (`InstrumentedScheduler`): host clock between two model-output arrivals
   (from `schedule()` after an idle step), i.e. the engine step including scheduler
   overhead. With async scheduling on one GPU, a record also holds the part of the
-  next step's launch that its own step did not hide; `charge_own_launch` moves it
-  back (see [collecting the FPM stream](learned-forward-pass-model.md#1-collect-the-fpm-stream)).
+  next step's launch that its own step did not hide (see
+  [collecting the FPM stream](learned-forward-pass-model.md#1-collect-the-fpm-stream)).
 - **SGLang** (`SchedulerMetricsReporter` + `DeviceTimer`): CUDA events around the
   forward, accumulated and flushed when the batch result is processed. With the
   overlap scheduler on, the disaggregated prefill loop does KV hand-off work before

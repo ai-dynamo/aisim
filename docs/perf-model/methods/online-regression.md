@@ -907,10 +907,10 @@ regression construction rejects nonpositive or nonfinite weights.
 Each estimator instance belongs to one worker and fixed deployment identity.
 The caller must route observations to that instance; a `worker_id` metadata field
 does not select another instance internally. A one-GPU vLLM worker with async
-scheduling reports the next pass's launch in the current pass's `wall_time`;
-[`charge_own_launch`](../fpm_ml/learned-forward-pass-model.md#1-collect-the-fpm-stream)
-moves it back before tuning. Predict before tuning on the new
-observation when evaluating online accuracy.
+scheduling reports the part of the next pass's launch that the current pass did
+not hide in the current pass's `wall_time`
+([collecting the FPM stream](../fpm_ml/learned-forward-pass-model.md#1-collect-the-fpm-stream)).
+Predict before tuning on the new observation when evaluating online accuracy.
 
 For an aggregated predictor, classify all active attention-DP ranks: any locally
 mixed rank selects `contains_locally_mixed`; otherwise separate prefill-only and
