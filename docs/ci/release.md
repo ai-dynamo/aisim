@@ -167,6 +167,12 @@ An unchanged Python manifest reuses the same resolution for both commits.
 The report runs independently of wheel builds and tests, and Full CI Success
 requires it. Nightly CI uses the same report generator with its broader
 Python/architecture matrix and previous successful scheduled nightly baseline.
+Nightly also publishes `evidence.json` with `source_sha` and `source_ref` for
+the selected source. Its `base_sha` is empty for the previous-nightly comparison;
+`baseline_status` is `previous_scheduled_nightly`, or `unavailable` when no
+retained scheduled-run evidence exists. The lookup paginates successful runs
+and their artifacts. A selected archive with missing, empty, or malformed
+`deps.csv` fails evidence generation instead of using an empty baseline.
 
 ## Source layout is not the publication boundary
 

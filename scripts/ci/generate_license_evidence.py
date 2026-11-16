@@ -84,33 +84,46 @@ def previous_nightly() -> list[dict[str, str]]:
         request.add_unredirected_header("Authorization", f"Bearer {token}")
         return urllib.request.urlopen(request, timeout=30)
 
-    with get(
-        f"https://api.github.com/repos/{repository}/actions/workflows/"
-        "nightly-ci.yml/runs?branch=main&event=schedule&status=success&per_page=10"
-    ) as response:
-        runs = json.load(response)
-    for run in runs.get("workflow_runs", []):
-        if str(run["id"]) == current:
-            continue
-        page = 1
-        while True:
-            with get(f"{run['artifacts_url']}?per_page=100&page={page}") as response:
-                artifacts = json.load(response).get("artifacts", [])
-            for artifact in artifacts:
-                if artifact["name"] != "license-artifacts" or artifact.get("expired"):
-                    continue
-                with get(artifact["archive_download_url"]) as response:
-                    data = response.read()
-                with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                    for name in archive.namelist():
-                        if Path(name).name == "deps.csv":
-                            with io.TextIOWrapper(archive.open(name)) as stream:
-                                return list(csv.DictReader(stream))
-                raise RuntimeError("prior license-artifacts is missing deps.csv")
-            if len(artifacts) < 100:
-                break
-            page += 1
-    return []
+    run_page = 1
+    while True:
+        with get(
+            f"https://api.github.com/repos/{repository}/actions/workflows/"
+            f"nightly-ci.yml/runs?branch=main&event=schedule&status=success&per_page=10&page={run_page}"
+        ) as response:
+            runs = json.load(response).get("workflow_runs", [])
+        for run in runs:
+            if str(run["id"]) == current:
+                continue
+            artifact_page = 1
+            while True:
+                with get(f"{run['artifacts_url']}?per_page=100&page={artifact_page}") as response:
+                    artifacts = json.load(response).get("artifacts", [])
+                for artifact in artifacts:
+                    if artifact["name"] != "license-artifacts" or artifact.get("expired"):
+                        continue
+                    with get(artifact["archive_download_url"]) as response:
+                        data = response.read()
+                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                        for name in archive.namelist():
+                            if Path(name).name == "deps.csv":
+                                with io.TextIOWrapper(archive.open(name)) as stream:
+                                    reader = csv.DictReader(stream)
+                                    if sorted(reader.fieldnames or []) != sorted(FIELDS):
+                                        raise ValueError("invalid prior license inventory headers")
+                                    rows = list(reader)
+                                if not rows or any(
+                                    None in row or any(not (row[field] or "").strip() for field in FIELDS)
+                                    for row in rows
+                                ):
+                                    raise ValueError("invalid prior license inventory rows")
+                                return rows
+                    raise RuntimeError("prior license-artifacts is missing deps.csv")
+                if len(artifacts) < 100:
+                    break
+                artifact_page += 1
+        if len(runs) < 10:
+            return []
+        run_page += 1
 
 
 def difference(rows: list[dict[str, str]], prior: list[dict[str, str]]) -> list[dict[str, str]]:

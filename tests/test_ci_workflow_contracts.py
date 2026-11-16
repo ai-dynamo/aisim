@@ -2615,6 +2615,8 @@ def _nightly_license_report(
     workspace_members=(),
     manual_prior=None,
     artifact_pages=None,
+    preceding_runs=0,
+    baseline_csv=None,
     bundled=None,
     bundled_arches=("amd64", "arm64"),
 ):
@@ -2666,6 +2668,11 @@ def _nightly_license_report(
         return archive.getvalue()
 
     archives = {"https://fixture/archive": archived(prior), "https://fixture/manual-archive": archived(manual_prior)}
+    if baseline_csv is not None:
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("deps.csv", baseline_csv)
+        archives["https://fixture/archive"] = archive.getvalue()
 
     responses = []
 
@@ -2676,12 +2683,21 @@ def _nightly_license_report(
             raise lookup_error
         if "/runs?" in request.full_url:
             query = parse_qs(urlsplit(request.full_url).query)
+            assert query["branch"] == ["main"]
+            assert query["status"] == ["success"]
+            assert query["per_page"] == ["10"]
             runs = [{"id": 1, "artifacts_url": "https://fixture/artifacts"}] if prior else []
+            runs = [
+                {"id": i + 10, "artifacts_url": "https://fixture/empty-artifacts"} for i in range(preceding_runs)
+            ] + runs
             if manual_prior and query.get("event") != ["schedule"]:
                 # A newer successful dispatch shares the main workflow ref,
                 # but its selected release source has unrelated dependencies.
                 runs.insert(0, {"id": 3, "artifacts_url": "https://fixture/manual-artifacts"})
-            payload = {"workflow_runs": runs}
+            page = int(query.get("page", ["1"])[0])
+            payload = {"workflow_runs": runs[(page - 1) * 10 : page * 10]}
+        elif request.full_url.startswith("https://fixture/empty-artifacts?"):
+            payload = {"artifacts": []}
         elif request.full_url.startswith("https://fixture/artifacts?"):
             query = parse_qs(urlsplit(request.full_url).query)
             assert query["per_page"] == ["100"]
@@ -2717,7 +2733,12 @@ def _nightly_license_report(
         patch.dict(os.environ, {"GH_API_TOKEN": "fixture", "GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "2"}),
         patch("urllib.request.urlopen", side_effect=urlopen),
     ):
-        assert license_evidence.main([str(tmp_path), "--previous-nightly"]) == 0
+        assert (
+            license_evidence.main(
+                [str(tmp_path), "--previous-nightly", "--source-sha", "a" * 40, "--source-ref", "refs/heads/main"]
+            )
+            == 0
+        )
     assert all(response.closed for response in responses)
     with (tmp_path / "deps.csv").open() as inventory, (tmp_path / "deps-diff.csv").open() as difference:
         return list(csv.DictReader(inventory)), list(csv.DictReader(difference))
@@ -2755,6 +2776,61 @@ def test_nightly_license_first_run_uses_empty_baseline(tmp_path, capsys):
     assert len(inventory) == len(difference) == 3
     assert all(row["change"] == "added" for row in difference)
     assert "No prior scheduled license evidence" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("has_baseline", [False, True])
+def test_nightly_license_report_records_source_and_baseline_provenance(tmp_path, has_baseline):
+    crates = [("0.2.17", "MIT")]
+    prior, _ = _nightly_license_report(tmp_path, crates)
+    _nightly_license_report(tmp_path, crates, prior if has_baseline else None)
+    evidence = json.loads((tmp_path / "evidence.json").read_text())
+    assert evidence["source_sha"] == "a" * 40
+    assert evidence["source_ref"] == "refs/heads/main"
+    assert evidence["base_sha"] == ""
+    assert evidence["baseline_status"] == ("previous_scheduled_nightly" if has_baseline else "unavailable")
+
+
+@pytest.mark.parametrize("preceding_runs", [10, 20])
+def test_nightly_license_baseline_finds_evidence_after_artifact_free_runs(tmp_path, preceding_runs):
+    crates = [("0.2.17", "MIT")]
+    prior, _ = _nightly_license_report(tmp_path, crates)
+    assert _nightly_license_report(tmp_path, crates, prior, preceding_runs=preceding_runs)[1] == []
+    assert json.loads((tmp_path / "evidence.json").read_text())["baseline_status"] == "previous_scheduled_nightly"
+
+
+def test_nightly_license_baseline_exhausts_artifact_free_run_pages(tmp_path):
+    inventory, difference = _nightly_license_report(tmp_path, [("0.2.17", "MIT")], preceding_runs=10)
+    assert len(inventory) == len(difference) == 3
+    assert json.loads((tmp_path / "evidence.json").read_text())["baseline_status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "baseline_csv",
+    [
+        "",
+        "dependency_type,name,version,spdx_license\n",
+        "dependency_type,name,version\npython,prettytable,3.16.0\n",
+        "dependency_type,name,version,spdx_license,extra\npython,prettytable,3.16.0,BSD-3-Clause,x\n",
+        "dependency_type,name,version,spdx_license\npython,prettytable,3.16.0\n",
+        "dependency_type,name,version,spdx_license\npython,prettytable,,BSD-3-Clause\n",
+    ],
+)
+def test_nightly_license_baseline_rejects_invalid_inventory_before_publishing(tmp_path, baseline_csv):
+    prior = [{"dependency_type": "python", "name": "prettytable", "version": "3.16.0", "spdx_license": "BSD-3-Clause"}]
+    with pytest.raises(ValueError, match="invalid prior license inventory"):
+        _nightly_license_report(tmp_path, [("0.2.17", "MIT")], prior, baseline_csv=baseline_csv)
+    for filename in ("deps.csv", "deps-diff.csv", "evidence.json"):
+        assert not (tmp_path / filename).exists()
+
+
+@pytest.mark.parametrize(
+    "bundled",
+    [[], [{"dependency_type": "python", "name": "example", "version": "1.0", "spdx_license": "Apache-2.0"}]],
+)
+def test_nightly_license_inventory_rejects_empty_or_wrong_type_bundled_rows(tmp_path, bundled):
+    with pytest.raises(SystemExit, match="invalid bundled configuration inventory"):
+        _nightly_license_report(tmp_path, [], bundled=bundled)
+    assert not (tmp_path / "deps-diff.csv").exists()
 
 
 def test_nightly_license_baseline_lookup_failure_does_not_publish_diff(tmp_path):
