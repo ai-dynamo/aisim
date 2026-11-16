@@ -113,6 +113,11 @@ def load_repeatability_source(source_campaign_dir: str | Path) -> FPMCollectionP
         options.update(
             benchmark_points_json=json.dumps(points["payload"], sort_keys=True, separators=(",", ":")),
             benchmark_points_sha256=points["sha256"],
+            # A list that the planner generated names its generator and its drop counts. A user file has neither.
+            benchmark_points_origin=points.get("origin"),
+            benchmark_points_dropped_json=(
+                json.dumps(points["dropped"], sort_keys=True, separators=(",", ":")) if "dropped" in points else None
+            ),
         )
     capability = copy.deepcopy(saved["capability"])
     config = capability.pop("model_config")
@@ -406,6 +411,9 @@ def _subset_plan(
         source.options,
         benchmark_points_json=canonical,
         benchmark_points_sha256=_canonical_hash(selected["benchmark_points"]),
+        # A bounded sample is not the list that a generator produced, so it is labeled and staged as an explicit list.
+        benchmark_points_origin=None,
+        benchmark_points_dropped_json=None,
     )
     if comparison_mode == "full_grid":
         options = source.options
@@ -512,6 +520,9 @@ def _sample_evidence(plan: FPMCollectionPlan, selected: dict[str, Any], director
         "runtime_run_id": collection.runtime_run_id,
         "runtime_grid_digest": collection.runtime_grid_digest,
         "measurement": extract_measurement_evidence(root / "raw", collection, evidence_version=evidence_version),
+        # Repeats compare latency only. A plan with measure_power runs each
+        # attempt's own power window, but power is never compared or combined
+        # across attempts.
         "points": {
             key: {
                 "wall_time_seconds": max(value for _, value in item.rank_wall_times),

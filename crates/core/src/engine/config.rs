@@ -26,6 +26,9 @@ const DEFAULT_CHUNKED_PREFILL_SIZE: usize = 8_192;
 const DEFAULT_CLIP_MAX_NEW_TOKENS: usize = 4_096;
 const DEFAULT_SCHEDULE_CONSERVATIVENESS: f64 = 1.0;
 const DEFAULT_HOST_OFFLOAD_BANDWIDTH_GBPS: f64 = 32.0;
+/// Later pipeline stages one rank tracks. A stage holds at least one layer, so this is far
+/// above any served model's depth; it bounds the per-stage state a rank allocates.
+pub(crate) const MAX_PIPELINE_FILL_PASSES: f64 = 1024.0;
 
 fn serialize_scheduler_limit<S: serde::Serializer>(
     value: &usize,
@@ -389,6 +392,13 @@ pub struct SglangConfig {
     /// Extra request rows for in-transfer PD decode requests. Unset uses
     /// twice the requested batch size for explicit limits at or below 32.
     pub disaggregation_decode_extra_slots: Option<usize>,
+    /// DeepSeek-V4 sliding-window prefix reuse: how many cached sequence tails the SWA pool has
+    /// room for (SGLang `swa_prefix_tails`, one window and one page of SWA KV each). A prefix
+    /// hit then ends on a page whose SWA KV is still cached: before a prefill chunk end, a
+    /// prompt end, or a fork point an earlier request recomputed. Unset reuses cached KV up to
+    /// any page, as for full attention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swa_prefix_tails: Option<usize>,
 }
 
 const fn default_reserved_decode_tokens() -> usize {
@@ -413,6 +423,7 @@ impl Default for SglangConfig {
             disaggregation_decode_enable_radix_cache: false,
             num_reserved_decode_tokens: default_reserved_decode_tokens(),
             disaggregation_decode_extra_slots: None,
+            swa_prefix_tails: None,
         }
     }
 }
@@ -1029,6 +1040,10 @@ pub struct EngineConfig {
     /// Additional divisor applied to decode latency.
     #[serde(default = "default_one")]
     pub decode_speedup_ratio: f64,
+    /// Later pipeline stages a prefill forward still crosses after its pass retires (PP size - 1
+    /// on a PP prefill worker, whose passes retire at the per-stage rate); delays the KV handoff.
+    #[serde(default)]
+    pub pipeline_fill_passes: f64,
     /// MTP/EAGLE draft-token count. One verification forward can emit up to
     /// `aic_nextn + 1` output tokens.
     pub aic_nextn: Option<usize>,
@@ -1140,6 +1155,8 @@ struct EngineConfigWire {
     #[serde(default = "default_one")]
     decode_speedup_ratio: f64,
     #[serde(default)]
+    pipeline_fill_passes: f64,
+    #[serde(default)]
     aic_nextn: Option<usize>,
     #[serde(default)]
     aic_nextn_accept_rates: Option<String>,
@@ -1222,6 +1239,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             enable_chunked_prefill: wire.enable_chunked_prefill,
             speedup_ratio: wire.speedup_ratio,
             decode_speedup_ratio: wire.decode_speedup_ratio,
+            pipeline_fill_passes: wire.pipeline_fill_passes,
             aic_nextn: wire.aic_nextn,
             aic_nextn_accept_rates: wire.aic_nextn_accept_rates,
             aic_mtp_seed: wire.aic_mtp_seed,
@@ -1270,6 +1288,7 @@ impl Default for EngineConfig {
             enable_chunked_prefill: true,
             speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            pipeline_fill_passes: 0.0,
             aic_nextn: None,
             aic_nextn_accept_rates: None,
             aic_mtp_seed: default_aic_mtp_seed(),
@@ -1501,6 +1520,22 @@ impl EngineConfig {
             !self.sglang.host_loop || self.worker_type != WorkerType::Decode,
             "sglang.host_loop is not modeled on a decode rank; the decode rank runs the text P/D decode loop"
         );
+        ensure!(
+            self.sglang.swa_prefix_tails.is_none() || self.backend == Backend::Sglang,
+            "sglang.swa_prefix_tails is supported only for backend=sglang"
+        );
+        ensure!(
+            self.sglang.swa_prefix_tails != Some(0),
+            "sglang.swa_prefix_tails must be positive"
+        );
+        // SWA reuse is tracked on SGLang's 256-token pages, each a whole number of KV blocks.
+        let swa_page = crate::engine::kv_manager::sglang_backend::SWA_PAGE_TOKENS;
+        ensure!(
+            self.sglang.swa_prefix_tails.is_none()
+                || (self.block_size > 0 && swa_page.is_multiple_of(self.block_size)),
+            "sglang.swa_prefix_tails requires block_size to divide the {swa_page}-token SWA page, got {}",
+            self.block_size
+        );
         if self.sglang.disaggregation_decode_enable_radix_cache {
             ensure!(
                 self.backend == Backend::Sglang,
@@ -1541,6 +1576,16 @@ impl EngineConfig {
         ensure!(
             self.decode_speedup_ratio.is_finite() && self.decode_speedup_ratio >= 0.0,
             "decode_speedup_ratio must be finite and non-negative"
+        );
+        ensure!(
+            self.pipeline_fill_passes.is_finite()
+                && self.pipeline_fill_passes >= 0.0
+                && self.pipeline_fill_passes.fract() == 0.0,
+            "pipeline_fill_passes must be a non-negative whole number"
+        );
+        ensure!(
+            self.pipeline_fill_passes <= MAX_PIPELINE_FILL_PASSES,
+            "pipeline_fill_passes must be at most {MAX_PIPELINE_FILL_PASSES}"
         );
         if let Some(nextn) = self.aic_nextn {
             normalize_conditional_accept_rates(nextn, self.aic_nextn_accept_rates.as_deref())?;
@@ -1684,16 +1729,17 @@ impl EngineConfig {
                     "native_host_offload with MTP requires async_scheduling=false"
                 );
                 ensure!(
-                    self.worker_type == WorkerType::Aggregated,
-                    "native_host_offload with aic_nextn requires worker_type=aggregated"
-                );
-                ensure!(
-                    host_offload.scope == G2Scope::DpRankLocal,
-                    "native_host_offload with aic_nextn requires dp_rank_local scope"
+                    host_offload.scope == G2Scope::DpRankLocal
+                        || self.worker_type != WorkerType::Aggregated,
+                    "native_host_offload with aic_nextn on an aggregated worker requires dp_rank_local scope"
                 );
                 ensure!(
                     self.g3_offload.is_none(),
                     "native_host_offload with aic_nextn does not support g3_offload"
+                );
+                ensure!(
+                    self.kvcr.is_none() || self.worker_type == WorkerType::Aggregated,
+                    "kvcr with aic_nextn requires worker_type=aggregated"
                 );
                 ensure!(
                     self.state_cache.is_none()
@@ -1810,6 +1856,23 @@ mod tests {
             pipeline_layout: Default::default(),
             comm_overhead_factor: 1.0,
             routing_location: crate::AfdRoutingLocation::A,
+        }
+    }
+
+    #[test]
+    fn swa_prefix_tails_require_a_block_size_dividing_the_swa_page() {
+        let config = |block_size| {
+            let mut config = EngineConfig::for_backend(Backend::Sglang);
+            config.block_size = block_size;
+            config.sglang.swa_prefix_tails = Some(8);
+            config
+        };
+        for block_size in [1, 64, 256] {
+            config(block_size).validate().expect("divides the SWA page");
+        }
+        for block_size in [96, 512] {
+            let error = config(block_size).validate().unwrap_err().to_string();
+            assert!(error.contains("256-token SWA page"), "{error}");
         }
     }
 
@@ -2635,13 +2698,6 @@ mod tests {
             ),
             (
                 |config| {
-                    set_canonical_mtp(config, 1);
-                    config.worker_type = WorkerType::Decode;
-                },
-                "requires worker_type=aggregated",
-            ),
-            (
-                |config| {
                     set_canonical_mtp(config, 2);
                     let host = config.native_host_offload.as_mut().unwrap();
                     host.scope = G2Scope::ClusterShared;
@@ -2796,6 +2852,13 @@ mod tests {
                     })
                 },
                 "kvcr cannot be combined with g3_offload",
+            ),
+            (
+                |config| {
+                    set_canonical_mtp(config, 1);
+                    config.worker_type = WorkerType::Prefill;
+                },
+                "kvcr with aic_nextn requires worker_type=aggregated",
             ),
             (
                 |config| config.kvcr.as_mut().unwrap().bandwidth_gbps = -1.0,
@@ -3233,5 +3296,41 @@ mod tests {
             ..EngineConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pipeline_fill_passes_must_be_a_whole_stage_count() {
+        for stages in [0.0, 1.0, 3.0] {
+            let config = EngineConfig {
+                pipeline_fill_passes: stages,
+                ..EngineConfig::default()
+            };
+            config.validate().unwrap();
+        }
+        for stages in [-1.0, 0.5, f64::NAN, f64::INFINITY] {
+            let config = EngineConfig {
+                pipeline_fill_passes: stages,
+                ..EngineConfig::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pipeline_fill_passes must be a non-negative whole number"),
+                "{stages}"
+            );
+        }
+        let config = EngineConfig {
+            pipeline_fill_passes: MAX_PIPELINE_FILL_PASSES + 1.0,
+            ..EngineConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("pipeline_fill_passes must be at most 1024")
+        );
     }
 }

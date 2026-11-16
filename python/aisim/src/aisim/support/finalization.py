@@ -273,10 +273,15 @@ def _finalized_resources(
     profile that has runtime-probe evidence stays linear, so the merged groups are returned in the linear layout.
     Every other profile, such as a config-derived one, gets the merged grouped measurements, as before.
     """
-    from .runtime import runtime_probe_manifest
+    from .runtime import as_saved_resources, runtime_probe_manifest
 
+    probe = runtime_probe_manifest(source)
+    if probe is not None:
+        # A source imported before the later cache group fields existed keeps them out of its finalized groups and of
+        # the cell observations that its provenance records.
+        observations = [as_saved_resources(probe["observed_resources"], item) for item in observations]
     merged = _merge_resources(observations, manifest, source_references=source_references)
-    if source.profile_deployment().resources.cache_layout != "linear" or runtime_probe_manifest(source) is None:
+    if source.profile_deployment().resources.cache_layout != "linear" or probe is None:
         return merged, merged
     linear = linear_runtime_resources(merged)
     if linear is None:
@@ -297,6 +302,7 @@ def _verify_collection(
         published_dense_synthetic_cells,
         validate_formal_database_commit,
     )
+    from collector.fpm_forward.glm53flash_points import GLM_POINTS_ORIGIN, glm_plan_manifest
     from collector.fpm_forward.planner import backend_identity_columns
     from collector.fpm_forward.runner import CHECKPOINT_SCHEMA
     from collector.fpm_forward.runtime_memory import (
@@ -379,6 +385,13 @@ def _verify_collection(
     reviewed_options = reviewed_collection.to_dict()
     for options in (reviewed_options, saved_options):
         options.setdefault("gpu_memory_utilization", request.collection.memory_fraction)
+    saved_points = saved_options.get("benchmark_points", {})
+    if saved_points.get("origin") == GLM_POINTS_ORIGIN:
+        # The planner generated this list from the collection limits and the accepted profile. The reviewed settings
+        # must generate the same list.
+        saved_options.pop("benchmark_points")
+        if glm_plan_manifest(reviewed_collection, [deployment])[1] != saved_points.get("sha256"):
+            raise ValueError("saved GLM-5.3-Flash point list differs from the list generated for the reviewed settings")
     if saved_options != reviewed_options:
         raise ValueError("saved collection options differ from the reviewed runtime and collection settings")
     expected_graph = reviewed_collection.compilation_config

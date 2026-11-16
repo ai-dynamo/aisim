@@ -152,10 +152,15 @@ simulator workload assumption, supplied separately by the unified CLI as
 
 `estimation_mode` defaults to `auto`; `fallback_policy` defaults to `deny`.
 Auto always searches `op_level`, `fpm_interpolation`, then `fpm_regression`,
-including when fallback is denied. For an explicit choice of one of those three
-modes, deny permits only that estimator; allow tries the requested estimator
-first, then the remaining estimators in the same global priority order. Each
-native mode tries the ordered `systems_paths` before moving to another estimator.
+including when fallback is denied. When the SILICON `op_level` candidate
+reports a missing linear-attention table or kernel (Mamba2, GDN, KDA), auto
+rebuilds that candidate in `HYBRID` before `fpm_interpolation`, and the
+provenance records the miss in `selection_failures` together with the
+requested and selected database modes. For an explicit choice of one of those
+three modes, deny permits only that estimator; allow tries the requested
+estimator first, then the remaining estimators in the same global priority
+order. Each native mode tries the ordered `systems_paths` before moving to
+another estimator.
 Omitted roots preserve configured SDK discovery (or the systems-path environment
 override when the SDK uses its packaged default); an explicit `default` entry
 selects the packaged root.
@@ -183,10 +188,11 @@ store has a usable fit. Offline prediction/recommendation reject an untrained
 regression instead of fabricating a latency. The current aggregated regression
 retains its four workload stores; dedicated roles retain one each.
 
-The returned provenance records the requested and selected modes, failed
-selection attempts, effective backend version, data policy, selected root,
-and complete estimator configuration. Its resolved config pins the selected
-mode with deny so saved replay input repeats that selection.
+The returned provenance records the requested and selected estimation and
+database modes, failed selection attempts, effective backend version, data
+policy, selected root, and complete estimator configuration. Its resolved
+config pins the selected mode with deny so saved replay input repeats that
+selection.
 
 ### Diagnostic source values
 
@@ -1398,11 +1404,15 @@ work as before in this release. The next release removes them.
 | `engine.estimation_mode` | `auto` | `x` | `-` | Deprecated; use [`engine.ais_perf_model`](#unified-perf-model-input). `auto`, `op_level`, `fpm_interpolation`, `fpm_regression`, or `fpm_learned`. Regression and learned roles are priced per iteration (see [engine replay timing](#engine-replay-timing)). |
 | `engine.workers.<role>.timing.estimation_mode` | `null` | `x` | `-` | Deprecated; use [`engine.ais_perf_model`](#unified-perf-model-input). Optional role override using the same five modes; omission inherits the global selection. |
 | `engine.workers.<role>.timing.type` | `default` | `x` | `-` | `default`, `fixed`, or `polynomial`. |
-| `engine.workers.<role>.timing.prefill_ms` | `null` | `x` | `-` | Nonnegative and required for `fixed` timing. |
-| `engine.workers.<role>.timing.decode_ms` | `null` | `x` | `-` | Nonnegative and required for `fixed` timing. |
+| `engine.workers.<role>.timing.prefill_ms` | `null` | `x` | `-` | Finite, nonnegative and required for `fixed` timing. |
+| `engine.workers.<role>.timing.decode_ms` | `null` | `x` | `-` | Finite, nonnegative and required for `fixed` timing. |
 | `engine.workers.<role>.timing.forward_model` | `op_level` | `x` | `-` | Deprecated; use [`engine.ais_perf_model`](#unified-perf-model-input). `op_level` or `fpm`; `default` timing only. `fpm` replays whole-forward (FPM) latency measured for the role's exact model, hardware, backend version, parallel shape and quantization, and fails closed when no such cell exists. |
 | `engine.workers.<role>.timing.fpm_parquet_path` | `null` | `x` | `-` | Deprecated; use [`engine.ais_perf_model`](#unified-perf-model-input). External FPM parquet for `forward_model: fpm`; the adjacent same-stem `.metadata.json` sidecar is required. Relative paths are anchored to the working directory when the engine is constructed. Preserved per role in recommendations, candidate YAML, and ordinary prefill/decode companions of AFD roles. |
 | `engine.workers.<role>.timing.estimator_config.state_snapshot` | `null` | `x` | `-` | Deprecated; use [`engine.ais_perf_model`](#unified-perf-model-input). `recommend`: `{path, sha256}` of a calibrated snapshot; the role takes its estimator and engine identity from it. See [snapshot roles](#recommending-with-a-calibrated-snapshot). `predict` requires the complete saved configuration, as for any `state_snapshot`. |
+
+Fixed timing accepts zero for either phase. Nonfinite values (infinity or NaN)
+are configuration errors, rejected before prediction output is prepared, including
+when `--overwrite` is used.
 
 AFD replay prices every decode pass at its actual batch, context length and
 MTP verification width. The former `estimator_config.afd.frozen_decode_identity`

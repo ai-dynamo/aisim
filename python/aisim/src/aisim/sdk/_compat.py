@@ -33,15 +33,32 @@ _FACADE_LOCAL_ATTRIBUTES = frozenset(
 class _CanonicalPackageFacade(ModuleType):
     """Keep package metadata local while forwarding API mutations."""
 
+    @property
+    def __dict__(self) -> dict[str, object]:
+        """Expose delegated attributes to tools that inspect before patching.
+
+        Patching tools may save the original value from this mapping.
+        Hiding canonical names can make their undo delete the real attribute.
+        Build a fresh view so canonical updates remain visible, while import
+        metadata continues to describe this compatibility package.
+        Mutating this snapshot does not update either module; use attribute
+        assignment to change delegated names.
+        """
+        namespace = super().__dict__
+        canonical = namespace.get("_canonical_module")
+        if canonical is None:
+            return namespace
+        return {**vars(canonical), **namespace}
+
     def __setattr__(self, name: str, value: object) -> None:
-        canonical = self.__dict__.get("_canonical_module")
+        canonical = super().__dict__.get("_canonical_module")
         if canonical is None or name in _FACADE_LOCAL_ATTRIBUTES:
             super().__setattr__(name, value)
             return
         setattr(canonical, name, value)
 
     def __delattr__(self, name: str) -> None:
-        canonical = self.__dict__.get("_canonical_module")
+        canonical = super().__dict__.get("_canonical_module")
         if canonical is None or name in _FACADE_LOCAL_ATTRIBUTES:
             super().__delattr__(name)
             return

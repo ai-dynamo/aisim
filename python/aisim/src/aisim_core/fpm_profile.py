@@ -53,6 +53,18 @@ class FpmCacheGroup(_ProfileModel):
     block for one or two steps. vLLM's startup sizing in that mode counts
     ``2 + k + c`` blocks for a Mamba group, where ``c`` is the spec's
     ``num_prefill_checkpoint_blocks``. It counts 1 block for a ring group.
+
+    Four optional fields describe the group beyond its geometry.
+    ``prefix_cacheable`` says whether vLLM's manager for the group takes part in
+    prefix caching. A ring spec does not. ``transfer_bytes_per_block`` is the
+    bytes that vLLM's P/D connector reads for one block of the group in a
+    transfer on one TP rank, for the vLLM version of the deployment. It can be
+    larger than the page, because the connector reads a block in regions that
+    layers of other groups can share. The probe import of a vLLM 0.33.0 record
+    does not write it.
+    ``prefill_checkpoint_blocks`` (0 or 1, state groups only) and
+    ``prefill_checkpoint_alignment`` (positive, with one checkpoint block) are
+    the prefill checkpoint settings of a Mamba spec.
     """
 
     name: _Nonempty
@@ -63,6 +75,13 @@ class FpmCacheGroup(_ProfileModel):
     sliding_window: Annotated[int, Field(gt=0, le=2**32 - 1)] | None = None
     # The lower bound is checked in _window, so a zero or negative count gets the text that Rust gives for zero.
     blocks_per_request: Annotated[int, Field(le=2**32 - 1)] | None = None
+    prefix_cacheable: bool | None = None
+    # _window checks the lower bounds below to give the Rust texts. json_schema_extra keeps them in the JSON Schema.
+    transfer_bytes_per_block: Annotated[int, Field(le=2**53, json_schema_extra={"exclusiveMinimum": 0})] | None = None
+    prefill_checkpoint_blocks: Annotated[int, Field(json_schema_extra={"minimum": 0, "maximum": 1})] | None = None
+    prefill_checkpoint_alignment: (
+        Annotated[int, Field(le=2**32 - 1, json_schema_extra={"exclusiveMinimum": 0})] | None
+    ) = None
 
     @model_validator(mode="after")
     def _window(self) -> FpmCacheGroup:
@@ -76,14 +95,31 @@ class FpmCacheGroup(_ProfileModel):
                 raise ValueError("state cache groups cannot have a sliding_window")
         elif self.blocks_per_request is not None:
             raise ValueError("blocks_per_request applies only to state cache groups")
+        if self.transfer_bytes_per_block is not None and self.transfer_bytes_per_block <= 0:
+            raise ValueError("transfer_bytes_per_block must be positive and at most 2**53")
+        if self.prefill_checkpoint_blocks is not None and (
+            self.kind != "state" or self.prefill_checkpoint_blocks not in (0, 1)
+        ):
+            raise ValueError("prefill_checkpoint_blocks requires a state group and must be 0 or 1")
+        if self.prefill_checkpoint_alignment is not None and (
+            self.prefill_checkpoint_blocks != 1 or self.prefill_checkpoint_alignment <= 0
+        ):
+            raise ValueError("prefill_checkpoint_alignment requires prefill_checkpoint_blocks=1 and must be positive")
         return self
 
     @model_serializer(mode="wrap")
     def _serialize_group(self, handler):
-        # Do not add an absent block count to saved profiles or change plan IDs.
+        # Do not add absent optional fields to saved profiles or change plan IDs.
         result = handler(self)
-        if self.blocks_per_request is None:
-            result.pop("blocks_per_request", None)
+        for name in (
+            "blocks_per_request",
+            "prefix_cacheable",
+            "transfer_bytes_per_block",
+            "prefill_checkpoint_blocks",
+            "prefill_checkpoint_alignment",
+        ):
+            if getattr(self, name) is None:
+                result.pop(name, None)
         return result
 
 
@@ -105,6 +141,9 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     mamba_cache_mode: Literal["none", "align"] | None = None
     # The lower bound is checked in _prefix_caching, so a size of zero or less gets the text that Rust gives for zero.
     hash_block_size_tokens: Annotated[int, Field(le=2**32 - 1)] | None = None
+    # The version of the runtime that observed the cache group evidence. It can differ from the deployment's
+    # backend_version, which is a dataset label.
+    runtime_framework_version: str | None = None
 
     @model_validator(mode="after")
     def _prefix_caching(self) -> FpmRuntimeMemoryProfile:
@@ -113,13 +152,20 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
             raise ValueError("mamba_cache_mode align requires enable_prefix_caching=true")
         if self.hash_block_size_tokens is not None and self.hash_block_size_tokens <= 0:
             raise ValueError("hash_block_size_tokens must be positive")
+        if self.runtime_framework_version is not None and not self.runtime_framework_version.strip():
+            raise ValueError("runtime_framework_version must be nonempty")
         return self
 
     @model_serializer(mode="wrap")
     def _serialize_memory(self, handler):
         # Do not add absent evidence to saved profiles or change plan IDs.
         result = handler(self)
-        for name in ("enable_prefix_caching", "mamba_cache_mode", "hash_block_size_tokens"):
+        for name in (
+            "enable_prefix_caching",
+            "mamba_cache_mode",
+            "hash_block_size_tokens",
+            "runtime_framework_version",
+        ):
             if getattr(self, name) is None:
                 result.pop(name, None)
         return result

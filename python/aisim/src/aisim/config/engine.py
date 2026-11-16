@@ -165,6 +165,13 @@ class SchedulerPredictionConfig(StrictModel):
             "or MTP with G2 host offload."
         ),
     )
+    load_balance_method: Literal["round_robin", "total_tokens"] = Field(
+        default="round_robin",
+        description=(
+            "SGLang PD decode only: how a request picks its attention-DP rank (SGLang --load-balance-method). "
+            "total_tokens sends it to the rank holding the fewest tokens; round_robin takes ranks in turn."
+        ),
+    )
 
 
 class KvCapacityPredictionConfig(StrictModel):
@@ -331,6 +338,7 @@ class KvCachePredictionConfig(StrictModel):
     prefix_match_unit: PositiveU64 | None = None
     prefix_caching: bool = True
     decode_radix_cache: bool = False
+    swa_prefix_tails: PositiveInt | Literal["auto"] | None = "auto"
     bytes_per_token: KvBytesPerToken = "auto"
     capacity: KvCapacityPredictionConfig = Field(default_factory=KvCapacityPredictionConfig)
     host_offload: HostOffloadConfig | None = None
@@ -501,8 +509,8 @@ class TimingConfig(StrictModel):
                 value.setdefault("fallback_policy", "deny")
         return value
 
-    prefill_ms: float | None = Field(default=None, ge=0.0)
-    decode_ms: float | None = Field(default=None, ge=0.0)
+    prefill_ms: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    decode_ms: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_timing(self) -> TimingConfig:
@@ -1532,19 +1540,14 @@ def _validate_speculation(engine, *, modes: set[str], backends: set[str]) -> Non
             if worker.scheduler.async_scheduling is True:
                 raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
             cache = worker.kv_cache
-            if (
-                backends != {"vllm"}
-                or modes != {"aggregated"}
-                or role != "aggregated"
-                or worker.parallelism.attention_data != 1
-                or not cache.prefix_caching
-                or cache.host_offload.scope != "dp_rank_local"
-                or cache.g3_offload is not None
-            ):
+            if backends != {"vllm"} or not cache.prefix_caching or cache.g3_offload is not None:
                 raise ValueError(
-                    "mtp speculation with host_offload requires aggregated vllm, attention_data=1, "
-                    "prefix_caching=true, scope=dp_rank_local, and no g3_offload"
+                    "mtp speculation with host_offload requires vllm, prefix_caching=true, and no g3_offload"
                 )
+            if role == "aggregated" and cache.host_offload.scope != "dp_rank_local":
+                raise ValueError("mtp speculation with host_offload requires scope=dp_rank_local on workers.aggregated")
+            if role != "aggregated" and cache.kvcr is not None:
+                raise ValueError(f"mtp speculation does not support kv_cache.kvcr on workers.{role}")
         if kind == "ngram" and worker.timing.forward_model != "op_level":
             raise ValueError(f"{kind} speculation requires op_level timing")
         if kind != "ngram" and worker.kv_cache.capacity.type != "fixed":
@@ -1588,9 +1591,16 @@ def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> No
             ("prefill_schedule_interval", "vllm", 1),
             ("prefill_decode_interval", "sglang", 0),
             ("async_scheduling", "vllm", None),
+            ("load_balance_method", "sglang", "round_robin"),
         ):
             if engine.backend != backend and getattr(worker.scheduler, field) != default:
                 raise ValueError(f"workers.{role}.scheduler.{field} is supported only for backend={backend}")
+        if worker.scheduler.load_balance_method != "round_robin" and (
+            role != "decode" or engine.mode != "disaggregated"
+        ):
+            raise ValueError(
+                f"workers.{role}.scheduler.load_balance_method is supported only for the disaggregated decode role"
+            )
 
 
 def _validate_decode_radix_cache(*, backends: set[str], workers, speculative: bool) -> None:

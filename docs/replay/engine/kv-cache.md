@@ -44,6 +44,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 |---|---|---|---|
 | `block_size` | vLLM `64`, SGLang `1`, TensorRT-LLM `32` | Searchable; fixed by default | Tokens per block. vLLM and TensorRT-LLM require at least 2. |
 | `prefix_caching` | `true` | fixed | Keep completed prompt blocks for reuse by later requests. |
+| `swa_prefix_tails` | `auto` | fixed | SGLang only. Sequence tails per attention-DP rank that keep their DeepSeek-V4 sliding-window KV; `null` turns it off. `auto` uses four per running request for a DeepSeek-V4 checkpoint and is off for other models. See [DeepSeek-V4 SWA prefix reuse](#deepseek-v4-swa-prefix-reuse). |
 | `decode_radix_cache` | `false` | fixed | SGLang `decode` only. Enables the decode worker's radix cache (`--disaggregation-decode-enable-radix-cache`); requires `prefix_caching: true` and no speculative decoding. See [SGLang decode radix cache](#sglang-decode-radix-cache). |
 | `bytes_per_token` | `auto` | fixed | KV bytes per token on one TP shard. `auto` derives it from the model, KV precision and this role's parallelism. |
 | `capacity.type` | `default` | fixed | `default` sizes G1 from GPU memory; `fixed` uses `blocks` or `bytes`. |
@@ -102,6 +103,22 @@ forwards and on idle. Under memory pressure, decode retraction stably orders
 requests by descending output length and then ascending prompt length, retracts
 from the end, and evicts unused cache toward a 20-token reserve per survivor.
 These contracts follow [SGLang v0.5.20](https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e).
+
+### SGLang simulator storage
+
+Waiting-queue admission reserves the request's host-side page-ID vector for its
+bounded prompt-plus-output target, including a partial final page. Chunked
+prefill also reserves spare capacity on a private radix leaf when it can extend
+in place. The leaf releases unused capacity when it gains a child or its last
+holder exits. Shared leaves, HiCache edges, and sliding-window cache boundaries
+cannot extend in place and do not receive this tail reservation.
+
+Disaggregated destination activation takes ownership of the transferred prompt's
+page vector and retains amortized growth during decode. It does not run chunked
+prefill or promise completion-sized page-list capacity. In ordinary decode the
+radix cache receives the prompt at running admission and the output at terminal
+cleanup, rather than extending a leaf after every token. These host allocation
+choices do not reserve simulated GPU pages or change predicted serving times.
 
 ### SGLang decode radix cache
 
@@ -169,6 +186,60 @@ a salted prompt should use `ReplayRequestHashes::from_tokens_with_cache_salt`.
 This is a simulator contract pinned to SGLang v0.5.22. AISim does not check
 the installed serving runtime's support for `cache_salt` or the decode radix
 flag; verify both capabilities when deploying an older SGLang version.
+
+<a id="deepseek-v4-swa-prefix-reuse"></a>
+
+## DeepSeek-V4 SWA prefix reuse
+
+DeepSeek-V4 layers keep a sliding window of KV next to their compressed KV.
+SGLang serves these models with 256-token KV pages and frees a running
+request's SWA pages as the request moves past them, so a cached sequence holds
+SWA KV only on the pages just before the points where it was inserted into the
+radix cache. A prefix hit must end on a page whose SWA KV is cached
+(`create_match_validator` in SGLang v0.5.21
+`mem_cache/unified_cache/components/swa.py`). A request that forks elsewhere
+inside another cached sequence, such as a subagent's first turn, therefore
+recomputes from the last such page even though full KV covers more.
+
+`kv_cache.swa_prefix_tails` turns this on for SGLang `aggregated` and `prefill`
+workers. Replay keeps the SWA pages SGLang leaves cached:
+
+- Each prefill chunk end and the prompt end is an insert. An insert that ends
+  on a page boundary keeps the two SWA pages before it; any other insert keeps
+  the last whole page before it.
+- A request whose hit was cut back inserts at its fork point once it has
+  recomputed that far, in place of that chunk's end, so the next request
+  forking there reuses it (`finalize_match_result_in_tree_core`).
+- Replay's generated output tokens differ from the next prompt in a trace, so a
+  continuation diverges where the previous output began instead of matching
+  through it to the tail. A finished request therefore keeps its SWA page
+  before the end of its prompt.
+
+A hit refreshes the SWA page it ended on and the one before it. The SWA pool
+holds one window and one page (384 tokens) per `swa_prefix_tails`, per
+attention-DP rank; beyond that, the least recently used SWA page is dropped.
+Evicting a sequence's tail also drops its SWA pages. With HiCache, an SWA page
+stays valid while its node is host-resident, and the host SWA pool adds room:
+it is sized from the device SWA pool by the ratio of `hicache.num_host_blocks`
+to device KV blocks. Under `write_through` the host copy duplicates the device
+page, so the larger of the two pools bounds the cached SWA pages; under
+`write_back` the two pools add up. `write_through_selective` copies a node to
+the host only after repeated hits, so the device pool alone bounds the cached
+SWA pages.
+
+`auto` sizes the pool as SGLang's `cap` mode does: four tails per running
+request (`max_sequences`). It applies to a checkpoint whose bundled or local
+config has architecture `DeepseekV4ForCausalLM` or `DeepseekV41ForCausalLM`.
+Set a number to match a server that sized its SWA pool another way (for
+`swa_full_tokens_ratio`, the pool's tokens beyond 384 per running request,
+divided by 384), or `null` to match full KV at any page. These are modeling
+assumptions: SWA pages are tracked on replay's page grid rounded up to 256
+tokens, a chunk end's partial page is not tracked, and the pool shares no
+capacity with full KV.
+A decode worker's radix cache matches full KV as before. Native engine
+configurations set the resolved count as `sglang.swa_prefix_tails` (a positive
+integer, SGLang only; unset turns it off). It requires a `block_size` that
+divides the 256-token SWA page.
 
 <a id="host-offload-g2"></a>
 <a id="native-vllm-host-offload-prediction"></a>
@@ -349,14 +420,16 @@ G2 supports vLLM aggregated and token-only disaggregated workers with prefix
 caching and any `attention_data`. It is rejected with SGLang, TensorRT-LLM,
 ngram speculation, `state_cache`, and Belady eviction.
 
-Canonical `engine.speculation.kind: mtp` can combine with G2 only on an
-aggregated vLLM worker with `attention_data: 1`, `scope: dp_rank_local`, prefix
-caching and no G3. Use explicit fixed KV capacity and default timing. This
-models synchronous single-module MTP with one uniform shared FullAttention
-cache; separate draft models and grouped caches are unsupported. See
+Canonical `engine.speculation.kind: mtp` can combine with G2 on aggregated and
+token-only disaggregated vLLM workers, with any `attention_data`, prefix
+caching and no G3. An aggregated worker needs `scope: dp_rank_local`; prefill
+and decode workers take either scope. Use explicit fixed KV capacity and
+default timing. Scheduling is synchronous. Separate draft models and grouped
+caches are unsupported. See
 [speculation](speculation.md#registered-schemes) for the complete composition.
 
-This combined behavior is adapted and modified from the
+An aggregated worker models single-module MTP with one uniform shared
+FullAttention cache. This combined behavior is adapted and modified from the
 [vLLM v0.32.0 scheduler](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py)
 and [OffloadingConnector](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py),
 Copyright contributors to the vLLM project, Apache-2.0. Prompt stores exclude
@@ -365,6 +438,18 @@ completes. A next step that can never fit physical KV capacity or the total
 padded verification budget is rejected instead of retried indefinitely; this
 is a simulation capacity guard. The scheduling baseline does not change the
 version or provenance of the performance data used for timing.
+
+Prefill and decode workers keep the speculative lifecycle they have without
+G2. G2 stores complete prompt blocks only, so drafts never reach it. A restore
+resumes at the loaded prefix, as on an aggregated worker. Accepted drafts that
+take a G1 block a store still reads make the forward that writes it wait for
+that copy, and so does preempting a request whose store is in flight; a store
+prepared in that same pass delays the rank's next pass. A preempted request
+resumes once G1 has room for its tokens and its next one; a shared pool keeps
+the G1 blocks it copies until each copy completes, so its stores can delay
+that. The capacity guard above does not cover these workers: when G1 holds
+fewer than about two requests, a replay can end with a stall error or not
+terminate, with or without G2. Size G1 for several concurrent requests.
 
 For shared pools, the report's `g2_domains` gives capacity and resident blocks.
 Workers that publish KV events report G2 changes with `"tier": "host_pinned"`;
@@ -512,7 +597,7 @@ KVCR supports vLLM aggregated workers with any `attention_data`, and pulls
 between the prefill ranks of P/D. Workers may be fixed or Planner-scaled; a
 draining worker is removed only after every pull from or into it has landed and
 been taken by its target. Rejected: missing or `cluster_shared` `host_offload`,
-a `host_offload.connector` other than `offloading_v0_24`, `g3_offload` together with `kvcr`, `kvcr` on the decode role, `parallelism.pipeline` above 1,
+a `host_offload.connector` other than `offloading_v0_24`, `g3_offload` together with `kvcr`, `kvcr` on the decode role, MTP on a prefill role with `kvcr`, `parallelism.pipeline` above 1,
 `parallelism.prefill_context` above 1 (native `prefill_context_parallel_size`), and `recommend`.
 Everything G2 rejects is rejected too, including SGLang and TensorRT-LLM.
 
@@ -668,13 +753,43 @@ Rejected: `recommend`, G2/G3 offload, and speculative decoding with sub-block
 ## Agentic traffic with G2
 
 AgentX snapshot, warmup and continuous-profile traffic supports G2 on vLLM with
-one aggregated worker, one prefill and one decode worker, or several aggregated
-workers that each own a `dp_rank_local` G2. All need `attention_data: 1` and static
-workers. Without speculation, either G2 scope works with one worker per role.
-Canonical MTP additionally supports a single aggregated worker with local G2 and
-prefix caching, within the [combined scope](#supported) above. Other speculation
-and G3 are not supported. `kvcr` is accepted but never pulls, because agentic
-traffic carries no router hint. Results are qualified `functional_only`.
+static aggregated or prefill/decode workers of any count and `attention_data`,
+with either G2 scope. A role may omit G2. Each role uses canonical MTP, within
+the [combined scope](#supported) above, or no speculation. G3 is not supported.
+When the replay composition captures engine
+KV events, each worker publishes its G2 residency as native `HostPinned` events,
+so a KV-aware placement policy can follow a G2-resident prefix to its owner, or
+to any replica of a `cluster_shared` pool. The built-in round-robin composition
+leaves this capture disabled by default. Snapshot and profile plays
+use play-local token identities, so G1 and G2 hits never cross a recycled play.
+`kvcr` requires `dp_rank_local` G2 and the other [KVCR constraints](#kvcr-peer-fetch);
+it is rejected with `cluster_shared`. In supported AgentX configurations it
+never pulls, because agentic traffic carries no router hint. Results are
+qualified `functional_only`.
+
+A `cluster_shared` pool under AgentX follows this contract:
+
+- **Ownership and discovery.** The replay deployment owns one pool. Every
+  participating rank, across replicas and P/D roles, joins it; the first
+  participant fixes layout, capacity, and shared bandwidth, and capacity is
+  counted once in `g2_domains`. A block becomes resident when its D2H store
+  completes. With engine KV-event capture enabled, the pool publishes a
+  `HostPinned` store to every subscribed rank. Pool-wide LRU eviction publishes
+  the matching removal to those subscribers.
+- **Identity.** Conversations of one play share G2 prefixes. Snapshot and
+  profile plays use play-local token identities and a distinct `cache_id`, so
+  equal source prompts in recycled plays occupy separate entries and never hit
+  each other.
+- **Contention.** Concurrent restores of the same entries count residency once
+  and split the pool's directional bandwidth max-min fairly, deterministically
+  from the replay clock.
+- **Stale entries.** If a placement scored residency that is evicted before the
+  request is admitted, the request recomputes the missing prefix. Its routing
+  overlap then exceeds the realized `host_reused_input_tokens`.
+- **Membership.** AgentX G2 requires static pools, so worker failure and
+  ownership handoff are outside its support boundary.
+- **Disabling sharing.** `scope: dp_rank_local` reproduces the private-G2
+  result exactly, even when shared-only bandwidth fields remain set.
 
 Two small offline fixtures use fixed timing and need no GPU:
 

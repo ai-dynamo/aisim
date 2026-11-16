@@ -75,8 +75,20 @@ they are excluded from the cost configuration passed to
 identity are preserved through that constructor and saved configuration.
 Direct replay descriptors using a generic canonical timing identity must also
 provide explicit `aic_nextn_accept_rates` on the worker rank. They do not inherit
-the legacy `nextn` acceptance defaults. The rank may omit `aic_nextn`; native
-replay derives it from the canonical scheme. An explicit rank depth must match.
+the legacy `nextn` acceptance defaults. The rank may omit `aic_nextn` or set it to `null`; native
+replay derives it from the canonical scheme. An explicit numeric rank depth must match.
+The shared `EngineLaunchConfig` adapter follows the same rule: canonical
+`nextn` remains zero for registered schemes, while scheduler `aic_nextn` uses
+the resolved draft depth. Saved-timing compatibility checks use these launch
+rules too, including explicit acceptance and capacity provenance. Rust adapters
+can resolve this depth with `ForwardPassSpeculationConfig::replay_depth()`;
+registered schemes require an initialized Python interpreter or the
+`embed-python` feature. Disabled speculation and ngram resolve in Rust.
+Direct ngram descriptors retain the native default conditional acceptance rates
+`[0.85, 0.3, 0, 0, 0]`, truncated to draft depth, when
+`aic_nextn_accept_rates` is omitted or blank. The public Runner ngram block still
+requires an explicit workload acceptance assumption. On vLLM, ngram defaults to
+synchronous scheduling and rejects explicit `async_scheduling: true`.
 The legacy `aic_nextn_accepted` shorthand still requires an explicit rank depth
 to convert the expected count to acceptance rates.
 
@@ -107,11 +119,14 @@ an explicit FPM request with `fallback_policy: deny` fails, while an allowed
 fallback can select OP without discarding the scheme.
 
 `kind: mtp` also supports [G2 host offload](kv-cache.md#host-offload-g2)
-on aggregated vLLM with `attention_data: 1`, prefix caching enabled and
-`host_offload.scope: dp_rank_local`. This uses synchronous, single-module MTP
-with a uniform shared FullAttention cache. Agentic G2 additionally requires a
-single static worker. Separate draft models, other speculative schemes,
-asynchronous scheduling, P/D, shared G2 pools, and G3 are outside this combined
+on aggregated and token-only P/D vLLM workers with prefix caching enabled and
+any `attention_data`, including agentic traffic on static workers. An
+aggregated worker needs `host_offload.scope: dp_rank_local` and uses
+synchronous, single-module MTP with a uniform shared FullAttention cache.
+Prefill and decode workers take either scope and keep the lifecycle described
+under [MTP](#mtp); see [what G2 supports](kv-cache.md#supported). Separate
+draft models, other speculative schemes,
+asynchronous scheduling, and G3 are outside this combined
 scope. Keep the canonical `engine.speculation` block, fixed KV capacity and
 default timing; acceptance and seed remain workload assumptions. This composition
 defaults `scheduler.async_scheduling` to `false` and rejects an explicit `true`.
