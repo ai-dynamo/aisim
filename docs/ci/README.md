@@ -567,15 +567,6 @@ examples. The manifest supplies profiles, dependencies, timeouts, and output
 assertions; the harness reads the commands from README and records per-block
 logs and results locally. See `--help` for the available profiles and options.
 
-The Dynamo profile checks public availability of the documented release pair.
-Before publication, `prepare_dynamo_rc.py` builds the matching RC wheels from
-immutable AISim and Dynamo source revisions without changing Docker. The harness
-verifies their versions and SHA-256 hashes, constrains installation to those
-artifacts, and runs all README Dynamo commands unchanged. Reports and the job
-summary distinguish RC validation from public-index installation. Once all three
-release wheels are published, CI automatically uses the public indexes; network,
-build, installation, and prediction failures remain failures in either mode.
-
 ## Slack review digest and weekly PIC
 
 `Slack review digest` runs each Monday and Thursday at 09:00 America/Los_Angeles.

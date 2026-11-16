@@ -43,48 +43,21 @@ jobs:
         run: python -m pip install --require-hashes -r scripts/readme/requirements.txt
       - name: Check harness and reporting contracts
         run: |
-          python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py scripts/readme/test_prepare_dynamo_rc.py
+          python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py
           python scripts/readme/check_readme_commands.py --validate
-      - name: Select Dynamo package source
-        if: matrix.profile == 'dynamo'
-        id: dynamo-packages
-        run: |
-          python scripts/readme/prepare_dynamo_rc.py probe --output "$RUNNER_TEMP/dynamo-candidate.json"
-          python -c 'import json,sys; print("source=" + json.load(open(sys.argv[1]))["source"])' \
-            "$RUNNER_TEMP/dynamo-candidate.json" >> "$GITHUB_OUTPUT"
-      - name: Install native RC build prerequisites
-        if: matrix.profile == 'dynamo' && steps.dynamo-packages.outputs.source == 'release-candidate'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libhwloc-dev libudev-dev pkg-config \
-            libclang-dev protobuf-compiler python3-dev cmake
-      - name: Prepare pinned Dynamo RC wheels
-        if: matrix.profile == 'dynamo' && steps.dynamo-packages.outputs.source == 'release-candidate'
-        env:
-          CARGO_BUILD_JOBS: '2'
-        run: >-
-          python scripts/readme/prepare_dynamo_rc.py build
-          --output "$RUNNER_TEMP/dynamo-candidate.json"
-          --wheelhouse "$RUNNER_TEMP/dynamo-rc-wheels"
       - name: Execute README commands
         env:
           PROFILE: ${{ matrix.profile }}
-        run: |
-          candidate_args=()
-          if [ "$PROFILE" = dynamo ]; then
-            candidate_args+=(--candidate-manifest "$RUNNER_TEMP/dynamo-candidate.json")
-          fi
-          python scripts/readme/check_readme_commands.py \
-            --profile "$PROFILE" \
-            --workspace "$RUNNER_TEMP/readme-$PROFILE" \
-            --output "readme-results/$PROFILE" "${candidate_args[@]}"
+        run: >-
+          python scripts/readme/check_readme_commands.py
+          --profile "$PROFILE"
+          --workspace "$RUNNER_TEMP/readme-$PROFILE"
+          --output "readme-results/$PROFILE"
       - name: Preserve command evidence even after failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: readme-${{ matrix.profile }}
-          path: |
-            readme-results/
-            ${{ runner.temp }}/dynamo-candidate.json
+          path: readme-results/
           if-no-files-found: error
           retention-days: 30
