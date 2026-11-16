@@ -31,6 +31,18 @@
       "title": "Observation Id",
       "type": "string"
     },
+    "phase": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Phase"
+    },
     "source": {
       "anyOf": [
         {

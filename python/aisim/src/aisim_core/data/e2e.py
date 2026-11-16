@@ -448,6 +448,7 @@ class SeriesRow(_Record):
     coverage: float | None = Field(default=None, ge=0, le=1)  # fraction of the interval with samples
     unit: str | None = None
     source: str | None = None
+    phase: str | None = None  # canonical phase; times are ms from the start of that phase
 
 
 class SnapshotMember(_Record):
