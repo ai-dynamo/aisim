@@ -350,24 +350,22 @@ impl RadixCache {
         reusable
     }
 
-    /// Record an insert of the first `cached_pages` pages of the path ending on `tail`,
-    /// `tail_pages` deep, whose forward ended at `end_tokens` (SGLang `cache_unfinished_req`).
-    /// The request frees its SWA KV below the page holding `end_tokens - 1 - page`, so the last
-    /// whole SWA page before the end stays cached, and the one before it too when the end is
-    /// page-aligned.
-    pub(crate) fn mark_swa_window(
-        &mut self,
-        tail: NodeId,
-        tail_pages: usize,
-        cached_pages: usize,
-        end_tokens: usize,
-    ) {
+    /// Record an insert on the path ending on `tail`, `tail_pages` deep, whose forward ended at
+    /// `end_tokens` (SGLang `cache_unfinished_req`). The request frees its SWA KV below the page
+    /// holding `end_tokens - 1 - page`, so the last whole SWA page before the end stays cached,
+    /// and the one before it too when the end is page-aligned.
+    pub(crate) fn mark_swa_window(&mut self, tail: NodeId, tail_pages: usize, end_tokens: usize) {
         let Some(span) = self.swa.as_ref().map(|swa| swa.page_span) else {
             return;
         };
-        debug_assert!(cached_pages <= tail_pages);
+        debug_assert_eq!(
+            std::iter::successors(Some(tail), |&id| self.nodes[id].parent)
+                .map(|id| self.nodes[id].key.len())
+                .sum::<usize>(),
+            tail_pages
+        );
         let page_tokens = span * self.page_size;
-        let end = (end_tokens / page_tokens * span).min(cached_pages / span * span);
+        let end = (end_tokens / page_tokens * span).min(tail_pages / span * span);
         if end_tokens % page_tokens == 0 && end > span {
             self.mark_swa_boundary(tail, tail_pages, end - span);
         }
@@ -375,24 +373,21 @@ impl RadixCache {
     }
 
     /// Mark the end of the first `pages` pages of the path ending on `tail`, `tail_pages` deep,
-    /// splitting the edge there if needed. Walks up from `tail`, so it compares no keys.
+    /// splitting the edge there if needed.
     fn mark_swa_boundary(&mut self, tail: NodeId, tail_pages: usize, pages: usize) {
         if pages == 0 {
             return;
         }
-        let (mut current, mut end) = (tail, tail_pages);
-        loop {
-            let start = end - self.nodes[current].key.len();
-            if pages > start {
-                if pages < end {
-                    current = self.split_node(current, pages - start);
-                }
-                break;
-            }
+        let mut current = tail;
+        let mut start = tail_pages - self.nodes[tail].key.len();
+        while pages <= start {
             current = self.nodes[current]
                 .parent
                 .expect("SWA page lies on the path to its tail");
-            end = start;
+            start -= self.nodes[current].key.len();
+        }
+        if pages - start < self.nodes[current].key.len() {
+            current = self.split_node(current, pages - start);
         }
         let swa = self.swa.as_mut().expect("SWA tracking is enabled");
         swa.clock += 1;
@@ -1430,7 +1425,7 @@ mod tests {
     fn insert_with_window(cache: &mut RadixCache, tokens: &[u32], past_end: usize) -> Vec<usize> {
         let pages = cache.page_pool.allocate(tokens.len()).unwrap();
         let tail = cache.insert(tokens, &pages);
-        cache.mark_swa_window(tail, tokens.len(), tokens.len(), tokens.len() + past_end);
+        cache.mark_swa_window(tail, tokens.len(), tokens.len() + past_end);
         pages
     }
 
@@ -1454,7 +1449,7 @@ mod tests {
         // A recomputed fork point is a page-aligned insert end: it keeps two SWA pages. It is
         // reached from the tail of the path it lies on, three pages below it.
         let (_, tail) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7]);
-        cache.mark_swa_window(tail, 7, 4, 4);
+        cache.mark_swa_window(tail, 7, 4);
         assert_eq!(swa_reusable(&cache, &[1, 2, 3, 4, 9]), 4);
         assert_eq!(swa_reusable(&cache, &[1, 2, 3, 9]), 2);
         assert_eq!(

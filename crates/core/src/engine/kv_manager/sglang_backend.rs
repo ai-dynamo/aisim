@@ -366,12 +366,10 @@ impl SglangKvManager {
         match lease.swa_fork_pages {
             Some(fork) if fork <= cached_pages => {
                 self.cache
-                    .mark_swa_window(tail, tail_pages, fork, fork * self.cache.page_size());
+                    .mark_swa_window(tail, tail_pages, fork * self.cache.page_size());
                 lease.swa_fork_pages = None;
             }
-            _ => self
-                .cache
-                .mark_swa_window(tail, tail_pages, cached_pages, end_tokens),
+            _ => self.cache.mark_swa_window(tail, tail_pages, end_tokens),
         }
     }
 
@@ -926,7 +924,9 @@ impl SglangKvManager {
     /// Inserts the full token sequence so future requests can reuse it,
     /// publishes the pages the tree retained, frees the request's duplicates
     /// of pages the tree already held, starts the HiCache backup, then
-    /// unlocks the path. Returns the node the sequence ends on.
+    /// unlocks the path. Returns the node the sequence ends on. It is unlocked
+    /// but still in the tree for the caller's SWA mark: nothing here evicts
+    /// device pages, and the backup reclaims only host-only leaves.
     fn cache_finished_hashes(
         &mut self,
         page_hashes: &[LocalBlockHash],
