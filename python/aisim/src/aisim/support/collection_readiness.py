@@ -212,6 +212,7 @@ def _matches_request(request: SupportRequest, plan) -> bool:
         )
         and plan.options.max_cudagraph_capture_size == request.collection.max_cudagraph_capture_size
         and (plan.options.gpu_memory_utilization or 0.9) == request.collection.memory_fraction
+        and plan.options.measure_power == request.collection.measure_power
         and plan.options.warmup_iterations == (FPM_WARMUP_ITERATIONS if warmup is None else warmup)
         and all(
             cell.topology.tp == parallel["tensor"]

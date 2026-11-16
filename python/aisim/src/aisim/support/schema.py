@@ -141,6 +141,9 @@ class CollectionSpec(StrictModel):
     cudagraph_mode: Literal["NONE", "PIECEWISE", "FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"] | None = None
     cudagraph_capture_sizes: list[PositiveStrictInt] | None = None
     max_cudagraph_capture_size: PositiveStrictInt | None = None
+    # Collector power window (--fpm-measure-power). False opts out, for a
+    # Dynamo image whose self-benchmark predates the window.
+    measure_power: bool = Field(default=True, strict=True)
     # Global warm-up iterations of the collector. Without a value the collector keeps its default. The GLM-5.3-Flash
     # producer runs its own warm-ups, so a collection of that model needs 0.
     warmup_iterations: int | None = Field(default=None, strict=True, ge=0)
@@ -152,6 +155,8 @@ class CollectionSpec(StrictModel):
         # explicitly reviewed policy is always serialized, including explicit.
         if "prefill_cudagraph_policy" not in self.model_fields_set:
             values.pop("prefill_cudagraph_policy", None)
+        if self.measure_power:
+            values.pop("measure_power", None)
         for name in ("cudagraph_mode", "cudagraph_capture_sizes", "max_cudagraph_capture_size", "warmup_iterations"):
             if getattr(self, name) is None:
                 values.pop(name, None)

@@ -1534,7 +1534,12 @@ def derive_profile(
 
 # The cache group fields that only a runtime probe import writes. A cache_groups claim gives the geometry, so it may
 # leave them out.
-_PROBE_GROUP_FIELDS = ("prefill_checkpoint_blocks", "prefill_checkpoint_alignment")
+_PROBE_GROUP_FIELDS = (
+    "prefix_cacheable",
+    "transfer_bytes_per_block",
+    "prefill_checkpoint_blocks",
+    "prefill_checkpoint_alignment",
+)
 
 
 def _cache_group_shapes(groups: list[Any], ignored: tuple[str, ...] = ()) -> Counter[str]:
@@ -1613,13 +1618,17 @@ def linear_runtime_resources(resources: Mapping[str, Any]) -> dict[str, Any] | N
 
     Every group must be an attention group without a window, all groups must have one block size of at least 2
     tokens, and the exact sum of page_size_bytes / block_size_tokens must be a whole number of bytes per token.
-    Every other field, such as runtime_memory and the resource provenance, is kept. Import, acceptance,
+    Every other field, such as runtime_memory and the resource provenance, is kept, except the vLLM version of the
+    cache group evidence. Import, acceptance,
     finalization and validation all use this function.
     """
     if _linear_layout_gap(resources) is not None:
         return None
     linear = {key: deepcopy(value) for key, value in resources.items() if key != "cache_groups"}
     linear.update(cache_layout="linear", kv_bytes_per_token=int(_measured_kv_bytes(resources)))
+    # The version of the cache group evidence leaves with the groups, so a linear profile keeps its bytes.
+    if isinstance(linear.get("runtime_memory"), dict):
+        linear["runtime_memory"].pop("runtime_framework_version", None)
     return linear
 
 
@@ -1695,6 +1704,22 @@ def _observation_mismatch(key: str, typed: Any, resources: Mapping[str, Any]) ->
     if resources.get(measured_key) is None:
         layout = f" for its {resources['cache_layout']} cache_layout" if resources.get("cache_layout") else ""
         return f"{claim}, but the runtime probe measured no {measured_key}{layout}; {remedy}"
+    # The probe import of a vLLM 0.33.0 record writes no transfer bytes, so a stated value has nothing to match. When
+    # the claim matches without them, only removing them from the override helps.
+    if (
+        key == "cache_groups"
+        and any(group.get("transfer_bytes_per_block") is not None for group in typed)
+        and all(group.get("transfer_bytes_per_block") is None for group in resources[key])
+        and _matches_observation(
+            key,
+            [{name: value for name, value in group.items() if name != "transfer_bytes_per_block"} for group in typed],
+            resources,
+        )
+    ):
+        return (
+            f"{claim} states transfer_bytes_per_block, but the runtime probe evidence holds no "
+            "transfer_bytes_per_block for its cache groups; remove transfer_bytes_per_block from the override."
+        )
     return f"{claim} differs from the runtime probe's measured {key}={compact(resources[key])}; {remedy}"
 
 

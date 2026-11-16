@@ -64,6 +64,21 @@ pub struct FpmCacheGroup {
     /// for every other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks_per_request: Option<u32>,
+    /// Whether vLLM's manager for this group takes part in prefix caching. A
+    /// ring spec does not. Replay with prefix caching on needs it on every
+    /// group, and does not read it yet. `None` in a profile imported before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_cacheable: Option<bool>,
+    /// The bytes that vLLM's P/D connector reads for one block of this group in
+    /// a transfer on one TP rank, for the vLLM version of the deployment. The
+    /// connector reads a block in regions that layers of other groups can
+    /// share, so the value can be larger than `page_size_bytes`. Positive and at
+    /// most 2**53. The probe import of a vLLM 0.33.0 record does not write it:
+    /// what the P/D connector of vLLM 0.33.0 reads for a block depends on facts
+    /// that the record does not hold. Sizing does not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_bytes_per_block: Option<u64>,
     /// The `num_prefill_checkpoint_blocks` of a Mamba spec: 0 or 1, and only
     /// in a `state` group. In vLLM 0.33.0, a KDA layer that prefills with
     /// FlashKDA has one checkpoint block.
@@ -104,6 +119,14 @@ impl FpmCacheGroup {
         } else if self.blocks_per_request.is_some() {
             return Err(invalid(
                 "blocks_per_request applies only to state cache groups",
+            ));
+        }
+        if self
+            .transfer_bytes_per_block
+            .is_some_and(|bytes| bytes == 0 || bytes > MAX_EXACT_BYTES)
+        {
+            return Err(invalid(
+                "transfer_bytes_per_block must be positive and at most 2**53",
             ));
         }
         if self
@@ -298,6 +321,11 @@ pub struct FpmRuntimeMemoryConfig {
     /// The probe's resolved `hash_block_size`, in tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash_block_size_tokens: Option<u32>,
+    /// The version of the runtime that observed the cache group evidence,
+    /// such as `0.33.0`. It can differ from the deployment's
+    /// `backend_version`, which is a dataset label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_framework_version: Option<String>,
 }
 
 impl FpmRuntimeMemoryConfig {
@@ -323,6 +351,13 @@ impl FpmRuntimeMemoryConfig {
         }
         if self.hash_block_size_tokens == Some(0) {
             return Err(invalid("hash_block_size_tokens must be positive"));
+        }
+        if self
+            .runtime_framework_version
+            .as_deref()
+            .is_some_and(|version| version.trim().is_empty())
+        {
+            return Err(invalid("runtime_framework_version must be nonempty"));
         }
         Ok(())
     }
@@ -907,6 +942,8 @@ mod tests {
             page_size_bytes: 160,
             sliding_window: window,
             blocks_per_request: None,
+            prefix_cacheable: None,
+            transfer_bytes_per_block: None,
             prefill_checkpoint_blocks: None,
             prefill_checkpoint_alignment: None,
         }
@@ -980,6 +1017,7 @@ mod tests {
                 enable_prefix_caching: None,
                 mamba_cache_mode: None,
                 hash_block_size_tokens: None,
+                runtime_framework_version: None,
             }),
             ..resources()
         }
@@ -1512,6 +1550,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_memory_records_the_vllm_version_of_its_evidence() {
+        let plain = runtime_resources().runtime_memory.unwrap();
+        let observed = FpmRuntimeMemoryConfig {
+            enable_prefix_caching: Some(true),
+            hash_block_size_tokens: Some(4),
+            runtime_framework_version: Some("0.33.0".into()),
+            ..plain.clone()
+        };
+        observed.validate().unwrap();
+        // The version follows the prefix-caching evidence and round trips.
+        let saved = serde_json::to_string(&observed).unwrap();
+        assert_eq!(
+            saved,
+            r#"{"kv_cache_bytes":600,"gpu_memory_utilization":0.8,"max_model_len":4096,"provenance":"Synthetic initialized-worker cache allocation","enable_prefix_caching":true,"hash_block_size_tokens":4,"runtime_framework_version":"0.33.0"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<FpmRuntimeMemoryConfig>(&saved).unwrap(),
+            observed
+        );
+        // An absent or null version is not written.
+        let mut null = serde_json::to_value(&plain).unwrap();
+        null["runtime_framework_version"] = serde_json::Value::Null;
+        assert_eq!(
+            serde_json::from_value::<FpmRuntimeMemoryConfig>(null).unwrap(),
+            plain
+        );
+        // An empty version is refused, and so is a value that is not text.
+        for text in ["", " "] {
+            let empty = FpmRuntimeMemoryConfig {
+                runtime_framework_version: Some(text.into()),
+                ..plain.clone()
+            };
+            assert_eq!(
+                memory_rejection(&empty),
+                "runtime_framework_version must be nonempty"
+            );
+        }
+        let mut number = serde_json::to_value(&plain).unwrap();
+        number["runtime_framework_version"] = 33.into();
+        assert!(serde_json::from_value::<FpmRuntimeMemoryConfig>(number).is_err());
+        // The resource section validates the record.
+        let mut resources = runtime_resources();
+        resources.runtime_memory = Some(observed);
+        resources.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<FpmResourceConfig>(serde_json::to_value(&resources).unwrap())
+                .unwrap(),
+            resources
+        );
+    }
+
+    #[test]
     fn grouped_page_boundaries_keep_full_history_and_evict_windows() {
         let local = group(Some(32));
         // First 32 tokens occupy two physical pages. Token 33 retains parts of
@@ -1652,6 +1742,58 @@ mod tests {
     }
 
     #[test]
+    fn transfer_bytes_per_block_must_be_positive_and_exact() {
+        let text = "transfer_bytes_per_block must be positive and at most 2**53";
+        for base in [group(None), state_group(Some(1))] {
+            let page = base.page_size_bytes;
+            for bytes in [0, MAX_EXACT_BYTES + 1] {
+                let invalid = FpmCacheGroup {
+                    transfer_bytes_per_block: Some(bytes),
+                    ..base.clone()
+                };
+                assert_eq!(rejection(&invalid), text);
+            }
+            // The connector can read more than the page of the group for one
+            // block, so a value above the page is valid.
+            for bytes in [1, page, page + 1, MAX_EXACT_BYTES] {
+                FpmCacheGroup {
+                    transfer_bytes_per_block: Some(bytes),
+                    ..base.clone()
+                }
+                .validate()
+                .unwrap();
+            }
+            // The marker has no rule of its own.
+            for cacheable in [false, true] {
+                FpmCacheGroup {
+                    prefix_cacheable: Some(cacheable),
+                    ..base.clone()
+                }
+                .validate()
+                .unwrap();
+            }
+        }
+        // A transfer size above the page of the group is valid: the field
+        // allows bytes beyond the page.
+        FpmCacheGroup {
+            page_size_bytes: 13_045_120,
+            transfer_bytes_per_block: Some(21_978_496),
+            ..group(None)
+        }
+        .validate()
+        .unwrap();
+        // The kind checks run first, so an invalid group keeps its first error.
+        let unusable = FpmCacheGroup {
+            transfer_bytes_per_block: Some(0),
+            ..state_group(None)
+        };
+        assert_eq!(
+            rejection(&unusable),
+            "state cache groups require a positive blocks_per_request"
+        );
+    }
+
+    #[test]
     fn checkpoint_fields_need_a_state_group_and_each_other() {
         let blocks_text = "prefill_checkpoint_blocks requires a state group and must be 0 or 1";
         let alignment_text = "prefill_checkpoint_alignment requires prefill_checkpoint_blocks=1 and must be positive";
@@ -1723,6 +1865,8 @@ mod tests {
             page_size_bytes: 13_045_120,
             sliding_window: None,
             blocks_per_request,
+            prefix_cacheable: None,
+            transfer_bytes_per_block: None,
             prefill_checkpoint_blocks: None,
             prefill_checkpoint_alignment: None,
         };
@@ -1779,6 +1923,11 @@ mod tests {
             ),
             (None, None)
         );
+        // It also loads without the prefix-caching marker and the transfer bytes.
+        assert_eq!(
+            (loaded.prefix_cacheable, loaded.transfer_bytes_per_block),
+            (None, None)
+        );
         assert_eq!(serde_json::to_string(&loaded).unwrap(), earlier);
         // Set fields follow the block count in declaration order.
         let marked = FpmCacheGroup {
@@ -1789,7 +1938,15 @@ mod tests {
         assert!(serde_json::to_string(&marked).unwrap().ends_with(
             r#""blocks_per_request":1,"prefill_checkpoint_blocks":1,"prefill_checkpoint_alignment":16}"#
         ));
-        for original in [attention, state, marked] {
+        let transferred = FpmCacheGroup {
+            prefix_cacheable: Some(false),
+            transfer_bytes_per_block: Some(64),
+            ..marked.clone()
+        };
+        assert!(serde_json::to_string(&transferred).unwrap().ends_with(
+            r#""blocks_per_request":1,"prefix_cacheable":false,"transfer_bytes_per_block":64,"prefill_checkpoint_blocks":1,"prefill_checkpoint_alignment":16}"#
+        ));
+        for original in [attention, state, marked, transferred] {
             let saved = serde_json::to_string(&original).unwrap();
             assert_eq!(
                 serde_json::from_str::<FpmCacheGroup>(&saved).unwrap(),

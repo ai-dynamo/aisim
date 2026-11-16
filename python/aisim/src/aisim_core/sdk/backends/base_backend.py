@@ -2013,6 +2013,7 @@ class BaseBackend:
         cache_key = (
             self._make_agg_cache_key(isl, osl, b, ctx_tokens, agg_extra),
             visual_cache_key,
+            getattr(model, "forward_model", "op_level"),
             # Explicit progress and an omitted kwarg schedule identically at
             # 1.0 but record different scheduling metadata, so they must not
             # share a cache entry.

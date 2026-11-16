@@ -477,7 +477,7 @@ unknown row policies are rejected.
 | Field | Schema-8 contract |
 |---|---|
 | `measurement_policy` | Required in the sidecar and every row; `dynamo_native_single_sample_power_window_v1` |
-| `power_w` | Required nullable Parquet DOUBLE (float64) column; mean watts per GPU from a separate power window of at least one second |
+| `power_w` | Required nullable Parquet DOUBLE (float64) column; mean watts per GPU from a separate power window of at least two seconds |
 | `latency_ms` | Single-sample forward latency in milliseconds, preserved independently of the power window |
 
 Every non-null `power_w` must be finite and greater than zero. Null records
