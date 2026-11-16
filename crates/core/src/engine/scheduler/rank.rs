@@ -327,7 +327,11 @@ impl RankEngine for SchedulerRank {
         // vLLM `launch`: outputs wait for the next pass's launch. When a command
         // leaves no next pass, the engine loop returns them at once, never
         // before their pass ended.
-        if !self.launches_next_pass()
+        if self
+            .held_outputs
+            .as_ref()
+            .is_some_and(|held| held.latest.is_some())
+            && !self.launches_next_pass()
             && let Some(held) = self.held_outputs.as_mut()
             && let Some((end_ms, outputs)) = held.latest.take()
         {
@@ -476,7 +480,8 @@ impl RankEngine for SchedulerRank {
         }
         // vLLM `launch`: the engine loop returns this pass's outputs once it
         // has launched the next pass, which it forms now if it has work.
-        if !pending.effects.outputs.is_empty()
+        if self.held_outputs.is_some()
+            && !pending.effects.outputs.is_empty()
             && self.launches_next_pass()
             && let Some(held) = self.held_outputs.as_mut()
         {
