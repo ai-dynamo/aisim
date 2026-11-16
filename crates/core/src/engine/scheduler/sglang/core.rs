@@ -104,6 +104,10 @@ pub(crate) struct SglangCore {
     inflight_source: Vec<SglangRequest>,
     /// Device time of the forward the last pass launched under the host loop.
     last_forward_ms: Option<f64>,
+    /// When each later PP stage finishes the forward it last took; empty without later stages.
+    pipeline_stage_free_ms: Vec<f64>,
+    /// When the forward the last pass launched under the host loop leaves the last PP stage.
+    last_forward_ready_ms: Option<f64>,
     /// Encoder outputs retained across prefill batches.
     vision_cache: VisionCache,
     prefill_rounds_remaining: usize,
@@ -129,6 +133,9 @@ struct UnpricedPass {
     /// the previous forward is observed.
     end_ms: Option<f64>,
     launch: Option<HostLaunch>,
+    /// PP prefill handoffs this forward completes; they wait until it leaves the
+    /// last pipeline stage.
+    pipeline_fill_requests: Vec<Uuid>,
     result: EnginePassResult,
 }
 
@@ -280,6 +287,14 @@ impl SglangCore {
                     .expect("HiCache has KV byte geometry");
             kv_manager.enable_hicache(hicache, block_bytes);
         }
+        if enable_prefix_caching
+            && let Some(tails) = args
+                .sglang
+                .as_ref()
+                .and_then(|sglang| sglang.swa_prefix_tails)
+        {
+            kv_manager.enable_swa_prefix(tails);
+        }
 
         Self {
             config,
@@ -313,6 +328,8 @@ impl SglangCore {
             frontend,
             inflight_source: Vec::new(),
             last_forward_ms: None,
+            pipeline_stage_free_ms: Vec::new(),
+            last_forward_ready_ms: None,
             vision_cache,
         }
     }
@@ -776,7 +793,9 @@ impl SglangCore {
         request
     }
 
-    fn complete_source(&mut self, mut request: SglangRequest) {
+    /// `pipeline_fill_ms` is the time the request's last forward still spends in later PP stages;
+    /// a pass-completed request gets it in `resolve_pass`, once that forward is priced.
+    fn complete_source(&mut self, mut request: SglangRequest, pipeline_fill_ms: f64) {
         self.batch_is_full = false;
         let uuid = request.uuid;
         self.active_request_ids.remove(&uuid);
@@ -788,13 +807,14 @@ impl SglangCore {
             cache_materialized_prefix(&mut request, &mut self.kv_manager, &self.config);
         }
         let published = request.cached_tokens() > cached_before;
-        let transfer_timing = prefill_handoff_transfer_timing(
+        let mut transfer_timing = prefill_handoff_transfer_timing(
             request.prompt_len(),
             self.config.kv_transfer_bandwidth,
             self.config.kv_transfer_bytes_per_token,
             0,
             self.config.kv_transfer_timing_mode,
         );
+        transfer_timing.pipeline_fill_ms = pipeline_fill_ms;
         let payload = HeldSglangPrefill { request };
         let released = match self.source_holds.complete_source(uuid, payload) {
             SourceCompletion::Release(payload) => {
@@ -1052,6 +1072,30 @@ impl SglangCore {
         self.waiting.len() + self.prebuilt_ready.len() + self.running.len()
     }
 
+    /// SGLang load-inquirer budget for disaggregated decode. Allocated
+    /// transfer/waiting rows already occupy KV; count only unallocated queues again.
+    pub(crate) fn decode_load(&self) -> (usize, usize) {
+        let cache = self.kv_manager.cache();
+        let used = cache.total_tokens() - cache.available_tokens() - cache.evictable_size;
+        let pending = self
+            .pending_destinations
+            .payloads()
+            .map(|r| r.prompt_len())
+            .sum::<usize>();
+        let retracted = self
+            .waiting
+            .iter()
+            .filter(|r| r.retracted)
+            .map(|r| r.current_sequence_len())
+            .sum::<usize>();
+        let requests = self.running.len()
+            + self.waiting.len()
+            + self.prebuilt_ready.len()
+            + self.pending_destinations.len()
+            + self.destination_holds.len();
+        (used + pending + retracted, requests)
+    }
+
     pub(crate) fn mocker_metrics(&self) -> MockerMetrics {
         self.mocker_metrics_with_cache(0, 0)
     }
@@ -1196,6 +1240,21 @@ impl SglangCore {
         Ok(result)
     }
 
+    /// Run a forward that left stage 0 at `stage0_end_ms` after `stage_ms` through the later PP
+    /// stages in order. A stage takes it once the stage before has finished it and the stage
+    /// itself has finished the forward ahead, so a short chunk cannot overtake a long one.
+    /// Returns when it leaves the last stage.
+    fn pipeline_ready_ms(&mut self, stage0_end_ms: f64, stage_ms: f64) -> f64 {
+        self.pipeline_stage_free_ms
+            .resize(self.config.pipeline_fill_passes as usize, 0.0);
+        let mut ready_ms = stage0_end_ms;
+        for free_ms in &mut self.pipeline_stage_free_ms {
+            ready_ms = ready_ms.max(*free_ms) + stage_ms;
+            *free_ms = ready_ms;
+        }
+        ready_ms
+    }
+
     /// Finish the scheduled pass. A group `iteration` sets the language-model
     /// forward's shared duration; without one the pass prices its own prefill
     /// or decode. Vision encoding keeps its own time ahead of that forward.
@@ -1239,6 +1298,9 @@ impl SglangCore {
             .max(self.kv_manager.host_load_end_ms());
         let forward_ms = forward_end_ms - stream_start_ms;
         let mut result = pass.result;
+        // When this pass's forward leaves stage 0, and its time per stage.
+        let mut stage0 = Some((forward_end_ms, forward_ms));
+        let host_launch = pass.launch.is_some();
         if let Some(launch) = pass.launch {
             let host = self
                 .host
@@ -1246,6 +1308,7 @@ impl SglangCore {
                 .expect("a host-loop launch requires the host loop");
             let forward_ms = launch.forward.is_some().then_some(forward_ms);
             let gpu_end_ms = host.launch(pass.selected_ms, forward_ms.zip(launch.forward));
+            stage0 = gpu_end_ms.zip(forward_ms);
             self.last_forward_ms = Some(forward_ms.unwrap_or(0.0));
             if let Some(gpu_end_ms) = gpu_end_ms {
                 result.lifecycle_events.splice(
@@ -1263,6 +1326,27 @@ impl SglangCore {
             self.last_forward_ms = Some(forward_ms);
         }
         result.end_ms = pass.end_ms.unwrap_or(forward_end_ms);
+        if self.config.pipeline_fill_passes > 0.0 {
+            let ready_ms =
+                stage0.map(|(end_ms, stage_ms)| self.pipeline_ready_ms(end_ms, stage_ms));
+            if host_launch {
+                self.last_forward_ready_ms = ready_ms;
+            }
+            if let Some(ready_ms) = ready_ms {
+                let fill_ms = (ready_ms - result.end_ms).max(0.0);
+                for event in &mut result.lifecycle_events {
+                    if let SchedulerLifecycleEvent::SourceHeld {
+                        request_id,
+                        transfer_timing,
+                        ..
+                    } = event
+                        && pass.pipeline_fill_requests.contains(request_id)
+                    {
+                        transfer_timing.pipeline_fill_ms = fill_ms;
+                    }
+                }
+            }
+        }
         if let Some(fpm) = &mut result.fpm {
             fpm.wall_time_secs = forward_ms / 1000.0;
         }
@@ -1566,9 +1650,22 @@ impl SglangCore {
                     .extract_if(.., |request| request.pending_terminal),
             );
         }
+        // A PP prefill forward's last stages run after this pass retires; its
+        // handoffs wait for them once the forward is priced.
+        let pipeline_fill_requests = if self.config.pipeline_fill_passes > 0.0 {
+            decode
+                .completed_requests
+                .iter()
+                .map(|request| request.uuid)
+                .collect()
+        } else {
+            Vec::new()
+        };
         for request in decode.completed_requests.drain(..) {
-            self.complete_source(request);
+            self.complete_source(request, 0.0);
         }
+        // Under the host loop, this pass observes the forward the previous one launched.
+        let observed_ready_ms = self.last_forward_ready_ms.take();
         self.last_forward_ms = None;
         let (end_ms, mut output_signals, observed_forward, launch) = match &mut self.host {
             Some(host) => {
@@ -1649,8 +1746,10 @@ impl SglangCore {
                         .extract_if(.., |request| observed_terminals.contains(&request.uuid)),
                 );
                 terminals.append(&mut finishing_inflight);
+                let observed_fill_ms =
+                    observed_ready_ms.map_or(0.0, |ready_ms| (ready_ms - end_ms).max(0.0));
                 for request in terminals {
-                    self.complete_source(request);
+                    self.complete_source(request, observed_fill_ms);
                 }
                 (
                     Some(end_ms),
@@ -1796,13 +1895,17 @@ impl SglangCore {
             decode: decode_shape
                 .as_mut()
                 .filter(|shape| shape.charged)
-                .map(|shape| DecodeWork {
-                    batch_size: shape.batch_size,
-                    active_kv_tokens: shape.active_kv_tokens,
-                    mean_context_length: shape.mean_context_length,
-                    kv_bound_tokens: self.config.total_kv_tokens,
-                    lengths: std::mem::take(&mut shape.lengths),
-                    verify_width: self.config.speculative_max_tokens.unwrap_or(1),
+                .map(|shape| {
+                    let verify_width = self.config.speculative_max_tokens.unwrap_or(1);
+                    DecodeWork {
+                        batch_size: shape.batch_size,
+                        active_kv_tokens: shape.active_kv_tokens,
+                        mean_context_length: shape.mean_context_length,
+                        kv_bound_tokens: self.config.total_kv_tokens,
+                        widths: vec![verify_width; shape.lengths.len()],
+                        lengths: std::mem::take(&mut shape.lengths),
+                        verify_width,
+                    }
                 }),
         };
         self.host_capacity_blocked = !self.model_work_in_pass
@@ -1863,6 +1966,7 @@ impl SglangCore {
             decode: decode_shape,
             end_ms,
             launch,
+            pipeline_fill_requests,
             result,
         });
         Ok(work)

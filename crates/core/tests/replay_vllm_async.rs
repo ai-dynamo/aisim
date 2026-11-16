@@ -5,8 +5,8 @@
 
 use std::collections::VecDeque;
 
-use aisimulate_core::engine::{EngineConfig, PassLaunchConfig, TimingModelConfig};
-use aisimulate_core::replay::{
+use aisim_core::engine::{EngineConfig, PassLaunchConfig, TimingModelConfig};
+use aisim_core::replay::{
     CURRENT_REPLAY_SPEC_VERSION, DirectRequest, PerRequestRecord, ReplayEngineConfig,
     ReplayEngineFactory, ReplayReport, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer,
     WorkerPoolSpec,

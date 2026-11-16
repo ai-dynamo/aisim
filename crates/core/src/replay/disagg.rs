@@ -353,6 +353,7 @@ impl TransferLinks {
         self.transfers.next_event()
     }
 
+    /// Queue `delay_ms` of link work that starts at `ready_ms` (no earlier than `now_ms`).
     fn submit(
         &mut self,
         handoff_id: HandoffId,
@@ -360,14 +361,16 @@ impl TransferLinks {
         source: usize,
         destination: usize,
         now_ms: f64,
+        ready_ms: f64,
     ) {
+        debug_assert!(ready_ms >= now_ms);
         self.advance(now_ms);
         let id = self.next_job;
         self.next_job += 1;
         self.transfers.submit(Job {
             id,
             direction: Direction::Write,
-            ready: now_ms,
+            ready: ready_ms,
             bytes: delay_ms,
             links: [
                 Link {
@@ -863,17 +866,20 @@ impl DisaggFlowState {
         let state = self.state(uuid)?;
         let handoff_id = state.handoff_id;
         let ranks = (state.prefill_worker_idx(), state.decode_worker_idx());
-        if delay_ms > 0.0 {
+        // A PP prefill's later stages are compute, not link work: the KV
+        // occupies the shared links only once they finish.
+        let ready_ms = now_ms + state.coordinator.pipeline_fill_ms();
+        if delay_ms > 0.0 || ready_ms > now_ms {
             let Some(links) = &mut self.links else {
                 return Ok(TransferStart::Scheduled(ScheduledTransfer {
-                    at_ms: now_ms + delay_ms,
+                    at_ms: ready_ms + delay_ms,
                     handoff_id,
                 }));
             };
             let (Some(source), Some(destination)) = ranks else {
                 bail!("offline disagg transfer for {uuid} has no prefill or decode rank");
             };
-            links.submit(handoff_id, delay_ms, source, destination, now_ms);
+            links.submit(handoff_id, delay_ms, source, destination, now_ms, ready_ms);
             return Ok(TransferStart::Linked);
         }
         self.apply_handoff_fact(
@@ -2468,7 +2474,8 @@ where
             return Ok(());
         }
         if let Some(token_id) = signal.token_id {
-            self.admission.defer_output_token(signal.uuid, token_id)?;
+            self.admission
+                .defer_output_token(signal.uuid, token_id, self.now_ms)?;
             // Generalized-engine completion effects become visible at the
             // attention-DP group boundary. Recording the token here therefore
             // preserves the old EngineComponent::align_pass_token_times
@@ -2657,6 +2664,21 @@ where
                 )
             }
             SimulationWorkerStage::Decode => {
+                // Read only settled state, before another eager pass can run. The
+                // policy throttles queue inspection and later refreshes on dispatch.
+                if self.decode_placement.needs_scheduler_load(
+                    payload.worker_idx,
+                    self.now_ms,
+                    payload.completed_requests > 0,
+                ) {
+                    let (tokens, requests) = self.decode_engine.decode_load(payload.worker_idx)?;
+                    self.decode_placement.observe_scheduler_load(
+                        payload.worker_idx,
+                        tokens,
+                        requests,
+                        self.now_ms,
+                    );
+                }
                 self.wake_deferred_actions(SimulationWorkerStage::Decode, payload.worker_idx);
                 if self.collect_fpm
                     && let Some(fpm) = payload.fpm
@@ -2810,7 +2832,7 @@ where
         Ok(uuid)
     }
 
-    /// Start passes on every idle prefill worker that can make progress at the current timestamp.
+    /// Yields to admission between passes so reactions can join unstarted work.
     fn drive_prefill_workers(&mut self) -> Result<bool> {
         let mut changed = false;
         loop {
@@ -2820,10 +2842,13 @@ where
             }
             changed = true;
             self.handle_prefill_engine_effects(effects)?;
+            if self.admission.holds_passes() {
+                return Ok(changed);
+            }
         }
     }
 
-    /// Start passes on every idle decode worker that can make progress at the current timestamp.
+    /// Yields to admission between passes so reactions can join unstarted work.
     fn drive_decode_workers(&mut self) -> Result<bool> {
         let mut changed = false;
         loop {
@@ -2839,6 +2864,9 @@ where
             }
             changed = true;
             self.handle_decode_engine_effects(effects)?;
+            if self.admission.holds_passes() {
+                return Ok(changed);
+            }
         }
     }
 
@@ -3086,6 +3114,19 @@ where
 
     /// Repeatedly process all work that becomes possible without advancing logical time.
     fn drain_current_timestamp(&mut self) -> Result<()> {
+        // Empty source wakeups must not start engine work between native events.
+        let cluster_in_flight = self.cluster_in_flight();
+        if self.admission.wakeup_step(self.now_ms, cluster_in_flight)?
+            && self.drive_started
+            && self
+                .next_timestamps()
+                .1
+                .is_none_or(|next_ms| next_ms > self.now_ms)
+        {
+            // A final empty wakeup must not suppress a due periodic sample.
+            self.apply_telemetry_ticks()?;
+            return Ok(());
+        }
         #[cfg(test)]
         {
             self.stats.semantic_drain_count += 1;
@@ -3128,8 +3169,23 @@ where
             changed |= self.release_encoded_arrivals()?;
             changed |= self.release_ready_arrivals()?;
             changed |= self.release_tokenized()?;
+            // Submit arrivals released at this boundary before a worker commits
+            // its next pass. The engine still enforces async batch eligibility.
+            changed |= self.drive_pending_actions()?;
+            if self.admission.holds_passes() {
+                continue;
+            }
             changed |= self.drive_prefill_workers()?;
+            // Prefill reactions must reach placement before decode starts.
+            if self.admission.holds_passes() {
+                continue;
+            }
             changed |= self.drive_decode_workers()?;
+            // Settle current feedback before observers run, without moving native
+            // tick boundaries for feedback that emerges in a later drain iteration.
+            if self.admission.holds_passes() {
+                continue;
+            }
             let removed_prefill = self
                 .prefill_engine
                 .try_remove_drained()
@@ -4117,6 +4173,16 @@ where
             return Ok(ReplayStepOutcome::Settled {
                 now_ms: self.now_ms,
             });
+        }
+        if self.admission.is_external()
+            && self.cluster_in_flight() == 0
+            && self.only_idle_events_remain()
+            && self.prefill_engine.is_drained()
+            && self.decode_engine.is_drained()
+            && self.flow.action_queues.is_empty()
+            && self.flow.requests_by_handoff.is_empty()
+        {
+            self.admission.check_not_stalled()?;
         }
 
         loop {
