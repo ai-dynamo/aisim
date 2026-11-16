@@ -1415,11 +1415,14 @@ impl EngineConfig {
 
     /// Batches a busy vLLM engine keeps committed, its `max_concurrent_batches`:
     /// two with async scheduling and one without. Engine replay does not model
-    /// pipeline parallelism, which would raise this depth.
+    /// pipeline parallelism, which would raise this depth. MTP with G2 runs
+    /// synchronously, except with a state cache.
     pub(crate) fn max_concurrent_batches(&self) -> usize {
         if self.backend == Backend::Vllm
             && self.async_scheduling != Some(false)
-            && !(self.native_host_offload.is_some() && self.aic_nextn.is_some())
+            && !(self.native_host_offload.is_some()
+                && self.aic_nextn.is_some()
+                && self.state_cache.is_none())
         {
             2
         } else {
@@ -2912,6 +2915,7 @@ mod tests {
         let mut config = native_host_offload_config();
         hybrid_mtp_host_config(&mut config);
         config.validate().unwrap();
+        assert_eq!(config.max_concurrent_batches(), 2);
         let cases: &[InvalidHostConfigCase] = &[
             (
                 |config| {
