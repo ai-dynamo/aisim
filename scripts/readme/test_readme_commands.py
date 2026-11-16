@@ -78,3 +78,98 @@ def test_prediction_tensor_override_metric(tmp_path, actual):
     else:
         with pytest.raises(ValueError, match="Unexpected decode_gpus_per_worker"):
             assert_outputs(entry, tmp_path, tmp_path / "log")
+
+
+def rc_manifest(tmp_path):
+    import hashlib
+    import zipfile
+
+    packages = {"aisim": "0.14.0", "ai-dynamo": "1.7.0", "ai-dynamo-runtime": "1.7.0"}
+    wheels = []
+    for name, version in packages.items():
+        normalized = name.replace("-", "_")
+        path = tmp_path / f"{normalized}-{version}-py3-none-any.whl"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(f"{normalized}-{version}.dist-info/METADATA", f"Name: {name}\nVersion: {version}\n")
+        wheels.append(
+            {
+                "filename": path.name,
+                "name": name,
+                "version": version,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    candidate = {"source": "release-candidate", "wheelhouse": str(tmp_path), "packages": packages, "wheels": wheels}
+    manifest = tmp_path / "candidate.json"
+    manifest.write_text(json.dumps(candidate))
+    return manifest, candidate
+
+
+def test_rc_wheels_constrain_exact_artifacts_and_retain_provenance(tmp_path):
+    from scripts.readme.check_readme_commands import candidate_environment
+
+    manifest, candidate = rc_manifest(tmp_path)
+    env = {}
+    assert candidate_environment(manifest, tmp_path, env) == candidate
+    constraints = (tmp_path / "candidate-constraints.txt").read_text()
+    for wheel in candidate["wheels"]:
+        assert f"{wheel['name']} @ {(tmp_path / wheel['filename']).as_uri()}" in constraints
+    assert env["PIP_CONSTRAINT"] == str(tmp_path / "candidate-constraints.txt")
+
+
+@pytest.mark.parametrize("damage", ["hash", "version", "missing-runtime", "duplicate", "path"])
+def test_invalid_rc_artifacts_fail_before_install(tmp_path, damage):
+    from scripts.readme.check_readme_commands import candidate_environment
+
+    manifest, candidate = rc_manifest(tmp_path)
+    if damage == "hash":
+        candidate["wheels"][0]["sha256"] = "0" * 64
+    elif damage == "version":
+        candidate["packages"]["aisim"] = "0.15.0"
+    elif damage == "missing-runtime":
+        candidate["wheels"].pop()
+    elif damage == "duplicate":
+        candidate["wheels"].append(candidate["wheels"][0])
+    else:
+        candidate["wheels"][0]["filename"] = "../outside.whl"
+    manifest.write_text(json.dumps(candidate))
+    with pytest.raises(ValueError):
+        candidate_environment(manifest, tmp_path, {})
+
+
+def test_published_release_does_not_substitute_rc_wheels(tmp_path):
+    from scripts.readme.check_readme_commands import candidate_environment
+
+    manifest = tmp_path / "candidate.json"
+    manifest.write_text(json.dumps({"source": "public-index", "wheels": []}))
+    env = {}
+    assert candidate_environment(manifest, tmp_path, env)["source"] == "public-index"
+    assert env == {}
+    manifest.write_text(json.dumps({"source": "public-index", "wheels": [{}]}))
+    with pytest.raises(ValueError, match="must not substitute"):
+        candidate_environment(manifest, tmp_path, env)
+
+
+def test_rc_install_failure_is_still_a_failure(tmp_path, monkeypatch):
+    from scripts.readme import check_readme_commands as harness
+
+    candidate_path, candidate = rc_manifest(tmp_path)
+    monkeypatch.setattr(harness.venv, "create", lambda *args, **kwargs: None)
+    observed = []
+
+    def fail_install(command, cwd, env, log, timeout):
+        observed.append(env.get("PIP_CONSTRAINT"))
+        return 1, False
+
+    monkeypatch.setattr(harness, "run_shell", fail_install)
+    report = harness.run_profile(
+        "dynamo",
+        tmp_path / "workspace",
+        tmp_path / "results",
+        {"install": "failing install"},
+        {"install": {"profiles": ["dynamo"], "needs": [], "timeout": 10}},
+        candidate_path,
+    )
+    assert report["checks"][0]["status"] == "failed"
+    assert report["package_source"] == candidate
+    assert observed and observed[0]

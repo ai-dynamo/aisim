@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,8 @@ import subprocess
 import sys
 import time
 import venv
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 
 import psutil
@@ -143,10 +146,68 @@ def assert_outputs(entry: dict, cwd: Path, log: Path) -> None:
             raise ValueError(f"Missing expected output: {expected}")
 
 
-def run_profile(profile: str, workspace: Path, output: Path, blocks: dict, manifest: dict) -> dict:
+def candidate_environment(path: Path, output: Path, env: dict) -> dict:
+    """Constrain installs to verified RC artifacts without rewriting README commands."""
+    candidate = json.loads(path.read_text())
+    if candidate["source"] == "public-index":
+        if candidate.get("wheels"):
+            raise ValueError("Public-index validation must not substitute local wheels")
+        return candidate
+    if candidate["source"] != "release-candidate":
+        raise ValueError("Unknown candidate source")
+    wheelhouse = Path(candidate["wheelhouse"]).resolve(strict=True)
+    expected = candidate["packages"]
+    if set(expected) != {"aisim", "ai-dynamo", "ai-dynamo-runtime"}:
+        raise ValueError("Candidate must include the complete Dynamo release pair and runtime")
+    constraints = []
+    seen = set()
+    for wheel in candidate["wheels"]:
+        filename = wheel["filename"]
+        if Path(filename).name != filename or not filename.endswith(".whl"):
+            raise ValueError("Unsafe candidate wheel filename")
+        artifact = (wheelhouse / filename).resolve(strict=True)
+        if artifact.parent != wheelhouse:
+            raise ValueError("Candidate wheel escaped its wheelhouse")
+        with artifact.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        if digest != wheel["sha256"]:
+            raise ValueError(f"Candidate wheel hash mismatch: {filename}")
+        with zipfile.ZipFile(artifact) as archive:
+            metadata = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+            if len(metadata) != 1:
+                raise ValueError(f"Invalid wheel metadata: {filename}")
+            package = BytesParser().parsebytes(archive.read(metadata[0]))
+        name = package["Name"].lower().replace("_", "-")
+        version = package["Version"]
+        if name in seen or expected.get(name) != version or (wheel["name"], wheel["version"]) != (name, version):
+            raise ValueError(f"Candidate wheel package/version mismatch: {filename}")
+        seen.add(name)
+        constraints.append(f"{name} @ {artifact.as_uri()}")
+    if seen != set(expected):
+        raise ValueError("Candidate wheel set is incomplete")
+    constraint_path = output / "candidate-constraints.txt"
+    constraint_path.write_text("\n".join(constraints) + "\n")
+    env["PIP_CONSTRAINT"] = str(constraint_path)
+    return candidate
+
+
+def run_profile(
+    profile: str,
+    workspace: Path,
+    output: Path,
+    blocks: dict,
+    manifest: dict,
+    candidate_manifest: Path | None = None,
+) -> dict:
     workspace.mkdir(parents=True, exist_ok=False)
     output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    package_source = {"source": "public-index"}
+    if candidate_manifest:
+        if profile != "dynamo":
+            raise ValueError("Candidate wheels are only supported for the Dynamo profile")
+        package_source = candidate_environment(candidate_manifest, output, env)
+    print(f"Package source: {package_source['source']}", flush=True)
     # All examples use public models. Isolate host credentials and caches without
     # changing the user's Hugging Face login or production authentication code.
     env.pop("HF_TOKEN", None)
@@ -217,6 +278,7 @@ def run_profile(profile: str, workspace: Path, output: Path, blocks: dict, manif
         print(f"{profile}/{name}: {row['status']} ({row['seconds']}s)", flush=True)
         report = {
             "profile": profile,
+            "package_source": package_source,
             "sha": sha,
             "checks": results,
             "expected": selected,
@@ -242,6 +304,7 @@ def main() -> int:
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--candidate-manifest", type=Path)
     args = parser.parse_args()
     manifest = json.loads((ROOT / "scripts/readme/readme_commands.json").read_text())
     blocks = read_blocks((ROOT / "README.md").read_text(), manifest)
@@ -250,7 +313,17 @@ def main() -> int:
         return 0
     if not args.profile or not args.workspace or not args.output:
         parser.error("--profile, --workspace and --output are required for execution")
-    report = run_profile(args.profile, args.workspace.resolve(), args.output.resolve(), blocks, manifest)
+    report = run_profile(
+        args.profile, args.workspace.resolve(), args.output.resolve(), blocks, manifest, args.candidate_manifest
+    )
+    if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with Path(summary).open("a") as stream:
+            stream.write(f"### README / {args.profile}\n\n")
+            stream.write(f"Package source: **{report['package_source']['source']}**.\n\n")
+            if report["package_source"]["source"] == "release-candidate":
+                stream.write("RC validation only; public-index installation is not checked.\n\n")
+            for check in report["checks"]:
+                stream.write(f"- `{check['id']}`: {check['status']}\n")
     return int(any(row["status"] != "passed" for row in report["checks"]))
 
 
