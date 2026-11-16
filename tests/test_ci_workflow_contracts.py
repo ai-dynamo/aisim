@@ -2823,6 +2823,24 @@ def test_nightly_license_baseline_rejects_invalid_inventory_before_publishing(tm
         assert not (tmp_path / filename).exists()
 
 
+@pytest.mark.parametrize("licenses", [("GPL-3.0-only", "MIT"), ("MIT", "GPL-3.0-only")])
+def test_nightly_license_baseline_rejects_conflicting_duplicates_before_publishing(tmp_path, licenses):
+    prior = [
+        {"dependency_type": "crate", "name": "getrandom", "version": "0.2.17", "spdx_license": spdx}
+        for spdx in licenses
+    ]
+    with pytest.raises(ValueError, match="conflicting license metadata"):
+        _nightly_license_report(tmp_path, [("0.2.17", "MIT")], prior)
+    for filename in ("deps.csv", "deps-diff.csv", "evidence.json"):
+        assert not (tmp_path / filename).exists()
+
+
+def test_nightly_license_baseline_accepts_identical_duplicates(tmp_path):
+    crates = [("0.2.17", "MIT")]
+    prior, _ = _nightly_license_report(tmp_path, crates)
+    assert _nightly_license_report(tmp_path, crates, prior * 2)[1] == []
+
+
 @pytest.mark.parametrize(
     "bundled",
     [[], [{"dependency_type": "python", "name": "example", "version": "1.0", "spdx_license": "Apache-2.0"}]],
@@ -2929,6 +2947,33 @@ def test_ci_license_evidence_requires_complete_baseline_inventories(tmp_path):
     with pytest.raises(ValueError, match="missing Python dependency inventories"):
         license_evidence.main([str(head), "--base-dir", str(tmp_path / "missing-base")])
     assert not (head / "deps-diff.csv").exists()
+
+
+@pytest.mark.parametrize("input_side", ["head", "base"])
+@pytest.mark.parametrize(
+    "python_row",
+    [
+        ",1.0,MIT",
+        " ,1.0,MIT",
+        "example,,MIT",
+        "example, ,MIT",
+        "example,1.0,",
+        "example,1.0, \t",
+        "example,1.0",
+    ],
+)
+def test_ci_license_evidence_rejects_incomplete_local_rows_before_publishing(tmp_path, input_side, python_row):
+    for side in ("head", "base"):
+        directory = tmp_path / side
+        (directory / "python").mkdir(parents=True)
+        (directory / "python" / "inventory.csv").write_text("Name,Version,License\nexample,1.0,MIT\n")
+        (directory / "cargo-metadata.json").write_text('{"packages": []}')
+    (tmp_path / input_side / "python" / "inventory.csv").write_text(f"Name,Version,License\n{python_row}\n")
+
+    with pytest.raises(ValueError, match="missing or empty required fields"):
+        license_evidence.main([str(tmp_path / "head"), "--base-dir", str(tmp_path / "base")])
+    for filename in ("deps.csv", "deps-diff.csv", "evidence.json"):
+        assert not (tmp_path / "head" / filename).exists()
 
 
 def test_full_ci_evidence_runs_independently_of_build_scope_and_uses_shared_generator():

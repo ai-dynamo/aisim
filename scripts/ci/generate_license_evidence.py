@@ -22,6 +22,18 @@ def identity(row: dict[str, str]) -> tuple[str, str, str]:
     return row["dependency_type"], row["name"], row["version"]
 
 
+def index_inventory(rows: list[dict[str, str]]) -> dict[tuple[str, str, str], dict[str, str]]:
+    unique = {}
+    for row in rows:
+        if any(not isinstance(row.get(field), str) or not row[field].strip() for field in FIELDS):
+            raise ValueError("invalid license inventory row: missing or empty required fields")
+        key = identity(row)
+        if key in unique and unique[key] != row:
+            raise ValueError("conflicting license metadata for one dependency version")
+        unique[key] = row
+    return unique
+
+
 def inventory(directory: Path, *, include_bundled: bool = False) -> list[dict[str, str]]:
     rows = []
     for filename in sorted((directory / "python").glob("*.csv")):
@@ -64,12 +76,7 @@ def inventory(directory: Path, *, include_bundled: bool = False) -> list[dict[st
                     "spdx_license": package.get("license") or "UNKNOWN",
                 }
             )
-    unique = {}
-    for row in rows:
-        key = identity(row)
-        if key in unique and unique[key] != row:
-            raise ValueError("conflicting license metadata for one dependency version")
-        unique[key] = row
+    unique = index_inventory(rows)
     return [unique[key] for key in sorted(unique)]
 
 
@@ -127,8 +134,8 @@ def previous_nightly() -> list[dict[str, str]]:
 
 
 def difference(rows: list[dict[str, str]], prior: list[dict[str, str]]) -> list[dict[str, str]]:
-    current = {identity(row): row for row in rows}
-    baseline = {identity(row): row for row in prior}
+    current = index_inventory(rows)
+    baseline = index_inventory(prior)
     result = []
     for key in sorted(current.keys() | baseline.keys()):
         new, old = current.get(key), baseline.get(key)

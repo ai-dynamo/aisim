@@ -173,6 +173,9 @@ the selected source. Its `base_sha` is empty for the previous-nightly comparison
 retained scheduled-run evidence exists. The lookup paginates successful runs
 and their artifacts. A selected archive with missing, empty, or malformed
 `deps.csv` fails evidence generation instead of using an empty baseline.
+Local inventories also reject missing or blank required fields. Both comparison
+paths reject conflicting rows for the same dependency type, name, and version
+before writing reports; identical duplicates are deduplicated.
 
 ## Source layout is not the publication boundary
 
