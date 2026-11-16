@@ -7895,40 +7895,42 @@ mod tests {
 
     #[test]
     fn launch_and_fit_must_agree_on_the_cuda_graph_capture_size() {
-        let mut role = ReplayRoleConfig::default();
-        role.rank.launch = Some(crate::engine::PassLaunchConfig {
-            decode_ms: 1.0,
-            piecewise_ms: 1.0,
-            eager_ms: 1.0,
-            max_cudagraph_capture_size: 4096,
-            eager_queue_fraction: 0.0,
-        });
-        role.rank.timing_model = TimingModelConfig::External {
-            provider: "aic".into(),
-            config: serde_json::json!({
-                "model": "test-model", "backend": "vllm", "system": "test-system", "tp": 1,
-                "estimator_config": {"fpm_regression": {"fit": {"linear": {
-                    "feature_axes": ["E"], "max_cudagraph_capture_size": 512
-                }}}}
-            }),
-        };
-        let Err(error) = resolve_role_timing(
-            &mut role,
-            false,
-            ForwardPassWorkerType::Aggregated,
-            None,
-            false,
-            &mut Vec::new(),
-            &mut serde_json::Map::new(),
-        ) else {
-            panic!("a launch capture size that differs from the fit's must be rejected");
-        };
-        let error = error.to_string();
-        assert!(
-            error.contains("scheduler.launch.max_cudagraph_capture_size (4096) differs")
-                && error.contains("fit.linear.max_cudagraph_capture_size (512)"),
-            "{error}"
-        );
+        for launch_size in [4096, 512] {
+            let mut role = ReplayRoleConfig::default();
+            role.rank.launch = Some(crate::engine::PassLaunchConfig {
+                decode_ms: 1.0,
+                piecewise_ms: 1.0,
+                eager_ms: 1.0,
+                max_cudagraph_capture_size: launch_size,
+                eager_queue_fraction: 0.0,
+            });
+            role.rank.timing_model = TimingModelConfig::External {
+                provider: "aic".into(),
+                config: serde_json::json!({
+                    "model": "test-model", "backend": "vllm", "system": "test-system", "tp": 1,
+                    "estimator_config": {"fpm_regression": {"fit": {"linear": {
+                        "feature_axes": ["E"], "max_cudagraph_capture_size": 512
+                    }}}}
+                }),
+            };
+            // The test model has no estimator, so equal sizes fail only later.
+            let Err(error) = resolve_role_timing(
+                &mut role,
+                false,
+                ForwardPassWorkerType::Aggregated,
+                None,
+                false,
+                &mut Vec::new(),
+                &mut serde_json::Map::new(),
+            ) else {
+                panic!("the test model cannot build an estimator");
+            };
+            let error = error.to_string();
+            let rejected = error
+                .contains("scheduler.launch.max_cudagraph_capture_size (4096) differs")
+                && error.contains("fit.linear.max_cudagraph_capture_size (512)");
+            assert_eq!(rejected, launch_size != 512, "{error}");
+        }
     }
 
     fn aic_config() -> AicTimingConfig {
