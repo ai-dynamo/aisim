@@ -350,42 +350,49 @@ impl RadixCache {
         reusable
     }
 
-    /// Record an insert of cached `page_keys` whose forward ended at `end_tokens` (SGLang
-    /// `cache_unfinished_req`). The request frees its SWA KV below the page holding
-    /// `end_tokens - 1 - page`, so the last whole SWA page before the end stays cached, and the
-    /// one before it too when the end is page-aligned. Ignores an uncached path.
-    pub(crate) fn mark_swa_window(&mut self, page_keys: &[LocalBlockHash], end_tokens: usize) {
+    /// Record an insert of the first `cached_pages` pages of the path ending on `tail`,
+    /// `tail_pages` deep, whose forward ended at `end_tokens` (SGLang `cache_unfinished_req`).
+    /// The request frees its SWA KV below the page holding `end_tokens - 1 - page`, so the last
+    /// whole SWA page before the end stays cached, and the one before it too when the end is
+    /// page-aligned.
+    pub(crate) fn mark_swa_window(
+        &mut self,
+        tail: NodeId,
+        tail_pages: usize,
+        cached_pages: usize,
+        end_tokens: usize,
+    ) {
         let Some(span) = self.swa.as_ref().map(|swa| swa.page_span) else {
             return;
         };
+        debug_assert!(cached_pages <= tail_pages);
         let page_tokens = span * self.page_size;
-        let end = (end_tokens / page_tokens * span).min(page_keys.len() / span * span);
+        let end = (end_tokens / page_tokens * span).min(cached_pages / span * span);
         if end_tokens % page_tokens == 0 && end > span {
-            self.mark_swa_boundary(&page_keys[..end - span]);
+            self.mark_swa_boundary(tail, tail_pages, end - span);
         }
-        self.mark_swa_boundary(&page_keys[..end]);
+        self.mark_swa_boundary(tail, tail_pages, end);
     }
 
-    /// Mark the end of cached `page_keys`, splitting the edge there if needed.
-    fn mark_swa_boundary(&mut self, page_keys: &[LocalBlockHash]) {
-        if page_keys.is_empty() {
+    /// Mark the end of the first `pages` pages of the path ending on `tail`, `tail_pages` deep,
+    /// splitting the edge there if needed. Walks up from `tail`, so it compares no keys.
+    fn mark_swa_boundary(&mut self, tail: NodeId, tail_pages: usize, pages: usize) {
+        if pages == 0 {
             return;
         }
-        let (mut current, mut depth) = (self.root, 0);
-        while depth < page_keys.len() {
-            let Some(&child) = self.nodes[current].children.get(&page_keys[depth]) else {
-                return;
-            };
-            let common = Self::key_match(&self.nodes[child].key, &page_keys[depth..]);
-            depth += common;
-            current = if common < self.nodes[child].key.len() {
-                if depth < page_keys.len() {
-                    return;
+        let (mut current, mut end) = (tail, tail_pages);
+        loop {
+            let start = end - self.nodes[current].key.len();
+            if pages > start {
+                if pages < end {
+                    current = self.split_node(current, pages - start);
                 }
-                self.split_node(child, common)
-            } else {
-                child
-            };
+                break;
+            }
+            current = self.nodes[current]
+                .parent
+                .expect("SWA page lies on the path to its tail");
+            end = start;
         }
         let swa = self.swa.as_mut().expect("SWA tracking is enabled");
         swa.clock += 1;
@@ -1422,9 +1429,8 @@ mod tests {
     /// Insert `tokens` as one forward that ended `past_end` tokens after them.
     fn insert_with_window(cache: &mut RadixCache, tokens: &[u32], past_end: usize) -> Vec<usize> {
         let pages = cache.page_pool.allocate(tokens.len()).unwrap();
-        cache.insert(tokens, &pages);
-        let keys = cache.page_hashes(tokens);
-        cache.mark_swa_window(&keys, tokens.len() + past_end);
+        let tail = cache.insert(tokens, &pages);
+        cache.mark_swa_window(tail, tokens.len(), tokens.len(), tokens.len() + past_end);
         pages
     }
 
@@ -1445,9 +1451,10 @@ mod tests {
             0,
             "a fork inside the sequence finds no SWA page"
         );
-        // A recomputed fork point is a page-aligned insert end: it keeps two SWA pages.
-        let fork = cache.page_hashes(&[1, 2, 3, 4]);
-        cache.mark_swa_window(&fork, 4);
+        // A recomputed fork point is a page-aligned insert end: it keeps two SWA pages. It is
+        // reached from the tail of the path it lies on, three pages below it.
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7]);
+        cache.mark_swa_window(tail, 7, 4, 4);
         assert_eq!(swa_reusable(&cache, &[1, 2, 3, 4, 9]), 4);
         assert_eq!(swa_reusable(&cache, &[1, 2, 3, 9]), 2);
         assert_eq!(
