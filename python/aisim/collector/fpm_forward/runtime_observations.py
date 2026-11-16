@@ -993,7 +993,7 @@ def _shared_slot_allocations(
     count: int,
     precision: str,
 ) -> tuple[set[str], set[str]]:
-    """vLLM 0.27/0.28 plan: each allocation slot is shared by layers of distinct groups."""
+    """Validate projected layer allocations, with aliases declared only inside ``shared_by``."""
     covered: set[str] = set()
     used_storage: set[str] = set()
     intervals: dict[str, list[tuple[int, int]]] = {}
@@ -1008,16 +1008,25 @@ def _shared_slot_allocations(
         stride = _nonnegative(allocation.get("block_stride"), "allocation block stride")
         offset = _nonnegative(allocation.get("offset"), "allocation byte offset")
         slot = storages[storage_id]["size_bytes"] // count
-        if (stride and stride != slot) or (not stride and (offset or storage_id in used_storage)):
+        if not stride and (offset or storage_id in used_storage):
             raise ValueError("allocation has an unsupported packed stride or undeclared storage alias")
         if storage_id in packing and packing[storage_id] != stride:
             raise ValueError("packed and unpacked allocations alias one storage")
         packing[storage_id] = stride
         width = max(layer_groups[name][1]["spec_page_size_bytes"] for name in names)
-        if offset + width > slot:
+        if width > (stride or slot):
             raise ValueError("allocation page bytes exceed the physical storage slot")
+        if offset + (count - 1) * stride + width > storages[storage_id]["size_bytes"]:
+            raise ValueError("allocation page bounds exceed the backing storage")
         for lower, upper in intervals.setdefault(storage_id, []):
-            if offset < upper and lower < offset + width:
+            # Explicit strides also describe layer-outer buffers: each layer's
+            # offset may span many pool blocks. Compare all repeating pages,
+            # including padding, without enumerating the block count. Pages b
+            # and b+d overlap iff -other_width < delta+d*stride < width.
+            delta = lower - offset
+            low = max((-(upper - lower) - delta) // stride + 1, 1 - count)
+            high = min(-((delta - width) // stride) - 1, count - 1)
+            if low <= high:
                 raise ValueError("packed allocation page intervals overlap")
         intervals[storage_id].append((offset, offset + width))
         views = []
