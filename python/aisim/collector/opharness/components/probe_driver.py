@@ -38,6 +38,9 @@ import yaml
 
 _HERE = Path(__file__).resolve().parent
 HARNESS = _HERE.parent
+sys.path.insert(0, str(_HERE))
+from dummies import dummy_leaf  # the one name of a dummy directory, shared with its writer
+
 # The workspace holds everything generated: configs/, dummy_models/, campaigns/, results/.
 ROOT = Path(os.environ.get("AIS_PROBE_WORKSPACE") or HARNESS / "workspace")
 # generator source: this repo by default; override to pin a specific checkout
@@ -234,7 +237,7 @@ def derive_roster_checkpoints(fam: dict, targets: dict, only: list[str] | None =
     manifest = json.loads((ROOT / "dummy_models" / "variants_manifest.json").read_text())
     variants_of: dict[str, list[str]] = {}
     for v in manifest["variants"]:
-        variants_of.setdefault(v["repo"], []).append(v["variant"].split("__", 1)[1])
+        variants_of.setdefault(v["repo"], []).append(v["layer_kind"])
     # representative-first ordering: index 0 is the default probe variant
     _head = {"rep": 0, "all_kinds": 1, "rep_mix": 2, "interleave_pair": 3}
 
@@ -305,10 +308,24 @@ def exec_fingerprint(run: dict, bundle_files: list[str]) -> str:
     return h.hexdigest()[:12]
 
 
+def _manifest_owner(dummy_root: Path, family_dir: str, leaf: str) -> str | None:
+    """The repo the dummy manifest records for ``<family_dir>/<leaf>``, None when it has no entry."""
+    manifest = dummy_root / "variants_manifest.json"
+    if not manifest.exists():
+        return None
+    for v in json.loads(manifest.read_text()).get("variants") or []:
+        if v.get("variant") == leaf and v.get("family") == family_dir:
+            return v.get("repo")
+    return None
+
+
 def select_dummy_dir(
-    dummy_root: Path, repo_tag: str, variant: str, fam_name: str, fam: dict, ck: dict
+    dummy_root: Path, repo: str, variant: str, fam_name: str, fam: dict, ck: dict
 ) -> tuple[Path | None, str | None]:
-    """(dummy dir, skip reason). Dummy dirs are keyed by ADAPTER family.
+    """(dummy dir, skip reason). Dummy dirs are keyed by ADAPTER family and named by the full
+    repo id (dummies.dummy_leaf); the directory picked must be the one the dummy manifest
+    records for this repo, so a directory left by another repo or another generation of the
+    generator is never probed under this repo's name.
 
     When targets declare ``dummy_overrides.family`` for the checkpoint (or its
     family), ONLY that adapter's dir is this checkpoint's dummy: a dir built by
@@ -318,11 +335,22 @@ def select_dummy_dir(
     override until the plan was rebuilt). Without an override: the targets family
     dir, then generic, then any adapter dir (a roster repo may use a special one)."""
     want = ((ck.get("dummy_overrides") or {}).get("family")) or ((fam.get("dummy_overrides") or {}).get("family"))
-    leaf = f"{repo_tag}__{variant}"
+    leaf = dummy_leaf(repo, variant)
+
+    def owned(vdir: Path) -> tuple[Path | None, str | None]:
+        owner = _manifest_owner(dummy_root, vdir.parent.name, leaf)
+        if owner == repo:
+            return vdir, None
+        whose = f"records it for {owner}" if owner else "has no entry for it"
+        return None, (
+            f"dummy {vdir.parent.name}/{leaf} is not {repo}'s: variants_manifest.json {whose}"
+            " — rebuild with components/dummies.py"
+        )
+
     if want:
         vdir = dummy_root / want / leaf
         if vdir.exists():
-            return vdir, None
+            return owned(vdir)
         other = next((d.name for d in sorted(dummy_root.iterdir()) if d.is_dir() and (d / leaf).exists()), None)
         if other:
             return None, (
@@ -334,7 +362,7 @@ def select_dummy_dir(
     for famdir in dict.fromkeys(order):
         vdir = dummy_root / famdir / leaf
         if vdir.exists():
-            return vdir, None
+            return owned(vdir)
     return None, f"no dummy dir {leaf}"
 
 
@@ -391,7 +419,6 @@ def enumerate_runs(
                 continue  # adapter pending (kimi_k3)
             override = (fam.get("variant_overrides") or {}).get(backend)
             for ck in fam["checkpoints"]:
-                repo_tag = ck["repo"].split("/")[-1]
                 # per-checkpoint variants win (architectures in a mixed family each have
                 # their own layer kinds); else the family list
                 ck_variants = ck.get("variants") or variants
@@ -404,7 +431,7 @@ def enumerate_runs(
                 ck_override = (ck.get("variant_overrides") or {}).get(backend) or override
                 use_variants = ck_variants if full else [ck_override or ck_variants[0]]
                 for variant in use_variants:
-                    vdir, why = select_dummy_dir(ROOT / "dummy_models", repo_tag, variant, fam_name, fam, ck)
+                    vdir, why = select_dummy_dir(ROOT / "dummy_models", ck["repo"], variant, fam_name, fam, ck)
                     if vdir is None:
                         runs.append({"skip": why, "repo": ck["repo"], "variant": variant, "backend": backend})
                         continue
@@ -644,11 +671,15 @@ def load_plan(cdir: Path) -> list[dict]:
 def import_raws(result_dir: Path, cdir: Path) -> None:
     """File the raws of a pipeline job's ``probe.serving`` shards into ``<campaign>/raw/``.
     A shard counts only when the job ran this emit (its spec fingerprint equals the plan's);
-    a probe that died before writing a raw leaves its console tail as ``raw/<id>.tail``."""
+    a probe that died before writing a raw leaves its console tail as ``raw/<id>.tail``.
+    The attempt imported last is the run's state: a raw replaces an earlier tail and a tail
+    removes an earlier raw, so a failed retry never leaves the earlier success as evidence.
+    Two attempts of one run under the same ``result_dir`` have no order; neither is taken
+    and the run holds no raw until one attempt is imported alone."""
     runs = {r["id"]: r for r in load_plan(cdir) if "skip" not in r}
     raw_dir = cdir / "raw"
     raw_dir.mkdir(exist_ok=True)
-    n = 0
+    attempts: dict[str, list[tuple[Path, dict, dict]]] = {}
     for res_file in sorted(result_dir.rglob("probe_serving.json")):
         doc = json.loads(res_file.read_text())
         res = doc.get("result") or {}
@@ -660,11 +691,24 @@ def import_raws(result_dir: Path, cdir: Path) -> None:
         if res.get("fingerprint") != run["exec_fingerprint"]:
             print(f"skip {rid}: the job ran another emit of this run (fingerprint differs)", file=sys.stderr)
             continue
+        attempts.setdefault(rid, []).append((res_file, doc, res))
+    n = 0
+    for rid, found in attempts.items():
+        raw_file, tail_file = raw_dir / f"{rid}.json", raw_dir / f"{rid}.tail"
+        if len(found) > 1:
+            where = ", ".join(str(f.parent.relative_to(result_dir)) for f, _, _ in found)
+            print(f"ambiguous {rid}: {len(found)} attempts under {result_dir} ({where}); none taken", file=sys.stderr)
+            raw_file.unlink(missing_ok=True)
+            tail_file.write_text(f"ambiguous: {len(found)} attempts of this run in one import ({where})")
+            continue
+        res_file, doc, res = found[0]
         raw = res_file.parent / str(res.get("raw"))
-        if res.get("raw") and raw.exists():
-            (raw_dir / f"{rid}.json").write_text(raw.read_text())
+        if res.get("raw") and raw.exists() and not res.get("failed"):
+            raw_file.write_text(raw.read_text())
+            tail_file.unlink(missing_ok=True)
         else:
-            (raw_dir / f"{rid}.tail").write_text(res.get("tail") or doc.get("error") or "")
+            tail_file.write_text(res.get("tail") or doc.get("error") or "")
+            raw_file.unlink(missing_ok=True)
         n += 1
     print(f"imported {n} shard results into {raw_dir}")
 

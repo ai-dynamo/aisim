@@ -82,6 +82,15 @@ def _load_targets_declarations() -> tuple[dict, dict, dict]:
 
 _SPECIAL, _HFQUANT_COMPLETE_FROM_SIBLING, _DROP_AUTO_MAP, _TOKENIZER_FROM = _load_targets_declarations()
 
+
+def dummy_leaf(repo: str, variant: str) -> str:
+    """The directory name of one dummy: the full repo id and the cut. The writer (main) and the
+    reader (probe_driver.select_dummy_dir) both call this. The basename alone is not an identity:
+    RadixArk/ and nvidia/ publish a Qwen3.8-2.4T-A95B-NVFP4 with different quantization, and one
+    overwrote the other's dummy. A Hub repo id holds no ``--``, so ``<org>--<name>`` is one-to-one."""
+    return f"{repo.replace('/', '--')}__{variant}"
+
+
 # Frameworks load more than config.json from the model dir even for a
 # dummy-weight probe: the tokenizer (vllm/sglang at engine init, trtllm at
 # generate for end_id), custom modeling / processor code (Kimi: tiktoken.model
@@ -105,12 +114,11 @@ def _provision_aux_files(
 
     if (out_dir / "tokenizer_config.json").exists():
         return
-    name = repo.split("/")[-1]
     candidates = [configs / "aux_files" / repo.replace("/", "_")]
-    candidates += sorted(p for p in out_root.glob(f"*/{name}__*") if p.is_dir() and p != out_dir)
+    candidates += sorted(p for p in out_root.glob(f"*/{dummy_leaf(repo, '*')}") if p.is_dir() and p != out_dir)
     sib = _TOKENIZER_FROM.get(repo)
     if sib:
-        candidates += sorted(p for p in out_root.glob(f"*/{sib.split('/')[-1]}__*") if p.is_dir())
+        candidates += sorted(p for p in out_root.glob(f"*/{dummy_leaf(sib, '*')}") if p.is_dir())
     for src in candidates:
         if (src / "tokenizer_config.json").exists():
             copied = []
@@ -126,7 +134,7 @@ def _provision_aux_files(
             where = src.relative_to(out_root) if src.is_relative_to(out_root) else src
             edits.append(
                 f"aux files {len(copied)} from {where}"
-                + (f" (declared tokenizer_from {sib})" if sib and sib.split("/")[-1] in src.name else "")
+                + (f" (declared tokenizer_from {sib})" if sib and src.name.startswith(dummy_leaf(sib, "")) else "")
             )
             return
     caveats.append("MISSING TOKENIZER/AUX FILES: no fetched aux dir, no earlier variant, no declared tokenizer_from")
@@ -851,6 +859,7 @@ def main() -> int:
 
     manifest = {"generator": Path(__file__).name, "rule": "depth-only cut, width preserved", "variants": []}
     failures = 0
+    written: dict[Path, str] = {}
     for repo, family in load_repos(args.configs).items():
         src = args.configs / (repo.replace("/", "_") + ".json")
         if not src.exists():
@@ -873,8 +882,11 @@ def main() -> int:
                 edits.append(f"auto_map removed: {_DROP_AUTO_MAP[repo]}")
             new_n = cfg.get("num_hidden_layers") or _m3_text_config(cfg)["num_hidden_layers"]
             stale = _check_no_stale_layer_refs(cfg, new_n)
-            tag = f"{repo.split('/')[-1]}__{var['name']}"
+            tag = dummy_leaf(repo, var["name"])
             out_dir = args.out / family / tag
+            if out_dir in written:  # one directory, one (repo, cut): never a second config over the first
+                raise SystemExit(f"{repo} {var['name']}: {out_dir} was already written for {written[out_dir]}")
+            written[out_dir] = repo
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
             caveats: list[str] = []

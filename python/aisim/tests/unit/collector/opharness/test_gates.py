@@ -161,7 +161,10 @@ def test_a_gate_reads_only_its_own_backends_trace(gates, tmp_path):
         (shard / "probe_trace_case.json").write_text(json.dumps(doc))
     dirs = sorted(tmp_path.iterdir())
     assert gates._trace(dirs, name, "vllm", "0.32.0").parent.parent.name == "vllm-0.32.0"
-    assert gates._trace(dirs, name, "vllm", "0.33.0").parent.parent.name.startswith("vllm-")
+    assert gates._trace(dirs, name, "vllm", "0.31.0").parent.parent.name == "vllm-0.31.0"
+    assert gates._trace(dirs, name, "vllm", "0.32.0+cu129").parent.parent.name == "vllm-0.32.0"  # a build tag aside
+    # a trace of another release is never the gate's trace, not even when it is the only one
+    assert gates._trace(dirs, name, "vllm", "0.33.0") is None
     assert gates._trace(dirs[:1], name, "vllm", "0.32.0") is None
 
 
@@ -260,3 +263,94 @@ def test_a_derived_gate_names_one_planned_case_of_its_path(gates):
     in_scope = {g["gate"] for g in gates.gates_in_scope("vllm", "sm100")}
     with_derived = {g["gate"] for g in gates.gates_in_scope("vllm", "sm100", derive=True)}
     assert not in_scope & set(names) and with_derived == in_scope | set(names)
+
+
+# ---------------------------------------------------------------- what a trace may prove (review 2026-11-16)
+_SM90_GEMM = "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN"
+
+
+@pytest.fixture()
+def workspace(tmp_path, monkeypatch):
+    """A scratch probe workspace for every loaded copy of the driver (grading reads it twice:
+    the verdict directory and the serving records)."""
+    sys.path.insert(0, str(COMPONENTS))
+    import path_diff
+    import probe_driver
+
+    root = tmp_path / "workspace"
+    for mod in {probe_driver, path_diff.probe_driver}:
+        monkeypatch.setattr(mod, "ROOT", root)
+    return root
+
+
+def _checked_in(gates, backend, name):
+    return next(g for g in gates.load()["gates"] if g["backend"] == backend and g["gate"] == name)
+
+
+def _serving(root, gate, version, kernel):
+    record = {"id": "serving", "target": {"repo": gate["repo"]}, "outcome": {"status": "ok"}, "imported_at": 1}
+    record["runtime"] = {"backend": gate["backend"], "version": version, "sm": "sm90", "tp": 1, "isl": 4096}
+    record["runtime"]["kv_cache_dtype"] = "auto"
+    record.update(ops=[], orphan_kernels=[kernel], kernel_phases={kernel: ["prefill", "decode"]})
+    path = root / "campaigns" / "serving" / "records.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(record))
+
+
+def _trace_file(gates, jobs, shard, backend, version, kernels, **result):
+    f = jobs / f"{gates.SHARD_OP}__{shard}" / "probe_trace_case.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    base = {"sm": 90, "framework_version": version, "error": None, "failed": not kernels}
+    base.update(kernels=kernels, measured_kernels=kernels)
+    f.write_text(json.dumps({"probe": "trace_case", "args": {"backend": backend}, "result": {**base, **result}}))
+
+
+def _grade_cli(gates, monkeypatch, gate, op, jobs):
+    argv = ["gates.py", "grade", "--sm", "sm90", "--fw", gate["backend"], "--op", op, "--repo", gate["repo"]]
+    monkeypatch.setattr(sys, "argv", [*argv, "--results", str(jobs)])
+    return gates.main()
+
+
+def test_a_failed_constituent_capture_invalidates_the_combined_gate(gates, workspace, tmp_path, monkeypatch):
+    """The combined MLA BMM gate traces two cases. The post-BMM capture that recorded no kernel
+    (failed, no error text) was covered by the pre-BMM capture and the gate graded aligned."""
+    gate = _checked_in(gates, "vllm", "mla_bmm_gen_DeepSeek-V3")
+    version, jobs = gates.gate_version(gate), tmp_path / "jobs"
+    cases = [name for name, _ in gates._cases(gate)]
+    assert len(cases) == 2
+    _serving(workspace, gate, version, _SM90_GEMM)
+    for name in cases:
+        _trace_file(gates, jobs, name, "vllm", version, [_SM90_GEMM])
+    assert _grade_cli(gates, monkeypatch, gate, "mla_bmm_gen_pre", jobs) == 0  # both captures ran: aligned
+    _trace_file(gates, jobs, cases[1], "vllm", version, [])
+    assert _grade_cli(gates, monkeypatch, gate, "mla_bmm_gen_pre", jobs) == 1
+    report = json.loads((gates.verdict_dir("sm90", "vllm", version) / f"{gate['gate']}.json").read_text())
+    assert report["verdict"] == "invalid-capture" and cases[1] in report["capture_run_error"]
+
+
+def test_a_trace_from_another_release_never_grades_the_gate(gates, workspace, tmp_path, monkeypatch):
+    """Only an older release's successful trace is offered to the checked-in GEMM gate: it is
+    not the gate's trace (a 0.30.0 trace once passed the 0.31.0 gate under a 0.31.0 label)."""
+    gate = next(g for g in gates.gates_in_scope("vllm", "sm90", op="gemm") if g["gate"] == "gemm_bf16_Llama-3.1-8B")
+    monkeypatch.setattr(gates, "gates_in_scope", lambda *a, **k: [gate])  # the repo has a second GEMM gate
+    version, jobs = gates.gate_version(gate), tmp_path / "jobs"
+    older = "0.1.0"
+    assert older != version
+    _serving(workspace, gate, version, _SM90_GEMM)
+    _trace_file(gates, jobs, gate["gate"], "vllm", older, [_SM90_GEMM])
+    verdicts = gates.grade("sm90", [jobs], fw="vllm", op="gemm", repo=gate["repo"])
+    assert verdicts == {("vllm", gate["gate"]): "missing-trace"}
+    assert _grade_cli(gates, monkeypatch, gate, "gemm", jobs) == 1
+    assert not (gates.verdict_dir("sm90", "vllm", version) / f"{gate['gate']}.json").exists()
+    # handed to the grading boundary directly, the same trace is an invalid capture
+    sys.path.insert(0, str(COMPONENTS))
+    import path_diff
+
+    trace = jobs / f"{gates.SHARD_OP}__{gate['gate']}" / "probe_trace_case.json"
+    out = tmp_path / "direct.json"
+    rc = path_diff.diff(trace, gate["repo"], "vllm", version, "sm90", save=str(out), target_roles=("gemm",))
+    report = json.loads(out.read_text())
+    assert rc == 1 and report["verdict"] == "invalid-capture" and older in report["capture_run_error"]
+    # the gate's own release grades
+    _trace_file(gates, jobs, gate["gate"], "vllm", version, [_SM90_GEMM])
+    assert _grade_cli(gates, monkeypatch, gate, "gemm", jobs) == 0

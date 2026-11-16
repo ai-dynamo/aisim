@@ -10,8 +10,8 @@ case run under torch.profiler). The serving side is a probe record of the same S
 a campaign (probe_driver.py). Both kernel sets go through the ONE vocabulary
 (kernel_taxonomy.yaml rules for that SM); components/gates.py calls diff() for every gate.
 
-  aligned              every collector kernel of the gate's target roles name-matches a
-                       serving kernel of that role, the collector launched no target-role
+  aligned              every collector kernel of the gate's target roles has the equivalence
+                       key of a serving kernel of that role, the collector launched no target-role
                        backend family serving did not (subset relation: the collector
                        exercises one op, serving runs the whole model), and every other
                        kernel of the timed runs is one serving runs. A kernel that differs
@@ -22,7 +22,8 @@ a campaign (probe_driver.py). Both kernel sets go through the ONE vocabulary
                        inside a role, or auxiliary work in the timed runs serving never does
   unlabeled-kernels    the capture ran kernels the vocabulary cannot label on this SM
   no-collector-signal  the capture ran no kernel of any target role
-  invalid-capture      the capture itself failed
+  invalid-capture      a capture of the gate failed, recorded no kernel, or ran at another
+                       framework release than the gate's
 """
 
 from __future__ import annotations
@@ -140,7 +141,8 @@ def grade(col_kernels, srv_kernels, target_roles, cap_error, role_of, col_measur
       no-collector-signal  the capture executed no kernel of any target role:
                            it proves nothing about the op (auxiliary quant /
                            norm / kv-cache overlap does not count)
-      invalid-capture      the capture command itself failed
+      invalid-capture      the capture command itself failed (cap_error: also a case
+                           that recorded no kernel or ran at another release)
     """
 
     def by_role(kerns):
@@ -162,9 +164,11 @@ def grade(col_kernels, srv_kernels, target_roles, cap_error, role_of, col_measur
     col_target = {r: col_roles[r] for r in target_roles if col_roles.get(r)}
 
     def name_hits(ck, sk, role=None):
-        eq = lambda k: equiv_key(k, role)
-        sk2 = {eq(s) for s in sk}
-        return {c for c in ck if any(eq(c) in s or s in eq(c) for s in sk2)}
+        # equal equivalence keys, nothing looser: a name that contains another is another kernel
+        # (``..._mxfp4_swiglu`` fuses an epilogue ``..._mxfp4`` does not); what may differ is
+        # listed in _EQUIV_RULES, and a tactic is handled by tactic_key below
+        sk2 = {equiv_key(s, role) for s in sk}
+        return {c for c in ck if equiv_key(c, role) in sk2}
 
     evidence, drift, tactic_drift, missing_roles, only_col = {}, {}, {}, [], []
     for role, ck in col_target.items():
@@ -252,22 +256,62 @@ def select_serving(record: dict, phase: str | None) -> tuple[set, bool]:
     return kernels, scoped
 
 
-def load_collector_side(files) -> dict:
+def same_release(recorded, version) -> bool:
+    """Whether a trace recorded at ``recorded`` is evidence for a gate that runs at ``version``:
+    the rule a collection applies to its own runtime (framework_manifest.require_collector_runtime),
+    equal public versions, a local build tag aside. A version that does not parse matches nothing."""
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(str(recorded)).public == Version(str(version)).public
+    except InvalidVersion:
+        return False
+
+
+def capture_error(doc: dict, version: str | None = None) -> str | None:
+    """Why one ``probe_trace_case.json`` is no evidence, None when it is: the probe's own
+    error, an explicit ``failed``, a result that is not one, no kernel at all (trace_case
+    marks that ``failed`` with no error text), or a release other than the gate's."""
+    part = doc.get("result")
+    if doc.get("error"):
+        return str(doc["error"])
+    if not isinstance(part, dict):
+        return "the capture holds no result"
+    if part.get("error"):
+        return str(part["error"])
+    kernels, timed = part.get("kernels"), part.get("measured_kernels")
+    if not isinstance(kernels, list) or not (timed is None or isinstance(timed, list)):
+        return "the capture's kernel lists are malformed"
+    if part.get("failed") or not kernels:
+        return "the capture failed: it recorded no kernel" if not kernels else "the capture is marked failed"
+    if version is not None:
+        recorded = part.get("framework_version")
+        if recorded is None:
+            return f"the capture records no framework release; the gate runs at {version}"
+        if not same_release(recorded, version):
+            return f"the capture ran at release {recorded}; the gate runs at {version}"
+    return None
+
+
+def load_collector_side(files, version: str | None = None) -> dict:
     """The collector side of a gate: the ``probe_trace_case.json`` of each of its cases
-    (``{"result": {"kernels", "measured_kernels", "error", "env", "row", ...}}``). A gate's
-    ``also`` cases union their kernels; the first error wins; the timed-run kernels are None
-    unless every case recorded them."""
+    (``{"result": {"kernels", "measured_kernels", "error", "env", "row", ...}}``). Each case
+    is checked by itself (capture_error, against ``version`` when given) before a gate's
+    ``also`` cases union their kernels: a case that failed is not covered by one that ran.
+    The first error wins; the timed-run kernels are None unless every case recorded them."""
     files = [files] if isinstance(files, (str, Path)) else list(files)
     kernels, measured, errors, cmds, envs = set(), set(), [], [], {}
     for f in files:
         doc = json.loads(Path(f).read_text())
-        part = doc.get("result") or {}
-        errors.append(doc.get("error") or part.get("error"))
+        part = doc.get("result") if isinstance(doc.get("result"), dict) else {}
+        error = capture_error(doc, version)
+        errors.append(f"{Path(f).parent.name}: {error}" if error and len(files) > 1 else error)
         cmds.append(f"probe.{doc.get('probe')} {part.get('op')} {part.get('row')}")
         envs.update(part.get("env") or {})
-        kernels.update(part.get("kernels") or [])
-        if measured is not None and part.get("measured_kernels") is not None:
-            measured.update(part["measured_kernels"])
+        ran, timed = part.get("kernels"), part.get("measured_kernels")
+        kernels.update(ran if isinstance(ran, list) else [])
+        if measured is not None and isinstance(timed, list):
+            measured.update(timed)
         else:
             measured = None
     return {
@@ -324,7 +368,7 @@ def diff(
     phase: str | None = None,
     isl: int = probe_driver.DEFAULT_ISL,
 ) -> int:
-    cap = load_collector_side(capture_files)
+    cap = load_collector_side(capture_files, version)
     col_kernels = sorted({n for k in cap["kernels"] if (n := probe_driver.normalize_kernel(k))})
     col_backends, _ = probe_driver.label_kernels(col_kernels, sm)
     candidates = serving_records(repo, framework, version, sm, kv_dtype, isl)

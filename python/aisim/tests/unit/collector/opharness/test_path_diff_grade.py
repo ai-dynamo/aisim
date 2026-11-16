@@ -288,3 +288,109 @@ def test_a_kernel_of_another_family_is_drift_not_a_tactic():
     labels["bmm_E4m3_E4m3E4m3_Fp32_x"] = ("triton", "moe_gemm")
     g = path_diff.grade(col, srv, ("moe_gemm",), None, labels.get, col, srv)
     assert g["verdict"] == "diverged" and g["kernel_drift"] and g["tactic_drift"] is None
+
+
+# ---------------------------------------------------------------- kernel identity (review 2026-11-16)
+# a kernel matches a serving kernel when their equivalence keys are equal; a name that contains
+# another names another kernel
+
+
+def _real_role(sm):
+    return lambda k: path_diff.probe_driver.kernel_role(k, sm)
+
+
+def test_a_fused_epilogue_kernel_is_not_the_kernel_without_it():
+    """Triton's MXFP4 MoE GEMM with the fused SwiGLU epilogue against the one without it, under
+    the checked-in sm100 taxonomy: one name contains the other and that proved nothing."""
+    normalize = path_diff.probe_driver.normalize_kernel
+    col, srv = normalize("_matmul_NNT_bf16xbf16xmxfp4_swiglu"), normalize("_matmul_NNT_bf16xbf16xmxfp4")
+    role = _real_role("sm100")
+    assert role(col)[1] == role(srv)[1] == "moe_gemm"
+    g = path_diff.grade([col], {srv}, ("moe_gemm",), None, role, [col], {srv})
+    assert g["verdict"] == "diverged" and g["role_evidence"]["moe_gemm"]["matched"] == []
+    assert g["kernel_drift"]["moe_gemm"]["collector_only_kernels"] == [col] and g["tactic_drift"] is None
+    # the same kernel on both sides is still the same kernel
+    assert path_diff.grade([col], {col}, ("moe_gemm",), None, role, [col], {col})["verdict"] == "aligned"
+
+
+def test_a_listed_tile_equivalence_and_a_tactic_still_align():
+    """What may differ stays explicit: a cuBLAS tile (an _EQUIV_RULES entry) is the same kernel,
+    a TRT-LLM-gen tactic is listed as tactic drift, and neither diverges a gate."""
+    tile_a = "nvjet_sm100_tst_128x256_64x4_2x1_v_bz_coopA_TNN"
+    tile_b = "nvjet_sm100_tst_256x128_64x8_1x2_h_bz_coopB_TNN"
+    role = _real_role("sm100")
+    g = path_diff.grade([tile_a], {tile_b}, ("gemm",), None, role, [tile_a], {tile_b})
+    assert g["verdict"] == "aligned" and g["kernel_drift"] is None and g["tactic_drift"] is None
+    # another layout is another kernel, tile equivalence or not
+    other = "nvjet_sm100_tst_256x128_64x8_1x2_h_bz_coopB_NNT"
+    assert path_diff.grade([tile_a], {other}, ("gemm",), None, role, [tile_a], {other})["verdict"] == "diverged"
+    tactic_a = "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64_m64x64x32_c1x1x1"
+    tactic_b = "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et128x64_m64x64x32_c1x1x1"
+    g = path_diff.grade([tactic_a], {tactic_b}, ("moe_gemm",), None, role, [tactic_a], {tactic_b})
+    assert g["verdict"] == "aligned" and g["tactic_drift"]["moe_gemm"]["collector_only_kernels"] == [tactic_a]
+
+
+def test_an_auxiliary_kernel_is_matched_by_its_key_too():
+    quant, fused = "per_token_group_quant_8bit_kernel", "per_token_group_quant_8bit_kernel_fused"
+    labels = {**_LABELS, fused: ("sgl_kernel", "quant")}
+    g = path_diff.grade([_B200_GEMM, fused], {_B200_GEMM, quant}, ("gemm",), None, labels.get, [_B200_GEMM, fused])
+    assert g["verdict"] == "diverged" and g["aux_drift"] == {"quant": [fused]}
+
+
+# ---------------------------------------------------------------- one capture, one piece of evidence
+# each constituent capture of a gate is checked by itself before the kernels are united
+
+
+def _capture(tmp_path, name, **result):
+    f = tmp_path / name / "probe_trace_case.json"
+    f.parent.mkdir(parents=True)
+    base = {"framework_version": "0.31.0", "error": None, "failed": False, "kernels": [], "measured_kernels": None}
+    f.write_text(json.dumps({"probe": "trace_case", "result": {**base, **result}}))
+    return f
+
+
+def test_a_failed_capture_is_not_covered_by_one_that_ran(tmp_path):
+    """trace_case marks a capture that recorded no kernel ``failed`` with no error text: next to
+    an ``also`` capture that ran, the union of the two looked like complete evidence."""
+    ran = _capture(tmp_path, "gate", kernels=["k"], measured_kernels=["k"])
+    empty = _capture(tmp_path, "gate__post", failed=True)
+    assert path_diff.load_collector_side([ran])["error"] is None
+    side = path_diff.load_collector_side([ran, empty])
+    assert side["error"] == "gate__post: the capture failed: it recorded no kernel" and side["kernels"] == ["k"]
+    assert path_diff.load_collector_side([empty, ran])["error"].startswith("gate__post: ")
+
+
+@pytest.mark.parametrize(
+    "result, message",
+    [
+        ({"kernels": ["k"], "failed": True}, "marked failed"),
+        ({"kernels": []}, "recorded no kernel"),
+        ({"kernels": "k"}, "malformed"),
+        ({"kernels": ["k"], "measured_kernels": "k"}, "malformed"),
+        ({"kernels": ["k"], "error": "exit=1"}, "exit=1"),
+    ],
+)
+def test_a_capture_that_failed_or_is_malformed_is_an_error(tmp_path, result, message):
+    assert message in path_diff.load_collector_side(_capture(tmp_path, "gate", **result))["error"]
+
+
+def test_a_capture_without_a_result_is_an_error(tmp_path):
+    f = tmp_path / "probe_trace_case.json"
+    f.write_text(json.dumps({"probe": "trace_case", "error": "ValueError: no planned case"}))
+    assert path_diff.load_collector_side(f)["error"] == "ValueError: no planned case"
+    f.write_text(json.dumps({"probe": "trace_case", "result": ["k"]}))
+    assert path_diff.load_collector_side(f)["error"] == "the capture holds no result"
+
+
+def test_a_capture_is_evidence_for_its_own_release_only(tmp_path):
+    """The grading boundary checks the release again: the rule a collection applies to its
+    runtime, equal public versions."""
+    cap = _capture(tmp_path, "gate", kernels=["k"], framework_version="0.30.0")
+    assert path_diff.load_collector_side(cap)["error"] is None  # no gate release given: nothing to check
+    assert path_diff.load_collector_side(cap, "0.30.0")["error"] is None
+    assert path_diff.load_collector_side(cap, "0.30.0+cu129")["error"] is None
+    assert "ran at release 0.30.0; the gate runs at 0.31.0" in path_diff.load_collector_side(cap, "0.31.0")["error"]
+    unrecorded = _capture(tmp_path, "old", kernels=["k"], framework_version=None)
+    assert "records no framework release" in path_diff.load_collector_side(unrecorded, "0.31.0")["error"]
+    assert path_diff.same_release("1.3.0rc29", "1.3.0rc29") and not path_diff.same_release("1.3.0rc29", "1.3.0rc20")
+    assert not path_diff.same_release("0.0.0.dev0+g1aa0e962", "0.5.21") and not path_diff.same_release("main", "main")

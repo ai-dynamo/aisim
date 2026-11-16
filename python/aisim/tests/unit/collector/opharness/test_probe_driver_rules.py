@@ -175,6 +175,18 @@ def test_spans_and_launchers_are_not_orphans(pd):
     assert orphans == ["flash::FlashAttnFwdSm90"]
 
 
+def _dummy(ws: Path, family: str, repo: str, variant: str, owner: str | None = None) -> Path:
+    """One dummy as dummies.py leaves it: ``<family>/<org>--<name>__<variant>`` and its manifest entry."""
+    root = ws / "dummy_models"
+    leaf = f"{repo.replace('/', '--')}__{variant}"
+    (root / family / leaf).mkdir(parents=True, exist_ok=True)
+    manifest = root / "variants_manifest.json"
+    doc = json.loads(manifest.read_text()) if manifest.exists() else {"variants": []}
+    doc["variants"].append({"variant": leaf, "repo": owner or repo, "family": family, "layer_kind": variant})
+    manifest.write_text(json.dumps(doc))
+    return root
+
+
 def _targets_for(repo: str, variants: list[str], **extra) -> dict:
     return {
         "topologies": [{"tp": 1, "evidence": "real"}, {"tp": 2, "evidence": "real"}],
@@ -188,7 +200,7 @@ def test_a_campaign_renders_and_identifies_by_its_system(pd, tmp_path, monkeypat
     """The system names the render, the SM and the run id: the same case on h200 and on
     b200 is two runs, so two campaigns' raws never overwrite each other."""
     monkeypatch.setattr(pd, "ROOT", tmp_path)
-    (tmp_path / "dummy_models" / "generic" / "M__rep").mkdir(parents=True)
+    _dummy(tmp_path, "generic", "org/M", "rep")
     targets = _targets_for("org/M", ["rep"])
     h200 = [r for r in pd.enumerate_runs(targets, "h200_sxm", False, ["vllm"]) if "skip" not in r]
     b200 = [r for r in pd.enumerate_runs(targets, "b200_sxm", False, ["vllm"]) if "skip" not in r]
@@ -201,7 +213,7 @@ def test_a_campaign_renders_and_identifies_by_its_system(pd, tmp_path, monkeypat
 def test_each_backend_is_probed_at_its_own_default_release(pd, tmp_path, monkeypatch):
     """Without --version every backend runs at its own default, not at the first backend's."""
     monkeypatch.setattr(pd, "ROOT", tmp_path)
-    (tmp_path / "dummy_models" / "generic" / "M__rep").mkdir(parents=True)
+    _dummy(tmp_path, "generic", "org/M", "rep")
     targets = _targets_for("org/M", ["rep"])
     targets["backends"]["sglang"] = {"default_version": "0.5.9", "versions": ["0.5.9"], "images": {"0.5.9": "img"}}
     runs = [r for r in pd.enumerate_runs(targets, "h200_sxm", False, ["vllm", "sglang"]) if "skip" not in r]
@@ -211,7 +223,7 @@ def test_each_backend_is_probed_at_its_own_default_release(pd, tmp_path, monkeyp
 def test_the_representative_cut_is_the_first_variant_unless_overridden(pd, tmp_path, monkeypatch):
     monkeypatch.setattr(pd, "ROOT", tmp_path)
     for v in ("depth8", "depth4"):
-        (tmp_path / "dummy_models" / "generic" / f"Big__{v}").mkdir(parents=True)
+        _dummy(tmp_path, "generic", "org/Big", v)
     targets = _targets_for("org/Big", ["depth8", "depth4"])
     runs = [r for r in pd.enumerate_runs(targets, "h200_sxm", False, ["vllm"]) if "skip" not in r]
     assert {r["variant"] for r in runs} == {"depth8"} and {r["tp"] for r in runs} == {1}
@@ -222,7 +234,7 @@ def test_the_representative_cut_is_the_first_variant_unless_overridden(pd, tmp_p
 
 def test_tp_required_scoped_by_the_campaign_sm(pd, tmp_path, monkeypatch):
     monkeypatch.setattr(pd, "ROOT", tmp_path)
-    (tmp_path / "dummy_models" / "generic" / "K__rep").mkdir(parents=True)
+    _dummy(tmp_path, "generic", "org/K", "rep")
     policy = {"tp_required": [{"repo": "org/K", "backend": "vllm", "tp": 2, "sms": [100]}]}
     targets = _targets_for("org/K", ["rep"], topology_policy=policy)
     tps = lambda system: {r["tp"] for r in pd.enumerate_runs(targets, system, False, ["vllm"]) if "skip" not in r}
@@ -301,30 +313,100 @@ def test_golden_facts_status_flags_the_swallowed_resolution_failure(pd):
     assert pd.golden_facts_status("") == {"applied": True}
 
 
-def _dummy_tree(tmp_path, *leaves):
-    root = tmp_path / "dummy_models"
-    for fam, leaf in leaves:
-        (root / fam / leaf).mkdir(parents=True)
-    return root
-
-
 def test_select_dummy_dir_refuses_another_adapter_when_override_declared(pd, tmp_path):
-    root = _dummy_tree(tmp_path, ("generic", "DeepSeek-V4.1-Flash__rep"))
+    repo = "deepseek-ai/DeepSeek-V4.1-Flash"
+    root = _dummy(tmp_path, "generic", repo, "rep")
     ck = {"dummy_overrides": {"family": "dsv41"}}
-    vdir, why = pd.select_dummy_dir(root, "DeepSeek-V4.1-Flash", "rep", "roster", {}, ck)
+    vdir, why = pd.select_dummy_dir(root, repo, "rep", "roster", {}, ck)
     assert vdir is None and "generic" in why and "dsv41" in why and "dummies.py" in why
-    (root / "dsv41" / "DeepSeek-V4.1-Flash__rep").mkdir(parents=True)
-    vdir, why = pd.select_dummy_dir(root, "DeepSeek-V4.1-Flash", "rep", "roster", {}, ck)
+    _dummy(tmp_path, "dsv41", repo, "rep")
+    vdir, why = pd.select_dummy_dir(root, repo, "rep", "roster", {}, ck)
     assert why is None and vdir.parent.name == "dsv41"
 
 
 def test_select_dummy_dir_default_order_is_family_then_generic_then_any(pd, tmp_path):
-    root = _dummy_tree(tmp_path, ("generic", "M__rep"), ("glm", "M__rep"), ("zzz", "N__rep"))
-    assert pd.select_dummy_dir(root, "M", "rep", "glm", {}, {})[0].parent.name == "glm"
-    assert pd.select_dummy_dir(root, "M", "rep", "roster", {}, {})[0].parent.name == "generic"
-    assert pd.select_dummy_dir(root, "N", "rep", "roster", {}, {})[0].parent.name == "zzz"
-    vdir, why = pd.select_dummy_dir(root, "Q", "rep", "roster", {}, {})
+    for family, repo in (("generic", "org/M"), ("glm", "org/M"), ("zzz", "org/N")):
+        root = _dummy(tmp_path, family, repo, "rep")
+    assert pd.select_dummy_dir(root, "org/M", "rep", "glm", {}, {})[0].parent.name == "glm"
+    assert pd.select_dummy_dir(root, "org/M", "rep", "roster", {}, {})[0].parent.name == "generic"
+    assert pd.select_dummy_dir(root, "org/N", "rep", "roster", {}, {})[0].parent.name == "zzz"
+    vdir, why = pd.select_dummy_dir(root, "org/Q", "rep", "roster", {}, {})
     assert vdir is None and why.startswith("no dummy dir")
+
+
+def test_a_dummy_directory_is_one_repos_by_name_and_by_manifest(pd, tmp_path):
+    """Two orgs publish one basename (RadixArk/ and nvidia/ Qwen3.8-2.4T-A95B-NVFP4): each has
+    its own directory, a repo with no directory of its own is not served the other's, and a
+    directory the manifest records for another repo, or not at all, is refused."""
+    name = "Qwen3.8-2.4T-A95B-NVFP4"
+    root = _dummy(tmp_path, "generic", f"RadixArk/{name}", "depth8")
+    vdir, why = pd.select_dummy_dir(root, f"nvidia/{name}", "depth8", "roster", {}, {})
+    assert vdir is None and why.startswith("no dummy dir")
+    _dummy(tmp_path, "generic", f"nvidia/{name}", "depth8")
+    select = lambda org: pd.select_dummy_dir(root, f"{org}/{name}", "depth8", "roster", {}, {})[0]
+    picked = {org: select(org) for org in ("RadixArk", "nvidia")}
+    assert picked["RadixArk"] != picked["nvidia"] and all(org in picked[org].name for org in picked)
+    # the directory exists but the manifest names another owner, or has no entry (an earlier generation)
+    _dummy(tmp_path, "generic", "org/M", "rep", owner="other/M")
+    vdir, why = pd.select_dummy_dir(root, "org/M", "rep", "roster", {}, {})
+    assert vdir is None and "other/M" in why and "dummies.py" in why
+    (root / "generic" / "org--N__rep").mkdir()
+    vdir, why = pd.select_dummy_dir(root, "org/N", "rep", "roster", {}, {})
+    assert vdir is None and "no entry" in why
+
+
+def test_two_roster_repos_of_one_name_get_their_own_dummy_end_to_end(pd, tmp_path, monkeypatch):
+    """RadixArk/ and nvidia/ Qwen3.8-2.4T-A95B-NVFP4 are both in the roster. The generator named a
+    dummy by the basename, so the second config overwrote the first and every run of the NVIDIA
+    checkpoint probed RadixArk's quantization. The two configs here have the shape of the public
+    ones (one 4-bit group; an 8-bit and a 4-bit group) on the bundled Qwen3.8 base config."""
+    import dummies
+
+    name = "Qwen3.8-2.4T-A95B-NVFP4"
+    bundled = pd.HARNESS.parents[1] / "src" / "aisim_core" / "model_configs" / "Qwen--Qwen3.8-2.4T-A95B_config.json"
+    base = json.loads(bundled.read_text())
+    group = lambda bits, targets: {"targets": targets, "weights": {"num_bits": bits, "type": "float"}}
+    groups = {
+        f"RadixArk/{name}": {"group_0": group(4, ["Linear"])},
+        f"nvidia/{name}": {"group_0": group(8, ["re:.*self_attn.*"]), "group_1": group(4, ["re:.*mlp.experts.*"])},
+    }
+    configs, out = tmp_path / "configs", tmp_path / "dummy_models"
+    for repo, config_groups in groups.items():
+        stem = repo.replace("/", "_")
+        quant = {"quant_method": "compressed-tensors", "config_groups": config_groups}
+        (configs / "aux_files" / stem).mkdir(parents=True)
+        (configs / "aux_files" / stem / "tokenizer_config.json").write_text(json.dumps({"repo": repo}))
+        (configs / f"{stem}.json").write_text(json.dumps({**base, "quantization_config": quant}))
+    monkeypatch.setattr(sys, "argv", ["dummies.py", "--configs", str(configs), "--out", str(out)])
+    assert dummies.main() == 0
+    manifest = json.loads((out / "variants_manifest.json").read_text())["variants"]
+    assert len(manifest) == len(list(out.glob("*/*/config.json"))) == 4
+
+    monkeypatch.setattr(pd, "ROOT", tmp_path)
+    targets = pd.load_targets(pd.HARNESS / "targets.yaml")
+    assert set(groups) <= set(pd.roster_repos(targets))
+    runs = pd.enumerate_runs(targets, "b200_sxm", False, ["sglang", "vllm", "trtllm"], only=list(groups))
+    runs = [r for r in runs if r.get("repo") in groups]
+    assert len(runs) == 12 and all("skip" not in r for r in runs)
+    dirs = {repo: {r["model_dir"] for r in runs if r["repo"] == repo} for repo in groups}
+    assert all(len(d) == 1 for d in dirs.values()) and len(set.union(*dirs.values())) == 2
+    bits = lambda config_groups: [g["weights"]["num_bits"] for g in config_groups.values()]
+    for repo, (model_dir,) in dirs.items():
+        vdir = Path(model_dir.replace(pd.WORK, str(tmp_path)))
+        owner = [v["repo"] for v in manifest if v["variant"] == vdir.name and v["family"] == vdir.parent.name]
+        assert owner == [repo]
+        dummy = json.loads((vdir / "config.json").read_text())
+        assert bits(dummy["quantization_config"]["config_groups"]) == bits(groups[repo])
+        assert json.loads((vdir / "tokenizer_config.json").read_text()) == {"repo": repo}
+
+
+def test_the_dummy_directory_name_is_one_to_one_with_the_repo(pd):
+    import dummies
+
+    assert pd.dummy_leaf is dummies.dummy_leaf  # the reader and the writer share the one helper
+    assert dummies.dummy_leaf("nvidia/M", "rep") == "nvidia--M__rep"
+    assert dummies.dummy_leaf("nvidia/M", "rep") != dummies.dummy_leaf("RadixArk/M", "rep")
+    assert dummies.dummy_leaf("a_b/c", "rep") != dummies.dummy_leaf("a/b_c", "rep")
 
 
 def test_the_roster_floor_is_every_model_path_the_case_yamls_declare(pd):
@@ -340,7 +422,7 @@ def test_a_roster_repo_without_a_dummy_needs_no_config(pd, tmp_path, monkeypatch
     monkeypatch.setattr(pd, "ROOT", tmp_path)
     (tmp_path / "configs").mkdir()
     (tmp_path / "dummy_models").mkdir()
-    manifest = {"variants": [{"repo": "org/built", "variant": "built__rep"}]}
+    manifest = {"variants": [{"repo": "org/built", "variant": "org--built__rep", "layer_kind": "rep"}]}
     (tmp_path / "dummy_models" / "variants_manifest.json").write_text(json.dumps(manifest))
     monkeypatch.setattr(pd, "derived_repos", lambda fam, targets: ["org/built", "org/unbuilt"])
     with pytest.raises(SystemExit, match="org/built has dummies but no fetched config"):

@@ -137,6 +137,75 @@ def test_import_files_only_this_emit_and_records_label_by_the_raw_sm(pd, tmp_pat
     assert "dead vllm 1 org/d kv=auto: no raw: RuntimeError: CUDA error: no kernel image" in out
 
 
+def _one_run_campaign(pd):
+    cdir = pd.campaign_dir("c")
+    pd.emit_shards([_run(pd, "vllm")], cdir, "http://share/c", upload=False)
+    return cdir, json.loads((cdir / "plan.json").read_text())[0]["exec_fingerprint"]
+
+
+def _decode_gate(pd, tmp_path, monkeypatch) -> int:
+    """Grade a capture of the raw's decode kernel against the campaign through path_diff.diff
+    (0 aligned, 2 no serving record)."""
+    sys.path.insert(0, str(COMPONENTS))
+    import path_diff
+
+    monkeypatch.setattr(path_diff.probe_driver, "ROOT", pd.ROOT)
+    kernel = RAW_SM100["decode_kernels"][0]["kernel"]
+    result = {"framework_version": "1", "error": None, "failed": False, "kernels": [kernel]}
+    result["measured_kernels"] = [kernel]
+    capture = tmp_path / "capture.json"
+    capture.write_text(json.dumps({"probe": "trace_case", "result": result}))
+    return path_diff.diff(capture, "org/m", "vllm", "1", "sm100", target_roles=("attention",), phase="decode")
+
+
+def test_a_failed_retry_removes_the_earlier_success(pd, tmp_path, monkeypatch, capsys):
+    """One emit, two attempts: the second died before its raw. The first attempt's raw stayed in
+    the campaign, the record stayed ok and the gate aligned on it."""
+    cdir, fingerprint = _one_run_campaign(pd)
+    _job_shard(tmp_path / "job1", "vllm_tp1", fingerprint, RAW_SM100)
+    pd.import_raws(tmp_path / "job1", cdir)
+    pd.build_records(cdir)
+    assert _decode_gate(pd, tmp_path, monkeypatch) == 0
+    _job_shard(tmp_path / "job2", "vllm_tp1", fingerprint, None, tail="retry failed\n")
+    pd.import_raws(tmp_path / "job2", cdir)
+    capsys.readouterr()
+    pd.build_records(cdir)
+    assert not (cdir / "raw" / "vllm_tp1.json").exists() and pd.load_records(cdir) == {}
+    assert "vllm_tp1 vllm 1 org/m kv=auto: no raw: retry failed" in capsys.readouterr().out
+    assert _decode_gate(pd, tmp_path, monkeypatch) == 2
+
+
+def test_a_successful_retry_removes_the_earlier_failure(pd, tmp_path, monkeypatch):
+    cdir, fingerprint = _one_run_campaign(pd)
+    _job_shard(tmp_path / "job1", "vllm_tp1", fingerprint, None, tail="first attempt failed\n")
+    pd.import_raws(tmp_path / "job1", cdir)
+    pd.build_records(cdir)
+    assert (cdir / "raw" / "vllm_tp1.tail").exists() and _decode_gate(pd, tmp_path, monkeypatch) == 2
+    _job_shard(tmp_path / "job2", "vllm_tp1", fingerprint, RAW_SM100)
+    pd.import_raws(tmp_path / "job2", cdir)
+    pd.build_records(cdir)
+    assert not (cdir / "raw" / "vllm_tp1.tail").exists()
+    (record,) = pd.load_records(cdir).values()
+    assert record["outcome"] == {"status": "ok"} and _decode_gate(pd, tmp_path, monkeypatch) == 0
+
+
+def test_two_attempts_in_one_import_have_no_order_and_neither_is_taken(pd, tmp_path, capsys):
+    """Result directories carry no attempt order: a success and a failure of one run handed over
+    together leave the run without a raw until one attempt is imported alone."""
+    cdir, fingerprint = _one_run_campaign(pd)
+    _job_shard(tmp_path / "job1", "vllm_tp1", fingerprint, RAW_SM100)
+    pd.import_raws(tmp_path / "job1", cdir)
+    both = tmp_path / "both"
+    _job_shard(both / "a-old", "vllm_tp1", fingerprint, RAW_SM100)
+    _job_shard(both / "z-retry", "vllm_tp1", fingerprint, None, tail="retry failed\n")
+    pd.import_raws(both, cdir)
+    assert "ambiguous vllm_tp1: 2 attempts" in capsys.readouterr().err
+    assert not (cdir / "raw" / "vllm_tp1.json").exists()
+    assert "ambiguous" in (cdir / "raw" / "vllm_tp1.tail").read_text()
+    pd.import_raws(both / "a-old", cdir)
+    assert (cdir / "raw" / "vllm_tp1.json").exists() and not (cdir / "raw" / "vllm_tp1.tail").exists()
+
+
 def test_a_campaign_prompt_length_reaches_every_probe_and_the_run_id(pd):
     cdir = pd.campaign_dir("c")
     run = dict(_run(pd, "sglang", 2), isl=512)

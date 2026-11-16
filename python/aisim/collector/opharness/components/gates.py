@@ -367,21 +367,31 @@ def verdict_dir(sm: str, fw: str, version: str) -> Path:
 
 def _trace(results: list[Path], name: str, backend: str, version: str, sm: int | None = None) -> Path | None:
     """The ``backend`` trace of shard ``name`` among the result dirs (shard names repeat across
-    backends and systems), from a run on ``sm`` and at ``version`` when it says so. A trace that
-    ran on another SM is never used (grading sm90 once read a B200 trace of the same shard); one
-    that died before recording its SM is the last resort, and a trace from another release fails
-    the runtime check and grades invalid."""
-    found = []
+    backends and systems), from a run on ``sm`` and at ``version``. A trace that ran on another
+    SM (grading sm90 once read a B200 trace of the same shard) or at another release (a 0.30.0
+    trace once passed the 0.31.0 gate) is never used, not even when it is the only one: the
+    gate then has no trace. One that died before recording its SM or release is the last
+    resort and grades invalid by its own error."""
+    sys.path.insert(0, str(HERE))
+    import path_diff
+
+    found, other_release = [], []
     for d in results:
         for f in sorted(Path(d).rglob(f"{SHARD_OP}__{name}/probe_trace_case.json")):
             doc = json.loads(f.read_text())
             if (doc.get("args") or {}).get("backend") != backend:
                 continue
-            res = doc.get("result") or {}
-            ran_sm = res.get("sm")
+            res = doc.get("result") if isinstance(doc.get("result"), dict) else {}
+            ran_sm, recorded = res.get("sm"), res.get("framework_version")
             if sm is not None and ran_sm is not None and int(ran_sm) != sm:
                 continue
-            found.append((ran_sm is None, res.get("framework_version") not in (version, None), f))
+            if recorded is not None and not path_diff.same_release(recorded, version):
+                other_release.append((f, recorded))
+                continue
+            found.append((ran_sm is None, recorded is None, f))
+    if not found:
+        for f, recorded in other_release:
+            print(f"[other-release] {name}: {f} ran at {backend} {recorded}, the gate at {version}", file=sys.stderr)
     return min(found)[2] if found else None
 
 
