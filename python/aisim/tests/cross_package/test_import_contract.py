@@ -349,6 +349,51 @@ def test_legacy_package_patch_updates_canonical_package(package_suffix: str, att
     assert getattr(canonical_package, attribute) is not mocked
 
 
+@pytest.mark.parametrize(
+    ("package_suffix", "attribute"),
+    [
+        ("memory", "estimate_state_cache"),
+        ("models", "get_model"),
+        ("models.blocks", "MoEBlockShape"),
+        ("operations", "clear_all_op_caches"),
+        ("speculation", "NullScheme"),
+        ("work_delta", "solve_cell"),
+    ],
+)
+def test_legacy_package_monkeypatch_restores_canonical_attribute(package_suffix: str, attribute: str) -> None:
+    """Patch teardown must preserve the API for subsequent SDK consumers."""
+    legacy = importlib.import_module(f"aisim.sdk.{package_suffix}")
+    canonical = importlib.import_module(f"aisim_core.sdk.{package_suffix}")
+    original = getattr(canonical, attribute)
+    assert vars(legacy)[attribute] is original
+    assert vars(legacy)["__name__"] == legacy.__name__
+    assert legacy.__name__ != canonical.__name__
+    assert vars(legacy)["__path__"] == legacy.__path__
+
+    # Introspection returns a detached snapshot, with local metadata winning.
+    namespace = vars(legacy)
+    namespace[attribute] = object()
+    namespace["__name__"] = "snapshot_only"
+    assert getattr(legacy, attribute) is original
+    assert getattr(canonical, attribute) is original
+    assert vars(legacy)["__name__"] == legacy.__name__
+
+    replacement = object()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(legacy, attribute, replacement)
+        assert getattr(canonical, attribute) is replacement
+        assert vars(legacy)[attribute] is replacement
+    assert getattr(canonical, attribute) is original
+    assert getattr(legacy, attribute) is original
+
+    # Changes made through the canonical namespace must also be visible.
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(canonical, attribute, replacement)
+        assert getattr(legacy, attribute) is replacement
+        assert vars(legacy)[attribute] is replacement
+    assert vars(legacy)[attribute] is original
+
+
 @pytest.mark.parametrize("namespace", ["aisim.sdk", "aisim_core.sdk"])
 def test_memory_package_patch_reaches_kv_cache(namespace: str) -> None:
     """Patching a KV-capacity name on the package must reach kv_cache's callers."""

@@ -511,7 +511,7 @@ def test_public_runner_infers_canonical_depth_without_duplicate_rank_input(backe
     assert inferred.metrics["total_output_tokens"] == 16
     for metric in ("mean_e2e_latency_ms", "mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s"):
         assert inferred.metrics[metric] == explicit.metrics[metric]
-    with pytest.raises(RuntimeError, match="aic_nextn conflicts with resolved speculative depth 2"):
+    with pytest.raises(RuntimeError, match="canonical speculative depth conflicts with scheduler aic_nextn"):
         runner.run(replace(spec, backend_deployment=replace(deployment, agg_engine_args={**args, "aic_nextn": 1})))
 
 
@@ -753,7 +753,25 @@ def test_agentic_g2_runner_capability_remains_explicit(nested_rank, scopes, work
 @pytest.mark.parametrize(
     "scopes,field,value",
     [
+        (("dp_rank_local",), "num_workers", 2),
+        (("cluster_shared",), "num_workers", 2),
+        (("dp_rank_local", None), "num_prefill_workers", 2),
+        ((None, "cluster_shared"), "num_decode_workers", 3),
+    ],
+)
+def test_agentic_g2_accepts_multiple_replicas(nested_rank, scopes, field, value):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field,value",
+    [
         (("cluster_shared",), "num_workers", 0),
+        (("dp_rank_local",), "num_workers", -1),
+        (("cluster_shared",), "num_workers", 1.5),
         (("dp_rank_local",), "num_workers", True),
         (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
     ],
@@ -763,6 +781,24 @@ def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, va
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
     with pytest.raises(ValueError, match=f"{field} to be a positive integer"):
         EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize("offload_role", ["prefill", "decode"])
+@pytest.mark.parametrize("dp_source", ["dp_size", "aic_attention_dp_size", "timing", "parallel_config"])
+def test_agentic_g2_accepts_dp_on_role_without_offload(nested_rank, offload_role, dp_source):
+    scopes = ("cluster_shared", None) if offload_role == "prefill" else (None, "dp_rank_local")
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    other_role = "decode" if offload_role == "prefill" else "prefill"
+    args = getattr(spec.backend_deployment, f"{other_role}_engine_args")
+    rank = args.get("rank", args)
+    if dp_source == "timing":
+        rank["timing_model"] = {"type": "external", "provider": "aic", "config": {"attention_dp": 2}}
+    elif dp_source == "parallel_config":
+        spec.backend_deployment.parallel_config[f"{other_role}_attention_dp"] = 2
+    else:
+        args[dp_source] = 2
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
@@ -1626,6 +1662,161 @@ def test_runner_rejects_decode_pipeline_parallelism_before_prefill_capacity(monk
     )
     with pytest.raises(ValueError, match="does not support pipeline parallelism for decode"):
         EngineReplayRunnerFactory(runtime=RecordingRuntime()).create(0).run(_spec(deployment=deployment))
+
+
+@pytest.mark.parametrize("role", ["aggregated", "decode"])
+def test_sglang_pipeline_parallelism_is_only_for_prefill(monkeypatch, role):
+    _forbid_capacity(monkeypatch)
+    args = {**_engine_args(role=role, backend="sglang"), "aic_pp_size": 2}
+    with pytest.raises(ValueError, match=f"does not support pipeline parallelism for {role}"):
+        _materialize_engine_role("sglang", "test", {}, args, role)
+    aic.reject_pipeline_parallelism("prefill", 2, backend="sglang")
+
+
+@pytest.mark.parametrize("source", ["deployment", "flat"])
+def test_sglang_prefill_pipeline_needs_an_aic_timing_model(monkeypatch, source):
+    # Fixed and polynomial timing price one stage, so a PP width would be dropped.
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    parallel = {"prefill_pp": 4} if source == "deployment" else {}
+    if source == "flat":
+        args["aic_pp_size"] = 4
+    with pytest.raises(ValueError, match="requires an AIC timing model, not .fixed. timing"):
+        _materialize_engine_role("sglang", "test", parallel, args, "prefill")
+
+
+def test_sglang_prefill_pipeline_width_reaches_the_default_aic_timing(monkeypatch):
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("timing_model")
+    # The deployment width is the timing width when the rank does not state one.
+    rank = _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, args, "prefill")["rank"]
+    assert rank["timing_model"]["config"]["pp"] == 4
+    with pytest.raises(ValueError, match="prefill pipeline widths conflict"):
+        _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": 2}, "prefill")
+    # A nested rank that states no width inherits it inside the rank.
+    outer = ("worker_type", "engine_type", "aic_backend", "aic_model_path", "aic_system")
+    nested = {key: args[key] for key in outer}
+    nested["rank"] = {key: value for key, value in args.items() if key not in outer}
+    rank = _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, nested, "prefill")["rank"]
+    assert rank["timing_model"]["config"]["pp"] == 4
+
+
+def test_sglang_prefill_timing_only_pipeline_width_sizes_capacity(monkeypatch):
+    calls = []
+
+    def estimate(**kwargs):
+        calls.append(kwargs)
+        return 321
+
+    monkeypatch.setattr(aic, "estimate_num_gpu_blocks", estimate)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("num_gpu_blocks")
+    for name in ("pp", "pp_size"):
+        calls.clear()
+        timing = {"type": "external", "provider": "aic", "config": {name: 4}}
+        # The timing width is the only one stated: capacity and timing read the same topology.
+        rank = _materialize_engine_role("sglang", "test", {}, {**args, "timing_model": timing}, "prefill")["rank"]
+        assert [call["pp_size"] for call in calls] == [4]
+        assert rank["num_gpu_blocks"] == 321
+        assert rank["timing_model"]["config"][name] == 4
+        assert "aic_pp_size" not in rank
+
+
+@pytest.mark.parametrize("source", ["deployment", "flat"])
+def test_sglang_prefill_pipeline_rejects_an_unknown_timing_width(monkeypatch, source):
+    # Native replay runs an unknown width as one stage, so a wider role would be priced as PP1.
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("num_gpu_blocks")
+    args["timing_model"] = {"type": "external", "provider": "aic", "config": {"pp": "unknown"}}
+    parallel = {"prefill_pp": 4} if source == "deployment" else {}
+    if source == "flat":
+        args["aic_pp_size"] = 4
+    with pytest.raises(ValueError, match="requires a timing model that records its pipeline width"):
+        _materialize_engine_role("sglang", "test", parallel, args, "prefill")
+
+
+@pytest.mark.parametrize("width", [[4], 4.0, "4", True])
+def test_sglang_prefill_pipeline_width_must_be_a_positive_integer(monkeypatch, width):
+    _forbid_capacity(monkeypatch)
+    args = _engine_args(role="prefill", backend="sglang")
+    args.pop("timing_model")
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": width}, "prefill")
+
+
+def test_sglang_pd_prefill_compiles_pipeline_stages():
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "mode": "disaggregated",
+                "backend": "sglang",
+                "model": "sglang-pd-smoke",
+                "hardware": "h200_sxm",
+                "context_length": 4096,
+                "workers": {
+                    "prefill": {
+                        "parallelism": {"pipeline": 4},
+                        "kv_cache": {"block_size": 64, "capacity": {"type": "fixed", "blocks": 64}},
+                    },
+                    "decode": {
+                        "kv_cache": {"block_size": 64, "capacity": {"type": "fixed", "blocks": 64}},
+                        "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                    },
+                },
+            },
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 128, "output_tokens": 1},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    assert deployment.parallel_config["prefill_pp"] == 4
+    assert deployment.prefill_engine_args["timing_model"]["config"]["pp"] == 4
+    # Fixed timing prices one stage, so the compiler rejects the width before sizing any role.
+    fixed = config.model_dump(mode="json", exclude_unset=True)
+    fixed["engine"]["workers"]["prefill"]["timing"] = {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+    with pytest.raises(ValueError, match="pipeline parallelism on prefill requires an AIC timing model"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(fixed))
+
+
+def test_public_sglang_pd_prefill_pipeline_replays_with_aic_timing():
+    """The public config, AIC timing from the bundled data and the native engine price PP prefill."""
+
+    def replay(pipeline):
+        kv_cache = {"block_size": 64, "capacity": {"type": "fixed", "blocks": 4096}}
+        config = CorePredictionConfig.model_validate(
+            {
+                "engine": {
+                    "mode": "disaggregated",
+                    "backend": "sglang",
+                    "model": "meta-llama/Meta-Llama-3.1-70B",
+                    "hardware": "h200_sxm",
+                    "context_length": 32768,
+                    "workers": {
+                        "prefill": {"parallelism": {"pipeline": pipeline}, "kv_cache": kv_cache},
+                        "decode": {"kv_cache": kv_cache},
+                    },
+                },
+                "traffic": {
+                    # Several prefill chunks, one request at a time.
+                    "source": {"type": "synthetic", "input_tokens": 20000, "output_tokens": 4},
+                    "load": {"type": "concurrency", "concurrency": 1},
+                    "stop": {"requests": 4},
+                },
+            }
+        )
+        return EngineReplayRunnerFactory().create(0).run(prediction_to_replay_spec(config)).metrics
+
+    single, piped = replay(1), replay(4)
+    assert (single["completed_requests"], piped["completed_requests"]) == (4, 4)
+    assert (single["prefill_gpus_per_worker"], piped["prefill_gpus_per_worker"]) == (1, 4)
+    # Passes retire at the per-stage rate, and the last chunk still crosses the other three stages.
+    assert single["mean_ttft_ms"] / 4 < piped["mean_ttft_ms"] < single["mean_ttft_ms"]
+    assert piped["mean_itl_ms"] == pytest.approx(single["mean_itl_ms"])
 
 
 def test_runner_rejects_nested_inferred_capacity_when_fixed_timing_discards_reservation():
@@ -3259,6 +3450,7 @@ def test_direct_replay_capacity_uses_the_resolved_timing_version(monkeypatch, tm
         "estimator": "op_level",
         "timing_source": "aic",
         "data_version": expected,
+        "database_mode": "SILICON",
         "data_identity": None,
         "data_version_unavailable_reason": None,
     }
