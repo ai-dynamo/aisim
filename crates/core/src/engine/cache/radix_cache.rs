@@ -1079,8 +1079,9 @@ impl RadixCache {
         }
         let edge = &mut self.nodes[node];
         if edge.children.is_empty() && edge.lock_ref <= 1 {
-            edge.key.reserve(pages);
-            edge.value.reserve(pages);
+            // Exact: doubling a long leaf for a short turn only gets shrunk back at unlock.
+            edge.key.reserve_exact(pages);
+            edge.value.reserve_exact(pages);
         }
     }
 
@@ -1831,6 +1832,20 @@ mod tests {
             cache.node(tail).value.capacity(),
             cache.node(tail).value.len()
         );
+    }
+
+    #[test]
+    fn continuing_turn_reserves_only_its_own_pages_on_the_leaf() {
+        let mut cache = RadixCache::new(100, 1);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let (_, tail) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        cache.inc_lock_ref(tail);
+
+        // A session's next turn adds two pages to the eight its last turn left cached.
+        cache.reserve_leaf_extension(tail, 2);
+
+        let node = cache.node(tail);
+        assert_eq!((node.key.capacity(), node.value.capacity()), (10, 10));
     }
 
     #[test]
