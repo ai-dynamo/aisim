@@ -106,11 +106,10 @@ the selected `aisim` wheel, because uninstalling the old distribution can remove
 files listed in both RECORDs. Both CLI names remain available after migration;
 Canonical Python imports are `aisim` and `aisim_core`; `aisimulate` and `aisimulate_core` remain forwarding aliases.
 
-Dynamo and other consumers must change their **distribution dependency** to
-`aisim` before sharing the new environment. Do not migrate the historical Dynamo
-pair documented below in place; its dependency still selects `aisimulate`.
-Use a compatible downstream release and run `pip check` after installing the
-complete environment. Skipping dependency installation is not a substitute for
+Dynamo and other consumers must declare the **distribution dependency**
+`aisim` before sharing the new environment. Use the matching Dynamo release
+[documented below](#optional-dynamo-integration) and run `pip check` after
+installing the complete environment. Skipping dependency installation is not a substitute for
 updating that requirement.
 
 ## Use current source
@@ -174,37 +173,14 @@ The [artifact contract](../ci/release.md) describes wheel/crate versioning.
 
 ## Optional Dynamo integration
 
-The engine stack does not require Dynamo. For `--stack dynamo`, install a
-Dynamo distribution that supplies the required runner and adapters into the
-same environment. The root [README](../../README.md#with-dynamo) records a validated pair: `ai-dynamo==1.7.0.dev20261028` and
-`aisimulate==0.13.0.dev202610240000000082`, from the NVIDIA prerelease index.
-Installation, `pip check`, CPU prediction, an eight-trial recommendation, and
-prediction of the best candidate pass with Python 3.12 on Linux.
+For `--stack dynamo`, install `aisim==0.14.0` with `ai-dynamo==1.7.0` in a fresh
+Linux Python 3.12 environment, following the
+[root README](../../README.md#with-dynamo). Keep AISim aligned with Dynamo's
+declared dependency and run `pip check` after installation.
 
-The AISim wheel corresponds to source
-[`f3a3e3156530574f5e7a10446f19e571b82db871`](https://github.com/ai-dynamo/aisim/commit/f3a3e3156530574f5e7a10446f19e571b82db871)
-and [nightly run 40076769417](https://github.com/ai-dynamo/aisim/actions/runs/40076769417).
-The Dynamo wheel is the October 28 nightly build.
-This is a README simulation qualification, not a claim that Dynamo's entire
-nightly pipeline passed. Full CI README checks retest the installed artifacts
-when relevant files change.
-
-A validated AISim 0.14.0 pair is still pending. As of November 16, 2026,
-`ai-dynamo==1.7.0.dev20261116` still declares
-`aisimulate==0.13.0.dev202610290000000087`, rather than the renamed `aisim`
-distribution used by AISim 0.14. The [source dependency declaration](https://github.com/ai-dynamo/dynamo/blob/64da7324dca0a44398f392d77f867dee02198baa/pyproject.toml#L17)
-records the same old distribution pin. A compatible Dynamo build must migrate
-that dependency before replacing the historical pair. Then validate the exact
-installed wheels with `pip check`, prediction, recommendation, and prediction
-of the best candidate before updating the README pins. Installing overlapping
-`aisim` and `aisimulate` distributions is not a compatible upgrade path, even
-if the dependency resolver accepts both names.
-
-Keep this environment separate from a current AISim source checkout.
-Dynamo pins an exact AISim nightly; substituting TOT violates that package
-contract. Public Dynamo 1.4.2 lacks the modern stack registration, and 1.5.0 uses
-removed AISim imports when forced alongside TOT. Do not bypass dependency
-resolution with `--no-deps` or independently upgrade AISim in this pair.
+Planner requires additional dependencies from the same Dynamo revision as the
+installed wheels; see the
+[Planner installation example](../../examples/cli/dynamo-planner/README.md).
 
 The [Dynamo deployment guide](../sweeper/deployment-generation.md)
 separately explains generated serving artifacts and runtime version pins.

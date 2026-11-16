@@ -91,47 +91,20 @@ If both are already installed, use a fresh environment or uninstall
 `aisimulate` and **force-reinstall** the selected `aisim` wheel to restore its
 files. For an environment containing Dynamo, first select a Dynamo release
 whose declared dependency is `aisim`; a release that still requires
-`aisimulate` can reinstall the old distribution. Keep the historical pair below
-in a separate environment until that downstream migration is available.
+`aisimulate` can reinstall the old distribution.
 Use `aisim` and `aisim_core` for new Python imports; `aisimulate` and `aisimulate_core` remain compatibility aliases.
 
 ### With Dynamo
 
-> **Compatibility warning:** Older Dynamo releases may be incompatible with
-> current AISim source. Dynamo 1.5.0 uses removed AISim imports, and
-> 1.4.2 does not register the `dynamo` stack. The pinned nightly pair below is
-> validated together; it does not establish compatibility with AISim tip
-> of tree. Do not upgrade AISim independently of Dynamo's declared dependency.
-
-**AISim 0.14.0 pairing is pending Dynamo dependency migration.** As of
-November 16, 2026, the latest published Dynamo nightly,
-`ai-dynamo==1.7.0.dev20261116`, still requires
-`aisimulate==0.13.0.dev202610290000000087`. AISim 0.14 uses the renamed `aisim`
-distribution. Installing both names can overwrite shared package files; a
-successful dependency resolution alone does not make that combination compatible.
-Dynamo's [source dependency declaration](https://github.com/ai-dynamo/dynamo/blob/64da7324dca0a44398f392d77f867dee02198baa/pyproject.toml#L17)
-also still selects `aisimulate`.
-
-Keep the previously validated pair below until a Dynamo build declares a
-matching `aisim` dependency and passes installation, `pip check`, Dynamo
-prediction, recommendation, and prediction of the best candidate together.
-The 0.14.0 branch does not yet have a validated 0.14.0 Dynamo pair.
-
-Install the historical pair on Linux with Python 3.12 in a **separate environment**:
-
-The Dynamo command examples below use this historical pair's `aisimulate` executable. Current source-built AISim environments use `aisim`.
+Install the matching release pair on Linux with Python 3.12 in a fresh environment:
 
 <!-- readme-check: dynamo-install -->
 ```bash
 python3 -m pip install --extra-index-url https://pypi.nvidia.com \
-  "aisimulate==0.13.0.dev202610240000000082" "ai-dynamo==1.7.0.dev20261028"
+  "aisim==0.14.0" "ai-dynamo==1.7.0"
 python3 -m pip check
-aisimulate predict --help
+aisim predict --help
 ```
-
-This pair exercises the nightly AISim wheel, not the current source checkout.
-The Full CI README checks record installed versions and run both Dynamo
-prediction and recommendation; `--help` alone does not validate the adapters.
 
 **Planner needs additional dependencies.** Install the requirements from the
 same Dynamo revision as the wheels before using a top-level `planner` section.
@@ -197,7 +170,7 @@ See the API reference for the runnable example, arguments and results.
 
 <!-- readme-check: dynamo-predict -->
 ```bash
-aisimulate predict \
+aisim predict \
   --stack dynamo \
   --config prediction.yaml \
   --output-dir ./aisim-dynamo-prediction
@@ -279,7 +252,7 @@ See the API reference for the runnable example, arguments and results.
 
 <!-- readme-check: dynamo-recommend -->
 ```bash
-aisimulate recommend \
+aisim recommend \
   --stack dynamo \
   --config recommendation.yaml \
   --output-dir ./aisim-dynamo-recommendation
@@ -300,7 +273,7 @@ For the Dynamo result, use the same stack on the round trip:
 
 <!-- readme-check: dynamo-roundtrip -->
 ```bash
-aisimulate predict \
+aisim predict \
   --stack dynamo \
   --config ./aisim-dynamo-recommendation/recommendations/0001.yaml \
   --output-dir ./aisim-dynamo-best-prediction
