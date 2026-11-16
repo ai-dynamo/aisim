@@ -2589,8 +2589,41 @@ def test_import_refuses_hybrid_evidence_of_another_vllm_version(tmp_path, layout
 
 
 def test_import_keeps_plain_records_of_a_patch_release(tmp_path):
-    # A record without hybrid evidence imports as before, whatever exact version its campaign-local bundle pins.
+    # A plain record may use a patch release of an audited runtime line, as with the collection observers.
     path, launches = observation_fixture(tmp_path, layout="attention", version="0.33.1")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+
+
+@pytest.mark.parametrize(
+    "version", ["0.26.0", "0.28.1", "0.31.0", "0.34.0", "0.33.0rc1", "0.33.0.dev1", "0.33.0+custom"]
+)
+def test_import_refuses_unaudited_runtime_even_when_bundle_and_launch_agree(tmp_path, version):
+    path, launches = observation_fixture(tmp_path, version=version)
+    launches["tp2"]["identity"]["runtime_framework_version"] = version
+    _replace_launch(path, launches)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    assert f"runtime observation import requires audited vLLM; the bundle names vLLM {version}" in str(
+        result["diagnostics"]
+    )
+    with pytest.raises(ValueError, match="runtime observation import requires audited vLLM"):
+        runtime_observations.validate_observation_phase(
+            path, "tp2", launches["tp2"], phase="prefill", attempt_id="attempt-001"
+        )
+
+
+@pytest.mark.parametrize("version", ["0.27.0", "0.28.0"])
+def test_import_keeps_audited_shared_slot_runtimes(tmp_path, version):
+    path, launches = observation_fixture(tmp_path, version=version)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+
+
+@pytest.mark.parametrize("version", ["0.32.0", "0.32.1"])
+def test_import_uses_the_audited_layer_strided_mapping_for_patch_releases(tmp_path, version):
+    path, launches = _strided_fixture(tmp_path, version=version)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
 

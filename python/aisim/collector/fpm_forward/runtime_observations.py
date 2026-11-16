@@ -38,6 +38,8 @@ from .runtime.fpm_memory_observer import (
     _SPEC_MODULE,
     _WINDOW_SPECS,
     HYBRID_EVIDENCE_VERSION,
+    MEMORY_SUPPORTED_VERSIONS,
+    audited_release,
 )
 from .runtime_instrumentation import (
     OBSERVATION_SCHEMA,
@@ -1468,6 +1470,12 @@ def _configuration(
     _same(bundle.sha256, attempt["bundle"].get("sha256"), "instrumentation bundle hash")
     if not bundle.manifest.get("source_notes") or not bundle.manifest["runtime"].get("source_files"):
         raise ValueError("runtime source mapping requires hashed source_notes and runtime.source_files")
+    # Reuse the memory observer's audited releases and patch-release policy. This route also supports the exact
+    # campaign-local 0.28.0 adapter audited in runtime/instrumentation/vllm-0.28.0.md, which uses shared slots.
+    runtime_version = bundle.manifest["runtime"]["version"]
+    release = audited_release(runtime_version, (*MEMORY_SUPPORTED_VERSIONS, "0.28.0"))
+    if release is None:
+        raise ValueError(f"runtime observation import requires audited vLLM; the bundle names vLLM {runtime_version}")
     phases = attempt.get("phases", {})
     required_phases = collection_phases(launch.get("worker_type"))
     if phase is not None:
@@ -1577,7 +1585,7 @@ def _configuration(
                 worker["cache"],
                 scheduler["cache"],
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"]),
-                bundle.manifest["runtime"]["version"],
+                release,
             )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
