@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -434,6 +434,7 @@ def benchmark_with_power(
     explicit_graph_cleanup: bool = False,
     num_eager_warmups: int | None = None,
     min_warmup_seconds: float = 0.0,
+    capture_context: Callable[[], object] | None = None,
 ):
     """
     Context manager that handles warmup, graph capture, timing, and power monitoring.
@@ -468,6 +469,13 @@ def benchmark_with_power(
                          to ~30% slower for up to ~0.1 s: on B200 a 1-token MoE layer
                          timed 0.110 ms after 3 replay warmups, 0.084 ms (steady)
                          after ~0.1 s of them. Default 0 keeps the count-only warmup.
+        capture_context: Zero-argument callable returning a context manager that
+                         is entered around the graph capture only. Frameworks
+                         whose model code branches on a process-global capture
+                         flag (SGLang's ``model_capture_mode``) need that flag set
+                         while their kernels are captured, or they take their
+                         eager branch inside the capture and fail. Defaults to
+                         None, i.e. a bare capture.
 
     Yields:
         dict with keys:
@@ -563,10 +571,14 @@ def benchmark_with_power(
             g = graph_cls()
             if explicit_graph_cleanup:
                 original_stream = dev_mod.current_stream()
+            # Framework capture flags must be set for the capture itself, not for
+            # the surrounding benchmark: model code that branches on them would
+            # otherwise take the eager path inside a stream that cannot host it.
+            capture_scope = nullcontext() if capture_context is None else capture_context()
             try:
                 if explicit_graph_cleanup:
                     try:
-                        with graph_ctx(g):
+                        with capture_scope, graph_ctx(g):
                             for _ in range(repeat_n):
                                 kernel_func()
                     finally:
@@ -574,7 +586,7 @@ def benchmark_with_power(
                         # context restores the caller's current stream.
                         dev_mod.set_stream(original_stream)
                 else:
-                    with graph_ctx(g):
+                    with capture_scope, graph_ctx(g):
                         for _ in range(repeat_n):
                             kernel_func()
                 dev_mod.synchronize()
