@@ -78,6 +78,11 @@ frameworks:
     # their version key; re-collect them from main at c540ff90a. Moving the
     # lane to 0.5.21 needs the GLM attention runner, KDA, mHC and GEMM ports,
     # then a re-collection.
+    # Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) has no model pin:
+    # its QSA route shares the `msa` module with MiniMax-M3, whose family pin is
+    # 0.5.23, and one release per collector file means the Qwen run moves with
+    # the family (pin-consolidation rule). The accepted C3.3/C3.4 tables were
+    # collected on 0.5.21 and stay under that version key.
     models: {}
   trtllm:
     source_repo: "https://github.com/NVIDIA/TensorRT-LLM.git"
@@ -148,14 +153,6 @@ frameworks:
       sparse_attention: *vllm_0320_runtime
       msa: *vllm_0320_runtime
       mhc: *vllm_0320_runtime
-    # kda family pin RETIRED: the family ran on the
-    # kimi-k3 preview image (0.1.dev19262) while the consumer's fused-decode
-    # pricing did not match 0.27's packed-decode serving path.
-    # On 0.30.0 the opharness framework-mode probe of Kimi-K3 runs the fused
-    # decode kernel (kda_decode_fusion_many_heads_kernel) and FlashKDA prefill
-    # (opharness findings vllm_0300_upgrade_2026_09_27), and the kda collector
-    # follows 0.30's is_flashkda_supported contract — so kda resolves to the
-    # default 0.30.0 like every other vllm op.
       # mla / mla_bmm family pins (0.27.0) were folded into the 0.29.0
       # default per the pin-consolidation rule: pins BELOW the
       # target version upgrade with it; the kda preview pin (an odd dev-build
@@ -209,6 +206,13 @@ frameworks:
       # transformers Glm5NextConfig; the 0.31.0 tables stay under their key.
       "zai-org/GLM-5.3-Flash": *vllm_0320_runtime
       "nvidia/GLM-5.3-Flash-NVFP4": *vllm_0320_runtime
+      # Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) has no model pin:
+      # its QSA route shares the `msa` module with MiniMax-M3, whose family pin
+      # is 0.32.0, and one release per collector file means the Qwen run moves
+      # with the family (pin-consolidation rule, as the GLM-5.3 pin did). The
+      # accepted C3.4 rows were collected on 0.31.0 (tag commit
+      # db9527a46873454610df6dbedf79a36d6bf1a7f6, the release shipping
+      # vllm/models/qwen4_exp/) and stay under that version key.
   vllm_xpu:
     base_framework: vllm
     data_backend: vllm

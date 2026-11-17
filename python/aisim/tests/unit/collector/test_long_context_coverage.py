@@ -24,6 +24,9 @@ PKG_ROOT = Path(__file__).resolve().parents[3]
 # after the FP8-compute skip widened to triton and fa4 prefill (no FP8-compute path there),
 # fa4's FP8-KV prefill was left out (serving cannot run it), and Nemotron-H moved from flashinfer
 # to trtllm_mha on SM100/103 (trtllm_mha has no BF16-compute prefill on an FP8 KV cache).
+# The four msa entries were regenerated again when the QSA module plan for
+# Qwen3.8-Flash-Next joined the MSA plan: the pinned default population (no
+# COLLECTOR_MODEL_PATH) still lists MiniMax-M3 first, and the QSA points are additive.
 BASELINE = {
     "sglang:attention_context": [27353, "d3fe2bc461ca9d1901f729d121b2461bfcce8bc60e55b9f8baa3c57da2d3c085"],
     "sglang:attention_generation": [36096, "403666ff16ab29e96d2ef9a79c7c1595a64d8208f2c4ce5c1d3abc7274994653"],
@@ -31,8 +34,8 @@ BASELINE = {
     "sglang:dsa_generation_module": [5700, "995f99c01c986b3fa038f21eb7c3f306965cad81b18516c7bf8f774d1d8b1d13"],
     "sglang:mla_context_module": [13176, "d63d0534649bab9324ee70c23fcfcce0373bc7903537342c42850dcfa88e46fa"],
     "sglang:mla_generation_module": [13248, "da66d1707e49f320831b1acbd6e090a7a5e615b9fe9523c38817ac3816f75391"],
-    "sglang:msa_context_module": [12350, "ec381d6168ee455b9e4a2666aee44d7fde609bf7ebe19412ac25e7704b59aaa1"],
-    "sglang:msa_generation_module": [1930, "18a1aaa0f67336597f617632a1b8d7bb5893f0874e79cfdec84bf88dff21c7d6"],
+    "sglang:msa_context_module": [17094, "96d52ac079ef21d87908e98cfe15f24ce4210a43c7a4fb9dcda2e6924745cd06"],
+    "sglang:msa_generation_module": [2666, "22526f9f053cf465f53820e0d912265b6d6445347f8b31abafa523eecb7f3410"],
     "trtllm:attention_context": [36261, "1dcb3ce260dd61381831f647b287b7c41640273508900ea18e361096109f3757"],
     "trtllm:attention_generation": [30054, "10f11fc455c7123272fa4fee898f3b962ab11d7a24f43bb1b3e34afd7ea77e2a"],
     "trtllm:dsa_context_module": [65220, "76c41b415880af8991b96ce5f79b1bc1326429703f358461a9c96a6b660a559c"],
@@ -47,8 +50,8 @@ BASELINE = {
     "vllm:dsa_generation_module": [10152, "64009d7847fe4065c7a7f2047560c34535a96d614c69d50227bffdb36a314731"],
     "vllm:mla_context_module": [13176, "d63d0534649bab9324ee70c23fcfcce0373bc7903537342c42850dcfa88e46fa"],
     "vllm:mla_generation_module": [13248, "da66d1707e49f320831b1acbd6e090a7a5e615b9fe9523c38817ac3816f75391"],
-    "vllm:msa_context_module": [37050, "f6e84a28e1f2b84992b264097c70884126e42c00dbc939b7b1da8c86496bd370"],
-    "vllm:msa_generation_module": [5790, "e4fad3bb4e4c216880d90f66c7ff38906d069ae57e581b3ad8165958d53b2235"],
+    "vllm:msa_context_module": [41794, "55d0191ed66d11da91e8a38ca3110b0980f8d118e764bca2b72e751454d06b91"],
+    "vllm:msa_generation_module": [6526, "079f73a2b6c196564a281a01822a2117f2b4409c95480cdc087441e7ee0b8a0f"],
 }
 
 

@@ -470,6 +470,12 @@ def _get_precision_combos(phase: str):
     ]
 
 
+# Attention types this collector implements. `msa` and `qsa` rows exist in the
+# shared spec table for the dedicated module collectors and must never be
+# dispatched through this MLA/DSA builder.
+_MLA_COLLECTOR_ATTENTION_TYPES = ("mla", "dsa")
+
+
 def _get_backends(attn_type: str):
     """Return the attention backend string to use for a given attention type.
 
@@ -3084,7 +3090,17 @@ def main():
     if args.attn_type:
         attn_types = [args.attn_type]
     else:
-        attn_types = sorted({spec.attention_type for spec in get_mla_module_model_specs(apply_model_filter=False)})
+        # This collector implements MLA and DSA only. The YAML spec table also
+        # carries `msa`/`qsa` rows for the dedicated module collectors; they
+        # must not be enumerated here or an unscoped run would dispatch a QSA
+        # checkpoint through the MLA builder.
+        attn_types = sorted(
+            {
+                spec.attention_type
+                for spec in get_mla_module_model_specs(apply_model_filter=False)
+                if spec.attention_type in _MLA_COLLECTOR_ATTENTION_TYPES
+            }
+        )
 
     failed_dispatches = 0
     gpu_id = int(args.device.split(":")[-1]) if ":" in args.device else 0

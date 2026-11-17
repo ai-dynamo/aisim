@@ -265,6 +265,20 @@ def runtime_chunk_size(model_runner) -> int:
             pass
     if isinstance(sglang_chunk, int) and sglang_chunk > 0:
         return sglang_chunk
+    # SGLang 0.5.21 resolves the default chunk size into the published schedule
+    # bag and leaves the raw ServerArgs field at None; the scheduler and the
+    # model read the bag. Read what the runtime actually runs with.
+    try:
+        from sglang.srt.runtime_context import get_schedule
+    except ImportError:
+        get_schedule = None
+    if get_schedule is not None:
+        try:
+            resolved = getattr(get_schedule(), "chunked_prefill_size", None)
+        except Exception:
+            resolved = None
+        if isinstance(resolved, int) and resolved > 0:
+            return resolved
     raise RuntimeError("SGLang did not initialize server_args.chunked_prefill_size")
 
 

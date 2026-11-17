@@ -371,9 +371,13 @@ def test_msa_skips_keep_each_backends_precisions(op):
         assert (combos("trtllm", sm), combos("vllm", sm), combos("sglang", sm)) == (trtllm, vllm, sglang), sm
 
 
+def _op_cases(op, model_path):
+    return [case for case in OP_PLANS[op].expand() if case.model_path == model_path]
+
+
 def test_msa_plan_times_the_model_shards_on_the_long_context_grid():
-    cases = OP_PLANS["msa_context_module"].expand()
-    assert {case.model_path for case in cases} == {"MiniMaxAI/MiniMax-M3"}
+    cases = _op_cases("msa_context_module", "MiniMaxAI/MiniMax-M3")
+    assert cases
     # MiniMax-M3's 64 heads at TP 1 to 16.
     assert {case.num_heads for case in cases} == {64, 32, 16, 8, 4}
     dsa = {
@@ -383,8 +387,21 @@ def test_msa_plan_times_the_model_shards_on_the_long_context_grid():
     }
     # Both 1M-context models share the long-context grid.
     assert {(case.batch_size, case.seq_len, case.prefix_len) for case in cases} == dsa
-    decode = {(case.batch_size, case.seq_len) for case in OP_PLANS["msa_generation_module"].expand()}
+    decode = {(case.batch_size, case.seq_len) for case in _op_cases("msa_generation_module", "MiniMaxAI/MiniMax-M3")}
     assert {(b, s) for b in (1, 2, 4) for s in (262144, 524288, 1048575)} <= decode
+
+
+def test_msa_plan_carries_the_qsa_rows_of_the_shared_op():
+    """Qwen3.8-Flash-Next shares the MSA module op with its own per-rank shard axis."""
+    for op in ("msa_context_module", "msa_generation_module"):
+        cases = _op_cases(op, "Qwen/Qwen3.8-Flash-Next")
+        assert cases, op
+        # 24 native query heads at TP 1/2/4/8 — heads the shared grid does not carry.
+        assert {case.num_heads for case in cases} == {24, 12, 6, 3}
+        # The QSA layer and its KV stay bf16 in both artifacts.
+        assert {(case.compute_dtype, case.kv_cache_dtype, case.gemm_type) for case in cases} == {
+            ("bfloat16", "bfloat16", "bfloat16")
+        }
 
 
 def test_trtllm_msa_times_a_thinned_prefix_grid_up_to_16k_where_it_runs_the_triton_reference():
@@ -411,7 +428,18 @@ def test_msa_rows_carry_their_points():
     for op, batches in (("msa_context_module", {1, 2, 4, 8, 16, 32, 64, 128, 256}), ("msa_generation_module", {0})):
         sglang = plan(op, "sglang", 100)
         assert {row[1] for row in sglang.rows} == batches
-        assert {(row[2], row[7]) for row in sglang.rows} == {(64, 1), (32, 2), (16, 4), (8, 8), (4, 16)}
+        assert {(row[2], row[7]) for row in sglang.rows} == {
+            (64, 1),
+            (32, 2),
+            (16, 4),
+            (8, 8),
+            (4, 16),
+            # Qwen3.8-Flash-Next's QSA rows ride the same op and worker.
+            (24, 1),
+            (12, 2),
+            (6, 4),
+            (3, 8),
+        }
         points = [tuple(point) for row in sglang.rows for point in row[8]]
         assert sorted(points) == sorted((c.batch_size, c.seq_len, c.prefix_len) for c in sglang.cases)
         for row in sglang.rows:
@@ -654,7 +682,10 @@ def test_deepep_plans_every_packaged_moe_shape_once():
     for op in ("deepep_ll", "deepep_normal"):
         op_plan = plan(op, "sglang", 100)
         assert op_plan.cases == sorted(set(op_plan.cases))
-        assert len(op_plan.cases) == 25
+        # One shape per packaged checkpoint geometry; Qwen3.8-Flash-Next's
+        # 2560/512-experts/topk-10 row is one of them.
+        assert len(op_plan.cases) == 26
+        assert any((case.hidden_size, case.num_experts, case.topk) == (2560, 512, 10) for case in op_plan.cases)
         assert op_plan.rows == [case._asdict() for case in op_plan.cases]
         assert all(list(row) == ["hidden_size", "num_experts", "topk"] for row in op_plan.rows)
         # The shapes run on every SM: a kernel limit fails its shape at run time.

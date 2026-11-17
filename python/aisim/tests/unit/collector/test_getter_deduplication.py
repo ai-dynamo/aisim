@@ -310,15 +310,20 @@ def test_vllm_sm90_repository_moe_getter_excludes_unconsumable_dsv4_cases(monkey
 
     # Every row plans its checkpoint's quant modes on every backend; vLLM
     # leaves out tp>1 with ep>1 (collector/skips.py). The count moves only
-    # with the model rows or the shared grid.
-    assert len(cases) == 2265
-    assert sum(len(case[1]) for case in cases) == 65685
+    # with the model rows or the shared grid. Qwen3.8-Flash-Next adds its two
+    # real MoE artifacts (bfloat16 base, fp8_block -FP8 alias) on the
+    # 2560/640, topk-10, 512-expert row: +84 cases / +2436 flat rows.
+    assert len(cases) == 2349
+    assert sum(len(case[1]) for case in cases) == 68121
     # MiniMax-M3's declared MoE geometry must be present as its own rows —
     # a generator defect could drop it while unrelated cases preserve the
     # aggregate counts above. (case[:8] = moe_type, num_tokens, hidden,
     # inter, topk, num_experts, tp, ep.)
     assert any(case[2] == 6144 and case[3] == 3072 and case[4] == 4 and case[5] == 128 for case in cases), (
         "MiniMax-M3 MoE row (6144/3072, topk4, 128 experts) missing from the vLLM SM90 getter"
+    )
+    assert any(case[2] == 2560 and case[3] == 640 and case[4] == 10 and case[5] == 512 for case in cases), (
+        "Qwen3.8-Flash-Next MoE row (2560/640, topk10, 512 experts) missing from the vLLM SM90 getter"
     )
     # Native artifacts stay excluded on SM90 (vLLM 0.24.0 serves them there
     # as Marlin W4A16, so the SM100-gated w4a8_mxfp4_mxfp8 label must not

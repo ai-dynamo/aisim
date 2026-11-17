@@ -96,6 +96,22 @@ class TestGetPrecisionCombos:
         assert ctx == gen
 
 
+class TestAttentionTypeDispatch:
+    def test_unscoped_run_never_dispatches_msa_or_qsa_through_the_mla_builder(self):
+        """The spec table also names the dedicated module collectors' rows.
+
+        An unscoped run must enumerate MLA and DSA only: a QSA (Qwen3.8-Flash-Next)
+        or MSA (MiniMax-M3) row has no MLA/DSA builder here.
+        """
+        from collector.case_generator import get_mla_module_model_specs
+
+        mod = _import_module()
+        declared = {spec.attention_type for spec in get_mla_module_model_specs(apply_model_filter=False)}
+        assert {"msa", "qsa"} <= declared
+        assert mod._MLA_COLLECTOR_ATTENTION_TYPES == ("mla", "dsa")
+        assert {kind for kind in declared if kind in mod._MLA_COLLECTOR_ATTENTION_TYPES} == {"mla", "dsa"}
+
+
 class TestGetBackends:
     def test_dsa_uses_0514_backend_name(self):
         mod = _import_module()

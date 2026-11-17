@@ -2,13 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # MiniMax-M3 support landed in SGLang v0.5.16 (models/minimax_m3.py +
-# layers/attention/minimax_sparse_backend.py + minimax_sparse_ops/); the msa
-# family runs on 0.5.23. One release per file; earlier code is
-# `git log -- <this file>` away.
+# layers/attention/minimax_sparse_backend.py + minimax_sparse_ops/), and its
+# `msa` family pin has since moved to 0.5.23. Qwen4-Exp compressed QSA lands in
+# v0.5.21 (models/qwen4_exp.py + layers/attention/qsa/ +
+# mem_cache/qsa_kv_pool.py) and was collected at the 0.5.21 this campaign
+# validated; it then moved with the `msa` family to 0.5.23 per the
+# pin-consolidation rule, so one release (the family pin) serves both routes.
+# The 0.5.21 Qwen tables stay under their version key.
+# One release per file (owner policy 2026-09-20); earlier code is `git log -- <this file>` away.
 __compat__ = "sglang==0.5.23"
 
 """
-MSA Module Collector for SGLang — MiniMax-M3 sparse-attention benchmarking.
+MSA Module Collector for SGLang — MiniMax-M3 MSA and Qwen4-Exp QSA
+sparse-attention benchmarking.
+
+Two routes share one op family because the perf consumer keys both on
+``msa_context_module`` / ``msa_generation_module``:
+
+``attention_type: msa`` — MiniMax-M3 (this section).
+``attention_type: qsa`` — Qwen3.8-Flash-Next (see the QSA section below).
 
 Profiles the complete MiniMax-M3 sparse-attention module forward pass (the
 fused qkv+index projection, grouped Gemma QK norm + partial RoPE, index
@@ -46,19 +58,57 @@ Per SM, SGLang's M3 server-args override
 The collector never pins a kernel: ``kernel_source`` records what ran.
 
 Op names / perf schema are aligned with collector/trtllm/collect_msa_module.py
-(msa_context_module / msa_generation_module, architecture
-MiniMaxM3ForCausalLM) so perf_database queries work across frameworks.
-Unless noted, SGLang citations in this file are @v0.5.23 and relative to
-python/sglang/srt (kernel paths start at python/sglang/kernels).
+(msa_context_module / msa_generation_module) so perf_database queries work
+across frameworks; the persisted ``architecture`` is the checkpoint's own
+(``MiniMaxM3ForCausalLM`` / ``Qwen4ExpForConditionalGeneration``).
+Unless noted, SGLang citations are @v0.5.23 on the MSA route and @v0.5.21 on
+the QSA route, relative to python/sglang/srt (kernel paths start at
+python/sglang/kernels).
+
+QSA route (``attention_type: qsa``, Qwen3.8-Flash-Next @ SGLang v0.5.21):
+the benchmark hosts the real checkpoint config with a 4-layer text stack
+(three GDN layers then one QSA layer — the checkpoint's own
+``full_attention_interval=4`` period), PLE tables dropped, and per-rank head
+counts sharded exactly as serving does. The timed unit is
+``Qwen4ExpAttentionDecoderLayer.self_attention``: fused qkv+output-gate
+projection, fused Gemma QK-norm + MRoPE + gate, the QSA indexer (index-QK
+projection, q-norm, fused RoPE+store, compressed-key top-k selection), the
+sparse attention call itself, and o_proj. Attention dispatch is SGLang's own:
+the hybrid-GDN wrapper's full-attention side becomes ``QwenSparseAttnBackend``
+for every ``is_qwen_qsa`` model (layers/attention/attention_registry.py
+:458-466@v0.5.21), and that routing is verified per case. Compressed QSA makes
+SGLang pin ``page_size=64`` (arg_groups/model_overrides/qwen4_exp.py), and
+decode runs under a captured CUDA graph where serving covers the batch size.
+The collector never pins a kernel: it records the route the backend actually
+took in ``kernel_source``. Context prefixes are aligned to the checkpoint's
+``indexer_compress_ratio`` (4): the pool addresses whole compressed groups and
+the extend write plan asserts ``prefix % ratio == 0`` on the device
+(qwen_sparse_attn_backend.py:527), so a sub-group prefix such as the declared
+1 is measured as the smallest legal one (4) and the RoPE-ceiling point floors
+to a group boundary instead of aborting the sweep.
+
+Measurement deviation on that route: the M3 history seeding
+(``_initialize_msa_history``, which writes the cached prefix's KV and index
+keys through the sparse backend's pooled writer) is MSA-only and does not run
+for QSA. QSA's main KV cache and its two index side caches therefore keep the
+allocator's zero fill, which is the condition the accepted C3.3 QSA rows were
+measured under. The block choice is score-dependent, but the timed top-k work
+is the selected block count, which the geometry fixes, so a zero-filled
+history does not change the measured kernels' shape. Seeding QSA would move a
+table already in the dataset, so it stays a documented deviation until those
+rows are re-collected.
 
 Usage (inside the pinned SGLang image, collector/framework_manifest.yaml):
     python3 -m collector.sglang.collect_msa_module --mode context --quick \
         --batch-size 2 --seq-len 512 --num-heads 64
     python3 -m collector.sglang.collect_msa_module --mode generation --quick \
         --batch-size 4 --seq-len 2048 --num-heads 64
+    python3 -m collector.sglang.collect_msa_module --mode context --quick \
+        --model Qwen/Qwen3.8-Flash-Next --num-heads 24 --batch-size 1 --seq-len 8192
 """
 
 import argparse
+import functools
 import gc
 import json
 import os
@@ -75,7 +125,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from collector.case_generator import (
+    get_mla_module_model_aliases,
+    get_mla_module_model_specs,
+)
 from collector.helper import (
+    PerfLogError,
     PhaseClock,
     _resolve_local_model_path,
     benchmark_with_power,
@@ -89,6 +144,7 @@ from collector.op_plans import plan, plan_cases
 try:
     from collector.sglang.runtime_compat import resolved_arg
     from collector.sglang.runtime_limits import (
+        KERNEL_LIMIT,
         kernel_limit_error,
         kv_pool_capacity_tokens,
         kv_pool_page_size,
@@ -104,6 +160,7 @@ try:
 except ModuleNotFoundError:  # direct-script import inside the subprocess
     from runtime_compat import resolved_arg
     from runtime_limits import (
+        KERNEL_LIMIT,
         kernel_limit_error,
         kv_pool_capacity_tokens,
         kv_pool_page_size,
@@ -132,6 +189,31 @@ MSA_ARCHITECTURE = "MiniMaxM3ForCausalLM"  # AIC-canonical persisted architectur
 # attention-backend wiring (mem_cache/kv_cache_configurator.py:1890-1896,
 # 2552-2600; layers/attention/attention_registry.py:375-391).
 SGLANG_MSA_ARCHITECTURE = "MiniMaxM3SparseForCausalLM"
+
+# Qwen4-Exp compressed QSA (Qwen3.8-Flash-Next, SGLang v0.5.21). The
+# checkpoint's own architectures[0] IS SGLang's model EntryClass, so unlike M3
+# above no config rewrite is needed — the bundled config is a real multimodal
+# config (vision_config present, language_model_only=false), which is what
+# keeps is_mrope_enabled=True on the loaded model.
+QSA_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
+# Benchmark-layer surgery: the checkpoint alternates three linear (GDN) layers
+# with one full-attention (QSA) layer (full_attention_interval=4,
+# layer_types[3] == "full_attention"), so a 4-layer stack reproduces the QSA
+# layer's serving construction path with one PLE-free period of context.
+QSA_BENCH_NUM_LAYERS = 4
+QSA_BENCH_LAYER = 3
+QSA_BENCH_LAYER_TYPES = [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+]
+# MoE experts per benchmark layer. The routed MoE block is outside the timed
+# module and every loaded layer builds one (Qwen4Exp always uses
+# Qwen2MoeSparseMoeBlock), so the count is shrunk from the checkpoint's 512 to
+# keep dummy-weight residency small; top-k stays checkpoint-verbatim and must
+# remain <= this count.
+QSA_BENCH_NUM_EXPERTS = 16
 
 # Perf-database dtype strings → SGLang ServerArgs kv_cache_dtype values
 # (same mapping as collect_mla_module.py).
@@ -162,8 +244,314 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Attention routes
+# ═══════════════════════════════════════════════════════════════════════
+
+_MSA_MODULE_ATTENTION_TYPES = ("msa", "qsa")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Test-case generation (collect.py entrypoints)
 # ═══════════════════════════════════════════════════════════════════════
+
+
+@functools.cache
+def _model_max_position_embeddings(model_id: str) -> int:
+    """Max context (RoPE table size) from the bundled config — the same value
+    SGLang uses for the rotary cache (get_rope max_position,
+    models/minimax_m3.py:546-552) and default context_length.
+
+    Multimodal checkpoints (Qwen4-Exp) keep the decoder's RoPE bound in
+    ``text_config.max_position_embeddings``; the outer config has no such
+    field. Both spellings are read here so the sweep ceiling is the decoder's.
+
+    Raises when the artifact config cannot be resolved: a silent ``None``
+    would disable every RoPE ceiling check and widen the sweep past the
+    rotary table size (unresolvable declarations fail loudly)."""
+    config_dir = _resolve_local_model_path(model_id)
+    with open(os.path.join(config_dir, "config.json")) as f:
+        config = json.load(f)
+    text_config = config.get("text_config") or config
+    value = text_config.get("max_position_embeddings") or config.get("max_position_embeddings")
+    if not value:
+        raise RuntimeError(
+            f"max_position_embeddings missing/empty in {model_id} config.json; "
+            "cannot bound the MSA sweep against the RoPE table size"
+        )
+    return int(value)
+
+
+@functools.cache
+def _qsa_compress_ratio(model_id: str) -> int:
+    """QSA compressed-group width (tokens per sparse-attention block).
+
+    Qwen4-Exp compresses each ``indexer_compress_ratio`` tokens into one
+    sparse block: the checkpoint declares 4
+    (``text_config.indexer_compress_ratio``), the pool keeps it verbatim as
+    ``qsa_compress_ratio`` and derives ``qsa_block_topk = index_topk // ratio``
+    (mem_cache/qsa_kv_pool.py:113-119@v0.5.21), and the QSA pool refuses a page
+    that is not a ratio multiple (same file, :72-77).
+
+    A context prefix must be a multiple of this ratio: the extend write plan
+    asserts exactly that on the device
+    (qwen_sparse_attn_backend.py:527@v0.5.21, "prefix sharing is page-granular
+    and the page is a ratio multiple"), and a misaligned prefix raises a
+    device-side assert that poisons the CUDA context for the rest of the sweep
+    instead of failing one shape. Serving can only produce ratio-aligned
+    prefixes, so aligning the sweep keeps it inside the serving envelope.
+
+    Raises when the artifact declares no such field (the QSA route must not
+    guess a group width)."""
+    config_dir = _resolve_local_model_path(model_id)
+    with open(os.path.join(config_dir, "config.json")) as f:
+        config = json.load(f)
+    text_config = config.get("text_config") or config
+    value = text_config.get("indexer_compress_ratio") or config.get("indexer_compress_ratio")
+    if not value or int(value) <= 1:
+        raise RuntimeError(
+            f"indexer_compress_ratio missing/empty in {model_id} config.json; "
+            "cannot align the QSA sweep to the compressed-block width"
+        )
+    return int(value)
+
+
+_MEMORY_BUDGET_SAFETY_FACTOR = 0.9
+# The M3 KV pool page on the SM90/SM100 serving paths (fa3/fa4 + page 128,
+# arg_groups/overrides.py:502-529@v0.5.16); page-128 rounding upper-bounds
+# any smaller resolved page. Used for plan-time footprint estimates only —
+# the worker re-validates against the real resolved page and pool.
+_PLAN_PAGE_SIZE = 128
+# Compressed QSA forces page_size=64 in SGLang's own Qwen4-Exp override
+# (arg_groups/model_overrides/qwen4_exp.py@v0.5.21: compressed_slot ==
+# full_slot // compress_ratio needs page-aligned full-KV allocation). 64 is
+# also the smallest page that is a multiple of the compress ratio, so the
+# estimate matches the resolved pool exactly.
+_QSA_PLAN_PAGE_SIZE = 64
+_M3_HEAD_DIM = 128
+_M3_INDEX_HEADS = 4
+_M3_INDEX_DIM = 128
+_M3_NATIVE_GQA_RATIO = 16  # 64 q / 4 kv heads (bundled config)
+
+
+def _loaded_num_layers() -> int:
+    """Layers the worker loads (SGLANG_TEST_NUM_LAYERS, default 2) — every one of
+    them owns a slot in the main pool and the index-K pool, so the plan-time
+    footprint is per token x layers (memory_pool.py:5404 MiniMaxSparseKVPool
+    builds one MHA pool over start_layer..end_layer plus one index pool per
+    sparse layer @0.5.21)."""
+    return int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "2"))
+
+
+def _estimated_kv_bytes_per_token(num_heads: int, kv_cache_dtype: str) -> int:
+    """Upper-bound bytes/token of the M3 pools at this per-GPU head count, for
+    ALL loaded layers: main paged K+V (kv-head sharded; fp8 stores 1 B/elem, else
+    bf16) plus the index-K side cache (model dtype unless fp8 attn-GEMM,
+    memory_pool.py:5392 get_minimax_sparse_index_dtype @0.5.21; index_dtype=
+    model_dtype @v0.5.16 kv_cache_configurator.py:1246). The 0.5.16-era
+    estimate priced one layer while the worker loads two: the three
+    largest-batch decode cells (b=256/512/1024 x 131072/65536/32768) passed the
+    plan filter and then failed the worker's execute-or-raise capacity check
+    (33.6M planned tokens > 24.5M real pool, H20 0.5.21 smoke 2026-10-01)."""
+    kv_heads = max(1, num_heads // _M3_NATIVE_GQA_RATIO)
+    main_elem = 1 if kv_cache_dtype == "fp8" else 2
+    main = 2 * kv_heads * _M3_HEAD_DIM * main_elem
+    index_heads = min(_M3_INDEX_HEADS, num_heads)
+    index = index_heads * _M3_INDEX_DIM * 2
+    return (main + index) * _loaded_num_layers()
+
+
+def _qsa_text_config(model_path: str) -> dict:
+    """Return the Qwen4-Exp decoder config (outer config for a text-only export).
+
+    QSA geometry is per checkpoint (GQA ratio, head_dim, index schema), so it
+    is never inferred from the M3 constants above. A checkpoint without the
+    indexer schema raises instead of producing M3-shaped rows under a QSA
+    label.
+    """
+    config_dir = _resolve_local_model_path(model_path)
+    with open(os.path.join(config_dir, "config.json")) as f:
+        config = json.load(f)
+    text_config = config.get("text_config") or config
+    required = (
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "indexer_n_heads",
+        "indexer_kv_heads",
+        "indexer_head_dim",
+        "indexer_budget",
+        "indexer_compress_ratio",
+    )
+    missing = [name for name in required if text_config.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"model {model_path} is missing the QSA indexer/config fields {missing}; "
+            "the msa_module collector only supports Qwen4-Exp checkpoints for "
+            "attention_type qsa"
+        )
+    return text_config
+
+
+def _qsa_bytes_per_token(num_heads: int, kv_cache_dtype: str, text_config: dict) -> int:
+    """Pool bytes/token of the Qwen4-Exp QSA layer at this per-GPU head count.
+
+    Mirrors QSAKVTokenToKVPool (mem_cache/qsa_kv_pool.py@v0.5.21): the paged
+    main K/V of the full-attention layer (kv-head sharded; fp8 stores 1 B/elem,
+    else bf16) plus the three QSA side buffers, all ``index_state_dtype`` bf16
+    (class attribute, :36) except the int64 MRoPE position ring:
+
+    * ``qsa_key_state_buffer_pool`` — one raw index key per compressed slot
+      (``qsa_compressed_capacity = ceil(state_size / ratio)``, :124), so
+      ``index_kv_heads * index_head_dim * 2 / ratio`` bytes per token;
+    * ``qsa_compressed_k_buffer_pool`` — one compressed key per compressed
+      page, same per-token cost (``qsa_compressed_page_size = page/ratio``,
+      :123);
+    * ``qsa_rope_position_buffer`` — three int64 MRoPE axes per token (:163).
+
+    Per-request pending rings are budgeted with the other per-request buffers
+    by SGLang, so they are deliberately excluded — this stays a lower bound
+    like the M3 estimate.
+    """
+    ratio = int(text_config["indexer_compress_ratio"])
+    index_state = int(text_config["indexer_kv_heads"]) * int(text_config["indexer_head_dim"]) * 2
+    side = 2 * index_state // ratio + 3 * 8
+    return _qsa_main_kv_bytes_per_token(num_heads, kv_cache_dtype, text_config) + side
+
+
+def _qsa_main_kv_bytes_per_token(num_heads: int, kv_cache_dtype: str, text_config: dict) -> int:
+    """Paged main K+V bytes/token of one QSA layer (kv-head sharded)."""
+    native_q = int(text_config["num_attention_heads"])
+    native_kv = int(text_config["num_key_value_heads"])
+    gqa_ratio = max(1, native_q // native_kv)
+    kv_heads = max(1, num_heads // gqa_ratio)
+    main_elem = 1 if kv_cache_dtype == "fp8" else 2
+    return 2 * kv_heads * int(text_config["head_dim"]) * main_elem
+
+
+# Transient bytes/token the PREFIXED QSA extend path materialises on top of the
+# pool, as a multiple of one layer's main K+V. For any row with a prefix the
+# backend gathers that row's whole context out of the pool — one index_select
+# per request, then a torch.cat of the per-request parts, and the same again
+# for V (layers/attention/qwen_sparse_attn_backend.py:1326-1361@v0.5.21), so the
+# peak is TWO full copies of the context K+V per token. It is a per-shape
+# workspace, not part of the pool: the pool holds every request's context for
+# the whole sweep, and this is allocated on top for each measured shape.
+#
+# Measured on H200 (C3.3, one shape per fresh process): 6407-6488 B/token total
+# at TP1 against a 2200 B/token pool + 2*2048 transient, and 3610 B/token at TP8
+# against 1176 + 2*1024 — i.e. pool + 2x, plus a small per-token path overhead.
+_QSA_PREFIX_GATHER_COPIES = 2
+# Plan-time headroom over that model: the measured totals run 1.03x (TP1) and
+# 1.12x (TP8) of pool + transient, which is the rest of the path's per-token
+# metadata (req->token tables, positions, topk indices). 1.15 covers the
+# measured worst case and still admits every shape the device can run.
+_QSA_PLAN_FOOTPRINT_MARGIN = 1.15
+# Mirrors the worker's own max_total_tokens sizing (+5%, see run_msa_module):
+# the pool it allocates is this much larger than the tokens the sweep needs.
+_PLAN_POOL_SLACK = 1.05
+
+
+def _qsa_prefix_transient_bytes_per_token(num_heads: int, kv_cache_dtype: str, text_config: dict) -> int:
+    """Per-shape extend-path workspace bytes/token for a prefixed QSA chunk."""
+    return _QSA_PREFIX_GATHER_COPIES * _qsa_main_kv_bytes_per_token(num_heads, kv_cache_dtype, text_config)
+
+
+def _kv_cost_estimate(
+    attention_type: str, num_heads: int, kv_cache_dtype: str, model_path: str
+) -> tuple[int, int, int]:
+    """(plan page size, pool bytes/token, per-shape workspace bytes/token)."""
+    if attention_type == "qsa":
+        text_config = _qsa_text_config(model_path)
+        return (
+            _QSA_PLAN_PAGE_SIZE,
+            _qsa_bytes_per_token(num_heads, kv_cache_dtype, text_config),
+            _qsa_prefix_transient_bytes_per_token(num_heads, kv_cache_dtype, text_config),
+        )
+    # MSA gathers nothing of its own: its pool estimate is the whole footprint.
+    return _PLAN_PAGE_SIZE, _estimated_kv_bytes_per_token(num_heads, kv_cache_dtype), 0
+
+
+def _qsa_footprint_refusal(
+    shape: tuple,
+    *,
+    page_size: int,
+    bytes_per_token: int,
+    workspace_bytes: int,
+    total_memory: int,
+) -> str | None:
+    """Why a prefixed QSA point's pool plus its per-shape gather workspace cannot fit, or None.
+
+    The pool is sized from the case's largest runnable point and stays resident
+    for the whole sweep, while the prefixed extend path allocates another two
+    copies of the context K/V per measured shape on top of it
+    (``_qsa_prefix_transient_bytes_per_token``). Bounding only the pool admits
+    points that OOM mid-sweep: the C3.3 run aborted 215 of 11888 shapes that
+    way, including b=128 prefix=262140 at ~197 GiB against a 104.67 GiB
+    measured peer. This is a capacity refusal, so the worker raises it before
+    allocating the point (layer_permissions.md: "refuse at run time, before
+    allocation").
+    """
+    batch, seq_len, prefix_len = shape
+    per_token = (bytes_per_token * _PLAN_POOL_SLACK + workspace_bytes) * _QSA_PLAN_FOOTPRINT_MARGIN
+    needed = required_kv_alloc_tokens(batch, seq_len, prefix_len, page_size, is_prefill=True) * per_token
+    allowed = int(total_memory * _MEMORY_BUDGET_SAFETY_FACTOR)
+    if needed <= allowed:
+        return None
+    return (
+        f"{KERNEL_LIMIT}: does not fit: the pool plus the {workspace_bytes} B/token prefix gather "
+        f"needs {needed / 2**30:.1f} GiB, the device allows {allowed / 2**30:.1f} GiB "
+        f"({_MEMORY_BUDGET_SAFETY_FACTOR:g} of its memory)"
+    )
+
+
+def _require_aligned_qsa_prefixes(shapes, *, model_path: str) -> None:
+    """Refuse a QSA prefix the compressed pool cannot address, on the host.
+
+    The plan already raises every prefix to a group boundary; an ad-hoc shape
+    (``--quick``/``--prefix-len``) can still be misaligned, and the device-side
+    assert it would hit poisons the CUDA context for the rest of the sweep.
+    """
+    ratio = _qsa_compress_ratio(model_path)
+    misaligned = [shape for shape in shapes if shape[2] % ratio]
+    if misaligned:
+        raise RuntimeError(
+            f"QSA manifest carries prefixes outside the compressed-block width {ratio}: "
+            f"{misaligned[:3]} (model={model_path}); the write plan asserts prefix % ratio == 0 "
+            "on the device and a violation poisons the CUDA context for every remaining shape"
+        )
+
+
+def _resolve_model_spec(model_path: str):
+    """The declared mla_module model row for a checkpoint path (aliases included).
+
+    A targeted run may name an artifact alias (for example the FP8 checkpoint)
+    of a row whose representative ``model_path`` is the base artifact —
+    ``model_aliases`` share one physical collector case. An undeclared path
+    raises: guessing would run a MiniMax module under a Qwen4-Exp row or
+    vice versa.
+    """
+    specs = get_mla_module_model_specs(backend="sglang", apply_model_filter=False)
+    exact = [spec for spec in specs if spec.model_path == model_path]
+    if not exact:
+        exact = [
+            spec for spec in specs if model_path in get_mla_module_model_aliases(spec.model_path, backend="sglang")
+        ]
+    if len(exact) != 1:
+        declared = sorted({spec.model_path for spec in specs})
+        raise ValueError(
+            f"model {model_path!r} resolves to {len(exact)} mla_module model row(s); declared paths: {declared}"
+        )
+    return exact[0]
+
+
+def _attention_type_for_model(model_path: str) -> str:
+    """Resolve a case's attention type from its declared model row.
+
+    The case tuple keeps the trtllm/sglang positional prefix (no
+    attention_type field), so the worker looks it up here — the same model
+    identity the perf row persists.
+    """
+    return _resolve_model_spec(model_path).attention_type
 
 
 def get_msa_context_module_test_cases():
@@ -365,18 +753,61 @@ def cleanup_distributed():
     except Exception:
         pass
 
+    # destroy_model_parallel only tears down the model-parallel groups; the
+    # WORLD process group (and, on 0.5.21+, the published runtime placement)
+    # outlives it, which would make the next runner in this process see a stale
+    # world size and a stale init guard. Tear both down when the runtime has
+    # them.
+    if hasattr(parallel_state, "destroy_distributed_environment"):
+        try:
+            parallel_state.destroy_distributed_environment()
+        except Exception:
+            pass
 
-def load_model_runner(
-    model_path: str,
-    num_heads: int,
-    kv_cache_dtype: str,
-    target_tp_size: int,
+    # v0.5.21 replaced the caller-supplied ``ParallelState`` with a
+    # process-wide runtime context (``sglang.srt.runtime_context``). The
+    # context is process state, not process-group state, so ModelRunner
+    # teardown leaves it behind and the NEXT runner in this worker would read
+    # the previous run's published config. Reset it when the runtime has one;
+    # older SGLang has no such module and needs nothing here.
+    try:
+        from sglang.srt.runtime_context import reset_context
+    except ImportError:
+        return
+    try:
+        reset_context()
+    except Exception:
+        pass
+
+
+def _resolved_page_size(server_args):
+    """The page size the runner will actually use.
+
+    The Qwen4-Exp override declares ``page_size=64`` for the compressed QSA
+    pool (arg_groups/model_overrides/qwen4_exp.py@v0.5.21). Through 0.5.20 that
+    landed on the ``ServerArgs`` record itself; 0.5.21 resolves declarations
+    into the published schedule bag and leaves the record's raw value
+    untouched, while ``ModelRunner`` reads ``get_schedule().page_size``. Read
+    the same field the runner reads, so "verified after load" means verified.
+    """
+    try:
+        from sglang.srt.runtime_context import get_schedule
+    except ImportError:
+        return server_args.page_size
+    return getattr(get_schedule(), "page_size", None) or server_args.page_size
+
+
+def _start_model_runner(
+    *,
+    local_model_path: str,
+    override_args: dict,
+    sglang_kv_dtype: str,
+    gpu_id: int,
     max_total_tokens: int | None,
     chunked_prefill_size: int | None,
     max_running_requests: int | None,
-    device: str = "cuda:0",
 ):
-    """Load an SGLang ModelRunner hosting the M3 sparse module (dummy weights).
+    """ServerArgs → ModelConfig → ModelRunner, as serving constructs them.
 
     Serving-selected defaults are deliberately NOT overridden: attention
     backend, page size and the fp8 attention-GEMM mode resolve exactly as for
@@ -401,32 +832,8 @@ def load_model_runner(
 
     suppress_other_loggers()
 
-    device_str = str(device)
-    gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
-
-    num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "2"))
     load_format = os.environ.get("SGLANG_LOAD_FORMAT", "dummy")
 
-    sglang_kv_dtype = SGLANG_KV_DTYPE.get(kv_cache_dtype)
-    if sglang_kv_dtype is None:
-        raise ValueError(f"unsupported kv_cache_dtype {kv_cache_dtype!r} for MSA")
-
-    _register_minimax_m3_text_config()
-    local_model_path = _resolve_sglang_model_dir(model_path)
-    with open(os.path.join(local_model_path, "config.json")) as f:
-        raw_config = json.load(f)
-    override_args = _build_model_override_args(raw_config, num_heads, target_tp_size, num_layers)
-
-    # attention_backend stays framework-selected (None): the collector measures
-    # serving truth. SM89 and SM12x have no M3 override branch and take the
-    # generic flashinfer + page-1 default. Through v0.5.16 that crashed at
-    # backend init on the M3 KV pool (get_kv_cache_quant_method returned
-    # None), and the l40s/rtx tables collected with --attention-backend triton
-    # were withdrawn (review 4969690316 Standards-1). MiniMaxSparseKVPool now
-    # forwards get_kv_cache_quant_method to its main pool
-    # (mem_cache/memory_pool.py:6057-6060), so the default may initialize
-    # there; whether it does is unverified on a GPU at this pin. Cases that
-    # still fail stay classified failures.
     server_args = ServerArgs(
         model_path=local_model_path,
         dtype="auto",
@@ -448,11 +855,6 @@ def load_model_runner(
     _set_envs_and_config(server_args)
 
     model_config = ModelConfig.from_server_args(server_args)
-    actual_architecture = (model_config.hf_config.architectures or [None])[0]
-    if actual_architecture != SGLANG_MSA_ARCHITECTURE:
-        raise RuntimeError(
-            f"SGLang loaded architecture={actual_architecture!r} for {model_path}, expected {SGLANG_MSA_ARCHITECTURE!r}"
-        )
 
     from collector.sglang.runtime_compat import free_local_port, init_runtime_config
 
@@ -480,6 +882,90 @@ def load_model_runner(
     build_minimax_fused_qkv_index(model_runner.model)
     model_runner.alloc_memory_pool()
     model_runner.init_attention_backends()
+    return model_runner, server_args, model_config
+
+
+def load_model_runner(
+    model_path: str,
+    num_heads: int,
+    kv_cache_dtype: str,
+    target_tp_size: int,
+    max_total_tokens: int | None,
+    chunked_prefill_size: int | None,
+    max_running_requests: int | None,
+    device: str = "cuda:0",
+    attention_type: str = "msa",
+):
+    """Load an SGLang ModelRunner hosting one sparse-attention module.
+
+    ``attention_type`` selects the route: ``msa`` (MiniMax-M3 sparse layer,
+    ``_load_msa_model_runner``) or ``qsa`` (Qwen4-Exp compressed-QSA layer,
+    ``_load_qsa_model_runner``). Both build dummy weights of the real serving
+    layer and validate the shard.
+    """
+    if attention_type not in _MSA_MODULE_ATTENTION_TYPES:
+        raise ValueError(f"unknown attention_type {attention_type!r}; expected one of {_MSA_MODULE_ATTENTION_TYPES}")
+    loader = _load_qsa_model_runner if attention_type == "qsa" else _load_msa_model_runner
+    return loader(
+        model_path=model_path,
+        num_heads=num_heads,
+        kv_cache_dtype=kv_cache_dtype,
+        target_tp_size=target_tp_size,
+        max_total_tokens=max_total_tokens,
+        chunked_prefill_size=chunked_prefill_size,
+        max_running_requests=max_running_requests,
+        device=device,
+    )
+
+
+def _load_msa_model_runner(
+    *,
+    model_path: str,
+    num_heads: int,
+    kv_cache_dtype: str,
+    target_tp_size: int,
+    max_total_tokens: int | None,
+    chunked_prefill_size: int | None,
+    max_running_requests: int | None,
+    device: str = "cuda:0",
+):
+    """MiniMax-M3 route: serving-selected attention backend + page size.
+
+    The M3 server-args handler resolves attention_backend / page_size per
+    platform (arg_groups/overrides.py:465-537@v0.5.16 — fa3 + page 128 on
+    SM90, fa4 + page 128 on SM100) inside ServerArgs.__post_init__
+    (server_args.py:2969 _handle_model_specific_adjustments); nothing here
+    overrides that.
+    """
+    device_str = str(device)
+    gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
+
+    num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "2"))
+
+    sglang_kv_dtype = SGLANG_KV_DTYPE.get(kv_cache_dtype)
+    if sglang_kv_dtype is None:
+        raise ValueError(f"unsupported kv_cache_dtype {kv_cache_dtype!r} for MSA (SGLANG_KV_DTYPE)")
+
+    _register_minimax_m3_text_config()
+    local_model_path = _resolve_sglang_model_dir(model_path)
+    with open(os.path.join(local_model_path, "config.json")) as f:
+        raw_config = json.load(f)
+    override_args = _build_model_override_args(raw_config, num_heads, target_tp_size, num_layers)
+
+    model_runner, server_args, model_config = _start_model_runner(
+        local_model_path=local_model_path,
+        override_args=override_args,
+        sglang_kv_dtype=sglang_kv_dtype,
+        gpu_id=gpu_id,
+        max_total_tokens=max_total_tokens,
+        chunked_prefill_size=chunked_prefill_size,
+        max_running_requests=max_running_requests,
+    )
+    actual_architecture = (model_config.hf_config.architectures or [None])[0]
+    if actual_architecture != SGLANG_MSA_ARCHITECTURE:
+        raise RuntimeError(
+            f"SGLang loaded architecture={actual_architecture!r} for {model_path}, expected {SGLANG_MSA_ARCHITECTURE!r}"
+        )
 
     head_dim = int(raw_config.get("head_dim", raw_config["hidden_size"] // raw_config["num_attention_heads"]))
     attn = model_runner.model.model.layers[0].self_attn
@@ -493,6 +979,281 @@ def load_model_runner(
         f"fp8_attn_gemm={sparse.fp8_attn_gemm}, use_msa={sparse.use_msa}, msa_decode={sparse._use_msa_decode}, "
         f"chunked_prefill_size={resolved_arg(server_args, 'chunked_prefill_size')}, "
         f"max_total_tokens={max_total_tokens}, max_running_requests={max_running_requests}"
+    )
+    return model_runner
+
+
+def _qsa_local_kv_heads(text_config: dict, target_tp_size: int) -> int:
+    """K/V heads on one target-TP rank, exactly as serving shards them.
+
+    Qwen3_5AttentionDecoderLayer.__init__: when ``total_kv_heads >= kv_tp_size``
+    the heads divide; otherwise they are replicated, i.e.
+    ``num_kv_heads = max(1, total_kv // kv_tp_size)`` (and it asserts
+    ``kv_tp_size % total_kv == 0``). Qwen3.8-Flash-Next has 2 native K/V heads,
+    so TP 2 keeps 1 and TP 4/8 replicate 1.
+    """
+    native_kv = int(text_config["num_key_value_heads"])
+    if native_kv < target_tp_size and target_tp_size % native_kv != 0:
+        raise ValueError(
+            f"target_tp_size={target_tp_size} cannot shard or replicate "
+            f"num_key_value_heads={native_kv} the way serving does"
+        )
+    return max(1, native_kv // target_tp_size)
+
+
+def _build_qsa_model_override_args(config: dict, num_heads: int, target_tp_size: int, num_layers: int) -> dict:
+    """Single-GPU emulation of one target-TP rank + benchmark-stack surgery.
+
+    The override is nested under ``text_config`` because the checkpoint is a
+    real multimodal Qwen4-Exp config: ``get_config`` applies a dict override to
+    a PretrainedConfig sub-config with ``.update()`` (utils/hf_transformers/
+    config.py:324-335@v0.5.21), which is exactly what serving's config path
+    does for these checkpoints. The outer config is left untouched so
+    ``language_model_only`` stays false and the loaded model keeps
+    ``is_mrope_enabled``/``model_is_mrope`` on (the QSA bench must feed MRoPE
+    positions, see ``_module_positions``).
+
+    Inside the text config:
+
+    * ``num_attention_heads = num_heads`` and
+      ``num_key_value_heads = max(1, native_kv // tp)`` reproduce serving's
+      per-rank shard (Qwen3_5AttentionDecoderLayer.__init__). The indexer is
+      replicated, not sharded (``indexer_n_heads`` stays 4), matching
+      QSAIndexer@v0.5.21.
+    * ``num_hidden_layers = 4`` with ``layer_types`` set to three linear (GDN)
+      layers plus one ``full_attention`` layer — the checkpoint's own
+      ``full_attention_interval=4`` period. ``layers_block_type`` and
+      ``full_attention_layer_ids`` are properties over ``layer_types``
+      (qwen4_exp config + qwen3_next config:260-285), so the hybrid backend
+      wrapper wires layer 3 to ``QwenSparseAttnBackend`` with no other surgery.
+    * ``ple_layer_ids = []`` drops the PLE tables. They are model-global host
+      state, not part of the timed attention module, and their real width
+      (vocab x 18M-table projections) is out of scope for a module bench.
+      With no PLE layer, ``has_ple`` is false and no ``ple_batch`` is needed.
+    * ``num_experts`` is shrunk to ``QSA_BENCH_NUM_EXPERTS``. The routed MoE
+      block sits outside the timed module; every loaded layer still builds the
+      real ``Qwen2MoeSparseMoeBlock`` with checkpoint-verbatim top-k, just
+      over fewer dummy experts, so dummy residency stays small.
+    """
+    if "text_config" not in config:
+        raise ValueError(
+            "Qwen4-Exp QSA rows require the checkpoint's multimodal config "
+            "(nested text_config); a text-only export would turn off "
+            "is_mrope_enabled and change the measured attention path"
+        )
+    text_config = config["text_config"]
+    native_q = int(text_config["num_attention_heads"])
+    if native_q % target_tp_size != 0 or native_q // target_tp_size != num_heads:
+        raise ValueError(f"num_heads={num_heads} does not equal native {native_q} / target_tp {target_tp_size}")
+    if len(QSA_BENCH_LAYER_TYPES) != num_layers:
+        raise ValueError(f"QSA benchmark stacks {len(QSA_BENCH_LAYER_TYPES)} layer types, got num_layers={num_layers}")
+    return {
+        "text_config": {
+            "num_hidden_layers": num_layers,
+            "layer_types": list(QSA_BENCH_LAYER_TYPES),
+            "ple_layer_ids": [],
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": _qsa_local_kv_heads(text_config, target_tp_size),
+            "num_experts": QSA_BENCH_NUM_EXPERTS,
+        }
+    }
+
+
+def _validate_qsa_module(model_runner, layer, num_heads: int, target_tp_size: int, text_config: dict):
+    """Verify the single-GPU module emulates one target-TP QSA rank of serving.
+
+    Shapes per Qwen3_5AttentionDecoderLayer + Qwen4Exp override
+    (@v0.5.21): qkv_proj packs
+    ``(num_heads * (1 + attn_output_gate) + 2 * num_kv_heads) * head_dim``
+    (Qwen4-Exp forces ``attn_output_gate = True``), o_proj input
+    ``num_heads * head_dim``, and the indexer holds the checkpoint's index
+    schema verbatim (replicated across TP). Dispatch is proven, not assumed:
+    the layer must be the QSA flavor, the hybrid wrapper's full-attention side
+    must be ``QwenSparseAttnBackend``, and the loaded pool must be the QSA
+    hybrid pool at the compressed page size SGLang pins.
+    """
+    head_dim = int(text_config["head_dim"])
+    local_kv = _qsa_local_kv_heads(text_config, target_tp_size)
+    # Qwen3_5AttentionDecoderLayer keeps qkv_proj / o_proj / num_heads on the
+    # LAYER (models/qwen3_5.py:1184-1247@v0.5.21) and Qwen4-Exp adds
+    # ``is_qsa`` / ``indexer`` there too (models/qwen4_exp.py:1535-1543); the
+    # M3 route's ``layer.self_attn`` attribute does not exist on this model.
+    if not getattr(layer, "is_qsa", False):
+        raise RuntimeError(
+            "benchmark layer did not come out QSA; the layer_types surgery or "
+            "the checkpoint's indexer schema did not take"
+        )
+    _expect(int(layer.num_heads), num_heads, "layer.num_heads")
+    _expect(int(layer.num_kv_heads), local_kv, "layer.num_kv_heads")
+    _expect(int(layer.head_dim), head_dim, "layer.head_dim")
+    gate_heads = 2 if getattr(layer, "attn_output_gate", False) else 1
+    _expect(
+        int(layer.qkv_proj.output_size_per_partition),
+        (gate_heads * num_heads + 2 * local_kv) * head_dim,
+        "qkv_proj.output_size_per_partition",
+    )
+    _expect(
+        int(layer.o_proj.input_size_per_partition),
+        num_heads * head_dim,
+        "o_proj.input_size_per_partition",
+    )
+
+    indexer = getattr(layer, "indexer", None)
+    if indexer is None:
+        raise RuntimeError("QSA layer has no indexer")
+    _expect(int(indexer.index_n_heads), int(text_config["indexer_n_heads"]), "indexer.index_n_heads")
+    _expect(int(indexer.index_kv_heads), int(text_config["indexer_kv_heads"]), "indexer.index_kv_heads")
+    _expect(int(indexer.index_head_dim), int(text_config["indexer_head_dim"]), "indexer.index_head_dim")
+    _expect(int(indexer.token_topk), int(text_config["indexer_budget"]), "indexer.token_topk")
+    _expect(
+        int(indexer.compress_ratio),
+        int(text_config["indexer_compress_ratio"]),
+        "indexer.compress_ratio",
+    )
+    _expect(
+        int(indexer.index_qk_proj.output_size),
+        (int(indexer.index_n_heads) + int(indexer.index_kv_heads)) * int(indexer.index_head_dim),
+        "indexer.index_qk_proj.output_size",
+    )
+
+    if not model_runner.model_config.model_is_mrope:
+        raise RuntimeError(
+            "loaded Qwen4-Exp model is not MRoPE; the QSA bench feeds "
+            "[3, tokens] positions and a non-mrope load would measure a "
+            "different attention path"
+        )
+
+    backend = model_runner.attn_backend
+    full_attn_backend = getattr(backend, "full_attn_backend", None)
+    if type(full_attn_backend).__name__ != "QwenSparseAttnBackend":
+        raise RuntimeError(
+            "hybrid attention wrapper's full-attention backend is "
+            f"{type(full_attn_backend).__name__}, expected QwenSparseAttnBackend; "
+            "attn_backend_wrapper did not take the is_qwen_qsa branch "
+            "(attention_registry.py:458-466@v0.5.21)"
+        )
+    if int(layer.layer_id) not in getattr(backend, "full_attn_layers", ()):
+        raise RuntimeError(
+            f"benchmark layer {layer.layer_id} is not in the hybrid wrapper's "
+            f"full_attn_layers {getattr(backend, 'full_attn_layers', None)}; the "
+            "layer_types surgery did not produce a QSA layer"
+        )
+    if getattr(full_attn_backend, "qsa_profile", None) is None:
+        raise RuntimeError("QwenSparseAttnBackend parsed no QSA profile from the loaded config")
+
+    pool = model_runner.token_to_kv_pool
+    ratio = int(text_config["indexer_compress_ratio"])
+    page_size = kv_pool_page_size(model_runner)
+    _expect(int(getattr(pool, "qsa_compress_ratio", -1)), ratio, "kv_pool.qsa_compress_ratio")
+    _expect(
+        int(getattr(pool, "qsa_compressed_page_size", -1)),
+        page_size // ratio,
+        "kv_pool.qsa_compressed_page_size",
+    )
+    if page_size % ratio != 0 or page_size == 1:
+        raise RuntimeError(
+            f"QSA requires a page-aligned pool (page={page_size}, ratio={ratio}); "
+            "SGLang's qwen4_exp server-args override pins page_size=64"
+        )
+    main_dtype = pool.get_key_buffer(int(layer.layer_id)).dtype
+    if main_dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"QSA main KV cache is {main_dtype}, expected bfloat16: both "
+            "Qwen3.8-Flash-Next checkpoints keep the QSA layer and its KV in BF16"
+        )
+    index_dtype = pool.get_qsa_key_state_buffer(int(layer.layer_id)).dtype
+    if index_dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"QSA index-state buffer is {index_dtype}, expected bfloat16 (QSAKVTokenToKVPool.index_state_dtype@v0.5.21)"
+        )
+
+
+def _qsa_module(model_runner):
+    """The timed unit: the QSA layer's ``self_attention`` bound method."""
+    layer = model_runner.model.model.layers[QSA_BENCH_LAYER]
+    if not getattr(layer, "is_qsa", False):
+        raise RuntimeError(f"layer {QSA_BENCH_LAYER} of the loaded benchmark stack is not a QSA layer")
+    return layer.self_attention
+
+
+def _module_hidden_size(model_runner, attention_type: str) -> int:
+    """Hidden width the benchmarked module consumes.
+
+    ``self_attention`` is fed the hyper-connection-mixed hidden state, i.e.
+    ``config.hidden_size`` (the hc widening happens in
+    ``_prepare_qwen4_exp_attn`` and is undone by ``attn_hyper_connection.mix``
+    before the attention call). Read it from the layer so the multimodal outer
+    config (which has no ``hidden_size``) is never consulted.
+
+    The QSA route times layer ``QSA_BENCH_LAYER``; the MSA route times layer 0
+    of a stack that may be shorter than the QSA benchmark layer.
+    """
+    layers = model_runner.model.model.layers
+    for layer_id in (QSA_BENCH_LAYER, 0) if attention_type == "qsa" else (0,):
+        if layer_id >= len(layers):
+            continue
+        hidden_size = getattr(layers[layer_id], "hidden_size", None)
+        if hidden_size:
+            return int(hidden_size)
+    return int(model_runner.model.config.hidden_size)
+
+
+def _load_qsa_model_runner(
+    *,
+    model_path: str,
+    num_heads: int,
+    kv_cache_dtype: str,
+    target_tp_size: int,
+    max_total_tokens: int | None,
+    chunked_prefill_size: int | None,
+    max_running_requests: int | None,
+    device: str = "cuda:0",
+):
+    """Qwen4-Exp QSA route: real checkpoint config, 4-layer serving-shaped stack.
+
+    No config rewrite is needed (unlike M3): the bundled checkpoint config
+    already declares ``architectures=["Qwen4ExpForConditionalGeneration"]``,
+    which is SGLang's EntryClass, and the multimodal config keeps
+    ``is_mrope_enabled``. SGLang's own qwen4_exp server-args override pins
+    ``page_size=64`` for the compressed pool
+    (arg_groups/model_overrides/qwen4_exp.py@v0.5.21); the resolved value is
+    verified after load rather than assumed.
+    """
+    device_str = str(device)
+    gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
+
+    sglang_kv_dtype = SGLANG_KV_DTYPE.get(kv_cache_dtype)
+    if sglang_kv_dtype is None:
+        raise ValueError(f"unsupported kv_cache_dtype {kv_cache_dtype!r} for QSA (SGLANG_KV_DTYPE)")
+
+    local_model_path = _resolve_local_model_path(model_path)
+    with open(os.path.join(local_model_path, "config.json")) as f:
+        raw_config = json.load(f)
+    text_config = _qsa_text_config(model_path)
+    override_args = _build_qsa_model_override_args(raw_config, num_heads, target_tp_size, QSA_BENCH_NUM_LAYERS)
+
+    model_runner, server_args, model_config = _start_model_runner(
+        local_model_path=local_model_path,
+        override_args=override_args,
+        sglang_kv_dtype=sglang_kv_dtype,
+        gpu_id=gpu_id,
+        max_total_tokens=max_total_tokens,
+        chunked_prefill_size=chunked_prefill_size,
+        max_running_requests=max_running_requests,
+    )
+    actual_architecture = (model_config.hf_config.architectures or [None])[0]
+    if actual_architecture != QSA_ARCHITECTURE:
+        raise RuntimeError(
+            f"SGLang loaded architecture={actual_architecture!r} for {model_path}, expected {QSA_ARCHITECTURE!r}"
+        )
+    _expect(int(_resolved_page_size(server_args)), _QSA_PLAN_PAGE_SIZE, "schedule.page_size")
+
+    _validate_qsa_module(
+        model_runner,
+        model_runner.model.model.layers[QSA_BENCH_LAYER],
+        num_heads,
+        target_tp_size,
+        text_config,
     )
     return model_runner
 
@@ -581,6 +1342,29 @@ def _make_schedule_batch(model_runner, reqs, tree_cache):
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
+
+
+def _sglang_capture_context():
+    """SGLang's own CUDA-graph capture scope (a no-op on runtimes without one).
+
+    Model code branches on ``get_is_capture_mode()``: the QSA indexer skips its
+    cos/sin cache resize (qsa_indexer.py:175,401@v0.5.21) and the layer overlaps
+    the indexer onto ``alt_stream`` (qwen4_exp.py:1593) only while a graph is
+    being captured, and ``project_qk``'s ``positions.max().item()`` is illegal
+    on a capturing stream. Serving enters this scope from its graph runners; a
+    raw ``torch.cuda.CUDAGraph`` in the benchmark leaves the flag clear, so the
+    module would take its eager branch inside the capture and fail. Reuse the
+    framework's scope rather than poking the module global: it also disables
+    tensor disposal, which would otherwise record ``data_ptr() == 0`` frees
+    into the graph.
+    """
+    from contextlib import nullcontext
+
+    try:
+        from sglang.srt.model_executor.runner import model_capture_mode
+    except ImportError:
+        return nullcontext()
+    return model_capture_mode()
 
 
 def _extend_batch(model_runner, reqs, prefix_len: int):
@@ -750,10 +1534,148 @@ def _decode_kernel_source(model_runner, max_seqlen_k: int) -> str:
     return f"sglang_minimax_decode_{main}_{_decode_topk_variant(sparse, max_seqlen_k)}"
 
 
+def _qsa_full_attn_backend(model_runner):
+    """The QSA backend inside Qwen4-Exp's hybrid attention wrapper.
+
+    ``attn_backend_wrapper`` builds
+    ``HybridLinearAttnBackend(full_attn_backend=QwenSparseAttnBackend,
+    linear_attn_backend=GDNAttnBackend, cfg.full_attention_layer_ids)`` for
+    every ``is_qwen_qsa`` model (attention_registry.py:458-466@v0.5.21), so the
+    QSA backend is the wrapper's full-attention child.
+    """
+    full_attn_backend = getattr(model_runner.attn_backend, "full_attn_backend", None)
+    if type(full_attn_backend).__name__ != "QwenSparseAttnBackend":
+        raise RuntimeError(
+            "QSA kernel_source resolution needs the hybrid wrapper's "
+            f"QwenSparseAttnBackend, got {type(full_attn_backend).__name__}"
+        )
+    return full_attn_backend
+
+
+def _qsa_backend_module():
+    """The SGLang module that owns QSA route dispatch.
+
+    The route predicates below live on the module, not the backend instance
+    (``_resolve_trtllm_sparse_decode`` / ``_resolve_flash_attn_varlen_func``), so
+    the label is resolved from the same code that picks the kernel. Importing it
+    here also proves the backend class came from this module.
+    """
+    import sglang.srt.layers.attention.qwen_sparse_attn_backend as qsa_module
+
+    return qsa_module
+
+
+def _require_qsa_symbol(module, name: str):
+    """Fail loud when an upstream rename would make the label a guess."""
+    symbol = getattr(module, name, None)
+    if symbol is None:
+        raise RuntimeError(
+            f"QSA module {module.__name__} has no {name!r} (renamed upstream?); "
+            "refusing to guess the kernel_source label"
+        )
+    return symbol
+
+
+def _qsa_prefill_kernel_source(model_runner, prefix_len: int) -> str:
+    """Record the QSA prefill route serving executes for this point.
+
+    ``QwenSparseAttnBackend.forward_extend`` has exactly two CUDA routes: the
+    no-prefix Triton sparse-GQA kernel over the current chunk's K/V, and — when
+    any request carries a prefix — the chunk-prefill Triton kernel over the
+    packed full-context K/V (qwen_sparse_attn_backend.py:1318,1354@v0.5.21,
+    selected by ``any(prefix_lens)``). Both symbols are checked to exist so a
+    rename cannot silently mislabel rows.
+    """
+    module = _qsa_backend_module()
+    _require_qsa_symbol(module, "sparse_gqa_fwd_interface_triton")
+    _qsa_full_attn_backend(model_runner)
+    if prefix_len > 0:
+        _require_qsa_symbol(module, "sparse_gqa_fwd_interface_triton_ck")
+        return "sglang_qwen4exp_qsa_prefill_triton_ck"
+    return "sglang_qwen4exp_qsa_prefill_triton"
+
+
+def _fa4_cute_varlen_target(varlen):
+    """The FA4-cute implementation an SGLang varlen wrapper delegates to, if any.
+
+    When ``flash_attn`` (FA2) is absent, ``_resolve_flash_attn_varlen_func``
+    returns a module-local wrapper over
+    ``flash_attn.cute.interface.flash_attn_varlen_func``
+    (qwen_sparse_attn_backend.py:83-91@v0.5.21). That wrapper carries the same
+    name as the FA2 entry point, so it cannot be told apart by name or module;
+    identify it by the single closure it captures and only when that closure is
+    genuinely the cute interface. Everything else stays unidentified and the
+    caller keeps raising.
+    """
+    if getattr(varlen, "__name__", "") != "flash_attn_varlen_func":
+        return None
+    freevars = getattr(getattr(varlen, "__code__", None), "co_freevars", ())
+    cells = getattr(varlen, "__closure__", None) or ()
+    for freevar, cell in zip(freevars, cells, strict=False):
+        if freevar != "cute_varlen_func":
+            continue
+        try:
+            target = cell.cell_contents
+        except ValueError:
+            return None
+        if getattr(target, "__module__", "").startswith("flash_attn"):
+            return target
+    return None
+
+
+def _qsa_decode_kernel_source(model_runner) -> str:
+    """Record the QSA decode route serving executes on this device.
+
+    ``QwenSparseAttnBackend._forward_paged_attention`` resolves, in order
+    (qwen_sparse_attn_backend.py:1539,1608,1620@v0.5.21):
+
+    1. the FlashInfer trtllm-gen paged sparse decode — SM100/SM120 only
+       (``_resolve_trtllm_sparse_decode``), so it is absent on H200;
+    2. on HIP, the packed Triton sparse decode;
+    3. otherwise the packed varlen fallback, which is FA2 ``flash_attn``, the
+       SM121-only ``qwen38_qsa_sm121_varlen`` replacement, or — when FA2 is not
+       installed — the FA4-cute wrapper built over
+       ``flash_attn.cute.interface`` via ``_resolve_flash_attn_varlen_func``.
+
+    Each branch is labelled separately because they are different kernels;
+    a resolver that returns something this collector cannot name raises rather
+    than mislabelling the row.
+    """
+    module = _qsa_backend_module()
+    _qsa_full_attn_backend(model_runner)
+    resolve_trtllm = _require_qsa_symbol(module, "_resolve_trtllm_sparse_decode")
+    if resolve_trtllm() is not None:
+        return "sglang_qwen4exp_qsa_decode_trtllm_sparse"
+
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        _require_qsa_symbol(module, "sparse_gqa_packed_decode_triton")
+        return "sglang_qwen4exp_qsa_decode_triton_packed"
+
+    resolve_varlen = _require_qsa_symbol(module, "_resolve_flash_attn_varlen_func")
+    varlen = resolve_varlen()
+    name = getattr(varlen, "__name__", "")
+    origin = getattr(varlen, "__module__", "")
+    if name == "qwen38_qsa_sm121_varlen":
+        return "sglang_qwen4exp_qsa_decode_sm121_varlen"
+    if origin.startswith("flash_attn"):
+        return "sglang_qwen4exp_qsa_decode_fa2_varlen"
+    if _fa4_cute_varlen_target(varlen) is not None:
+        return "sglang_qwen4exp_qsa_decode_fa4_cute_varlen"
+    raise RuntimeError(
+        "QSA packed decode resolved "
+        f"{origin}.{name}, which has no registered kernel_source label "
+        "(neither FA2, the FA4-cute wrapper, nor the SM121 replacement); "
+        "add a label before collecting"
+    )
+
+
 def _log_msa_row(
     *,
     perf_filename: str,
     model_path: str,
+    architecture: str,
     compute_dtype: str,
     kv_cache_dtype: str,
     gemm_type: str,
@@ -768,31 +1690,64 @@ def _log_msa_row(
     device_name: str,
     power_stats,
 ):
-    if not log_perf(
-        item_list=[
-            {
-                "model": model_path,
-                "architecture": MSA_ARCHITECTURE,
-                "mla_dtype": compute_dtype,
-                "kv_cache_dtype": kv_cache_dtype,
-                "gemm_type": gemm_type,
-                "num_heads": num_heads,
-                "batch_size": batch_size,
-                "isl": isl,
-                "tp_size": target_tp_size,
-                "step": step,
-                "latency": f"{latency_ms:.4f}",
-            }
-        ],
-        framework="SGLang",
-        version=get_version("sglang"),
-        device_name=device_name,
-        op_name=op_name,
-        kernel_source=kernel_source,
-        perf_filename=perf_filename,
-        power_stats=power_stats,
-    ):
+    # ``log_perf`` raises PerfLogError when the log file itself is unusable —
+    # e.g. a resumed run finds the perf txt and its parked ``.retained`` twin
+    # both present, or the inode is unowned. That cannot be fixed by the next
+    # point, so convert it to the fatal write error here: the sweep aborts on the
+    # first point with the real cause in the traceback instead of counting one
+    # identical failure per remaining shape and then discarding the whole case
+    # ("persisted no rows"). C3.3 heal 2026-11-01 lost 15 minutes of H200 time
+    # per case to exactly this before it was diagnosed.
+    try:
+        persisted = log_perf(
+            item_list=[
+                {
+                    "model": model_path,
+                    "architecture": architecture,
+                    "mla_dtype": compute_dtype,
+                    "kv_cache_dtype": kv_cache_dtype,
+                    "gemm_type": gemm_type,
+                    "num_heads": num_heads,
+                    "batch_size": batch_size,
+                    "isl": isl,
+                    "tp_size": target_tp_size,
+                    "step": step,
+                    "latency": f"{latency_ms:.4f}",
+                }
+            ],
+            framework="SGLang",
+            version=get_version("sglang"),
+            device_name=device_name,
+            op_name=op_name,
+            kernel_source=kernel_source,
+            perf_filename=perf_filename,
+            power_stats=power_stats,
+        )
+    except PerfLogError as error:
+        raise PerfLogWriteError(f"failed to persist MSA row to {perf_filename}: {error}") from error
+    if not persisted:
         raise PerfLogWriteError(f"failed to persist MSA row to {perf_filename}")
+
+
+def _module_positions(attention_type: str, forward_batch, fallback):
+    """Positions to feed the timed module.
+
+    ``qsa`` layers are MRoPE: ``Qwen4ExpAttentionDecoderLayer.self_attention``
+    routes positions into the fused QK-norm+RoPE kernel with
+    ``mrope_axis_map`` whenever ``positions.dim() == 2``, and serving feeds the
+    ``[3, tokens]`` MRoPE tensor the multimodal model wrapper swaps in
+    (``forward_batch.mrope_positions``, computed by ``ForwardBatch.init_new``
+    for extend and decode text-only batches). A 1-D fallback would silently
+    change the rotary path, so it raises instead.
+    """
+    if attention_type != "qsa":
+        return fallback
+    mrope = getattr(forward_batch, "mrope_positions", None)
+    if mrope is None:
+        raise RuntimeError(
+            "Qwen4-Exp QSA module forward needs MRoPE positions ([3, tokens]); ForwardBatch.mrope_positions is unset"
+        )
+    return mrope
 
 
 def _run_prefill_point(
@@ -805,6 +1760,8 @@ def _run_prefill_point(
     num_warmup: int,
     num_iterations: int,
     device: str,
+    hidden_size: int,
+    attention_type: str = "msa",
 ):
     """Benchmark one context (prefill) point; returns (latency_ms, power_stats).
 
@@ -843,12 +1800,17 @@ def _run_prefill_point(
     with _forward_ctx(model_runner, forward_batch):
         model_runner.attn_backend.init_forward_metadata(forward_batch)
     point_clock.mark("metadata")
-    _initialize_msa_history(model_runner, attention_module, forward_batch, prefix_len)
+    # MSA-only: the helper writes M3's fused KV+index history through
+    # MiniMaxSparseAttnBackend's pool writer and reads `.attn`/`.num_kv_heads`/
+    # `.idx_head_dim`, which a QSA layer does not have. QSA keeps the zero fill
+    # its accepted C3.3 rows were measured with (see the module docstring).
+    if attention_type != "qsa":
+        _initialize_msa_history(model_runner, attention_module, forward_batch, prefix_len)
     point_clock.mark("history")
 
     hidden_states = torch.randn(
         batch_size * seq_len,
-        model_runner.model.config.hidden_size,
+        hidden_size,
         dtype=torch.bfloat16,
         device="cuda",
     )
@@ -859,6 +1821,7 @@ def _run_prefill_point(
         .contiguous()
         .flatten()
     )
+    positions = _module_positions(attention_type, forward_batch, positions)
     point_clock.mark("inputs")
 
     def kernel_func():
@@ -903,6 +1866,8 @@ def _run_decode_point(
     num_warmup: int,
     num_iterations: int,
     device: str,
+    hidden_size: int,
+    attention_type: str = "msa",
 ):
     """Benchmark one generation (decode) point; returns (latency_ms, power_stats, kernel_source).
 
@@ -924,6 +1889,14 @@ def _run_decode_point(
     DSA's). Serving's MSA decode plan is built only when MSA owns decode, which a
     graph-enabled server never does (:289-291, 305-307, 469-470). The dense half
     of the hybrid backend is never read by the benchmark layer.
+
+    QSA route: the same parity is taken through the QSA backend's own graph
+    state (``init_cuda_graph_state`` then ``init_forward_metadata_out_graph
+    (..., in_capture=True)``, qwen_sparse_attn_backend.py:762,731-749
+    @v0.5.21), which sizes the static FA2/compressed-page buffers serving's
+    decode graph reads. Only the full-attention child is initialized: the
+    timed layer never executes the GDN side, whose graph state belongs to
+    serving's graph runner (same rationale as the MSA collector).
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -955,22 +1928,41 @@ def _run_decode_point(
     with _forward_ctx(model_runner, forward_batch):
         model_runner.attn_backend.init_forward_metadata(forward_batch)
         if use_graph:
-            sparse.init_forward_metadata_out_graph(forward_batch, in_capture=True)
-    # The KV bound every decode kernel of this point is launched with
-    # (minimax_sparse_backend.py:1823 passes it to minimax_sparse_decode).
-    max_seqlen_k = int(sparse._max_seqlen_k)
+            if attention_type == "qsa":
+                qsa_backend = _qsa_full_attn_backend(model_runner)
+                qsa_backend.init_cuda_graph_state(max_bs=batch_size, max_num_tokens=batch_size)
+                qsa_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            else:
+                # Capture parity for the SPARSE backend only: the benchmarked
+                # layer routes exclusively to MiniMaxSparseAttnBackend
+                # (hybrid dispatch by layer id,
+                # minimax_sparse_backend.py:585-597), so only its capture-time
+                # metadata is consumed. The dense fa3 side of the hybrid
+                # wrapper needs its full graph-runner state
+                # (init_cuda_graph_state buffers) for an in_capture call,
+                # which the serving decode graph runner owns — the module
+                # bench never executes a dense layer, so its eager metadata is
+                # kept.
+                model_runner.attn_backend.sparse.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    # The KV bound every MSA decode kernel of this point is launched with
+    # (minimax_sparse_backend.py:1823 passes it to minimax_sparse_decode). The
+    # QSA route labels its own kernel source from the backend it routed to.
+    max_seqlen_k = int(sparse._max_seqlen_k) if attention_type != "qsa" else 0
     point_clock.mark("metadata")
-    _initialize_msa_history(model_runner, attention_module, forward_batch, kv_len)
+    # MSA-only, same reason as the context path.
+    if attention_type != "qsa":
+        _initialize_msa_history(model_runner, attention_module, forward_batch, kv_len)
     point_clock.mark("history")
 
     hidden_states = torch.randn(
         batch_size,
-        model_runner.model.config.hidden_size,
+        hidden_size,
         dtype=torch.bfloat16,
         device="cuda",
     )
     # The decoded token's position (seq_lens - 1 after prepare_for_decode).
     positions = torch.full((batch_size,), kv_len, device="cuda", dtype=torch.int64)
+    positions = _module_positions(attention_type, forward_batch, positions)
     point_clock.mark("inputs")
 
     def kernel_func():
@@ -991,11 +1983,16 @@ def _run_decode_point(
             repeat_n=1,
             allow_graph_fail=False,
             use_cuda_graph=use_graph,
+            capture_context=_sglang_capture_context if attention_type == "qsa" else None,
         ) as results:
             pass
         point_clock.mark("bench")
         point_clock.absorb(results.get("phase_seconds"), prefix="bench_")
-        return results["latency_ms"], results["power_stats"], _decode_kernel_source(model_runner, max_seqlen_k)
+        if attention_type == "qsa":
+            kernel_source = _qsa_decode_kernel_source(model_runner)
+        else:
+            kernel_source = _decode_kernel_source(model_runner, max_seqlen_k)
+        return results["latency_ms"], results["power_stats"], kernel_source
     finally:
         model_runner.req_to_token_pool.clear()
         model_runner.token_to_kv_pool_allocator.clear()
@@ -1023,8 +2020,14 @@ def run_msa_module(
     target_tp_size: int = 1,
     quick_shape: tuple | None = None,
     inner_manifest=(),
+    attention_type: str | None = None,
 ):
-    """Run the MSA module benchmark sweep — called inside a subprocess.
+    """Run one sparse-attention module benchmark sweep — inside a subprocess.
+
+    ``attention_type`` selects the module route: ``msa`` (MiniMax-M3 sparse
+    layer) or ``qsa`` (Qwen4-Exp compressed QSA layer). When omitted it is
+    resolved from the declared model row (``_attention_type_for_model``), so the
+    registry's positional case tuple keeps its existing layout.
 
     ``quick_shape``: optional single (batch, seq, prefix) point for CLI
     smoke runs; replaces the sweep but keeps every construction path.
@@ -1032,11 +2035,26 @@ def run_msa_module(
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(device)
 
+    if attention_type is None:
+        attention_type = _attention_type_for_model(model_path)
+    if attention_type not in _MSA_MODULE_ATTENTION_TYPES:
+        raise ValueError(f"unknown attention_type {attention_type!r}")
+
     if compute_dtype != "bfloat16":
         # SGLang derives the attention GEMM precision itself: bf16, or fp8 q with
         # an fp8_e4m3 KV cache on trtllm_mha + SM100 (server_args.py:592-610).
-        raise ValueError(f"the MSA plan collects compute bfloat16 only; got compute={compute_dtype}")
+        raise ValueError(
+            f"sparse-attention modules compute in bf16 at this pin "
+            f"(M3 kernels assert q.dtype in bf16/fp16, decode/flash_with_topk_idx.py:778-782; "
+            f"QSA kernels are bf16-only, qsa/kernel.py@v0.5.21); got compute={compute_dtype}"
+        )
     if gemm_type != "bfloat16":
+        if attention_type == "qsa":
+            raise ValueError(
+                f"Qwen3.8-Flash-Next QSA projections are bf16 in both checkpoints "
+                f"(the FP8 checkpoint quantizes routed experts only); got gemm={gemm_type!r} "
+                f"(mla_module_plan declares the QSA combos)"
+            )
         raise ValueError(
             f"MiniMax-M3 is a BF16 artifact; SGLang's quantized-M3 flows are MXFP8 and the "
             f"M3.1 NVFP4 stack (arg_groups/model_overrides/minimax_m3.py:18-34), "
@@ -1059,6 +2077,10 @@ def run_msa_module(
             f"MSA module {phase} has no points: the plan queues no empty row; model={model_path}, "
             f"heads={num_heads}, batch_filter={batch_size_filter} (ad-hoc runs: --quick)"
         )
+    if attention_type == "qsa":
+        # The plan aligns its prefixes; an ad-hoc shape can still be off a
+        # compressed group, and the device assert it would hit is unrecoverable.
+        _require_aligned_qsa_prefixes(shapes, model_path=model_path)
 
     # A point this device cannot run is refused with its reason before anything is
     # allocated for it, and the ModelRunner is sized for the points that remain.
@@ -1069,14 +2091,35 @@ def run_msa_module(
         # chunks a longer prefill.
         chunk = int(serving_memory_defaults(tp_size=1)[0])
         refuse(shapes, refused, lambda shape: over_chunk(shape, chunk))
+        # The QSA extend path allocates a per-shape gather workspace on top of
+        # the resident pool, so bounding the pool alone is not enough. Refuse
+        # the points whose combined footprint the device cannot hold before the
+        # runner is sized for the ones that remain.
+        if attention_type == "qsa":
+            page_size, bytes_per_token, workspace_bytes = _kv_cost_estimate(
+                "qsa", num_heads, kv_cache_dtype, model_path
+            )
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            refuse(
+                shapes,
+                refused,
+                lambda shape: _qsa_footprint_refusal(
+                    shape,
+                    page_size=page_size,
+                    bytes_per_token=bytes_per_token,
+                    workspace_bytes=workspace_bytes,
+                    total_memory=total_memory,
+                ),
+            )
     runnable = [shape for shape in shapes if shape not in refused]
     if not runnable:
         raise RuntimeError(refusal_summary(refused, len(shapes)))
 
     # 128 is the M3 serving page on SM90/SM100 (arg_groups/model_overrides/
     # minimax_m3.py:163-168, 181-187), 1 elsewhere; page-128 rounding is an upper
-    # bound for any smaller resolved page. The pool SGLang builds is checked
-    # against the real page below.
+    # bound for any smaller resolved page, including QSA's pinned 64
+    # (arg_groups/model_overrides/qwen4_exp.py@v0.5.21). The pool SGLang builds
+    # is checked against the real page below.
     page_size_guess = 128
     max_total_tokens = max(
         required_kv_alloc_tokens(b, s, p, page_size_guess, is_prefill=is_prefill) for (b, s, p) in runnable
@@ -1084,8 +2127,9 @@ def run_msa_module(
     max_total_tokens += max(1024, max_total_tokens // 20)
     max_running_requests = max(b for (b, _s, _p) in runnable)
 
+    route_label = "QSA" if attention_type == "qsa" else "MSA"
     print(
-        f"\n{'=' * 60}\nMSA Module {phase}: model={model_path}, heads={num_heads}, "
+        f"\n{'=' * 60}\n{route_label} Module {phase}: model={model_path}, heads={num_heads}, "
         f"target_tp={target_tp_size}, kv={kv_cache_dtype}, gemm={gemm_type}, "
         f"shapes={len(shapes)}, GPU={gpu_id}\n{'=' * 60}"
     )
@@ -1105,6 +2149,7 @@ def run_msa_module(
             chunked_prefill_size=None,
             max_running_requests=max_running_requests,
             device=device,
+            attention_type=attention_type,
         )
 
         # Refuse what the built runner cannot run: a prefill beyond the chunk it
@@ -1121,7 +2166,13 @@ def run_msa_module(
         if not runnable:
             raise RuntimeError(refusal_summary(refused, len(shapes)))
 
-        attention_module = model_runner.model.model.layers[0].self_attn
+        if attention_type == "qsa":
+            attention_module = _qsa_module(model_runner)
+            architecture = QSA_ARCHITECTURE
+        else:
+            attention_module = model_runner.model.model.layers[0].self_attn
+            architecture = MSA_ARCHITECTURE
+        hidden_size = _module_hidden_size(model_runner, attention_type)
         device_name = torch.cuda.get_device_name(device)
         perf_filename = _resolve_perf_path(output_path, f"msa_{phase}_module_perf.txt")
         op_name = f"msa_{phase}_module"
@@ -1140,8 +2191,13 @@ def run_msa_module(
                         num_warmup=8,
                         num_iterations=10,
                         device=device,
+                        hidden_size=hidden_size,
+                        attention_type=attention_type,
                     )
-                    kernel_source = _prefill_kernel_source(model_runner)
+                    if attention_type == "qsa":
+                        kernel_source = _qsa_prefill_kernel_source(model_runner, p)
+                    else:
+                        kernel_source = _prefill_kernel_source(model_runner)
                     isl, step = s, p
                 else:
                     latency, power_stats, kernel_source = _run_decode_point(
@@ -1153,11 +2209,16 @@ def run_msa_module(
                         num_warmup=8,
                         num_iterations=10,
                         device=device,
+                        hidden_size=hidden_size,
+                        attention_type=attention_type,
                     )
+                    if attention_type == "qsa":
+                        kernel_source = _qsa_decode_kernel_source(model_runner)
                     isl, step = 1, s
                 _log_msa_row(
                     perf_filename=perf_filename,
                     model_path=model_path,
+                    architecture=architecture,
                     compute_dtype=compute_dtype,
                     kv_cache_dtype=kv_cache_dtype,
                     gemm_type=gemm_type,
@@ -1227,22 +2288,24 @@ def _run_msa_subprocess(
     batch_size_filter: int | None,
     target_tp_size: int,
     inner_manifest=(),
+    attention_type: str | None = None,
 ):
-    """Run one MSA sweep in a subprocess with CUDA_VISIBLE_DEVICES isolation
-    (same pattern as collect_mla_module._run_mla_subprocess: SGLang's
-    ModelRunner/NCCL state cannot be re-initialized in-process)."""
+    """Run one MSA/QSA sweep in a subprocess with CUDA_VISIBLE_DEVICES
+    isolation (same pattern as collect_mla_module._run_mla_subprocess:
+    SGLang's ModelRunner/NCCL state cannot be re-initialized in-process)."""
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     phase = "context" if is_prefill else "generation"
     output_repr = f'"{output_path}"' if output_path else "None"
     batch_repr = "None" if batch_size_filter is None else str(batch_size_filter)
+    attention_repr = "None" if attention_type is None else f'"{attention_type}"'
     code = (
         f'import sys; sys.path.insert(0, "{os.path.dirname(os.path.abspath(__file__))}")\n'
         f"from collect_msa_module import run_msa_module\n"
         f'run_msa_module({num_heads}, "{model_path}", "{kv_cache_dtype}", '
         f'"{compute_dtype}", "{gemm_type}", {is_prefill}, 0, {output_repr}, '
-        f"{batch_repr}, {target_tp_size}, None, {inner_manifest!r})\n"
+        f"{batch_repr}, {target_tp_size}, None, {inner_manifest!r}, {attention_repr})\n"
     )
 
     _timeout_env = os.environ.get("AIC_MLA_MODULE_SUBPROCESS_TIMEOUT_SEC")
@@ -1294,6 +2357,7 @@ def run_msa_module_worker(
     *,
     perf_filename: str,
     device: str = "cuda:0",
+    attention_type: str | None = None,
 ):
     """Worker-compatible positional wrapper used by collector/collect.py.
 
@@ -1301,15 +2365,18 @@ def run_msa_module_worker(
     placeholder. ``inner_manifest`` is the [batch, seq_len, prefix_len] points
     the plan's row lists (op_plans._sglang_msa_rows); the subprocess runs
     them, or refuses one with its reason, and never re-derives the grid.
+    ``attention_type`` is resolved from the model row inside the subprocess
+    when omitted.
     """
     device_str = str(device) if not isinstance(device, str) else device
     gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
     is_prefill = "context" in perf_filename
     batch_size_filter = batch_size if is_prefill and batch_size > 0 else None
+    route_label = "QSA" if attention_type == "qsa" else "MSA"
 
     print(f"\n{'=' * 60}")
     print(
-        f"MSA Module {'Context' if is_prefill else 'Generation'}: model={model_path}, "
+        f"{route_label} Module {'Context' if is_prefill else 'Generation'}: model={model_path}, "
         f"heads={num_heads}, target_tp={target_tp_size}, kv={kv_cache_dtype}, "
         f"compute={compute_dtype}, gemm={gemm_type}, "
         f"batch_filter={batch_size_filter or 'all'}, GPU={gpu_id}"
@@ -1330,6 +2397,7 @@ def run_msa_module_worker(
         batch_size_filter=batch_size_filter,
         target_tp_size=target_tp_size,
         inner_manifest=tuple(tuple(shape) for shape in inner_manifest),
+        attention_type=attention_type,
     )
 
 
@@ -1339,11 +2407,22 @@ def run_msa_module_worker(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MiniMax-M3 MSA module-level collector for SGLang")
+    parser = argparse.ArgumentParser(description="MiniMax-M3 MSA / Qwen4-Exp QSA module-level collector for SGLang")
     parser.add_argument("--mode", choices=["context", "generation"], required=True)
     parser.add_argument("--model", type=str, default="MiniMaxAI/MiniMax-M3")
-    parser.add_argument("--num-heads", type=int, default=64)
-    parser.add_argument("--target-tp-size", type=int, default=None, help="defaults to 64 // num_heads")
+    parser.add_argument("--num-heads", type=int, default=None)
+    parser.add_argument(
+        "--target-tp-size",
+        type=int,
+        default=None,
+        help="defaults to the model row's native // num-heads",
+    )
+    parser.add_argument(
+        "--attention-type",
+        choices=["msa", "qsa"],
+        default=None,
+        help="defaults to the model row's declared attention type",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument("--prefix-len", type=int, default=0)
@@ -1354,12 +2433,32 @@ def main():
     args = parser.parse_args()
 
     gpu_id = int(args.device.split(":")[-1]) if ":" in args.device else 0
-    target_tp = args.target_tp_size or max(1, 64 // args.num_heads)
+    model_spec = _resolve_model_spec(args.model)
+    attention_type = args.attention_type or model_spec.attention_type
+    if attention_type != model_spec.attention_type:
+        raise SystemExit(
+            f"--attention-type {attention_type} contradicts the declared mla_module "
+            f"row for {model_spec.model_path} ({model_spec.attention_type})"
+        )
+    # Native query heads of the declared row: 64 for MiniMax-M3, 24 for
+    # Qwen3.8-Flash-Next. The default shard is the row's native count, so
+    # --num-heads defaults per model instead of assuming M3's 64.
+    native_heads = int(model_spec.native_num_heads)
+    num_heads = args.num_heads or native_heads
+    if native_heads % num_heads:
+        raise SystemExit(f"--num-heads {num_heads} is not a TP shard of the row's {native_heads} native heads")
+    implied_tp = native_heads // num_heads
+    if args.target_tp_size is not None and args.target_tp_size != implied_tp:
+        raise SystemExit(
+            f"--target-tp-size {args.target_tp_size} contradicts --num-heads {num_heads}: "
+            f"{native_heads} native heads shard to {num_heads} at TP {implied_tp}"
+        )
+    target_tp = args.target_tp_size or max(1, implied_tp)
     is_prefill = args.mode == "context"
 
     if args.quick:
         run_msa_module(
-            num_heads=args.num_heads,
+            num_heads=num_heads,
             model_path=args.model,
             kv_cache_dtype=args.kv_cache_dtype,
             compute_dtype="bfloat16",
@@ -1374,14 +2473,19 @@ def main():
                 args.seq_len or (512 if is_prefill else 2048),
                 args.prefix_len,
             ),
+            attention_type=attention_type,
         )
         return
 
     # Full sweeps run the plan's rows, so a CLI reproduction runs the exact planned points.
-    for _0, batch, heads, kv_dtype, compute, gemm, model, target_tp, points in plan(
+    # The filter compares the row's local head count against the RESOLVED
+    # ``num_heads``: ``args.num_heads`` is None when the flag is omitted, and
+    # comparing against it selected no M3 or QSA row at all. Each row carries
+    # its own TP, which is the plan's authority on the shard it was measured at.
+    for _0, batch, heads, kv_dtype, compute, gemm, model, row_tp, points in plan(
         f"msa_{args.mode}_module", "sglang", get_sm_version()
     ).rows:
-        if model != args.model or heads != args.num_heads or kv_dtype != args.kv_cache_dtype:
+        if model != args.model or heads != num_heads or kv_dtype != args.kv_cache_dtype:
             continue
         if args.batch_size is not None and batch != args.batch_size:
             continue
@@ -1395,7 +2499,7 @@ def main():
             gpu_id=gpu_id,
             output_path=args.output_path,
             batch_size_filter=batch or None,
-            target_tp_size=target_tp,
+            target_tp_size=row_tp,
             inner_manifest=points,
         )
 

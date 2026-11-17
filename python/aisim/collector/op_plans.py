@@ -1212,8 +1212,29 @@ def _packaged_config(model_path: str, kind: str = "config") -> dict:
 
 
 def _max_position(model_path: str) -> int | None:
-    value = _packaged_config(model_path).get("max_position_embeddings")
+    """The checkpoint's RoPE/context bound, from its decoder config when it has one.
+
+    A multimodal checkpoint (Qwen3.8-Flash-Next) keeps the decoder fields under
+    ``text_config``; the outer config carries only the multimodal envelope, so
+    reading the top level alone would leave the sweep unbounded (and queue
+    points past the rotary table, which serving cannot issue).
+    """
+    config = _packaged_config(model_path)
+    value = (config.get("text_config") or {}).get("max_position_embeddings") or config.get("max_position_embeddings")
     return int(value) if value else None
+
+
+def _compressed_block_width(model_path: str) -> int:
+    """Tokens compressed into one sparse block (QSA's ``indexer_compress_ratio``), or 1.
+
+    A compressed-attention route addresses a prefix only in whole groups: SGLang
+    asserts ``prefix % ratio == 0`` on the device, so every planned prefix of
+    such a checkpoint is raised to a group boundary before it reaches a
+    collector.
+    """
+    config = _packaged_config(model_path)
+    value = (config.get("text_config") or {}).get("indexer_compress_ratio") or config.get("indexer_compress_ratio")
+    return int(value) if value and int(value) > 1 else 1
 
 
 def _modelopt_quant(model_path: str) -> dict:
@@ -1330,41 +1351,79 @@ def _long_context_points(phase: str, sweep, max_position: int | None) -> list[tu
     return [(batch, length, 0) for batch, length in sorted(grid) if max_position is None or length < max_position]
 
 
+def _compressed_prefix_points(points, width: int, max_position: int | None):
+    """Raise every prefix to the compressed-group width, deduped in the aligned space.
+
+    A compressed-attention route addresses a prefix only in whole groups: SGLang
+    asserts ``prefix % width == 0`` on the device and a violation poisons the
+    CUDA context for the rest of the sweep. Rounding up can also collide two
+    declared anchors on one addressable prefix (1 and 4 both become 4), and a
+    raised point must not cross the RoPE table, so ceiling points are dropped
+    instead of moved.
+    """
+    if width <= 1:
+        return points
+    aligned, seen = [], set()
+    for batch, length, prefix in points:
+        point = (batch, length, -(-prefix // width) * width)
+        if max_position is not None and point[2] + length > max_position:
+            continue
+        if point not in seen:
+            seen.add(point)
+            aligned.append(point)
+    return aligned
+
+
 def _sparse_module_expand(
-    attention_type: str, phase: str, *, shared_index_only: bool = False
+    attention_type: str | tuple[str, ...], phase: str, *, shared_index_only: bool = False
 ) -> Callable[[], list[ModuleCase]]:
+    attention_types = (attention_type,) if isinstance(attention_type, str) else tuple(attention_type)
+
     def expand() -> list[ModuleCase]:
         """Every (precision, heads, point) of each checkpoint, at the projection GEMMs it stands for."""
         sweep = get_mla_module_sweep_spec(_MODULE_SWEEP)
-        precisions = get_mla_module_precision_specs(_MODULE_SWEEP, phase=phase, attention_type=attention_type)
-        cases = []
-        for model, gemms in _sparse_module_models(attention_type):
-            if shared_index_only and not _shares_dsa_index(model.model_path):
-                continue
-            # A row that declares its tensor_parallel_sizes measures only the heads those shards run.
-            shards = model.tensor_parallel_sizes
-            shard_heads = {model.native_num_heads // tp for tp in shards} if shards else None
-            points = _long_context_points(phase, sweep, _max_position(model.model_path))
-            for precision in precisions:
-                if precision.gemm_type not in gemms:
+        cases: list[ModuleCase] = []
+        for kind in attention_types:
+            precisions = get_mla_module_precision_specs(_MODULE_SWEEP, phase=phase, attention_type=kind)
+            kind_cases: list[ModuleCase] = []
+            for model, gemms in _sparse_module_models(kind):
+                if shared_index_only and not _shares_dsa_index(model.model_path):
                     continue
-                for num_heads in sweep.inner_sweep_head_counts:
-                    if shard_heads is not None and num_heads not in shard_heads:
+                # A row that declares its tensor_parallel_sizes measures only the heads those
+                # shards run. The shared grid keeps its own order (main's plans pin it);
+                # a shard count it does not carry (Qwen3.8-Flash-Next's 6 and 3) is
+                # appended in descending order after the shared ones.
+                if model.tensor_parallel_sizes:
+                    shard_heads = {model.native_num_heads // tp for tp in model.tensor_parallel_sizes}
+                    head_counts = [heads for heads in sweep.inner_sweep_head_counts if heads in shard_heads]
+                    head_counts += sorted(shard_heads - set(sweep.inner_sweep_head_counts), reverse=True)
+                else:
+                    head_counts = list(sweep.inner_sweep_head_counts)
+                max_position = _max_position(model.model_path)
+                points = _long_context_points(phase, sweep, max_position)
+                if kind == "qsa":
+                    points = _compressed_prefix_points(points, _compressed_block_width(model.model_path), max_position)
+                for precision in precisions:
+                    if precision.gemm_type not in gemms:
                         continue
-                    cases += [
-                        ModuleCase(
-                            length,
-                            batch,
-                            num_heads,
-                            precision.kv_cache_dtype,
-                            precision.compute_dtype,
-                            precision.gemm_type,
-                            model.model_path,
-                            prefix,
-                        )
-                        for batch, length, prefix in points
-                    ]
-        return _with_history_module_cases(cases, attention_type, phase, sweep, shared_index_only=shared_index_only)
+                    for num_heads in head_counts:
+                        kind_cases += [
+                            ModuleCase(
+                                length,
+                                batch,
+                                num_heads,
+                                precision.kv_cache_dtype,
+                                precision.compute_dtype,
+                                precision.gemm_type,
+                                model.model_path,
+                                prefix,
+                            )
+                            for batch, length, prefix in points
+                        ]
+            cases.extend(
+                _with_history_module_cases(kind_cases, kind, phase, sweep, shared_index_only=shared_index_only)
+            )
+        return cases
 
     return expand
 
@@ -1594,7 +1653,8 @@ def _sglang_msa_rows(phase: str) -> Callable[[list, int | None], list[tuple[list
         """
         native_heads = {
             spec.model_path: spec.native_num_heads
-            for spec in get_mla_module_model_specs(attention_type="msa", apply_model_filter=False)
+            for kind in ("msa", "qsa")
+            for spec in get_mla_module_model_specs(attention_type=kind, apply_model_filter=False)
         }
         tasks: dict[tuple, list[ModuleCase]] = {}
         for case in cases:
@@ -1615,10 +1675,17 @@ def _sglang_msa_rows(phase: str) -> Callable[[list, int | None], list[tuple[list
 
 
 def _msa_module_plan(phase: str) -> OpPlan:
-    """An MSA module op. vLLM times one point per task (run_msa_module_worker takes the case)."""
+    """An MSA or QSA module op. vLLM times one point per task (run_msa_module_worker takes the case).
+
+    One op carries both sparse attention kinds because the perf consumer keys on
+    ``msa_context_module`` / ``msa_generation_module``: MiniMax-M3's MSA and
+    Qwen4-Exp's compressed QSA persist under the architecture each checkpoint
+    declares. A backend that serves only one kind leaves the other's cases out
+    through ``collector/skips.py``.
+    """
     return OpPlan(
         ModuleCase,
-        _sparse_module_expand("msa", phase),
+        _sparse_module_expand(("msa", "qsa"), phase),
         dtype_field=("kv_cache_dtype", "compute_dtype", "gemm_type"),
         group_fields=_MODULE_GROUP,
         batch_rows={"trtllm": _trtllm_module_rows(), "sglang": _sglang_msa_rows(phase)},

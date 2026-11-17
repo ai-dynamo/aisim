@@ -58,7 +58,9 @@ def _runner(monkeypatch, *, device_chunk=8192, runtime_chunk=8192, kv_capacity=N
     timed = {"points": []}
     monkeypatch.setattr(mod, "serving_memory_defaults", lambda tp_size: (device_chunk, 256))
     runner = types.SimpleNamespace(
-        model=types.SimpleNamespace(model=types.SimpleNamespace(layers=[types.SimpleNamespace(self_attn=None)]))
+        model=types.SimpleNamespace(
+            model=types.SimpleNamespace(layers=[types.SimpleNamespace(self_attn=None, hidden_size=6144)])
+        )
     )
     monkeypatch.setattr(mod, "cleanup_distributed", lambda: None)
     monkeypatch.setattr(mod, "load_model_runner", lambda **kwargs: timed.update(load=kwargs) or runner)
@@ -339,3 +341,107 @@ def test_the_module_must_run_servings_fused_qkv_index_projection(monkeypatch):
         mod._validate_msa_module(runner, _attention(fused_width=None), 8, 8, 128)
     with pytest.raises(RuntimeError, match="fused_qkv_index_proj.output_size_per_partition"):
         mod._validate_msa_module(runner, _attention(fused_width=10 * 128), 8, 8, 128)
+
+
+class _FakeTensorPath:
+    """Chainable stand-in for the ``arange(...).unsqueeze().expand()...`` shape."""
+
+    def unsqueeze(self, _axis):
+        return self
+
+    def expand(self, *_shape):
+        return self
+
+    def contiguous(self):
+        return self
+
+    def flatten(self):
+        return self
+
+
+@pytest.mark.parametrize("prefix_len", [0, 512])
+@pytest.mark.parametrize("attention_type", ["msa", "qsa"])
+def test_prefill_point_extends_the_full_batch_and_seeds_only_msa_history(monkeypatch, attention_type, prefix_len):
+    """Two regressions on the shared prefill point.
+
+    * Every context point builds its batch through ``_extend_batch``, which
+      stages the cached prefix exactly as serving's chunked prefill does. The
+      point used to hand-roll ``_make_schedule_batch`` + ``prepare_for_extend``
+      and only reached the serving-shaped helper for prefix == 0.
+    * The M3 history seed writes MiniMax's fused KV+index rows and reads
+      attributes a QSA layer does not have, so it is MSA-only. QSA keeps the
+      zero fill its accepted rows were measured with.
+    """
+    import contextlib
+
+    mod = _import_module(monkeypatch)
+
+    calls = {"reqs": [], "extend": [], "history": []}
+    batch = types.SimpleNamespace(input_ids="ids")
+
+    monkeypatch.setattr(mod, "_make_reqs", lambda size, full: calls["reqs"].append((size, full)) or [object()] * size)
+    monkeypatch.setattr(
+        mod,
+        "_extend_batch",
+        lambda runner, reqs, prefix: calls["extend"].append((len(reqs), prefix)) or batch,
+    )
+    monkeypatch.setattr(mod, "_forward_ctx", lambda runner, fb: contextlib.nullcontext())
+    monkeypatch.setattr(mod, "_module_positions", lambda kind, fb, fallback: fallback)
+    monkeypatch.setattr(
+        mod,
+        "_initialize_msa_history",
+        lambda runner, module, fb, length: calls["history"].append(length),
+    )
+    monkeypatch.setattr(mod, "_minimax_sparse_ops", lambda: types.SimpleNamespace(_msa_fallback_warned=False))
+
+    class _ForwardBatch:
+        @staticmethod
+        def init_new(_batch, _runner, **_kwargs):
+            return types.SimpleNamespace()
+
+    _stub_modules(
+        monkeypatch,
+        {"sglang.srt.model_executor.forward_batch_info": {"ForwardBatch": _ForwardBatch}},
+    )
+
+    @contextlib.contextmanager
+    def _bench(**_kwargs):
+        yield {"latency_ms": 7.5, "power_stats": {"power": 1.0}}
+
+    monkeypatch.setattr(mod, "benchmark_with_power", _bench)
+    monkeypatch.setattr(mod.torch, "randn", lambda *_a, **_k: _FakeTensorPath(), raising=False)
+    monkeypatch.setattr(mod.torch, "arange", lambda *_a, **_k: _FakeTensorPath(), raising=False)
+    monkeypatch.setattr(mod.torch, "device", lambda name: name, raising=False)
+    monkeypatch.setattr(mod.torch, "bfloat16", "bfloat16", raising=False)
+
+    runner = types.SimpleNamespace(
+        req_to_token_pool=types.SimpleNamespace(clear=lambda: None),
+        token_to_kv_pool_allocator=types.SimpleNamespace(clear=lambda: None),
+        attn_backend=types.SimpleNamespace(init_forward_metadata=lambda fb: None),
+    )
+
+    def module(**_kwargs):
+        return None
+
+    latency, _power = mod._run_prefill_point(
+        runner,
+        module,
+        2,
+        1024,
+        prefix_len,
+        num_warmup=0,
+        num_iterations=1,
+        device="cuda:0",
+        hidden_size=2560,
+        attention_type=attention_type,
+    )
+
+    assert latency == 7.5
+    # The full prompt reaches the request builder; the helper receives the
+    # cached prefix so it can stage it and then extend [prefix, prefix+seq).
+    assert calls["reqs"] == [(2, prefix_len + 1024)]
+    assert calls["extend"] == [(2, prefix_len)]
+    if attention_type == "qsa":
+        assert calls["history"] == [], "QSA must never run the M3 history writer"
+    else:
+        assert calls["history"] == [prefix_len]
