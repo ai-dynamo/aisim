@@ -59,6 +59,8 @@ def quality_case(validation_case, tmp_path, monkeypatch, materialized_workload, 
     worker_type = selection if isinstance(selection, str) else None
     replay_args, request, root, trace, replay_output = validation_case
     payload = request.model_dump(mode="json")
+    if isinstance(selection, dict):
+        payload["collection"].update(selection)
     payload["identity"]["framework_version"] = "0.27.0"
     payload["identity"]["runtime_framework_version"] = "0.27.0"
     payload["fpm_profile"]["deployments"][0].update(backend_version="0.27.0", fmha_quant_mode="fp8")

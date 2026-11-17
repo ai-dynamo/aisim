@@ -867,6 +867,117 @@ def test_import_recomputes_storage_and_pool_capacity_and_keeps_every_rank(tmp_pa
     assert len(result["provenance"]["artifacts"]) == 12
 
 
+def _shared_stride_fixture(root, *, stride=8, offsets=(0, 32), storage_bytes=64, independent=False):
+    """Four synthetic blocks, 8-byte declared pages and 4-byte tensor payloads.
+
+    layer0 and layer1 explicitly alias across groups; layer2 needs its own pages.
+    The default layer-outer placement fills one 64-byte storage exactly, even
+    though its block stride is 8 rather than storage_bytes // num_blocks (16).
+    """
+    path, launches = observation_fixture(root, packed=True)
+
+    def place(record):
+        cache = record["cache"]
+        cache["num_blocks"] = 4
+        for group in cache["groups"]:
+            group["spec_page_size_bytes"] = 8
+        if record["kind"] != "worker":
+            cache["initial_free_blocks"] = 2
+            return
+        cache["storages"][0]["size_bytes"] = storage_bytes
+        if independent:
+            cache["storages"].append(
+                {"storage_id": "s1", "device": "cuda:0", "pointer": 2048, "size_bytes": storage_bytes}
+            )
+        cache["allocated_cache_bytes"] = storage_bytes * len(cache["storages"])
+        cache["available_cache_bytes"] = cache["allocated_cache_bytes"] + 256
+        for index, allocation in enumerate(cache["tensor_allocations"]):
+            storage_id = f"s{index}" if independent else "s0"
+            allocation.update(storage_id=storage_id, size=storage_bytes, block_stride=stride, offset=offsets[index])
+            for name in allocation["shared_by"]:
+                cache["layer_tensors"][name].update(
+                    storage_id=storage_id,
+                    storage_offset_bytes=offsets[index],
+                    shape=[4, 2],
+                    stride_bytes=[stride, 2],
+                )
+
+    _mutate(path, place)
+    return path, launches
+
+
+@pytest.mark.parametrize(
+    "stride,offsets,storage_bytes,independent,pool_page",
+    [
+        (8, (0, 32), 64, False, 16),
+        (8, (32, 0), 64, False, 16),
+        (12, (0, 48), 96, False, 24),
+        (8, (0, 0), 64, True, 32),
+    ],
+    ids=["layer-outer", "reversed-offsets", "padded-stride", "independent-storages"],
+)
+def test_shared_by_explicit_stride_imports_and_round_trips(
+    tmp_path, stride, offsets, storage_bytes, independent, pool_page
+):
+    path, launches = _shared_stride_fixture(
+        tmp_path, stride=stride, offsets=offsets, storage_bytes=storage_bytes, independent=independent
+    )
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = FpmResourceProfile.model_validate(result["resources"])
+    # Physical storage, including page/stride padding, is charged once despite
+    # the declared alias; the scheduler reserves two of the four pool blocks.
+    assert resources.runtime_memory.kv_cache_bytes == 2 * pool_page
+    assert [group.page_size_bytes for group in resources.cache_groups] == [pool_page, pool_page]
+    assert [group.num_layers for group in resources.cache_groups] == [2, 1]
+    assert len(result["provenance"]["rank_capacities"]) == 8
+    assert FpmResourceProfile.model_validate_json(resources.model_dump_json()) == resources
+
+
+@pytest.mark.parametrize(
+    "offsets,diagnostic",
+    [
+        ((0, 0), "packed allocation page intervals overlap"),
+        ((0, 4), "packed allocation page intervals overlap"),
+        ((0, 8), "packed allocation page intervals overlap"),
+        ((8, 0), "packed allocation page intervals overlap"),
+        ((0, 36), "allocation page bounds exceed the backing storage"),
+    ],
+    ids=["same-block", "page-padding", "cross-block", "reversed-cross-block", "final-page-padding"],
+)
+def test_shared_by_explicit_stride_refuses_overlapping_or_out_of_bounds_pages(tmp_path, offsets, diagnostic):
+    path, launches = _shared_stride_fixture(tmp_path, offsets=offsets)
+    # Every tensor fits: four blocks at stride 8 with a 4-byte payload. In the
+    # final-page case the last tensor ends at 64, but its 8-byte page ends at 68.
+    assert all(offset + 3 * 8 + 4 <= 64 for offset in offsets)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    assert diagnostic in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("inconsistent", [False, True], ids=["page-wider-than-stride", "inconsistent-strides"])
+def test_shared_by_explicit_stride_refuses_invalid_strides(tmp_path, inconsistent):
+    path, launches = _shared_stride_fixture(tmp_path, stride=8 if inconsistent else 6)
+    if inconsistent:
+
+        def change_stride(record):
+            if record["kind"] == "worker":
+                record["cache"]["tensor_allocations"][1]["block_stride"] = 6
+                record["cache"]["layer_tensors"]["layer2"]["stride_bytes"][0] = 6
+
+        _mutate(path, change_stride)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    diagnostic = (
+        "packed and unpacked allocations alias one storage"
+        if inconsistent
+        else "allocation page bytes exceed the physical storage slot"
+    )
+    assert diagnostic in str(result["diagnostics"])
+
+
 @pytest.mark.parametrize("kernel_subdivision", [False, True])
 def test_aliased_layers_cannot_assign_same_bytes_to_different_pool_blocks(tmp_path, kernel_subdivision):
     path, launch = observation_fixture(tmp_path)
@@ -1315,6 +1426,224 @@ def test_invented_observer_verdict_does_not_authorize_invalid_physical_evidence(
     assert "overlap" in " ".join(result["diagnostics"])
 
 
+# vLLM 0.32.0 kv_cache_layout.py:KVCacheLayout permutations of logical [L, B, H, N, C].
+_LAYOUTS = {
+    "LBHNC": (0, 1, 2, 3, 4),
+    "LBNHC": (0, 1, 3, 2, 4),
+    "LHBNC": (0, 2, 1, 3, 4),
+    "BLHNC": (1, 0, 2, 3, 4),
+    "BLNHC": (1, 0, 3, 2, 4),
+    "BHLNC": (1, 2, 0, 3, 4),
+}
+_ONE_GROUP = (("layer0", "layer1"),)
+_TWO_GROUPS = (("layer0", "layer1"), ("layer2", "layer3"))
+
+
+def _layout_strides(order, shape):
+    """Byte strides in logical [L, B, H, N, C] order, as vLLM 0.32 compute_layout_strides."""
+    strides, current = [0] * 5, 1
+    for dimension in reversed(order):
+        strides[dimension] = current
+        current *= shape[dimension]
+    return strides
+
+
+def _layer_strided(record, *, layout="LBNHC", groups=_ONE_GROUP, kernel=16, heads=2, content=8):
+    """Rewrite a record into the vLLM 0.32 single-buffer plan; every group aliases from byte 0."""
+    cache = record["cache"]
+    count = cache["num_blocks"]
+    template = {key: value for key, value in cache["groups"][0].items() if key not in ("layer_names", "layer_classes")}
+    page = heads * 16 * content
+    cache["groups"] = [{**template, "layer_names": list(names), "spec_page_size_bytes": page} for names in groups]
+    if record["kind"] == "scheduler":
+        cache["group_pool_ids"] = ["pool"] * len(groups)
+        return
+    size = max(len(names) for names in groups) * count * page
+    cache.update(allocated_cache_bytes=size, available_cache_bytes=size + 256)
+    cache["storages"][0]["size_bytes"] = size
+    ratio = 16 // kernel
+    cache["tensor_allocations"], cache["layer_tensors"] = [], {}
+    for group, names in zip(cache["groups"], groups, strict=True):
+        group["layer_classes"] = dict.fromkeys(names, "vllm.model_executor.layers.attention.Attention")
+        strides = _layout_strides(_LAYOUTS[layout], (len(names), count * ratio, heads, kernel, content))
+        cache["tensor_allocations"].append(
+            {
+                "storage_id": "s0",
+                "size": size,
+                "layers": list(names),
+                "layer_stride": strides[0],
+                "block_stride": strides[1] * ratio,
+                "offset": 0,
+                "host_resident": False,
+            }
+        )
+        for index, name in enumerate(names):
+            # create_kv_cache_views views C bytes as bfloat16 elements of 2 bytes.
+            cache["layer_tensors"][name] = {
+                "storage_id": "s0",
+                "storage_offset_bytes": index * strides[0],
+                "shape": [count * ratio, heads, kernel, content // 2],
+                "stride_bytes": [strides[1], strides[2], strides[3], 2],
+                "element_size_bytes": 2,
+                "block_axis": 0,
+                "kernel_block_size_tokens": kernel,
+            }
+
+
+def _strided_fixture(root, version="0.32.0", **layout):
+    path, launch = observation_fixture(root, dense=True, version=version)
+    _mutate(path, lambda record: _layer_strided(record, **layout))
+    return path, launch
+
+
+@pytest.mark.parametrize("layout", sorted(_LAYOUTS))
+@pytest.mark.parametrize("groups", [_ONE_GROUP, _TWO_GROUPS], ids=["one-group", "aliased-groups"])
+def test_vllm_032_layer_strided_plan_imports_every_layout(tmp_path, layout, groups):
+    path, launch = _strided_fixture(tmp_path, layout=layout, groups=groups)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = FpmResourceProfile.model_validate(result["resources"])
+    # Smallest pool: decode DP0 has 95 blocks, two permanently reserved; each
+    # pool block holds two layers of 256-byte pages.
+    assert resources.runtime_memory.kv_cache_bytes == 93 * 2 * 256
+    assert [group.num_layers for group in resources.cache_groups] == [2] * len(groups)
+    assert {group.page_size_bytes for group in resources.cache_groups} == {512}
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
+def test_vllm_032_kernel_block_subdivision_keeps_manager_block_stride(tmp_path, layout):
+    path, launch = _strided_fixture(tmp_path, layout=layout, kernel=8)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 93 * 2 * 256
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC", "LHBNC"])
+def test_vllm_032_layer_outer_aliases_allow_a_smaller_last_group(tmp_path, layout):
+    groups = (*_TWO_GROUPS, ("layer4",))
+    path, launch = _strided_fixture(tmp_path, layout=layout, groups=groups)
+
+    result = validate_observations(path, launch)["tp2"]
+
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = FpmResourceProfile.model_validate(result["resources"])
+    assert [group.num_layers for group in resources.cache_groups] == [2, 2, 1]
+    # The smaller alias uses only part of the two-layer backing pool; it does
+    # not add storage or change which block owns any shared byte.
+    assert resources.runtime_memory.kv_cache_bytes == 93 * 2 * 256
+
+
+def _legacy_field(cache):
+    cache["tensor_allocations"][0]["shared_by"] = cache["tensor_allocations"][0]["layers"]
+
+
+def _wrong_layer_offset(cache):
+    cache["layer_tensors"]["layer1"]["storage_offset_bytes"] += 256
+
+
+def _overlapping_layers(cache):
+    # LBNHC layer pages need count * 256 bytes; a 256-byte layer stride overlaps.
+    cache["tensor_allocations"][0]["layer_stride"] = 256
+    cache["layer_tensors"]["layer1"]["storage_offset_bytes"] = 256
+
+
+def _wrong_block_stride(cache):
+    cache["tensor_allocations"][0]["block_stride"] *= 2
+
+
+def _past_storage_end(cache):
+    cache["tensor_allocations"][0]["offset"] = 256
+    for name in ("layer0", "layer1"):
+        cache["layer_tensors"][name]["storage_offset_bytes"] += 256
+
+
+def _host_resident(cache):
+    cache["tensor_allocations"][0]["host_resident"] = True
+
+
+def _mixed_views(cache):
+    view = cache["layer_tensors"]["layer1"]
+    view["stride_bytes"] = [view["stride_bytes"][0], 32, 16, 2]
+
+
+def _mixed_groups(cache):
+    first, second = cache["tensor_allocations"]
+    first["layers"], second["layers"] = ["layer0", "layer2"], ["layer1", "layer3"]
+
+
+def _same_group_alias(cache):
+    allocation = cache["tensor_allocations"][0]
+    allocation["layers"] = ["layer0"]
+    cache["tensor_allocations"].append({**allocation, "layers": ["layer1"]})
+    cache["layer_tensors"]["layer1"]["storage_offset_bytes"] = 0
+
+
+@pytest.mark.parametrize(
+    "layout,groups,edit,diagnostic",
+    [
+        ("LBNHC", _ONE_GROUP, _legacy_field, "shared_by plan"),
+        ("LBNHC", _ONE_GROUP, _wrong_layer_offset, "offsets contradict"),
+        ("LBNHC", _ONE_GROUP, _overlapping_layers, "pages overlap"),
+        ("BLNHC", _ONE_GROUP, _wrong_block_stride, "block stride"),
+        ("LBNHC", _ONE_GROUP, _past_storage_end, "backing storage"),
+        ("LBNHC", _ONE_GROUP, _host_resident, "host-resident"),
+        ("LBNHC", _ONE_GROUP, _mixed_views, "different physical views"),
+        ("LBNHC", _TWO_GROUPS, _mixed_groups, "one cache group"),
+        ("LBNHC", _ONE_GROUP, _same_group_alias, "same bytes"),
+    ],
+)
+def test_vllm_032_layer_strided_plan_rejects_unproven_placement(tmp_path, layout, groups, edit, diagnostic):
+    path, launch = _strided_fixture(tmp_path, layout=layout, groups=groups)
+    _mutate(path, lambda record: edit(record["cache"]) if record["kind"] == "worker" else None)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    assert diagnostic in " ".join(result["diagnostics"])
+
+
+def test_vllm_032_aliased_groups_must_agree_on_block_ownership(tmp_path):
+    path, launch = _strided_fixture(tmp_path, groups=_TWO_GROUPS)
+
+    def block_outer_second_group(record):
+        # Group 1 reuses the same bytes in BLNHC order, so one byte would
+        # belong to different pool blocks in the two aliased groups.
+        if record["kind"] != "worker":
+            return
+        cache = record["cache"]
+        strides = _layout_strides(_LAYOUTS["BLNHC"], (2, cache["num_blocks"], 2, 16, 8))
+        cache["tensor_allocations"][1].update(layer_stride=strides[0], block_stride=strides[1])
+        for index, name in enumerate(("layer2", "layer3")):
+            cache["layer_tensors"][name].update(
+                storage_offset_bytes=index * strides[0], stride_bytes=[strides[1], strides[2], strides[3], 2]
+            )
+
+    _mutate(path, block_outer_second_group)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "incomplete"
+    assert "pool block ownership" in " ".join(result["diagnostics"])
+
+
+def test_vllm_032_allocations_at_different_offsets_cannot_overlap(tmp_path):
+    path, launch = _strided_fixture(tmp_path, groups=(("layer0", "layer1"), ("layer2",)))
+
+    def shifted_second_group(record):
+        if record["kind"] == "worker":
+            record["cache"]["tensor_allocations"][1]["offset"] = 256
+            record["cache"]["layer_tensors"]["layer2"]["storage_offset_bytes"] = 256
+
+    _mutate(path, shifted_second_group)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "incomplete"
+    assert "different offsets overlap" in " ".join(result["diagnostics"])
+
+
+def test_layer_strided_plan_is_bound_to_its_audited_runtime_version(tmp_path):
+    path, launch = _strided_fixture(tmp_path, version="0.28.0")
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "incomplete"
+    assert "layer-strided plan" in " ".join(result["diagnostics"])
+
+
 def _phase_records(path, phase, kind):
     index = json.loads(path.read_text())
     artifacts = index["configurations"]["tp2"]["attempts"][0]["phases"][phase]["artifacts"]
@@ -1336,6 +1665,9 @@ def glm_tp4_cache_groups():
 
     The four KDA groups come first, each with one prefill checkpoint block aligned to 16 tokens, then the attention
     group and the tail group. Every page is one 13,516,800-byte pool block.
+
+    Only the tail ring takes no part in prefix caching. No group holds transfer bytes, which the record does not
+    decide.
     """
     page = 13_516_800
     return [
@@ -1350,6 +1682,7 @@ def glm_tp4_cache_groups():
                 "blocks_per_request": 1,
                 "prefill_checkpoint_blocks": 1,
                 "prefill_checkpoint_alignment": 16,
+                "prefix_cacheable": True,
             }
             for index, layers in enumerate((9, 9, 8, 8))
         ),
@@ -1360,6 +1693,7 @@ def glm_tp4_cache_groups():
             "block_size_tokens": 2176,
             "page_size_bytes": page,
             "sliding_window": None,
+            "prefix_cacheable": True,
         },
         {
             "name": "runtime_group_5",
@@ -1369,6 +1703,7 @@ def glm_tp4_cache_groups():
             "page_size_bytes": page,
             "sliding_window": None,
             "blocks_per_request": 1,
+            "prefix_cacheable": False,
         },
     ]
 
@@ -1652,6 +1987,7 @@ def test_mamba_hybrid_observations_import_state_groups(tmp_path):
             "block_size_tokens": 64,
             "page_size_bytes": 16_384,
             "sliding_window": None,
+            "prefix_cacheable": True,
         },
         *(
             {
@@ -1663,10 +1999,12 @@ def test_mamba_hybrid_observations_import_state_groups(tmp_path):
                 "sliding_window": None,
                 "blocks_per_request": 1,
                 "prefill_checkpoint_blocks": 0,
+                "prefix_cacheable": True,
             }
             for index in (1, 2)
         ),
     ]
+    # Each Mamba page is padded (8,000 of 8,192 bytes), and no group holds transfer bytes: equality pins the absence.
     assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 16_384
 
 
@@ -2362,8 +2700,41 @@ def test_import_refuses_hybrid_evidence_of_another_vllm_version(tmp_path, layout
 
 
 def test_import_keeps_plain_records_of_a_patch_release(tmp_path):
-    # A record without hybrid evidence imports as before, whatever exact version its campaign-local bundle pins.
+    # A plain record may use a patch release of an audited runtime line, as with the collection observers.
     path, launches = observation_fixture(tmp_path, layout="attention", version="0.33.1")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+
+
+@pytest.mark.parametrize(
+    "version", ["0.26.0", "0.28.1", "0.31.0", "0.34.0", "0.33.0rc1", "0.33.0.dev1", "0.33.0+custom"]
+)
+def test_import_refuses_unaudited_runtime_even_when_bundle_and_launch_agree(tmp_path, version):
+    path, launches = observation_fixture(tmp_path, version=version)
+    launches["tp2"]["identity"]["runtime_framework_version"] = version
+    _replace_launch(path, launches)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert result["resources"] is None
+    assert f"runtime observation import requires audited vLLM; the bundle names vLLM {version}" in str(
+        result["diagnostics"]
+    )
+    with pytest.raises(ValueError, match="runtime observation import requires audited vLLM"):
+        runtime_observations.validate_observation_phase(
+            path, "tp2", launches["tp2"], phase="prefill", attempt_id="attempt-001"
+        )
+
+
+@pytest.mark.parametrize("version", ["0.27.0", "0.28.0"])
+def test_import_keeps_audited_shared_slot_runtimes(tmp_path, version):
+    path, launches = observation_fixture(tmp_path, version=version)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+
+
+@pytest.mark.parametrize("version", ["0.32.0", "0.32.1"])
+def test_import_uses_the_audited_layer_strided_mapping_for_patch_releases(tmp_path, version):
+    path, launches = _strided_fixture(tmp_path, version=version)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
 
@@ -3356,3 +3727,60 @@ def test_import_refuses_the_live_glm53flash_record_declared_with_bfloat16_attent
         str(error.value)
         == "FMHA precision 'bfloat16' differs from the checkpoint-native 'fp8' for KV-cache dtype 'fp8'"
     )
+
+
+# The group of the live record that takes no part in prefix caching: the ring of the 11 indexer tail layers, a
+# CircularBufferSpec group.
+LIVE_RING_GROUP = "runtime_group_5"
+
+
+def test_import_marks_the_ring_group_of_vllm_0330_as_not_prefix_cacheable(tmp_path):
+    groups = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"][
+        "cache_groups"
+    ]
+    ring = next(group for group in groups if group["name"] == LIVE_RING_GROUP)
+    assert ring["prefix_cacheable"] is False  # CircularBufferSpec, vLLM 0.33.0 kv_cache_interface.py:999-1000
+
+
+def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
+    from aisim.support.config_profile import linear_runtime_resources
+
+    resources = _import(_campaign_from_fixture(tmp_path / "live", FIXTURES / "glm53flash_vllm_0330_probe"))["resources"]
+    assert resources["runtime_memory"]["runtime_framework_version"] == "0.33.0"
+    # The import of a vLLM 0.28.0 record holds no prefix-caching evidence, and its result keeps its bytes.
+    path, launches = observation_fixture(tmp_path / "attention", layout="attention")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    assert "runtime_framework_version" not in result["resources"]["runtime_memory"]
+    # A vLLM 0.33.0 record of one attention group has a linear layout. That layout has no cache groups, so it does not
+    # hold the version of their evidence.
+    path, launches = observation_fixture(tmp_path / "kernel", layout="kernel_view")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["resources"]["runtime_memory"]["runtime_framework_version"] == "0.33.0"
+    linear = linear_runtime_resources(result["resources"])
+    assert linear is not None and "cache_groups" not in linear
+    assert "runtime_framework_version" not in linear["runtime_memory"]
+
+
+def test_import_writes_no_transfer_bytes_for_a_record_of_vllm_0330(tmp_path):
+    groups = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"][
+        "cache_groups"
+    ]
+    # What the P/D connector of vLLM 0.33.0 moves for one block depends on facts that the record does not hold, so no
+    # group holds the key. The marker of every group: the four KDA groups and the attention group take part in prefix
+    # caching, the ring does not.
+    assert [(group["name"], group["prefix_cacheable"], "transfer_bytes_per_block" in group) for group in groups] == [
+        *((f"runtime_group_{index}", True, False) for index in range(5)),
+        (LIVE_RING_GROUP, False, False),
+    ]
+
+
+def test_import_writes_no_transfer_bytes_for_a_padded_page_of_an_attention_layer(tmp_path):
+    # The latent layer views 64 x 28 bf16 values of its 3,840-byte page, so 256 bytes of the page are padding.
+    path, launches = observation_fixture(tmp_path, layout="kernel_view")
+    _edit_view(path, "latent.0", shape=[8, 64, 28])
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    (group,) = result["resources"]["cache_groups"]
+    assert group["prefix_cacheable"] is True
+    assert "transfer_bytes_per_block" not in group

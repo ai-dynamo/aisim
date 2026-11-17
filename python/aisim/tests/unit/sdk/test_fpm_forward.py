@@ -1733,11 +1733,15 @@ def test_schema8_fpm_static_summary_energy(schema8_fpm_database, context_energy,
     assert summary.get_generation_energy_wms_dict() == {"fpm_forward_decode": pytest.approx(generation_energy)}
     covered_ms = (22.0 if context_energy else 0.0) + (6.0 if generation_energy else 0.0)
     assert summary.get_power_data_coverage() == pytest.approx(covered_ms / 28.0)
-    # Watts publish only at 0.9 coverage; the energy dicts above stay either way.
-    if covered_ms / 28.0 >= 0.9:
-        assert summary.get_result_dict()["power_w"] == pytest.approx((context_energy + generation_energy) / 28.0)
-    else:
+    # The SDK publication gate withholds watts below 90% coverage, while
+    # retaining the exact operation energy and latency above for diagnostics.
+    if covered_ms / 28.0 < 0.9:
         assert summary.get_result_dict()["power_w"] is None
+        assert summary.get_e2e_power_avg() is None
+    else:
+        watts = (context_energy + generation_energy) / 28.0
+        assert summary.get_result_dict()["power_w"] == pytest.approx(watts)
+        assert summary.get_e2e_power_avg() == pytest.approx(watts)
 
 
 @pytest.mark.parametrize(
@@ -2081,6 +2085,29 @@ def _run_disagg(database, model_config):
 
 class TestFPMPowerPublication:
     """Public SDK watts for FPM models are published only where V1 supports them."""
+
+    def test_aggregate_cache_separates_op_level_and_fpm_models(self, fpm_power_root):
+        from aisim.sdk.predict import predict_agg_worker
+
+        fpm_model = _qwen_fpm()
+        op_model = models.get_model("Qwen/Qwen3-0.6B", _model_config(), BACKEND)
+        database = fpm_power_root(fpm_model, _full_power, rows=_agg_rows(fpm_model))
+        backend = get_backend(BACKEND)
+        runtime = sdk_config.RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=512)
+
+        def run(model):
+            return predict_agg_worker(
+                model=model, backend=backend, database=database, runtime_config=runtime, ctx_tokens=512
+            )
+
+        op_summary = run(op_model)
+        assert op_summary.get_result_dict()["power_w"] > 0
+        fpm_summary = run(fpm_model)
+        assert fpm_summary is not op_summary
+        assert fpm_summary.get_result_dict()["power_w"] > 0
+        assert fpm_summary.get_power_data_coverage() > 0.9
+        assert run(op_model) is op_summary
+        assert run(fpm_model) is fpm_summary
 
     @pytest.mark.parametrize("schema_version", [6, 7])
     @pytest.mark.parametrize("mode", ["static", "agg", "disagg"])

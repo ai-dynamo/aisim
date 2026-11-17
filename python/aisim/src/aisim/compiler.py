@@ -959,6 +959,12 @@ def _worker_engine_args(
         payload["state_cache"] = {"bytes_per_request": cache.state_cache.bytes_per_request}
         if (window := cache.state_cache.resolved_sliding_window()) is not None:
             payload["state_cache"]["sliding_window"] = window
+        if cache.state_cache.num_speculative_states is not None:
+            payload["state_cache"]["num_speculative_states"] = cache.state_cache.num_speculative_states
+        # Default-off switches stay absent so existing specs remain byte-identical.
+        for flag in ("prefill_checkpoint", "junction_checkpoints"):
+            if getattr(cache.state_cache, flag):
+                payload["state_cache"][flag] = True
         payload["kv_cache_bytes_per_token"] = cache.bytes_per_token
     if capacity.type == "default" and cache.state_cache is not None:
         assert isinstance(cache.bytes_per_token, int)

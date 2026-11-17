@@ -5,6 +5,7 @@
 
 from aisim_core.fpm_profile import FpmCacheGroup as FpmCacheGroup
 from aisim_core.fpm_profile import FpmDeploymentProfile as FpmDeploymentProfile
+from aisim_core.fpm_profile import FpmMambaCache as FpmMambaCache
 from aisim_core.fpm_profile import FpmModelProfile as FpmModelProfile
 from aisim_core.fpm_profile import FpmResourceProfile as FpmResourceProfile
 from aisim_core.fpm_profile import FpmRuntimeMemoryProfile as FpmRuntimeMemoryProfile
