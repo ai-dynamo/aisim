@@ -38,9 +38,9 @@
       },
       "disagg": {
         "values": {
-          "disagg_request": 91.013,
-          "disagg_tpot": 8.915,
-          "disagg_ttft": 82.098
+          "disagg_request": 91.924,
+          "disagg_tpot": 9.295,
+          "disagg_ttft": 82.629
         }
       },
       "mixed": {
@@ -50,9 +50,9 @@
       },
       "static": {
         "values": {
-          "static_ctx": 41.464,
-          "static_gen": 7.297,
-          "static_total": 48.760999999999996
+          "static_ctx": 41.732,
+          "static_gen": 7.662,
+          "static_total": 49.394
         }
       }
     },
@@ -1490,9 +1490,9 @@
       },
       "disagg": {
         "values": {
-          "disagg_request": 36.22,
-          "disagg_tpot": 6.176,
-          "disagg_ttft": 30.044
+          "disagg_request": 36.719,
+          "disagg_tpot": 6.375,
+          "disagg_ttft": 30.344
         }
       },
       "mixed": {
@@ -1502,13 +1502,13 @@
       },
       "static": {
         "values": {
-          "static_ctx": 15.173,
+          "static_ctx": 15.325,
           "static_ctx_energy": 0.0,
           "static_ctx_power": 0.0,
-          "static_gen": 5.784,
+          "static_gen": 5.98,
           "static_gen_energy": 0.0,
           "static_gen_power": 0.0,
-          "static_total": 20.957
+          "static_total": 21.305
         }
       }
     },
@@ -1887,7 +1887,7 @@
     },
     "deepseek-r1-gb200-vllm-scan-coverage::disagg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "29d6901feef3c768950ac96795e756a665483bb9"
     },
     "deepseek-r1-gb200-vllm-scan-coverage::mixed": {
       "engine": "rust",
@@ -1895,7 +1895,7 @@
     },
     "deepseek-r1-gb200-vllm-scan-coverage::static": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "29d6901feef3c768950ac96795e756a665483bb9"
     },
     "deepseek-v3-b200-vllm-shape-prefix-heavy::agg": {
       "engine": "rust",
@@ -2743,7 +2743,7 @@
     },
     "qwen3-32b-gb200-vllm-power::disagg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "29d6901feef3c768950ac96795e756a665483bb9"
     },
     "qwen3-32b-gb200-vllm-power::mixed": {
       "engine": "rust",
@@ -2751,7 +2751,7 @@
     },
     "qwen3-32b-gb200-vllm-power::static": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "29d6901feef3c768950ac96795e756a665483bb9"
     },
     "qwen35-27b-b200-sglang-isl1024-osl2::agg": {
       "engine": "rust",
