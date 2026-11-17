@@ -1631,10 +1631,10 @@ def _validate_prediction_launch(engine: EnginePredictionConfig) -> None:
     """`scheduler.launch` models vLLM's engine loop with its uniprocess executor: one aggregated GPU per engine."""
     for role in ("prefill", "decode"):
         worker = getattr(engine.workers, role)
-        if worker is not None and worker.scheduler.launch is not None:
+        if worker is not None and not is_afd_worker(worker) and worker.scheduler.launch is not None:
             raise ValueError(f"workers.{role}.scheduler.launch is supported only on aggregated workers")
     worker = engine.workers.aggregated
-    if worker is None or worker.scheduler.launch is None:
+    if worker is None or is_afd_worker(worker) or worker.scheduler.launch is None:
         return
     if worker.scheduler.async_scheduling is False:
         raise ValueError("workers.aggregated.scheduler.launch requires async_scheduling")

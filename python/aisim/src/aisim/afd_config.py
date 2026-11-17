@@ -91,6 +91,7 @@ def validate_afd_worker(worker):
     if scheduler is not None and (
         getattr(scheduler, "prefill_schedule_interval", 1) != 1
         or getattr(scheduler, "async_scheduling", None) is not None
+        or getattr(scheduler, "launch", None) is not None
     ):
         raise ValueError("AFD uses the SGLang scheduler; vLLM scheduling controls are unsupported")
     return worker
