@@ -1121,6 +1121,93 @@ def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path
         rc_wheels.verify(tmp_path, expected)
 
 
+def test_pinned_rc_build_executes_all_three_locked_feature_builds(tmp_path):
+    job = _workflow("readme-checks.yml")["jobs"]["commands"]
+    log = tmp_path / "commands.jsonl"
+    executables = tmp_path / "bin"
+    executables.mkdir()
+    for name in ("git", "uv"):
+        executable = executables / name
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "with open(os.environ['COMMAND_LOG'], 'a') as output:\n"
+            "    output.write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]) + '\\n')\n"
+        )
+        executable.chmod(0o755)
+    wheelhouse = tmp_path / "wheelhouse"
+    subprocess.run(
+        ["bash", str(REPOSITORY_ROOT / "scripts/ci/build_readme_rc_wheels.sh")],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": str(executables) + os.pathsep + os.environ["PATH"],
+            "RUNNER_TEMP": str(tmp_path),
+            "COMMAND_LOG": str(log),
+            "AISIM_RC_WHEELHOUSE": str(wheelhouse),
+            "AISIM_RC_REVISION": job["env"]["AISIM_RC_REVISION"],
+            "DYNAMO_RC_REVISION": job["env"]["DYNAMO_RC_REVISION"],
+        },
+    )
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    expected = []
+    for name, revision in (
+        ("aisim", "77d82652b2f83fd67afefc3141d69a5f06e630be"),
+        ("dynamo", "9653d05441b37b6a004837651fd991e44158d755"),
+    ):
+        checkout = str(tmp_path / f"{name}-rc")
+        expected.extend(
+            [
+                ["git", "init", checkout],
+                ["git", "-C", checkout, "fetch", "--depth", "1", f"https://github.com/ai-dynamo/{name}.git", revision],
+                ["git", "-C", checkout, "checkout", "--detach", "FETCH_HEAD"],
+            ]
+        )
+    build = ["uv", "build", "--wheel", "--out-dir", str(wheelhouse)]
+    expected.extend(
+        [
+            [*build, "--config-setting=build-args=--locked", str(tmp_path / "aisim-rc/python/aisim")],
+            [*build, str(tmp_path / "dynamo-rc")],
+            [
+                *build,
+                "--config-setting=build-args=--locked --features ais-forward-pass",
+                str(tmp_path / "dynamo-rc/lib/bindings/python"),
+            ],
+        ]
+    )
+    assert commands == expected
+
+
+@pytest.mark.parametrize("filename,exists", [("missing.whl", False), ("not-a-wheel.txt", True)])
+def test_release_build_rejects_invalid_prebuilt_wheel_before_building(tmp_path, monkeypatch, filename, exists):
+    wheel = tmp_path / filename
+    if exists:
+        wheel.write_bytes(b"not a wheel")
+    calls = []
+    monkeypatch.setattr(release_artifacts, "_run", lambda *args, **kwargs: calls.append(args))
+    output = tmp_path / "dist"
+    with pytest.raises(ValueError, match="existing .whl file"):
+        release_artifacts.build(output, release_artifacts.VERSION, release_artifacts.VERSION, wheel)
+    assert calls == []
+    assert list(output.iterdir()) == []
+
+
+def test_release_main_forwards_prebuilt_wheel_argument(tmp_path, monkeypatch):
+    wheel = tmp_path / "application.whl"
+    output = tmp_path / "dist"
+    monkeypatch.setattr(
+        sys, "argv", ["build_release_artifacts.py", "--output-dir", str(output), "--prebuilt-wheel", str(wheel)]
+    )
+    monkeypatch.setattr(release_artifacts, "check_manifests", lambda: ("1.2.3", "1.2.3"))
+    # main supports historical source roots; restore its derived globals after this invocation.
+    for name in ("EXPECTED_PYTHON_PROJECTS", "EXPECTED_CRATE"):
+        monkeypatch.setattr(release_artifacts, name, getattr(release_artifacts, name))
+    calls = []
+    monkeypatch.setattr(release_artifacts, "build", lambda *args: calls.append(args))
+    release_artifacts.main()
+    assert calls == [(output.resolve(), "1.2.3", "1.2.3", wheel)]
+
+
 @pytest.mark.parametrize("reuse", [False, True])
 def test_release_build_reuses_exact_wheel_but_still_builds_and_verifies_crate(tmp_path, monkeypatch, reuse):
     version = release_artifacts.VERSION

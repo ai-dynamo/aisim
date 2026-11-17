@@ -276,13 +276,13 @@ marked it N/A.
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification reuses it |
+| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
 | Collector Data | Data-tree invariants (`check_collector_data.py` R1-R7) and the backend-facts registry; the cross-backend sanity scan is informational |
 | Prediction Regression | Collect old/new static, scheduling, and silicon-reference snapshots; fail when a previously working case stops working |
-| Release Artifact Contract | Build the wheel and crate; verify installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
+| Release Artifact Contract | Reuse the same-architecture application test wheel with `--prebuilt-wheel` and build the crate; verify package contents, installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
 
 ### Numerical and installed-package evidence
 
