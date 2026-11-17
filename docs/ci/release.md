@@ -409,8 +409,8 @@ Persistent project and Dynamo wheel handoffs use Artifactory, including companio
 
 | Workflow | Wheel generation or consumption | Retained output / disposition |
 | --- | --- | --- |
-| `ci.yml` | Application test wheel built once; application tests and application verification reuse it; protected final staging reuses that original wheel | Artifactory `application-test-wheel-<arch>`; Actions completion manifest and reports; no duplicate wheel payload |
-| `ci.yml` same-job validation | Rust feature modes, Python compatibility, engine golden regression, and release artifact contract build/install locally | Disposable local wheel/build directories; only test/contract reports are retained |
+| `ci.yml` | Application test wheel built once; application tests, application verification, release-artifact contracts, and protected final staging reuse that original wheel | Artifactory `application-test-wheel-<arch>`; Actions completion manifest and reports; no duplicate wheel payload; release contracts still build the crate and validate both artifacts |
+| `ci.yml` same-job validation | Rust feature modes, Python compatibility, and engine golden regression build/install locally | Disposable local wheel/build directories; only test/contract reports are retained |
 | `validate-platform-wheels.yml` | Docker Linux amd64/arm64 and native macOS invoke `build-platform-wheel` | Disposable local `wheelhouse`; Actions provenance and installed-CLI JSON only |
 | `nightly-ci.yml` | Trusted release builder produces wheel/crate/checksum/provenance bundle; staged wheels are downloaded and smoke-tested | Artifactory `nightly-dist-<arch>`; Actions completion manifest and metadata reports |
 | `fpe-support-matrix.yml` | Standalone exact wheel build or nightly reuse; discovery, matrix shards, and packaging use the qualified wheel | Artifactory `fpe-qualified-wheel`; matrix/web reports remain Actions artifacts |
@@ -424,7 +424,7 @@ Persistent project and Dynamo wheel handoffs use Artifactory, including companio
 | `performance.yml` | Builds base/head wheels into separate temporary dist directories, installs and compares in the same job | Disposable local dist/venv paths; only the separate benchmark results directory is uploaded |
 | `prediction-regression-gate.yml` | Source install can build a local wheel before producing snapshots | Disposable install wheel; Actions gate snapshots and comparison reports only |
 | `collector-check.yml` | Source install can build a local wheel | Disposable install wheel; cross-backend `.md`/`.json` reports only |
-| `readme-checks.yml` | Source/development profiles perform editable installs in isolated workspaces | Disposable build/venv paths; Actions command logs, installation metadata, environment log, and harness reports only |
+| `readme-checks.yml` | Source/development profiles install in isolated workspaces; Dynamo builds or reuses a verified matching pinned RC wheel set | Artifactory `readme-rc-wheels-<build-input-hash>` for the three RC wheels and build-input record; Actions retains only its completion manifest and command/provenance reports; every README command runs afresh |
 | `accuracy-digest.yml` | No product wheel generation; consumes qualified accuracy data | Actions preview, report, and delivery-state data only |
 | `fast-ci.yml` | No product wheel producer; dependency installs/tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
 | `pages.yml` | No product wheel producer; dependencies/tests and allowlisted site packaging | Pages/site and validation data only |

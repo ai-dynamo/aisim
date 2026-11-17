@@ -194,6 +194,32 @@ separate Fast run; this preserves validation in both admission contexts.
 
 ## Full CI
 
+### Reusing pinned README dependencies
+
+The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
+three-wheel bundle is built on a miss and reused through Artifactory on matching
+subsequent runs. The key includes both source revisions, the build recipe and
+storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
+GitHub-hosted runner image version. A changed key or expired manifest rebuilds
+the bundle. Cross-run reuse accepts successful Full CI producers from this
+repository's `main`, or the exact same admitted PR head; another PR cannot
+populate the cache for this PR or for `main`.
+
+The existing wheel-storage action checks the source SHA, producer run/attempt,
+architecture, scope, sizes, and checksums. The README job additionally verifies
+the build-input record and the complete three-package wheel set. Only the
+completion manifest is retained in GitHub Actions; wheels stay in Artifactory.
+Every README command and result assertion still executes in a fresh environment
+on both cold and reused builds. Full CI selection, test suites, platforms,
+Python versions, and required gates are unchanged.
+
+Release-artifact contracts consume the same exact-source, per-architecture
+manylinux wheel already built for application tests. They continue to build the
+Rust crate, verify the complete two-artifact package contract, install into a
+clean environment, check dependencies and versions, and exercise both CLIs.
+Standalone release builders still build a fresh wheel by default; only callers
+supplying a verified `--prebuilt-wheel` reuse one.
+
 Full CI first verifies the target commit, checks the standalone Fast CI
 prerequisite, and calculates validation scope. Expensive jobs wait for the
 prerequisite and scope selection.

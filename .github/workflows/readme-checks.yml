@@ -8,11 +8,17 @@ on:
       daily:
         type: boolean
         default: false
+      pr_number:
+        description: Verified originating PR number from Full CI target validation
+        type: string
+        default: ''
 permissions:
   contents: read
+  actions: read
 jobs:
   commands:
     name: README / ${{ matrix.profile }}
+    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +29,10 @@ jobs:
       HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
       HF_HUB_DISABLE_XET: '1'
       PIP_DEFAULT_TIMEOUT: '60'
+      AISIM_RC_REVISION: 77d82652b2f83fd67afefc3141d69a5f06e630be
+      DYNAMO_RC_REVISION: 9653d05441b37b6a004837651fd991e44158d755
+      AISIM_RC_WHEELHOUSE: ${{ runner.temp }}/dynamo-rc-wheels
+      RC_PR_NUMBER: ${{ inputs.pr_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -45,26 +55,40 @@ jobs:
         run: |
           python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py
           python scripts/readme/check_readme_commands.py --validate
-      - name: Build the pinned Dynamo RC wheels
+      - name: Find matching pinned Dynamo RC wheels
+        id: rc-wheels
         if: matrix.profile == 'dynamo'
         env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/readme_rc_wheels.py prepare --directory "$AISIM_RC_WHEELHOUSE"
+      - name: Restore verified pinned Dynamo RC wheels
+        if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id != ''
+        uses: ./.github/actions/wheel-storage
+        with:
+          mode: download
+          name: ${{ steps.rc-wheels.outputs.name }}
+          path: ${{ env.AISIM_RC_WHEELHOUSE }}
+          run-id: ${{ steps.rc-wheels.outputs.run-id }}
+          source-sha: ${{ env.AISIM_RC_REVISION }}
+          architecture: amd64
+          scope: ${{ steps.rc-wheels.outputs.scope }}
+          pr-number: ${{ steps.rc-wheels.outputs.pr-number }}
+          url: ${{ vars.WHEEL_STORAGE_URL }}
+          repo: ${{ vars.WHEEL_STORAGE_REPO }}
+          token: ${{ secrets.ARTIFACTORY_TOKEN }}
+      - name: Build the pinned Dynamo RC wheels
+        if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id == ''
+        env:
           CARGO_BUILD_JOBS: '2'
+        run: bash scripts/ci/build_readme_rc_wheels.sh
+      - name: Install RC runtime libraries on reuse
+        if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id != ''
         run: |
           sudo apt-get update
-          sudo apt-get install -y libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
-          for entry in aisim:77d82652b2f83fd67afefc3141d69a5f06e630be dynamo:9653d05441b37b6a004837651fd991e44158d755; do
-            repo="${entry%%:*}"
-            revision="${entry#*:}"
-            git init "$RUNNER_TEMP/$repo-rc"
-            git -C "$RUNNER_TEMP/$repo-rc" fetch --depth 1 "https://github.com/ai-dynamo/$repo.git" "$revision"
-            git -C "$RUNNER_TEMP/$repo-rc" checkout --detach FETCH_HEAD
-          done
-          wheels="$RUNNER_TEMP/dynamo-rc-wheels"
-          uv build --wheel --out-dir "$wheels" --config-setting=build-args=--locked "$RUNNER_TEMP/aisim-rc/python/aisim"
-          uv build --wheel --out-dir "$wheels" "$RUNNER_TEMP/dynamo-rc"
-          uv build --wheel --out-dir "$wheels" --config-setting='build-args=--locked --features ais-forward-pass' \
-            "$RUNNER_TEMP/dynamo-rc/lib/bindings/python"
-          echo "AISIM_RC_WHEELHOUSE=$wheels" >> "$GITHUB_ENV"
+          sudo apt-get install -y libhwloc15 libudev1
+      - name: Verify the RC wheel set and build inputs
+        if: matrix.profile == 'dynamo'
+        run: python scripts/ci/readme_rc_wheels.py verify --directory "$AISIM_RC_WHEELHOUSE"
       - name: Execute README commands
         env:
           PROFILE: ${{ matrix.profile }}
@@ -73,6 +97,20 @@ jobs:
           --profile "$PROFILE"
           --workspace "$RUNNER_TEMP/readme-$PROFILE"
           --output "readme-results/$PROFILE"
+      - name: Preserve tested pinned Dynamo RC wheels
+        if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id == ''
+        uses: ./.github/actions/wheel-storage
+        with:
+          mode: upload
+          name: ${{ steps.rc-wheels.outputs.name }}
+          path: ${{ env.AISIM_RC_WHEELHOUSE }}
+          source-sha: ${{ env.AISIM_RC_REVISION }}
+          architecture: amd64
+          scope: ${{ inputs.pr_number != '' && 'pr' || ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'official' || 'preview') }}
+          pr-number: ${{ inputs.pr_number }}
+          url: ${{ vars.WHEEL_STORAGE_URL }}
+          repo: ${{ vars.WHEEL_STORAGE_REPO }}
+          token: ${{ secrets.ARTIFACTORY_TOKEN }}
       - name: Preserve command evidence even after failure
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
