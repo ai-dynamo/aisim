@@ -778,6 +778,11 @@ impl GroupedPrefixCoordinator {
 
     /// The blocks a new request needs for the whole prompt, counting inactive
     /// hit blocks again (`single:216-268`, `single:1716-1816`, `mgr:519-536`).
+    /// This is vLLM's whole-prompt test of a waiting request (v0.32
+    /// `single:213-265`, `mgr:522-539`). vLLM's second test, on the first
+    /// chunk and without the admission cap (`mgr:558-576`, v0.32
+    /// `mgr:561-579`), is a separate count, which a later change adds as a
+    /// function of its own.
     pub(crate) fn admission_blocks(
         &self,
         pool: &GroupedBlockPool,
@@ -798,12 +803,18 @@ impl GroupedPrefixCoordinator {
                     let mut skipped_blocks = 0;
                     if let GroupRuleKind::SlidingWindow { window } = rule.kind {
                         // The admission cap of `SlidingWindowSpec`
-                        // (`iface:859-866`), and the blocks below the window
-                        // at the hit (`single:1153-1188`).
+                        // (`iface:859-866`, v0.32 `iface:878-885`), and the
+                        // blocks below the window at the hit
+                        // (`single:1153-1188`, v0.32 `single:1167-1170`), as
+                        // vLLM's whole-prompt test counts them (`single:216-268`,
+                        // v0.32 `single:213-265`): the capped count against
+                        // the absolute block indices of the hit. The count of
+                        // vLLM's second test, on the first chunk, is not this
+                        // one; a later change adds it as a separate function.
                         let retained = (window - 1 + self.limits.max_in_flight_tokens)
                             .min(self.limits.max_model_len);
+                        required = required.min(retained.div_ceil(block) + 1);
                         skipped_blocks = hit.tokens.saturating_sub(window - 1) / block;
-                        required = required.min(skipped_blocks + retained.div_ceil(block) + 1);
                     }
                     let new = required.saturating_sub(skipped_blocks.max(keys.len()));
                     let inactive = keys[skipped_blocks.min(keys.len())..]
@@ -1881,31 +1892,75 @@ mod tests {
     }
 
     #[test]
-    fn sliding_window_admission_counts_fresh_blocks_after_a_long_hit() {
-        let groups = [attention("window", 4, Some(8))];
-        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
-            for prompt in [108, 200] {
+    fn sliding_window_admission_after_a_hit_is_vllms_whole_prompt_count() {
+        // vLLM's whole-prompt test (v0.31 mgr:519-536, v0.32 mgr:522-539)
+        // for a sliding-window group (v0.31 single:216-268, v0.32
+        // single:213-265):
+        //   required = min(cdiv(prompt, B), cap), with
+        //   cap = cdiv(min(window - 1 + in_flight, max_model_len), B) + 1
+        //         (v0.31 iface:859-866, v0.32 iface:878-885);
+        //   skipped = max(0, hit - window + 1) // B
+        //         (v0.31 single:1185-1188, v0.32 single:1167-1170);
+        //   new = max(required - max(skipped, len(hit blocks)), 0);
+        //   plus the hit blocks from `skipped` on that no request holds.
+        // The hit list has one entry per hit block, null blocks included.
+        // vLLM compares the capped count with absolute block indices, so a
+        // long hit gives no new block here. vLLM's second test, on the first
+        // chunk and without the cap (v0.31 mgr:558-576, v0.32 mgr:561-579),
+        // is a separate count.
+        //
+        // C1, window 8, block 4, in flight 8, model length 200, prompt 108,
+        // hit 96: cap = cdiv(min(7 + 8, 200), 4) + 1 = 5; required =
+        // min(27, 5) = 5; skipped = 89 // 4 = 22; the hit list has 24
+        // entries, so new = max(5 - 24, 0) = 0; the two hit blocks of the
+        // window run count when no request holds them: 2, else 0.
+        // (window, block, in flight, model length, prompt, hit, the cached
+        // blocks that end at the hit, not held, held)
+        type Case = (u32, u32, usize, usize, usize, usize, usize, usize, usize);
+        let cases: [Case; 6] = [
+            (8, 4, 8, 200, 108, 96, 2, 2, 0),
+            (8, 4, 8, 200, 200, 96, 2, 2, 0),
+            // C3: skipped = 5 // 4 = 1, 3 entries, new = 5 - 3 = 2.
+            (8, 4, 8, 200, 108, 12, 2, 4, 2),
+            // C4, cold: new = min(27, 5) = 5.
+            (8, 4, 8, 200, 108, 0, 0, 5, 5),
+            // C5: cap = cdiv(13, 4) + 1 = 5, skipped = 91 // 4 = 22.
+            (6, 4, 8, 200, 108, 96, 2, 2, 0),
+            // C6: cap = cdiv(min(127 + 16384, 131072), 16) + 1 = 1,033;
+            // skipped = 49,873 // 16 = 3,117; 3,125 entries; new = 0; the
+            // eight blocks of the window run.
+            (128, 16, 16384, 131_072, 100_000, 50_000, 8, 8, 0),
+        ];
+        for (window, block, in_flight, model_len, prompt, hit_tokens, run, idle, held) in cases {
+            let groups = [attention("window", block, Some(window))];
+            for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
                 let coordinator = GroupedPrefixCoordinator::new(
-                    GroupedPrefixRules::new(&groups, 4, version).unwrap(),
+                    GroupedPrefixRules::new(&groups, block as usize, version).unwrap(),
                     AdmissionLimits {
-                        max_in_flight_tokens: 8,
-                        max_model_len: 200,
+                        max_in_flight_tokens: in_flight,
+                        max_model_len: model_len,
                     },
                 );
-                let mut kv = kv_pool(&groups, 8);
+                let mut kv = kv_pool(&groups, 16);
                 let pool = kv.block_pool_mut().unwrap();
-                seed_many(pool, 0, 4, &[92, 96]);
-                let request = lease(prompt, 4);
+                let ends: Vec<usize> = (0..run).map(|i| hit_tokens - i * block as usize).collect();
+                seed_many(pool, 0, block as usize, &ends);
+                let request = lease(prompt, block as usize);
                 let hit = coordinator.find_longest_hit(pool, &request, prompt);
-                assert_eq!(hit.tokens, 96);
-                // Skip 22 blocks; retain at most ceil((7 + 8) / 4) + 1
-                // blocks from there: two inactive hits and three fresh blocks.
-                assert_eq!(coordinator.admission_blocks(pool, &hit, prompt), 5);
+                let case = format!("{version:?}, window {window}, prompt {prompt}");
+                assert_eq!(hit.tokens, hit_tokens, "{case}");
+                assert_eq!(
+                    coordinator.admission_blocks(pool, &hit, prompt),
+                    idle,
+                    "{case}"
+                );
                 let mut block_lease = coordinator.new_lease();
                 coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
-                assert_eq!(coordinator.admission_blocks(pool, &hit, prompt), 3);
-                assert!(coordinator.allocate(pool, &mut block_lease, prompt, 96, 104, 1));
-                assert_eq!(pool.active_blocks(), 4);
+                assert_eq!(
+                    coordinator.admission_blocks(pool, &hit, prompt),
+                    held,
+                    "{case}"
+                );
                 coordinator.release_request(pool, &mut block_lease);
             }
         }
