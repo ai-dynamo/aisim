@@ -723,6 +723,7 @@ impl G2Connector {
                 stores_at_finish: false,
                 reranks_at_finish: false,
                 preemption_waits_for_all: false,
+                admits_kv_holders_first: false,
             },
             Self::OffloadingV032 => ConnectorRules {
                 policy: HostPolicy::Ranked,
@@ -737,6 +738,7 @@ impl G2Connector {
                 stores_at_finish: true,
                 reranks_at_finish: true,
                 preemption_waits_for_all: false,
+                admits_kv_holders_first: true,
             },
             Self::SimpleCpuV032 => ConnectorRules {
                 policy: HostPolicy::FreeQueue,
@@ -751,6 +753,7 @@ impl G2Connector {
                 stores_at_finish: true,
                 reranks_at_finish: false,
                 preemption_waits_for_all: true,
+                admits_kv_holders_first: true,
             },
         }
     }
@@ -794,6 +797,10 @@ pub(crate) struct ConnectorRules {
     /// A preemption waits for every transfer in flight, not only the
     /// preempted request's stores.
     pub(crate) preemption_waits_for_all: bool,
+    /// The scheduler admits a waiting request that holds G1 for a load
+    /// before every other waiter (`kv_holding_waiting`). Otherwise skipped
+    /// requests keep the order of their first skip (`skipped_waiting`).
+    pub(crate) admits_kv_holders_first: bool,
 }
 
 const DEFAULT_SHARED_HOST_OFFLOAD_BANDWIDTH_GBPS: f64 = 80.0;

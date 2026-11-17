@@ -2193,6 +2193,10 @@ impl VllmCore {
             .native_host_offload
             .as_ref()
             .and_then(|a| a.retry_epoch());
+        let kv_holders_first = self
+            .native_host_offload
+            .as_ref()
+            .is_some_and(VllmHostOffloadAdapter::admits_kv_holders_first);
         self.kv_manager.begin_step();
         self.state.compact_running();
         let mut token_budget = self.args.max_num_batched_tokens.unwrap_or(usize::MAX);
@@ -2334,11 +2338,10 @@ impl VllmCore {
                 && self.native_host_offload.is_some()
                 && self.state.has_materialized_waiting());
             let prioritize_connector_waiting = self.native_host_offload.is_some();
-            // A G3 or KVCR restore can wake a connector waiter ahead of one
-            // that already holds reserved G1 for its load; serve that owner
-            // first so the restored head cannot block the space it waits for.
-            // A rank without G3 that has never pulled keeps plain G2 order.
-            let g1_owner = retry_epoch_before.and_then(|_| {
+            // A connector waiter that holds no G1 can queue ahead of one that
+            // already holds reserved G1 for its load; serve that owner first
+            // so the head cannot block the space it waits for.
+            let g1_owner = if kv_holders_first && self.state.has_ready_connector_waiter() {
                 self.state.connector_waiting.iter().copied().find(|uuid| {
                     self.state.connector_waiting_members.contains(uuid)
                         && !self.state.connector_deadline_waiting_members.contains(uuid)
@@ -2349,7 +2352,9 @@ impl VllmCore {
                             .and_then(|r| r.host_offload.as_deref())
                             .is_some_and(|h| h.reserved_blocks() > 0)
                 })
-            });
+            } else {
+                None
+            };
             let Some(uuid) = g1_owner.or_else(|| {
                 self.state
                     .next_waiting_uuid(prefer_materialized, prioritize_connector_waiting)

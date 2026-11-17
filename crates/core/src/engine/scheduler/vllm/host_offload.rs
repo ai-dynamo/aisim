@@ -476,6 +476,13 @@ impl VllmHostOffloadAdapter {
             .or((self.shared || self.hybrid.is_some()).then_some(SourceReleaseOrder::TailFirst))
     }
 
+    /// Whether a waiting request that holds G1 for a load is admitted before
+    /// the others: the connector's rule, or any rank that G3 or a KVCR pull
+    /// can wake.
+    pub(super) fn admits_kv_holders_first(&self) -> bool {
+        self.rules.admits_kv_holders_first || self.retry_epoch().is_some()
+    }
+
     /// G1 has a state cache: lookups, loads and stores carry recurrent states.
     pub(super) fn set_hybrid(&mut self, blocks_per_state: usize) {
         self.hybrid = Some(HybridStates {
