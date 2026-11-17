@@ -2096,6 +2096,87 @@ def test_overwrite_only_removes_known_outputs(tmp_path) -> None:
     assert not (recommendations / "0001.yaml").exists()
 
 
+def test_prepare_output_directory_accepts_missing_and_empty_directories(tmp_path) -> None:
+    missing = tmp_path / "missing"
+    assert prepare_output_directory(missing, overwrite=False) == missing
+    assert missing.is_dir()
+    assert prepare_output_directory(missing, overwrite=False) == missing
+
+
+@pytest.mark.parametrize("status", ["failed", "resource_limited", "timed_out", "cancelled", None])
+def test_unfinished_run_leftovers_are_reused_without_overwrite(tmp_path, capsys, status) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "fpm-coverage.json").write_text("{}")
+    (root / "resource-plan.json").write_text("{}")
+    (root / "execution-events.jsonl").write_text("{}\n")
+    (root / "recommendations").mkdir()
+    if status is not None:
+        (root / "resource-runtime.json").write_text(json.dumps({"status": status}))
+
+    assert prepare_output_directory(root, overwrite=False) == root
+
+    assert root.is_dir()
+    assert not any(root.iterdir())
+    assert "removed diagnostics left by an unfinished run" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "result",
+    ["prediction.json", "recommendation.json", "recommendation.csv", "report.html", "requests.jsonl"],
+)
+def test_finished_run_results_are_refused_without_overwrite(tmp_path, result) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "resource-runtime.json").write_text(json.dumps({"status": "failed"}))
+    (root / result).write_text("old")
+
+    with pytest.raises(ValueError, match="results from an earlier AISim run that ended with status 'failed'"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / result).read_text() == "old"
+    assert (root / "resource-runtime.json").exists()
+
+
+def test_completed_runtime_or_numbered_recommendations_are_refused(tmp_path) -> None:
+    completed = tmp_path / "completed"
+    completed.mkdir()
+    (completed / "resource-runtime.json").write_text(json.dumps({"status": "completed"}))
+    (completed / "resource-plan.json").write_text("{}")
+    with pytest.raises(ValueError, match="results from a finished AISim run"):
+        prepare_output_directory(completed, overwrite=False)
+    assert (completed / "resource-plan.json").exists()
+
+    numbered = tmp_path / "numbered"
+    (numbered / "recommendations").mkdir(parents=True)
+    (numbered / "recommendations" / "0001.yaml").write_text("old")
+    with pytest.raises(ValueError, match="results from a finished AISim run"):
+        prepare_output_directory(numbered, overwrite=False)
+    assert (numbered / "recommendations" / "0001.yaml").exists()
+
+
+def test_unreadable_runtime_report_is_not_treated_as_unfinished(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "resource-runtime.json").write_text("not json")
+    with pytest.raises(ValueError, match="not empty"):
+        prepare_output_directory(root, overwrite=False)
+    assert (root / "resource-runtime.json").read_text() == "not json"
+
+
+def test_unknown_files_are_refused_and_named(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "fpm-coverage.json").write_text("{}")
+    (root / "notes.txt").write_text("keep")
+
+    with pytest.raises(ValueError, match=r"files AISim did not write \(notes\.txt\)"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / "notes.txt").read_text() == "keep"
+    assert (root / "fpm-coverage.json").exists()
+
+
 @pytest.mark.parametrize("resource_limited", [0, 1])
 def test_recommendation_writes_an_empty_result_before_returning_failure(
     tmp_path, monkeypatch, capsys, resource_limited

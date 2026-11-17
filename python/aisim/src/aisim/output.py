@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
@@ -23,32 +24,86 @@ _RECOMMENDATION_NAME = re.compile(r"^[0-9]{4}\.yaml$")
 _COMPACT_JSON = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
 
 
+# Files a finished run leaves behind. Their presence means the directory holds
+# results that a retry must not silently replace.
+_RESULT_FILES = frozenset(
+    {
+        "prediction.json",
+        "report.html",
+        "recommendation.json",
+        "recommendation.csv",
+        "requests.jsonl",
+        "telemetry-requests.jsonl",
+        "telemetry-samples.jsonl",
+        "telemetry-lifecycle.jsonl",
+    }
+)
+# Diagnostics that runs write whether or not they succeed.
+_DIAGNOSTIC_FILES = frozenset(
+    {
+        "fpm-coverage.json",
+        "resource-plan.json",
+        "resource-runtime.json",
+        "execution-events.jsonl",
+        "afd-replay-spec.json",
+        "afd-qualification.json",
+    }
+)
+_KNOWN_FILES = _RESULT_FILES | _DIAGNOSTIC_FILES
+
+
+def _unfinished_run_leftovers(root: Path) -> list[Path] | None:
+    """Return the files of an unfinished AISim run, or None if the directory holds anything else.
+
+    A directory qualifies only when every entry is an AISim diagnostic file, no
+    result file exists, and ``resource-runtime.json`` (when present) does not
+    report a completed run. Unknown files and finished results are never touched.
+    """
+
+    leftovers: list[Path] = []
+    for entry in root.iterdir():
+        if entry.name == "recommendations" and entry.is_dir() and not any(entry.iterdir()):
+            leftovers.append(entry)
+            continue
+        if entry.name not in _DIAGNOSTIC_FILES or not (entry.is_file() or entry.is_symlink()):
+            return None
+        leftovers.append(entry)
+    runtime = root / "resource-runtime.json"
+    if runtime.is_file():
+        try:
+            status = json.loads(runtime.read_text(encoding="utf-8")).get("status")
+        except (OSError, ValueError, AttributeError):
+            return None
+        if status == "completed":
+            return None
+    return leftovers
+
+
 def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
-    """Create an output directory without deleting unrelated user files."""
+    """Create an output directory without deleting unrelated user files.
+
+    A directory that holds only the diagnostics of an unfinished AISim run (for
+    example after a failed or resource-limited run) is cleared and reused, so the
+    obvious retry works without ``--overwrite``. Finished results and files that
+    AISim did not write still require a new directory or ``--overwrite``.
+    """
 
     root = Path(path)
     if root.exists() and not root.is_dir():
         raise ValueError(f"output path {root} exists and is not a directory")
     if root.exists() and any(root.iterdir()) and not overwrite:
-        raise ValueError(f"output directory {root} is not empty; pass --overwrite to replace known AISim outputs")
+        leftovers = _unfinished_run_leftovers(root)
+        if leftovers is None:
+            raise ValueError(_non_empty_message(root))
+        for target in leftovers:
+            if target.is_dir() and not target.is_symlink():
+                target.rmdir()
+            else:
+                target.unlink()
+        sys.stderr.write(f"aisim: reusing {root}: removed diagnostics left by an unfinished run\n")
     root.mkdir(parents=True, exist_ok=True)
     if overwrite:
-        for name in (
-            "prediction.json",
-            "report.html",
-            "fpm-coverage.json",
-            "recommendation.json",
-            "recommendation.csv",
-            "requests.jsonl",
-            "telemetry-requests.jsonl",
-            "telemetry-samples.jsonl",
-            "telemetry-lifecycle.jsonl",
-            "resource-plan.json",
-            "resource-runtime.json",
-            "execution-events.jsonl",
-            "afd-replay-spec.json",
-            "afd-qualification.json",
-        ):
+        for name in sorted(_KNOWN_FILES):
             target = root / name
             if target.is_file() or target.is_symlink():
                 target.unlink()
@@ -58,6 +113,30 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
                 if _RECOMMENDATION_NAME.fullmatch(target.name) and (target.is_file() or target.is_symlink()):
                     target.unlink()
     return root
+
+
+def _non_empty_message(root: Path) -> str:
+    names = {entry.name for entry in root.iterdir()}
+    unknown = sorted(name for name in names if name not in _KNOWN_FILES and name != "recommendations")
+    if unknown:
+        shown = ", ".join(unknown[:3]) + (", ..." if len(unknown) > 3 else "")
+        return (
+            f"output directory {root} is not empty and contains files AISim did not write ({shown}); "
+            "choose a new --output-dir (--overwrite removes only known AISim outputs)"
+        )
+    status = None
+    try:
+        status = json.loads((root / "resource-runtime.json").read_text(encoding="utf-8")).get("status")
+    except (OSError, ValueError, AttributeError):
+        pass
+    if isinstance(status, str) and status != "completed":
+        held = f"results from an earlier AISim run that ended with status {status!r}"
+    else:
+        held = "results from a finished AISim run"
+    return (
+        f"output directory {root} is not empty and holds {held}; "
+        "choose a new --output-dir to keep them, or pass --overwrite to replace them"
+    )
 
 
 def write_prediction_report(root: Path, report: dict[str, Any]) -> Path:

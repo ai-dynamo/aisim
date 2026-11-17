@@ -229,8 +229,15 @@ for `recommendation.json`, CSV, selected YAML and partial-result semantics.
 
 ### Existing Output Directories
 
-Without `--overwrite`, the CLI rejects an existing nonempty output directory. With `--overwrite`, it
-replaces only the known output files listed below and preserves unrelated files.
+Without `--overwrite`, the CLI rejects an existing nonempty output directory, with one exception:
+a directory that holds only the diagnostics of an unfinished run (`fpm-coverage.json`,
+`resource-plan.json`, `resource-runtime.json` that does not report `completed`,
+`execution-events.jsonl`, `afd-replay-spec.json`, `afd-qualification.json`, or an empty
+`recommendations/`) is cleared and reused, and the CLI prints one line saying so. This lets you
+retry a failed or resource-limited run in the same directory. A directory with any result file or
+any file AISim did not write is still rejected, and the error says which case applies. With
+`--overwrite`, the CLI replaces only the known output files listed below and preserves unrelated
+files.
 
 Specifically, overwrite may replace `prediction.json`, `recommendation.json`, `recommendation.csv`,
 `requests.jsonl`, `resource-plan.json`, `resource-runtime.json`, `execution-events.jsonl`,
@@ -664,7 +671,7 @@ Check KV capacity against request lengths, context limits, and traffic stop limi
 | `aisim: command not found` | The environment containing AISim must be active. | From the tutorial directory, run `source .venv/bin/activate`, then `python -m pip show aisim`. |
 | Installation reports an unsupported Python version | AISim requires Python 3.11–3.13. | Check `python3 --version` and create the environment with a supported interpreter. |
 | Configuration or trace file cannot be found | Check the path and the directory where you ran the command. | Run from the directory containing `prediction.yaml`, or use absolute paths. |
-| Output directory is not empty | Each run needs an empty directory or explicit overwrite. | Add `--output-dir ./another-prediction`, or `--overwrite` to replace known outputs. |
+| Output directory is not empty | The directory holds a finished run's results or files AISim did not write. Leftovers from an unfinished run are reused automatically. | Add `--output-dir ./another-prediction`, or `--overwrite` to replace known outputs. |
 | Stack or config adapter is unavailable | Use the Python environment containing the selected integration. `router` and `planner` are Dynamo-owned sections. | Install a matched pair from the [installation guide](../getting-started/installation.md#optional-dynamo-integration) and use `--stack dynamo`. |
 | `predict` rejects a domain or `optimization` | A search input was passed to a concrete prediction command. | Run `recommend` first, then predict `recommendations/0001.yaml`. |
 | `--set` produces an unknown-field or load-validation error | Paths must be supported, and load fields must match the selected load type. | For the quick-start input, use `--set traffic.load.concurrency=8`. To change load type, replace the whole `traffic.load` mapping. |
