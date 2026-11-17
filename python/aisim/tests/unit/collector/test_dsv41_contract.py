@@ -518,6 +518,24 @@ def test_module_worker_missing_sglang_metadata_fails_before_gpu(monkeypatch, mod
     assert not Path(module_worker_case["perf_filename"]).exists()
 
 
+def test_module_worker_refuses_a_kernel_trace_before_the_native_run(monkeypatch, module_worker_case):
+    """The TP ranks run in processes the native runner spawns, so a trace of the wrapper
+    would report a partial kernel set as the case's path."""
+    from collector import helper
+    from collector.sglang import collect_dsv41_module
+
+    monkeypatch.setattr(metadata, "version", Mock(return_value="0.5.4"))
+    monkeypatch.setenv(helper.TRACE_CHILD_DIR_ENV, str(Path(module_worker_case["perf_filename"]).parent))
+    native_run = Mock()
+    monkeypatch.setattr(collect_dsv41_module.subprocess, "run", native_run)
+
+    with pytest.raises(RuntimeError, match="cannot trace the DSV4.1 native runner"):
+        collect_dsv41_module.run_dsv41_module_worker(**module_worker_case)
+
+    native_run.assert_not_called()
+    assert not Path(module_worker_case["perf_filename"]).exists()
+
+
 def test_registry_provenance_covers_execution_and_geometry_dependencies(tmp_path):
     from collector import provenance
     from collector.op_catalog import family_for_perf_file, load_family_map
