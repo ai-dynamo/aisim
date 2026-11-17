@@ -11,6 +11,7 @@
 # from vLLM (Apache-2.0), copyright contributors to the vLLM project:
 # https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/models/mistral3.py
 
+import contextvars
 import http.client
 import importlib.resources as pkg_resources
 import json
@@ -536,8 +537,9 @@ def _cached_after_network_failure(
 def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main") -> dict | None:
     """Load a JSON file from a Hugging Face model repo; see :func:`_download_hf_json_at`."""
     data, commit = _download_hf_json_at(hf_id, filename, raise_on_404=raise_on_404, revision=revision)
-    if commit is not None:
-        _CACHE_SNAPSHOT_COMMIT[(hf_id, filename)] = commit
+    capture = _SNAPSHOT_CAPTURE.get()
+    if capture is not None and commit is not None:
+        capture[(hf_id, filename)] = commit
     return data
 
 
@@ -600,10 +602,20 @@ def _download_hf_json_at(
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 
 
-# Snapshot commit of the last file served from the local cache, and of the last
-# config.json per model, so the loader can read companion files from the same commit.
-_CACHE_SNAPSHOT_COMMIT: dict[tuple[str, str], str] = {}
-_CONFIG_SNAPSHOT_COMMIT: dict[str, str] = {}
+# Snapshot provenance for cache-served files. A capture is scoped to one loader
+# call through a context variable, so concurrent loads cannot see each other's
+# commits. The loaded raw config keeps its commit in _CONFIG_PROVENANCE, keyed by
+# the identity of the cached dict (held, so the id cannot be reused).
+_SNAPSHOT_CAPTURE: contextvars.ContextVar[dict[tuple[str, str], str] | None] = contextvars.ContextVar(
+    "aisim_hf_snapshot_capture", default=None
+)
+_CONFIG_PROVENANCE: dict[int, tuple[dict, str]] = {}
+
+
+def _config_snapshot_commit(raw_config: dict) -> str | None:
+    """The cache snapshot commit a loaded raw config came from, or None."""
+    entry = _CONFIG_PROVENANCE.get(id(raw_config))
+    return entry[1] if entry is not None and entry[0] is raw_config else None
 
 
 def _download_hf_config(hf_id: str) -> dict:
@@ -619,13 +631,7 @@ def _download_hf_config(hf_id: str) -> dict:
     Raises:
         HuggingFaceDownloadError: If the HuggingFace API returns an error
     """
-    _CACHE_SNAPSHOT_COMMIT.pop((hf_id, "config.json"), None)
-    config = _download_hf_json(hf_id, "config.json", raise_on_404=True) or {}
-    if commit := _CACHE_SNAPSHOT_COMMIT.pop((hf_id, "config.json"), None):
-        _CONFIG_SNAPSHOT_COMMIT[hf_id] = commit
-    else:
-        _CONFIG_SNAPSHOT_COMMIT.pop(hf_id, None)
-    return config
+    return _download_hf_json(hf_id, "config.json", raise_on_404=True) or {}
 
 
 def _parse_nemotron_block_configs(block_configs: list[dict]) -> list[BlockConfig]:
@@ -2149,18 +2155,26 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
 
-    _CONFIG_SNAPSHOT_COMMIT.pop(model_path, None)
-    raw_config = _download_hf_config(model_path)
+    capture: dict[tuple[str, str], str] = {}
+    token = _SNAPSHOT_CAPTURE.set(capture)
+    try:
+        raw_config = _download_hf_config(model_path)
+    finally:
+        _SNAPSHOT_CAPTURE.reset(token)
     # A config served from the cache pins its companions to the same snapshot, so a
     # transient failure cannot pair cached dimensions with newer remote metadata.
-    pinned = {"revision": commit} if (commit := _CONFIG_SNAPSHOT_COMMIT.pop(model_path, None)) else {}
+    commit = capture.get((model_path, "config.json"))
+    pinned = {"revision": commit} if commit else {}
     config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
     try:
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
     except Exception as exc:  # best-effort for optional quant config
         logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
         hf_quant_config = None
-    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+    loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+    if commit:
+        _CONFIG_PROVENANCE[id(loaded)] = (loaded, commit)
+    return loaded
 
 
 @cache
@@ -2193,7 +2207,8 @@ def get_model_config_from_model_path(model_path: str) -> dict:
                 path = Path(model_path) / filename
                 data = _load_json_with_infinity(path) if path.is_file() else None
             else:
-                data = _download_hf_json(model_path, filename, raise_on_404=False)
+                pinned = {"revision": commit} if (commit := _config_snapshot_commit(raw_config)) else {}
+                data = _download_hf_json(model_path, filename, raise_on_404=False, **pinned)
             if data is not None:
                 if not isinstance(data, dict):
                     family = "Kimi" if kimi else "Qwen3-VL"

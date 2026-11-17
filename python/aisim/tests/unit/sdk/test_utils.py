@@ -263,6 +263,61 @@ def test_model_loader_reads_quant_config_at_the_cached_config_commit(monkeypatch
     ]
 
 
+def test_concurrent_loads_keep_their_own_snapshot_pins(monkeypatch):
+    import threading
+
+    barrier = threading.Barrier(2)
+    quant_revisions: dict[str, str] = {}
+    lock = threading.Lock()
+
+    def fake_at(hf_id, filename, *, raise_on_404=True, revision="main"):
+        if filename == "config.json":
+            barrier.wait(timeout=10)  # both loads are mid-flight together
+            commit = "c" * 40 if hf_id == "org/cached" else None
+            return {"architectures": ["LlamaForCausalLM"]}, commit
+        with lock:
+            quant_revisions[hf_id] = revision
+        return None, None
+
+    monkeypatch.setattr(utils, "_download_hf_json_at", fake_at)
+    threads = [
+        threading.Thread(target=utils._load_model_config_from_model_path.__wrapped__, args=(model,))
+        for model in ("org/cached", "org/online")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert quant_revisions == {"org/cached": "c" * 40, "org/online": "main"}
+
+
+def test_processor_files_follow_the_cached_config_commit(monkeypatch):
+    commit = "d" * 40
+    raw = {"architectures": ["Qwen3VLForConditionalGeneration"]}
+    utils._CONFIG_PROVENANCE[id(raw)] = (raw, commit)
+    requested = []
+
+    def companion(model_path, filename, *, raise_on_404=True, revision="main"):
+        requested.append((filename, revision))
+        return None
+
+    class Stop(Exception):
+        pass
+
+    def stop(_raw):
+        raise Stop
+
+    monkeypatch.setattr(utils, "_load_model_config_from_model_path", lambda path: raw)
+    monkeypatch.setattr(utils, "_download_hf_json", companion)
+    monkeypatch.setattr(utils, "_parse_hf_config_json", stop)
+    try:
+        with pytest.raises(Stop):
+            utils.get_model_config_from_model_path.__wrapped__("org/qwen-vl-not-bundled")
+    finally:
+        utils._CONFIG_PROVENANCE.pop(id(raw), None)
+    assert requested == [("preprocessor_config.json", commit)]
+
+
 @pytest.mark.parametrize(
     "settings,expected",
     [
