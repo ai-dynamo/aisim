@@ -110,6 +110,7 @@ areas:
       - tests/test_aic_sync.py
       - tests/test_cloud_agent_install.py
       - tests/test_ci_workflow_contracts.py
+      - tests/test_fast_ci_policy.py
       - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
       - tests/test_pages_site.py
