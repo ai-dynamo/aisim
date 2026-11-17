@@ -1064,7 +1064,8 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_memo: Memo::clock(128),
+            // Per-rank phase pricing meets a new decode KV length on almost every pass.
+            phase_memo: Memo::clock(4096),
             vision,
             iteration,
         })

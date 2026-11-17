@@ -6086,6 +6086,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn repeated_dsv41_stages_share_queries_with_identical_per_op_values() {
+        let mut engine = dsv41_probe_engine(true);
+        // A second bounded layer: "decoder" again under its own name.
+        for ops in [&mut engine.context_ops, &mut engine.generation_ops] {
+            let mut layer = ops[1].clone();
+            layer.set_name("decoder_1".into());
+            ops.push(layer);
+        }
+        engine.context_plan = OpListPlan::new(&engine.context_ops);
+        engine.generation_plan = OpListPlan::new(&engine.generation_ops);
+        for plan in [&engine.context_plan, &engine.generation_plan] {
+            assert!(plan.query_slot(0).is_some());
+            assert_ne!(plan.query_slot(1), plan.query_slot(0), "bounded differs");
+            assert_eq!(plan.query_slot(2), plan.query_slot(1), "layers share");
+        }
+        // Debug builds re-price the lent result; each layer keeps its own name.
+        let (context, generation) = engine
+            .run_static_per_op(&runtime(3, 700, 2), StaticMode::Both, 32)
+            .unwrap();
+        for values in [context, generation] {
+            let names: Vec<_> = values.iter().map(|value| value.0.as_str()).collect();
+            assert_eq!(names, ["encoder", "decoder", "decoder_1"]);
+            assert_eq!(values[2].1.to_bits(), values[1].1.to_bits());
+        }
+    }
+
+    #[test]
     fn dsv41_telemetry_retains_prefill_remainders() {
         let engine = dsv41_probe_engine(false);
         let unit = dsv41_probe_token_ms(&engine);

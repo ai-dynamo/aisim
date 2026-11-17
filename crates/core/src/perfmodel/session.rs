@@ -163,11 +163,12 @@ impl OpListPlan {
     }
 }
 
-/// Pricing key of a GLM-5.3-Flash boundary without its per-layer display
-/// names. These names, including those of generic children, never select
-/// data, so identical layers price identically; debug builds re-price every
-/// shared query to check this ([`QueryMemo::query`]). Other families return
-/// `None` and are always queried.
+/// Pricing key of a GLM-5.3-Flash boundary or a DeepSeek-V4.1 stage without
+/// its per-layer display names. These names, including those of GLM generic
+/// children, never select data, so identical layers price identically; debug
+/// builds re-price every shared query to check this ([`QueryMemo::query`]).
+/// A DeepSeek-V4.1 stage's children carry no layer in their names and keep
+/// them. Other families return `None` and are always queried.
 fn pricing_identity(op: &Op) -> Option<String> {
     if !matches!(
         op,
@@ -176,6 +177,7 @@ fn pricing_identity(op: &Op) -> Option<String> {
             | Op::Glm53Router(_)
             | Op::Glm53Ffn(_)
             | Op::Glm53Primitive(_)
+            | Op::Dsv41Stage(_)
     ) {
         return None;
     }
