@@ -33,11 +33,37 @@ also require a Codex review of the same commit. The risk level changes review
 depth, not merge authority: every tier still requires the applicable CODEOWNER
 approval.
 
-| Risk | Review before Full CI | Human merge gate |
-| --- | --- | --- |
-| Low | Fast CI and CodeRabbit | Applicable CODEOWNER |
-| Medium | Fast CI, CodeRabbit, and Codex | Applicable CODEOWNER |
-| High | Fast CI, CodeRabbit, and Codex | CODEOWNER plus relevant domain, architecture, security, or release owner |
+| Risk | Change impact | Review before Full CI | Human merge gate |
+| --- | --- | --- | --- |
+| Low | Explanatory docs, additive tests, or demonstrated behavior-preserving refactors with no product, dependency, release, or validation-policy change. | Fast CI and CodeRabbit | Applicable CODEOWNER |
+| Medium | Bounded behavior, dependency, review-policy, or CI orchestration changes that do not cross a High-impact boundary. | Fast CI, CodeRabbit, and Codex | Applicable CODEOWNER |
+| High | Material prediction or engine-semantics changes; public/serialized compatibility changes; security or execution-trust boundaries; weakened required validation; release/publication behavior. | Fast CI, CodeRabbit, and Codex | CODEOWNER plus relevant domain, architecture, security, or release owner |
+
+Choose the highest applicable change-impact tier from the actual behavior,
+scope, and rollback consequences, not file names, patch size, or the author's
+label. A small formula or permission change can be High; a comment in the same
+file can be Low. Passing tests and resolving findings increase confidence but
+do not reduce the potential consequence of the change. Explain the classification
+with the affected consumer or boundary.
+
+CodeRabbit's summary should call this **Change impact**. It is our review-routing
+rubric, separate from CodeRabbit's Low/Medium/High **Triage Risk** score and its
+[**Merge Risk**](https://docs.coderabbit.ai/pr-reviews/merge-risk) assessment of
+remaining risk after review. A High-impact change can have Minimal remaining
+Merge Risk after adequate review and validation. Reconcile the Merge Risk
+explanation with applicable inline findings, custom pre-merge warnings, and
+uncovered behavior. The absence of inline comments does not establish absence
+of risk.
+
+Review evidence must identify its commit and source: verified current-head
+checks, author-reported local results, pending work, or unavailable evidence.
+Check accessible runs and linked results before claiming evidence is missing;
+an inaccessible result is unverified, and an older-head result is stale. Full CI
+pending initial-review admission is expected under the sequence below. Missing
+Full CI or CODEOWNER approval remains a readiness condition; neither alone
+proves a code defect. Concrete validation gaps for changed behavior still
+count as technical risk. Bot ratings and warning checks advise reviewers;
+they do not change the CI, CODEOWNER, or human merge gates above.
 
 Fast CI contains quick deterministic checks: source and legal policy, generated
 CODEOWNERS integrity, lint, syntax compilation, whitespace, and Rust formatting.

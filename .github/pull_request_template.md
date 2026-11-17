@@ -15,7 +15,7 @@ State the problem, the behavior change, and the intended consumer.
 Point reviewers to the riskiest files, decisions, and cross-layer contracts.
 -->
 
-- Risk level: <!-- low / medium / high -->
+- Risk level: <!-- low / medium / high; explain using the change-impact rubric in REVIEW.md -->
 - Start with:
 - Public or serialized contract changed: <!-- no / yes: describe -->
 - Feature Support Matrix: <!-- unaffected / updated pages/feature-support-matrix/features.toml and docs/replay/features.md -->
