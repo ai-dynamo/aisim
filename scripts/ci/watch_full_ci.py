@@ -20,6 +20,7 @@ WORKFLOW = ".github/workflows/ci.yml"
 ADVISORY_JOBS = {"Collector Data / Perf data sanity (informational)"}
 BLOCKING_CONCLUSIONS = {"failure", "timed_out"}
 VALIDATION_GATE = "Full CI Success"
+PUBLICATION_JOB_PREFIX = "Stage Application Wheel ("
 
 
 class WatchError(RuntimeError):
@@ -142,6 +143,9 @@ def watch(
             if job["status"] == "completed"
             and job.get("conclusion") in BLOCKING_CONCLUSIONS
             and job["name"] not in ADVISORY_JOBS
+            # Pages can observe different instants around gate completion.
+            # Publication failures are never blocking-validation failures.
+            and not job["name"].startswith(PUBLICATION_JOB_PREFIX)
         ]
         if failures:
             failure = min(failures, key=lambda job: (job["completed_at"], job["id"]))

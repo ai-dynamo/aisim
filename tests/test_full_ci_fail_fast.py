@@ -164,6 +164,21 @@ def test_finished_validation_never_cancels_publication(conclusion):
     assert not server.cancellations
 
 
+@pytest.mark.parametrize("arch", ["amd64", "arm64"])
+def test_publication_failure_never_cancels_when_gate_page_is_stale(arch):
+    server = Server(
+        [
+            [
+                {"jobs": [job(controller.VALIDATION_GATE, None, status="in_progress", id=9)]},
+                {"jobs": [job(f"Stage Application Wheel ({arch})")]},
+            ]
+        ]
+    )
+    with pytest.raises(controller.WatchError, match="timed out"):
+        server.watch(timeout=0)
+    assert not server.cancellations
+
+
 @pytest.mark.parametrize("changes", [{"run_attempt": 3}, {"status": "completed"}])
 @pytest.mark.parametrize("when", ["startup", "before-cancel", "periodic"])
 def test_old_or_finished_attempt_is_never_canceled(changes, when):
@@ -285,6 +300,11 @@ def test_advisory_exceptions_match_the_actual_full_ci_workflow_tree():
 
     visit("ci.yml")
     assert advisory == controller.ADVISORY_JOBS
+    jobs = load_workflow("ci.yml")["jobs"]
+    publication = jobs["stage-application-wheel"]
+    assert publication["name"].startswith(controller.PUBLICATION_JOB_PREFIX)
+    assert "readiness" in publication["needs"]
+    assert "stage-application-wheel" not in jobs["readiness"]["needs"]
 
 
 def test_main_writes_cancellation_summary_without_executing_watched_code(tmp_path, monkeypatch):
