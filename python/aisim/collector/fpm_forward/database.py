@@ -231,6 +231,7 @@ def aggregate_cell(
         cell_dir / "raw",
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
+        expected_backend=plan.backend,
     )
     if collection.execution_mode == "native_graph_policy":
         # Raises on a malformed or contradictory record. A gap that the reader reports, such as prompt hashes that

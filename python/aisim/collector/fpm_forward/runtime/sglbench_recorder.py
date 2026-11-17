@@ -84,6 +84,7 @@ under ``python/sglang`` at both tags::
     srt/managers/scheduler_components/ipc_channels.py  SchedulerIpcChannels.create
     srt/managers/schedule_policy.py      _IS_HIP
     srt/managers/tp_worker.py            TpModelWorker.model_runner, TpModelWorker.get_worker_info
+    srt/model_executor/forward_batch_info.py  ForwardMode (member names)
     srt/model_executor/model_runner.py   ModelRunner.init_cuda_graphs
     srt/model_executor/runner/decode_cuda_graph_runner.py   DecodeCudaGraphRunner.capture_bs
     srt/model_executor/runner/prefill_cuda_graph_runner.py  PrefillCudaGraphRunner.capture_num_tokens
@@ -206,6 +207,49 @@ _CHECK_PRESENCE_NAMES = (
 # Scheduler.init_model_worker sets its default there (max_running_requests // pp_size, at least 1) when the
 # operator gave none. is_hip is the module constant sglang.srt.managers.schedule_policy._IS_HIP.
 _CHECK_NAMES = (*_CHECK_VALUE_NAMES, *_CHECK_PRESENCE_NAMES, "pp_max_micro_batch_size", "is_hip")
+
+# Every SGLang name this module reaches by an import, as an attribute of an imported class or as a field of
+# the batch and result objects SGLang hands it, as far as the name exists before a scheduler is built:
+# (module, name, kind). sglbench_preflight.py imports each module and looks each name up, so an image whose
+# SGLang lacks one is refused before the model is loaded. The kinds: "name" is a module-level name; "class"
+# is a module-level name that must be a class, because ``make_recorder_class`` subclasses it and the hook
+# registry takes a class with ``HookType.REPLACE`` only; "attribute" is ``Owner.attribute``, an attribute of
+# a module-level class; "field" is ``Owner.field``, a field of a module-level dataclass. A field has its own
+# kind because one without a default is no attribute of its class (``ScheduleBatch.reqs``).
+# Each row was read in the source at both tags, in the files the module docstring lists:
+# - ``ScheduleBatch`` is the class of the batch that ``run_batch`` and ``process_batch_result`` get, and
+#   ``GenerationBatchResult`` and ``EmbeddingBatchResult`` are the two classes of the result;
+# - the three ``ForwardMode`` members are names that ``record_batch`` logs as "mode". It tests for ``EXTEND``
+#   itself, and the reader of the log tests for all three (sglbench_driver.py ``MODE_EXTEND``, ``MODE_DECODE``
+#   and ``MODE_IDLE``).
+# Not listed, because only an object of a running scheduler holds them: the attributes that
+# ``Scheduler.__init__`` sets (``_LIMIT_NAMES``, ``_CHECK_VALUE_NAMES``, ``_CHECK_PRESENCE_NAMES``,
+# ``recv_from_tokenizer``, ``enable_overlap``, ``tp_worker`` with its graph runners), the values of
+# ``get_parallel()`` (``_RANK_NAMES``), ``Req.rid`` and ``synchronize`` of the copy event. The header marks a
+# value it cannot read, and a batch that cannot be read gets a fault line.
+SGLANG_SEAM_NAMES = (
+    ("sglang", "__version__", "name"),
+    ("sglang.srt.managers.scheduler", "Scheduler", "class"),
+    ("sglang.srt.managers.scheduler", "Scheduler.run_batch", "attribute"),
+    ("sglang.srt.managers.scheduler", "Scheduler.process_batch_result", "attribute"),
+    ("sglang.srt.managers.scheduler", "run_scheduler_process", "name"),
+    ("sglang.srt.plugins.hook_registry", "HookRegistry.register", "attribute"),
+    ("sglang.srt.plugins.hook_registry", "HookType.REPLACE", "attribute"),
+    ("sglang.srt.runtime_context", "get_parallel", "name"),
+    ("sglang.srt.managers.schedule_policy", "_IS_HIP", "name"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.reqs", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.forward_iter", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.launch_ts", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.forward_mode", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_num_tokens", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.prefix_lens", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_lens", "field"),
+    ("sglang.srt.managers.utils", "GenerationBatchResult.copy_done", "field"),
+    ("sglang.srt.managers.utils", "EmbeddingBatchResult.copy_done", "field"),
+    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.EXTEND", "attribute"),
+    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.DECODE", "attribute"),
+    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.IDLE", "attribute"),
+)
 
 
 # ---------------------------------------------------------------------------------------------------------------

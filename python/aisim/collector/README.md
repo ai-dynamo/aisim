@@ -178,8 +178,11 @@ in [the September 17 campaign](trtllm/gym-profiles-20260917.md).
 
 ## Whole-forward FPM campaign
 
-Use the dedicated `python3 -m collector.fpm_forward` entry point for vLLM
-whole-forward campaigns. The compatibility route
+Use the dedicated `python3 -m collector.fpm_forward` entry point for
+whole-forward campaigns. `--backend` selects the engine: `vllm`, the default of
+this entry point, runs Dynamo's vLLM worker as described here, and `sglang` runs
+SGLang's own engine as described under [SGLang cells](#sglang-cells). The
+compatibility route
 `python3 collector/collect.py --ops fpm_forward` remains supported and must be
 selected alone. Both routes require a resolved model, `--gpu`, and
 `--fpm-max-gpus`. The campaign derives a latency-blind prefill/decode
@@ -293,6 +296,94 @@ plan or checkpoint to bypass the mismatch.
 `run-manifest.json` schema v2 is invocation-scoped: its `attempts` include the
 attempt ID, timestamps, final status, and partial phase timings for failed
 attempts; a no-op resume writes no historical attempts.
+
+### SGLang cells
+
+`--backend sglang`, on either route, collects dense tensor-parallel cells from
+SGLang itself. A cell starts `runtime/sglbench_launcher.py` in an SGLang image,
+with no Dynamo worker and no etcd. The launcher builds SGLang's engine in its
+own process, plans the points from the limits and CUDA graph sizes that engine
+reports, and writes the rank and merged artifacts of the same result schema as
+the vLLM producer. Staging, the in-pod gate, validation and publication are
+therefore the ones described above, and the rows are published with
+`backend: sglang` under the same measurement policy.
+
+```bash
+python3 -m collector.fpm_forward \
+  --backend sglang \
+  --model-path Qwen/Qwen3-0.6B \
+  --gpu h200_sxm \
+  --fpm-max-gpus 2 \
+  --fpm-prefill-cudagraph-policy runtime \
+  --fpm-runtime-backend-version 0.5.23 \
+  --fpm-backend-version 0.5.23 \
+  --generator-set K8sConfig.k8s_image=<SGLang 0.5.23 image> \
+  --fpm-database-root <systems data root> \
+  --plan-only
+```
+
+An SGLang plan must give:
+
+| Option | Why |
+|---|---|
+| `--fpm-runtime-backend-version` | The SGLang release of the image. The launcher accepts `0.5.22` and `0.5.23` (`TESTED_VERSIONS` in `runtime/sglbench_compat.py`), and the pod refuses any other installed release before the engine starts. |
+| `--fpm-backend-version` | The data label: the table directory and the `backend_version` and `aic_database_version` of every row. Without it the plan would take the newest curated SGLang version as its database version (`aic_database_version`) and check precision against that version's operator tables, while `backend_version` and the directory carried the pod's release. |
+| `--fpm-prefill-cudagraph-policy runtime` | The default policy passes a vLLM capture list. SGLang captures its own graph sizes, and the launcher reads them from the engine. |
+| An image | On Kubernetes `K8sConfig.k8s_image`, through `--generator-config` or `--generator-set`: the Generator's default is a Dynamo vLLM image. On Slurm `--fpm-slurm-container-image`. |
+
+It may not give `--fpm-model-profile`, `--fpm-runtime-instrumentation`,
+`--fpm-runtime-launch`, `--fpm-runtime-configuration`, `--fpm-cudagraph-mode`,
+`--fpm-cudagraph-capture-sizes`, `--fpm-max-cudagraph-capture-size`,
+`--fpm-enforce-eager`, `--fpm-decoder-replay`, or an explicit backend identity
+(`--fpm-moe-backend`, `--fpm-attention-backend`, `--fpm-enable-wideep true`,
+`--fpm-enable-eplb true`). Planning also refuses an MoE model and a model with
+an FPM execution identity (DeepSeek V4.1, GLM-5.3-Flash). Repeatability
+validation and the runtime probe remain vLLM only.
+
+An SGLang cell runs on one node. Planning does not know how many GPUs a node
+holds, so a plan whose `--fpm-max-gpus` exceeds one node is admitted and each
+of its multi-node cells is refused when it is rendered, before a pod is
+scheduled. Such a campaign stays incomplete and publishes only with
+`--fpm-publish-partial`. A cell is refused in the same way when its KV-cache
+dtype is one SGLang does not take (`int8`), or when `K8sConfig.extra_env`
+switches `DYN_BENCH_KV_WARMUP` or `DYN_BENCH_PREFILL_REAL_SEED` off: the
+launcher stages real cached state only.
+
+The resource Pod and the environment of an SGLang cell come from the
+Generator's vLLM FPM render of the same cell. `sglang_fpm_builder.py` asks for
+that render, translates the worker command flag by flag into the launcher's and
+SGLang's flags, and switches the gate to its mode without etcd. A flag without
+a translation refuses the cell. The cell stages every `runtime/sglbench_*.py`
+file, which are the launcher's modules and `sglbench_preflight.py`, in the place
+of `preflight.py`.
+
+`collector-provenance.json` records `runtime.backend` as `sglang` and the
+version of the installed `sglang` distribution as `runtime.backend_version`.
+Validation requires that version to equal the `producer.sglang_version` the
+launcher wrote into every rank artifact. Publication into the packaged data
+tree refuses a data label that has no measured data there, and the tree holds
+none for SGLang 0.5.22 or 0.5.23, so a formal SGLang table labelled with its
+release needs `--fpm-database-root`.
+
+An SGLang table carries four deviation notes. Each lives at the code that the
+item names. The first two are differences from AISim's generated SGLang
+serving deployment:
+
+- Mixed chunk and the decode graph list (`sglang_fpm_builder.py`). The
+  generated serving deployment switches mixed chunk on and passes its own
+  decode graph list. The launcher refuses mixed chunk and the cell passes no
+  graph list, so the table measures SGLang's defaults for both.
+- Context length (`sglang_fpm_builder.py`). `--fpm-max-model-len -1`, the
+  default, means vLLM's auto-fit. For SGLang no context length is passed and the
+  model's own limit applies.
+- Environment (`sglang_fpm_builder.py`). The cell keeps the environment the
+  Generator renders for the hardware, for example `NCCL_CUMEM_ENABLE=1`. The
+  generated serving deployment gets the same variables, so this differs only
+  from a plain SGLang start, where SGLang chooses that variable itself.
+- Releases (`planner.py`, `_require_sglang_launcher_inputs`). The launcher
+  accepts two SGLang releases, and neither is the collector's operator pin
+  (`0.5.21` in `framework_manifest.yaml`). The formal FPM path does not consult
+  that pin for any backend.
 
 ## Failure philosophy: observe, don't predict
 

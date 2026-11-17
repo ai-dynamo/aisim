@@ -49,7 +49,7 @@ from aisim.fpm_contract import (
     fpm_benchmark_result_name,
 )
 
-from .test_fpm_runner import _cell, _plan, _write_provenance
+from .test_fpm_runner import _cell, _plan
 
 pytestmark = pytest.mark.unit
 
@@ -58,6 +58,13 @@ FPM_EXEC = RUNTIME / "fpm_exec.sh"
 
 # Exit statuses of the gate's checker (fpm_exec.sh: pending_status = 10, then 11, invalid() exits 20).
 GATE_ACCEPT, GATE_RANK_PENDING, GATE_MERGED_PENDING, GATE_INVALID = 0, 10, 11, 20
+
+# The SGLang release of the FAKE pod, one of the two the launcher accepts. The collector records the installed
+# release in the provenance file, the launcher writes the release it runs on into the producer block of every
+# rank artifact (sglbench_launcher.py, _start_up_checks), and the validator requires the two to agree for an
+# SGLang cell.
+POD_SGLANG_VERSION = "0.5.23"
+LAUNCHER_PRODUCER = {"sglang_version": POD_SGLANG_VERSION}
 
 FAKE_RUN_ID = "fake-run-1"
 FAKE_GRID_DIGEST = "fake-grid-digest"
@@ -242,6 +249,8 @@ def _build_kwargs(mode: str, points: list[dict], *, dp: int = 1, completed: int 
 
 def _rank_artifacts(mode: str, points: list[dict], *, dp: int = 1, completed: int | None = None, **extra) -> list[dict]:
     kwargs = {**_build_kwargs(mode, points, dp=dp, completed=completed), **extra}
+    # Without a producer block of its own, an artifact carries what the launcher always adds to one.
+    kwargs.setdefault("producer", LAUNCHER_PRODUCER)
     elapsed = kwargs.pop("benchmark_elapsed_seconds")
     kwargs.pop("dp_rank")
     # Ranks may report different elapsed times; the validator allows that.
@@ -251,21 +260,38 @@ def _rank_artifacts(mode: str, points: list[dict], *, dp: int = 1, completed: in
     ]
 
 
-def _pod(root: Path, cell) -> Path:
-    """The collected layout the validator needs: ``<raw>/<pod>/benchmark*.json`` beside a provenance file."""
+def _pod(root: Path, cell, *, sglang_version: str = POD_SGLANG_VERSION) -> Path:
+    """The collected layout the validator needs: ``<raw>/<pod>/benchmark*.json`` beside a provenance file.
+
+    The provenance is the one the collector writes in the pod of an SGLang cell (runner.py,
+    ``_attempt_provenance_command``): backend ``sglang`` and the version of the installed distribution.
+    """
     pod = root / "raw" / "pod-0"
     pod.mkdir(parents=True)
-    # Fixture scaffolding: the helper writes '"backend": "vllm"', the only value the validator accepts
-    # (native_artifact.py, _validate_collector_provenance). It says nothing about which engine produced the
-    # artifact.
-    _write_provenance(pod / "collector-provenance.json", cell_id=cell.cell_id)
+    provenance = {
+        "schema_name": "aic_fpm_collector_provenance",
+        "schema_version": 1,
+        "cell_id": cell.cell_id,
+        "plan_sha256": "plan-sha",
+        "attempt_id": "attempt",
+        "runtime": {"backend": "sglang", "backend_version": sglang_version},
+    }
+    (pod / "collector-provenance.json").write_text(json.dumps(provenance))
     return pod
 
 
 def _validate(cell, root: Path):
+    """The validator as the host calls it for a cell of an SGLang plan."""
     return validate_native_collection(
-        cell, root / "raw", expected_plan_sha256="plan-sha", expected_attempt_id="attempt"
+        cell, root / "raw", expected_plan_sha256="plan-sha", expected_attempt_id="attempt", expected_backend="sglang"
     )
+
+
+def _sglang_plan(cell):
+    """The helper plan of the vLLM runner suite, with the backend of an SGLang collection."""
+    plan = _plan(cell)
+    plan.backend = "sglang"
+    return plan
 
 
 def _result_files(pod: Path) -> list[str]:
@@ -459,7 +485,9 @@ def test_measured_time_is_the_sum_of_group_times_and_may_equal_elapsed(tmp_path)
     cell = _cell(phase="decode", dp=2, strategy="tp")
     pod = _pod(tmp_path, cell)
     payloads = [
-        artifact.build_rank_artifact(**{**kwargs, "dp_rank": rank, "benchmark_elapsed_seconds": total})
+        artifact.build_rank_artifact(
+            **{**kwargs, "dp_rank": rank, "benchmark_elapsed_seconds": total}, producer=LAUNCHER_PRODUCER
+        )
         for rank in (0, 1)
     ]
     artifact.write_artifacts(str(pod / "benchmark.json"), payloads)
@@ -789,7 +817,7 @@ def test_decode_rows_are_published_as_real_kv(tmp_path, strategy, dp):
     points = _decode_points()
     artifact.write_artifacts(str(pod / "benchmark.json"), _rank_artifacts("decode", points, dp=dp))
 
-    rows = aggregate_cell(_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
+    rows = aggregate_cell(_sglang_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
 
     assert [row["kv_seed_regime"] for row in rows] == ["real_kv"] * len(points)
     assert [(row["batch_size"], row["total_prefill_tokens"], row["total_kv_read_tokens"]) for row in rows] == [
@@ -808,7 +836,7 @@ def test_prefill_rows_are_published_with_real_prefix_provenance(tmp_path, templa
     pod = _pod(tmp_path, cell)
     points = _prefill_points()
     artifact.write_artifacts(str(pod / "benchmark.json"), _rank_artifacts("prefill", points))
-    plan = _plan(cell)
+    plan = _sglang_plan(cell)
     # The generic template refuses a cached prefill row whose native regime is not "real_prefix".
     plan.capability.template_id = template_id
 
@@ -825,7 +853,11 @@ def test_readiness_reader_accepts_an_artifact_without_measurement_protocol(tmp_p
     cell = _cell(phase=phase, dp=2, strategy="tp")
     pod = _pod(tmp_path, cell)
     payloads = _rank_artifacts(
-        phase, _points(phase), dp=2, config={"content_seed": "0"}, producer={"run_started_at": 111.0}
+        phase,
+        _points(phase),
+        dp=2,
+        config={"content_seed": "0"},
+        producer={**LAUNCHER_PRODUCER, "run_started_at": 111.0},
     )
     artifact.write_artifacts(str(pod / "benchmark.json"), payloads)
     collection = _validate(cell, tmp_path)
@@ -2481,7 +2513,7 @@ def test_an_int_time_placed_alike_in_the_fpm_the_group_and_the_sum_is_refused_by
     else:
         fpm = artifact.build_fpm(point, 0, 1.0)  # FAKE: a batch of exactly one second
     kwargs = {**_build_kwargs(phase, [point]), "measurements": [artifact.build_measurement(point, {0: fpm})]}
-    payload = artifact.build_rank_artifact(**kwargs)
+    payload = artifact.build_rank_artifact(**kwargs, producer=LAUNCHER_PRODUCER)
     assert payload["status"] == "complete"
     assert artifact.build_merged_artifact([payload], ["/results/benchmark.json"])["status"] == "complete"
 

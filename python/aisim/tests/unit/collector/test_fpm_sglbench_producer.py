@@ -43,13 +43,15 @@ Everything that stands in for an engine is FAKE and is named so:
   (``_bench_stop_at_timeout_boundary``).
 
 The two checkers are used as shipped, through the helpers of ``test_fpm_sglbench_artifact.py``. Its ``_pod``
-writes the collected layout with a provenance file that says ``"backend": "vllm"``: fixture scaffolding,
-because the validator accepts no other value (native_artifact.py, ``_validate_collector_provenance``), and no
-statement about which engine produced an artifact.
+writes the collected layout with the provenance file of an SGLang cell (``"backend": "sglang"`` and a tested
+release), and its ``_validate`` calls the validator as the host does for a cell of an SGLang plan. The
+validator then wants the same release in the producer block of every rank artifact, where the launcher writes
+it; here the simulated driver writes it in the launcher's place.
 """
 
 from __future__ import annotations
 
+import argparse
 import collections
 import dataclasses
 import itertools
@@ -61,11 +63,12 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from collector.fpm_forward.config import _freeze_benchmark_points
+from collector.fpm_forward import planner as fpm_planner
+from collector.fpm_forward.config import FPMCollectionOptions, _freeze_benchmark_points
 from collector.fpm_forward.database import aggregate_cell, write_formal_database
+from collector.fpm_forward.planner import build_collection_plan
 from collector.fpm_forward.runtime import sglbench_artifact as artifact
 from collector.fpm_forward.runtime import sglbench_content as content
 from collector.fpm_forward.runtime import sglbench_grid as grid
@@ -77,8 +80,16 @@ from aisim.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.engine import EngineHandle, _fpm_spec_dict
 from aisim_core.sdk.operations.fpm_forward import _CELL_MATCH_COLUMNS
 
-from .test_fpm_runner import _cell, _plan
-from .test_fpm_sglbench_artifact import GATE_ACCEPT, GATE_INVALID, _gate, _pod, _validate
+from .test_fpm_runner import _cell
+from .test_fpm_sglbench_artifact import (
+    GATE_ACCEPT,
+    GATE_INVALID,
+    POD_SGLANG_VERSION,
+    _gate,
+    _pod,
+    _sglang_plan,
+    _validate,
+)
 from .test_fpm_sglbench_content import PageCacheModel
 from .test_fpm_sglbench_grid import H200_DECODE_GRAPH_ROWS, H200_PAGE_1, H200_PAGE_64, H200_PREFILL_GRAPH_ROWS, _ladder
 
@@ -410,6 +421,8 @@ def _simulate_run(
     producer = {
         "timing_source": "FAKE: typed into test_fpm_sglbench_producer.py, never measured",
         "engine": "FAKE: a page-cache model, no SGLang",
+        # The release of the FAKE pod, which the launcher writes here and the validator compares with the provenance.
+        "sglang_version": POD_SGLANG_VERSION,
         "page_size": page,
         "limits": limits.as_dict(),
         "content": {
@@ -665,7 +678,7 @@ def test_complete_run_passes_the_validator_and_the_gate(tmp_path, phase, page_si
 
     # Publication: one row per planned point (a repeated coordinate would raise), at the planned coordinates,
     # with the slowest rank's FAKE time. Decode rows are published as real KV.
-    rows = aggregate_cell(_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
+    rows = aggregate_cell(_sglang_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
     assert [(row["batch_size"], row["total_prefill_tokens"], row["total_kv_read_tokens"]) for row in rows] == (
         _coordinates(run.built.point_dicts())
     )
@@ -734,7 +747,7 @@ def test_a_capped_run_measures_the_lower_end_that_is_added_after_the_cap(tmp_pat
     written = artifact.write_artifacts(str(pod / "benchmark.json"), run.payloads)
 
     _assert_accepted(tmp_path, cell, run, written)
-    rows = aggregate_cell(_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
+    rows = aggregate_cell(_sglang_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
     assert [(row["batch_size"], row["total_prefill_tokens"], row["total_kv_read_tokens"]) for row in rows] == (
         _coordinates(run.built.point_dicts())
     )
@@ -1138,7 +1151,7 @@ def test_manifest_driven_run_measures_exactly_the_requested_coordinates(tmp_path
 
     _assert_accepted(tmp_path, cell, run, written)
     # Publication covers the requested coordinates exactly: nothing clamped, relabelled or dropped.
-    rows = aggregate_cell(_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
+    rows = aggregate_cell(_sglang_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
     assert [(row["batch_size"], row["total_prefill_tokens"], row["total_kv_read_tokens"]) for row in rows] == requested
 
 
@@ -1210,7 +1223,7 @@ def test_manifest_driven_run_at_page_size_one_stages_a_single_cached_token(tmp_p
     # Both checkers accept. The validator returns each point with its regime: "real_prefix" for the one-token
     # prefix, "real_kv" for a decode point.
     _assert_accepted(tmp_path, cell, run, written)
-    rows = aggregate_cell(_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
+    rows = aggregate_cell(_sglang_plan(cell), cell, tmp_path, expected_attempt_id="attempt")
     assert [(row["batch_size"], row["total_prefill_tokens"], row["total_kv_read_tokens"]) for row in rows] == requested
 
 
@@ -1282,8 +1295,8 @@ def test_agg_run_stages_prefill_before_decode_and_passes_the_gate_in_agg_mode(tm
 # ---------------------------------------------------------------------------------------------------------------
 
 # Where the FAKE table is published and how the reader is asked for it. The system file and the model's packaged
-# config are the reader's own inputs; nothing was measured on that system or model here. The version is a label
-# for the table directory and names no SGLang release.
+# config are the reader's own inputs; nothing was measured on that system or model here. The version is the data
+# label of the plan (--fpm-backend-version): it names the table directory and no SGLang release.
 READER_SYSTEM = "h200_sxm"
 READER_BACKEND = "sglang"
 READER_MODEL = "Qwen/Qwen3-0.6B"
@@ -1291,13 +1304,17 @@ FAKE_READER_VERSION = "fake-sglbench-reader-test"
 
 
 @pytest.mark.parametrize("h200", [H200_PAGE_1, H200_PAGE_64], ids=["page-1", "page-64"])
-def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_reader(tmp_path, h200):
+def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_reader(tmp_path, monkeypatch, h200):
     """Plan the default grid, write it with FAKE times, publish it with AISim's own Python path, and read it back.
 
     The path is ``aggregate_cell`` and ``write_formal_database`` (collector/fpm_forward/database.py), then
     ``PerfDatabase`` and ``EngineHandle.for_database``, loaded as tests/unit/sdk/test_fpm_forward.py loads them.
     This is the one test that fails when an axis rule plans a table the reader cannot serve. It says nothing
     about how close an interpolated answer is to an engine: the FAKE times have no shape.
+
+    The plan and its cells come from ``build_collection_plan`` with backend ``sglang``, so the rows carry the
+    identity a formal SGLang collection of this model gets on the host. The reader's operators are built on
+    their own from the same model, and the test fails when the two identities differ.
     """
     # H200_PAGE_1 and H200_PAGE_64 hold the six limits in the recorder headers of two runs of the engine probe,
     # benchmarks/evidence/collector/sglbench-engine-probe-20261113 (headers of v0522-q06-p1 and v0522-q06-p64):
@@ -1315,7 +1332,28 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
     systems_root = tmp_path / "systems"
     systems_root.mkdir()
     shutil.copy(Path(aisim_core.__file__).parent / "systems" / f"{READER_SYSTEM}.yaml", systems_root)
-    # The reader matches a table row on the identity of the model's own op, so the cells are given that identity.
+    # The plan of a formal SGLang collection of the model on one GPU: one TP 1 cell per phase. The runtime
+    # version is the release of the FAKE pod, which publication compares with the provenance file of _pod.
+    monkeypatch.setattr(fpm_planner, "_git_revision", lambda: "test-revision")  # plan without a git checkout
+    plan = build_collection_plan(
+        backend=READER_BACKEND,
+        model_path=READER_MODEL,
+        system=READER_SYSTEM,
+        selected_ops={"attention_context", "attention_generation"},
+        has_model_cases=False,
+        options=FPMCollectionOptions.from_args(
+            argparse.Namespace(fpm_max_gpus=1, fpm_prefill_cudagraph_policy="runtime")
+        ),
+        collector_config={"runtime_backend_version": POD_SGLANG_VERSION, "aic_database_version": FAKE_READER_VERSION},
+    )
+    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.tp) for cell in plan.cells] == [
+        ("prefill", "single", 1),
+        ("decode", "single", 1),
+    ]
+    # "plan-sha" is the plan hash in the provenance file of _pod.
+    plan = dataclasses.replace(plan, sha256="plan-sha")
+    cells = {cell.workload_kind: cell for cell in plan.cells}
+    # The reader's own operators for the same model, built without the plan.
     model_config = sdk_config.ModelConfig(
         tp_size=1,
         pp_size=1,
@@ -1325,34 +1363,7 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
     )
     model = models.get_model(READER_MODEL, model_config, READER_BACKEND)
     reader_ops = {"prefill": model.context_ops[0], "decode": model.generation_ops[0]}
-    identity = dict(zip(_CELL_MATCH_COLUMNS, reader_ops["prefill"]._match_identity, strict=True))
-    cells = {
-        phase: dataclasses.replace(
-            _cell(phase=phase, dp=1, strategy="single"),
-            weight_quantization=identity["gemm_quant_mode"],
-            kv_cache_dtype=identity["kv_cache_dtype"],
-            gemm_quant_mode=identity["gemm_quant_mode"],
-            moe_quant_mode=identity["moe_quant_mode"],
-            fmha_quant_mode=identity["fmha_quant_mode"],
-            comm_quant_mode=identity["comm_quant_mode"],
-        )
-        for phase in PHASES
-    }
-    # Only what aggregate_cell and write_formal_database read from a collection plan. "plan-sha" is what the
-    # provenance file of _pod says; the version labels the rows instead of that file's fixture value.
-    plan = SimpleNamespace(
-        sha256="plan-sha",
-        model_path=model.model_path,
-        system=READER_SYSTEM,
-        backend=READER_BACKEND,
-        backend_version=FAKE_READER_VERSION,
-        cells=tuple(cells.values()),
-        options=SimpleNamespace(warmup_iterations=0),
-        capability=SimpleNamespace(
-            support_level="native", template_id=None, template_version=None, aic_database_version="test"
-        ),
-        aic_revision="test-revision",
-    )
+    assert model.model_path == plan.model_path
 
     # Plan each phase, write its rank artifact with FAKE times, and collect the rows AISim publishes for it.
     grids = {}
@@ -1389,10 +1400,19 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
             measurements=measurements,
             benchmark_elapsed_seconds=fake_elapsed,
             config={"points_source": built.source},
-            producer={"timing_source": "FAKE: typed into test_fpm_sglbench_producer.py, never measured"},
+            producer={
+                "timing_source": "FAKE: typed into test_fpm_sglbench_producer.py, never measured",
+                "sglang_version": POD_SGLANG_VERSION,
+            },
         )
         artifact.write_artifacts(str(pod / "benchmark.json"), [payload])
         cell_rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+        # Every row carries the cell identity the reader's operator of this phase asks for, column by column.
+        published_identity = {
+            tuple("" if row[column] is None else str(row[column]) for column in _CELL_MATCH_COLUMNS)
+            for row in cell_rows
+        }
+        assert published_identity == {reader_ops[phase]._match_identity}
         # One row per planned point, in order, each with its own FAKE time: no two rows of a phase are equal.
         published = [row["latency_ms"] for row in cell_rows]
         assert published == [fake_ms[phase, point.benchmark_id] for point in built.points]
@@ -1476,7 +1496,7 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
 # ---------------------------------------------------------------------------------------------------------------
 
 # Runs with "-I -S": no environment, no site-packages, no AISim. argv: runtime directory, limits record as
-# JSON, mode, output path. Its time values are FAKE.
+# JSON, mode, output path, and the SGLang release the launcher would write. Its time values are FAKE.
 _POD_SCRIPT = """
 import json
 import sys
@@ -1538,7 +1558,12 @@ payload = artifact.build_rank_artifact(
     expected_points=len(built.points),
     measurements=measurements,
     benchmark_elapsed_seconds=fake_elapsed_seconds,
-    producer={"timing_source": "FAKE", "limits": limits.as_dict(), "content": plan.stats()},
+    producer={
+        "timing_source": "FAKE",
+        "sglang_version": sys.argv[5],
+        "limits": limits.as_dict(),
+        "content": plan.stats(),
+    },
 )
 written = artifact.write_artifacts(sys.argv[4], [payload])
 print(json.dumps({"digest": built.digest, "points": len(built.points), "written": written}))
@@ -1553,8 +1578,9 @@ def test_pod_imports_all_three_modules_with_the_standard_library_only_and_its_fi
     pod = _pod(tmp_path, cell)
     output_path = str(pod / "benchmark.json")
 
+    argv = [str(RUNTIME), json.dumps(limits.as_dict()), phase, output_path, POD_SGLANG_VERSION]
     done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", _POD_SCRIPT, str(RUNTIME), json.dumps(limits.as_dict()), phase, output_path],
+        [sys.executable, "-I", "-S", "-c", _POD_SCRIPT, *argv],
         capture_output=True,
         text=True,
         timeout=120,

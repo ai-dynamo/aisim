@@ -45,6 +45,13 @@ from pathlib import Path
 
 import pytest
 
+from .test_fpm_sglbench_preflight import (
+    seam_rows_missing_for,
+    seam_rows_not_in_source,
+    sglang_names_reached_by_import,
+    sglang_source_roots,
+)
+
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 MODULE_PATH = RUNTIME / "sglbench_recorder.py"
 TEST_PATH = Path(__file__).resolve()
@@ -754,6 +761,88 @@ def test_module_source_imports_sglang_only_inside_functions_and_reads_one_variab
         assert call.keywords == []
     assert "getenv" not in source
     assert "environ[" not in source
+
+
+# The two releases the module was read against; its header names their commits.
+SEAM_VERSIONS = ("0.5.22", "0.5.23")
+
+# The seam rows, typed here on their own, so that a change of the list has to be made in two places.
+SEAM_NAMES = (
+    ("sglang", "__version__", "name"),
+    ("sglang.srt.managers.scheduler", "Scheduler", "class"),
+    ("sglang.srt.managers.scheduler", "Scheduler.run_batch", "attribute"),
+    ("sglang.srt.managers.scheduler", "Scheduler.process_batch_result", "attribute"),
+    ("sglang.srt.managers.scheduler", "run_scheduler_process", "name"),
+    ("sglang.srt.plugins.hook_registry", "HookRegistry.register", "attribute"),
+    ("sglang.srt.plugins.hook_registry", "HookType.REPLACE", "attribute"),
+    ("sglang.srt.runtime_context", "get_parallel", "name"),
+    ("sglang.srt.managers.schedule_policy", "_IS_HIP", "name"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.reqs", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.forward_iter", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.launch_ts", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.forward_mode", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_num_tokens", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.prefix_lens", "field"),
+    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_lens", "field"),
+    ("sglang.srt.managers.utils", "GenerationBatchResult.copy_done", "field"),
+    ("sglang.srt.managers.utils", "EmbeddingBatchResult.copy_done", "field"),
+    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.EXTEND", "attribute"),
+    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.DECODE", "attribute"),
+    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.IDLE", "attribute"),
+)
+
+
+def _seam_members(owner):
+    return [name.partition(".")[2] for _module, name, _kind in SEAM_NAMES if name.startswith(owner + ".")]
+
+
+def test_seam_names_are_the_typed_rows_and_name_everything_the_module_takes_from_sglang():
+    import sglbench_driver as driver  # the reader of the log, for its three mode names
+
+    assert recorder.SGLANG_SEAM_NAMES == SEAM_NAMES
+    assert len(set(SEAM_NAMES)) == len(SEAM_NAMES)
+    reached = sglang_names_reached_by_import(ast.parse(MODULE_PATH.read_text(encoding="utf-8")))
+    assert reached == {
+        ("sglang", None),
+        ("sglang", "__version__"),
+        ("sglang.srt.managers.scheduler", None),
+        ("sglang.srt.managers.scheduler", "Scheduler"),
+        ("sglang.srt.managers.scheduler", "run_scheduler_process"),
+        ("sglang.srt.plugins.hook_registry", "HookRegistry"),
+        ("sglang.srt.plugins.hook_registry", "HookRegistry.register"),
+        ("sglang.srt.plugins.hook_registry", "HookType"),
+        ("sglang.srt.plugins.hook_registry", "HookType.REPLACE"),
+        ("sglang.srt.runtime_context", "get_parallel"),
+        ("sglang.srt.managers.schedule_policy", "_IS_HIP"),
+    }
+    # An import or a read that gets no row is noticed here, so the list cannot fall behind the code.
+    assert seam_rows_missing_for(reached, SEAM_NAMES) == []
+    assert seam_rows_missing_for(reached, SEAM_NAMES[:6] + SEAM_NAMES[7:]) == [
+        ("sglang.srt.plugins.hook_registry", "HookType"),
+        ("sglang.srt.plugins.hook_registry", "HookType.REPLACE"),
+    ]
+    # The class row is the hook target, and its two methods are the ones the subclass wraps.
+    assert (*recorder.TARGET.rpartition(".")[::2], "class") in SEAM_NAMES
+    assert _seam_members("Scheduler") == ["run_batch", "process_batch_result"]
+    # What no import shows: the fields read from the batch and the result, and the mode names that are logged.
+    # The FAKE batch of this file has exactly the fields the recorder reads, and a recorder that read one
+    # more would fail the batch tests until the FAKE had it.
+    assert sorted(_seam_members("ScheduleBatch")) == sorted(field.name for field in dataclasses.fields(FakeBatch))
+    assert _seam_members("GenerationBatchResult") == _seam_members("EmbeddingBatchResult") == ["copy_done"]
+    assert hasattr(FakeResult(None), "copy_done")
+    assert _seam_members("ForwardMode") == [driver.MODE_EXTEND, driver.MODE_DECODE, driver.MODE_IDLE]
+    assert set(_seam_members("ForwardMode")) <= set(FakeForwardMode.__members__)
+
+
+def test_every_seam_name_is_in_the_sglang_source_at_both_tags():
+    # Skipped where no SGLang source is at hand. With it, each row is looked up in the parsed files of both
+    # releases; nothing is imported.
+    for version, python_root in sglang_source_roots(SEAM_VERSIONS).items():
+        assert seam_rows_not_in_source(SEAM_NAMES, python_root) == [], version
+        # The look-up notices a field the source does not have, and a field is not found as an attribute.
+        module = "sglang.srt.managers.schedule_batch"
+        assert seam_rows_not_in_source(((module, "ScheduleBatch.no_such_field", "field"),), python_root)
+        assert seam_rows_not_in_source(((module, "ScheduleBatch.reqs", "attribute"),), python_root)
 
 
 def test_module_file_has_the_required_header_and_plain_ascii_lines():

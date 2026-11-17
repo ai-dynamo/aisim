@@ -98,6 +98,41 @@ import inspect
 # source can report another string; the caller then refuses it.
 TESTED_VERSIONS = ("0.5.22", "0.5.23")
 
+# Every SGLang name this module reaches by an import or as an attribute of an imported class, as far as the
+# name exists before an engine is built: (module, name, kind). sglbench_preflight.py imports each module and
+# looks each name up, so an image whose SGLang lacks one is refused before the model is loaded. The kinds:
+# "name" is a module-level name; "class" is a module-level name that must be a class, because ``build_engine``
+# subclasses it; "attribute" is ``Owner.attribute``, an attribute of a module-level class.
+# Each row was read in the source at both tags, in the files the module docstring lists. Two notes on them:
+# - ``ServerArgs`` is a class statement with the two methods, and the module then rebinds the name to
+#   ``msgspec.defstruct(...)`` built with the namespace of that class (srt/server_args.py), so both methods
+#   are attributes of the class whose records ``prepare_server_args`` returns;
+# - ``async_generate``, ``get_all_child_pids`` and ``shutdown`` are called on the engine object and are
+#   methods of ``Engine`` itself.
+# Not listed, because no class holds them:
+# - ``is_cuda`` and ``is_hip`` of ``get_platform()``. ``PlatformContext.__getattr__`` answers both from a
+#   table of probes (srt/runtime_context.py), and reading ``is_cuda`` calls ``torch.cuda.is_available()``
+#   (srt/utils/common.py), which asks the device;
+# - what an engine and a model config set on themselves while they are built (``loop``,
+#   ``tokenizer_manager``, ``hf_config``, ``hf_text_config``, ``vocab_size``), the tokenizer's attributes, the
+#   request fields ``generate_batch`` sets and the chunk fields it reads. A change of one of these shows at
+#   the call that uses it.
+SGLANG_SEAM_NAMES = (
+    ("sglang", "__version__", "name"),
+    ("sglang.srt.plugins", "load_plugins", "name"),
+    ("sglang.srt.server_args", "prepare_server_args", "name"),
+    ("sglang.srt.server_args", "ServerArgs.resolve_once", "attribute"),
+    ("sglang.srt.server_args", "ServerArgs.resolved_dict", "attribute"),
+    ("sglang.srt.arg_groups.overrides", "resolving_view", "name"),
+    ("sglang.srt.runtime_context", "get_platform", "name"),
+    ("sglang.srt.configs.model_config", "ModelConfig.from_server_args", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine", "class"),
+    ("sglang.srt.entrypoints.engine", "Engine.run_scheduler_process_func", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine.async_generate", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine.get_all_child_pids", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine.shutdown", "attribute"),
+)
+
 # Config attributes that say a model has expert layers. A truthy value of any of them on the top config or on
 # the text config counts. Where SGLang reads them, at both tags:
 # - ``num_local_experts``, ``num_experts``, ``n_routed_experts``, ``num_experts_per_tok`` and

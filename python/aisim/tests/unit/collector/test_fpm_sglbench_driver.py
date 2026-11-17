@@ -46,7 +46,7 @@ from pathlib import Path
 import pytest
 
 from .test_fpm_runner import _cell
-from .test_fpm_sglbench_artifact import GATE_ACCEPT, GATE_INVALID, _gate, _pod, _validate
+from .test_fpm_sglbench_artifact import GATE_ACCEPT, GATE_INVALID, POD_SGLANG_VERSION, _gate, _pod, _validate
 from .test_fpm_sglbench_content import PageCacheModel
 
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
@@ -95,6 +95,8 @@ FAKE_CONFIG = {"warmup_iterations": 5, "timeout": 10_800, "points_source": "gene
 FAKE_PRODUCER = {
     "timing_source": "FAKE: typed into test_fpm_sglbench_driver.py, never measured",
     "engine": "FAKE: a page-cache model and hand-written recorder lines, no SGLang",
+    # The release the launcher checked. The validator compares it with the provenance file of the pod.
+    "sglang_version": POD_SGLANG_VERSION,
 }
 
 # Few values on every axis: most tests need a run, not a dense grid.

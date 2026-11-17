@@ -1536,7 +1536,11 @@ class BenchmarkRun:
         return 0 if self._grid is None else len(self._grid.points)
 
     def _own_producer_facts(self) -> dict:
-        """What the driver knows about the run, for the ``producer`` block. No AISim reader parses the block."""
+        """What the driver knows about the run, for the ``producer`` block. No AISim reader parses these keys.
+
+        The one key of the block with a reader is the launcher's ``sglang_version``: the host validator compares
+        it with the pod's provenance file (native_artifact.py, ``validate_native_collection``).
+        """
         limits, plan = self._limits, self._plan
         return {
             "timing_metric": "scheduler_wall_time",

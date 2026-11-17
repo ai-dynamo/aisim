@@ -41,6 +41,7 @@ from .config import (
 from .glm53flash_points import GLM_ARCHITECTURE, GLM_POINTS_ORIGIN, glm_plan_manifest
 from .memory_admission import TopologyMemoryDecision, filter_memory_infeasible_topologies
 from .runtime.fpm_memory_observer import MEMORY_SUPPORTED_VERSIONS, audited_release
+from .runtime.sglbench_compat import TESTED_VERSIONS as SGLANG_TESTED_VERSIONS
 from .topology import enumerate_fpm_topologies, topology_strategy
 from .types import ParallelTopology
 
@@ -614,7 +615,11 @@ class FPMCollectionPlan:
             "capability": self.capability.to_dict(),
             "dtype_profile": self.dtype_profile.to_dict(),
             "point_generation": {
-                "owner": "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler",
+                "owner": (
+                    "collector.fpm_forward.runtime.sglbench_launcher"
+                    if self.backend == "sglang"
+                    else "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler"
+                ),
                 "method": "native_self_benchmark",
                 "source": (
                     "generated_glm53flash_grid"
@@ -630,8 +635,12 @@ class FPMCollectionPlan:
                     "total_kv_read_tokens",
                 ],
                 "partition_policy": "balanced_v1",
-                "point_admission": "dynamo_live_scheduler",
-                "precondition": "vllm_engine_initialized",
+                # An SGLang cell has no Dynamo scheduler: the launcher's grid admits a point by its feasibility
+                # rules over the limits the engine reports (runtime/sglbench_grid.py).
+                "point_admission": (
+                    "sglbench_feasibility_rules" if self.backend == "sglang" else "dynamo_live_scheduler"
+                ),
+                "precondition": "sglang_engine_initialized" if self.backend == "sglang" else "vllm_engine_initialized",
                 "prefill_sampling": prefill_sampling,
                 "planned_point_count": (
                     sum(len(explicit_points.get(phase, [])) for phase in ("prefill", "decode"))
@@ -734,6 +743,114 @@ def _require_real_prefix_seeding(
             )
 
 
+def _require_sglang_launcher_inputs(
+    *,
+    options: FPMCollectionOptions,
+    collector_config: dict[str, Any],
+    fpm_profile: object,
+    runtime_instrumentation: object,
+    runtime_launch: object,
+    runtime_configuration: str,
+) -> None:
+    """Refuse the inputs an SGLang plan must give and may not give, before anything is resolved.
+
+    An SGLang cell starts ``runtime/sglbench_launcher.py`` in an SGLang image with no Dynamo worker. Whatever
+    only Dynamo's vLLM worker implements is refused here by its option, not later in the pod.
+    """
+    tested = ", ".join(SGLANG_TESTED_VERSIONS)
+    # Deviation note (two SGLang releases, neither of them the operator pin).
+    # What differs: the collector pins one release per backend and op (framework_manifest.yaml; 0.5.21 for the
+    # SGLang operators). The launcher accepts the two releases of sglbench_compat.TESTED_VERSIONS, and the
+    # formal FPM path consults that manifest for no backend. A plan therefore names its one release here: the
+    # release is part of the plan hash, and the pod refuses another installed version before the engine starts
+    # (runner.py, _attempt_provenance_command), on every system.
+    # Direction of the error: none in a table, whose rows carry the release that ran. The operator tables of
+    # the same system describe another SGLang release.
+    # How to retire it: test the launcher at the operator pin, or move that pin to a release it accepts.
+    runtime_version = collector_config.get("runtime_backend_version")
+    if runtime_version is None:
+        raise ValueError(
+            f"SGLang FPM collection requires --fpm-runtime-backend-version, the SGLang release of the image ({tested})"
+        )
+    if runtime_version not in SGLANG_TESTED_VERSIONS:
+        raise ValueError(
+            f"--fpm-runtime-backend-version {runtime_version!r} is not an SGLang release the launcher was tested "
+            f"with ({tested})"
+        )
+    if collector_config.get("aic_database_version") is None:
+        # Without the label the plan takes the newest curated SGLang version as its database version
+        # (capability.aic_database_version, which is in the plan hash and in every published row) and checks
+        # precision against that version's operator tables. The rows and the table directory would still carry
+        # the release the pod reports. With the label, precision comes from the checkpoint and one name stands in
+        # the plan, the rows and the directory.
+        raise ValueError(
+            "SGLang FPM collection requires --fpm-backend-version: without it the plan's database version would "
+            "be the newest curated SGLang version, and precision would be checked against that version's operator "
+            "tables instead of the checkpoint"
+        )
+    if fpm_profile is not None:
+        raise ValueError(
+            "--fpm-model-profile is not supported with --backend sglang: an FPM profile describes vLLM deployments"
+        )
+    for flag, given in (
+        ("--fpm-runtime-instrumentation", runtime_instrumentation is not None),
+        ("--fpm-runtime-launch", runtime_launch is not None),
+        ("--fpm-runtime-configuration", runtime_configuration != "collection"),
+    ):
+        if given:
+            raise ValueError(f"{flag} is not supported with --backend sglang: runtime observation is vLLM only")
+    if options.prefill_cudagraph_policy != "runtime":
+        raise ValueError(
+            "SGLang FPM collection requires --fpm-prefill-cudagraph-policy runtime: an explicit capture list is a "
+            "vLLM list, and SGLang captures its own sizes, which the launcher reads from the engine"
+        )
+    for flag, given in (
+        ("--fpm-cudagraph-mode", options.cudagraph_mode is not None),
+        ("--fpm-cudagraph-capture-sizes", options.cudagraph_capture_sizes is not None),
+        ("--fpm-max-cudagraph-capture-size", options.max_cudagraph_capture_size is not None),
+        ("--fpm-enforce-eager", options.enforce_eager),
+        ("--fpm-decoder-replay", options.decoder_replay),
+    ):
+        if given:
+            raise ValueError(f"{flag} is a vLLM engine setting and is not supported with --backend sglang")
+    if options.compilation_config:
+        raise ValueError(
+            "SGLang FPM collection cannot pass a vLLM compilation config "
+            f"({sorted(options.compilation_config)}); the cell builder has no SGLang flag for it"
+        )
+    # --fpm-max-model-len -1, vLLM's auto-fit and the default, is allowed: the cell builder then passes no
+    # --context-length and the model's own limit applies.
+
+
+def _require_sglang_launcher_cells(
+    *, is_moe: bool, execution: tuple[str, ...], topologies: tuple[ParallelTopology, ...]
+) -> None:
+    """Refuse every cell the SGLang launcher cannot measure: it runs a dense model under tensor parallelism.
+
+    Each cell of a plan gets ``execution``, one of ``topologies`` and the strategy of that topology, so these
+    arguments cover the cells before any is built.
+    """
+    if is_moe:
+        # sglbench_launcher.py refuses a model with expert layers: its prompts are seeded token ids, and expert
+        # routing depends on the content. This also refuses the strategies tep, dep and pure_tp.
+        raise ValueError("SGLang FPM collection does not support MoE models yet; only dense TP cells are collected")
+    if execution != LEGACY_EXECUTION_IDENTITY:
+        # The launcher's artifact carries no execution_mode, which validate_native_collection demands of a cell
+        # with an execution identity (DeepSeek V4.1 and GLM-5.3-Flash).
+        raise ValueError(
+            "SGLang FPM collection does not support a model with an FPM execution identity "
+            f"({dict(zip(EXECUTION_COLUMNS, execution, strict=True))})"
+        )
+    for topology in topologies:
+        # What is left is the TP preset of a dense model: strategy "tp", or "single" for its one-GPU cell
+        # (topology.py, topology_strategy).
+        if any(getattr(topology, axis) != 1 for axis in PARALLEL_AXES if axis != "tp"):
+            raise ValueError(
+                "SGLang FPM collection supports tensor-parallel cells only (pp, dp, cp and the MoE sizes must be "
+                f"1); got topology {topology.to_dict()}"
+            )
+
+
 def build_collection_plan(
     *,
     backend: str,
@@ -751,9 +868,18 @@ def build_collection_plan(
     runtime_launch: dict[str, Any] | None = None,
     runtime_configuration: str = "collection",
 ) -> FPMCollectionPlan:
-    if backend != "vllm":
-        raise ValueError("FPM Generator V1 currently supports only backend=vllm")
+    if backend not in ("vllm", "sglang"):
+        raise ValueError(f"FPM collection supports only backend=vllm and backend=sglang, got {backend!r}")
     collector_config = dict(collector_config or {})
+    if backend == "sglang":
+        _require_sglang_launcher_inputs(
+            options=options,
+            collector_config=collector_config,
+            fpm_profile=fpm_profile,
+            runtime_instrumentation=runtime_instrumentation,
+            runtime_launch=runtime_launch,
+            runtime_configuration=runtime_configuration,
+        )
     runtime_backend_version = collector_config.get("runtime_backend_version")
     if runtime_backend_version is None and runtime_launch is not None:
         runtime_backend_version = runtime_launch.get("identity", {}).get("runtime_framework_version")
@@ -840,6 +966,8 @@ def build_collection_plan(
         options=options,
         allow_pure_tp=capability.allow_pure_tp,
     )
+    if backend == "sglang":
+        _require_sglang_launcher_cells(is_moe=capability.is_moe, execution=execution, topologies=candidate_topologies)
     policies = _backend_policies(options, collector_config, backend=backend)
     if profile is not None:
         deployments = _validate_profile_identities(

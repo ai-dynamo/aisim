@@ -42,6 +42,13 @@ from pathlib import Path
 
 import pytest
 
+from .test_fpm_sglbench_preflight import (
+    seam_rows_missing_for,
+    seam_rows_not_in_source,
+    sglang_names_reached_by_import,
+    sglang_source_roots,
+)
+
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 # The pod holds the runtime files flat in one directory and imports them by their plain names. The directory
 # goes to the END of the path so that it shadows nothing.
@@ -1424,6 +1431,64 @@ def test_module_imports_the_sglang_names_from_the_modules_that_hold_them_at_both
         ("sglang.srt.configs.model_config", "ModelConfig"),
         ("sglang.srt.entrypoints.engine", "Engine"),
     }
+
+
+# The seam rows, typed here on their own, so that a change of the list has to be made in two places. The
+# rows of kind "name" and "class" and ``ModelConfig.from_server_args`` come from the imports of the test
+# above; the others are methods the accessors call on a record or an engine that SGLang built.
+SEAM_NAMES = (
+    ("sglang", "__version__", "name"),
+    ("sglang.srt.plugins", "load_plugins", "name"),
+    ("sglang.srt.server_args", "prepare_server_args", "name"),
+    ("sglang.srt.server_args", "ServerArgs.resolve_once", "attribute"),
+    ("sglang.srt.server_args", "ServerArgs.resolved_dict", "attribute"),
+    ("sglang.srt.arg_groups.overrides", "resolving_view", "name"),
+    ("sglang.srt.runtime_context", "get_platform", "name"),
+    ("sglang.srt.configs.model_config", "ModelConfig.from_server_args", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine", "class"),
+    ("sglang.srt.entrypoints.engine", "Engine.run_scheduler_process_func", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine.async_generate", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine.get_all_child_pids", "attribute"),
+    ("sglang.srt.entrypoints.engine", "Engine.shutdown", "attribute"),
+)
+
+
+def test_seam_names_are_the_typed_rows_and_name_everything_the_module_imports_from_sglang():
+    assert compat.SGLANG_SEAM_NAMES == SEAM_NAMES
+    assert len(set(SEAM_NAMES)) == len(SEAM_NAMES)
+    reached = sglang_names_reached_by_import(_module_tree())
+    assert reached == {
+        ("sglang", None),
+        ("sglang", "__version__"),
+        ("sglang.srt.plugins", "load_plugins"),
+        ("sglang.srt.server_args", "prepare_server_args"),
+        ("sglang.srt.arg_groups.overrides", "resolving_view"),
+        ("sglang.srt.runtime_context", "get_platform"),
+        ("sglang.srt.configs.model_config", "ModelConfig"),
+        ("sglang.srt.configs.model_config", "ModelConfig.from_server_args"),
+        ("sglang.srt.entrypoints.engine", "Engine"),
+    }
+    # An import or a read that gets no row is noticed here, so the list cannot fall behind the code.
+    assert seam_rows_missing_for(reached, SEAM_NAMES) == []
+    assert seam_rows_missing_for(reached, SEAM_NAMES[1:]) == [("sglang", None), ("sglang", "__version__")]
+    assert seam_rows_missing_for(reached, SEAM_NAMES[:7] + SEAM_NAMES[8:]) == [
+        ("sglang.srt.configs.model_config", "ModelConfig"),
+        ("sglang.srt.configs.model_config", "ModelConfig.from_server_args"),
+    ]
+    # The two tests ``build_engine`` makes of the class before it subclasses it are rows as well.
+    assert ("sglang.srt.entrypoints.engine", "Engine", "class") in SEAM_NAMES
+    assert ("sglang.srt.entrypoints.engine", "Engine.run_scheduler_process_func", "attribute") in SEAM_NAMES
+
+
+def test_every_seam_name_is_in_the_sglang_source_at_both_tags():
+    # Skipped where no SGLang source is at hand. With it, each row is looked up in the parsed files of both
+    # releases; nothing is imported.
+    for version, python_root in sglang_source_roots(compat.TESTED_VERSIONS).items():
+        assert seam_rows_not_in_source(SEAM_NAMES, python_root) == [], version
+        # The look-up notices a name the source does not have.
+        assert seam_rows_not_in_source(
+            (("sglang.srt.entrypoints.engine", "Engine.no_such_name", "attribute"),), python_root
+        )
 
 
 def test_module_has_no_version_branch():

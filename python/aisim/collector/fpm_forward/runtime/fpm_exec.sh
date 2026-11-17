@@ -55,6 +55,32 @@ if [[ ! "$finalization_timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
   exit 2
 fi
 
+# An SGLang self-benchmark cell is one sglbench_launcher.py process on one
+# node. It has no Dynamo runtime and so no discovery service. The Collector
+# writes this switch into collector-runtime-env.sh for such a cell only. In
+# the mode etcd is neither started nor awaited, ETCD_ENDPOINTS is not
+# exported, sglbench_preflight.py replaces preflight.py, and the result files
+# are read once more after the launcher has exited. Unset or empty, every
+# step below is the one of a Dynamo cell.
+sglbench_mode=0
+case "${AISIMULATE_SGLBENCH_GATE:-}" in
+  "") ;;
+  1)
+    # A headless follower takes the leader's etcd port as the leader's liveness
+    # signal, and the DP completion barrier exists to keep the leader's etcd up
+    # until every rank has finished, so the mode has no multinode form.
+    if [[ "${FPM_NODE_COUNT}" != "1" || "${FPM_NODE_RANK}" != "0" ]]; then
+      echo "AISIMULATE_SGLBENCH_GATE=1 requires FPM_NODE_COUNT=1 and FPM_NODE_RANK=0" >&2
+      exit 2
+    fi
+    sglbench_mode=1
+    ;;
+  *)
+    echo "AISIMULATE_SGLBENCH_GATE must be unset, empty or 1" >&2
+    exit 2
+    ;;
+esac
+
 if [[ -f "${workdir}/fpm_memory_worker.py" ]]; then
   # The wrappers are staged alongside this script and delegate all execution
   # to the image's installed vLLM/Dynamo classes. Supported execution or
@@ -104,7 +130,7 @@ trap 'exit 143' TERM
 # after it: preflight imports vLLM/torch, whose cold-vs-warm page-cache delta
 # across nodes is unbounded. Start etcd first so the probe budget only has to
 # cover pod-exec skew.
-if [[ "${FPM_NODE_RANK}" == "0" ]]; then
+if (( ! sglbench_mode )) && [[ "${FPM_NODE_RANK}" == "0" ]]; then
   data_dir=/tmp/fpm-forward-etcd
   rm -rf "${data_dir}"
   etcd \
@@ -118,9 +144,18 @@ fi
 
 # Adapter activation and its import path have already been sourced from the
 # frozen startup settings; no image-specific path belongs in this wrapper.
-python3 "${workdir}/preflight.py"
+if (( sglbench_mode )); then
+  # Started by path, as the launcher is: Python then puts this directory on
+  # sys.path and the preflight finds its sglbench_* siblings without PYTHONPATH.
+  python3 "${workdir}/sglbench_preflight.py"
+else
+  python3 "${workdir}/preflight.py"
+fi
 
-if [[ "${FPM_NODE_RANK}" == "0" ]]; then
+if (( sglbench_mode )); then
+  # No etcd was started, so there is no port to wait for.
+  :
+elif [[ "${FPM_NODE_RANK}" == "0" ]]; then
   # The leader owns the etcd process, so its readiness wait is etcd-aware:
   # a dead etcd (missing binary, bound port, data-dir permissions) fails the
   # cell immediately with direct evidence instead of burning the configured probe
@@ -162,7 +197,9 @@ else:
 PY
 fi
 
-export ETCD_ENDPOINTS="${etcd_endpoint}"
+if (( ! sglbench_mode )); then
+  export ETCD_ENDPOINTS="${etcd_endpoint}"
+fi
 
 benchmark_path_for_dp_rank() {
   local dp_rank=$1
@@ -443,6 +480,26 @@ while true; do
     wait "$engine_pid"
     engine_status=$?
     set -e
+    if (( sglbench_mode )); then
+      # The launcher ends by itself once its files are in place. The check
+      # above may have started before its last rename, so the files are read
+      # once more before the exit counts as a failure. This stays in the
+      # mode: a Dynamo worker that exits by itself is a failure even when its
+      # files are complete.
+      set +e
+      check_result_files
+      result_status=$?
+      set -e
+      if (( result_status == 0 )); then
+        break
+      fi
+      if (( result_status == 20 )); then
+        # The rule of the loop above: files that are there and are not
+        # complete give 1, whatever status the launcher ended with. The EXIT
+        # trap clears what is left of the launcher's process group.
+        exit 1
+      fi
+    fi
     terminate_engine "$engine_pid"
     engine_pid=""
     echo "Engine exited before writing all FPM benchmark outputs (rank, merged, and advertised worker probe)" >&2

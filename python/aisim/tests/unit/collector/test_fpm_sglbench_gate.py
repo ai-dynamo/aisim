@@ -1,0 +1,435 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The collector's gate, ``fpm_exec.sh``, in the mode of an SGLang self-benchmark cell. No SGLang, no GPU.
+
+The whole script runs, staged by the helpers of test_fpm_exec.py. What differs from those tests:
+
+- The mode is switched on the way the collector does it, by a line in ``collector-runtime-env.sh``.
+- ``PATH`` holds the commands the gate runs and nothing else, so no ``etcd`` of the machine can be found.
+  Tests that have to show that etcd was NOT started keep the trace-writing stub of test_fpm_exec.py there.
+- Both preflight files are stand-ins that leave a mark. The preflight itself is tested in
+  test_fpm_sglbench_preflight.py; one test here stages the shipped file, to show that the gate starts it by
+  path and stops on its failure.
+- The engine is a FAKE launcher: a short Python program that writes typed-in result files and ends the way
+  ``sglbench_launcher.py`` ends, with its exit codes and its wait after the last file. It is not the launcher
+  and no engine produced the files.
+
+The last tests run the same script without the switch, to show that a Dynamo cell still gets today's gate.
+"""
+
+from __future__ import annotations
+
+import json
+import shlex
+import shutil
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from .test_fpm_exec import (
+    FPM_EXEC,
+    _benchmark_result,
+    _finalized_artifacts,
+    _run,
+    _setsid_run_script,
+    _stage,
+    _write_executable,
+)
+
+RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
+# The pod holds the runtime files flat in one directory and imports them by their plain names. The directory
+# goes to the END of the path so that it shadows nothing.
+if str(RUNTIME) not in sys.path:
+    sys.path.append(str(RUNTIME))
+
+import sglbench_launcher as launcher
+
+pytestmark = pytest.mark.unit
+
+SWITCH = "AISIMULATE_SGLBENCH_GATE"
+
+# Every command the gate runs: bash for run.sh, python3 for the preflight and the checker, awk for the two
+# engine streams, sleep for the polls, dirname and mkdir for the result folders, and rm and tail around etcd.
+GATE_COMMANDS = ("bash", "python3", "awk", "sleep", "dirname", "mkdir", "rm", "tail")
+
+ENGINE_EXITED = "Engine exited before writing all FPM benchmark outputs (rank, merged, and advertised worker probe)"
+ONE_NODE_ONLY = f"{SWITCH}=1 requires FPM_NODE_COUNT=1 and FPM_NODE_RANK=0"
+UNKNOWN_VALUE = f"{SWITCH} must be unset, empty or 1"
+LIVENESS_TEST = '  if ! kill -0 "$engine_pid" 2>/dev/null; then\n'
+
+
+def _stage_cell(tmp_path: Path, *, switch: str | None = "1", etcd_stub: bool = False, **stage_options):
+    """One staged pod. ``switch`` is the value of the mode line, None for a cell without the line."""
+    staged = _stage(tmp_path, run_script="", **stage_options)
+    bin_dir = tmp_path / "bin"
+    if not etcd_stub:
+        (bin_dir / "etcd").unlink()
+    for command in GATE_COMMANDS:
+        found = shutil.which(command)
+        assert found, f"the gate needs {command}"
+        _write_executable(bin_dir / command, f'#!/bin/sh\nexec {shlex.quote(found)} "$@"\n')
+    staged.env["PATH"] = str(bin_dir)
+    assert (shutil.which("etcd", path=staged.env["PATH"]) is not None) == etcd_stub
+    # Neither name may come from the shell that runs the tests.
+    for name in (SWITCH, "ETCD_ENDPOINTS"):
+        staged.env.pop(name, None)
+
+    staged.sglbench_preflight_ran = tmp_path / "sglbench-preflight-ran"
+    staged.dynamo_preflight_ran = tmp_path / "dynamo-preflight-ran"
+    staged.engine_report = tmp_path / "engine-report.json"
+    (staged.workdir / "sglbench_preflight.py").write_text(
+        f"open({str(staged.sglbench_preflight_ran)!r}, 'w').close()\n"
+    )
+    (staged.workdir / "preflight.py").write_text(f"open({str(staged.dynamo_preflight_ran)!r}, 'w').close()\n")
+    if switch is not None:
+        with (staged.workdir / "collector-runtime-env.sh").open("a") as handle:
+            handle.write(f"export {SWITCH}={switch}\n")
+    return staged
+
+
+def _fake_launcher(
+    tmp_path: Path,
+    staged: SimpleNamespace,
+    *,
+    files: dict,
+    exit_code: int,
+    final_wait: float = launcher.FINAL_WAIT_SECONDS,
+    wait_for: Path | None = None,
+    kill_itself: bool = False,
+    ends_on_sigterm: bool = False,
+) -> None:
+    """Stage the FAKE launcher as ``run.sh``.
+
+    It reports what it was started with, waits for ``wait_for`` when one is given, writes ``files`` in their
+    order by rename (the rank file before the merged one) and then, like ``sglbench_launcher.py``, ignores
+    SIGTERM, stays alive for ``final_wait`` seconds and ends with ``exit_code``. With ``kill_itself`` it dies
+    of SIGKILL before it writes anything, as the launcher does when SGLang kills it. With ``ends_on_sigterm``
+    it idles after its files and ends on SIGTERM, which is what a Dynamo worker does.
+    """
+    body = f"""\
+import json
+import os
+import pathlib
+import signal
+import sys
+import time
+
+pathlib.Path({str(staged.engine_report)!r}).write_text(json.dumps({{
+    "etcd_endpoints": os.environ.get("ETCD_ENDPOINTS"),
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "sglbench_preflight_ran": os.path.exists({str(staged.sglbench_preflight_ran)!r}),
+    "dynamo_preflight_ran": os.path.exists({str(staged.dynamo_preflight_ran)!r}),
+}}))
+wait_for = {str(wait_for) if wait_for else None!r}
+deadline = time.monotonic() + 30
+while wait_for and not os.path.exists(wait_for):
+    if time.monotonic() > deadline:
+        sys.exit("the FAKE launcher waited for the gate in vain")
+    time.sleep(0.02)
+if {kill_itself!r}:
+    os.kill(os.getpid(), signal.SIGKILL)
+if not {ends_on_sigterm!r}:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+for path, payload in json.loads({json.dumps(files)!r}).items():
+    partial = path + ".tmp"
+    pathlib.Path(partial).write_text(json.dumps(payload))
+    os.replace(partial, path)
+if {ends_on_sigterm!r}:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    while True:
+        time.sleep(0.1)
+time.sleep({final_wait})
+sys.exit({exit_code})
+"""
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, body))
+
+
+def _complete_files(staged: SimpleNamespace) -> dict:
+    return _finalized_artifacts({str(staged.benchmark_output): _benchmark_result()})
+
+
+def _unfinished_rank(status: str, error: str) -> dict:
+    rank = _benchmark_result(status=status, valid=False)
+    rank["errors"] = [error]
+    return rank
+
+
+def _engine_report(staged: SimpleNamespace) -> dict:
+    return json.loads(staged.engine_report.read_text())
+
+
+def _hold_the_liveness_test(staged: SimpleNamespace, first_check_done: Path) -> None:
+    """Make the gate wait, between its file check and its liveness test, until the engine is gone.
+
+    The mark tells the FAKE launcher that the first check is over. The launcher then writes its files and
+    ends, so the liveness test finds complete files on disk and no process: the window that the launcher's
+    own wait keeps shut in a real cell.
+    """
+    script = staged.script.read_text()
+    assert script.count(LIVENESS_TEST) == 1
+    hold = (
+        f'  : > {shlex.quote(str(first_check_done))}\n  while kill -0 "$engine_pid" 2>/dev/null; do sleep 0.1; done\n'
+    )
+    staged.script.write_text(script.replace(LIVENESS_TEST, hold + LIVENESS_TEST))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The mode
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_complete_files_give_0_with_no_etcd_no_endpoint_and_the_sglang_preflight(tmp_path):
+    staged = _stage_cell(tmp_path)
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=launcher.EXIT_COMPLETE)
+    done = _run(staged)
+
+    assert done.returncode == 0, done.stderr
+    assert not (staged.results / "etcd.log").exists()
+    assert "etcd exited" not in done.stderr and "etcd readiness timeout" not in done.stderr
+    assert staged.sglbench_preflight_ran.exists() and not staged.dynamo_preflight_ran.exists()
+    assert _engine_report(staged) == {
+        "etcd_endpoints": None,
+        # The launcher is started by path and needs no import path from the gate.
+        "pythonpath": staged.env.get("PYTHONPATH"),
+        "sglbench_preflight_ran": True,
+        "dynamo_preflight_ran": False,
+    }
+    # The launcher ended by itself inside the grace period; nothing had to be killed.
+    assert "sending SIGKILL" not in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code", "with_merged_file", "error"),
+    [
+        ("failed", launcher.EXIT_FAILED, False, "failed: FAKE reason"),
+        ("partial", launcher.EXIT_PARTIAL, True, "benchmark stopped by timeout after 1 of 2 points"),
+    ],
+)
+def test_a_rank_file_that_is_not_complete_gives_1_and_not_the_launchers_code(
+    tmp_path, status, exit_code, with_merged_file, error
+):
+    staged = _stage_cell(tmp_path)
+    files = {str(staged.benchmark_output): _unfinished_rank(status, error)}
+    if with_merged_file:
+        files = _finalized_artifacts(files)
+    assert len(files) == 1 + with_merged_file
+    _fake_launcher(tmp_path, staged, files=files, exit_code=exit_code)
+    done = _run(staged)
+
+    assert done.returncode == 1
+    assert f"Invalid FPM benchmark result {staged.benchmark_output}: " in done.stderr
+    assert f"status={status!r} valid=False errors=[{error!r}]" in done.stderr
+    assert ENGINE_EXITED not in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "kill_itself", "expected"),
+    [(launcher.EXIT_REJECTED, False, 64), (0, True, 137)],
+    ids=["rejected-without-an-artifact", "killed"],
+)
+def test_no_file_gives_the_status_the_launcher_ended_with(tmp_path, exit_code, kill_itself, expected):
+    staged = _stage_cell(tmp_path)
+    _fake_launcher(tmp_path, staged, files={}, exit_code=exit_code, final_wait=0, kill_itself=kill_itself)
+    done = _run(staged)
+
+    assert done.returncode == expected
+    assert ENGINE_EXITED in done.stderr
+    assert list(staged.results.glob("benchmark*")) == []
+
+
+@pytest.mark.parametrize(
+    ("switch", "env_overrides", "message"),
+    [
+        ("1", {"FPM_NODE_COUNT": 2}, ONE_NODE_ONLY),
+        ("1", {"FPM_NODE_COUNT": 2, "FPM_NODE_RANK": 1}, ONE_NODE_ONLY),
+        ("1", {"FPM_NODE_RANK": 1}, ONE_NODE_ONLY),
+        ("2", {}, UNKNOWN_VALUE),
+        ("0", {}, UNKNOWN_VALUE),
+        ("true", {}, UNKNOWN_VALUE),
+    ],
+    ids=["two-nodes-leader", "two-nodes-follower", "rank-1", "switch-2", "switch-0", "switch-true"],
+)
+def test_more_than_one_node_or_another_switch_value_gives_2_before_anything_starts(
+    tmp_path, switch, env_overrides, message
+):
+    staged = _stage_cell(tmp_path, switch=switch, etcd_stub=True, env_overrides=env_overrides)
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0, ends_on_sigterm=True)
+    done = _run(staged)
+
+    assert done.returncode == 2
+    assert done.stderr == message + "\n"
+    assert not staged.etcd_trace.exists()
+    assert not staged.sglbench_preflight_ran.exists() and not staged.dynamo_preflight_ran.exists()
+    assert not staged.engine_report.exists()
+
+
+@pytest.mark.parametrize("mode", ["sglbench", "dynamo"])
+def test_files_that_are_complete_only_after_the_launcher_ended_are_accepted_in_the_mode_alone(tmp_path, mode):
+    staged = _stage_cell(tmp_path, switch="1" if mode == "sglbench" else None, etcd_stub=mode == "dynamo")
+    first_check_done = tmp_path / "first-check-done"
+    _hold_the_liveness_test(staged, first_check_done)
+    files = _complete_files(staged)
+    _fake_launcher(tmp_path, staged, files=files, exit_code=0, final_wait=0, wait_for=first_check_done)
+    done = _run(staged)
+
+    # In both modes the files on disk are complete and were written after the first check.
+    assert first_check_done.exists()
+    for path, payload in files.items():
+        assert json.loads(Path(path).read_text()) == payload
+    if mode == "sglbench":
+        assert done.returncode == 0, done.stderr
+        assert done.stderr == ""
+    else:
+        # A Dynamo worker that ends by itself stays a failure, as it is today.
+        assert done.returncode == 1
+        assert ENGINE_EXITED in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    [("failed", launcher.EXIT_FAILED), ("partial", launcher.EXIT_PARTIAL)],
+)
+def test_the_second_check_gives_1_for_a_file_that_is_not_complete_as_the_first_does(tmp_path, status, exit_code):
+    staged = _stage_cell(tmp_path)
+    first_check_done = tmp_path / "first-check-done"
+    _hold_the_liveness_test(staged, first_check_done)
+    error = f"{status}: FAKE reason"
+    files = {str(staged.benchmark_output): _unfinished_rank(status, error)}
+    _fake_launcher(tmp_path, staged, files=files, exit_code=exit_code, final_wait=0, wait_for=first_check_done)
+    done = _run(staged)
+
+    # No check saw the file while the launcher lived. The result is still the one of a check that did: 1 and
+    # the checker's line, not the launcher's code, so the status of a cell does not depend on the timing.
+    assert done.returncode == 1
+    assert f"status={status!r} valid=False errors=[{error!r}]" in done.stderr
+    assert ENGINE_EXITED not in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected"),
+    [(launcher.EXIT_COMPLETE, 1), (launcher.EXIT_INTERNAL, launcher.EXIT_INTERNAL)],
+    ids=["launcher-0", "launcher-70"],
+)
+def test_the_second_check_does_not_accept_a_rank_file_without_its_merged_file(tmp_path, exit_code, expected):
+    staged = _stage_cell(tmp_path)
+    first_check_done = tmp_path / "first-check-done"
+    _hold_the_liveness_test(staged, first_check_done)
+    # A complete rank file alone is "finalization pending" for the checker, and nothing can finalize it now.
+    files = {str(staged.benchmark_output): _benchmark_result()}
+    _fake_launcher(tmp_path, staged, files=files, exit_code=exit_code, final_wait=0, wait_for=first_check_done)
+    done = _run(staged)
+
+    assert done.returncode == expected
+    assert done.stderr.endswith(ENGINE_EXITED + "\n")
+    assert json.loads(staged.benchmark_output.read_text())["status"] == "complete"
+    assert not staged.benchmark_output.with_name("benchmark_merged.json").exists()
+
+
+def test_a_failing_sglang_preflight_ends_the_cell_with_its_status_before_the_launcher_starts(tmp_path):
+    staged = _stage_cell(tmp_path)
+    (staged.workdir / "sglbench_preflight.py").write_text("import sys\nsys.exit('FAKE: a seam is missing')\n")
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0)
+    done = _run(staged)
+
+    assert done.returncode == 1
+    assert done.stderr == "FAKE: a seam is missing\n"
+    assert not staged.engine_report.exists() and not staged.dynamo_preflight_ran.exists()
+
+
+def test_the_shipped_preflight_under_the_gate_ends_a_cell_whose_image_has_no_sglang(tmp_path):
+    staged = _stage_cell(tmp_path)
+    # The pod's python3 is the interpreter of the tests without the packages of this machine, so that no
+    # SGLang can be found whatever is installed here.
+    _write_executable(tmp_path / "bin" / "python3", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+    # The launcher's files and the preflight as the collector stages them: flat, beside the gate's inputs.
+    for path in RUNTIME.glob("sglbench_*.py"):
+        text = path.read_text(encoding="utf-8")
+        if path.name == "sglbench_preflight.py":
+            assert text.count('"/results/') == 1
+            text = text.replace('"/results/', f'"{staged.results}/')
+        (staged.workdir / path.name).write_text(text, encoding="utf-8")
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0)
+    done = _run(staged)
+
+    assert done.returncode == 1
+    audit = json.loads((staged.results / "runtime-preflight.json").read_text())
+    assert audit["status"] == "failed" and audit["sglang_version"] is None
+    assert done.stderr.splitlines() == [f"[sglbench] preflight FAILED: {failure}" for failure in audit["failures"]]
+    # Started by path, it found every sibling without PYTHONPATH: all failures are about SGLang.
+    assert audit["launcher_modules"] and not [failure for failure in audit["failures"] if "sglbench_" in failure]
+    assert not staged.engine_report.exists()
+
+
+def test_the_mode_starts_the_file_the_collector_ships_by_path_with_a_plain_python3():
+    script = FPM_EXEC.read_text(encoding="utf-8")
+    assert script.count('\n  python3 "${workdir}/sglbench_preflight.py"\n') == 1
+    assert (RUNTIME / "sglbench_preflight.py").is_file()
+    # The switch is read after the file that carries it has been sourced, and before anything is started.
+    sourced = script.index('source "${workdir}/collector-runtime-env.sh"')
+    read = script.index('case "${' + SWITCH + ':-}" in')
+    assert sourced < read < script.index("etcd_pid=$!")
+
+
+def test_the_switch_is_the_name_the_cell_builder_writes():
+    # The cell builder writes the line and the gate reads it; neither file can import the other. A name that
+    # changed on one side only would leave every SGLang cell with the gate of a Dynamo cell, which waits for an
+    # etcd the image does not have.
+    from collector.fpm_forward import sglang_fpm_builder
+
+    assert sglang_fpm_builder.GATE_SWITCH_ENV == SWITCH
+    assert FPM_EXEC.read_text(encoding="utf-8").count('case "${' + sglang_fpm_builder.GATE_SWITCH_ENV + ':-}" in') == 1
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Without the switch
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("switch", [None, ""], ids=["unset", "empty"])
+def test_without_the_switch_the_same_script_still_needs_etcd(tmp_path, switch):
+    staged = _stage_cell(tmp_path, switch=switch)
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0, ends_on_sigterm=True)
+    done = _run(staged)
+
+    assert done.returncode == 1
+    assert done.stderr.startswith("etcd exited with status 127 before becoming ready\n")
+    # The Dynamo preflight ran, between the start of etcd and the wait for it; the launcher never started.
+    assert staged.dynamo_preflight_ran.exists() and not staged.sglbench_preflight_ran.exists()
+    assert not staged.engine_report.exists()
+
+
+@pytest.mark.parametrize("switch", [None, ""], ids=["unset", "empty"])
+def test_without_the_switch_etcd_is_started_and_its_endpoint_is_exported(tmp_path, switch):
+    staged = _stage_cell(tmp_path, switch=switch, etcd_stub=True)
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0, ends_on_sigterm=True)
+    done = _run(staged)
+
+    assert done.returncode == 0, done.stderr
+    assert staged.etcd_trace.exists() and (staged.results / "etcd.log").exists()
+    assert _engine_report(staged) == {
+        "etcd_endpoints": f"http://127.0.0.1:{staged.etcd_port}",
+        "pythonpath": staged.env.get("PYTHONPATH"),
+        "sglbench_preflight_ran": False,
+        "dynamo_preflight_ran": True,
+    }
+
+
+def test_without_the_switch_a_failing_preflight_still_ends_the_cell_with_its_status(tmp_path):
+    staged = _stage_cell(tmp_path, switch=None, etcd_stub=True)
+    # The stand-in waits for the trace of the etcd stub, so that the order of the two is not left to chance.
+    (staged.workdir / "preflight.py").write_text(
+        "import os, sys, time\n"
+        "deadline = time.monotonic() + 30\n"
+        f"while not os.path.exists({str(staged.etcd_trace)!r}) and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "sys.exit(7)\n"
+    )
+    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0, ends_on_sigterm=True)
+    done = _run(staged)
+
+    assert done.returncode == 7
+    assert staged.etcd_trace.exists(), "etcd is started before the preflight"
+    assert not staged.engine_report.exists() and not staged.sglbench_preflight_ran.exists()

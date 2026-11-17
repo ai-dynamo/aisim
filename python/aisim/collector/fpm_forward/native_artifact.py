@@ -564,6 +564,7 @@ def _validate_collector_provenance(
     *,
     expected_plan_sha256: str | None,
     expected_attempt_id: str | None,
+    expected_backend: str = "vllm",
 ) -> tuple[str, str]:
     pod_names = set()
     for path, _payload in rank_payloads:
@@ -603,7 +604,7 @@ def _validate_collector_provenance(
         runtime = payload.get("runtime")
         if (
             not isinstance(runtime, dict)
-            or runtime.get("backend") != "vllm"
+            or runtime.get("backend") != expected_backend
             or not isinstance(runtime.get("backend_version"), str)
             or not runtime["backend_version"]
         ):
@@ -864,8 +865,13 @@ def validate_native_collection(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    expected_backend: str = "vllm",
 ) -> NativeCollection:
-    """Validate a complete native rank set and return synchronized measurements."""
+    """Validate a complete native rank set and return synchronized measurements.
+
+    ``expected_backend`` is the backend of the plan the cell belongs to. A cell carries none, so a caller without
+    a plan validates a vLLM collection.
+    """
 
     rank_payloads = _rank_artifacts(raw_root)
     if not rank_payloads:
@@ -876,6 +882,7 @@ def validate_native_collection(
         rank_payloads,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
+        expected_backend=expected_backend,
     )
     expected_ranks = list(range(cell.topology.dp))
     seen_ranks: set[int] = set()
@@ -937,6 +944,20 @@ def validate_native_collection(
                 "native GLM-5.3-Flash producer.vllm_package_version differs from the Collector provenance runtime: "
                 f"expected {backend_version!r}, found {payload['producer']['vllm_package_version']!r}: {path}"
             )
+        if expected_backend == "sglang":
+            # The launcher writes the release it checked, sglang.__version__, into the producer block of every rank
+            # artifact (runtime/sglbench_launcher.py, _start_up_checks). The Collector provenance holds the version
+            # of the installed sglang distribution. A pod where the two differ did not run the release the plan
+            # names.
+            producer = payload.get("producer")
+            launcher_version = producer.get("sglang_version") if isinstance(producer, dict) else None
+            if not isinstance(launcher_version, str) or not launcher_version:
+                raise ValueError(f"native SGLang rank artifact has no producer.sglang_version: {path}")
+            if launcher_version != backend_version:
+                raise ValueError(
+                    "native SGLang producer.sglang_version differs from the Collector provenance runtime: "
+                    f"expected {backend_version!r}, found {launcher_version!r}: {path}"
+                )
         if input_provenance is None:
             input_provenance = evidence
         elif _without_sidecar_names(evidence) != _without_sidecar_names(input_provenance):

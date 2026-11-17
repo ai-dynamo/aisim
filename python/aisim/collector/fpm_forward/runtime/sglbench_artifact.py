@@ -727,8 +727,11 @@ def build_rank_artifact(
         host name here would turn that comparison into a mismatch; such values belong in ``producer``.
         ``mode`` is added here and may not be supplied.
     producer
-        Free-form evidence that no reader parses: timing metric and clock, staging method, page size, overlap
-        and streaming settings, content source and seed, limits record, SGLang version, run-specific values.
+        Free-form evidence: timing metric and clock, staging method, page size, overlap and streaming settings,
+        content source and seed, limits record, SGLang version, run-specific values. One key has a reader: for a
+        cell of an SGLang plan, ``validate_native_collection`` (native_artifact.py) requires ``sglang_version``
+        in every rank artifact and compares it with the installed release in the pod's provenance file. No
+        reader parses the other keys.
 
     ``config`` and ``producer`` must be JSON data without NaN or infinity, with a str for every dict key at
     every depth; a tuple is accepted and is written as a list. They are serialised once here, so a value that

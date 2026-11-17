@@ -46,9 +46,10 @@ is named so:
   launcher or ``SIG_IGN`` is in place. A fixture restores the handlers after every test.
 
 The two checkers are used as shipped, through the helpers of ``test_fpm_sglbench_artifact.py``: the validator
-(``validate_native_collection``) and the gate (the Python text inside ``check_result_files()`` of
-``runtime/fpm_exec.sh``). ``_pod`` writes the collected layout with a provenance file that says
-``"backend": "vllm"``: fixture scaffolding, because the validator accepts no other value.
+(``validate_native_collection``, called as the host calls it for a cell of an SGLang plan) and the gate (the
+Python text inside ``check_result_files()`` of ``runtime/fpm_exec.sh``). ``_pod`` writes the collected layout
+with the provenance file of an SGLang cell: ``"backend": "sglang"`` and the release the FAKE ``sglang`` package
+reports, which the validator compares with the release the launcher wrote into its artifact.
 
 The names and the texts the tests expect are typed here on their own: the flags, their defaults and variables
 (Dynamo's vLLM worker), the fields of SGLang's resolved arguments with their defaults (the field files of
@@ -1456,9 +1457,9 @@ class _Launch:
         return [call for call in self.world.calls if call.key[0] == benchmark_id]
 
 
-def _new_pod(tmp_path: Path, mode: str):
+def _new_pod(tmp_path: Path, mode: str, sglang_version: str = FAKE_SGLANG_VERSION):
     cell = _cell(phase="prefill" if mode == "agg" else mode, dp=1, strategy="single")
-    return cell, _pod(tmp_path, cell)
+    return cell, _pod(tmp_path, cell, sglang_version=sglang_version)
 
 
 def _launch(
@@ -2792,7 +2793,9 @@ def test_a_field_that_only_one_release_has_is_recorded_with_a_default(tmp_path, 
         else:
             world.resolved["enable_nvidia_megakernel"] = megakernel
 
-    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare)
+    # The provenance file of the pod names the release that is installed there.
+    pod = _new_pod(tmp_path, "prefill", "0.5.22" if megakernel == "absent" else FAKE_SGLANG_VERSION)
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, pod=pod)
 
     on_disk = _assert_accepted(launch)
     assert on_disk["producer"]["enable_nvidia_megakernel"] == (None if megakernel == "absent" else megakernel)

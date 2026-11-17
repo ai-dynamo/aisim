@@ -2836,15 +2836,25 @@ scheduler produces for one call, and `sglbench_launcher.py` tests SGLang's resol
 arguments and environment variables under their upstream names; these two import no
 SGLang. The tests model those interfaces with fakes.
 
+The collector path that starts the launcher follows the same two revisions.
+`python/aisim/collector/fpm_forward/sglang_fpm_builder.py`, with the test
+`python/aisim/tests/unit/collector/test_fpm_sglang_builder.py`, writes nine of SGLang's
+command-line flags under their upstream names and repeats the choice names of the
+`kv_cache_dtype` field; it imports no SGLang.
+`python/aisim/collector/fpm_forward/runtime/sglbench_preflight.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{preflight,gate}.py`, types no SGLang
+name: it looks up the module, class, attribute and field names that `sglbench_compat.py`
+and `sglbench_recorder.py` list in `SGLANG_SEAM_NAMES`.
+
 Upstream paths, under `python/sglang/`: `__init__.py`, `version.py` and, under `srt/`,
 `server_args.py`, `environ.py`, `runtime_context.py`,
 `arg_groups/{arg_utils.py,kv_cache_hook.py,model_override_base.py,overrides.py,parallel_hook.py,serving_hook.py,validation_hook.py}`,
-`arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,parallel.py,schedule.py,serving.py,spec.py}`,
+`arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,model.py,parallel.py,schedule.py,serving.py,spec.py}`,
 `configs/{model_config.py,step3_vl.py}`, `entrypoints/engine.py`,
 `managers/{data_parallel_controller.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
 `managers/async_d2h_copy_worker.py` (v0.5.23 only),
 `managers/scheduler_components/{batch_result_processor.py,dp_attn.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
-`mem_cache/{common.py,kv_cache_builder.py,registry.py}`,
+`mem_cache/{common.py,kv_cache_builder.py,kv_cache_dtype.py,registry.py}`,
 `model_executor/{forward_batch_info.py,model_runner.py}`,
 `model_executor/runner/{decode_cuda_graph_runner.py,eager_runner.py,prefill_cuda_graph_runner.py}`,
 `model_loader/utils.py`, `models/{dbrx.py,step3_vl.py}`,
