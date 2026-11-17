@@ -1341,15 +1341,18 @@ impl TraceCollector {
             .get_or_insert_with(Default::default);
     }
 
-    /// Cumulative outcome counters and this interval's latency sample, or
-    /// `None` when feedback is not enabled.
-    pub(crate) fn completion_feedback_snapshot(&mut self) -> Option<CompletionFeedbackSnapshot> {
+    /// Cumulative outcome counters, plus this interval's latency sample when
+    /// `take_interval` is set. `None` when feedback is not enabled.
+    pub(crate) fn completion_feedback_snapshot(
+        &mut self,
+        take_interval: bool,
+    ) -> Option<CompletionFeedbackSnapshot> {
         let gpu_seconds = self.prefill_worker_seconds * self.prefill_gpus_per_worker as f64
             + self.decode_worker_seconds * self.decode_gpus_per_worker as f64
             + self.encoder_gpu_seconds;
         self.completion_feedback
             .as_mut()
-            .map(|feedback| feedback.snapshot(self.sla, gpu_seconds))
+            .map(|feedback| feedback.snapshot(self.sla, gpu_seconds, take_interval))
     }
 
     /// Add provisioned worker-seconds for the interval just elapsed. The runtime

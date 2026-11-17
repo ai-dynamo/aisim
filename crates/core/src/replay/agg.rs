@@ -1304,7 +1304,10 @@ where
             })
             .collect();
         let snapshot = ReplayTelemetrySnapshot {
-            completion_feedback: self.collector.completion_feedback_snapshot(),
+            // A baseline is gauge-only: pending latency pairs wait for the next sample.
+            completion_feedback: self
+                .collector
+                .completion_feedback_snapshot(kind != ReplayTelemetrySampleKind::Baseline),
             host_caches,
             sample_ordinal,
             kind,

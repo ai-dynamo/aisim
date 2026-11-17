@@ -170,9 +170,14 @@ Each observer sample also carries `completion_feedback`, measured outcomes for
 closed-loop scaling policies: the SLA thresholds, cumulative terminal,
 completed and SLA-satisfying request counts, cumulative provisioned
 GPU-seconds, and up to 64 `(TTFT, mean ITL)` pairs from requests completed
-since the previous sample. `good_requests_strict_itl` excludes single-token
-outputs when an ITL threshold is set. The counters match the final report's
-goodput and GPU-hours. Telemetry capture does not export this block.
+since the previous sample. Both values are in milliseconds, and mean ITL is
+`None` for a single-token completion. The baseline sample carries the counters
+but no pairs; pairs from earlier completions arrive with the next sample.
+`good_requests_strict_itl` excludes single-token outputs when an ITL threshold
+is set. In the last sample, `gpu_seconds` equals the report's
+`throughput.gpu_hours` multiplied by 3600 and, with an SLA configured,
+`good_requests` equals `goodput.completed_requests`. Telemetry capture does
+not export this block.
 
 `with_telemetry_capture(interval_ms)` retains native telemetry in
 `ReplayReport.telemetry`, including preparation and profiling requests, periodic

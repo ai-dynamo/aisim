@@ -78,11 +78,22 @@ impl CompletionFeedback {
         }
     }
 
+    /// Cumulative counters, plus the pending latency sample when `take_interval`
+    /// is set. A baseline leaves that sample for the next interval sample.
     pub(super) fn snapshot(
         &mut self,
         sla: SlaThresholds,
         gpu_seconds: f64,
+        take_interval: bool,
     ) -> CompletionFeedbackSnapshot {
+        let (latency_samples, latency_population) = if take_interval {
+            (
+                std::mem::take(&mut self.samples),
+                std::mem::take(&mut self.population),
+            )
+        } else {
+            (Vec::new(), 0)
+        };
         CompletionFeedbackSnapshot {
             schema_version: 1,
             sla,
@@ -91,8 +102,8 @@ impl CompletionFeedback {
             good_requests: self.good,
             good_requests_strict_itl: self.good_strict_itl,
             gpu_seconds,
-            latency_samples: std::mem::take(&mut self.samples),
-            latency_population: std::mem::take(&mut self.population),
+            latency_samples,
+            latency_population,
         }
     }
 }
@@ -140,7 +151,7 @@ mod tests {
         c.on_terminal(failed, 150.0, ReplayTerminalStatus::Canceled);
         c.on_terminal(failed, 160.0, ReplayTerminalStatus::Canceled);
         c.add_worker_seconds(3.0, 5.0);
-        let sample = c.completion_feedback_snapshot().unwrap();
+        let sample = c.completion_feedback_snapshot(true).unwrap();
         assert_eq!(sample.terminal_requests, 6);
         assert_eq!(sample.completed_requests, 5);
         assert_eq!(sample.good_requests, 2);
@@ -161,10 +172,10 @@ mod tests {
         let mut c = collector();
         complete(&mut c, 1, &[50.0, 60.0]);
         c.add_worker_seconds(1.0, 2.0);
-        let first = c.completion_feedback_snapshot().unwrap();
+        let first = c.completion_feedback_snapshot(true).unwrap();
         // The runtime passes provisioned worker seconds, including drains.
         c.add_worker_seconds(2.0, 3.0);
-        let next = c.completion_feedback_snapshot().unwrap();
+        let next = c.completion_feedback_snapshot(true).unwrap();
         assert_eq!(next.terminal_requests, first.terminal_requests);
         assert_eq!(next.good_requests, first.good_requests);
         assert_eq!(next.gpu_seconds - first.gpu_seconds, 32.0);
@@ -179,7 +190,7 @@ mod tests {
             for i in 1..=10_000 {
                 complete(&mut c, i, &[i as f64, i as f64 + 1.0]);
             }
-            c.completion_feedback_snapshot().unwrap()
+            c.completion_feedback_snapshot(true).unwrap()
         };
         let a = run();
         assert_eq!(a, run());
@@ -197,7 +208,7 @@ mod tests {
             c.retire_completed().unwrap();
             assert!(c.requests.is_empty());
         }
-        let sample = c.completion_feedback_snapshot().unwrap();
+        let sample = c.completion_feedback_snapshot(true).unwrap();
         assert_eq!(sample.completed_requests, 1000);
         assert_eq!(sample.good_requests, 1000);
         assert_eq!(sample.latency_samples.len(), SAMPLE_LIMIT);

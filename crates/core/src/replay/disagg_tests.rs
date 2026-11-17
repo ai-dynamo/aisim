@@ -118,6 +118,51 @@ fn disagg_completion_feedback_matches_final_slo_and_gpu_accounting() {
     assert!((final_sample.gpu_seconds - report.throughput.gpu_hours * 3600.0).abs() < 1e-9);
 }
 
+#[test]
+fn disagg_baseline_leaves_earlier_latency_pairs_for_the_first_interval_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    // Zero-latency passes complete the first request before telemetry starts.
+    let mut config = disagg_config();
+    for args in [&mut config.prefill_args, &mut config.decode_args] {
+        args.timing_model = crate::engine::TimingModelConfig::Fixed {
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+        };
+    }
+    DisaggRuntime::from_requests(
+        &config,
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 0.0), request(2, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    )
+    .run()
+    .unwrap();
+    let samples = samples.lock().unwrap();
+    assert_eq!(samples[0].kind, ReplayTelemetrySampleKind::Baseline);
+    let baseline = samples[0].completion_feedback.as_ref().unwrap();
+    assert_eq!(baseline.completed_requests, 1);
+    assert!(baseline.latency_samples.is_empty());
+    assert_eq!(baseline.latency_population, 0);
+    let first = samples[1].completion_feedback.as_ref().unwrap();
+    assert_eq!(first.latency_samples, vec![(0.0, Some(0.0))]);
+    assert_eq!(first.latency_population, 1);
+    let last = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(last.completed_requests, 2);
+}
+
 #[derive(Debug)]
 struct QueueUntilWorkerPlacement {
     scheduler_id: Option<usize>,
