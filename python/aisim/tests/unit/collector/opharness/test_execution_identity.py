@@ -57,3 +57,18 @@ def test_the_dummy_the_image_and_the_arguments_are_part_of_the_fingerprint(pd):
     run = {"image": "i", "probe_script": "probe_vllm.py", "probe_env": {}}
     with_kv = pd.exec_fingerprint({**run, "probe_args": ["--kv-cache-dtype", "fp8"]}, [])
     assert with_kv != pd.exec_fingerprint({**run, "probe_args": []}, [])
+
+
+def test_a_changed_probe_helper_changes_the_fingerprint(pd, tmp_path, monkeypatch):
+    """The probe scripts import their siblings (_dense_dummy), so a raw produced before a
+    helper changed is another emit's raw."""
+    probes = tmp_path / "probes"
+    probes.mkdir()
+    (probes / "probe_vllm.py").write_text("import _dense_dummy\n")
+    (probes / "_dense_dummy.py").write_text("FILL = 1\n")
+    monkeypatch.setattr(pd, "_HERE", tmp_path)
+    run = {"image": "i", "probe_script": "probe_vllm.py", "probe_args": [], "probe_env": {}}
+    before = pd.exec_fingerprint(run, [])
+    assert pd.exec_fingerprint(run, []) == before
+    (probes / "_dense_dummy.py").write_text("FILL = 2\n")
+    assert pd.exec_fingerprint(run, []) != before

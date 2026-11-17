@@ -284,7 +284,7 @@ def _run_id(
 
 # ------------------------------------------------------------ execution identity
 # The run id names the CASE. The fingerprint names what one emit hands the job: the image,
-# the probe script and its arguments, and every input file the bundle carries (the dummy
+# the probe modules and the script's arguments, and every input file the bundle carries (the dummy
 # checkpoint and the rendered engine config). The spec carries it into the job, and
 # --import-raws files a raw only when the job ran this emit's fingerprint.
 def probe_script(run: dict) -> str:
@@ -296,10 +296,12 @@ def probe_script(run: dict) -> str:
 def exec_fingerprint(run: dict, bundle_files: list[str]) -> str:
     """``bundle_files`` are the bundle's input paths relative to the workspace."""
     h = hashlib.sha1()
-    script = _HERE / "probes" / run["probe_script"]
     spec = [run.get("image"), run["probe_script"], run["probe_args"], run.get("probe_env")]
     h.update(json.dumps(spec, sort_keys=True).encode())
-    h.update(script.read_bytes() if script.exists() else b"")
+    # every probe module, not the entry script alone: the scripts import their siblings
+    for module in sorted((_HERE / "probes").glob("*.py")):
+        h.update(module.name.encode())
+        h.update(module.read_bytes())
     for rel in sorted(bundle_files):
         root = ROOT / rel
         for f in sorted(p for p in ([root] if root.is_file() else root.rglob("*")) if p.is_file()):
