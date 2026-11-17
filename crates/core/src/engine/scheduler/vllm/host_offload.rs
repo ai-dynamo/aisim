@@ -287,7 +287,16 @@ impl VllmHostRequestState {
     /// `boundary_blocks`. Decode-time boundaries are not offloaded, like
     /// decode blocks.
     pub(super) fn note_retained_boundary(&mut self, boundary_blocks: usize) {
-        if boundary_blocks <= self.prompt_blocks && !self.unstored_states.contains(&boundary_blocks)
+        // A cohort larger than the pool is not offered before a readmission,
+        // which forgets it.
+        if boundary_blocks > self.prompt_blocks || self.unstored_room == Some(None) {
+            return;
+        }
+        // Passes retain boundaries in rising order, so only one at or below
+        // the last can be a repeat.
+        let last = self.unstored_states.last();
+        if last.is_none_or(|&last| last < boundary_blocks)
+            || !self.unstored_states.contains(&boundary_blocks)
         {
             self.unstored_states.push(boundary_blocks);
         }
