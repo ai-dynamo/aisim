@@ -169,18 +169,27 @@ impl GroupedPrefixRules {
                         GroupRuleKind::Ring
                     }
                 }
-                FpmCacheKind::Attention => {
-                    ensure!(
-                        cacheable,
-                        "kv_cache_groups with enable_prefix_caching=true require prefix_cacheable=true on every attention group; turn prefix caching off to replay them cold"
-                    );
-                    match group.sliding_window {
-                        Some(window) => GroupRuleKind::SlidingWindow {
+                FpmCacheKind::Attention => match group.sliding_window {
+                    Some(window) => {
+                        // The window specs that opt out of prefix caching are
+                        // a ring of one block per request (v0.31
+                        // `KpoolTailSpec`, `iface:1015-1038`) and a bounded
+                        // replay window (`SlidingWindowMLASpec`, v0.31
+                        // `iface:949-955`, v0.32 `iface:968-970`). Neither is
+                        // a window rule. A full-attention group that opts out
+                        // takes no part in the hit and gets fresh blocks, as
+                        // in vLLM (v0.31 `coord:743-749`, v0.32
+                        // `coord:713-720`).
+                        ensure!(
+                            cacheable,
+                            "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not model"
+                        );
+                        GroupRuleKind::SlidingWindow {
                             window: window as usize,
-                        },
-                        None => GroupRuleKind::FullAttention,
+                        }
                     }
-                }
+                    None => GroupRuleKind::FullAttention,
+                },
                 // The table has no rule for a convolution group, so the
                 // group fails here and does not lose its window.
                 FpmCacheKind::Convolution => bail!(
@@ -1612,33 +1621,61 @@ mod tests {
     }
 
     #[test]
-    fn rules_refuse_non_cacheable_attention_before_lookup() {
+    fn rules_refuse_a_non_cacheable_sliding_window_group() {
+        // The window specs that opt out of prefix caching: the v0.31 ring
+        // `KpoolTailSpec` (iface:1015-1038), which GLM-5.3-Flash builds with
+        // `block_size=ring` and `sliding_window=ring`
+        // (glm5next/common/attention.py:205-212; v0.32 has no such spec), and
+        // a bounded replay window (`SlidingWindowMLASpec`, v0.31
+        // iface:949-955, v0.32 :968-970).
         for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
-            for window in [None, Some(17)] {
-                let mut groups = [attention("full", 16, None), attention("other", 16, window)];
-                groups[1].prefix_cacheable = Some(false);
-                let mut kv = kv_pool(&groups, 4);
-                let pool = kv.block_pool_mut().unwrap();
-                seed_many(pool, 0, 16, &[16]);
-                let request = lease(17, 16);
-                assert!(
-                    pool.key_hit(0, request.prefix_hash_at(16).unwrap())
-                        .is_some()
-                );
-                assert!(
-                    pool.key_hit(1, request.prefix_hash_at(16).unwrap())
-                        .is_none()
-                );
-                // Reject before a 17-token lookup can authorize skipping 16
-                // tokens that the second attention group has not computed.
-                let err = GroupedPrefixRules::new(&groups, 16, version)
-                    .unwrap_err()
-                    .to_string();
-                assert!(
-                    err.contains("require prefix_cacheable=true on every attention group"),
-                    "{err}"
-                );
-            }
+            let mut groups = [
+                attention("full", 16, None),
+                attention("other", 16, Some(17)),
+            ];
+            groups[1].prefix_cacheable = Some(false);
+            let err = GroupedPrefixRules::new(&groups, 16, version)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not model",
+                "{version:?}"
+            );
+            // The same ring as a state group is accepted.
+            let ring = [attention("full", 16, None), state("ring", 16, false, false)];
+            assert!(GroupedPrefixRules::new(&ring, 16, version).is_ok());
+        }
+    }
+
+    #[test]
+    fn non_cacheable_full_attention_group_takes_no_part_in_the_hit() {
+        // Two full-attention groups of block 16, the second with
+        // `prefix_cacheable: false`. vLLM's hybrid coordinator skips a group
+        // that opts out of prefix caching in the lookup, so its slot of the
+        // hit stays empty (v0.31 coord:743-749, v0.32 coord:713-720). Its
+        // manager then counts `cdiv(17, 16) = 2` new blocks with no computed
+        // block (v0.31 single:216-268, v0.32 single:213-265). The first group
+        // hits 16 tokens and needs one new block and its inactive hit block.
+        let mut groups = [attention("full", 16, None), attention("other", 16, None)];
+        groups[1].prefix_cacheable = Some(false);
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            let coordinator = with_limits(GroupedPrefixRules::new(&groups, 16, version).unwrap());
+            let mut kv = kv_pool(&groups, 8);
+            let pool = kv.block_pool_mut().unwrap();
+            seed_many(pool, 0, 16, &[16]);
+            let request = lease(17, 16);
+            let hit = coordinator.find_longest_hit(pool, &request, 17);
+            assert_eq!(hit.tokens, 16, "{version:?}");
+            assert_eq!(hit.per_group[1], GroupHitBlocks::None, "{version:?}");
+            assert_eq!(coordinator.admission_blocks(pool, &hit, 17), 2 + 2);
+            let mut block_lease = coordinator.new_lease();
+            coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
+            assert!(coordinator.allocate(pool, &mut block_lease, 17, 16, 17, 1));
+            assert_eq!(attention_copies(&block_lease, 0), 2);
+            assert_eq!(attention_copies(&block_lease, 1), 2);
+            coordinator.release_request(pool, &mut block_lease);
+            assert_eq!(pool.active_blocks(), 0);
         }
     }
 
