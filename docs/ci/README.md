@@ -200,7 +200,7 @@ The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
 three-wheel bundle is built on a miss and reused through Artifactory on matching
 subsequent runs. The key includes both source revisions, the build recipe and
 storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
-GitHub-hosted runner image version and storage repository. A changed key or expired manifest rebuilds
+job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
 the bundle. Cross-run reuse accepts successful Full CI producers from this
 repository's `main`, or the exact same admitted PR head; another PR cannot
 populate the cache for this PR or for `main`.
@@ -210,6 +210,13 @@ on both main and PR refs. Main seeds its RC bundle under `preview/` in that test
 repository; PR producers use their verified `pr/<number>/` namespace. This
 enables trusted-main reuse without giving PR jobs access to official release
 storage. Other product/release wheel handoffs keep their existing environments.
+
+The Dynamo profile runs in the existing NVIDIA-connected AMD64 pool and CI job
+image because GitHub-hosted runners cannot resolve NVIDIA Artifactory. It checks
+storage DNS before compilation. Native prerequisites are prepared before key
+generation so cold and reused jobs have the same fingerprint. Source and macOS
+README profiles keep their original runner placement; all README commands and
+the separate platform/Python compatibility matrices remain in place.
 
 The existing wheel-storage action checks the source SHA, producer run/attempt,
 architecture, scope, sizes, and checksums. The README job additionally verifies

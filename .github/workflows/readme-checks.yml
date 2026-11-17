@@ -25,7 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(inputs.daily && '[{"profile":"development","os":"ubuntu-24.04"},{"profile":"release","os":"ubuntu-24.04"},{"profile":"dynamo","os":"ubuntu-24.04"},{"profile":"macos","os":"macos-15"}]' || '[{"profile":"source","os":"ubuntu-24.04"},{"profile":"dynamo","os":"ubuntu-24.04"}]') }}
-    runs-on: ${{ matrix.os }}
+    # Artifactory DNS is available inside the existing NVIDIA runner network.
+    runs-on: ${{ matrix.profile == 'dynamo' && 'prod-aisim-default-amd64-v1' || matrix.os }}
+    container: ${{ matrix.profile == 'dynamo' && vars.CI_JOB_CONTAINER_IMAGE || '' }}
     timeout-minutes: 330
     env:
       HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
@@ -35,6 +37,23 @@ jobs:
       DYNAMO_RC_REVISION: 9653d05441b37b6a004837651fd991e44158d755
       RC_PR_NUMBER: ${{ inputs.pr_number }}
     steps:
+      - name: Prepare the NVIDIA-connected Dynamo job environment
+        if: matrix.profile == 'dynamo'
+        shell: bash
+        run: |
+          {
+            echo "HOME=${GITHUB_WORKSPACE}"
+            echo "USER=runner"
+            echo "CARGO_HOME=${RUNNER_TEMP}/cargo"
+            echo "RUSTUP_HOME=${RUNNER_TEMP}/rustup"
+          } >> "${GITHUB_ENV}"
+          {
+            cat /etc/os-release
+            nproc
+            for resource in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max; do
+              if [ -f "$resource" ]; then echo "$resource"; cat "$resource"; fi
+            done
+          } | tee "${RUNNER_TEMP}/rc-runner-environment.txt"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
@@ -56,17 +75,45 @@ jobs:
         run: |
           python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py
           python scripts/readme/check_readme_commands.py --validate
+      - name: Prepare and identify the RC native build environment
+        if: matrix.profile == 'dynamo'
+        shell: bash
+        env:
+          RC_STORAGE_URL: ${{ vars.WHEEL_STORAGE_URL }}
+        run: |
+          # Fail before compilation if this runner cannot reach the storage DNS.
+          python -c 'import os, socket; from urllib.parse import urlsplit; endpoint = urlsplit(os.environ["RC_STORAGE_URL"]); assert endpoint.scheme == "https" and endpoint.hostname; socket.getaddrinfo(endpoint.hostname, 443)'
+          as_root() {
+            if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+          }
+          as_root apt-get update
+          as_root apt-get install -y build-essential libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
+          echo "LIBRARY_PATH=${pythonLocation}/lib" >> "${GITHUB_ENV}"
       - name: Find matching pinned Dynamo RC wheels
         id: rc-wheels
         if: matrix.profile == 'dynamo'
         env:
           GH_TOKEN: ${{ github.token }}
           RC_STORAGE_REPO: ${{ vars.WHEEL_STORAGE_REPO }}
+          RC_STORAGE_URL: ${{ vars.WHEEL_STORAGE_URL }}
+          RC_JOB_IMAGE: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
         run: |
           wheelhouse="${RUNNER_TEMP}/dynamo-rc-wheels"
           echo "AISIM_RC_WHEELHOUSE=${wheelhouse}" >> "${GITHUB_ENV}"
           echo "RC_STORAGE_REPO=${RC_STORAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "RC_STORAGE_URL=${RC_STORAGE_URL}" >> "${GITHUB_ENV}"
+          echo "RC_JOB_IMAGE=${RC_JOB_IMAGE}" >> "${GITHUB_ENV}"
           python scripts/ci/readme_rc_wheels.py prepare --directory "$wheelhouse"
+      - name: Preserve RC build-input and runner evidence
+        if: matrix.profile == 'dynamo'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: readme-rc-build-inputs
+          path: |
+            ${{ env.AISIM_RC_WHEELHOUSE }}/rc-build-inputs.json
+            ${{ runner.temp }}/rc-runner-environment.txt
+          overwrite: true
+          if-no-files-found: error
       - name: Restore verified pinned Dynamo RC wheels
         if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id != ''
         uses: ./.github/actions/wheel-storage
@@ -87,11 +134,6 @@ jobs:
         env:
           CARGO_BUILD_JOBS: '2'
         run: bash scripts/ci/build_readme_rc_wheels.sh
-      - name: Install RC runtime libraries on reuse
-        if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libhwloc15 libudev1
       - name: Verify the RC wheel set and build inputs
         if: matrix.profile == 'dynamo'
         run: python scripts/ci/readme_rc_wheels.py verify --directory "$AISIM_RC_WHEELHOUSE"

@@ -1046,12 +1046,19 @@ def test_rc_wheels_discovery_paginates_past_expired_manifests():
 def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, changed_input):
     for key in ("AISIM_RC_REVISION", "DYNAMO_RC_REVISION"):
         monkeypatch.setenv(key, "a" * 40)
-    monkeypatch.setenv("ImageOS", "ubuntu24")
-    monkeypatch.setenv("ImageVersion", "20261117.1")
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
     monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pr-pypi-local")
+    monkeypatch.setenv("RC_STORAGE_URL", "https://artifactory.invalid/artifactory")
+    os_release = tmp_path / "os-release"
+    os_release.write_text("Linux image version")
+    monkeypatch.setattr(rc_wheels, "OS_RELEASE", os_release)
     monkeypatch.setattr(rc_wheels.platform, "system", lambda: "Linux")
     monkeypatch.setattr(rc_wheels.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(rc_wheels.subprocess, "check_output", lambda *a, **kw: "pinned tool version")
+    monkeypatch.setattr(
+        rc_wheels.subprocess,
+        "check_output",
+        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"pinned package versions",
+    )
     for relative in rc_wheels.INPUTS:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1060,9 +1067,23 @@ def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, 
     (tmp_path / changed_input).write_text("changed")
     assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
     (tmp_path / changed_input).write_text("original")
-    monkeypatch.setenv("ImageVersion", "20261118.1")
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:new-version")
     assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
-    monkeypatch.setenv("ImageVersion", "20261117.1")
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
+    os_release.write_text("rebuilt Linux image")
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    os_release.write_text("Linux image version")
+    monkeypatch.setattr(
+        rc_wheels.subprocess,
+        "check_output",
+        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"updated package versions",
+    )
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    monkeypatch.setattr(
+        rc_wheels.subprocess,
+        "check_output",
+        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"pinned package versions",
+    )
     monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
     assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
 
@@ -1079,6 +1100,11 @@ def test_main_rc_producers_share_test_storage_with_pr_consumers():
         if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "upload"
     )
     assert upload["with"]["scope"] == "${{ inputs.pr_number != '' && 'pr' || 'preview' }}"
+    assert job["runs-on"] == "${{ matrix.profile == 'dynamo' && 'prod-aisim-default-amd64-v1' || matrix.os }}"
+    assert job["container"] == "${{ matrix.profile == 'dynamo' && vars.CI_JOB_CONTAINER_IMAGE || '' }}"
+    commands = _run_commands(job)
+    assert commands.index("socket.getaddrinfo") < commands.index("readme_rc_wheels.py prepare")
+    assert commands.index("apt-get install") < commands.index("readme_rc_wheels.py prepare")
 
 
 def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path):

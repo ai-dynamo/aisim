@@ -3,8 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-sudo apt-get update
-sudo apt-get install -y libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
 for entry in "aisim:${AISIM_RC_REVISION}" "dynamo:${DYNAMO_RC_REVISION}"; do
   repo="${entry%%:*}"
   revision="${entry#*:}"
