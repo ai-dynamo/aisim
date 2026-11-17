@@ -6,7 +6,13 @@
 from typing import Any
 
 from .capacity import estimate_state_cache
-from .config.engine import EnginePredictionConfig, StateCacheConfig, WorkerPredictionConfig, recorded_state_pool
+from .config.engine import (
+    EnginePredictionConfig,
+    StateCacheConfig,
+    WorkerPredictionConfig,
+    _validate_hybrid_host_offload,
+    recorded_state_pool,
+)
 
 
 def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str) -> dict[str, Any]:
@@ -52,8 +58,15 @@ def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionC
         raise ValueError("prefix_match_unit must be a positive divisor of resolved block_size")
     if sizing.prefill_checkpoint and cache.prefix_match_unit != block_size:
         raise ValueError("state_cache.prefill_checkpoint requires prefix_match_unit equal to block_size")
-    if cache.host_offload is not None and cache.prefix_match_unit != block_size:
-        raise ValueError("state_cache with host_offload requires prefix_match_unit equal to block_size")
+    if cache.host_offload is not None:
+        # The state's family is known here, also for an inferred geometry.
+        _validate_hybrid_host_offload(
+            cache.host_offload.connector,
+            cache.prefix_match_unit,
+            block_size,
+            window="sliding_window_lookahead_tokens" in result,
+            kvcr=cache.kvcr is not None,
+        )
     size = StateCacheConfig(bytes_per_request=result["bytes_per_request"])
     blocks = size.state_blocks(block_size, bytes_per_token)
     block_bytes = block_size * bytes_per_token

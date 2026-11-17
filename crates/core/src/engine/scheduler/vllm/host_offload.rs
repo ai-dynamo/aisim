@@ -3745,6 +3745,28 @@ mod tests {
     }
 
     #[test]
+    fn a_window_hit_makes_its_checkpoint_the_newest() {
+        // vLLM looks its sliding-window groups up after the full-attention
+        // ones (`_lookup_complete_chunks`), so the checkpoint is touched last.
+        let mut adapter = adapter(8);
+        adapter.set_hybrid(1, Some(false)).unwrap();
+        let manager = G1Manager::new_with_caching(16, 4, KvEventPublishers::default(), 0, true);
+        let (sequence, lease, mut host) = request(Uuid::from_u128(1), (1..=9).collect());
+        let blocks = host.block_keys.clone();
+        let checkpoint = |block: usize| HostBlockKey::state(blocks[block].sequence_hash(), 1);
+        // The deeper checkpoint is stored first, so it is the older one.
+        for key in [blocks[0], blocks[1], checkpoint(1), checkpoint(0)] {
+            seed_host(&mut adapter, key);
+        }
+        let cost = raw_cost(&manager, &sequence, &lease);
+        let HostLookup::Hit(hit) = adapter.lookup(&mut host, &sequence, &cost, 4, 0.0) else {
+            panic!("the checkpoint after block 1 is a hit")
+        };
+        assert_eq!(hit.keys, [checkpoint(1), blocks[0], blocks[1]]);
+        assert_eq!(adapter.host.lock().lru_order().last(), Some(&checkpoint(1)));
+    }
+
+    #[test]
     fn a_hybrid_hit_ends_at_the_deepest_state_with_every_slot() {
         // vLLM's hybrid lookup needs the attention prefix and every Mamba
         // group's block at one boundary (`_lookup_complete_chunks`, and the

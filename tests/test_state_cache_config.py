@@ -709,6 +709,20 @@ def test_auto_dsv4_mtp_state_includes_draft_rows(auto_dsv4_payload, forbid_estim
     }
 
 
+def test_auto_dsv4_compiles_with_host_offload_on_the_default_connector(auto_dsv4_payload, forbid_estimators):
+    """Sizing knows the state is a sliding window, which G2 keeps on the default connector only."""
+    kv_cache = auto_dsv4_payload["engine"]["workers"]["aggregated"]["kv_cache"]
+    kv_cache["host_offload"] = {"num_host_blocks": 64}
+    args = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(auto_dsv4_payload)
+    ).backend_deployment.agg_engine_args
+    assert args["native_host_offload"]["num_host_blocks"] == 64
+    assert "sliding_window" in args["state_cache"]
+    kv_cache["host_offload"]["connector"] = "offloading_v0_32"
+    with pytest.raises(ValueError, match="connector=offloading_v0_24"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
+
+
 def test_auto_dsv4_pd_transfers_rows_and_state(auto_dsv4_payload, forbid_estimators):
     _to_pd(auto_dsv4_payload, kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50})
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload)).backend_deployment
