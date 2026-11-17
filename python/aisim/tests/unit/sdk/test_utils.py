@@ -318,6 +318,29 @@ def test_processor_files_follow_the_cached_config_commit(monkeypatch):
     assert requested == [("preprocessor_config.json", commit)]
 
 
+def test_remote_config_with_cached_quant_fallback_uses_one_snapshot(monkeypatch, hf_cache):
+    cached = "a" * 40
+    _cache_file(
+        hf_cache,
+        "org/mixed",
+        "config.json",
+        {"architectures": ["LlamaForCausalLM"], "hidden_size": 1024},
+        commit=cached,
+    )
+    _cache_file(hf_cache, "org/mixed", "hf_quant_config.json", {"quantization": {"quant_algo": "FP8"}}, commit=cached)
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/main/config.json"):
+            return io.BytesIO(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 2048}).encode())
+        raise utils.urllib.error.URLError("transient")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    loaded = utils._load_model_config_from_model_path.__wrapped__("org/mixed")
+    # Remote dimensions are never paired with the cached snapshot's quantization.
+    assert loaded["hidden_size"] == 1024
+    assert utils._config_snapshot_commit(loaded) == cached
+
+
 @pytest.mark.parametrize(
     "settings,expected",
     [

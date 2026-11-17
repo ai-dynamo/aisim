@@ -2159,18 +2159,33 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     token = _SNAPSHOT_CAPTURE.set(capture)
     try:
         raw_config = _download_hf_config(model_path)
+        # A config served from the cache pins its companions to the same snapshot, so a
+        # transient failure cannot pair cached dimensions with newer remote metadata.
+        commit = capture.get((model_path, "config.json"))
+        pinned = {"revision": commit} if commit else {}
+        try:
+            hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
+        except Exception as exc:  # best-effort for optional quant config
+            logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
+            hf_quant_config = None
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
-    # A config served from the cache pins its companions to the same snapshot, so a
-    # transient failure cannot pair cached dimensions with newer remote metadata.
-    commit = capture.get((model_path, "config.json"))
-    pinned = {"revision": commit} if commit else {}
+    quant_commit = capture.get((model_path, "hf_quant_config.json"))
+    if commit is None and quant_commit is not None:
+        # The config came from the network but the quant file fell back to a cached
+        # snapshot: use that snapshot's config too, or drop the mismatched quant file.
+        cached_config = _load_cached_hf_json(model_path, "config.json", quant_commit)
+        if cached_config is not None:
+            raw_config, commit = cached_config, quant_commit
+            pinned = {"revision": commit}
+        else:
+            logger.warning(
+                "Ignoring cached hf_quant_config.json for %s: it is from snapshot %s, not the downloaded config",
+                model_path,
+                quant_commit,
+            )
+            hf_quant_config = None
     config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
-    try:
-        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
     loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
     if commit:
         _CONFIG_PROVENANCE[id(loaded)] = (loaded, commit)
