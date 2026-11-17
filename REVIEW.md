@@ -137,6 +137,18 @@ For review-policy-only changes, published vendor-schema validation, policy
 checks, and link/attribution checks can provide the relevant evidence. Tests
 that merely pin natural-language wording do not establish review quality.
 
+CodeRabbit has no repository-specific path allowlist: current and future source
+directories are eligible under its
+[default path exclusions](https://docs.coderabbit.ai/configuration/path-instructions#default-ignored-paths).
+Those defaults still skip binary, generated, lock, and some data files. Inspect
+the ignored-files summary and require separate provenance, machine-readable
+summaries, and relevant validation for skipped data or compatibility artifacts;
+an eligible path is not proof that its changes were reviewed. The configured
+[`fail_commit_status`](https://docs.coderabbit.ai/pr-reviews/status-check#fail-the-check-when-a-review-errors)
+fails the CodeRabbit check on review errors. It does not fail skipped or
+rate-limited reviews. Verify review completion and coverage at the current head
+before approval; a successful or neutral status alone is insufficient.
+
 Fast CI contains quick deterministic checks: source and legal policy, generated
 CODEOWNERS integrity, lint, syntax compilation, whitespace, and Rust formatting.
 Full CI contains the expensive multi-architecture dependency, Rust, Python,

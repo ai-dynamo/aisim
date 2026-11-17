@@ -79,6 +79,8 @@ reviews:
   poem: false
   in_progress_fortune: false
   review_status: true
+  # Fail on review errors; skips and rate limits still need coverage verification.
+  fail_commit_status: true
   review_details: true
   review_progress: true
   collapse_walkthrough: true
@@ -100,37 +102,10 @@ reviews:
       - "!wip"
       - "!do-not-review"
 
-  # Use an allowlist so data and compatibility artifacts are reviewed even
-  # when their file types would normally be skipped.
-  path_filters:
-    - ".claude/**"
-    - ".github/**"
-    - "crates/**"
-    - "docker/**"
-    - "docs/**"
-    - "examples/**"
-    - "python/**"
-    - "scripts/**"
-    - "tests/**"
-    - ".coderabbit.yaml"
-    - ".dockerignore"
-    - ".gitattributes"
-    - ".gitignore"
-    - "AGENTS.md"
-    - "Cargo.lock"
-    - "Cargo.toml"
-    - "CODEOWNERS"
-    - "CONTRIBUTORS.md"
-    - "LICENSE"
-    - "README.md"
-    - "REVIEW.md"
-    - "deny.toml"
-    - "pytest.ini"
-    - "*.json"
-    - "*.md"
-    - "*.toml"
-    - "*.yaml"
-    - "*.yml"
+  # Keep current and future source directories eligible without an allowlist.
+  # CodeRabbit's default binary, generated-file, and lock-file ignores still apply.
+  # Data/compatibility changes skipped by those defaults need separate evidence.
+  path_filters: []
 
   path_instructions:
     - path: "**/*"
