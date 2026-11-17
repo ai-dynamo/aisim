@@ -9,11 +9,14 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
+
+from scripts.ci import readme_rc_wheels as rc_wheels
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTION = ROOT / ".github/actions/wheel-storage"
@@ -112,6 +115,65 @@ def test_bundle_survives_consumer_only_rerun_and_cross_run(handoff, package):
     handoff.monkeypatch.setenv("GITHUB_REPOSITORY", "ai-dynamo/aisim")
     download(handoff, run="303")
     assert all("/1330347449/101/1/" in url for url, _, _ in handoff.requests)
+
+
+@pytest.mark.parametrize("producer_branch", ["main", "pull-request/42"])
+def test_rc_producer_reaches_verified_download_in_shared_test_repository(handoff, producer_branch):
+    expected = {"storage_repo": "sw-dynamo-aisimulate-pr-pypi-local", "recipe": "fixed RC inputs"}
+    name = rc_wheels.handoff_name(expected)
+    scope = "preview" if producer_branch == "main" else "pr"
+    for key, value in {
+        "STORAGE_NAME": name,
+        "STORAGE_REPO": expected["storage_repo"],
+        "STORAGE_SCOPE": scope,
+        "STORAGE_PR_NUMBER": "" if scope == "preview" else "42",
+    }.items():
+        handoff.monkeypatch.setenv(key, value)
+    for package in ("aisim", "ai_dynamo", "ai_dynamo_runtime"):
+        with zipfile.ZipFile(handoff.source / f"{package}.whl", "w") as archive:
+            archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.0\n")
+    (handoff.source / "rc-build-inputs.json").write_text(json.dumps(expected))
+    transfer.main()
+    env = {
+        **handoff.env,
+        "GITHUB_RUN_ID": "202",
+        "GITHUB_REF_NAME": "pull-request/42",
+        "RC_PR_NUMBER": "42",
+    }
+    producer = {
+        "id": 101,
+        "repository_id": 1330347449,
+        "head_repository_id": 1330347449,
+        "head_sha": env["GITHUB_SHA"],
+    }
+    run = {
+        "id": 101,
+        "repository": {"id": 1330347449},
+        "head_repository": {"id": 1330347449},
+        "head_sha": env["GITHUB_SHA"],
+        "head_branch": producer_branch,
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+    }
+
+    def request(endpoint):
+        if "/artifacts?" in endpoint:
+            return {"artifacts": [{"name": name + "-manifest", "expired": False, "workflow_run": producer}]}
+        return run
+
+    selected = rc_wheels.find_producer(name, env, request)
+    assert selected == {"run-id": "101", "scope": scope, "pr-number": "" if scope == "preview" else "42"}
+    handoff.monkeypatch.setenv("STORAGE_SCOPE", selected["scope"])
+    handoff.monkeypatch.setenv("STORAGE_PR_NUMBER", selected["pr-number"])
+    download(handoff, run="202")
+    rc_wheels.verify(handoff.output, expected)
+    handoff.requests.clear()
+    handoff.monkeypatch.setenv("STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
+    with pytest.raises(ValueError, match="producer mismatch"):
+        download(handoff, run="202")
+    assert handoff.requests == []
 
 
 @pytest.mark.parametrize(
