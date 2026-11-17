@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -52,40 +53,95 @@ _DIAGNOSTIC_FILES = frozenset(
 _KNOWN_FILES = _RESULT_FILES | _DIAGNOSTIC_FILES
 
 
-def _unfinished_run_leftovers(root: Path) -> list[Path] | None:
-    """Return the files of an unfinished AISim run, or None if the directory holds anything else.
+# Terminal statuses that ``supervision.run_process`` records in resource-runtime.json
+# for a run that did not complete. Anything else, including a missing or
+# unreadable report, means the directory is preserved.
+_FAILED_RUN_STATUSES = frozenset({"failed", "resource_limited", "timed_out", "cancelled"})
+_RUNTIME_REPORT = "resource-runtime.json"
 
-    A directory qualifies only when every entry is an AISim diagnostic file, no
-    result file exists, and ``resource-runtime.json`` (when present) does not
-    report a completed run. Unknown files and finished results are never touched.
+_Fingerprint = tuple[int, int, int, int, bool]
+
+
+def _fingerprint(path: Path) -> _Fingerprint:
+    info = path.lstat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, stat.S_ISDIR(info.st_mode))
+
+
+def _failed_runtime_status(path: Path) -> str | None:
+    """Return the status of a valid runtime report that records a failed run, else None."""
+
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        return None
+    status = report.get("status")
+    return status if status in _FAILED_RUN_STATUSES else None
+
+
+def _unfinished_run_leftovers(root: Path) -> dict[str, _Fingerprint] | None:
+    """Fingerprint the files of a failed AISim run, or return None to preserve the directory.
+
+    A directory qualifies only when every entry is a regular AISim diagnostic
+    file (or an empty ``recommendations/`` directory), none is a symlink, and a
+    valid ``resource-runtime.json`` records one of the failed-run statuses.
     """
 
-    leftovers: list[Path] = []
+    leftovers: dict[str, _Fingerprint] = {}
     for entry in root.iterdir():
-        if entry.name == "recommendations" and entry.is_dir() and not any(entry.iterdir()):
-            leftovers.append(entry)
-            continue
-        if entry.name not in _DIAGNOSTIC_FILES or not (entry.is_file() or entry.is_symlink()):
-            return None
-        leftovers.append(entry)
-    runtime = root / "resource-runtime.json"
-    if runtime.is_file():
         try:
-            status = json.loads(runtime.read_text(encoding="utf-8")).get("status")
-        except (OSError, ValueError, AttributeError):
+            mode = entry.lstat().st_mode
+        except OSError:
             return None
-        if status == "completed":
+        if entry.name == "recommendations" and stat.S_ISDIR(mode):
+            if any(entry.iterdir()):
+                return None
+        elif entry.name not in _DIAGNOSTIC_FILES or not stat.S_ISREG(mode):
             return None
+        leftovers[entry.name] = _fingerprint(entry)
+    if _RUNTIME_REPORT not in leftovers or _failed_runtime_status(root / _RUNTIME_REPORT) is None:
+        return None
     return leftovers
+
+
+def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> None:
+    """Remove the fingerprinted leftovers, stopping at the first file that changed.
+
+    Each file is checked again just before it is removed, and the runtime report
+    goes last, so a directory another process starts using keeps its evidence.
+    No output-directory lock exists yet; see the PR notes on the remaining race.
+    """
+
+    for name in sorted(leftovers, key=lambda item: item == _RUNTIME_REPORT):
+        target = root / name
+        try:
+            unchanged = _fingerprint(target) == leftovers[name]
+        except FileNotFoundError:
+            unchanged = False
+        if not unchanged:
+            raise ValueError(
+                f"output directory {root} changed while AISim was preparing it ({name}); "
+                "nothing else was removed. Choose a new --output-dir"
+            )
+        if leftovers[name][4]:
+            target.rmdir()
+        else:
+            target.unlink()
+    if any(root.iterdir()):
+        raise ValueError(f"output directory {root} changed while AISim was preparing it; choose a new --output-dir")
 
 
 def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
     """Create an output directory without deleting unrelated user files.
 
-    A directory that holds only the diagnostics of an unfinished AISim run (for
-    example after a failed or resource-limited run) is cleared and reused, so the
-    obvious retry works without ``--overwrite``. Finished results and files that
-    AISim did not write still require a new directory or ``--overwrite``.
+    A directory that holds only the diagnostics of a failed AISim run (a runtime
+    report with status failed, resource_limited, timed_out or cancelled) is
+    cleared and reused, so the obvious retry works without ``--overwrite``.
+    Finished results, files that AISim did not write, and diagnostics without a
+    failed-run runtime report still require a new directory or ``--overwrite``.
     """
 
     root = Path(path)
@@ -95,12 +151,8 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
         leftovers = _unfinished_run_leftovers(root)
         if leftovers is None:
             raise ValueError(_non_empty_message(root))
-        for target in leftovers:
-            if target.is_dir() and not target.is_symlink():
-                target.rmdir()
-            else:
-                target.unlink()
-        sys.stderr.write(f"aisim: reusing {root}: removed diagnostics left by an unfinished run\n")
+        _clear_unfinished_run(root, leftovers)
+        sys.stderr.write(f"aisim: reusing {root}: removed diagnostics left by a failed run\n")
     root.mkdir(parents=True, exist_ok=True)
     if overwrite:
         for name in sorted(_KNOWN_FILES):
@@ -118,6 +170,7 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
 def _non_empty_message(root: Path) -> str:
     names = {entry.name for entry in root.iterdir()}
     unknown = sorted(name for name in names if name not in _KNOWN_FILES and name != "recommendations")
+    advice = "choose a new --output-dir to keep them, or pass --overwrite to replace known AISim outputs"
     if unknown:
         shown = ", ".join(unknown[:3]) + (", ..." if len(unknown) > 3 else "")
         return (
@@ -126,25 +179,46 @@ def _non_empty_message(root: Path) -> str:
         )
     status = None
     try:
-        status = json.loads((root / "resource-runtime.json").read_text(encoding="utf-8")).get("status")
-    except (OSError, ValueError, AttributeError):
+        report = json.loads((root / _RUNTIME_REPORT).read_text(encoding="utf-8"))
+        status = report.get("status") if isinstance(report, dict) else None
+    except (OSError, ValueError):
         pass
-    if isinstance(status, str) and status != "completed":
-        held = f"results from an earlier AISim run that ended with status {status!r}"
-    else:
-        held = "results from a finished AISim run"
-    return (
-        f"output directory {root} is not empty and holds {held}; "
-        "choose a new --output-dir to keep them, or pass --overwrite to replace them"
+    has_results = bool(names & _RESULT_FILES) or (
+        (root / "recommendations").is_dir() and any((root / "recommendations").iterdir())
     )
+    if has_results and isinstance(status, str) and status != "completed":
+        held = f"results from an earlier AISim run that ended with status {status!r}"
+    elif has_results or status == "completed":
+        held = "results from a finished AISim run"
+    elif _RUNTIME_REPORT not in names:
+        held = "AISim diagnostics without a runtime report that records a failed run"
+    else:
+        held = "AISim diagnostics whose runtime report does not record a failed run"
+    return f"output directory {root} is not empty and holds {held}; {advice}"
 
 
-def write_prediction_report(root: Path, report: dict[str, Any]) -> Path:
+def _open_result(path: Path, *, exclusive: bool):
+    """Open a result file for writing.
+
+    With ``exclusive`` (the CLI, after ``prepare_output_directory``), a file that
+    appeared after preparation makes the write fail instead of being replaced.
+    """
+
+    if not exclusive:
+        return path.open("w", encoding="utf-8")
+    try:
+        return path.open("x", encoding="utf-8")
+    except FileExistsError as error:
+        raise ValueError(f"{path} appeared after the output directory was prepared; refusing to replace it") from error
+
+
+def write_prediction_report(root: Path, report: dict[str, Any], *, exclusive: bool = False) -> Path:
     path = root / "prediction.json"
     # json.dump writes the chunks json.dumps would join, so a large per-request
     # report is never held as one string. A failed encoding leaves no report, as before.
+    output = _open_result(path, exclusive=exclusive)
     try:
-        with path.open("w", encoding="utf-8") as output:
+        with output:
             json.dump(report, output, indent=2, sort_keys=True)
             output.write("\n")
     except BaseException:
@@ -161,16 +235,16 @@ def write_fpm_coverage(root: Path, coverage: dict[str, Any]) -> Path:
     return path
 
 
-def write_requests(root: Path, records: list[dict[str, Any]]) -> Path:
+def write_requests(root: Path, records: list[dict[str, Any]], *, exclusive: bool = False) -> Path:
     path = root / "requests.jsonl"
-    with path.open("w", encoding="utf-8") as output:
+    with _open_result(path, exclusive=exclusive) as output:
         for record in records:
             output.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
             output.write("\n")
     return path
 
 
-def write_telemetry(root: Path, telemetry: dict[str, Any]) -> dict[str, Any]:
+def write_telemetry(root: Path, telemetry: dict[str, Any], *, exclusive: bool = False) -> dict[str, Any]:
     """Write all-phase telemetry streams and return their compact report manifest."""
 
     streams = ("requests", "samples", "lifecycle")
@@ -179,14 +253,16 @@ def write_telemetry(root: Path, telemetry: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
             raise ValueError(f"telemetry.{stream} must be a list of JSON mappings")
     paths = {stream: root / f"telemetry-{stream}.jsonl" for stream in streams}
+    created: list[Path] = []
     try:
         for stream, path in paths.items():
-            with path.open("w", encoding="utf-8") as output:
+            with _open_result(path, exclusive=exclusive) as output:
+                created.append(path)
                 for record in telemetry[stream]:
                     json.dump(record, output, sort_keys=True, separators=(",", ":"), allow_nan=False)
                     output.write("\n")
     except BaseException:
-        for path in paths.values():
+        for path in created:
             path.unlink(missing_ok=True)
         raise
     return {
@@ -196,36 +272,38 @@ def write_telemetry(root: Path, telemetry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def write_recommendation_result(root: Path, result: SweepResult) -> Path:
+def write_recommendation_result(root: Path, result: SweepResult, *, exclusive: bool = False) -> Path:
     """Write the lossless recommendation ledger and derived candidate views."""
 
     path = root / "recommendation.json"
-    path.write_text(result.to_json() + "\n", encoding="utf-8")
+    with _open_result(path, exclusive=exclusive) as output:
+        output.write(result.to_json() + "\n")
     return path
 
 
-def write_recommendation_csv(root: Path, result: SweepResult) -> Path:
+def write_recommendation_csv(root: Path, result: SweepResult, *, exclusive: bool = False) -> Path:
     """Write the complete candidate ledger as an analysis-friendly CSV."""
 
     path = root / "recommendation.csv"
-    path.write_text(result.to_csv(), encoding="utf-8")
+    with _open_result(path, exclusive=exclusive) as output:
+        output.write(result.to_csv())
     return path
 
 
-def write_recommendations(root: Path, configs: list[Mapping[str, Any]]) -> list[Path]:
+def write_recommendations(root: Path, configs: list[Mapping[str, Any]], *, exclusive: bool = False) -> list[Path]:
     directory = root / "recommendations"
     directory.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for index, config in enumerate(configs, start=1):
         path = directory / f"{index:04d}.yaml"
-        path.write_text(
-            yaml.safe_dump(
-                dict(config),
-                sort_keys=False,
-                allow_unicode=True,
-            ),
-            encoding="utf-8",
-        )
+        with _open_result(path, exclusive=exclusive) as output:
+            output.write(
+                yaml.safe_dump(
+                    dict(config),
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            )
         paths.append(path)
     return paths
 
