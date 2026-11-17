@@ -32,7 +32,10 @@ pytestmark = pytest.mark.unit
     "revision,path_revision",
     [(None, "main"), ("a" * 40, "a" * 40), ("release/v1", "release%2Fv1")],
 )
-def test_download_hf_config_json_revision(monkeypatch, revision, path_revision):
+def test_download_hf_config_json_revision(monkeypatch, tmp_path, revision, path_revision):
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "empty-cache"))
     requests = []
     metadata = {"architectures": ["UnregisteredDecoderForCausalLM"]}
 
@@ -46,6 +49,112 @@ def test_download_hf_config_json_revision(monkeypatch, revision, path_revision):
     kwargs = {} if revision is None else {"revision": revision}
     assert utils._download_hf_json("test/model", "config.json", **kwargs) == metadata
     assert requests == [f"https://huggingface.co/test/model/raw/{path_revision}/config.json"]
+
+
+@pytest.fixture
+def hf_cache(monkeypatch, tmp_path):
+    """An isolated Hugging Face hub cache, network access that fails the test, and offline mode cleared."""
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HUGGINGFACE_HUB_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    cache = tmp_path / "hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
+
+    def no_network(request, *, timeout):
+        raise AssertionError(f"unexpected network access: {request.full_url}")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", no_network)
+    return cache
+
+
+def _cache_file(cache, hf_id, filename, payload, *, ref="main", commit="c" * 40):
+    repo = cache / f"models--{hf_id.replace('/', '--')}"
+    snapshot = repo / "snapshots" / commit
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / filename).write_text(json.dumps(payload))
+    (repo / "refs").mkdir(exist_ok=True)
+    (repo / "refs" / ref).write_text(commit)
+
+
+@pytest.mark.parametrize("variable", ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"])
+def test_offline_mode_reads_the_local_cache_without_network(monkeypatch, hf_cache, variable):
+    _cache_file(hf_cache, "org/model", "config.json", {"architectures": ["X"]})
+    monkeypatch.setenv(variable, "1")
+
+    assert utils._download_hf_json("org/model", "config.json") == {"architectures": ["X"]}
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_offline_mode_fails_fast_when_not_cached(monkeypatch, hf_cache, value):
+    monkeypatch.setenv("HF_HUB_OFFLINE", value)
+
+    with pytest.raises(utils.HuggingFaceDownloadError) as error:
+        utils._download_hf_json("org/missing", "config.json")
+
+    message = str(error.value)
+    assert "offline mode is on (HF_HUB_OFFLINE is set)" in message
+    assert "not in the local Hugging Face cache" in message
+    assert "hf download org/missing config.json" in message
+
+
+def test_offline_mode_skips_optional_files(monkeypatch, hf_cache):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    assert utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=False) is None
+
+
+def test_offline_value_zero_still_downloads(monkeypatch, hf_cache):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setattr(
+        utils.urllib.request, "urlopen", lambda request, *, timeout: io.BytesIO(b'{"architectures": ["Y"]}')
+    )
+
+    assert utils._download_hf_json("org/model", "config.json") == {"architectures": ["Y"]}
+
+
+def test_pinned_commit_is_read_from_cache_before_network(hf_cache):
+    commit = "d" * 40
+    _cache_file(hf_cache, "org/model", "config.json", {"pinned": True}, commit=commit)
+
+    assert utils._download_hf_json("org/model", "config.json", revision=commit) == {"pinned": True}
+
+
+def test_network_failure_falls_back_to_cache(monkeypatch, hf_cache, caplog):
+    _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
+
+    def unreachable(request, *, timeout):
+        raise utils.urllib.error.URLError("nodename nor servname provided")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", unreachable)
+    with caplog.at_level(logging.WARNING):
+        assert utils._download_hf_json("org/model", "config.json") == {"cached": True}
+    assert "using the cached copy" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [utils.urllib.error.URLError("nodename nor servname provided"), TimeoutError("timed out")],
+)
+def test_network_failure_without_cache_explains_the_options(monkeypatch, hf_cache, failure):
+    def unreachable(request, *, timeout):
+        raise failure
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", unreachable)
+    with pytest.raises(utils.HuggingFaceDownloadError) as error:
+        utils._download_hf_json("org/model", "config.json")
+
+    message = str(error.value)
+    assert "the download from Hugging Face failed" in message
+    assert "AISim bundles configs only for its supported models" in message
+    assert "HF_HUB_OFFLINE=1" in message
+
+
+def test_offline_mode_reaches_the_model_config_loader(monkeypatch, hf_cache):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    utils._load_model_config_from_model_path.cache_clear()
+
+    with pytest.raises(utils.HuggingFaceDownloadError, match="offline mode is on"):
+        utils._load_model_config_from_model_path("org/not-bundled-model")
 
 
 @pytest.mark.parametrize("use_tilde", [False, True])

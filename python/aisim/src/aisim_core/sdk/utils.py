@@ -435,8 +435,78 @@ def _get_hf_auth_headers() -> dict[str, str]:
     return headers
 
 
+_TRUTHY = ("1", "ON", "YES", "TRUE")
+_OFFLINE_VARIABLES = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+_COMMIT_HASH = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _hf_offline_variable() -> str | None:
+    """Return the environment variable that turns Hugging Face offline mode on, if any."""
+    for name in _OFFLINE_VARIABLES:
+        if os.environ.get(name, "").strip().upper() in _TRUTHY:
+            return name
+    return None
+
+
+def _hf_hub_cache() -> Path:
+    """Locate the Hugging Face hub cache with the same precedence as huggingface_hub."""
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if configured := os.environ.get(name):
+            return Path(configured).expanduser()
+    default_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
+    return Path(os.environ.get("HF_HOME", default_home)).expanduser() / "hub"
+
+
+def _cached_hf_file(hf_id: str, filename: str, revision: str) -> Path | None:
+    """Find ``filename`` for ``hf_id`` at ``revision`` in the local Hugging Face cache."""
+    repo = _hf_hub_cache() / f"models--{hf_id.replace('/', '--')}"
+    commit = revision
+    if not _COMMIT_HASH.fullmatch(revision):
+        try:
+            commit = (repo / "refs" / revision).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+    path = repo / "snapshots" / commit / filename
+    return path if path.is_file() else None
+
+
+def _load_cached_hf_json(hf_id: str, filename: str, revision: str) -> dict | None:
+    path = _cached_hf_file(hf_id, filename, revision)
+    if path is None:
+        return None
+    logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
+    return _load_json_with_infinity(path)
+
+
+def _local_config_hint(hf_id: str, filename: str) -> str:
+    return (
+        f"AISim bundles configs only for its supported models. For {hf_id}, pass a local directory "
+        f"that contains {filename} as the model, or fetch the file into the Hugging Face cache while "
+        f"online with `hf download {hf_id} {filename}`."
+    )
+
+
 def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main") -> dict | None:
-    """Download and parse a JSON file from a HuggingFace model repo."""
+    """Load a JSON file from a Hugging Face model repo, from the local cache or the network.
+
+    Offline mode (``HF_HUB_OFFLINE`` or ``TRANSFORMERS_OFFLINE``) reads only the
+    local Hugging Face cache and never opens a connection. Online, a pinned commit
+    is read from the cache when present; other revisions are fetched so a moved
+    branch is honored, and the cache is the fallback when the network fails.
+    """
+    offline = _hf_offline_variable()
+    if offline is not None or _COMMIT_HASH.fullmatch(revision):
+        cached = _load_cached_hf_json(hf_id, filename, revision)
+        if cached is not None:
+            return cached
+    if offline is not None:
+        if not raise_on_404:
+            logger.debug("%s is set; skipping optional %s for %s", offline, filename, hf_id)
+            return None
+        raise HuggingFaceDownloadError(
+            f"Cannot load {hf_id}'s {filename}: Hugging Face offline mode is on ({offline} is set) and the "
+            f"file is not in the local Hugging Face cache ({_hf_hub_cache()}). {_local_config_hint(hf_id, filename)}"
+        )
     url = f"https://huggingface.co/{hf_id}/raw/{quote(revision, safe='')}/{filename}"
     try:
         req = urllib.request.Request(url, headers=_get_hf_auth_headers())
@@ -453,6 +523,17 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
             f"(in priority order): (1) set the HF_TOKEN environment variable, "
             f"(2) set the HUGGING_FACE_HUB_TOKEN environment variable, or "
             f"(3) run `huggingface-cli login` (token stored at {token_path})."
+        ) from e
+    except (urllib.error.URLError, OSError) as e:
+        cached = _load_cached_hf_json(hf_id, filename, revision)
+        if cached is not None:
+            logger.warning("Could not reach Hugging Face for %s's %s (%s); using the cached copy", hf_id, filename, e)
+            return cached
+        reason = getattr(e, "reason", None) or e
+        raise HuggingFaceDownloadError(
+            f"Cannot load {hf_id}'s {filename}: the download from Hugging Face failed ({reason}) and the file is "
+            f"not in the local Hugging Face cache. {_local_config_hint(hf_id, filename)} "
+            "Set HF_HUB_OFFLINE=1 to use only local files without trying the network."
         ) from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e

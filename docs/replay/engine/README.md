@@ -103,7 +103,7 @@ Field tables on these pages use the following columns:
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
 | `engine.mode` | `aggregated` | `{choices: [aggregated, disaggregated]}` | `aggregated` or `disaggregated`. AFD is a per-role worker type described in [Analytical AFD and EPD](analytical.md). |
-| `engine.model` | Required | fixed | Hugging Face ID or local model directory. |
+| `engine.model` | Required | fixed | Hugging Face ID or local model directory. Bundled models load offline. For any other ID, AISim reads `config.json` from the local Hugging Face cache or downloads it; with `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1` it reads only the cache and never opens a connection. |
 | `engine.hardware` | Required | `auto` allowed | System identifier, such as `h200_sxm`. `auto` is recommendation-only and resolves from `optimization.hardware`. |
 | `engine.backend` | `vllm` | `{choices: [vllm, sglang]}` | `vllm`, `sglang`, or `trtllm`. Selects both the scheduler semantics and the performance data. |
 | `engine.backend_version` | `current` | fixed | Selects performance data only. It does not change scheduler behavior. Must be a queryable version for the hardware and backend: `current`, `previous` when configured, `next` when newer data is available, or a version one of those available aliases resolves to. See [backend versions](#backend-versions). |
