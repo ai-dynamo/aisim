@@ -922,7 +922,8 @@ def test_linear_draft_with_a_changed_value_is_refused_at_acceptance(tmp_path, ca
 
 # The groups that the GLM-5.3-Flash TP4 probe fixture imports, as the import of its live vLLM 0.33.0 record gives them:
 # four KDA groups with one prefill checkpoint block aligned to 16 tokens each, the 11 MLA and 11 indexer layers and the
-# 11 tail layers. Every page is one pool block of 13,516,800 bytes.
+# 11 tail layers. Every page is one pool block of 13,516,800 bytes. Only the tail takes no part in prefix caching. No
+# group holds transfer bytes, which the record does not decide.
 _GLM_GROUPS = [
     {
         "name": f"runtime_group_{index}",
@@ -933,6 +934,7 @@ _GLM_GROUPS = [
         "sliding_window": None,
         **({} if index == 4 else {"blocks_per_request": 1}),
         **({"prefill_checkpoint_blocks": 1, "prefill_checkpoint_alignment": 16} if index < 4 else {}),
+        "prefix_cacheable": index != 5,
     }
     for index, layers in enumerate((9, 9, 8, 8, 22, 11))
 ]
@@ -977,7 +979,12 @@ def test_state_group_claim_must_match_blocks_per_request(tmp_path, capsys, block
 
 
 # The cache group fields that only the runtime probe import writes.
-_PROBE_FIELDS = ("prefill_checkpoint_blocks", "prefill_checkpoint_alignment")
+_PROBE_FIELDS = (
+    "prefix_cacheable",
+    "transfer_bytes_per_block",
+    "prefill_checkpoint_blocks",
+    "prefill_checkpoint_alignment",
+)
 
 
 @pytest.mark.parametrize(
@@ -1003,6 +1010,10 @@ _PROBE_FIELDS = ("prefill_checkpoint_blocks", "prefill_checkpoint_alignment")
         ),
         # A field stated for one group is compared on every group, and the other groups then differ.
         ({"prefill_checkpoint_blocks": [1, None, None, None, None, None]}, False),
+        # The stated marker matches the probe: only the tail ring takes no part in prefix caching.
+        ({"prefix_cacheable": [True, True, True, True, True, False]}, True),
+        ({"prefix_cacheable": [True] * 6}, False),
+        ({"prefix_cacheable": [None, None, None, None, None, False]}, False),
     ],
 )
 def test_cache_group_claim_compares_probe_fields_only_when_stated(tmp_path, capsys, stated, accepted):
@@ -1024,6 +1035,48 @@ def test_cache_group_claim_compares_probe_fields_only_when_stated(tmp_path, caps
         assert status == 1
         assert "resource_overrides.cache_groups" in diagnostics
         assert "differs from the runtime probe's measured" in diagnostics
+
+
+_TRANSFER_CLAIM = (
+    "states transfer_bytes_per_block, but the runtime probe evidence holds no transfer_bytes_per_block for its cache "
+    "groups; remove transfer_bytes_per_block from the override."
+)
+
+
+@pytest.mark.parametrize(
+    ("groups", "wrong_geometry"),
+    [([0], False), (range(6), False), ([0], True)],
+    ids=["one_group", "every_group", "and_a_wrong_page"],
+)
+def test_cache_group_claim_with_transfer_bytes_is_refused(tmp_path, capsys, groups, wrong_geometry):
+    # The import of a vLLM 0.33.0 record writes no transfer bytes, so a stated value has no measurement to match.
+    claim = [{key: value for key, value in group.items() if key not in _PROBE_FIELDS} for group in _GLM_GROUPS]
+    for index in groups:
+        claim[index]["transfer_bytes_per_block"] = claim[index]["page_size_bytes"]
+    if wrong_geometry:
+        claim[1]["page_size_bytes"] += 1
+    checkpoint, index, _ = _campaign(
+        tmp_path, tp=4, layout="glm_tp4", checkpoint=(1, 16), resource_overrides={"cache_groups": claim}
+    )
+    status = _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2"])
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    diagnostics = "\n".join(json.loads(Path(result["validation"]).read_text())["diagnostics"])
+    assert status == 1
+    if wrong_geometry:
+        # Main's text names the measured groups, which shows the other difference too.
+        assert "differs from the runtime probe's measured cache_groups=" in diagnostics
+        assert _TRANSFER_CLAIM not in diagnostics
+    else:
+        assert _TRANSFER_CLAIM in diagnostics
+
+
+def test_cache_group_claim_with_transfer_bytes_against_evidence_without_groups_keeps_main_text():
+    from aisim.support.config_profile import _observation_mismatch
+
+    claim = [{**_GLM_GROUPS[4], "transfer_bytes_per_block": 1}]
+    text = _observation_mismatch("cache_groups", claim, {"cache_layout": "linear", "kv_bytes_per_token": 512})
+    assert ", but the runtime probe measured no cache_groups for its linear cache_layout;" in text
+    assert "transfer_bytes_per_block from the override" not in text
 
 
 @pytest.mark.parametrize("claim", [False, True])
@@ -2550,3 +2603,296 @@ def test_mixed_known_and_pending_probe_preview_records_every_configuration(tmp_p
     assert state.configurations["tp2"].history[-1]["result"]["status"] == "deferred"
     assert state.configurations["incomplete"].history[-1]["result"]["status"] == "pending_runtime_version"
     assert not output.exists()
+
+
+def _save_as(monkeypatch, edit):
+    """Make the head's import save its cache groups after ``edit``, for a session that an earlier tree imported."""
+    from collector.fpm_forward import runtime_memory
+
+    normalized = runtime_memory._normalized_groups
+
+    def saved(*args, **kwargs):
+        groups = normalized(*args, **kwargs)
+        for group in groups:
+            edit(group)
+        return groups
+
+    monkeypatch.setattr(runtime_memory, "_normalized_groups", saved)
+
+
+def _save_without_evidence_version(monkeypatch):
+    """Make the head's import leave out the vLLM version of the evidence, for a session imported before that field."""
+    from collector.fpm_forward import runtime_observations
+
+    configuration = runtime_observations._configuration
+
+    def saved(*args, **kwargs):
+        result = configuration(*args, **kwargs)
+        result["resources"]["runtime_memory"].pop("runtime_framework_version", None)
+        return result
+
+    monkeypatch.setattr(runtime_observations, "_configuration", saved)
+
+
+def _saved_memory_keys(request):
+    from aisim.support.runtime import runtime_probe_manifest
+
+    saved = runtime_probe_manifest(request)["observed_resources"]["runtime_memory"]
+    profile = request.profile_deployment().resources.model_dump(mode="json")["runtime_memory"]
+    return set(saved) | set(profile)
+
+
+def _without_marks(group):
+    # The tree of dbee3c4b7 saved the groups of a vLLM 0.33.0 import without these two fields.
+    group.pop("prefix_cacheable", None)
+    group.pop("transfer_bytes_per_block", None)
+
+
+def _saved_group_keys(request):
+    from aisim.support.runtime import runtime_probe_manifest
+
+    saved = runtime_probe_manifest(request)["observed_resources"]["cache_groups"]
+    profile = request.profile_deployment().resources.model_dump(mode="json")["cache_groups"]
+    return {key for group in [*saved, *profile] for key in group}
+
+
+def test_a_saved_draft_without_the_group_marks_verifies(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_runtime_profile
+
+    _save_as(monkeypatch, _without_marks)
+    _save_without_evidence_version(monkeypatch)
+    checkpoint, _, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
+    monkeypatch.undo()
+    assert not {"prefix_cacheable", "transfer_bytes_per_block"} & _saved_group_keys(request)
+    assert "runtime_framework_version" not in _saved_memory_keys(request)
+    assert verify_runtime_profile(request) is not None
+    state = _load(checkpoint)
+    state, _ = save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
+
+
+def _finalized(tmp_path, capsys, request, root):
+    target = tmp_path / "finalized"
+    from aisim.support.finalization import finalize
+
+    finalize(request, root, target)
+    return SupportRequest.from_yaml(target / "request.yaml")
+
+
+def test_a_finalized_profile_without_the_group_marks_verifies(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_runtime_profile
+
+    _save_as(monkeypatch, _without_marks)
+    _save_without_evidence_version(monkeypatch)
+    _, request, _, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    final = _finalized(tmp_path, capsys, request, root)
+    monkeypatch.undo()
+    assert verify_runtime_profile(final) is None
+
+
+def test_an_old_collection_finalizes_without_the_group_marks(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_runtime_profile
+
+    # The draft was imported, accepted and collected by the tree of dbee3c4b7; this tree finalizes it.
+    _save_as(monkeypatch, _without_marks)
+    _save_without_evidence_version(monkeypatch)
+    _, request, _, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    monkeypatch.undo()
+    final = _finalized(tmp_path, capsys, request, root)
+    groups = final.profile_deployment().resources.model_dump(mode="json")["cache_groups"]
+    assert not {"prefix_cacheable", "transfer_bytes_per_block"} & {key for group in groups for key in group}
+    assert final.profile_deployment().resources.runtime_memory.runtime_framework_version is None
+    assert verify_runtime_profile(final) is None
+
+
+def test_the_draft_and_the_finalized_profile_keep_the_evidence_version(tmp_path, capsys):
+    from aisim.support.runtime import verify_runtime_profile
+
+    _, request, _, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    assert request.profile_deployment().resources.runtime_memory.runtime_framework_version == "0.33.0"
+    final = _finalized(tmp_path, capsys, request, root)
+    assert final.profile_deployment().resources.runtime_memory.runtime_framework_version == "0.33.0"
+    assert verify_runtime_profile(final) is None
+
+
+@pytest.mark.parametrize("saved_version", [None, "0.32.0"], ids=["legacy", "mismatched_evidence"])
+def test_reimport_of_the_same_observations_can_be_accepted_and_reverified(tmp_path, capsys, monkeypatch, saved_version):
+    from collector.fpm_forward import runtime_observations
+
+    from aisim.support.plan import request_id
+    from aisim.support.runtime import verify_runtime_profile
+
+    # Hybrid probe imports use vLLM 0.33.0. Before this change, their saved groups lacked the marks and their
+    # runtime memory lacked the evidence version. Such drafts still verify; a stated, wrong version must not.
+    _save_as(monkeypatch, _without_marks)
+    configuration = runtime_observations._configuration
+
+    def saved(*args, **kwargs):
+        result = configuration(*args, **kwargs)
+        memory = result["resources"]["runtime_memory"]
+        if saved_version is None:
+            memory.pop("runtime_framework_version", None)
+        else:
+            memory["runtime_framework_version"] = saved_version
+        return result
+
+    monkeypatch.setattr(runtime_observations, "_configuration", saved)
+    checkpoint, index, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
+    monkeypatch.undo()
+    assert not {"prefix_cacheable", "transfer_bytes_per_block"} & _saved_group_keys(request)
+    state = _load(checkpoint)
+    if saved_version is None:
+        assert "runtime_framework_version" not in _saved_memory_keys(request)
+        assert verify_runtime_profile(request) is not None
+        state, _ = save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+        assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
+    else:
+        with pytest.raises(ValueError, match="saved observed resources differ from immutable runtime evidence"):
+            verify_runtime_profile(request)
+
+    # Re-import the exact same evidence through the public CLI, then accept and verify its new draft.
+    before = {path: path.read_bytes() for path in index.parent.rglob("*") if path.is_file()}
+    assert _import(checkpoint, index, tmp_path / "upgraded-drafts", configurations=["tp2"]) == 0
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    upgraded = SupportRequest.from_yaml(result["request"])
+    assert result["status"] == "complete"
+    assert request_id(upgraded) != request_id(request)
+    groups = upgraded.profile_deployment().resources.cache_groups
+    assert all(group.prefix_cacheable is not None for group in groups)
+    assert all(group.transfer_bytes_per_block is None for group in groups)
+    assert upgraded.profile_deployment().resources.runtime_memory.runtime_framework_version == "0.33.0"
+    state = _load(checkpoint)
+    assert state.configurations["tp2"].acceptance is None
+    state, _ = save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
+    assert verify_runtime_profile(SupportRequest.model_validate(state.configurations["tp2"].draft_request)) is not None
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+    if saved_version is None:
+        assert verify_runtime_profile(request) is not None
+
+
+def _flip_marker(group):
+    group["prefix_cacheable"] = not group["prefix_cacheable"]
+
+
+def _without_checkpoint_blocks(group):
+    group.pop("prefill_checkpoint_blocks", None)
+
+
+def _with_transfer_bytes(group):
+    group["transfer_bytes_per_block"] = group["page_size_bytes"]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [_flip_marker, _without_checkpoint_blocks, _with_transfer_bytes],
+    ids=["wrong_marker", "missing_other_key", "transfer_bytes_without_a_measurement"],
+)
+def test_a_saved_draft_with_other_group_differences_is_refused(tmp_path, capsys, monkeypatch, edit):
+    from aisim.support.runtime import verify_runtime_profile
+
+    _save_as(monkeypatch, edit)
+    _, _, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="saved observed resources differ from immutable runtime evidence"):
+        verify_runtime_profile(request)
+
+
+def _shrink_formal_record(record, num=9, den=10):
+    # The formal run measured a pool of 90 blocks where the probe measured 100, so its usable capacity is smaller.
+    cache = record["cache"]
+    cache["num_blocks"] = cache["num_blocks"] * num // den
+    if record["kind"] == "worker":
+        for field in ("available_cache_bytes", "allocated_cache_bytes"):
+            cache[field] = cache[field] * num // den
+        for storage in cache["storages"]:
+            storage["size_bytes"] = storage["size_bytes"] * num // den
+        for allocation in cache["tensor_allocations"]:
+            allocation["size"] = allocation["size"] * num // den
+            for position, name in enumerate(allocation["layers"]):
+                old = allocation["offset"] + position * allocation["layer_stride"]
+                for view in cache["layer_tensors"][name]:
+                    view["storage_offset_bytes"] += old * num // den - old
+            allocation["offset"] = allocation["offset"] * num // den
+            allocation["layer_stride"] = allocation["layer_stride"] * num // den
+        for views in cache["layer_tensors"].values():
+            for view in views:
+                view["shape"][view["block_axis"]] = view["shape"][view["block_axis"]] * num // den
+    else:
+        cache["initial_free_blocks"] = cache["num_blocks"] - cache["reserved_blocks"]
+        cache["kv_cache_max_concurrency"] = cache["kv_cache_max_concurrency"] * num / den
+
+
+def _old_session_revision(tmp_path, capsys, monkeypatch):
+    """A vLLM 0.33.0 session that the tree of dbee3c4b7 imported, accepted and collected, whose formal run measured
+    less capacity, and the memory revision that this tree imports from the formal observations and accepts."""
+    _save_as(monkeypatch, _without_marks)
+    _save_without_evidence_version(monkeypatch)
+    checkpoint, original, files, root = _completed_runtime_collection(
+        tmp_path, capsys, layout="mamba_hybrid", decode_prefix_caching=False
+    )
+    monkeypatch.undo()
+    collection = json.loads((root / "fpm-checkpoint/fpm_forward.json").read_text())
+    index = Path(collection["runtime_observations"])
+    document = json.loads(index.read_text())
+    for phase in document["configurations"]["tp2"]["attempts"][0]["phases"].values():
+        for ref in phase["artifacts"]:
+            if ref.get("kind") == "observation":
+                path = index.parent / ref["path"]
+                record = json.loads(path.read_text())
+                _shrink_formal_record(record)
+                _write(path, record)
+                ref["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    _write(index, document)
+    assert _import(checkpoint, index, tmp_path / "revised", configurations=["tp2"]) == 0
+    revised = Path(json.loads(capsys.readouterr().out)["configurations"]["tp2"]["request"])
+    state = _load(checkpoint)
+    save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    return original, root, collection, index, revised
+
+
+def test_an_old_collection_takes_a_memory_revision_without_the_group_marks(tmp_path, capsys, monkeypatch):
+    from aisim.support.finalization import finalize
+    from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
+
+    original, root, _, _, revised = _old_session_revision(tmp_path, capsys, monkeypatch)
+    assert not {"prefix_cacheable", "transfer_bytes_per_block"} & _saved_group_keys(original)
+    # The new import of the formal observations states the marker.
+    assert "prefix_cacheable" in _saved_group_keys(SupportRequest.from_yaml(revised))
+    with pytest.raises(ValueError, match="smaller than the accepted bound"):
+        finalize(original, root, tmp_path / "unreviewed")
+    target = tmp_path / "resolved-revision"
+    finalize(original, root, target, memory_config=revised)
+    final = SupportRequest.from_yaml(target / "request.yaml")
+    groups = final.profile_deployment().resources.model_dump(mode="json")["cache_groups"]
+    assert not {"prefix_cacheable", "transfer_bytes_per_block"} & {key for group in groups for key in group}
+    assert final.profile_deployment().resources.runtime_memory.runtime_framework_version is None
+    assert final.profile_deployment().resources.runtime_memory.kv_cache_bytes < (
+        original.profile_deployment().resources.runtime_memory.kv_cache_bytes
+    )
+    assert runtime_probe_manifest(final) is None
+    assert verify_runtime_profile(final) is None
+
+
+def test_an_old_collection_revision_that_changes_another_input_is_refused(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_collection_runtime
+
+    original, _, collection, index, revised = _old_session_revision(tmp_path, capsys, monkeypatch)
+    request = SupportRequest.from_yaml(revised)
+    request.workload.request_count += 1
+    with pytest.raises(ValueError, match="memory revision changed non-capacity onboarding inputs"):
+        verify_collection_runtime(original, index, collection_checkpoint=collection, memory_request=request)
+
+
+def test_a_memory_revision_of_an_original_with_a_wrong_marker_is_refused(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import _verify_memory_revision
+
+    original, _, _, _, revised = _old_session_revision(tmp_path, capsys, monkeypatch)
+    request = SupportRequest.from_yaml(revised)
+    # The original draft states a marker that differs from the one of the revision.
+    payload = original.model_dump(mode="json", exclude_none=True)
+    groups = payload["fpm_profile"]["deployments"][0]["resources"]["cache_groups"]
+    marked = request.profile_deployment().resources.model_dump(mode="json")["cache_groups"]
+    groups[0]["prefix_cacheable"] = not marked[0]["prefix_cacheable"]
+    with pytest.raises(ValueError, match="memory revision changed non-capacity onboarding inputs"):
+        _verify_memory_revision(SupportRequest.model_validate(payload), request, {})

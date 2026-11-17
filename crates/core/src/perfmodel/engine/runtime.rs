@@ -3831,6 +3831,8 @@ impl Engine {
             return get_mix_step_ops(
                 &self.context_ops,
                 &self.generation_ops,
+                Some(&self.context_plan),
+                Some(&self.generation_plan),
                 Some(op_memo),
                 &self.db,
                 ctx_tokens,
@@ -3874,7 +3876,7 @@ impl Engine {
                     operations.begin(Some(self.context_plan.slot_names()));
                     run_context_ops_planned(
                         &self.context_ops,
-                        None,
+                        Some(&self.context_plan),
                         Some(op_memo),
                         &self.db,
                         n_prefill,
@@ -3907,7 +3909,7 @@ impl Engine {
             operations.begin(Some(self.generation_plan.slot_names()));
             total += run_generation_ops_step_planned(
                 &self.generation_ops,
-                None,
+                Some(&self.generation_plan),
                 Some(op_memo),
                 &self.db,
                 n_decode,
@@ -8888,6 +8890,8 @@ pub(crate) mod tests {
             let got = crate::session::get_mix_step_ops(
                 &ctx_ops,
                 &gen_ops,
+                None,
+                None,
                 None,
                 &db,
                 requests * new_tokens + remainder,

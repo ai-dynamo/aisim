@@ -37,11 +37,12 @@ Sweeper workloads, and the native JSON execution boundary.
 The built-in engine supports offline vLLM and SGLang with aggregated or separate
 prefill/decode workers and HBM-only KV cache, including speculative decoding
 with explicit acceptance assumptions and a compatible timing model.
-vLLM also supports local or shared [G2 host offload](../engine/kv-cache.md#agentic-g2) on a static
-aggregated or P/D deployment with any positive integer worker count per role,
-attention DP=1 on every role and speculative decoding disabled. The supported
-exception is canonical MTP on a single aggregated worker with local G2 and prefix
-caching; see the [combined scope](../engine/speculation.md#registered-schemes).
+vLLM also supports local or shared [G2 host offload](../engine/kv-cache.md#agentic-g2) on static
+workers of any count and attention DP. Speculative decoding with G2 is limited
+to canonical MTP with prefix caching (see the
+[combined scope](../engine/speculation.md#registered-schemes)), and to MTP on a
+[hybrid G2](../engine/kv-cache.md#hybrid-g2) with
+`engine.speculation.disable_eagle_block_drop`.
 Weka, Agentic Mooncake, and agentic Dynamo traces share this path. Online execution,
 other backends, and Dynamo-owned routing need their own qualified integration.
 

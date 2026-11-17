@@ -64,6 +64,21 @@ pub struct FpmCacheGroup {
     /// for every other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks_per_request: Option<u32>,
+    /// Whether vLLM's manager for this group takes part in prefix caching. A
+    /// ring spec does not. Replay with prefix caching on needs it on every
+    /// group, and does not read it yet. `None` in a profile imported before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_cacheable: Option<bool>,
+    /// The bytes that vLLM's P/D connector reads for one block of this group in
+    /// a transfer on one TP rank, for the vLLM version of the deployment. The
+    /// connector reads a block in regions that layers of other groups can
+    /// share, so the value can be larger than `page_size_bytes`. Positive and at
+    /// most 2**53. The probe import of a vLLM 0.33.0 record does not write it:
+    /// what the P/D connector of vLLM 0.33.0 reads for a block depends on facts
+    /// that the record does not hold. Sizing does not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_bytes_per_block: Option<u64>,
     /// The `num_prefill_checkpoint_blocks` of a Mamba spec: 0 or 1, and only
     /// in a `state` group. In vLLM 0.33.0, a KDA layer that prefills with
     /// FlashKDA has one checkpoint block.
@@ -104,6 +119,14 @@ impl FpmCacheGroup {
         } else if self.blocks_per_request.is_some() {
             return Err(invalid(
                 "blocks_per_request applies only to state cache groups",
+            ));
+        }
+        if self
+            .transfer_bytes_per_block
+            .is_some_and(|bytes| bytes == 0 || bytes > MAX_EXACT_BYTES)
+        {
+            return Err(invalid(
+                "transfer_bytes_per_block must be positive and at most 2**53",
             ));
         }
         if self
@@ -205,11 +228,65 @@ impl FpmCacheGroup {
     }
 }
 
+/// Observed vLLM align layout: one attention group and equally padded Mamba
+/// groups share one physical pool. Internal prefill checkpoint slots are absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FpmMambaCache {
+    pub state_storage: String,
+    pub block_size_tokens: u32,
+    pub page_size_bytes: u64,
+    pub state_groups: u32,
+    pub prefix_match_unit: u32,
+    pub num_speculative_states: u32,
+}
+
+impl FpmMambaCache {
+    fn validate(&self) -> Result<(), AicError> {
+        if self.state_storage != "full_state" {
+            return Err(invalid(
+                "mamba_align requires state_storage=full_state; use cache_layout=unmodeled for ReplaySSM or RecoverSSM",
+            ));
+        }
+        let error = if self.block_size_tokens < 2 {
+            "mamba_cache.block_size_tokens must be at least 2"
+        } else if self.state_groups == 0 {
+            "mamba_cache.state_groups must be positive"
+        } else if self.prefix_match_unit == 0
+            || !self
+                .block_size_tokens
+                .is_multiple_of(self.prefix_match_unit)
+        {
+            "mamba_cache.prefix_match_unit must divide block_size_tokens"
+        } else if self.page_size_bytes == 0
+            || !self
+                .page_size_bytes
+                .is_multiple_of(u64::from(self.block_size_tokens))
+        {
+            "mamba_cache.page_size_bytes must be a positive multiple of block_size_tokens"
+        } else if self
+            .page_size_bytes
+            .checked_mul(u64::from(self.state_groups))
+            .is_none_or(|bytes| bytes > MAX_EXACT_BYTES)
+        {
+            "mamba_cache.page_size_bytes times state_groups must not exceed 2**53"
+        } else if self.num_speculative_states > 5 {
+            "mamba_cache.num_speculative_states must be at most 5"
+        } else {
+            return Ok(());
+        };
+        Err(invalid(error))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FpmCacheLayout {
+    MambaAlign,
     Linear,
     Grouped,
+    /// Observed allocation without a supported cache allocator model.
+    Unmodeled,
 }
 
 /// How the runtime probe cached the state of its Mamba layers. vLLM's `all`
@@ -244,6 +321,11 @@ pub struct FpmRuntimeMemoryConfig {
     /// The probe's resolved `hash_block_size`, in tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash_block_size_tokens: Option<u32>,
+    /// The version of the runtime that observed the cache group evidence,
+    /// such as `0.33.0`. It can differ from the deployment's
+    /// `backend_version`, which is a dataset label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_framework_version: Option<String>,
 }
 
 impl FpmRuntimeMemoryConfig {
@@ -270,6 +352,13 @@ impl FpmRuntimeMemoryConfig {
         if self.hash_block_size_tokens == Some(0) {
             return Err(invalid("hash_block_size_tokens must be positive"));
         }
+        if self
+            .runtime_framework_version
+            .as_deref()
+            .is_some_and(|version| version.trim().is_empty())
+        {
+            return Err(invalid("runtime_framework_version must be nonempty"));
+        }
         Ok(())
     }
 }
@@ -294,6 +383,8 @@ pub struct FpmResourceConfig {
     pub cache_layout: FpmCacheLayout,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_groups: Vec<FpmCacheGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mamba_cache: Option<FpmMambaCache>,
     pub max_num_tokens: u32,
     pub max_batch_size: u32,
     pub provenance: String,
@@ -322,7 +413,34 @@ impl FpmResourceConfig {
                 ));
             }
         }
+        if self.mamba_cache.is_some() != (self.cache_layout == FpmCacheLayout::MambaAlign) {
+            return Err(invalid("mamba_cache requires cache_layout=mamba_align"));
+        }
+        let observed_pool = self.runtime_memory.is_some()
+            && self.kv_bytes_per_token.is_none()
+            && self.cache_groups.is_empty();
         match self.cache_layout {
+            FpmCacheLayout::MambaAlign if !observed_pool => {
+                return Err(invalid(
+                    "Mamba shared pool requires runtime_memory without scalar or grouped geometry",
+                ));
+            }
+            FpmCacheLayout::Unmodeled if !observed_pool => {
+                return Err(invalid(
+                    "unmodeled cache requires runtime_memory without scalar or grouped cache geometry",
+                ));
+            }
+            FpmCacheLayout::MambaAlign => {
+                let cache = self.mamba_cache.as_ref().unwrap();
+                cache.validate()?;
+                let bytes = self.runtime_memory.as_ref().unwrap().kv_cache_bytes;
+                if !bytes.is_multiple_of(cache.page_size_bytes) || bytes <= cache.page_size_bytes {
+                    return Err(invalid(
+                        "Mamba pool must contain whole physical pages and a reserved null page",
+                    ));
+                }
+            }
+            FpmCacheLayout::Unmodeled => {}
             FpmCacheLayout::Linear
                 if self.cache_groups.is_empty()
                     && self
@@ -373,6 +491,11 @@ impl FpmResourceConfig {
     }
 
     pub fn require_memory(&self) -> Result<(), AicError> {
+        if self.cache_layout == FpmCacheLayout::Unmodeled {
+            return Err(invalid(
+                "unmodeled FPM cache supports timing queries only; cache sizing and replay require a supported cache layout",
+            ));
+        }
         if self.runtime_memory.is_none() && self.declared_bytes().iter().any(Option::is_none) {
             return Err(invalid(
                 "FPM memory is pending runtime profiling; collect and finalize runtime memory or provide all four declared non-KV resource values before simulation",
@@ -426,6 +549,8 @@ pub struct FpmCacheBudget {
     pub request_peak_cache_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_occupancy_cache_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_cache: Option<serde_json::Value>,
 }
 
 impl ForwardPassPerfModelConfig {
@@ -484,11 +609,23 @@ impl ForwardPassPerfModelConfig {
         .map_err(|error| invalid(format!("FPM resource profile: {error}")))?;
         resources.validate()?;
         if execution.is_some()
-            && (resources.cache_layout != FpmCacheLayout::Linear
+            && (resources.cache_layout == FpmCacheLayout::Grouped
                 || resources.runtime_memory.is_none())
         {
             return Err(invalid(
-                "speculative-round FPM resources require observed runtime memory and a linear cache",
+                "speculative-round FPM resources require observed runtime memory and a linear, mamba_align, or unmodeled cache",
+            ));
+        }
+        if let Some(cache) = &resources.mamba_cache
+            && (cache.num_speculative_states != self.nextn
+                || self.worker_type != ForwardPassWorkerType::Aggregated
+                || self.attention_dp != 1
+                || self.cp_size.unwrap_or(1) != 1
+                || self.dcp.unwrap_or(1) != 1
+                || self.moe_ep_size.unwrap_or(1) != 1)
+        {
+            return Err(invalid(
+                "Mamba profile requires aggregated pure-TP execution and the measured speculative depth",
             ));
         }
         Ok(Some(resources))
@@ -612,6 +749,9 @@ impl FpmResourceConfig {
         context: u64,
     ) -> Result<FpmCacheBudget, AicError> {
         self.validate()?;
+        if self.cache_layout == FpmCacheLayout::Unmodeled {
+            self.require_memory()?;
+        }
         if request.memory_fraction_kind != "of_total" {
             return Err(invalid(
                 "vLLM FPM resources require memory_fraction_kind='of_total'",
@@ -702,9 +842,34 @@ impl FpmResourceConfig {
                 }),
             )
         };
+        let replay_cache = self.mamba_cache.as_ref().map(|cache| {
+            let mut state = serde_json::json!({
+                "bytes_per_request": cache.page_size_bytes * u64::from(cache.state_groups),
+            });
+            if cache.num_speculative_states > 0 {
+                state["num_speculative_states"] = cache.num_speculative_states.into();
+            }
+            serde_json::json!({
+                "block_size": cache.block_size_tokens,
+                "prefix_match_unit": cache.prefix_match_unit,
+                "num_gpu_blocks": total / cache.page_size_bytes - 1,
+                "kv_cache_bytes_per_token": cache.page_size_bytes / u64::from(cache.block_size_tokens),
+                "state_cache": state,
+            })
+        });
         let token_count = |bytes| self.kv_bytes_per_token.map(|rate| bytes / rate);
         let footprint = |tokens: u64, chunk: u32| {
-            let bytes = if self.cache_layout == FpmCacheLayout::Linear {
+            let bytes = if let Some(cache) = &self.mamba_cache {
+                let pages = tokens.div_ceil(u64::from(cache.block_size_tokens));
+                // Peak includes old/new state plus a partial attention source.
+                pages
+                    .checked_add(
+                        u64::from(cache.state_groups)
+                            * (2 + u64::from(cache.num_speculative_states))
+                            + 1,
+                    )
+                    .and_then(|pages| pages.checked_mul(cache.page_size_bytes))
+            } else if self.cache_layout == FpmCacheLayout::Linear {
                 tokens.checked_mul(self.kv_bytes_per_token.unwrap())
             } else {
                 self.cache_groups.iter().try_fold(0u64, |sum, group| {
@@ -747,6 +912,7 @@ impl FpmResourceConfig {
             cache_groups: self.cache_groups.clone(),
             request_peak_cache_bytes,
             request_occupancy_cache_bytes,
+            replay_cache,
         })
     }
 }
@@ -776,6 +942,8 @@ mod tests {
             page_size_bytes: 160,
             sliding_window: window,
             blocks_per_request: None,
+            prefix_cacheable: None,
+            transfer_bytes_per_block: None,
             prefill_checkpoint_blocks: None,
             prefill_checkpoint_alignment: None,
         }
@@ -814,6 +982,7 @@ mod tests {
             kv_bytes_per_token: None,
             cache_layout: FpmCacheLayout::Grouped,
             cache_groups: vec![group(Some(32))],
+            mamba_cache: None,
             max_num_tokens: 128,
             max_batch_size: 8,
             provenance: "Hand-derived rank-local byte fixture".into(),
@@ -848,9 +1017,78 @@ mod tests {
                 enable_prefix_caching: None,
                 mamba_cache_mode: None,
                 hash_block_size_tokens: None,
+                runtime_framework_version: None,
             }),
             ..resources()
         }
+    }
+
+    #[test]
+    fn mamba_budget_counts_one_shared_pool_null_page_and_scratch_states() {
+        let mut resources = runtime_resources();
+        resources.cache_layout = FpmCacheLayout::MambaAlign;
+        resources.cache_groups.clear();
+        resources.runtime_memory.as_mut().unwrap().kv_cache_bytes = 640;
+        resources.mamba_cache = Some(FpmMambaCache {
+            state_storage: "full_state".into(),
+            block_size_tokens: 8,
+            page_size_bytes: 64,
+            state_groups: 2,
+            prefix_match_unit: 2,
+            num_speculative_states: 3,
+        });
+        let mut request = request();
+        request.cuda_graph_reserved_bytes = 0;
+        let budget = resources.estimate_budget(&request, 16).unwrap();
+        assert_eq!(budget.total_kv_size_bytes, 640);
+        assert_eq!(budget.total_kv_size_tokens, None);
+        assert_eq!(budget.request_peak_cache_bytes, 832);
+        assert_eq!(
+            budget.replay_cache.unwrap(),
+            serde_json::json!({
+                "block_size": 8, "prefix_match_unit": 2, "num_gpu_blocks": 9,
+                "kv_cache_bytes_per_token": 8,
+                "state_cache": {"bytes_per_request": 128, "num_speculative_states": 3},
+            })
+        );
+        for policy in ["replayssm", "recoverssm"] {
+            resources.mamba_cache.as_mut().unwrap().state_storage = policy.into();
+            assert!(
+                resources
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("state_storage=full_state")
+            );
+        }
+        resources.mamba_cache.as_mut().unwrap().state_storage = "full_state".into();
+        let mut missing_policy = serde_json::to_value(&resources).unwrap();
+        missing_policy["mamba_cache"]
+            .as_object_mut()
+            .unwrap()
+            .remove("state_storage");
+        assert!(serde_json::from_value::<FpmResourceConfig>(missing_policy).is_err());
+        resources.runtime_memory.as_mut().unwrap().kv_cache_bytes = 641;
+        assert!(resources.validate().is_err());
+        resources.runtime_memory.as_mut().unwrap().kv_cache_bytes = 640;
+        let mut scalar = resources.clone();
+        scalar.kv_bytes_per_token = Some(8);
+        assert!(
+            scalar
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Mamba shared pool requires runtime_memory")
+        );
+        let cache = resources.mamba_cache.as_mut().unwrap();
+        cache.prefix_match_unit = 3;
+        assert!(
+            resources
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("prefix_match_unit must divide block_size_tokens")
+        );
     }
 
     fn role_config() -> ForwardPassPerfModelConfig {
@@ -927,6 +1165,54 @@ mod tests {
         assert_eq!(budget.memory_breakdown, None);
         query.cuda_graph_reserved_bytes = 20;
         assert!(resources.estimate_budget(&query, 4096).is_err());
+    }
+
+    #[test]
+    fn unmodeled_observed_cache_never_supplies_a_simulated_capacity() {
+        let mut config = round_config();
+        for deployment in config.fpm_profile.as_mut().unwrap()["deployments"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let resources = deployment["resources"].as_object_mut().unwrap();
+            resources.insert("cache_layout".into(), "unmodeled".into());
+            resources.remove("kv_bytes_per_token");
+        }
+        let resources = config.fpm_resources().unwrap().unwrap();
+        assert!(
+            resources
+                .require_memory()
+                .unwrap_err()
+                .to_string()
+                .contains("unmodeled")
+        );
+        assert!(
+            resources
+                .estimate_budget(&request(), 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("unmodeled")
+        );
+        let mut invalid = resources.clone();
+        invalid.kv_bytes_per_token = Some(10);
+        let geometry =
+            "unmodeled cache requires runtime_memory without scalar or grouped cache geometry";
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains(geometry)
+        );
+        invalid.kv_bytes_per_token = None;
+        invalid.runtime_memory = None;
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains(geometry)
+        );
     }
 
     #[test]
@@ -1264,6 +1550,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_memory_records_the_vllm_version_of_its_evidence() {
+        let plain = runtime_resources().runtime_memory.unwrap();
+        let observed = FpmRuntimeMemoryConfig {
+            enable_prefix_caching: Some(true),
+            hash_block_size_tokens: Some(4),
+            runtime_framework_version: Some("0.33.0".into()),
+            ..plain.clone()
+        };
+        observed.validate().unwrap();
+        // The version follows the prefix-caching evidence and round trips.
+        let saved = serde_json::to_string(&observed).unwrap();
+        assert_eq!(
+            saved,
+            r#"{"kv_cache_bytes":600,"gpu_memory_utilization":0.8,"max_model_len":4096,"provenance":"Synthetic initialized-worker cache allocation","enable_prefix_caching":true,"hash_block_size_tokens":4,"runtime_framework_version":"0.33.0"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<FpmRuntimeMemoryConfig>(&saved).unwrap(),
+            observed
+        );
+        // An absent or null version is not written.
+        let mut null = serde_json::to_value(&plain).unwrap();
+        null["runtime_framework_version"] = serde_json::Value::Null;
+        assert_eq!(
+            serde_json::from_value::<FpmRuntimeMemoryConfig>(null).unwrap(),
+            plain
+        );
+        // An empty version is refused, and so is a value that is not text.
+        for text in ["", " "] {
+            let empty = FpmRuntimeMemoryConfig {
+                runtime_framework_version: Some(text.into()),
+                ..plain.clone()
+            };
+            assert_eq!(
+                memory_rejection(&empty),
+                "runtime_framework_version must be nonempty"
+            );
+        }
+        let mut number = serde_json::to_value(&plain).unwrap();
+        number["runtime_framework_version"] = 33.into();
+        assert!(serde_json::from_value::<FpmRuntimeMemoryConfig>(number).is_err());
+        // The resource section validates the record.
+        let mut resources = runtime_resources();
+        resources.runtime_memory = Some(observed);
+        resources.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<FpmResourceConfig>(serde_json::to_value(&resources).unwrap())
+                .unwrap(),
+            resources
+        );
+    }
+
+    #[test]
     fn grouped_page_boundaries_keep_full_history_and_evict_windows() {
         let local = group(Some(32));
         // First 32 tokens occupy two physical pages. Token 33 retains parts of
@@ -1404,6 +1742,58 @@ mod tests {
     }
 
     #[test]
+    fn transfer_bytes_per_block_must_be_positive_and_exact() {
+        let text = "transfer_bytes_per_block must be positive and at most 2**53";
+        for base in [group(None), state_group(Some(1))] {
+            let page = base.page_size_bytes;
+            for bytes in [0, MAX_EXACT_BYTES + 1] {
+                let invalid = FpmCacheGroup {
+                    transfer_bytes_per_block: Some(bytes),
+                    ..base.clone()
+                };
+                assert_eq!(rejection(&invalid), text);
+            }
+            // The connector can read more than the page of the group for one
+            // block, so a value above the page is valid.
+            for bytes in [1, page, page + 1, MAX_EXACT_BYTES] {
+                FpmCacheGroup {
+                    transfer_bytes_per_block: Some(bytes),
+                    ..base.clone()
+                }
+                .validate()
+                .unwrap();
+            }
+            // The marker has no rule of its own.
+            for cacheable in [false, true] {
+                FpmCacheGroup {
+                    prefix_cacheable: Some(cacheable),
+                    ..base.clone()
+                }
+                .validate()
+                .unwrap();
+            }
+        }
+        // A transfer size above the page of the group is valid: the field
+        // allows bytes beyond the page.
+        FpmCacheGroup {
+            page_size_bytes: 13_045_120,
+            transfer_bytes_per_block: Some(21_978_496),
+            ..group(None)
+        }
+        .validate()
+        .unwrap();
+        // The kind checks run first, so an invalid group keeps its first error.
+        let unusable = FpmCacheGroup {
+            transfer_bytes_per_block: Some(0),
+            ..state_group(None)
+        };
+        assert_eq!(
+            rejection(&unusable),
+            "state cache groups require a positive blocks_per_request"
+        );
+    }
+
+    #[test]
     fn checkpoint_fields_need_a_state_group_and_each_other() {
         let blocks_text = "prefill_checkpoint_blocks requires a state group and must be 0 or 1";
         let alignment_text = "prefill_checkpoint_alignment requires prefill_checkpoint_blocks=1 and must be positive";
@@ -1475,6 +1865,8 @@ mod tests {
             page_size_bytes: 13_045_120,
             sliding_window: None,
             blocks_per_request,
+            prefix_cacheable: None,
+            transfer_bytes_per_block: None,
             prefill_checkpoint_blocks: None,
             prefill_checkpoint_alignment: None,
         };
@@ -1531,6 +1923,11 @@ mod tests {
             ),
             (None, None)
         );
+        // It also loads without the prefix-caching marker and the transfer bytes.
+        assert_eq!(
+            (loaded.prefix_cacheable, loaded.transfer_bytes_per_block),
+            (None, None)
+        );
         assert_eq!(serde_json::to_string(&loaded).unwrap(), earlier);
         // Set fields follow the block count in declaration order.
         let marked = FpmCacheGroup {
@@ -1541,7 +1938,15 @@ mod tests {
         assert!(serde_json::to_string(&marked).unwrap().ends_with(
             r#""blocks_per_request":1,"prefill_checkpoint_blocks":1,"prefill_checkpoint_alignment":16}"#
         ));
-        for original in [attention, state, marked] {
+        let transferred = FpmCacheGroup {
+            prefix_cacheable: Some(false),
+            transfer_bytes_per_block: Some(64),
+            ..marked.clone()
+        };
+        assert!(serde_json::to_string(&transferred).unwrap().ends_with(
+            r#""blocks_per_request":1,"prefix_cacheable":false,"transfer_bytes_per_block":64,"prefill_checkpoint_blocks":1,"prefill_checkpoint_alignment":16}"#
+        ));
+        for original in [attention, state, marked, transferred] {
             let saved = serde_json::to_string(&original).unwrap();
             assert_eq!(
                 serde_json::from_str::<FpmCacheGroup>(&saved).unwrap(),

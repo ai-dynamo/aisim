@@ -612,11 +612,14 @@ pub(crate) fn generation_op_runtime(
 /// (passes 1 and 2) or the decode pass, its index in its op list, the op,
 /// its runtime context, its RAW result and the divisor the total applies to
 /// it (pass 2's `scale_factor`, otherwise 1). `op_memo`, when given, answers
-/// single-field ops ([`OpMemo`]).
+/// single-field ops ([`OpMemo`]). With the op lists' [`OpListPlan`]s, each
+/// pass queries every query slot once ([`QueryMemo`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_mix_step_ops<'a>(
     context_ops: &'a [Op],
     generation_ops: &'a [Op],
+    context_plan: Option<&OpListPlan>,
+    generation_plan: Option<&OpListPlan>,
     op_memo: Option<&OpMemo>,
     db: &PerfDatabase,
     ctx_tokens: u32,
@@ -648,6 +651,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     // ignored, so threading it through is harmless.
     let effective_isl_combined = (ctx_tokens + gen_tokens).max(1);
     let mut total = 0.0_f64;
+    let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
         if op.is_context_attention() {
             continue;
@@ -667,7 +671,9 @@ pub(crate) fn get_mix_step_ops<'a>(
             gen_seq_imbalance_correction_scale: 1.0,
             num_image_tokens: 0,
         };
-        let result = shared_query(op_memo, db, OpList::Context, index, op, &ctx)?;
+        let result = memo.query(index, || {
+            shared_query(op_memo, db, OpList::Context, index, op, &ctx)
+        })?;
         total += result.latency_ms;
         on_op(true, index, op, &ctx, result, 1.0);
     }
@@ -689,6 +695,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     let isl_eff_pass2 = new_tokens_per_prefill_req.max(1);
     let ctx_attn_batch = prefill_batch.max(1);
     let scale_factor = ((isl_eff_pass2 + ctx_tokens - 1) / ctx_tokens.max(1)).max(1) as f64;
+    let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
         if !op.is_context_attention() {
             continue;
@@ -703,7 +710,9 @@ pub(crate) fn get_mix_step_ops<'a>(
             gen_seq_imbalance_correction_scale: 1.0,
             num_image_tokens: 0,
         };
-        let result = shared_query(op_memo, db, OpList::Context, index, op, &ctx)?;
+        let result = memo.query(index, || {
+            shared_query(op_memo, db, OpList::Context, index, op, &ctx)
+        })?;
         total += result.latency_ms / scale_factor;
         on_op(true, index, op, &ctx, result, scale_factor);
     }
@@ -716,6 +725,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     // than query at the `decode_batch.max(1)` floor, which would add a spurious
     // batch-1 generation_attention and inflate the step latency.
     if decode_batch > 0 {
+        let mut memo = QueryMemo::new(generation_plan, generation_ops);
         for (index, op) in generation_ops.iter().enumerate() {
             if !op.is_generation_attention() {
                 continue;
@@ -730,7 +740,9 @@ pub(crate) fn get_mix_step_ops<'a>(
                 gen_seq_imbalance_correction_scale: 1.0,
                 num_image_tokens: 0,
             };
-            let result = shared_query(op_memo, db, OpList::Generation, index, op, &ctx)?;
+            let result = memo.query(index, || {
+                shared_query(op_memo, db, OpList::Generation, index, op, &ctx)
+            })?;
             total += result.latency_ms;
             on_op(false, index, op, &ctx, result, 1.0);
         }

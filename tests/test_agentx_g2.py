@@ -356,11 +356,10 @@ def test_weka_g2_rejects_incompatible_shared_layout() -> None:
 @pytest.mark.parametrize(
     "fault,message",
     [
-        ("dp", "agentic host offload requires attention DP=1 on every role"),
         ("backend", "agentic host offload requires backend=vllm on every role"),
         ("aic_nextn", "requires canonical mtp speculation"),
         ("nextn", "requires canonical mtp speculation"),
-        ("speculation", "agentic G2 replay requires speculative decoding disabled"),
+        ("speculation", "requires canonical mtp speculation"),
         ("g3", "agentic replay does not support G3 offload"),
         ("scope", "dp_rank_local"),
         ("scaling", "agentic host offload requires static worker pools without a scaling policy"),
@@ -382,14 +381,7 @@ def test_agentic_invalid_configuration_matrix_rejects_python_and_native(role, fa
     args = getattr(spec.backend_deployment, args_field)
     engine = payload["spec"]["engine"] if aggregated else payload["spec"]["engine"][role]
     rank = engine["rank"]
-    if fault == "dp":
-        args["aic_attention_dp_size"] = 2
-        engine["dp_size"] = 2
-        if not aggregated:
-            # The deployment restriction includes a role that has no offload.
-            args.pop("native_host_offload")
-            rank.pop("native_host_offload")
-    elif fault == "backend":
+    if fault == "backend":
         args["engine_type"] = "sglang"
         rank["backend"] = "sglang"
     elif fault in {"aic_nextn", "nextn", "speculation"}:
@@ -413,8 +405,127 @@ def test_agentic_invalid_configuration_matrix_rejects_python_and_native(role, fa
         _runtime.run_replay_json(json.dumps(payload))
 
 
+def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
+    """Canonical MTP with the EAGLE block drop off; G2 requires canonical speculation and default timing."""
+    engine.update(
+        model="meta-llama/Meta-Llama-3.1-8B",
+        backend_version="0.24.0",
+        estimation_mode="op_level",
+        speculation={
+            "kind": "mtp",
+            "params": {"depth": depth},
+            "expected_accepted_tokens": float(depth),
+            "disable_eagle_block_drop": True,
+        },
+    )
+    worker = engine["workers"]["aggregated"]
+    worker["timing"] = {"type": "default"}
+    return worker
+
+
+def test_agentic_g2_accepts_mtp_for_a_hybrid_model_with_the_drop_off() -> None:
+    """Both API boundaries accept MTP with G2 for a state cache with disable_eagle_block_drop."""
+    config = _config("agentx-g2-local.yaml")
+    kv_cache = _mtp_with_drop_off(config["engine"], 1)["kv_cache"]
+    kv_cache.update(state_cache={"bytes_per_request": 1_000_000}, prefix_match_unit=4)
+    kv_cache["capacity"]["blocks"] = 16
+    kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+    _runtime.run_replay_json(json.dumps(payload))
+
+
+def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None:
+    """A request preempted for MTP draft slots makes the forward wait for its slow stores.
+
+    Before the forward read that wait, this run stopped with an effect-free zero-duration pass.
+    """
+    config = {
+        "engine": {
+            "hardware": "h200_sxm",
+            "backend": "vllm",
+            "context_length": 256,
+            "workers": {
+                "aggregated": {
+                    "scheduler": {"max_batched_tokens": 16, "max_sequences": 16},
+                    "kv_cache": {
+                        "block_size": 4,
+                        "bytes_per_token": 16,
+                        "prefix_match_unit": 4,
+                        "capacity": {"type": "fixed", "blocks": 12},
+                        "state_cache": {"bytes_per_request": 64, "num_speculative_states": 3},
+                        "host_offload": {
+                            "num_host_blocks": 32,
+                            "connector": "offloading_v0_32",
+                            "d2h_bandwidth_gbps": 1e-5,
+                            "h2d_bandwidth_gbps": 1e-5,
+                        },
+                    },
+                }
+            },
+        },
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 8, "output_tokens": 1},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        },
+    }
+    _mtp_with_drop_off(config["engine"], 3)
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+    payload.pop("traffic")
+    payload["spec"].update(max_sim_time_ms=5000, max_in_flight=8)
+    assert payload["spec"]["engine"]["rank"]["aic_nextn_accept_rates"] == "1,1,1"
+    turns = [(1, 0, 16, 4), (1, 0, 8, 4), (1, 1000, 32, 1), (100, 0, 22, 8), (200, 0, 8, 20)]
+    payload["spec"]["requests"] = [
+        {
+            "id": str(index),
+            "arrival_time_ms": arrival,
+            "input_tokens": length,
+            "input_token_ids": list(range(first, first + length)),
+            "output_tokens": output,
+        }
+        for index, (arrival, first, length, output) in enumerate(turns)
+    ]
+    report = json.loads(_runtime.run_replay_json(json.dumps(payload)))
+    assert report["num_requests"] == len(turns)
+
+
+def test_agentic_g2_runs_multi_worker_attention_dp_pd_with_mtp_on_one_shared_pool(tmp_path) -> None:
+    """Two DP2 prefill workers and one DP2 decode worker share one G2 pool under MTP.
+
+    The resumed parent is the third request, so round-robin places it on a prefill
+    rank that never held its prefix: it restores from the shared pool. Six output
+    tokens per request make every decode run draft rounds.
+    """
+    config = _canonical_mtp(_config("agentx-g2-shared-pd.yaml"))
+    source = config["traffic"]["source"]
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(Path(source["paths"][0]).read_text().replace('"out":1', '"out":6'))
+    source["paths"] = [str(trace)]
+    prefill = config["engine"]["workers"]["prefill"]
+    prefill["kv_cache"]["capacity"]["blocks"] = 4  # 9 input and 6 output tokens
+    decode = config["engine"]["workers"]["decode"] = copy.deepcopy(prefill)
+    prefill["parallelism"].update(replicas=2, attention_data=2)
+    decode["parallelism"].update(attention_data=2)
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    lowered = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)["spec"]
+    assert lowered["topology"]["prefill"]["initial_workers"] == 2
+    for role in ("prefill", "decode"):
+        assert lowered["engine"][role]["dp_size"] == 2
+        assert lowered["engine"][role]["rank"]["aic_nextn"] == 2
+    report = _run(config)
+    assert report["completed_requests"] == 4
+    assert report["total_output_tokens"] == 24
+    assert [domain["capacity_blocks"] for domain in report["g2_domains"]] == [8]
+    restored = _restored(report)
+    assert restored["first_admission_g1_reused_input_tokens"] == 0
+    assert restored["first_admission_host_reused_input_tokens"] > 0
+
+
 def test_agentic_g2_runs_on_several_aggregated_workers_with_private_pools() -> None:
-    """Each aggregated worker owns a dp_rank_local G2, so both checks accept several workers."""
+    """Several aggregated workers with a private G2 each run through both boundaries."""
     config = _config("agentx-g2-local.yaml")
     config["engine"]["workers"]["aggregated"]["parallelism"]["replicas"] = 2
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
@@ -483,34 +594,6 @@ def test_agentic_g2_replays_planner_snapshots_with_an_unknown_attention_dp(name,
     assert [row["ttft_ms"] for row in report["per_request"]] != [row["ttft_ms"] for row in fixed["per_request"]]
 
 
-@pytest.mark.parametrize(
-    "name,args_field,fault",
-    [
-        ("agentx-g2-local.yaml", "agg_engine_args", None),
-        ("agentx-g2-local.yaml", "agg_engine_args", "role"),
-        ("agentx-g2-local.yaml", "agg_engine_args", "identity"),
-        ("agentx-g2-shared-pd.yaml", "decode_engine_args", None),
-        ("agentx-g2-shared-pd.yaml", "decode_engine_args", "role"),
-    ],
-)
-def test_agentic_g2_takes_the_role_dp_when_the_timing_identity_spells_it_unknown(name, args_field, fault) -> None:
-    """An unknown attention DP in the timing identity leaves the role's own DP, which must still be 1."""
-    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_config(name)))
-    args = getattr(spec.backend_deployment, args_field)
-    identity = {"backend": "vllm", "tp": "unknown", "attention_dp": "unknown"}
-    args["timing_model"] = {"type": "external", "provider": "aic", "config": identity}
-    if fault == "role":
-        args["aic_attention_dp_size"] = 2
-    elif fault == "identity":
-        identity["attention_dp_size"] = 2
-    capabilities = EngineReplayRunnerFactory().capabilities()
-    if fault is None:
-        capabilities.require_compatible(spec)
-    else:
-        with pytest.raises(ValueError, match="agentic host offload requires attention DP=1 on every role"):
-            capabilities.require_compatible(spec)
-
-
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 @pytest.mark.parametrize("with_g2", [False, True])
 def test_agentic_g3_rejection_matches_without_requiring_g2(backend, with_g2) -> None:
@@ -532,11 +615,8 @@ def test_agentic_g3_rejection_matches_without_requiring_g2(backend, with_g2) -> 
         _runtime.run_replay_json(json.dumps(payload))
 
 
-@pytest.mark.parametrize("replicas", [1, 2])
-def test_agentic_canonical_mtp_with_local_g2_requires_one_worker(replicas) -> None:
-    config = _config("agentx-g2-local.yaml")
-    engine = config["engine"]
-    engine.update(
+def _canonical_mtp(config: dict) -> dict:
+    config["engine"].update(
         model="meta-llama/Meta-Llama-3.1-8B",
         backend_version="0.24.0",
         estimation_mode="op_level",
@@ -547,19 +627,39 @@ def test_agentic_canonical_mtp_with_local_g2_requires_one_worker(replicas) -> No
             "seed": 17,
         },
     )
-    engine["workers"]["aggregated"]["timing"] = {"type": "default"}
-    engine["workers"]["aggregated"]["kv_cache"]["capacity"]["blocks"] = 4
-    if replicas == 2:
-        engine["workers"]["aggregated"]["parallelism"]["replicas"] = replicas
-        spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
-        payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
-        with pytest.raises(ValueError, match="agentic G2 replay requires speculative decoding disabled"):
-            EngineReplayRunnerFactory().capabilities().require_compatible(spec)
-        with pytest.raises(RuntimeError, match="agentic host offload requires speculative decoding disabled"):
-            _runtime.run_replay_json(json.dumps(payload))
-        return
+    for worker in config["engine"]["workers"].values():
+        worker["timing"] = {"type": "default"}
+    return config
+
+
+def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
+    config = _canonical_mtp(_config("agentx-g2-local.yaml"))
+    config["engine"]["workers"]["aggregated"]["kv_cache"]["capacity"]["blocks"] = 4
     report = _run(config)
     assert report["completed_requests"] == 4
     assert report["total_output_tokens"] == 4
     assert report["agentic_qualification"] == "functional_only"
     assert _restored(report)["first_admission_host_reused_input_tokens"] > 0
+
+
+@pytest.mark.parametrize("replicas,attention_dp", [(1, 2), (2, 1), (2, 2)])
+def test_agentic_canonical_mtp_executes_on_static_local_g2_fleets(replicas, attention_dp, tmp_path) -> None:
+    config = _canonical_mtp(_config("agentx-g2-local.yaml"))
+    source = config["traffic"]["source"]
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(Path(source["paths"][0]).read_text().replace('"out":1', '"out":6'))
+    source["paths"] = [str(trace)]
+    worker = config["engine"]["workers"]["aggregated"]
+    # The last draft burst reserves 9 prompt + 5 emitted + 3 lookahead tokens:
+    # ceil(17 / 4) = 5 blocks, even though only one output token remains.
+    worker["kv_cache"]["capacity"]["blocks"] = 5
+    worker["parallelism"].update(replicas=replicas, attention_data=attention_dp)
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    lowered = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)["spec"]
+    assert lowered["topology"]["workers"]["initial_workers"] == replicas
+    assert lowered["engine"]["dp_size"] == attention_dp
+    assert lowered["engine"]["rank"]["aic_nextn"] == 2
+    report = _run(config)
+    assert report["completed_requests"] == 4
+    assert report["total_output_tokens"] == 24
+    assert report["agentic_qualification"] == "functional_only"

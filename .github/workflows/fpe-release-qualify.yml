@@ -4,6 +4,10 @@ name: FPE Support Matrix (release)
 
 on:
   workflow_call:
+    secrets:
+      ARTIFACTORY_TOKEN:
+        description: Required caller mapping; each job resolves its protected environment's token
+        required: true
     inputs:
       release:
         description: Release version discovered from origin/release/<version>

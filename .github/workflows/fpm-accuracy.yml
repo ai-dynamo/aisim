@@ -166,6 +166,8 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     uses: ./.github/workflows/fpm-accuracy-branch.yml
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     permissions:
       contents: read
       actions: read
