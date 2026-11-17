@@ -64,6 +64,9 @@ Full CI or CODEOWNER approval remains a readiness condition; neither alone
 proves a code defect. Concrete validation gaps for changed behavior still
 count as technical risk. Bot ratings and warning checks advise reviewers;
 they do not change the CI, CODEOWNER, or human merge gates above.
+For review-policy-only changes, published vendor-schema validation, policy
+checks, and link/attribution checks can provide the relevant evidence. Tests
+that merely pin natural-language wording do not establish review quality.
 
 Fast CI contains quick deterministic checks: source and legal policy, generated
 CODEOWNERS integrity, lint, syntax compilation, whitespace, and Rust formatting.

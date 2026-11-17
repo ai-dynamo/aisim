@@ -318,6 +318,12 @@ reviews:
           is traced through all affected Rust, Python, CLI, serialization,
           documentation, and test consumers. Fail when a layer is stale, a new
           path is untested, or the PR asserts compatibility without evidence.
+          For external review configuration or instruction-only changes, use
+          published vendor-schema validation and matching policy, documentation,
+          and attribution evidence. Do not require simulator runtime tests or
+          tests that merely assert prompt wording. If necessary evidence is
+          inaccessible, return Inconclusive and identify the affected consumer
+          and missing evidence instead of assuming the path is untested.
       - name: "Modeling and data evidence"
         mode: warning
         instructions: |
