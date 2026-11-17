@@ -188,6 +188,10 @@ pub struct AgenticMooncakeRow {
     /// configured engine timing model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_api_time_ms: Option<f64>,
+    /// Source-recorded start offset of a request that `not_before_ms` does not
+    /// hold to the recorded clock. Snapshot cuts read it; replay does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_start_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

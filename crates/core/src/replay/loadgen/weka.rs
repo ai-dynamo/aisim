@@ -1319,11 +1319,9 @@ fn lower_trace(
             // every other request is timed by its dependency edges, so an
             // authored floor would hold it to the recorded wall clock after the
             // replay ran faster or an idle cap compressed a gap.
-            let not_before_ms = if agentx && !dependencies.is_empty() {
-                0.0
-            } else {
-                seconds_to_milliseconds(request.request.t - root_time)
-            };
+            let recorded_start_ms = seconds_to_milliseconds(request.request.t - root_time);
+            let edge_timed = agentx && !dependencies.is_empty();
+            let not_before_ms = if edge_timed { 0.0 } else { recorded_start_ms };
             rows.push(AgenticMooncakeRow {
                 request_id,
                 play_id: play_id.clone(),
@@ -1340,6 +1338,8 @@ fn lower_trace(
                 hash_ids: Some(hash_ids),
                 not_before_ms,
                 recorded_api_time_ms: request.request.api_time.map(seconds_to_milliseconds),
+                // A snapshot still cuts an edge-timed request by its recorded start.
+                recorded_start_ms: edge_timed.then_some(recorded_start_ms),
                 priority: None,
                 strict_priority: None,
                 policy_class: None,
@@ -2613,6 +2613,7 @@ fn normalize_relative_path(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::loadgen::{AgenticSnapshotOptions, AgenticSnapshotSelection};
     use tempfile::tempdir;
 
     fn request(t: f64, input: usize, output: usize, hashes: &[u64]) -> serde_json::Value {
@@ -4202,6 +4203,31 @@ mod tests {
             ..Default::default()
         };
         let (graph, _, _) = load_weka_agentic_graph_cached(&path, Some(4), options, false).unwrap();
+        // A snapshot cuts by recorded starts, which edge-timed requests keep:
+        // without them the play's span is zero, so a sampled cut lands on
+        // turn 0 and an imported cut is out of bounds.
+        let prepared = graph
+            .prepare_snapshots(1, AgenticSnapshotOptions::seeded(42))
+            .unwrap();
+        let sampled = &prepared.snapshots()[0];
+        assert_eq!(sampled.recorded_last_start_ms, 1_200.0);
+        assert!((300.0..=900.0).contains(&sampled.t_star_ms));
+        let imported = graph
+            .prepare_snapshots(
+                1,
+                AgenticSnapshotOptions {
+                    seed: 42,
+                    initial_selections: Some(vec![AgenticSnapshotSelection {
+                        source_play_id: sampled.source_play_id.clone(),
+                        t_star_ms: 1_000.0,
+                    }]),
+                    corpus_cursor: Some(1),
+                },
+            )
+            .unwrap();
+        let requests = &imported.snapshots()[0].requests;
+        assert_eq!(requests.iter().filter(|r| r.historical).count(), 2);
+        assert!(requests.iter().any(|r| r.recorded_end_ms == Some(1_100.0)));
         let mut driver =
             crate::replay::loadgen::WorkloadDriver::new_agentic_trace(graph, 4).unwrap();
         let root = driver.pop_ready(0.0, usize::MAX);
