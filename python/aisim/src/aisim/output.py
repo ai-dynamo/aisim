@@ -70,18 +70,43 @@ def _fingerprint(path: Path) -> _Fingerprint:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, stat.S_ISDIR(info.st_mode))
 
 
+def _read_runtime_report(path: Path) -> dict[str, Any] | None:
+    """Read a runtime report only if it is a regular file; never block on a FIFO or follow a symlink."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            report = json.loads(source.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(descriptor)
+    return report if isinstance(report, dict) else None
+
+
+def _runtime_status(report: dict[str, Any] | None) -> str | None:
+    """The status of a schema-1 runtime report, or None for anything malformed."""
+
+    if report is None:
+        return None
+    version = report.get("schema_version")
+    # bool is an int subclass, and True == 1; a JSON true is not schema version 1.
+    if type(version) is not int or version != 1:
+        return None
+    status = report.get("status")
+    return status if isinstance(status, str) else None
+
+
 def _failed_runtime_status(path: Path) -> str | None:
     """Return the status of a valid runtime report that records a failed run, else None."""
 
-    try:
-        if not stat.S_ISREG(path.lstat().st_mode):
-            return None
-        report = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(report, dict) or report.get("schema_version") != 1:
-        return None
-    status = report.get("status")
+    status = _runtime_status(_read_runtime_report(path))
     return status if status in _FAILED_RUN_STATUSES else None
 
 
@@ -332,12 +357,8 @@ def _non_empty_message(root: Path) -> str:
             f"output directory {root} is not empty and contains files AISim did not write ({shown}); "
             "choose a new --output-dir (--overwrite removes only known AISim outputs)"
         )
-    status = None
-    try:
-        report = json.loads((root / _RUNTIME_REPORT).read_text(encoding="utf-8"))
-        status = report.get("status") if isinstance(report, dict) else None
-    except (OSError, ValueError):
-        pass
+    # The same safe read as eligibility: a FIFO or symlink here must not block or be followed.
+    status = _runtime_status(_read_runtime_report(root / _RUNTIME_REPORT))
     has_results = bool(names & _RESULT_FILES) or (
         (root / "recommendations").is_dir() and any((root / "recommendations").iterdir())
     )
@@ -372,12 +393,13 @@ def write_prediction_report(root: Path, report: dict[str, Any], *, exclusive: bo
     # json.dump writes the chunks json.dumps would join, so a large per-request
     # report is never held as one string. A failed encoding leaves no report, as before.
     output = _open_result(path, exclusive=exclusive)
+    identity = _file_identity(output)
     try:
         with output:
             json.dump(report, output, indent=2, sort_keys=True)
             output.write("\n")
     except BaseException:
-        path.unlink(missing_ok=True)
+        _unlink_if_same(path, identity)
         raise
     return path
 
@@ -399,6 +421,22 @@ def write_requests(root: Path, records: list[dict[str, Any]], *, exclusive: bool
     return path
 
 
+def _file_identity(output: Any) -> tuple[int, int]:
+    status = os.fstat(output.fileno())
+    return status.st_dev, status.st_ino
+
+
+def _unlink_if_same(path: Path, identity: tuple[int, int]) -> None:
+    """Roll back a file this call created, but never one another writer put in its place."""
+
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return
+    if (status.st_dev, status.st_ino) == identity:
+        path.unlink(missing_ok=True)
+
+
 def write_telemetry(root: Path, telemetry: dict[str, Any], *, exclusive: bool = False) -> dict[str, Any]:
     """Write all-phase telemetry streams and return their compact report manifest."""
 
@@ -408,17 +446,17 @@ def write_telemetry(root: Path, telemetry: dict[str, Any], *, exclusive: bool = 
         if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
             raise ValueError(f"telemetry.{stream} must be a list of JSON mappings")
     paths = {stream: root / f"telemetry-{stream}.jsonl" for stream in streams}
-    created: list[Path] = []
+    created: list[tuple[Path, tuple[int, int]]] = []
     try:
         for stream, path in paths.items():
             with _open_result(path, exclusive=exclusive) as output:
-                created.append(path)
+                created.append((path, _file_identity(output)))
                 for record in telemetry[stream]:
                     json.dump(record, output, sort_keys=True, separators=(",", ":"), allow_nan=False)
                     output.write("\n")
     except BaseException:
-        for path in created:
-            path.unlink(missing_ok=True)
+        for path, identity in created:
+            _unlink_if_same(path, identity)
         raise
     return {
         **{key: value for key, value in telemetry.items() if key not in streams},
