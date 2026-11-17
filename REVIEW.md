@@ -12,11 +12,13 @@ root-cause finding over several comments on its symptoms.
 
 Use these priorities:
 
-- **P0**: exploitable security issue, data loss, or repository-wide outage.
-- **P1**: incorrect public behavior, corrupted or materially wrong prediction,
-  deadlock, release breakage, or an unsafe compatibility change.
-- **P2**: reachable defect, missing validation, significant performance
-  regression, or insufficient evidence for a changed contract.
+- **P0**: stop-ship critical security exposure, data loss, or broad outage,
+  supported by concrete reachability and impact evidence.
+- **P1**: a major regression in supported public behavior, materially wrong
+  prediction, deadlock, release breakage, or unsafe compatibility change.
+- **P2**: a bounded reachable defect, missing validation, performance regression,
+  or insufficient evidence for a changed contract without demonstrated P0/P1
+  consequences.
 - **P3**: low-risk maintainability concern with a concrete future failure mode.
 
 Do not report preference-only naming, formatting, or documentation nits already
@@ -155,3 +157,42 @@ Ask for the smallest evidence that would disprove the risky assumption: a
 negative test, boundary case, exact command and result, explained golden diff,
 held-out comparison, or production trace. When that evidence is unavailable,
 say precisely what remains unmodeled or unverified.
+
+## Codex review method
+
+Review the complete PR against its actual base at the current head, including
+earlier commits, renames, and deletions. Identify the reviewed head and base
+where the reporting format allows it. Evidence for an older head is historical;
+refresh it or state the limitation after a push or relevant base change.
+
+Trace affected contracts through the final consumer and inspect nearby failure
+paths and relevant tests. Check empty, invalid, boundary, and unsupported inputs;
+state transitions and resource accounting; and producer/consumer compatibility
+as applicable. Verify an apparent defect against the implementation and the
+base behavior before reporting it. Existing problems, documented supported
+absence paths, and intentional behavior changes are not introduced regressions
+by themselves; flag a violated contract or concrete harmful consequence.
+
+Each finding should identify the triggering conditions, affected consumer,
+observable failure, and evidence supporting its priority. Anchor it to the
+smallest useful changed line range and suggest the smallest adequate correction
+or regression case. A direct code trace or independent numerical derivation can
+establish a defect without executing it; do not claim a reproduction you did
+not run. Prefer one root-cause finding over repeated symptoms, and do not repeat
+another reviewer's finding without checking that it still applies.
+
+Grade urgency by demonstrated impact and reachability. High-impact code is not
+automatically a P1 defect, and a missing test alone does not establish P1 harm.
+The [GitHub Codex reviewer](https://learn.chatgpt.com/docs/third-party/github#request-a-codex-review)
+reports P0/P1 findings. Keep P2/P3 for review surfaces or tasks that request that
+scope; never inflate priority to fit the GitHub reporting threshold. Follow the
+surface's required output format rather than adding unsupported report fields.
+
+Distinguish inspected code and verified current-head results from author claims,
+pending checks, and unavailable evidence. Use proportional validation of the
+affected consumer; tests that merely repeat implementation or prompt wording do
+not establish correctness. If tools, dependencies, data, or CI logs are
+unavailable, state the coverage limit instead of claiming a pass or a code
+defect solely from the missing environment. Full CI pending initial-review
+admission is expected under this contract. A report with no P0/P1 findings does
+not certify absence of lower-priority defects, human approval, or merge readiness.

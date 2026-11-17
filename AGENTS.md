@@ -2,6 +2,25 @@
 
 This file adds explicit repository-wide development guards.
 
+## Code Review Rules
+
+For code and PR reviews, first read [the review contract](REVIEW.md), including
+its [Codex review method](REVIEW.md#codex-review-method). Apply the area-specific
+rules below when reviewing the corresponding code.
+
+- Ground findings in a reachable failure introduced or worsened by the full
+  PR. Follow changed inputs through real callers, consumers, and outputs;
+  verify the code independently of author claims and other bots' verdicts.
+  Keep mechanical formatting and lint checks in CI.
+- Treat formulas, data selection, interpolation, defaults, and rank reduction
+  as numerical behavior. Preserve the Rust single oracle and synchronized
+  Rust/Python/CLI/serialized contracts. Use explained before/after results or
+  an independent oracle; parity alone does not establish prediction accuracy.
+- For engine changes, inspect cancellation, draining, retry, and terminal-state
+  accounting. For CI changes, inspect fork inputs, execution trust, exact-head
+  evidence, and required gates. Distinguish expected absence and optional
+  monitoring failures from corruption or missing required validation.
+
 ## Wheel artifact handoffs
 
 GitHub Actions artifacts must not contain Python wheels or wheel-containing
