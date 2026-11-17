@@ -243,7 +243,8 @@ collector gives the layout the `native_runtime` capability. Precision then comes
 from the checkpoint, and the runtime measures every cell.
 
 Generator and Collector share the accepted Dynamo-native benchmark result
-schema versions (2, and 3 with a power window) through the rendered
+schema versions (2, and 3 with a power window, whose power block must carry the
+window's `step_wall_times_s`) through the rendered
 `fpm_env.sh`; the staged `fpm_exec.sh` validates that contract in-pod without
 a Collector-side text patch. `--fpm-measure-power` (default on; never run by
 `--smoke`) requests the per-point power window and publishes `power_w`; see the
