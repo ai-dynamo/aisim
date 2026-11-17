@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 # These files take precedence over the managed root policy on GitHub.
-if [[ -e .github/CODEOWNERS || -e docs/CODEOWNERS ]]; then
+if [[ -f .github/CODEOWNERS || -L .github/CODEOWNERS || -f docs/CODEOWNERS || -L docs/CODEOWNERS ]]; then
     echo "::error::The generated root CODEOWNERS must be the repository's only CODEOWNERS file."
     exit 1
 fi

@@ -219,3 +219,27 @@ def test_shadow_ownership_files_fail_before_tests(repository, shadow):
     result = subprocess.run(["bash", str(script)], cwd=root, capture_output=True, text=True)
     assert result.returncode != 0
     assert "only CODEOWNERS file" in result.stdout
+
+
+def test_ownership_tool_directory_is_not_a_shadow_file(repository):
+    root, _ = repository
+    script = root / "scripts/ci/check_codeowners.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text((ROOT / "scripts/ci/check_codeowners.sh").read_text())
+    (root / ".github/codeowners").mkdir(parents=True)
+    binaries = root / "bin"
+    binaries.mkdir()
+    python = binaries / "python"
+    python.write_text('#!/bin/sh\necho "ownership tests reached"\nexit 23\n')
+    python.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=root,
+        env={**os.environ, "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    # On a case-insensitive checkout, .github/CODEOWNERS resolves to this
+    # directory. GitHub only discovers ownership files, not directories.
+    assert result.returncode == 23
+    assert "ownership tests reached" in result.stdout
