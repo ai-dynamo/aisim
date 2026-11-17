@@ -376,6 +376,10 @@ eviction rules G2 follows:
 | G1 blocks being copied | Freed with their request; a new owner waits for the copy | The same | Held until the copy completes, then freed first block first |
 | A preemption | Waits for the preempted request's stores | The same | Waits for every transfer in flight |
 
+A rank-local pool that keeps the checkpoints of a sliding-window
+[state cache](#state-cache) follows `offloading_v0_32` under either offloading
+name, as vLLM has sliding-window groups from v0.32.0 on.
+
 vLLM main has changed some of these rules since v0.32.0. Each profile models the
 rules of the version it names; none was compared with a running vLLM. The model
 also differs from vLLM v0.32.0 here:
@@ -444,7 +448,8 @@ and shared bandwidths; otherwise the run is rejected. In `recommend` with
 G2 supports vLLM aggregated and disaggregated workers with prefix
 caching and any `attention_data`. It also keeps the states of a
 [state cache](#state-cache): a recurrent state on a v0.32.0 profile, see
-[hybrid models](#hybrid-g2), and a sliding-window state on the default one. G2
+[hybrid models](#hybrid-g2), and a sliding-window state under either offloading
+connector name. G2
 is rejected with SGLang, TensorRT-LLM, ngram speculation and Belady eviction.
 
 Canonical `engine.speculation.kind: mtp` can combine with G2 on aggregated and
@@ -801,24 +806,36 @@ interval of at least one checkpoint's tokens) to keep the pool for prompt
 blocks. The checkpoints a prompt pass retains are stored in one cohort with
 that pass's prompt blocks, as the connector issues one store per request and
 step. G2 takes the whole cohort or none of it, and evicts none of its blocks
-to make room for the rest. A cohort that found no room is offered again with
-what the next pass adds; one larger than the pool is never stored, and replay
-warns once. A boundary reached during decode is not stored. A restore resumes at the highest boundary that has
-both its token blocks and its whole checkpoint in G2, below the logits cap and,
-with speculative decoding that keeps the EAGLE block drop, one block below the
-token hit. If G2 evicted a
-checkpoint, the restore uses a lower boundary or recomputes. A lookup makes
-the checkpoint it resumes at the newest in G2; checkpoints at lower boundaries
-age and are evicted first. The load brings the token blocks up to that
+to make room for the rest. A cohort that found no room is offered again, with
+what later passes added, when the pool's room changes. One larger than the pool
+is not offered again before the request is readmitted; replay warns once and
+names `retention_interval` and `num_host_blocks`. A boundary reached during
+decode is not stored. A restore resumes at the highest boundary that has both
+its token blocks and its whole checkpoint in G2, below the logits cap. With
+speculative decoding that keeps the EAGLE block drop it is also one block below
+the last prompt block G2 holds, as vLLM's drafter group drops the last chunk it
+finds; a block-aligned prompt whose blocks are all in G2 therefore still
+resumes at the logits cap. If G2 evicted a checkpoint, the restore uses a lower
+boundary or recomputes. The load brings the token blocks up to that
 boundary and the checkpoint, which becomes the request's state there, as the
 state a prefill worker hands to a decode worker does. G1 also caches the window
 at that boundary when it has room, so a later request resumes there from G1.
 
-A rank that offloads a sliding-window state follows the default connector
-(`offloading_v0_24`), so the order in which G2 evicts checkpoints is that
-connector's. The v0.32.0 profiles keep recurrent states only; see
-[hybrid models](#hybrid-g2).
-Its stores keep the G1 token blocks they copy until the whole cohort is
+vLLM has sliding-window groups from v0.32.0 on, so a rank-local pool that
+offloads a sliding-window state follows the `offloading_v0_32`
+[profile](#connector-profiles), whether `connector` names it or keeps its
+default. `simple_cpu_v0_32` is rejected: vLLM's `SimpleCPUOffloadConnector`
+keeps sliding-window groups too, but replay does not model how it stores them
+block by block. Blocks and checkpoints are ranked when their store starts. A finishing request offers a cohort it could not store
+earlier and re-ranks what it stored, offered or loaded, each checkpoint just
+above the block that ends at its boundary. Prefill and decode workers keep
+`connector` at its default; a prefill worker does the finish-time work when it
+releases the request after the KV transfer, later than vLLM. A cluster-shared
+pool has no vLLM counterpart and keeps its own order: a lookup makes the
+prompt's blocks and the checkpoint it resumes at the newest, so checkpoints at
+lower boundaries are evicted first.
+
+The rank's stores keep the G1 token blocks they copy until the whole cohort is
 copied, as a shared pool's do, and the checkpoints in the cohort lengthen that
 copy. vLLM also flushes a store before a pass reuses one of its
 sliding-window blocks, so that pass waits for the copy. Replay holds no G1

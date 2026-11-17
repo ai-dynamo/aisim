@@ -299,10 +299,10 @@ def _validate_hybrid_host_offload(
     connector: str, prefix_match_unit: int | None, block_size: int | None, *, window: bool, kvcr: bool
 ) -> None:
     if window:
-        # The model stores a window's checkpoints in the cohort of the default
-        # connector's block store.
-        if connector != "offloading_v0_24":
-            raise ValueError("a sliding-window state_cache requires host_offload.connector=offloading_v0_24")
+        # vLLM has sliding-window groups from v0.32 on: a rank-local pool
+        # follows that version's OffloadingConnector under either of its names.
+        if connector == "simple_cpu_v0_32":
+            raise ValueError("a sliding-window state_cache does not support host_offload.connector=simple_cpu_v0_32")
         if kvcr:
             raise ValueError("state_cache does not support kvcr")
         return

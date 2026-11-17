@@ -631,12 +631,22 @@ impl HostTier {
             };
         if covered < needed {
             if structurally_unfittable && !self.warned_structurally_unfittable {
-                tracing::warn!(
-                    cohort_blocks,
-                    missing_blocks,
-                    host_capacity_blocks = self.config.capacity_blocks,
-                    "native host-offload store cohort cannot fit; retrying without advancing the store cursor"
-                );
+                let host_capacity_blocks = self.config.capacity_blocks;
+                if weighted.is_empty() {
+                    tracing::warn!(
+                        cohort_blocks,
+                        missing_blocks,
+                        host_capacity_blocks,
+                        "native host-offload store cohort cannot fit; retrying without advancing the store cursor"
+                    );
+                } else {
+                    tracing::warn!(
+                        cohort_blocks,
+                        host_capacity_blocks,
+                        "state checkpoints make a store cohort larger than host_offload.num_host_blocks, \
+                         so it is not stored; set state_cache.retention_interval or raise num_host_blocks"
+                    );
+                }
                 self.warned_structurally_unfittable = true;
             }
             self.observe(HostOffloadObservation {
@@ -2500,10 +2510,12 @@ pub(crate) mod tests {
         assert_eq!(tier.next_transfer_id, 0);
     }
 
-    #[test]
-    fn weighted_entries_occupy_evict_and_transfer_by_weight() {
+    #[rstest::rstest]
+    #[case(HostPolicy::CohortLru)]
+    #[case(HostPolicy::Ranked)]
+    fn weighted_entries_occupy_evict_and_transfer_by_weight(#[case] policy: HostPolicy) {
         // A 1 MB block at 1 GB/s takes 1 ms.
-        let mut tier = tier(8);
+        let mut tier = policy_tier(8, policy);
         make_resident(&mut tier, &[key(1), key(2)], 0.0);
         let store = |tier: &mut HostTier, entry: u64, at_ms: f64| {
             let outcome = tier.prepare_cohort(C, request_id(), &[], None, &[key(entry)], 4, at_ms);
@@ -3037,6 +3049,24 @@ pub(crate) mod tests {
         }];
         assert_eq!(tier.take_events(B), removed);
         assert_eq!(tier.take_events(A), removed);
+    }
+
+    #[test]
+    fn an_evicted_entry_without_router_identity_publishes_no_removal() {
+        // A state row published no `Stored` event either.
+        let mut tier = shared(2, 0.0);
+        tier.subscribe(B);
+        tier.prepare_store(A, request_id(), &[key(1)], Some(&[meta(None, 7, 0)]), 0.0);
+        tier.prepare_store(A, request_id(), &[key(2)], None, 0.0);
+        tier.submit_prepared_stores(A, 0.0);
+        tier.tick(A, 2.0);
+        assert_eq!(tier.take_events(B), [stored(None, 0, &[(1, 7)])]);
+        let blocks = [meta(None, 8, 0), meta(Some(3), 9, 1)];
+        tier.prepare_store(A, request_id(), &[key(3), key(4)], Some(&blocks), 2.0);
+        let removed = [KvEventData::Removed {
+            block_hashes: vec![1],
+        }];
+        assert_eq!(tier.take_events(B), removed);
     }
 
     #[test]

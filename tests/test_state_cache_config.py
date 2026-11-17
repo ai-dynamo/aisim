@@ -136,10 +136,10 @@ def test_manual_geometry_rejects_invalid_unsigned_integers(field, value):
             },
             "g3_offload",
         ),
-        # A sliding-window state is offloaded only by the default connector and without KVCR.
+        # A sliding-window state is offloaded by an offloading connector and without KVCR.
         (
-            {"state_cache": WINDOW, "host_offload": {"num_host_blocks": 8, "connector": "offloading_v0_32"}},
-            "connector=offloading_v0_24",
+            {"state_cache": WINDOW, "host_offload": {"num_host_blocks": 8, "connector": "simple_cpu_v0_32"}},
+            "connector=simple_cpu_v0_32",
         ),
         (
             {"state_cache": WINDOW, "host_offload": {"num_host_blocks": 8}, "kvcr": {}},
@@ -153,8 +153,10 @@ def test_manual_geometry_rejects_unusable_capacity(overrides, error):
         KvCachePredictionConfig.model_validate({**KV, **overrides})
 
 
-def test_sliding_window_state_accepts_host_offload():
-    KvCachePredictionConfig.model_validate({**KV, "state_cache": WINDOW, "host_offload": {"num_host_blocks": 8}})
+@pytest.mark.parametrize("connector", ["offloading_v0_24", "offloading_v0_32"])
+def test_sliding_window_state_accepts_host_offload(connector):
+    host_offload = {"num_host_blocks": 8, "connector": connector}
+    KvCachePredictionConfig.model_validate({**KV, "state_cache": WINDOW, "host_offload": host_offload})
 
 
 @pytest.mark.parametrize(
@@ -710,8 +712,8 @@ def test_auto_dsv4_mtp_state_includes_draft_rows(auto_dsv4_payload, forbid_estim
 
 
 @pytest.mark.parametrize("mtp", [False, True])
-def test_auto_dsv4_runs_with_host_offload_on_the_default_connector(auto_dsv4_payload, forbid_estimators, mtp):
-    """Sizing knows the state is a sliding window: G2 keeps it on the default connector, MTP with its block drop."""
+def test_auto_dsv4_runs_with_host_offload_on_an_offloading_connector(auto_dsv4_payload, forbid_estimators, mtp):
+    """Sizing knows the state is a sliding window: G2 keeps it under either offloading name, MTP with its block drop."""
     worker = auto_dsv4_payload["engine"]["workers"]["aggregated"]
     if mtp:
         # MTP needs default timing; B200 has the DeepSeek V4 vLLM data.
@@ -719,14 +721,15 @@ def test_auto_dsv4_runs_with_host_offload_on_the_default_connector(auto_dsv4_pay
         auto_dsv4_payload["engine"].update(hardware="b200_sxm", speculation=speculation)
         worker.update(timing={"type": "default"}, parallelism={"tensor": 8, "moe_expert": 8})
     kv_cache = worker["kv_cache"]
-    kv_cache["host_offload"] = {"num_host_blocks": 64}
-    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
-    args = spec.backend_deployment.agg_engine_args
-    assert args["native_host_offload"]["num_host_blocks"] == 64
-    assert "sliding_window" in args["state_cache"]
-    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 1
-    kv_cache["host_offload"]["connector"] = "offloading_v0_32"
-    with pytest.raises(ValueError, match="connector=offloading_v0_24"):
+    for connector in ("offloading_v0_24", "offloading_v0_32"):
+        kv_cache["host_offload"] = {"num_host_blocks": 64, "connector": connector}
+        spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
+        args = spec.backend_deployment.agg_engine_args
+        assert args["native_host_offload"]["num_host_blocks"] == 64
+        assert "sliding_window" in args["state_cache"]
+        assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 1
+    kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
+    with pytest.raises(ValueError, match="connector=simple_cpu_v0_32"):
         prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
 
 

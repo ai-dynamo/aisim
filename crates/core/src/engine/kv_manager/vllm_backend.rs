@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::AllocationRequirement;
 use super::grouped::{GroupedKvPool, GroupedLease};
-use super::state_cache_manager::{StateCacheManager, StateRequest, state_resume_limit};
+use super::state_cache_manager::{StateCacheManager, StateRequest};
 use crate::engine::belady::BeladyOracle;
 use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, ReserveOutcome, VllmBlockPool,
@@ -875,14 +875,14 @@ impl VllmKvManager {
         let Some(manager) = &self.state_cache else {
             return 0;
         };
-        // A window a host load landed is resumed in place: it needs only the
-        // blocks of its next write, not a copy of the window G1 cached there.
+        // A window a host load landed is resumed in place: its next write
+        // goes into the landed state, with no copy of the window G1 cached.
         if manager.sliding_window.is_some()
             && let Some(state) = lease.state.as_deref()
             && !state.working.is_empty()
             && state.computed_tokens == cached_tokens
         {
-            return manager.write_blocks(&self.pool, state, cached_tokens + 1);
+            return 0;
         }
         let inactive_source_blocks =
             lease
@@ -2171,12 +2171,18 @@ impl VllmKvManager {
         if let Some(manager) = &self.state_cache {
             // Token policy bounds must be applied BEFORE selecting an actual
             // state checkpoint: truncating a joint hit afterwards can invent one.
-            let (limit, _) = state_resume_limit(
-                sequence,
-                self.block_size,
-                manager.mtp_enabled,
-                overlap_blocks,
-            );
+            // A host load's window, landed at its prefix end, is resumed
+            // there: the host lookup that chose the boundary applied its own
+            // bounds.
+            let landed = (lease.state.as_deref())
+                .filter(|state| manager.sliding_window.is_some() && !state.working.is_empty())
+                .map(|state| state.computed_tokens / self.block_size)
+                .filter(|&blocks| blocks <= overlap_blocks);
+            let needs_logits = sequence.generated_tokens() < sequence.max_output_tokens();
+            if needs_logits {
+                overlap_blocks =
+                    overlap_blocks.min(sequence.len().saturating_sub(1) / self.block_size);
+            }
             let find = |limit: usize| {
                 (1..=limit)
                     .rev()
@@ -2188,14 +2194,13 @@ impl VllmKvManager {
                     })
                     .unwrap_or(0)
             };
-            // A host load's window, landed at its prefix end, is resumed
-            // there: the host lookup that chose the boundary applied these
-            // bounds.
-            let landed = (lease.state.as_deref())
-                .filter(|state| manager.sliding_window.is_some() && !state.working.is_empty())
-                .map(|state| state.computed_tokens / self.block_size)
-                .filter(|&blocks| blocks <= overlap_blocks);
-            overlap_blocks = landed.unwrap_or_else(|| find(limit));
+            // vLLM drops the MTP block from the hit. For a sliding window the
+            // MTP group's dropped block must lie inside the block-aligned token
+            // hit, so the state hit also lands one block lower.
+            if needs_logits && manager.mtp_enabled {
+                overlap_blocks = overlap_blocks.saturating_sub(1);
+            }
+            overlap_blocks = landed.unwrap_or_else(|| find(overlap_blocks));
             active_overlap_blocks = lease.entries[..overlap_blocks]
                 .iter()
                 .filter(|entry| {

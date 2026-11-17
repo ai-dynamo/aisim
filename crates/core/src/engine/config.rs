@@ -1418,6 +1418,20 @@ impl EngineConfig {
         (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_none())
     }
 
+    /// The G2 this rank runs. vLLM has sliding-window groups from v0.32 on,
+    /// so a rank-local pool that keeps their checkpoints follows that
+    /// version's `OffloadingConnector` under either of its names. A
+    /// cluster-shared pool has no vLLM counterpart and keeps its own rules.
+    pub(crate) fn resolved_host_offload(&self) -> Option<NativeHostOffloadConfig> {
+        let mut host = self.native_host_offload.clone()?;
+        let window =
+            (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_some());
+        if window && host.scope == G2Scope::DpRankLocal {
+            host.connector = G2Connector::OffloadingV032;
+        }
+        Some(host)
+    }
+
     /// Batches a busy vLLM engine keeps committed, its `max_concurrent_batches`:
     /// two with async scheduling and one without. Engine replay does not model
     /// pipeline parallelism, which would raise this depth. MTP with G2 runs
@@ -1457,11 +1471,13 @@ impl EngineConfig {
             );
             if let Some(host) = &self.native_host_offload {
                 if state_cache.sliding_window.is_some() {
-                    // The model stores a window's checkpoints in the cohort
-                    // of the default connector's block store.
+                    // See `resolved_host_offload`: the offloading connector
+                    // stores a window's checkpoints with its prompt blocks.
+                    // SimpleCPU stores a window block by block, which is not
+                    // modeled.
                     ensure!(
-                        host.connector.is_default(),
-                        "a sliding-window state_cache requires host_offload.connector=offloading_v0_24"
+                        host.connector != G2Connector::SimpleCpuV032,
+                        "a sliding-window state_cache does not support host_offload.connector=simple_cpu_v0_32"
                     );
                     ensure!(self.kvcr.is_none(), "state_cache does not support kvcr");
                 } else {
@@ -1519,6 +1535,16 @@ impl EngineConfig {
                 .kv_cache_bytes_per_token
                 .ok_or_else(|| anyhow::anyhow!("state_cache requires kv_cache_bytes_per_token"))?;
             let state_blocks = state_cache.state_blocks(self.block_size, bytes_per_token)?;
+            if let Some(host) = &self.native_host_offload
+                && state_cache.sliding_window.is_some()
+            {
+                // A checkpoint is one G2 entry of the state's rows.
+                ensure!(
+                    host.num_host_blocks > state_blocks,
+                    "native_host_offload.num_host_blocks ({}) must exceed one state checkpoint ({state_blocks} blocks)",
+                    host.num_host_blocks
+                );
+            }
             if let Some(depth) = state_cache.num_speculative_states {
                 ensure!(
                     depth > 0 && self.aic_nextn == Some(depth),
@@ -1831,8 +1857,7 @@ impl EngineConfig {
                     "kvcr with aic_nextn requires worker_type=aggregated"
                 );
                 ensure!(
-                    self.state_cache.is_some()
-                        || (self.kv_cache_groups.is_empty() && self.prefix_match_unit.is_none()),
+                    self.kv_cache_groups.is_empty() && self.prefix_match_unit.is_none(),
                     "native_host_offload with aic_nextn requires a scalar uniform FullAttention KV pool"
                 );
             }
@@ -2358,19 +2383,36 @@ mod tests {
             let error = serde_json::from_value::<EngineConfig>(input).unwrap_err();
             assert!(error.to_string().contains(message), "{field}: {error}");
         }
-        // A sliding-window state is offloaded with its prompt
-        // blocks, by the default connector and without KVCR.
+        // A sliding-window state is offloaded with its prompt blocks, without
+        // KVCR. A rank-local pool follows the v0.32 offloading connector under
+        // either of its names; a shared pool keeps its own rules.
         let mut input = state_cache_config_json();
         input["state_cache"]["sliding_window"] = serde_json::json!({"lookahead_tokens": 0});
-        input["native_host_offload"] = serde_json::json!({"num_host_blocks": 8});
-        serde_json::from_value::<EngineConfig>(input.clone()).unwrap();
-        let mut connector = input.clone();
-        connector["native_host_offload"]["connector"] = serde_json::json!("offloading_v0_32");
-        input["kvcr"] = serde_json::json!({});
-        for (rejected, message) in [(connector, "offloading_v0_24"), (input, "support kvcr")] {
-            let error = serde_json::from_value::<EngineConfig>(rejected).unwrap_err();
-            assert!(error.to_string().contains(message), "{error}");
+        let resolved = |host: serde_json::Value| {
+            let mut input = input.clone();
+            input["native_host_offload"] = host;
+            serde_json::from_value::<EngineConfig>(input)
+                .map(|config| config.resolved_host_offload().unwrap().connector)
+                .map_err(|error| error.to_string())
+        };
+        let host =
+            |connector: &str| serde_json::json!({"num_host_blocks": 8, "connector": connector});
+        for connector in ["offloading_v0_24", "offloading_v0_32"] {
+            assert_eq!(resolved(host(connector)), Ok(G2Connector::OffloadingV032));
         }
+        let shared = serde_json::json!({
+            "num_host_blocks": 8, "scope": "cluster_shared", "kv_layout_id": "tp1",
+        });
+        assert_eq!(resolved(shared), Ok(G2Connector::OffloadingV024));
+        assert!(
+            resolved(host("simple_cpu_v0_32"))
+                .unwrap_err()
+                .contains("simple_cpu_v0_32")
+        );
+        input["native_host_offload"] = host("offloading_v0_24");
+        input["kvcr"] = serde_json::json!({});
+        let error = serde_json::from_value::<EngineConfig>(input).unwrap_err();
+        assert!(error.to_string().contains("support kvcr"), "{error}");
     }
 
     #[test]

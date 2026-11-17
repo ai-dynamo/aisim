@@ -48,7 +48,6 @@ pub(crate) use g1_manager::{
 };
 pub(crate) use grouped::GroupedKvPool;
 pub(crate) use sglang_backend::SglangKvManager;
-pub(crate) use state_cache_manager::state_resume_limit;
 pub(crate) use vllm_backend::{BlockRequestLease, mamba_prefill_checkpoint, state_boundaries};
 
 #[cfg(test)]

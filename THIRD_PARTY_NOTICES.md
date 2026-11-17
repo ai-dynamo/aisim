@@ -566,7 +566,9 @@ the host tier) and
 sliding-window prefix-cache retention (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`,
 replay boundaries, the EAGLE/MTP block after a boundary and the DeepSeek V4 MTP
 group) and its offload to the host tier of vLLM [`v0.32.0`](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be)
-(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). Files at v0.32.0:
+(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). The modeled functions of the
+first four files below are unchanged at main commit
+`0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0.32.0:
 
 - [`vllm/v1/core/kv_cache_coordinator.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py)
   (`_validate_prefix_cache_retention_interval`, `replay_boundaries`,

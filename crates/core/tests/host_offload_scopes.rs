@@ -236,13 +236,16 @@ fn overlapping_mtp_requests_run_on_two_attention_dp_ranks() {
 fn sliding_window_state_restores_on_another_prefill_worker_through_the_cluster_pool() {
     // A sliding-window prompt resumes only where its state checkpoint is, so the
     // second prefill worker needs the first one's checkpoint, not just its
-    // blocks. Under MTP the checkpoint one block lower is the one it can use.
+    // blocks. Under MTP the checkpoint one block lower is the one it can use;
+    // the drafter group drops a block of the hit, which for a block-aligned
+    // prompt is the one past the logits cap.
     // A pass stores its prompt blocks and checkpoints whole or not at all:
     // two blocks and two four-row checkpoints do not fit the eight-block pool.
-    for (mtp, state_bytes, reuse) in [
-        (false, 1_000_000, 8),
-        (true, 1_000_000, 4),
-        (false, 4_000_000, 0),
+    for (mtp, tokens, state_bytes, reuse) in [
+        (false, 9, 1_000_000, 8),
+        (true, 9, 1_000_000, 4),
+        (true, 8, 1_000_000, 4),
+        (false, 9, 4_000_000, 0),
     ] {
         let with_state = |mut rank: Value| {
             rank["state_cache"] = json!({
@@ -259,26 +262,25 @@ fn sliding_window_state_restores_on_another_prefill_worker_through_the_cluster_p
             "prefill": with_state(rank(host("cluster_shared"))),
             "decode": with_state(rank(host("cluster_shared"))),
         });
-        let report = run_with(
-            &timed_factory(),
-            disaggregated(2),
-            engine,
-            requests(2, "prefill_dp_rank"),
-        )
-        .unwrap();
+        let mut requests = requests(2, "prefill_dp_rank");
+        for request in &mut requests {
+            request["input_tokens"] = json!(tokens);
+            request["input_token_ids"] = json!(PROMPT[..tokens]);
+        }
+        let report = run_with(&timed_factory(), disaggregated(2), engine, requests).unwrap();
         assert_eq!(report.request_counts.completed_requests, 2);
         assert_eq!(
             host_reuse(&report),
             [Some(0), Some(reuse)],
-            "mtp={mtp} state_bytes={state_bytes}"
+            "mtp={mtp} tokens={tokens} state_bytes={state_bytes}"
         );
     }
 }
 
 #[test]
 fn a_state_restore_is_admitted_with_room_for_both_state_copies() {
-    // After its load a request holds the restored checkpoint and still needs
-    // the state it writes, beside its token blocks.
+    // After its load a request computes on in the restored checkpoint, and G1
+    // counts a second copy of it: the window it caches at the boundary.
     let state_rank = |host: Value, gpu_blocks: usize, state_bytes: usize, retention: Value| {
         let mut rank = rank(host);
         rank["num_gpu_blocks"] = json!(gpu_blocks);
@@ -289,21 +291,29 @@ fn a_state_restore_is_admitted_with_room_for_both_state_copies() {
         rank
     };
     // Two restores arrive at once: three blocks and a two-row checkpoint each,
-    // then one more block and the request's own state. Each needs eight of the
-    // twelve G1 blocks, so the second load waits for the first request.
+    // then one more block and the cached copy. Each is admitted with room for
+    // eight of the twelve G1 blocks, so the second load waits for the first
+    // request.
     // `evict` fills G1 first, so both prompts survive only in the host tier.
-    let local = json!({"scope": "dp_rank_local", "num_host_blocks": 64});
-    let restores = trace(&[
-        ("a0", 0.0, 1, 12, 1),
-        ("b0", 20.0, 201, 12, 1),
-        ("evict", 40.0, 101, 40, 1),
-        ("a1", 200.0, 1, 13, 1),
-        ("b1", 200.0, 201, 13, 1),
-    ]);
-    let engine = json!({"rank": state_rank(local.clone(), 12, 2_000_000, Value::Null)});
-    let report = run(aggregated(1), engine, restores).unwrap();
-    assert_eq!(report.request_counts.completed_requests, 5);
-    assert_eq!(host_reuse(&report), [0, 12, 0, 12, 0].map(Some));
+    // A rank-local pool runs the v0.32 offloading connector under either name.
+    let local = |connector: &str| json!({"num_host_blocks": 64, "connector": connector});
+    for connector in ["offloading_v0_24", "offloading_v0_32"] {
+        let restores = trace(&[
+            ("a0", 0.0, 1, 12, 1),
+            ("b0", 20.0, 201, 12, 1),
+            ("evict", 40.0, 101, 40, 1),
+            ("a1", 200.0, 1, 13, 1),
+            ("b1", 200.0, 201, 13, 1),
+        ]);
+        let engine = json!({"rank": state_rank(local(connector), 12, 2_000_000, Value::Null)});
+        let report = run(aggregated(1), engine, restores).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 5);
+        assert_eq!(
+            host_reuse(&report),
+            [0, 12, 0, 12, 0].map(Some),
+            "{connector}"
+        );
+    }
     // `short` leaves G1 the first block and its checkpoint; G2 has a deeper
     // hit for `a1`. The load is admitted for the checkpoint it restores, not
     // the one G1 holds: four token blocks and two two-row states fill the
@@ -314,7 +324,7 @@ fn a_state_restore_is_admitted_with_room_for_both_state_copies() {
         ("short", 200.0, 1, 5, 1),
         ("a1", 300.0, 1, 13, 1),
     ]);
-    let engine = json!({"rank": state_rank(local, 8, 2_000_000, Value::Null)});
+    let engine = json!({"rank": state_rank(local("offloading_v0_24"), 8, 2_000_000, Value::Null)});
     let report = run(aggregated(1), engine, deeper).unwrap();
     assert_eq!(report.request_counts.completed_requests, 4);
     assert_eq!(host_reuse(&report), [0, 8, 0, 4].map(Some));
@@ -404,6 +414,46 @@ fn concurrent_state_restores_wait_their_turn_and_keep_their_checkpoints() {
         ]);
         let report = run(disaggregated(1), engine, requests).unwrap();
         assert_eq!(report.request_counts.completed_requests, 4);
+        assert_eq!(host_reuse(&report), reuse.map(Some), "A={a}");
+    }
+}
+
+#[test]
+fn a_window_restore_that_waits_for_room_lets_a_landed_load_go_first() {
+    // B's load lands while A, ahead of it in the queue, still waits for room
+    // for its whole restore. B holds part of that room, so it goes first.
+    // Before, A blocked the queue and the replay stopped with an idle pass.
+    let role = || {
+        let mut pool = host("cluster_shared");
+        pool["num_host_blocks"] = json!(16);
+        // A block takes 1 ms each way, so the loads overlap.
+        for link in ["d2h_bandwidth_gbps", "h2d_bandwidth_gbps"] {
+            pool[link] = json!(1.0);
+        }
+        for link in ["shared_d2h_bandwidth_gbps", "shared_h2d_bandwidth_gbps"] {
+            pool[link] = json!(0.0);
+        }
+        let mut rank = rank(pool);
+        rank["num_gpu_blocks"] = json!(8);
+        rank["max_num_seqs"] = json!(2);
+        rank["max_num_batched_tokens"] = json!(16);
+        rank["state_cache"] = json!({
+            "bytes_per_request": 1_000_000, "sliding_window": {"lookahead_tokens": 1},
+        });
+        canonical_mtp(&mut rank, 1);
+        json!({"rank": rank})
+    };
+    // A waits in the restore's footprint check, then in G1's admission.
+    for (a, b, gap, reuse) in [(12, 8, 1.0, [0, 0, 8, 4]), (13, 9, 0.0, [0, 0, 8, 4])] {
+        let engine = json!({"rank": rank(Value::Null), "prefill": role(), "decode": role()});
+        let requests = trace(&[
+            ("r0", 0.0, 101, a, 1),
+            ("r1", gap, 1, b, 1),
+            ("r2", 2.0 * gap, 101, a, 1),
+            ("r3", 3.0 * gap, 1, b, 1),
+        ]);
+        let report = run_with(&timed_factory(), disaggregated(1), engine, requests).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 4, "A={a}");
         assert_eq!(host_reuse(&report), reuse.map(Some), "A={a}");
     }
 }

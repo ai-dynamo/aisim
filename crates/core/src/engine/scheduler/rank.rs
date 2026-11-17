@@ -544,7 +544,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,
-        native_host_offload: config.native_host_offload.clone(),
+        native_host_offload: config.resolved_host_offload(),
         state_cache: config.state_cache,
         prefix_match_unit: config.prefix_match_unit,
         kv_transfer_bandwidth: config.kv_transfer_bandwidth,
