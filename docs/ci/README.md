@@ -497,6 +497,12 @@ components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
 
+The application wheel-build job allows ten minutes on AMD64 and fifteen on
+ARM64. The ARM64 build budget includes cold release compilation, manylinux
+repair, provenance checks, and wheel handoff; compilation can consume most of
+ten minutes before those final steps run. Application test shards retain their
+separate fifteen-minute job budget and all per-test timeouts.
+
 The implementation reduces repeated work through wheel reuse, 24 application
 shards, pytest workers, and uv installation. Wheel verification overlaps test
 execution. Rust embedding prepares Python and Rust binaries concurrently in
