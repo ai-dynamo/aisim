@@ -36,9 +36,15 @@ use crate::perf_database::dsa::{
 };
 use crate::perf_database::gemm::quant_tc_flops;
 
-/// The architecture the MSA collector stamps on every row — the sole native
-/// head geometry in the msa tables (Python `DEFAULT_MSA_ARCHITECTURE`).
+/// Default MSA table architecture — the stamp on MiniMax-M3 rows (Python
+/// `DEFAULT_MSA_ARCHITECTURE`). The op's `architecture` field selects the
+/// silicon slice; Qwen3.8-Flash-Next QSA rows are keyed by
+/// `Qwen4ExpForConditionalGeneration`.
 const MSA_ARCHITECTURE: &str = "MiniMaxM3ForCausalLM";
+
+fn default_msa_architecture() -> String {
+    MSA_ARCHITECTURE.to_string()
+}
 
 /// One MSA module block (context or generation — the phase is chosen by the
 /// `Op` variant). Field-for-field mirror of Python `_BaseMSAModule`.
@@ -46,6 +52,12 @@ const MSA_ARCHITECTURE: &str = "MiniMaxM3ForCausalLM";
 pub struct MsaModuleOp {
     pub name: String,
     pub scale_factor: f64,
+    /// Architecture slice this op reads from the msa tables. Rows are keyed by
+    /// architecture, and different architectures carry different native head
+    /// geometry, so the lookup must not assume the M3 stamp. Defaults keep
+    /// previously serialized specs (and every M3 caller) on MiniMax.
+    #[serde(default = "default_msa_architecture")]
+    pub architecture: String,
     /// Local (per-rank) query heads.
     pub num_heads: u32,
     pub num_kv_heads: u32,
@@ -251,7 +263,7 @@ impl MsaModuleOp {
             self.kv_cache_dtype,
             self.fmha_quant_mode,
             self.gemm_quant_mode,
-            MSA_ARCHITECTURE,
+            &self.architecture,
             &sol,
         )
     }
@@ -290,7 +302,7 @@ impl MsaModuleOp {
             self.num_heads,
             self.kv_cache_dtype,
             self.gemm_quant_mode,
-            MSA_ARCHITECTURE,
+            &self.architecture,
             &sol,
         )
     }
@@ -589,6 +601,7 @@ mod tests {
         MsaModuleOp {
             name: "msa".to_string(),
             scale_factor: 1.0,
+            architecture: MSA_ARCHITECTURE.to_string(),
             num_heads: 8,
             num_kv_heads: 1,
             hidden_size: 6144,
@@ -672,8 +685,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn msa_key() -> DsaKey {
+        msa_key_for(MSA_ARCHITECTURE)
+    }
+
+    fn msa_key_for(architecture: &str) -> DsaKey {
         DsaKey {
-            architecture: MSA_ARCHITECTURE.to_string(),
+            architecture: architecture.to_string(),
             fmha_quant: "bfloat16".to_string(),
             kv_quant: "bfloat16".to_string(),
             gemm_quant: "bfloat16".to_string(),
@@ -681,40 +698,49 @@ mod tests {
     }
 
     /// One-point grids at the coordinates the loader would produce for
-    /// kernel_source="default" rows (flashmla_kv bucket): context
-    /// `[heads=8][prefix=0][isl=1024][b=1] = 10.0`; generation collapsed to
-    /// `[heads=8][step=0][seq=4097][b=1] = 0.5`.
-    fn inject_msa_grids(db: &PerfDatabase) {
-        let mut ctx_head = DsaHeadGrid::new();
-        ctx_head
-            .entry(8)
-            .or_default()
-            .entry(0)
-            .or_default()
-            .entry(1024)
-            .or_default()
-            .insert(1, LeafValue::latency_only(10.0));
-        let mut gen_head = DsaHeadGrid::new();
-        gen_head
-            .entry(8)
-            .or_default()
-            .entry(0)
-            .or_default()
-            .entry(4097)
-            .or_default()
-            .insert(1, LeafValue::latency_only(0.5));
-        let context = DsaGrids {
-            by_keys: BTreeMap::from([(
-                msa_key(),
+    /// kernel_source="default" rows (flashmla_kv bucket), one per
+    /// `(architecture, context_ms)` entry: context
+    /// `[heads=8][prefix=0][isl=1024][b=1] = context_ms`; generation collapsed
+    /// to `[heads=8][step=0][seq=4097][b=1] = context_ms / 20`.
+    fn msa_grids(entries: &[(&str, f64)]) -> (DsaGrids, DsaGrids) {
+        let mut context = BTreeMap::new();
+        let mut generation = BTreeMap::new();
+        for (architecture, context_ms) in entries {
+            let mut ctx_head = DsaHeadGrid::new();
+            ctx_head
+                .entry(8)
+                .or_default()
+                .entry(0)
+                .or_default()
+                .entry(1024)
+                .or_default()
+                .insert(1, LeafValue::latency_only(*context_ms));
+            let mut gen_head = DsaHeadGrid::new();
+            gen_head
+                .entry(8)
+                .or_default()
+                .entry(0)
+                .or_default()
+                .entry(4097)
+                .or_default()
+                .insert(1, LeafValue::latency_only(context_ms / 20.0));
+            let key = msa_key_for(architecture);
+            context.insert(
+                key.clone(),
                 BTreeMap::from([("flashmla_kv".to_string(), ctx_head)]),
-            )]),
-        };
-        let generation = DsaGrids {
-            by_keys: BTreeMap::from([(
-                msa_key(),
-                BTreeMap::from([("flashmla_kv".to_string(), gen_head)]),
-            )]),
-        };
+            );
+            generation.insert(key, BTreeMap::from([("flashmla_kv".to_string(), gen_head)]));
+        }
+        (
+            DsaGrids { by_keys: context },
+            DsaGrids {
+                by_keys: generation,
+            },
+        )
+    }
+
+    fn inject_msa_grids(db: &PerfDatabase) {
+        let (context, generation) = msa_grids(&[(MSA_ARCHITECTURE, 10.0)]);
         db.msa.inject_for_test(context, generation);
     }
 
@@ -748,6 +774,62 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// Silicon lookup keys on the op's own architecture, not the M3 default:
+    /// Qwen3.8-Flash-Next QSA rows are keyed by
+    /// `Qwen4ExpForConditionalGeneration`, and reading the wrong slice would
+    /// interpolate M3 head geometry.
+    #[test]
+    fn msa_silicon_lookup_keys_on_the_op_architecture() {
+        const QSA: &str = "Qwen4ExpForConditionalGeneration";
+        let mut db = db("vllm", "0.24.0");
+        db.database_mode = DatabaseMode::Silicon;
+        let (context, generation) = msa_grids(&[(MSA_ARCHITECTURE, 10.0), (QSA, 20.0)]);
+        db.msa.inject_for_test(context, generation);
+
+        let mut qsa = msa_op();
+        qsa.architecture = QSA.to_string();
+        approx(
+            qsa.query_context(&db, 1, 1024, 0)
+                .expect("qsa context silicon hit")
+                .latency_ms,
+            20.0,
+        );
+        approx(
+            qsa.query_generation(&db, 1, 4097)
+                .expect("qsa generation silicon hit")
+                .latency_ms,
+            1.0,
+        );
+
+        let m3 = msa_op();
+        approx(
+            m3.query_context(&db, 1, 1024, 0)
+                .expect("m3 context silicon hit")
+                .latency_ms,
+            10.0,
+        );
+        approx(
+            m3.query_generation(&db, 1, 4097)
+                .expect("m3 generation silicon hit")
+                .latency_ms,
+            0.5,
+        );
+    }
+
+    /// Specs serialized before the field existed stay loadable and keep the
+    /// M3 slice every legacy caller expects.
+    #[test]
+    fn msa_op_json_without_architecture_defaults_to_m3() {
+        let mut value = serde_json::to_value(msa_op()).expect("serialize msa op");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("architecture");
+        let restored: MsaModuleOp =
+            serde_json::from_value(value).expect("deserialize legacy msa op");
+        assert_eq!(restored.architecture, MSA_ARCHITECTURE);
     }
 
     /// A quant slice absent from the injected table is a typed silicon miss:

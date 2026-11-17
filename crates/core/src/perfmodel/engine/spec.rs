@@ -522,6 +522,7 @@ pub(crate) mod tests {
         crate::operators::MsaModuleOp {
             name: "context_attention".into(),
             scale_factor: 62.0,
+            architecture: "MiniMaxM3ForCausalLM".into(),
             num_heads: 8,
             num_kv_heads: 1,
             hidden_size: 7168,
@@ -1831,13 +1832,13 @@ pub(crate) mod tests {
         let start = bytes.windows(op.len()).position(|x| x == op).unwrap();
         // The baseline v27 P2P op has neither span Option tag nor force-scale-out bool.
         bytes.drain(start + op.len() - 2..start + op.len());
-        for version in [27_u32, 28, 29, 31] {
+        for version in [27_u32, 28, 29, 30] {
             bytes[..4].copy_from_slice(&version.to_le_bytes());
             assert!(matches!(
                 EngineSpec::from_bincode(&bytes),
                 Err(AicError::UnsupportedSchemaVersion {
                     got,
-                    expected: 30,
+                    expected: 31,
                     ..
                 }) if got == version
             ));

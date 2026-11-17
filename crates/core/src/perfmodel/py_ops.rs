@@ -3442,7 +3442,7 @@ macro_rules! msa_class {
                 if $is_context { "context" } else { "generation" };
 
             #[new]
-            #[pyo3(signature = (name, scale_factor, num_heads, num_kv_heads, hidden_size, head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, block_size, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, dsa_architecture="GlmMoeDsaForCausalLM", dsa_scale_k=1.0))]
+            #[pyo3(signature = (name, scale_factor, num_heads, num_kv_heads, hidden_size, head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, block_size, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, dsa_architecture="GlmMoeDsaForCausalLM", dsa_scale_k=1.0, architecture="MiniMaxM3ForCausalLM"))]
             #[allow(clippy::too_many_arguments)]
             fn new(
                 name: String,
@@ -3461,10 +3461,12 @@ macro_rules! msa_class {
                 gemm_quant_mode: &Bound<'_, PyAny>,
                 dsa_architecture: &str,
                 dsa_scale_k: f64,
+                architecture: &str,
             ) -> PyResult<PyClassInitializer<Self>> {
                 let module = crate::operators::MsaModuleOp {
                     name,
                     scale_factor,
+                    architecture: architecture.to_string(),
                     num_heads,
                     num_kv_heads,
                     hidden_size,
@@ -3508,6 +3510,7 @@ macro_rules! msa_class {
                 kwargs.set_item("gemm_quant_mode", enum_token(&o.gemm_quant_mode))?;
                 kwargs.set_item("dsa_architecture", o.dsa_architecture.clone())?;
                 kwargs.set_item("dsa_scale_k", o.dsa_scale_k)?;
+                kwargs.set_item("architecture", o.architecture.clone())?;
                 Ok((args, kwargs))
             }
 
@@ -3587,6 +3590,11 @@ macro_rules! msa_class {
                 py: Python<'py>,
             ) -> PyResult<Bound<'py, PyAny>> {
                 py_enum_member(py, "FMHAQuantMode", &enum_token(&slf.as_super().msa()?.fmha_quant_mode))
+            }
+
+            #[getter(_architecture)]
+            fn architecture(slf: PyRef<'_, Self>) -> PyResult<String> {
+                Ok(slf.as_super().msa()?.architecture.clone())
             }
 
             #[getter(_dsa_architecture)]

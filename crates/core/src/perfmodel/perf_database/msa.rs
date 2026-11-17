@@ -5,7 +5,9 @@
 //!
 //! Two parquet files: `msa_context_module_perf.parquet` and
 //! `msa_generation_module_perf.parquet`, collected with the exact DSA-module
-//! row schema (architecture always `MiniMaxM3ForCausalLM`, kernel_source
+//! row schema (architecture is the checkpoint's own — `MiniMaxM3ForCausalLM`
+//! for M3, `Qwen4ExpForConditionalGeneration` for Qwen3.8-Flash-Next QSA —
+//! kernel_source
 //! `"default"`, op_name `msa_context_module` / `msa_generation_module` — never
 //! a skip_indexer tag). Loading therefore reuses the DSA parquet loader
 //! verbatim (Python `operations/msa.py` delegates to the DSA loaders the same

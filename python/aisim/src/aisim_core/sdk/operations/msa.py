@@ -11,8 +11,11 @@ per *block* (block_size tokens) rather than per token.
 
 MSA has its own module-level silicon tables (``msa_context_module_perf`` /
 ``msa_generation_module_perf``, DSA-module row schema; collected on the
-serving path for trtllm/vllm/sglang across the mainstream systems). SILICON
-queries resolve on those tables through the engine's interpolation with the
+serving path for trtllm/vllm/sglang across the mainstream systems). Rows are
+keyed by the checkpoint's architecture (``MiniMaxM3ForCausalLM`` for M3,
+``Qwen4ExpForConditionalGeneration`` for Qwen3.8-Flash-Next QSA); pass
+``architecture=...`` when the op does not read the M3 slice. SILICON queries
+resolve on those tables through the engine's interpolation with the
 analytic MSA SOL (same three-group split as DSA/DSV4 — GEMM projections,
 indexer, sparse attention) as the anchor. HYBRID / EMPIRICAL try the silicon
 path first; on a typed data miss they fall back to the legacy CROSS-OP

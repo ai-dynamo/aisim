@@ -134,7 +134,12 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 // - 30 (AFD): append four communication variants and the typed source-ordered
 //   pool execution plan; P2P fabric selectors and independent F-node width
 //   are part of the same positional wire-format change.
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 30;
+// - 31 (MSA per-checkpoint architecture): `MsaModuleOp` gained the
+//   checkpoint's own `architecture` between `scale_factor` and `num_heads`
+//   (positional bincode), so a Qwen QSA row resolves on its own identity
+//   instead of the hardcoded M3 one. The serde default covers JSON only;
+//   schema-30 bincode payloads are rejected.
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 31;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].
