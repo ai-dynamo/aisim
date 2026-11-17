@@ -18,7 +18,7 @@ from typing import Any
 
 import yaml
 
-from aisim.fpm_contract import FPM_RESOLVED_CONFIG_GLOB
+from aisim.fpm_contract import FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION, FPM_RESOLVED_CONFIG_GLOB
 from aisim_core.decoder_config import decoder_config_key
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
@@ -64,6 +64,9 @@ _RUN_IDENTITY_FIELDS = (
     "runtime_run_id",
     "runtime_grid_digest",
 )
+SINGLE_SAMPLE_MEASUREMENT_POLICY = "dynamo_native_single_sample_v1"
+# Schema-8 sidecar and row policy of runs measured with the power window.
+POWER_WINDOW_MEASUREMENT_POLICY = "dynamo_native_single_sample_power_window_v1"
 
 
 def _dotted_get(payload: object, path: str) -> object:
@@ -264,10 +267,18 @@ def aggregate_cell(
         and kvwarm_meta.get("skip_reason") == "dense_model_content_insensitive"
         and _dense_synthetic_kv_eligible(plan, cell, cell_dir / "raw", collection)
     )
+    # Only a validated schema-3 collection selects the power policy (P4).
+    powered = collection.artifact_schema_version == FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION
+    if powered and not getattr(plan.options, "measure_power", False):
+        # An image-level DYN_BENCHMARK_POWER_WINDOW_S bypasses the plan's identity.
+        raise ValueError(f"{cell.cell_id} wrote power-window artifacts under a plan without measure_power")
 
-    def _kv_seed_regime(point: dict[str, Any], phase: str) -> str:
+    def _kv_seed_regime(point: dict[str, Any], phase: str, native_regime: str | None) -> str:
         if phase == "prefill" and (not cell.execution_identity[0] or int(point["total_kv_read_tokens"]) == 0):
             return "n/a"
+        # New producers report deliberate skips without a fake-fallback stamp.
+        if native_regime == "skip:dense_model_content_insensitive":
+            return native_regime if dense_synthetic else "fake_fallback"
         reasons = point.get("sample_reasons") or []
         # A cached prefill states in its point stamps how the engine seeded its prefix, and the warm-up block, which
         # describes the decode protocol, cannot classify it. A prefix that real forward passes computed is real KV,
@@ -303,7 +314,7 @@ def aggregate_cell(
         batch = int(point["batch_size"])
         total_prefill = int(point["total_prefill_tokens"])
         total_kv = int(point["total_kv_read_tokens"])
-        regime = _kv_seed_regime(point, phase)
+        regime = _kv_seed_regime(point, phase, measurement.kv_seed_regime)
         if cell.execution_identity[0] and (phase == "decode" or total_kv > 0) and regime != "real_kv":
             raise ValueError(
                 f"execution-identity cells require real KV measurements for cached prefill and decode, got {regime}"
@@ -352,10 +363,12 @@ def aggregate_cell(
                 "partition_policy": "balanced_v1",
                 "kv_seed_regime": regime,
                 "latency_ms": max(latency for _rank, latency in measurement.rank_wall_times) * 1000.0,
+                # Power travels with the selected latency sample; never combined across samples.
+                **({"power_w": measurement.power_w} if powered else {}),
                 "global_warmup_iterations": plan.options.warmup_iterations,
                 "warmup_repeats": 0,
                 "measurement_repeats": 1,
-                "measurement_policy": "dynamo_native_single_sample_v1",
+                "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
                 "model_support_level": capability.support_level,
                 "model_template_id": capability.template_id,
                 "model_template_version": capability.template_version,
@@ -421,6 +434,31 @@ def _validate_kv_seed_classification(metadata: dict[str, Any], rows: list[dict[s
         raise ValueError("FPM KV seed classification policy differs from published rows")
 
 
+def _validate_power_schema(metadata: dict[str, Any], schema: Any) -> None:
+    """Check a sealed schema-8 pair before interpreting or republishing rows."""
+    if metadata.get("schema_version") != 8:
+        return
+    import pyarrow as pa
+
+    if metadata.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY:
+        raise ValueError("schema-8 FPM sidecar measurement_policy must be the power-window policy")
+    if not pa.types.is_float64(schema.field("power_w").type):
+        raise ValueError("schema-8 FPM power_w must be a nullable Parquet DOUBLE column")
+
+
+def _validate_power_rows(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if row.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY:
+            raise ValueError(
+                f"schema-8 FPM database has rows without measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}"
+            )
+        power = row.get("power_w")
+        if power is not None and (
+            isinstance(power, bool) or not isinstance(power, int | float) or not math.isfinite(power) or power <= 0
+        ):
+            raise ValueError("schema-8 FPM power_w must be null or finite and greater than zero")
+
+
 def validate_formal_database_commit(
     parquet_path: Path,
     metadata_path: Path,
@@ -448,13 +486,12 @@ def validate_formal_database_commit(
         raise TypeError(f"FPM database commit record must be a mapping: {metadata_path}")
     if payload.get("schema_name") == "aic_fpm_forward_perf" and payload.get("schema_version") == 6:
         raise ValueError(
-            "historical schema-6 FPM publications cannot be finalized by this collector; schema 7 is required. "
+            "historical schema-6 FPM publications cannot be finalized by this collector; schema 7 or 8 is required. "
             "Preserve the existing artifacts. Automatic migration is unsupported; "
             "use a fresh output directory for any new collection."
         )
     expected = {
         "schema_name": "aic_fpm_forward_perf",
-        "schema_version": 7,
         "system": plan.system,
         "backend": plan.backend,
     }
@@ -463,6 +500,9 @@ def validate_formal_database_commit(
         for key, value in expected.items()
         if payload.get(key) != value
     }
+    # Schema 8 (power) republishes schema-7 pairs; a checkpoint sealed before still validates.
+    if payload.get("schema_version") not in (7, 8):
+        mismatches["schema_version"] = {"actual": payload.get("schema_version"), "expected": [7, 8]}
     if mismatches:
         raise ValueError(f"FPM database commit record does not match the frozen plan: {mismatches}")
     if payload.get("parquet_sha256") != _sha256(parquet_path):
@@ -473,10 +513,11 @@ def validate_formal_database_commit(
     except ImportError as error:
         raise RuntimeError("validating fpm_forward_perf.parquet requires pyarrow") from error
     parquet = pq.ParquetFile(parquet_path)
-    required = {*_ROW_KEY, *_RUN_IDENTITY_FIELDS}
+    required = {*_ROW_KEY, *_RUN_IDENTITY_FIELDS, *(("power_w",) if payload["schema_version"] == 8 else ())}
     missing = sorted(required - set(parquet.schema_arrow.names))
     if missing:
-        raise ValueError(f"committed FPM database is missing schema-v7 columns: {missing}")
+        raise ValueError(f"committed FPM database is missing schema-v{payload['schema_version']} columns: {missing}")
+    _validate_power_schema(payload, parquet.schema_arrow)
     row_count = payload.get("row_count")
     if not isinstance(row_count, int) or row_count < 1 or parquet.metadata.num_rows != row_count:
         raise ValueError(
@@ -484,6 +525,8 @@ def validate_formal_database_commit(
             f"parquet={parquet.metadata.num_rows}, metadata={row_count!r}"
         )
     rows = parquet.read().to_pylist()
+    if payload["schema_version"] == 8:
+        _validate_power_rows(rows)
     _validate_kv_seed_classification(payload, rows)
     identities = _run_identities_by_cell(rows, source="committed")
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -558,8 +601,16 @@ def validate_formal_database_commit(
             }
             if not requested <= coordinates:
                 raise ValueError(f"committed FPM cell does not cover requested coordinates: {cell.cell_id}")
+        # A null power_w is the column a schema-8 republish adds to older rows;
+        # omitting it keeps cell digests sealed before that republish valid.
         canonical_rows = sorted(
-            json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False) for row in selected
+            json.dumps(
+                {key: value for key, value in row.items() if key != "power_w" or value is not None},
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            for row in selected
         )
         digest = hashlib.sha256("\n".join(canonical_rows).encode()).hexdigest()
         if expected_cell_rows is not None and expected_cell_rows.get(cell.cell_id) != digest:
@@ -740,15 +791,20 @@ def write_formal_database(
             required = {*_ROW_KEY, *_RUN_IDENTITY_FIELDS}
             if committed.get("schema_version") == 6:
                 required -= set(EXECUTION_COLUMNS)
+            elif committed.get("schema_version") == 8:
+                required.add("power_w")
             elif committed.get("schema_version") != 7:
                 raise ValueError("existing FPM database has unsupported schema version")
             missing = sorted(required - set(table.column_names))
             if missing:
                 raise ValueError(
-                    "existing FPM database does not satisfy the attempt-bound schema-v7 row-key "
+                    "existing FPM database does not satisfy the attempt-bound schema-v7/v8 row-key "
                     f"contract (missing columns: {missing}); publish to a clean destination: {parquet_path}"
                 )
+            _validate_power_schema(committed, table.schema)
             existing_rows = table.to_pylist()
+            if committed.get("schema_version") == 8:
+                _validate_power_rows(existing_rows)
             _validate_kv_seed_classification(committed, existing_rows)
             if committed.get("schema_version") == 6:
                 for row in existing_rows:
@@ -782,6 +838,21 @@ def write_formal_database(
                     "identity; database left unchanged"
                 )
                 return parquet_path, metadata_path, tuple(skipped_cells)
+        # Schema 8 binds every row to the power-window policy, so one pair
+        # cannot hold power-window and latency-only rows. Refuse the merge
+        # before anything is written; the existing pair stays as committed.
+        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
+        powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
+        if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
+            raise ValueError(
+                "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every "
+                f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
+                f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
+            )
+        if powered:
+            for row in [*merged, *rows]:
+                row.setdefault("power_w", None)
+            _validate_power_rows(rows)
         index = {tuple(row[key] for key in _ROW_KEY): row for row in merged}
         if len(index) != len(merged):
             raise ValueError(f"existing FPM database contains duplicate physical keys: {parquet_path}")
@@ -814,12 +885,22 @@ def write_formal_database(
         temporary = _temporary_path(parquet_path)
         temporary_metadata = _temporary_path(metadata_path)
         try:
-            pq.write_table(pa.Table.from_pylist(merged), temporary, compression="zstd")
+            table = pa.Table.from_pylist(merged)
+            if powered:
+                # The loader requires a DOUBLE column; an all-null column would infer the null type.
+                column = table.schema.get_field_index("power_w")
+                if pa.types.is_null(table.schema.field(column).type):
+                    table = table.set_column(
+                        column, pa.field("power_w", pa.float64()), pa.nulls(table.num_rows, type=pa.float64())
+                    )
+                elif not pa.types.is_float64(table.schema.field(column).type):
+                    raise ValueError("schema-8 FPM power_w must be a nullable Parquet DOUBLE column")
+            pq.write_table(table, temporary, compression="zstd")
             metadata = {
                 "schema_name": "aic_fpm_forward_perf",
-                "schema_version": 7,
+                "schema_version": 8 if powered else 7,
                 "coordinate_system": "iteration_totals_balanced_v1",
-                "measurement_policy": "dynamo_native_single_sample_v1",
+                "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
                 "warmup_repeats": 0,
                 "measurement_repeats": 1,
                 "row_count": len(merged),

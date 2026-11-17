@@ -191,7 +191,6 @@ impl ReplayEngineConfig {
         }
         match topology {
             ReplayTopology::Aggregated { .. } => {
-                validate_host_mtp_dp(&self.rank, self.dp_size)?;
                 if self.rank.g3_offload.is_some() && self.dp_size != 1 {
                     return Err(ReplayError::InvalidSpec(
                         "g3_offload supports only dp_size=1".to_string(),
@@ -199,12 +198,8 @@ impl ReplayEngineConfig {
                 }
             }
             ReplayTopology::Disaggregated { .. } => {
-                let roles =
-                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage));
-                for role in &roles {
-                    validate_host_mtp_dp(&role.rank, role.dp_size)?;
-                }
-                let [prefill, decode] = roles.map(|role| role.rank);
+                let [prefill, decode] =
+                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage).rank);
                 if prefill.g3_offload.is_some() || decode.g3_offload.is_some() {
                     return Err(ReplayError::InvalidSpec(
                         "g3_offload supports only aggregated replay".to_string(),
@@ -231,6 +226,8 @@ pub struct ReplayRoleFactory {
     dp_size: NonZeroU32,
     tensor_parallel_size: u32,
     prefill_context_parallel_size: u32,
+    /// Pipeline stages of an SGLang PP prefill worker; one elsewhere.
+    pipeline_parallel_size: u32,
     backend: Backend,
     total_blocks: u64,
     kv_cache_capacity_bytes: Option<u64>,
@@ -366,6 +363,11 @@ impl ReplayRoleFactory {
                     .ok()
                     .and_then(|cp| gpus.checked_mul(cp))
             })
+            .and_then(|gpus| {
+                usize::try_from(self.pipeline_parallel_size)
+                    .ok()
+                    .and_then(|pp| gpus.checked_mul(pp))
+            })
             .ok_or_else(|| ReplayError::InvalidSpec("engine GPU count overflows usize".into()))
     }
 
@@ -457,7 +459,6 @@ impl ReplayEngineFactory {
         let dp_size = NonZeroU32::new(role.dp_size).ok_or_else(|| {
             ReplayError::InvalidSpec("native engine dp_size must be positive".into())
         })?;
-        validate_host_mtp_dp(&role.rank, dp_size.get())?;
         if role.tensor_parallel_size == 0 {
             return Err(ReplayError::InvalidSpec(
                 "native tensor_parallel_size must be positive".into(),
@@ -499,10 +500,38 @@ impl ReplayEngineFactory {
         });
         let g3_config = role.rank.g3_offload.take();
         let kvcr_config = role.rank.kvcr.take();
-        if kvcr_config.is_some() && pipeline_parallel_size(&role.rank.timing_model)? > 1 {
+        let pipeline_size = pipeline_parallel_size(&role.rank.timing_model)?;
+        if kvcr_config.is_some() && pipeline_size > 1 {
             return Err(ReplayError::InvalidSpec(
                 "kvcr does not support pipeline parallelism (pp must be 1)".into(),
             ));
+        }
+        // A prefill worker with pp stages keeps pp chunks in flight (SGLang's PP event loop feeds the
+        // next chunk of the same prompt into stage 0 while the previous one runs on later stages), so
+        // its passes retire at the per-stage rate. The timing provider prices the whole forward over
+        // every stage; the prompt's last forward still crosses the later stages before its KV is handed off.
+        if pipeline_size > 1 && (stage != WorkerStage::Prefill || backend != Backend::Sglang) {
+            return Err(ReplayError::InvalidSpec(
+                "engine replay prices pipeline parallelism only on an SGLang disaggregated prefill worker"
+                    .into(),
+            ));
+        }
+        if pipeline_size > 1 {
+            let fill_passes = (pipeline_size - 1) as f64;
+            if fill_passes > crate::engine::MAX_PIPELINE_FILL_PASSES {
+                return Err(ReplayError::InvalidSpec(format!(
+                    "pp {pipeline_size} exceeds the supported pipeline stage count"
+                )));
+            }
+            // The stage count sets the fill; zero is the unset default.
+            let supplied = role.rank.pipeline_fill_passes;
+            if supplied != 0.0 && supplied != fill_passes {
+                return Err(ReplayError::InvalidSpec(format!(
+                    "pipeline_fill_passes {supplied} conflicts with pp {pipeline_size}; expected 0 or {fill_passes}"
+                )));
+            }
+            role.rank.speedup_ratio = pipeline_speedup_ratio(&role.rank)?;
+            role.rank.pipeline_fill_passes = fill_passes;
         }
         // A pull moves G2 bytes times the tensor-parallel size; it does not
         // model how prefill context parallelism shards the prompt's KV.
@@ -532,6 +561,9 @@ impl ReplayEngineFactory {
             dp_size,
             tensor_parallel_size: role.tensor_parallel_size,
             prefill_context_parallel_size: role.prefill_context_parallel_size,
+            pipeline_parallel_size: u32::try_from(pipeline_size).map_err(|_| {
+                ReplayError::InvalidSpec("pipeline parallel size exceeds u32".into())
+            })?,
             backend,
             total_blocks,
             kv_cache_capacity_bytes,
@@ -691,127 +723,24 @@ fn pipeline_parallel_size(timing: &crate::engine::TimingModelConfig) -> Result<u
     })
 }
 
+/// The prefill speedup ratio a rank replays with: its own ratio times its pipeline stages, whose
+/// passes retire at the per-stage rate. Diagnostics scale the timing evidence by the same value.
+pub(crate) fn pipeline_speedup_ratio(rank: &EngineConfig) -> Result<f64, ReplayError> {
+    let pipeline_size = pipeline_parallel_size(&rank.timing_model)?;
+    if pipeline_size == 1 {
+        return Ok(rank.speedup_ratio);
+    }
+    // A zero ratio means unscaled; normalize it before dividing by the stages.
+    let ratio = if rank.speedup_ratio == 0.0 {
+        1.0
+    } else {
+        rank.speedup_ratio
+    };
+    Ok(ratio * pipeline_size as f64)
+}
+
 fn engine_error(error: impl std::fmt::Display) -> ReplayError {
     ReplayError::Engine(error.to_string())
-}
-
-fn validate_host_mtp_dp(rank: &EngineConfig, dp_size: u32) -> ReplayResult<()> {
-    if rank.native_host_offload.is_some() && rank.aic_nextn.is_some() && dp_size != 1 {
-        return Err(ReplayError::InvalidSpec(
-            "native_host_offload with MTP supports only dp_size=1".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod host_mtp_dp_tests {
-    use super::*;
-    use crate::engine::NativeHostOffloadConfig;
-
-    struct TestTiming;
-    impl TimingModel for TestTiming {
-        fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
-            Ok(1.0)
-        }
-        fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
-            Ok(1.0)
-        }
-    }
-
-    fn rank(host: bool, nextn: Option<usize>, shared: bool) -> EngineConfig {
-        let offload = NativeHostOffloadConfig::new(8).with_bandwidths(0.0, 0.0);
-        EngineConfig {
-            num_gpu_blocks: 8,
-            block_size: 4,
-            kv_cache_bytes_per_token: Some(16),
-            native_host_offload: host.then(|| {
-                if shared {
-                    offload.cluster_shared("mtp-dp-test")
-                } else {
-                    offload
-                }
-            }),
-            aic_nextn: nextn,
-            timing_model: nextn.map_or(crate::engine::TimingModelConfig::Polynomial, |depth| {
-                crate::engine::TimingModelConfig::External {
-                    provider: "aic".into(),
-                    config: serde_json::json!({"speculation": {"kind": "mtp", "params": {"depth": depth}}}),
-                }
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn g2_mtp_dp_limit_is_enforced_at_topology_and_direct_factory_entrypoints() {
-        for (host, nextn, dp_size, shared, supported) in [
-            (true, Some(2), 1, false, true),
-            (true, Some(2), 2, false, false),
-            (true, Some(2), 2, true, false),
-            (true, None, 2, false, true),
-            (true, None, 2, true, true),
-            (false, Some(2), 2, false, true),
-        ] {
-            let config = ReplayEngineConfig {
-                dp_size,
-                rank: rank(host, nextn, shared),
-                ..Default::default()
-            };
-            let validation = config.validate_topology(&ReplayTopology::aggregated(1));
-            let construction = ReplayEngineFactory::with_timing_model(Arc::new(TestTiming))
-                .role_factory(&config, WorkerStage::Aggregated, false);
-            if supported {
-                validation.unwrap();
-                assert_eq!(construction.unwrap().dp_size(), dp_size);
-            } else {
-                assert!(
-                    validation
-                        .unwrap_err()
-                        .to_string()
-                        .contains("MTP supports only dp_size=1")
-                );
-                let error = match construction {
-                    Ok(_) => {
-                        panic!("direct role construction must enforce the MTP/G2 DP limit")
-                    }
-                    Err(error) => error,
-                };
-                assert!(error.to_string().contains("MTP supports only dp_size=1"));
-            }
-        }
-    }
-
-    #[test]
-    fn role_override_cannot_bypass_the_g2_mtp_dp_limit() {
-        let config = ReplayEngineConfig {
-            prefill: Some(ReplayRoleConfig {
-                dp_size: 2,
-                rank: rank(true, Some(2), false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let topology: ReplayTopology = serde_json::from_value(serde_json::json!({
-            "kind": "disaggregated",
-            "prefill": {"initial_workers": 1},
-            "decode": {"initial_workers": 1}
-        }))
-        .unwrap();
-        assert!(
-            config
-                .validate_topology(&topology)
-                .unwrap_err()
-                .to_string()
-                .contains("MTP supports only dp_size=1")
-        );
-        let error =
-            match ReplayEngineFactory::new().role_factory(&config, WorkerStage::Prefill, false) {
-                Ok(_) => panic!("role overrides must validate their resolved DP size"),
-                Err(error) => error,
-            };
-        assert!(error.to_string().contains("MTP supports only dp_size=1"));
-    }
 }
 
 #[cfg(test)]
@@ -1072,6 +1001,100 @@ mod kvcr_tests {
             "{:?}",
             plain.err()
         );
+    }
+
+    #[test]
+    fn pipeline_stages_are_priced_only_on_an_sglang_prefill_worker() {
+        let config = |backend| ReplayEngineConfig {
+            rank: EngineConfig {
+                backend,
+                timing_model: crate::engine::TimingModelConfig::External {
+                    provider: "aic".into(),
+                    config: serde_json::json!({"model": "m", "system": "s", "pp": 4}),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        struct Unit;
+        impl crate::engine::TimingModel for Unit {
+            fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+                Ok(1.0)
+            }
+            fn predict_decode_ms(
+                &self,
+                _: usize,
+                _: usize,
+                _: usize,
+                _: usize,
+            ) -> anyhow::Result<f64> {
+                Ok(1.0)
+            }
+        }
+        // Its passes retire at the per-stage rate on four stages' GPUs.
+        let prefill = ReplayEngineFactory::with_timing_model(Arc::new(Unit))
+            .role_factory(&config(Backend::Sglang), WorkerStage::Prefill, false)
+            .unwrap();
+        assert_eq!(prefill.gpus_per_worker().unwrap(), 4);
+        let rank = prefill.factory.config();
+        assert_eq!((rank.speedup_ratio, rank.pipeline_fill_passes), (4.0, 3.0));
+        // Zero means unscaled, so it is one before the stages divide it.
+        let mut unscaled = config(Backend::Sglang);
+        unscaled.rank.speedup_ratio = 0.0;
+        let prefill = ReplayEngineFactory::with_timing_model(Arc::new(Unit))
+            .role_factory(&unscaled, WorkerStage::Prefill, false)
+            .unwrap();
+        assert_eq!(prefill.factory.config().speedup_ratio, 4.0);
+        // A supplied fill must agree with the stage count; an oversized stage count is rejected.
+        let mut matching = config(Backend::Sglang);
+        matching.rank.pipeline_fill_passes = 3.0;
+        ReplayEngineFactory::with_timing_model(Arc::new(Unit))
+            .role_factory(&matching, WorkerStage::Prefill, false)
+            .unwrap();
+        let mut conflicting = config(Backend::Sglang);
+        conflicting.rank.pipeline_fill_passes = 1.0;
+        let error = ReplayEngineFactory::with_timing_model(Arc::new(Unit))
+            .role_factory(&conflicting, WorkerStage::Prefill, false)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("conflicts with pp 4"), "{error}");
+        let mut oversized = config(Backend::Sglang);
+        oversized.rank.timing_model = crate::engine::TimingModelConfig::External {
+            provider: "aic".into(),
+            config: serde_json::json!({"model": "m", "system": "s", "pp": 4096}),
+        };
+        let error = ReplayEngineFactory::with_timing_model(Arc::new(Unit))
+            .role_factory(&oversized, WorkerStage::Prefill, false)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("exceeds the supported"),
+            "{error}"
+        );
+        // Diagnostics scale the timing evidence by the ratio replay charged.
+        assert_eq!(pipeline_speedup_ratio(&unscaled.rank).unwrap(), 4.0);
+        let mut doubled = config(Backend::Sglang);
+        doubled.rank.speedup_ratio = 2.0;
+        assert_eq!(pipeline_speedup_ratio(&doubled.rank).unwrap(), 8.0);
+        assert_eq!(
+            pipeline_speedup_ratio(&EngineConfig::default()).unwrap(),
+            EngineConfig::default().speedup_ratio
+        );
+        for (backend, stage) in [
+            (Backend::Vllm, WorkerStage::Prefill),
+            (Backend::Sglang, WorkerStage::Decode),
+            (Backend::Sglang, WorkerStage::Aggregated),
+        ] {
+            let Err(error) = role_factory(&config(backend), stage) else {
+                panic!("pp=4 on {backend:?} {stage:?} must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("only on an SGLang disaggregated prefill worker"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

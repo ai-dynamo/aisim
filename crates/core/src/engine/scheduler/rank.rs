@@ -529,6 +529,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         enable_chunked_prefill: config.enable_chunked_prefill,
         speedup_ratio: config.speedup_ratio,
         decode_speedup_ratio: config.decode_speedup_ratio,
+        pipeline_fill_passes: config.pipeline_fill_passes,
         worker_type: match config.worker_type {
             WorkerType::Aggregated => CoreWorkerType::Aggregated,
             WorkerType::Prefill => CoreWorkerType::Prefill,
@@ -538,6 +539,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         aic_nextn: config.aic_nextn,
         aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
         aic_mtp_seed: config.aic_mtp_seed,
+        disable_eagle_block_drop: config.disable_eagle_block_drop,
         kv_transfer_bytes_per_token: config.kv_transfer_bytes_per_token,
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),

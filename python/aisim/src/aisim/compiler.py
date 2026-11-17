@@ -281,7 +281,12 @@ def _deployment(
     for role in ("aggregated",) if mode == "agg" else ("prefill", "decode"):
         worker = getattr(engine.workers, role)
         if worker is not None:
-            reject_pipeline_parallelism(role, worker.parallelism.pipeline)
+            reject_pipeline_parallelism(role, worker.parallelism.pipeline, backend=engine.backend)
+            # Only AIC timing reads a pipeline width; fixed and polynomial timing price one stage.
+            if worker.parallelism.pipeline > 1 and worker.timing.type != "default":
+                raise ValueError(
+                    f"pipeline parallelism on {role} requires an AIC timing model, not {worker.timing.type!r} timing"
+                )
     if mode == "disagg":
         from aisim_core.sdk.perf_database import load_system_spec
 
@@ -954,6 +959,12 @@ def _worker_engine_args(
         payload["state_cache"] = {"bytes_per_request": cache.state_cache.bytes_per_request}
         if (window := cache.state_cache.resolved_sliding_window()) is not None:
             payload["state_cache"]["sliding_window"] = window
+        if cache.state_cache.num_speculative_states is not None:
+            payload["state_cache"]["num_speculative_states"] = cache.state_cache.num_speculative_states
+        # Default-off switches stay absent so existing specs remain byte-identical.
+        for flag in ("prefill_checkpoint", "junction_checkpoints"):
+            if getattr(cache.state_cache, flag):
+                payload["state_cache"][flag] = True
         payload["kv_cache_bytes_per_token"] = cache.bytes_per_token
     if capacity.type == "default" and cache.state_cache is not None:
         assert isinstance(cache.bytes_per_token, int)

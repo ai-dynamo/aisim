@@ -218,6 +218,9 @@ pub(crate) struct MockEngineArgs {
     pub speedup_ratio: f64,
     #[builder(default = "1.0")]
     pub decode_speedup_ratio: f64,
+    /// Later pipeline stages a prefill forward still crosses after its pass retires (PP prefill).
+    #[builder(default = "0.0")]
+    pub pipeline_fill_passes: f64,
     #[builder(default = "WorkerType::Aggregated")]
     pub worker_type: WorkerType,
     #[builder(default = "Arc::new(PerfModel::Polynomial)")]
@@ -228,6 +231,9 @@ pub(crate) struct MockEngineArgs {
     pub aic_nextn_accept_rates: Option<String>,
     #[builder(default = "42")]
     pub aic_mtp_seed: u64,
+    /// MTP keeps vLLM's non-speculative prefix-cache rules.
+    #[builder(default = "false")]
+    pub disable_eagle_block_drop: bool,
     #[builder(default = "None")]
     pub kv_transfer_bytes_per_token: Option<usize>,
     #[builder(default = "None")]

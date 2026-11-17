@@ -122,7 +122,7 @@ pub enum TransferKind {
 /// (`off`/`conservative`/`balanced`/`aggressive`) before serialising, so the
 /// wire form is always an explicit list of kind tokens; `None` on the wire
 /// means the default ALL-transfers policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TransferPolicy {
     pub xshape: bool,
     pub xquant: bool,

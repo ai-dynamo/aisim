@@ -669,10 +669,54 @@ explains the retained workload routing and feature mathematics.
 - `FpmCacheGroup` literals must supply `blocks_per_request: None` for attention
   and convolution groups. Exhaustive matches on `FpmCacheKind` must handle
   `State`. Serialized groups that omit the field still deserialize, and `None`
-  is not serialized.
+  is not serialized. Literals must also supply `prefix_cacheable` and
+  `transfer_bytes_per_block`. Use `None` for unknown values. A hand-made
+  `transfer_bytes_per_block` requires a measurement for that specific group;
+  aggregate transfer sizes for multiple state groups cannot populate it. See
+  the [transfer measurement limits](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets).
+  Serialized groups that omit these fields still deserialize, and `None` is
+  not serialized.
+- A vLLM 0.33.0 runtime probe import now writes `prefix_cacheable` for each
+  cache group, except a group that holds a `SlidingWindowMLASpec` layer. It
+  writes `transfer_bytes_per_block` for no group. An onboarding session whose
+  probe was imported before this change keeps working without the new field,
+  also for a memory revision:
+  - Before the formal collection, its accepted draft still verifies and stays
+    accepted. Plan and collect as before.
+  - After the formal collection, `aisim onboard finalize` of the existing
+    collection with the accepted draft works. The finalized profile has no
+    `prefix_cacheable`.
+  - If the formal collection measured less capacity than the accepted bound,
+    import the formal observations, accept that draft and run
+    `aisim onboard finalize --memory-config` with it, as before. The new import
+    states `prefix_cacheable`, and the finalized profile still has none.
+  - A profile that was finalized before this change still verifies.
+  A saved cache group that states `prefix_cacheable` or
+  `transfer_bytes_per_block` must state the value of a fresh import of the same
+  evidence. Every other difference is still refused with `saved observed
+  resources differ from immutable runtime evidence`.
+- To get `prefix_cacheable` into the profile of such a session, run
+  `aisim onboard import-observations` again on the same observations, then
+  review and accept the new draft. The new draft has a new request identity, so
+  `aisim onboard finalize` refuses the existing collection directory. Plan and
+  collect again into a new output directory. That costs a new formal
+  collection. Sizing and cold replay do not read the field, and grouped prefix
+  caching is not modeled for vLLM 0.33.0, so a session does not need this for
+  prediction or recommendation.
+- A vLLM 0.33.0 runtime probe import now also writes
+  `runtime_memory.runtime_framework_version`, the version of the runtime that
+  observed the cache groups. A session whose probe was imported before this
+  change keeps working without it, in the same steps as for `prefix_cacheable`
+  above: its draft verifies, the existing collection finalizes, and the
+  finalized profile has no `runtime_framework_version`. A saved record that
+  states the field must state the value of a fresh import. Sizing and cold
+  replay do not read the field, so such a session does not need it. A new
+  import of the same observations, as for `prefix_cacheable` above, also
+  writes it.
 - `FpmRuntimeMemoryConfig` literals must supply `enable_prefix_caching`,
-  `mamba_cache_mode` and `hash_block_size_tokens` as `None`. Serialized records
-  that omit these fields still deserialize, and `None` is not serialized.
+  `mamba_cache_mode`, `hash_block_size_tokens` and `runtime_framework_version`
+  as `None`. Serialized records that omit these fields still deserialize, and
+  `None` is not serialized.
 
 ### Rust AgentX snapshot options
 

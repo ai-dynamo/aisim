@@ -711,11 +711,19 @@ impl Glm53MhcOp {
             self.hidden_size,
             &anchor,
         ) {
-            Ok(row) => Ok(PerformanceResult::with_energy(
+            Ok(Some(row)) => Ok(PerformanceResult::with_energy(
                 row.latency / sites,
                 row.energy / sites,
                 Source::Silicon,
             )),
+            // No message for this miss: without GLM rows, HYBRID takes this
+            // arm on every site of every rank walk.
+            Ok(None) if db.database_mode == DatabaseMode::Hybrid => Ok(analytical),
+            Ok(None) => Err(AicError::PerfDatabase(format!(
+                "GLM-5.3-Flash mHC has no {MHC_ARCHITECTURE} rows for role {} at {}",
+                self.role,
+                db.data_root.display()
+            ))),
             Err(err) if db.database_mode == DatabaseMode::Hybrid && err.is_missing_perf_data() => {
                 Ok(analytical)
             }

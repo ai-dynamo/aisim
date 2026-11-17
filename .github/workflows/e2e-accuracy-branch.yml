@@ -5,9 +5,9 @@ name: E2E Accuracy Branch
 on:
   workflow_call:
     secrets:
-      # Resolved from each wheel job's protected environment, not from the caller.
       ARTIFACTORY_TOKEN:
-        required: false
+        description: Required caller mapping; each job resolves its protected environment's token
+        required: true
       HF_READ_AISIM_INFX_CACHE:
         required: true
     inputs:

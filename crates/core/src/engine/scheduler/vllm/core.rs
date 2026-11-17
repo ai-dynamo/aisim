@@ -31,7 +31,9 @@ use crate::engine::common::utils::{
 use crate::engine::host_offload::{G2Binding, HostTierHandle};
 use crate::engine::kv_manager::AllocationRequirement;
 use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
-use crate::engine::kv_manager::{G1Manager, GroupedKvPool};
+use crate::engine::kv_manager::{
+    G1Manager, GroupedKvPool, mamba_prefill_checkpoint, state_boundaries,
+};
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
     CompletedLoad, HostLookup, HostTransferProgress, StartLoad, VllmHostOffloadAdapter,
@@ -678,6 +680,11 @@ pub(crate) struct VllmCore {
     speculative_sampler: Option<SpeculativeDecodeSampler>,
     /// Native MTP lookahead depth, fixed by the worker configuration.
     native_mtp_depth: Option<usize>,
+    /// Whether a G2 restore under MTP resumes at the loaded prefix. vLLM
+    /// v0.32.0 adds the connector hit to the local hit, and only an annotated
+    /// drafter KV group loses the last chunk of the connector hit. A uniform
+    /// cache has no such group.
+    mtp_restore_keeps_loaded_prefix: bool,
     kv_event_buffer: Option<CapturedKvEventBuffer>,
     source_holds: SourceHolds<HeldVllmPrefill>,
     pending_destinations: PendingDestinations<VllmRequestState>,
@@ -935,7 +942,7 @@ impl VllmCore {
                     .expect("normalized MTP acceptance rates");
             SpeculativeDecodeSampler::new(rates, args.aic_mtp_seed.wrapping_add(seed_offset))
         });
-        let native_host_offload = args
+        let mut native_host_offload = args
             .native_host_offload
             .as_ref()
             .map(|config| {
@@ -959,9 +966,16 @@ impl VllmCore {
         .with_state_cache(
             args.state_cache,
             args.kv_cache_bytes_per_token,
-            args.aic_nextn.is_some(),
+            args.aic_nextn.is_some() && !args.disable_eagle_block_drop,
         )
         .with_prefix_match_unit(args.prefix_match_unit);
+        let blocks_per_state = kv_manager.state_blocks_per_request();
+        if let Some(adapter) = native_host_offload.as_mut()
+            && blocks_per_state > 0
+        {
+            adapter.set_hybrid(blocks_per_state);
+            kv_manager.record_state_handoffs();
+        }
         if let Some(order) = native_host_offload
             .as_ref()
             .and_then(VllmHostOffloadAdapter::store_source_hold)
@@ -975,14 +989,17 @@ impl VllmCore {
                     .expect("validated grouped cache capacity"),
             ));
         }
-        let native_mtp_depth = if args.worker_type == WorkerType::Aggregated
-            && args.prefix_match_unit.is_none()
-            && kv_manager.supports_native_speculative_slots()
-        {
-            policy::native_mtp_depth(args.scheduling_policy(), args.aic_nextn)
-        } else {
-            None
-        };
+        // MTP over one uniform token cache, on any worker type.
+        let uniform_mtp_depth =
+            if args.prefix_match_unit.is_none() && kv_manager.supports_native_speculative_slots() {
+                policy::native_mtp_depth(args.scheduling_policy(), args.aic_nextn)
+            } else {
+                None
+            };
+        let native_mtp_depth =
+            uniform_mtp_depth.filter(|_| args.worker_type == WorkerType::Aggregated);
+        let mtp_restore_keeps_loaded_prefix = native_mtp_depth.is_some()
+            || (native_host_offload.is_some() && uniform_mtp_depth.is_some());
         Ok(Self {
             kv_manager,
             belady_oracle: None,
@@ -991,6 +1008,7 @@ impl VllmCore {
             state: SchedulerState::default(),
             speculative_sampler,
             native_mtp_depth,
+            mtp_restore_keeps_loaded_prefix,
             kv_event_buffer,
             source_holds: SourceHolds::default(),
             pending_destinations: PendingDestinations::default(),
@@ -1056,6 +1074,11 @@ impl VllmCore {
     #[cfg(test)]
     pub(crate) fn connector_waiting_selections(&self) -> usize {
         self.state.connector_waiting_selections()
+    }
+
+    #[cfg(test)]
+    pub(super) fn host_offload(&self) -> Option<&VllmHostOffloadAdapter> {
+        self.native_host_offload.as_ref()
     }
 
     #[cfg(test)]
@@ -1211,11 +1234,17 @@ impl VllmCore {
                 if policy::should_reject_for_model_len(&request.sequence, self.args.max_model_len) {
                     anyhow::bail!("destination prompt must be shorter than max_model_len");
                 }
+                if !self
+                    .kv_manager
+                    .accepts_sequence_length(request.sequence.len())
+                {
+                    anyhow::bail!("state_cache destination prompt must not be empty");
+                }
                 if let Some(message) = policy::destination_capacity_error(
                     self.args.scheduling_policy(),
                     &request.sequence,
                     self.args.num_gpu_blocks,
-                    self.kv_manager.state_blocks_per_request(),
+                    self.kv_manager.state_reserved_blocks_per_request(),
                 ) {
                     anyhow::bail!(message);
                 }
@@ -1678,7 +1707,66 @@ impl VllmCore {
             request.host_offload.as_deref_mut(),
         ) {
             let now_ms = adapter.current_time_ms();
+            // vLLM takes a pass's state hand-offs before a request can finish
+            // in it, so one finishing in its publishing pass still offers them.
+            for handoff in self.kv_manager.take_state_handoffs_of(uuid) {
+                adapter.store_state_handoff(
+                    &handoff,
+                    host,
+                    request.sequence.num_input_tokens(),
+                    self.args.block_size,
+                    &mut self.kv_manager,
+                    now_ms,
+                );
+            }
             adapter.finish_request(
+                uuid,
+                host,
+                &request.sequence.lease,
+                request.num_computed_tokens,
+                request.sequence.num_input_tokens(),
+                self.args.block_size,
+                &mut self.kv_manager,
+                now_ms,
+            );
+        }
+    }
+
+    /// Offer this pass's state hand-offs, then its computed blocks, to G2:
+    /// vLLM stores a step's boundary hand-offs before its blocks.
+    fn store_pass_blocks(&mut self, scheduled: &FxHashMap<Uuid, ScheduledWork>, now_ms: f64) {
+        let Some(adapter) = self.native_host_offload.as_mut() else {
+            return;
+        };
+        let (running, requests) = (&self.state.running, &mut self.state.requests);
+        for handoff in self.kv_manager.take_state_handoffs() {
+            let Some(request) = requests.get_mut(&handoff.owner) else {
+                continue;
+            };
+            let Some(host) = request.host_offload.as_deref_mut() else {
+                continue;
+            };
+            adapter.store_state_handoff(
+                &handoff,
+                host,
+                request.sequence.num_input_tokens(),
+                self.args.block_size,
+                &mut self.kv_manager,
+                now_ms,
+            );
+        }
+        for uuid in running
+            .iter()
+            .copied()
+            .filter(|uuid| scheduled.contains_key(uuid))
+        {
+            let Some(request) = requests.get_mut(&uuid) else {
+                continue;
+            };
+            let Some(host) = request.host_offload.as_deref_mut() else {
+                continue;
+            };
+            adapter.observe_completed_blocks(
                 uuid,
                 host,
                 &request.sequence.lease,
@@ -1846,6 +1934,47 @@ impl VllmCore {
                     .div_ceil(self.args.block_size),
             )
         }
+    }
+
+    /// Whether a preempted request would resume without the blocks its
+    /// emission takes. vLLM resumes a request only with room for the token it
+    /// sampled last, and speculative emission takes that token's blocks in the
+    /// pass that samples it. Resumed without them, the request is preempted by
+    /// the same pass and resumed again at the same instant, without end while
+    /// the stores of a shared pool hold the blocks. Only a rank with a host
+    /// pool waits: its queue serves the handoffs and restores that own G1
+    /// blocks first, so the waiting request cannot keep them from finishing.
+    fn resumed_emission_lacks_blocks(&self, uuid: Uuid, cost: &PrefillCost) -> bool {
+        if self.native_host_offload.is_none()
+            || self.speculative_sampler.is_none()
+            || self.native_mtp_depth.is_some()
+        {
+            return false;
+        }
+        let request = &self.state.requests[&uuid];
+        if request.status != RequestStatus::Preempted || request.sequence.num_allocated_tokens() > 0
+        {
+            return false;
+        }
+        let remaining =
+            policy::remaining_generation_tokens(&request.sequence, self.args.max_model_len);
+        let (AllocationRequirement::Blocks(resumed), AllocationRequirement::Blocks(emitted)) = (
+            request
+                .sequence
+                .admission_requirement(&self.kv_manager, cost, 0),
+            self.kv_manager.decode_requirement(
+                &request.sequence.lease,
+                request.sequence.len(),
+                remaining.min(1),
+            ),
+        ) else {
+            return false;
+        };
+        let free = self
+            .args
+            .num_gpu_blocks
+            .saturating_sub(self.kv_manager.num_active_blocks());
+        resumed + emitted > free
     }
 
     fn host_inflight_tail_blocks(&self) -> usize {
@@ -2171,6 +2300,7 @@ impl VllmCore {
         let admission = AdmissionInvariant::new(self.pending_destinations.has_pending());
         let mut host_step_skipped = Vec::new();
         let native_mtp_depth = self.native_mtp_depth;
+        let keeps_loaded_prefix = self.mtp_restore_keeps_loaded_prefix;
         // Agent-style workloads can keep many requests in both collections.
         // Scan once, then update only the selected request's contribution as
         // this pass queues/consumes a host load or admits a new prefill.
@@ -2277,7 +2407,7 @@ impl VllmCore {
                 {
                     counts.record(request.sequence.len(), cost.cached_tokens)?;
                 }
-                if native_mtp_depth.is_some() {
+                if keeps_loaded_prefix {
                     let requires_logits =
                         !policy::generation_complete(&request.sequence, self.args.max_model_len);
                     let activated = request.host_offload.as_deref().and_then(|host| {
@@ -2293,17 +2423,32 @@ impl VllmCore {
                         self.kv_manager.resolve_prefill_cost(
                             scheduling_policy,
                             request.sequence.len(),
-                            true,
+                            !self.args.disable_eagle_block_drop,
                             requires_logits,
                             cost,
                         )
                     });
                 }
+                // vLLM records shared_prefix_boundary at every lookup from waiting
+                // and keeps it across a connector load, whose post-load path skips
+                // the lookup.
+                if !request
+                    .host_offload
+                    .as_deref()
+                    .is_some_and(VllmHostRequestState::has_activated_load)
+                {
+                    let junction = self.kv_manager.prefix_junction(
+                        &request.sequence.sequence,
+                        &request.sequence.lease,
+                        cost.cached_tokens,
+                    );
+                    request.sequence.lease.set_junction(junction);
+                }
                 if let (Some(adapter), Some(host)) = (
                     self.native_host_offload.as_mut(),
                     request.host_offload.as_deref_mut(),
                 ) {
-                    if native_mtp_depth.is_none() {
+                    if !keeps_loaded_prefix {
                         cost = VllmHostOffloadAdapter::freeze_activated_cost(
                             host,
                             cost,
@@ -2414,7 +2559,7 @@ impl VllmCore {
                                     } else {
                                         0
                                     };
-                                let decide_admission = if native_mtp_depth.is_some() {
+                                let decide_admission = if keeps_loaded_prefix {
                                     policy::decide_waiting_admission_with_adjusted_cost
                                 } else {
                                     policy::decide_waiting_admission_with_cost
@@ -2424,7 +2569,7 @@ impl VllmCore {
                                         policy: scheduling_policy,
                                         num_gpu_blocks: self.args.num_gpu_blocks,
                                         block_size: self.args.block_size,
-                                        mtp_enabled: self.args.aic_nextn.is_some(),
+                                        mtp_enabled: self.eagle_block_drop(),
                                     },
                                     &request.sequence,
                                     is_fresh,
@@ -2473,6 +2618,15 @@ impl VllmCore {
                 }
             } else {
                 decision
+            };
+            let decision = match decision {
+                AdmissionDecision::Admit { prefill_cost }
+                    if host_hit.is_none()
+                        && self.resumed_emission_lacks_blocks(uuid, &prefill_cost) =>
+                {
+                    AdmissionDecision::Wait
+                }
+                decision => decision,
             };
             let prefill_cost = match decision {
                 AdmissionDecision::Admit { prefill_cost } => prefill_cost,
@@ -2633,36 +2787,17 @@ impl VllmCore {
                 !stopped_at_queued_arrival && !self.state.waiting_members.is_empty();
         }
 
-        if let Some(adapter) = self.native_host_offload.as_mut() {
-            let (running, requests) = (&self.state.running, &mut self.state.requests);
-            for uuid in running
-                .iter()
-                .copied()
-                .filter(|uuid| scheduled.contains_key(uuid))
-            {
-                let Some(request) = requests.get_mut(&uuid) else {
-                    continue;
-                };
-                let Some(host) = request.host_offload.as_deref_mut() else {
-                    continue;
-                };
-                adapter.observe_completed_blocks(
-                    uuid,
-                    host,
-                    &request.sequence.lease,
-                    request.num_computed_tokens,
-                    request.sequence.num_input_tokens(),
-                    self.args.block_size,
-                    &mut self.kv_manager,
-                    now_ms,
-                );
-            }
-        }
-
-        let compute_start_ms = self
+        // A hybrid G2 stores after emission, where replay reserves draft-token
+        // slots (vLLM does so while scheduling): a request preempted for them
+        // retracts the states its pass published, so it must not offer them.
+        let store_after_emission = self
             .native_host_offload
             .as_ref()
-            .map_or(now_ms, |adapter| adapter.compute_not_before_ms(now_ms));
+            .is_some_and(VllmHostOffloadAdapter::is_hybrid);
+        if !store_after_emission {
+            self.store_pass_blocks(&scheduled, now_ms);
+        }
+
         let prefill = priced_prefill(
             batch_count,
             batch_total_isl,
@@ -2691,6 +2826,16 @@ impl VllmCore {
         // that computes prefill and decode together may be one forward.
         let (decode, mut output_signals) =
             self.emit_ready_tokens(now_ms, &scheduled, &mut decode_acceptance)?;
+        if store_after_emission {
+            self.store_pass_blocks(&scheduled, now_ms);
+        }
+        // Read after emission: accepted drafts that take a block a store still
+        // reads, and a preemption for draft slots with the stores it adds,
+        // delay this pass's forward.
+        let compute_start_ms = self
+            .native_host_offload
+            .as_ref()
+            .map_or(now_ms, |adapter| adapter.compute_not_before_ms(now_ms));
         // Emit the terminal signals for the requests the gate rejected above
         // (see the gate comment for why this can't be done inline).
         for uuid in rejected_uuids {
@@ -3014,9 +3159,20 @@ impl VllmCore {
         snapshot
     }
 
-    /// Modified simulation of vLLM v0.29.0's align split without internal
-    /// prefill checkpoints. Copyright contributors to the vLLM project.
+    /// Whether MTP applies vLLM's EAGLE trailing prefix-cache block drop
+    /// (`use_eagle_block_drop`).
+    fn eagle_block_drop(&self) -> bool {
+        self.args.aic_nextn.is_some() && !self.args.disable_eagle_block_drop
+    }
+
+    /// Modified simulation of vLLM v0.29.0's align split. Copyright contributors to the vLLM project.
     /// Source: https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/sched/scheduler.py
+    /// A block-floored shared-prefix `junction`, recorded at admission, also
+    /// stops the chunk, as in that revision. With
+    /// `state_cache.prefill_checkpoint`, a final chunk that exports the prompt's
+    /// last full-block state from inside its forward (Mamba2's internal
+    /// checkpoint at vLLM 43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5) stops only
+    /// at a junction. Returns the chunk and the checkpoint its pass reserves.
     /// See THIRD_PARTY_NOTICES.md; Apache-2.0.
     fn align_state_prefill(
         &self,
@@ -3024,16 +3180,38 @@ impl VllmCore {
         prompt: usize,
         known: usize,
         desired: usize,
-    ) -> usize {
+        junction: Option<usize>,
+    ) -> (usize, Option<usize>) {
         let Some(unit) = self.args.prefix_match_unit else {
-            return desired;
+            return (desired, None);
         };
         let alignment = self.args.block_size;
         let prefill_end = prompt.max(known.saturating_sub(1));
         if !self.args.enable_prefix_caching || start >= prefill_end {
-            return desired;
+            return (desired, None);
         }
+        let native_mtp = self
+            .args
+            .state_cache
+            .is_some_and(|state| state.num_speculative_states.is_some())
+            && !self.args.disable_eagle_block_drop;
+        let prefill_checkpoint = self
+            .args
+            .state_cache
+            .is_some_and(|state| state.prefill_checkpoint);
         let mut end = start + desired;
+        // vLLM decides on the unclipped chunk end.
+        let exports_checkpoint = prefill_checkpoint
+            && mamba_prefill_checkpoint(
+                start,
+                end,
+                prefill_end,
+                prefill_end,
+                unit,
+                alignment,
+                native_mtp,
+            )
+            .is_some();
         if end < prefill_end {
             let aligned = end / alignment * alignment;
             // A block larger than the whole step budget must make progress
@@ -3045,22 +3223,36 @@ impl VllmCore {
             }
         }
         // Match the state cache's replay boundary, including prompts that end on a full block.
-        let last_full = prompt.saturating_sub(1) / alignment * alignment;
-        let tail = prompt / unit * unit;
+        let (last_full, resend_full, tail) = state_boundaries(prompt, alignment, unit, native_mtp);
         let next = start.checked_add(alignment - start % alignment);
-        for stop in [
+        let stops = [
             next.filter(|_| !start.is_multiple_of(alignment)),
+            Some(resend_full),
             Some(last_full),
             (last_full < tail && tail < prompt).then_some(tail),
-        ]
-        .into_iter()
-        .flatten()
+        ];
+        // A sub-block junction's state is not separately cacheable.
+        let junction = junction
+            .filter(|&junction| start < junction && junction < end)
+            .map(|junction| start + (junction - start) / alignment * alignment);
+        for stop in stops
+            .into_iter()
+            .filter(|_| !exports_checkpoint)
+            .chain([junction])
+            .flatten()
         {
             if start < stop && stop < end {
                 end = stop;
             }
         }
-        end.saturating_sub(start)
+        // The pass reserves the checkpoint of the chunk it schedules, keyed on
+        // its end; a junction stop short of the prompt leaves none.
+        let checkpoint = prefill_checkpoint
+            .then(|| {
+                mamba_prefill_checkpoint(start, end, prefill_end, end, unit, alignment, native_mtp)
+            })
+            .flatten();
+        (end.saturating_sub(start), checkpoint)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3097,7 +3289,7 @@ impl VllmCore {
                         .resolve_prefill_cost(
                             self.args.scheduling_policy(),
                             request.sequence.len(),
-                            self.args.aic_nextn.is_some(),
+                            self.eagle_block_drop(),
                             !policy::generation_complete(
                                 &request.sequence,
                                 self.args.max_model_len,
@@ -3165,16 +3357,19 @@ impl VllmCore {
         } else {
             None
         };
-        let desired_tokens = mtp.map_or_else(
+        // Recorded at the waiting lookup (see the admission loop).
+        let junction = request.sequence.lease.junction();
+        let (desired_tokens, prefill_checkpoint) = mtp.map_or_else(
             || {
                 self.align_state_prefill(
                     effective_computed_before,
                     prompt_len,
                     request.sequence.len(),
                     remaining_known_tokens.min(*token_budget),
+                    junction,
                 )
             },
-            |work| work.query_tokens,
+            |work| (work.query_tokens, None),
         );
         // Speculative positions consume scheduler budget but are not committed
         // sequence/KV state until verification accepts them.
@@ -3212,6 +3407,16 @@ impl VllmCore {
         }
         let mut actual_computed_after = desired_computed_after;
         let host_offload_enabled = self.native_host_offload.is_some();
+        {
+            let lease = &mut self
+                .state
+                .requests
+                .get_mut(&uuid)
+                .unwrap_or_else(|| panic!("schedule_request: {uuid} removed before planning"))
+                .sequence
+                .lease;
+            lease.set_prefill_checkpoint(prefill_checkpoint);
+        }
 
         loop {
             let allocation_outcome = {
@@ -3319,6 +3524,9 @@ impl VllmCore {
         }
         let known_tokens_used = actual_computed_after.saturating_sub(effective_computed_before);
         if known_tokens_used == 0 && actual_computed_after < self.state.request_sequence_len(uuid) {
+            if let Some(request) = self.state.requests.get_mut(&uuid) {
+                request.sequence.lease.set_prefill_checkpoint(None);
+            }
             return Ok(ScheduleOutcome::Blocked);
         }
         let tokens_used = mtp.map_or(known_tokens_used + scheduled_drafts, |work| {
@@ -3820,6 +4028,7 @@ impl VllmCore {
         for &SpeculativeBurst { uuid, burst, .. } in &bursts {
             let completed = {
                 let kv_manager = &mut self.kv_manager;
+                let native_host_offload = &mut self.native_host_offload;
                 let request = self
                     .state
                     .requests
@@ -3864,9 +4073,25 @@ impl VllmCore {
                                 .as_mut()
                                 .expect("legacy speculative reservation"),
                         );
-                        assert!(
-                            matches!(allocation, NativeAllocation::Ready { dependencies, .. } if dependencies.is_empty())
-                        );
+                        // A reserved block may still be the source of an in-flight G2
+                        // store. vLLM flushes the pending stores of every block a step
+                        // allocates, lookahead slots included, before its forward, so
+                        // this pass's forward waits. A store prepared in this pass has
+                        // its deadline at the pass boundary: the next pass waits for it.
+                        let NativeAllocation::Ready { dependencies, .. } = allocation else {
+                            panic!("speculative decode reservation must cover its blocks");
+                        };
+                        if !dependencies.is_empty() {
+                            native_host_offload
+                                .as_mut()
+                                .expect("G1 source dependencies require native host offload")
+                                .fence_speculative_growth(
+                                    uuid,
+                                    &mut request.sequence.lease,
+                                    &dependencies,
+                                    kv_manager,
+                                );
+                        }
                     }
                     output_signals.push(OutputSignal {
                         uuid,
@@ -4289,6 +4514,9 @@ mod state_cache_tests {
             .state_cache(Some(StateCacheConfig {
                 bytes_per_request: 64,
                 sliding_window: None,
+                num_speculative_states: None,
+                prefill_checkpoint: false,
+                junction_checkpoints: false,
             }))
             .build()
             .unwrap()
@@ -4330,6 +4558,73 @@ mod state_cache_tests {
                 .reused_input_tokens,
             12
         );
+    }
+
+    #[test]
+    fn full_state_mtp_preserves_vllm_resend_boundaries() {
+        // Resend positions follow vLLM db9527a46873454610df6dbedf79a36d6bf1a7f6's
+        // KVCacheCoordinator.get_replay_boundaries plus attention/Mamba lookup.
+        // Replay also stops a chunk there so the state exists; vLLM has one only
+        // where a chunk ended (the align-mode difference in kv-cache.md).
+        // The logits cap precedes the MTP drop; partial tails exclude page boundaries.
+        // The draft depth sizes the scratch states only, so one depth covers it.
+        let depth = 3;
+        for (unit, cases) in [
+            (
+                2,
+                [
+                    (15, 12),
+                    (16, 0),
+                    (17, 14),
+                    (18, 8),
+                    (19, 8),
+                    (24, 8),
+                    (25, 22),
+                    (32, 16),
+                    (33, 30),
+                ],
+            ),
+            (
+                8,
+                [
+                    (15, 0),
+                    (16, 0),
+                    (17, 8),
+                    (18, 8),
+                    (19, 8),
+                    (24, 8),
+                    (25, 16),
+                    (32, 16),
+                    (33, 24),
+                ],
+            ),
+        ] {
+            for (prompt, expected) in cases {
+                let mut config = args(128, true, Some(depth));
+                config.block_size = 8;
+                config.prefix_match_unit = Some(unit);
+                config.state_cache.as_mut().unwrap().num_speculative_states = Some(depth);
+                let mut core = VllmCore::new(config);
+                submit(&mut core, 93_040, prompt, 16);
+                for _ in 0..32 {
+                    if core.state.requests.is_empty() {
+                        break;
+                    }
+                    step(&mut core);
+                }
+                assert!(core.state.requests.is_empty());
+                assert_eq!(core.kv_manager.num_active_blocks(), 0);
+                let second = submit(&mut core, 93_041, prompt, 1);
+                let pass = step(&mut core);
+                let reused = pass
+                    .admissions
+                    .iter()
+                    .find(|a| a.uuid == second)
+                    .unwrap()
+                    .reused_input_tokens;
+                assert_eq!(reused, expected, "unit={unit}, prompt={prompt}");
+            }
+        }
     }
 
     #[test]
@@ -4450,18 +4745,18 @@ mod state_cache_tests {
         config.prefix_match_unit = Some(2);
         config.state_cache.as_mut().unwrap().bytes_per_request = 6 * 16;
         let mut core = VllmCore::new(config);
-        assert_eq!(core.align_state_prefill(0, 25, 25, 8), 6);
-        assert_eq!(core.align_state_prefill(6, 25, 25, 3), 0); // leftover budget
-        assert_eq!(core.align_state_prefill(16, 25, 25, 8), 2); // partial hit -> next full boundary
-        assert_eq!(core.align_state_prefill(18, 24, 24, 6), 6); // exact prompt boundary
-        assert_eq!(core.align_state_prefill(24, 25, 25, 1), 1); // residual tail
-        assert_eq!(core.align_state_prefill(25, 25, 26, 1), 1); // decode
+        assert_eq!(core.align_state_prefill(0, 25, 25, 8, None).0, 6);
+        assert_eq!(core.align_state_prefill(6, 25, 25, 3, None).0, 0); // leftover budget
+        assert_eq!(core.align_state_prefill(16, 25, 25, 8, None).0, 2); // partial hit -> next full boundary
+        assert_eq!(core.align_state_prefill(18, 24, 24, 6, None).0, 6); // exact prompt boundary
+        assert_eq!(core.align_state_prefill(24, 25, 25, 1, None).0, 1); // residual tail
+        assert_eq!(core.align_state_prefill(25, 25, 26, 1, None).0, 1); // decode
         core.args.max_num_batched_tokens = Some(4);
-        assert_eq!(core.align_state_prefill(0, 25, 25, 4), 4); // block > total budget
-        assert_eq!(core.align_state_prefill(4, 25, 25, 4), 2);
+        assert_eq!(core.align_state_prefill(0, 25, 25, 4, None).0, 4); // block > total budget
+        assert_eq!(core.align_state_prefill(4, 25, 25, 4, None).0, 2);
         core.args.state_cache = None;
         core.args.prefix_match_unit = None;
-        assert_eq!(core.align_state_prefill(0, 25, 25, 8), 8); // token-only unchanged
+        assert_eq!(core.align_state_prefill(0, 25, 25, 8, None).0, 8); // token-only unchanged
     }
 
     #[test]
@@ -4505,6 +4800,9 @@ mod state_cache_tests {
         config.state_cache = Some(StateCacheConfig {
             bytes_per_request: 1500,
             sliding_window: None,
+            num_speculative_states: None,
+            prefill_checkpoint: false,
+            junction_checkpoints: false,
         });
         let mut core = VllmCore::new(config);
         let ids = (0..3)
@@ -5016,21 +5314,51 @@ mod state_cache_tests {
 
     #[test]
     fn pd_destination_capacity_counts_the_state() {
-        // Two prompt blocks fit; prompt plus one state does not.
-        let mut destination = VllmCore::new(pd_args(2, WorkerType::Decode));
+        // Two prompt blocks fit; prompt plus one state does not, and neither
+        // does prompt, state and its speculative copy in three blocks.
+        let mut speculative = pd_args(3, WorkerType::Decode);
+        speculative.aic_nextn = Some(1);
+        speculative
+            .state_cache
+            .as_mut()
+            .unwrap()
+            .num_speculative_states = Some(1);
+        for args in [pd_args(2, WorkerType::Decode), speculative] {
+            let mut destination = VllmCore::new(args);
+            let error = destination
+                .apply_command_effects(
+                    SchedulerCommand::ReserveDestination {
+                        handoff_id: HandoffId::from(Uuid::from_u128(94_101)),
+                        request: pd_request(94_100, 8, 3),
+                    },
+                    true,
+                )
+                .expect_err("prompt plus state exceeds the pool");
+            assert!(
+                error
+                    .to_string()
+                    .contains("destination prompt and state exceed the KV pool capacity")
+            );
+        }
+    }
+
+    #[test]
+    fn pd_destination_rejects_an_empty_prompt_with_a_state_cache() {
+        // Activation would place the state before the prompt's last token.
+        let mut destination = VllmCore::new(pd_args(64, WorkerType::Decode));
         let error = destination
             .apply_command_effects(
                 SchedulerCommand::ReserveDestination {
-                    handoff_id: HandoffId::from(Uuid::from_u128(94_101)),
-                    request: pd_request(94_100, 8, 3),
+                    handoff_id: HandoffId::from(Uuid::from_u128(94_151)),
+                    request: pd_request(94_150, 0, 3),
                 },
                 true,
             )
-            .expect_err("prompt plus state exceeds the pool");
+            .expect_err("an empty prompt has no state position");
         assert!(
             error
                 .to_string()
-                .contains("destination prompt and state exceed the KV pool capacity")
+                .contains("destination prompt must not be empty")
         );
     }
 
