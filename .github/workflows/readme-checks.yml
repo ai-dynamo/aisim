@@ -31,7 +31,6 @@ jobs:
       PIP_DEFAULT_TIMEOUT: '60'
       AISIM_RC_REVISION: 77d82652b2f83fd67afefc3141d69a5f06e630be
       DYNAMO_RC_REVISION: 9653d05441b37b6a004837651fd991e44158d755
-      AISIM_RC_WHEELHOUSE: ${{ runner.temp }}/dynamo-rc-wheels
       RC_PR_NUMBER: ${{ inputs.pr_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -60,7 +59,10 @@ jobs:
         if: matrix.profile == 'dynamo'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python scripts/ci/readme_rc_wheels.py prepare --directory "$AISIM_RC_WHEELHOUSE"
+        run: |
+          wheelhouse="${RUNNER_TEMP}/dynamo-rc-wheels"
+          echo "AISIM_RC_WHEELHOUSE=${wheelhouse}" >> "${GITHUB_ENV}"
+          python scripts/ci/readme_rc_wheels.py prepare --directory "$wheelhouse"
       - name: Restore verified pinned Dynamo RC wheels
         if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id != ''
         uses: ./.github/actions/wheel-storage
