@@ -625,3 +625,49 @@ def test_smallest_first_keeps_the_smaller_best_when_a_larger_one_qualifies_later
     sampler.observe(one, {"objective": -1.0})
     sampler.observe(four, {"objective": -4.0})
     assert sampler.best_gpus == 1
+
+
+def test_smallest_first_bound_uses_observed_gpus_including_extra_pools():
+    # An encoder pool adds GPUs beyond the topology: 1 language GPU + 4 encoder GPUs
+    # qualify at 5. A 2-language-GPU topology can still beat that and must stay.
+    sampler = SmallestFirstBranchSampler(_replica_branch(1, 2, 8), seed=5)
+    one, two, eight = sampler.suggest(3)
+    sampler.observe(one, {"objective": -5.0})
+    assert sampler.best_gpus == 5
+    later = {suggestion.parallel_config.total_gpus for suggestion in sampler.suggest(8)}
+    assert 2 in later
+    assert 8 not in later
+
+
+def test_smallest_first_does_not_retry_shapes_above_the_bound():
+    sampler = SmallestFirstBranchSampler(_replica_branch(1, 2, 4), seed=1)
+    one, two, four = sampler.suggest(3)
+    sampler.observe(one, {"objective": -1.0})
+    sampler.retry(four)  # e.g. a timeout reported after the 1-GPU success
+    assert all(suggestion.parallel_config.total_gpus <= 1 for suggestion in sampler.suggest(4))
+
+
+def test_conditional_min_gpus_arms_share_the_qualifying_bound():
+    shapes = tuple(ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=r) for r in (1, 2, 4))
+    base = _conditional_branch()
+    branch = BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=shapes,
+        supported_backends={shape: frozenset({"vllm"}) for shape in shapes},
+        knob_choices=base.knob_choices,
+        conditional_dimensions=base.conditional_dimensions,
+        prefer_smallest=True,
+    )
+    sampler = make_branch_sampler(branch, study_id="s", algorithm="bayesian", seed=11)
+    # The round-robin arm qualifies at 1 GPU; the KV-router arm must then stop
+    # suggesting 2- and 4-GPU pools even though it never observed a success itself.
+    first = sampler.suggest(2)
+    winner = next(
+        s for s in first if s.selection["adapter::router::mode"] == "round_robin" and s.parallel_config.total_gpus == 1
+    )
+    sampler.observe(winner, {"objective": -1.0})
+    later = []
+    for _ in range(6):
+        later.extend(sampler.suggest(2))
+    assert any(suggestion.selection["adapter::router::mode"] == "kv_router" for suggestion in later)
+    assert all(suggestion.parallel_config.total_gpus == 1 for suggestion in later)

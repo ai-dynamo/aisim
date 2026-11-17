@@ -238,10 +238,11 @@ without materializing the Cartesian product. Exhausting a finite space ends the 
 before `max_trials`; the summary says so.
 
 For `min_gpus`, both algorithms use this coverage order with the smallest legal GPU counts
-first; a Bayesian study has no useful score surface to model for this target. Once a candidate
-qualifies at `n` GPUs, backend/topology pairs that need more than `n` GPUs are not suggested
-again, and the remaining budget revisits scheduler/workload knobs at or below `n`. Pairs already
-queued in the same round still run. This guarantees the smallest counts are tried first within a
+first; the Bayesian samplers do not otherwise favor small shapes. Once a candidate qualifies with
+`n` provisioned GPUs (including any encoder pool), backend/topology pairs whose topology alone
+needs more than `n` GPUs are not suggested or retried again, across every conditional arm of the
+branch, and the remaining budget revisits scheduler/workload knobs within that bound. Pairs
+already queued in the same round still run. This guarantees the smallest counts are tried first within a
 small budget, but does not prove global optimality across all scheduler/workload combinations.
 
 Bayesian duplicates reuse cached measurements and still consume the suggestion budget.
