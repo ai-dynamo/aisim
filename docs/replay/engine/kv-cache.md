@@ -341,7 +341,7 @@ aisim predict --stack engine --config host-offload-prediction.yaml --capture-per
 | `latency_to_first_byte_ms` | `0.0` | Fixed delay before each transfer starts moving bytes. |
 | `shared_d2h_bandwidth_gbps` | `80.0` | Total GPU→host bandwidth of the pool. `cluster_shared` only. |
 | `shared_h2d_bandwidth_gbps` | `80.0` | Total host→GPU bandwidth of the pool. `cluster_shared` only. |
-| `connector` | `offloading_v0_24` | vLLM connector whose rules G2 follows: `offloading_v0_24`, `offloading_v0_32` or `simple_cpu_v0_32`. The last two need the aggregated worker, `dp_rank_local` and no `g3_offload` or `kvcr`; see [connector profiles](#g2-connector-profiles). |
+| `connector` | `offloading_v0_24` | vLLM connector whose rules G2 follows: `offloading_v0_24`, `offloading_v0_32` or `simple_cpu_v0_32`. The last two need the aggregated worker, `dp_rank_local` and no `g3_offload` or `kvcr`, except that a sliding-window [state cache](#state-cache) takes `offloading_v0_32` on prefill and decode workers too; see [connector profiles](#g2-connector-profiles). |
 
 `recommend` keeps `host_offload` fixed; its size and bandwidth are not searched.
 
@@ -828,9 +828,10 @@ default. `simple_cpu_v0_32` is rejected: vLLM's `SimpleCPUOffloadConnector`
 keeps sliding-window groups too, but replay does not model how it stores them
 block by block. Blocks and checkpoints are ranked when their store starts. A finishing request offers a cohort it could not store
 earlier and re-ranks what it stored, offered or loaded, each checkpoint just
-above the block that ends at its boundary. Prefill and decode workers keep
-`connector` at its default; a prefill worker does the finish-time work when it
-releases the request after the KV transfer, later than vLLM. A cluster-shared
+above the block that ends at its boundary. A prefill worker does the
+finish-time work when it releases the request after the KV transfer, later than
+vLLM; for other models that timing keeps `offloading_v0_32` to aggregated
+workers. A cluster-shared
 pool has no vLLM counterpart and keeps its own order: a lookup makes the
 prompt's blocks and the checkpoint it resumes at the newest, so checkpoints at
 lower boundaries are evicted first.

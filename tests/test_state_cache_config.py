@@ -154,9 +154,23 @@ def test_manual_geometry_rejects_unusable_capacity(overrides, error):
 
 
 @pytest.mark.parametrize("connector", ["offloading_v0_24", "offloading_v0_32"])
-def test_sliding_window_state_accepts_host_offload(connector):
+def test_sliding_window_state_accepts_host_offload(connector, auto_k3_payload, forbid_estimators):
     host_offload = {"num_host_blocks": 8, "connector": connector}
     KvCachePredictionConfig.model_validate({**KV, "state_cache": WINDOW, "host_offload": host_offload})
+    # Prefill and decode workers take either name too: a window runs the 0.32 rules on every worker.
+    prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(_public_pd(state_cache=WINDOW, host_offload=host_offload))
+    )
+    if connector == "offloading_v0_32":
+        # A recurrent state keeps that name to the aggregated worker, also when sizing infers its kind.
+        error = "supported only for the aggregated worker"
+        with pytest.raises(ValidationError, match=error):
+            CorePredictionConfig.model_validate(_public_pd(prefix_match_unit=64, host_offload=host_offload))
+        auto_k3_payload["engine"]["workers"]["aggregated"]["kv_cache"].update(
+            block_size=768, prefix_match_unit=768, host_offload=host_offload
+        )
+        with pytest.raises(ValueError, match=error):
+            prediction_to_replay_spec(CorePredictionConfig.model_validate(_to_pd(auto_k3_payload)))
 
 
 @pytest.mark.parametrize(

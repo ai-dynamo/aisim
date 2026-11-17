@@ -379,12 +379,18 @@ fn an_mtp_restore_keeps_its_loaded_prefix_on_a_prefill_worker_as_on_an_aggregate
 
 #[test]
 fn a_prefill_worker_restores_a_window_from_its_own_pool() {
-    // Prefill and decode workers keep `connector` at its default, and a
-    // rank-local pool with a sliding window still runs the v0.32 rules: the
-    // prompt's cohort is stored, survives G1's eviction, and restores with
-    // its checkpoint after the worker released the first request.
+    // A rank-local pool with a sliding window runs the v0.32 rules on prefill
+    // and decode workers too, under either offloading name: the prompt's
+    // cohort is stored, survives G1's eviction, and restores with its
+    // checkpoint after the worker released the first request.
+    for connector in ["offloading_v0_24", "offloading_v0_32"] {
+        a_prefill_worker_restores(connector);
+    }
+}
+
+fn a_prefill_worker_restores(connector: &str) {
     let role = || {
-        let mut rank = rank(json!({"num_host_blocks": 64}));
+        let mut rank = rank(json!({"num_host_blocks": 64, "connector": connector}));
         rank["num_gpu_blocks"] = json!(12);
         rank["state_cache"] = json!({
             "bytes_per_request": 2_000_000, "sliding_window": {"lookahead_tokens": 0},
@@ -398,8 +404,8 @@ fn a_prefill_worker_restores_a_window_from_its_own_pool() {
         ("a1", 200.0, 1, 13, 1),
     ]);
     let report = run(disaggregated(1), engine, requests).unwrap();
-    assert_eq!(report.request_counts.completed_requests, 3);
-    assert_eq!(host_reuse(&report), [0, 12, 0].map(Some));
+    assert_eq!(report.request_counts.completed_requests, 3, "{connector}");
+    assert_eq!(host_reuse(&report), [0, 12, 0].map(Some), "{connector}");
 }
 
 #[test]

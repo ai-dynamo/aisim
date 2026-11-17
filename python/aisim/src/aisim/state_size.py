@@ -7,6 +7,7 @@ from typing import Any
 
 from .capacity import estimate_state_cache
 from .config.engine import (
+    _PD_CONNECTOR_ERROR,
     EnginePredictionConfig,
     StateCacheConfig,
     WorkerPredictionConfig,
@@ -71,6 +72,8 @@ def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionC
         )
         if engine.speculation is not None and not window:
             _require_block_drop_off(engine.speculation)
+        if not window and role != "aggregated" and cache.host_offload.connector != "offloading_v0_24":
+            raise ValueError(_PD_CONNECTOR_ERROR)
     size = StateCacheConfig(bytes_per_request=result["bytes_per_request"])
     blocks = size.state_blocks(block_size, bytes_per_token)
     block_bytes = block_size * bytes_per_token

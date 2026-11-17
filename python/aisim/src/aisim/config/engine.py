@@ -304,6 +304,9 @@ class SlidingWindowStateConfig(StrictModel):
     lookahead_tokens: NonNegativeU64
 
 
+_PD_CONNECTOR_ERROR = "host_offload.connector other than offloading_v0_24 is supported only for the aggregated worker"
+
+
 def _require_block_drop_off(speculation) -> None:
     # Replay does not model the EAGLE block drop hiding the last block, and the
     # recurrent state, that a host load restored. A sliding window resumes one
@@ -1868,10 +1871,17 @@ def _validate_prediction_host_offload(engine: EnginePredictionConfig) -> None:
     for role, worker in configured:
         if not worker.kv_cache.prefix_caching:
             raise ValueError("host_offload requires prefix_caching=true")
-        if worker.kv_cache.host_offload.connector != "offloading_v0_24" and role != "aggregated":
-            raise ValueError(
-                "host_offload.connector other than offloading_v0_24 is supported only for the aggregated worker"
-            )
+        state = worker.kv_cache.state_cache
+        # A sliding window runs the 0.32 offloading rules on every worker, so
+        # it may name them. Sizing checks a state with inferred geometry.
+        names_window_rules = (
+            worker.kv_cache.host_offload.connector == "offloading_v0_32"
+            and state is not None
+            and (state.sliding_window_lookahead_tokens is not None or state.bytes_per_request is None)
+        )
+        named_default = worker.kv_cache.host_offload.connector == "offloading_v0_24"
+        if not (named_default or role == "aggregated" or names_window_rules):
+            raise ValueError(_PD_CONNECTOR_ERROR)
         if worker.kv_cache.g3_offload is not None and (role != "aggregated" or worker.parallelism.attention_data != 1):
             raise ValueError("g3_offload is supported only for the aggregated worker with attention_data=1")
         if worker.kv_cache.kvcr is not None and role == "decode":

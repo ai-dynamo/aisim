@@ -1891,9 +1891,15 @@ impl EngineConfig {
                 "native_host_offload is supported only for backend=vllm"
             );
             // A held P/D source reaches the connector's finish hook only after
-            // its transfer, while vLLM finishes it before.
+            // its transfer, while vLLM finishes it before. A sliding window
+            // runs the 0.32 offloading rules there all the same (see
+            // `resolved_host_offload`), so it may name them.
+            let names_window_rules = host_offload.connector == G2Connector::OffloadingV032
+                && (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_some());
             ensure!(
-                host_offload.connector.is_default() || self.worker_type == WorkerType::Aggregated,
+                host_offload.connector.is_default()
+                    || self.worker_type == WorkerType::Aggregated
+                    || names_window_rules,
                 "native_host_offload.connector other than offloading_v0_24 is supported only for worker_type=aggregated"
             );
             ensure!(
