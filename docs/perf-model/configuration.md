@@ -1613,9 +1613,9 @@ recorded `kv_cache_dtype`. Otherwise, the first matching rule below applies:
 | Checkpoint metadata | Inferred KV precision |
 |---|---|
 | `kv_cache_quant_algo`, or a ModelOpt `kv_cache_scheme` string, is not missing/null, `fp8`, `nvfp4`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
+| `kv_cache_quant_algo: nvfp4`, or ModelOpt `kv_cache_scheme: NVFP4` or a 4-bit float scheme (`quant_method: modelopt`) | NVFP4 |
 | DeepSeek V4/V4.1 architecture | FP8 |
 | `kv_cache_quant_algo: fp8`, or ModelOpt `kv_cache_scheme: FP8` | FP8 |
-| `kv_cache_quant_algo: nvfp4`, or ModelOpt `kv_cache_scheme: NVFP4` or a 4-bit float scheme (`quant_method: modelopt`) | NVFP4 |
 | `kv_cache_quant_algo: "none"` | BF16 |
 | KV declaration missing/null or `bfloat16`; weight `quant_algo` is `fp8`, `fp8_block`, or `nvfp4` | FP8 |
 | Other supported configurations | BF16 |

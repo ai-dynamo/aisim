@@ -973,7 +973,8 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
     # DSV4 is served with an FP8 KV cache: the packed fp8_ds_mla pool on Hopper and
     # the plain FP8 pool elsewhere (TRT-LLM's recommended configuration, SGLang's
     # default). A BF16 pool boots on Blackwell too; model it with an explicit kv=bf16.
-    if architecture in {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"}:
+    # A declared nvfp4 cache is kept, so get_model refuses it instead of sizing FP8.
+    if architecture in {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"} and kv_cache_algo != "nvfp4":
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
     # FMHA quant mode

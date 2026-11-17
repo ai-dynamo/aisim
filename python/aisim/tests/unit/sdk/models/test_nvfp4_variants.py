@@ -7,6 +7,7 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -822,3 +823,14 @@ def test_nvfp4_kv_cache_is_rejected_for_latent_caches(model_path):
     model_config = config.ModelConfig(kvcache_quant_mode=common.KVCacheQuantMode.nvfp4)
     with pytest.raises(ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"):
         get_model(model_path, model_config, "vllm")
+
+
+@pytest.mark.parametrize("model_path", ["deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4.1-Flash"])
+def test_nvfp4_kv_metadata_is_rejected_for_compressed_caches(model_path, tmp_path):
+    # The DeepSeek V4 FP8 KV default must not hide a checkpoint's nvfp4 declaration.
+    bundled = Path(aisim_core.__file__).parent / "model_configs" / f"{model_path.replace('/', '--')}_config.json"
+    raw = json.loads(bundled.read_text())
+    raw["quantization_config"]["kv_cache_quant_algo"] = "NVFP4"
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"):
+        get_model(str(tmp_path), _model_config(), "vllm")
