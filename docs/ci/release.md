@@ -426,9 +426,8 @@ Persistent project and Dynamo wheel handoffs use Artifactory, including companio
 | `collector-check.yml` | Source install can build a local wheel | Disposable install wheel; cross-backend `.md`/`.json` reports only |
 | `readme-checks.yml` | Source/development profiles perform editable installs in isolated workspaces | Disposable build/venv paths; Actions command logs, installation metadata, environment log, and harness reports only |
 | `accuracy-digest.yml` | No product wheel generation; consumes qualified accuracy data | Actions preview, report, and delivery-state data only |
-| `fast-ci.yml` | No product wheel producer; dependency installs/tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
+| `fast-ci.yml` | No product wheel producer; dependency installs and policy/ownership tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
 | `pages.yml` | No product wheel producer; dependencies/tests and allowlisted site packaging | Pages/site and validation data only |
-| `codeowners.yml` | No wheel generation | No wheel handoff |
 | `slack-review-digest.yml` | No wheel generation | No wheel handoff |
 
 The platform Dockerfile's legacy `aiconfigurator` migration-fixture wheel remains inside the local test build stage. The shared manylinux builder's unrepaired wheel is temporary; only its repaired caller-selected output enters a retained handoff. Simulation transfers include every wheel in the bundle, not just the AISim filename. No exported Actions or BuildKit cache is used as a wheel handoff; ordinary dependency-install caches do not change the producer/consumer storage contract.
