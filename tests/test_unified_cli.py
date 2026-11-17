@@ -2208,6 +2208,28 @@ def test_fifo_runtime_report_is_refused_without_blocking(tmp_path) -> None:
     assert sorted(entry.name for entry in root.iterdir()) == ["execution-events.jsonl", "resource-runtime.json"]
 
 
+def test_prediction_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, monkeypatch) -> None:
+    from aisim import output as output_module
+
+    root = tmp_path / "out"
+    root.mkdir()
+    real_dump = output_module.json.dump
+
+    def replace_then_fail(obj, fp, **kwargs):
+        # Another writer swaps in its own report while this call is serializing.
+        (root / "prediction.json").unlink()
+        (root / "prediction.json").write_text("replacement\n")
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(output_module.json, "dump", replace_then_fail)
+    try:
+        with pytest.raises(RuntimeError, match="serialization failed"):
+            output_module.write_prediction_report(root, {"a": 1}, exclusive=True)
+    finally:
+        monkeypatch.setattr(output_module.json, "dump", real_dump)
+    assert (root / "prediction.json").read_text() == "replacement\n"
+
+
 def test_telemetry_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, monkeypatch) -> None:
     from aisim import output as output_module
 

@@ -69,7 +69,11 @@ def _fingerprint(path: Path) -> _Fingerprint:
 
 
 def _read_runtime_report(path: Path) -> dict[str, Any] | None:
-    """Read a runtime report only if it is a regular file; never block on a FIFO or follow a symlink."""
+    """Read a runtime report only if it is a regular file, without blocking on a FIFO.
+
+    Symlinks are not followed where the platform has ``O_NOFOLLOW`` (POSIX);
+    callers also reject symlinks by ``lstat`` before cleanup.
+    """
 
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
