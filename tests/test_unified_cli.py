@@ -7,6 +7,8 @@ import csv
 import io
 import json
 import math
+import os
+import threading
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -2148,6 +2150,10 @@ def test_lone_events_file_is_never_removed(tmp_path) -> None:
         json.dumps({"schema_version": 1, "status": "running"}),
         json.dumps({"schema_version": 1, "status": "exploded"}),
         json.dumps({"schema_version": 1, "status": None}),
+        json.dumps({"schema_version": True, "status": "failed"}),
+        json.dumps({"schema_version": 1.0, "status": "failed"}),
+        json.dumps({"schema_version": 1, "status": []}),
+        json.dumps({"schema_version": 1, "status": {}}),
     ],
     ids=[
         "empty",
@@ -2160,6 +2166,10 @@ def test_lone_events_file_is_never_removed(tmp_path) -> None:
         "running",
         "unknown",
         "null-status",
+        "bool-schema",
+        "float-schema",
+        "list-status",
+        "dict-status",
     ],
 )
 def test_ambiguous_runtime_reports_preserve_the_directory(tmp_path, report) -> None:
@@ -2173,6 +2183,53 @@ def test_ambiguous_runtime_reports_preserve_the_directory(tmp_path, report) -> N
 
     assert (root / "execution-events.jsonl").exists()
     assert (root / "resource-runtime.json").read_text() == report
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+@pytest.mark.timeout(30)
+def test_fifo_runtime_report_is_refused_without_blocking(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "execution-events.jsonl").write_text("{}\n")
+    os.mkfifo(root / "resource-runtime.json")
+    result: dict[str, object] = {}
+
+    def prepare() -> None:
+        try:
+            prepare_output_directory(root, overwrite=False)
+        except ValueError as exc:
+            result["error"] = str(exc)
+
+    worker = threading.Thread(target=prepare, daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "preparation blocked on a FIFO runtime report"
+    assert "not empty" in str(result.get("error"))
+    assert sorted(entry.name for entry in root.iterdir()) == ["execution-events.jsonl", "resource-runtime.json"]
+
+
+def test_telemetry_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, monkeypatch) -> None:
+    from aisim import output as output_module
+
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "telemetry-samples.jsonl").write_text("theirs\n")
+    real_open = output_module._open_result
+
+    def open_then_replace(path, *, exclusive):
+        handle = real_open(path, exclusive=exclusive)
+        if path.name == "telemetry-requests.jsonl":
+            # Another writer swaps in its own requests file after this call created one.
+            path.unlink()
+            path.write_text("replacement\n")
+        return handle
+
+    monkeypatch.setattr(output_module, "_open_result", open_then_replace)
+    telemetry = {"requests": [{"a": 1}], "samples": [{"b": 2}], "lifecycle": []}
+    with pytest.raises(ValueError, match="appeared after the output directory was prepared"):
+        output_module.write_telemetry(root, telemetry, exclusive=True)
+    assert (root / "telemetry-requests.jsonl").read_text() == "replacement\n"
+    assert (root / "telemetry-samples.jsonl").read_text() == "theirs\n"
 
 
 @pytest.mark.parametrize("link", ["resource-runtime.json", "execution-events.jsonl", "recommendations"])

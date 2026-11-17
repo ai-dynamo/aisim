@@ -241,9 +241,11 @@ write keep the directory as it is, and the error says which case applies. Each f
 again just before it is removed; if one changed, nothing more is removed. With `--overwrite`, the
 CLI replaces only the known output files listed below and preserves unrelated files.
 
-Specifically, overwrite may replace `prediction.json`, `recommendation.json`, `recommendation.csv`,
-`requests.jsonl`, `resource-plan.json`, `resource-runtime.json`, `execution-events.jsonl`,
-`afd-replay-spec.json`, `afd-qualification.json`, and numbered `recommendations/NNNN.yaml` files.
+Specifically, overwrite may replace `prediction.json`, `report.html`, `recommendation.json`,
+`recommendation.csv`, `requests.jsonl`, `telemetry-requests.jsonl`, `telemetry-samples.jsonl`,
+`telemetry-lifecycle.jsonl`, `fpm-coverage.json`, `resource-plan.json`, `resource-runtime.json`,
+`execution-events.jsonl`, `afd-replay-spec.json`, `afd-qualification.json`, and numbered
+`recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
 configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or
 output adapters that are not installed leave existing artifacts intact. Errors raised while
