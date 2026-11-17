@@ -36,8 +36,8 @@ use crate::engine::kv_manager::{
 };
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
-    CompletedLoad, HostLookup, HostTransferProgress, StartLoad, VllmHostOffloadAdapter,
-    VllmHostRequestState,
+    CompletedLoad, HostLookup, HostLookupHit, HostTransferProgress, StartLoad,
+    VllmHostOffloadAdapter, VllmHostRequestState,
 };
 use crate::engine::scheduler::vllm::policy::{self, AdmissionDecision, PolicySequence};
 use crate::engine::scheduler::vllm::request::RequestKvState;
@@ -973,7 +973,11 @@ impl VllmCore {
         if let Some(adapter) = native_host_offload.as_mut()
             && blocks_per_state > 0
         {
-            adapter.set_hybrid(blocks_per_state);
+            // A sliding window says whether MTP's block drop applies to it.
+            let window = (args.state_cache.as_ref())
+                .and_then(|cache| cache.sliding_window.as_ref())
+                .map(|_| args.aic_nextn.is_some() && !args.disable_eagle_block_drop);
+            adapter.set_hybrid(blocks_per_state, window)?;
             kv_manager.record_state_handoffs();
         }
         if let Some(order) = native_host_offload
@@ -2586,7 +2590,12 @@ impl VllmCore {
                     }
                 }
             };
-            let decision = if native_mtp_depth.is_some() {
+            // A window checkpoint has many rows, and its restore holds two of
+            // them: the landed state and the one the first pass writes.
+            let restores_window = host_hit.as_ref().is_some_and(HostLookupHit::restores_state)
+                && (self.native_host_offload.as_ref())
+                    .is_some_and(VllmHostOffloadAdapter::keeps_window_checkpoints);
+            let decision = if native_mtp_depth.is_some() || restores_window {
                 if let (AdmissionDecision::Admit { prefill_cost }, Some(hit)) =
                     (&decision, &host_hit)
                 {
@@ -2595,7 +2604,12 @@ impl VllmCore {
                         .as_deref()
                         .map(VllmHostRequestState::reserved_blocks)
                         .unwrap_or_default();
-                    let footprint = hit.request_footprint_blocks();
+                    let landed = if restores_window {
+                        self.kv_manager.state_reserved_blocks_per_request()
+                    } else {
+                        0
+                    };
+                    let footprint = hit.request_footprint_blocks() + landed;
                     let needed = footprint.saturating_sub(
                         (prefill_cost.active_cached_tokens / self.args.block_size).max(reserved),
                     );

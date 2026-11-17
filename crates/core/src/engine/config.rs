@@ -1413,16 +1413,21 @@ impl EngineConfig {
         }
     }
 
+    /// A state cache without a sliding window: a recurrent state.
+    fn has_recurrent_state(&self) -> bool {
+        (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_none())
+    }
+
     /// Batches a busy vLLM engine keeps committed, its `max_concurrent_batches`:
     /// two with async scheduling and one without. Engine replay does not model
     /// pipeline parallelism, which would raise this depth. MTP with G2 runs
-    /// synchronously, except with a state cache.
+    /// synchronously, except with a recurrent state cache.
     pub(crate) fn max_concurrent_batches(&self) -> usize {
         if self.backend == Backend::Vllm
             && self.async_scheduling != Some(false)
             && !(self.native_host_offload.is_some()
                 && self.aic_nextn.is_some()
-                && self.state_cache.is_none())
+                && !self.has_recurrent_state())
         {
             2
         } else {
@@ -1451,16 +1456,27 @@ impl EngineConfig {
                 "state_cache is supported only for backend=vllm"
             );
             if let Some(host) = &self.native_host_offload {
-                // vLLM's CPU connectors hit a hybrid model at block boundaries
-                // (Mamba align mode); vLLM 0.24's connector stores no states.
-                ensure!(
-                    self.prefix_match_unit == Some(self.block_size),
-                    "state_cache with host_offload requires prefix_match_unit equal to block_size"
-                );
-                ensure!(
-                    host.connector != G2Connector::OffloadingV024,
-                    "state_cache with host_offload requires host_offload.connector=offloading_v0_32 or simple_cpu_v0_32"
-                );
+                if state_cache.sliding_window.is_some() {
+                    // The model stores a window's checkpoints in the cohort
+                    // of the default connector's block store.
+                    ensure!(
+                        host.connector.is_default(),
+                        "a sliding-window state_cache requires host_offload.connector=offloading_v0_24"
+                    );
+                    ensure!(self.kvcr.is_none(), "state_cache does not support kvcr");
+                } else {
+                    // vLLM's CPU connectors hit a hybrid model at block
+                    // boundaries (Mamba align mode); vLLM 0.24's connector
+                    // stores no states.
+                    ensure!(
+                        self.prefix_match_unit == Some(self.block_size),
+                        "state_cache with host_offload requires prefix_match_unit equal to block_size"
+                    );
+                    ensure!(
+                        host.connector != G2Connector::OffloadingV024,
+                        "state_cache with host_offload requires host_offload.connector=offloading_v0_32 or simple_cpu_v0_32"
+                    );
+                }
             }
             ensure!(
                 self.g3_offload.is_none(),
@@ -1788,9 +1804,10 @@ impl EngineConfig {
                 self.enable_prefix_caching,
                 "native_host_offload requires enable_prefix_caching=true"
             );
-            if self.aic_nextn.is_some() && self.state_cache.is_some() {
+            if self.aic_nextn.is_some() && self.has_recurrent_state() {
                 // Replay does not model the EAGLE block drop hiding the last
-                // block, and the state, that a host load restored.
+                // block, and the recurrent state, that a host load restored.
+                // A sliding window resumes one block lower instead.
                 ensure!(
                     self.disable_eagle_block_drop,
                     "native_host_offload with aic_nextn and state_cache requires disable_eagle_block_drop"
@@ -1814,7 +1831,8 @@ impl EngineConfig {
                     "kvcr with aic_nextn requires worker_type=aggregated"
                 );
                 ensure!(
-                    self.kv_cache_groups.is_empty() && self.prefix_match_unit.is_none(),
+                    self.state_cache.is_some()
+                        || (self.kv_cache_groups.is_empty() && self.prefix_match_unit.is_none()),
                     "native_host_offload with aic_nextn requires a scalar uniform FullAttention KV pool"
                 );
             }
@@ -2339,6 +2357,19 @@ mod tests {
             input[field] = value;
             let error = serde_json::from_value::<EngineConfig>(input).unwrap_err();
             assert!(error.to_string().contains(message), "{field}: {error}");
+        }
+        // A sliding-window state is offloaded with its prompt
+        // blocks, by the default connector and without KVCR.
+        let mut input = state_cache_config_json();
+        input["state_cache"]["sliding_window"] = serde_json::json!({"lookahead_tokens": 0});
+        input["native_host_offload"] = serde_json::json!({"num_host_blocks": 8});
+        serde_json::from_value::<EngineConfig>(input.clone()).unwrap();
+        let mut connector = input.clone();
+        connector["native_host_offload"]["connector"] = serde_json::json!("offloading_v0_32");
+        input["kvcr"] = serde_json::json!({});
+        for (rejected, message) in [(connector, "offloading_v0_24"), (input, "support kvcr")] {
+            let error = serde_json::from_value::<EngineConfig>(rejected).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
         }
     }
 

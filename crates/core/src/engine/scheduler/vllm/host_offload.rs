@@ -43,8 +43,19 @@
 //! is offered when G1 publishes it, before the pass's blocks (the scheduler's
 //! boundary hand-off), and a hit ends at the deepest block boundary that holds
 //! the attention prefix and every slot of the state there.
+//!
+//! A sliding-window state cache offloads on the default profile. vLLM
+//! v0.32.0's `OffloadingConnector` stores the sliding-window groups' blocks
+//! that `reachable_block_mask` retains (`storable_chunks`) in the request's
+//! store of that step, and loads the window ending at a hit, less the drafter
+//! group's last chunk (`_lookup_complete_chunks`), in
+//! `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` at
+//! commit `5df63a7203cdb9328d824a27b682e77c7b9928be`; see
+//! THIRD_PARTY_NOTICES.md. Replay keeps one checkpoint per retained boundary:
+//! one G2 entry that occupies a pool block per state row, as G1 keeps a
+//! retained window copy, stored in one cohort with the pass's prompt blocks.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -59,7 +70,7 @@ use crate::engine::host_offload::{
 };
 use crate::engine::kv_manager::{
     BlockRequestLease, DestinationReservation, G1Acquire, G1Manager, SourceReleaseOrder,
-    SourceReuseDependency, StateHandoff,
+    SourceReuseDependency, StateHandoff, state_resume_limit,
 };
 use crate::engine::{HostOffloadObserver, KvHintSource, NativeHostOffloadConfig};
 
@@ -134,6 +145,11 @@ struct HitWalk {
     range: (usize, usize),
     matched: usize,
     first_busy: usize,
+    /// With a state cache: the scan for a state below this walk, which reads
+    /// the tier and the loads like the walk. The deepest boundary it tried,
+    /// the one it found in blocks past the range start (0 for none), and
+    /// whether a key of that state is busy. `None` until a lookup scans.
+    state: Option<(usize, usize, bool)>,
 }
 
 /// Request-local connector cursor and transient load ownership.
@@ -174,6 +190,14 @@ pub(super) struct VllmHostRequestState {
     /// `offloading_v0_32`: boundaries, in blocks, of the states stored,
     /// offered or loaded, re-ranked with the blocks.
     accessed_states: BTreeSet<usize>,
+    /// Retained prompt boundaries, in blocks, whose sliding-window checkpoint
+    /// is not in G2 yet.
+    unstored_states: Vec<usize>,
+    /// Set when a store offer found no room: the pool's room epoch at that
+    /// offer, or `None` for a cohort larger than the pool. Until the request
+    /// is readmitted its cohort only grows, so it finds no room again before
+    /// the pool's room changes, or ever if it is larger than the pool.
+    unstored_room: Option<Option<u64>>,
 }
 
 impl VllmHostRequestState {
@@ -228,6 +252,8 @@ impl VllmHostRequestState {
             prompt_touch: None,
             hit_walk: HitWalk::default(),
             accessed_states: BTreeSet::new(),
+            unstored_states: Vec::new(),
+            unstored_room: None,
         }
     }
 
@@ -254,6 +280,16 @@ impl VllmHostRequestState {
                 });
             }
             self.block_keys.push(HostBlockKey::new(hash));
+        }
+    }
+
+    /// A prompt pass retained the sliding-window checkpoint at
+    /// `boundary_blocks`. Decode-time boundaries are not offloaded, like
+    /// decode blocks.
+    pub(super) fn note_retained_boundary(&mut self, boundary_blocks: usize) {
+        if boundary_blocks <= self.prompt_blocks && !self.unstored_states.contains(&boundary_blocks)
+        {
+            self.unstored_states.push(boundary_blocks);
         }
     }
 
@@ -305,6 +341,11 @@ impl HostLookupHit {
         self.base_g1_blocks + self.keys.len()
     }
 
+    /// The load also brings a state, which lands as the request's own.
+    pub(super) fn restores_state(&self) -> bool {
+        self.state_slots > 0
+    }
+
     pub(super) fn request_footprint_blocks(&self) -> usize {
         self.request_footprint_blocks
     }
@@ -342,18 +383,34 @@ pub(super) struct HostTransferProgress {
     pub(super) completed_any: bool,
 }
 
-/// Recurrent-state geometry of a hybrid model's G1 state cache.
+/// State geometry of a hybrid model's G1 state cache.
 #[derive(Clone, Copy)]
 struct HybridStates {
-    /// Slots per state, one per Mamba KV cache group.
+    /// Blocks per state: the slots of a recurrent state, one per Mamba KV
+    /// cache group and each its own G2 entry, or the rows of a sliding-window
+    /// checkpoint, which is one G2 entry of that weight.
     slots: usize,
+    /// Set for a sliding window: whether MTP's drafter group drops the last
+    /// block of a hit.
+    window: Option<bool>,
 }
 
 impl HybridStates {
+    fn key_iter(self, prefix: HostBlockKey) -> impl Iterator<Item = HostBlockKey> {
+        let slots = match self.window {
+            Some(_) => self.slots..self.slots + 1,
+            None => 0..self.slots,
+        };
+        slots.map(move |slot| HostBlockKey::state(prefix.sequence_hash(), slot))
+    }
+
     fn keys(self, prefix: HostBlockKey) -> Vec<HostBlockKey> {
-        (0..self.slots)
-            .map(|slot| HostBlockKey::state(prefix.sequence_hash(), slot))
-            .collect()
+        self.key_iter(prefix).collect()
+    }
+
+    /// Pool blocks one state key occupies.
+    fn weight(self) -> usize {
+        self.window.map_or(1, |_| self.slots)
     }
 }
 
@@ -361,8 +418,11 @@ pub(super) struct VllmHostOffloadAdapter {
     host: HostClient,
     shared: bool,
     rules: ConnectorRules,
-    /// Set when G1 has a state cache: G2 keeps recurrent states too.
+    /// Set when G1 has a state cache: G2 keeps its states too.
     hybrid: Option<HybridStates>,
+    /// Stores in flight that copy sliding-window checkpoints only: with no
+    /// token block they carry no G1 source dependency.
+    checkpoint_stores: FxHashSet<TransferId>,
     /// The rank publishes G2 residency as `HostPinned` KV events.
     publishes_residency: bool,
     g3: Option<super::g3_offload::VllmG3OffloadAdapter>,
@@ -453,6 +513,7 @@ impl VllmHostOffloadAdapter {
             shared,
             rules: config.connector.rules(),
             hybrid: None,
+            checkpoint_stores: FxHashSet::default(),
             publishes_residency: subscribe,
             g3: None,
             kvcr: None,
@@ -476,15 +537,37 @@ impl VllmHostOffloadAdapter {
             .or((self.shared || self.hybrid.is_some()).then_some(SourceReleaseOrder::TailFirst))
     }
 
-    /// G1 has a state cache: lookups, loads and stores carry recurrent states.
-    pub(super) fn set_hybrid(&mut self, blocks_per_state: usize) {
+    /// G1 has a state cache: lookups, loads and stores carry its states.
+    /// `window` is set for a sliding window, see [`HybridStates::window`].
+    /// The pool size is checked here, where the rows with draft tokens are
+    /// known.
+    pub(super) fn set_hybrid(
+        &mut self,
+        blocks_per_state: usize,
+        window: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let capacity = self.host.lock().capacity_blocks();
+        anyhow::ensure!(
+            window.is_none() || capacity > blocks_per_state,
+            "native_host_offload.num_host_blocks ({capacity}) must exceed one state \
+             checkpoint ({blocks_per_state} blocks)"
+        );
         self.hybrid = Some(HybridStates {
             slots: blocks_per_state,
+            window,
         });
+        Ok(())
     }
 
+    /// G2 keeps recurrent states, which a pass hands off as it publishes them.
     pub(super) fn is_hybrid(&self) -> bool {
-        self.hybrid.is_some()
+        self.hybrid.is_some_and(|hybrid| hybrid.window.is_none())
+    }
+
+    /// G2 keeps sliding-window checkpoints, stored with the prompt blocks of
+    /// their pass.
+    pub(super) fn keeps_window_checkpoints(&self) -> bool {
+        self.hybrid.is_some_and(|hybrid| hybrid.window.is_some())
     }
 
     /// Whether requests must retain router identities for residency events.
@@ -615,12 +698,16 @@ impl VllmHostOffloadAdapter {
                     range,
                     matched,
                     first_busy,
+                    state: None,
                 }
             };
             if (request.hit_walk.epochs, request.hit_walk.range) != (epochs, range) {
                 request.hit_walk = walk();
             }
-            debug_assert_eq!(request.hit_walk, walk());
+            debug_assert_eq!(
+                (request.hit_walk.matched, request.hit_walk.first_busy),
+                (walk().matched, walk().first_busy)
+            );
             let HitWalk {
                 mut matched,
                 first_busy,
@@ -632,22 +719,44 @@ impl VllmHostOffloadAdapter {
             let mut keys = Vec::new();
             let mut states_busy = false;
             if let Some(hybrid) = hybrid {
-                let busy = |key: &HostBlockKey| match tier.lookup(*key) {
-                    Lookup::Hit => Some(load_by_key.contains_key(key)),
+                let busy = |key: HostBlockKey| match tier.lookup(key) {
+                    Lookup::Hit => Some(load_by_key.contains_key(&key)),
                     Lookup::Pending { .. } => rules.waits_for_stores.then_some(true),
                     Lookup::Miss => None,
                 };
-                (matched, keys, states_busy) = (1..=matched)
-                    .rev()
-                    .find_map(|blocks| {
-                        let states = hybrid.keys(request.block_keys[base_g1_blocks + blocks - 1]);
-                        let mut any_busy = false;
-                        for key in &states {
-                            any_busy |= busy(key)?;
-                        }
-                        Some((blocks, states, any_busy))
-                    })
-                    .unwrap_or_default();
+                // The drafter group drops the last block of a window hit.
+                let deepest = match hybrid.window {
+                    Some(mtp) => {
+                        state_resume_limit(sequence, block_size, mtp, base_g1_blocks + matched)
+                            .0
+                            .saturating_sub(base_g1_blocks)
+                    }
+                    None => matched,
+                };
+                let scan = || {
+                    (1..=deepest)
+                        .rev()
+                        .find_map(|blocks| {
+                            let prefix = request.block_keys[base_g1_blocks + blocks - 1];
+                            let mut any_busy = false;
+                            for key in hybrid.key_iter(prefix) {
+                                any_busy |= busy(key)?;
+                            }
+                            Some((blocks, any_busy))
+                        })
+                        .unwrap_or_default()
+                };
+                // A blocked queue head looks up again on every pass: reuse
+                // the scan with the walk it follows.
+                (matched, states_busy) = match request.hit_walk.state {
+                    Some((scanned, blocks, busy)) if scanned == deepest => (blocks, busy),
+                    _ => scan(),
+                };
+                debug_assert_eq!((matched, states_busy), scan());
+                request.hit_walk.state = Some((deepest, matched, states_busy));
+                if matched > 0 {
+                    keys = hybrid.keys(request.block_keys[base_g1_blocks + matched - 1]);
+                }
             }
             let state_slots = keys.len();
             keys.extend_from_slice(&request.block_keys[base_g1_blocks..base_g1_blocks + matched]);
@@ -675,6 +784,14 @@ impl VllmHostOffloadAdapter {
                 &request.block_keys[..request.prompt_blocks],
                 &mut request.prompt_touch,
             );
+            // The connector looks its sliding-window groups up after the
+            // full-attention ones, so the checkpoint a hit resumes at ranks
+            // newest. Checkpoints at lower boundaries age and go first.
+            if let HostLookup::Hit(hit) = &outcome {
+                for key in &hit.keys[..hit.state_slots] {
+                    tier.touch(*key);
+                }
+            }
         }
         if rules.pins_hits
             && let HostLookup::Hit(hit) = &outcome
@@ -802,6 +919,9 @@ impl VllmHostOffloadAdapter {
             else {
                 continue;
             };
+            if self.checkpoint_stores.remove(transfer_id) {
+                continue;
+            }
             assert!(kv_manager.satisfy_native_source_dependency(source_dependency(*transfer_id)));
             if let Some(g3) = &mut self.g3 {
                 g3.store(&mut tier, blocks, now_ms);
@@ -886,6 +1006,9 @@ impl VllmHostOffloadAdapter {
             "H2D completed before its destination dependencies"
         );
         kv_manager.activate_native_destination(uuid, sequence, lease, load.reservation);
+        if self.keeps_window_checkpoints() {
+            kv_manager.cache_native_restored_window(lease);
+        }
         request.load = Some(LoadState::Activated(ActivatedPrefix {
             original_g1_tokens: load.original_g1_tokens,
             loaded_prefix_blocks: load.loaded_prefix_blocks,
@@ -943,6 +1066,10 @@ impl VllmHostOffloadAdapter {
         block_size: usize,
     ) -> Option<(usize, usize)> {
         request.restore_rounds.reset();
+        // A readmitted request retains its boundaries again as it recomputes;
+        // the connector drops a preempted request's blocks.
+        request.unstored_states.clear();
+        request.unstored_room = None;
         let attribution = match request.load.take() {
             Some(LoadState::Activated(load)) => {
                 assert!(reused_tokens / block_size <= load.loaded_prefix_blocks);
@@ -972,7 +1099,9 @@ impl VllmHostOffloadAdapter {
     /// Prepare one missing-only, per-request write-through cohort: the prompt
     /// blocks computed so far, or for an eager store every block computed
     /// before this pass (vLLM stores a step's blocks when the next step is
-    /// scheduled).
+    /// scheduled). A sliding-window rank adds the checkpoints its passes
+    /// retained: the connector offers a step's blocks of every KV group in one
+    /// job, which is stored whole or not at all.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn observe_completed_blocks(
         &mut self,
@@ -994,10 +1123,25 @@ impl VllmHostOffloadAdapter {
         } else {
             (computed_tokens.min(prompt_tokens) / block_size).min(request.prompt_blocks)
         };
-        if end <= request.next_store_block {
+        let start = request.next_store_block;
+        let end = end.max(start);
+        if let Some(room) = request.unstored_room {
+            // Applies due completions, as the offer it stands for would.
+            let now = self.host.lock().room_epoch(now_ms);
+            if room.is_none_or(|room| room == now) {
+                return;
+            }
+            request.unstored_room = None;
+        }
+        let window = self.hybrid.filter(|hybrid| hybrid.window.is_some());
+        let checkpoints = window.map_or_else(Vec::new, |window| {
+            (request.unstored_states.iter())
+                .flat_map(|&blocks| window.key_iter(request.block_keys[blocks - 1]))
+                .collect()
+        });
+        if end == start && checkpoints.is_empty() {
             return;
         }
-        let start = request.next_store_block;
         let mut tier = self.host.lock();
         if rules.reranks_at_finish {
             // `prepare_store` records the blocks it is offered, except those
@@ -1026,22 +1170,28 @@ impl VllmHostOffloadAdapter {
                 missing_indices.truncate(free);
             }
         }
-        if missing_indices.is_empty() {
+        if missing_indices.is_empty() && checkpoints.is_empty() {
             request.next_store_block = end;
             return;
         }
-        let Some(snapshot) =
-            kv_manager.snapshot_native_store_sources(uuid, lease, &missing_indices)
-        else {
-            return;
+        // A cohort of checkpoints alone copies no token block from G1.
+        let snapshot = if missing_indices.is_empty() {
+            None
+        } else {
+            let Some(snapshot) =
+                kv_manager.snapshot_native_store_sources(uuid, lease, &missing_indices)
+            else {
+                return;
+            };
+            assert_eq!(snapshot.len(), missing_indices.len());
+            assert!(
+                snapshot
+                    .sequence_hashes()
+                    .zip(missing_indices.iter().copied())
+                    .all(|(hash, index)| HostBlockKey::new(hash) == request.block_keys[index])
+            );
+            Some(snapshot)
         };
-        assert_eq!(snapshot.len(), missing_indices.len());
-        assert!(
-            snapshot
-                .sequence_hashes()
-                .zip(missing_indices.iter().copied())
-                .all(|(hash, index)| HostBlockKey::new(hash) == request.block_keys[index])
-        );
         // The offloading connectors protect every block they offer from
         // eviction. SimpleCPU's `get_new_blocks` protects none, so it offers
         // only the missing blocks.
@@ -1065,21 +1215,44 @@ impl VllmHostOffloadAdapter {
                 request.block_meta.as_deref().map(|meta| &meta[start..end]),
             )
         };
-        match tier.prepare_store(self.host.id(), uuid, keys, meta, now_ms) {
-            StoreOutcome::AlreadyPresent => request.next_store_block = end,
-            StoreOutcome::RetryCapacity { .. } => {}
+        let weight = window.map_or(1, HybridStates::weight);
+        let client = self.host.id();
+        match tier.prepare_cohort(client, uuid, keys, meta, &checkpoints, weight, now_ms) {
+            StoreOutcome::AlreadyPresent => {
+                request.next_store_block = end;
+                request.unstored_states.clear();
+            }
+            StoreOutcome::RetryCapacity {
+                structurally_unfittable,
+            } => {
+                // With checkpoints a cohort can exceed the pool or wait
+                // long for room in it. It is offered again when the pool's
+                // room changes, not on every decode pass.
+                if window.is_some() {
+                    request.unstored_room =
+                        Some((!structurally_unfittable).then(|| tier.room_epoch(now_ms)));
+                }
+            }
             StoreOutcome::Prepared {
                 transfer_id,
                 stored_blocks,
             } => {
-                assert_eq!(stored_blocks, snapshot.len());
-                kv_manager.attach_native_store_source_dependency(
-                    uuid,
-                    lease,
-                    snapshot,
-                    source_dependency(transfer_id),
-                );
-                if let Some(observer) = &self.observer {
+                request.unstored_states.clear();
+                if let Some(snapshot) = snapshot {
+                    assert_eq!(stored_blocks, snapshot.len());
+                    kv_manager.attach_native_store_source_dependency(
+                        uuid,
+                        lease,
+                        snapshot,
+                        source_dependency(transfer_id),
+                    );
+                } else {
+                    assert_eq!(stored_blocks, 0);
+                    self.checkpoint_stores.insert(transfer_id);
+                }
+                if let Some(observer) = &self.observer
+                    && !missing_indices.is_empty()
+                {
                     let mappings = missing_indices
                         .iter()
                         .map(|index| HostStoreBlockMapping {
@@ -1125,6 +1298,11 @@ impl VllmHostOffloadAdapter {
         now_ms: f64,
     ) {
         let hybrid = self.hybrid.expect("only a hybrid G1 hands off states");
+        if hybrid.window.is_some() {
+            // A window's checkpoint joins the block cohort of its pass.
+            request.note_retained_boundary(handoff.position / block_size);
+            return;
+        }
         // A state retracted with its pass (a same-pass preemption) is gone.
         if !kv_manager.state_handoff_is_live(handoff) {
             return;
@@ -2981,6 +3159,60 @@ mod tests {
         assert_eq!(adapter.compute_not_before_ms(0.0), 1.0);
     }
 
+    #[test]
+    fn a_cohort_without_room_is_offered_again_after_a_readmission_or_a_room_change() {
+        // Prompt A's three blocks and prompt B's one are in the five-block
+        // G2. A checkpoint is three rows.
+        let mut adapter = adapter(5);
+        adapter.set_hybrid(3, Some(false)).unwrap();
+        let mut manager = G1Manager::new_with_caching(1, 4, KvEventPublishers::default(), 0, true);
+        let (_, a_lease, mut a) = request(Uuid::nil(), (1..=12).collect());
+        let (_, b_lease, mut b) = request(Uuid::from_u128(1), (21..=24).collect());
+        let mut now_ms = 0.0;
+        for key in [a.block_keys.clone(), b.block_keys.clone()].concat() {
+            now_ms = seed_host(&mut adapter, key);
+        }
+        a.note_retained_boundary(3);
+        b.note_retained_boundary(1);
+        let mut offer = |adapter: &mut VllmHostOffloadAdapter,
+                         host: &mut VllmHostRequestState,
+                         lease: &BlockRequestLease,
+                         now_ms: f64| {
+            let (id, tokens) = (Uuid::nil(), host.block_keys.len() * 4);
+            adapter.observe_completed_blocks(
+                id,
+                host,
+                lease,
+                tokens,
+                tokens,
+                4,
+                &mut manager,
+                now_ms,
+            );
+        };
+        // A's blocks and checkpoint exceed the pool. A readmission that
+        // loaded two blocks leaves the last block and the checkpoint, which
+        // fit.
+        offer(&mut adapter, &mut a, &a_lease, now_ms);
+        assert_eq!(a.unstored_room, Some(None));
+        adapter.on_admitted(&mut a, 8, 4);
+        a.next_store_block = 2;
+        a.note_retained_boundary(3);
+        offer(&mut adapter, &mut a, &a_lease, now_ms);
+        assert!(a.unstored_states.is_empty());
+        // B's block and checkpoint fit the pool, but find no room while A's
+        // checkpoint is being stored. They do once that store has completed.
+        offer(&mut adapter, &mut b, &b_lease, now_ms);
+        assert!(matches!(b.unstored_room, Some(Some(_))));
+        adapter.host.lock().submit_prepared_stores(C, now_ms);
+        let stored_ms = (adapter.host.lock())
+            .transfer_deadline(a.latest_store.unwrap())
+            .unwrap();
+        adapter.host.lock().tick(C, stored_ms);
+        offer(&mut adapter, &mut b, &b_lease, stored_ms);
+        assert!(b.unstored_states.is_empty());
+    }
+
     fn connector_adapter(connector: G2Connector, capacity_blocks: usize) -> VllmHostOffloadAdapter {
         VllmHostOffloadAdapter::new(
             &NativeHostOffloadConfig::new(capacity_blocks)
@@ -3519,7 +3751,7 @@ mod tests {
         // SimpleCPU coordinator's `find_longest_cache_hit`).
         for connector in [G2Connector::SimpleCpuV032, G2Connector::OffloadingV032] {
             let mut adapter = connector_adapter(connector, 16);
-            adapter.set_hybrid(2);
+            adapter.set_hybrid(2, None).unwrap();
             let manager = G1Manager::new_with_caching(16, 4, KvEventPublishers::default(), 0, true);
             let (sequence, lease, mut host) = request(Uuid::from_u128(1), (1..=21).collect());
             let blocks = host.block_keys.clone();

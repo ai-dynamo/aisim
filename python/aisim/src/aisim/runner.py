@@ -1797,14 +1797,17 @@ def _materialize_engine_role(
         and any(rank.get(key) is not None for key in ("aic_nextn", "nextn"))
     ):
         raise ValueError("native_host_offload with speculative decoding requires canonical mtp speculation")
+    state_cache = rank.get("state_cache")
+    recurrent = isinstance(state_cache, Mapping) and state_cache.get("sliding_window") is None
     if kind not in (None, "none"):
         supported = {"vllm"} if kind == "ngram" else {"vllm", "sglang"}
         if backend not in supported:
             raise ValueError(f"{kind} speculation requires a supported backend")
         host_offload = rank.get("native_host_offload")
-        if host_offload is not None and rank.get("state_cache") is not None:
+        if host_offload is not None and recurrent:
             # Replay does not model the EAGLE block drop hiding the last block,
-            # and the state, that a host load restored.
+            # and the recurrent state, that a host load restored. A sliding
+            # window resumes one block lower instead.
             if kind != "mtp" or rank.get("disable_eagle_block_drop") is not True:
                 raise ValueError(
                     f"{kind} speculation with host_offload and state_cache requires mtp and disable_eagle_block_drop"
@@ -1827,7 +1830,7 @@ def _materialize_engine_role(
             )
     if rank.get("async_scheduling") is not None and not isinstance(rank["async_scheduling"], bool):
         raise ValueError(f"engine provider {role} async_scheduling must be a boolean")
-    if kind == "mtp" and rank.get("native_host_offload") is not None and rank.get("state_cache") is None:
+    if kind == "mtp" and rank.get("native_host_offload") is not None and not recurrent:
         if rank.get("async_scheduling") is True:
             raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
         rank["async_scheduling"] = False
@@ -2026,13 +2029,17 @@ def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) 
     ):
         raise ValueError("sub-block prefix_match_unit does not support speculative decoding")
     if backend != "vllm" or role not in ("aggregated", "prefill", "decode"):
-        raise ValueError("state_cache requires backend=vllm and an aggregated, prefill or decode G1 worker")
+        raise ValueError("state_cache requires backend=vllm and an aggregated, prefill or decode worker")
     host = rank.get("native_host_offload")
     if isinstance(host, dict):
         # Inferred geometry checks the unit against the resolved block_size.
         block_size = rank.get("block_size") if state_cache.bytes_per_request is not None else None
         _validate_hybrid_host_offload(
-            host.get("connector", "offloading_v0_24"), rank.get("prefix_match_unit"), block_size
+            host.get("connector", "offloading_v0_24"),
+            rank.get("prefix_match_unit"),
+            block_size,
+            window=state_cache.sliding_window is not None,
+            kvcr=rank.get("kvcr") is not None,
         )
     if rank.get("g3_offload") is not None:
         raise ValueError("state_cache does not support g3_offload")

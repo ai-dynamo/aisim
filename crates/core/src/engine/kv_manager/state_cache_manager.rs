@@ -27,6 +27,7 @@ use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, VllmBlockPool,
 };
 use crate::engine::common::hashing::SequenceHash;
+use crate::engine::common::sequence::RequestSequence;
 use crate::engine::config::SlidingWindowStateConfig;
 use rustc_hash::FxHashSet;
 
@@ -58,6 +59,26 @@ pub(crate) struct StateRequest {
     // Published internal checkpoint, discarded if this pass is retracted.
     checkpoint_published: Vec<BlockCopyId>,
     checkpoint_step: u64,
+}
+
+/// The highest boundary, in blocks, at which a request with a `hit_blocks`
+/// token hit may resume from a state checkpoint, and the token blocks past
+/// that boundary the resume also needs. vLLM leaves the last token to compute.
+/// It also drops the MTP block from the hit; for a sliding window that block
+/// must lie inside the block-aligned token hit, so the state hit lands one
+/// block lower.
+pub(crate) fn state_resume_limit(
+    sequence: &RequestSequence,
+    block_size: usize,
+    mtp_enabled: bool,
+    hit_blocks: usize,
+) -> (usize, usize) {
+    if sequence.generated_tokens() >= sequence.max_output_tokens() {
+        return (hit_blocks, 0);
+    }
+    let drafter_blocks = usize::from(mtp_enabled);
+    let limit = hit_blocks.min(sequence.len().saturating_sub(1) / block_size);
+    (limit.saturating_sub(drafter_blocks), drafter_blocks)
 }
 
 pub(crate) struct StateCacheManager {
