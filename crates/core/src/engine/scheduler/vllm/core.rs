@@ -1776,11 +1776,16 @@ impl VllmCore {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
+        self.has_schedulable_requests()
+            || self.destination_retry_ready
+            || self.has_unsubmitted_host_stores()
+    }
+
+    /// Requests the next pass can schedule.
+    fn has_schedulable_requests(&self) -> bool {
         !self.state.running_members.is_empty()
             || !self.state.waiting_members.is_empty()
             || self.state.has_ready_connector_waiter()
-            || self.destination_retry_ready
-            || self.has_unsubmitted_host_stores()
     }
 
     /// G2 stores a request prepared when it left between passes; the next
@@ -1834,8 +1839,9 @@ impl VllmCore {
             self.apply_host_progress(progress);
         }
         // With nothing to schedule, vLLM's next step is empty and it processes
-        // this pass's outputs at once.
-        if !self.is_ready() {
+        // this pass's outputs at once. A destination waiting for capacity
+        // schedules nothing: it needs the blocks these outputs free.
+        if !self.has_schedulable_requests() {
             let finished = std::mem::take(&mut self.finished_in_flight);
             self.free_finished(finished);
         }
