@@ -348,6 +348,15 @@ _COLLECT_ATTN_DOTTED = "collector.sglang.collect_attn"
 _COLLECT_ATTN_ENCODER_PATH = COLLECTOR_DIR / "sglang" / "collect_attn_encoder.py"
 _COLLECT_ATTN_ENCODER_DOTTED = "collector.sglang.collect_attn_encoder"
 _ATTN_LENIENT_EXTRAS = ("torch.nn",)
+# The kernel collectors run one attention rank: the override their decorator declares.
+_ONE_ATTENTION_RANK = {
+    "attn_tp_size": 1,
+    "attn_tp_rank": 0,
+    "attn_cp_size": 1,
+    "attn_cp_rank": 0,
+    "attn_dp_size": 1,
+    "attn_dp_rank": 0,
+}
 
 
 class TestCollectAttnImportSurface:
@@ -356,17 +365,7 @@ class TestCollectAttnImportSurface:
         _install_fake_sglang(monkeypatch, SGLANG_0523_ATTENTION_SURFACE, lenient_extras=_ATTN_LENIENT_EXTRAS)
         module = _import_fresh(monkeypatch, _COLLECT_ATTN_DOTTED, _COLLECT_ATTN_PATH)
         assert callable(module.run_attention_torch)
-        # The kernel collector runs one attention rank: the override the decorator declares.
-        assert _ATTENTION_PARALLEL.overrides == [
-            {
-                "attn_tp_size": 1,
-                "attn_tp_rank": 0,
-                "attn_cp_size": 1,
-                "attn_cp_rank": 0,
-                "attn_dp_size": 1,
-                "attn_dp_rank": 0,
-            }
-        ]
+        assert _ATTENTION_PARALLEL.overrides == [_ONE_ATTENTION_RANK]
 
     def test_import_fails_without_the_0523_kv_index_translator(self, monkeypatch):
         """The runner's translator is built from sglang's own class; there is no stand-in."""
@@ -461,17 +460,7 @@ class TestCollectMlaImportSurface:
         assert callable(module.run_mla)
         # The serving backend class itself, never a collector subclass of it.
         assert module.TRTLLMMLABackend is _Dummy
-        # The kernel collector runs one attention rank: the override the decorator declares.
-        assert _MLA_PARALLEL.overrides == [
-            {
-                "attn_tp_size": 1,
-                "attn_tp_rank": 0,
-                "attn_cp_size": 1,
-                "attn_cp_rank": 0,
-                "attn_dp_size": 1,
-                "attn_dp_rank": 0,
-            }
-        ]
+        assert _MLA_PARALLEL.overrides == [_ONE_ATTENTION_RANK]
 
     def test_import_fails_without_the_0523_kv_index_translator(self, monkeypatch):
         """The runner's translator is built from sglang's own class; there is no stand-in."""
@@ -624,16 +613,7 @@ class TestGlm5SparseImportSurface:
 # ---------------------------------------------------------------------------
 # collect_dsv4_attn.py / deepseekv4_sparse_modules.py
 # ---------------------------------------------------------------------------
-# Neither touches sglang at import time. Their sglang 0.5.23 names resolve where the DSV4
-# module and kernel paths run: mem_cache.registry (TreeCacheBuildContext, create_tree_cache;
-# ChunkCache is gone), cache_init_params, kv_cache_builder.uses_ssm_state,
-# allocator.swa.is_swa_req_ring, deepseek_v4_memory_pool, unified_cache.component_type,
-# configs.model_config / configs.deepseek_v4, managers.schedule_batch, model_executor
-# (forward_batch_info, forward_context, runner.model_capture_mode, model_runner,
-# pool_configurator.DSV4PoolConfigurator), runtime_context.get_context / get_schedule,
-# layers.attention.flashmla_backend.PAGE_SIZE, kernels.ops.attention.dsv4.attn
-# (get_paged_mqa_logits_metadata) and dsv4.topk (plan_topk_v2, topk_transform_paged[_v2]);
-# the 0.5.21 jit_kernel.dsv4.topk path is gone.
+# Neither touches sglang at import time: their names resolve where the DSV4 paths run.
 _COLLECT_DSV4_ATTN_PATH = COLLECTOR_DIR / "sglang" / "collect_dsv4_attn.py"
 _COLLECT_DSV4_ATTN_DOTTED = "collector.sglang.collect_dsv4_attn"
 _DSV4_SPARSE_PATH = COLLECTOR_DIR / "sglang" / "deepseekv4_sparse_modules.py"

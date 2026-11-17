@@ -7,7 +7,6 @@ The module imports tensorrt_llm at module scope, so the helpers are AST-extracte
 from __future__ import annotations
 
 import ast
-import contextlib
 import math
 import re
 import weakref
@@ -26,10 +25,9 @@ _HELPERS = (
     "_msa_implementation",
     "_shard_head_counts",
     "_kv_pool_tokens",
-    "_autotune_projections",
     "_write_index_key_history",
 )
-_CONSTANTS = ("_M3_POOL_ROUNDING_BYTES", "_TUNED_NUM_TOKENS", "_HISTORY_CHUNK_ELEMENTS")
+_CONSTANTS = ("_M3_POOL_ROUNDING_BYTES", "_HISTORY_CHUNK_ELEMENTS")
 
 
 def _load(**namespace):
@@ -133,50 +131,6 @@ def test_the_request_size_alone_misses_the_index_k_pages():
     batch, max_seq, tokens_per_block = 1, 65538, 128
     blocks = batch * -(-max_seq // tokens_per_block)
     assert _v2_slots(blocks * tokens_per_block, 1, tokens_per_block) < blocks
-
-
-def test_projections_are_tuned_at_each_count_under_autotune():
-    """Serving's warmup pass forwards every projection under autotune() at its token counts."""
-    events, tuning = [], [False]
-
-    class Linear:
-        def __init__(self, name, in_features):
-            self.name, self.in_features, self.dtype = name, in_features, "bf16"
-
-        def forward(self, x):
-            events.append((self.name, x, tuning[-1]))
-
-    class Module:
-        def __init__(self, children):
-            self.children = children
-
-        def modules(self):
-            return [self, *self.children]
-
-    @contextlib.contextmanager
-    def autotune():
-        tuning.append(True)
-        yield
-        tuning.append(False)
-
-    torch = SimpleNamespace(
-        inference_mode=contextlib.nullcontext,
-        randn=lambda shape, dtype, device: (shape, dtype, device),
-        bfloat16="bf16",
-        cuda=SimpleNamespace(synchronize=lambda: None),
-    )
-    ns = _load(time=__import__("time"), torch=torch, Linear=Linear, autotune=autotune)
-    module = Module([Linear("qkv_proj", 6144), object(), Linear("o_proj", 8192)])
-    ns["_autotune_projections"](module, (8192, 1), "cuda:0")
-    assert events == [
-        ("qkv_proj", ((8192, 6144), "bf16", "cuda:0"), True),
-        ("o_proj", ((8192, 8192), "bf16", "cuda:0"), True),
-        ("qkv_proj", ((1, 6144), "bf16", "cuda:0"), True),
-        ("o_proj", ((1, 8192), "bf16", "cuda:0"), True),
-    ]
-    assert ns["_TUNED_NUM_TOKENS"][module] == 8192
-    ns["_autotune_projections"](module, (32768,), "cuda:0")
-    assert ns["_TUNED_NUM_TOKENS"][module] == 32768
 
 
 def test_the_decode_contract_names_the_rc2_metadata_fields():

@@ -67,12 +67,13 @@ def test_msa_layer_cache_keys_on_model_heads_gemm_and_device():
     assert len(builds) == 2 and evictions == ["gc", "empty_cache"]
 
 
-def test_mla_projections_are_tuned_at_each_count_under_autotune():
+@pytest.mark.parametrize("filename", ["collect_mla_module.py", "collect_msa_module.py"])
+def test_projections_are_tuned_at_each_count_under_autotune(filename):
     """Serving's warmup pass forwards every projection under autotune() at its token counts."""
     import contextlib
     import weakref
 
-    tree = ast.parse((COLLECTOR / "collect_mla_module.py").read_text())
+    tree = ast.parse((COLLECTOR / filename).read_text())
     selected = [
         n
         for n in tree.body
@@ -117,7 +118,7 @@ def test_mla_projections_are_tuned_at_each_count_under_autotune():
         "Linear": Linear,
         "autotune": autotune,
     }
-    exec(compile(ast.Module(body=selected, type_ignores=[]), "collect_mla_module.py", "exec"), namespace)
+    exec(compile(ast.Module(body=selected, type_ignores=[]), filename, "exec"), namespace)
     module = Module([Linear("q_b_proj", 1536), object(), Linear("o_proj", 16384)])
     namespace["_autotune_projections"](module, (8192, 1), "cuda:0")
     assert events == [

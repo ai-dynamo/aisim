@@ -143,15 +143,8 @@ _MOE_COMMON_SURFACE = {
     "vllm.v1.worker.workspace": {"init_workspace_manager": _dummy},
 }
 
-# vllm.model_executor.layers.fused_moe.layer: the module-level FusedMoE
-# factory FUNCTION at 0.24.0 (layer.py:102-103, flagged "# TODO: rename
-# this" immediately above its def), renamed to FusedMoEFactory at 0.27.1
-# (layer.py:99, TODO removed; fused_moe/__init__.py exports FusedMoEFactory,
-# not FusedMoE -- no back-compat alias at either version).
-VLLM_0240_MOE_SURFACE = {
-    **_MOE_COMMON_SURFACE,
-    "vllm.model_executor.layers.fused_moe.layer": {"FusedMoE": _dummy},
-}
+# vllm.model_executor.layers.fused_moe.layer exports FusedMoEFactory (layer.py:99), with no
+# FusedMoE alias.
 VLLM_0271_MOE_SURFACE = {
     **_MOE_COMMON_SURFACE,
     "vllm.model_executor.layers.fused_moe.layer": {"FusedMoEFactory": _dummy},
@@ -182,53 +175,6 @@ _SENTINEL_KWARGS = dict(moe_tp_size=2, moe_ep_size=2, model_name="x", perf_filen
 _SENTINEL_ARGS = ("bfloat16", [1], 1, 1, 1, 1)
 _SENTINEL_MATCH = "does not combine logical TP and EP"
 
-# Verbatim pre-fix excerpt: collector/vllm/collect_moe.py lines 322-354 at
-# commit 86f07df2dd3df12179238e62f3480c7ac6ad83ee (HEAD at the start of
-# AIC-1782 Task V1, before run_moe_torch()'s unconditional FusedMoE import
-# gained its version-conditional FusedMoEFactory fallback), truncated right
-# after the TP/EP sentinel guard -- nothing past the guard is reachable in
-# these tests. "vs 0.24.0-shaped" on this exact pre-fix code proves the fix
-# is version-specific, not a general break. Embedded as a string constant
-# instead of a `git show` read: that commit is a branch-head object that
-# squash-merge-only main and base-branch rebases leave unreachable on fresh
-# clones, which turned the sibling sglang red-proof's `git show` into a hard
-# CalledProcessError in CI.
-_PRE_FIX_MOE_SNIPPET = '''\
-def run_moe_torch(
-    moe_type,
-    num_tokens_lists,
-    hidden_size,
-    inter_size,
-    topk,
-    num_experts,
-    moe_tp_size,
-    moe_ep_size,
-    model_name,
-    distributed="power_law",
-    power_law_alpha=0.0,
-    *,
-    perf_filename,
-    device="cuda:0",
-):
-    """Benchmark the vLLM 0.24.0 model-execution MoE path."""
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.forward_context import get_forward_context, set_forward_context
-    from vllm.model_executor.layers.fused_moe.experts.fallback import FallbackExperts
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
-    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
-    from vllm.v1.worker.workspace import init_workspace_manager
-
-    from collector.vllm.utils import setup_distributed
-
-    if moe_tp_size > 1 and moe_ep_size > 1:
-        raise ValueError("vLLM MoE collector does not combine logical TP and EP")
-'''
-
 
 class TestCollectMoeImportSurface:
     def test_imports_cleanly_against_0320_shaped_vllm(self, monkeypatch):
@@ -247,34 +193,6 @@ class TestCollectMoeImportSurface:
         )
         module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
         with pytest.raises(ImportError, match="FusedMoEFactory"):
-            module.run_moe_torch(*_SENTINEL_ARGS, **_SENTINEL_KWARGS)
-
-    def test_0271_shaped_fake_reproduces_a_break_on_prefix_code(self, monkeypatch, tmp_path):
-        """Red-proof, per the sglang round's precedent: exec the embedded
-        verbatim pre-fix excerpt (_PRE_FIX_MOE_SNIPPET, unconditional
-        ``from vllm...import FusedMoE``) against the 0.27.1-shaped fake
-        (which has no ``FusedMoE`` name) and confirm it fails on import,
-        not an assumption about what "should" happen."""
-        scratch_file = tmp_path / "collect_moe.py"
-        scratch_file.write_text(_PRE_FIX_MOE_SNIPPET)
-
-        _install_fake_vllm(monkeypatch, VLLM_0271_MOE_SURFACE)
-        module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, scratch_file)
-
-        with pytest.raises(ImportError, match="FusedMoE"):
-            module.run_moe_torch(*_SENTINEL_ARGS, **_SENTINEL_KWARGS)
-
-    def test_prefix_code_was_fine_against_0240_shaped_vllm(self, monkeypatch, tmp_path):
-        """Companion to the test above: the pre-fix code was never broken in
-        general, only against 0.27.1's shape -- confirms the break (and this
-        regression test) is version-specific."""
-        scratch_file = tmp_path / "collect_moe.py"
-        scratch_file.write_text(_PRE_FIX_MOE_SNIPPET)
-
-        _install_fake_vllm(monkeypatch, VLLM_0240_MOE_SURFACE)
-        module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, scratch_file)
-
-        with pytest.raises(ValueError, match=_SENTINEL_MATCH):
             module.run_moe_torch(*_SENTINEL_ARGS, **_SENTINEL_KWARGS)
 
     def test_load_model_moe_config_raises_for_radixark_nvfp4_missing_config(self, monkeypatch):
@@ -334,18 +252,9 @@ _COLLECT_GEMM_DOTTED = "collector.vllm.collect_gemm"
 
 
 class TestCollectGemmImportSurface:
-    """Every surface collect_gemm.py touches -- directly and via
-    collector/vllm/utils.py -- was found byte-identical or line-shift-only
-    between v0.24.0 and v0.27.1 (this task's research); one fake tree
-    therefore covers both pinned versions. These are the forward-looking
-    regression guard, not a red/pre-fix reproduction -- there is no fix to
-    prove here, unlike collect_moe.py above."""
+    """The surface collect_gemm.py touches, directly and via collector/vllm/utils.py."""
 
-    def test_imports_cleanly_against_0240_shaped_vllm(self, monkeypatch):
-        _install_fake_vllm(monkeypatch, _GEMM_SURFACE)
-        _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
-
-    def test_imports_cleanly_against_0271_shaped_vllm(self, monkeypatch):
+    def test_imports_cleanly(self, monkeypatch):
         _install_fake_vllm(monkeypatch, _GEMM_SURFACE)
         _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
 
@@ -366,16 +275,8 @@ _GDN_COMMON_SURFACE = {
     "vllm.v1.attention.backends.utils": {"compute_causal_conv1d_metadata": _dummy},
 }
 
-# vllm.model_executor.layers.fla (0.24.0) relocated wholesale to the new
-# top-level vllm.third_party.flash_linear_attention (0.27.1, verified via
-# source clone: vllm/third_party/flash_linear_attention/ops/__init__.py);
-# the only symbol this collector touches there,
-# fused_recurrent_gated_delta_rule_packed_decode, is byte-identical at the
-# new location and re-exported from ops/__init__.py at both versions.
-VLLM_0240_GDN_SURFACE = {
-    **_GDN_COMMON_SURFACE,
-    "vllm.model_executor.layers.fla.ops": {"fused_recurrent_gated_delta_rule_packed_decode": _dummy},
-}
+# The only symbol this collector takes from vllm.third_party.flash_linear_attention is
+# fused_recurrent_gated_delta_rule_packed_decode (ops/__init__.py).
 VLLM_0271_GDN_SURFACE = {
     **_GDN_COMMON_SURFACE,
     "vllm.third_party.flash_linear_attention.ops": {"fused_recurrent_gated_delta_rule_packed_decode": _dummy},
@@ -384,63 +285,11 @@ VLLM_0271_GDN_SURFACE = {
 _COLLECT_GDN_PATH = COLLECTOR_DIR / "vllm" / "collect_gdn.py"
 _COLLECT_GDN_DOTTED = "collector.vllm.collect_gdn"
 
-# Verbatim pre-fix excerpt: collector/vllm/collect_gdn.py lines 13-29 at
-# commit 86f07df2dd3df12179238e62f3480c7ac6ad83ee (HEAD at the start of
-# AIC-1782 Task V1, before the module-level fla import gained its
-# version-conditional third_party.flash_linear_attention fallback) -- the
-# complete module-level import block, i.e. the import surface under test;
-# the file below this point is the aic_debug env read and function
-# definitions, none reachable by these tests. Embedded as a string constant
-# instead of a `git show` read (see _PRE_FIX_MOE_SNIPPET above for why
-# history reads are banned here).
-_PRE_FIX_GDN_SNIPPET = """\
-__compat__ = "vllm==0.24.0"
-
-import gc
-import os
-from types import SimpleNamespace
-
-import torch
-from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.model_executor.layers.fla.ops import fused_recurrent_gated_delta_rule_packed_decode
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import ChunkGatedDeltaRule
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
-from vllm.version import __version__ as vllm_version
-
-from collector.case_generator import get_common_gdn_test_cases
-from collector.helper import benchmark_with_power, get_sm_version, log_perf
-"""
-
 
 class TestCollectGdnImportSurface:
     def test_imports_cleanly_against_0271_shaped_vllm(self, monkeypatch):
         _install_fake_vllm(monkeypatch, VLLM_0271_GDN_SURFACE)
         _import_fresh(monkeypatch, _COLLECT_GDN_DOTTED, _COLLECT_GDN_PATH)
-
-    def test_0271_shaped_fake_reproduces_a_break_on_prefix_code(self, monkeypatch, tmp_path):
-        """Red-proof: the embedded verbatim pre-fix excerpt
-        (_PRE_FIX_GDN_SNIPPET, unconditional import from the old
-        vllm.model_executor.layers.fla.ops location) must fail on import
-        against the 0.27.1-shaped fake, which only has the new
-        vllm.third_party.flash_linear_attention.ops path."""
-        scratch_file = tmp_path / "collect_gdn.py"
-        scratch_file.write_text(_PRE_FIX_GDN_SNIPPET)
-
-        _install_fake_vllm(monkeypatch, VLLM_0271_GDN_SURFACE)
-
-        with pytest.raises(ImportError, match="fla"):
-            _import_fresh(monkeypatch, _COLLECT_GDN_DOTTED, scratch_file)
-
-    def test_prefix_code_was_fine_against_0240_shaped_vllm(self, monkeypatch, tmp_path):
-        """Companion to the test above: the pre-fix code was never broken in
-        general, only against 0.27.1's shape."""
-        scratch_file = tmp_path / "collect_gdn.py"
-        scratch_file.write_text(_PRE_FIX_GDN_SNIPPET)
-
-        _install_fake_vllm(monkeypatch, VLLM_0240_GDN_SURFACE)
-        _import_fresh(monkeypatch, _COLLECT_GDN_DOTTED, scratch_file)
 
 
 # ---------------------------------------------------------------------------

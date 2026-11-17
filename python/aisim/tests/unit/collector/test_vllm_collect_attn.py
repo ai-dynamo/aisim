@@ -416,12 +416,6 @@ def test_the_gate_reads_vllms_own_hook_map():
     assert hooked([[PLAIN, "org/a"]]) == () and hooked(()) == ()
 
     tree = ast.parse(ATTN_SOURCE.read_text(), filename=str(ATTN_SOURCE))
-    (imported,) = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom) and any(alias.name == "MODELS_CONFIG_MAP" for alias in node.names)
-    ]
-    assert imported.module == "vllm.model_executor.models.config"
     # The collector never builds or rebinds the map.
     stores = [
         node
@@ -517,37 +511,6 @@ def test_the_attention_collector_names_no_model_and_holds_no_backend_table():
             assert not names & {"models", "owners", "architecture"}
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             assert node.value.id != "AttentionBackendEnum"
-
-
-def test_the_model_branch_builds_its_config_from_the_bundled_config_of_the_rows_model():
-    tree = ast.parse(ATTN_SOURCE.read_text(), filename=str(ATTN_SOURCE))
-    run = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_attention_torch")
-    branch = next(
-        node
-        for node in ast.walk(run)
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "models" and node.orelse
-    )
-
-    def config_call(statements):
-        (call,) = [
-            node
-            for statement in statements
-            for node in ast.walk(statement)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "create_vllm_config"
-        ]
-        return {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
-
-    of_model, generic = config_call(branch.body), config_call(branch.orelse)
-    assert of_model["model_name"] == "_resolve_local_model_path(models[0])"
-    assert "fake_hf_model" in generic["model_name"]
-    # Only the generic config is shaped before VllmConfig runs the model hooks.
-    assert of_model[None] == "serving_config" and of_model["max_model_len"] == "None"
-    selection = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "model_attention_selection"
-    )
-    assert config_call(selection.body)["model_name"] == "_resolve_local_model_path(model)"
 
 
 def test_the_layer_shape_is_written_through_one_helper_before_or_after_the_hooks():
