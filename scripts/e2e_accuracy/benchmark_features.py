@@ -5,6 +5,11 @@
 import math
 import re
 
+
+class IncompleteSiliconEvidence(ValueError):
+    """A snapshot cannot publish under the current silicon evidence contract."""
+
+
 SCHEMA = "aisimulate.benchmark.features.v1"
 STATES = {"enabled", "disabled", "not_applicable", "unknown"}
 USAGE = {"exercised", "not_observed", "unknown"}
@@ -240,11 +245,13 @@ def validate(value, benchmark_id=None, *, require_complete=False):
             raise ValueError("Speculation off makes draft length not applicable")
     if require_complete:
         if seen != SILICON_FEATURES:
-            raise ValueError("New self-collected publications require the eight silicon features")
+            raise IncompleteSiliconEvidence("New self-collected publications require the eight silicon features")
         for row in value["features"]:
             identity, state = row["id"], row["state"]
             if state == "unknown" or not row["evidence"]:
-                raise ValueError(f"New self-collected publications require resolved, evidenced settings: {identity}")
+                raise IncompleteSiliconEvidence(
+                    f"New self-collected publications require resolved, evidenced settings: {identity}"
+                )
             params = {p["name"]: p["value"] for p in row["parameters"]}
             if identity in {"cache.g2", "cache.g3"}:
                 scopes = {"local", "shared"} if state == "enabled" else {"not_applicable"}

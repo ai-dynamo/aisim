@@ -80,6 +80,12 @@ snapshot until that release has a qualified campaign. See the
 [accuracy campaign contract](../../pages/e2e-accuracy/README.md)
 for pinned scheduler settings, measurement selection, and provenance.
 
+AgentX snapshots that lack silicon receipts required by the current contract
+are rejected and shown as failed refreshes. Pages can still deploy the other
+qualified results and documentation. Missing measured speculative acceptance
+continues to fail AgentX evaluation; no default acceptance or partial cohort
+can qualify as a complete campaign.
+
 ### Weekly accuracy Slack report
 
 [Accuracy Slack Weekly](../../.github/workflows/accuracy-digest.yml) combines the day's
@@ -101,6 +107,12 @@ on CPU. Branch results remain in Actions artifacts for 90 days. Pages validates
 and publishes successful branch results independently; failed refreshes retain
 the prior qualified result. Accuracy is advisory, outside PR prediction campaigns
 and release staging gates. See [FPM details](../../pages/fpm-accuracy/README.md).
+
+Each configuration runs in a fresh worker process so native estimator and
+training state is released between configurations. A lost worker or an early
+dependency exit fails the campaign; partial results cannot qualify. Evaluators
+use the import namespaces and project layout shipped by each exact release wheel,
+including releases that predate the AISim package rename.
 
 Manual dispatch accepts optional `hf_revision`, a full 40-character dataset commit.
 Use it to evaluate a migrated dataset branch with compatible preview consumers

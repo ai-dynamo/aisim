@@ -19,6 +19,7 @@ from typing import Any
 from scripts.fpm_accuracy.exceptions import DependencyError
 from scripts.fpm_accuracy.models.fpt_predictor import ForwardPassTimePredictor, Prediction, PredictorContext
 from scripts.fpm_accuracy.types.forward_pass import ForwardPassInput, ForwardPassIteration
+from scripts.release.package_identity import runtime_module
 
 FEATURE_PRESET = "fpm5"
 # Smaller than the trainer defaults (600 trees x 31 leaves, rate 0.05): on the
@@ -50,8 +51,8 @@ class LearnedFpm5Predictor(ForwardPassTimePredictor):
     @classmethod
     def fit(cls, context: PredictorContext, iterations: Sequence[ForwardPassIteration]) -> LearnedFpm5Predictor:
         try:
-            from aisim_core.sdk import fpm_learned
-            from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
+            fpm_learned = runtime_module("aisim_core.sdk.fpm_learned")
+            perf_model_type = runtime_module("aisim_core.sdk.rust_engine_step").RustForwardPassPerfModel
         except ImportError as exc:  # pragma: no cover - depends on the evaluated wheel
             raise DependencyError("This AISim revision does not provide the learned forward-pass model.") from exc
         if FEATURE_PRESET not in getattr(fpm_learned, "FEATURE_PRESETS", {}):
@@ -70,7 +71,7 @@ class LearnedFpm5Predictor(ForwardPassTimePredictor):
         except ValueError:
             # Too few training rows for any store: every scored point is unavailable.
             return cls(None, {"stores": {}, "metadata": {}})
-        return cls(RustForwardPassPerfModel.from_learned(artifact), artifact)
+        return cls(perf_model_type.from_learned(artifact), artifact)
 
     def predict(self, features: ForwardPassInput) -> Prediction:
         if self._model is None:

@@ -21,10 +21,10 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.release.package_identity import installed_distribution, wheels
+from scripts.release.package_identity import installed_distribution, project_directory, wheels
 
 ROOT = Path(__file__).resolve().parents[2]
-PACKAGES = ("aisim/", "aisim_core/", "aisimulate/", "aisimulate_core/")
+PACKAGES = ("aisim/", "aisim_core/", "aisimulate/", "aisimulate_core/", "aiconfigurator/", "aiconfigurator_core/")
 PROBES = Path("python/aisim/tools/support_matrix")
 DATA = Path("python/aisim/src/aisim_core/systems/fpe_support_matrix")
 
@@ -104,7 +104,7 @@ def prepare_harness(source: Path, destination: Path) -> Path:
     for name in ("fpe_support_matrix.py", "generate_fpe_support_matrix.py"):
         shutil.copyfile(ROOT / PROBES / name, package / name)
     # Model inventory and task/topology enumeration belong to the release.
-    shutil.copyfile(source / PROBES / "support_matrix.py", package / "support_matrix.py")
+    shutil.copyfile(project_directory(source) / "tools/support_matrix/support_matrix.py", package / "support_matrix.py")
     return destination
 
 
@@ -168,7 +168,14 @@ def validate_required_probes(plan: dict, receipt: dict) -> list[dict]:
 
 
 def package_reports(
-    reports: Path, expected: dict, wheel_sha: str, shards: list, destination: Path, *, probe_plan: dict
+    reports: Path,
+    expected: dict,
+    wheel_sha: str,
+    shards: list,
+    destination: Path,
+    *,
+    probe_plan: dict,
+    source_project: Path = Path("release-source/python/aisim"),
 ) -> None:
     required_probes = validate_required_probes(probe_plan, {**expected, "wheel_sha256": wheel_sha})
     qualifier = load_tool("qualify_fpe_support_matrix")
@@ -198,7 +205,7 @@ def package_reports(
                 ("FPE_BRANCH", expected["source_branch"]),
             ]
         )
-        + " release-source/python/aisim/.venv/bin/python scripts/fpe/run_release_fpe.py probe"
+        + f" {shlex.quote(str(source_project / '.venv/bin/python'))} scripts/fpe/run_release_fpe.py probe"
     )
     for path in (destination / DATA).glob("*.csv"):
         with path.open(newline="") as handle:
@@ -255,6 +262,7 @@ def main() -> None:
             json.loads(args.shards.read_text()),
             args.destination,
             probe_plan=json.loads(args.required_probes.read_text()),
+            source_project=Path("release-source/python") / project_directory(args.source_root).name,
         )
         return
     verify_installed_wheel(wheel)

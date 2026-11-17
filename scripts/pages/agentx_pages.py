@@ -23,6 +23,7 @@ from scripts.e2e_accuracy.agentx_contract import (
     validate_public,
     validate_result,
 )
+from scripts.e2e_accuracy.benchmark_features import IncompleteSiliconEvidence
 from scripts.e2e_accuracy.benchmark_features import validate as validate_features
 from scripts.pages.prepare_e2e_accuracy_pages import ancestor, api, api_items, artifact_key, strict_json, trusted_run
 
@@ -182,7 +183,18 @@ def prepare(repo, output):
         for artifact in artifacts:
             if artifact["expired"] or not re.fullmatch(r"e2e-agentx-web-[0-9a-f]{16}", artifact["name"]):
                 continue
-            files = unpack(api(f"actions/artifacts/{artifact['id']}/zip", binary=True, max_bytes=512 * 1024 * 1024))
+            try:
+                files = unpack(api(f"actions/artifacts/{artifact['id']}/zip", binary=True, max_bytes=512 * 1024 * 1024))
+            except IncompleteSiliconEvidence as error:
+                # An archive predating a stricter receipt contract must not
+                # publish, or prevent unrelated documentation from deploying.
+                branch = next((b for b in branches if artifact["name"] == "e2e-agentx-web-" + artifact_key(b)), None)
+                if branch is None:
+                    raise ValueError("AgentX artifact branch mismatch") from error
+                if branch not in updates or updates[branch]["run_id"] == str(run["id"]):
+                    updates[branch] = {"status": "failed", "run_id": str(run["id"])}
+                print(f"Rejecting AgentX artifact {artifact['id']} from run {run['id']}: {error}", file=sys.stderr)
+                continue
             summary = strict_json(files["summary.json"])
             snapshot = summary["snapshot"]
             branch, number = snapshot["branch"], snapshot["run_attempt"]

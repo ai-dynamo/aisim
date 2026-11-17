@@ -41,6 +41,52 @@ WHEEL = "c" * 64
 IDENTITY = {"schema_version": 1, "source_branch": "release/0.12.0", "source_sha": SHA, "tooling_sha": TOOLING}
 
 
+@pytest.mark.parametrize("layout", ["aisim", "aisimulate"])
+def test_release_project_layout_is_selected_without_mutating_source(tmp_path, layout):
+    from scripts.release.package_identity import project_directory
+
+    project = tmp_path / "python" / layout
+    project.mkdir(parents=True)
+    assert project_directory(tmp_path) == project
+    (tmp_path / "python" / ({"aisim", "aisimulate"} - {layout}).pop()).mkdir()
+    with pytest.raises(ValueError, match="expected one AISim Python project"):
+        project_directory(tmp_path)
+
+
+@pytest.mark.parametrize("canonical,historical", [("aisim", "aisimulate"), ("aisim_core", "aisimulate_core")])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_evaluators_import_the_namespace_of_the_installed_wheel(tmp_path, canonical, historical, legacy):
+    package = tmp_path / (historical if legacy else canonical)
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "sdk.py").write_text("identity = 'unchanged-release'\n")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            f"from scripts.release.package_identity import runtime_module; "
+            f"assert runtime_module('{canonical}.sdk').identity == 'unchanged-release'",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(tmp_path)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_namespace_compatibility_does_not_hide_a_broken_canonical_dependency(monkeypatch):
+    from scripts.release import package_identity
+
+    missing = ModuleNotFoundError("missing native dependency", name="broken_native_dependency")
+    importer = Mock(side_effect=missing)
+    monkeypatch.setattr(package_identity.importlib, "import_module", importer)
+    with pytest.raises(ModuleNotFoundError, match="missing native dependency"):
+        package_identity.runtime_module("aisim_core.sdk")
+    importer.assert_called_once_with("aisim_core.sdk")
+
+
 @pytest.fixture
 def probe_plan():
     selectors = json.loads((ROOT / ".github/fpe-required-probes.json").read_text())["probes"]
@@ -160,9 +206,10 @@ def test_discovery_does_not_silently_truncate_releases(tmp_path):
         RELEASE.list_releases(tmp_path)
 
 
-def test_harness_uses_release_inventory_and_current_probe_code(tmp_path):
+@pytest.mark.parametrize("layout", ["aisim", "aisimulate"])
+def test_harness_uses_release_inventory_and_current_probe_code(tmp_path, layout):
     source = tmp_path / "release"
-    inventory = source / RELEASE.PROBES / "support_matrix.py"
+    inventory = source / "python" / layout / "tools/support_matrix/support_matrix.py"
     inventory.parent.mkdir(parents=True)
     inventory.write_text("release inventory\n")
     destination = RELEASE.prepare_harness(source, tmp_path / "harness")
@@ -412,7 +459,11 @@ def test_discovery_plan_round_trips_through_packaging_cli(tmp_path, monkeypatch,
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     destination = tmp_path / "web"
     plan_path = tmp_path / "resolved-probes.json"
+    source = tmp_path / "release"
+    (source / "python/aisimulate").mkdir(parents=True)
     arguments = [
+        "--source-root",
+        str(source),
         "--wheel-dir",
         str(wheel_dir),
         "--shards",

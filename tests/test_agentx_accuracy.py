@@ -175,6 +175,7 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     )
     modules = {
         "aisim": api,
+        "aisim_core": SimpleNamespace(),
         "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=lambda value: value),
         # No get_latest_database_version: the reviewed pin must take precedence.
         "aisim.sdk.perf_database": SimpleNamespace(),
@@ -188,6 +189,7 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
             resources=SimpleNamespace(files=lambda package: tmp_path),
         ),
     )
+    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     missing = agentx_predict.predict(config, tmp_path)
     assert missing["reason"] == "database_unavailable"
     assert missing["prediction_backend_version"] == version
@@ -225,6 +227,7 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
     )
     modules = {
         "aisim": api,
+        "aisim_core": SimpleNamespace(),
         "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=lambda _: {}),
         "aisim.sdk.perf_database": SimpleNamespace(),
         "aisim.replay.dashboard": SimpleNamespace(),
@@ -244,6 +247,7 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
         "importlib",
         SimpleNamespace(import_module=import_module, resources=SimpleNamespace(files=lambda _: tmp_path)),
     )
+    monkeypatch.setattr(agentx_predict, "runtime_module", import_module)
     monkeypatch.setattr(agentx_predict, "asdict", lambda value: value)
     data = tmp_path / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
     data.parent.mkdir(parents=True)
@@ -272,6 +276,16 @@ def test_historical_driver_digest_preserves_the_original_file_closure():
         canonical({name: hashlib.sha256(name.encode()).hexdigest() for name in names})
     ).hexdigest()
     assert driver_digest(files.__getitem__) == expected
+
+
+def test_driver_digest_includes_runtime_namespace_selection():
+    root = Path(__file__).resolve().parents[1]
+
+    def changed(name):
+        content = (root / name).read_bytes()
+        return content + b"\n# changed namespace policy\n" if name == "scripts/release/package_identity.py" else content
+
+    assert driver_digest(changed) != driver_digest()
 
 
 @pytest.mark.parametrize("historical", [False, True])
@@ -858,3 +872,27 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, mo
     job["head_sha"] = "e" * 40
     with pytest.raises(ValueError, match="Untrusted"):
         publisher.prepare(tmp_path, tmp_path / "foreign")
+
+    # Retained results from an older receipt contract cannot publish, but must
+    # not take down the rest of the documentation deployment.
+    from test_benchmark_features import silicon_metadata
+
+    job["head_sha"] = run["head_sha"]
+    features = silicon_metadata("fresh-weka")
+    features["features"][0].update(state="unknown", evidence=[])
+    files = bundle(result(id="fresh-weka", category="self_collected", feature_metadata=features))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, content in files.items():
+            zipped.writestr(name, content)
+    publisher.prepare(tmp_path, tmp_path / "incomplete")
+    assert not (tmp_path / "incomplete" / key).exists()
+    assert json.loads((tmp_path / "incomplete/updates.json").read_text())["main"]["status"] == "failed"
+    # Structural corruption is still an error, independently of receipt age.
+    files["summary.json"] += b" "
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, content in files.items():
+            zipped.writestr(name, content)
+    with pytest.raises(ValueError, match="checksum"):
+        publisher.prepare(tmp_path, tmp_path / "corrupt")

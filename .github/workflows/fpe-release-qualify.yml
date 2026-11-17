@@ -49,8 +49,12 @@ jobs:
           path: release-source
           persist-credentials: false
       - uses: ./.github/actions/setup-manylinux-python-rust
+      - name: Resolve the unchanged release project layout
+        run: |
+          project=$(python -c 'from pathlib import Path; from scripts.release.package_identity import project_directory; print(project_directory(Path("release-source")))')
+          echo "RELEASE_PROJECT=${project}" >> "${GITHUB_ENV}"
       - name: Build the unmodified release package once
-        working-directory: release-source/python/aisim
+        working-directory: ${{ env.RELEASE_PROJECT }}
         run: |
           python -m pip install maturin==1.15.0
           python -m maturin build --release --locked --auditwheel skip --out "${RUNNER_TEMP}/release-raw-wheel"
@@ -61,12 +65,14 @@ jobs:
       - name: Install the release's locked dependencies and exact wheel
         run: |
           python -m pip install uv==0.12.6
-          uv sync --project release-source/python/aisim --locked --no-install-project --no-dev --python "$(command -v python)"
-          uv pip install --python release-source/python/aisim/.venv/bin/python --no-deps fpe-release-wheel/*.whl
-          uv pip check --python release-source/python/aisim/.venv/bin/python
+          project=$(python -c 'from pathlib import Path; from scripts.release.package_identity import project_directory; print(project_directory(Path("release-source")))')
+          uv sync --project "${project}" --locked --no-install-project --no-dev --python "$(command -v python)"
+          uv pip install --python "${project}/.venv/bin/python" --no-deps fpe-release-wheel/*.whl
+          uv pip check --python "${project}/.venv/bin/python"
+          echo "RELEASE_PROJECT=${project}" >> "${GITHUB_ENV}"
       - id: discover
         name: Discover the release inventory through its verified wheel
-        run: release-source/python/aisim/.venv/bin/python scripts/fpe/run_release_fpe.py discover
+        run: '"${RELEASE_PROJECT}/.venv/bin/python" scripts/fpe/run_release_fpe.py discover'
       - uses: ./.github/actions/wheel-storage
         with:
           mode: upload
@@ -121,15 +127,17 @@ jobs:
       - name: Install the release's locked dependencies and exact wheel
         run: |
           python -m pip install uv==0.12.6
-          uv sync --project release-source/python/aisim --locked --no-install-project --no-dev --python "$(command -v python)"
-          uv pip install --python release-source/python/aisim/.venv/bin/python --no-deps fpe-release-wheel/*.whl
-          uv pip check --python release-source/python/aisim/.venv/bin/python
+          project=$(python -c 'from pathlib import Path; from scripts.release.package_identity import project_directory; print(project_directory(Path("release-source")))')
+          uv sync --project "${project}" --locked --no-install-project --no-dev --python "$(command -v python)"
+          uv pip install --python "${project}/.venv/bin/python" --no-deps fpe-release-wheel/*.whl
+          uv pip check --python "${project}/.venv/bin/python"
+          echo "RELEASE_PROJECT=${project}" >> "${GITHUB_ENV}"
       - name: Probe the complete release shard
         env:
           FPE_SYSTEM: ${{ matrix.shard.system }}
           FPE_BACKEND: ${{ matrix.shard.backend }}
         run: |
-          release-source/python/aisim/.venv/bin/python scripts/fpe/run_release_fpe.py probe \
+          "${RELEASE_PROJECT}/.venv/bin/python" scripts/fpe/run_release_fpe.py probe \
             --system "${FPE_SYSTEM}" --backend "${FPE_BACKEND}" \
             --output-dir "fpe-release-results/${FPE_SYSTEM}/${FPE_BACKEND}" \
             --forward-model op_level --sdk-log-level ERROR --max-workers 8
@@ -145,7 +153,10 @@ jobs:
     environment: automated-release
     name: Qualify release FPE artifact
     needs: [prepare, generate]
-    runs-on: ubuntu-24.04
+    # Wheel payloads live on internal Artifactory; use the admitted network.
+    runs-on: prod-aisim-default-amd64-v1
+    container:
+      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

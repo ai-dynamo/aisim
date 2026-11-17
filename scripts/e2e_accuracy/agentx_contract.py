@@ -68,6 +68,8 @@ def driver_digest(read_file=None):
             names += ("../../benchmarks/evidence/accuracy/qwen-weka/cache_probe.py",)
     if b'"simulation_features.py"' in read_file("scripts/e2e_accuracy/agentx_contract.py"):
         names += ("simulation_features.py",)
+    if b'"../release/package_identity.py"' in read_file("scripts/e2e_accuracy/agentx_contract.py"):
+        names += ("../release/package_identity.py",)
     return hashlib.sha256(
         canonical(
             {

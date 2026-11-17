@@ -3,11 +3,34 @@
 """Resolve current and historical artifact identities without renaming imports."""
 
 import argparse
+import importlib
 import importlib.metadata
 import tomllib
 from pathlib import Path
 
 PACKAGE_NAMES = ("aisim", "aisimulate")
+
+
+def project_directory(source: Path) -> Path:
+    """Find the unchanged Python project in a current or historical checkout."""
+    matches = [source / "python" / name for name in PACKAGE_NAMES if (source / "python" / name).is_dir()]
+    if len(matches) != 1:
+        raise ValueError(f"expected one AISim Python project in {source}, found {matches}")
+    return matches[0]
+
+
+def runtime_module(name: str):
+    """Import an evaluated wheel's namespace without masking broken dependencies."""
+    root, separator, suffix = name.partition(".")
+    if root not in {"aisim", "aisim_core"}:
+        raise ValueError(f"not an AISim runtime module: {name}")
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as error:
+        if error.name != root:
+            raise
+    historical = {"aisim": "aisimulate", "aisim_core": "aisimulate_core"}[root]
+    return importlib.import_module(historical + separator + suffix)
 
 
 def wheels(directory: Path) -> list[Path]:

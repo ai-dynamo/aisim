@@ -22,6 +22,15 @@ transfer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(transfer)
 
 
+def test_internal_wheel_transfers_use_admitted_runners_with_network_access():
+    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+        for name, job in yaml.safe_load(workflow.read_text()).get("jobs", {}).items():
+            if any(step.get("uses") == "./.github/actions/wheel-storage" for step in job.get("steps", [])):
+                runner = job["runs-on"]
+                assert "ubuntu-" not in str(runner), (workflow.name, name)
+                assert "container" in job, (workflow.name, name)
+
+
 @pytest.fixture
 def handoff(tmp_path, monkeypatch):
     source = tmp_path / "build"

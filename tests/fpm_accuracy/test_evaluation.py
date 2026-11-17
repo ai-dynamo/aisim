@@ -37,6 +37,27 @@ def case(tmp_path):
     return dataset.measurement_case(CONFIGURATION_PATH)
 
 
+def test_configuration_worker_preserves_results_and_measurement_membership(case):
+    from scripts.fpm_accuracy.run_fpm_accuracy import evaluate_configuration, evaluate_isolated
+
+    unavailable = replace(case, status="no_measurements", observations=(), fpm_artifacts=())
+    expected = evaluate_configuration(unavailable, False, True)
+    actual = evaluate_isolated(unavailable, False, True)
+    assert actual == expected
+    assert actual[0]["configuration_id"] == case.configuration.configuration_id
+
+
+def test_successful_dependency_exit_cannot_qualify_an_incomplete_campaign(case, monkeypatch):
+    from scripts.fpm_accuracy import run_fpm_accuracy
+
+    def exit_early(*args, **kwargs):
+        raise SystemExit(0)
+
+    monkeypatch.setattr(run_fpm_accuracy, "evaluate_case", exit_early)
+    with pytest.raises(RuntimeError, match="exited before returning results: 0"):
+        run_fpm_accuracy.evaluate_configuration(case, False, True)
+
+
 class Predictor(ForwardPassTimePredictor):
     def __init__(self, method, context, events):
         self.method, self.context, self.events = method, context, events

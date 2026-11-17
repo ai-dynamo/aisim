@@ -159,7 +159,10 @@ jobs:
     environment: ${{ inputs.pr_number == '' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Discover matrix shards
     needs: prepare-wheel
-    runs-on: ubuntu-24.04
+    # Wheel payloads live on internal Artifactory; use the admitted network.
+    runs-on: prod-aisim-default-amd64-v1
+    container:
+      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
     outputs:
       shards: ${{ steps.shards.outputs.shards }}
       required-probes: ${{ steps.shards.outputs.required_probes }}
@@ -280,7 +283,10 @@ jobs:
     environment: ${{ inputs.pr_number == '' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Qualify and build FPE support matrix
     needs: [generate, discover-shards, prepare-wheel]
-    runs-on: ubuntu-24.04
+    # Wheel payloads live on internal Artifactory; use the admitted network.
+    runs-on: prod-aisim-default-amd64-v1
+    container:
+      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
