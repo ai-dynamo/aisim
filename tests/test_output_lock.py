@@ -122,17 +122,11 @@ def test_a_held_lock_blocks_failed_run_cleanup(tmp_path) -> None:
     root = tmp_path / "out"
     root.mkdir()
     (root / "execution-events.jsonl").write_text("")
-    (root / "resource-runtime.json").write_text(
-        json.dumps({"schema_version": 1, "status": "failed"}) + "\n"
-    )
+    (root / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}) + "\n")
     with OutputDirectoryOwnership():
-        prepare_output_directory(
-            root, overwrite=True
-        )  # takes the lock; leaves nothing to reuse
+        prepare_output_directory(root, overwrite=True)  # takes the lock; leaves nothing to reuse
         (root / "execution-events.jsonl").write_text("")
-        (root / "resource-runtime.json").write_text(
-            json.dumps({"schema_version": 1, "status": "failed"}) + "\n"
-        )
+        (root / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}) + "\n")
         assert _blocked(root)
         assert sorted(entry.name for entry in root.iterdir()) == [
             "execution-events.jsonl",
@@ -188,11 +182,7 @@ def test_scope_tracks_each_directory_separately(tmp_path) -> None:
             ownership.descriptor_for(first),
             ownership.descriptor_for(second),
         )
-        assert (
-            held_first is not None
-            and held_second is not None
-            and held_first != held_second
-        )
+        assert held_first is not None and held_second is not None and held_first != held_second
         assert os.fstat(held_first).st_ino == os.stat(first).st_ino
 
 
@@ -222,9 +212,7 @@ def test_variable_without_the_locked_descriptor_grants_nothing(tmp_path) -> None
         prepare_output_directory(root, overwrite=False)
         descriptor = ownership.descriptor_for(root)
         # Same variable, but the descriptor was not passed: no exemption.
-        with _Holder(
-            root, env=_env(**{OUTPUT_LOCK_FD_ENVIRONMENT: str(descriptor)})
-        ) as stranger:
+        with _Holder(root, env=_env(**{OUTPUT_LOCK_FD_ENVIRONMENT: str(descriptor)})) as stranger:
             assert stranger.state.startswith("refused")
 
 
@@ -260,9 +248,7 @@ def test_lock_adds_no_file_to_the_directory(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("argv", [[], ["--help"]])
-def test_cli_main_closes_an_inherited_descriptor_it_never_used(
-    tmp_path, monkeypatch, argv
-) -> None:
+def test_cli_main_closes_an_inherited_descriptor_it_never_used(tmp_path, monkeypatch, argv) -> None:
     import aisim.main as cli
 
     root = tmp_path / "out"
