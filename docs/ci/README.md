@@ -210,6 +210,9 @@ on both main and PR refs. Main seeds its RC bundle under `preview/` in that test
 repository; PR producers use their verified `pr/<number>/` namespace. This
 enables trusted-main reuse without giving PR jobs access to official release
 storage. Other product/release wheel handoffs keep their existing environments.
+The `pr_number` input comes from Full CI's verified target validation; a nonempty
+value selects `pr` upload scope and enables discovery of that exact admitted PR
+head alongside trusted main preview producers.
 
 The Dynamo profile runs in the existing NVIDIA-connected AMD64 pool and CI job
 image because GitHub-hosted runners cannot resolve NVIDIA Artifactory. It checks

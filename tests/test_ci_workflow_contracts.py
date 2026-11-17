@@ -1107,6 +1107,39 @@ def test_main_rc_producers_share_test_storage_with_pr_consumers():
     assert commands.index("apt-get install") < commands.index("readme_rc_wheels.py prepare")
 
 
+@pytest.mark.parametrize(
+    "producer",
+    [
+        {"run-id": "", "scope": "", "pr-number": ""},
+        {"run-id": "10", "scope": "preview", "pr-number": ""},
+        {"run-id": "11", "scope": "pr", "pr-number": "42"},
+    ],
+    ids=["cold", "trusted-main", "exact-pr"],
+)
+def test_rc_prepare_cli_outputs_reach_workflow_restore_inputs(tmp_path, monkeypatch, producer):
+    expected = {"verified": "build identity"}
+    monkeypatch.setattr(rc_wheels, "identity", lambda: expected)
+    monkeypatch.setattr(rc_wheels, "find_producer", lambda name, env: producer)
+    output = tmp_path / "github-output"
+    directory = tmp_path / "wheels"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setattr(sys, "argv", ["readme_rc_wheels.py", "prepare", "--directory", str(directory)])
+    rc_wheels.main()
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values == {"name": rc_wheels.handoff_name(expected), **producer}
+    assert json.loads((directory / "rc-build-inputs.json").read_text()) == expected
+
+    job = _workflow("readme-checks.yml")["jobs"]["commands"]
+    assert job["env"]["RC_PR_NUMBER"] == "${{ inputs.pr_number }}"
+    restore = next(step for step in job["steps"] if step.get("name") == "Restore verified pinned Dynamo RC wheels")
+    inputs = {}
+    for name in ("name", "run-id", "scope", "pr-number"):
+        binding = re.fullmatch(r"\$\{\{ steps\.rc-wheels\.outputs\.([^ ]+) \}\}", restore["with"][name])
+        assert binding is not None, f"restore input {name} must consume the RC prepare outputs"
+        inputs[name] = values[binding[1]]
+    assert inputs == {"name": rc_wheels.handoff_name(expected), **producer}
+
+
 def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path):
     expected = {"pinned": "build inputs"}
     (tmp_path / "rc-build-inputs.json").write_text(json.dumps(expected))
