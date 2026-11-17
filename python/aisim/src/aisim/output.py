@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
 import stat
 import sys
@@ -110,9 +112,9 @@ def _unfinished_run_leftovers(root: Path) -> dict[str, _Fingerprint] | None:
 def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> None:
     """Remove the fingerprinted leftovers, stopping at the first file that changed.
 
-    Each file is checked again just before it is removed, and the runtime report
-    goes last, so a directory another process starts using keeps its evidence.
-    No output-directory lock exists yet; see the PR notes on the remaining race.
+    Runs under the output-directory lock. Each file is still checked again just
+    before it is removed, and the runtime report goes last, so a process that
+    writes without the lock (an older AISim, or anything else) keeps its evidence.
     """
 
     for name in sorted(leftovers, key=lambda item: item == _RUNTIME_REPORT):
@@ -134,6 +136,59 @@ def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> Non
         raise ValueError(f"output directory {root} changed while AISim was preparing it; choose a new --output-dir")
 
 
+# One AISim run owns an output directory at a time. The lock is an advisory
+# flock on the directory itself, so it adds no file to the directory. It is
+# taken before the directory is inspected or cleaned and held until the process
+# exits, which covers every later report write. The supervisor records the
+# directory it holds here so its worker process, which writes the results under
+# the same lock, does not try to take it a second time.
+OUTPUT_LOCK_ENVIRONMENT = "AISIM_OUTPUT_DIR_LOCK"
+_HELD_LOCKS: dict[str, int] = {}
+
+
+def _lock_key(root: Path) -> str:
+    return os.path.realpath(root)
+
+
+def lock_output_directory(root: Path) -> None:
+    """Take the output-directory lock for the rest of this process.
+
+    Re-entrant within a process, and a no-op in a worker whose parent AISim
+    process already holds the same directory. Fails fast when another run holds it.
+    """
+
+    key = _lock_key(root)
+    if key in _HELD_LOCKS or os.environ.get(OUTPUT_LOCK_ENVIRONMENT) == key:
+        return
+    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError(f"output path {root} is not a directory")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError(
+                f"another AISim run is using output directory {root}; "
+                "wait for it to finish or choose a different --output-dir"
+            ) from exc
+    except BaseException:
+        os.close(descriptor)
+        raise
+    _HELD_LOCKS[key] = descriptor
+    os.environ[OUTPUT_LOCK_ENVIRONMENT] = key
+
+
+def release_output_directory_lock(root: str | Path) -> None:
+    """Release a lock taken by this process (tests and long-lived callers)."""
+
+    key = _lock_key(Path(root))
+    descriptor = _HELD_LOCKS.pop(key, None)
+    if descriptor is not None:
+        os.close(descriptor)
+        if os.environ.get(OUTPUT_LOCK_ENVIRONMENT) == key:
+            del os.environ[OUTPUT_LOCK_ENVIRONMENT]
+
+
 def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
     """Create an output directory without deleting unrelated user files.
 
@@ -147,7 +202,10 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
     root = Path(path)
     if root.exists() and not root.is_dir():
         raise ValueError(f"output path {root} exists and is not a directory")
-    if root.exists() and any(root.iterdir()) and not overwrite:
+    root.mkdir(parents=True, exist_ok=True)
+    # Lock before inspecting, so no other run can write between the check and the cleanup.
+    lock_output_directory(root)
+    if any(root.iterdir()) and not overwrite:
         leftovers = _unfinished_run_leftovers(root)
         if leftovers is None:
             raise ValueError(_non_empty_message(root))
