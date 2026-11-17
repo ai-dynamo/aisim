@@ -830,14 +830,16 @@ impl GroupedPrefixCoordinator {
                         prompt_tokens,
                         rules.checkpoint_position(prompt_tokens),
                     );
-                    // A fine-grained split can publish the producer's tail
-                    // inside its final logical block before prefill finishes.
+                    // A split at the last cacheable stop or a fine-grained
+                    // split can publish the producer's tail inside its final
+                    // logical block before prefill finishes.
                     // The following write preserves that state and takes a
                     // new running block (v0.32 single:1867-1900). Cover both
                     // copies, reusing any hit/checkpoint allowance already
                     // counted instead of adding a third state block.
                     let tail = rules.partial_tail(prompt_tokens);
-                    let producer_copy = rules.fine_grained()
+                    let producer_copy = (rules.fine_grained()
+                        || rules.last_cacheable_stop(prompt_tokens) == tail)
                         && hit.tokens < tail
                         && tail < prompt_tokens
                         && !tail.is_multiple_of(block);
@@ -2423,16 +2425,30 @@ mod tests {
                 if checkpoint && version == VllmRuleVersion::V0_31_0 {
                     continue;
                 }
-                let groups = [
-                    attention("full", 64, None),
-                    state("s", 64, true, checkpoint),
-                ];
                 // v0.31's hash-aligned prompt has no intermediate tail.
                 // v0.32 splits one hash earlier. Block-sized hashes and
                 // prompts with no earlier positive hash need no producer copy.
-                for (hash, prompt, v31_blocks, v32_blocks) in
-                    [(4, 4, 2, 2), (4, 48, 2, 3), (4, 64, 2, 3), (64, 50, 2, 2)]
-                {
+                // Attention blocks at the hash size also split at the tail,
+                // through last_cacheable_stop rather than fine_grained.
+                for (attention_block, hash, prompt, v31_blocks, v32_blocks) in [
+                    (64, 4, 4, 2, 2),
+                    (64, 4, 48, 2, 3),
+                    (64, 4, 64, 2, 3),
+                    (64, 64, 50, 2, 2),
+                    (4, 4, 4, 2, 2),
+                    (4, 4, 48, 13, 14),
+                    (4, 4, 50, 15, 15),
+                    (4, 4, 64, 17, 18),
+                ] {
+                    // Checkpoint mode requires state blocks to be the
+                    // smallest cacheable blocks.
+                    if checkpoint && attention_block < 64 {
+                        continue;
+                    }
+                    let groups = [
+                        attention("full", attention_block, None),
+                        state("s", 64, true, checkpoint),
+                    ];
                     let expected = match version {
                         VllmRuleVersion::V0_31_0 => v31_blocks,
                         VllmRuleVersion::V0_32_0 => v32_blocks,
@@ -2446,7 +2462,7 @@ mod tests {
                     assert_eq!(
                         coordinator.admission_blocks(pool, &hit, prompt),
                         expected as usize,
-                        "{version:?}, checkpoint={checkpoint}, hash={hash}, prompt={prompt}"
+                        "{version:?}, checkpoint={checkpoint}, attention_block={attention_block}, hash={hash}, prompt={prompt}"
                     );
                     let mut block_lease = coordinator.new_lease();
                     prefill(
