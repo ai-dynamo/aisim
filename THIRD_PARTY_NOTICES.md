@@ -289,7 +289,7 @@ Pinned upstream collection and preserved-file SHA-256:
 `5fb7a61a53f71f476169fa8e2419d3073c8d7e96206d8986b7d4fbb0f11fbcdd`
 
 AISim-modified root overlay SHA-256:
-`b0335ad47b5317ecd3366bb996dd578c12abadbcd155b11f8314df9fc6118b35`
+`c2c927f49fc270c4ceb754b7e1cbca7e42ea4ecbb7247fce3c560742ccc1e89d`
 
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
