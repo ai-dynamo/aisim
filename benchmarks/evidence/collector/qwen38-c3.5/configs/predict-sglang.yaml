@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default `aisimulate predict` workflow for Qwen3.8-Flash-Next on H200,
+# SGLang 0.5.21. Topology matches the C2 weight-load validation:
+# TP8 / MoE expert-parallel 8 (moe_tp 1), no speculative decoding.
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load: {type: concurrency, concurrency: 8}
+  stop: {requests: 64}
+
+engine:
+  mode: aggregated
+  model: Qwen/Qwen3.8-Flash-Next
+  hardware: h200_sxm
+  backend: sglang
+  backend_version: "0.5.21"
+  context_length: 4096
+  workers:
+    aggregated:
+      parallelism: {tensor: 8, pipeline: 1, attention_data: 1, moe_tensor: 1, moe_expert: 8}
+      scheduler: {max_batched_tokens: 8192, max_sequences: 8}
+      kv_cache:
+        block_size: 64
+        prefix_caching: false
+        capacity: {type: default, memory_fraction: 0.9}

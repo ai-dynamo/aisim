@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Supplementary check for the collector's single cold-start coordinate
+# (batch=1, kv=0, prefill=1). It does not modify the published parquet; it only
+# tests whether the 225.6 ms BF16 / 211.8 ms FP8 value is first-touch.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qwen38-tiny-prefill
+  namespace: aisimulate-qwen38
+  labels:
+    app.kubernetes.io/part-of: aisimulate
+    app.kubernetes.io/component: cold-start-probe
+spec:
+  restartPolicy: Never
+  nodeName: psap-de-h200-cluster-6mgmp-gpu-h200-7zgjh
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: probe
+      image: docker.io/vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3
+      command: [/bin/bash, /harness/probe.sh]
+      env:
+        - {name: HF_HUB_CACHE, value: /hf-cache/hub}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: TRANSFORMERS_OFFLINE, value: "1"}
+        - {name: HF_HOME, value: /scratch/hf-home}
+        - {name: HOME, value: /scratch}
+        - {name: TMPDIR, value: /scratch}
+        - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+        - {name: VLLM_LOGGING_LEVEL, value: INFO}
+        - {name: NCCL_DEBUG, value: WARN}
+        - {name: VLLM_CACHE_ROOT, value: /scratch/vllm-cache}
+        - {name: XDG_CACHE_HOME, value: /scratch/.cache}
+        - {name: TRITON_CACHE_DIR, value: /scratch/triton-cache}
+        - {name: TORCHINDUCTOR_CACHE_DIR, value: /scratch/torch-cache}
+        - {name: TORCH_EXTENSIONS_DIR, value: /scratch/torch-ext}
+      resources:
+        requests:
+          cpu: "16"
+          memory: 64Gi
+          ephemeral-storage: 8Gi
+        limits:
+          cpu: "32"
+          memory: 128Gi
+          ephemeral-storage: 24Gi
+          nvidia.com/gpu: 8
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: model-cache
+          mountPath: /hf-cache
+          readOnly: true
+        - name: harness
+          mountPath: /harness
+          readOnly: true
+        - name: scratch
+          mountPath: /scratch
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: qwen38-model-cache
+        readOnly: true
+    - name: harness
+      configMap:
+        name: qwen38-tiny-prefill
+        defaultMode: 493
+    - name: scratch
+      emptyDir:
+        sizeLimit: 24Gi
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi

@@ -1,0 +1,61 @@
+start 08:57:59Z
+healthy 09:06:20Z
+== cold: first requests after readiness ==
+cold-1 n=1 ttft=285.6
+cold-4 n=4 ttft=1214.1
+== warmups: 3 x prefill=64 ==
+== warm: prefill=1 x20, neighbours x5 ==
+warm-1 n=1 ttft=59.7
+warm-1 n=1 ttft=57.9
+warm-1 n=1 ttft=57.3
+warm-1 n=1 ttft=55.9
+warm-1 n=1 ttft=60.7
+warm-1 n=1 ttft=56.6
+warm-1 n=1 ttft=57.0
+warm-1 n=1 ttft=56.7
+warm-1 n=1 ttft=61.4
+warm-1 n=1 ttft=65.6
+warm-1 n=1 ttft=63.6
+warm-1 n=1 ttft=58.3
+warm-1 n=1 ttft=56.8
+warm-1 n=1 ttft=60.8
+warm-1 n=1 ttft=57.3
+warm-1 n=1 ttft=59.5
+warm-1 n=1 ttft=57.9
+warm-1 n=1 ttft=58.3
+warm-1 n=1 ttft=60.5
+warm-1 n=1 ttft=56.7
+warm-4 n=4 ttft=152.5
+warm-4 n=4 ttft=147.6
+warm-4 n=4 ttft=143.8
+warm-4 n=4 ttft=142.6
+warm-4 n=4 ttft=145.5
+warm-8 n=8 ttft=1227.6
+warm-8 n=8 ttft=144.9
+warm-8 n=8 ttft=142.0
+warm-8 n=8 ttft=149.5
+warm-8 n=8 ttft=148.6
+warm-16 n=16 ttft=708.0
+warm-16 n=16 ttft=151.0
+warm-16 n=16 ttft=145.1
+warm-16 n=16 ttft=144.8
+warm-16 n=16 ttft=142.0
+warm-32 n=32 ttft=955.8
+warm-32 n=32 ttft=145.5
+warm-32 n=32 ttft=146.8
+warm-32 n=32 ttft=147.1
+warm-32 n=32 ttft=146.6
+warm-64 n=64 ttft=153.1
+warm-64 n=64 ttft=150.3
+warm-64 n=64 ttft=153.3
+warm-64 n=64 ttft=150.9
+warm-64 n=64 ttft=153.3
+warm-97 n=97 ttft=708.9
+warm-97 n=97 ttft=151.1
+warm-97 n=97 ttft=153.9
+warm-97 n=97 ttft=151.7
+warm-97 n=97 ttft=160.7
+  (Worker_TP3_EP3 pid=1075) INFO 11-03 09:04:29 [model_runner.py:407] Model loading took 43.53 GiB memory and 295.938460 seconds
+  (Worker_TP6_EP6 pid=1078) INFO 11-03 09:04:29 [model_runner.py:407] Model loading took 43.53 GiB memory and 295.914814 seconds
+  (Worker_TP7_EP7 pid=1079) INFO 11-03 09:04:29 [model_runner.py:407] Model loading took 43.53 GiB memory and 295.950643 seconds
+end 09:06:42Z

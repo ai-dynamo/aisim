@@ -1,0 +1,78 @@
+[
+  {
+    "backend": "vllm",
+    "precision": "bfloat16",
+    "model": "Qwen/Qwen3.8-Flash-Next",
+    "backend_version": "0.31.0",
+    "topology": {
+      "tp": 8,
+      "moe_tp_size": 1,
+      "moe_ep_size": 8,
+      "worker_type": "aggregated"
+    },
+    "database_mode": "SILICON",
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "input_tokens": 8192,
+    "prefill_ms": 144.0921,
+    "decode_ms": 5.8499,
+    "status": "ok"
+  },
+  {
+    "backend": "vllm",
+    "precision": "fp8",
+    "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+    "backend_version": "0.31.0",
+    "topology": {
+      "tp": 8,
+      "moe_tp_size": 1,
+      "moe_ep_size": 8,
+      "worker_type": "aggregated"
+    },
+    "database_mode": "SILICON",
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "input_tokens": 8192,
+    "prefill_ms": 144.1256,
+    "decode_ms": 6.1479,
+    "status": "ok"
+  },
+  {
+    "backend": "sglang",
+    "precision": "bfloat16",
+    "model": "Qwen/Qwen3.8-Flash-Next",
+    "backend_version": "0.5.21",
+    "topology": {
+      "tp": 8,
+      "moe_tp_size": 1,
+      "moe_ep_size": 8,
+      "worker_type": "aggregated"
+    },
+    "database_mode": "SILICON",
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "input_tokens": 8192,
+    "prefill_ms": 162.7078,
+    "decode_ms": 5.6064,
+    "status": "ok"
+  },
+  {
+    "backend": "sglang",
+    "precision": "fp8",
+    "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+    "backend_version": "0.5.21",
+    "topology": {
+      "tp": 8,
+      "moe_tp_size": 1,
+      "moe_ep_size": 8,
+      "worker_type": "aggregated"
+    },
+    "database_mode": "SILICON",
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "input_tokens": 8192,
+    "prefill_ms": 160.4421,
+    "decode_ms": 5.5592,
+    "status": "ok"
+  }
+]

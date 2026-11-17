@@ -47,6 +47,7 @@ A cold regression is not usable for offline prediction.
 - [Collector](collector/README.md): operation data, runtime pins, and publication.
 - [Extend the model](extending.md): model structure, native operations, and SOL integration.
 - [DeepSeek-V4.1](models/deepseek-v41.md): model-specific execution and physical memory contracts.
+- [Qwen3.8-Flash-Next](models/qwen38-flash-next.md): QSA module, PLE residency and precision boundaries.
 - [Power](power.md) and [limitations](limitations.md): interpretation and boundaries.
 - API reference: [Python](api/python.md), [Rust](api/rust.md).
 
