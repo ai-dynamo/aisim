@@ -459,13 +459,18 @@ def _hf_hub_cache() -> Path:
 
 def _cached_hf_file(hf_id: str, filename: str, revision: str) -> Path | None:
     """Find ``filename`` for ``hf_id`` at ``revision`` in the local Hugging Face cache."""
+    if ".." in Path(revision).parts or ".." in Path(hf_id).parts or Path(filename).name != filename:
+        return None
     repo = _hf_hub_cache() / f"models--{hf_id.replace('/', '--')}"
     commit = revision
     if not _COMMIT_HASH.fullmatch(revision):
+        # Branch and tag refs may contain slashes; the hub cache stores them as nested files.
         try:
             commit = (repo / "refs" / revision).read_text(encoding="utf-8").strip()
         except OSError:
             return None
+    if not _COMMIT_HASH.fullmatch(commit):
+        return None
     path = repo / "snapshots" / commit / filename
     return path if path.is_file() else None
 
@@ -478,11 +483,30 @@ def _load_cached_hf_json(hf_id: str, filename: str, revision: str) -> dict | Non
     return _load_json_with_infinity(path)
 
 
-def _local_config_hint(hf_id: str, filename: str) -> str:
+def _local_config_hint(hf_id: str, filename: str, revision: str = "main") -> str:
+    pinned = "" if revision == "main" else f" --revision {revision}"
+    at = "" if revision == "main" else f" at revision {revision}"
     return (
-        f"AISim bundles configs only for its supported models. For {hf_id}, pass a local directory "
+        f"AISim bundles configs only for its supported models. For {hf_id}{at}, pass a local directory "
         f"that contains {filename} as the model, or fetch the file into the Hugging Face cache while "
-        f"online with `hf download {hf_id} {filename}`."
+        f"online with `hf download {hf_id} {filename}{pinned}`."
+    )
+
+
+def _is_transient_http_error(error: urllib.error.HTTPError) -> bool:
+    """Rate limits and server errors say nothing about the file; treat them like an outage."""
+    return error.code == 429 or error.code >= 500
+
+
+def _cached_after_network_failure(hf_id: str, filename: str, revision: str, url: str, reason: object) -> dict:
+    cached = _load_cached_hf_json(hf_id, filename, revision)
+    if cached is not None:
+        logger.warning("Could not reach Hugging Face for %s's %s (%s); using the cached copy", hf_id, filename, reason)
+        return cached
+    raise HuggingFaceDownloadError(
+        f"Cannot load {hf_id}'s {filename}: the download from Hugging Face failed ({reason}; URL: {url}) and "
+        f"the file is not in the local Hugging Face cache. {_local_config_hint(hf_id, filename, revision)} "
+        "Set HF_HUB_OFFLINE=1 to use only local files without trying the network."
     )
 
 
@@ -492,7 +516,8 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
     Offline mode (``HF_HUB_OFFLINE`` or ``TRANSFORMERS_OFFLINE``) reads only the
     local Hugging Face cache and never opens a connection. Online, a pinned commit
     is read from the cache when present; other revisions are fetched so a moved
-    branch is honored, and the cache is the fallback when the network fails.
+    branch is honored. The cache is the fallback when the network fails or Hugging
+    Face answers with a rate limit or server error (HTTP 429 or 5xx).
     """
     offline = _hf_offline_variable()
     if offline is not None or _COMMIT_HASH.fullmatch(revision):
@@ -505,7 +530,8 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
             return None
         raise HuggingFaceDownloadError(
             f"Cannot load {hf_id}'s {filename}: Hugging Face offline mode is on ({offline} is set) and the "
-            f"file is not in the local Hugging Face cache ({_hf_hub_cache()}). {_local_config_hint(hf_id, filename)}"
+            f"file is not in the local Hugging Face cache ({_hf_hub_cache()}). "
+            f"{_local_config_hint(hf_id, filename, revision)}"
         )
     url = f"https://huggingface.co/{hf_id}/raw/{quote(revision, safe='')}/{filename}"
     try:
@@ -515,6 +541,8 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
     except urllib.error.HTTPError as e:
         if e.code == 404 and not raise_on_404:
             return None
+        if _is_transient_http_error(e):
+            return _cached_after_network_failure(hf_id, filename, revision, url, f"HTTP error {e.code}: {e.reason}")
         token_path = Path.home() / ".cache" / "huggingface" / "token"
         raise HuggingFaceDownloadError(
             f"Failed to download {hf_id}'s {filename} from HuggingFace: "
@@ -525,16 +553,10 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
             f"(3) run `huggingface-cli login` (token stored at {token_path})."
         ) from e
     except (urllib.error.URLError, OSError) as e:
-        cached = _load_cached_hf_json(hf_id, filename, revision)
-        if cached is not None:
-            logger.warning("Could not reach Hugging Face for %s's %s (%s); using the cached copy", hf_id, filename, e)
-            return cached
-        reason = getattr(e, "reason", None) or e
-        raise HuggingFaceDownloadError(
-            f"Cannot load {hf_id}'s {filename}: the download from Hugging Face failed ({reason}) and the file is "
-            f"not in the local Hugging Face cache. {_local_config_hint(hf_id, filename)} "
-            "Set HF_HUB_OFFLINE=1 to use only local files without trying the network."
-        ) from e
+        try:
+            return _cached_after_network_failure(hf_id, filename, revision, url, getattr(e, "reason", None) or e)
+        except HuggingFaceDownloadError as missing:
+            raise missing from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 

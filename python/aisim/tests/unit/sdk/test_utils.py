@@ -10,6 +10,7 @@ Tests HuggingFace config parsing and model config retrieval.
 import io
 import json
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -67,13 +68,23 @@ def hf_cache(monkeypatch, tmp_path):
     return cache
 
 
-def _cache_file(cache, hf_id, filename, payload, *, ref="main", commit="c" * 40):
+def _cache_file(cache, hf_id, filename, payload, *, ref="main", commit="c" * 40, symlink=True):
+    """Lay out a file the way huggingface_hub does: a blob, a snapshot symlink to it, and an optional ref."""
     repo = cache / f"models--{hf_id.replace('/', '--')}"
     snapshot = repo / "snapshots" / commit
     snapshot.mkdir(parents=True, exist_ok=True)
-    (snapshot / filename).write_text(json.dumps(payload))
-    (repo / "refs").mkdir(exist_ok=True)
-    (repo / "refs" / ref).write_text(commit)
+    if symlink:
+        blobs = repo / "blobs"
+        blobs.mkdir(exist_ok=True)
+        blob = blobs / f"{abs(hash((hf_id, filename, commit))):x}"
+        blob.write_text(json.dumps(payload))
+        (snapshot / filename).symlink_to(os.path.relpath(blob, snapshot))
+    else:
+        (snapshot / filename).write_text(json.dumps(payload))
+    if ref is not None:
+        ref_path = repo / "refs" / ref
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        ref_path.write_text(commit)
 
 
 @pytest.mark.parametrize("variable", ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"])
@@ -114,7 +125,8 @@ def test_offline_value_zero_still_downloads(monkeypatch, hf_cache):
 
 def test_pinned_commit_is_read_from_cache_before_network(hf_cache):
     commit = "d" * 40
-    _cache_file(hf_cache, "org/model", "config.json", {"pinned": True}, commit=commit)
+    _cache_file(hf_cache, "org/model", "config.json", {"pinned": True}, commit=commit, ref=None)
+    assert not (hf_cache / "models--org--model" / "refs").exists()
 
     assert utils._download_hf_json("org/model", "config.json", revision=commit) == {"pinned": True}
 
@@ -147,6 +159,123 @@ def test_network_failure_without_cache_explains_the_options(monkeypatch, hf_cach
     assert "the download from Hugging Face failed" in message
     assert "AISim bundles configs only for its supported models" in message
     assert "HF_HUB_OFFLINE=1" in message
+
+
+def test_cache_symlinks_resolve_to_blobs(monkeypatch, hf_cache):
+    _cache_file(hf_cache, "org/model", "config.json", {"linked": True}, symlink=True)
+    snapshot_file = hf_cache / "models--org--model" / "snapshots" / ("c" * 40) / "config.json"
+    assert snapshot_file.is_symlink()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    assert utils._download_hf_json("org/model", "config.json") == {"linked": True}
+
+
+def test_offline_mode_reads_a_ref_containing_a_slash(monkeypatch, hf_cache):
+    _cache_file(hf_cache, "org/model", "config.json", {"branch": "release/v1"}, ref="release/v1", commit="f" * 40)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    assert utils._download_hf_json("org/model", "config.json", revision="release/v1") == {"branch": "release/v1"}
+    with pytest.raises(utils.HuggingFaceDownloadError):
+        utils._download_hf_json("org/model", "config.json", revision="release/v2")
+
+
+@pytest.mark.parametrize("revision", ["../../escape", "main/../../escape"])
+def test_cache_lookup_rejects_path_traversal(monkeypatch, hf_cache, revision):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    with pytest.raises(utils.HuggingFaceDownloadError):
+        utils._download_hf_json("org/model", "config.json", revision=revision)
+
+
+@pytest.mark.parametrize(
+    "settings,expected",
+    [
+        ({"HF_HUB_CACHE": "a", "HUGGINGFACE_HUB_CACHE": "b", "HF_HOME": "c", "XDG_CACHE_HOME": "d"}, "a"),
+        ({"HUGGINGFACE_HUB_CACHE": "b", "HF_HOME": "c", "XDG_CACHE_HOME": "d"}, "b"),
+        ({"HF_HOME": "c", "XDG_CACHE_HOME": "d"}, "c/hub"),
+        ({"XDG_CACHE_HOME": "d"}, "d/huggingface/hub"),
+    ],
+)
+def test_hub_cache_location_follows_huggingface_hub_precedence(monkeypatch, tmp_path, settings, expected):
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, str(tmp_path / value))
+
+    assert utils._hf_hub_cache() == tmp_path / expected
+
+
+def _http_error(code, reason):
+    return utils.urllib.error.HTTPError("https://huggingface.co/x", code, reason, {}, None)
+
+
+@pytest.mark.parametrize("code,reason", [(429, "Too Many Requests"), (500, "Server Error"), (503, "Unavailable")])
+def test_transient_http_errors_fall_back_to_cache(monkeypatch, hf_cache, code, reason):
+    _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
+
+    def failing(request, *, timeout):
+        raise _http_error(code, reason)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", failing)
+    assert utils._download_hf_json("org/model", "config.json") == {"cached": True}
+
+
+@pytest.mark.parametrize("code", [429, 502])
+def test_transient_http_errors_without_cache_do_not_suggest_auth(monkeypatch, hf_cache, code):
+    def failing(request, *, timeout):
+        raise _http_error(code, "busy")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", failing)
+    with pytest.raises(utils.HuggingFaceDownloadError) as error:
+        utils._download_hf_json("org/model", "config.json")
+
+    message = str(error.value)
+    assert f"HTTP error {code}" in message
+    assert "not in the local Hugging Face cache" in message
+    assert "HF_TOKEN" not in message
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_auth_errors_keep_the_authentication_advice(monkeypatch, hf_cache, code):
+    def failing(request, *, timeout):
+        raise _http_error(code, "denied")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", failing)
+    with pytest.raises(utils.HuggingFaceDownloadError, match="HF_TOKEN"):
+        utils._download_hf_json("org/model", "config.json")
+
+
+def test_missing_optional_file_still_returns_none(monkeypatch, hf_cache):
+    def failing(request, *, timeout):
+        raise _http_error(404, "Not Found")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", failing)
+    assert utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=False) is None
+
+
+@pytest.mark.parametrize("offline", [True, False])
+def test_recovery_command_names_the_pinned_revision(monkeypatch, hf_cache, offline):
+    commit = "b" * 40
+    if offline:
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    else:
+
+        def unreachable(request, *, timeout):
+            raise utils.urllib.error.URLError("down")
+
+        monkeypatch.setattr(utils.urllib.request, "urlopen", unreachable)
+
+    with pytest.raises(utils.HuggingFaceDownloadError) as error:
+        utils._download_hf_json("org/model", "config.json", revision=commit)
+
+    assert f"hf download org/model config.json --revision {commit}" in str(error.value)
+    assert f"at revision {commit}" in str(error.value)
+
+
+def test_recovery_command_omits_main_revision(monkeypatch, hf_cache):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    with pytest.raises(utils.HuggingFaceDownloadError) as error:
+        utils._download_hf_json("org/model", "config.json")
+    assert "`hf download org/model config.json`" in str(error.value)
 
 
 def test_offline_mode_reaches_the_model_config_loader(monkeypatch, hf_cache):
