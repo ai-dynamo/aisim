@@ -18,6 +18,7 @@
 //! embedded [`crate::AicEngineBuilder`] live in [`crate::py`]. The agg sweep is
 //! orchestrated in Python — there is no Rust `run_agg`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -309,15 +310,19 @@ impl PerOpSlotFold {
     }
 
     fn add(&mut self, slot: usize, r: PerformanceResult) {
-        let source = r.source.as_str();
+        self.add_value(slot, (r.latency_ms, r.energy_wms, r.source.as_str()));
+    }
+
+    /// Fold one value into `slot`.
+    fn add_value(&mut self, slot: usize, (latency_ms, energy_wms, source): PerOpSlotValue) {
         if let Some(entry) = self.entries.get_mut(slot) {
-            entry.0 += r.latency_ms;
-            entry.1 += r.energy_wms;
+            entry.0 += latency_ms;
+            entry.1 += energy_wms;
             if entry.2 != source {
                 entry.2 = "mixed";
             }
         } else if slot == self.entries.len() {
-            self.entries.push((r.latency_ms, r.energy_wms, source));
+            self.entries.push((latency_ms, energy_wms, source));
         } else {
             self.misordered = true;
         }
@@ -653,6 +658,39 @@ impl OperationObserver {
                 op.query(db, &runtime())
             }),
             Self::Values(fold) => fold.add(slot, op, result, divisor),
+        }
+    }
+
+    /// [`Self::add`] of a result its pass's [`QueryMemo`] may have lent. An
+    /// undivided slot fold reads it in place; anything else takes it.
+    fn add_lent(
+        &mut self,
+        inference_phase: &'static str,
+        slot: Option<usize>,
+        op: &Op,
+        result: Cow<'_, PerformanceResult>,
+        divisor: f64,
+        runtime: impl FnOnce() -> RuntimeContext,
+    ) {
+        match (&mut *self, slot) {
+            (Self::Latency, _) => {}
+            (
+                Self::Values(RankValueFold {
+                    slots: Some(slots), ..
+                }),
+                Some(slot),
+            ) if divisor == 1.0 => slots.add_value(
+                slot,
+                (result.latency_ms, result.energy_wms, result.source.as_str()),
+            ),
+            _ => self.add(
+                inference_phase,
+                slot,
+                op,
+                result.into_owned(),
+                divisor,
+                runtime,
+            ),
         }
     }
 }
@@ -1706,7 +1744,7 @@ impl Engine {
             runtime.prefix,
             runtime.seq_imbalance_correction_scale,
             ContextOpFilter::All,
-            |_, op, result| on_op(op, result),
+            |_, op, result| on_op(op, result.into_owned()),
         )
     }
 
@@ -1782,6 +1820,7 @@ impl Engine {
                 runtime.gen_seq_imbalance_correction_scale,
                 false,
                 |index, op, r| {
+                    let r = r.into_owned();
                     let slot = plan.name_slot(index);
                     if let Some((_, entry)) = &mut step_fold[slot] {
                         entry.latency_ms += r.latency_ms;
@@ -2946,7 +2985,7 @@ impl Engine {
                 runtime.prefix,
                 runtime.seq_imbalance_correction_scale,
                 ContextOpFilter::All,
-                |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r),
+                |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r.into_owned()),
             )?;
         }
         if matches!(mode, StaticMode::Generation | StaticMode::Both) {
@@ -3849,7 +3888,7 @@ impl Engine {
                     } else {
                         ("generation", plan.generation_slot[index])
                     };
-                    operations.add(phase, slot, op, result, divisor, || *runtime);
+                    operations.add_lent(phase, slot, op, result, divisor, || *runtime);
                 },
             );
         }
@@ -3886,7 +3925,7 @@ impl Engine {
                         ContextOpFilter::All,
                         |index, op, result| {
                             let slot = Some(self.context_plan.name_slot(index));
-                            operations.add("context", slot, op, result, 1.0, || {
+                            operations.add_lent("context", slot, op, result, 1.0, || {
                                 context_op_runtime(
                                     op,
                                     n_prefill,
@@ -3919,7 +3958,7 @@ impl Engine {
                 false,
                 |index, op, result| {
                     let slot = Some(self.generation_plan.name_slot(index));
-                    operations.add("generation", slot, op, result, 1.0, || runtime);
+                    operations.add_lent("generation", slot, op, result, 1.0, || runtime);
                 },
             )?;
         }
@@ -4865,6 +4904,23 @@ pub(crate) mod tests {
         memo.query(1, || Ok(PerformanceResult::new(1.0, Source::Silicon)))
             .unwrap();
         let _ = memo.query(4, || Ok(PerformanceResult::new(2.0, Source::Silicon)));
+    }
+
+    /// A query slot lends its one result to every op of the slot; an op
+    /// without a slot owns its own.
+    #[test]
+    fn a_shared_query_lends_the_result_of_its_slot() {
+        use crate::operators::base::Source;
+        let ops = glm_layer_ops(false);
+        let plan = OpListPlan::new(&ops);
+        let mut memo = QueryMemo::new(Some(&plan), &ops);
+        let price = || Ok(PerformanceResult::new(1.0, Source::Silicon));
+        // KDA attention of layers 0 and 1 (indices 1 and 4) share a slot;
+        // the generic op at index 5 has none.
+        for index in [1, 4] {
+            assert!(matches!(memo.query(index, price), Ok(Cow::Borrowed(_))));
+        }
+        assert!(matches!(memo.query(5, price), Ok(Cow::Owned(_))));
     }
 
     #[test]

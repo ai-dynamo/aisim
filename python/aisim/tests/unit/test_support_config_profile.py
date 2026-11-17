@@ -1768,6 +1768,19 @@ def test_kv_cache_type_preserves_known_precision_and_unresolved_metadata(tmp_pat
         assert draft.resolved["kv_bytes_per_token"] == 32
 
 
+@pytest.mark.parametrize("scheme", ["NVFP4", {"num_bits": 4, "type": "float"}, "sidecar"])
+def test_modelopt_nvfp4_kv_cache_uses_its_width(tmp_path, scheme):
+    if scheme == "sidecar":
+        _sidecar(tmp_path, quantization={"quant_algo": "NVFP4", "kv_cache_quant_algo": "NVFP4"})
+        config = _config(tmp_path)
+    else:
+        quant = {"quant_method": "modelopt", "quant_algo": "NVFP4", "kv_cache_scheme": scheme}
+        config = _config(tmp_path, quantization_config=quant)
+    draft = derive_profile(config, _request())
+    assert draft.resolved["kv_cache_dtype"] == "nvfp4"
+    assert draft.resolved["kv_bytes_per_token"] == 18  # 32 KV elements at 9/16 byte
+
+
 def test_weight_quantization_does_not_select_runtime_attention_or_kv_dtype(tmp_path):
     config = _config(tmp_path, quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]})
     draft = derive_profile(config, _request())
