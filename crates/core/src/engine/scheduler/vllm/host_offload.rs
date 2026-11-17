@@ -1462,7 +1462,7 @@ impl VllmHostOffloadAdapter {
         if dependencies.is_empty() {
             return;
         }
-        let tier = self.host.lock();
+        let tier = self.host.read();
         for dependency in dependencies {
             let store = transfer_id(*dependency);
             match tier.transfer_deadline(store) {
@@ -1483,7 +1483,7 @@ impl VllmHostOffloadAdapter {
     pub(super) fn preempt_request(&mut self, request: &mut VllmHostRequestState) {
         request.restore_rounds.reset();
         let deadline = {
-            let tier = self.host.lock();
+            let tier = self.host.read();
             if self.rules.preemption_waits_for_all {
                 tier.last_deadline(self.host.id())
             } else {
@@ -1545,8 +1545,7 @@ impl VllmHostOffloadAdapter {
 
     pub(super) fn next_deadline(&self) -> Option<f64> {
         self.host
-            .lock()
-            .next_deadline(self.host.id())
+            .next_deadline()
             .into_iter()
             .chain(self.g3.as_ref().and_then(|g3| g3.next_deadline()))
             .chain(self.kvcr.as_ref().and_then(|kvcr| kvcr.next_deadline()))
@@ -1554,7 +1553,7 @@ impl VllmHostOffloadAdapter {
     }
 
     pub(super) fn current_time_ms(&self) -> f64 {
-        self.host.lock().current_time_ms()
+        self.host.read().current_time_ms()
     }
 
     /// Stores a request prepared when it left between passes. Only the 0.32
@@ -1562,11 +1561,11 @@ impl VllmHostOffloadAdapter {
     /// next step, and `Scheduler.has_requests` keeps the engine stepping until
     /// it has, so an engine boundary submits them.
     pub(super) fn has_unsubmitted_stores(&self) -> bool {
-        self.rules.stores_at_finish && self.host.lock().has_prepared_stores(self.host.id())
+        self.rules.stores_at_finish && self.host.read().has_prepared_stores(self.host.id())
     }
 
     pub(super) fn has_work(&self) -> bool {
-        self.host.lock().has_pending_work(self.host.id())
+        self.host.read().has_pending_work(self.host.id())
             || self.g3.as_ref().is_some_and(|g3| g3.has_work())
             || self.kvcr.as_ref().is_some_and(|kvcr| kvcr.has_work())
     }
