@@ -378,6 +378,31 @@ fn an_mtp_restore_keeps_its_loaded_prefix_on_a_prefill_worker_as_on_an_aggregate
 }
 
 #[test]
+fn a_prefill_worker_restores_a_window_from_its_own_pool() {
+    // Prefill and decode workers keep `connector` at its default, and a
+    // rank-local pool with a sliding window still runs the v0.32 rules: the
+    // prompt's cohort is stored, survives G1's eviction, and restores with
+    // its checkpoint after the worker released the first request.
+    let role = || {
+        let mut rank = rank(json!({"num_host_blocks": 64}));
+        rank["num_gpu_blocks"] = json!(12);
+        rank["state_cache"] = json!({
+            "bytes_per_request": 2_000_000, "sliding_window": {"lookahead_tokens": 0},
+        });
+        json!({"rank": rank})
+    };
+    let engine = json!({"rank": rank(Value::Null), "prefill": role(), "decode": role()});
+    let requests = trace(&[
+        ("a0", 0.0, 1, 12, 1),
+        ("evict", 40.0, 101, 40, 1),
+        ("a1", 200.0, 1, 13, 1),
+    ]);
+    let report = run(disaggregated(1), engine, requests).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 3);
+    assert_eq!(host_reuse(&report), [0, 12, 0].map(Some));
+}
+
+#[test]
 fn concurrent_state_restores_wait_their_turn_and_keep_their_checkpoints() {
     // Two prompts restore from G2 while G1 has room for one of them. The
     // second load starts only when G1 can also hold its checkpoint, and a
