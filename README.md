@@ -359,6 +359,22 @@ replace validation on the target hardware. Benchmark shortlisted
 configurations on a real deployment before making production capacity or SLA
 decisions.
 
+## Agent skills
+
+Product-owned agent skills live in [`skills/`](skills/) for installation with
+Agent Skills-compatible tooling. They guide these workflows:
+
+| Skill | Example request |
+| --- | --- |
+| [Explain results](skills/aisim-explain-results/SKILL.md) | Explain this prediction's latency, throughput and queueing bottlenecks. |
+| [Replay a workload](skills/aisim-replay-workload/SKILL.md) | Replay this request trace with its original timing and session structure. |
+| [Validate benchmarks](skills/aisim-validate-benchmarks/SKILL.md) | Compare this serving benchmark with the matching AISim prediction. |
+| [FPM self-service](skills/aisim-fpm-self-service/SKILL.md) | Onboard this model and runtime for forward-pass modeling on my target hardware. |
+
+Use a skill with the documentation and CLI matching your installed AISim
+version. These source skills become NVIDIA-verified catalog entries only after
+NVSkills CI qualification and catalog registration.
+
 ## SDKs
 
 Use the focused SDK documentation instead of treating CLI internals as public
