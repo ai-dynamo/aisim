@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import fcntl
 import json
 import os
@@ -138,29 +139,66 @@ def _clear_unfinished_run(root: Path, leftovers: dict[str, _Fingerprint]) -> Non
 
 # One AISim run owns an output directory at a time. The lock is an advisory
 # flock on the directory itself, so it adds no file to the directory. It is
-# taken before the directory is inspected or cleaned and held until the process
-# exits, which covers every later report write. The supervisor records the
-# directory it holds here so its worker process, which writes the results under
-# the same lock, does not try to take it a second time.
-OUTPUT_LOCK_ENVIRONMENT = "AISIM_OUTPUT_DIR_LOCK"
-_HELD_LOCKS: dict[str, int] = {}
+# taken before the directory is inspected or cleaned. Inside an
+# ``OutputDirectoryOwnership`` scope (the CLI), it is held until the scope ends,
+# after the last report write; outside one, it covers preparation only.
+#
+# The supervisor hands its locked descriptor to its worker explicitly: the
+# worker inherits the open descriptor (``pass_fds``) and its number in
+# ``AISIM_OUTPUT_DIR_LOCK_FD``. Holding the same open file description, the
+# worker keeps the lock even if the supervisor exits first. A process that sees
+# the variable without the matching locked descriptor gets no exemption.
+OUTPUT_LOCK_FD_ENVIRONMENT = "AISIM_OUTPUT_DIR_LOCK_FD"
+_inherited_descriptor: int | None = None
+_owner: contextvars.ContextVar[OutputDirectoryOwnership | None] = contextvars.ContextVar(
+    "aisim_output_directory_owner", default=None
+)
 
 
-def _lock_key(root: Path) -> str:
-    return os.path.realpath(root)
+def adopt_inherited_output_lock() -> None:
+    """Take the supervisor's lock descriptor, if any, and hide it from grandchildren."""
 
-
-def lock_output_directory(root: Path) -> None:
-    """Take the output-directory lock for the rest of this process.
-
-    Re-entrant within a process, and a no-op in a worker whose parent AISim
-    process already holds the same directory. Fails fast when another run holds it.
-    """
-
-    key = _lock_key(root)
-    if key in _HELD_LOCKS or os.environ.get(OUTPUT_LOCK_ENVIRONMENT) == key:
+    global _inherited_descriptor
+    raw = os.environ.pop(OUTPUT_LOCK_FD_ENVIRONMENT, None)
+    if raw is None:
         return
-    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        descriptor = int(raw)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            return
+        os.set_inheritable(descriptor, False)
+    except (ValueError, OSError):
+        return
+    _inherited_descriptor = descriptor
+
+
+def _identity(status: os.stat_result) -> tuple[int, int]:
+    return status.st_dev, status.st_ino
+
+
+def _take_inherited(root: Path) -> int | None:
+    """Return the inherited descriptor when it is a held lock on ``root``."""
+
+    global _inherited_descriptor
+    descriptor = _inherited_descriptor
+    if descriptor is None:
+        return None
+    try:
+        if _identity(os.fstat(descriptor)) != _identity(os.stat(root)):
+            return None
+        # Re-locking our own open file description succeeds; any other holder fails.
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        return None
+    _inherited_descriptor = None
+    return descriptor
+
+
+def _lock(root: Path) -> int:
+    descriptor = _take_inherited(root)
+    if descriptor is not None:
+        return descriptor
+    descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise ValueError(f"output path {root} is not a directory")
@@ -171,22 +209,55 @@ def lock_output_directory(root: Path) -> None:
                 f"another AISim run is using output directory {root}; "
                 "wait for it to finish or choose a different --output-dir"
             ) from exc
+        # The path must still name the locked directory.
+        if _identity(os.fstat(descriptor)) != _identity(os.stat(root)):
+            raise ValueError(f"output directory {root} was replaced while AISim was locking it")
     except BaseException:
         os.close(descriptor)
         raise
-    _HELD_LOCKS[key] = descriptor
-    os.environ[OUTPUT_LOCK_ENVIRONMENT] = key
+    return descriptor
 
 
-def release_output_directory_lock(root: str | Path) -> None:
-    """Release a lock taken by this process (tests and long-lived callers)."""
+class OutputDirectoryOwnership:
+    """Run-scoped ownership of output-directory locks.
 
-    key = _lock_key(Path(root))
-    descriptor = _HELD_LOCKS.pop(key, None)
-    if descriptor is not None:
-        os.close(descriptor)
-        if os.environ.get(OUTPUT_LOCK_ENVIRONMENT) == key:
-            del os.environ[OUTPUT_LOCK_ENVIRONMENT]
+    Locks taken by ``prepare_output_directory`` inside the scope are held until
+    it ends. Re-entry for the same directory within one scope reuses the lock;
+    another scope, in this process or another, is refused.
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[tuple[int, int], int] = {}
+        self._token: contextvars.Token | None = None
+
+    def __enter__(self) -> OutputDirectoryOwnership:
+        self._token = _owner.set(self)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._token is not None:
+            _owner.reset(self._token)
+            self._token = None
+        self.release()
+
+    def descriptor_for(self, root: str | Path) -> int | None:
+        """The held lock descriptor for ``root``, for handing to a worker."""
+
+        try:
+            return self._held.get(_identity(os.stat(root)))
+        except OSError:
+            return None
+
+    def _holds(self, root: Path) -> bool:
+        return self.descriptor_for(root) is not None
+
+    def _keep(self, descriptor: int) -> None:
+        self._held[_identity(os.fstat(descriptor))] = descriptor
+
+    def release(self) -> None:
+        held, self._held = self._held, {}
+        for descriptor in held.values():
+            os.close(descriptor)
 
 
 def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
@@ -204,14 +275,32 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
         raise ValueError(f"output path {root} exists and is not a directory")
     root.mkdir(parents=True, exist_ok=True)
     # Lock before inspecting, so no other run can write between the check and the cleanup.
-    lock_output_directory(root)
+    owner = _owner.get()
+    if owner is not None and owner._holds(root):
+        descriptor = None
+    else:
+        descriptor = _lock(root)
+    try:
+        _prepare_locked(root, overwrite=overwrite)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    if descriptor is not None:
+        if owner is not None:
+            owner._keep(descriptor)
+        else:
+            os.close(descriptor)
+    return root
+
+
+def _prepare_locked(root: Path, *, overwrite: bool) -> None:
     if any(root.iterdir()) and not overwrite:
         leftovers = _unfinished_run_leftovers(root)
         if leftovers is None:
             raise ValueError(_non_empty_message(root))
         _clear_unfinished_run(root, leftovers)
         sys.stderr.write(f"aisim: reusing {root}: removed diagnostics left by a failed run\n")
-    root.mkdir(parents=True, exist_ok=True)
     if overwrite:
         for name in sorted(_KNOWN_FILES):
             target = root / name
@@ -222,7 +311,6 @@ def prepare_output_directory(path: str | Path, *, overwrite: bool) -> Path:
             for target in recommendations.iterdir():
                 if _RECOMMENDATION_NAME.fullmatch(target.name) and (target.is_file() or target.is_symlink()):
                     target.unlink()
-    return root
 
 
 def _non_empty_message(root: Path) -> str:

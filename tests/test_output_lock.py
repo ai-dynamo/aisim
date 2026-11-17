@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import select
 import subprocess
 import sys
 import textwrap
@@ -15,51 +17,68 @@ import pytest
 
 import aisim.output as output
 from aisim.output import (
-    OUTPUT_LOCK_ENVIRONMENT,
-    lock_output_directory,
+    OUTPUT_LOCK_FD_ENVIRONMENT,
+    OutputDirectoryOwnership,
+    adopt_inherited_output_lock,
     prepare_output_directory,
-    release_output_directory_lock,
 )
 
+_LOCK_MESSAGE = "another AISim run is using output directory"
+
+# Prepares (and so locks) a directory inside an ownership scope, reports, and
+# holds it until a line arrives on stdin. Adopts a lock handed over by a parent.
 _HOLDER = textwrap.dedent(
     """
     import sys
-    from aisim.output import prepare_output_directory
+    from aisim.output import OutputDirectoryOwnership, adopt_inherited_output_lock, prepare_output_directory
 
-    prepare_output_directory(sys.argv[1], overwrite=False)
-    print("locked", flush=True)
-    sys.stdin.readline()
+    adopt_inherited_output_lock()
+    with OutputDirectoryOwnership():
+        try:
+            prepare_output_directory(sys.argv[1], overwrite=False)
+        except ValueError as exc:
+            print("refused", exc, flush=True)
+            sys.exit(2)
+        print("locked", flush=True)
+        sys.stdin.readline()
     """
 )
 
 
 @pytest.fixture(autouse=True)
-def _isolated_locks(monkeypatch):
-    monkeypatch.delenv(OUTPUT_LOCK_ENVIRONMENT, raising=False)
-    before = set(output._HELD_LOCKS)
-    yield
-    for key in set(output._HELD_LOCKS) - before:
-        release_output_directory_lock(key)
+def _clean_environment(monkeypatch):
+    monkeypatch.delenv(OUTPUT_LOCK_FD_ENVIRONMENT, raising=False)
+    monkeypatch.setattr(output, "_inherited_descriptor", None)
 
 
-def _child_env() -> dict[str, str]:
+def _env(**extra: str) -> dict[str, str]:
     env = dict(os.environ)
-    env.pop(OUTPUT_LOCK_ENVIRONMENT, None)
+    env.pop(OUTPUT_LOCK_FD_ENVIRONMENT, None)
+    env.update(extra)
     return env
 
 
 class _Holder:
-    """Another process that has prepared, and so locked, an output directory."""
+    """Another process that runs prepare_output_directory on a directory."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        env: dict[str, str] | None = None,
+        pass_fds: tuple[int, ...] = (),
+    ) -> None:
         self.process = subprocess.Popen(
             [sys.executable, "-c", _HOLDER, str(root)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
-            env=_child_env(),
+            env=env if env is not None else _env(),
+            pass_fds=pass_fds,
         )
-        assert self.process.stdout.readline().strip() == "locked"
+        ready, _, _ = select.select([self.process.stdout], [], [], 60)
+        assert ready, "holder did not report within 60 s"
+        self.state = self.process.stdout.readline().strip()
 
     def release(self) -> None:
         self.process.stdin.write("\n")
@@ -77,13 +96,20 @@ class _Holder:
         self.process.stdout.close()
 
 
-def test_second_process_fails_fast_while_a_run_holds_the_directory(tmp_path) -> None:
+def _blocked(root: Path) -> bool:
+    """Whether another process is refused by the lock (a refusal for content means it got the lock)."""
+    with _Holder(root) as other:
+        if other.state == "locked":
+            other.release()
+        return other.state.startswith("refused") and _LOCK_MESSAGE in other.state
+
+
+def test_a_running_holder_blocks_prepare_and_overwrite(tmp_path) -> None:
     root = tmp_path / "out"
     with _Holder(root) as holder:
+        assert holder.state == "locked"
         (root / "prediction.json").write_text("{}\n")
-        with pytest.raises(
-            ValueError, match="another AISim run is using output directory"
-        ):
+        with pytest.raises(ValueError, match=_LOCK_MESSAGE):
             prepare_output_directory(root, overwrite=True)
         # The refused run removed nothing, even with --overwrite.
         assert (root / "prediction.json").read_text() == "{}\n"
@@ -92,86 +118,142 @@ def test_second_process_fails_fast_while_a_run_holds_the_directory(tmp_path) -> 
     assert not (root / "prediction.json").exists()
 
 
-def test_lock_blocks_failed_run_cleanup_by_another_process(tmp_path) -> None:
+def test_a_held_lock_blocks_failed_run_cleanup(tmp_path) -> None:
     root = tmp_path / "out"
     root.mkdir()
-    lock_output_directory(root)
     (root / "execution-events.jsonl").write_text("")
-    (root / "resource-runtime.json").write_text('{"status": "failed"}\n')
-    script = textwrap.dedent(
-        """
-        import sys
-        from aisim.output import prepare_output_directory
-        try:
-            prepare_output_directory(sys.argv[1], overwrite=False)
-        except ValueError as exc:
-            print(exc)
-            sys.exit(2)
-        """
+    (root / "resource-runtime.json").write_text(
+        json.dumps({"schema_version": 1, "status": "failed"}) + "\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(root)],
-        capture_output=True,
-        text=True,
-        env=_child_env(),
-        timeout=60,
-    )
-    assert result.returncode == 2
-    assert "another AISim run is using output directory" in result.stdout
-    assert sorted(entry.name for entry in root.iterdir()) == [
-        "execution-events.jsonl",
-        "resource-runtime.json",
-    ]
+    with OutputDirectoryOwnership():
+        prepare_output_directory(
+            root, overwrite=True
+        )  # takes the lock; leaves nothing to reuse
+        (root / "execution-events.jsonl").write_text("")
+        (root / "resource-runtime.json").write_text(
+            json.dumps({"schema_version": 1, "status": "failed"}) + "\n"
+        )
+        assert _blocked(root)
+        assert sorted(entry.name for entry in root.iterdir()) == [
+            "execution-events.jsonl",
+            "resource-runtime.json",
+        ]
+    # Released: the failed-run leftovers are now eligible for reuse.
+    prepare_output_directory(root, overwrite=False)
+    assert list(root.iterdir()) == []
 
 
-def test_lock_is_reentrant_within_a_process(tmp_path) -> None:
+def test_scope_holds_until_exit_and_is_reentrant(tmp_path) -> None:
+    root = tmp_path / "out"
+    with OutputDirectoryOwnership() as ownership:
+        prepare_output_directory(root, overwrite=False)
+        prepare_output_directory(root, overwrite=True)
+        assert ownership.descriptor_for(root) is not None
+        assert _blocked(root)
+    assert not _blocked(root)
+
+
+def test_another_scope_in_the_same_process_is_refused(tmp_path) -> None:
+    root = tmp_path / "out"
+    with OutputDirectoryOwnership():
+        prepare_output_directory(root, overwrite=False)
+        with OutputDirectoryOwnership(), pytest.raises(ValueError, match=_LOCK_MESSAGE):
+            prepare_output_directory(root, overwrite=False)
+
+
+def test_refused_preparation_releases_its_lock(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "prediction.json").write_text("{}\n")
+    with OutputDirectoryOwnership() as ownership:
+        with pytest.raises(ValueError, match="results from a finished AISim run"):
+            prepare_output_directory(root, overwrite=False)
+        assert ownership.descriptor_for(root) is None
+        assert not _blocked(root)
+
+
+def test_preparation_outside_a_scope_locks_only_while_preparing(tmp_path) -> None:
     root = tmp_path / "out"
     prepare_output_directory(root, overwrite=False)
-    prepare_output_directory(root, overwrite=True)
-    assert output._HELD_LOCKS[os.path.realpath(root)] >= 0
+    assert not _blocked(root)
 
 
-def test_worker_of_the_holding_supervisor_does_not_relock(tmp_path) -> None:
+def test_scope_tracks_each_directory_separately(tmp_path) -> None:
+    first, second = tmp_path / "a", tmp_path / "b"
+    with OutputDirectoryOwnership() as ownership:
+        prepare_output_directory(first, overwrite=False)
+        prepare_output_directory(second, overwrite=False)
+        prepare_output_directory(first, overwrite=False)
+        held_first, held_second = (
+            ownership.descriptor_for(first),
+            ownership.descriptor_for(second),
+        )
+        assert (
+            held_first is not None
+            and held_second is not None
+            and held_first != held_second
+        )
+        assert os.fstat(held_first).st_ino == os.stat(first).st_ino
+
+
+def test_handed_over_lock_survives_the_parent(tmp_path) -> None:
     root = tmp_path / "out"
-    prepare_output_directory(root, overwrite=False)
-    assert os.environ[OUTPUT_LOCK_ENVIRONMENT] == os.path.realpath(root)
-    # A worker inherits the environment and writes under its parent's lock.
-    script = textwrap.dedent(
-        """
-        import sys
-        from aisim import output
-        output.prepare_output_directory(sys.argv[1], overwrite=False)
-        assert not output._HELD_LOCKS
-        """
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(root)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
+    ownership = OutputDirectoryOwnership()
+    with ownership:
+        prepare_output_directory(root, overwrite=False)
+        descriptor = ownership.descriptor_for(root)
+        os.set_inheritable(descriptor, True)
+        worker = _Holder(
+            root,
+            env=_env(**{OUTPUT_LOCK_FD_ENVIRONMENT: str(descriptor)}),
+            pass_fds=(descriptor,),
+        )
+    # The "supervisor" has released its copy; the worker still holds the lock.
+    with worker:
+        assert worker.state == "locked"
+        assert _blocked(root)
+        worker.release()
+    assert not _blocked(root)
+
+
+def test_variable_without_the_locked_descriptor_grants_nothing(tmp_path) -> None:
+    root = tmp_path / "out"
+    with OutputDirectoryOwnership() as ownership:
+        prepare_output_directory(root, overwrite=False)
+        descriptor = ownership.descriptor_for(root)
+        # Same variable, but the descriptor was not passed: no exemption.
+        with _Holder(
+            root, env=_env(**{OUTPUT_LOCK_FD_ENVIRONMENT: str(descriptor)})
+        ) as stranger:
+            assert stranger.state.startswith("refused")
+
+
+def test_adopting_hides_the_variable_from_grandchildren(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    descriptor = os.open(root, os.O_RDONLY)
+    try:
+        monkeypatch.setenv(OUTPUT_LOCK_FD_ENVIRONMENT, str(descriptor))
+        adopt_inherited_output_lock()
+        assert OUTPUT_LOCK_FD_ENVIRONMENT not in os.environ
+        assert output._inherited_descriptor == descriptor
+    finally:
+        output._inherited_descriptor = None
+        os.close(descriptor)
 
 
 def test_symlinked_path_shares_the_lock(tmp_path) -> None:
     root = tmp_path / "out"
     alias = tmp_path / "alias"
-    with _Holder(root):
+    with _Holder(root) as holder:
+        assert holder.state == "locked"
         alias.symlink_to(root, target_is_directory=True)
-        with pytest.raises(ValueError, match="another AISim run"):
+        with pytest.raises(ValueError, match=_LOCK_MESSAGE):
             prepare_output_directory(alias, overwrite=False)
 
 
 def test_lock_adds_no_file_to_the_directory(tmp_path) -> None:
     root = tmp_path / "out"
-    prepare_output_directory(root, overwrite=False)
-    assert list(root.iterdir()) == []
-
-
-def test_release_lets_another_process_take_the_directory(tmp_path) -> None:
-    root = tmp_path / "out"
-    prepare_output_directory(root, overwrite=False)
-    release_output_directory_lock(root)
-    assert OUTPUT_LOCK_ENVIRONMENT not in os.environ
-    with _Holder(root) as holder:
-        holder.release()
+    with OutputDirectoryOwnership():
+        prepare_output_directory(root, overwrite=False)
+        assert list(root.iterdir()) == []
