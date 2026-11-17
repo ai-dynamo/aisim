@@ -328,6 +328,8 @@ fn direction(kind: Kind) -> Direction {
 struct Client {
     link: HostLink,
     prepared_stores: VecDeque<TransferId>,
+    /// This client's entries in [`HostTier::transfers`].
+    pending_transfers: usize,
     /// Physically complete transfers the owner has not consumed yet.
     done: VecDeque<(f64, CompletedTransfer)>,
     seen_epoch: u64,
@@ -446,6 +448,7 @@ impl HostTier {
             Client {
                 link,
                 prepared_stores: VecDeque::new(),
+                pending_transfers: 0,
                 done: VecDeque::new(),
                 seen_epoch: self.completion_epoch,
                 holds_completed_sources: false,
@@ -502,7 +505,7 @@ impl HostTier {
             match self.transfers[&id].kind {
                 Kind::Load => {
                     self.remove_queued(id);
-                    let transfer = self.transfers.remove(&id).expect("owned load disappeared");
+                    let transfer = self.remove_transfer(id).expect("owned load disappeared");
                     self.release_load_pins(&transfer.blocks);
                 }
                 Kind::Store if self.is_submitted(id) => {}
@@ -658,7 +661,7 @@ impl HostTier {
             });
             self.client(client).prepared_stores.push_back(transfer_id);
         }
-        self.transfers.insert(
+        self.insert_transfer(
             transfer_id,
             Transfer {
                 kind,
@@ -903,8 +906,7 @@ impl HostTier {
 
     fn complete_external_with(&mut self, id: TransferId, kvcr_origin: bool) {
         let transfer = self
-            .transfers
-            .remove(&id)
+            .remove_transfer(id)
             .filter(|transfer| transfer.kind == Kind::External)
             .expect("external G2 reservation missing");
         self.lookup_epoch += 1;
@@ -945,7 +947,7 @@ impl HostTier {
                 && !self.is_submitted(id),
             "external G2 reservation missing"
         );
-        let transfer = self.transfers.remove(&id).unwrap();
+        let transfer = self.remove_transfer(id).unwrap();
         self.lookup_epoch += 1;
         for key in transfer.blocks {
             let mut entry = self.entries.remove(&key).unwrap();
@@ -1299,7 +1301,7 @@ impl HostTier {
         }
 
         let transfer_id = self.allocate_transfer_id();
-        self.transfers.insert(
+        self.insert_transfer(
             transfer_id,
             Transfer {
                 kind: Kind::Load,
@@ -1359,7 +1361,7 @@ impl HostTier {
             return done.len() != before;
         }
         self.remove_queued(transfer_id);
-        let transfer = self.transfers.remove(&transfer_id).unwrap();
+        let transfer = self.remove_transfer(transfer_id).unwrap();
         self.release_load_pins(&transfer.blocks);
         self.observe(HostOffloadObservation {
             request_id: transfer.request_id,
@@ -1436,8 +1438,7 @@ impl HostTier {
             blocks,
             deadline,
         } = self
-            .transfers
-            .remove(&transfer_id)
+            .remove_transfer(transfer_id)
             .expect("due host transfer disappeared");
         assert!(deadline.is_none_or(|deadline| deadline == at_ms));
         self.completion_epoch += 1;
@@ -1556,12 +1557,15 @@ impl HostTier {
     }
 
     pub(crate) fn has_pending_work(&self, client: u64) -> bool {
-        !self.clients[&client].done.is_empty()
-            || self.has_queued_events(client)
-            || self
-                .transfers
+        let state = &self.clients[&client];
+        debug_assert_eq!(
+            state.pending_transfers,
+            self.transfers
                 .values()
-                .any(|transfer| transfer.client == client)
+                .filter(|transfer| transfer.client == client)
+                .count()
+        );
+        !state.done.is_empty() || self.has_queued_events(client) || state.pending_transfers > 0
     }
 
     pub(crate) fn capacity_blocks(&self) -> usize {
@@ -1616,6 +1620,20 @@ impl HostTier {
         self.clients
             .get_mut(&client)
             .expect("host client is not registered")
+    }
+
+    fn insert_transfer(&mut self, id: TransferId, transfer: Transfer) {
+        self.client(transfer.client).pending_transfers += 1;
+        self.transfers.insert(id, transfer);
+    }
+
+    /// A retired owner's submitted stores outlive its count.
+    fn remove_transfer(&mut self, id: TransferId) -> Option<Transfer> {
+        let transfer = self.transfers.remove(&id)?;
+        if let Some(owner) = self.clients.get_mut(&transfer.client) {
+            owner.pending_transfers -= 1;
+        }
+        Some(transfer)
     }
 
     fn observe(&self, observation: HostOffloadObservation<'_>) {
@@ -2729,7 +2747,9 @@ pub(crate) mod tests {
             else {
                 panic!("free slot")
             };
+            assert!(tier.has_pending_work(A));
             finish(&mut tier, transfer_id);
+            assert!(!tier.has_pending_work(A));
             assert_eq!(tier.next_deadline(A), None);
             assert_eq!(tier.next_deadline(B), Some(0.0));
             assert_eq!(tier.tick(B, 0.0), (vec![], true));
@@ -2747,6 +2767,7 @@ pub(crate) mod tests {
             else {
                 panic!("resident block must load")
             };
+            assert!(tier.has_pending_work(client));
             assert!(tier.cancel_load(client, load, 1.0, 1.0));
             assert_eq!(tier.next_deadline(client), None);
             assert_eq!(tier.tick(client, 1.0), (vec![], false));
