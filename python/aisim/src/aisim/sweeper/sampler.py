@@ -522,6 +522,41 @@ class RandomBranchSampler:
         del suggestion, reason
 
 
+class SmallestFirstBranchSampler(RandomBranchSampler):
+    """Ascending-GPU search for the ``min_gpus`` target.
+
+    A Bayesian study models a score surface. ``min_gpus`` has no useful surface:
+    its score is the negated GPU count of a candidate that passes every gate, so
+    a GP sampler spends its budget wherever it predicts high scores and can skip
+    the smallest shapes entirely. This sampler instead visits legal
+    backend/topology pairs in ascending total GPU count, then revisits their knob
+    domains. Once a configuration qualifies at ``n`` GPUs, pairs that need more
+    than ``n`` GPUs cannot improve the result and are dropped, so the remaining
+    budget explores knob settings at or below the best count found.
+    """
+
+    def __init__(self, branch: BranchSpace, *, seed: int) -> None:
+        super().__init__(replace(branch, prefer_smallest=True), seed=seed)
+        self._best_gpus: int | None = None
+
+    @property
+    def best_gpus(self) -> int | None:
+        """Smallest GPU count observed to qualify, or ``None``."""
+        return self._best_gpus
+
+    def observe(self, suggestion: Suggestion, metrics: dict[str, float]) -> None:
+        # The sweeper calls observe() only for candidates that passed every
+        # min_gpus gate (budget, aggregate SLA, goodput floor); gated trials go
+        # through observe_infeasible().
+        del metrics
+        gpus = suggestion.parallel_config.total_gpus
+        if self._best_gpus is not None and gpus >= self._best_gpus:
+            return
+        self._best_gpus = gpus
+        self._arms = deque(arm for arm in self._arms if arm[1].total_gpus <= gpus)
+        self._retries = deque(retry for retry in self._retries if retry.parallel_config.total_gpus <= gpus)
+
+
 class SeededBayesianBranchSampler:
     """Local Vizier GP-UCB-PE designer with an explicit reproducible seed.
 
@@ -844,6 +879,9 @@ def make_branch_sampler(
     pairs default to a single maximized ``"objective"``; pass >=2 for a Pareto study."""
 
     def construct(flat_branch: BranchSpace, flat_study_id: str, flat_seed: int) -> BranchSampler:
+        if flat_branch.prefer_smallest:
+            # min_gpus: ascending GPU-count search, whatever optimizer was requested.
+            return SmallestFirstBranchSampler(flat_branch, seed=flat_seed)
         if algorithm == "random":
             return RandomBranchSampler(flat_branch, seed=flat_seed)
         if algorithm == "bayesian":
