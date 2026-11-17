@@ -122,8 +122,8 @@ pub(crate) struct GroupStateLease {
     pub(crate) running: Option<BlockCopyId>,
     /// A cached hit block, and the index of the block whose end it covers.
     pub(crate) hit: Option<(BlockCopyId, usize)>,
-    /// The running block before a boundary crossing, and the step after
-    /// which it can go.
+    /// The running block before a boundary crossing or producer copy-on-write,
+    /// and the step after which it can go.
     pub(crate) previous: Option<(BlockCopyId, u64)>,
     /// The copy block of a partial hit.
     pub(crate) copy: Option<BlockCopyId>,
@@ -580,6 +580,39 @@ mod tests {
         assert!(blocks.reserve(&[], 5).is_some());
         assert!(blocks.key_hit(0, h1).is_none());
         assert!(!blocks.key_hit(0, h0).unwrap().is_active);
+    }
+
+    #[test]
+    fn block_mode_duplicate_key_survives_primary_eviction_only() {
+        let hash = 7;
+        let key = CacheKey::Grouped { group: 0, hash };
+        let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 24, 8);
+        let blocks = pool.block_pool_mut().unwrap();
+        let mut reservation = blocks.reserve(&[], 3).unwrap();
+        let primary = blocks.take_private(&mut reservation);
+        let duplicate = blocks.take_private(&mut reservation);
+        let other_group = blocks.take_private(&mut reservation);
+        assert!(blocks.cache(primary, key));
+        assert!(!blocks.cache(duplicate, key));
+        assert!(blocks.cache(other_group, CacheKey::Grouped { group: 2, hash }));
+        blocks.cancel(reservation);
+        // Primary first in the LRU, so pressure must promote the duplicate.
+        blocks.release_all([primary, duplicate]);
+        let first = blocks.reserve(&[], 1).unwrap();
+        assert!(!blocks.key_hit(0, hash).unwrap().is_active);
+        assert!(blocks.key_hit(2, hash).unwrap().is_active);
+        assert_eq!(blocks.inactive_cached_blocks(), 1);
+        let mut hit = blocks.reserve(&[key], 0).unwrap();
+        let held = blocks.activate(&mut hit);
+        assert_eq!(held, vec![duplicate]);
+        blocks.cancel(hit);
+        blocks.release(held[0]);
+        let last = blocks.reserve(&[], 1).unwrap();
+        assert!(blocks.key_hit(0, hash).is_none());
+        assert!(blocks.key_hit(2, hash).unwrap().is_active);
+        blocks.cancel(last);
+        blocks.cancel(first);
+        blocks.release(other_group);
     }
 
     #[test]

@@ -144,6 +144,10 @@ impl GroupedPrefixRules {
         let mut rules = Vec::with_capacity(groups.len());
         let mut checkpoints = Vec::new();
         for group in groups {
+            ensure!(
+                group.prefix_cacheable.is_some(),
+                "kv_cache_groups with enable_prefix_caching=true require prefix_cacheable on every group"
+            );
             let block = group.block_size_tokens as usize;
             let mut cacheable = group.prefix_cacheable == Some(true);
             let kind = match group.kind {
@@ -165,12 +169,18 @@ impl GroupedPrefixRules {
                         GroupRuleKind::Ring
                     }
                 }
-                FpmCacheKind::Attention => match group.sliding_window {
-                    Some(window) => GroupRuleKind::SlidingWindow {
-                        window: window as usize,
-                    },
-                    None => GroupRuleKind::FullAttention,
-                },
+                FpmCacheKind::Attention => {
+                    ensure!(
+                        cacheable,
+                        "kv_cache_groups with enable_prefix_caching=true require prefix_cacheable=true on every attention group; turn prefix caching off to replay them cold"
+                    );
+                    match group.sliding_window {
+                        Some(window) => GroupRuleKind::SlidingWindow {
+                            window: window as usize,
+                        },
+                        None => GroupRuleKind::FullAttention,
+                    }
+                }
                 // The table has no rule for a convolution group, so the
                 // group fails here and does not lose its window.
                 FpmCacheKind::Convolution => bail!(
@@ -783,8 +793,8 @@ impl GroupedPrefixCoordinator {
                         // at the hit (`single:1153-1188`).
                         let retained = (window - 1 + self.limits.max_in_flight_tokens)
                             .min(self.limits.max_model_len);
-                        required = required.min(retained.div_ceil(block) + 1);
                         skipped_blocks = hit.tokens.saturating_sub(window - 1) / block;
+                        required = required.min(skipped_blocks + retained.div_ceil(block) + 1);
                     }
                     let new = required.saturating_sub(skipped_blocks.max(keys.len()));
                     let inactive = keys[skipped_blocks.min(keys.len())..]
@@ -970,7 +980,14 @@ impl GroupedPrefixCoordinator {
                         first && state.hit.is_some() && !computed_before.is_multiple_of(block);
                     let cow_is_running =
                         cow && (computed_before - 1) / block == (target - 1) / block;
-                    let running = (state.running.is_none() || crossing) && !cow_is_running;
+                    // A producer can also have published its own partial
+                    // running state (v0.31 single:1903-1936, v0.32 :1867-1900).
+                    // As on the linear path, preserve that immutable copy in
+                    // `previous` and take a fresh writable block, even when
+                    // the next write stays inside the same logical block.
+                    let producer_cow = state.running.is_some_and(|id| !pool.is_private(id));
+                    let running =
+                        (state.running.is_none() || crossing || producer_cow) && !cow_is_running;
                     let copy = cow && !cow_is_running;
                     if !first && let Some(copy) = state.copy.take() {
                         releases.push(copy);
@@ -1561,6 +1578,57 @@ mod tests {
     }
 
     #[test]
+    fn rules_refuse_missing_prefix_cacheability() {
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            for missing in 0..2 {
+                let mut groups = [attention("full", 16, None), state("s", 16, true, false)];
+                groups[missing].prefix_cacheable = None;
+                // Legacy profiles permit absence, but it cannot identify a
+                // state group as a ring when prefix caching is enabled.
+                assert!(groups[missing].validate().is_ok());
+                let err = GroupedPrefixRules::new(&groups, 16, version)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("require prefix_cacheable on every group"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rules_refuse_non_cacheable_attention_before_lookup() {
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            for window in [None, Some(17)] {
+                let mut groups = [attention("full", 16, None), attention("other", 16, window)];
+                groups[1].prefix_cacheable = Some(false);
+                let mut kv = kv_pool(&groups, 4);
+                let pool = kv.block_pool_mut().unwrap();
+                seed_many(pool, 0, 16, &[16]);
+                let request = lease(17, 16);
+                assert!(
+                    pool.key_hit(0, request.prefix_hash_at(16).unwrap())
+                        .is_some()
+                );
+                assert!(
+                    pool.key_hit(1, request.prefix_hash_at(16).unwrap())
+                        .is_none()
+                );
+                // Reject before a 17-token lookup can authorize skipping 16
+                // tokens that the second attention group has not computed.
+                let err = GroupedPrefixRules::new(&groups, 16, version)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("require prefix_cacheable=true on every attention group"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rules_refuse_convolution_groups() {
         // A convolution group keeps a window, and the table has no rule for it.
         let mut convolution = attention("convolution", 4, Some(4));
@@ -1759,6 +1827,37 @@ mod tests {
         );
         // A short prompt needs fewer blocks than the cap.
         assert_eq!(one_batch.admission_blocks(pool, &hit, 100), 7 + 7);
+    }
+
+    #[test]
+    fn sliding_window_admission_counts_fresh_blocks_after_a_long_hit() {
+        let groups = [attention("window", 4, Some(8))];
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            for prompt in [108, 200] {
+                let coordinator = GroupedPrefixCoordinator::new(
+                    GroupedPrefixRules::new(&groups, 4, version).unwrap(),
+                    AdmissionLimits {
+                        max_in_flight_tokens: 8,
+                        max_model_len: 200,
+                    },
+                );
+                let mut kv = kv_pool(&groups, 8);
+                let pool = kv.block_pool_mut().unwrap();
+                seed_many(pool, 0, 4, &[92, 96]);
+                let request = lease(prompt, 4);
+                let hit = coordinator.find_longest_hit(pool, &request, prompt);
+                assert_eq!(hit.tokens, 96);
+                // Skip 22 blocks; retain at most ceil((7 + 8) / 4) + 1
+                // blocks from there: two inactive hits and three fresh blocks.
+                assert_eq!(coordinator.admission_blocks(pool, &hit, prompt), 5);
+                let mut block_lease = coordinator.new_lease();
+                coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
+                assert_eq!(coordinator.admission_blocks(pool, &hit, prompt), 3);
+                assert!(coordinator.allocate(pool, &mut block_lease, prompt, 96, 104, 1));
+                assert_eq!(pool.active_blocks(), 4);
+                coordinator.release_request(pool, &mut block_lease);
+            }
+        }
     }
 
     #[test]
@@ -2259,6 +2358,48 @@ mod tests {
         let state = state_lease(&block_lease, 1);
         assert!(state.copy.is_none() && state.running.is_some());
         assert_eq!(pool.active_blocks(), 5 + 1);
+    }
+
+    #[test]
+    fn producer_partial_state_keeps_separate_capacity_until_eviction() {
+        // Producer-tail CoW: v0.31 single:1903-1936 and v0.32
+        // single:1867-1900 preserve the cached boundary before another write.
+        let groups = [attention("full", 32, None), state("s", 32, true, false)];
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            let mut coordinator =
+                with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+            let mut kv = kv_pool(&groups, 5);
+            let pool = kv.block_pool_mut().unwrap();
+            let request = lease(50, 4);
+            let hit = coordinator.find_longest_hit(pool, &request, 50);
+            let mut block_lease = coordinator.new_lease();
+            let mut before = 0;
+            for (step, target) in [(1, 32), (2, 48), (3, 50)] {
+                coordinator.begin_step();
+                assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, step));
+                coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit, step);
+                before = target;
+            }
+            // Two attention blocks, the retained state at 48, and the
+            // writable state at 50. The state at 32 is already inactive.
+            assert_eq!(pool.active_blocks(), 4, "{version:?}");
+            let state = state_lease(&block_lease, 1);
+            assert!(pool.is_private(state.running.unwrap()));
+            assert!(state.previous.is_some());
+            assert_eq!(pool.inactive_cached_blocks(), 1);
+            coordinator.release_request(pool, &mut block_lease);
+            assert_eq!(pool.active_blocks(), 0);
+            assert_eq!(pool.inactive_cached_blocks(), 4);
+            assert!(hit_exists(pool, 1, 4, 48));
+            // One free block, then eviction of state 32 and both attention blocks;
+            // the preserved partial state is still independently resident.
+            let pressure = pool.reserve(&[], 4).unwrap();
+            assert!(hit_exists(pool, 1, 4, 48));
+            let last = pool.reserve(&[], 1).unwrap();
+            assert!(!hit_exists(pool, 1, 4, 48));
+            pool.cancel(last);
+            pool.cancel(pressure);
+        }
     }
 
     #[test]
