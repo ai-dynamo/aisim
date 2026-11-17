@@ -36,6 +36,7 @@ from .estimator_readiness import perf_data_missing_message
 from .output import (
     OutputDirectoryOwnership,
     adopt_inherited_output_lock,
+    discard_inherited_output_lock,
     format_recommendation_stdout,
     prepare_output_directory,
     write_fpm_coverage,
@@ -438,9 +439,13 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     # A supervised worker writes under its supervisor's output-directory lock;
     # a direct call takes its own. Either way the lock ends with this command.
-    adopt_inherited_output_lock()
     with OutputDirectoryOwnership():
-        return _main(argv)
+        adopt_inherited_output_lock()
+        try:
+            return _main(argv)
+        finally:
+            # Parsing or validation can exit before any preparation claims it.
+            discard_inherited_output_lock()
 
 
 def _main(argv: Sequence[str] | None = None) -> int:

@@ -172,6 +172,15 @@ def adopt_inherited_output_lock() -> None:
     _inherited_descriptor = descriptor
 
 
+def discard_inherited_output_lock() -> None:
+    """Close an adopted descriptor that no preparation claimed."""
+
+    global _inherited_descriptor
+    descriptor, _inherited_descriptor = _inherited_descriptor, None
+    if descriptor is not None:
+        os.close(descriptor)
+
+
 def _identity(status: os.stat_result) -> tuple[int, int]:
     return status.st_dev, status.st_ino
 

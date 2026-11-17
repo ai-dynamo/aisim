@@ -257,3 +257,28 @@ def test_lock_adds_no_file_to_the_directory(tmp_path) -> None:
     with OutputDirectoryOwnership():
         prepare_output_directory(root, overwrite=False)
         assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("argv", [[], ["--help"]])
+def test_cli_main_closes_an_inherited_descriptor_it_never_used(
+    tmp_path, monkeypatch, argv
+) -> None:
+    import aisim.main as cli
+
+    root = tmp_path / "out"
+    with OutputDirectoryOwnership() as ownership:
+        prepare_output_directory(root, overwrite=False)
+        descriptor = os.dup(ownership.descriptor_for(root))
+    try:
+        monkeypatch.setenv(OUTPUT_LOCK_FD_ENVIRONMENT, str(descriptor))
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        assert output._inherited_descriptor is None
+        assert not _blocked(root)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
