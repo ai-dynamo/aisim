@@ -11,6 +11,7 @@
 # from vLLM (Apache-2.0), copyright contributors to the vLLM project:
 # https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/models/mistral3.py
 
+import http.client
 import importlib.resources as pkg_resources
 import json
 import logging
@@ -457,9 +458,23 @@ def _hf_hub_cache() -> Path:
     return Path(os.environ.get("HF_HOME", default_home)).expanduser() / "hub"
 
 
-def _cached_hf_file(hf_id: str, filename: str, revision: str) -> Path | None:
-    """Find ``filename`` for ``hf_id`` at ``revision`` in the local Hugging Face cache."""
-    if ".." in Path(revision).parts or ".." in Path(hf_id).parts or Path(filename).name != filename:
+def _check_hf_revision(revision: str) -> None:
+    """Reject revisions that are not a commit, branch or tag name before any lookup."""
+    path = Path(revision)
+    if not revision or path.is_absolute() or ".." in path.parts or "\\" in revision or "\x00" in revision:
+        raise HuggingFaceDownloadError(
+            f"unsupported Hugging Face revision {revision!r}: expected a commit hash, branch or tag name "
+            "(for example main, v1.0 or release/v1)"
+        )
+
+
+def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str] | None:
+    """Find ``filename`` for ``hf_id`` at ``revision`` in the local Hugging Face cache.
+
+    Returns the file and the snapshot commit it belongs to.
+    """
+    _check_hf_revision(revision)
+    if ".." in Path(hf_id).parts or Path(filename).name != filename:
         return None
     repo = _hf_hub_cache() / f"models--{hf_id.replace('/', '--')}"
     commit = revision
@@ -472,15 +487,21 @@ def _cached_hf_file(hf_id: str, filename: str, revision: str) -> Path | None:
     if not _COMMIT_HASH.fullmatch(commit):
         return None
     path = repo / "snapshots" / commit / filename
-    return path if path.is_file() else None
+    return (path, commit) if path.is_file() else None
+
+
+def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[dict, str] | None:
+    found = _cached_hf_file(hf_id, filename, revision)
+    if found is None:
+        return None
+    path, commit = found
+    logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
+    return _load_json_with_infinity(path), commit
 
 
 def _load_cached_hf_json(hf_id: str, filename: str, revision: str) -> dict | None:
-    path = _cached_hf_file(hf_id, filename, revision)
-    if path is None:
-        return None
-    logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
-    return _load_json_with_infinity(path)
+    found = _load_cached_hf_json_at(hf_id, filename, revision)
+    return None if found is None else found[0]
 
 
 def _local_config_hint(hf_id: str, filename: str, revision: str = "main") -> str:
@@ -498,8 +519,10 @@ def _is_transient_http_error(error: urllib.error.HTTPError) -> bool:
     return error.code == 429 or error.code >= 500
 
 
-def _cached_after_network_failure(hf_id: str, filename: str, revision: str, url: str, reason: object) -> dict:
-    cached = _load_cached_hf_json(hf_id, filename, revision)
+def _cached_after_network_failure(
+    hf_id: str, filename: str, revision: str, url: str, reason: object
+) -> tuple[dict, str]:
+    cached = _load_cached_hf_json_at(hf_id, filename, revision)
     if cached is not None:
         logger.warning("Could not reach Hugging Face for %s's %s (%s); using the cached copy", hf_id, filename, reason)
         return cached
@@ -511,7 +534,21 @@ def _cached_after_network_failure(hf_id: str, filename: str, revision: str, url:
 
 
 def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main") -> dict | None:
+    """Load a JSON file from a Hugging Face model repo; see :func:`_download_hf_json_at`."""
+    data, commit = _download_hf_json_at(hf_id, filename, raise_on_404=raise_on_404, revision=revision)
+    if commit is not None:
+        _CACHE_SNAPSHOT_COMMIT[(hf_id, filename)] = commit
+    return data
+
+
+def _download_hf_json_at(
+    hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main"
+) -> tuple[dict | None, str | None]:
     """Load a JSON file from a Hugging Face model repo, from the local cache or the network.
+
+    Returns the data and, when it came from the local cache, the snapshot commit
+    it belongs to (``None`` for a network download), so related files can be
+    read from the same commit.
 
     Offline mode (``HF_HUB_OFFLINE`` or ``TRANSFORMERS_OFFLINE``) reads only the
     local Hugging Face cache and never opens a connection. Online, a pinned commit
@@ -519,15 +556,16 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
     branch is honored. The cache is the fallback when the network fails or Hugging
     Face answers with a rate limit or server error (HTTP 429 or 5xx).
     """
+    _check_hf_revision(revision)
     offline = _hf_offline_variable()
     if offline is not None or _COMMIT_HASH.fullmatch(revision):
-        cached = _load_cached_hf_json(hf_id, filename, revision)
+        cached = _load_cached_hf_json_at(hf_id, filename, revision)
         if cached is not None:
             return cached
     if offline is not None:
         if not raise_on_404:
             logger.debug("%s is set; skipping optional %s for %s", offline, filename, hf_id)
-            return None
+            return None, None
         raise HuggingFaceDownloadError(
             f"Cannot load {hf_id}'s {filename}: Hugging Face offline mode is on ({offline} is set) and the "
             f"file is not in the local Hugging Face cache ({_hf_hub_cache()}). "
@@ -537,10 +575,10 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
     try:
         req = urllib.request.Request(url, headers=_get_hf_auth_headers())
         with urllib.request.urlopen(req, timeout=30) as response:
-            return json.load(response)
+            return json.load(response), None
     except urllib.error.HTTPError as e:
         if e.code == 404 and not raise_on_404:
-            return None
+            return None, None
         if _is_transient_http_error(e):
             return _cached_after_network_failure(hf_id, filename, revision, url, f"HTTP error {e.code}: {e.reason}")
         token_path = Path.home() / ".cache" / "huggingface" / "token"
@@ -552,13 +590,20 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
             f"(2) set the HUGGING_FACE_HUB_TOKEN environment variable, or "
             f"(3) run `huggingface-cli login` (token stored at {token_path})."
         ) from e
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        # HTTPException covers a body cut short (IncompleteRead) or a malformed response.
         try:
             return _cached_after_network_failure(hf_id, filename, revision, url, getattr(e, "reason", None) or e)
         except HuggingFaceDownloadError as missing:
             raise missing from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
+
+
+# Snapshot commit of the last file served from the local cache, and of the last
+# config.json per model, so the loader can read companion files from the same commit.
+_CACHE_SNAPSHOT_COMMIT: dict[tuple[str, str], str] = {}
+_CONFIG_SNAPSHOT_COMMIT: dict[str, str] = {}
 
 
 def _download_hf_config(hf_id: str) -> dict:
@@ -574,7 +619,13 @@ def _download_hf_config(hf_id: str) -> dict:
     Raises:
         HuggingFaceDownloadError: If the HuggingFace API returns an error
     """
-    return _download_hf_json(hf_id, "config.json", raise_on_404=True) or {}
+    _CACHE_SNAPSHOT_COMMIT.pop((hf_id, "config.json"), None)
+    config = _download_hf_json(hf_id, "config.json", raise_on_404=True) or {}
+    if commit := _CACHE_SNAPSHOT_COMMIT.pop((hf_id, "config.json"), None):
+        _CONFIG_SNAPSHOT_COMMIT[hf_id] = commit
+    else:
+        _CONFIG_SNAPSHOT_COMMIT.pop(hf_id, None)
+    return config
 
 
 def _parse_nemotron_block_configs(block_configs: list[dict]) -> list[BlockConfig]:
@@ -2047,7 +2098,7 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     return raw_config
 
 
-def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
+def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revision: str = "main") -> dict:
     """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
         return raw_config
@@ -2060,7 +2111,8 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False)
+        pinned = {} if revision == "main" else {"revision": revision}
+        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False, **pinned)
     if processor_config is not None:
         raw_config["image_processor_config"] = processor_config
     return raw_config
@@ -2097,9 +2149,14 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+    _CONFIG_SNAPSHOT_COMMIT.pop(model_path, None)
+    raw_config = _download_hf_config(model_path)
+    # A config served from the cache pins its companions to the same snapshot, so a
+    # transient failure cannot pair cached dimensions with newer remote metadata.
+    pinned = {"revision": commit} if (commit := _CONFIG_SNAPSHOT_COMMIT.pop(model_path, None)) else {}
+    config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
     try:
-        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
     except Exception as exc:  # best-effort for optional quant config
         logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
         hf_quant_config = None

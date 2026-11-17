@@ -186,6 +186,83 @@ def test_cache_lookup_rejects_path_traversal(monkeypatch, hf_cache, revision):
         utils._download_hf_json("org/model", "config.json", revision=revision)
 
 
+def test_absolute_revision_is_rejected_before_any_cache_lookup(monkeypatch, hf_cache, tmp_path):
+    commit = "e" * 40
+    _cache_file(hf_cache, "org/model", "config.json", {"absolute": True}, commit=commit)
+    revision_file = tmp_path / "revision"
+    revision_file.write_text(commit)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    with pytest.raises(utils.HuggingFaceDownloadError, match="unsupported Hugging Face revision"):
+        utils._download_hf_json("org/model", "config.json", revision=str(revision_file))
+    # A slash inside a branch name is still a revision, not a path.
+    _cache_file(hf_cache, "org/model", "config.json", {"branch": True}, ref="release/v1", commit="f" * 40)
+    assert utils._download_hf_json("org/model", "config.json", revision="release/v1") == {"branch": True}
+
+
+def test_interrupted_response_body_falls_back_to_cache(monkeypatch, hf_cache, caplog):
+    _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
+
+    class Truncated(io.BytesIO):
+        def read(self, *args):
+            raise utils.http.client.IncompleteRead(b'{"partial', 100)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", lambda request, *, timeout: Truncated())
+    with caplog.at_level(logging.WARNING):
+        assert utils._download_hf_json("org/model", "config.json") == {"cached": True}
+    assert "using the cached copy" in caplog.text
+
+
+def test_cached_config_pins_quant_metadata_to_the_same_commit(monkeypatch, hf_cache):
+    cached_commit = "a" * 40
+    _cache_file(hf_cache, "org/pinned", "config.json", {"cached_dims": True}, commit=cached_commit)
+    _cache_file(hf_cache, "org/pinned", "hf_quant_config.json", {"quant": "cached"}, commit=cached_commit)
+    requested = []
+
+    def flaky(request, *, timeout):
+        requested.append(request.full_url)
+        if request.full_url.endswith("/main/config.json"):
+            raise utils.urllib.error.URLError("transient")
+        # The remote main has moved on; its metadata must not be mixed in.
+        return io.BytesIO(json.dumps({"quant": "remote-main"}).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", flaky)
+    raw, commit = utils._download_hf_json_at("org/pinned", "config.json", raise_on_404=True)
+    assert raw == {"cached_dims": True} and commit == cached_commit
+    # The loader reads the companion file at the commit the config came from.
+    assert utils._download_hf_json("org/pinned", "hf_quant_config.json", revision=commit) == {"quant": "cached"}
+    assert all(cached_commit in url or url.endswith("/main/config.json") for url in requested)
+
+
+def test_model_loader_reads_quant_config_at_the_cached_config_commit(monkeypatch, hf_cache):
+    cached_commit = "b" * 40
+    config = {
+        "architectures": ["LlamaForCausalLM"],
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 8,
+        "hidden_size": 4096,
+        "num_attention_heads": 32,
+        "intermediate_size": 14336,
+        "vocab_size": 128256,
+        "max_position_embeddings": 4096,
+    }
+    _cache_file(hf_cache, "org/not-bundled", "config.json", config, commit=cached_commit)
+    requested = []
+
+    def flaky(request, *, timeout):
+        requested.append(request.full_url)
+        if request.full_url.endswith("/main/config.json"):
+            raise utils.urllib.error.URLError("transient")
+        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", flaky)
+    utils._load_model_config_from_model_path.__wrapped__("org/not-bundled")
+    # The optional quant file is requested at the cached config's commit, not main.
+    assert [url for url in requested if "hf_quant_config.json" in url] == [
+        f"https://huggingface.co/org/not-bundled/raw/{cached_commit}/hf_quant_config.json"
+    ]
+
+
 @pytest.mark.parametrize(
     "settings,expected",
     [
