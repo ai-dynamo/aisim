@@ -136,6 +136,12 @@ def resolve_nextn_auto(model_path: str) -> int:
     text sub-config when applicable); absent or 0 means the checkpoint ships no
     MTP layers and MTP stays disabled. The checkpoint is the single source of
     truth -- there is no model-family fallback.
+
+    ``mtp_num_hidden_layers`` is the second accepted spelling: Qwen3.8-Flash-Next
+    and its successors describe the draft stack that way while still shipping a
+    ``mtp`` sub-config. Both keys mean "number of native MTP draft layers", so
+    reading only the first would silently resolve ``auto`` to 0 and disable MTP.
+    When both are present they must agree.
     """
     # Local import: utils pulls in the perf-database layer, which config
     # builders must not depend on at import time.
@@ -148,7 +154,14 @@ def resolve_nextn_auto(model_path: str) -> int:
     raw = info.get("raw_config", {})
     text_key = MULTIMODAL_TEXT_CONFIG_KEY.get(info["architecture"])
     cfg = raw[text_key] if text_key and text_key in raw else raw
-    return int(cfg.get("num_nextn_predict_layers") or 0)
+    legacy = int(cfg.get("num_nextn_predict_layers") or 0)
+    nested = int(cfg.get("mtp_num_hidden_layers") or 0)
+    if legacy and nested and legacy != nested:
+        raise ValueError(
+            f"Conflicting MTP draft depth in {model_path!r}: "
+            f"num_nextn_predict_layers={legacy}, mtp_num_hidden_layers={nested}"
+        )
+    return legacy or nested
 
 
 def resolve_dspark_nextn(model_path: str) -> int | None:

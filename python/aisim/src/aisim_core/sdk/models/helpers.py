@@ -86,7 +86,16 @@ _PROJECTION_GROUP_MARKERS = {
     "q": ("q_a_proj", "q_b_proj", "q_proj"),
     "kv": ("kv_a_proj", "kv_b_proj", "kv_proj", "k_proj", "v_proj"),
     "o": ("o_proj",),
-    "indexer": ("indexer.wq_b", "indexer.wk", "indexer.weights_proj"),
+    "indexer": (
+        "indexer.wq_b",
+        "indexer.wk",
+        "indexer.weights_proj",
+        # ``index_qk_proj`` is the fused indexer Q+K projection Qwen Sparse
+        # Attention (Qwen3.8-Flash-Next) uses in place of DeepSeek's separate
+        # wq_b/wk pair. Without it the QSA indexer reads as quantized even
+        # though the checkpoint lists it in ``modules_to_not_convert``.
+        "indexer.index_qk_proj",
+    ),
 }
 _PROJECTION_MODULE_PATHS = {
     **_PROJECTION_GROUP_MARKERS,
@@ -988,6 +997,25 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         if kv_cache_algo not in ("fp8", "nvfp4"):
             overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
+    # Qwen3.8-Flash-Next quantizes routed experts only: the config carries no
+    # kv_cache_scheme and lists every attention projection (``self_attn.q/k/v/o``,
+    # the indexer and its QSA merge) in modules_to_not_convert, so both
+    # runtimes run the QSA module at the checkpoint dtype over a BF16 KV pool.
+    # The weight-precision rule above would otherwise infer an FP8 pool, which
+    # describes a serving state this checkpoint never enters and demands an MSA
+    # row keyed on a quantization the kernel cannot produce. This guard only
+    # fires when kv_cache_quant_algo is absent, so an explicit ``fp8`` still
+    # resolves to an FP8 pool and an explicit unquantized value to BF16. (An
+    # explicit ``bfloat16`` is still rewritten to FP8 by the weight-precision
+    # rule above; that is a pre-existing precedence quirk, tracked separately.)
+    if (
+        architecture == "Qwen4ExpForConditionalGeneration"
+        and kv_cache_algo is None
+        and any("self_attn" in str(pattern).lower() for pattern in quant_exclude_patterns(raw_config))
+    ):
+        overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.bfloat16
+        overrides["fmha_quant_mode"] = common.FMHAQuantMode.bfloat16
+
     return overrides
 
 
@@ -1485,6 +1513,9 @@ def check_is_moe(model_path: str, model_info: dict | None = None) -> bool:
     if family == "QWEN35":
         extra_params = model_info.get("extra_params")
         return isinstance(extra_params, common.Qwen35Config) and extra_params.num_experts > 0
+    if family == "QWEN4EXP":
+        extra_params = model_info.get("extra_params")
+        return isinstance(extra_params, common.Qwen4ExpConfig) and extra_params.num_experts > 0
     if family == "NEMOTRONH":
         extra_params = model_info.get("extra_params")
         if extra_params is None or not hasattr(extra_params, "hybrid_override_pattern"):

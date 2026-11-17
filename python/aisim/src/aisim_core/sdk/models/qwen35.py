@@ -174,8 +174,15 @@ class Qwen35Model(BaseModel):
     ) -> None:
         super().__init__(*args)
         self._backend_name = backend_name
-        cfg: common.Qwen35Config = self.extra_params
-        assert isinstance(cfg, common.Qwen35Config), "Qwen35Model requires Qwen35Config extra_params"
+        cfg = self.extra_params
+        # Qwen3.8-Flash-Next (Qwen4-Exp) subclasses this class: it keeps the GDN
+        # contract but swaps the full-attention block for QSA and adds PLE and
+        # gated-residual branches. Accepting its config here lets it inherit the
+        # GDN pipeline, SSM-dtype resolution and mixed-precision resolver instead
+        # of duplicating them.
+        assert isinstance(cfg, (common.Qwen35Config, common.Qwen4ExpConfig)), (
+            "Qwen35Model requires Qwen35Config or Qwen4ExpConfig extra_params"
+        )
 
         (
             self._projection_gemm_quant_mode,

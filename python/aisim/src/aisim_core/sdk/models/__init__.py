@@ -347,6 +347,7 @@ from aisim_core.sdk.models.moe import MOEModel
 from aisim_core.sdk.models.nemotron_h import NemotronHModel
 from aisim_core.sdk.models.nemotron_nas import NemotronNas
 from aisim_core.sdk.models.qwen3vl import Qwen3VLModel, Qwen3VLMoEModel
+from aisim_core.sdk.models.qwen4_exp import Qwen4ExpModel
 from aisim_core.sdk.models.qwen35 import Qwen35Model
 
 __all__ = [
@@ -364,6 +365,7 @@ __all__ = [
     "NemotronNas",
     "Qwen3VLMoEModel",
     "Qwen3VLModel",
+    "Qwen4ExpModel",
     "Qwen35Model",
     "_apply_model_quant_defaults",
     "_architecture_to_model_family",

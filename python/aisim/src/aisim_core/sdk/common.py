@@ -384,6 +384,73 @@ class Qwen35Config:
 
 
 @dataclass(frozen=True)
+class Qwen4ExpConfig:
+    """Config for Qwen3.8-Flash-Next (Qwen4-Exp): GDN + QSA hybrid with PLE.
+
+    Shares the Qwen3.5 GDN contract (``linear_*``) but replaces the full-attention
+    layers with Qwen Sparse Attention (QSA), a compressed-indexer block-sparse
+    attention, and adds gated residual ("hyper-connection") and n-gram PLE
+    branches that have no Qwen3.5 equivalent.
+
+    layer_types: per-layer "linear_attention" (GDN) or "full_attention" (QSA).
+    indexer_*: QSA compressed indexer. ``block_topk`` (selected block count) is
+        ``indexer_budget // indexer_compress_ratio``; the runtime only accepts
+        512 or 2048 block top-k widths.
+    hc_count/hc_lowrank: gated-residual branch count and the low-rank width of
+        the per-branch down/up mix GEMMs.
+    ple_layer_ids: **1-based** decoder layer ids carrying an n-gram PLE branch.
+        This matches the runtime test ``(layer_id + 1) in ple_layer_ids`` and the
+        checkpoint's ``model.language_model.layers.<id-1>.ple.*`` tensor names;
+        storing 0-based ids here would silently move the branch one layer down.
+    ngram_*: n-gram embedding table geometry. ``ple_embed_dim`` is the per-layer
+        PLE embedding width and ``heads_per_ngram`` counts heads added per n-gram
+        slot; ``split_ngram_parts`` is the table shard count.
+    mtp_num_hidden_layers: native MTP draft depth (this checkpoint spells it
+        ``mtp_num_hidden_layers`` rather than ``num_nextn_predict_layers``).
+    output_gate_type: sigmoid head-wise output gate (shape-neutral).
+    """
+
+    layer_types: tuple[str, ...]  # per-layer: "linear_attention" (GDN) or "full_attention" (QSA)
+    linear_num_key_heads: int
+    linear_key_head_dim: int
+    linear_num_value_heads: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+    indexer_n_heads: int
+    indexer_kv_heads: int
+    indexer_head_dim: int
+    indexer_budget: int
+    indexer_compress_ratio: int
+    hc_count: int
+    hc_lowrank: int
+    ple_layer_ids: tuple[int, ...]
+    ple_embed_dim: int
+    ple_conv_kernel_size: int
+    ngram_size: int
+    heads_per_ngram: int
+    ngram_vocab_size_base: int
+    split_ngram_parts: int
+    topk: int = 0
+    num_experts: int = 0
+    moe_inter_size: int = 0
+    shared_expert_inter_size: int = 0
+    mtp_num_hidden_layers: int = 0
+    vision_config: VisionEncoderConfig | None = None
+    image_token_id: int = 0
+    video_token_id: int = 0
+
+    @property
+    def qsa_block_topk(self) -> int:
+        """Blocks selected per query row (``indexer_budget // compress_ratio``)."""
+        return self.indexer_budget // self.indexer_compress_ratio
+
+    @property
+    def ple_layer_indices(self) -> tuple[int, ...]:
+        """0-based decoder layer indices carrying a PLE branch."""
+        return tuple(idx - 1 for idx in self.ple_layer_ids)
+
+
+@dataclass(frozen=True)
 class KimiK3Config:
     """Config for Kimi-K3 hybrid KDA + MLA LatentMoE model.
 
@@ -780,6 +847,14 @@ DefaultHFModels = {
     # Qwen3.8-Max Models
     "Qwen/Qwen3.8-2.4T-A95B",
     "Qwen/Qwen3.8-2.4T-A95B-FP8",
+    # Qwen3.8-Flash-Next: bundled configs are byte-identical to the pinned
+    # checkpoint revisions recorded in model_configs/QWEN38_FLASH_NEXT_PROVENANCE.md.
+    # Registration keeps resolution offline so live Hugging Face `main` edits
+    # cannot change the frozen checkpoint identity.
+    # nvidia/Qwen3.8-Flash-Next-NVFP4@fc694b54 is intentionally NOT listed: it is
+    # Blackwell-only and no Blackwell system is qualified for this model yet.
+    "Qwen/Qwen3.8-Flash-Next",
+    "Qwen/Qwen3.8-Flash-Next-FP8",
     # MiMo Models
     "XiaomiMiMo/MiMo-V2-Flash",
     "XiaomiMiMo/MiMo-7B-Base",
@@ -869,6 +944,7 @@ ModelFamily = {
     "NEMOTRONH",
     "HYBRIDMOE",
     "QWEN35",
+    "QWEN4EXP",
     "QWEN3VL",
     "QWEN3VL_MOE",
     "GEMMA4MIX",
@@ -919,6 +995,11 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
     # Qwen3.8-Max: FLAT config (no text_config nesting) -- do NOT add to
     # MULTIMODAL_TEXT_CONFIG_KEY below, unlike the two VLM classes above.
     "Qwen3_5MoeForCausalLM": "QWEN35",
+    # Qwen3.8-Flash-Next: Qwen4-Exp text decoder (GDN + QSA hybrid with QSA's
+    # compressed indexer, gated residual and n-gram PLE). The checkpoint nests
+    # the decoder under text_config, so this entry is also listed in
+    # MULTIMODAL_TEXT_CONFIG_KEY below.
+    "Qwen4ExpForConditionalGeneration": "QWEN4EXP",
     "Gemma4ForConditionalGeneration": "GEMMA4MIX",
     "MuseGlimmerForConditionalGeneration": "MUSEGLIMMER",
     "Mistral3ForConditionalGeneration": "MISTRAL3",
@@ -941,6 +1022,8 @@ MULTIMODAL_TEXT_CONFIG_KEY = {
     "Llama4ForConditionalGeneration": "text_config",
     "Qwen3_5ForConditionalGeneration": "text_config",
     "Qwen3_5MoeForConditionalGeneration": "text_config",
+    # Qwen3.8-Flash-Next ships a vision tower plus a text_config decoder.
+    "Qwen4ExpForConditionalGeneration": "text_config",
     "Gemma4ForConditionalGeneration": "text_config",
     "MuseGlimmerForConditionalGeneration": "text_config",
     "Qwen3VLForConditionalGeneration": "text_config",

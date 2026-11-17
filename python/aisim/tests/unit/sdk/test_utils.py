@@ -596,6 +596,251 @@ class TestParseHFConfig:
         assert extra_params.linear_conv_kernel_dim == 4
         assert extra_params.shared_expert_inter_size == 2048
 
+    @staticmethod
+    def _qwen38_flash_next_config(**text_overrides):
+        """Minimal Qwen3.8-Flash-Next config: 8 decoder layers (6 GDN + 2 QSA).
+
+        Geometry mirrors the released checkpoint
+        (``Qwen/Qwen3.8-Flash-Next@de4b8e4d``) but truncated to 8 layers so the
+        parser tests stay cheap. The bundled-config test below covers the real
+        48-layer geometry.
+        """
+        layer_types = ["linear_attention"] * 3 + ["full_attention"]
+        layer_types = layer_types * 2  # 8 layers: 6 GDN + 2 QSA
+        text_config = {
+            "num_hidden_layers": 8,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "hidden_size": 2560,
+            "head_dim": 256,
+            "moe_intermediate_size": 640,
+            "shared_expert_intermediate_size": 640,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144,
+            "layer_types": layer_types,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [2],
+            "ple_embed_dim": 2560,
+            "ple_conv_kernel_size": 4,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "ngram_vocab_size_base": 20000000,
+            "split_ngram_parts": 128,
+            "mtp_num_hidden_layers": 1,
+            "output_gate_type": "sigmoid",
+        }
+        text_config.update(text_overrides)
+        return {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "image_token_id": 248056,
+            "video_token_id": 248057,
+            "vision_config": {
+                "depth": 27,
+                "hidden_size": 1152,
+                "num_heads": 16,
+                "intermediate_size": 4304,
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 2560,
+                "deepstack_visual_indexes": [],
+            },
+            "text_config": text_config,
+        }
+
+    def test_parse_qwen38_flash_next_config(self):
+        """Qwen3.8-Flash-Next parses into Qwen4ExpConfig with QSA and PLE fields."""
+        result = _parse_hf_config_json(self._qwen38_flash_next_config())
+
+        assert result["architecture"] == "Qwen4ExpForConditionalGeneration"
+        assert result["layers"] == 8
+        assert result["hidden_size"] == 2560
+        assert result["n"] == 24
+        assert result["n_kv"] == 2
+        assert result["d"] == 256
+        assert result["vocab"] == 248320
+        assert result["topk"] == 10
+        assert result["num_experts"] == 512
+        assert result["moe_inter_size"] == 640
+
+        extra_params = result["extra_params"]
+        assert isinstance(extra_params, common.Qwen4ExpConfig)
+        assert extra_params.layer_types.count("linear_attention") == 6
+        assert extra_params.layer_types.count("full_attention") == 2
+        assert extra_params.shared_expert_inter_size == 640
+        # QSA indexer: budget 2048 / compress ratio 4 == 512 selected blocks.
+        assert extra_params.indexer_budget == 2048
+        assert extra_params.indexer_compress_ratio == 4
+        assert extra_params.qsa_block_topk == 512
+        assert extra_params.indexer_n_heads == 4
+        assert extra_params.indexer_kv_heads == 1
+        assert extra_params.indexer_head_dim == 128
+        assert extra_params.hc_count == 4
+        assert extra_params.hc_lowrank == 320
+        assert extra_params.ple_embed_dim == 2560
+        assert extra_params.ple_conv_kernel_size == 4
+        assert extra_params.ngram_size == 3
+        assert extra_params.heads_per_ngram == 8
+        assert extra_params.ngram_vocab_size_base == 20000000
+        assert extra_params.split_ngram_parts == 128
+        assert extra_params.mtp_num_hidden_layers == 1
+        assert extra_params.image_token_id == 248056
+        assert extra_params.video_token_id == 248057
+        # The Qwen3.5 ViT contract carries over; Qwen3.8-Flash-Next ships no
+        # deepstack mergers, so there is exactly one PatchMerger instance.
+        assert extra_params.vision_config is not None
+        assert extra_params.vision_config.out_hidden_size == 2560
+        assert extra_params.vision_config.projector_dims == ((4608, 4608), (4608, 2560))
+        assert extra_params.vision_config.projector_n_instances == 1
+
+    @pytest.mark.parametrize(
+        "bundled_name",
+        [
+            "Qwen--Qwen3.8-Flash-Next_config.json",
+            "Qwen--Qwen3.8-Flash-Next-FP8_config.json",
+        ],
+    )
+    def test_parse_qwen38_flash_next_bundled_config(self, bundled_name):
+        """Both bundled checkpoints parse with the released 48-layer geometry."""
+        config_path = utils._get_model_config_path() / bundled_name
+        with open(config_path) as f:
+            config = json.load(f)
+
+        result = _parse_hf_config_json(config)
+
+        assert result["layers"] == 48
+        assert result["hidden_size"] == 2560
+        assert result["n"] == 24
+        assert result["n_kv"] == 2
+        assert result["d"] == 256
+        assert result["context"] == 262144
+        assert result["topk"] == 10
+        assert result["num_experts"] == 512
+        assert result["moe_inter_size"] == 640
+
+        extra_params = result["extra_params"]
+        assert isinstance(extra_params, common.Qwen4ExpConfig)
+        assert len(extra_params.layer_types) == 48
+        # full_attention_interval=4: 12 QSA layers out of 48.
+        assert extra_params.layer_types.count("full_attention") == 12
+        assert extra_params.layer_types.count("linear_attention") == 36
+        assert extra_params.qsa_block_topk == 512
+        assert extra_params.mtp_num_hidden_layers == 1
+        assert extra_params.shared_expert_inter_size == 640
+
+    def test_parse_qwen38_flash_next_ple_layer_ids_are_one_based(self):
+        """ple_layer_ids [2] means decoder layer index 1, not index 2.
+
+        The runtime tests ``(layer_id + 1) in ple_layer_ids`` and the checkpoint
+        stores the branch at ``model.language_model.layers.1.ple.*``. Getting
+        this wrong moves the PLE branch one layer down and misprices the model.
+        """
+        result = _parse_hf_config_json(self._qwen38_flash_next_config(ple_layer_ids=[2, 5]))
+
+        extra_params = result["extra_params"]
+        assert extra_params.ple_layer_ids == (2, 5)
+        assert extra_params.ple_layer_indices == (1, 4)
+
+    def test_parse_qwen38_flash_next_rejects_out_of_range_ple_layer_id(self):
+        for bad in ([0], [9], [-1]):
+            with pytest.raises(ValueError, match="ple_layer_ids are 1-based"):
+                _parse_hf_config_json(self._qwen38_flash_next_config(ple_layer_ids=bad))
+
+    def test_parse_qwen38_flash_next_rejects_unsupported_block_topk(self):
+        """A ratio yielding a block top-k other than 512/2048 is a hard error."""
+        config = self._qwen38_flash_next_config(indexer_budget=1024, indexer_compress_ratio=4)
+        with pytest.raises(ValueError, match="must be 512 or 2048"):
+            _parse_hf_config_json(config)
+
+    def test_parse_qwen38_flash_next_rejects_indivisible_indexer_budget(self):
+        config = self._qwen38_flash_next_config(indexer_budget=2050, indexer_compress_ratio=4)
+        with pytest.raises(ValueError, match="positive multiple of"):
+            _parse_hf_config_json(config)
+
+    @pytest.mark.parametrize("field", ["hc_count", "hc_lowrank"])
+    def test_parse_qwen38_flash_next_rejects_missing_gated_residual(self, field):
+        config = self._qwen38_flash_next_config()
+        config["text_config"][field] = 0
+        with pytest.raises(ValueError, match="hc_count/hc_lowrank"):
+            _parse_hf_config_json(config)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "ple_embed_dim",
+            "ple_conv_kernel_size",
+            "ngram_size",
+            "heads_per_ngram",
+            "ngram_vocab_size_base",
+            "split_ngram_parts",
+        ],
+    )
+    def test_parse_qwen38_flash_next_rejects_missing_ple_geometry(self, field):
+        """A zero-width PLE field is rejected instead of silently pricing no table.
+
+        With ``ple_embed_dim=0`` the n-gram ``Embedding`` and the two projection
+        GEMMs become zero-width: no error, no FLOPs, and 51.2e9 parameters
+        (12.8 GB/rank at TP8) vanish from the resident-weights inventory.
+        """
+        config = self._qwen38_flash_next_config()
+        config["text_config"][field] = 0
+        with pytest.raises(ValueError, match=f"missing or non-positive.*{field}"):
+            _parse_hf_config_json(config)
+
+    def test_parse_qwen38_flash_next_allows_absent_ple_when_no_layer_carries_it(self):
+        """No ``ple_layer_ids`` means no branch to size, so the fields may be absent."""
+        config = self._qwen38_flash_next_config(ple_layer_ids=[])
+        for field in ("ple_embed_dim", "ngram_vocab_size_base", "split_ngram_parts"):
+            config["text_config"].pop(field)
+
+        extra_params = _parse_hf_config_json(config)["extra_params"]
+
+        assert extra_params.ple_layer_ids == ()
+        assert extra_params.ple_layer_indices == ()
+        assert extra_params.ple_embed_dim == 0
+
+    def test_parse_qwen38_flash_next_rejects_unknown_output_gate_type(self):
+        config = self._qwen38_flash_next_config(output_gate_type="softmax")
+        with pytest.raises(ValueError, match="output_gate_type='sigmoid' only"):
+            _parse_hf_config_json(config)
+
+    def test_parse_qwen38_flash_next_rejects_unknown_layer_type(self):
+        layer_types = ["linear_attention"] * 7 + ["sliding_attention"]
+        config = self._qwen38_flash_next_config(layer_types=layer_types)
+        with pytest.raises(ValueError, match="layer_types must contain only"):
+            _parse_hf_config_json(config)
+
+    def test_parse_qwen38_flash_next_trims_layer_types_including_mtp(self):
+        """A future revision that concatenates MTP draft layer types is trimmed.
+
+        ``layer_types`` sizes the 48 decoder layers; the MTP draft stack is
+        described separately under ``mtp.layer_types``. If a checkpoint starts
+        emitting both in one list, the parser must drop the trailing draft
+        entries instead of rejecting the config.
+        """
+        layer_types = ["linear_attention"] * 3 + ["full_attention"]
+        layer_types = layer_types * 2  # 8 decoder layers
+        config = self._qwen38_flash_next_config(layer_types=layer_types + ["full_attention"])
+
+        result = _parse_hf_config_json(config)
+
+        assert result["layers"] == 8
+        assert len(result["extra_params"].layer_types) == 8
+
     def test_parse_llama4_scout_config(self):
         """Test Llama 4 Scout (VLM, step=1: all-MoE) → HybridMoEConfig with alternating attn pattern."""
         config = {
@@ -1456,6 +1701,50 @@ class TestGetModelConfigFromHFID:
 
         assert result["architecture"] == "LlamaForCausalLM"  # architecture
         mock_download.assert_called_once_with(model_id)
+
+
+class TestResolveNextnAuto:
+    """``nextn='auto'`` must read both native MTP draft-depth spellings."""
+
+    @staticmethod
+    def _resolve(raw_config, architecture="Qwen4ExpForConditionalGeneration"):
+        info = {"architecture": architecture, "raw_config": raw_config}
+        with patch("aisim_core.sdk.utils.get_model_config_from_model_path", return_value=info):
+            from aisim_core.sdk.config_builders import resolve_nextn_auto
+
+            return resolve_nextn_auto("acme/Fake-Model")
+
+    def test_reads_nested_mtp_num_hidden_layers(self):
+        """Qwen3.8-Flash-Next spells the draft depth ``mtp_num_hidden_layers``.
+
+        Reading only ``num_nextn_predict_layers`` would resolve to 0 and quietly
+        disable MTP for every checkpoint that uses the newer spelling.
+        """
+        raw = {"text_config": {"mtp_num_hidden_layers": 1}}
+        assert self._resolve(raw) == 1
+
+    def test_reads_legacy_num_nextn_predict_layers(self):
+        raw = {"text_config": {"num_nextn_predict_layers": 3}}
+        assert self._resolve(raw) == 3
+
+    def test_flat_config_without_multimodal_text_key(self):
+        raw = {"num_nextn_predict_layers": 2}
+        assert self._resolve(raw, architecture="LlamaForCausalLM") == 2
+
+    def test_absent_keys_mean_no_mtp(self):
+        raw = {"text_config": {}}
+        assert self._resolve(raw) == 0
+
+    def test_conflicting_spellings_raise(self):
+        raw = {"text_config": {"num_nextn_predict_layers": 1, "mtp_num_hidden_layers": 2}}
+        with pytest.raises(ValueError, match="Conflicting MTP draft depth"):
+            self._resolve(raw)
+
+    def test_empty_model_path_raises(self):
+        from aisim_core.sdk.config_builders import resolve_nextn_auto
+
+        with pytest.raises(ValueError, match="requires a model path"):
+            resolve_nextn_auto("")
 
 
 class TestSafeMkdir:
