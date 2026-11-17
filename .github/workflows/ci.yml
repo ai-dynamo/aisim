@@ -1077,7 +1077,8 @@ jobs:
     permissions:
       contents: read
       actions: read
-    secrets: inherit
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     with:
       pr_number: ${{ needs.select-full-ci.outputs.pr-number }}
 

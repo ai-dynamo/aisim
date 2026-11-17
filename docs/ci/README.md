@@ -210,7 +210,12 @@ Pinned RCs are test dependencies, so the Dynamo profile uses `pr-wheel-staging`
 on both main and PR refs. Main seeds its RC bundle under `preview/` in that test
 repository; PR producers use their verified `pr/<number>/` namespace. This
 enables trusted-main reuse without giving PR jobs access to official release
-storage. Other product/release wheel handoffs keep their existing environments.
+storage. Source, development, release, and macOS README profiles run in a
+separate job with no environment binding or storage secrets. The reusable
+workflow receives only the named `ARTIFACTORY_TOKEN`; only the Dynamo job
+references it, using the selected environment's value. The release-artifact
+contract now binds the same ref-selected storage environment as its application
+wheel producer; other wheel handoffs keep their existing environments.
 The `pr_number` input comes from Full CI's verified target validation; a nonempty
 value selects `pr` upload scope and enables discovery of that exact admitted PR
 head alongside trusted main preview producers.
@@ -218,7 +223,7 @@ head alongside trusted main preview producers.
 The Dynamo profile runs in the existing NVIDIA-connected AMD64 pool and CI job
 image because GitHub-hosted runners cannot resolve NVIDIA Artifactory. It checks
 storage DNS before compilation. Native prerequisites are prepared before key
-generation so cold and reused jobs have the same fingerprint. Source and macOS
+generation so cold and reused jobs have the same fingerprint. The other four
 README profiles keep their original runner placement; all README commands and
 the separate platform/Python compatibility matrices remain in place.
 

@@ -1090,8 +1090,8 @@ def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, 
 
 def test_main_rc_producers_share_test_storage_with_pr_consumers():
     workflow = _workflow("readme-checks.yml")
-    job = workflow["jobs"]["commands"]
-    assert "matrix.profile == 'dynamo' && 'pr-wheel-staging'" in job["environment"]
+    job = workflow["jobs"]["dynamo"]
+    assert job["environment"] == "pr-wheel-staging"
     prepare = next(step for step in job["steps"] if step.get("id") == "rc-wheels")
     assert prepare["env"]["RC_STORAGE_REPO"] == "${{ vars.WHEEL_STORAGE_REPO }}"
     upload = next(
@@ -1100,8 +1100,8 @@ def test_main_rc_producers_share_test_storage_with_pr_consumers():
         if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "upload"
     )
     assert upload["with"]["scope"] == "${{ inputs.pr_number != '' && 'pr' || 'preview' }}"
-    assert job["runs-on"] == "${{ matrix.profile == 'dynamo' && 'prod-aisim-default-amd64-v1' || matrix.os }}"
-    assert job["container"] == "${{ matrix.profile == 'dynamo' && vars.CI_JOB_CONTAINER_IMAGE || '' }}"
+    assert job["runs-on"] == "prod-aisim-default-amd64-v1"
+    assert job["container"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
     commands = _run_commands(job)
     assert commands.index("socket.getaddrinfo") < commands.index("readme_rc_wheels.py prepare")
     assert commands.index("apt-get install") < commands.index("readme_rc_wheels.py prepare")
@@ -1129,7 +1129,7 @@ def test_rc_prepare_cli_outputs_reach_workflow_restore_inputs(tmp_path, monkeypa
     assert values == {"name": rc_wheels.handoff_name(expected), **producer}
     assert json.loads((directory / "rc-build-inputs.json").read_text()) == expected
 
-    job = _workflow("readme-checks.yml")["jobs"]["commands"]
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
     assert job["env"]["RC_PR_NUMBER"] == "${{ inputs.pr_number }}"
     restore = next(step for step in job["steps"] if step.get("name") == "Restore verified pinned Dynamo RC wheels")
     inputs = {}
@@ -1155,7 +1155,7 @@ def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path
 
 
 def test_pinned_rc_build_executes_all_three_locked_feature_builds(tmp_path):
-    job = _workflow("readme-checks.yml")["jobs"]["commands"]
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
     log = tmp_path / "commands.jsonl"
     executables = tmp_path / "bin"
     executables.mkdir()

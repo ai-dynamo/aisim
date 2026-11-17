@@ -393,15 +393,21 @@ Set repository variable `WHEEL_STORAGE_URL` to `https://artifactory.nvidia.com/a
 | `pr-wheel-staging` | `sw-dynamo-aisimulate-pr-pypi-local` | Copied-PR CI, PR accuracy previews, and simulation comparisons (including manual comparisons launched from main) |
 | `automated-release` | `sw-dynamo-aisimulate-pypi-local` | Main/release CI, nightly builds, release FPE, and official accuracy/FPE consumers |
 
-Full CI selects the environment from the workflow ref: `main` and `release/*` use `automated-release`, while PR/source refs use `pr-wheel-staging`. Standalone FPE uses the same rule unless an explicit `pr_number` selects PR storage, including a manual dispatch from main. E2E accuracy previews use PR storage; published accuracy campaigns and their cross-run nightly downloads use official storage. The manifest records the producer's storage repository, and downloads reject a repository mismatch before making an authenticated request.
+Full CI selects the environment from the workflow ref: `main` and `release/*` use `automated-release`, while PR/source refs use `pr-wheel-staging`. Standalone FPE uses the same rule unless an explicit `pr_number` selects PR storage, including a manual dispatch from main. E2E accuracy previews use PR storage; published accuracy campaigns and their cross-run nightly downloads use official storage. The manifest records the producer's storage repository, and downloads reject a repository mismatch before making an authenticated request. The release-artifact contract now binds this ref-selected environment explicitly to download the application-test wheel.
 
-The pinned Dynamo README RC bundle is a test dependency and uses
-`pr-wheel-staging` on every ref. A main producer seeds that test repository's
-`preview/` namespace; a PR producer uses `pr/<number>/`. Its reuse key binds the
-storage repository as well as the build inputs. PR consumers can therefore reuse
-trusted main RC builds with their existing test-storage credential; they never
-read the official release repository. Product/release artifacts retain the
-environment selection described above.
+The separate Dynamo README job always binds `pr-wheel-staging`, including main
+and release refs, because the pinned RC bundle is a test dependency. Main seeds
+preview scope and verified PR heads use PR scope. Source, development, release,
+and macOS README jobs have no environment binding or storage secret references.
+The reusable README workflow declares and receives only the named
+`ARTIFACTORY_TOKEN`; its Dynamo job uses the selected environment's value and
+checks it before native compilation. These are job-binding changes; environment
+protection settings and credential grants are unchanged.
+
+Its reuse key binds the storage repository as well as build inputs. PR
+consumers can reuse trusted main RC builds with their existing test-storage
+credential; they never read the official release repository. Product/release
+artifacts retain the environment selection described above.
 
 Before enabling transfer jobs:
 
@@ -409,7 +415,7 @@ Before enabling transfer jobs:
 - Preserve branch admission: `automated-release` admits `main` and `release/*`; `pr-wheel-staging` admits trusted `pull-request/*` refs and the main/release refs used to launch manual PR comparisons. A manual PR comparison remains in PR storage even when its workflow is dispatched from main.
 - Retain objects in **both** repositories for at least as long as their Actions manifests (30 days by default; FPE/accuracy handoffs use seven days). Expired objects require a producer rebuild, not a fallback to a different wheel.
 
-The action never forwards credentials to redirects. The existing environment-scoped credential is passed only to the transfer step, and the manifest pins the producer's storage repository before any download. No credential or environment configuration is changed by the workflow code. Rollout should exercise one copied-PR build, a consumer-only rerun, and a main-branch nightly/accuracy reuse before closing infrastructure validation.
+The action never forwards credentials to redirects. The existing environment-scoped credential is referenced only by transfer steps and the Dynamo job's nonempty-credential preflight, and the manifest pins the producer's storage repository before any download. These job bindings do not change credential grants or environment protection settings. Rollout should exercise one copied-PR build, a consumer-only rerun, and a main-branch nightly/accuracy reuse before closing infrastructure validation.
 
 ### Wheel producers and retained outputs
 
@@ -432,7 +438,7 @@ Persistent project and Dynamo wheel handoffs use Artifactory, including companio
 | `performance.yml` | Builds base/head wheels into separate temporary dist directories, installs and compares in the same job | Disposable local dist/venv paths; only the separate benchmark results directory is uploaded |
 | `prediction-regression-gate.yml` | Source install can build a local wheel before producing snapshots | Disposable install wheel; Actions gate snapshots and comparison reports only |
 | `collector-check.yml` | Source install can build a local wheel | Disposable install wheel; cross-backend `.md`/`.json` reports only |
-| `readme-checks.yml` | Source/development profiles install in isolated workspaces; Dynamo builds or reuses a verified matching pinned RC wheel set | Artifactory `readme-rc-wheels-<build-input-hash>` for the three RC wheels and build-input record; Actions retains only its completion manifest and command/provenance reports; every README command runs afresh |
+| `readme-checks.yml` | Source/development/release/macOS profiles keep isolated workspaces without a storage environment; the separate Dynamo job builds or reuses a verified matching pinned RC wheel set in `pr-wheel-staging` | Artifactory `readme-rc-wheels-<build-input-hash>` for the three RC wheels and build-input record; Actions retains only its completion manifest and command/provenance reports; every README command runs afresh |
 | `accuracy-digest.yml` | No product wheel generation; consumes qualified accuracy data | Actions preview, report, and delivery-state data only |
 | `fast-ci.yml` | No product wheel producer; dependency installs/tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
 | `pages.yml` | No product wheel producer; dependencies/tests and allowlisted site packaging | Pages/site and validation data only |
