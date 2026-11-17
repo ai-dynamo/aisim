@@ -10,6 +10,7 @@ from .config.engine import (
     EnginePredictionConfig,
     StateCacheConfig,
     WorkerPredictionConfig,
+    _require_block_drop_off,
     _validate_hybrid_host_offload,
     recorded_state_pool,
 )
@@ -60,13 +61,16 @@ def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionC
         raise ValueError("state_cache.prefill_checkpoint requires prefix_match_unit equal to block_size")
     if cache.host_offload is not None:
         # The state's family is known here, also for an inferred geometry.
+        window = "sliding_window_lookahead_tokens" in result
         _validate_hybrid_host_offload(
             cache.host_offload.connector,
             cache.prefix_match_unit,
             block_size,
-            window="sliding_window_lookahead_tokens" in result,
+            window=window,
             kvcr=cache.kvcr is not None,
         )
+        if engine.speculation is not None and not window:
+            _require_block_drop_off(engine.speculation)
     size = StateCacheConfig(bytes_per_request=result["bytes_per_request"])
     blocks = size.state_blocks(block_size, bytes_per_token)
     block_bytes = block_size * bytes_per_token

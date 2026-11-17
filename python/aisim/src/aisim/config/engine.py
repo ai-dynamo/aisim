@@ -287,6 +287,14 @@ class SlidingWindowStateConfig(StrictModel):
     lookahead_tokens: NonNegativeU64
 
 
+def _require_block_drop_off(speculation) -> None:
+    # Replay does not model the EAGLE block drop hiding the last block, and the
+    # recurrent state, that a host load restored. A sliding window resumes one
+    # block lower instead.
+    if not speculation.disable_eagle_block_drop:
+        raise ValueError("mtp speculation with host_offload and state_cache requires disable_eagle_block_drop")
+
+
 def _validate_hybrid_host_offload(
     connector: str, prefix_match_unit: int | None, block_size: int | None, *, window: bool, kvcr: bool
 ) -> None:
@@ -1637,14 +1645,12 @@ def _validate_speculation(engine, *, modes: set[str], backends: set[str]) -> Non
             if kind != "mtp":
                 raise ValueError(f"{kind} speculation does not support host_offload")
             cache = worker.kv_cache
-            if cache.state_cache is not None and cache.state_cache.sliding_window_lookahead_tokens is None:
-                # Replay does not model the EAGLE block drop hiding the last
-                # block, and the recurrent state, that a host load restored. A
-                # sliding window resumes one block lower instead.
-                if not engine.speculation.disable_eagle_block_drop:
-                    raise ValueError(
-                        "mtp speculation with host_offload and state_cache requires disable_eagle_block_drop"
-                    )
+            state = cache.state_cache
+            if state is not None and state.sliding_window_lookahead_tokens is None:
+                # An inferred state's family is known only after sizing, which
+                # checks a recurrent one there.
+                if state.bytes_per_request is not None:
+                    _require_block_drop_off(engine.speculation)
             elif worker.scheduler.async_scheduling is True:
                 raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
             elif backends != {"vllm"} or not cache.prefix_caching or cache.g3_offload is not None:

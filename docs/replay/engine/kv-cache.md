@@ -475,7 +475,9 @@ the speculative lifecycle they have without G2. G2 stores complete prompt
 blocks only, so drafts never reach it. With a uniform token cache a restore
 resumes at the loaded prefix, as on an aggregated worker. With a sliding-window
 state cache it loads and resumes one block short of the G2 hit, as vLLM's
-drafter KV group loads a connector hit without its last block. Accepted drafts that take a G1 block a store still
+drafter KV group loads a connector hit without its last block; with
+[`disable_eagle_block_drop`](speculation.md#prefix-caching) the hit follows the
+non-speculative rules. Accepted drafts that take a G1 block a store still
 reads make the forward that writes it wait for that copy, and so does
 preempting a request whose store is in flight; a store prepared in that same
 pass delays the rank's next pass. A preempted request resumes once G1 has room
@@ -803,7 +805,8 @@ to make room for the rest. A cohort that found no room is offered again with
 what the next pass adds; one larger than the pool is never stored, and replay
 warns once. A boundary reached during decode is not stored. A restore resumes at the highest boundary that has
 both its token blocks and its whole checkpoint in G2, below the logits cap and,
-with speculative decoding, one block below the token hit. If G2 evicted a
+with speculative decoding that keeps the EAGLE block drop, one block below the
+token hit. If G2 evicted a
 checkpoint, the restore uses a lower boundary or recomputes. A lookup makes
 the checkpoint it resumes at the newest in G2; checkpoints at lower boundaries
 age and are evicted first. The load brings the token blocks up to that

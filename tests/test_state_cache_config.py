@@ -709,15 +709,22 @@ def test_auto_dsv4_mtp_state_includes_draft_rows(auto_dsv4_payload, forbid_estim
     }
 
 
-def test_auto_dsv4_compiles_with_host_offload_on_the_default_connector(auto_dsv4_payload, forbid_estimators):
-    """Sizing knows the state is a sliding window, which G2 keeps on the default connector only."""
-    kv_cache = auto_dsv4_payload["engine"]["workers"]["aggregated"]["kv_cache"]
+@pytest.mark.parametrize("mtp", [False, True])
+def test_auto_dsv4_runs_with_host_offload_on_the_default_connector(auto_dsv4_payload, forbid_estimators, mtp):
+    """Sizing knows the state is a sliding window: G2 keeps it on the default connector, MTP with its block drop."""
+    worker = auto_dsv4_payload["engine"]["workers"]["aggregated"]
+    if mtp:
+        # MTP needs default timing; B200 has the DeepSeek V4 vLLM data.
+        speculation = {"kind": "mtp", "params": {"depth": 1}, "expected_accepted_tokens": 1.0}
+        auto_dsv4_payload["engine"].update(hardware="b200_sxm", speculation=speculation)
+        worker.update(timing={"type": "default"}, parallelism={"tensor": 8, "moe_expert": 8})
+    kv_cache = worker["kv_cache"]
     kv_cache["host_offload"] = {"num_host_blocks": 64}
-    args = prediction_to_replay_spec(
-        CorePredictionConfig.model_validate(auto_dsv4_payload)
-    ).backend_deployment.agg_engine_args
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
+    args = spec.backend_deployment.agg_engine_args
     assert args["native_host_offload"]["num_host_blocks"] == 64
     assert "sliding_window" in args["state_cache"]
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 1
     kv_cache["host_offload"]["connector"] = "offloading_v0_32"
     with pytest.raises(ValueError, match="connector=offloading_v0_24"):
         prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
@@ -959,9 +966,17 @@ def test_the_drop_switch_requires_vllm():
         CorePredictionConfig.model_validate(raw)
 
 
-def test_mtp_with_g2_and_a_state_cache_needs_the_drop_off():
+def test_mtp_with_g2_and_a_state_cache_needs_the_drop_off(auto_k3_payload, forbid_estimators):
+    error = "with host_offload and state_cache requires disable_eagle_block_drop"
     host = {"num_host_blocks": 8, "connector": "simple_cpu_v0_32"}
     raw = _public(timing="default", state_cache=STATE, prefix_match_unit=64, host_offload=host)
     raw["engine"]["speculation"] = MTP
-    with pytest.raises(ValidationError, match="with host_offload and state_cache requires disable_eagle_block_drop"):
+    with pytest.raises(ValidationError, match=error):
         CorePredictionConfig.model_validate(raw)
+    # An inferred state is known to be recurrent only at sizing.
+    auto_k3_payload["engine"]["speculation"] = MTP
+    worker = auto_k3_payload["engine"]["workers"]["aggregated"]
+    worker["timing"] = {"type": "default"}
+    worker["kv_cache"].update(block_size=768, prefix_match_unit=768, host_offload=host)
+    with pytest.raises(ValueError, match=error):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_k3_payload))
