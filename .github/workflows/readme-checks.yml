@@ -18,7 +18,9 @@ permissions:
 jobs:
   commands:
     name: README / ${{ matrix.profile }}
-    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
+    # Fixed RCs are test dependencies: main seeds the same test-only storage
+    # consumed by PRs, without exposing official release storage to PR tokens.
+    environment: ${{ matrix.profile == 'dynamo' && 'pr-wheel-staging' || ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging') }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,9 +61,11 @@ jobs:
         if: matrix.profile == 'dynamo'
         env:
           GH_TOKEN: ${{ github.token }}
+          RC_STORAGE_REPO: ${{ vars.WHEEL_STORAGE_REPO }}
         run: |
           wheelhouse="${RUNNER_TEMP}/dynamo-rc-wheels"
           echo "AISIM_RC_WHEELHOUSE=${wheelhouse}" >> "${GITHUB_ENV}"
+          echo "RC_STORAGE_REPO=${RC_STORAGE_REPO}" >> "${GITHUB_ENV}"
           python scripts/ci/readme_rc_wheels.py prepare --directory "$wheelhouse"
       - name: Restore verified pinned Dynamo RC wheels
         if: matrix.profile == 'dynamo' && steps.rc-wheels.outputs.run-id != ''
@@ -108,7 +112,7 @@ jobs:
           path: ${{ env.AISIM_RC_WHEELHOUSE }}
           source-sha: ${{ env.AISIM_RC_REVISION }}
           architecture: amd64
-          scope: ${{ inputs.pr_number != '' && 'pr' || ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'official' || 'preview') }}
+          scope: ${{ inputs.pr_number != '' && 'pr' || 'preview' }}
           pr-number: ${{ inputs.pr_number }}
           url: ${{ vars.WHEEL_STORAGE_URL }}
           repo: ${{ vars.WHEEL_STORAGE_REPO }}

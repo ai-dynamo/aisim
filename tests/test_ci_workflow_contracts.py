@@ -986,7 +986,7 @@ def test_rc_wheels_reuse_only_successful_main_or_exact_current_pr():
 
     assert rc_wheels.find_producer("bundle", env, request) == {
         "run-id": "10",
-        "scope": "official",
+        "scope": "preview",
         "pr-number": "",
     }
     run["head_branch"] = env["GITHUB_REF_NAME"]
@@ -1048,6 +1048,7 @@ def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, 
         monkeypatch.setenv(key, "a" * 40)
     monkeypatch.setenv("ImageOS", "ubuntu24")
     monkeypatch.setenv("ImageVersion", "20261117.1")
+    monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pr-pypi-local")
     monkeypatch.setattr(rc_wheels.platform, "system", lambda: "Linux")
     monkeypatch.setattr(rc_wheels.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(rc_wheels.subprocess, "check_output", lambda *a, **kw: "pinned tool version")
@@ -1061,6 +1062,23 @@ def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, 
     (tmp_path / changed_input).write_text("original")
     monkeypatch.setenv("ImageVersion", "20261118.1")
     assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    monkeypatch.setenv("ImageVersion", "20261117.1")
+    monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+
+
+def test_main_rc_producers_share_test_storage_with_pr_consumers():
+    workflow = _workflow("readme-checks.yml")
+    job = workflow["jobs"]["commands"]
+    assert "matrix.profile == 'dynamo' && 'pr-wheel-staging'" in job["environment"]
+    prepare = next(step for step in job["steps"] if step.get("id") == "rc-wheels")
+    assert prepare["env"]["RC_STORAGE_REPO"] == "${{ vars.WHEEL_STORAGE_REPO }}"
+    upload = next(
+        step
+        for step in job["steps"]
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "upload"
+    )
+    assert upload["with"]["scope"] == "${{ inputs.pr_number != '' && 'pr' || 'preview' }}"
 
 
 def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path):

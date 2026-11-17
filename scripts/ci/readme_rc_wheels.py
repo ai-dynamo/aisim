@@ -40,12 +40,16 @@ def identity(root: Path = ROOT) -> dict:
     if any(not re.fullmatch(r"[a-f0-9]{40}", value) for value in revisions.values()):
         raise ValueError("RC revisions must be full commit SHAs")
     image = {key: os.environ[key] for key in ("ImageOS", "ImageVersion")}
+    storage_repo = os.environ["RC_STORAGE_REPO"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", storage_repo):
+        raise ValueError("RC storage repository must be configured")
     if not all(image.values()) or platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("RC reuse requires an identified Linux AMD64 runner image")
     return {
         "schema": 1,
         "revisions": revisions,
         "image": image,
+        "storage_repo": storage_repo,
         "python": platform.python_version(),
         "rust": subprocess.check_output(["rustc", "-Vv"], text=True).strip(),
         "uv": subprocess.check_output(["uv", "--version"], text=True).strip(),
@@ -87,7 +91,7 @@ def find_producer(name: str, env: dict, request=api) -> dict[str, str]:
             ):
                 continue
             if run.get("head_branch") == "main":
-                return {"run-id": str(run["id"]), "scope": "official", "pr-number": ""}
+                return {"run-id": str(run["id"]), "scope": "preview", "pr-number": ""}
             if (
                 run.get("head_branch") == env["GITHUB_REF_NAME"]
                 and run.get("head_sha") == env["GITHUB_SHA"]

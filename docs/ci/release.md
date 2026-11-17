@@ -395,6 +395,14 @@ Set repository variable `WHEEL_STORAGE_URL` to `https://artifactory.nvidia.com/a
 
 Full CI selects the environment from the workflow ref: `main` and `release/*` use `automated-release`, while PR/source refs use `pr-wheel-staging`. Standalone FPE uses the same rule unless an explicit `pr_number` selects PR storage, including a manual dispatch from main. E2E accuracy previews use PR storage; published accuracy campaigns and their cross-run nightly downloads use official storage. The manifest records the producer's storage repository, and downloads reject a repository mismatch before making an authenticated request.
 
+The pinned Dynamo README RC bundle is a test dependency and uses
+`pr-wheel-staging` on every ref. A main producer seeds that test repository's
+`preview/` namespace; a PR producer uses `pr/<number>/`. Its reuse key binds the
+storage repository as well as the build inputs. PR consumers can therefore reuse
+trusted main RC builds with their existing test-storage credential; they never
+read the official release repository. Product/release artifacts retain the
+environment selection described above.
+
 Before enabling transfer jobs:
 
 - Use the existing `ARTIFACTORY_TOKEN` from each job's selected GitHub environment. PR jobs receive the `pr-wheel-staging` token and repository; post-merge/release jobs receive the separate `automated-release` token and repository. The selected token must support read plus deploy/write for uploads (including read-back) and read for downloads under that repository's applicable `pr/**`, `preview/**`, or official `ci-wheels/1330347449/**` namespace. No new secret names or delete/admin permission are required. Existing final-publication configuration remains unchanged.
