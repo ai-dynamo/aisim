@@ -28,7 +28,7 @@ from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
 
 from .capacity import materialize_aic_num_gpu_blocks, reject_pipeline_parallelism, resolve_model_context_length
 from .config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control
-from .config.engine import StateCacheConfig
+from .config.engine import StateCacheConfig, _validate_hybrid_host_offload
 from .power import normalize_power_summary, power_metadata
 from .sweeper.provider import JSONValue
 from .sweeper.replay import (
@@ -1452,6 +1452,7 @@ def _materialize_engine_role(
         }
         memory_diagnostics[role] = role_memory
     capacity_materialized = False
+    state_cache_from_profile = False
     num_gpu_blocks_is_explicit = False
     # A nested canonical timing config carries the CP knobs too; check them
     # against parallel_config BEFORE capacity materialization resolves them
@@ -1511,6 +1512,7 @@ def _materialize_engine_role(
             )
             if timing_only_width:
                 role_config.pop("aic_pp_size", None)
+            state_cache_from_profile = role_config.get("state_cache") is not None
             if role_memory is not None and "total_gpu_capacity_bytes" in role_memory:
                 role_memory["status"] = "available"
                 if "num_gpu_blocks" in role_memory:
@@ -1596,7 +1598,7 @@ def _materialize_engine_role(
         # role mappings may use the same shorthand.
         rank = role_config
 
-    state_cache = _manual_state_cache(rank, deployment_backend, role)
+    state_cache = None if state_cache_from_profile else _manual_state_cache(rank, deployment_backend, role)
     if state_cache is not None:
         # A state pool is explicit unless the compiler derived it from an FPM profile's recorded runtime memory.
         num_gpu_blocks_is_explicit = rank.pop("num_gpu_blocks_is_explicit", True)
@@ -1784,6 +1786,8 @@ def _materialize_engine_role(
             rank["aic_nextn_accept_rates"] = ",".join(str(rate) for rate in speculation.acceptance_rates)
         else:
             rank["aic_nextn_accepted"] = speculation.expected_accepted_tokens
+            if speculation.disable_eagle_block_drop:
+                rank["disable_eagle_block_drop"] = True
         rank["aic_mtp_seed"] = speculation.seed
 
     kind = speculation.kind if speculation is not None else canonical_kind
@@ -1798,26 +1802,32 @@ def _materialize_engine_role(
         if backend not in supported:
             raise ValueError(f"{kind} speculation requires a supported backend")
         host_offload = rank.get("native_host_offload")
-        if host_offload is not None and not (
+        if host_offload is not None and rank.get("state_cache") is not None:
+            # Replay does not model the EAGLE block drop hiding the last block,
+            # and the state, that a host load restored.
+            if kind != "mtp" or rank.get("disable_eagle_block_drop") is not True:
+                raise ValueError(
+                    f"{kind} speculation with host_offload and state_cache requires mtp and disable_eagle_block_drop"
+                )
+        elif host_offload is not None and not (
             kind == "mtp"
             and backend == "vllm"
-            and role == "aggregated"
-            and dp_size == 1
             and rank.get("enable_prefix_caching", True) is True
-            and isinstance(host_offload, Mapping)
-            and host_offload.get("scope", "dp_rank_local") == "dp_rank_local"
+            and (
+                role != "aggregated"
+                or (isinstance(host_offload, Mapping) and host_offload.get("scope", "dp_rank_local") == "dp_rank_local")
+            )
             and rank.get("g3_offload") is None
-            and rank.get("state_cache") is None
             and rank.get("prefix_match_unit") is None
             and not rank.get("kv_cache_groups")
         ):
             raise ValueError(
-                f"{kind} speculation with host_offload supports only aggregated vllm MTP, attention DP=1, "
-                "prefix caching, scope=dp_rank_local, and uniform G1/G2 without G3 or state cache"
+                f"{kind} speculation with host_offload supports only vllm MTP with prefix caching, "
+                "scope=dp_rank_local on aggregated workers, and uniform G1/G2 without G3"
             )
     if rank.get("async_scheduling") is not None and not isinstance(rank["async_scheduling"], bool):
         raise ValueError(f"engine provider {role} async_scheduling must be a boolean")
-    if kind == "mtp" and rank.get("native_host_offload") is not None:
+    if kind == "mtp" and rank.get("native_host_offload") is not None and rank.get("state_cache") is None:
         if rank.get("async_scheduling") is True:
             raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
         rank["async_scheduling"] = False
@@ -2012,14 +2022,20 @@ def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) 
         rank.get("prefix_match_unit") is not None
         and rank["prefix_match_unit"] != rank.get("block_size")
         and rank.get("aic_nextn") is not None
+        and state_cache.num_speculative_states is None
     ):
         raise ValueError("sub-block prefix_match_unit does not support speculative decoding")
     if backend != "vllm" or role not in ("aggregated", "prefill", "decode"):
         raise ValueError("state_cache requires backend=vllm and an aggregated, prefill or decode G1 worker")
-    if rank.get("native_host_offload") is not None:
-        raise ValueError("state_cache supports G1 only; native_host_offload is not supported")
+    host = rank.get("native_host_offload")
+    if isinstance(host, dict):
+        # Inferred geometry checks the unit against the resolved block_size.
+        block_size = rank.get("block_size") if state_cache.bytes_per_request is not None else None
+        _validate_hybrid_host_offload(
+            host.get("connector", "offloading_v0_24"), rank.get("prefix_match_unit"), block_size
+        )
     if rank.get("g3_offload") is not None:
-        raise ValueError("state_cache supports G1 only; g3_offload is not supported")
+        raise ValueError("state_cache does not support g3_offload")
     # Only prefill and decode roles transfer KV.
     transfer = ("kv_transfer_bytes_per_token", "kv_transfer_bandwidth") if role == "aggregated" else ()
     conflicts = [
@@ -2038,8 +2054,16 @@ def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) 
         value = rank.get(name)
         if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= (1 << 64) - 1:
             raise ValueError(f"state_cache requires explicit positive {name} within u64")
-    if rank["num_gpu_blocks"] < state_cache.state_blocks(rank["block_size"], rank["kv_cache_bytes_per_token"]) + 1:
-        raise ValueError("state_cache capacity must fit one token block and one request state")
+    if (
+        rank["num_gpu_blocks"]
+        < state_cache.state_blocks(rank["block_size"], rank["kv_cache_bytes_per_token"])
+        * (1 + (state_cache.num_speculative_states or 0))
+        + 1
+    ):
+        raise ValueError(
+            "state_cache capacity must fit one token block and one request state "
+            "plus its num_speculative_states scratch copies"
+        )
     return state_cache
 
 

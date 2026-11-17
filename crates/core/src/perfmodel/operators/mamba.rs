@@ -68,14 +68,14 @@ impl Mamba2Op {
             self.chunk_size,
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
                     .clamp_non_negative()
@@ -191,14 +191,14 @@ impl GdnOp {
             &self.mamba_ssm_dtype,
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
                     .clamp_non_negative()
@@ -409,14 +409,14 @@ impl KdaOp {
             self.head_v_dim,
             &|b, s| self.sol_latency_ms_with(db, kernel_source, b, s),
         ) {
-            Ok(value) => {
+            Ok(Some(value)) => {
                 Ok(
                     PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
-            Err(AicError::PerfDatabase(_)) => {
+            Ok(None) | Err(AicError::PerfDatabase(_)) => {
                 let latency =
                     self.sol_latency_ms_with(db, kernel_source, batch_size as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)

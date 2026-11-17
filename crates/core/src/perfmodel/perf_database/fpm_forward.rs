@@ -67,7 +67,7 @@ pub const FPM_FORWARD_PARTITION_POLICY: &str = "balanced_v1";
 pub const FPM_FORWARD_MEASUREMENT_POLICY: &str = "dynamo_native_single_sample_v1";
 pub const FPM_NATIVE_CUDA_MEASUREMENT_POLICY: &str = "vllm_native_fpm_model_step_cuda_v1";
 pub const FPM_NATIVE_AR_CUDA_MEASUREMENT_POLICY: &str = "vllm_native_ar_model_step_cuda_v1";
-/// Single-sample latency plus a separate >= 1 s power window (schema 8, vLLM).
+/// Single-sample latency plus a separate >= 2 s power window (schema 8, vLLM).
 pub const FPM_FORWARD_POWER_MEASUREMENT_POLICY: &str =
     "dynamo_native_single_sample_power_window_v1";
 const FPM_ROW_MEASUREMENT_POLICY: &str = "per_row_single_sample_or_median_of_3";

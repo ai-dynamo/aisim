@@ -45,6 +45,26 @@ jobs:
         run: |
           python -m pytest -c /dev/null -p no:cacheprovider scripts/readme/test_readme_commands.py scripts/readme/test_readme_report.py
           python scripts/readme/check_readme_commands.py --validate
+      - name: Build the pinned Dynamo RC wheels
+        if: matrix.profile == 'dynamo'
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
+          for entry in aisim:77d82652b2f83fd67afefc3141d69a5f06e630be dynamo:9653d05441b37b6a004837651fd991e44158d755; do
+            repo="${entry%%:*}"
+            revision="${entry#*:}"
+            git init "$RUNNER_TEMP/$repo-rc"
+            git -C "$RUNNER_TEMP/$repo-rc" fetch --depth 1 "https://github.com/ai-dynamo/$repo.git" "$revision"
+            git -C "$RUNNER_TEMP/$repo-rc" checkout --detach FETCH_HEAD
+          done
+          wheels="$RUNNER_TEMP/dynamo-rc-wheels"
+          uv build --wheel --out-dir "$wheels" --config-setting=build-args=--locked "$RUNNER_TEMP/aisim-rc/python/aisim"
+          uv build --wheel --out-dir "$wheels" "$RUNNER_TEMP/dynamo-rc"
+          uv build --wheel --out-dir "$wheels" --config-setting='build-args=--locked --features ais-forward-pass' \
+            "$RUNNER_TEMP/dynamo-rc/lib/bindings/python"
+          echo "AISIM_RC_WHEELHOUSE=$wheels" >> "$GITHUB_ENV"
       - name: Execute README commands
         env:
           PROFILE: ${{ matrix.profile }}
