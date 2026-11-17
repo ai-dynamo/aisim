@@ -87,7 +87,7 @@ jobs:
             if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
           }
           as_root apt-get update
-          as_root apt-get install -y build-essential libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
+          as_root apt-get install -y build-essential gh libhwloc-dev libudev-dev pkg-config libclang-dev protobuf-compiler cmake
           echo "LIBRARY_PATH=${pythonLocation}/lib" >> "${GITHUB_ENV}"
       - name: Find matching pinned Dynamo RC wheels
         id: rc-wheels
