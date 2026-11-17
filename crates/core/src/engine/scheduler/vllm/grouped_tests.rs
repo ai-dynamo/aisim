@@ -1265,19 +1265,13 @@ fn pool_case(
             .unwrap(),
     );
     let mut now = 0.0;
-    let mut step = |core: &mut VllmCore| {
-        let result = core.execute_pass(&mut TraceCollector::default(), now);
-        core.complete_engine_boundary(result.end_ms);
-        now = result.end_ms;
-        result
-    };
     let rp: Vec<u32> = (44_000_000..44_000_000 + producer).collect();
     submit_tokens(&mut core, 1, rp.clone(), 4);
     for _ in 0..50 {
         if core.is_drained() {
             break;
         }
-        step(&mut core);
+        async_step(&mut core, &mut now);
     }
     assert!(core.is_drained());
     let mut rc_tokens = rp;
@@ -1287,7 +1281,7 @@ fn pool_case(
     let (mut rc_pass, mut rn_pass, mut active, mut peak) = (None, None, Vec::new(), 0);
     for pass in 0..50 {
         block_pool(&core).reset_peak_active_blocks();
-        let result = step(&mut core);
+        let result = async_step(&mut core, &mut now);
         assert_eq!(result.mocker_metrics.vllm_preemptions_total, 0);
         for admission in &result.admissions {
             if admission.uuid == rc {
@@ -1502,6 +1496,260 @@ fn grouped_prefix_eviction_frees_cached_blocks_oldest_first() {
     // Request one is gone.
     let seventh = submit_tokens(&mut core, 807, (0..16).collect(), 1);
     assert_eq!(drain(&mut core, &mut trace, &mut step), vec![(seventh, 0)]);
+}
+
+/// A rank with a full-attention group and a prefix-cacheable state group of
+/// 4-token blocks, a hash block of 4 and `blocks` pool blocks.
+fn async_prefix_core(version: &str, blocks: u64, max_concurrent_batches: usize) -> VllmCore {
+    let mut attention = group("attention", 4, 8, None);
+    attention.prefix_cacheable = Some(true);
+    let mut kda = state("kda", 8, 1);
+    kda.prefix_cacheable = Some(true);
+    kda.prefill_checkpoint_blocks = (version != "0.31.0").then_some(0);
+    VllmCore::new(
+        MockEngineArgs::builder()
+            .block_size(4)
+            .num_gpu_blocks(1)
+            .max_num_batched_tokens(Some(64))
+            .max_num_seqs(Some(8))
+            .max_model_len(Some(64))
+            .enable_prefix_caching(true)
+            .prefix_match_unit(Some(4))
+            .vllm_version(Some(version.to_string()))
+            .kv_cache_groups(vec![attention, kda])
+            .kv_cache_capacity_bytes(Some(blocks * 8))
+            .speedup_ratio(0.0)
+            .max_concurrent_batches(max_concurrent_batches)
+            .build()
+            .unwrap(),
+    )
+}
+
+/// One pass at `now_ms` and its boundary. `now_ms` moves to the end of the
+/// pass, so the next pass is formed while this one is in flight.
+fn async_step(core: &mut VllmCore, now_ms: &mut f64) -> crate::engine::scheduler::EnginePassResult {
+    let mut trace = TraceCollector::default();
+    let result = core.execute_pass(&mut trace, *now_ms);
+    core.complete_engine_boundary(result.end_ms);
+    *now_ms = result.end_ms;
+    result
+}
+
+#[test]
+fn grouped_prefix_blocks_of_a_finished_request_first_serve_pass_k_plus_2_with_async_scheduling() {
+    // X (4 tokens) keeps the rank busy. R (17 tokens) prefills in passes 0
+    // and 1 and finishes in pass 1 with 5 attention blocks and 2 state blocks.
+    // W (21 tokens) needs 7 blocks of the 12 and fits only in R's blocks.
+    // vLLM frees R's blocks when it processes the outputs of step 1 (v0.31
+    // sched:2171, :2650-2679, v0.32 sched:2230, :2714-2744). Without async
+    // scheduling that comes before the scheduling of step 2, so W starts in
+    // step 2. With async scheduling the engine schedules step 2 before it
+    // processes the outputs of step 1 (v0.31 engine/core.py:697, :740-755,
+    // v0.32 engine/core.py:725, :768-783), so W starts in step 3. The block
+    // counts are replay's. After R's last pass X holds 2 attention blocks, its
+    // running state block and the previous state block of its crossing at 4:
+    // 4 blocks, and 11 with async scheduling, where R still holds its 7. Pass
+    // 2 releases X's previous state block: 3 left with async scheduling.
+    // Without async scheduling pass 2 also admits W, whose first chunk of 20
+    // tokens takes 5 attention blocks and 1 state block: 9. With async
+    // scheduling vLLM also holds X's previous state block for one more step
+    // (v0.31 mgr:552-556, v0.32 mgr:555-559), a known difference.
+    for version in ["0.31.0", "0.32.0"] {
+        for (max_concurrent_batches, admitting_pass, after_finish, after_next) in
+            [(1, 2, 4, 9), (2, 3, 11, 3)]
+        {
+            let mut core = async_prefix_core(version, 12, max_concurrent_batches);
+            let mut now = 0.0;
+            submit_tokens(&mut core, 1, (1000..1004).collect(), 30);
+            let r = submit_tokens(&mut core, 2, (2000..2017).collect(), 1);
+            let w = submit_tokens(&mut core, 3, (3000..3021).collect(), 1);
+            async_step(&mut core, &mut now);
+            let finished = async_step(&mut core, &mut now);
+            assert!(
+                finished
+                    .output_signals
+                    .iter()
+                    .any(|signal| signal.uuid == r && signal.completed),
+                "{version}"
+            );
+            // With async scheduling R still holds its 7 blocks.
+            assert_eq!(block_pool(&core).active_blocks(), after_finish, "{version}");
+            let mut active = Vec::new();
+            let admitted = (2..6).find(|_| {
+                let result = async_step(&mut core, &mut now);
+                active.push(block_pool(&core).active_blocks());
+                assert_eq!(result.mocker_metrics.vllm_preemptions_total, 0, "{version}");
+                result
+                    .admissions
+                    .iter()
+                    .any(|admission| admission.uuid == w)
+            });
+            assert_eq!(admitted, Some(admitting_pass), "{version}");
+            assert_eq!(active[0], after_next, "{version}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_async_scheduling_frees_a_finished_request_after_a_running_request_releases_its_previous_state()
+ {
+    // This test pins a known difference from vLLM. G (10 tokens) publishes
+    // its state at 8 in pass 0, crosses that boundary in pass 1 and releases
+    // the block of that state one pass later, in pass 2. F (9 tokens)
+    // prefills 8 tokens in pass 0 and 1 in pass 1, where it finishes with 3
+    // attention blocks and 2 state blocks; its cached blocks are attention
+    // at 4 and 8 and its state at 8. Without async scheduling F's blocks
+    // enter the LRU in pass 1, tail first, before G's block. With async
+    // scheduling replay frees F's blocks after it has formed pass 2, so
+    // after G's block. After pass 2 G holds 4 blocks, 4 blocks are cached
+    // and 3 are free. In pass 4 H (3 tokens) takes 2 blocks and G 2 more (its
+    // fourth attention block and its next state block), so the pool evicts
+    // its oldest cached block: F's attention block at 8 without async
+    // scheduling, G's state block at 8 with it. A later prompt that starts
+    // with G's tokens then hits 8 tokens against 0, and one that starts with
+    // F's tokens 0 against 8.
+    // By a reading of vLLM, F goes first in both modes. vLLM frees F when it
+    // processes the outputs of step 1 (v0.31 sched:2171, :2650-2679, v0.32
+    // sched:2230, :2714-2744). It frees G's block in `allocate_slots` on the
+    // processed-token basis (v0.31 mgr:552-556, v0.32 mgr:555-559), through
+    // the base path of `MambaManager.remove_skipped_blocks` (v0.31
+    // single:1647-1675, base path :1655-1657, :687-725, :1626-1645,
+    // :1990-1995; v0.32 single:1613-1641, base path :1621-1623, :672-710,
+    // :1592-1611, :1954-1959). With async scheduling the tokens of the step
+    // in flight do not count, so vLLM frees G's block in the scheduling of
+    // step 3, one step later than replay. So the outcome without async
+    // scheduling equals vLLM's, and the outcome with async scheduling is
+    // replay's own.
+    let cached = |core: &VllmCore, group: u16, tokens: &[u32], end: usize| {
+        let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+        lease.configure_prefix_hashes(tokens, 4);
+        block_pool(core)
+            .key_hit(group, lease.prefix_hash_at(end).unwrap())
+            .is_some()
+    };
+    for version in ["0.31.0", "0.32.0"] {
+        for max_concurrent_batches in [1usize, 2] {
+            let mut core = async_prefix_core(version, 11, max_concurrent_batches);
+            let mut now = 0.0;
+            let g: Vec<u32> = (1000..1010).collect();
+            let f: Vec<u32> = (2000..2009).collect();
+            submit_tokens(&mut core, 1, g.clone(), 30);
+            let f_id = submit_tokens(&mut core, 2, f.clone(), 1);
+            // H arrives so that pass 4 admits it in both modes: without
+            // async scheduling after pass 3, and with async scheduling while
+            // pass 2 is in flight, when pass 3 is already queued behind it.
+            let arrival = if max_concurrent_batches == 1 { 3 } else { 2 };
+            let mut admitted = None;
+            let mut f_finished = None;
+            for pass in 0..5 {
+                let result = async_step(&mut core, &mut now);
+                if !result.admissions.is_empty() && pass > 0 {
+                    admitted = Some(pass);
+                }
+                if result
+                    .output_signals
+                    .iter()
+                    .any(|signal| signal.uuid == f_id && signal.completed)
+                {
+                    f_finished = Some(pass);
+                }
+                if pass == 2 {
+                    // After pass 2: G holds 4 blocks and 4 are cached.
+                    assert_eq!(block_pool(&core).active_blocks(), 4, "{version}");
+                    assert_eq!(block_pool(&core).inactive_cached_blocks(), 4, "{version}");
+                }
+                if pass == arrival {
+                    core.apply_command_effects(
+                        SchedulerCommand::Submit(DirectRequest {
+                            uuid: Some(Uuid::from_u128(3)),
+                            tokens: (3000..3003).collect(),
+                            max_output_tokens: 1,
+                            ..Default::default()
+                        }),
+                        false,
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(f_finished, Some(1), "{version}");
+            assert_eq!(admitted, Some(4), "{version}");
+            // [F attention at 4, F attention at 8, F state at 8, G state at 8]
+            let left = [
+                cached(&core, 0, &f, 4),
+                cached(&core, 0, &f, 8),
+                cached(&core, 1, &f, 8),
+                cached(&core, 1, &g, 8),
+            ];
+            // Later prompts that start with G's and with F's tokens.
+            let mut g_probe = waiting_probe(&core, 4, (1000..1016).collect());
+            let mut f_probe = waiting_probe(&core, 5, (2000..2016).collect());
+            let hits = (
+                waiting_hit(&core, &mut g_probe),
+                waiting_hit(&core, &mut f_probe),
+            );
+            if max_concurrent_batches == 1 {
+                // vLLM's order in both modes: F's attention block at 8 goes
+                // first, G's state at 8 stays.
+                assert_eq!(left, [true, false, true, true], "{version}");
+                assert_eq!(hits, (8, 0), "{version}");
+            } else {
+                // Replay with async scheduling: G's state at 8 goes first, so
+                // the G prompt hits less and the F prompt more than in vLLM.
+                assert_eq!(left, [true, true, true, false], "{version}");
+                assert_eq!(hits, (0, 8), "{version}");
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_copy_sources_leave_at_the_end_of_the_pass_with_async_scheduling() {
+    // The tight-pool case with async scheduling. Without a KV connector in a
+    // consumer role vLLM does not defer its block frees (v0.31
+    // sched:156, :175-181, v0.32 sched:167, :186-192), so the copy sources
+    // still leave at the end of `schedule()` (v0.31 sched:1434-1442, v0.32
+    // sched:1474-1482). RN waits one pass on pools of 13 to 17 blocks, as
+    // with one batch. RC's blocks leave one pass later, so on 12 blocks RN
+    // starts one pass later than with one batch.
+    for version in ["0.31.0", "0.32.0"] {
+        for blocks in 12..=18 {
+            let expected = match blocks {
+                12 => (0, 5, vec![7, 7, 7, 7, 0, 6, 6, 6, 0], 12),
+                18 => (0, 0, vec![13, 13, 13, 0], 18),
+                _ => (0, 1, vec![7, 13, 13, 13, 0], 12),
+            };
+            assert_eq!(
+                tight_pool_case(version, blocks, 2),
+                expected,
+                "{version} on {blocks} blocks"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_boundary_hit_holds_its_state_blocks_until_the_next_pass_with_async_scheduling() {
+    // The boundary-hit case with async scheduling. Replay holds RC's hit
+    // blocks until RC's next allocation, one pass, as with one batch. vLLM
+    // frees them on the processed token count, so with a step in flight it
+    // holds them one more step (v0.31 kv_cache_manager.py:552-556, v0.32
+    // :555-559). Replay does not model that step. RC's blocks leave
+    // one pass later than with one batch, so on 12 and 13 blocks RN starts
+    // one pass later.
+    for version in ["0.31.0", "0.32.0"] {
+        for blocks in 12..=18 {
+            let expected = match blocks {
+                12 | 13 => (0, 5, vec![12, 8, 8, 8, 0, 6, 6, 6, 0], 12),
+                18 => (0, 0, vec![18, 14, 14, 0], 18),
+                _ => (0, 1, vec![12, 14, 14, 14, 0], 12),
+            };
+            assert_eq!(
+                pool_case(version, blocks, 2, 4400, 6528, 4352),
+                expected,
+                "{version} on {blocks} blocks"
+            );
+        }
+    }
 }
 
 /// A waiting request outside the core's queues, with the prefix hashes that
