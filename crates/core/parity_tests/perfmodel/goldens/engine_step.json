@@ -806,16 +806,16 @@
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile": {
       "agg": {
         "values": {
-          "agg_request": 215.07433262812395,
-          "agg_tpot": 74.95262711911715,
-          "agg_ttft": 140.1217055090068
+          "agg_request": 215.5426022454098,
+          "agg_tpot": 75.17298929195753,
+          "agg_ttft": 140.36961295345225
         }
       },
       "disagg": {
         "values": {
-          "disagg_request": 154.278,
-          "disagg_tpot": 11.113,
-          "disagg_ttft": 143.165
+          "disagg_request": 154.701,
+          "disagg_tpot": 11.101,
+          "disagg_ttft": 143.6
         }
       },
       "mixed": {
@@ -823,9 +823,9 @@
       },
       "static": {
         "values": {
-          "static_ctx": 72.305,
-          "static_gen": 8.459,
-          "static_total": 80.76400000000001
+          "static_ctx": 72.526,
+          "static_gen": 8.463,
+          "static_total": 80.98899999999999
         }
       }
     },
@@ -2351,11 +2351,11 @@
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::agg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "82ff7f371523cf85328fa2a17f420ca30c5d5e52"
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::disagg": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "82ff7f371523cf85328fa2a17f420ca30c5d5e52"
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::mixed": {
       "engine": "rust",
@@ -2363,7 +2363,7 @@
     },
     "minimax-m25-nvfp4-h200-vllm-hybrid-xprofile::static": {
       "engine": "rust",
-      "git_head": "56cb821e347509711f29fda13c2574e655a57e21"
+      "git_head": "82ff7f371523cf85328fa2a17f420ca30c5d5e52"
     },
     "minimax-m27-b200-vllm-isl1024-osl2::agg": {
       "engine": "rust",
