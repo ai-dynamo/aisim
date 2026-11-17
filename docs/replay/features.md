@@ -13,7 +13,7 @@ is a separate [performance-model question](../perf-model/support-matrix.md).
 
 | Feature | Backend / execution | Topology and workload | Boundaries |
 | --- | --- | --- | --- |
-| Native token scheduling | vLLM, SGLang, TensorRT-LLM | Aggregated or P/D; synthetic and compatible traces | Engine-specific admission/cache behavior; no real network or host-runtime overhead |
+| Native token scheduling | vLLM, SGLang, TensorRT-LLM | Aggregated or P/D; synthetic and compatible traces | Engine-specific admission/cache behavior; no real network or host-runtime overhead, except vLLM's optional [pass launch](engine/workers.md#vllm-pass-launch) costs |
 | Attention-DP | All three native backends | Aggregated and independently sized P/D pools | Rank-local scheduling and G1; one grouped pass completes at the maximum rank time |
 | Native MTP | Supported engine/model path | Token or qualified agentic replay with explicit acceptance | Separate from ngram; canonical MTP supports scoped G2 below, and a hybrid G2 with `disable_eagle_block_drop`; no grouped-cache/G3 combination; sub-block state-cache matching needs `num_speculative_states`; agentic accuracy is functional-only |
 | [Registered speculative schemes](engine/speculation.md#registered-schemes) | Offline vLLM/SGLang, subject to scheme/model constraints | Prediction, aggregated or P/D; token or qualified agentic replay | Existing linear 1–5-token executor; fixed KV capacity; default timing with supported OP cost; only MTP supports scoped G2 or a hybrid G2 with `disable_eagle_block_drop`; no trees, grouped-cache/G3 combination or generic-scheme recommendation; sub-block state-cache matching needs `num_speculative_states` |
