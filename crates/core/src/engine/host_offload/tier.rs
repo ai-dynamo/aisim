@@ -614,21 +614,26 @@ impl HostTier {
         let cohort_blocks = offered_blocks + (protected.len() - offered_blocks) * weight;
         let structurally_unfittable = cohort_blocks > self.config.capacity_blocks;
         let entries = &self.entries;
-        let (victims, covered) =
-            if structurally_unfittable || self.config.eviction == HostEviction::Caller {
-                (Vec::new(), 0)
-            } else {
-                self.lru.victims_covering(needed, |key| {
-                    entries
-                        .get(&key)
-                        .filter(|entry| {
-                            !protected.contains(&key)
-                                && entry.state == EntryState::Resident
-                                && entry.load_pins == 0
-                        })
-                        .map(|entry| entry.weight as usize)
-                })
-            };
+        // Victims are resident entries, so a need above the resident blocks
+        // fails without the walk, which in a ranked order also passes every
+        // pending and pinned entry.
+        let (victims, covered) = if structurally_unfittable
+            || self.config.eviction == HostEviction::Caller
+            || needed > self.resident_blocks
+        {
+            (Vec::new(), 0)
+        } else {
+            self.lru.victims_covering(needed, |key| {
+                entries
+                    .get(&key)
+                    .filter(|entry| {
+                        !protected.contains(&key)
+                            && entry.state == EntryState::Resident
+                            && entry.load_pins == 0
+                    })
+                    .map(|entry| entry.weight as usize)
+            })
+        };
         if covered < needed {
             if structurally_unfittable && !self.warned_structurally_unfittable {
                 let host_capacity_blocks = self.config.capacity_blocks;
