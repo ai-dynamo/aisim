@@ -850,21 +850,7 @@ impl GroupedPrefixCoordinator {
                         prompt_tokens,
                         rules.checkpoint_position(prompt_tokens),
                     );
-                    // A split at the last cacheable stop or a fine-grained
-                    // split can publish the producer's tail inside its final
-                    // logical block before prefill finishes.
-                    // The following write preserves that state and takes a
-                    // new running block (v0.32 single:1867-1900). Cover both
-                    // copies, reusing any hit/checkpoint allowance already
-                    // counted instead of adding a third state block.
-                    let tail = rules.partial_tail(prompt_tokens);
-                    let producer_copy = (rules.fine_grained()
-                        || rules.last_cacheable_stop(prompt_tokens) == tail)
-                        && hit.tokens < tail
-                        && tail < prompt_tokens
-                        && !tail.is_multiple_of(block);
-                    let required = new + usize::from(inactive) + usize::from(checkpoint);
-                    required.max(2 * usize::from(producer_copy))
+                    new + usize::from(inactive) + usize::from(checkpoint)
                 }
                 GroupRuleKind::Ring => 1,
             };
@@ -2475,168 +2461,132 @@ mod tests {
     }
 
     #[test]
-    fn admission_preserves_a_producer_tail_within_one_logical_block() {
-        let groups = [attention("full", 64, None), state("s", 64, true, false)];
-        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
-            let mut coordinator =
-                with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
-            let mut kv = kv_pool(&groups, 3);
-            let pool = kv.block_pool_mut().unwrap();
-            let request = lease(50, 4);
-            let hit = coordinator.find_longest_hit(pool, &request, 50);
-            assert_eq!(hit.tokens, 0);
-            // The split publishes state 48 before the final two tokens.
-            // Admission must cover attention, cached state and writable state,
-            // even though the entire prompt fits in one logical block.
-            assert_eq!(
-                coordinator.admission_blocks(pool, &hit, 50),
-                3,
-                "{version:?}"
-            );
-            let mut block_lease = coordinator.new_lease();
-            assert_eq!(
-                prefill(
-                    &mut coordinator,
-                    pool,
-                    &mut block_lease,
-                    &request,
-                    50,
-                    &hit,
-                    BUDGET,
-                ),
-                vec![48, 50],
-                "{version:?}"
-            );
-            assert_eq!(pool.active_blocks(), 3);
-            let state = state_lease(&block_lease, 1);
-            assert!(pool.is_private(state.running.unwrap()));
-            assert_eq!(state.previous.map(|(_, step)| step), Some(2));
-            assert!(hit_exists(pool, 1, 4, 48));
-            coordinator.release_request(pool, &mut block_lease);
-            assert_eq!(pool.active_blocks(), 0);
-            assert_eq!(pool.inactive_cached_blocks(), 2);
-        }
-    }
-
-    #[test]
-    fn producer_tail_admission_respects_hash_and_version_boundaries() {
-        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
-            for checkpoint in [false, true] {
+    fn admission_counts_vllms_whole_prompt_blocks_without_the_producer_copy() {
+        // vLLM's whole-prompt test (v0.31 mgr:519-536, v0.32 mgr:522-539)
+        // counts an attention group as `cdiv(prompt, A)` less its hit blocks,
+        // plus the hit blocks that no request holds and a copy block for a
+        // hit inside a block (v0.31 single:216-268, v0.32 single:213-265).
+        // It counts a state group as `cdiv(prompt, S) - len(computed)`, plus
+        // one for a hit inside a block that the request consumes, capped at
+        // `1 + partial hit + checkpoint` (v0.31 single:1762-1777,
+        // :1806-1811; v0.32 single:1724-1739, :1768-1773). A new request is
+        // not yet the producer of a tail, so the copy that its own published
+        // tail takes later is not counted.
+        // (attention block, hash, prompt, checkpoint, vLLM's count)
+        let cold = [
+            // 1 + 1 for every prompt inside one block of 64.
+            (64, 4, 4, false, 2),
+            (64, 4, 48, false, 2),
+            (64, 4, 50, false, 2),
+            (64, 4, 64, false, 2),
+            (64, 64, 50, false, 2),
+            (64, 4, 48, true, 2),
+            (64, 4, 50, true, 2),
+            (64, 4, 64, true, 2),
+            // cdiv(prompt, 4) + 1.
+            (4, 4, 4, false, 1 + 1),
+            (4, 4, 48, false, 12 + 1),
+            (4, 4, 50, false, 13 + 1),
+            (4, 4, 64, false, 16 + 1),
+        ];
+        for (attention_block, hash, prompt, checkpoint, count) in cold {
+            for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
                 if checkpoint && version == VllmRuleVersion::V0_31_0 {
                     continue;
                 }
-                // v0.31's hash-aligned prompt has no intermediate tail.
-                // v0.32 splits one hash earlier. Block-sized hashes and
-                // prompts with no earlier positive hash need no producer copy.
-                // Attention blocks at the hash size also split at the tail,
-                // through last_cacheable_stop rather than fine_grained.
-                for (attention_block, hash, prompt, v31_blocks, v32_blocks) in [
-                    (64, 4, 4, 2, 2),
-                    (64, 4, 48, 2, 3),
-                    (64, 4, 64, 2, 3),
-                    (64, 64, 50, 2, 2),
-                    (4, 4, 4, 2, 2),
-                    (4, 4, 48, 13, 14),
-                    (4, 4, 50, 15, 15),
-                    (4, 4, 64, 17, 18),
-                ] {
-                    // Checkpoint mode requires state blocks to be the
-                    // smallest cacheable blocks.
-                    if checkpoint && attention_block < 64 {
-                        continue;
-                    }
-                    let groups = [
-                        attention("full", attention_block, None),
-                        state("s", 64, true, checkpoint),
-                    ];
-                    let expected = match version {
-                        VllmRuleVersion::V0_31_0 => v31_blocks,
-                        VllmRuleVersion::V0_32_0 => v32_blocks,
-                    };
-                    let mut coordinator =
-                        with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
-                    let mut kv = kv_pool(&groups, expected);
+                let groups = [
+                    attention("full", attention_block, None),
+                    state("s", 64, true, checkpoint),
+                ];
+                let coordinator =
+                    with_limits(GroupedPrefixRules::new(&groups, hash, version).unwrap());
+                let kv = kv_pool(&groups, 32);
+                let pool = kv.block_pool().unwrap();
+                let hit = coordinator.find_longest_hit(pool, &lease(prompt, hash), prompt);
+                assert_eq!(hit.tokens, 0);
+                assert_eq!(
+                    coordinator.admission_blocks(pool, &hit, prompt),
+                    count,
+                    "{version:?}, attention {attention_block}, hash {hash}, prompt {prompt}, checkpoint={checkpoint}"
+                );
+            }
+        }
+        // A hit at 32 or at the tail 48 inside the blocks of 64: one copy
+        // block per group, and the two hit blocks when no request holds
+        // them: 4, else 2.
+        let groups = [attention("full", 64, None), state("s", 64, true, false)];
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            for hit_tokens in [32, 48] {
+                for held in [false, true] {
+                    let coordinator =
+                        with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+                    let mut kv = kv_pool(&groups, 8);
                     let pool = kv.block_pool_mut().unwrap();
-                    let request = lease(prompt, hash);
-                    let hit = coordinator.find_longest_hit(pool, &request, prompt);
+                    let keys = [key(0, 4, hit_tokens), key(1, 4, hit_tokens)];
+                    for key in keys {
+                        seed(pool, key);
+                    }
+                    let other = if held {
+                        let mut reservation = pool.reserve(&keys, 0).unwrap();
+                        let copies = pool.activate(&mut reservation);
+                        pool.cancel(reservation);
+                        copies
+                    } else {
+                        Vec::new()
+                    };
+                    let hit = coordinator.find_longest_hit(pool, &lease(50, 4), 50);
+                    assert_eq!(hit.tokens, hit_tokens);
                     assert_eq!(
-                        coordinator.admission_blocks(pool, &hit, prompt),
-                        expected as usize,
-                        "{version:?}, checkpoint={checkpoint}, attention_block={attention_block}, hash={hash}, prompt={prompt}"
+                        coordinator.admission_blocks(pool, &hit, 50),
+                        if held { 2 } else { 4 },
+                        "{version:?}, hit {hit_tokens}, held={held}"
                     );
-                    let mut block_lease = coordinator.new_lease();
-                    prefill(
-                        &mut coordinator,
-                        pool,
-                        &mut block_lease,
-                        &request,
-                        prompt,
-                        &hit,
-                        BUDGET,
-                    );
-                    assert_eq!(pool.active_blocks(), expected as usize);
-                    coordinator.release_request(pool, &mut block_lease);
-                    assert_eq!(pool.active_blocks(), 0);
+                    pool.release_all(other);
                 }
             }
         }
     }
 
     #[test]
-    fn producer_tail_admission_reuses_inactive_hit_capacity() {
+    fn producer_copy_needs_a_block_that_admission_does_not_count() {
+        // Blocks of 64, a hash block of 4, a cold prompt of 50 tokens. The
+        // split stops at the tail 48, and the write 48..50 takes the copy.
+        // vLLM's admission counts 2 blocks; the allocation of the copy then
+        // needs a third (v0.31 single:1891-1936, v0.32 single:1855-1900).
+        // When it does not fit, vLLM preempts the last running request, the
+        // request itself included, and tries again (v0.31 sched:745-813,
+        // v0.32 sched:776-844). vLLM counts the pending copy in the blocks
+        // that a prefill in flight still needs (v0.31 sched:3003-3017, v0.32
+        // sched:3060-3076, with single:1770-1777 and v0.32 :1732-1739); that
+        // count is not part of this coordinator.
         let groups = [attention("full", 64, None), state("s", 64, true, false)];
         for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
-            // A hit at 48 already covers the tail, so it only needs the
-            // initial copy. A hit at 32 must also produce and preserve 48.
-            for (hit_tokens, copies, ends) in [(32, 3, vec![48, 50]), (48, 2, vec![50])] {
-                for active in [false, true] {
-                    let mut coordinator =
-                        with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
-                    let mut kv = kv_pool(&groups, if active { 2 + copies } else { 4 });
-                    let pool = kv.block_pool_mut().unwrap();
-                    let keys = [key(0, 4, hit_tokens), key(1, 4, hit_tokens)];
-                    for key in keys {
-                        seed(pool, key);
-                    }
-                    let other = if active {
-                        let mut reservation = pool.reserve(&keys, 0).unwrap();
-                        let held = pool.activate(&mut reservation);
-                        pool.cancel(reservation);
-                        held
-                    } else {
-                        Vec::new()
-                    };
-                    let request = lease(50, 4);
-                    let hit = coordinator.find_longest_hit(pool, &request, 50);
-                    assert_eq!(hit.tokens, hit_tokens);
-                    // A released hit supplies reusable capacity after its copy
-                    // runs. An active hit held by another request cannot do so.
-                    assert_eq!(
-                        coordinator.admission_blocks(pool, &hit, 50),
-                        if active { copies as usize } else { 4 }
-                    );
-                    let mut block_lease = coordinator.new_lease();
-                    coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
-                    assert_eq!(
-                        prefill(
-                            &mut coordinator,
-                            pool,
-                            &mut block_lease,
-                            &request,
-                            50,
-                            &hit,
-                            BUDGET,
-                        ),
-                        ends
-                    );
-                    assert_eq!(
-                        pool.active_blocks(),
-                        copies as usize + 2 * usize::from(active)
-                    );
-                    coordinator.release_request(pool, &mut block_lease);
-                    pool.release_all(other);
-                    assert_eq!(pool.active_blocks(), 0);
+            for pool_blocks in [2, 3] {
+                let mut coordinator =
+                    with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+                let mut kv = kv_pool(&groups, pool_blocks);
+                let pool = kv.block_pool_mut().unwrap();
+                let request = lease(50, 4);
+                let hit = coordinator.find_longest_hit(pool, &request, 50);
+                assert_eq!(coordinator.admission_blocks(pool, &hit, 50), 2);
+                let mut block_lease = coordinator.new_lease();
+                coordinator.begin_step();
+                let chunk = coordinator
+                    .rules()
+                    .align_split(0, 50, 50, BUDGET, 0, BUDGET);
+                assert_eq!(chunk, 48, "{version:?}");
+                assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 1));
+                coordinator.finalize(pool, &mut block_lease, &request, 50, 48, &hit, 1);
+                assert!(hit_exists(pool, 1, 4, 48));
+                coordinator.begin_step();
+                let fits = coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 2);
+                assert_eq!(fits, pool_blocks == 3, "{version:?}, pool {pool_blocks}");
+                if fits {
+                    assert_eq!(pool.active_blocks(), 3);
+                } else {
+                    assert_eq!(pool.active_blocks(), 2);
                 }
+                coordinator.release_request(pool, &mut block_lease);
             }
         }
     }
