@@ -1212,8 +1212,16 @@ impl GroupedPrefixCoordinator {
                 }
                 (GroupRuleKind::State, GroupLease::State(state)) => {
                     let tail = rules.partial_tail(prompt);
+                    // The tail inside a block is kept only with hits inside a
+                    // block. Without them vLLM rounds the cached length down
+                    // to the scheduler block (v0.31 `coord:796-806`, v0.32
+                    // `coord:767-794`), a multiple of the state block, and
+                    // registers no tail (v0.31 `single:2096-2097`, v0.32
+                    // `single:2101`). A kept tail makes the next write take a
+                    // fresh block.
                     let kept = computed_after == rules.replay_boundary(prompt, block)
-                        || (rules.hash_block < block
+                        || (rules.alignment == rules.hash_block
+                            && rules.hash_block < block
                             && !tail.is_multiple_of(block)
                             && computed_after == tail)
                         || junction.is_some_and(|junction| {
@@ -2672,6 +2680,202 @@ mod tests {
             assert!(!hit_exists(pool, 1, 4, 48));
             pool.cancel(last);
             pool.cancel(pressure);
+        }
+    }
+
+    #[test]
+    fn producer_copy_is_taken_only_with_hits_inside_a_block() {
+        // With hits inside a block on, a chunk that ends at the prompt's
+        // partial tail inside a state block publishes the running block, and
+        // the next allocation takes a fresh block and keeps the published
+        // copy (v0.31 single:2094-2147, :1891-1936; v0.32 single:2067-2112,
+        // :1855-1900). With checkpoint blocks, a final chunk without a valid
+        // checkpoint follows the same rule (v0.32 single:2019-2066). The
+        // chunk 48..50 cannot export the checkpoint at 48.
+        for (version, checkpoint) in [
+            (VllmRuleVersion::V0_31_0, false),
+            (VllmRuleVersion::V0_32_0, false),
+            (VllmRuleVersion::V0_32_0, true),
+        ] {
+            let groups = [
+                attention("full", 32, None),
+                state("s", 32, true, checkpoint),
+            ];
+            let mut coordinator =
+                with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+            assert_eq!(coordinator.rules().alignment, 4);
+            let mut kv = kv_pool(&groups, 8);
+            let pool = kv.block_pool_mut().unwrap();
+            let request = lease(50, 4);
+            let hit = coordinator.find_longest_hit(pool, &request, 50);
+            let mut block_lease = coordinator.new_lease();
+            let mut before = 0;
+            for (step, target) in [(1, 32), (2, 48), (3, 50)] {
+                coordinator.begin_step();
+                assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, step));
+                coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit, step);
+                before = target;
+            }
+            let case = format!("{version:?}, checkpoint={checkpoint}");
+            assert!(hit_exists(pool, 1, 4, 48), "{case}");
+            assert_eq!(pool.active_blocks(), 2 + 2, "{case}");
+            assert!(state_lease(&block_lease, 1).previous.is_some(), "{case}");
+            coordinator.release_request(pool, &mut block_lease);
+        }
+        // With them off, vLLM rounds the cached length down to the scheduler
+        // block before the state manager sees it (v0.31 coord:796-806,
+        // :808-840; v0.32 coord:767-794, :354-377). The rounded length is a
+        // multiple of the state block, so vLLM registers no tail and takes no
+        // copy (v0.31 single:2096-2097; v0.32 single:2101). A window group of
+        // block 8 has no sub-block lookup, so the alignment is 8 at a hash
+        // block of 4. A budget of 4 makes a chunk end at the tail 12: the
+        // prompt end on v0.31, one token before it on v0.32.
+        for (version, prompt) in [
+            (VllmRuleVersion::V0_31_0, 12),
+            (VllmRuleVersion::V0_32_0, 13),
+        ] {
+            let groups = [attention("window", 8, Some(8)), state("s", 8, true, false)];
+            let mut coordinator =
+                with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+            assert_eq!(coordinator.rules().alignment, 8);
+            let mut kv = kv_pool(&groups, 8);
+            let pool = kv.block_pool_mut().unwrap();
+            let request = lease(prompt + 1, 4);
+            let hit = coordinator.find_longest_hit(pool, &request, prompt);
+            let mut block_lease = coordinator.new_lease();
+            let mut before = 0;
+            for (step, target) in [(1, 4), (2, 8), (3, 12), (4, 13)] {
+                if before < prompt {
+                    let chunk = coordinator
+                        .rules()
+                        .align_split(before, prompt, prompt, 4, 0, 4);
+                    assert_eq!(before + chunk, target, "{version:?}");
+                }
+                coordinator.begin_step();
+                assert!(coordinator.allocate(pool, &mut block_lease, prompt, before, target, step));
+                if target < 13 {
+                    coordinator.finalize(
+                        pool,
+                        &mut block_lease,
+                        &request,
+                        prompt,
+                        target,
+                        &hit,
+                        step,
+                    );
+                }
+                before = target;
+            }
+            assert!(hit_exists(pool, 1, 4, 8), "{version:?}");
+            assert!(!hit_exists(pool, 1, 4, 12), "{version:?}");
+            // The write 12..13, the last prompt token on v0.32 or the first
+            // decode token on v0.31, stays on the running state block: two
+            // window blocks and one state block.
+            assert_eq!(pool.active_blocks(), 2 + 1, "{version:?}");
+            assert!(state_lease(&block_lease, 1).previous.is_none());
+            coordinator.release_request(pool, &mut block_lease);
+        }
+    }
+
+    /// For each prompt in order on one pool: the hit, the junction, the
+    /// admission count, then each chunk end with the active blocks after its
+    /// allocation, the active blocks after one decode token, and the
+    /// inactive cached blocks after the release.
+    fn glm_trace(version: VllmRuleVersion, checkpoint: bool) -> Vec<Vec<usize>> {
+        let mut coordinator = with_limits(rules_glm(version, checkpoint));
+        let groups = groups_glm(checkpoint);
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let block = GLM_BLOCK as usize;
+        let mut step = 1;
+        let mut trace = Vec::new();
+        // Cold, warm on the first prompt's prefix, and a block boundary.
+        for prompt in [9000, 12_000, 4 * block] {
+            let request = lease(prompt, block);
+            let hit = coordinator.find_longest_hit(pool, &request, prompt);
+            let junction = hit.tokens + hit.junction_tokens;
+            let mut row = vec![
+                hit.tokens,
+                hit.junction_tokens,
+                coordinator.admission_blocks(pool, &hit, prompt),
+            ];
+            let mut block_lease = coordinator.new_lease();
+            coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
+            let mut computed = hit.tokens;
+            while computed <= prompt {
+                coordinator.begin_step();
+                let target = if computed < prompt {
+                    computed
+                        + coordinator
+                            .rules()
+                            .align_split(computed, prompt, prompt, BUDGET, junction, BUDGET)
+                } else {
+                    prompt + 1
+                };
+                assert!(coordinator.allocate(
+                    pool,
+                    &mut block_lease,
+                    prompt,
+                    computed,
+                    target,
+                    step
+                ));
+                row.extend([target, pool.active_blocks()]);
+                if target <= prompt {
+                    coordinator.finalize(
+                        pool,
+                        &mut block_lease,
+                        &request,
+                        prompt,
+                        target,
+                        &hit,
+                        step,
+                    );
+                }
+                computed = target;
+                step += 1;
+            }
+            coordinator.release_request(pool, &mut block_lease);
+            row.push(pool.inactive_cached_blocks());
+            trace.push(row);
+        }
+        trace
+    }
+
+    #[test]
+    fn glm_groups_at_the_hash_block_keep_their_counts() {
+        // The six GLM-5.3-Flash groups with the hash block equal to the
+        // block. A state is published only at a block boundary, where the
+        // next write already takes a new block, so the producer copy never
+        // adds one, and no group has a window or a tail inside a block. The
+        // rows give the hit, the junction, the admission count, each chunk
+        // end with the active blocks, one decode token, and the inactive
+        // cached blocks after the release, for a cold prompt, a warm prompt
+        // and a prompt that ends on a block boundary.
+        let no_checkpoint = vec![
+            vec![0, 0, 10, 6528, 8, 8704, 13, 9000, 14, 9001, 10, 8],
+            vec![8704, 0, 15, 10880, 14, 12000, 15, 12001, 11, 13],
+            vec![0, 6528, 9, 6528, 8, 8704, 13, 8705, 14, 21],
+        ];
+        let expected: [(VllmRuleVersion, bool, Vec<Vec<usize>>); 3] = [
+            (VllmRuleVersion::V0_31_0, false, no_checkpoint.clone()),
+            (VllmRuleVersion::V0_32_0, false, no_checkpoint),
+            (
+                VllmRuleVersion::V0_32_0,
+                true,
+                vec![
+                    vec![0, 0, 14, 6528, 8, 9000, 18, 9001, 10, 8],
+                    vec![8704, 0, 19, 12000, 19, 12001, 11, 13],
+                    vec![0, 6528, 13, 6528, 8, 8704, 13, 8705, 14, 21],
+                ],
+            ),
+        ];
+        for (version, checkpoint, rows) in expected {
+            assert_eq!(
+                glm_trace(version, checkpoint),
+                rows,
+                "{version:?}, checkpoint={checkpoint}"
+            );
         }
     }
 
