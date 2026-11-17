@@ -356,8 +356,8 @@ pub(crate) struct HostTier {
     entries: FxHashMap<HostBlockKey, Entry>,
     /// Includes pinned residents; pending destinations count only in `used_blocks`.
     resident_blocks: usize,
-    /// Blocks ever admitted, by a store or an external reservation. A key
-    /// the tier lacked is still absent while this count stands.
+    /// Unit blocks ever admitted, by a store or an external reservation. A
+    /// prompt key the tier lacked is still absent while this count stands.
     admitted_blocks: u64,
     /// Pool blocks that resident and pending entries occupy.
     used_blocks: usize,
@@ -692,7 +692,9 @@ impl HostTier {
         }
 
         let transfer_id = self.allocate_transfer_id();
-        self.admitted_blocks += missing.len() as u64;
+        // A weighted entry is no key of a prompt, so the prompt-touch memo
+        // does not count it.
+        self.admitted_blocks += units as u64;
         self.lookup_epoch += 1;
         let weight = u32::try_from(weight).expect("host entry weight overflow");
         for (index, key) in missing.iter().enumerate() {
@@ -2509,11 +2511,13 @@ pub(crate) mod tests {
             outcome
         };
         // A four-block entry takes four blocks and four blocks' time.
-        let room = tier.room_epoch(100.0);
+        let (room, admitted) = (tier.room_epoch(100.0), tier.admitted_blocks);
         let StoreOutcome::Prepared { transfer_id, .. } = store(&mut tier, 10, 100.0) else {
             panic!("the entry fits")
         };
         assert_ne!(tier.room_epoch(100.0), room);
+        // It leaves a caller's prompt-touch memo standing.
+        assert_eq!(tier.admitted_blocks, admitted);
         assert_eq!(tier.occupancy(), (2, 6));
         assert_eq!(tier.transfer_deadline(transfer_id), Some(104.0));
         // A second one lacks two blocks. The first is pending and no victim,
