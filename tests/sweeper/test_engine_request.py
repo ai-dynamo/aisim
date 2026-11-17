@@ -243,6 +243,21 @@ def test_kv_transfer_bytes_honor_explicit_quantization(tmp_path):
     assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs, kvcache_quant_mode="fp8") == 64
 
 
+def test_kv_transfer_bytes_keep_fractional_nvfp4_width():
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    # Qwen3-8B: K+V * 8 KV heads * 36 layers * (128 // 2 + 128 // 16 = 72 bytes), as vLLM sizes it.
+    assert estimate_kv_bytes_per_token("Qwen/Qwen3-8B", tp_size=1, pp_size=1, kvcache_quant_mode="nvfp4") == 41_472
+
+
+@pytest.mark.parametrize("model", ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V4.1-Flash"])
+def test_kv_transfer_bytes_refuse_nvfp4_for_latent_caches(model):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    with pytest.raises(ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"):
+        estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, kvcache_quant_mode="nvfp4")
+
+
 def test_memory_preflight_preserves_same_model_controls(monkeypatch):
     import aisim.sweeper.kv_estimate as memory
 
