@@ -207,6 +207,17 @@ def _non_empty_message(root: Path) -> str:
             f"output directory {root} is not empty and contains files AISim did not write ({shown}); "
             "choose a new --output-dir (--overwrite removes only known AISim outputs)"
         )
+    irregular = sorted(
+        entry.name
+        for entry in root.iterdir()
+        if entry.name != "recommendations" and not stat.S_ISREG(entry.lstat().st_mode)
+    )
+    if irregular:
+        shown = ", ".join(irregular[:3]) + (", ..." if len(irregular) > 3 else "")
+        return (
+            f"output directory {root} is not empty and holds entries that are not regular files ({shown}); "
+            "choose a new --output-dir"
+        )
     # The same safe read as eligibility: a FIFO or symlink here must not block or be followed.
     status = _runtime_status(_read_runtime_report(root / _RUNTIME_REPORT))
     has_results = bool(names & _RESULT_FILES) or (
@@ -319,8 +330,9 @@ def write_recommendation_result(root: Path, result: SweepResult, *, exclusive: b
     """Write the lossless recommendation ledger and derived candidate views."""
 
     path = root / "recommendation.json"
+    text = result.to_json() + "\n"  # serialize first: a failure must not truncate an existing file
     with _open_result(path, exclusive=exclusive) as output:
-        output.write(result.to_json() + "\n")
+        output.write(text)
     return path
 
 
@@ -328,8 +340,9 @@ def write_recommendation_csv(root: Path, result: SweepResult, *, exclusive: bool
     """Write the complete candidate ledger as an analysis-friendly CSV."""
 
     path = root / "recommendation.csv"
+    text = result.to_csv()
     with _open_result(path, exclusive=exclusive) as output:
-        output.write(result.to_csv())
+        output.write(text)
     return path
 
 
@@ -339,14 +352,9 @@ def write_recommendations(root: Path, configs: list[Mapping[str, Any]], *, exclu
     paths: list[Path] = []
     for index, config in enumerate(configs, start=1):
         path = directory / f"{index:04d}.yaml"
+        text = yaml.safe_dump(dict(config), sort_keys=False, allow_unicode=True)
         with _open_result(path, exclusive=exclusive) as output:
-            output.write(
-                yaml.safe_dump(
-                    dict(config),
-                    sort_keys=False,
-                    allow_unicode=True,
-                )
-            )
+            output.write(text)
         paths.append(path)
     return paths
 

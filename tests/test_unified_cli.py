@@ -2230,6 +2230,32 @@ def test_prediction_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, 
     assert (root / "prediction.json").read_text() == "replacement\n"
 
 
+def test_symlinked_diagnostic_is_named_as_the_refusal_reason(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}))
+    (tmp_path / "elsewhere.jsonl").write_text("{}\n")
+    (root / "execution-events.jsonl").symlink_to(tmp_path / "elsewhere.jsonl")
+
+    with pytest.raises(ValueError, match=r"not regular files \(execution-events.jsonl\)"):
+        prepare_output_directory(root, overwrite=False)
+    assert (root / "execution-events.jsonl").is_symlink()
+    assert (root / "resource-runtime.json").exists()
+
+
+def test_recommendation_yaml_failure_keeps_the_existing_file(tmp_path) -> None:
+    from aisim import output as output_module
+
+    root = tmp_path / "out"
+    (root / "recommendations").mkdir(parents=True)
+    existing = root / "recommendations" / "0001.yaml"
+    existing.write_text("previous: true\n")
+
+    with pytest.raises(yaml.representer.RepresenterError):
+        output_module.write_recommendations(root, [{"bad": object()}])
+    assert existing.read_text() == "previous: true\n"
+
+
 def test_telemetry_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, monkeypatch) -> None:
     from aisim import output as output_module
 
