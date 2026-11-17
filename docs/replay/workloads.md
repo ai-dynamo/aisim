@@ -364,7 +364,9 @@ follows the AgentX client, the AIPerf fork in the
 - Only a play's root is held to its recorded offset. Every other request is
   timed by its dependency edges alone, so a replay that runs faster than the
   recording, or whose idle gaps are capped, does not wait for recorded
-  timestamps.
+  timestamps. After an `agentic_snapshot` cut, a request whose previous or
+  spawning turn lies before the cut also waits for its recorded offset from the
+  cut.
 - A subagent that no main turn precedes is dropped. A flattened chain that no
   main turn precedes is spawned by the first one.
 - Each stream is its own chat conversation: its first request is one user

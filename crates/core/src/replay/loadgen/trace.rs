@@ -1618,6 +1618,7 @@ impl AgenticTraceBuilder {
             recorded_interval_ms: raw
                 .recorded_start_ms
                 .map(|start| (start, raw.recorded_api_time_ms.map(|api| start + api))),
+            recorded_start_gates_frontier: raw.recorded_start_ms.is_some(),
             priority: raw.priority.unwrap_or(0),
             strict_priority: raw.strict_priority.unwrap_or(0),
             policy_class: raw.policy_class,
@@ -2034,6 +2035,7 @@ fn canonical_agentic_graph_digest(
                 not_before_ms,
                 recorded_api_time_ms,
                 recorded_interval_ms: _,
+                recorded_start_gates_frontier: _,
                 priority,
                 strict_priority,
                 policy_class,

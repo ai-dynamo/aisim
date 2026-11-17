@@ -2613,7 +2613,9 @@ fn normalize_relative_path(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::loadgen::{AgenticSnapshotOptions, AgenticSnapshotSelection};
+    use crate::replay::loadgen::{
+        AgenticSnapshotOptions, AgenticSnapshotRequest, AgenticSnapshotSelection,
+    };
     use tempfile::tempdir;
 
     fn request(t: f64, input: usize, output: usize, hashes: &[u64]) -> serde_json::Value {
@@ -4212,22 +4214,13 @@ mod tests {
         let sampled = &prepared.snapshots()[0];
         assert_eq!(sampled.recorded_last_start_ms, 1_200.0);
         assert!((300.0..=900.0).contains(&sampled.t_star_ms));
-        let imported = graph
-            .prepare_snapshots(
-                1,
-                AgenticSnapshotOptions {
-                    seed: 42,
-                    initial_selections: Some(vec![AgenticSnapshotSelection {
-                        source_play_id: sampled.source_play_id.clone(),
-                        t_star_ms: 1_000.0,
-                    }]),
-                    corpus_cursor: Some(1),
-                },
-            )
-            .unwrap();
-        let requests = &imported.snapshots()[0].requests;
-        assert_eq!(requests.iter().filter(|r| r.historical).count(), 2);
+        let requests = agentx_cut(&path, 600.0);
+        assert_eq!(requests.iter().filter(|r| r.historical).count(), 1);
         assert!(requests.iter().any(|r| r.recorded_end_ms == Some(1_100.0)));
+        // Both streams resume at their recorded offsets from the cut, not when
+        // the historical spawning turn returned.
+        assert_eq!(delay_ms(&requests, "outer:1:inner:0"), 300.0);
+        assert_eq!(delay_ms(&requests, "outer:2"), 600.0);
         let mut driver =
             crate::replay::loadgen::WorkloadDriver::new_agentic_trace(graph, 4).unwrap();
         let root = driver.pop_ready(0.0, usize::MAX);
@@ -4282,6 +4275,36 @@ mod tests {
                 .unwrap()
                 .ends_with("outer:1:inner:0")
         );
+    }
+
+    /// The play's snapshot requests at an imported cut, AgentX client.
+    fn agentx_cut(path: &Path, t_star_ms: f64) -> Vec<AgenticSnapshotRequest> {
+        let options = WekaImportOptions {
+            client: WekaClient::Agentx,
+            ..Default::default()
+        };
+        let (graph, _, _) = load_weka_agentic_graph_cached(path, Some(4), options, false).unwrap();
+        let seeded = graph
+            .prepare_snapshots(1, AgenticSnapshotOptions::seeded(42))
+            .unwrap();
+        let cut = AgenticSnapshotOptions {
+            seed: 42,
+            initial_selections: Some(vec![AgenticSnapshotSelection {
+                source_play_id: seeded.snapshots()[0].source_play_id.clone(),
+                t_star_ms,
+            }]),
+            corpus_cursor: Some(1),
+        };
+        let prepared = graph.prepare_snapshots(1, cut).unwrap();
+        prepared.snapshots()[0].requests.clone()
+    }
+
+    fn delay_ms(requests: &[AgenticSnapshotRequest], source: &str) -> f64 {
+        let suffix = format!(":request:{source}");
+        let request = requests
+            .iter()
+            .find(|request| request.source_request_id.ends_with(&suffix));
+        request.unwrap().remaining_delay_ms
     }
 
     fn agentx_rows(path: &Path) -> Vec<AgenticMooncakeRow> {
@@ -4372,6 +4395,11 @@ mod tests {
                 ("outer:1:inner:0".into(), Completion, 0.0, ReplayBarrier),
             ]
         );
+        // Cut at 1200 ms, with m0 as history: a's second chain keeps its
+        // recorded offset although its replay barrier is still live.
+        let requests = agentx_cut(&path, 1_200.0);
+        assert_eq!(delay_ms(&requests, "outer:1:inner:0"), 300.0);
+        assert_eq!(delay_ms(&requests, "outer:1:inner:1"), 600.0);
         // b and c share the group joined by m1, which starts at b's marker.
         assert_eq!(
             edges(&rows, "outer:2:inner:0"),
