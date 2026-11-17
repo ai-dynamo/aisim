@@ -323,6 +323,15 @@ impl G1Manager {
         self.inner.get_lease_prefill_cost(sequence, lease)
     }
 
+    /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
+    pub(crate) fn get_native_waiting_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.get_waiting_lease_prefill_cost(sequence, lease)
+    }
+
     pub(crate) fn reserve_native_destination_at(
         &mut self,
         owner: Uuid,

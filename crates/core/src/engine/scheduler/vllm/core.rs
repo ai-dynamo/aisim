@@ -2539,7 +2539,10 @@ impl VllmCore {
                     .requests
                     .get_mut(&uuid)
                     .expect("waiting request missing from state");
-                let mut cost = request.sequence.prefill_cost(&self.kv_manager);
+                let mut cost = self.kv_manager.get_native_waiting_prefill_cost(
+                    &request.sequence.sequence,
+                    &mut request.sequence.lease,
+                );
                 if request.sequence.sequence.enable_prefix_caching()
                     && let Some(counts) = &mut self.g1_prefix_cache_lookup
                 {

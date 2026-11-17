@@ -568,6 +568,101 @@ fn newly_published_checkpoint_becomes_restorable_only_next_step() {
 }
 
 #[test]
+fn waiting_lookup_reuses_a_state_miss_until_a_state_or_a_longer_overlap_ends_it() {
+    let mut manager = manager(16, 4, 1, true);
+    manager.configure_prefix_match_unit(Some(4));
+    let (query, mut waiting) = request(Uuid::from_u128(2), 17, 4, true, 0);
+    let hashes = (0..4)
+        .map(|block| waiting.sequence_hash(block).unwrap())
+        .collect::<Vec<_>>();
+    let cached = |manager: &VllmKvManager, waiting: &mut BlockRequestLease| {
+        manager
+            .get_waiting_lease_prefill_cost(&query, waiting)
+            .cached_tokens
+    };
+
+    // A 9-token prompt publishes its state at token 8, hidden from lookups
+    // until the next step.
+    let owner = Uuid::from_u128(1);
+    let (mut sequence, mut lease) = request(owner, 9, 4, true, 0);
+    allocated(manager.allocate_lease(owner, &mut lease, 8, 0));
+    manager.begin_step();
+    manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    manager.begin_step();
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    assert_eq!(cached(&manager, &mut waiting), 8);
+    manager.finish_lease(owner, lease);
+    clear_reclaimable_and_assert_empty(&mut manager);
+
+    // Three token blocks hit, so a state at token 16 is out of reach until
+    // the fourth block is cached too.
+    for &hash in &hashes[..3] {
+        seed_key(&mut manager, CacheKey::Token(hash));
+    }
+    let state = |block: usize| CacheKey::State {
+        prefix: hashes[block],
+        slot: 0,
+    };
+    seed_key(&mut manager, state(3));
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    seed_key(&mut manager, CacheKey::Token(hashes[3]));
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    assert_eq!(cached(&manager, &mut waiting), 16);
+    clear_reclaimable_and_assert_empty(&mut manager);
+
+    // A state that becomes visible inside the overlap ends the miss.
+    for &hash in &hashes[..3] {
+        seed_key(&mut manager, CacheKey::Token(hash));
+    }
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    seed_key(&mut manager, state(1));
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+    assert_eq!(cached(&manager, &mut waiting), 8);
+    clear_reclaimable_and_assert_empty(&mut manager);
+
+    // Preemption drops the miss: the request resumes with a longer sequence.
+    assert_eq!(cached(&manager, &mut waiting), 0);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_some());
+    manager.preempt_lease(waiting.owner(), &mut waiting);
+    assert!(manager.repeated_state_miss(&query, &waiting).is_none());
+}
+
+#[test]
+fn hybrid_hit_below_the_overlap_counts_only_its_own_active_blocks() {
+    // Three token blocks hit; the state is below the third, at token 8 (the
+    // count looks past the hit) or at token 4 (it looks at the hit itself).
+    for (state_block, cached_tokens) in [(1, 8), (0, 4)] {
+        let mut manager = manager(16, 4, 1, true);
+        manager.configure_prefix_match_unit(Some(4));
+        let (query, waiting) = request(Uuid::from_u128(1), 17, 4, true, 0);
+        let hashes = (0..3)
+            .map(|block| waiting.sequence_hash(block).unwrap())
+            .collect::<Vec<_>>();
+        for &hash in &hashes {
+            seed_key(&mut manager, CacheKey::Token(hash));
+        }
+        let state = CacheKey::State {
+            prefix: hashes[state_block],
+            slot: 0,
+        };
+        seed_key(&mut manager, state);
+        for (pinned, active_cached_tokens) in [(&hashes[2..], 0), (&hashes[..], cached_tokens)] {
+            let pins = manager.pool.reserve(pinned, 0).unwrap().reservation;
+            let cost = manager.get_lease_prefill_cost(&query, &waiting);
+            assert_eq!(cost.cached_tokens, cached_tokens);
+            assert_eq!(cost.active_cached_tokens, active_cached_tokens);
+            manager.pool.cancel(pins);
+        }
+        clear_reclaimable_and_assert_empty(&mut manager);
+    }
+}
+
+#[test]
 fn mtp_bound_does_not_drop_an_already_earlier_sparse_checkpoint() {
     let mut manager = manager(32, 4, 1, true);
     manager.enable_state_cache(1, true);
