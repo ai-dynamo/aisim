@@ -236,6 +236,18 @@ def test_cached_engine_handle_mirrors_database_systems_root(_handle_cache_harnes
     assert captured[-1] == "/env/root"
 
 
+def test_configured_systems_root_never_composes_the_default_dataset(monkeypatch, tmp_path):
+    """A configured root is used as is; the pinned dataset must not be fetched just to be ignored."""
+    from aisim_core.data import default_systems
+
+    def fail():
+        raise AssertionError("the default systems root must not be composed")
+
+    monkeypatch.setattr(default_systems, "default_systems_path", fail)
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(tmp_path))
+    assert rust_engine_step._resolve_forward_pass_systems_paths(()) == [str(tmp_path)]
+
+
 def _dense_model() -> SimpleNamespace:
     return SimpleNamespace(
         model_path="Test/Dense",

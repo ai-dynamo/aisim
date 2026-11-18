@@ -1085,14 +1085,12 @@ def _validate_worker_type(worker_type: str) -> str:
 def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
     from aisim_core.data.default_systems import default_systems_path
 
-    packaged = None  # the default root, composed only when something asks for it
     if not entries:
         from aisim_core.sdk.perf_database import get_systems_paths
 
-        configured = get_systems_paths()
-        packaged = default_systems_path()
-        env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-        entries = tuple([env_root] if configured == [packaged] and env_root is not None else configured)
+        # Honors AICONFIGURATOR_SYSTEMS_PATH and set_systems_paths, and composes the default root only when
+        # neither is configured.
+        entries = tuple(get_systems_paths())
     resolved: list[str] = []
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
