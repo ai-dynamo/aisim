@@ -37,8 +37,8 @@ use crate::engine::kv_manager::{
 };
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
-    CompletedLoad, HostLookup, HostTransferProgress, StartLoad, VllmHostOffloadAdapter,
-    VllmHostRequestState,
+    CompletedLoad, HostLookup, HostLookupHit, HostTransferProgress, StartLoad, StateKind,
+    VllmHostOffloadAdapter, VllmHostRequestState,
 };
 use crate::engine::scheduler::vllm::policy::{self, AdmissionDecision, PolicySequence};
 use crate::engine::scheduler::vllm::request::RequestKvState;
@@ -969,6 +969,7 @@ impl VllmCore {
                 .as_ref()
                 .is_some_and(|host| host.scope == G2Scope::ClusterShared);
         let emit_token_ids = args.emit_kv_token_ids;
+        let eagle_block_drop = args.aic_nextn.is_some() && !args.disable_eagle_block_drop;
         let speculative_sampler = args.aic_nextn.map(|nextn| {
             let rates =
                 normalize_conditional_accept_rates(nextn, args.aic_nextn_accept_rates.as_deref())
@@ -999,14 +1000,24 @@ impl VllmCore {
         .with_state_cache(
             args.state_cache,
             args.kv_cache_bytes_per_token,
-            args.aic_nextn.is_some() && !args.disable_eagle_block_drop,
+            eagle_block_drop,
         )
         .with_prefix_match_unit(args.prefix_match_unit);
         let blocks_per_state = kv_manager.state_blocks_per_request();
         if let Some(adapter) = native_host_offload.as_mut()
             && blocks_per_state > 0
         {
-            adapter.set_hybrid(blocks_per_state);
+            let window = args
+                .state_cache
+                .is_some_and(|cache| cache.sliding_window.is_some());
+            let kind = if window {
+                StateKind::SlidingWindow {
+                    drops_drafter_block: eagle_block_drop,
+                }
+            } else {
+                StateKind::Recurrent
+            };
+            adapter.set_hybrid(blocks_per_state, kind);
             kv_manager.record_state_handoffs();
         }
         if let Some(order) = native_host_offload
@@ -2418,6 +2429,9 @@ impl VllmCore {
         };
         let mut admit_queued_arrivals = false;
         let mut stopped_at_queued_arrival = false;
+        // Set once a window restore waits for room: the rest of the pass
+        // serves only waiters that already hold G1 for their load.
+        let mut g1_owners_only = false;
         while !preempted_any
             && self.state.running.len() < max_num_running
             // vLLM does not call connector lookup after the current batch has
@@ -2443,22 +2457,29 @@ impl VllmCore {
             // A G3 or KVCR restore can wake a connector waiter ahead of one
             // that already holds reserved G1 for its load; serve that owner
             // first so the restored head cannot block the space it waits for.
-            // A rank without G3 that has never pulled keeps plain G2 order.
-            let g1_owner = retry_epoch_before.and_then(|_| {
-                self.state.connector_waiting.iter().copied().find(|uuid| {
-                    self.state.connector_waiting_members.contains(uuid)
-                        && !self.state.connector_deadline_waiting_members.contains(uuid)
-                        && self
-                            .state
-                            .requests
-                            .get(uuid)
-                            .and_then(|r| r.host_offload.as_deref())
-                            .is_some_and(|h| h.reserved_blocks() > 0)
+            // A rank without G3 that has never pulled keeps plain G2 order,
+            // until a window restore waits for room (`g1_owners_only`).
+            let g1_owner = (retry_epoch_before.is_some() || g1_owners_only)
+                .then(|| {
+                    self.state.connector_waiting.iter().copied().find(|uuid| {
+                        self.state.connector_waiting_members.contains(uuid)
+                            && !self.state.connector_deadline_waiting_members.contains(uuid)
+                            && self
+                                .state
+                                .requests
+                                .get(uuid)
+                                .and_then(|r| r.host_offload.as_deref())
+                                .is_some_and(|h| h.reserved_blocks() > 0)
+                    })
                 })
-            });
+                .flatten();
             let Some(uuid) = g1_owner.or_else(|| {
-                self.state
-                    .next_waiting_uuid(prefer_materialized, prioritize_connector_waiting)
+                (!g1_owners_only)
+                    .then(|| {
+                        self.state
+                            .next_waiting_uuid(prefer_materialized, prioritize_connector_waiting)
+                    })
+                    .flatten()
             }) else {
                 break;
             };
@@ -2703,7 +2724,16 @@ impl VllmCore {
                     }
                 }
             };
-            let decision = if native_mtp_depth.is_some() {
+            // A window checkpoint has many rows, and G1 counts two copies of
+            // them for a request that resumes from a state: here the landed
+            // checkpoint, which the request computes on in, and the window G1
+            // caches at the boundary when it has room. The load is admitted
+            // with room for both, so the request does not wait with its
+            // checkpoint landed.
+            let restores_window = host_hit.as_ref().is_some_and(HostLookupHit::restores_state)
+                && (self.native_host_offload.as_ref())
+                    .is_some_and(VllmHostOffloadAdapter::keeps_window_checkpoints);
+            let decision = if native_mtp_depth.is_some() || restores_window {
                 if let (AdmissionDecision::Admit { prefill_cost }, Some(hit)) =
                     (&decision, &host_hit)
                 {
@@ -2712,7 +2742,12 @@ impl VllmCore {
                         .as_deref()
                         .map(VllmHostRequestState::reserved_blocks)
                         .unwrap_or_default();
-                    let footprint = hit.request_footprint_blocks();
+                    let cached_copy = if restores_window {
+                        self.kv_manager.state_reserved_blocks_per_request()
+                    } else {
+                        0
+                    };
+                    let footprint = hit.request_footprint_blocks() + cached_copy;
                     let needed = footprint.saturating_sub(
                         (prefill_cost.active_cached_tokens / self.args.block_size).max(reserved),
                     );
@@ -2748,6 +2783,15 @@ impl VllmCore {
             let prefill_cost = match decision {
                 AdmissionDecision::Admit { prefill_cost } => prefill_cost,
                 AdmissionDecision::Wait => {
+                    // vLLM starts a load whose blocks fit and steps past the
+                    // request. Replay holds a window restore back until the
+                    // request's whole footprint fits beside the loads in
+                    // flight, so a waiter behind it that already holds G1 for
+                    // its load goes first: it frees that room.
+                    if restores_window && !g1_owners_only {
+                        g1_owners_only = true;
+                        continue;
+                    }
                     break;
                 }
                 AdmissionDecision::Reject => {
@@ -2910,7 +2954,7 @@ impl VllmCore {
         let store_after_emission = self
             .native_host_offload
             .as_ref()
-            .is_some_and(VllmHostOffloadAdapter::is_hybrid);
+            .is_some_and(VllmHostOffloadAdapter::keeps_recurrent_states);
         if !store_after_emission {
             self.store_pass_blocks(&scheduled, now_ms);
         }
