@@ -1124,7 +1124,7 @@ impl RadixCache {
             return;
         }
         let edge = &mut self.nodes[node];
-        if edge.children.is_empty() && edge.lock_ref <= 1 {
+        if !edge.mamba_checkpoint && edge.children.is_empty() && edge.lock_ref <= 1 {
             // Exact: doubling a long leaf for a short turn only gets shrunk back at unlock.
             edge.key.reserve_exact(pages);
             edge.value.reserve_exact(pages);
@@ -1935,6 +1935,45 @@ mod tests {
             cache.node(tail).value.capacity(),
             cache.node(tail).value.len()
         );
+    }
+
+    #[test]
+    fn mamba_checkpoint_does_not_reserve_unusable_tail_capacity() {
+        let mut cache = RadixCache::new(32, 1);
+        let tokens: Vec<u32> = (0..4).collect();
+        let mut pages = cache.page_pool.allocate(tokens.len()).unwrap();
+        let tail = cache.insert(&tokens, &pages);
+        cache.inc_lock_ref(tail);
+        cache.mark_mamba_checkpoint(tail);
+        let capacities = (
+            cache.node(tail).key.capacity(),
+            cache.node(tail).value.capacity(),
+        );
+
+        cache.reserve_leaf_extension(tail, 65_536);
+
+        assert_eq!(
+            (
+                cache.node(tail).key.capacity(),
+                cache.node(tail).value.capacity()
+            ),
+            capacities
+        );
+        let extended: Vec<u32> = (0..6).collect();
+        pages.extend(cache.page_pool.allocate(2).unwrap());
+        let child = cache.insert_from_node(tail, tokens.len(), &extended, &pages);
+
+        assert_ne!(child, tail);
+        assert_eq!(cache.node(child).parent, Some(tail));
+        assert_eq!(*cache.node(tail).key, cache.page_hashes(&tokens));
+        assert_eq!(cache.mamba_checkpoint_count(), 1);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&extended)),
+            (4, 6)
+        );
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 6);
     }
 
     #[test]
