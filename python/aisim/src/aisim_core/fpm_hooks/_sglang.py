@@ -22,9 +22,15 @@ Step diagnostics (see ``_struct.STEP_FIELDS``) come from three more wrappers:
   CPU, so the hook never adds a device synchronization.
 - The schedule-time host timestamp is ``batch.fpm_start_time``.
 
-The stock emitter sums every forward interval that finished since the last
+SGLang 0.5.20 sums every forward interval that finished since the last
 record, so under the overlap scheduler a record can include the next step
 (see the learned-model docs). The host timestamps make such records visible.
+
+SGLang 0.5.23 and later (sgl-project/sglang#38711) time each batch result on
+its own (``FpmTiming``), pass the result to the builder, and build speculative
+decode aggregates from a snapshot taken before the result settles. The hook
+then takes per-category device time from the record's own intervals instead of
+the DeviceTimer reporter, and takes the decode pairs from the same snapshot.
 """
 
 from __future__ import annotations
@@ -43,6 +49,8 @@ _PATCHED = "_aisim_fpm_request_lists"
 _STEP_CONTEXT = "_aisim_fpm_step_context"
 _DEVICE_TIME = "_aisim_fpm_device_time_by_category"
 _TIMER_HOOKED = "_aisim_fpm_category_reporter"
+_SNAPSHOT_PAIRS = "_aisim_fpm_snapshot_pairs"
+_TIMING_TOTALS = "_aisim_fpm_device_time_by_category"
 
 
 def request_pairs(batch) -> list[tuple[int, int]] | None:
@@ -187,8 +195,10 @@ def _owner_class(module: ModuleType) -> type | None:
     )
 
 
-def _wrap_init_fpm(owner: type) -> None:
+def _wrap_init_fpm(owner: type, attach_reporter: bool) -> None:
     init_fpm = vars(owner).get("_init_fpm")
+    if not attach_reporter:
+        return
     if init_fpm is None:
         logger.info("fpm_hooks: SGLang metrics reporter has no _init_fpm; device time per category is lazy")
         return
@@ -202,7 +212,7 @@ def _wrap_init_fpm(owner: type) -> None:
     owner._init_fpm = wrapped_init_fpm
 
 
-def _wrap_emit(owner: type) -> None:
+def _wrap_emit(owner: type, attach_reporter: bool) -> None:
     emit = vars(owner).get("_emit_forward_pass_metrics")
     if emit is None:
         logger.warning("fpm_hooks: SGLang metrics reporter has no _emit_forward_pass_metrics; no step diagnostics")
@@ -211,7 +221,8 @@ def _wrap_emit(owner: type) -> None:
     def wrapped_emit(self, batch, *args, **kwargs):
         # Fallback when _init_fpm ran before the hook: the first record may
         # then miss the device time reported before this point.
-        attach_device_time_reporter(self)
+        if attach_reporter:
+            attach_device_time_reporter(self)
         result = args[0] if args else kwargs.get("result")
         setattr(self, _STEP_CONTEXT, (result, time.monotonic()))
         try:
@@ -221,6 +232,68 @@ def _wrap_emit(owner: type) -> None:
 
     wrapped_emit.__wrapped__ = emit  # type: ignore[attr-defined]
     owner._emit_forward_pass_metrics = wrapped_emit
+
+
+def _wrap_spec_snapshot(owner: type) -> None:
+    """Keep the (1, past) pairs behind the speculative decode snapshot (SGLang 0.5.23+)."""
+    snapshot = vars(owner).get("snapshot_spec_decode_metrics")
+    if snapshot is None:
+        return
+
+    def wrapped_snapshot(self, batch, result, *args, **kwargs):
+        out = snapshot(self, batch, result, *args, **kwargs)
+        if getattr(result, "fpm_scheduled_requests", None) is not None:
+            # Same source as the snapshot aggregate: req.seqlen - 1 before the result settles.
+            reqs = list(getattr(batch, "reqs", None) or [])
+            setattr(result, _SNAPSHOT_PAIRS, [(1, max(int(req.seqlen) - 1, 0)) for req in reqs])
+        return out
+
+    wrapped_snapshot.__wrapped__ = snapshot  # type: ignore[attr-defined]
+    owner.snapshot_spec_decode_metrics = wrapped_snapshot
+
+
+def patch_fpm_timing(timing_cls: type) -> bool:
+    """Give each per-result FPM record its own device time per category (SGLang 0.5.23+).
+
+    ``FpmTiming`` sees every interval of one batch result; the totals are added
+    to the record when its span is published, so they match ``wall_time``.
+    """
+    ready = vars(timing_cls).get("on_interval_ready")
+    publish_when_ready = vars(timing_cls).get("publish_when_ready")
+    if ready is None or publish_when_ready is None or getattr(ready, _PATCHED, False):
+        return False
+
+    def wrapped_ready(self, interval):
+        try:
+            totals = self.__dict__.setdefault(_TIMING_TOTALS, {})
+            category = (getattr(interval, "metadata", None) or {}).get("category", "unknown")
+            totals[category] = totals.get(category, 0.0) + interval.elapsed_time() / 1000.0
+        except Exception:
+            logger.debug("fpm_hooks: interval category time unavailable", exc_info=True)
+        return ready(self, interval)
+
+    def wrapped_publish_when_ready(self, metrics, publisher):
+        timing = self
+
+        class _WithCategories:
+            def publish(self, record):
+                import msgspec
+
+                totals = timing.__dict__.get(_TIMING_TOTALS)
+                scheduled = getattr(record, "scheduled_requests", None)
+                if totals and "device_time_s_by_category" in getattr(scheduled, "__struct_fields__", ()):
+                    scheduled = msgspec.structs.replace(scheduled, device_time_s_by_category=dict(totals))
+                    record = msgspec.structs.replace(record, scheduled_requests=scheduled)
+                publisher.publish(record)
+
+        return publish_when_ready(self, metrics, _WithCategories())
+
+    setattr(wrapped_ready, _PATCHED, True)
+    wrapped_ready.__wrapped__ = ready  # type: ignore[attr-defined]
+    wrapped_publish_when_ready.__wrapped__ = publish_when_ready  # type: ignore[attr-defined]
+    timing_cls.on_interval_ready = wrapped_ready
+    timing_cls.publish_when_ready = wrapped_publish_when_ready
+    return True
 
 
 def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
@@ -245,12 +318,21 @@ def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
     fpm_mod.ScheduledRequestMetrics = extended
     diagnostics_failed = False
 
-    def wrapped(self, batch):
+    timing_cls = getattr(fpm_mod, "FpmTiming", None)
+    per_result_timing = timing_cls is not None
+
+    def wrapped(self, batch, *args, **kwargs):
         nonlocal diagnostics_failed
-        restore = fill_decode_seq_lens(batch, getattr(self, _STEP_CONTEXT, None))
+        # SGLang 0.5.23+ passes the batch result; a speculative decode result
+        # carries a pre-settle aggregate snapshot that the builder returns as is.
+        result = args[0] if args else kwargs.get("result")
+        snapshot_pairs = None
+        if getattr(result, "fpm_scheduled_requests", None) is not None:
+            snapshot_pairs = getattr(result, _SNAPSHOT_PAIRS, None)
+        restore = snapshot_pairs is None and fill_decode_seq_lens(batch, getattr(self, _STEP_CONTEXT, None))
         try:
-            metrics = build(self, batch)
-            pairs = request_pairs(batch)
+            metrics = build(self, batch, *args, **kwargs)
+            pairs = snapshot_pairs if snapshot_pairs is not None else request_pairs(batch)
         finally:
             if restore:
                 batch.seq_lens_cpu = None
@@ -270,7 +352,10 @@ def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
     setattr(wrapped, _PATCHED, True)
     wrapped.__wrapped__ = build  # type: ignore[attr-defined]
     owner._build_scheduled_request_metrics = wrapped
-    _wrap_init_fpm(owner)
-    _wrap_emit(owner)
+    _wrap_init_fpm(owner, attach_reporter=not per_result_timing)
+    _wrap_emit(owner, attach_reporter=not per_result_timing)
+    _wrap_spec_snapshot(owner)
+    if per_result_timing:
+        patch_fpm_timing(timing_cls)
     logger.info("fpm_hooks: SGLang FPM now carries per-request lists and step diagnostics")
     return True

@@ -472,3 +472,99 @@ def test_sglang_hook_survives_speculative_decode_without_cpu_seq_lens(fake_sglan
     mixin.forward_pass_device_timer.finish(0.02, "target_verify")
     mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(accept_lens=_Lens([3, 2], is_cpu=False)))
     assert mixin.published[-1][1].past_kv_lengths == [702, 91]
+
+
+@pytest.fixture
+def fake_sglang_0523(monkeypatch):
+    """Mirrors SGLang 0.5.23 (sgl-project/sglang#38711): per-result FpmTiming, builder takes the result,
+    speculative decode aggregates come from a pre-settle snapshot on the result."""
+    fpm = _stock_fpm_module("sglang.srt.observability.forward_pass_metrics")
+    reporter = types.ModuleType("sglang.srt.managers.scheduler_components.metrics_reporter")
+
+    class FpmTiming:
+        def __init__(self):
+            self._callback = None
+            self.span = 0.0
+
+        def on_interval_ready(self, interval):
+            self.span += interval.elapsed_time() / 1000.0
+
+        def publish_when_ready(self, metrics, publisher):
+            publisher.publish(msgspec.structs.replace(metrics, wall_time=self.span))
+
+    class _Interval:
+        def __init__(self, ms, category):
+            self.ms = ms
+            self.metadata = {"category": category}
+
+        def elapsed_time(self):
+            return self.ms
+
+    class SchedulerMetricsReporter:
+        def __init__(self, spec=(0, 0)):
+            self._spec = spec
+            self.published = []
+
+        def _active_spec_config_snapshot(self):
+            return {"num_steps": self._spec[0], "num_draft_tokens": self._spec[1]}
+
+        def snapshot_spec_decode_metrics(self, batch, result):
+            cls = fpm.ScheduledRequestMetrics
+            lens = [r.seqlen - 1 for r in batch.reqs]
+            result.fpm_scheduled_requests = cls(num_decode_requests=len(lens), sum_decode_kv_tokens=sum(lens))
+
+        def _emit_forward_pass_metrics(self, batch, result=None):
+            record = fpm.ForwardPassMetrics(scheduled_requests=self._build_scheduled_request_metrics(batch, result))
+            result.fpm_timing.publish_when_ready(record, types.SimpleNamespace(publish=self.published.append))
+
+        def _build_scheduled_request_metrics(self, batch, result=None):
+            snapshot = getattr(result, "fpm_scheduled_requests", None)
+            if snapshot is not None:
+                return snapshot
+            lens = [int(sl) for sl in batch.seq_lens_cpu]
+            return fpm.ScheduledRequestMetrics(num_decode_requests=len(lens), sum_decode_kv_tokens=sum(lens))
+
+    fpm.FpmTiming = FpmTiming
+    reporter.SchedulerMetricsReporter = SchedulerMetricsReporter
+    for name in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.observability",
+        "sglang.srt.managers",
+        "sglang.srt.managers.scheduler_components",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, fpm.__name__, fpm)
+    monkeypatch.setitem(sys.modules, reporter.__name__, reporter)
+    return fpm, reporter, _Interval
+
+
+def test_sglang_0523_hook_uses_result_snapshot_and_per_result_device_time(fake_sglang_0523):
+    fpm, reporter, interval = fake_sglang_0523
+    assert sglang.patch_sglang_metrics_reporter(reporter) is True
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+    # speculative decode: snapshot before the result settles (one pending token outside KV)
+    batch = types.SimpleNamespace(
+        forward_mode=_Mode("decode"), reqs=[_Req(seqlen=701), _Req(seqlen=91)], seq_lens_cpu=None
+    )
+    result = types.SimpleNamespace(accept_lens=_Lens([3, 2]), fpm_timing=fpm.FpmTiming())
+    mixin.snapshot_spec_decode_metrics(batch, result)
+    for ms, category in ((6.0, "target_verify"), (1.5, "eagle_draft"), (0.5, "eagle_draft_extend")):
+        result.fpm_timing.on_interval_ready(interval(ms, category))
+    mixin._emit_forward_pass_metrics(batch, result)
+    record = mixin.published[-1]
+    m = record.scheduled_requests
+    assert m.past_kv_lengths == [700, 90] and m.sum_decode_kv_tokens == 790
+    assert m.extend_lengths == [4, 4] and m.spec_accept_lengths == [3, 2]
+    assert m.device_time_s_by_category == pytest.approx(
+        {"target_verify": 0.006, "eagle_draft": 0.0015, "eagle_draft_extend": 0.0005}
+    )
+    assert sum(m.device_time_s_by_category.values()) == pytest.approx(record.wall_time)
+    # non-speculative decode: the builder reads seq_lens_cpu, the hook the same source
+    plain = types.SimpleNamespace(forward_mode=_Mode("decode"), reqs=[_Req(seqlen=11)], seq_lens_cpu=[10])
+    result = types.SimpleNamespace(accept_lens=None, fpm_timing=fpm.FpmTiming())
+    result.fpm_timing.on_interval_ready(interval(2.0, "decode"))
+    mixin._emit_forward_pass_metrics(plain, result)
+    m = mixin.published[-1].scheduled_requests
+    assert m.past_kv_lengths == [10] and m.extend_lengths == [4]
+    assert m.device_time_s_by_category == pytest.approx({"decode": 0.002})
