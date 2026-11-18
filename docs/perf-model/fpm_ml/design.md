@@ -57,14 +57,16 @@ One record = one FPM event from one engine worker:
 - **vLLM** (`InstrumentedScheduler`): host clock between two `schedule()` calls, i.e.
   the engine step including scheduler overhead. Overlap is not an issue.
 - **SGLang** (`SchedulerMetricsReporter` + `DeviceTimer`): CUDA events around the
-  forward, accumulated and flushed when the batch result is processed. With the
-  overlap scheduler on, the disaggregated prefill loop does KV hand-off work before
-  the flush, so the next forward completes first and is merged into the current record
-  (2× bimodal step times for identical batch shapes, 18% of records dropped, 22%
-  prefill error). **All SGLang collection is done with `--disable-overlap-schedule`**,
-  which makes each record exactly one forward. A model trained overlap-off still
-  predicts overlap-on decode steps to within a near-constant 5.5% offset; overlap-on
-  prefill records are not usable as truth.
+  forward. Before 0.5.23 they are accumulated and flushed when the batch result is
+  processed. With the overlap scheduler on, the disaggregated prefill loop does KV
+  hand-off work before the flush, so the next forward completes first and is merged
+  into the current record (2× bimodal step times for identical batch shapes, 18% of
+  records dropped, 22% prefill error); speculative decoding shifts time between
+  neighbouring records the same way. SGLang 0.5.23 (sgl-project/sglang#38711) times
+  each batch result on its own. **Collect SGLang FPM with the deployment's overlap
+  setting on 0.5.23 or later.** Overlap off is a different step: on GLM-5.3 with MTP
+  it adds 12% decode GPU time at equal batch and KV size. Only on older SGLang use
+  `--disable-overlap-schedule`, accepting that offset (5.5% to 14% on decode so far).
 
 A **capture run** is one fresh deployment on its own nodes, one aiperf seed, every
 concurrency tier run once (20 min each). Runs are the unit of independence: steps
@@ -183,14 +185,16 @@ defaults.
 | --- | --- |
 | `spec_num_steps`, `spec_num_draft_tokens` | Active speculative configuration of the worker (`_active_spec_config_snapshot`); 0 when speculation is off. |
 | `spec_accept_lengths[i]` | Tokens committed by request *i* in a speculative decode step, bonus token included (`result.accept_lens`). Read only when already on the CPU, so the hook adds no device synchronization; empty otherwise. |
-| `device_time_s_by_category` | Seconds of device time per DeviceTimer category (`decode`, `extend`, `target_verify`, `eagle_draft`, `eagle_draft_extend`, ...). The hook adds one DeviceTimer reporter and drains it at each record, so the categories cover the same intervals as `wall_time`. |
+| `device_time_s_by_category` | Seconds of device time per DeviceTimer category (`decode`, `extend`, `target_verify`, `eagle_draft`, `eagle_draft_extend`, ...). On SGLang 0.5.23+ the hook sums the intervals of the record's own batch result, so the categories add up to `wall_time` minus any gaps between intervals. Before 0.5.23 it adds one DeviceTimer reporter and drains it at each record, covering the same intervals as `wall_time`. |
 | `host_scheduled_at_s` | Host monotonic time when the scheduler started building the batch (`batch.fpm_start_time`). |
 | `host_emitted_at_s` | Host monotonic time when the record was emitted. Consecutive differences give the step period on the host clock; the gap to the summed device time is exposed CPU time. Under the overlap scheduler they also show where a record merged two forwards. |
 
 Host times are per worker process and only comparable within one capture.
-Checked against SGLang v0.5.20 (`94602c9c`): DeviceTimer tags the target verify,
-the EAGLE/MTP draft and the draft extend, and `GenerationBatchResult.accept_lens` is
-on the CPU when the record is emitted.
+Checked against SGLang v0.5.20 (`94602c9c`) and v0.5.23 (`297e54fd`): DeviceTimer tags the
+target verify, the EAGLE/MTP draft and the draft extend, and
+`GenerationBatchResult.accept_lens` is on the CPU when the record is emitted. On
+0.5.23 a speculative decode record's aggregates come from a snapshot taken before
+the result settles; the hook takes the per-request lists from the same snapshot.
 
 ### Validation of the recorded lists
 

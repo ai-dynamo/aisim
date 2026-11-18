@@ -71,17 +71,27 @@ model's identity.
 `wall_time` means different things per backend. The vLLM producer
 (`InstrumentedScheduler`) measures each step from `schedule()` to
 `update_from_output()` on the host clock, one value per step. The SGLang
-producer reads a CUDA-event `DeviceTimer` around the forward, but it
-accumulates every *finished* interval at emission time and drops the record
-when nothing finished. With the overlap scheduler on, a step whose result
-processing does long host work (the last chunk of a request in
+producer reads a CUDA-event `DeviceTimer` around the forward. Before SGLang
+0.5.23 it accumulates every *finished* interval at emission time and drops the
+record when nothing finished. With the overlap scheduler on, a step whose
+result processing does long host work (the last chunk of a request in
 disaggregated prefill hands the KV cache to the decode worker) lets the next
 forward finish first, so that record carries two forwards and the next record
 is lost (V4.1-Flash prefill: 18% of batches missing, a 2× bimodal step time,
-22% MAPE). **Collect SGLang FPM with `--disable-overlap-schedule`**; the
-non-overlap loop emits exactly one interval per batch and the measured GPU
-time is the same quantity a production overlap deployment spends per forward.
-The same requirement holds for the SGLang simulator's own collection hook.
+22% MAPE). Speculative decoding under overlap shows the same shift in
+aggregated serving. SGLang 0.5.23
+([sgl-project/sglang#38711](https://github.com/sgl-project/sglang/pull/38711))
+times each batch result on its own, so every record holds exactly its own
+forward with overlap on.
+
+**Collect SGLang FPM with the deployment's overlap setting, on SGLang 0.5.23 or
+later.** `--disable-overlap-schedule` changes the step itself, not only its
+timing: on GLM-5.3-NVFP4 (B300, TP8, aggregated, MTP with 3 draft tokens)
+decode GPU time at equal batch and KV size is 12% higher with overlap off on
+both 0.5.20 and 0.5.23, and a model trained on overlap-off steps over-predicts
+overlap-on decode by 14%. On SGLang before 0.5.23, overlap off avoids merged
+records at the cost of that offset. The same applies to the SGLang
+simulator's own collection hook.
 
 ### Per-request fields
 
@@ -754,8 +764,8 @@ for identical batch shapes and 18% of prefill batches missing from the FPM
 stream, the accumulator effect described in §1. With the flag, drops are 0%
 and identical-shape step times agree to 1%.
 
-A model trained on overlap-off data still predicts overlap-on decode steps
-(the GPU forward is the same quantity): scored against the overlap-on test
+A model trained on overlap-off data predicts overlap-on decode steps with
+a near constant offset: scored against the overlap-on test
 run it gives 5.5% MAPE (5.6% median) with a p95 of 8.4%, i.e. a near
 constant offset that the online correction grid absorbs. The overlap-on
 prefill records themselves are unusable as truth because of the accumulator
