@@ -53,13 +53,28 @@ Build separate checkouts of baseline
 cargo +1.99.0 build --release --locked -p aisim-core --features extension-module
 ```
 
-Set `MAMBA_BASE_RUNTIME` and `MAMBA_FIXED_RUNTIME` to the resulting
-`target/release/libaisim_core.so` files. Set `MAMBA_EXECUTION` to the captured
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:8d8b27909fa07d7dfeed116170b4778683527f0feae695c394a1a83de8ddf971 -->
+
+Set `MAMBA_BASE_CHECKOUT` and `MAMBA_FIXED_CHECKOUT` to the absolute paths of
+the baseline and candidate checkouts, respectively. Point each runtime variable
+to its checkout's built library and verify both files exist:
+
+```bash
+export MAMBA_BASE_RUNTIME="$MAMBA_BASE_CHECKOUT/target/release/libaisimulate_core.so"
+export MAMBA_FIXED_RUNTIME="$MAMBA_FIXED_CHECKOUT/target/release/libaisimulate_core.so"
+test -f "$MAMBA_BASE_RUNTIME" && test -f "$MAMBA_FIXED_RUNTIME"
+```
+
+Proceed only if the check succeeds. Set `MAMBA_EXECUTION` to the captured
 execution descriptor, `MAMBA_NATIVE` to its native postprocess directory and
 `MAMBA_RESULTS` to a fresh scratch output directory. Extract the exact
 historical scorer from this repository's immutable commit, keeping it outside
 the checkout:
 
+
+<!-- /coderabbit-ai-generated:v1 -->
 ```bash
 git show f2a460101cfb09bdb52c00ddf2680bc16b0dba84:scripts/prediction_regression/compare_mamba_cache_accuracy.py > "$MAMBA_RESULTS/scorer.py"
 python3 "$MAMBA_RESULTS/scorer.py" run \
