@@ -713,11 +713,20 @@ impl VllmKvManager {
         let checkpoint_blocks = self.admission_checkpoint_blocks(cost.cached_tokens, known_tokens);
         if let Some(state) = &self.state_cache {
             // Align mode rotates working allocations across physical blocks.
-            // The previous state remains an input until the next pass, even
-            // on a cold prompt. Price that peak before starting prefill.
-            let rotates = state
-                .align_block_size
-                .is_some_and(|block| known_tokens > block);
+            // The previous state remains an input until the next pass, so a
+            // cold prompt needs both only when an align stop splits its
+            // prefill. Price that peak before starting prefill.
+            let rotates = state.align_block_size.is_some_and(|block| {
+                let (last_full, resend_full, tail) = state_boundaries(
+                    known_tokens,
+                    block,
+                    self.prefix_match_unit.unwrap_or(block),
+                    state.speculative_drop(),
+                );
+                [last_full, resend_full, tail]
+                    .into_iter()
+                    .any(|stop| 0 < stop && stop < known_tokens)
+            });
             // An internal prefill checkpoint already supplies the second
             // cold state; do not charge it twice on a one-pass prefill.
             let copies = if cost.cached_tokens > 0 || (rotates && checkpoint_blocks == 0) {

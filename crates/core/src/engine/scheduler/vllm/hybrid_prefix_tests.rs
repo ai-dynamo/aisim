@@ -148,6 +148,35 @@ fn cold_aligned_admission_requires_the_state_rotation_peak() {
 }
 
 #[test]
+fn cold_one_pass_prefill_under_the_eagle_drop_needs_one_working_state() {
+    // The drop keeps no state at token 64, so the 65-token prompt runs in one
+    // pass: two token blocks, one working state and one scratch state.
+    let mut config = args(false, false);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.num_gpu_blocks = 6;
+    config.aic_nextn = Some(1);
+    config.aic_nextn_accept_rates = Some("1".to_string());
+    let state = config.state_cache.as_mut().unwrap();
+    state.bytes_per_request = 1500;
+    state.num_speculative_states = Some(1);
+    let mut core = VllmCore::new(config);
+    let id = submit(&mut core, 901, (0..65).collect(), 1);
+    let mut passes = vec![step(&mut core)];
+    assert_eq!(passes[0].admissions.len(), 1);
+    while !core.state.requests.is_empty() && passes.len() < 8 {
+        passes.push(step(&mut core));
+    }
+    assert!(
+        passes
+            .iter()
+            .flat_map(|pass| &pass.output_signals)
+            .any(|signal| signal.uuid == id && signal.completed && !signal.rejected)
+    );
+    assert_eq!(core.state.preemptions_total, 0);
+}
+
+#[test]
 fn prefill_checkpoint_finishes_the_prompt_in_one_pass() {
     // The final chunk runs to the prompt end and exports the state at
     // (P - 1) // B * B = 12 from inside its forward, in one extra state

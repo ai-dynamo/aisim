@@ -479,6 +479,11 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
     expected_blocks = 32767 if cache_layout == "mamba_align" else 32768
     kv_cache = {"block_size": 64} if cache_layout == "mamba_align" else None
     public = _speculative_public(profile, timing_systems, kv_cache)
+    if cache_layout == "mamba_align":
+        unchunked = public.model_dump(mode="json")
+        unchunked["engine"]["enable_chunked_prefill"] = False
+        with pytest.raises(ValidationError, match="requires engine.enable_chunked_prefill to be true"):
+            CorePredictionConfig.model_validate(unchunked)
     restored = CorePredictionConfig.model_validate_json(public.model_dump_json())
     spec = prediction_to_replay_spec(restored)
     diagnostics = {}
