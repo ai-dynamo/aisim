@@ -949,9 +949,10 @@ impl GroupedPrefixCoordinator {
     /// `single:1214-1230`, `single:1658-1675`, `single:1858-1864`, v0.32
     /// `single:1643-1674`). The blocks that vLLM frees before an allocation
     /// (window blocks below the window, the checkpoint block, the previous
-    /// running block and the copy block of a partial state hit) are released
-    /// first (`kv_cache_manager.py:552-554`). Then one atomic reservation
-    /// takes every fresh block, or none. `prefill_end` is vLLM's prefill end
+    /// running block, the copy block of a partial state hit and the hit block
+    /// of a state hit on a block boundary) are released first
+    /// (`kv_cache_manager.py:552-554`). Then one atomic reservation takes
+    /// every fresh block, or none. `prefill_end` is vLLM's prefill end
     /// `max(prompt, num_tokens - 1)`, which a resumed request extends over
     /// its output tokens (v0.32 `mgr:518-520`). Only a chunk that reaches it
     /// takes a checkpoint block. A first allocation after a hit inside a
@@ -1044,6 +1045,21 @@ impl GroupedPrefixCoordinator {
                     let copy = cow && !cow_is_running;
                     if !first && let Some(copy) = state.copy.take() {
                         releases.push(copy);
+                    }
+                    // The hit block of a hit on a block boundary leaves once
+                    // the request has computed past it, with the other skipped
+                    // blocks and before the reservation, as vLLM frees it on
+                    // the processed token count (v0.31 `mgr:552-556`,
+                    // `single:1626-1645`, v0.32 `mgr:555-559`,
+                    // `single:1592-1611`). vLLM 0.31.0 turns async scheduling
+                    // on by default and then holds it one more step. A hit
+                    // inside a block left the lease as a copy source in the
+                    // first allocation, so this never applies to it.
+                    if let Some((hit, index)) = state.hit
+                        && computed_before.div_ceil(block).saturating_sub(1) > index
+                    {
+                        releases.push(hit);
+                        state.hit = None;
                     }
                     let checkpoint = (target >= prefill_end)
                         .then(|| rules.checkpoint_position(target))
@@ -1276,17 +1292,11 @@ impl GroupedPrefixCoordinator {
                         pool.cache(id, key);
                         self.published_this_step.insert(key);
                     }
-                    // The hit and previous blocks go after one pass, as on the
-                    // linear path and in the runtime probe, which ran without
-                    // async scheduling. vLLM 0.31.0 turns async scheduling on
-                    // by default and then holds them one more pass
+                    // The previous block goes after one pass, as on the linear
+                    // path and in the runtime probe, which ran without async
+                    // scheduling. vLLM 0.31.0 turns async scheduling on by
+                    // default and then holds it one more pass
                     // (`kv_cache_manager.py:552-554` with `num_in_flight_tokens`).
-                    if let Some((id, index)) = state.hit
-                        && computed_after.div_ceil(block) - 1 > index
-                    {
-                        pool.release(id);
-                        state.hit = None;
-                    }
                     if let Some((id, previous_step)) = state.previous
                         && step > previous_step
                     {
@@ -2326,9 +2336,10 @@ mod tests {
     #[test]
     fn resumed_state_holds_cached_and_running_blocks_during_the_first_step() {
         // single:1858-1868: a resumed request holds the hit block and the
-        // running block. single:1658-1675 frees the hit block once
-        // `cdiv(processed, block) - 1 > hit_index`: `cdiv(6000, 2176) - 1 ==
-        // 2 > 1`.
+        // running block. vLLM frees the hit block at the request's next
+        // `allocate_slots` (mgr:552-556, single:1626-1645), once
+        // `cdiv(processed, block) - 1 > hit_index` (single:1667-1671):
+        // `cdiv(6000, 2176) - 1 == 2 > 1`.
         let groups = groups_glm(false);
         let mut coordinator = with_limits(rules_glm(VllmRuleVersion::V0_31_0, false));
         let hash = 2176;
@@ -2361,6 +2372,15 @@ mod tests {
         // G0: 2 hits + 1 new, ring 1, states 8.
         assert_eq!(pool.active_blocks(), 12);
         coordinator.finalize(pool, &mut block_lease, &request, 9000, 6000, &hit, 1);
+        // The hit blocks stay through the first step.
+        for group in GLM_STATES {
+            let state = state_lease(&block_lease, usize::from(group));
+            assert!(state.hit.is_some() && state.running.is_some());
+        }
+        assert_eq!(pool.active_blocks(), 12);
+        assert_eq!(pool.inactive_cached_blocks(), 0);
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6000, 6001, 2));
         for group in GLM_STATES {
             let state = state_lease(&block_lease, usize::from(group));
             assert!(state.hit.is_none() && state.running.is_some());
@@ -3828,8 +3848,8 @@ mod tests {
     #[test]
     fn a_hit_on_a_block_boundary_pins_no_copy_source() {
         // A hit on a block boundary takes no copy (v0.31 single:321-327), so
-        // the hit block of a state group stays in the request until the hit
-        // rule releases it.
+        // the hit block of a state group stays in the request until its next
+        // allocation (v0.31 mgr:552-556, single:1626-1645).
         let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
         let mut kv = kv_pool(&groups_glm(false), 32);
         let pool = kv.block_pool_mut().unwrap();
@@ -3863,6 +3883,15 @@ mod tests {
         }
         coordinator.finalize(pool, &mut block_lease, &request, 4700, 4700, &hit, 1);
         assert_eq!(coordinator.copy_source_count(), 0);
+        assert_eq!(pool.active_blocks(), 12);
+        assert_eq!(pool.inactive_cached_blocks(), 0);
+        assert_eq!(coordinator.release_copy_sources(pool), 0);
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4700, 4701, 2));
+        for group in GLM_STATES {
+            let state = state_lease(&block_lease, usize::from(group));
+            assert!(state.hit.is_none() && state.running.is_some());
+        }
         assert_eq!(pool.active_blocks(), 8);
         assert_eq!(pool.inactive_cached_blocks(), 4);
     }
@@ -3891,5 +3920,370 @@ mod tests {
         coordinator.release_request(pool, &mut block_lease);
         assert_eq!(pool.active_blocks(), 0);
         assert_eq!(pool.inactive_cached_blocks(), 6);
+    }
+
+    /// Prefill a request of 4,400 tokens from no hit and release it. Its chunks
+    /// end at 4,352 and 4,400, so it publishes a state at 4,352, on a block
+    /// boundary of each 2,176-token group.
+    fn produce_on_a_boundary(
+        coordinator: &mut GroupedPrefixCoordinator,
+        pool: &mut GroupedBlockPool,
+        base: u32,
+    ) {
+        let request = lease_from(base, 4400);
+        let hit = coordinator.find_longest_hit(pool, &request, 4400);
+        assert_eq!(hit.tokens, 0);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        let ends = prefill(
+            coordinator,
+            pool,
+            &mut block_lease,
+            &request,
+            4400,
+            &hit,
+            BUDGET,
+        );
+        assert_eq!(ends, [4352, 4400]);
+        coordinator.release_request(pool, &mut block_lease);
+    }
+
+    /// Evict the oldest cached block: take every free block and one more, and
+    /// give them back.
+    fn evict_one(pool: &mut GroupedBlockPool) {
+        let free = pool.capacity_blocks() - pool.active_blocks() - pool.inactive_cached_blocks();
+        let mut reservation = pool.reserve(&[], free + 1).unwrap();
+        let taken: Vec<_> = (0..free + 1)
+            .map(|_| pool.take_private(&mut reservation))
+            .collect();
+        pool.cancel(reservation);
+        pool.release_all(taken);
+    }
+
+    #[test]
+    fn a_boundary_hit_block_leaves_after_the_copy_sources_of_its_pass() {
+        // A hits 3,264 tokens, inside a block, and B hits 4,352, on a block
+        // boundary. vLLM frees A's copy sources at the end of the step
+        // (v0.31 sched:1434-1442) and B's hit blocks at B's next
+        // `allocate_slots` (v0.31 mgr:552-556, single:1626-1645), in a later
+        // step. So A's sources enter the free queue first, in either
+        // admission order.
+        for a_first in [true, false] {
+            let mut coordinator =
+                with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+            let mut kv = kv_pool(&groups_glm(false), 64);
+            let pool = kv.block_pool_mut().unwrap();
+            produce(&mut coordinator, pool, 0);
+            produce_on_a_boundary(&mut coordinator, pool, 1_000_000);
+            let b_request = lease_from(1_000_000, 4700);
+            let admit_b = |coordinator: &mut GroupedPrefixCoordinator,
+                           pool: &mut GroupedBlockPool| {
+                let hit = coordinator.find_longest_hit(pool, &b_request, 4700);
+                assert_eq!(hit.tokens, 4352);
+                let mut lease = coordinator.new_lease();
+                assert!(coordinator.pin_hit(pool, &mut lease, &hit).is_ok());
+                assert!(coordinator.allocate(pool, &mut lease, 4700, 4352, 4700, 1));
+                coordinator.finalize(pool, &mut lease, &b_request, 4700, 4700, &hit, 1);
+                (lease, hit)
+            };
+            let admit_a = |coordinator: &mut GroupedPrefixCoordinator,
+                           pool: &mut GroupedBlockPool| {
+                let (request, mut lease, hit) = consume(coordinator, pool, 0);
+                coordinator.finalize(pool, &mut lease, &request, 3800, 3800, &hit, 1);
+                (request, lease, hit)
+            };
+            let ((a_request, mut a_lease, a_hit), (mut b_lease, b_hit)) = if a_first {
+                let a = admit_a(&mut coordinator, pool);
+                (a, admit_b(&mut coordinator, pool))
+            } else {
+                let b = admit_b(&mut coordinator, pool);
+                (admit_a(&mut coordinator, pool), b)
+            };
+            // A: 7 blocks and 5 sources. B: 8 blocks and 4 hit blocks.
+            assert_eq!(pool.active_blocks(), 24, "{a_first}");
+            assert_eq!(coordinator.release_copy_sources(pool), 5);
+            assert_eq!(pool.active_blocks(), 19, "{a_first}");
+            // The next pass: both requests compute one token, in running order.
+            coordinator.begin_step();
+            for is_a in if a_first {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                if is_a {
+                    assert!(coordinator.allocate(pool, &mut a_lease, 3800, 3800, 3801, 2));
+                    coordinator.finalize(pool, &mut a_lease, &a_request, 3800, 3801, &a_hit, 2);
+                } else {
+                    assert!(coordinator.allocate(pool, &mut b_lease, 4700, 4700, 4701, 2));
+                    coordinator.finalize(pool, &mut b_lease, &b_request, 4700, 4701, &b_hit, 2);
+                }
+            }
+            assert_eq!(coordinator.release_copy_sources(pool), 0);
+            assert_eq!(pool.active_blocks(), 15, "{a_first}");
+            assert_eq!(pool.inactive_cached_blocks(), 13, "{a_first}");
+            // The four producer states at 2,176 go first, then A's sources in
+            // group order, then B's hit blocks.
+            let (mut a_gone, mut b_gone) = (None, None);
+            for eviction in 1..=13 {
+                evict_one(pool);
+                if a_gone.is_none() && key_state(pool, 2, &a_request, 3264).is_none() {
+                    a_gone = Some(eviction);
+                }
+                if b_gone.is_none() && key_state(pool, 2, &b_request, 4352).is_none() {
+                    b_gone = Some(eviction);
+                }
+            }
+            assert_eq!((a_gone, b_gone), (Some(6), Some(10)), "{a_first}");
+        }
+    }
+
+    #[test]
+    fn a_request_that_ends_first_frees_its_boundary_hit_block_after_its_attention_blocks() {
+        // A request that ends frees its blocks in group order, each group tail
+        // first (v0.31 coord:387-395, single:581-589). Its hit blocks are still
+        // in its state groups, so they go after its full-attention blocks.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 32);
+        let pool = kv.block_pool_mut().unwrap();
+        produce_on_a_boundary(&mut coordinator, pool, 0);
+        let request = lease_from(0, 4700);
+        let hit = coordinator.find_longest_hit(pool, &request, 4700);
+        assert_eq!(hit.tokens, 4352);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4352, 4700, 1));
+        coordinator.finalize(pool, &mut block_lease, &request, 4700, 4700, &hit, 1);
+        assert_eq!(pool.active_blocks(), 12);
+        assert_eq!(coordinator.release_copy_sources(pool), 0);
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(pool.active_blocks(), 0);
+        assert_eq!(pool.inactive_cached_blocks(), 6);
+        evict_one(pool);
+        assert_eq!(key_state(pool, 0, &request, 4352), None);
+        assert_eq!(key_state(pool, 0, &request, 2176), Some(false));
+        evict_one(pool);
+        assert_eq!(key_state(pool, 0, &request, 2176), None);
+        for group in GLM_STATES {
+            assert_eq!(key_state(pool, group, &request, 4352), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_request_with_a_copy_source_and_a_boundary_hit_releases_the_source_first() {
+        // The full-attention group (block 64) hits 48 tokens inside a block and
+        // takes a copy. The state group (block 16) hits on its block boundary
+        // at 48 and takes none. The copy source leaves at the end of the pass
+        // (v0.31 sched:1434-1442), the state hit block at the request's next
+        // allocation (v0.31 mgr:552-556).
+        let groups = [attention("full", 64, None), state("kda", 16, true, false)];
+        let hash = 8;
+        let mut coordinator =
+            with_limits(GroupedPrefixRules::new(&groups, hash, VllmRuleVersion::V0_31_0).unwrap());
+        let mut kv = kv_pool(&groups, 16);
+        let pool = kv.block_pool_mut().unwrap();
+        seed_many(pool, 0, hash, &[48]);
+        seed_states(pool, &[1], hash, 48);
+        let request = lease(100, hash);
+        let hit = coordinator.find_longest_hit(pool, &request, 100);
+        assert_eq!(hit.tokens, 48);
+        let mut block_lease = coordinator.new_lease();
+        coordinator.begin_step();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert!(coordinator.allocate(pool, &mut block_lease, 100, 48, 100, 1));
+        assert_eq!(coordinator.copy_source_count(), 1);
+        assert!(state_lease(&block_lease, 1).hit.is_some());
+        coordinator.finalize(pool, &mut block_lease, &request, 100, 100, &hit, 1);
+        assert!(state_lease(&block_lease, 1).hit.is_some());
+        assert_eq!(coordinator.release_copy_sources(pool), 1);
+        evict_one(pool);
+        assert!(!hit_exists(pool, 0, hash, 48));
+        assert!(hit_exists(pool, 1, hash, 48));
+    }
+
+    /// A request of 9,000 tokens on the prefix of `produce_on_a_boundary`: it
+    /// hits 4,352 tokens, on a block boundary, and its first chunk computes to
+    /// 8,704. It then holds 13 blocks: 4 full-attention blocks, the ring block,
+    /// and a hit block and a running block in each state group.
+    fn admit_past_a_boundary_hit(
+        coordinator: &mut GroupedPrefixCoordinator,
+        pool: &mut GroupedBlockPool,
+    ) -> GroupedBlockLease {
+        let request = lease_from(0, 9000);
+        let hit = coordinator.find_longest_hit(pool, &request, 9000);
+        assert_eq!(hit.tokens, 4352);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 8704, 1));
+        coordinator.finalize(pool, &mut block_lease, &request, 9000, 8704, &hit, 1);
+        assert_eq!(coordinator.release_copy_sources(pool), 0);
+        assert_eq!(pool.active_blocks(), 13);
+        block_lease
+    }
+
+    #[test]
+    fn a_next_allocation_can_take_the_blocks_of_its_boundary_hit() {
+        // vLLM frees the skipped blocks before the free-block test of
+        // `allocate_slots` (v0.31 kv_cache_manager.py:552-556, :570-576). The
+        // next chunk, to 9,000, crosses the block boundary at 8,704 and needs 5
+        // fresh blocks: one full-attention block and a running block in each
+        // state group. On a pool of 14 blocks one block is free and the 4 hit
+        // blocks leave first, so the allocation succeeds.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 14);
+        let pool = kv.block_pool_mut().unwrap();
+        produce_on_a_boundary(&mut coordinator, pool, 0);
+        let mut block_lease = admit_past_a_boundary_hit(&mut coordinator, pool);
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 2));
+        // 13 - 4 hit blocks + 5 fresh blocks.
+        assert_eq!(pool.active_blocks(), 14);
+        for group in GLM_STATES {
+            assert!(state_lease(&block_lease, usize::from(group)).hit.is_none());
+        }
+        coordinator.release_request(pool, &mut block_lease);
+    }
+
+    #[test]
+    fn a_refused_next_allocation_still_releases_the_boundary_hit_block() {
+        // On a pool of 13 blocks no block is free, and the 4 released hit blocks
+        // do not cover the 5 fresh blocks, so the allocation is refused. vLLM
+        // has freed the skipped blocks before its test, so they stay released.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 13);
+        let pool = kv.block_pool_mut().unwrap();
+        produce_on_a_boundary(&mut coordinator, pool, 0);
+        let mut block_lease = admit_past_a_boundary_hit(&mut coordinator, pool);
+        coordinator.begin_step();
+        assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 2));
+        assert_eq!(pool.active_blocks(), 9);
+        assert_eq!(pool.inactive_cached_blocks(), 4);
+        for group in GLM_STATES {
+            assert!(state_lease(&block_lease, usize::from(group)).hit.is_none());
+        }
+        // A second try changes nothing, and the request leaves cleanly.
+        assert!(!coordinator.allocate(pool, &mut block_lease, 9000, 8704, 9000, 2));
+        assert_eq!(pool.active_blocks(), 9);
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(pool.active_blocks(), 0);
+    }
+
+    /// A request of 13,000 tokens with checkpoint blocks: it hits 8,704 tokens,
+    /// on a block boundary, and computes its whole prompt in one chunk. It then
+    /// holds 19 blocks: 6 full-attention blocks, the ring block, and a hit, a
+    /// running and a checkpoint block in each state group. The checkpoint block
+    /// holds the state at 10,880 and is cached.
+    fn admit_with_a_checkpoint_block(
+        coordinator: &mut GroupedPrefixCoordinator,
+        pool: &mut GroupedBlockPool,
+        version: VllmRuleVersion,
+    ) -> GroupedBlockLease {
+        let hash = 2176;
+        seed_many(pool, 0, hash, &[2176, 4352, 6528, 8704]);
+        seed_states(pool, &GLM_STATES, hash, 8704);
+        let request = lease(13000, hash);
+        let hit = coordinator.find_longest_hit(pool, &request, 13000);
+        assert_eq!(hit.tokens, 8704, "{version:?}");
+        let mut block_lease = coordinator.new_lease();
+        coordinator.begin_step();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert!(coordinator.allocate(pool, &mut block_lease, 13000, 8704, 13000, 1));
+        coordinator.finalize(pool, &mut block_lease, &request, 13000, 13000, &hit, 1);
+        assert_eq!(coordinator.release_copy_sources(pool), 0);
+        for group in GLM_STATES {
+            let state = state_lease(&block_lease, usize::from(group));
+            assert!(
+                state.hit.is_some() && state.checkpoint.is_some(),
+                "{version:?}"
+            );
+        }
+        assert_eq!(pool.active_blocks(), 19, "{version:?}");
+        assert_eq!(pool.inactive_cached_blocks(), 0, "{version:?}");
+        block_lease
+    }
+
+    #[test]
+    fn the_checkpoint_block_leaves_before_the_boundary_hit_block_of_its_group() {
+        // vLLM frees the skipped blocks manager by manager, in group order
+        // (v0.32 kv_cache_coordinator.py:447-450), and the blocks of a state
+        // group in descending index order (v0.32
+        // single_type_kv_cache_manager.py:1604-1608). So the checkpoint block
+        // of group 2 enters the free queue first, then its hit block, then the
+        // blocks of group 3.
+        let version = VllmRuleVersion::V0_32_0;
+        let mut coordinator = with_limits(rules_glm(version, true));
+        let mut kv = kv_pool(&groups_glm(true), 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 13000, 13000, 13001, 2));
+        // The 4 hit and the 4 checkpoint blocks are cached now.
+        assert_eq!(pool.active_blocks(), 11, "{version:?}");
+        assert_eq!(pool.inactive_cached_blocks(), 8, "{version:?}");
+        evict_one(pool);
+        assert!(!hit_exists(pool, 2, 2176, 10880), "{version:?}");
+        assert!(hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        evict_one(pool);
+        assert!(!hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        assert!(hit_exists(pool, 3, 2176, 10880), "{version:?}");
+        coordinator.release_request(pool, &mut block_lease);
+    }
+
+    #[test]
+    fn a_request_that_ends_first_frees_its_checkpoint_block_before_its_boundary_hit_block() {
+        // A request that ends frees its blocks manager by manager, in group
+        // order (v0.32 kv_cache_coordinator.py:407-408), and each group's table
+        // in reverse order (v0.32 single_type_kv_cache_manager.py:581-589): in
+        // a state group the running block, the checkpoint block, then the hit
+        // block, and then the next group.
+        let version = VllmRuleVersion::V0_32_0;
+        let mut coordinator = with_limits(rules_glm(version, true));
+        let mut kv = kv_pool(&groups_glm(true), 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut block_lease = admit_with_a_checkpoint_block(&mut coordinator, pool, version);
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(pool.active_blocks(), 0, "{version:?}");
+        // The five cached full-attention blocks go first, then the
+        // checkpoint block of group 2.
+        for _ in 0..6 {
+            evict_one(pool);
+        }
+        assert!(!hit_exists(pool, 2, 2176, 10880), "{version:?}");
+        assert!(hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        // Then the hit block of group 2, before the blocks of group 3.
+        evict_one(pool);
+        assert!(!hit_exists(pool, 2, 2176, 8704), "{version:?}");
+        assert!(hit_exists(pool, 3, 2176, 10880), "{version:?}");
+    }
+
+    #[test]
+    fn a_request_that_ends_first_frees_its_running_state_block_before_its_boundary_hit_block() {
+        // The first chunk ends on the block boundary at 8,704, so the running
+        // block of each state group holds the cached state at 8,704. A request
+        // that ends frees each group's table in reverse order (v0.31
+        // single_type_kv_cache_manager.py:581-589): the running block, at index
+        // 3, before the hit block, at index 1. `release_request` has no rule that
+        // depends on the vLLM version, so one rule row is enough.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 64);
+        let pool = kv.block_pool_mut().unwrap();
+        produce_on_a_boundary(&mut coordinator, pool, 0);
+        let request = lease_from(0, 9000);
+        let mut block_lease = admit_past_a_boundary_hit(&mut coordinator, pool);
+        for group in GLM_STATES {
+            assert_eq!(key_state(pool, group, &request, 8704), Some(true));
+            assert_eq!(key_state(pool, group, &request, 4352), Some(true));
+        }
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(pool.active_blocks(), 0);
+        // The four full-attention blocks, tail first, then the running block of
+        // group 2.
+        for _ in 0..5 {
+            evict_one(pool);
+        }
+        for at in [2176, 4352, 6528, 8704] {
+            assert_eq!(key_state(pool, 0, &request, at), None, "{at}");
+        }
+        assert_eq!(key_state(pool, 2, &request, 8704), None);
+        assert_eq!(key_state(pool, 2, &request, 4352), Some(false));
     }
 }

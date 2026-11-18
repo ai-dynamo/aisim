@@ -121,6 +121,8 @@ pub(crate) struct GroupStateLease {
     /// The block that the request writes.
     pub(crate) running: Option<BlockCopyId>,
     /// A cached hit block, and the index of the block whose end it covers.
+    /// The block of a hit on a block boundary is held until the request's
+    /// next allocation.
     pub(crate) hit: Option<(BlockCopyId, usize)>,
     /// The running block before a boundary crossing or producer copy-on-write,
     /// and the step after which it can go.
