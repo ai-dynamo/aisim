@@ -1941,12 +1941,15 @@ impl Engine {
     /// Python `_run_context_phase` (`base_backend.py:144`): `effective_isl =
     /// isl - prefix`, validate `> 0`, then one full pass over `context_ops`.
     fn run_context_phase(&self, runtime: &RuntimeConfig) -> Result<f64, AicError> {
-        self.run_context_phase_with(runtime, None, |_, _| {})
+        self.run_context_phase_with(runtime, false, None, |_, _| {})
     }
 
+    /// `any_cached` marks a prefill whose exact cached-token total is nonzero
+    /// even when its integer mean `runtime.prefix` rounds to zero.
     fn run_context_phase_with(
         &self,
         runtime: &RuntimeConfig,
+        any_cached: bool,
         coverage: Option<&mut FpmQueryCoverage>,
         mut on_op: impl FnMut(&Op, PerformanceResult),
     ) -> Result<f64, AicError> {
@@ -2000,7 +2003,7 @@ impl Engine {
             runtime.prefix,
             runtime.seq_imbalance_correction_scale,
             ContextOpFilter::All,
-            false,
+            any_cached,
             |_, op, result| on_op(op, result.into_owned()),
         )
     }
@@ -2124,7 +2127,7 @@ impl Engine {
             prefix,
             ..Default::default()
         };
-        self.run_context_phase_with(&rt, coverage, |_, _| {})
+        self.run_context_phase_with(&rt, false, coverage, |_, _| {})
     }
 
     /// Preserve static prefill geometry, including explicitly equal per-request
@@ -2145,7 +2148,7 @@ impl Engine {
             ..Default::default()
         };
         let mut queries = Vec::new();
-        let prefill_ms = self.run_context_phase_with(&runtime, coverage, |_, result| {
+        let prefill_ms = self.run_context_phase_with(&runtime, false, coverage, |_, result| {
             queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
         })?;
         Ok(static_prefill_estimate(prefill_ms, queries))
@@ -2261,7 +2264,7 @@ impl Engine {
                     osl: 1,
                     ..Default::default()
                 };
-                self.run_context_phase_with(&runtime, coverage, on_op)
+                self.run_context_phase_with(&runtime, total_kv_read_tokens > 0, coverage, on_op)
             }
         }
     }
@@ -4634,9 +4637,9 @@ pub(crate) mod tests {
             .into(),
             scale_factor: 1.0,
             kernel_source: if prefill {
-                "vllm_mamba_chunk_scan_combined_varlen"
+                "mamba_chunk_scan_combined"
             } else {
-                "vllm_flashinfer_selective_state_update"
+                "selective_state_update_flashinfer"
             }
             .into(),
             phase: if prefill { "context" } else { "generation" }.into(),
@@ -4886,10 +4889,7 @@ pub(crate) mod tests {
         write_parquet(
             &data.join("mamba2_perf.parquet"),
             &[
-                Col::Str(
-                    "kernel_source",
-                    vec!["vllm_mamba_chunk_scan_combined_varlen"],
-                ),
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"]),
                 Col::Str("phase", vec!["context"]),
                 Col::I64("batch_size", vec![2]),
                 Col::I64("seq_len", vec![16]),
@@ -4935,6 +4935,12 @@ pub(crate) mod tests {
         let (latency, source) = prefill(1);
         assert_eq!(source, "sol");
         assert!((latency - 4_788_224.0 / db.system_spec.gpu.mem_bw * 1000.0).abs() < 1e-12);
+        // The exact-total query keeps the same cache signal.
+        assert_eq!(engine.predict_prefill_latency_total(2, 32, 0).unwrap(), 0.5);
+        assert_eq!(
+            engine.predict_prefill_latency_total(2, 32, 1).unwrap(),
+            latency
+        );
     }
 
     #[test]
@@ -4950,10 +4956,7 @@ pub(crate) mod tests {
         write_parquet(
             &data.join("mamba2_perf.parquet"),
             &[
-                Col::Str(
-                    "kernel_source",
-                    vec!["vllm_flashinfer_selective_state_update"],
-                ),
+                Col::Str("kernel_source", vec!["selective_state_update_flashinfer"]),
                 Col::Str("phase", vec!["generation"]),
                 Col::I64("batch_size", vec![2]),
                 Col::I64("seq_len", vec![1]),
@@ -5189,7 +5192,8 @@ pub(crate) mod tests {
             ("generation", "does not match its context list"),
             ("prefill", "needs phase"),
         ] {
-            let mut op = qualified_mamba(true, 1);
+            // The generation op keeps its decode kernel, so only the list check fails.
+            let mut op = qualified_mamba(phase == "prefill", 1);
             if let Op::Mamba2(m) = &mut op {
                 m.phase = phase.into();
             }

@@ -81,7 +81,8 @@ impl Mamba2Op {
                 self.phase
             ));
         }
-        // Known kernel labels run in one phase only.
+        // Each supported kernel label runs in one phase only. A qualified op
+        // must use one of them; a legacy op keeps any label.
         let kernel_phase = match self.kernel_source.as_str() {
             "causal_conv1d_fn" | "causal_conv1d_fn_token_major" | "mamba_chunk_scan_combined" => {
                 Some("context")
@@ -92,16 +93,20 @@ impl Mamba2Op {
             | "selective_state_update_triton" => Some("generation"),
             _ => None,
         };
-        if self.state_dtype != "unrecorded"
-            && let Some(phase) = kernel_phase
-            && phase != self.phase
-        {
-            return Some(format!(
+        if self.state_dtype == "unrecorded" {
+            return None;
+        }
+        match kernel_phase {
+            None => Some(format!(
+                "unsupported kernel {:?} for a qualified Mamba2 op",
+                self.kernel_source
+            )),
+            Some(phase) if phase != self.phase => Some(format!(
                 "kernel {} runs in the {phase} phase, not {:?}",
                 self.kernel_source, self.phase
-            ));
+            )),
+            Some(_) => None,
         }
-        None
     }
 
     pub fn query(
@@ -708,7 +713,7 @@ mod tests {
         let mut op = super::Mamba2Op {
             name: "ssu".into(),
             scale_factor: 1.0,
-            kernel_source: "vllm_flashinfer_selective_state_update".into(),
+            kernel_source: "selective_state_update_flashinfer".into(),
             phase: "generation".into(),
             d_model: 4096,
             d_state: 128,
@@ -765,6 +770,11 @@ mod tests {
                 .unwrap()
                 .contains("runs in the generation phase")
         );
+        // A qualified op must name a supported kernel; a legacy op may not.
+        op.kernel_source = "causal_conv1d_updte".into();
+        assert!(op.field_error().unwrap().contains("unsupported kernel"));
+        op.state_dtype = "unrecorded".into();
+        assert_eq!(op.field_error(), None);
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane
