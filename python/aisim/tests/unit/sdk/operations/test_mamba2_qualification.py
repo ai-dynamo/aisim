@@ -44,3 +44,32 @@ def test_legacy_subclass_still_unpickles():
     clone = pickle.loads(pickle.dumps(op))
     assert type(clone) is LegacyKernel
     assert clone.__getnewargs_ex__() == op.__getnewargs_ex__()
+
+
+def test_ad_hoc_query_takes_the_op_width_and_rejects_partial_requests():
+    from aisim.sdk.perf_database import get_database
+
+    database = get_database("b200_sxm", "trtllm", "1.3.0rc20", allow_unlisted_version=True)
+    if database is None:
+        pytest.skip("b200_sxm/trtllm/1.3.0rc20 data missing")
+    op = ops.Mamba2Kernel(
+        "generation_mamba_ssm",
+        1,
+        "selective_state_update",
+        "generation",
+        4096,
+        64,
+        64,
+        128,
+        4,
+        4,
+        128,
+        state_dtype="bfloat16",
+        token_width=4,
+    )
+    # Eight tokens at width four are two whole requests.
+    result = op._engine_query(database, batch_size=8, s=16, x=8)
+    assert float(result) > 0
+    assert result.source == "sol"
+    with pytest.raises(Exception, match="not a multiple of token_width 4"):
+        op._engine_query(database, batch_size=5, s=16, x=5)

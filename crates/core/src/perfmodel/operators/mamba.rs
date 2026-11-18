@@ -165,8 +165,10 @@ impl Mamba2Op {
         let conv_dim = d_inner + 2.0 * n_groups * d_state;
         let x = if self.phase == "context" && seq_len > 0.0 {
             batch_size * seq_len
-        } else {
+        } else if self.phase == "generation" {
             batch_size * self.token_width as f64
+        } else {
+            batch_size
         };
         if self.is_conv() {
             x * conv_dim * (d_conv + 1.0) * 2.0 + x * conv_dim * 2.0
@@ -688,6 +690,10 @@ mod tests {
         let logical = op.sol_total_bytes(2.0, 16.0);
         op.kernel_source = "causal_conv1d_fn_token_major".into();
         assert_eq!(op.sol_total_bytes(2.0, 16.0), logical);
+        // Decode width never scales context work, even without a sequence length.
+        let unit = op.sol_total_bytes(2.0, 0.0);
+        op.token_width = 4;
+        assert_eq!(op.sol_total_bytes(2.0, 0.0), unit);
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane

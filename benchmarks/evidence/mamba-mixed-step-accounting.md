@@ -228,10 +228,10 @@ _, _, decode = eng.mixed_step_breakdown_per_op(*args)
 print(eng.mixed_step_latency(*args), sum(row[1] for row in decode))
 ```
 
-The same script at the current head `50ded579`, with the `aisim_core` package
-names, gives 26.294 ms and a 0.345 ms decode component. That value is not a
-before/after delta, because main changed between the revisions. The current
-head also splits this shape's 1904-token remainder into two request chunks.
+The same script at commit `50ded579`, with the `aisim_core` package names,
+gives 26.294 ms and a 0.345 ms decode component. That value is not a
+before/after delta, because main changed between the revisions. That commit
+also splits this shape's 1904-token remainder into two request chunks.
 One request has at most `isl - prefix = 1096` new tokens.
 
 ## Controls

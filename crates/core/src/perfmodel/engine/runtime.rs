@@ -1243,7 +1243,8 @@ impl Engine {
     /// Mixed steps price only top-level qualified Mamba ops per phase, so a
     /// qualified op inside a composite is rejected. Generation Mamba queries
     /// carry `requests * (nextn + 1)` flattened tokens and the op divides by
-    /// its own width (`decode_width`); the two must agree. Whole-model FPM
+    /// its own width (`decode_width`); the two must agree. Ad-hoc queries pass
+    /// width 0, because the probe engine has no model `nextn`. Whole-model FPM
     /// `sol_ops` use a separate path and are not walked. `seen` records
     /// whether any qualified (`[0]`) or unrecorded (`[1]`) Mamba2 op appeared.
     fn validate_mamba_ops(
@@ -1286,7 +1287,9 @@ impl Engine {
                             "a qualified op cannot be nested in a composite".into(),
                         );
                     }
+                    // Width 0: an ad-hoc generation query, whose op sets its own width.
                     if let Some(width) = decode_width
+                        && width != 0
                         && qualified
                         && m.token_width != width
                     {
@@ -3568,12 +3571,7 @@ impl Engine {
             AicError::InvalidEngineConfig(format!("evaluate_ops_json: invalid op list JSON: {e}"))
         })?;
         Self::reject_sd_round_ops(&ops)?;
-        Self::validate_mamba_ops(
-            &ops,
-            (!is_context).then(|| self.nextn.saturating_add(1)),
-            true,
-            &mut [false; 2],
-        )?;
+        Self::validate_mamba_ops(&ops, (!is_context).then_some(0), true, &mut [false; 2])?;
         let mut out = PerOpFold::new(if is_context { "context" } else { "generation" });
         for op in &ops {
             let r = if is_context {
@@ -3682,12 +3680,7 @@ impl Engine {
             ))
         })?;
         Self::reject_sd_round_ops(&ops)?;
-        Self::validate_mamba_ops(
-            &ops,
-            (!is_context).then(|| self.nextn.saturating_add(1)),
-            true,
-            &mut [false; 2],
-        )?;
+        Self::validate_mamba_ops(&ops, (!is_context).then_some(0), true, &mut [false; 2])?;
         let sol_db = self.db.sol_full_view();
         let mut out = PerOpSolFold::default();
         for op in &ops {
@@ -4736,7 +4729,6 @@ pub(crate) mod tests {
             (with("fp16", 1), "unsupported state_dtype"),
             (with("float16", 0), "must be positive"),
             (with("unrecorded", 4), "unrecorded"),
-            (with("float16", 4), "token_width 4"),
         ] {
             let err = engine
                 .evaluate_ops_json(&ops, false, 2, 16, 0, 1.0, None)
@@ -4747,8 +4739,9 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains(message), "{err}");
         }
-        // A width-four decode prices whole requests: 8 tokens, never 5.
-        let mtp = build_engine(Some(3));
+        // Ad-hoc queries run on a model-less engine, so the op's own width
+        // applies: a width-four decode prices whole requests, 8 tokens, never 5.
+        let mtp = build_engine(None);
         mtp.evaluate_ops_json(&with("float16", 4), false, 8, 16, 0, 1.0, None)
             .unwrap();
         let err = mtp
