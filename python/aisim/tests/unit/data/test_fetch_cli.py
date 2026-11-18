@@ -23,6 +23,8 @@ def files(tmp_path):
 
 @pytest.fixture
 def run(monkeypatch, tmp_path, capsys, files):
+    for name in ("AISIM_DATASET", "AISIM_DATA_MAX_BYTES"):
+        monkeypatch.delenv(name, raising=False)
     transport = FakeTransport(files)
     monkeypatch.setattr(data_cli, "make_transport", lambda: transport)
     cache = tmp_path / "cache"

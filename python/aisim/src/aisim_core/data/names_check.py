@@ -85,13 +85,14 @@ def _dataset_root(path: Path, manifest: Manifest) -> Path:
     raise LoaderError(f"cannot find the dataset root that holds the artifacts of {path}")
 
 
-def check_names(root: Path | str) -> tuple[list[PathFinding], list[str]]:
+def check_names(root: Path | str, base: Path | str | None = None) -> tuple[list[PathFinding], list[str]]:
     """``(findings, errors)`` for every configuration manifest under ``root``.
 
     ``errors`` lists manifests that could not be read or verified; they are not name findings.
+    Paths are relative to ``base`` (the dataset root); by default ``root`` itself, or its folder for a file.
     """
     root = Path(root)
-    base = root if root.is_dir() else root.parent
+    base = Path(base) if base else root if root.is_dir() else root.parent
     findings: list[PathFinding] = []
     errors: list[str] = []
     manifests, discovery_errors = discover_manifests(root)

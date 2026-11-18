@@ -17,7 +17,7 @@ from typing import Any, get_args
 
 from pydantic import ValidationError
 
-from aisim_core.data import Category, Manifest, check_dataset, check_manifest
+from aisim_core.data import Category, CategoryIndex, Manifest, _verify, check_dataset, check_manifest
 from aisim_core.data.fetch import Cache, Selection, SelectionError, Transport, fetch, resolve_revision
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.names_check import check_names, iter_manifests
@@ -49,11 +49,15 @@ def validate_local(path: str | Path) -> dict[str, Any]:
     manifests = iter_manifests(path)
     root = _dataset_root(path, manifests)
     dataset_checked = False
+    cataloged: set[str] = set()  # manifests check_dataset already checked
 
     if path.is_dir() and path == root and (root / "catalog" / "dataset.json").is_file():
         dataset_checked = True
         try:
-            check_dataset(root, unchecked_categories=UNCHECKED_CATEGORIES)
+            index = check_dataset(root, unchecked_categories=UNCHECKED_CATEGORIES)
+            for reference in index.categories.values():
+                entries = CategoryIndex.model_validate_json(_verify(root, reference.index).read_bytes())
+                cataloged.update(entry.manifest.path for entry in entries.entries)
         except _ERRORS as exc:
             findings.append(_finding("dataset", "catalog/dataset.json", f"{type(exc).__name__}: {exc}"))
     for manifest_file in manifests:
@@ -65,7 +69,7 @@ def validate_local(path: str | Path) -> dict[str, Any]:
             continue
         if manifest.category in UNCHECKED_CATEGORIES:
             skipped.add(manifest.category)
-        elif not dataset_checked:  # check_dataset already ran check_manifest for each catalog entry
+        elif relative not in cataloged:  # check_dataset already ran check_manifest for catalog entries
             try:
                 check_manifest(root, relative)
             except _ERRORS as exc:
@@ -73,7 +77,7 @@ def validate_local(path: str | Path) -> dict[str, Any]:
         for check in ENTRY_CHECKS.get(manifest.category, ()):
             findings.extend(check(root, relative, manifest))
 
-    name_findings, name_errors = check_names(path)
+    name_findings, name_errors = check_names(path, root)
     for item in name_findings:
         findings.append(_finding("names", item.path, f"{item.finding.value!r} is not canonical", **_name_fields(item)))
     for message in name_errors:

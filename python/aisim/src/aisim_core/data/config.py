@@ -112,5 +112,10 @@ def resolve_source(
     repo = repo or env_repo or (config.repo if config else None) or shipped_repo
     # A revision only means something for its repository: keep the pair together unless overridden.
     default_revision = shipped_revision if repo == shipped_repo else FALLBACK_REVISION
-    revision = revision or (env_revision if repo == env_repo else None) or (config.revision if config else None) or None
+    revision = (
+        revision
+        or (env_revision if repo == env_repo else None)
+        or (config.revision if config and (config.repo or shipped_repo) == repo else None)
+        or None
+    )
     return repo, revision or default_revision

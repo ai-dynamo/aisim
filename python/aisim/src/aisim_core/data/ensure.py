@@ -44,6 +44,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
@@ -261,7 +262,7 @@ def _describe(selection: Selection) -> str:
 
 def _command(pin: DataPin, selection: Selection) -> str:
     """A ``aisim data fetch`` command that is valid for ``selection`` (it needs a selector)."""
-    flags = [f"--category {selection.category}"]
+    flags = ["--category", selection.category]
     for flag, value in (
         ("--model", selection.model),
         ("--hardware", selection.hardware),
@@ -273,16 +274,17 @@ def _command(pin: DataPin, selection: Selection) -> str:
         ("--cache-dir", pin.cache_dir),
     ):
         if value:
-            flags.append(f"{flag} {value}")
+            flags += [flag, str(value)]
     # One flag per ID: without them the command would download every matching entry, not the one the pin names.
-    flags.extend(f"--configuration {cid}" for cid in selection.configuration_ids)
+    for configuration_id in selection.configuration_ids:
+        flags += ["--configuration", configuration_id]
     has_selector = selection.configuration_ids or selection.hardware
     if selection.select_all or (selection.category == "op-latency" and not has_selector):
         flags.append("--all")
     # The command line does not apply the auto-download threshold to an explicit fetch unless
     # AISIM_DATA_MAX_BYTES is set; --no-limit makes the command valid in both cases.
     flags.append("--no-limit")
-    return "aisim data fetch " + " ".join(flags)
+    return shlex.join(["aisim", "data", "fetch", *flags])
 
 
 # --------------------------------------------------------------------------- ensure

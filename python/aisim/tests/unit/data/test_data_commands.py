@@ -263,6 +263,19 @@ def test_config_location_honors_cache_env(monkeypatch, tmp_path):
     assert config_path() == tmp_path / "dc" / "config.json"
 
 
+def test_config_revision_applies_only_to_its_own_repo(env):
+    config = InitConfig(mode="all", repo="cfg/repo", revision="cfgrev")
+    assert resolve_source("other/data", config=config) == ("other/data", "main")
+    assert resolve_source("cfg/repo", config=config) == ("cfg/repo", "cfgrev")
+
+
+def test_fetch_reads_config_from_cache_dir(run, tmp_path):
+    cache = tmp_path / "explicit"
+    save_config(InitConfig(mode="all", repo=REPO, revision=SHA), config_path(cache_dir=cache))
+    status, out, _ = run("data", "fetch", "--category", "op-latency", "--all", "--cache-dir", str(cache))
+    assert status == 0 and json.loads(out)["plan"]["revision"] == SHA
+
+
 def test_precedence_flag_env_config_shipped(env, monkeypatch):
     config = InitConfig(mode="all", repo="cfg/repo", revision="cfgrev")
     assert resolve_source(config=config) == ("cfg/repo", "cfgrev")
@@ -368,6 +381,19 @@ def test_validate_reports_corruption_and_names(run, tmp_path):
     report = json.loads(out)
     checks = {f["check"] for f in report["findings"]}
     assert status == 1 and report["ok"] is False and {"names", "dataset"} <= checks
+
+
+def test_validate_checks_uncataloged_manifest_when_catalog_present(run, tmp_path):
+    root = tmp_path / "ds"
+    _write_dataset(root, run.files)
+    doc = json.loads((root / "data/op-latency/h200_sxm/manifest.json").read_text())
+    doc["artifacts"][0]["sha256"] = "0" * 64
+    extra = root / "data/op-latency/extra/manifest.json"
+    extra.parent.mkdir(parents=True)
+    extra.write_text(json.dumps(doc))
+    status, out, _ = run("data", "validate", str(root))
+    findings = json.loads(out)["findings"]
+    assert status == 1 and any(f["check"] == "manifest" and f["path"].endswith("extra/manifest.json") for f in findings)
 
 
 def test_validate_single_manifest(run, tmp_path):

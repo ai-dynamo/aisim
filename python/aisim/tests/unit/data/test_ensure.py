@@ -148,6 +148,14 @@ def test_over_threshold_refuses_with_size_and_command(tmp_path, files):
     assert "fpm/m1/data.parquet" not in transport.opened  # nothing downloaded
 
 
+def test_recovery_command_quotes_cache_path(tmp_path, files):
+    with pytest.raises(DataTooLargeError) as e:
+        ensure_data(
+            CONFIG, pin(tmp_path / "my cache", max_bytes=1, categories=("fpm",)), transport=FakeTransport(files)
+        )
+    assert f"--cache-dir '{tmp_path / 'my cache' / 'cache'}'" in str(e.value)
+
+
 def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
     with pytest.raises(MissingDataError, match=r"model=other.*system=h200|system=h200.*model=other"):
         ensure_data({**CONFIG, "model": "other"}, pin(tmp_path), transport=FakeTransport(files))
