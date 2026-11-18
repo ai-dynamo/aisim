@@ -588,6 +588,7 @@ def test_silicon_requires_exact_runtime_glm_tables():
     [
         ("nvidia/GLM-5.3-Flash-NVFP4", "b300_sxm", 4, None),
         ("nvidia/GLM-5.3-Flash-NVFP4", "gb200", 4, None),
+        ("zai-org/GLM-5.3-Flash", "gb200", 4, None),
         ("nvidia/GLM-5.3-Flash-NVFP4", "gb300", 4, None),
         ("zai-org/GLM-5.3-Flash", "h100_sxm", 8, "bfloat16"),
     ],
