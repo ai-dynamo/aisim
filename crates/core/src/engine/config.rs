@@ -3369,14 +3369,23 @@ mod tests {
         let decoded: EngineConfig = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.sglang.scheduler_select_time_ms, 1.5);
 
-        for disable in [
-            (|config: &mut EngineConfig| config.backend = Backend::Vllm) as fn(&mut EngineConfig),
-            |config| config.sglang.host_loop = true,
-            |config| config.afd = Some(Arc::new(sample_afd_config())),
+        for mut unsupported in [
+            EngineConfig::for_backend(Backend::Vllm),
+            EngineConfig {
+                sglang: SglangConfig {
+                    host_loop: true,
+                    ..SglangConfig::default()
+                },
+                ..EngineConfig::for_backend(Backend::Sglang)
+            },
+            EngineConfig {
+                afd: Some(Arc::new(sample_afd_config())),
+                ..EngineConfig::for_backend(Backend::Sglang)
+            },
         ] {
-            let mut config = config.clone();
-            disable(&mut config);
-            let error = config.validate().unwrap_err().to_string();
+            unsupported.validate().unwrap();
+            unsupported.sglang.scheduler_select_time_ms = 1.5;
+            let error = unsupported.validate().unwrap_err().to_string();
             assert!(
                 error.contains(
                     "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
