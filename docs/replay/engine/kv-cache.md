@@ -57,7 +57,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `g3_offload` | Unset (off) | Rejected | G3 block; see [G3 offload](#g3-offload). |
 | `kvcr` | Unset (off) | Rejected | KVCR block; see [KVCR peer fetch](#kvcr-peer-fetch). |
 | `state_cache` | Unset (off) | Rejected | Recurrent-state block; see [state cache](#state-cache). |
-| `prefix_match_unit` | Unset; `block_size` with a recurrent `state_cache` | Rejected | Prefix-matching granularity with `state_cache`. |
+| `prefix_match_unit` | Unset; `block_size` with a recurrent `state_cache` and prefix caching | Rejected | Prefix-matching granularity with `state_cache`; incompatible with detailed native KV-event artifacts. |
 
 The block-size defaults above are simulation defaults. When a Sweeper candidate's
 role block size is absent or `null`, the deployment generator omits `--block-size`
@@ -688,7 +688,7 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `state_cache.retention_interval` | Unset (every block boundary) | DeepSeek V4 with inferred bytes only. vLLM's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: `0` or a multiple of the resolved `block_size`. DeepSeek V4 rejects `prefix_match_unit`. |
 | `state_cache.sliding_window_lookahead_tokens` | Inferred (DeepSeek V4: 64) | Tokens past the full-attention hit that the MTP layer's sliding-window group reads; sizing fills it. Set it only with explicit `bytes_per_request`, to replay a state resolved earlier. |
-| `prefix_match_unit` | `block_size` for a recurrent state, unset for a sliding window | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. |
+| `prefix_match_unit` | `block_size` for a recurrent state with prefix caching, otherwise unset | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. Rejects detailed native KV-event artifact capture. |
 
 `state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
 a requested page size (default 64) that is enlarged to fit one state per layer.
@@ -747,6 +747,16 @@ there.
 vLLM uses align mode for a recurrent state whenever prefix caching is on, so an
 unset `prefix_match_unit` resolves to `block_size`: prefill chunks stop at the
 block boundaries where the state is kept.
+
+Detailed native artifact capture (`run_replay_with_artifacts_json`) requires KV
+event export and rejects any set `prefix_match_unit` before engine construction.
+This includes the default `block_size` unit for recurrent states with prefix
+caching: inferred Kimi K3 states, explicit `bytes_per_request` states, and
+DeepSeek V4 with explicit bytes and no `sliding_window_lookahead_tokens`.
+Sliding-window states and recurrent states with prefix caching disabled do not
+receive that default. Ordinary CLI `--capture-telemetry` and `--export-html`
+use telemetry capture without native KV-event export and support the aligned
+recurrent-state default.
 
 ### State pool from recorded runtime memory
 

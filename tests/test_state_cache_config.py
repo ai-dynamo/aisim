@@ -425,6 +425,81 @@ def test_unset_prefix_match_unit_aligns_only_a_cached_recurrent_state(forbid_est
     assert prediction_to_replay_spec(config).backend_deployment.agg_engine_args.get("prefix_match_unit") == unit
 
 
+@pytest.mark.parametrize("unit", [None, 16, 64])
+def test_recurrent_state_rejects_detailed_native_artifacts(forbid_estimators, unit):
+    from aisim import _runtime
+
+    config = CorePredictionConfig.model_validate(_public(prefix_match_unit=unit))
+    spec = prediction_to_replay_spec(config)
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    assert runtime.execution_spec["spec"]["engine"]["rank"]["prefix_match_unit"] == (unit or 64)
+    error = "detailed replay artifacts require KV event export, which prefix_match_unit"
+    with pytest.raises(RuntimeError, match=error):
+        _runtime.run_replay_with_artifacts_json(json.dumps(runtime.execution_spec))
+
+
+@pytest.mark.parametrize("overrides", [{"prefix_caching": False}, {"state_cache": WINDOW}])
+def test_unaligned_state_supports_detailed_native_artifacts(forbid_estimators, overrides):
+    from aisim import _runtime
+
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_public(**overrides)))
+    assert "prefix_match_unit" not in spec.backend_deployment.agg_engine_args
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    captured = json.loads(_runtime.run_replay_with_artifacts_json(json.dumps(runtime.execution_spec)))
+    assert captured["report"]["completed_requests"] == 1
+    assert len(captured["artifacts"]["requests"]) == 1
+
+
+def test_default_recurrent_state_cli_telemetry_preserves_alignment(tmp_path, forbid_estimators):
+    import yaml
+
+    import aisim.main as cli
+
+    path = tmp_path / "state.yaml"
+    path.write_text(yaml.safe_dump(_public()), encoding="utf-8")
+    output = tmp_path / "output"
+    assert cli.main(["predict", "-c", str(path), "--output-dir", str(output), "--capture-telemetry"]) == 0
+    prediction = json.loads((output / "prediction.json").read_text())
+    assert prediction["completed_requests"] == 1
+    # A 128-token prompt stops at 64 to retain a resumable recurrent state.
+    assert prediction["mean_ttft_ms"] == pytest.approx(2.0)
+    requests = [json.loads(line) for line in (output / "telemetry-requests.jsonl").read_text().splitlines()]
+    assert len(requests) == 1
+    assert requests[0]["input_length"] == 128
+    assert requests[0]["output_length"] == 1
+
+
+def test_manual_dsv4_without_lookahead_uses_recurrent_aligned_chunks(forbid_estimators):
+    from aisim import ReplayOutputRequirements
+
+    payload = _public()
+    payload["engine"]["model"] = FLASH
+    payload["engine"]["workers"]["aggregated"]["scheduler"] = {"max_batched_tokens": 100}
+    payload["traffic"]["source"]["input_tokens"] = 192
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(payload))
+    args = spec.backend_deployment.agg_engine_args
+    assert args["prefix_match_unit"] == args["block_size"] == 64
+    assert args["state_cache"] == STATE
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            spec,
+            output_requirements=ReplayOutputRequirements(capture_telemetry=True, telemetry_sample_interval_ms=0.5),
+        )
+    )
+    # Floor the 100-token step budget to 64-token boundaries: 64 + 64 + 64.
+    # An unaligned replay would instead schedule 100 + 92.
+    samples = report.metadata["native_report"]["telemetry"]["samples"]
+    chunks = [sample["traffic"]["committed_prefill_tokens"] for sample in samples]
+    assert [tokens for tokens in chunks if tokens] == [64, 64, 64]
+    assert report.metrics["completed_requests"] == 1
+    assert report.metrics["total_output_tokens"] == 1
+    assert report.metrics["committed_prefill_tokens"] == 192
+
+
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "1536", 1 << 64, 63, 65])
 def test_aligned_state_config_rejects_invalid_geometry(value):
     with pytest.raises(ValidationError, match="prefix_match_unit"):

@@ -4637,6 +4637,14 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
         serde_json::from_value(spec.engine.clone())
             .context("invalid native engine descriptor in execution ReplaySpec")?
     };
+    if capture_artifacts {
+        // Detailed artifacts export native KV events. Reject before timing or
+        // engine construction, including a unit defaulted by the compiler.
+        ensure!(
+            engine_config.rank.prefix_match_unit.is_none(),
+            "detailed replay artifacts require KV event export, which prefix_match_unit does not yet support"
+        );
+    }
     if telemetry_sample_interval_ms.is_some() {
         ensure!(
             spec.encoder.is_none(),
