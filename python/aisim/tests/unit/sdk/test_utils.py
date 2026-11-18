@@ -406,7 +406,7 @@ def test_corrupt_cached_quant_config_is_not_ignored(monkeypatch, hf_cache, conte
     assert quant_file.read_text() == contents
 
 
-def test_corrupt_config_during_companion_fallback_keeps_download_error(monkeypatch, hf_cache):
+def test_corrupt_config_after_network_failure_keeps_download_error_cause(monkeypatch, hf_cache):
     model = "org/corrupt-config"
     _cache_file(hf_cache, model, "config.json", {})
     _cache_file(hf_cache, model, "hf_quant_config.json", {"quantization": {"quant_algo": "FP8"}})
@@ -414,8 +414,6 @@ def test_corrupt_config_during_companion_fallback_keeps_download_error(monkeypat
     config_file.write_text("{broken")
 
     def remote(request, *, timeout):
-        if request.full_url.endswith("/main/config.json"):
-            return io.BytesIO(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 2048}).encode())
         raise utils.urllib.error.URLError("transient")
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
@@ -464,15 +462,17 @@ def test_offline_processor_and_config_from_one_snapshot_still_load(monkeypatch, 
     assert loaded["raw_config"]["preprocessor_config"] == {"snapshot": "cached"}
 
 
-def test_remote_config_with_cached_quant_fallback_uses_one_snapshot(monkeypatch, hf_cache):
+@pytest.mark.parametrize("cached_config", [True, False])
+def test_remote_config_with_cached_quant_fallback_rejects_unverified_snapshot(monkeypatch, hf_cache, cached_config):
     cached = "a" * 40
-    _cache_file(
-        hf_cache,
-        "org/mixed",
-        "config.json",
-        {"architectures": ["LlamaForCausalLM"], "hidden_size": 1024},
-        commit=cached,
-    )
+    if cached_config:
+        _cache_file(
+            hf_cache,
+            "org/mixed",
+            "config.json",
+            {"architectures": ["LlamaForCausalLM"], "hidden_size": 1024},
+            commit=cached,
+        )
     _cache_file(hf_cache, "org/mixed", "hf_quant_config.json", {"quantization": {"quant_algo": "FP8"}}, commit=cached)
 
     def remote(request, *, timeout):
@@ -481,10 +481,10 @@ def test_remote_config_with_cached_quant_fallback_uses_one_snapshot(monkeypatch,
         raise utils.urllib.error.URLError("transient")
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
-    loaded = utils._load_model_config_from_model_path.__wrapped__("org/mixed")
-    # Remote dimensions are never paired with the cached snapshot's quantization.
-    assert loaded["hidden_size"] == 1024
-    assert utils._config_snapshot_commit(loaded) == cached
+    # The cached quant file cannot replace successful remote dimensions or be
+    # attached to them. An explicit error leaves the model selection unchanged.
+    with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached hf_quant_config.json"):
+        utils._load_model_config_from_model_path.__wrapped__("org/mixed")
 
 
 @pytest.mark.parametrize(
@@ -503,6 +503,145 @@ def test_hub_cache_location_follows_huggingface_hub_precedence(monkeypatch, tmp_
         monkeypatch.setenv(name, str(tmp_path / value))
 
     assert utils._hf_hub_cache() == tmp_path / expected
+
+
+@pytest.mark.parametrize("setting", ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"])
+def test_offline_cache_expands_environment_variables(monkeypatch, hf_cache, setting):
+    _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    cache_root = {
+        "HF_HUB_CACHE": hf_cache,
+        "HUGGINGFACE_HUB_CACHE": hf_cache,
+        "HF_HOME": hf_cache.parent,
+        "XDG_CACHE_HOME": hf_cache.parent,
+    }[setting]
+    if setting == "XDG_CACHE_HOME":
+        hub = hf_cache.parent / "huggingface" / "hub"
+        hub.parent.mkdir()
+        hf_cache.rename(hub)
+    monkeypatch.setenv("AISIM_TEST_SCRATCH", str(cache_root))
+    monkeypatch.setenv(setting, "$AISIM_TEST_SCRATCH")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    assert utils._download_hf_json("org/model", "config.json") == {"cached": True}
+
+
+@pytest.mark.parametrize("model", ["org--model", "org/model--variant", "org/../model", "org/model.git", "/org/model"])
+def test_invalid_model_ids_cannot_alias_a_cached_model(monkeypatch, hf_cache, model):
+    _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    with pytest.raises(utils.HuggingFaceDownloadError, match="unsupported Hugging Face model ID"):
+        utils._download_hf_json(model, "config.json")
+    assert utils._download_hf_json("org/model", "config.json") == {"cached": True}
+
+
+def test_local_directory_with_reserved_hub_spelling_still_loads(tmp_path):
+    model = tmp_path / "org--model"
+    model.mkdir()
+    (model / "config.json").write_text('{"architectures": ["LlamaForCausalLM"]}')
+    assert utils._load_model_config_from_model_path.__wrapped__(str(model))["architectures"] == ["LlamaForCausalLM"]
+
+
+@pytest.mark.parametrize("filename", ["config.json", "hf_quant_config.json"])
+def test_dangling_cache_ref_is_corruption_even_for_optional_files(monkeypatch, hf_cache, filename):
+    _cache_file(hf_cache, "org/model", filename, {})
+    ref = hf_cache / "models--org--model" / "refs" / "main"
+    ref.unlink()
+    ref.symlink_to("missing-target")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    with pytest.raises(utils.HuggingFaceDownloadError, match="Invalid cached ref.*dangling ref link"):
+        utils._download_hf_json("org/model", filename, raise_on_404=filename == "config.json")
+    ref.unlink()
+    assert utils._download_hf_json("org/model", filename, raise_on_404=False) is None
+
+
+def test_cached_json_preserves_quoted_nan_and_infinity_like_network(monkeypatch, hf_cache):
+    payload = {"_name_or_path": "org/NaN", "note": 'Infinity -Infinity NaN with "quotes"'}
+    _cache_file(hf_cache, "org/model", "config.json", payload)
+    monkeypatch.setattr(
+        utils.urllib.request, "urlopen", lambda request, *, timeout: io.BytesIO(json.dumps(payload).encode())
+    )
+    online = utils._download_hf_json("org/model", "config.json")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert utils._download_hf_json("org/model", "config.json") == online == payload
+
+
+def test_local_nonfinite_json_normalization_preserves_strings(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text('{"values": [Infinity, -Infinity, NaN], "name": "org/NaN-Infinity"}')
+    assert utils._load_json_with_infinity(path) == {"values": [None, None, None], "name": "org/NaN-Infinity"}
+
+
+@pytest.mark.parametrize("architecture", ["Qwen3VLForConditionalGeneration", "KimiK25ForConditionalGeneration"])
+def test_failed_processor_load_can_retry_offline_in_same_process(monkeypatch, hf_cache, architecture):
+    model = f"org/retry-{architecture}"
+    config = {"architectures": [architecture], "hidden_size": 1024}
+    _cache_file(hf_cache, model, "config.json", config)
+    _cache_file(hf_cache, model, "preprocessor_config.json", {"source": "cached"})
+    requests = []
+
+    def remote(request, *, timeout):
+        requests.append(request.full_url)
+        if request.full_url.endswith("/config.json"):
+            return io.BytesIO(json.dumps({**config, "hidden_size": 2048}).encode())
+        if request.full_url.endswith("/preprocessor_config.json"):
+            raise utils.urllib.error.URLError("transient")
+        raise _http_error(404, "missing")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    monkeypatch.setattr(utils, "_parse_hf_config_json", lambda raw: {"architecture": architecture})
+    utils._load_model_config_from_model_path.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    try:
+        with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached") as error:
+            utils.get_model_config_from_model_path(model)
+        assert "config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1" in str(
+            error.value
+        )
+        assert "local model directory" in str(error.value)
+        assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        request_count = len(requests)
+        loaded = utils.get_model_config_from_model_path(model)
+        assert loaded["raw_config"]["hidden_size"] == 1024
+        assert loaded["raw_config"]["preprocessor_config"] == {"source": "cached"}
+        assert utils._config_snapshot_commit(loaded["raw_config"]) == "c" * 40
+        assert len(requests) == request_count
+        assert utils.get_model_config_from_model_path(model) is loaded
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_kimi_video_limits_follow_pinned_processor_through_real_parser(monkeypatch, hf_cache):
+    model = "org/kimi-video-limits"
+    commit = "d" * 40
+    # Reuse the checked-in checkpoint; the processor budgets below are synthetic.
+    config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
+    _cache_file(hf_cache, model, "config.json", config, commit=commit)
+    requested = []
+
+    def remote(request, *, timeout):
+        url = request.full_url
+        requested.append(url)
+        if url.endswith("/main/config.json"):
+            raise utils.urllib.error.URLError("transient")
+        if url.endswith("/preprocessor_config.json"):
+            return io.BytesIO(b'{"max_patches": 8192}')
+        if url.endswith("/video_preprocessor_config.json"):
+            return io.BytesIO(b'{"max_patches": 1024}')
+        raise _http_error(404, "missing")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    loaded = utils.get_model_config_from_model_path.__wrapped__(model)
+    encoder = loaded["encoder_config"]
+    assert encoder.video_max_patches == 1024
+    assert encoder.image_max_patches == 8192
+    assert encoder.max_video_frames == 4
+    assert f"https://huggingface.co/{model}/raw/{commit}/video_preprocessor_config.json" in requested
 
 
 def _http_error(code, reason):

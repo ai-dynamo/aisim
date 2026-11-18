@@ -103,7 +103,7 @@ Field tables on these pages use the following columns:
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
 | `engine.mode` | `aggregated` | `{choices: [aggregated, disaggregated]}` | `aggregated` or `disaggregated`. AFD is a per-role worker type described in [Analytical AFD and EPD](analytical.md). |
-| `engine.model` | Required | fixed | Hugging Face ID or local model directory. Bundled models load offline. Other IDs download `config.json`, falling back to the local Hugging Face cache on network failure, HTTP 429, or HTTP 5xx. Pinned commits read the cache first. With `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1`, only the cache is read; missing required config raises an error, while missing optional metadata is allowed. Cached companions must match the config snapshot; processor fallback with an unverified snapshot raises an error. Corrupt cached files or refs raise errors. |
+| `engine.model` | Required | fixed | Hugging Face ID or local model directory. Bundled models load offline. Other IDs download `config.json`, falling back to the local Hugging Face cache on network failure, HTTP 429, or HTTP 5xx. FPM profiles with `profile.model_revision` pinned to a commit read the cache first. With `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1`, only the cache is read; missing required config raises an error, while missing optional metadata is allowed. The SDK and FPM Collector pin cached config companions to that snapshot; cached quantization or processor metadata with an unverified snapshot raises an error and never replaces a successfully downloaded config. Corrupt cached files or refs raise errors. |
 | `engine.hardware` | Required | `auto` allowed | System identifier, such as `h200_sxm`. `auto` is recommendation-only and resolves from `optimization.hardware`. |
 | `engine.backend` | `vllm` | `{choices: [vllm, sglang]}` | `vllm`, `sglang`, or `trtllm`. Selects both the scheduler semantics and the performance data. |
 | `engine.backend_version` | `current` | fixed | Selects performance data only. It does not change scheduler behavior. Must be a queryable version for the hardware and backend: `current`, `previous` when configured, `next` when newer data is available, or a version one of those available aliases resolves to. See [backend versions](#backend-versions). |
@@ -114,6 +114,15 @@ Field tables on these pages use the following columns:
 | `engine.detokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_output_us` (finite and non-negative, default `0`). Detokenizes each pass's outputs on the worker that emits tokens before the client receives them; see [Response detokenization](#detokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and `traffic.load.agentic_profile` are rejected. |
 
 <a id="tokenization"></a>
+
+For a cached config, the SDK and FPM Collector read `hf_quant_config.json` at
+that config's snapshot commit. A successful network config is never replaced
+with an older cached config when its quantization request fails: an unverified
+cached sidecar raises an error. To retry offline, first cache `config.json` and
+any needed quantization or processor files from the same revision, then set
+`HF_HUB_OFFLINE=1`; alternatively, supply a local model directory. Replay's
+`engine.model` takes an ID or directory; the separate FPM profile field
+`profile.model_revision` supports an explicit revision pin.
 
 ## Request tokenization
 

@@ -81,16 +81,10 @@ def _load_json_with_infinity(file_path) -> dict:
     Load JSON file with support for JavaScript-style Infinity and NaN values.
 
     Standard JSON doesn't support Infinity/NaN, but HuggingFace configs may contain them (e.g., Nemotron-H-56B)
-    This function pre-processes the file content to replace these values before parsing.
+    Decode non-finite constants as null without changing quoted strings.
     """
     with open(file_path) as f:
-        content = f.read()
-    # Replace JavaScript-style Infinity/NaN with Python-compatible values
-    # Use regex to match standalone Infinity/-Infinity/NaN (not part of a string)
-    content = re.sub(r"\bInfinity\b", "null", content)
-    content = re.sub(r"-Infinity\b", "null", content)
-    content = re.sub(r"\bNaN\b", "null", content)
-    return json.loads(content)
+        return json.load(f, parse_constant=lambda _: None)
 
 
 def _derive_nemotronh_hybrid_pattern(config: dict) -> str:
@@ -459,9 +453,28 @@ def _hf_hub_cache() -> Path:
     """Locate the Hugging Face hub cache with the same precedence as huggingface_hub."""
     for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
         if configured := os.environ.get(name):
-            return Path(configured).expanduser()
+            return Path(os.path.expandvars(configured)).expanduser()
     default_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
-    return Path(os.environ.get("HF_HOME", default_home)).expanduser() / "hub"
+    return Path(os.path.expandvars(str(os.environ.get("HF_HOME", default_home)))).expanduser() / "hub"
+
+
+def _check_hf_model_id(hf_id: str) -> None:
+    """Reject ambiguous Hub IDs before encoding their cache directory name."""
+    parts = hf_id.split("/")
+    if (
+        len(parts) not in (1, 2)
+        or len(parts[-1]) > 96
+        or "--" in hf_id
+        or ".." in hf_id
+        or hf_id.endswith(".git")
+        or any(
+            not re.fullmatch(r"[\w.-]+", part) or part.startswith((".", "-")) or part.endswith((".", "-"))
+            for part in parts
+        )
+    ):
+        raise HuggingFaceDownloadError(
+            f"unsupported Hugging Face model ID {hf_id!r}: expected model or namespace/model"
+        )
 
 
 def _check_hf_revision(revision: str) -> None:
@@ -479,6 +492,7 @@ def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str
 
     Returns the file and the snapshot commit it belongs to.
     """
+    _check_hf_model_id(hf_id)
     _check_hf_revision(revision)
     if ".." in Path(hf_id).parts or Path(filename).name != filename:
         return None
@@ -489,8 +503,14 @@ def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str
         ref_path = repo / "refs" / revision
         try:
             commit = ref_path.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            return None
+        except FileNotFoundError as error:
+            try:
+                ref_path.lstat()
+            except FileNotFoundError:
+                return None
+            except OSError as probe_error:
+                raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: {probe_error}") from probe_error
+            raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: dangling ref link") from error
         except (OSError, UnicodeError) as error:
             raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: {error}") from error
     if not _COMMIT_HASH.fullmatch(commit):
@@ -520,7 +540,9 @@ def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[d
     path, commit = found
     logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
     try:
-        data = _load_json_with_infinity(path)
+        # Match the network JSON decoder, including quoted NaN/Infinity text.
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: {error}") from error
     if not isinstance(data, dict):
@@ -586,6 +608,7 @@ def _download_hf_json_at(
     branch is honored. The cache is the fallback when the network fails or Hugging
     Face answers with a rate limit or server error (HTTP 429 or 5xx).
     """
+    _check_hf_model_id(hf_id)
     _check_hf_revision(revision)
     offline = _hf_offline_variable()
     if offline is not None or _COMMIT_HASH.fullmatch(revision):
@@ -624,6 +647,8 @@ def _download_hf_json_at(
         # HTTPException covers a body cut short (IncompleteRead) or a malformed response.
         try:
             return _cached_after_network_failure(hf_id, filename, revision, url, getattr(e, "reason", None) or e)
+        except _HuggingFaceCacheError:
+            raise
         except HuggingFaceDownloadError as missing:
             raise missing from e
     except Exception as e:
@@ -2132,8 +2157,18 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     return raw_config
 
 
+def _check_hf_companion_snapshot(hf_id: str, filename: str, revision: str, cached_commit: str | None) -> None:
+    """Cached metadata must belong to the selected config's verified snapshot."""
+    if cached_commit is not None and cached_commit != revision:
+        raise HuggingFaceDownloadError(
+            f"Cannot mix cached {filename} from snapshot {cached_commit} with {hf_id} config at {revision}. "
+            "Cache config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1, "
+            "or supply a local model directory."
+        )
+
+
 def _download_hf_companion_json(hf_id: str, filename: str, *, revision: str = "main") -> dict | None:
-    """Reject cached processor metadata unless the model config pins its snapshot."""
+    """Reject cached companion metadata unless the model config pins its snapshot."""
     capture: dict[tuple[str, str], str] = {}
     token = _SNAPSHOT_CAPTURE.set(capture)
     try:
@@ -2141,12 +2176,7 @@ def _download_hf_companion_json(hf_id: str, filename: str, *, revision: str = "m
         data = _download_hf_json(hf_id, filename, raise_on_404=False, **pinned)
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
-    cached_commit = capture.get((hf_id, filename))
-    if cached_commit is not None and cached_commit != revision:
-        raise HuggingFaceDownloadError(
-            f"Cannot mix cached {filename} from snapshot {cached_commit} with {hf_id} config at {revision}. "
-            "Use HF_HUB_OFFLINE=1 to load one cached snapshot or supply a local model directory."
-        )
+    _check_hf_companion_snapshot(hf_id, filename, revision, capture.get((hf_id, filename)))
     return data
 
 
@@ -2166,6 +2196,36 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revisi
         processor_config = _download_hf_companion_json(model_path, "preprocessor_config.json", revision=revision)
     if processor_config is not None:
         raw_config["image_processor_config"] = processor_config
+    return raw_config
+
+
+def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, revision: str = "main") -> dict:
+    """Finish processor I/O before memoizing a raw config, so failed loads can retry."""
+    architecture = (raw_config.get("architectures") or [None])[0]
+    kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
+    qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
+    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
+        # Bundled checkpoints use the pinned processor defaults. Other checkpoints
+        # may override them with media_proc_cfg or native HF processor files.
+        processor = {}
+        files = [("preprocessor_config.json", None)]
+        if kimi:
+            files.append(("video_preprocessor_config.json", "video_processor"))
+        for filename, key in files:
+            if os.path.isdir(model_path):
+                path = Path(model_path) / filename
+                data = _load_json_with_infinity(path) if path.is_file() else None
+            else:
+                data = _download_hf_companion_json(model_path, filename, revision=revision)
+            if data is not None:
+                if not isinstance(data, dict):
+                    family = "Kimi" if kimi else "Qwen3-VL"
+                    raise ValueError(f"{family} {filename} must be an object")
+                if key is None:
+                    processor.update(data)
+                else:
+                    processor[key] = data
+        raw_config = {**raw_config, "preprocessor_config": processor}
     return raw_config
 
 
@@ -2191,6 +2251,7 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     # Check if it's a local path
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
+        config = _attach_multimodal_processor_config(config, model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     # Otherwise treat as HuggingFace path
@@ -2217,22 +2278,11 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
             hf_quant_config = None
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
-    quant_commit = capture.get((model_path, "hf_quant_config.json"))
-    if commit is None and quant_commit is not None:
-        # The config came from the network but the quant file fell back to a cached
-        # snapshot: use that snapshot's config too, or drop the mismatched quant file.
-        cached_config = _load_cached_hf_json(model_path, "config.json", quant_commit)
-        if cached_config is not None:
-            raw_config, commit = cached_config, quant_commit
-            pinned = {"revision": commit}
-        else:
-            logger.warning(
-                "Ignoring cached hf_quant_config.json for %s: it is from snapshot %s, not the downloaded config",
-                model_path,
-                quant_commit,
-            )
-            hf_quant_config = None
+    _check_hf_companion_snapshot(
+        model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
+    )
     config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
+    config = _attach_multimodal_processor_config(config, model_path, **pinned)
     loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
     if commit:
         _CONFIG_PROVENANCE[id(loaded)] = (loaded, commit)
@@ -2252,34 +2302,6 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         Quantization metadata retains its original root or text_config scope.
     """
     raw_config = _load_model_config_from_model_path(model_path)
-    architecture = (raw_config.get("architectures") or [None])[0]
-    kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
-    qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
-    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
-        # Only Kimi and Qwen3-VL consume these processor files. Bundled
-        # checkpoints use the pinned processor defaults; local/downloaded
-        # checkpoints may override them with the original media_proc_cfg or
-        # native HF layout. Qwen's per-clip video budget is not modeled.
-        processor = {}
-        files = [("preprocessor_config.json", None)]
-        if kimi:
-            files.append(("video_preprocessor_config.json", "video_processor"))
-        for filename, key in files:
-            if os.path.isdir(model_path):
-                path = Path(model_path) / filename
-                data = _load_json_with_infinity(path) if path.is_file() else None
-            else:
-                revision = _config_snapshot_commit(raw_config) or "main"
-                data = _download_hf_companion_json(model_path, filename, revision=revision)
-            if data is not None:
-                if not isinstance(data, dict):
-                    family = "Kimi" if kimi else "Qwen3-VL"
-                    raise ValueError(f"{family} {filename} must be an object")
-                if key is None:
-                    processor.update(data)
-                else:
-                    processor[key] = data
-        raw_config = {**raw_config, "preprocessor_config": processor}
     parsed = _parse_hf_config_json(raw_config)
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))
