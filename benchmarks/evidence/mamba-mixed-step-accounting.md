@@ -102,10 +102,11 @@ analytical bound is an allowed result.
 
 Qualified Baseline to qualified Candidate.
 
-`InferenceSession.run_agg`, TensorRT-LLM. The script below (`agg.py`) ran each
-case with `python agg.py OUT0.json --qual 1 --nextn 0` and
-`python agg.py OUT3.json --qual 1 --nextn 3` at each commit, from the commit's
-`python/aisimulate` package environment, with `qual_patch.py` beside it. The
+`InferenceSession.run_agg`, TensorRT-LLM. The script below (`agg.py`) ran
+each case at each commit, from the commit's `python/aisimulate` package
+environment, with `qual_patch.py` beside it. The commands were
+`python agg.py OUT0.json --qual 1 --nextn 0` and
+`python agg.py OUT3.json --qual 1 --nextn 3`. The
 measured runs reused one session for all cases. This version builds a fresh
 session per case, because `run_agg` caches results by a key that omits
 `prefix`:
@@ -182,10 +183,32 @@ compares replay's pure-decode and mixed iterations with the static decode
 cost. The MTP0 column has width one and does not change. The `run_agg`, per-phase and replay
 results above and below do not use packed telemetry.
 
-Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3: a 6000-token chunk with a
-3000-token prefix rises 1.21% (26.013 to 26.328 ms). The decode component rises
+Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
+`gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
+(26.013 to 26.328 ms) from Baseline to Candidate. The decode component rises
 from 0.20 to 0.35 ms because decode Mamba now runs at decode coordinates. Pure
-prefill does not change.
+prefill does not change. Each revision ran `python phases.py` from its
+`python/aisimulate` environment, with `qual_patch.py` beside it:
+
+```python
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qual_patch; qual_patch.apply(3)
+from aisimulate_core import AicEngine
+from aisimulate_core.sdk.engine import compile_engine
+spec = compile_engine("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "b200_sxm", "trtllm",
+                      "1.3.0rc20", tp_size=1, nextn=3, moe_tp_size=1, moe_ep_size=1)
+eng = AicEngine.from_spec(spec)
+args = (6000, 8, 4096, 64, 3000)  # ctx_tokens, gen_tokens, isl, osl, prefix
+_, _, decode = eng.mixed_step_breakdown_per_op(*args)
+print(eng.mixed_step_latency(*args), sum(row[1] for row in decode))
+```
+
+The same script at the current head `50ded579`, with the `aisim_core` package
+names, gives 26.294 ms and a 0.345 ms decode component. That value is not a
+before/after delta, because main changed between the revisions. The current
+head also splits this shape's 1904-token remainder into two request chunks.
+One request has at most `isl - prefix = 1096` new tokens.
 
 ## Controls
 
@@ -194,7 +217,7 @@ prefill does not change.
   decode as separate per-rank phase passes. Over 14 configurations, requests,
   output tokens, cache reuse and per-request status matched. Latency metrics
   differed only by rounding, about 1e-16. Current op-level Replay prices a
-  mixed rank as one mix-step iteration and then splits its evidence by phase,
+  mixed rank as one mix-step iteration. It then splits the evidence by phase,
   so this control does not describe the current code. The replay regression
   `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
   covers the current path.
