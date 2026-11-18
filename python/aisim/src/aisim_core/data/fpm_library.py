@@ -93,40 +93,48 @@ class FpmLibraryMetadata(BaseModel):
 class FpmLibraryRow(BaseModel):
     """Notes for one row of ``fpm_forward_perf.parquet`` (``aic_fpm_forward_perf/v6``).
 
-    The table is read natively; this model records the columns AISim relies on. A table may carry more.
-    Single-sample legacy tables may omit the per-row measurement-policy columns.
+    The table is read natively; this model records the columns AISim relies on. A table may carry more. The
+    required fields are exactly the columns the native loader looks up unconditionally (see
+    ``NATIVE_REQUIRED_COLUMNS``); single-sample legacy tables may omit the per-row measurement-policy columns.
     """
 
     model_config = ConfigDict(extra="allow")
 
+    cell_id: str
     model_path: str
     system: str
     backend: str
     backend_version: str
+    weight_quantization: str
     tp: int
     pp: int
     dp: int
     moe_tp: int
     moe_ep: int
     cp: int
-    workload_kind: str | None = None
+    workload_kind: str
     batch_size: int
     total_prefill_tokens: int
     total_kv_read_tokens: int
-    partition_policy: str | None = None
+    partition_policy: str
     latency_ms: float
-    gemm_quant_mode: str | None = None
-    moe_quant_mode: str | None = None
-    fmha_quant_mode: str | None = None
-    comm_quant_mode: str | None = None
-    kv_cache_dtype: str | None = None
-    moe_backend: str | None = None
-    attention_backend: str | None = None
-    enable_wideep: bool | None = None
-    enable_eplb: bool | None = None
+    gemm_quant_mode: str
+    moe_quant_mode: str
+    fmha_quant_mode: str
+    comm_quant_mode: str
+    kv_cache_dtype: str
+    moe_backend: str
+    attention_backend: str
+    enable_wideep: bool
+    enable_eplb: bool
     measurement_policy: str | None = None
     measurement_repeats: int | None = None
     warmup_repeats: int | None = None
+
+
+NATIVE_REQUIRED_COLUMNS: tuple[str, ...] = tuple(
+    name for name, field_info in FpmLibraryRow.model_fields.items() if field_info.is_required()
+)
 
 
 class FpmMeasurementFile(BaseModel):
@@ -343,6 +351,7 @@ def stage_fpm_library(
     table supports the requested estimator and workload.
     """
     parquet, sidecar = Path(parquet_path).resolve(), Path(metadata_path).resolve()
+    systems_paths = _stageable_roots(systems_paths, output_dir)
     if not parquet.is_file() or not sidecar.is_file():
         raise FpmContractError(f"FPM library {artifact_id or parquet} is not materialized locally")
     metadata = read_library_metadata(sidecar)
@@ -368,6 +377,8 @@ def stage_fpm_library(
         "parquet_sha256": parquet_sha256,
         "metadata_sha256": metadata_sha256,
         "systems_paths": [str(p) for p in systems_paths] if systems_paths is not None else None,
+        "parquet_path": str(parquet),
+        "metadata_path": str(sidecar),
     }
     temporary = None
     if output_dir is None:
@@ -403,6 +414,17 @@ def stage_fpm_library(
 
 
 STAGED_MARKER = ".staged.json"
+
+
+def _stageable_roots(systems_paths: Sequence[str | Path] | None, output_dir: str | Path | None) -> list[Path] | None:
+    """Systems roots as the canonical resolver reads them (``default``, ``~``), minus the root being replaced."""
+    if systems_paths is None:
+        return None
+    from aisim_core.sdk.perf_database import _normalize_systems_paths
+
+    destination = Path(output_dir).expanduser().absolute().resolve() if output_dir is not None else None
+    roots = [Path(r).expanduser() for p in systems_paths for r in _normalize_systems_paths([os.fspath(p)])]
+    return [r for r in roots if destination is None or r.absolute().resolve() != destination]
 
 
 def _staged_marker(root: Path) -> Any:
@@ -467,19 +489,19 @@ def _link_overlay_entries(source_root: Path, target_root: Path, backend: str, ve
     """Expose op/SOL data while keeping the selected FPM directory isolated."""
     for entry in source_root.iterdir():
         if entry.name != backend:
-            (target_root / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            (target_root / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
     source_backend, target_backend = source_root / backend, target_root / backend
     if not source_backend.is_dir():
         return
     for entry in source_backend.iterdir():
         if entry.name != version:
-            (target_backend / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            (target_backend / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
     source_version, target_version = source_backend / version, target_backend / version
     if not source_version.is_dir():
         return
     for entry in source_version.iterdir():
         if entry.name not in {LIBRARY_FILE, METADATA_FILE}:
-            (target_version / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            (target_version / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
 
 
 def _safe_relative_path(value: Any, field_name: str) -> Path:
@@ -580,15 +602,22 @@ def _validated(value: Mapping[str, Any] | FpmResourceProfile, where: str, source
 _TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 
 
+_IDENTITY_KEYS = ("system", "backend", "backend_version", "worker_type")
+
+
 def complete_fpm_profile(
-    profile: Mapping[str, Any], metadata: Mapping[str, Any] | None
+    profile: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None,
+    *,
+    identity: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Fill deployments that lack ``resources`` from the sidecar; the user's block always wins.
 
     ``profile`` is the user's ``fpm_profile`` dictionary (deployments may omit ``resources``). A sidecar block
     applies to the deployment its ``configuration_selector`` names (every incomplete deployment when the sidecar
-    has no selector). Returns the completed dictionary and the source of each deployment's resources. A
-    deployment with neither raises :class:`FpmResourcesPendingError`.
+    has no selector) and only to deployments of the library's own ``identity`` (system, backend, backend_version);
+    a deployment that names another hardware, version or role is left to its own resources.
+    Returns the completed dictionary and the source of each deployment's resources. A deployment with neither raises :class:`FpmResourcesPendingError`.
     """
     selector = (metadata or {}).get("configuration_selector") or {}
     out = json.loads(json.dumps(profile, allow_nan=False))
@@ -603,6 +632,10 @@ def complete_fpm_profile(
             f"deployment {index} (tp={deployment.get('tp')}, dp={deployment.get('dp')}, ep={deployment.get('moe_ep')})"
         )
         applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
+        wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
+        applies = applies and all(
+            deployment.get(name) in (None, value) for name, value in wanted.items() if name in _IDENTITY_KEYS
+        )
         resolved = resolve_resources(
             deployment.get("resources"),
             metadata if applies else None,
@@ -616,5 +649,8 @@ def complete_fpm_profile(
 
 def with_estimator_path(config: dict[str, Any], parquet_path: Path) -> None:
     """Point the interpolation estimator at the staged library unless the user chose a path."""
-    interpolation = config.setdefault("estimator_config", {}).setdefault("fpm_interpolation", {})
+    estimator = dict(config.get("estimator_config") or {})
+    interpolation = dict(estimator.get("fpm_interpolation") or {})
     interpolation.setdefault("fpm_parquet_path", str(parquet_path))
+    estimator["fpm_interpolation"] = interpolation
+    config["estimator_config"] = estimator

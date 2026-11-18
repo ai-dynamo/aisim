@@ -1,19 +1,11 @@
 {
   "$id": "aic_fpm_forward_perf/v6",
   "additionalProperties": true,
-  "description": "Notes for one row of ``fpm_forward_perf.parquet`` (``aic_fpm_forward_perf/v6``).\n\nThe table is read natively; this model records the columns AISim relies on. A table may carry more.\nSingle-sample legacy tables may omit the per-row measurement-policy columns.",
+  "description": "Notes for one row of ``fpm_forward_perf.parquet`` (``aic_fpm_forward_perf/v6``).\n\nThe table is read natively; this model records the columns AISim relies on. A table may carry more. The\nrequired fields are exactly the columns the native loader looks up unconditionally (see\n``NATIVE_REQUIRED_COLUMNS``); single-sample legacy tables may omit the per-row measurement-policy columns.",
   "properties": {
     "attention_backend": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Attention Backend"
+      "title": "Attention Backend",
+      "type": "string"
     },
     "backend": {
       "title": "Backend",
@@ -27,17 +19,13 @@
       "title": "Batch Size",
       "type": "integer"
     },
+    "cell_id": {
+      "title": "Cell Id",
+      "type": "string"
+    },
     "comm_quant_mode": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Comm Quant Mode"
+      "title": "Comm Quant Mode",
+      "type": "string"
     },
     "cp": {
       "title": "Cp",
@@ -48,64 +36,24 @@
       "type": "integer"
     },
     "enable_eplb": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Enable Eplb"
+      "title": "Enable Eplb",
+      "type": "boolean"
     },
     "enable_wideep": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Enable Wideep"
+      "title": "Enable Wideep",
+      "type": "boolean"
     },
     "fmha_quant_mode": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Fmha Quant Mode"
+      "title": "Fmha Quant Mode",
+      "type": "string"
     },
     "gemm_quant_mode": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Gemm Quant Mode"
+      "title": "Gemm Quant Mode",
+      "type": "string"
     },
     "kv_cache_dtype": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Kv Cache Dtype"
+      "title": "Kv Cache Dtype",
+      "type": "string"
     },
     "latency_ms": {
       "title": "Latency Ms",
@@ -140,48 +88,24 @@
       "type": "string"
     },
     "moe_backend": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Moe Backend"
+      "title": "Moe Backend",
+      "type": "string"
     },
     "moe_ep": {
       "title": "Moe Ep",
       "type": "integer"
     },
     "moe_quant_mode": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Moe Quant Mode"
+      "title": "Moe Quant Mode",
+      "type": "string"
     },
     "moe_tp": {
       "title": "Moe Tp",
       "type": "integer"
     },
     "partition_policy": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Partition Policy"
+      "title": "Partition Policy",
+      "type": "string"
     },
     "pp": {
       "title": "Pp",
@@ -215,34 +139,43 @@
       "default": null,
       "title": "Warmup Repeats"
     },
+    "weight_quantization": {
+      "title": "Weight Quantization",
+      "type": "string"
+    },
     "workload_kind": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Workload Kind"
+      "title": "Workload Kind",
+      "type": "string"
     }
   },
   "required": [
+    "cell_id",
     "model_path",
     "system",
     "backend",
     "backend_version",
+    "weight_quantization",
     "tp",
     "pp",
     "dp",
     "moe_tp",
     "moe_ep",
     "cp",
+    "workload_kind",
     "batch_size",
     "total_prefill_tokens",
     "total_kv_read_tokens",
-    "latency_ms"
+    "partition_policy",
+    "latency_ms",
+    "gemm_quant_mode",
+    "moe_quant_mode",
+    "fmha_quant_mode",
+    "comm_quant_mode",
+    "kv_cache_dtype",
+    "moe_backend",
+    "attention_backend",
+    "enable_wideep",
+    "enable_eplb"
   ],
   "title": "FpmLibraryRow",
   "type": "object"
