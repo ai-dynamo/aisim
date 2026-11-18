@@ -712,5 +712,7 @@ gate on the published head remains the exact-head result.
   multi-chunk TTFT limit above.
 - A pure-prefill packed step prices every operation at the integer mean of
   its new tokens per request, as main does. Two prefills of 8 and 9 new
-  tokens price as two of 8. The mixed packed step keeps the remainder for
-  qualified Mamba operations.
+  tokens price as two of 8. The exact-total query
+  `predict_prefill_latency_total` does the same for a graph without a
+  whole-model FPM. For example, 2 requests and 17 new tokens price 16 tokens.
+  The mixed packed step keeps the remainder for qualified Mamba operations.
