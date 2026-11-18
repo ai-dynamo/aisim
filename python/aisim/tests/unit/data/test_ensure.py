@@ -94,7 +94,7 @@ def files(tmp_path):
 
 
 def pin(tmp_path, **kw):
-    kw.setdefault("categories", ("fpm",))
+    kw.setdefault("categories", ("fpm",))  # these tests exercise FPM data; the default pin names op-latency
     return DataPin(repo=REPO, revision=SHA, cache_dir=tmp_path / "cache", **kw)
 
 
@@ -202,7 +202,9 @@ def test_local_override_needs_no_network_or_cache(tmp_path, files):
     out = ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
     assert out.datasets["fpm"]["source"] == "local" and out.revisions["fpm"] == f"local:{root}"
     with pytest.raises(MissingDataError, match="no fpm data"):
-        ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(
+            {**CONFIG, "model": "nope"}, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+        )
 
 
 def test_corrupt_local_file_is_an_error(tmp_path, files):
@@ -297,7 +299,7 @@ def test_an_fpm_dataset_republished_in_place_is_not_served_from_the_old_preparat
             (root / path).write_bytes(data)
 
     publish(files)
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     first = ensure_data(CONFIG, local).config["systems_paths"][0]
     assert ensure_data(CONFIG, local).config["systems_paths"][0] == first  # unchanged content is reused
     # Corrected measurements: same identity and configuration ID, different table bytes and manifest digests.
@@ -379,7 +381,8 @@ def test_the_revision_is_resolved_once_and_every_fetch_uses_that_commit(tmp_path
             return super().open_file(repo, sha, path)
 
     transport = Moving(files)
-    ensure_data(CONFIG, DataPin(repo=REPO, revision="main", cache_dir=tmp_path / "cache"), transport=transport)
+    moving = DataPin(repo=REPO, revision="main", categories=("fpm",), cache_dir=tmp_path / "cache")
+    ensure_data(CONFIG, moving, transport=transport)
     assert transport.resolves == 1 and transport.shas == {SHA}
 
 
@@ -434,7 +437,7 @@ def test_the_fpm_preparation_key_covers_the_runtime_destination(tmp_path):
             (root / path).write_bytes(data)
 
     publish()
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     first = ensure_data(CONFIG, local).config["systems_paths"][0]
     # Same source path, size and digest; only where the artifact lands in the runtime tree changes.
     manifest = json.loads(files["fpm/m1/manifest.json"])
@@ -732,3 +735,7 @@ def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path):
     cfg.write_text("{truncated")  # corrupt saved config is reported, not ignored
     with pytest.raises(ConfigError):
         pin_from_environment(env)
+
+
+def test_default_pin_names_only_the_op_database():
+    assert DataPin(local_root=Path("x")).categories == ("op-latency",)
