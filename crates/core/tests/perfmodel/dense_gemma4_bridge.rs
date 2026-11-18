@@ -54,8 +54,8 @@
 //! prints a visible `SKIP` line and returns; it does not silently read as
 //! coverage. Set `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1` to make an import failure a
 //! hard failure, so the test cannot false-pass. The `rust-feature-modes` CI job
-//! installs the Python package before its embedded `cargo test` run, so the
-//! assertions execute there and the variable only guards local checkouts.
+//! installs the Python package and sets that variable in its embedded `cargo
+//! test` step, so an import regression fails CI instead of skipping silently.
 
 #![cfg(feature = "embed-python")]
 
@@ -223,13 +223,13 @@ fn dense_gemma4_capacity_rejects_instead_of_estimating_naively() {
     );
 }
 
-/// The scheduler-block entry point the replay bridge calls.
+/// The scheduler-block estimator the replay path installs.
 ///
-/// `python.rs::estimate_aic_num_gpu_blocks` imports
-/// `aisim_core.sdk.memory.estimate_num_gpu_blocks`, passes the kwargs
-/// `aic_capacity_kwargs` builds, and wraps the `PyErr` in `anyhow!`. That
-/// wrapper has no other behavior, so calling the same Python entry point with
-/// the same dense request proves the third consumer rejects the checkpoint
+/// `python.rs::materialize_aic_capacity` calls `estimate_aic_num_gpu_blocks`,
+/// which imports `aisim_core.sdk.memory.estimate_num_gpu_blocks`, passes the
+/// kwargs `aic_capacity_kwargs` builds, and wraps the `PyErr` in `anyhow!`.
+/// That wrapper has no other behavior, so calling the same Python entry point
+/// with the same dense request proves the third consumer rejects the checkpoint
 /// instead of converting it into a block count.
 #[test]
 fn dense_gemma4_num_gpu_blocks_rejects_instead_of_returning_a_count() {

@@ -1130,6 +1130,29 @@ def test_estimate_kv_cache_rejects_corrupt_gemma4_metadata_before_the_database(m
         )
 
 
+def test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error():
+    # The re-raise is request-wide, not Gemma-specific: it lives in the generic
+    # native-build `except`. An invalid request must not be priced by the naive
+    # estimator, which would return a capacity for a topology the native path
+    # just rejected. Before this branch the same call below returned
+    # source="naive_fallback" with total_kv_size_tokens=1840487 on 0809faae9.
+    with pytest.raises(InvalidEngineConfigurationError, match="Parallelism width mismatch"):
+        memory.estimate_kv_cache(
+            "deepseek-ai/DeepSeek-V3",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            tp_size=3,
+            moe_tp_size=1,
+            moe_ep_size=2,
+            gpu_memory_capacity_bytes_override=800 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
 def test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint(monkeypatch):
     # The metadata gate must not turn the documented naive fallback into an
     # error for a well-formed dense checkpoint whose database is unavailable.
