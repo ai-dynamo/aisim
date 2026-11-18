@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import stat
 import tempfile
 import urllib.request
 from functools import cache
@@ -495,7 +496,21 @@ def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str
     if not _COMMIT_HASH.fullmatch(commit):
         raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: expected a 40-hex commit, got {commit!r}")
     path = repo / "snapshots" / commit / filename
-    return (path, commit) if path.is_file() else None
+    try:
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            # A missing name is optional absence; a dangling blob link is corrupt.
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                return None
+            raise _HuggingFaceCacheError(f"Invalid cached {filename} at {path}: dangling snapshot link") from None
+        if not stat.S_ISREG(mode):
+            raise _HuggingFaceCacheError(f"Invalid cached {filename} at {path}: expected a regular file")
+    except OSError as error:
+        raise _HuggingFaceCacheError(f"Invalid cached {filename} at {path}: {error}") from error
+    return path, commit
 
 
 def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[dict, str] | None:

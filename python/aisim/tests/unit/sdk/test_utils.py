@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -337,6 +338,39 @@ def test_loader_distinguishes_missing_and_corrupt_cache_refs(monkeypatch, hf_cac
     message = "offline mode" if ref_contents is None else "Invalid cached ref"
     with pytest.raises(utils.HuggingFaceDownloadError, match=message):
         utils._load_model_config_from_model_path.__wrapped__(model)
+
+
+@pytest.mark.parametrize("entry", ["missing", "directory", "dangling", "permission", "valid"])
+def test_cached_quant_snapshot_entries_are_validated(monkeypatch, hf_cache, entry):
+    model = f"org/snapshot-{entry}"
+    metadata = {"architectures": ["LlamaForCausalLM"]}
+    _cache_file(hf_cache, model, "config.json", metadata)
+    path = hf_cache / f"models--org--snapshot-{entry}" / "snapshots" / ("c" * 40) / "hf_quant_config.json"
+    denied = PermissionError("cannot stat snapshot")
+    if entry == "directory":
+        path.mkdir()
+    elif entry == "dangling":
+        path.symlink_to("missing-blob")
+    elif entry == "permission":
+        real_stat = Path.stat
+
+        def probe(candidate, *args, **kwargs):
+            if candidate == path:
+                raise denied
+            return real_stat(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", probe)
+    elif entry == "valid":
+        _cache_file(hf_cache, model, "hf_quant_config.json", {"quantization": {"quant_algo": "FP8"}})
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    if entry in ("missing", "valid"):
+        loaded = utils._load_model_config_from_model_path.__wrapped__(model)
+        assert ("hf_quant_config" in loaded) == (entry == "valid")
+    else:
+        with pytest.raises(utils.HuggingFaceDownloadError, match="Invalid cached hf_quant_config.json") as error:
+            utils._load_model_config_from_model_path.__wrapped__(model)
+        if entry == "permission":
+            assert error.value.__cause__ is denied
 
 
 def test_pinned_profile_consumer_reports_offline_miss_and_loads_cached_config(monkeypatch, hf_cache):
