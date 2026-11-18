@@ -4,9 +4,12 @@
 """aisim-e2e/v1: InferenceX and developer fixtures share one evaluator loader."""
 
 import gzip
+import json
 
+import pyarrow.parquet as pq
 import pytest
 
+from aisim_core.data import check_manifest
 from aisim_core.data.e2e import (
     LOG_CAP_BYTES,
     E2eManifestBody,
@@ -16,17 +19,23 @@ from aisim_core.data.e2e import (
     SnapshotAcquisition,
     SnapshotMember,
     aiperf_to_configuration,
+    evaluation_points,
     inferencex_to_configurations,
+    load_e2e,
     make_metric,
     public_release_problems,
     read_provenance,
+    read_raw_record,
     read_snapshot,
     redact,
     store_provenance,
     throughput_per_device,
     to_canonical,
+    write_configuration,
     write_snapshot,
 )
+from aisim_core.data.loaders import LoaderError
+from aisim_core.data.parquet import read_parquet_schema_id
 
 pytestmark = pytest.mark.unit
 
@@ -172,6 +181,56 @@ def test_per_device_throughput_is_explicit():
 # ---------------------------------------------------------------- round trip through one loader
 
 
+def test_inferencex_and_developer_share_the_evaluator_loader(tmp_path):
+    (infx,) = inferencex_to_configurations([_infx_record()])
+    dev = _dev_config(log=b"server log\n" * 10, log_redacted=True)
+    points = {}
+    for name, cfg in (("infx", infx), ("dev", dev)):
+        path = write_configuration(tmp_path, cfg)
+        check = load_e2e(tmp_path, path, config=None)
+        assert check.manifest.category == "e2e" and check.manifest.configuration_id == cfg.body.configuration_id()
+        (point,) = evaluation_points(check)
+        points[name] = point
+        for artifact in check.manifest.artifacts:
+            if artifact.format == "parquet":
+                assert read_parquet_schema_id(tmp_path / artifact.path) == artifact.artifact_schema
+                assert pq.ParquetFile(tmp_path / artifact.path).metadata.row_group(0).column(0).compression == "ZSTD"
+    i, d = points["infx"], points["dev"]
+    # Canonical units regardless of source: seconds and ms both become ms.
+    assert i.metrics[("ttft", "mean")] == pytest.approx(100.0) and d.metrics[("ttft", "mean")] == pytest.approx(100.0)
+    assert i.metrics[("e2el", "mean")] == pytest.approx(1500.0) and d.metrics[("e2el", "mean")] == pytest.approx(1500.0)
+    assert d.metrics[("ttft", "p90")] == 150.0
+    assert ("ttft", "p90") in i.unavailable  # InferenceX did not report P90
+    assert ("itl", "mean") in d.unavailable  # AIPerf has no separate ITL
+    assert (
+        i.per_device_throughput["output_throughput"] == 150.0 and d.per_device_throughput["output_throughput"] == 1200.0
+    )
+    assert i.per_device_throughput["total_throughput"] == 1200.0
+    assert set(i.__dataclass_fields__) == set(d.__dataclass_fields__)
+
+
+def test_inferencex_metrics_every_statistic_zero_vs_missing(tmp_path):
+    (cfg,) = inferencex_to_configurations([_infx_record()])
+    path = write_configuration(tmp_path, cfg)
+    ds = load_e2e(tmp_path, path)
+    by_key = {(m.metric, m.statistic): m for m in ds.metrics}
+    assert by_key[("ttft", "p99")].value == pytest.approx(300.0)  # extra statistic stored
+    assert by_key[("tpot", "median")].status == "valid" and by_key[("tpot", "median")].value == 0.0
+    assert by_key[("itl", "mean")].status == "missing" and by_key[("itl", "mean")].value is None
+    for metric in ("ttft", "tpot", "itl", "e2el"):
+        for stat in ("mean", "median", "p90"):
+            assert (metric, stat) in by_key
+    assert by_key[("output_throughput", "value")].normalization == "per_device"
+    assert by_key[("output_throughput", "value")].device_count == 8
+    assert by_key[("interactivity", "mean")].normalization == "per_user"
+    # Unmapped metrics are not invented; they stay in the raw artifact and are noted verbatim.
+    assert ds.body.source_fields["unmapped_metrics"] == ["weird_metric"]
+    raw = read_raw_record(tmp_path, ds, ds.observations[0].observation_id)
+    assert b"weird_metric" in raw
+    assert json.loads(ds.observations[0].unmapped_metrics_json) == {"weird_metric": 7}  # typed, verbatim
+    assert ds.body.dp_attention == {"decode": False, "prefill": False}  # booleans never become degrees
+
+
 def test_inferencex_disaggregated_groups_and_identity():
     configs = inferencex_to_configurations(
         [
@@ -195,6 +254,25 @@ def test_open_settings_do_not_change_identity():
     assert base.configuration_id() != other.configuration_id()
 
 
+def test_requests_table_and_developer_observation(tmp_path):
+    cfg = _dev_config()
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, cfg))
+    assert len(ds.requests) == 2 and ds.requests[0].ttft_ms == pytest.approx(100.0)
+    assert ds.requests[0].itl_ms is None  # not measured is null, not zero
+    obs = ds.observations[0]
+    assert (obs.input_tokens, obs.output_tokens, obs.requests_total, obs.outcome) == (1024, 128, 2, "complete")
+    assert check_manifest is not None
+
+
+def test_loader_rejects_tamper_and_wrong_schema(tmp_path):
+    cfg = _dev_config()
+    path = write_configuration(tmp_path, cfg)
+    table = next(tmp_path.rglob("metrics.parquet"))
+    table.write_bytes(table.read_bytes() + b"x")
+    with pytest.raises(ValueError):
+        load_e2e(tmp_path, path)
+
+
 # ---------------------------------------------------------------- provenance
 
 
@@ -212,6 +290,13 @@ def test_provenance_cap_redaction_and_hash_link(tmp_path):
     assert b"hf_" not in redact(b"token=hf_" + b"a" * 30)
     body = _dev_body().model_copy(update={"provenance_artifacts": [info]})
     assert public_release_problems(body) == [f"unredacted tier-3 artifact: {info.artifact_id}"]
+
+
+def test_provenance_manifest_mismatch_detected(tmp_path):
+    cfg = _dev_config(log=b"log")
+    path = write_configuration(tmp_path, cfg)
+    ds = load_e2e(tmp_path, path)
+    assert ds.observations[0].log_artifact_id in {p.artifact_id for p in ds.body.provenance_artifacts}
 
 
 # ---------------------------------------------------------------- snapshot
@@ -243,3 +328,11 @@ def test_snapshot_round_trip_and_tamper(tmp_path):
     (tmp_path / "snap.json").write_text(data.replace(snap.snapshot_id, "0" * 64))
     with pytest.raises(ValueError, match="snapshot ID"):
         read_snapshot(tmp_path, "snap.json")
+
+
+def test_loader_refuses_foreign_table_schema(tmp_path):
+    from aisim_core.data.loaders import E2eLoader
+
+    path = write_configuration(tmp_path, _dev_config())
+    with pytest.raises(LoaderError, match="unsupported table schema"):
+        E2eLoader(accepted_schemas=("aisim-e2e-requests/v1",)).load(tmp_path, path)

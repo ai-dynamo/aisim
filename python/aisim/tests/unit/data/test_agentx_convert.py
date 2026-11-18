@@ -12,6 +12,7 @@ from aisim_core.data.agentx_convert import (
     agentx_bundle_to_configuration,
     agentx_bundles_to_configurations,
 )
+from aisim_core.data.e2e import evaluation_points, load_e2e, name_findings_for_dataset, write_configuration
 
 pytestmark = pytest.mark.unit
 
@@ -118,6 +119,20 @@ def test_bundle_converts_with_canonical_names_and_lineage(tmp_path):
     k1 = next(r for r in data.requests if r.request_id == "k1")
     assert k1.cached_tokens == 64 and k1.source_trace_id == "t1" and k1.source_outer_idx == 3
     assert data.series[0].metric == "running_requests" and data.series[0].end_ms == 1000.0
+
+
+def test_silicon_statistics_match_the_agentx_cohort_definition(tmp_path):
+    data = agentx_bundle_to_configuration(_bundle(tmp_path, "qwen-weka-l4"))
+    out = tmp_path / "out"
+    out.mkdir()
+    dataset = load_e2e(out, write_configuration(out, data))
+    (point,) = evaluation_points(dataset)
+    # successful profile requests k1 and k2: mean ttft 300, mean tpot 15, tokens 32 over the 2000 ms span
+    assert point.metrics[("ttft", "mean")] == 300.0
+    assert point.metrics[("tpot", "mean")] == 15.0
+    assert point.metrics[("ttft", "median")] == 300.0
+    assert point.metrics[("output_throughput:total", "value")] == pytest.approx(32 * 1000 / 2000)
+    assert name_findings_for_dataset(dataset) == []
 
 
 def test_bundles_with_one_serving_identity_merge_into_one_configuration(tmp_path):

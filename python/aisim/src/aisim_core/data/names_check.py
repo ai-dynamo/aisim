@@ -4,8 +4,8 @@
 """Check a dataset directory for non-canonical names: the pre-PR check for contributors and their agents.
 
 Applies to every category (op-latency, FPM, e2e, eval): the envelope identity of each configuration manifest
-(hardware, framework, precision, deployment) is checked.
-Nothing is rewritten; each finding names the canonical spelling to use. Offline only.
+(hardware, framework, precision, deployment) is checked, and e2e configurations are checked down to their
+table values. Nothing is rewritten; each finding names the canonical spelling to use. Offline only.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from aisim_core.data import Manifest
+from aisim_core.data.e2e import load_e2e, name_findings_for_dataset
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.names import NameFinding, name_findings
 
@@ -74,6 +75,8 @@ def check_names(root: Path | str) -> tuple[list[PathFinding], list[str]]:
         try:
             manifest = Manifest.model_validate_json(path.read_text(encoding="utf-8"))
             found = _identity_findings(manifest)
+            if manifest.category == "e2e":
+                found += name_findings_for_dataset(load_e2e(base, relative))
         except (LoaderError, ValueError, OSError) as exc:
             errors.append(f"{relative}: {type(exc).__name__}: {exc}")
             continue

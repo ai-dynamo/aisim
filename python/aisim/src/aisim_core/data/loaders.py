@@ -16,6 +16,7 @@ an inconsistent category/purpose/identity and invalid paths.
 * :class:`OpLatencyLoader` materializes a ``systems`` root (``data/<system>/...``
   plus hardware specs) that can be appended to ``systems_paths``.
 * :class:`FpmLoader` selects FPM catalog entries; it cannot load them yet.
+* :class:`E2eLoader` returns pyarrow table views.
 """
 
 from __future__ import annotations
@@ -23,9 +24,11 @@ from __future__ import annotations
 import shutil
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
+
+import pyarrow as pa
 
 from aisim_core.data import (
     Category,
@@ -36,6 +39,7 @@ from aisim_core.data import (
     configuration_id,
 )
 from aisim_core.data.fetch import Selection
+from aisim_core.data.parquet import read_parquet
 
 MANIFEST_SCHEMA = "aisim-artifact-manifest/v1"
 
@@ -180,4 +184,58 @@ class FpmLoader(Loader):
         return self._selection(config, model=config.get("model"))
 
 
-LOADERS: dict[str, type[Loader]] = {cls.category: cls for cls in (OpLatencyLoader, FpmLoader)}
+# --------------------------------------------------------------------------- e2e
+
+
+@dataclass(frozen=True)
+class E2eTables:
+    """Verified Parquet artifacts as pyarrow tables keyed by ``artifact_id``."""
+
+    manifest: Manifest
+    tables: dict[str, pa.Table] = field(default_factory=dict)
+
+    def __getitem__(self, artifact_id: str) -> pa.Table:
+        return self.tables[artifact_id]
+
+
+class E2eLoader(Loader):
+    """E2E tables as pyarrow views; nothing is converted or materialized."""
+
+    category: ClassVar[Category] = "e2e"
+    purposes: ClassVar[tuple[str, ...]] = ("e2e-configuration",)
+
+    def __init__(self, accepted_schemas: tuple[str, ...] | None = None):
+        # None accepts exactly the schema each artifact declares in its manifest.
+        self.accepted_schemas = accepted_schemas
+
+    def select(self, config: Mapping[str, Any]) -> Selection:
+        return self._selection(config, model=config.get("model"))
+
+    def load(
+        self,
+        root: Path,
+        manifest_path: str,
+        *,
+        config: Mapping[str, Any] | None = None,
+        columns: Mapping[str, list[str]] | None = None,
+    ) -> E2eTables:
+        """Read every Parquet artifact; the stamped schema ID must match what is accepted."""
+        root = Path(root)
+        manifest = self.read_manifest(root, manifest_path, config)
+        tables = {}
+        for artifact in manifest.artifacts:
+            if artifact.format != "parquet":
+                continue
+            if self.accepted_schemas is not None and artifact.artifact_schema not in self.accepted_schemas:
+                raise LoaderError(f"unsupported table schema: {artifact.artifact_schema}")
+            tables[artifact.artifact_id] = read_parquet(
+                _verify(root, artifact),
+                artifact.artifact_schema,
+                columns=(columns or {}).get(artifact.artifact_id),
+            )
+        if not tables:
+            raise LoaderError("manifest declares no Parquet tables")
+        return E2eTables(manifest, tables)
+
+
+LOADERS: dict[str, type[Loader]] = {cls.category: cls for cls in (OpLatencyLoader, FpmLoader, E2eLoader)}

@@ -65,7 +65,7 @@ import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity, Manifest, _file, _verify, configuration_id
-from aisim_core.data.loaders import LoaderError
+from aisim_core.data.loaders import E2eLoader, E2eTables, LoaderError
 from aisim_core.data.names import NameFinding, canonical_name, canonical_unit, name_findings, normalize, split_framework
 from aisim_core.data.parquet import read_parquet, write_parquet
 
@@ -791,6 +791,14 @@ def read_raw_records(root: Path, manifest: Manifest, observations: Iterable[Obse
     return out
 
 
+def read_raw_record(root: Path, dataset: E2eDataset, observation_id: str) -> bytes:
+    """Verified raw record of one observation of a loaded configuration."""
+    obs = next((o for o in dataset.observations if o.observation_id == observation_id), None)
+    if obs is None:
+        raise LoaderError(f"unknown observation: {observation_id}")
+    return read_raw_records(Path(root), dataset.manifest, [obs])[observation_id]
+
+
 # --------------------------------------------------------------------------- configuration write/read
 
 
@@ -916,6 +924,116 @@ def body_from_manifest(manifest: Manifest) -> E2eManifestBody:
     if body.identity() != manifest.identity:
         raise LoaderError("e2e manifest body disagrees with the envelope identity")
     return body
+
+
+@dataclass(frozen=True)
+class E2eDataset:
+    """Verified typed rows for one configuration, identical for every source."""
+
+    tables: E2eTables
+    body: E2eManifestBody
+    observations: list[ObservationRow]
+    metrics: list[MetricRow]
+    requests: list[RequestRow]
+    series: list[SeriesRow] = field(default_factory=list)
+
+    @property
+    def manifest(self) -> Manifest:
+        return self.tables.manifest
+
+
+def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None = None) -> E2eDataset:
+    """Load one configuration through :class:`E2eLoader` and cross-check its tables."""
+    root = Path(root)
+    tables = E2eLoader(accepted_schemas=E2E_TABLE_SCHEMAS).load(root, manifest_path, config=config)
+    body = body_from_manifest(tables.manifest)
+    by_schema = {a.artifact_schema: a.artifact_id for a in tables.manifest.artifacts if a.format == "parquet"}
+    if OBSERVATIONS_SCHEMA not in by_schema or METRICS_SCHEMA not in by_schema:
+        raise LoaderError("manifest must declare observation and metric tables")
+    observations = table_to_rows(OBSERVATIONS_SCHEMA, tables[by_schema[OBSERVATIONS_SCHEMA]])
+    metrics = table_to_rows(METRICS_SCHEMA, tables[by_schema[METRICS_SCHEMA]])
+    requests = (
+        table_to_rows(REQUESTS_SCHEMA, tables[by_schema[REQUESTS_SCHEMA]]) if REQUESTS_SCHEMA in by_schema else []
+    )
+    series = table_to_rows(SERIES_SCHEMA, tables[by_schema[SERIES_SCHEMA]]) if SERIES_SCHEMA in by_schema else []
+    known = {o.observation_id for o in observations}
+    if len(known) != len(observations):
+        raise LoaderError("duplicate observation_id")
+    artifact_ids = {a.artifact_id for a in tables.manifest.artifacts}
+    for o in observations:
+        if o.configuration_id != tables.manifest.configuration_id:
+            raise LoaderError(f"observation {o.observation_id} has a different configuration_id")
+        for ref in (o.raw_artifact_id, o.log_artifact_id, *o.evidence_refs):
+            if ref is not None and ref not in artifact_ids:
+                raise LoaderError(f"observation {o.observation_id} references unknown artifact {ref}")
+    for rows in (metrics, requests, series):
+        if {r.observation_id for r in rows} - known:
+            raise LoaderError("rows reference unknown observations")
+    info_ids = {p.artifact_id for p in body.provenance_artifacts}
+    if info_ids - artifact_ids or {a.artifact_id for a in tables.manifest.artifacts if a.format == "gzip"} - info_ids:
+        raise LoaderError("provenance artifacts and manifest body disagree")
+    return E2eDataset(tables, body, observations, metrics, requests, series)
+
+
+# --------------------------------------------------------------------------- evaluator view
+
+
+@dataclass(frozen=True)
+class EvaluationPoint:
+    """One benchmark point in canonical units; the same shape for every source."""
+
+    observation_id: str
+    configuration_id: str
+    input_tokens: int | None
+    output_tokens: int | None
+    concurrency: int | None
+    # (metric, statistic) -> canonical value, valid metrics only (latency ms, throughput tokens/s).
+    metrics: dict[tuple[str, str], float]
+    # (metric, statistic) pairs that are missing or invalid; never zero-filled.
+    unavailable: frozenset[tuple[str, str]]
+    # Per-device tokens/s by throughput metric, normalized explicitly.
+    per_device_throughput: dict[str, float]
+
+
+def evaluation_points(dataset: E2eDataset) -> list[EvaluationPoint]:
+    metrics: dict[str, list[MetricRow]] = {}
+    for row in dataset.metrics:
+        metrics.setdefault(row.observation_id, []).append(row)
+    points = []
+    for obs in dataset.observations:
+        values, unavailable, device = {}, set(), {}
+        for row in metrics.get(obs.observation_id, []):
+            if row.scope != "run":
+                continue
+            # Consumers read canonical names only: a known alias (``p50``) or a stored spelling the registry
+            # rejects is ignored until the dataset is fixed (see name_findings_for).
+            if name_findings("metric", "", row.metric) or name_findings("statistic", "", row.statistic):
+                continue
+            key = (row.metric, row.statistic)
+            if row.status != "valid":
+                unavailable.add(key)
+            elif row.metric.endswith("throughput"):
+                # Throughput keys carry their normalization: total and per-device never mix.
+                values[(f"{row.metric}:{row.normalization}", row.statistic)] = row.value
+                if row.normalization == "total" and row.device_count is None and obs.device_count:
+                    row = row.model_copy(update={"device_count": obs.device_count})
+                if row.normalization == "per_device" or (row.normalization == "total" and row.device_count):
+                    device[row.metric] = throughput_per_device(row)
+            else:
+                values[key] = row.value
+        points.append(
+            EvaluationPoint(
+                obs.observation_id,
+                obs.configuration_id,
+                obs.input_tokens,
+                obs.output_tokens,
+                obs.concurrency,
+                values,
+                frozenset(unavailable),
+                device,
+            )
+        )
+    return points
 
 
 # --------------------------------------------------------------------------- snapshot
@@ -1511,3 +1629,7 @@ def name_findings_for(
             seen.add(("metric", "series", point.metric))
             out += found
     return out
+
+
+def name_findings_for_dataset(dataset: E2eDataset) -> list[NameFinding]:
+    return name_findings_for(dataset.body, dataset.observations, dataset.metrics, dataset.requests, dataset.series)
