@@ -131,7 +131,9 @@ def test_model_graph_rejects_moe_kernel_source_without_a_compatible_operator(mod
     ("model_path", "num_experts", "topk", "expected"),
     [
         ("google/gemma-4-31B-it", None, 0, False),  # dense 31B / E2B / E4B
+        ("google/gemma-4-31B-it", None, None, False),
         ("google/gemma-4-31B-it", 0, 0, False),
+        ("google/gemma-4-26B-A4B", 1, 1, True),
         ("google/gemma-4-26B-A4B", 128, 8, True),  # routed-MoE
     ],
 )
@@ -162,14 +164,26 @@ def test_gemma4_moe_detection_follows_expert_config(model_path, num_experts, top
         (128, 129),
         (128, -8),
         (-128, 8),
+        ("128", 8),
+        (128, "8"),
+        (128.5, 8),
+        (128, 8.5),
+        (128.0, 8),
+        (128, 8.0),
+        (True, 1),
+        (128, True),
+        (False, 0),
+        (None, False),
+        (0.0, 0),
+        (None, 0.0),
     ],
 )
 def test_gemma4_rejects_inconsistent_expert_config(num_experts, topk):
     """A checkpoint declaring impossible expert routing is corrupt, not dense.
 
     That covers one expert field missing, a routing width above the expert
-    count, and negative values (which are truthy, so a presence check alone
-    would accept them). Treating any of these as dense would silently build a
+    count, negative values, and non-integers (including booleans and floats
+    equal to valid integers). Treating any of these as dense would silently build a
     graph with no routed-expert work, so classification must fail loudly
     instead. Use the engine-config error type so the Rust bridge rejects the
     checkpoint instead of treating the failure as an unsupported model and

@@ -19,6 +19,8 @@ checkable parity assertion for the port.
 
 from __future__ import annotations
 
+import json
+from importlib.resources import files
 from types import SimpleNamespace
 
 import pytest
@@ -1128,6 +1130,64 @@ def test_estimate_kv_cache_rejects_corrupt_gemma4_metadata_before_the_database(m
             gpu_memory_capacity_bytes_override=200 * _GIB,
             allow_naive_fallback=True,
         )
+
+
+@pytest.mark.parametrize("system", ["gb300", "unavailable_gemma4_type_regression"])
+@pytest.mark.parametrize("entry_point", ["kv_cache", "best_available"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_experts", "128"),
+        ("num_experts", 128.5),
+        ("num_experts", 128.0),
+        ("num_experts", True),
+        ("num_experts", False),
+        ("num_experts", 0.0),
+        ("top_k_experts", "8"),
+        ("top_k_experts", 8.5),
+        ("top_k_experts", 8.0),
+        ("top_k_experts", True),
+        ("top_k_experts", False),
+        ("top_k_experts", 0.0),
+    ],
+)
+def test_malformed_local_gemma4_expert_types_cannot_fall_back(tmp_path, field, value, entry_point, system):
+    # Exercise the real local-config parser, pre-database gate and Rust bridge.
+    # Neither an available database nor a missing system may hide corrupt types
+    # by returning naive capacity or selecting an unready regression estimator.
+    from aisim_core.sdk import RustForwardPassPerfModel
+
+    config_path = files("aisim_core").joinpath("model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_config.json")
+    raw_config = json.loads(config_path.read_text())
+    raw_config["text_config"][field] = value
+    (tmp_path / "config.json").write_text(json.dumps(raw_config))
+
+    if entry_point == "kv_cache":
+        with pytest.raises(InvalidEngineConfigurationError, match="inconsistent expert metadata"):
+            memory.estimate_kv_cache(
+                str(tmp_path),
+                system,
+                "vllm",
+                max_num_tokens=8192,
+                max_batch_size=256,
+                memory_fraction_kind="of_total",
+                memory_fraction_value=0.9,
+                gpu_memory_capacity_bytes_override=400 * _GIB,
+                allow_naive_fallback=True,
+                allow_hf_config_download=False,
+            )
+    else:
+        with pytest.raises(ValueError, match="invalid engine config:.*inconsistent expert metadata"):
+            RustForwardPassPerfModel.best_available(
+                {
+                    "model": str(tmp_path),
+                    "system": system,
+                    "backend": "vllm",
+                    "worker_type": "aggregated",
+                    "estimation_mode": "auto",
+                    "fallback_policy": "allow",
+                }
+            )
 
 
 def test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error():
