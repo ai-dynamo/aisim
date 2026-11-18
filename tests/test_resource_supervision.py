@@ -58,11 +58,62 @@ def test_calibration_checkpoint_keeps_record_and_total_bounds(tmp_path, monkeypa
     with pytest.raises(ResourceLimitError, match="checkpoint budget"):
         supervision.checkpoint("candidate_completed", {"calibration": "x" * supervision._CHECKPOINT_RECORD_BYTES})
     assert not path.exists()
-    with path.open("wb") as stream:
-        stream.truncate(supervision._CHECKPOINT_TOTAL_BYTES)
+
+    # The complete JSONL record, including its envelope and newline, fits exactly.
+    envelope = len(json.dumps({"event": "candidate_completed", "value": {"calibration": ""}})) + 1
+    value = {"calibration": "x" * (supervision._CHECKPOINT_RECORD_BYTES - envelope)}
+    count = supervision._CHECKPOINT_TOTAL_BYTES // supervision._CHECKPOINT_RECORD_BYTES
+    for index in range(count):
+        supervision.checkpoint("candidate_completed", value)
+        assert path.stat().st_size == (index + 1) * supervision._CHECKPOINT_RECORD_BYTES
+    with path.open(encoding="utf-8") as source:
+        for _ in range(count):
+            assert json.loads(source.readline()) == {"event": "candidate_completed", "value": value}
+        assert source.read() == ""
     with pytest.raises(ResourceLimitError, match="checkpoint budget"):
         supervision.checkpoint("candidate_completed", {"score": 1})
     assert path.stat().st_size == supervision._CHECKPOINT_TOTAL_BYTES
+
+
+@pytest.mark.parametrize("full_budget", [False, True], ids=["2mib-event", "64mib-log"])
+def test_resource_limited_recommendation_retains_large_partial_events(tmp_path, monkeypatch, full_budget):
+    from aisim import supervision
+    from aisim.config import CoreRecommendationConfig
+    from aisim.resources import ResourceLimitError
+
+    envelope = len(json.dumps({"event": "candidate_completed", "value": {"calibration": ""}})) + 1
+    payload_size = supervision._CHECKPOINT_RECORD_BYTES - envelope if full_budget else 2 * MIB
+    count = supervision._CHECKPOINT_TOTAL_BYTES // supervision._CHECKPOINT_RECORD_BYTES if full_budget else 1
+    script = tmp_path / "checkpoint_worker.py"
+    script.write_text(
+        "from aisim.supervision import checkpoint\n"
+        f"for _ in range({count}):\n"
+        f"    checkpoint('candidate_completed', {{'calibration': 'x' * {payload_size}}})\n"
+        "raise SystemExit(3)\n"
+    )
+
+    def run_checkpoint_worker(command, *, policy, events_output):
+        # Replace only the workload; use the real writer, supervisor and exporter.
+        assert command[1:4] == ["-m", "aisim.resource_worker", "recommend"]
+        report = run_process([sys.executable, str(script)], policy=policy, timeout=10, events_output=events_output)
+        assert Path(events_output).stat().st_size == count * (payload_size + envelope)
+        return report
+
+    monkeypatch.setattr(supervision, "run_process", run_checkpoint_worker)
+    raw = yaml.safe_load(_small_cli_config(tmp_path, "recommend").read_text())
+    raw["execution"] = {"resources": _policy(extra_mib=256).model_dump()}
+    config = CoreRecommendationConfig.model_validate(raw)
+    with pytest.raises(ResourceLimitError) as caught:
+        supervision.supervised_recommendation(config, {})
+
+    report = caught.value.plan
+    assert report["status"] == "resource_limited"
+    assert report["exit_code"] == 3
+    assert report["termination_complete"] is True
+    assert "partial_evidence_truncated" not in report
+    assert len(report["partial_events"]) == count
+    expected = {"event": "candidate_completed", "value": {"calibration": "x" * payload_size}}
+    assert all(event == expected for event in report["partial_events"])
 
 
 def test_watchdog_stops_small_allocation_and_reaps_child(tmp_path):

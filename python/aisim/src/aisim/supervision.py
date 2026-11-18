@@ -588,11 +588,15 @@ def supervised_recommendation(config, kwargs):
                 events = root / "events.jsonl"
                 report["partial_events"] = []
                 if events.exists():
-                    with events.open() as source:
+                    with events.open(encoding="utf-8") as source:
                         retained_bytes = 0
-                        for line in source:
+                        while line := source.readline(_CHECKPOINT_RECORD_BYTES + 1):
                             retained_bytes += len(line)
-                            if retained_bytes > 1024 * 1024:
+                            if (
+                                not line.endswith("\n")
+                                or len(line) > _CHECKPOINT_RECORD_BYTES
+                                or retained_bytes > _CHECKPOINT_TOTAL_BYTES
+                            ):
                                 report["partial_evidence_truncated"] = True
                                 break
                             report["partial_events"].append(json.loads(line))
