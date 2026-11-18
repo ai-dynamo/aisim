@@ -175,7 +175,7 @@ def package_reports(
     destination: Path,
     *,
     probe_plan: dict,
-    source_project: Path = Path("release-source/python/aisim"),
+    source_project: Path,
 ) -> None:
     required_probes = validate_required_probes(probe_plan, {**expected, "wheel_sha256": wheel_sha})
     qualifier = load_tool("qualify_fpe_support_matrix")

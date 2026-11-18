@@ -350,7 +350,8 @@ tooling commit, producer run, repository, and `amd64` architecture, reads the
 producer attempt from the manifest, and verifies each object's size and SHA-256
 before replacing local files. No `GITHUB_RUN_ATTEMPT` is needed for a download.
 Install the release's locked environment and exact restored wheel as in the
-workflow. The matrix's per-cell command uses `release-source/python/aisim/.venv/bin/python`
+workflow. The matrix's per-cell command uses the selected release source project's
+`.venv/bin/python` (`release-source/python/aisim` or `release-source/python/aisimulate`)
 directly to run the verified release wrapper with the recorded source, tooling,
 and branch. Each invocation requires a fresh `release-probe-harness/` directory;
 remove only that generated directory between reproductions. Raw shard reports

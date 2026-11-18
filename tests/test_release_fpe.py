@@ -439,7 +439,15 @@ def test_complete_release_reports_produce_publishable_ci_artifact(tmp_path, prob
     source = tmp_path / "reports"
     shards = reports(source, probe_plan["probes"])
     destination = tmp_path / "web"
-    RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=probe_plan)
+    RELEASE.package_reports(
+        source,
+        IDENTITY,
+        WHEEL,
+        shards,
+        destination,
+        probe_plan=probe_plan,
+        source_project=Path("release-source/python/aisim"),
+    )
     qualification = json.loads((destination / "fpe-qualification.json").read_text())
     assert qualification["source_sha"] == SHA
     assert qualification["tooling_sha"] == TOOLING
@@ -470,7 +478,15 @@ def test_incomplete_release_cannot_produce_a_web_artifact(tmp_path, probe_plan):
     next(source.rglob("fpe_support_matrix.json")).unlink()
     destination = tmp_path / "web"
     with pytest.raises(ValueError, match="missing shards"):
-        RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=probe_plan)
+        RELEASE.package_reports(
+            source,
+            IDENTITY,
+            WHEEL,
+            shards,
+            destination,
+            probe_plan=probe_plan,
+            source_project=Path("release-source/python/aisim"),
+        )
     assert not destination.exists()
 
 
@@ -487,7 +503,15 @@ def test_passing_previous_version_cannot_replace_a_failed_current_probe(tmp_path
         path.write_text(json.dumps(payload))
     destination = tmp_path / "web"
     with pytest.raises(ValueError, match="required known-good probes no longer pass"):
-        RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=probe_plan)
+        RELEASE.package_reports(
+            source,
+            IDENTITY,
+            WHEEL,
+            shards,
+            destination,
+            probe_plan=probe_plan,
+            source_project=Path("release-source/python/aisim"),
+        )
     assert not destination.exists()
 
 
@@ -498,7 +522,15 @@ def test_packaging_rejects_another_wheels_probe_plan_before_creating_output(tmp_
     wrong_plan["wheel_sha256"] = "d" * 64
     destination = tmp_path / "web"
     with pytest.raises(ValueError, match="provenance or policy"):
-        RELEASE.package_reports(source, IDENTITY, WHEEL, shards, destination, probe_plan=wrong_plan)
+        RELEASE.package_reports(
+            source,
+            IDENTITY,
+            WHEEL,
+            shards,
+            destination,
+            probe_plan=wrong_plan,
+            source_project=Path("release-source/python/aisim"),
+        )
     assert not destination.exists()
 
 
