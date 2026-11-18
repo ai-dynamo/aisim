@@ -217,29 +217,12 @@ def get_model(
     # Preserve caller intent before checkpoint defaults fill unset modes.
     # Model-specific mixed-precision splitters use this provenance rather than
     # trying to infer explicitness by comparing enum values after mutation.
-    # A mode an earlier get_model filled stays inferred only while unchanged.
-    # shortcut: an override equal to the filled mode reads as inferred; track assignments if that matters.
     for kind in ("gemm", "moe"):
-        mode = getattr(model_config, f"{kind}_quant_mode")
-        filled = getattr(model_config, f"_{kind}_quant_mode_inferred", None)
-        flag = getattr(model_config, f"_{kind}_quant_mode_is_explicit", None)
-        explicit = mode is not None
-        if filled is not None:
-            explicit = explicit and mode != filled
-        elif flag is not None:
-            explicit = explicit and flag
-        model_info[f"{kind}_quant_mode_is_explicit"] = explicit
+        model_info[f"{kind}_quant_mode_is_explicit"] = model_config._quant_mode_is_explicit(kind)
     _apply_model_quant_defaults(model_config, raw_config, architecture, backend_name)
-    # Record the resolved provenance (flag and filled mode) so later builds cannot read a stale flag.
     for kind in ("gemm", "moe"):
-        explicit = model_info[f"{kind}_quant_mode_is_explicit"]
-        if hasattr(model_config, f"_{kind}_quant_mode_inferred"):
-            setattr(model_config, f"_{kind}_quant_mode_is_explicit", explicit)
-            setattr(
-                model_config,
-                f"_{kind}_quant_mode_inferred",
-                None if explicit else getattr(model_config, f"{kind}_quant_mode"),
-            )
+        if not model_info[f"{kind}_quant_mode_is_explicit"]:
+            model_config._mark_quant_mode_inferred(kind, "filled")
     # vLLM (nvfp4_ds_mla) and TRT-LLM store FP4 MLA caches in their own layouts, which nvfp4 doesn't model.
     language = raw_config.get(common.MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)) or raw_config
     if model_config.kvcache_quant_mode == common.KVCacheQuantMode.nvfp4 and (

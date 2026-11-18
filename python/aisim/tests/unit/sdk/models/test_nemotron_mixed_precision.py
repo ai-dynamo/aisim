@@ -556,29 +556,39 @@ def test_canonical_api_resolves_nvfp4_lanes_under_the_selected_systems_root(monk
 
 
 def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
-    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     import dataclasses
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+
+    import copy
 
     def build(config):
         model = get_model(SUPER, config, backend_name="vllm")
         return _buckets(model.context_ops), _experts(model), sum(op.get_weights() for op in model.context_ops)
 
-    def assert_uniform(built):
-        assert all(set(modes) == {BF16} for modes in built[0].values()) and set(built[1]) == {MOE.fp8}
+    def assert_uniform(built, gemm, moe):
+        assert all(set(modes) == {gemm} for modes in built[0].values()) and set(built[1]) == {moe}
 
     direct = ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, system="gb200")
     # A Task-built config carries explicit=False flags for its inferred modes.
     task = _task(SUPER).build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
     for config in (direct, task):
         inferred = build(config)
-        # Rebuilding the same config keeps the checkpoint split (Mamba in_proj: FP8 and BF16 layers).
-        assert build(config) == inferred and len(inferred[0]["mamba_in_proj_gemm"]) == 2
+        # An unchanged rebuild, also from a copy, keeps the checkpoint split (Mamba in_proj: FP8 and BF16).
+        assert build(config) == build(copy.copy(config)) == inferred
+        assert len(inferred[0]["mamba_in_proj_gemm"]) == 2
         # Overrides on a copy, or assigned to the config itself, are explicit on every later build.
-        assert_uniform(build(dataclasses.replace(config, gemm_quant_mode=BF16, moe_quant_mode=MOE.fp8)))
+        assert_uniform(build(dataclasses.replace(config, gemm_quant_mode=BF16, moe_quant_mode=MOE.fp8)), BF16, MOE.fp8)
         config.gemm_quant_mode, config.moe_quant_mode = BF16, MOE.fp8
         for _ in range(3):
-            assert_uniform(build(config))
+            assert_uniform(build(config), BF16, MOE.fp8)
         # Clearing the overrides restores inference.
         config.gemm_quant_mode = config.moe_quant_mode = None
-        assert build(config) == inferred
-        assert build(config) == inferred
+        assert build(config) == build(config) == inferred
+    # An explicit mode equal to the one the checkpoint fills is still explicit when assigned, and on a
+    # direct config also when set through replace.
+    assert_uniform(build(dataclasses.replace(direct, gemm_quant_mode=FP8, moe_quant_mode=MOE.nvfp4)), FP8, MOE.nvfp4)
+    for config in (direct, task):
+        config.gemm_quant_mode, config.moe_quant_mode = FP8, MOE.nvfp4
+        for _ in range(2):
+            assert_uniform(build(config), FP8, MOE.nvfp4)

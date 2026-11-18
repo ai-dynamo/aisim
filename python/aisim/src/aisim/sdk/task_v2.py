@@ -51,7 +51,7 @@ from aisim.sdk.models import (
     resolve_vllm_moe_execution_mode,
 )
 from aisim.sdk.models.blocks.moe import LARGE_EP_READY_FAMILIES, MoEBlockShape
-from aisim.sdk.models.helpers import resolve_sglang_mla_compute, trtllm_mla_runs_fp8
+from aisim.sdk.models.helpers import record_inferred_quant_modes, resolve_sglang_mla_compute, trtllm_mla_runs_fp8
 from aisim.sdk.moe_comm_resolver import (
     a2a_covers_parallel,
     moe_compute_coverage,
@@ -1918,6 +1918,7 @@ class Task:
         model_config._gemm_quant_mode_is_explicit = self._gemm_quant_mode_explicit_by_role.get(role, False)
         model_config._fmha_quant_mode_from_data = self._fmha_from_data.get(role, False)
         model_config._moe_quant_mode_is_explicit = self._moe_quant_mode_explicit_by_role.get(role, False)
+        record_inferred_quant_modes(model_config)
         if parallel is not None:
             required_phases = tuple(dict.fromkeys((*self._role_phases(role), *self._required_large_ep_phases(role))))
             resolve_model_config_moe_comm(

@@ -1205,6 +1205,13 @@ def resolve_dsv4_moe_arch(
         model_config.moe_quant_mode = mode
 
 
+def record_inferred_quant_modes(model_config: config.ModelConfig) -> None:
+    """Remember the GEMM/MoE modes a resolver filled for inferred fields, so get_model can tell a later override."""
+    for kind in ("gemm", "moe"):
+        if getattr(model_config, f"_{kind}_quant_mode_is_explicit", None) is False:
+            model_config._mark_quant_mode_inferred(kind)
+
+
 def resolve_nvfp4_for_system(
     model_config: config.ModelConfig,
     system_name: str | None,
@@ -1257,6 +1264,7 @@ def resolve_nvfp4_for_system(
         model_config.gemm_quant_mode = common.GEMMQuantMode.nvfp4_wo
     if moe_q == common.MoEQuantMode.nvfp4:
         model_config.moe_quant_mode = common.MoEQuantMode.nvfp4_wo
+    record_inferred_quant_modes(model_config)
 
 
 def resolve_sglang_mla_compute(
