@@ -5,18 +5,22 @@ SPDX-License-Identifier: Apache-2.0
 
 # Dense Gemma 4 MoE classification evidence
 
-Measured on 2026-11-13 on macOS arm64 (Python 3.13.18) against `origin/main`
-`f85518b36` (the AISim rename) with the prediction-only Python and Rust sources
-of this branch. No GPU was run, and no performance data was added, re-collected,
-or re-fitted.
+The shape and recommendation probes below were originally reported on
+2026-11-13 on macOS arm64 (Python 3.13.18), comparing the then-branch sources
+with `f85518b36`. Their reported pre-rebase identity, `29bb28580`, is not
+available in this checkout; these tables remain historical author-reported
+results, not verification of the current head. No GPU was run, and no
+performance data was added, re-collected, or re-fitted.
 
-The code and test changes were measured at `29bb28580`; later commits add only
-this write-up, docstrings and one test, with no production-code change. The
-branch is based on `origin/main` `0809faae9`, where the fix is `7d97aac50`; an
-earlier rebase dropped a duplicate cherry-pick of the renamed runner-pool
-workflows, so the branch still carries no `.github/` change. The embedded bridge
-test described under [Guard](#guard) is the final commit and exercises that fix
-without changing production code.
+The published review head is `8f3a62e0fde729cf74db0b6b3551608338b367dd`,
+based on `0809faae9e543487dcf2142dc6afe2427a42f9bd`. The classifier fix
+is in `7d97aac50`; `ad2bb0b68` adds the embedded bridge tests, and
+`a584153b9` adds the request-wide fallback regression and the CI enforcement
+flag. **`8f3a62e0` changes production behavior**: both expert fields must be
+integers (excluding booleans), or absent, before sentinel and range checks.
+Earlier results do not validate that change. The exact-head verification below
+supersedes the PR description's `a584153b9` test totals. The branch does change
+`.github/workflows/ci.yml` to enforce bridge imports in an admitted Full CI run.
 
 ## Scope
 
@@ -27,6 +31,103 @@ serving accuracy, latency, or throughput. The recommendation probe supplies
 constant metrics through offline runner and performance-model doubles, so
 candidate scores are placeholders; only the selected shape set and the
 feasible/infeasible status are meaningful.
+
+## Exact-head verification (2026-11-18)
+
+Local verification below covers the unchanged published head
+`8f3a62e0fde729cf74db0b6b3551608338b367dd`, on Linux x86_64 (WSL2),
+Python 3.12.3, pytest 9.1.1 and Rust 1.91.1. A maturin 1.16.0 release wheel
+was built first, using the CI wheel's optimized release profile and
+`extension-module,jemalloc` features from `pyproject.toml`. Dependencies,
+wheel, Cargo targets, caches and pytest data were kept outside the checkout.
+No weights were downloaded. The installed classifier and KV-cache sources were
+byte-compared with the checkout before testing.
+
+With `REPAIR_SCRATCH` set to an external scratch directory, the build and test
+commands were:
+
+```bash
+export TMPDIR="$REPAIR_SCRATCH/tmp"
+export CARGO_TARGET_DIR="$REPAIR_SCRATCH/cargo-target"
+export UV_CACHE_DIR="$REPAIR_SCRATCH/uv-cache"
+export CARGO_BUILD_JOBS=2
+export UV_PROJECT_ENVIRONMENT="$REPAIR_SCRATCH/venv"
+export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+uv sync --project python/aisim --frozen --extra dev --no-install-project
+(cd python/aisim && uv tool run --from 'maturin>=1.12,<2' maturin build \
+  --release --interpreter /usr/bin/python3 --auditwheel skip \
+  --out "$REPAIR_SCRATCH/wheels")
+uv pip install --python "$REPAIR_SCRATCH/venv/bin/python" --no-deps \
+  "$REPAIR_SCRATCH"/wheels/*.whl
+source "$REPAIR_SCRATCH/venv/bin/activate"
+export PYO3_PYTHON="$VIRTUAL_ENV/bin/python"
+export PYTHONPATH="$VIRTUAL_ENV/lib/python3.12/site-packages"
+export AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1
+
+python -m pytest -c python/aisim/pytest.ini \
+  -o cache_dir="$REPAIR_SCRATCH/pytest-cache" \
+  --basetemp="$REPAIR_SCRATCH/pytest-pinned-rerun" \
+  python/aisim/tests/unit/generator/test_gemma4_dense_enumeration.py \
+  python/aisim/tests/unit/cli/test_disagg_moe_comm_resolution.py \
+  python/aisim/tests/unit/sdk/models/test_model_config.py \
+  python/aisim/tests/unit/sdk/task_v2/test_task_config.py \
+  python/aisim/tests/unit/sdk/test_memory_estimation.py \
+  python/aisim/tests/unit/sdk/test_moe_kernel_source_consumers.py \
+  python/aisim/tests/unit/sdk/test_utils.py \
+  python/aisim/tests/unit/test_modern_recommend_context.py \
+  python/aisim/tests/unit/support_matrix
+cargo test -p aisim-core --features embed-python --lib \
+  --test perfmodel_dense_gemma4_bridge gemma4 -- --nocapture
+```
+
+| Verification | Tested commit | Result |
+| --- | --- | --- |
+| Targeted pytest command above | `8f3a62e0fde729cf74db0b6b3551608338b367dd` | 1,160 passed |
+| Rust policy test `dense_gemma4_expert_parallelism_is_not_fallback_safe` | `8f3a62e0fde729cf74db0b6b3551608338b367dd` | 1 passed |
+| Embedded `perfmodel_dense_gemma4_bridge`, with import enforcement enabled | `8f3a62e0fde729cf74db0b6b3551608338b367dd` | 4 passed; no skips |
+
+The pytest command includes all 19 inconsistent-metadata cases and all 48
+public fallback-path type cases named in the regression table below. In the
+first full invocation, while the embedded test executable was compiling,
+1,159 passed and the public recommendation test failed because all eight
+candidates were `resource_limited` (`evaluated=0`). That test then passed in
+isolation, and the complete unchanged selection passed after compilation
+finished. No assertion, timeout or production source was changed for the rerun.
+The initial failure and both subsequent results are retained in the repair
+run's scratch logs (`pytest-pinned.log`, `pytest-resource-probe.log`, and
+`pytest-pinned-rerun.log`); native results are in `native-pinned.log`.
+
+The PR description's 1,098-pass result belongs to `a584153b9`. Its older full
+unit result (14,014 passed, 75 failed, 45 errors) was reported at `29bb28580`,
+whose object is unavailable here; that broad suite was not revalidated by this
+targeted rerun. Neither historical total is current-head passing evidence.
+
+### Hosted CI evidence, separate from local verification
+
+The Actions API query for exact head `8f3a62e0fde729cf74db0b6b3551608338b367dd`
+on 2026-11-18 returned Fast CI, codeowners and GitHub Pages runs, and **no
+Full CI run**. Thus `rust-feature-modes` is configured to enforce the bridge
+check, but has no hosted validation result for this head. Full CI admission,
+fresh reviews and technical reapproval remain with the controller.
+
+The Repository Policy failure was independently checked in both hosted logs:
+
+| Source | Exact source SHA | Run and failing job |
+| --- | --- | --- |
+| PR head | `8f3a62e0fde729cf74db0b6b3551608338b367dd` | [Fast CI 44420298369](https://github.com/ai-dynamo/aisim/actions/runs/44420298369), [Repository Policy 135211174950](https://github.com/ai-dynamo/aisim/actions/runs/44420298369/job/135211174950) |
+| main | `0809faae9e543487dcf2142dc6afe2427a42f9bd` | [Fast CI 44409204366](https://github.com/ai-dynamo/aisim/actions/runs/44409204366), [Repository Policy 135172502498](https://github.com/ai-dynamo/aisim/actions/runs/44409204366/job/135172502498) |
+
+Both fail
+`tests/test_artifactory_wheel_handoff.py::test_wheel_handoffs_require_internal_containerized_runners`
+at line 371 with `AttributeError: 'str' object has no attribute 'get'`.
+The test calls `job.get("container", {}).get("image")`, while the Dynamo job
+in `.github/workflows/readme-checks.yml` uses the valid string container form
+`${{ vars.CI_JOB_CONTAINER_IMAGE }}`. Both that workflow and the failing test
+are byte-unchanged between base `0809faae9` and reviewed head `8f3a62e0`.
+Fast CI's aggregate fails as a consequence. This is a verified pre-existing
+failure, not a passing check or a transient-infrastructure claim; its repair
+is outside the two selected findings.
 
 ## Inputs and provenance
 
@@ -160,8 +261,9 @@ The `estimate_kv_cache` re-raise is deliberately request-wide rather than
 Gemma-specific. It sits in the generic native-build `except` and re-raises every
 `InvalidEngineConfigurationError`, because pricing an invalid request naively
 would return a capacity for a configuration the native path just rejected.
-Missing performance data still takes the documented fallback. Measured
-before/after on a non-Gemma MoE model (`deepseek-ai/DeepSeek-V3`,
+Missing performance data still takes the documented fallback. The following
+before/after was author-reported at `a584153b9` on a non-Gemma MoE model
+(`deepseek-ai/DeepSeek-V3`,
 `h200_sxm`/`vllm`, `tp_size=3`, `moe_tp_size=1`, `moe_ep_size=2`, 800 GiB
 override, `allow_naive_fallback=True`): `origin/main` `0809faae9` returns
 `source="naive_fallback"` with `total_kv_size_tokens=1840487`; this branch
@@ -192,7 +294,9 @@ Pinned by
 | `test_dense_variant_rejects_moe_ep_gt_1` | The dense guard raises `InvalidEngineConfigurationError` (not `AssertionError`) for an explicit `moe_ep_size>1`, so `python -O` cannot disable it and the Rust bridge keeps the rejection non-fallback-safe |
 | `test_run_single_agg_attention_dp_follows_the_gemma4_classification` | Agg `run_single_agg` forces `attention_dp_size=1` for dense and preserves `dp` for routed |
 | `test_run_single_disagg_attention_dp_follows_the_gemma4_classification` | Both disagg roles apply the same dense/routed attention-DP rule |
-| Inconsistent-metadata cases in `tests/unit/sdk/models/test_model_config.py` | `(128, 0)`, `(0, 8)`, `(None, 8)`, `(128, None)`, `(128, 129)`, `(128, -8)` and `(-128, 8)` raise `InvalidEngineConfigurationError`; `(None, 0)`, `(0, 0)`, and `(128, 8)` classify as dense/dense/routed |
+| `test_gemma4_rejects_inconsistent_expert_config` / `test_gemma4_moe_detection_follows_expert_config` in `tests/unit/sdk/models/test_model_config.py` | `(128, 0)`, `(0, 8)`, `(None, 8)`, `(128, None)`, `(128, 129)`, `(128, -8)` and `(-128, 8)` raise `InvalidEngineConfigurationError`; `(None, 0)`, `(0, 0)`, and `(128, 8)` classify as dense/dense/routed |
+| Non-integer cases in `test_gemma4_rejects_inconsistent_expert_config` | Boolean pairs `(True, 1)`, `(128, True)`, `(False, 0)`, `(None, False)`; fractional pairs `(128.5, 8)`, `(128, 8.5)`; integer-valued floats `(128.0, 8)`, `(128, 8.0)`, `(0.0, 0)`, `(None, 0.0)`; and strings `("128", 8)`, `(128, "8")` all raise `InvalidEngineConfigurationError` at `8f3a62e0` |
+| `test_malformed_local_gemma4_expert_types_cannot_fall_back` in `tests/unit/sdk/test_memory_estimation.py` | Boolean `True`/`False`, fractional `128.5`/`8.5`, integer-valued floats `128.0`/`8.0`/`0.0`, and strings `"128"`/`"8"` are tested for both fields through the real local-config parser, `estimate_kv_cache(allow_naive_fallback=True)` and `best_available(auto, allow)`, on both `gb300` and an unavailable system (48 cases at `8f3a62e0`) |
 | `test_no_current_cli_matrix_row_records_the_dense_gemma4_rejection` | Generated-artifact guard: no CLI support-matrix row the generator still enumerates records the dense rejection for a checkpoint the classifier calls dense |
 | `test_the_current_cli_matrix_still_covers_a_dense_gemma4_checkpoint` | The same guard cannot pass vacuously: a currently enumerated dense Gemma 4 row must exist |
 | `test_dense_gemma4_coverage_check_ignores_other_dense_families` | Dropping every Gemma 4 row fails the coverage assertion even though other dense families remain in the matrix |
@@ -261,6 +365,28 @@ split CSVs, and confirm no Gemma 4 row keeps the dense rejection. Rows that
 still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
 `BUILD_FAILED`) stay failed with their own cause.
 
+### Remaining artifact decision (2026-11-18)
+
+Inspection at `8f3a62e0` confirms all 103 FPE rows and ten retired-version
+CLI rows above still record `FAIL`. Neither set was regenerated by the local
+verification above. The author's
+[retirement-contract objection](https://github.com/ai-dynamo/aisim/pull/783#issuecomment-6993101186)
+and [follow-up](https://github.com/ai-dynamo/aisim/pull/783#issuecomment-6994253205)
+remain unresolved: there are 212 failed `trtllm 1.3.0rc23` rows across all
+models, including ten for the routed Gemma 4 checkpoint too.
+`VALID_STATUSES` in `tools/support_matrix/support_matrix.py`
+has no retired/non-current status, and `scripts/pages/prepare_fpe_pages.py`
+rejects unknown FPE statuses. Introducing one changes the artifact/consumer
+contract; the author explicitly requests a separate, consistent lifecycle
+change rather than inventing a Gemma-only status.
+
+A maintainer must settle that disputed contract (including treatment of the
+other retired-version rows), or supply a complete same-source FPE campaign
+and an agreed retirement representation. The FPE guard must then land with
+the regenerated or explicitly non-current rows. Adding it against these
+unchanged artifacts would fail; an allowlist or skipped assertion would hide
+the remaining requirement. The Cross-Layer Contract finding stays open.
+
 ### Guard
 
 Three checks keep the classification and the rejection from regressing.
@@ -303,8 +429,10 @@ Three checks keep the classification and the rejection from regressing.
    Each test prints a visible `SKIP` and returns when the SDK is not
    importable, and hard-fails instead when `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1`
    is set, so a bare `cargo test` cannot read as coverage. The
-   `rust-feature-modes` job sets that variable in its embedded test step, so an
-   SDK import failure there fails CI rather than skipping. A local enforced run
+   `rust-feature-modes` job is configured to set that variable in its embedded
+   test step, so an SDK import failure would fail that step when the job is
+   admitted and executed. This is a workflow contract, not hosted test evidence.
+   A local enforced run
    needs the maturin-built extension, the SDK sources on `PYTHONPATH`, and
    `PYO3_PYTHON` pointing at the same interpreter the extension was built for;
    the module header records the exact command.
@@ -326,7 +454,7 @@ Three checks keep the classification and the rejection from regressing.
   candidate counts for a real cluster.
 - Recommendation scores come from constant offline metrics. This document makes
   no accuracy claim, and it does not compare against a GPU serving run.
-- Local measurements used a release native extension built with
-  `cargo build -p aisim-core --release --features extension-module`; the CI wheel
-  uses the standard `maturin` build with `jemalloc`. Neither the allocator nor
-  the build path affects classification or shape enumeration.
+- Historical local measurements used a release native extension built with
+  `cargo build -p aisim-core --release --features extension-module`. The
+  2026-11-18 verification uses the CI release wheel configuration, including
+  `jemalloc`; it does not measure serving performance.
