@@ -6,7 +6,7 @@
  "backend": "vllm",
  "version": "test-fpm-version",
  "table_sha256": "2071e17995569f17500acdec83fc28a0d92cd2a5a82ce2e6385f0f6fe3816849",
- "native_extension_sha256": "66ebc2a4ae3baa47ca172492f6f41b656c9e2c430f3e08af12a9e082fa4ee473",
+ "native_extension_sha256": "6bbb685aef20572f412b5fb87435b8f081418cba613a4ab9d3c2d09a0d806b32",
  "dispatch_ms": 22.400000000000002,
  "cases": {
   "cached": {

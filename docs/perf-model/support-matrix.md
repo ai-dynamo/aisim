@@ -90,10 +90,16 @@ which counts the restored recurrent state. A legacy operation, one with no
 recorded state dtype, still looks up the cold row. In `SILICON` or `HYBRID`
 mode, a successful lookup labels its result `silicon`. A `HYBRID` lookup that
 misses the model geometry gives `sol`, and `SOL` mode reads no row.
-Packed `ForwardPassMetrics` carry only prefill totals, so they cannot say which
-request is cold. If a packed step has any cached prefill token, every qualified
-prefill scan in it uses the SOL estimate. For a step that mixes cold and
-cached requests, this choice of source is therefore approximate.
+The native Mamba2 pricing of a packed step reads only the prefill totals of its
+`ForwardPassMetrics`, so it cannot say which request is cold. This is a limit of
+the pricing path. The optional `extend_lengths` and `past_kv_lengths` fields can
+identify the cold request, but this path does not read them. If a packed step
+has any cached prefill token, every qualified prefill scan in it uses the SOL
+estimate. For a step that mixes cold and
+cached requests, this choice of source is therefore approximate. Each prefill
+request must compute at least one new token. With a qualified Mamba2
+operation, a packed step with fewer new prefill tokens than prefill requests
+fails, with or without decode work.
 
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different

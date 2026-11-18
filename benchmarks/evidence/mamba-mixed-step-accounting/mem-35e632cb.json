@@ -1,4 +1,8 @@
 {
+ "build": {
+  "base_backend_sha256": "98452e0003777a0263f6c1d2e0b55ca8e5e8609c4c1c1384364b0d9e2b4813b6",
+  "native_extension_sha256": "fdaea0e29e759116dd012592ab5a859d9aead5d8a5537da00d387e95759c5780"
+ },
  "prefix=3000,ctx_tokens=2048": {
   "total": 62.542492,
   "weights": 58.816727,

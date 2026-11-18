@@ -24,6 +24,9 @@ Baseline, take the Main versions of the two accounting files and add back the
 
 ```bash
 git fetch https://github.com/milesial/aisimulate-public.git 686275e7350e4b4a39e88dec55c135312b671038
+git fetch https://github.com/ai-dynamo/aisim.git bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c
+git cat-file -e 686275e7350e4b4a39e88dec55c135312b671038^{commit}  # stop if either is missing
+git cat-file -e bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c^{commit}
 git checkout 686275e7350e4b4a39e88dec55c135312b671038
 git checkout bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c -- \
   crates/core/src/perfmodel/session.rs crates/core/src/perfmodel/engine/runtime.rs
@@ -497,11 +500,48 @@ records a Mamba2 op's draft query width, which compiles the op inside a
 instead of reusing the plain graph's engine. A qualified prefill query with
 no new token now fails instead of pricing state traffic.
 
+Commits `71fcef7b` and `bf03c37d` add three more fixes:
+
+- **Equal-length extends.** In the mixed step, a partial extend as long as
+  one request's new tokens now joins the batch of complete requests. Two
+  1096-token requests price as one `(2, 1096)` query, as packed telemetry
+  prices them, not as two `(1, 1096)` queries. A shorter extend keeps its own
+  query. SOL rows scale with the batch, so only measured rows change. In
+  `agg_caller.py`, the split budget `(16, 4096, 1024, 8128)` holds two
+  3072-token requests. Its measured TensorRT-LLM context convolution falls
+  from 1.338048 to 1.169136 ms, and its TTFT from 100.765 to 100.376 ms. Its
+  TPOT falls from 9.984 to 9.968 ms. No other case changes. The output is
+  [`caller-71fcef7b.json`](mamba-mixed-step-accounting/caller-71fcef7b.json).
+- **XPU FPM chunks.** With one vLLM XPU request, a whole-model FPM step
+  smaller than the request prices the mean of its chunks. The TTFT hook now
+  multiplies that mean by the chunk count, `ceil(new tokens / budget)`. For
+  isl 4096, prefix 1096 and a 2048 budget, the step averages a 2048- and a
+  952-token chunk. Commit `108835ac` scaled it by `3000 / 2048`. The
+  regression `test_compute_ttft_single_request_counts_a_short_final_fpm_chunk`
+  fails on `108835ac` with 61.59 ms instead of 83.0 ms.
+- **Zero-work prefills.** With a qualified Mamba2 operation, a packed step
+  with fewer new prefill tokens than prefill requests now fails in the mixed
+  path too, as it already did in the pure-prefill path.
+
+At `71fcef7b`, `mem.py`, `fpm_caller.py` and `telem.py` reproduce their
+earlier values. At `bf03c37d`, `agg_caller.py` and `telem.py` give the same
+output as at `71fcef7b`. These suites passed at both commits:
+
+- Python suites: 955 tests.
+- Engine-step parity: 305 tests. Golden set: 121 tests.
+- Rust Mamba tests: 31. Public API: 28. Embedded Replay tests: 9.
+
 [`mem.py`](mamba-mixed-step-accounting/mem.py) ran from the `35e632cb` and
 `1ea0211c` builds. It prices one vLLM `0.24.0` Nano request with isl 4096
-and osl 64. The raw outputs are
+and osl 64. The script imports the SDK of the active environment, not of the
+checkout. Run it with the interpreter of each build's own environment, for
+example `BUILD_VENV/bin/python mem.py > mem-COMMIT.json`. Its `build` entry
+records the SHA-256 of the imported `base_backend.py`, which holds the
+activation estimate, and of the compiled `aisim._runtime` extension. The raw outputs are
 [`mem-35e632cb.json`](mamba-mixed-step-accounting/mem-35e632cb.json) and
 [`mem-1ea0211c.json`](mamba-mixed-step-accounting/mem-1ea0211c.json).
+They come from the build-stamped script, rerun on each build. The values
+match the first runs exactly, and the two `base_backend.py` hashes differ.
 Values are in GiB:
 
 | Prefix and budget | Activations before | After | Total before | After |
@@ -537,9 +577,11 @@ For one vLLM request, the queuing factor is 1 and the dispatch overhead is
 `28 layers * 0.8 = 22.4` ms, so TTFT is the step plus 22.4 ms. The script
 also prices both inputs directly in each build and gets the same anchors.
 The values are synthetic. They show that the estimator receives one request
-instead of two, not a latency on real hardware. The script now also records
-the SHA-256 of the native extension that priced the run, because the
-estimator comes from the active environment, not from `REPO_ROOT`. At
+instead of two, not a latency on real hardware. The estimator comes from
+the active environment, not from `REPO_ROOT`. So the script now also records
+the SHA-256 of the compiled `aisim._runtime` extension that priced the run.
+An earlier version hashed the `aisim_core._native` module instead, which is
+a Python shim with the same bytes in every build. At
 `108835ac` it reproduces the `1ea0211c` values,
 [`fpm-108835ac.json`](mamba-mixed-step-accounting/fpm-108835ac.json). The deprecated hybrid FPM
 path with draft ops takes the same input, and its draft ops use the same
@@ -579,7 +621,9 @@ python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
 | `1ea0211c` | `7cbe9c48`, `14ffdb4c` | 305 passed | 121 passed |
 | `59c4575a` | None | 305 passed | 121 passed |
 | `1db9b803` | None | 305 passed | 121 passed |
-| `108835ac` | None | 305 passed | 121 passed |
+| `108835ac` | `5edfa0d9`, `d69b2bc7`, `7b93131d` | 305 passed | 121 passed |
+| `71fcef7b` | None | 305 passed | 121 passed |
+| `bf03c37d` | None | 305 passed | 121 passed |
 
 Each result applies to the code revision in the first column. The later
 heads add only tests, documentation or evidence, but the parity suites were
@@ -683,8 +727,16 @@ values, so the check still detects a mode or policy change.
 
 The gate's own `worker.py` ran each build on the 13 SILICON cases of
 Qwen3-32B and Nemotron-3-Super-120B FP8. The builds ran in turn, in five
-rounds, with 10 warm-up and 100 timed queries per case. Warm medians over
-the rounds, in microseconds, with the range of the round medians:
+rounds, with 10 warm-up and 100 timed queries per case. This local
+comparison is separate from the 89-case CI gate. The driver is
+[`host_perf.py`](mamba-mixed-step-accounting/host_perf.py). Put each build's
+checkout in `ROOT/BUILD/src` and its environment in `ROOT/BUILD/venv`, then
+run `python host_perf.py ROOT 5 OUT.json rbf1b539f r59c4575a r1db9b803`. The
+case list comes from the gate's `expand_cases`. The raw per-round cold and
+warm medians of every case are in
+[`host-perf-1db9b803.json`](mamba-mixed-step-accounting/host-perf-1db9b803.json).
+Warm medians over the rounds, in microseconds, with the range of the round
+medians:
 
 | Case | `bf1b539f` | `1db9b803` | Change |
 | --- | --- | --- | --- |
@@ -697,7 +749,9 @@ the rounds, in microseconds, with the range of the round medians:
 
 Across the 13 cases, the change runs from -7.4% to +2.3%, and the ranges
 overlap. An earlier three-round run measured `1ea0211c`, the code of
-`14ffdb4c`, at 17.08 us for the first case against 14.08 us for main. These
+`14ffdb4c`, at 17.08 us for the first case against 14.08 us for main. Its
+raw rounds are in
+[`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json). These
 are simulator host timings, not predicted serving latency. The paired CI
 gate on the published head remains the exact-head result.
 
