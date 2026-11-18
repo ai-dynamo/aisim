@@ -90,14 +90,11 @@ class ModelConfig:
     _fmha_quant_mode_from_data: bool | None = field(default=None, repr=False, compare=False, kw_only=True)
     moe_quant_mode: common.MoEQuantMode | None = None
     _moe_quant_mode_is_explicit: bool | None = field(default=None, repr=False, compare=False, kw_only=True)
-    # Inferred-mode provenance. ``_inferred``: the mode a resolver (get_model, Task, legacy) filled,
-    # carried through dataclasses.replace so topology-only replacements stay inferred; a different
-    # value is an override. ``_assigned``: set by any later assignment of the mode; default_factory
-    # makes __init__ reset it after the modes.
+    # Inferred-mode provenance, carried through dataclasses.replace so topology-only replacements
+    # keep it: the mode a resolver (get_model, Task, legacy) filled. A different value is an override.
+    # Assigning a mode records it as explicit (see __setattr__).
     _gemm_quant_mode_inferred: object = field(default=None, repr=False, compare=False, kw_only=True)
     _moe_quant_mode_inferred: object = field(default=None, repr=False, compare=False, kw_only=True)
-    _gemm_quant_mode_assigned: bool = field(default_factory=bool, init=False, repr=False, compare=False)
-    _moe_quant_mode_assigned: bool = field(default_factory=bool, init=False, repr=False, compare=False)
     kvcache_quant_mode: common.KVCacheQuantMode | None = None
     fmha_quant_mode: common.FMHAQuantMode | None = None
     comm_quant_mode: common.CommQuantMode | None = common.CommQuantMode.half
@@ -195,30 +192,30 @@ class ModelConfig:
     fpm_fmha_quant_mode: common.FMHAQuantMode | None = field(default=None, kw_only=True)
 
     def __setattr__(self, name: str, value) -> None:
-        if name in ("gemm_quant_mode", "moe_quant_mode"):
-            # An assignment states intent, even of the value a resolver filled.
-            object.__setattr__(self, f"_{name}_assigned", True)
         object.__setattr__(self, name, value)
+        if name in ("gemm_quant_mode", "moe_quant_mode"):
+            # An assignment states intent, even of the value a resolver filled. __init__ assigns the
+            # provenance fields after the modes, so construction and replace() keep their own.
+            object.__setattr__(self, f"_{name}_is_explicit", True)
+            object.__setattr__(self, f"_{name}_inferred", None)
 
     def _mark_quant_mode_inferred(self, kind: str) -> None:
         """Record the current ``{kind}_quant_mode`` as resolver-filled (inferred), not caller-chosen."""
         object.__setattr__(self, f"_{kind}_quant_mode_inferred", getattr(self, f"{kind}_quant_mode"))
         object.__setattr__(self, f"_{kind}_quant_mode_is_explicit", False)
-        object.__setattr__(self, f"_{kind}_quant_mode_assigned", False)
 
     def _quant_mode_is_explicit(self, kind: str) -> bool:
         """Whether the caller chose ``{kind}_quant_mode`` rather than a resolver filling it."""
         mode = getattr(self, f"{kind}_quant_mode")
-        if mode is None:
-            return False
-        if getattr(self, f"_{kind}_quant_mode_assigned") or getattr(self, f"_{kind}_quant_mode_is_explicit"):
-            return True
+        flag = getattr(self, f"_{kind}_quant_mode_is_explicit")
+        if mode is None or flag is True:
+            return mode is not None
         inferred = getattr(self, f"_{kind}_quant_mode_inferred")
         if inferred is not None:
             # shortcut: a replace() setting the value already inferred reads as inferred; assign it instead.
             return mode != inferred
         # Legacy rule: without provenance a set mode is explicit, unless a resolver flagged it inferred.
-        return getattr(self, f"_{kind}_quant_mode_is_explicit") is not False
+        return flag is not False
 
     def __post_init__(self) -> None:
         validate_parallel_size("cp_size", self.cp_size)

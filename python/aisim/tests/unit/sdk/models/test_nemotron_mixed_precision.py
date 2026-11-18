@@ -607,11 +607,19 @@ def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
         # Clearing the overrides restores inference.
         config.gemm_quant_mode = config.moe_quant_mode = None
         assert build(config) == build(config) == inferred
-    # An explicit mode equal to the one the checkpoint fills is still explicit when assigned.
+    # An explicit mode equal to the one the checkpoint fills is still explicit when assigned, also
+    # through a later topology-only replace (as sweeps do).
     for config in (direct, task):
         config.gemm_quant_mode, config.moe_quant_mode = FP8, MOE.nvfp4
         for _ in range(2):
             assert_uniform(build(config), FP8, MOE.nvfp4)
+        assert_uniform(build(dataclasses.replace(config, tp_size=1)), FP8, MOE.nvfp4)
+    # Also when assigned before the first build of a Task-built config.
+    fresh = _task(SUPER).build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
+    fresh.gemm_quant_mode = fresh.gemm_quant_mode
+    assert set(
+        _buckets(get_model(SUPER, dataclasses.replace(fresh, tp_size=1), "vllm").context_ops)["mamba_in_proj_gemm"]
+    ) == {FP8}
 
 
 def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypatch):

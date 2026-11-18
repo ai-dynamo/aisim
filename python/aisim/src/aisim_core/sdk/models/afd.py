@@ -41,6 +41,7 @@ def _resolve_afd_execution_quantization(model_config, model_path, system_spec, *
         marker = f"_{field}_quant_mode_is_explicit"
         if getattr(model_config, marker, None) is None:
             setattr(model_config, marker, getattr(model_config, f"{field}_quant_mode") is not None)
+    inferred_kinds = [k for k in ("gemm", "moe") if getattr(model_config, f"_{k}_quant_mode_is_explicit") is False]
 
     gemm_q = model_config.gemm_quant_mode
     moe_q = model_config.moe_quant_mode
@@ -63,7 +64,7 @@ def _resolve_afd_execution_quantization(model_config, model_path, system_spec, *
         model_config.gemm_quant_mode = common.GEMMQuantMode[resolved_gemm]
     if resolved_moe is not None:
         model_config.moe_quant_mode = common.MoEQuantMode[resolved_moe]
-    record_inferred_quant_modes(model_config)
+    record_inferred_quant_modes(model_config, inferred_kinds)
 
 
 class _OpKind(Enum):

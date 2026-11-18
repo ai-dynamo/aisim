@@ -1205,11 +1205,18 @@ def resolve_dsv4_moe_arch(
         model_config.moe_quant_mode = mode
 
 
-def record_inferred_quant_modes(model_config: config.ModelConfig) -> None:
-    """Remember the GEMM/MoE modes a resolver filled for inferred fields, so get_model can tell a later override."""
-    for kind in ("gemm", "moe"):
-        if getattr(model_config, f"_{kind}_quant_mode_is_explicit", None) is False:
-            model_config._mark_quant_mode_inferred(kind)
+def _inferred_quant_kinds(model_config: config.ModelConfig) -> list[str]:
+    return [k for k in ("gemm", "moe") if getattr(model_config, f"_{k}_quant_mode_is_explicit", None) is False]
+
+
+def record_inferred_quant_modes(model_config: config.ModelConfig, kinds: list[str] | None = None) -> None:
+    """Remember the GEMM/MoE modes a resolver filled for inferred fields, so get_model can tell a later override.
+
+    ``kinds``: the inferred kinds captured before the resolver assigned them (an assignment marks a
+    mode explicit); by default the kinds currently flagged inferred.
+    """
+    for kind in _inferred_quant_kinds(model_config) if kinds is None else kinds:
+        model_config._mark_quant_mode_inferred(kind)
 
 
 def resolve_nvfp4_for_system(
@@ -1245,6 +1252,7 @@ def resolve_nvfp4_for_system(
         model_config._gemm_quant_mode_is_explicit = model_config.gemm_quant_mode is not None
     if getattr(model_config, "_moe_quant_mode_is_explicit", None) is None:
         model_config._moe_quant_mode_is_explicit = model_config.moe_quant_mode is not None
+    inferred_kinds = _inferred_quant_kinds(model_config)
 
     gemm_q = model_config.gemm_quant_mode
     moe_q = model_config.moe_quant_mode
@@ -1264,7 +1272,7 @@ def resolve_nvfp4_for_system(
         model_config.gemm_quant_mode = common.GEMMQuantMode.nvfp4_wo
     if moe_q == common.MoEQuantMode.nvfp4:
         model_config.moe_quant_mode = common.MoEQuantMode.nvfp4_wo
-    record_inferred_quant_modes(model_config)
+    record_inferred_quant_modes(model_config, inferred_kinds)
 
 
 def resolve_sglang_mla_compute(
