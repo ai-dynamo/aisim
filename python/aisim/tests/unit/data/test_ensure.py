@@ -52,6 +52,7 @@ def files(tmp_path):
 
 
 def pin(tmp_path, **kw):
+    kw.setdefault("categories", ("fpm",))
     return DataPin(repo=REPO, revision=SHA, cache_dir=tmp_path / "cache", **kw)
 
 
@@ -111,7 +112,7 @@ def test_local_override_needs_no_network_or_cache(tmp_path, files):
     for path, data in files.items():
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
-    out = ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+    out = ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
     assert out.datasets["fpm"]["source"] == "local" and out.revisions["fpm"] == f"local:{root}"
     with pytest.raises(MissingDataError, match="no fpm data"):
         ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
@@ -123,7 +124,7 @@ def test_corrupt_local_file_is_an_error(tmp_path, files):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data if "m1/data" not in path else b"corrupt")
     with pytest.raises(MissingDataError, match="failed verification|unusable"):
-        ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
 def test_user_pinned_profile_conflict(tmp_path, files):
