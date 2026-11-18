@@ -617,7 +617,8 @@ def complete_fpm_profile(
     applies to the deployment its ``configuration_selector`` names (every incomplete deployment when the sidecar
     has no selector) and only to deployments of the library's own ``identity`` (system, backend, backend_version);
     a deployment that names another hardware, version or role is left to its own resources.
-    Returns the completed dictionary and the source of each deployment's resources. A deployment with neither raises :class:`FpmResourcesPendingError`.
+    Returns the completed dictionary and the source of each deployment's resources.
+    A deployment with neither raises :class:`FpmResourcesPendingError`.
     """
     selector = (metadata or {}).get("configuration_selector") or {}
     out = json.loads(json.dumps(profile, allow_nan=False))
