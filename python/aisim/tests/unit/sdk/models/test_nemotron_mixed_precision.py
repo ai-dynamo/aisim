@@ -323,6 +323,19 @@ def test_rejects_inconsistent_metadata(raw, pattern, match):
             "gb200",
             {MOE.fp8: 3, MOE.bfloat16: 1},
         ),
+        # Unlisted expert 0 reads the expert block, as vLLM does: a block listing or another expert.
+        (
+            _listing(
+                {
+                    "backbone.layers.1.mixer.experts": {"quant_algo": "FP8"},
+                    "backbone.layers.3.mixer.experts.1.up_proj": {"quant_algo": "FP8"},
+                    **_expert_listing({5: "NVFP4", 7: "NVFP4"})["quantization_config"]["quantized_layers"],
+                }
+            ),
+            MOE.nvfp4,
+            "gb200",
+            {MOE.fp8: 2, MOE.nvfp4: 2},
+        ),
     ],
 )
 def test_moe_modes(raw, default, system, expected):
