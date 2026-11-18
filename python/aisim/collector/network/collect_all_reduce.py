@@ -59,15 +59,19 @@ from helper import (
     xpu_graph_measure_enabled,
 )
 
-# vLLM's serving environment where the NVLink domain spans nodes (GB200 and GB300 NVL72), as
-# glm53flash_attention_launch exports it (VLLM_ENV and VLLM_NVL72_ENV): NVLink SHARP and
-# vLLM's NCCL symmetric memory. With VLLM_USE_NCCL_SYMM_MEM the communicator answers an
-# all-reduce from NCCL symmetric memory where it applies (vllm v0.32.0
+# vLLM's serving environment where the NVLink domain spans nodes (GB200 and GB300 NVL72):
+# NVLink SHARP, multi-node NVLink and vLLM's NCCL symmetric memory. With
+# VLLM_USE_NCCL_SYMM_MEM the communicator answers an all-reduce from NCCL symmetric memory
+# where it applies (vllm v0.32.0
 # cuda_communicator.py:428, symm_mem.py should_use_symm_mem) and bounds the custom
 # all-reduce by it (custom_all_reduce.py:243). On these systems the rows are about half the
 # default environment's (GB200, two GPUs: 3.8 vs 7.0 us at 128 bytes, 8.2 vs 24.5 us at
 # 1 MiB); on HGX systems the two environments measure the same. The benchmark exports it
 # itself, so the rows do not depend on the environment of the job that runs it.
+# glm53flash_attention_launch exports the same variables except NCCL_MNNVL_ENABLE, which it
+# turns off. Here it stays on: in a container with no IMEX channel on an NVL72 node the
+# benchmark then fails at communicator init, where with it off it ran but measured about
+# twice the serving latency (GB300, graph mode, 7.2 vs 3.7 us at 128 bytes on two GPUs).
 VLLM_NVL72_SERVING_ENV = {
     "NCCL_CUMEM_ENABLE": "1",
     "NCCL_NVLS_ENABLE": "1",

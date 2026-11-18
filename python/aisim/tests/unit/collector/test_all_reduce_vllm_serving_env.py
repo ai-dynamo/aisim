@@ -41,8 +41,9 @@ def _torch(device_name: str | None):
 
 
 @pytest.mark.parametrize("device", ["NVIDIA GB200", "NVIDIA GB300"])
-def test_nvl72_systems_get_the_environment_the_attention_launcher_exports(device):
-    assert _load(_torch(device))["vllm_serving_env"](device) == {**VLLM_ENV, **VLLM_NVL72_ENV}
+def test_nvl72_systems_get_the_attention_launcher_environment_with_multi_node_nvlink_on(device):
+    assert VLLM_NVL72_ENV == {"NCCL_MNNVL_ENABLE": "0"}
+    assert _load(_torch(device))["vllm_serving_env"](device) == {**VLLM_ENV, "NCCL_MNNVL_ENABLE": "1"}
 
 
 @pytest.mark.parametrize("device", ["NVIDIA B300 SXM6 AC", "NVIDIA H200", "NVIDIA L40S", "NVIDIA B200"])
