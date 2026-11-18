@@ -233,7 +233,8 @@ def test_public_pd_state_cache_requires_both_roles(role):
 
 def test_native_pd_state_cache_requires_both_roles():
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_public_pd()))
-    decode = {key: value for key, value in spec.backend_deployment.decode_engine_args.items() if key != "state_cache"}
+    decode = dict(spec.backend_deployment.decode_engine_args)
+    del decode["state_cache"], decode["prefix_match_unit"]
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, decode_engine_args=decode))
     with pytest.raises(RuntimeError, match="both prefill and decode"):
         EngineReplayRunnerFactory().create(0).run(spec)
@@ -273,7 +274,8 @@ def test_manual_pd_state_transfer_adds_one_state_to_ttft():
         return metrics["mean_ttft_ms"]
 
     # The 1500-byte state crosses a 1000 B/s link once, on top of the prompt KV.
-    assert ttft(True) - ttft(False) == pytest.approx(1500.0)
+    # The aligned prefill also stops at the last full block, which adds one 1 ms pass.
+    assert ttft(True) - ttft(False) == pytest.approx(1501.0)
 
 
 def test_recommendation_rejects_manual_cache_instead_of_dropping_it():
@@ -413,6 +415,14 @@ def test_aligned_state_config_survives_public_export_and_engine_handoff(forbid_e
     EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
     assert runtime.execution_spec["spec"]["engine"]["rank"]["state_cache"] == state
     assert runtime.execution_spec["spec"]["engine"]["rank"]["prefix_match_unit"] == 16
+
+
+@pytest.mark.parametrize(
+    "overrides,unit", [({}, KV["block_size"]), ({"state_cache": WINDOW}, None), ({"prefix_caching": False}, None)]
+)
+def test_unset_prefix_match_unit_aligns_only_a_cached_recurrent_state(forbid_estimators, overrides, unit):
+    config = CorePredictionConfig.model_validate(_public(**overrides))
+    assert prediction_to_replay_spec(config).backend_deployment.agg_engine_args.get("prefix_match_unit") == unit
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "1536", 1 << 64, 63, 65])
@@ -614,6 +624,7 @@ def test_auto_state_geometry_reaches_native_wire_and_fixed_budget(auto_k3_payloa
     spec = prediction_to_replay_spec(config)
     args = spec.backend_deployment.agg_engine_args
     assert args["block_size"] == 768
+    assert args["prefix_match_unit"] == 768
     assert args["kv_cache_bytes_per_token"] == 27648
     assert args["num_gpu_blocks"] == 8
     assert args["state_cache"] == {"bytes_per_request": 61046784}

@@ -57,7 +57,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `g3_offload` | Unset (off) | Rejected | G3 block; see [G3 offload](#g3-offload). |
 | `kvcr` | Unset (off) | Rejected | KVCR block; see [KVCR peer fetch](#kvcr-peer-fetch). |
 | `state_cache` | Unset (off) | Rejected | Recurrent-state block; see [state cache](#state-cache). |
-| `prefix_match_unit` | Unset | Rejected | Prefix-matching granularity with `state_cache`. |
+| `prefix_match_unit` | Unset; `block_size` with a recurrent `state_cache` | Rejected | Prefix-matching granularity with `state_cache`. |
 
 The block-size defaults above are simulation defaults. When a Sweeper candidate's
 role block size is absent or `null`, the deployment generator omits `--block-size`
@@ -396,7 +396,7 @@ also differs from vLLM v0.32.0 here:
 
 With [`state_cache`](#state-cache), the two v0.32.0 profiles also keep recurrent
 states, so a follow-up whose state left G1 can resume from host memory. This
-needs `prefix_match_unit` equal to `block_size`.
+needs an explicit `prefix_match_unit` equal to `block_size`.
 
 - A state goes to G2 when G1 publishes it, before the pass's blocks, as one key
   per state block, for example one per Mamba group. `offloading_v0_32` stores
@@ -682,13 +682,13 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 |---|---|---|
 | `state_cache.bytes_per_request` | Inferred | State bytes per request per rank. When set, `block_size` and numeric `bytes_per_token` must also be set. |
 | `state_cache.num_speculative_states` | Unset | Explicit full-state scratch copies per request. Must match the draft depth, from positive `nextn` or `engine.speculation`. Requires numeric state bytes and token geometry. Under MTP it also applies vLLM's [EAGLE block drop](speculation.md#prefix-caching) to state lookups. |
-| `state_cache.prefill_checkpoint` | `false` | vLLM's internal prefill checkpoint; see [below](#opt-in-align-rules). Needs `prefix_match_unit` equal to `block_size`. |
+| `state_cache.prefill_checkpoint` | `false` | vLLM's internal prefill checkpoint; see [below](#opt-in-align-rules). Needs an explicit `prefix_match_unit` equal to `block_size`. |
 | `state_cache.junction_checkpoints` | `false` | vLLM v0.29.0's shared-prefix junction states; see [below](#opt-in-align-rules). Needs an explicit `prefix_match_unit`. |
 | `state_cache.mamba_cache_dtype` | `auto` | Kimi K3 only. `auto` (model dtype), `float16` or `float32`. Used when bytes are inferred. |
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `state_cache.retention_interval` | Unset (every block boundary) | DeepSeek V4 with inferred bytes only. vLLM's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: `0` or a multiple of the resolved `block_size`. DeepSeek V4 rejects `prefix_match_unit`. |
 | `state_cache.sliding_window_lookahead_tokens` | Inferred (DeepSeek V4: 64) | Tokens past the full-attention hit that the MTP layer's sliding-window group reads; sizing fills it. Set it only with explicit `bytes_per_request`, to replay a state resolved earlier. |
-| `prefix_match_unit` | Unset (`block_size`) | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. |
+| `prefix_match_unit` | `block_size` for a recurrent state, unset for a sliding window | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. |
 
 `state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
 a requested page size (default 64) that is enlarged to fit one state per layer.
@@ -743,6 +743,10 @@ with one difference: when a prompt ends on a block boundary, replay also keeps
 the state one block earlier (two under the EAGLE block drop), so an identical
 resend resumes there. vLLM keeps a state there only if a prefill chunk ended
 there.
+
+vLLM uses align mode for a recurrent state whenever prefix caching is on, so an
+unset `prefix_match_unit` resolves to `block_size`: prefill chunks stop at the
+block boundaries where the state is kept.
 
 ### State pool from recorded runtime memory
 
