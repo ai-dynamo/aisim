@@ -1263,6 +1263,13 @@ impl Engine {
                             ),
                         );
                     }
+                    // Only generation lists carry a decode width.
+                    if qualified && (m.phase == "generation") != decode_width.is_some() {
+                        return invalid(
+                            &m.name,
+                            format!("qualified {} op in the wrong phase list", m.phase),
+                        );
+                    }
                     if qualified && !top_level {
                         return invalid(
                             &m.name,
@@ -4724,6 +4731,18 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains(message), "{err}");
         }
+        // A qualified generation op is not a context op.
+        let ops = with("float16", 1);
+        for err in [
+            engine
+                .evaluate_ops_json(&ops, true, 2, 16, 0, 1.0, None)
+                .unwrap_err(),
+            engine
+                .evaluate_ops_sol_json(&ops, true, 2, 16, 0, 1.0, None)
+                .unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("wrong phase list"), "{err}");
+        }
     }
 
     #[test]
@@ -4867,6 +4886,7 @@ pub(crate) mod tests {
             (None, with("float16", 0), "must be positive"),
             (None, with("unrecorded", 4), "unrecorded"),
             (None, nested, "nested"),
+            (None, qualified_mamba(true, 1), "wrong phase list"),
         ] {
             let err = build(nextn, op).unwrap_err().to_string();
             assert!(err.contains(message), "{err}");
@@ -4891,6 +4911,17 @@ pub(crate) mod tests {
         };
         phases("float16", "float16").unwrap();
         phases("unrecorded", "unrecorded").unwrap();
+        let err = Engine::build(
+            EngineSpec::new(
+                fixture_engine_config(None),
+                vec![qualified_mamba(false, 1)],
+                vec![],
+            ),
+            db.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("wrong phase list"), "{err}");
         // A qualified pair beside DSv4.1 stages would take the staged mixed
         // step, which has no per-phase Mamba pricing.
         let stage = |is_context| {
