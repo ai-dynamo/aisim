@@ -430,3 +430,33 @@ def test_run_agg_reuse_keeps_a_nested_mamba_op_distinct():
     for warm in (backend, get_backend("trtllm", "b200_sxm")):
         with pytest.raises(Exception, match="nested"):
             _agg_ttft(warm, qualified, database)
+
+
+def test_mixed_power_coverage_counts_each_mamba_query():
+    # The qualified convolution prices a powered measured row and the scan
+    # prices unpowered SOL. Under one name their rows fold, so coverage must
+    # come from each query, not from the folded row's energy.
+    import json
+
+    import aisim_core
+    from aisim_core.sdk import rust_engine_step
+
+    database = _hybrid_trtllm_database()
+
+    def step(model):
+        return rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+            model, database, ctx_tokens=2048, gen_tokens=0, isl=2048, osl=64, prefix=0
+        )
+
+    apart = _nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16")
+    shared = _nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16")
+    index = next(i for i, op in enumerate(shared.context_ops) if op._name == "context_mamba_ssm")
+    scan = json.loads(shared.context_ops[index]._spec_json())
+    scan["Mamba2"]["name"] = "context_mamba_conv1d"
+    shared.context_ops[index] = aisim_core.op_from_spec_json(json.dumps(scan))
+    one, two = step(apart), step(shared)
+    latency, energy = one["per_op_latency_ms"], one["per_op_energy_wms"]
+    assert energy["context_mamba_conv1d"] > 0 and energy["context_mamba_ssm"] == 0
+    folded = two["per_op_latency_ms"]["context_mamba_conv1d"]
+    assert folded == pytest.approx(latency["context_mamba_conv1d"] + latency["context_mamba_ssm"], rel=1e-12)
+    assert two["covered_latency_ms"] == pytest.approx(one["covered_latency_ms"], rel=1e-12)

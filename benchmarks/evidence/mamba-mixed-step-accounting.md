@@ -795,6 +795,16 @@ exact-head result.
   `predict_prefill_latency_total` does the same for a graph without a
   whole-model FPM. For example, 2 requests and 17 new tokens price 16 tokens.
   The mixed packed step keeps the remainder for qualified Mamba operations.
+- Replay prices a rank through `ForwardPassMetrics`, which carries prefill
+  totals and request counts, not each chunk's length. A qualified Mamba scan
+  therefore spreads the total evenly over the requests: chunks of 1000 and
+  500 tokens price as two chunks of 750. Other operations also see only the
+  totals. Per-chunk lengths would need a change to the shared telemetry
+  contract.
+- The compiled-engine identity is computed once per model object, database
+  object, query mode and transfer policy, as main computes it per model and
+  database object. Changing a model's operation lists after its first
+  estimate is not detected. Build a new model object instead.
 - In the mixed step, shared token-major operations take
   `ctx_tokens - prefix * floor(ctx_tokens / isl)` prefill tokens for every
   graph, as main does. A remainder longer than `isl - prefix` therefore

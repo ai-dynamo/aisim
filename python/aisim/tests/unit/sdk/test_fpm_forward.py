@@ -990,7 +990,7 @@ class TestFPMStaticAndMixed:
         _fold_width(generation, 1, 4)
         model.generation_ops.append(generation)
         handle = _cached_engine_handle(model, database)
-        native = handle._mixed_step_breakdown_per_op_with_metadata(ctx_tokens, gen_requests, isl, osl, 0)
+        native = handle._mixed_step_breakdown_per_op_with_metadata(ctx_tokens, gen_requests, isl, osl, 0)[:3]
         estimate = InferenceSession(model, database, backend).run_mixed(
             RuntimeConfig(isl=isl, osl=osl), MixedStepInput(ctx_tokens, gen_requests)
         )

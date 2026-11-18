@@ -1503,8 +1503,10 @@ class EngineHandle:
         list[_PerOpValueWithMetadata],
         list[_PerOpValueWithMetadata],
         list[_PerOpValueWithMetadata],
+        float,
     ]:
-        """Internal mixed-step per-op stream with inline-first fallback metadata."""
+        """Internal mixed-step per-op stream with inline-first fallback metadata,
+        plus the step's power-covered latency, decided per query before name folding."""
         return self._engine._mixed_step_breakdown_per_op_with_metadata(
             int(ctx_tokens),
             int(gen_tokens),

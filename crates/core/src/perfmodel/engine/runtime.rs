@@ -168,11 +168,16 @@ pub(crate) type StaticPerOpValuesWithCoverage = (
 );
 
 /// Per-op values for the shared, context-attention, and decode-attention
-/// buckets returned by the metadata-bearing mixed-step evaluation.
+/// buckets returned by the metadata-bearing mixed-step evaluation, plus the
+/// step's power-covered latency. Coverage follows
+/// [`StaticPerOpValuesWithCoverage`]: each query result counts when its own
+/// energy is positive, before the name fold, because a qualified Mamba op
+/// folds several prefill queries into one row.
 pub(crate) type MixedStepPerOpValuesWithMetadata = (
     Vec<PerOpValueWithMetadata>,
     Vec<PerOpValueWithMetadata>,
     Vec<PerOpValueWithMetadata>,
+    f64,
 );
 
 /// One SOL-decomposed per-op value: `(name, sol_time_ms, sol_math_ms,
@@ -194,6 +199,16 @@ struct PerOpFold {
     entries: Vec<PerOpValueWithMetadata>,
     /// Entry index per name slot, for [`Self::add_slot`].
     slots: Vec<Option<usize>>,
+}
+
+/// A query result's power-covered latency: all of it when its own energy is
+/// positive, else none. Callers sum it before name folding.
+fn covered_latency(r: &PerformanceResult) -> f64 {
+    if r.energy_wms > 0.0 {
+        r.latency_ms
+    } else {
+        0.0
+    }
 }
 
 fn insert_per_op_fallback(
@@ -1139,6 +1154,13 @@ impl Engine {
                 "Mamba ops must all record a state_dtype or all leave it unrecorded: mixed \
                  steps would charge decode Mamba work twice or not at all"
                     .into(),
+            ));
+        }
+        // A saturated `nextn + 1` would match a `u32::MAX` token width that no
+        // configured verify width can equal.
+        if seen[0] && nextn.checked_add(1).is_none() {
+            return Err(AicError::InvalidEngineConfig(
+                "qualified Mamba ops need nextn+1 to fit the u32 verify width".into(),
             ));
         }
         // DSv4.1 staged mixed steps price every context op token-major.
@@ -2310,6 +2332,9 @@ impl Engine {
     ///   speculative-round FPM one measured round per request. There,
     ///   `total_past_kv_tokens` excludes each request's current token,
     ///   matching the collector's `total_kv_read_tokens` axis.
+    ///   A whole-model FPM with draft tails, or with speculative decoding and
+    ///   no measured-round profile, has no such mapping and returns
+    ///   `InvalidEngineConfig` before any lookup.
     /// - A schema-v1 legacy profile takes a homogeneous batch of requests. Its
     ///   `total_past_kv_tokens` excludes each request's current token and must
     ///   divide by `batch_size`: two requests at sequence length 5 are `(2, 8)`.
@@ -3252,11 +3277,7 @@ impl Engine {
         let (mut context_covered_ms, mut generation_covered_ms) = (0.0_f64, 0.0_f64);
         self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, op, r| {
             // Decide coverage per result, before the name fold below.
-            let covered_ms = if r.energy_wms > 0.0 {
-                r.latency_ms
-            } else {
-                0.0
-            };
+            let covered_ms = covered_latency(&r);
             if is_context {
                 context_covered_ms += covered_ms;
                 context.add_slot(slot, op, r)
@@ -3356,15 +3377,16 @@ impl Engine {
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
     ) -> Result<(Vec<PerOpValue>, Vec<PerOpValue>, Vec<PerOpValue>), AicError> {
-        let (shared, context_attention, decode_attention) = self.mixed_step_breakdown_per_op_impl(
-            ctx_tokens,
-            gen_tokens,
-            isl,
-            osl,
-            prefix,
-            seq_imbalance_correction_scale,
-            gen_seq_imbalance_correction_scale,
-        )?;
+        let (shared, context_attention, decode_attention, _) = self
+            .mixed_step_breakdown_per_op_impl(
+                ctx_tokens,
+                gen_tokens,
+                isl,
+                osl,
+                prefix,
+                seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale,
+            )?;
         Ok((
             strip_per_op_metadata(shared),
             strip_per_op_metadata(context_attention),
@@ -3414,6 +3436,7 @@ impl Engine {
         if let Some((prefill_op, decode_op, ctx_tail, _gen_tail)) = self.fpm_split() {
             let mut shared = PerOpFold::new("context");
             let mut dec_attn = PerOpFold::new("generation");
+            let (mut shared_covered, mut dec_covered) = (0.0, 0.0);
             self.fpm_mixed_step_components(
                 prefill_op,
                 decode_op,
@@ -3425,10 +3448,16 @@ impl Engine {
                 prefix,
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |pass, op, result| match pass {
-                    MixedPass::SharedNonAttention => shared.add(op, result),
-                    MixedPass::DecodeAttention => dec_attn.add(op, result),
-                    MixedPass::ContextAttention => unreachable!("FPM uses the prefill component"),
+                |pass, op, result| {
+                    let (fold, covered) = match pass {
+                        MixedPass::SharedNonAttention => (&mut shared, &mut shared_covered),
+                        MixedPass::DecodeAttention => (&mut dec_attn, &mut dec_covered),
+                        MixedPass::ContextAttention => {
+                            unreachable!("FPM uses the prefill component")
+                        }
+                    };
+                    *covered += covered_latency(&result);
+                    fold.add(op, result);
                 },
             )?;
             let mut shared = shared.into_values();
@@ -3441,12 +3470,27 @@ impl Engine {
                     row.1 /= chunks;
                     row.2 /= chunks;
                 }
+                shared_covered /= chunks;
             }
-            return Ok((shared, Vec::new(), dec_attn.into_values()));
+            return Ok((
+                shared,
+                Vec::new(),
+                dec_attn.into_values(),
+                shared_covered + dec_covered,
+            ));
         }
         let mut shared = PerOpFold::new("context");
         let mut ctx_attn = PerOpFold::new("context");
         let mut dec_attn = PerOpFold::new("generation");
+        // Qualified Mamba prices this step's own chunks, so it is not amortized.
+        let mamba: HashSet<&str> = self
+            .context_ops
+            .iter()
+            .filter(|op| op.is_qualified_mamba())
+            .map(Op::name)
+            .collect();
+        // Covered latency: unamortized, then context rows the scale divides.
+        let (mut covered, mut amortized_covered) = (0.0, 0.0);
         self.mixed_step_breakdown_with(
             ctx_tokens,
             gen_tokens,
@@ -3456,11 +3500,15 @@ impl Engine {
             seq_imbalance_correction_scale,
             gen_seq_imbalance_correction_scale,
             |pass, op, r| {
-                let out = match pass {
-                    MixedPass::SharedNonAttention => &mut shared,
-                    MixedPass::ContextAttention => &mut ctx_attn,
-                    MixedPass::DecodeAttention => &mut dec_attn,
+                let (out, sum) = match pass {
+                    MixedPass::SharedNonAttention => (&mut shared, &mut covered),
+                    MixedPass::ContextAttention if !mamba.contains(op.name()) => {
+                        (&mut ctx_attn, &mut amortized_covered)
+                    }
+                    MixedPass::ContextAttention => (&mut ctx_attn, &mut covered),
+                    MixedPass::DecodeAttention => (&mut dec_attn, &mut covered),
                 };
+                *sum += covered_latency(&r);
                 out.add(op, r);
             },
         )?;
@@ -3470,13 +3518,7 @@ impl Engine {
             // division (`base_backend.py:1244-1246`): one `/ scale2` per
             // folded name, never a per-entry reciprocal multiply.
             let scale2 = isl.max(1).div_ceil(ctx_tokens) as f64;
-            // Qualified Mamba prices this step's own chunks, so it is not amortized.
-            let mamba: HashSet<&str> = self
-                .context_ops
-                .iter()
-                .filter(|op| op.is_qualified_mamba())
-                .map(Op::name)
-                .collect();
+            amortized_covered /= scale2;
             for entry in ctx_attn
                 .iter_mut()
                 .filter(|e| !mamba.contains(e.0.as_str()))
@@ -3485,7 +3527,12 @@ impl Engine {
                 entry.2 /= scale2;
             }
         }
-        Ok((shared.into_values(), ctx_attn, dec_attn.into_values()))
+        Ok((
+            shared.into_values(),
+            ctx_attn,
+            dec_attn.into_values(),
+            covered + amortized_covered,
+        ))
     }
 
     /// [`Self::decode_step_latency`] with the per-op values kept.
@@ -5175,6 +5222,12 @@ pub(crate) mod tests {
         ));
         for (nextn, op, message) in [
             (Some(3), qualified_mamba(false, 1), "token_width 1"),
+            // nextn + 1 overflows: a saturated width must not match u32::MAX.
+            (
+                Some(u32::MAX),
+                qualified_mamba(false, u32::MAX),
+                "fit the u32",
+            ),
             (None, with("fp16", 1), "unsupported state_dtype"),
             (None, with("float16", 0), "must be positive"),
             (None, with("unrecorded", 4), "unrecorded"),
@@ -7665,7 +7718,7 @@ pub(crate) mod tests {
         });
         let spec = EngineSpec::new(config, vec![composite], vec![generation; 3]);
         let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), &systems_root()).unwrap();
-        let (shared, prefill, decode) = engine
+        let (shared, prefill, decode, _) = engine
             .mixed_step_breakdown_per_op_with_metadata(1, 1, 2, 2, 0, 1.0, 1.0)
             .unwrap();
         assert!(shared.is_empty());

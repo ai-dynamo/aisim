@@ -1453,14 +1453,16 @@ def estimate_mixed_step_breakdown_with_rust(
     """
     handle = _cached_engine_handle(model, database)
     try:
-        shared_ops, ctx_attn_ops, decode_attn_ops = handle._mixed_step_breakdown_per_op_with_metadata(
-            int(ctx_tokens),
-            int(gen_tokens),
-            int(isl),
-            int(osl),
-            int(prefix or 0),
-            seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
-            gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+        shared_ops, ctx_attn_ops, decode_attn_ops, covered_latency_ms = (
+            handle._mixed_step_breakdown_per_op_with_metadata(
+                int(ctx_tokens),
+                int(gen_tokens),
+                int(isl),
+                int(osl),
+                int(prefix or 0),
+                seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
+                gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+            )
         )
     except ValueError as exc:
         _reraise_engine_error(exc)
@@ -1507,9 +1509,8 @@ def estimate_mixed_step_breakdown_with_rust(
         "component_energy_wms": component_energy_wms,
         "per_op_latency_ms": per_op_latency_ms,
         "per_op_energy_wms": per_op_energy_wms,
-        "covered_latency_ms": sum(
-            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
-        ),
+        # Decided per query before the name fold, as the static path does.
+        "covered_latency_ms": covered_latency_ms,
         "per_op_source": per_op_source,
         "moe_comm_fallbacks": fallbacks,
     }
