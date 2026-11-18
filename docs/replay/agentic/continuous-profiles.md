@@ -62,9 +62,12 @@ answers faster than the recorded API shortens the play. A turn that joins
 children waits for them and for its own recorded delay after its predecessor.
 The first request of a detected chain, which the trace anchors only with a
 replay barrier, starts when that barrier clears. Only play roots and, after a
-snapshot cut, each stream's next request whose predecessor lies before the cut
-keep a source-clock timer. Finite replay without a profile still waits for
-authored offsets.
+snapshot cut, requests whose previous or spawning turn lies before the cut
+keep a source-clock timer. Live joins and replay barriers still gate dispatch.
+With `traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer
+rule also applies to finite replay without a profile; other AgentX requests
+follow dependency events. With `client: recorded`, finite replay still waits
+for authored offsets.
 
 Idle guards advance pending workload timers after a tree or the whole client
 workload has no outstanding requests for its configured cap. Requests queued
