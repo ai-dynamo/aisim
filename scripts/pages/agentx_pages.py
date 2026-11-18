@@ -23,6 +23,7 @@ from scripts.e2e_accuracy.agentx_contract import (
     validate_public,
     validate_result,
 )
+from scripts.e2e_accuracy.benchmark_features import IncompleteSiliconEvidence
 from scripts.e2e_accuracy.benchmark_features import validate as validate_features
 from scripts.pages.prepare_e2e_accuracy_pages import ancestor, api, api_items, artifact_key, strict_json, trusted_run
 
@@ -98,6 +99,7 @@ def validate_bundle(files, *, preview=False):
     expected = {"summary.json", *(f"details/{identity}.json" for identity in ids)}
     if set(qualification["files"]) != expected:
         raise ValueError("Incomplete AgentX details")
+    incomplete_evidence = None
     for run in summary["runs"]:
         if run["detail_path"] != f"details/{run['id']}.json" or run["outcome"] not in {
             "completed",
@@ -110,7 +112,13 @@ def validate_bundle(files, *, preview=False):
             key: value for key, value in detail.items() if key not in {"schema", "snapshot", "report", "pairs"}
         }:
             raise ValueError("AgentX overview and detail disagree")
-        validate_result({k: v for k, v in detail.items() if k not in {"schema", "snapshot"}})
+        try:
+            validate_result({k: v for k, v in detail.items() if k not in {"schema", "snapshot"}})
+        except IncompleteSiliconEvidence as error:
+            # Recoverable incompleteness must not hide corruption in another
+            # result, or the snapshot/accounting checks below.
+            if incomplete_evidence is None:
+                incomplete_evidence = error
         features = detail.get("simulation_features")
         if features is not None and (
             features["evaluated_revision"] != summary["snapshot"]["commit_sha"]
@@ -122,10 +130,12 @@ def validate_bundle(files, *, preview=False):
             or run["coverage"]["measured"] != run["measured_requests"]
         ):
             raise ValueError("AgentX request accounting mismatch")
+    if incomplete_evidence is not None:
+        raise incomplete_evidence
     return summary
 
 
-def unpack(archive, *, preview=False):
+def _archive_files(archive):
     with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
         entries = zipped.infolist()
         if len({e.filename for e in entries}) != len(entries) or sum(e.file_size for e in entries) > 512 * 1024 * 1024:
@@ -133,6 +143,11 @@ def unpack(archive, *, preview=False):
         if any(e.file_size > 32 * 1024 * 1024 or (e.external_attr >> 16) & 0o170000 == 0o120000 for e in entries):
             raise ValueError("Invalid AgentX archive member")
         files = {e.filename: zipped.read(e) for e in entries}
+    return files
+
+
+def unpack(archive, *, preview=False):
+    files = _archive_files(archive)
     validate_bundle(files, preview=preview)
     return files
 
@@ -182,7 +197,16 @@ def prepare(repo, output):
         for artifact in artifacts:
             if artifact["expired"] or not re.fullmatch(r"e2e-agentx-web-[0-9a-f]{16}", artifact["name"]):
                 continue
-            files = unpack(api(f"actions/artifacts/{artifact['id']}/zip", binary=True, max_bytes=512 * 1024 * 1024))
+            files = _archive_files(
+                api(f"actions/artifacts/{artifact['id']}/zip", binary=True, max_bytes=512 * 1024 * 1024)
+            )
+            incomplete_evidence = None
+            try:
+                validate_bundle(files)
+            except IncompleteSiliconEvidence as error:
+                # Verify the exact producer before treating receipt age as a
+                # recoverable rejection of this otherwise valid archive.
+                incomplete_evidence = error
             summary = strict_json(files["summary.json"])
             snapshot = summary["snapshot"]
             branch, number = snapshot["branch"], snapshot["run_attempt"]
@@ -213,6 +237,14 @@ def prepare(repo, output):
                 raise ValueError("Untrusted AgentX producer")
             if matches[0].get("run_id") != run["id"] or matches[0].get("head_sha") != run["head_sha"]:
                 raise ValueError("Untrusted AgentX qualification job")
+            if incomplete_evidence is not None:
+                if branch not in updates or updates[branch]["run_id"] == str(run["id"]):
+                    updates[branch] = {"status": "failed", "run_id": str(run["id"])}
+                print(
+                    f"Rejecting AgentX artifact {artifact['id']} from run {run['id']}: {incomplete_evidence}",
+                    file=sys.stderr,
+                )
+                continue
             updates.setdefault(
                 branch,
                 {"status": "success" if matches[0]["conclusion"] == "success" else "failed", "run_id": str(run["id"])},
