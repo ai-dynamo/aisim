@@ -908,6 +908,32 @@ impl PerOpSolFold {
     }
 }
 
+/// The mix-step pass of each operation name, or the first name used in two
+/// passes. Context attention and a qualified Mamba op price only their
+/// prefill, generation attention and a qualified Mamba op only their decode,
+/// and every other context operation runs in the shared pass.
+fn mixed_pass_map(context: &[Op], generation: &[Op]) -> Result<HashMap<String, MixedPass>, String> {
+    let context = context.iter().map(|op| {
+        let pass = if op.is_context_attention() || op.is_qualified_mamba() {
+            MixedPass::ContextAttention
+        } else {
+            MixedPass::SharedNonAttention
+        };
+        (op, pass)
+    });
+    let decode = generation
+        .iter()
+        .filter(|op| op.is_generation_attention() || op.is_qualified_mamba())
+        .map(|op| (op, MixedPass::DecodeAttention));
+    let mut passes = HashMap::new();
+    for (op, pass) in context.chain(decode) {
+        if *passes.entry(op.name().to_owned()).or_insert(pass) != pass {
+            return Err(op.name().to_owned());
+        }
+    }
+    Ok(passes)
+}
+
 /// Which of the three mixed-step passes produced a sinked per-op value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MixedPass {
@@ -1125,29 +1151,15 @@ impl Engine {
                 "qualified Mamba ops are not supported beside DSv4.1 stages".into(),
             ));
         }
-        // Replay attributes a mixed rank's operations to a pass by name, so a
-        // qualified Mamba name may repeat only on qualified Mamba ops of its phase.
-        if seen[0] {
-            let context: HashSet<&str> = spec.context_ops.iter().map(Op::name).collect();
-            let generation: HashSet<&str> = spec.generation_ops.iter().map(Op::name).collect();
-            let shared = |ops: &[Op], other: &HashSet<&str>| {
-                ops.iter()
-                    .filter(|op| op.is_qualified_mamba())
-                    .find(|op| {
-                        other.contains(op.name())
-                            || ops
-                                .iter()
-                                .any(|o| !o.is_qualified_mamba() && o.name() == op.name())
-                    })
-                    .map(|op| op.name().to_owned())
-            };
-            if let Some(name) = shared(&spec.context_ops, &generation)
-                .or_else(|| shared(&spec.generation_ops, &context))
-            {
-                return Err(AicError::InvalidEngineConfig(format!(
-                    "qualified Mamba op {name} shares its name with an op of another pass"
-                )));
-            }
+        // Replay attributes a mixed rank's operations to a pass by name and
+        // splits every operation by token share when names collide, which
+        // would mix prefill and decode Mamba work.
+        if seen[0]
+            && let Err(name) = mixed_pass_map(&spec.context_ops, &spec.generation_ops)
+        {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "operation name {name} belongs to two mixed-step passes beside qualified Mamba ops"
+            )));
         }
         super::readiness::validate_glm53_kv(
             &db,
@@ -1684,27 +1696,7 @@ impl Engine {
         if self.fpm_split().is_some() || self.has_dsv41_stages() || !self.mixed_ops_supported {
             return None;
         }
-        // A qualified Mamba op prices only its own phase, like attention.
-        let context = self.context_ops.iter().map(|op| {
-            let pass = if op.is_context_attention() || op.is_qualified_mamba() {
-                MixedPass::ContextAttention
-            } else {
-                MixedPass::SharedNonAttention
-            };
-            (op, pass)
-        });
-        let decode = self
-            .generation_ops
-            .iter()
-            .filter(|op| op.is_generation_attention() || op.is_qualified_mamba())
-            .map(|op| (op, MixedPass::DecodeAttention));
-        let mut passes = HashMap::new();
-        for (op, pass) in context.chain(decode) {
-            if *passes.entry(op.name().to_owned()).or_insert(pass) != pass {
-                return None;
-            }
-        }
-        Some(passes)
+        mixed_pass_map(&self.context_ops, &self.generation_ops).ok()
     }
 
     /// Whether this engine supplies an unscaled STP whole-forward reference.
@@ -4999,17 +4991,29 @@ pub(crate) mod tests {
                 db.clone(),
             )
         };
-        let block = || Op::Elementwise(ElementwiseOp::new("ssm", 2.0));
+        let block = |name: &str| Op::Elementwise(ElementwiseOp::new(name, 2.0));
+        let attention = || {
+            generation_ops()
+                .into_iter()
+                .find(|op| matches!(op, Op::GenerationAttention(_)))
+                .unwrap()
+        };
         for (context, generation) in [
             (vec![named(true)], vec![named(false)]),
             // A context op of another pass under the same name.
-            (vec![named(true), block()], vec![qualified_mamba(false, 1)]),
+            (
+                vec![named(true), block("ssm")],
+                vec![qualified_mamba(false, 1)],
+            ),
+            // Unique Mamba names, but two other operations collide: Replay
+            // would split every operation, Mamba included, by token share.
+            (
+                vec![qualified_mamba(true, 1), block("generation_attention")],
+                vec![qualified_mamba(false, 1), attention()],
+            ),
         ] {
             let err = build(context, generation).unwrap_err().to_string();
-            assert!(
-                err.contains("shares its name with an op of another pass"),
-                "{err}"
-            );
+            assert!(err.contains("belongs to two mixed-step passes"), "{err}");
         }
         // Repeated names within one pass stay valid.
         build(
