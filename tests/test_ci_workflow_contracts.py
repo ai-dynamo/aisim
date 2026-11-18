@@ -3536,6 +3536,7 @@ def test_simulation_dynamo_text_only_request_against_current_api(tmp_path, monke
         (_SESSION, "    pub images: Vec<ImageSpec>,\n", _REQUEST_LITERAL, False, r"must set .*\['images'\]"),
         (_SESSION, "    pub(crate) note: Option<u8>,\n", _REQUEST_LITERAL, False, r"must set .*\['note'\]"),
         (_SESSION + "    pub ignore_eos: u8,\n", "", _REQUEST_LITERAL, False, r"must set .*\['ignore_eos'\]"),
+        (_SESSION + "    pub ignore_eos: Option<bool>,\n", "", _REQUEST_LITERAL, False, r"must set .*\['ignore_eos'\]"),
         (_SESSION + "    pub(crate) ignore_eos: bool,\n", "", _REQUEST_LITERAL, False, r"must set .*\['ignore_eos'\]"),
         (_SESSION, "    pub ignore_eos: bool,\n", _REQUEST_LITERAL, False, r"must set .*\['ignore_eos'\]"),
         (

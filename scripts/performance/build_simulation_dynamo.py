@@ -269,7 +269,10 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
         if not ((empty_images and name == "images") or (forward_ignore_eos and name == "ignore_eos"))
     ]
     required = [
-        name for name in optional if not (struct_fields[name][0] and _OPTION_TYPE.fullmatch(struct_fields[name][1]))
+        name
+        for name in optional
+        if (site.struct == "Request" and name == "ignore_eos")
+        or not (struct_fields[name][0] and _OPTION_TYPE.fullmatch(struct_fields[name][1]))
     ]
     if required and defaults is None:
         raise ValueError(
