@@ -10,6 +10,7 @@
 //! [`crate::perfmodel::engine::Engine`] drives these free functions over the precompiled
 //! op lists from an [`crate::perfmodel::engine::spec::EngineSpec`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -162,11 +163,12 @@ impl OpListPlan {
     }
 }
 
-/// Pricing key of a GLM-5.3-Flash boundary without its per-layer display
-/// names. These names, including those of generic children, never select
-/// data, so identical layers price identically; debug builds re-price every
-/// shared query to check this ([`QueryMemo::query`]). Other families return
-/// `None` and are always queried.
+/// Pricing key of a GLM-5.3-Flash boundary or a DeepSeek-V4.1 stage without
+/// its per-layer display names. These names, including those of GLM generic
+/// children, never select data, so identical layers price identically; debug
+/// builds re-price every shared query to check this ([`QueryMemo::query`]).
+/// A DeepSeek-V4.1 stage's children carry no layer in their names and keep
+/// them. Other families return `None` and are always queried.
 fn pricing_identity(op: &Op) -> Option<String> {
     if !matches!(
         op,
@@ -175,6 +177,7 @@ fn pricing_identity(op: &Op) -> Option<String> {
             | Op::Glm53Router(_)
             | Op::Glm53Ffn(_)
             | Op::Glm53Primitive(_)
+            | Op::Dsv41Stage(_)
     ) {
         return None;
     }
@@ -206,7 +209,8 @@ fn pricing_identity(op: &Op) -> Option<String> {
 
 /// Results of one pass, keyed by [`OpListPlan`] query slot. Every op in a
 /// pass shares the pass's runtime shape, so a slot's first result is exact
-/// for the rest of the slot.
+/// for the rest of the slot, and [`Self::query`] lends it to every op of the
+/// slot.
 pub(crate) struct QueryMemo<'p> {
     plan: Option<&'p OpListPlan>,
     results: Vec<Option<PerformanceResult>>,
@@ -225,24 +229,25 @@ impl<'p> QueryMemo<'p> {
         &mut self,
         index: usize,
         query: impl FnOnce() -> Result<PerformanceResult, AicError>,
-    ) -> Result<PerformanceResult, AicError> {
+    ) -> Result<Cow<'_, PerformanceResult>, AicError> {
         let Some(slot) = self.plan.and_then(|plan| plan.query_slot(index)) else {
-            return query();
+            return query().map(Cow::Owned);
         };
-        if let Some(result) = &self.results[slot] {
-            #[cfg(debug_assertions)]
-            {
-                let repriced = query();
-                assert!(
-                    repriced.as_ref().is_ok_and(|repriced| repriced == result),
-                    "op {index} shares query slot {slot} but prices as {repriced:?}, not {result:?}"
-                );
+        let result = match &mut self.results[slot] {
+            Some(result) => {
+                #[cfg(debug_assertions)]
+                {
+                    let repriced = query();
+                    assert!(
+                        repriced.as_ref().is_ok_and(|repriced| repriced == &*result),
+                        "op {index} shares query slot {slot} but prices as {repriced:?}, not {result:?}"
+                    );
+                }
+                &*result
             }
-            return Ok(result.clone());
-        }
-        let result = query()?;
-        self.results[slot] = Some(result.clone());
-        Ok(result)
+            empty => &*empty.insert(query()?),
+        };
+        Ok(Cow::Borrowed(result))
     }
 }
 
@@ -315,7 +320,7 @@ pub(crate) fn run_context_ops_with<'a>(
         prefix,
         seq_imbalance_correction_scale,
         filter,
-        |_, op, result| on_op(op, result),
+        |_, op, result| on_op(op, result.into_owned()),
     )
 }
 
@@ -333,7 +338,7 @@ pub(crate) fn run_context_ops_planned<'a>(
     prefix: u32,
     seq_imbalance_correction_scale: f64,
     filter: ContextOpFilter,
-    mut on_op: impl FnMut(usize, &'a Op, PerformanceResult),
+    mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
     let mut total = 0.0_f64;
@@ -496,7 +501,7 @@ pub(crate) fn run_generation_ops_step_beamed_with<'a>(
         kv_seq_tokens,
         gen_seq_imbalance_correction_scale,
         only_generation_attention,
-        |_, op, result| on_op(op, result),
+        |_, op, result| on_op(op, result.into_owned()),
     )
 }
 
@@ -514,7 +519,7 @@ pub(crate) fn run_generation_ops_step_planned<'a>(
     kv_seq_tokens: u32,
     gen_seq_imbalance_correction_scale: f64,
     only_generation_attention: bool,
-    mut on_op: impl FnMut(usize, &'a Op, PerformanceResult),
+    mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
     let ctx = generation_op_runtime(
@@ -630,7 +635,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     combined_prefix: u32,
     kv_per_decode_req: u32,
     decode_batch: u32,
-    mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, PerformanceResult, f64),
+    mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>, f64),
 ) -> Result<f64, AicError> {
     // ---- Pass 1: combined non-attention work (batch=1, isl=ctx+gen) ----
     // Python: `run_static` is called with `isl = num_tokens_combined`

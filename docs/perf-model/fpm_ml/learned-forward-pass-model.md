@@ -69,8 +69,17 @@ capture list, and max batched tokens all change `wall_time` and belong to the
 model's identity.
 
 `wall_time` means different things per backend. The vLLM producer
-(`InstrumentedScheduler`) measures each step from `schedule()` to
-`update_from_output()` on the host clock, one value per step. The SGLang
+(`InstrumentedScheduler`) ends each step when its model output arrives and
+starts it when the previous step's output arrived, or at `schedule()` after an
+idle step, on the host clock, one value per step. With async scheduling on a
+one-GPU worker, vLLM launches the next step before it processes the current
+step's output
+([`EngineCore.step_with_batch_queue`](https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5/vllm/v1/engine/core.py)).
+An eager next step (more scheduled tokens than `max_cudagraph_capture_size`)
+takes far longer to launch than a decode step takes to run, so the decode
+record carries the rest of that launch and the eager record looks short. A
+model fitted on such records learns how often each kind of step follows
+another, which changes with the workload. The SGLang
 producer reads a CUDA-event `DeviceTimer` around the forward, but it
 accumulates every *finished* interval at emission time and drops the record
 when nothing finished. With the overlap scheduler on, a step whose result

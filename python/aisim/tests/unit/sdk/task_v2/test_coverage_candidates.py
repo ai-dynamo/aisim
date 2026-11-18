@@ -14,8 +14,10 @@ two shipped-data checks (trtllm nvlink, and the no-coverage control).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -23,8 +25,10 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
+import aisim_core
 from aisim.sdk import common
 from aisim.sdk.config import ModelConfig
+from aisim.sdk.models import get_model
 from aisim.sdk.moe_comm_resolver import a2a_covers_parallel, resolve_model_config_moe_comm
 from aisim.sdk.perf_database import (
     PerfDataNotAvailableError,
@@ -389,6 +393,34 @@ def test_sglang_deepseek_node1_substitution_restores_wideep_mla_defaults():
 
     assert model_config.fmha_quant_mode == common.FMHAQuantMode.fp8_block
     assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+
+
+def test_sglang_deepseek_node1_substitution_keeps_declared_nvfp4_kv(tmp_path):
+    # The WideEP FP8 KV default must not hide a checkpoint's nvfp4 declaration.
+    bundled = Path(aisim_core.__file__).parent / "model_configs" / "deepseek-ai--DeepSeek-R1_config.json"
+    raw = json.loads(bundled.read_text())
+    raw["quantization_config"]["kv_cache_quant_algo"] = "NVFP4"
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    database = SimpleNamespace(
+        system="synthetic",
+        version="1.0",
+        system_spec={"node": {"num_gpus_per_node": 8}, "gpu": {"sm_version": 100}},
+        moe_a2a_coverage=lambda *_args: {"deepep_ht": {(8, 1)}},
+        moe_expert_compute_coverage=lambda *_args: {128},
+    )
+    model_config = ModelConfig(attention_dp_size=128, moe_tp_size=1, moe_ep_size=128)
+
+    resolve_model_config_moe_comm(
+        model_config,
+        model_path=str(tmp_path),
+        backend_name="sglang",
+        database=database,
+        required_phases=("context",),
+    )
+
+    assert model_config.kvcache_quant_mode == common.KVCacheQuantMode.nvfp4
+    with pytest.raises(ValueError, match="nvfp4 KV cache is modeled only for standard K/V attention"):
+        get_model(str(tmp_path), model_config, "sglang")
 
 
 def test_agg_requires_both_phases_covered(synth_systems):

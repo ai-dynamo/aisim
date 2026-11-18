@@ -245,8 +245,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         telemetry = native.get("telemetry")
         if not isinstance(telemetry, dict):
             raise RuntimeError("selected stack did not provide replay telemetry")
-        native = {**native, "telemetry": write_telemetry(root, telemetry)}
-    report_path = write_prediction_report(root, native)
+        native = {**native, "telemetry": write_telemetry(root, telemetry, exclusive=True)}
+    report_path = write_prediction_report(root, native, exclusive=True)
     write_afd_qualification_artifacts(root, spec, memory=native.get("afd_memory"))
     if args.capture_per_request:
         records = native.get("per_request")
@@ -254,7 +254,7 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
             raise RuntimeError("selected stack did not provide per-request prediction records")
         if any(not isinstance(record, dict) for record in records):
             raise RuntimeError("per-request records must be JSON mappings")
-        write_requests(root, records)
+        write_requests(root, records, exclusive=True)
     phases = result.report.metadata.get("agentic_phases")
     preparation_aborted = isinstance(phases, dict) and phases.get("phase") == "aborted"
     if preparation_aborted:
@@ -376,8 +376,8 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         [(candidate_id, concrete) for candidate_id, _, concrete in selected]
     )
     root = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
-    result_path = write_recommendation_result(root, result)
-    write_recommendation_csv(root, result)
+    result_path = write_recommendation_result(root, result, exclusive=True)
+    write_recommendation_csv(root, result, exclusive=True)
     if folded:
         sys.stderr.write(
             f"Folded {folded} scheduler-limit variant(s) with identical predicted metrics; "
@@ -386,7 +386,7 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     if not selected:
         sys.stderr.write(f"no feasible candidate found; saved full result to: {result_path}\n")
         return 3 if getattr(result.counts, "resource_limited", 0) else 1
-    paths = write_recommendations(root, [config for _, _, config in selected])
+    paths = write_recommendations(root, [config for _, _, config in selected], exclusive=True)
     try:
         write_output_adapters(
             output_adapters,
