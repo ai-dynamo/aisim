@@ -204,8 +204,8 @@ precedence. `fp8_static` additionally requires its overhead tables. A GEMM table
 with its own `fp8_static` rows needs no `compute_scale` table. Rows that the
 shared layer takes from a sibling version also count. The engine then needs
 `scale_matrix` only for a low-precision input, but the list of supported GEMM
-modes contains the mode only when the `scale_matrix` table is present. Such a
-row times the layer forward on a BF16 input with a static activation scale; see
+modes contains the mode only when the `scale_matrix` table is present. The
+measurement contract of a `fp8_static` row is in
 [GEMM precision transfer](methods/op-level.md#gemm-precision-transfer).
 Checkpoint-to-precision resolution and hardware compatibility are separate
 contracts; reachability of an estimate does not prove that the backend can

@@ -2382,7 +2382,7 @@ def test_validate_gemm_transfer_gate_never_borrows_from_fp8_static_rows(monkeypa
         def __getattr__(self, name):
             return getattr(real, name)
 
-    def make(gemm_modes, policy):
+    def make(gemm_modes, policy, gemm_quant=quant):
         database = GemmListing(gemm_modes)
         monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: database)
         return Task(
@@ -2391,7 +2391,7 @@ def test_validate_gemm_transfer_gate_never_borrows_from_fp8_static_rows(monkeypa
             system_name="b200_sxm",
             backend_name="vllm",
             backend_version="0.30.0",
-            gemm_quant_mode=quant,
+            gemm_quant_mode=gemm_quant,
             database_mode="HYBRID",
             transfer_policy=policy,
         )
@@ -2406,6 +2406,11 @@ def test_validate_gemm_transfer_gate_never_borrows_from_fp8_static_rows(monkeypa
     make(own_rows, "xprofile").validate()
     # A table that lists fp8 behaves as before: fp8 directly, sq through XQUANT from fp8.
     make(["bfloat16", "fp8", "fp8_static"], "balanced").validate()
+    # Nor is fp8_static an XPROFILE donor: with only fp8_static listed, bfloat16 has no
+    # reference of another profile, so XPROFILE and all transfers reject it.
+    for policy in ("xprofile", None):
+        with pytest.raises(ValueError, match="Unsupported gemm quant mode 'bfloat16'"):
+            make(["fp8_static"], policy, common.GEMMQuantMode.bfloat16).validate()
 
 
 def test_validate_gemm_xprofile_requires_listed_level_profile(monkeypatch):
