@@ -67,6 +67,31 @@ def apply_sets(cfg: dict, sets: list[str]) -> dict:
     return cfg
 
 
+# AISim log lines that mean some operations were priced from substituted data
+# or templates. Successful runs can emit them; the user must be told.
+FALLBACK_MARKERS = (
+    "Loading low-fidelity fallback rows",
+    "excluded from implicit nearest-earlier fallback",
+    "No exact CLI args template",
+)
+
+
+def keep_log(out: Path, stdout: str, stderr: str) -> dict:
+    """Save a run's stdout and stderr next to its output directory; return the log path and fallback lines."""
+    log = out.parent / f"{out.name}.aisim.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n")
+    except OSError:
+        log = None
+    seen = []
+    for line in f"{stdout}\n{stderr}".splitlines():
+        line = line.strip()
+        if any(marker in line for marker in FALLBACK_MARKERS) and line not in seen:
+            seen.append(line[:400])
+    return {"log_file": str(log) if log else None, "fallback_warnings": seen}
+
+
 def run(cmd, timeout):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -303,7 +328,7 @@ def main() -> int:
         ]
         for s in a.sets:
             cmd += ["--set", s]
-        rc, _, err = run(cmd, a.timeout)
+        rc, stdout, err = run(cmd, a.timeout)
         status, detail, result = classify(rc, err, out)
         entry = {
             "phase": phase,
@@ -312,6 +337,7 @@ def main() -> int:
             "status": status,
             "detail": detail,
             "output_dir": str(out),
+            **keep_log(out, stdout, err),
         }
         if result:
             entry["counts"] = result.get("counts")

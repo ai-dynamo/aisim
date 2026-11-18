@@ -376,3 +376,55 @@ def test_headroom_resource_override_keeps_report_and_prediction_inputs_aligned(
     assert [row["offered_rps"] for row in report["rows"]] == [rate for rate, _ in predictions]
     assert [row["num_requests"] for row in report["rows"]] == [total for _, total in predictions]
     assert [row["status"] for row in report["rows"]] == ["pass", "pass"]
+
+
+FALLBACK_LINE = "Loading low-fidelity fallback rows for gemm (b200_sxm, vllm 0.33.0)"
+
+
+def test_ladder_keeps_fallback_warnings_from_a_successful_search(ladder, monkeypatch, sizing_config, tmp_path, capsys):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "predict":
+            return 0, "", ""
+        out = Path(cmd[cmd.index("--output-dir") + 1])
+        out.mkdir()
+        (out / "recommendation.json").write_text(
+            json.dumps({"views": {"top_n": ["pick"]}, "candidates": [{"candidate_id": "pick", "used_gpus": 1}]})
+        )
+        return 0, "searched\n", f"INFO start\nWARNING {FALLBACK_LINE}\n"
+
+    monkeypatch.setattr(ladder, "run", fake_run)
+    assert invoke(ladder, monkeypatch, sizing_config, tmp_path) == 0
+    report = json.loads(capsys.readouterr().out)
+    step = report["steps"][0]
+    assert step["status"] == "qualified"
+    assert step["fallback_warnings"] == [f"WARNING {FALLBACK_LINE}"]
+    log = Path(step["log_file"])
+    assert log.parent == Path(step["output_dir"]).parent
+    assert FALLBACK_LINE in log.read_text() and "searched" in log.read_text()
+
+
+def test_headroom_keeps_fallback_warnings_from_a_successful_prediction(
+    headroom, monkeypatch, prediction_config, tmp_path, capsys
+):
+    def fake_predict(cmd, **kwargs):
+        total = int(next(v.split("=", 1)[1] for v in cmd if v.startswith("traffic.stop.requests=")))
+        rate = float(next(v.split("=", 1)[1] for v in cmd if v.startswith("traffic.load.requests_per_second=")))
+        metrics = {
+            "num_requests": total,
+            "completed_requests": total,
+            "goodput_completed_requests": total,
+            "goodput_request_throughput_rps": rate * 0.99,
+            "mean_ttft_ms": 100,
+            "num_ttft_samples": total,
+            "mean_tpot_ms": 10,
+            "num_tpot_samples": total,
+        }
+        return headroom.subprocess.CompletedProcess(cmd, 0, json.dumps(metrics), f"WARNING {FALLBACK_LINE}\n")
+
+    monkeypatch.setattr(headroom.subprocess, "run", fake_predict)
+    assert invoke_headroom(headroom, monkeypatch, prediction_config, tmp_path) == 0
+    rows = json.loads(capsys.readouterr().out)["rows"]
+    assert [row["status"] for row in rows] == ["pass", "pass"]
+    for row in rows:
+        assert row["fallback_warnings"] == [f"WARNING {FALLBACK_LINE}"]
+        assert FALLBACK_LINE in Path(row["log_file"]).read_text()

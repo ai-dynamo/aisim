@@ -79,9 +79,10 @@ Run `bash -n` on every generated script.
 
 - Single host: start etcd and NATS from the matching Dynamo release's
   `dev/docker-compose.yml`. Run the Dynamo runtime image with the model
-  mounted read-only, check the Dynamo and backend versions inside the
-  container, then `bash run_0.sh`. Confirm `GET /v1/models` before
-  benchmarking.
+  mounted read-only and the complete generated bundle mounted (or copied)
+  into the container, check the Dynamo and backend versions inside the
+  container, then run `bash run_0.sh` from the bundle directory. Confirm
+  `GET /v1/models` before benchmarking.
 - Multiple hosts: inspect every generated `run_N.sh` and assign each script
   to its corresponding node, preserving the generated GPU placement. Render
   with a reachable head-node address, not loopback. Start etcd and NATS from
@@ -121,10 +122,6 @@ those measurements do not validate the original trace prediction. Trace
 validation requires a separate replay procedure preserving the original
 per-request lengths and arrival process, which this guide does not provide.
 
-<!-- coderabbit-ai-generated:v1 -->
-
-<!-- coderabbit-ai-generated-section:v1:abd31d006b8b4daee25ec2d6be7157c62ea6dfdc8f73d9eaac98622f7c1e746e -->
-
 The generated `bench_run.sh` runs AIPerf in closed loop and, by default,
 sweeps multiple concurrency points. Each point sends 20 requests per unit
 of concurrency; the script does not use `BenchConfig.num_requests` to set
@@ -135,8 +132,6 @@ validate a request-rate (Poisson or constant) simulation because the arrival
 process differs.
 
 For a single point using the simulated request count, run:
-
-<!-- /coderabbit-ai-generated:v1 -->
 
 Closed loop (simulation used `concurrency: C`):
 
@@ -173,5 +168,8 @@ comparing latency.
 - The simulation ran `--stack engine`, without Dynamo's frontend, router or
   planner; the measurement includes them. Report that as a limitation of
   the comparison.
-- Stop the serving processes or delete the deployment when done, and tell
-  the user what was removed.
+- Stop the serving processes or delete the deployment when done. Also stop
+  the etcd and NATS containers you started for this spot-check (for example
+  `docker compose -f dev/docker-compose.yml down`), but leave alone any
+  discovery services that were already running before you started. Tell the
+  user what was removed.

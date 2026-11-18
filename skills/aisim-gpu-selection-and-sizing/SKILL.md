@@ -208,7 +208,11 @@ many rows it left out.
 
 If the AISim log shows "Loading low-fidelity fallback rows" or "No exact
 CLI args template", tell the user the prediction uses substituted
-performance data or templates for some operations.
+performance data or templates for some operations. `size_ladder.py` and
+`headroom_scan.py` save each AISim run's log next to its output directory
+(`log_file`) and copy any such lines into `fallback_warnings` in their JSON
+report, including for runs that succeeded. Check `fallback_warnings` on the
+step or row you report.
 
 ### 5. Confirm the compliance share and measure headroom
 

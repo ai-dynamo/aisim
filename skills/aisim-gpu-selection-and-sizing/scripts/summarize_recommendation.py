@@ -121,8 +121,26 @@ def main() -> int:
     if not path.is_file():
         print(f"error: {path} not found (the run did not finish or wrote elsewhere)", file=sys.stderr)
         return 2
-    d = json.loads(path.read_text())
-    cands = d.get("candidates") or []
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot read {path}: {exc}", file=sys.stderr)
+        return 2
+    # Fail loudly on a malformed artifact instead of reporting an empty result.
+    problems = []
+    if not isinstance(d, dict):
+        problems.append("top level is not an object")
+    else:
+        if not isinstance(d.get("candidates"), list):
+            problems.append("'candidates' is missing or not a list")
+        elif not all(isinstance(c, dict) and "candidate_id" in c for c in d["candidates"]):
+            problems.append("a candidate has no candidate_id")
+        if not isinstance(d.get("views"), dict):
+            problems.append("'views' is missing or not an object")
+    if problems:
+        print(f"error: {path} is not a valid AISim recommendation result: {'; '.join(problems)}", file=sys.stderr)
+        return 2
+    cands = d["candidates"]
     by_id = {c["candidate_id"]: c for c in cands}
 
     if a.export:

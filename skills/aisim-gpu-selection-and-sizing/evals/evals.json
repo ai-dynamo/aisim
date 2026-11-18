@@ -95,10 +95,11 @@
       "id": "ask-for-throughput-floor",
       "question": "How many H200s for Qwen/Qwen3.5-35B-A3B at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, vLLM?",
       "expected_skill": "aisim-gpu-selection-and-sizing",
-      "ground_truth": "The user gave no SLA-compliant throughput requirement or compliance share. The agent asks for them (offering 20 rps and a stated share as defaults), or states the value it will use and why, before running. It never applies a hidden 90% discount.",
+      "ground_truth": "The user gave no SLA-compliant throughput requirement or compliance share. Both are user decisions (SKILL.md step 1). The agent asks for both before running any search, offering 20 rps and a stated share such as 99% as defaults, and waits for the answer. It never applies a hidden 90% discount. Failing example: the agent picks 18 rps and 99% itself, states them, and runs the search without the user confirming them.",
       "expected_behavior": [
-        "min_goodput_rps is agreed with the user or stated explicitly in the answer",
-        "The compliance share used by headroom_scan.py is stated"
+        "Asks the user to confirm both min_goodput_rps and the compliance share before running a search",
+        "Does not run size_ladder.py or headroom_scan.py with values the user has not agreed to; stating self-chosen values does not substitute for agreement",
+        "Never applies a hidden 90% discount"
       ]
     },
     {

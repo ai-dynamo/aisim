@@ -141,8 +141,16 @@ files behind. Exit codes:
   and backend (for example "no deployment_mode has a viable parallel
   config"). Report the message; do not retry with invented data.
 - `3`: local resource limit. If `recommendations/` was still written, the
-  result covers only the candidates that ran; say so. Otherwise lower the
-  memory cap or free memory and rerun into a new directory.
+  result covers only the candidates that ran; say so. Then read the reason
+  in `resource-runtime.json` and the error message, and act on the cause:
+  - the run's processes exceeded the memory cap: a lower cap fails again.
+    Raise the cap (it must stay below free RAM) or shrink the search, for
+    example fewer GPUs or backends, then rerun.
+  - free host memory fell below the reserved headroom, or the cap was above
+    free RAM at start: free host memory (or lower the cap below free RAM),
+    then rerun.
+
+  Rerun into a new directory.
 
 The run log can include "Loading low-fidelity fallback rows" or "Sibling
 version ... excluded from implicit nearest-earlier fallback". They do not
