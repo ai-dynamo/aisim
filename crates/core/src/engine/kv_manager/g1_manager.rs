@@ -450,6 +450,10 @@ impl G1Manager {
             .activate_destination_lease(owner, sequence, lease, reservation.inner);
     }
 
+    pub(crate) fn cache_native_restored_window(&mut self, lease: &mut BlockRequestLease) {
+        self.inner.cache_restored_window(lease);
+    }
+
     pub(crate) fn cancel_destination(&mut self, reservation: DestinationReservation) {
         self.inner.cancel_destination(reservation.inner);
     }

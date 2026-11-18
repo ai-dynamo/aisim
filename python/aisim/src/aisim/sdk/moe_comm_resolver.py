@@ -268,6 +268,7 @@ def resolve_model_config_moe_comm(
         # inferred DeepSeek-V3/R1 configs once this tuple selects DeepEP.
         if not fmha_quant_mode_explicit:
             model_config.fmha_quant_mode = common.FMHAQuantMode.fp8_block
-        if not kvcache_quant_mode_explicit:
+        # A declared nvfp4 cache is kept, so get_model refuses it instead of sizing FP8.
+        if not kvcache_quant_mode_explicit and model_config.kvcache_quant_mode != common.KVCacheQuantMode.nvfp4:
             model_config.kvcache_quant_mode = common.KVCacheQuantMode.fp8
     return resolved

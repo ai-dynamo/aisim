@@ -423,15 +423,22 @@ def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
     return worker
 
 
-def test_agentic_g2_accepts_mtp_for_a_hybrid_model_with_the_drop_off() -> None:
-    """Both API boundaries accept MTP with G2 for a state cache with disable_eagle_block_drop."""
+@pytest.mark.parametrize("window", [False, True])
+def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
+    """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
     config = _config("agentx-g2-local.yaml")
     kv_cache = _mtp_with_drop_off(config["engine"], 1)["kv_cache"]
-    kv_cache.update(state_cache={"bytes_per_request": 1_000_000}, prefix_match_unit=4)
     kv_cache["capacity"]["blocks"] = 16
-    kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
+    if window:
+        del config["engine"]["speculation"]["disable_eagle_block_drop"]
+        kv_cache["state_cache"] = {"bytes_per_request": 1_000_000, "sliding_window_lookahead_tokens": 0}
+    else:
+        kv_cache.update(state_cache={"bytes_per_request": 1_000_000}, prefix_match_unit=4)
+        kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
     payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+    # A sliding window runs MTP with G2 synchronously, as a token cache does.
+    assert payload["spec"]["engine"]["rank"].get("async_scheduling") == (False if window else None)
     EngineReplayRunnerFactory().capabilities().require_compatible(spec)
     _runtime.run_replay_json(json.dumps(payload))
 
