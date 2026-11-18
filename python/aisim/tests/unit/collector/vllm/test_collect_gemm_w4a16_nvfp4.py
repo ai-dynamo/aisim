@@ -163,9 +163,13 @@ def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 6 * gib)
     refusal = collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0")  # 1 free + 4 reusable
     assert refusal.startswith("FIXME(kernel-limit): does not fit")
-    # The activation is budgeted too: 1 GiB more of it no longer fits in 1 free + 6 reusable.
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
-    assert collect_gemm._w4a16_nvfp4_does_not_fit(gib // 2, n, 1, "cuda:0").startswith("FIXME(kernel-limit)")
+    # The activation is budgeted too: preparation alone (3.25 MiB) fits in 4 MiB, but not with
+    # the 2 MiB activation.
+    mib = 2**20
+    monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (4 * mib, 80 * gib))
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 2 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(1, 128, 4096, "cuda:0") is None
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(256, 128, 4096, "cuda:0").startswith("FIXME(kernel-limit)")
     # The forward's BF16 output counts as well: a small weight with a 4 GiB output does not fit in 3 GiB.
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 4 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 16, "cuda:0").startswith("FIXME(kernel-limit)")
