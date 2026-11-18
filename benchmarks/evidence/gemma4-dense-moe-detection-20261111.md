@@ -249,15 +249,56 @@ still fail for a real reason (`PERF_DATA_MISSING`, `SDK_UNREPRESENTABLE`,
 
 ### Guard
 
-`tests/unit/support_matrix/test_support_matrix_dense_gemma4.py` fails when a
-row the CLI generator still enumerates records the dense rejection for a
-checkpoint the classifier calls dense, and also fails if the dense checkpoint
-drops out of the matrix entirely (so the first check cannot pass vacuously). It
-reports the ten rows above before the regeneration and passes after it. The
-Rust counterpart, `dense_gemma4_expert_parallelism_is_not_fallback_safe` in
-`crates/core/src/perfmodel/fpm/model.rs`, pins that the bridge maps the typed
-Python error to a non-fallback-safe `AicError`, so `best_available` surfaces the
-dense rejection instead of degrading to the regression estimator.
+Three checks keep the classification and the rejection from regressing.
+
+1. `tests/unit/support_matrix/test_support_matrix_dense_gemma4.py` fails when a
+   row the CLI generator still enumerates records the dense rejection for a
+   checkpoint the classifier calls dense, and also fails if the dense checkpoint
+   drops out of the matrix entirely (so the first check cannot pass vacuously).
+   It reports the ten rows above before the regeneration and passes after it.
+
+2. `dense_gemma4_expert_parallelism_is_not_fallback_safe` in
+   `crates/core/src/perfmodel/fpm/model.rs` pins that `best_available` does not
+   treat the dense rejection as fallback-safe. It builds the `AicError`
+   directly, so it covers the predicate but never crosses the Python boundary.
+
+3. `crates/core/tests/perfmodel/dense_gemma4_bridge.rs` (integration test
+   `perfmodel_dense_gemma4_bridge`) drives the rejection through the embedded
+   interpreter, where `py.rs` maps the SDK's
+   `InvalidEngineConfigurationError` to `AicError::InvalidEngineConfig`:
+   - `dense_gemma4_rejection_survives_the_bridge_with_fallback_allowed` sets
+     `ForwardPassFallbackPolicy::Allow` with `moe_ep_size=2` and requires
+     `best_available` to return `AicError::InvalidEngineConfig` carrying both
+     `compile_engine:` and the dense diagnostic. That pins the real mapping, not
+     a Rust-side construction, and shows the policy does not degrade to the
+     regression estimator.
+   - `dense_gemma4_capacity_rejects_instead_of_estimating_naively` calls
+     `estimate_kv_cache` with `allow_naive_fallback: true` and a capacity
+     override, and requires the dense diagnostic instead of a naive estimate
+     built from the same checkpoint metadata.
+   - `dense_gemma4_num_gpu_blocks_rejects_instead_of_returning_a_count` calls
+     `aisim_core.sdk.memory.estimate_num_gpu_blocks` with the same request, which
+     is the entry point `python.rs::estimate_aic_num_gpu_blocks` invokes from the
+     replay bridge, and requires the dense diagnostic instead of a scheduler
+     block count.
+   - `routed_gemma4_is_not_rejected_by_the_dense_guard` is the control: the
+     routed checkpoint keeps `moe_ep_size=2` and must never produce the dense
+     diagnostic.
+
+   Each test prints a visible `SKIP` and returns when the SDK is not
+   importable, and hard-fails instead when `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1`
+   is set, so a bare `cargo test` cannot read as coverage. The enforced run
+   needs the maturin-built extension, the SDK sources on `PYTHONPATH`, and
+   `PYO3_PYTHON` pointing at the same interpreter the extension was built for;
+   the module header records the exact command.
+
+   The capacity cases assert the message and its bridge context, not an error
+   variant: `memory.rs::estimate_kv_cache` maps every Python failure to
+   `KvCacheEstimateError::Unsupported` and
+   `python.rs::estimate_aic_num_gpu_blocks` wraps the `PyErr` in `anyhow`, so
+   those variants cannot separate a dense rejection from an unrepresentable
+   model. No caller branches on the difference today (`allow_naive_fallback` is
+   decided in Python), so a typed mapping is left as a separate change.
 
 ## Limitations
 
