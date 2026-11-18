@@ -1053,6 +1053,41 @@ mod admission_v0522 {
         assert!(second.admissions.is_empty());
     }
 
+    #[test]
+    fn continuation_runs_without_a_fresh_admission_budget() {
+        let config = SglangConfig::from_args(&test_args(8, 4, 8));
+        let mut manager = SglangKvManager::new(32, 4, KvEventPublishers::default(), 0);
+        let mut waiting =
+            WaitingQueue::from([SglangRequest::new(direct_request(vec![1; 12], 1), 4, 0)]);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        let continuation = first.can_run.pop().unwrap();
+        assert_eq!(continuation.materialized_tokens, 8);
+        let continuation_id = continuation.uuid;
+        let fresh = SglangRequest::new(direct_request(vec![2; 4], 1), 4, 0);
+        let fresh_id = fresh.uuid;
+        let mut waiting = WaitingQueue::from([fresh, continuation]);
+
+        let result =
+            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, None);
+
+        assert_eq!(result.can_run.len(), 1);
+        assert_eq!(result.can_run[0].uuid, continuation_id);
+        assert_eq!(result.can_run[0].materialized_tokens, 12);
+        assert!(result.admissions.is_empty());
+        assert!(!result.batch_is_full);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].uuid, fresh_id);
+        assert!(!waiting[0].kv_lease.is_active());
+    }
+
     /// LPM orders the continuation first itself; under FIFO it stays queued
     /// behind a fresh request with a longer cache hit, and admission finds it.
     #[rstest::rstest]
