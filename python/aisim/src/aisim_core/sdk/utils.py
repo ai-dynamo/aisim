@@ -2114,6 +2114,24 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     return raw_config
 
 
+def _download_hf_companion_json(hf_id: str, filename: str, *, revision: str = "main") -> dict | None:
+    """Reject cached processor metadata unless the model config pins its snapshot."""
+    capture: dict[tuple[str, str], str] = {}
+    token = _SNAPSHOT_CAPTURE.set(capture)
+    try:
+        pinned = {} if revision == "main" else {"revision": revision}
+        data = _download_hf_json(hf_id, filename, raise_on_404=False, **pinned)
+    finally:
+        _SNAPSHOT_CAPTURE.reset(token)
+    cached_commit = capture.get((hf_id, filename))
+    if cached_commit is not None and cached_commit != revision:
+        raise HuggingFaceDownloadError(
+            f"Cannot mix cached {filename} from snapshot {cached_commit} with {hf_id} config at {revision}. "
+            "Use HF_HUB_OFFLINE=1 to load one cached snapshot or supply a local model directory."
+        )
+    return data
+
+
 def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revision: str = "main") -> dict:
     """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
@@ -2127,8 +2145,7 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revisi
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        pinned = {} if revision == "main" else {"revision": revision}
-        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False, **pinned)
+        processor_config = _download_hf_companion_json(model_path, "preprocessor_config.json", revision=revision)
     if processor_config is not None:
         raw_config["image_processor_config"] = processor_config
     return raw_config
@@ -2234,8 +2251,8 @@ def get_model_config_from_model_path(model_path: str) -> dict:
                 path = Path(model_path) / filename
                 data = _load_json_with_infinity(path) if path.is_file() else None
             else:
-                pinned = {"revision": commit} if (commit := _config_snapshot_commit(raw_config)) else {}
-                data = _download_hf_json(model_path, filename, raise_on_404=False, **pinned)
+                revision = _config_snapshot_commit(raw_config) or "main"
+                data = _download_hf_companion_json(model_path, filename, revision=revision)
             if data is not None:
                 if not isinstance(data, dict):
                     family = "Kimi" if kimi else "Qwen3-VL"

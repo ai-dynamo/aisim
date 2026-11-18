@@ -350,6 +350,46 @@ def test_corrupt_config_during_companion_fallback_keeps_download_error(monkeypat
     assert isinstance(error.value.__cause__, json.JSONDecodeError)
 
 
+@pytest.mark.parametrize(
+    "architecture,filename",
+    [
+        ("Qwen3VLForConditionalGeneration", "preprocessor_config.json"),
+        ("KimiK25ForConditionalGeneration", "video_preprocessor_config.json"),
+        ("Llama4ForConditionalGeneration", "preprocessor_config.json"),
+    ],
+)
+def test_processor_only_cache_fallback_cannot_mix_with_remote_config(monkeypatch, hf_cache, architecture, filename):
+    model = f"org/processor-fallback-{architecture}"
+    _cache_file(hf_cache, model, filename, {"snapshot": "cached"})
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/main/config.json"):
+            return io.BytesIO(json.dumps({"architectures": [architecture]}).encode())
+        if request.full_url.endswith(f"/{filename}"):
+            raise utils.urllib.error.URLError("transient")
+        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+
+    def unexpected_parse(raw):
+        pytest.fail("mixed-snapshot processor metadata reached the model parser")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    monkeypatch.setattr(utils, "_parse_hf_config_json", unexpected_parse)
+    with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached"):
+        utils.get_model_config_from_model_path.__wrapped__(model)
+
+
+def test_offline_processor_and_config_from_one_snapshot_still_load(monkeypatch, hf_cache):
+    model = "org/processor-same-snapshot"
+    architecture = "Qwen3VLForConditionalGeneration"
+    _cache_file(hf_cache, model, "config.json", {"architectures": [architecture]})
+    _cache_file(hf_cache, model, "preprocessor_config.json", {"snapshot": "cached"})
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(utils, "_parse_hf_config_json", lambda raw: {"architecture": architecture})
+
+    loaded = utils.get_model_config_from_model_path.__wrapped__(model)
+    assert loaded["raw_config"]["preprocessor_config"] == {"snapshot": "cached"}
+
+
 def test_remote_config_with_cached_quant_fallback_uses_one_snapshot(monkeypatch, hf_cache):
     cached = "a" * 40
     _cache_file(
