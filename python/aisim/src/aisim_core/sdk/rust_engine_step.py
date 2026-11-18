@@ -1800,9 +1800,11 @@ def engine_identity(model: Any, database: Any) -> str:
     them, so identity checks detect a change without rebuilding either key on
     this per-query path.
     """
-    get_mode = getattr(database, "get_default_database_mode", None)
-    mode = get_mode() if get_mode is not None else None
-    policy = getattr(database, "transfer_policy", None)
+    # The stored attributes behind ``get_default_database_mode`` and
+    # ``transfer_policy``; reading them directly keeps the check near main's
+    # single identity test.
+    mode = getattr(database, "_default_database_mode", None)
+    policy = getattr(database, "_transfer_policy", None)
     memo = getattr(model, "_aic_engine_identity_memo", None)
     if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy:
         return memo[3]
