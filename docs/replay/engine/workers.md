@@ -477,9 +477,9 @@ productive pass of a non-overlapped SGLang worker. For attention DP, measure
 the union of batch-selection intervals that lie between completion of the
 previous pass on all ranks and the first forward launch of the next pass.
 Use a cost representative of the deployment and workload. The engine clock
-includes the cost once per group, and forward-pass telemetry reports the
-forward duration. Idle and same-timestamp retry passes with no model work
-take their usual time.
+includes the cost once per group. Active and idle ranks exclude the selection
+cost from forward-pass telemetry. Idle and same-timestamp retry passes with no
+model work take their usual time.
 
 Use this option with forward-only timing and exclude any time already priced
 by the configured timing provider, such as an observed whole-iteration cost.

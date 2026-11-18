@@ -3103,6 +3103,7 @@ impl VllmCore {
             // The forward's end and the retry it implies are set when it is
             // priced; `now_ms` holds their place.
             end_ms: now_ms,
+            end_without_selection_ms: None,
             same_timestamp_retry: crate::engine::generalized::SameTimestampRetry::NotApplicable,
             #[cfg(test)]
             completed_requests: requests_before.saturating_sub(self.state.requests.len()),

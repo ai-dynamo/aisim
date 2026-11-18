@@ -419,6 +419,7 @@ impl RankEngine for SchedulerRank {
             .ok_or_else(|| anyhow!("scheduler rank has no scheduled pass to resolve"))?;
         let pass = self.core.resolve_pass(iteration)?;
         let end_ms = pass.end_ms;
+        let end_without_selection_ms = pass.end_without_selection_ms;
         let previous_returned_ms = pass.previous_returned_ms;
         let (same_timestamp_retry, start_effects, completion_effects) = split_pass(pass)?;
         if let Some(held) = self.held_outputs.as_mut()
@@ -433,6 +434,7 @@ impl RankEngine for SchedulerRank {
             start_effects,
             pending: PendingPass {
                 started_at_ms,
+                end_without_selection_ms,
                 effects: completion_effects,
             },
         })
@@ -490,10 +492,23 @@ impl RankEngine for SchedulerRank {
         Ok(pending.effects)
     }
 
+    fn idle_telemetry_end_ms(&self, pending: &Self::PendingPass, end_ms: f64) -> f64 {
+        pending.end_without_selection_ms.unwrap_or(end_ms)
+    }
+
     fn complete_idle_group_pass(
         &mut self,
         started_at_ms: f64,
         end_ms: f64,
+    ) -> Result<Option<Self::PassCompletionEffects>> {
+        self.complete_idle_group_pass_with_telemetry(started_at_ms, end_ms, end_ms)
+    }
+
+    fn complete_idle_group_pass_with_telemetry(
+        &mut self,
+        started_at_ms: f64,
+        end_ms: f64,
+        telemetry_end_ms: f64,
     ) -> Result<Option<Self::PassCompletionEffects>> {
         self.core.complete_engine_boundary(end_ms);
         let lifecycle_events = self
@@ -508,7 +523,7 @@ impl RankEngine for SchedulerRank {
             kv_events,
             metrics: self.metrics(),
             forward_pass_metrics: ForwardPassMetrics {
-                duration_ms: (end_ms - started_at_ms).max(0.0),
+                duration_ms: (telemetry_end_ms - started_at_ms).max(0.0),
                 ..Default::default()
             },
             ..PassCompletionEffects::default()

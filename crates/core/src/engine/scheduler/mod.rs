@@ -273,6 +273,8 @@ pub(crate) struct AdmissionEvent {
 pub(crate) struct EnginePassResult {
     pub(crate) committed_requests: Vec<Uuid>,
     pub(crate) end_ms: f64,
+    /// Modeled pass boundary with serial batch selection excluded, when charged.
+    pub(crate) end_without_selection_ms: Option<f64>,
     /// Scheduler-owned same-timestamp convergence status. This is not an
     /// externally observable effect or ordinary progress.
     pub(crate) same_timestamp_retry: SameTimestampRetry,

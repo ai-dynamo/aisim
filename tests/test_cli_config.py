@@ -1839,6 +1839,26 @@ def test_aggregated_deployment_accepts_one_context_parallel_knob() -> None:
     assert "cp_size" not in spec.performance_model_metadata["aggregated"]["config"]
 
 
+def test_afd_prediction_rejects_scheduler_selection_cost():
+    raw = {
+        "engine": {
+            **_engine(),
+            "backend": "sglang",
+            "workers": {
+                "aggregated": {
+                    "type": "afd",
+                    "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8},
+                    "scheduler": {"scheduler_select_time_ms": 0.0},
+                },
+            },
+        },
+    }
+    CorePredictionConfig.model_validate(raw)
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["scheduler_select_time_ms"] = 1.5
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms is unsupported for AFD"):
+        CorePredictionConfig.model_validate(raw)
+
+
 @pytest.mark.parametrize("knob", ["prefill_context", "decode_context"])
 def test_afd_companion_rejects_context_parallelism(knob: str) -> None:
     # The companion's ParallelShape / GPU accounting carry tp/pp/dp/moe only, so

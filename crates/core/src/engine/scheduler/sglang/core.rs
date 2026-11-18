@@ -1304,10 +1304,10 @@ impl SglangCore {
         };
         // The configured interval is serial to the priced work. Keep it out
         // of forward telemetry and out of repeated pipeline stages.
-        let forward_end_ms = forward_end_ms + scheduler_ms;
+        let scheduled_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
         // When this pass's forward leaves stage 0, and its time per stage.
-        let mut stage0 = Some((forward_end_ms, forward_ms));
+        let mut stage0 = Some((scheduled_end_ms, forward_ms));
         let host_launch = pass.launch.is_some();
         if let Some(launch) = pass.launch {
             let host = self
@@ -1333,7 +1333,10 @@ impl SglangCore {
         } else {
             self.last_forward_ms = Some(forward_ms);
         }
-        result.end_ms = pass.end_ms.unwrap_or(forward_end_ms);
+        result.end_ms = pass.end_ms.unwrap_or(scheduled_end_ms);
+        if scheduler_ms > 0.0 && pass.end_ms.is_none() {
+            result.end_without_selection_ms = Some(forward_end_ms);
+        }
         if self.config.pipeline_fill_passes > 0.0 {
             let ready_ms =
                 stage0.map(|(end_ms, stage_ms)| self.pipeline_ready_ms(end_ms, stage_ms));
@@ -1936,6 +1939,7 @@ impl SglangCore {
             committed_requests,
             // The forward's end is set when it is priced; `now_ms` holds its place.
             end_ms: now_ms,
+            end_without_selection_ms: None,
             same_timestamp_retry: if defer_prefill {
                 crate::engine::generalized::SameTimestampRetry::Countdown {
                     remaining: remaining_after_round,

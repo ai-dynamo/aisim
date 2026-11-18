@@ -2254,6 +2254,23 @@ fn sglang_scheduler_selection_delays_productive_passes_without_changing_forward_
 }
 
 #[test]
+fn sglang_scheduler_selection_is_excluded_from_idle_rank_telemetry() {
+    let mut config = sglang_interval_config(0);
+    config.sglang.scheduler_select_time_ms = 1.5;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    submit_interval_request(&mut engine, 0, 1, 4, 2, now_ms);
+
+    let prefill = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(prefill.duration_ms, 8.5);
+    assert_interval_work(&prefill, 0, 1, 0);
+    assert_interval_work(&prefill, 1, 0, 0);
+    for rank in &prefill.ranks {
+        assert_eq!(rank.forward_pass_metrics.duration_ms, 7.0);
+    }
+}
+
+#[test]
 fn sglang_host_loop_reports_the_forward_duration_to_fpm_telemetry() {
     // Under the host loop a pass ends when the scheduler thread returns to its loop,
     // which is not when its forward ends; the forward-pass telemetry must carry the

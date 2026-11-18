@@ -3346,6 +3346,47 @@ mod tests {
     }
 
     #[test]
+    fn sglang_scheduler_selection_cost_defaults_to_zero_and_validates() {
+        let legacy = serde_json::json!({"backend": "sglang", "sglang": {}});
+        let config: EngineConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.sglang.scheduler_select_time_ms, 0.0);
+        config.validate().unwrap();
+
+        for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+            let mut config = config.clone();
+            config.sglang.scheduler_select_time_ms = invalid;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("scheduler_select_time_ms must be finite and non-negative"),
+                "{error}"
+            );
+        }
+
+        let mut config = config;
+        config.sglang.scheduler_select_time_ms = 1.5;
+        config.validate().unwrap();
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: EngineConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.sglang.scheduler_select_time_ms, 1.5);
+
+        for disable in [
+            (|config: &mut EngineConfig| config.backend = Backend::Vllm) as fn(&mut EngineConfig),
+            |config| config.sglang.host_loop = true,
+            |config| config.afd = Some(Arc::new(sample_afd_config())),
+        ] {
+            let mut config = config.clone();
+            disable(&mut config);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn async_scheduling_defaults_to_vllm_and_sets_the_batch_queue_depth() {
         for (backend, depth) in [("vllm", 2), ("sglang", 1), ("trtllm", 1)] {
             let mut config: EngineConfig =
