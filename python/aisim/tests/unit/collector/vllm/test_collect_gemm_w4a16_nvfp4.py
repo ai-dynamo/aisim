@@ -166,6 +166,9 @@ def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm
     # The activation is budgeted too: 1 GiB more of it no longer fits in 1 free + 6 reusable.
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(gib // 2, n, 1, "cuda:0").startswith("FIXME(kernel-limit)")
+    # The forward's BF16 output counts as well: a small weight with a 4 GiB output does not fit in 3 GiB.
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 4 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 16, "cuda:0").startswith("FIXME(kernel-limit)")
 
 
 def test_blackwell_keeps_the_scaled_fp4_quant_kernel(torch, collect_gemm, monkeypatch):

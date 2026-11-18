@@ -228,9 +228,12 @@ def _w4a16_nvfp4_does_not_fit(m, n, k, device):
     below SM100, the FP32 copy that ref_nvfp4_quant makes (4 B; nvfp4_emulation_utils.py
     :640-654 @0.31.0). Memory the allocator reserved but does not use is reusable, so it counts
     as available alongside driver-free memory. The BF16 activation (2 B per element) is
-    allocated before the weight, so it is counted too.
+    allocated before the weight, so it is counted too. The dry-run forward then adds the BF16
+    output (m x n) while the packed and BF16 weights are still live, after the temporary is freed.
     """
-    needed = int(n * k * (4.5 if get_sm_version() >= 100 else 6.5)) + 2 * m * k
+    preparation = n * k * (4.5 if get_sm_version() >= 100 else 6.5)
+    forward = 2.5 * n * k + 2 * m * n
+    needed = int(max(preparation, forward)) + 2 * m * k
     available = (
         torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     )
