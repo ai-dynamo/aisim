@@ -83,7 +83,7 @@ or evidence of serving accuracy. The repair adds no production work or retained
 state; its new replay fixture contains seven requests. Host performance was not
 benchmarked.
 
-## Timing identity and verification
+## Timing identity
 
 `HostOffloadConfig.connector` is independent of timing version. The compiler's
 `_worker_engine_args` serializes the host-offload descriptor to `native_host_offload`
@@ -92,6 +92,14 @@ cache behavior without consulting timing identity. Therefore the PR's 0.24.0
 operation timings with `offloading_v0_32` intentionally model v0.32 cache rules
 using those available measured operation timings. They do not represent a
 measured v0.32 deployment.
+
+## Local verification and revision identity
+
+The retained local results below cover the source and regression tests published
+in **`4e70f67a81c857d76af8f7d0b25e5f58a64f0d4b`**. The follow-up to CodeRabbit
+review **5962318003** changes this evidence report only. The PR description
+records the exact final documentation commit and its verification reruns;
+results from an earlier revision are not hosted checks for that commit.
 
 Local environment: Linux x86_64, Rust 1.91.1, Python 3.12.3, Cargo jobs=2.
 Python dependencies came from the locked project dev environment plus the
@@ -102,19 +110,33 @@ The loaded extension was verified in the scratch virtual environment:
 SHA-256 `4cef78b0ad90ab7fdbf207816cb8f2751b5fd9f01d25f27037a021a0ed052048`.
 
 - `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --workspace`:
-  **3571 passed, 3 ignored**, including the new G3 and hybrid tests and the
-  strengthened pin test.
+  **3571 passed, 3 ignored** at
+  `4e70f67a81c857d76af8f7d0b25e5f58a64f0d4b`: **3263 library tests**, **305
+  integration tests** and **3 doctests**. The library has two ignored tests and
+  the integration binaries have one. The workspace contains only `aisim-core`,
+  so `cargo test -p aisim-core` covers the same package. This includes the new
+  G3 and hybrid tests and the strengthened pin test. The PR description's older
+  3262 figure counted only library tests at
+  `a511fbaaa4264ecf078e75e22952a4d4290829e7`, before the additional G3 test.
 - `python -m pytest tests -k 'g2 or host_offload or state_cache or kvcr or g3 or connector or replay'`:
-  **949 passed**, 6477 deselected. Cache and test temporary directories were
-  redirected to the repair scratch directory; the runtime came from the release
-  wheel, not an editable/debug build.
+  **949 passed**, 6477 deselected, covering
+  `4e70f67a81c857d76af8f7d0b25e5f58a64f0d4b`. Cache and test temporary
+  directories were redirected to the repair scratch directory; the runtime
+  came from the release wheel, not an editable/debug build. The previously
+  reported 882 result predates the main merge and is historical only.
 - The earlier Python collection attempt lacked repository-tooling dependencies;
   installing the same three dependency groups as CI cleared all 26 collection
   errors. Initial fixture development also exposed a wrong G3 constructor name
   and insufficient hybrid state boundaries/capacity; these were corrected before
   the passing final suite. Negative ablation failures above were expected.
 
-Hosted evidence is separate: Fast CI run **44357257066** passed on the pinned
-head. No Full CI run exists for that head as inspected during repair. Fresh
-reviews, technical reapproval and Full CI on the corrective commit remain the
-controller's responsibility; local tests do not grant merge approval.
+## Hosted verification
+
+As inspected on 2026-11-18, [Fast CI run 44364037173](https://github.com/ai-dynamo/aisim/actions/runs/44364037173)
+passed on **`4e70f67a81c857d76af8f7d0b25e5f58a64f0d4b`**. Run 44357257066
+covered **`7c4b10d90640146c085d373843eb8608f6a72adb`** and is historical only.
+No Full CI run exists for `4e70f67a81c857d76af8f7d0b25e5f58a64f0d4b` as
+inspected during repair. There can be no hosted run for the unpublished
+evidence correction yet. Fresh reviews, technical reapproval and Full CI on
+the final commit remain pending controller admission; local results and Fast
+CI do not substitute for those requirements.
