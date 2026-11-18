@@ -36,7 +36,7 @@ use crate::perfmodel::afd::plan::AfdExecutionPlan;
 use crate::perfmodel::engine::spec::{EncoderImageShape, EngineSpec, VisionSpec};
 use crate::session::{
     ContextOpFilter, OpListPlan, OpMemo, QueryMemo, context_op_runtime, generation_op_runtime,
-    get_mix_step_ops, query_context_op, query_generation_op, run_context_ops,
+    get_mix_step_ops, mamba_cached_prefix, query_context_op, query_generation_op,
     run_context_ops_planned, run_context_ops_with, run_generation_ops_step,
     run_generation_ops_step_beamed_with, run_generation_ops_step_planned,
 };
@@ -2000,6 +2000,7 @@ impl Engine {
             runtime.prefix,
             runtime.seq_imbalance_correction_scale,
             ContextOpFilter::All,
+            false,
             |_, op, result| on_op(op, result.into_owned()),
         )
     }
@@ -3300,6 +3301,7 @@ impl Engine {
                 runtime.prefix,
                 runtime.seq_imbalance_correction_scale,
                 ContextOpFilter::All,
+                false,
                 |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r.into_owned()),
             )?;
         }
@@ -4229,15 +4231,20 @@ impl Engine {
             let n_prefill = sched.num_prefill_requests.max(1);
             let new_tokens_per_req = sched.sum_prefill_tokens / n_prefill;
             let prefix_per_req = sched.sum_prefill_kv_tokens / n_prefill;
+            let any_cached = sched.sum_prefill_kv_tokens > 0;
             total += match &mut *operations {
-                OperationObserver::Latency => run_context_ops(
+                OperationObserver::Latency => run_context_ops_planned(
                     &self.context_ops,
+                    None,
+                    None,
                     &self.db,
                     n_prefill,
                     new_tokens_per_req,
                     prefix_per_req,
                     1.0,
                     ContextOpFilter::All,
+                    any_cached,
+                    |_, _, _| {},
                 )?,
                 operations => {
                     // The walk visits every op in order, so names fold by
@@ -4253,6 +4260,7 @@ impl Engine {
                         prefix_per_req,
                         1.0,
                         ContextOpFilter::All,
+                        any_cached,
                         |index, op, result| {
                             let slot = Some(self.context_plan.name_slot(index));
                             operations.add_lent("context", slot, op, result, 1.0, || {
@@ -4260,7 +4268,7 @@ impl Engine {
                                     op,
                                     n_prefill,
                                     new_tokens_per_req,
-                                    prefix_per_req,
+                                    mamba_cached_prefix(op, prefix_per_req, any_cached),
                                     1.0,
                                     None,
                                 )
@@ -4863,6 +4871,70 @@ pub(crate) mod tests {
                 assert!(err.contains(message), "{phase}: {err}");
             }
         }
+    }
+
+    #[test]
+    fn packed_pure_prefill_with_any_cached_token_skips_cold_scan_rows() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        // One cold measured scan row for two 16-token prefills.
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec!["vllm_mamba_chunk_scan_combined_varlen"],
+                ),
+                Col::Str("phase", vec!["context"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![16]),
+                Col::I64("d_model", vec![4096]),
+                Col::I64("d_state", vec![128]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("nheads", vec![64]),
+                Col::I64("head_dim", vec![64]),
+                Col::I64("n_groups", vec![4]),
+                Col::I64("chunk_size", vec![128]),
+                Col::F64("latency", vec![0.5]),
+            ],
+        );
+        let db = Arc::new(PerfDatabase::load(root.path(), "testsys", "test", "1.0").expect("load"));
+        let spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![qualified_mamba(true, 1)],
+            vec![],
+        );
+        let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+        let prefill = |cached: u32| {
+            let metrics = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 2,
+                    sum_prefill_tokens: 32,
+                    sum_prefill_kv_tokens: cached,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let scalar = engine.forward_pass_time_ms(&[metrics.clone()]).unwrap();
+            let estimate = engine
+                .forward_pass_estimate(&[metrics], true, None)
+                .unwrap();
+            let op = &estimate.ranks[0].operations[0];
+            assert_eq!(scalar, estimate.latency_ms.unwrap());
+            (scalar, op.source.clone())
+        };
+        assert_eq!(prefill(0), (0.5, "silicon".to_string()));
+        // One cached token over two requests: the mean prefix rounds to zero,
+        // but the scan restores a state. 32 tokens * 18,560 bytes plus two
+        // 1 MiB BF16 states, each read and written once.
+        let (latency, source) = prefill(1);
+        assert_eq!(source, "sol");
+        assert!((latency - 4_788_224.0 / db.system_spec.gpu.mem_bw * 1000.0).abs() < 1e-12);
     }
 
     #[test]
@@ -9463,7 +9535,7 @@ pub(crate) mod tests {
         let without = base
             .mixed_step_latency(2048, 1, 2048, 0, 0, 1.0, 1.0)
             .unwrap();
-        let tail_ms = run_context_ops(
+        let tail_ms = crate::session::run_context_ops(
             std::slice::from_ref(&ctx_op),
             &db,
             1,

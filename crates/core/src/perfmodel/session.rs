@@ -320,13 +320,16 @@ pub(crate) fn run_context_ops_with<'a>(
         prefix,
         seq_imbalance_correction_scale,
         filter,
+        false,
         |_, op, result| on_op(op, result.into_owned()),
     )
 }
 
 /// [`run_context_ops_with`] over an op list with its [`OpListPlan`], reusing
 /// `op_memo`'s results when given one. The sink also receives each op's index
-/// in `ops`.
+/// in `ops`. `any_cached` marks a walk whose integer mean `prefix` can round a
+/// cached prefill down to zero; qualified Mamba ops then see at least one
+/// cached token ([`mamba_cached_prefix`]), and every other op keeps `prefix`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_context_ops_planned<'a>(
     ops: &'a [Op],
@@ -338,6 +341,7 @@ pub(crate) fn run_context_ops_planned<'a>(
     prefix: u32,
     seq_imbalance_correction_scale: f64,
     filter: ContextOpFilter,
+    any_cached: bool,
     mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
@@ -354,7 +358,7 @@ pub(crate) fn run_context_ops_planned<'a>(
                 op,
                 batch_size,
                 effective_isl,
-                prefix,
+                mamba_cached_prefix(op, prefix, any_cached),
                 seq_imbalance_correction_scale,
                 None,
             );
@@ -364,6 +368,17 @@ pub(crate) fn run_context_ops_planned<'a>(
         on_op(index, op, result);
     }
     Ok(total)
+}
+
+/// The prefix a context op sees in a packed walk: a qualified Mamba scan must
+/// not read cold-state rows when any prefill token is cached, even when the
+/// integer mean `prefix` rounds to zero. Other ops keep `prefix`.
+pub(crate) fn mamba_cached_prefix(op: &Op, prefix: u32, any_cached: bool) -> u32 {
+    if any_cached && op.is_qualified_mamba() {
+        prefix.max(1)
+    } else {
+        prefix
+    }
 }
 
 /// One context op at the context-phase shape — the single query body every
@@ -666,11 +681,7 @@ pub(crate) fn get_mix_step_ops<'a>(
             // Totals cannot say which request is cold, so any cached token in
             // the step keeps every chunk off cold-state scan rows, even when
             // the integer mean prefix rounds to zero.
-            let prefix = if combined_prefix > 0 {
-                prefix_per_req.max(1)
-            } else {
-                0
-            };
+            let prefix = mamba_cached_prefix(op, prefix_per_req, combined_prefix > 0);
             for (batch, tokens) in [(n - r, q), (r, q + 1)] {
                 if batch == 0 || tokens == 0 {
                     continue;
