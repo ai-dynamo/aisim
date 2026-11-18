@@ -3,6 +3,7 @@
 
 """Reject source files that a recorded Git revision does not contain."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -12,12 +13,15 @@ def require_committed(repo, revision, paths):
 
     `git diff HEAD` ignores untracked and ignored files, so a hashed source
     inventory can hold files the revision does not. Paths are absolute or
-    relative to `repo`.
+    relative to `repo`. Each path's own name is checked, without following
+    symlinks: an uncommitted link to a committed file is still uncommitted.
     """
-    repo = Path(repo).resolve()
-    relative = sorted({(repo / path).resolve().relative_to(repo).as_posix() for path in paths})
+    repo = os.path.abspath(repo)
+    relative = sorted(
+        {Path(os.path.relpath(os.path.abspath(os.path.join(repo, path)), repo)).as_posix() for path in paths}
+    )
     tree = subprocess.run(
-        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", revision, "--", *relative],
+        ["git", "-C", repo, "ls-tree", "-r", "--name-only", "-z", revision, "--", *relative],
         check=True,
         capture_output=True,
         text=True,

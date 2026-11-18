@@ -26,9 +26,14 @@ def _repo(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["untracked.py", "ignored.py"])
-def test_extra_source_is_rejected(tmp_path, name):
+@pytest.mark.parametrize("link", [False, True])
+def test_extra_source_is_rejected(tmp_path, name, link):
     package = _repo(tmp_path)
     require_committed(tmp_path, "HEAD", list(package.rglob("*.py")))
-    (package / name).write_text("B = 2\n")
+    if link:
+        # A link to a committed file resolves to a committed path but is not one.
+        (package / name).symlink_to("a.py")
+    else:
+        (package / name).write_text("B = 2\n")
     with pytest.raises(ValueError, match=f"pkg/{name}"):
         require_committed(tmp_path, "HEAD", list(package.rglob("*.py")))
