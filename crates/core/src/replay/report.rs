@@ -1341,6 +1341,13 @@ impl TraceCollector {
             .get_or_insert_with(Default::default);
     }
 
+    /// Whether completion feedback holds updates no telemetry sample has reported.
+    pub(crate) fn completion_feedback_pending(&self) -> bool {
+        self.completion_feedback
+            .as_ref()
+            .is_some_and(feedback::CompletionFeedback::has_unreported)
+    }
+
     /// Cumulative outcome counters, plus this interval's latency sample when
     /// `take_interval` is set. `None` when feedback is not enabled.
     pub(crate) fn completion_feedback_snapshot(

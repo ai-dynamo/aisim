@@ -1562,6 +1562,7 @@ where
             || telemetry.has_observations()
             || self.traffic.telemetry_has_observations()
             || self.engine.telemetry_has_interval_observations()
+            || self.collector.completion_feedback_pending()
         {
             self.publish_telemetry_sample(ReplayTelemetrySampleKind::Final)?;
         }

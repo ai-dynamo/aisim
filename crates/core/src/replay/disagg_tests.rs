@@ -163,6 +163,40 @@ fn disagg_baseline_leaves_earlier_latency_pairs_for_the_first_interval_sample() 
     assert_eq!(last.completed_requests, 2);
 }
 
+#[test]
+fn disagg_final_sample_reports_a_terminal_recorded_after_the_last_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = DisaggRuntime::from_requests(
+        &disagg_config(),
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    );
+    runtime.start_profile_observers().unwrap();
+    // A rejection at the instant of the last sample delivers no token and
+    // admits nothing, so only completion feedback knows about it.
+    let rejected = Uuid::from_u128(2);
+    runtime.collector.on_arrival(rejected, 0.0, 64, 2);
+    runtime
+        .collector
+        .on_terminal(rejected, 0.0, ReplayTerminalStatus::Rejected);
+    runtime.publish_final_telemetry_sample().unwrap();
+    let samples = samples.lock().unwrap();
+    let last = samples.last().unwrap();
+    assert_eq!(last.kind, ReplayTelemetrySampleKind::Final);
+    let feedback = last.completion_feedback.as_ref().unwrap();
+    assert_eq!(feedback.terminal_requests, 1);
+    assert_eq!(feedback.completed_requests, 0);
+}
+
 #[derive(Debug)]
 struct QueueUntilWorkerPlacement {
     scheduler_id: Option<usize>,

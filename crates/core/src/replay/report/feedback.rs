@@ -25,6 +25,8 @@ pub struct CompletionFeedbackSnapshot {
 #[derive(Debug, Default)]
 pub(super) struct CompletionFeedback {
     terminal: u64,
+    /// Terminal count carried by the last published snapshot.
+    reported_terminal: u64,
     completed: u64,
     good: u64,
     good_strict_itl: u64,
@@ -78,6 +80,11 @@ impl CompletionFeedback {
         }
     }
 
+    /// Whether a sample has yet to report a terminal update or a latency pair.
+    pub(super) fn has_unreported(&self) -> bool {
+        self.terminal != self.reported_terminal || self.population != 0
+    }
+
     /// Cumulative counters, plus the pending latency sample when `take_interval`
     /// is set. A baseline leaves that sample for the next interval sample.
     pub(super) fn snapshot(
@@ -94,6 +101,7 @@ impl CompletionFeedback {
         } else {
             (Vec::new(), 0)
         };
+        self.reported_terminal = self.terminal;
         CompletionFeedbackSnapshot {
             schema_version: 1,
             sla,

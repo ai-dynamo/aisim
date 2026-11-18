@@ -3600,6 +3600,7 @@ where
             || self.traffic.telemetry_has_observations()
             || self.prefill_engine.telemetry_has_interval_observations()
             || self.decode_engine.telemetry_has_interval_observations()
+            || self.collector.completion_feedback_pending()
         {
             self.publish_telemetry_sample(ReplayTelemetrySampleKind::Final)?;
         }
