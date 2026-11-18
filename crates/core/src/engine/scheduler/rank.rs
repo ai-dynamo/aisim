@@ -6,7 +6,7 @@
 
 //! Thin neutral contract adapter over the mechanically moved scheduler cores.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -56,9 +56,46 @@ pub struct SchedulerRank {
     group_pricing: bool,
     /// When the scheduled pass started, until it is resolved.
     scheduled_at_ms: Option<f64>,
+    /// vLLM `launch`: outputs the engine loop has not returned yet.
+    held_outputs: Option<HeldOutputs>,
+}
+
+/// vLLM's engine loop returns a pass's outputs only after it launches the
+/// next pass (`launch`), which may be after the pass ends.
+#[derive(Default)]
+struct HeldOutputs {
+    /// The latest pass's end and outputs, until the next pass is formed.
+    latest: Option<(f64, Vec<Output>)>,
+    /// Outputs by the time the engine loop returns them, in pass order.
+    returned: VecDeque<(f64, Vec<Output>)>,
+}
+
+impl HeldOutputs {
+    /// Drop a cancelled request's outputs; true when any was held.
+    fn discard(&mut self, request_id: Uuid) -> bool {
+        let mut dropped = false;
+        for (_, outputs) in self.latest.iter_mut().chain(self.returned.iter_mut()) {
+            let before = outputs.len();
+            outputs.retain(|output| output.request_id != request_id);
+            dropped |= outputs.len() != before;
+        }
+        self.latest.take_if(|(_, outputs)| outputs.is_empty());
+        self.returned.retain(|(_, outputs)| !outputs.is_empty());
+        dropped
+    }
+
+    fn is_empty(&self) -> bool {
+        self.latest.is_none() && self.returned.is_empty()
+    }
 }
 
 impl SchedulerRank {
+    /// vLLM `launch`: whether the engine loop launches another pass now, so
+    /// that the outputs it has not returned wait for that launch.
+    fn launches_next_pass(&self) -> bool {
+        self.core.is_ready() && !self.core.waiting_for_external_command()
+    }
+
     pub(crate) fn set_belady_oracle(&mut self, oracle: crate::engine::belady::BeladyOracle) {
         match &mut self.core {
             EngineCore::Vllm(core) => core.set_belady_oracle(oracle),
@@ -158,6 +195,7 @@ impl SchedulerRank {
             dp_rank: identity.dp_rank,
             group_pricing: config.decode_speedup_ratio == 1.0,
             scheduled_at_ms: None,
+            held_outputs: config.launch.map(|_| HeldOutputs::default()),
         })
     }
 
@@ -267,6 +305,15 @@ impl RankEngine for SchedulerRank {
         } else {
             false
         };
+        let suppressed_pending_output = suppressed_pending_output
+            | match (pending_suppression, self.held_outputs.as_mut()) {
+                (Some((request_id, discard_on_noop)), Some(held))
+                    if effects.result != CoreCommandResult::Noop || discard_on_noop =>
+                {
+                    held.discard(request_id)
+                }
+                _ => false,
+            };
         if suppressed_pending_output
             && let Some((request_id, _)) = pending_suppression
             && !effects.retired_requests.contains(&request_id)
@@ -276,6 +323,20 @@ impl RankEngine for SchedulerRank {
             // until the pass completion is observed, so publish the same
             // retirement delta that completion would have carried.
             effects.retired_requests.push(request_id);
+        }
+        // vLLM `launch`: outputs wait for the next pass's launch. When a command
+        // leaves no next pass, the engine loop returns them at once, never
+        // before their pass ended.
+        if self
+            .held_outputs
+            .as_ref()
+            .is_some_and(|held| held.latest.is_some())
+            && !self.launches_next_pass()
+            && let Some(held) = self.held_outputs.as_mut()
+            && let Some((end_ms, outputs)) = held.latest.take()
+        {
+            held.returned
+                .push_back((end_ms.max(context.now_ms), outputs));
         }
         if effects.result != CoreCommandResult::Noop || suppressed_pending_output {
             self.apply_handoff_tracking_update(handoff_update);
@@ -358,7 +419,14 @@ impl RankEngine for SchedulerRank {
             .ok_or_else(|| anyhow!("scheduler rank has no scheduled pass to resolve"))?;
         let pass = self.core.resolve_pass(iteration)?;
         let end_ms = pass.end_ms;
+        let previous_returned_ms = pass.previous_returned_ms;
         let (same_timestamp_retry, start_effects, completion_effects) = split_pass(pass)?;
+        if let Some(held) = self.held_outputs.as_mut()
+            && let Some((previous_end_ms, outputs)) = held.latest.take()
+        {
+            held.returned
+                .push_back((previous_returned_ms.unwrap_or(previous_end_ms), outputs));
+        }
         Ok(RankPass {
             end_ms,
             same_timestamp_retry,
@@ -410,6 +478,15 @@ impl RankEngine for SchedulerRank {
                     .retain(|_, request_id| *request_id != output.request_id);
             }
         }
+        // vLLM `launch`: the engine loop returns this pass's outputs once it
+        // has launched the next pass, which it forms now if it has work.
+        if self.held_outputs.is_some()
+            && !pending.effects.outputs.is_empty()
+            && self.launches_next_pass()
+            && let Some(held) = self.held_outputs.as_mut()
+        {
+            held.latest = Some((end_ms, std::mem::take(&mut pending.effects.outputs)));
+        }
         Ok(pending.effects)
     }
 
@@ -458,7 +535,35 @@ impl RankEngine for SchedulerRank {
     }
 
     fn is_drained(&self) -> bool {
-        self.core.is_drained()
+        self.core.is_drained() && self.held_outputs.as_ref().is_none_or(HeldOutputs::is_empty)
+    }
+
+    fn next_emission_ms(&self) -> Option<f64> {
+        let held = self.held_outputs.as_ref()?;
+        held.returned.front().map(|(at_ms, _)| *at_ms)
+    }
+
+    fn take_due_emissions(&mut self, now_ms: f64) -> Result<Option<Self::PassCompletionEffects>> {
+        let Some(held) = self.held_outputs.as_mut() else {
+            return Ok(None);
+        };
+        let mut outputs = Vec::new();
+        while held
+            .returned
+            .front()
+            .is_some_and(|(at_ms, _)| *at_ms <= now_ms)
+        {
+            let (_, due) = held.returned.pop_front().expect("peeked returned outputs");
+            outputs.extend(due);
+        }
+        if outputs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PassCompletionEffects {
+            outputs,
+            metrics: self.metrics(),
+            ..PassCompletionEffects::default()
+        }))
     }
 }
 
@@ -525,6 +630,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         prefill_schedule_interval: config.prefill_schedule_interval,
         prefill_decode_interval: config.prefill_decode_interval,
         max_concurrent_batches: config.max_concurrent_batches(),
+        launch: config.launch,
         enable_prefix_caching: config.enable_prefix_caching,
         enable_chunked_prefill: config.enable_chunked_prefill,
         speedup_ratio: config.speedup_ratio,
@@ -539,11 +645,12 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         aic_nextn: config.aic_nextn,
         aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
         aic_mtp_seed: config.aic_mtp_seed,
+        disable_eagle_block_drop: config.disable_eagle_block_drop,
         kv_transfer_bytes_per_token: config.kv_transfer_bytes_per_token,
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,
-        native_host_offload: config.native_host_offload.clone(),
+        native_host_offload: config.resolved_host_offload(),
         state_cache: config.state_cache,
         prefix_match_unit: config.prefix_match_unit,
         kv_transfer_bandwidth: config.kv_transfer_bandwidth,
@@ -1269,8 +1376,8 @@ mod tests {
         rank_for_worker(WorkerType::Aggregated)
     }
 
-    fn rank_for_worker(worker_type: WorkerType) -> SchedulerRank {
-        let config = EngineConfig {
+    fn rank_config(worker_type: WorkerType) -> EngineConfig {
+        EngineConfig {
             worker_type,
             num_gpu_blocks: 8,
             block_size: 4,
@@ -1282,7 +1389,11 @@ mod tests {
                 decode_ms: 10.0,
             },
             ..EngineConfig::default()
-        };
+        }
+    }
+
+    fn rank_for_worker(worker_type: WorkerType) -> SchedulerRank {
+        let config = rank_config(worker_type);
         SchedulerRank::new(
             RankIdentity {
                 worker_id: 1,
@@ -1473,6 +1584,184 @@ mod tests {
         assert!(effects.suppressed_pending_output);
         assert_eq!(effects.retired_requests, vec![request_id]);
         assert!(pending.effects.outputs.is_empty());
+    }
+
+    #[test]
+    fn a_cancel_drops_outputs_vllm_has_not_returned() {
+        // With `launch`, the first pass's output waits in the rank for the
+        // next pass's launch; cancelling the request drops it.
+        let request_id = Uuid::from_u128(90_002);
+        let config = EngineConfig {
+            launch: Some(crate::engine::PassLaunchConfig {
+                decode_ms: 1.0,
+                piecewise_ms: 1.0,
+                eager_ms: 1.0,
+                max_cudagraph_capture_size: 16,
+                eager_queue_fraction: 0.0,
+            }),
+            ..rank_config(WorkerType::Aggregated)
+        };
+        let mut rank = SchedulerRank::new(
+            RankIdentity {
+                worker_id: 1,
+                dp_rank: 0,
+                dp_size: NonZeroU32::MIN,
+            },
+            &config,
+        )
+        .unwrap();
+        let pending = start_request_pass(&mut rank, request_id, vec![5, 6]);
+        assert!(rank.complete_pass(pending, 0.0).unwrap().outputs.is_empty());
+        let effects = rank
+            .apply_command_effects(
+                Command::CancelRequest {
+                    request_id,
+                    discard_pending_output: false,
+                },
+                CommandContext {
+                    now_ms: 0.0,
+                    pass_in_flight: false,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(effects.suppressed_pending_output);
+        assert!(rank.is_drained());
+    }
+
+    /// The case from review: fixed 100/10 ms passes, launches of 150 ms, and
+    /// requests A, B and C with 1, 2 and 4 output tokens (and D with 4 when
+    /// `with_d`). Runs two passes: A's output leaves at 110 ms, and B's final
+    /// output then waits for the next pass's launch.
+    fn hold_b_final_output(with_d: bool) -> (SchedulerRank, [Uuid; 3]) {
+        let [a, b, c, d] = [1, 2, 3, 4].map(|n| Uuid::from_u128(96_000 + n));
+        let config = EngineConfig {
+            num_gpu_blocks: 16,
+            max_num_seqs: 4,
+            timing_model: TimingModelConfig::Fixed {
+                prefill_ms: 100.0,
+                decode_ms: 10.0,
+            },
+            launch: Some(crate::engine::PassLaunchConfig {
+                decode_ms: 150.0,
+                piecewise_ms: 1.0,
+                eager_ms: 150.0,
+                max_cudagraph_capture_size: 16,
+                eager_queue_fraction: 0.0,
+            }),
+            ..rank_config(WorkerType::Aggregated)
+        };
+        let mut rank = SchedulerRank::new(
+            RankIdentity {
+                worker_id: 1,
+                dp_rank: 0,
+                dp_size: NonZeroU32::MIN,
+            },
+            &config,
+        )
+        .unwrap();
+        let mut requests = vec![(a, vec![5]), (b, vec![5, 6]), (c, vec![5, 6, 7, 8])];
+        if with_d {
+            requests.push((d, vec![5, 6, 7, 8]));
+        }
+        for (request_id, outputs) in requests {
+            let submitted = rank
+                .apply_command_effects(
+                    Command::Submit(Request {
+                        cache_salt: None,
+                        request_id,
+                        tokens: vec![1, 2, 3, 4],
+                        max_output_tokens: outputs.len(),
+                        output_token_ids: Some(outputs),
+                        session_id: None,
+                        images: Vec::new(),
+                        kv_hint: None,
+                    }),
+                    CommandContext {
+                        now_ms: 0.0,
+                        pass_in_flight: false,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(submitted.result, CommandResult::Submitted(request_id));
+        }
+        let first = rank.execute_pass(0.0).unwrap();
+        assert_eq!(first.end_ms, 100.0);
+        assert!(
+            rank.complete_pass(first.pending, 100.0)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
+        let second = rank.execute_pass(100.0).unwrap();
+        assert_eq!(second.end_ms, 110.0);
+        assert_eq!(rank.next_emission_ms(), Some(110.0));
+        let returned = rank.take_due_emissions(110.0).unwrap().unwrap().outputs;
+        assert!(
+            returned
+                .iter()
+                .any(|output| output.request_id == a && output.completed)
+        );
+        assert!(
+            rank.complete_pass(second.pending, 110.0)
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
+        assert_eq!(rank.next_emission_ms(), None);
+        (rank, [a, b, c])
+    }
+
+    fn cancel(rank: &mut SchedulerRank, request_id: Uuid, now_ms: f64) -> bool {
+        rank.apply_command_effects(
+            Command::CancelRequest {
+                request_id,
+                discard_pending_output: false,
+            },
+            CommandContext {
+                now_ms,
+                pass_in_flight: false,
+            },
+            None,
+        )
+        .unwrap()
+        .suppressed_pending_output
+    }
+
+    #[test]
+    fn a_cancel_that_leaves_no_next_pass_returns_the_held_outputs() {
+        // Cancelling C leaves nothing to launch, so vLLM returns B's final
+        // output at once instead of holding it for a launch that never comes.
+        let (mut rank, [_, b, c]) = hold_b_final_output(false);
+        assert!(cancel(&mut rank, c, 110.0));
+        assert_eq!(rank.next_emission_ms(), Some(110.0));
+        assert!(!rank.is_ready());
+        assert!(!rank.is_drained());
+        let returned = rank.take_due_emissions(110.0).unwrap().unwrap().outputs;
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].request_id, b);
+        assert!(returned[0].completed);
+        assert!(rank.is_drained());
+        assert_eq!(rank.next_emission_ms(), None);
+    }
+
+    #[test]
+    fn a_cancel_that_leaves_a_next_pass_keeps_the_held_outputs_for_its_launch() {
+        // D still runs after C is cancelled, so B's final output waits for the
+        // launch of D's next pass, which ends with that pass at 120 ms.
+        let (mut rank, [_, b, c]) = hold_b_final_output(true);
+        assert!(cancel(&mut rank, c, 110.0));
+        assert_eq!(rank.next_emission_ms(), None);
+        rank.execute_pass(110.0).unwrap();
+        assert_eq!(rank.next_emission_ms(), Some(120.0));
+        let returned = rank.take_due_emissions(120.0).unwrap().unwrap().outputs;
+        assert!(
+            returned
+                .iter()
+                .any(|output| output.request_id == b && output.completed)
+        );
+        assert!(returned.iter().all(|output| output.request_id != c));
     }
 
     #[test]

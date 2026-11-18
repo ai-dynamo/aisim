@@ -100,7 +100,9 @@ not enable it.
 `require_compatible(spec)` checks versions and coarse combinations before
 execution. AgentX G2 additionally requires offline vLLM and static workers. G3
 cannot be combined with AgentX G2. Speculation with G2 is limited to canonical
-MTP with prefix caching and synchronous scheduling. The [feature matrix](../replay/features.md) records the built-in
+MTP with prefix caching and synchronous scheduling, and to MTP on a
+[hybrid G2](../replay/engine/kv-cache.md#hybrid-g2) with
+`disable_eagle_block_drop`. The [feature matrix](../replay/features.md) records the built-in
 stack's actual boundary, including limitations stricter than a capability flag.
 
 If every backend/topology pair fails Sweeper preflight, `RunnerIncompatibleError`

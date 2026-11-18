@@ -121,7 +121,7 @@ impl MhcTable {
     /// Query one op whose rows must carry `architecture` (model-specific
     /// call-site rows). Unlike [`Self::query_module`], rows from another
     /// architecture never answer, even when they share the compute shape;
-    /// a miss is a typed `PerfDatabase` error.
+    /// no rows for this architecture, op and shape is `Ok(None)`.
     pub fn query_architecture_module(
         &self,
         architecture: &str,
@@ -130,23 +130,17 @@ impl MhcTable {
         hc_mult: u32,
         hidden_size: u32,
         sol: &dyn Fn(&str, f64) -> f64,
-    ) -> Result<LeafValue, AicError> {
+    ) -> Result<Option<LeafValue>, AicError> {
         let key = MhcKey {
             op_name: op.to_string(),
             hc_mult,
             hidden_size,
         };
-        let by_tokens = self
-            .load()?
+        self.load()?
             .by_architecture
-            .get(&(architecture.to_owned(), key.clone()))
-            .ok_or_else(|| {
-                AicError::PerfDatabase(format!(
-                    "MHC module data missing for {architecture} {key:?} at {}",
-                    self.data_root.display()
-                ))
-            })?;
-        by_tokens.query(num_tokens as f64, &|t| sol(op, t))
+            .get(&(architecture.to_owned(), key))
+            .map(|by_tokens| by_tokens.query(num_tokens as f64, &|t| sol(op, t)))
+            .transpose()
     }
 
     /// Whether rows tagged `architecture` exist for this op and shape.
@@ -479,6 +473,25 @@ mod tests {
             .expect("query must succeed")
             .latency;
         assert_eq!(mid, 2.5);
+    }
+
+    /// Rows of the same shape under another architecture do not answer: the
+    /// miss is `None`, not an error.
+    #[test]
+    fn mhc_architecture_miss_is_none() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_mhc_parquet(
+            &tmp.path().join("mhc_module_perf.parquet"),
+            &[("ArchA", "pre", 8, 4, 4096, 1.0)],
+        );
+        let table = MhcTable::new(tmp.path().to_path_buf());
+        let query = |architecture| {
+            table
+                .query_architecture_module(architecture, "pre", 8, 4, 4096, &linear_sol)
+                .expect("query must succeed")
+        };
+        assert_eq!(query("ArchA").map(|row| row.latency), Some(1.0));
+        assert_eq!(query("ArchB"), None);
     }
 
     /// Item 1 (mechanism): beyond-range holds must anchor on the CALLER'S sol

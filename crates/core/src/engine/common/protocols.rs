@@ -210,6 +210,9 @@ pub(crate) struct MockEngineArgs {
     /// `EngineConfig::max_concurrent_batches`.
     #[builder(default = "1")]
     pub max_concurrent_batches: usize,
+    /// `EngineConfig::launch`.
+    #[builder(default = "None")]
+    pub launch: Option<crate::engine::PassLaunchConfig>,
     #[builder(default = "true")]
     pub enable_prefix_caching: bool,
     #[builder(default = "true")]
@@ -231,6 +234,9 @@ pub(crate) struct MockEngineArgs {
     pub aic_nextn_accept_rates: Option<String>,
     #[builder(default = "42")]
     pub aic_mtp_seed: u64,
+    /// MTP keeps vLLM's non-speculative prefix-cache rules.
+    #[builder(default = "false")]
+    pub disable_eagle_block_drop: bool,
     #[builder(default = "None")]
     pub kv_transfer_bytes_per_token: Option<usize>,
     #[builder(default = "None")]

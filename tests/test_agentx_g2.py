@@ -405,6 +405,100 @@ def test_agentic_invalid_configuration_matrix_rejects_python_and_native(role, fa
         _runtime.run_replay_json(json.dumps(payload))
 
 
+def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
+    """Canonical MTP with the EAGLE block drop off; G2 requires canonical speculation and default timing."""
+    engine.update(
+        model="meta-llama/Meta-Llama-3.1-8B",
+        backend_version="0.24.0",
+        estimation_mode="op_level",
+        speculation={
+            "kind": "mtp",
+            "params": {"depth": depth},
+            "expected_accepted_tokens": float(depth),
+            "disable_eagle_block_drop": True,
+        },
+    )
+    worker = engine["workers"]["aggregated"]
+    worker["timing"] = {"type": "default"}
+    return worker
+
+
+@pytest.mark.parametrize("window", [False, True])
+def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
+    """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
+    config = _config("agentx-g2-local.yaml")
+    kv_cache = _mtp_with_drop_off(config["engine"], 1)["kv_cache"]
+    kv_cache["capacity"]["blocks"] = 16
+    if window:
+        del config["engine"]["speculation"]["disable_eagle_block_drop"]
+        kv_cache["state_cache"] = {"bytes_per_request": 1_000_000, "sliding_window_lookahead_tokens": 0}
+    else:
+        kv_cache.update(state_cache={"bytes_per_request": 1_000_000}, prefix_match_unit=4)
+        kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+    # A sliding window runs MTP with G2 synchronously, as a token cache does.
+    assert payload["spec"]["engine"]["rank"].get("async_scheduling") == (False if window else None)
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+    _runtime.run_replay_json(json.dumps(payload))
+
+
+def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None:
+    """A request preempted for MTP draft slots makes the forward wait for its slow stores.
+
+    Before the forward read that wait, this run stopped with an effect-free zero-duration pass.
+    """
+    config = {
+        "engine": {
+            "hardware": "h200_sxm",
+            "backend": "vllm",
+            "context_length": 256,
+            "workers": {
+                "aggregated": {
+                    "scheduler": {"max_batched_tokens": 16, "max_sequences": 16},
+                    "kv_cache": {
+                        "block_size": 4,
+                        "bytes_per_token": 16,
+                        "prefix_match_unit": 4,
+                        "capacity": {"type": "fixed", "blocks": 12},
+                        "state_cache": {"bytes_per_request": 64, "num_speculative_states": 3},
+                        "host_offload": {
+                            "num_host_blocks": 32,
+                            "connector": "offloading_v0_32",
+                            "d2h_bandwidth_gbps": 1e-5,
+                            "h2d_bandwidth_gbps": 1e-5,
+                        },
+                    },
+                }
+            },
+        },
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 8, "output_tokens": 1},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        },
+    }
+    _mtp_with_drop_off(config["engine"], 3)
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+    payload.pop("traffic")
+    payload["spec"].update(max_sim_time_ms=5000, max_in_flight=8)
+    assert payload["spec"]["engine"]["rank"]["aic_nextn_accept_rates"] == "1,1,1"
+    turns = [(1, 0, 16, 4), (1, 0, 8, 4), (1, 1000, 32, 1), (100, 0, 22, 8), (200, 0, 8, 20)]
+    payload["spec"]["requests"] = [
+        {
+            "id": str(index),
+            "arrival_time_ms": arrival,
+            "input_tokens": length,
+            "input_token_ids": list(range(first, first + length)),
+            "output_tokens": output,
+        }
+        for index, (arrival, first, length, output) in enumerate(turns)
+    ]
+    report = json.loads(_runtime.run_replay_json(json.dumps(payload)))
+    assert report["num_requests"] == len(turns)
+
+
 def test_agentic_g2_runs_multi_worker_attention_dp_pd_with_mtp_on_one_shared_pool(tmp_path) -> None:
     """Two DP2 prefill workers and one DP2 decode worker share one G2 pool under MTP.
 

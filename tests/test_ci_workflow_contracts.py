@@ -825,7 +825,11 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert jobs["prediction-regression"]["uses"] == "./.github/workflows/prediction-regression-gate.yml"
 
     application_test_wheel = jobs["application-test-wheel"]
-    assert application_test_wheel["timeout-minutes"] == "10"
+    assert application_test_wheel["timeout-minutes"] == "${{ matrix.build_timeout_minutes }}"
+    assert {
+        entry["arch"]: entry["build_timeout_minutes"]
+        for entry in application_test_wheel["strategy"]["matrix"]["include"]
+    } == {"amd64": "10", "arm64": "15"}
     assert {"fast-ci", "select-full-ci"}.issubset(application_test_wheel["needs"])
     assert "application-test-wheel" in jobs["application-tests"]["needs"]
     assert {shard["suite"] for shard in jobs["application-tests"]["strategy"]["matrix"]["shard"]} == {
@@ -2285,8 +2289,13 @@ def test_release_qualification_pins_source_and_tooling_across_all_jobs():
     assert "maturin build --release --locked" in prepare
     assert "run_release_fpe.py record-wheel" in prepare
     assert "run_release_fpe.py discover" in prepare
-    assert "uv sync --project release-source/python/aisim --locked --no-install-project --no-dev" in prepare
+    assert 'project_directory(Path("release-source"))' in prepare
+    assert 'uv sync --project "${project}" --locked --no-install-project --no-dev' in prepare
     generate = _run_commands(jobs["generate"])
+    assert 'project_directory(Path("release-source"))' in generate
+    assert 'uv sync --project "${project}" --locked --no-install-project --no-dev' in generate
+    assert 'echo "RELEASE_PROJECT=${project}" >> "${GITHUB_ENV}"' in generate
+    assert '"${RELEASE_PROJECT}/.venv/bin/python" scripts/fpe/run_release_fpe.py probe' in generate
     assert "run_release_fpe.py probe" in generate
     assert "--max-workers 8" in generate
     assert "--max-topologies-per-role" not in generate

@@ -414,7 +414,9 @@ workers and HBM-only KV cache, including
 assumptions; ngram requires vLLM. vLLM additionally
 supports [G2 host offload](engine/kv-cache.md#agentic-g2) with static workers
 of any count and `attention_data`. Speculation with G2 is limited to canonical
-MTP with prefix caching. TensorRT-LLM, G3 offload and online
+MTP with prefix caching, and to MTP on a
+[hybrid G2](engine/kv-cache.md#hybrid-g2) with `engine.speculation.disable_eagle_block_drop`.
+TensorRT-LLM, G3 offload and online
 P/D are rejected. Results are qualified `functional_only`, not hardware
 accuracy. [Start an AgentX simulation](agentic/quickstart.md) walks through a
 complete run.

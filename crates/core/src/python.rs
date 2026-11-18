@@ -400,9 +400,12 @@ fn validate_public_agentic_engine(
         );
         for (name, role) in &roles {
             ensure!(
-                role.rank.aic_nextn.is_none() || role.rank.has_canonical_mtp_timing(),
+                role.rank.aic_nextn.is_none()
+                    || role.rank.has_canonical_mtp_timing()
+                    || (role.rank.state_cache.is_some() && role.rank.disable_eagle_block_drop),
                 "agentic host offload requires canonical mtp speculation or speculative \
-                 decoding disabled on the {name} role"
+                 decoding disabled on the {name} role, or MTP with state_cache and \
+                 disable_eagle_block_drop"
             );
             ensure!(
                 role.rank.backend == Backend::Vllm,
@@ -1061,7 +1064,8 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_memo: Memo::clock(128),
+            // Per-rank phase pricing meets a new decode KV length on almost every pass.
+            phase_memo: Memo::clock(4096),
             vision,
             iteration,
         })
@@ -2650,6 +2654,55 @@ fn materialize_aic_capacity(
         );
     }
     if resources.as_ref().is_some_and(|resources| {
+        resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::MambaAlign
+    }) {
+        ensure!(
+            role.rank.enable_prefix_caching,
+            "Mamba FPM cache requires the recorded prefix caching policy"
+        );
+        ensure!(
+            role.rank.native_host_offload.is_none() && role.rank.g3_offload.is_none(),
+            "Mamba FPM cache supports HBM replay only"
+        );
+        let budget = estimate_aic_grouped_budget(config, role)?;
+        let cache = budget
+            .replay_cache
+            .context("missing canonical Mamba replay geometry")?;
+        let block_size = cache["block_size"].as_u64().context("Mamba block size")? as usize;
+        let unit = cache["prefix_match_unit"]
+            .as_u64()
+            .context("Mamba prefix unit")? as usize;
+        let token_bytes = cache["kv_cache_bytes_per_token"]
+            .as_u64()
+            .context("Mamba token bytes")? as usize;
+        let state = serde_json::from_value(cache["state_cache"].clone())?;
+        ensure!(
+            role.rank.block_size == block_size,
+            "engine block_size conflicts with measured Mamba geometry"
+        );
+        ensure!(
+            role.rank
+                .prefix_match_unit
+                .is_none_or(|value| value == unit)
+                && role
+                    .rank
+                    .kv_cache_bytes_per_token
+                    .is_none_or(|value| value == token_bytes)
+                && role.rank.state_cache.is_none_or(|value| value == state)
+                && role.rank.kv_cache_groups.is_empty()
+                && role.rank.kv_cache_capacity_bytes.is_none(),
+            "engine cache geometry conflicts with measured Mamba profile"
+        );
+        role.rank.num_gpu_blocks = cache["num_gpu_blocks"]
+            .as_u64()
+            .context("Mamba pool blocks")? as usize;
+        role.rank.prefix_match_unit = Some(unit);
+        role.rank.kv_cache_bytes_per_token = Some(token_bytes);
+        role.rank.state_cache = Some(state);
+        role.rank.validate()?;
+        return Ok(());
+    }
+    if resources.as_ref().is_some_and(|resources| {
         resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::Grouped
     }) {
         ensure!(
@@ -3113,6 +3166,25 @@ fn resolve_role_timing(
     );
     let mut config: AicTimingConfig =
         serde_json::from_value(config).context("invalid AIC timing provider configuration")?;
+    if let Some(launch) = &role.rank.launch
+        && let Some(fit) = config
+            .estimator_request(worker_type)?
+            .estimator_config
+            .fpm_regression
+            .fit
+            .linear
+            .and_then(|linear| linear.max_cudagraph_capture_size)
+    {
+        // Both describe vLLM's max_cudagraph_capture_size: the fit prices a
+        // pass as graph or eager, and `launch` times its launch the same way.
+        ensure!(
+            usize::try_from(fit).is_ok_and(|fit| fit == launch.max_cudagraph_capture_size),
+            "scheduler.launch.max_cudagraph_capture_size ({}) differs from \
+             estimator_config.fpm_regression.fit.linear.max_cudagraph_capture_size ({fit}); \
+             both are vLLM's max_cudagraph_capture_size",
+            launch.max_cudagraph_capture_size
+        );
+    }
     let resources = if config.backend == "vllm" && config.pp == 1 {
         config.estimator_request(worker_type)?.fpm_resources()?
     } else {
@@ -7860,6 +7932,46 @@ mod tests {
                 mid_chunk_mixed_lengths > 0,
                 "{backend:?} never cut a prompt beside another prefill"
             );
+        }
+    }
+
+    #[test]
+    fn launch_and_fit_must_agree_on_the_cuda_graph_capture_size() {
+        for launch_size in [4096, 512] {
+            let mut role = ReplayRoleConfig::default();
+            role.rank.launch = Some(crate::engine::PassLaunchConfig {
+                decode_ms: 1.0,
+                piecewise_ms: 1.0,
+                eager_ms: 1.0,
+                max_cudagraph_capture_size: launch_size,
+                eager_queue_fraction: 0.0,
+            });
+            role.rank.timing_model = TimingModelConfig::External {
+                provider: "aic".into(),
+                config: serde_json::json!({
+                    "model": "test-model", "backend": "vllm", "system": "test-system", "tp": 1,
+                    "estimator_config": {"fpm_regression": {"fit": {"linear": {
+                        "feature_axes": ["E"], "max_cudagraph_capture_size": 512
+                    }}}}
+                }),
+            };
+            // The test model has no estimator, so equal sizes fail only later.
+            let Err(error) = resolve_role_timing(
+                &mut role,
+                false,
+                ForwardPassWorkerType::Aggregated,
+                None,
+                false,
+                &mut Vec::new(),
+                &mut serde_json::Map::new(),
+            ) else {
+                panic!("the test model cannot build an estimator");
+            };
+            let error = error.to_string();
+            let rejected = error
+                .contains("scheduler.launch.max_cudagraph_capture_size (4096) differs")
+                && error.contains("fit.linear.max_cudagraph_capture_size (512)");
+            assert_eq!(rejected, launch_size != 512, "{error}");
         }
     }
 
