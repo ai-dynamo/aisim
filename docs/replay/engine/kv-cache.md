@@ -377,9 +377,10 @@ eviction rules G2 follows:
 | A preemption | Waits for the preempted request's stores | The same | Waits for every transfer in flight |
 | A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | Loads do not wait for other loads or stores; queued loads hold G1 and keep their relative order |
 
-Activated handoffs retain precedence over fresh G2 restores. A pending
-destination reservation blocks fresh admission, including a landed load, but
-does not block a handoff whose KV has already been activated.
+On a decode rank with G2, or while a destination reservation is pending, an
+activated handoff is admitted before a fresh G2 restore, including one whose
+load has landed. A pending reservation blocks fresh admission but not a
+handoff whose KV has already been activated.
 
 The connector profile controls cache semantics independently of the timing
 model's `engine.backend_version`. For example, `offloading_v0_32` can use
