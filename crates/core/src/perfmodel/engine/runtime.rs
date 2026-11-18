@@ -1098,8 +1098,22 @@ impl Engine {
             .as_ref()
             .and_then(|s| s.nextn)
             .unwrap_or(0);
-        Self::validate_mamba_ops(&spec.context_ops, None, true)?;
-        Self::validate_mamba_ops(&spec.generation_ops, Some(nextn.saturating_add(1)), true)?;
+        // [qualified, unrecorded] Mamba2 ops seen across both phases.
+        let mut seen = [false; 2];
+        Self::validate_mamba_ops(&spec.context_ops, None, true, &mut seen)?;
+        Self::validate_mamba_ops(
+            &spec.generation_ops,
+            Some(nextn.saturating_add(1)),
+            true,
+            &mut seen,
+        )?;
+        if seen == [true, true] {
+            return Err(AicError::InvalidEngineConfig(
+                "Mamba ops must all record a state_dtype or all leave it unrecorded: mixed \
+                 steps would charge decode Mamba work twice or not at all"
+                    .into(),
+            ));
+        }
         super::readiness::validate_glm53_kv(
             &db,
             spec.context_ops.iter().chain(&spec.generation_ops),
@@ -1202,11 +1216,13 @@ impl Engine {
     /// qualified op inside a composite is rejected. Generation Mamba queries
     /// carry `requests * (nextn + 1)` flattened tokens and the op divides by
     /// its own width (`decode_width`); the two must agree. Whole-model FPM
-    /// `sol_ops` use a separate path and are not walked.
+    /// `sol_ops` use a separate path and are not walked. `seen` records
+    /// whether any qualified (`[0]`) or unrecorded (`[1]`) Mamba2 op appeared.
     fn validate_mamba_ops(
         ops: &[Op],
         decode_width: Option<u32>,
         top_level: bool,
+        seen: &mut [bool; 2],
     ) -> Result<(), AicError> {
         let invalid = |name: &str, why: String| {
             Err(AicError::InvalidEngineConfig(format!(
@@ -1217,6 +1233,7 @@ impl Engine {
             match op {
                 Op::Mamba2(m) => {
                     let qualified = op.is_qualified_mamba();
+                    seen[usize::from(!qualified)] = true;
                     if !matches!(
                         m.state_dtype.as_str(),
                         "unrecorded" | "float16" | "bfloat16" | "float32"
@@ -1254,21 +1271,27 @@ impl Engine {
                         );
                     }
                 }
-                Op::TokenScale(o) => {
-                    Self::validate_mamba_ops(std::slice::from_ref(&o.op), decode_width, false)?
+                Op::TokenScale(o) => Self::validate_mamba_ops(
+                    std::slice::from_ref(&o.op),
+                    decode_width,
+                    false,
+                    seen,
+                )?,
+                Op::Dsv41Stage(o) => {
+                    Self::validate_mamba_ops(&o.children, decode_width, false, seen)?
                 }
-                Op::Dsv41Stage(o) => Self::validate_mamba_ops(&o.children, decode_width, false)?,
                 Op::Overlap(o) => {
-                    Self::validate_mamba_ops(&o.group_a, decode_width, false)?;
-                    Self::validate_mamba_ops(&o.group_b, decode_width, false)?;
+                    Self::validate_mamba_ops(&o.group_a, decode_width, false, seen)?;
+                    Self::validate_mamba_ops(&o.group_b, decode_width, false, seen)?;
                 }
                 Op::Fallback(o) => {
                     Self::validate_mamba_ops(
                         std::slice::from_ref(&o.primary),
                         decode_width,
                         false,
+                        seen,
                     )?;
-                    Self::validate_mamba_ops(&o.fallback, decode_width, false)?;
+                    Self::validate_mamba_ops(&o.fallback, decode_width, false, seen)?;
                 }
                 _ => {}
             }
@@ -3516,6 +3539,7 @@ impl Engine {
             &ops,
             (!is_context).then(|| self.nextn.saturating_add(1)),
             true,
+            &mut [false; 2],
         )?;
         let mut out = PerOpFold::new(if is_context { "context" } else { "generation" });
         for op in &ops {
@@ -3629,6 +3653,7 @@ impl Engine {
             &ops,
             (!is_context).then(|| self.nextn.saturating_add(1)),
             true,
+            &mut [false; 2],
         )?;
         let sol_db = self.db.sol_full_view();
         let mut out = PerOpSolFold::default();
@@ -4815,6 +4840,30 @@ pub(crate) mod tests {
         ] {
             let err = build(nextn, op).unwrap_err().to_string();
             assert!(err.contains(message), "{err}");
+        }
+        // Mixed steps need both phases qualified or both unrecorded.
+        let phases = |context: &str, generation: &str| {
+            let op = |prefill, dtype: &str| match qualified_mamba(prefill, 1) {
+                Op::Mamba2(mut m) => {
+                    m.state_dtype = dtype.into();
+                    Op::Mamba2(m)
+                }
+                _ => unreachable!(),
+            };
+            Engine::build(
+                EngineSpec::new(
+                    fixture_engine_config(None),
+                    vec![op(true, context)],
+                    vec![op(false, generation)],
+                ),
+                db.clone(),
+            )
+        };
+        phases("float16", "float16").unwrap();
+        phases("unrecorded", "unrecorded").unwrap();
+        for (context, generation) in [("unrecorded", "float16"), ("float16", "unrecorded")] {
+            let err = phases(context, generation).unwrap_err().to_string();
+            assert!(err.contains("all record a state_dtype"), "{err}");
         }
     }
 
