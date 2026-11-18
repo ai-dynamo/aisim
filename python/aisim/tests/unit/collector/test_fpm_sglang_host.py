@@ -32,6 +32,7 @@ from collector.fpm_forward.repeatability import load_repeatability_source
 from collector.fpm_forward.runtime import sglbench_artifact as artifact
 from collector.fpm_forward.runtime.sglbench_compat import TESTED_VERSIONS
 from collector.fpm_forward.runtime_memory import saved_plan_identity
+from collector.fpm_forward.topology import topology_strategy
 from collector.fpm_forward.types import ParallelTopology
 
 from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
@@ -51,6 +52,7 @@ pytestmark = pytest.mark.unit
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 
 MODEL = "private-org/dense-model"
+MOE_MODEL = "private-org/moe-model"
 SYSTEM = "h200_sxm"
 DENSE_CONFIG = {
     "architectures": ["Phi3ForCausalLM"],
@@ -147,6 +149,18 @@ def _plan_inputs(tmp_path: Path, **overrides) -> dict:
         "collector_config": {"runtime_backend_version": "0.5.23", "aic_database_version": "0.5.23"},
     }
     return {**inputs, **overrides}
+
+
+def _moe_plan_inputs(tmp_path: Path, **overrides) -> dict:
+    """The inputs of a collection of the FAKE MoE model on one and two GPUs, with the TEP preset."""
+    inputs = {
+        "model_path": MOE_MODEL,
+        "model_architecture": "NewMoeDsaForCausalLM",
+        "model_config_path": _config(tmp_path, MOE_CONFIG),
+        # --fpm-parallel-presets tep. The default preset of a MoE model also plans DEP cells.
+        "options": _options(fpm_parallel_presets=["tep"]),
+    }
+    return _plan_inputs(tmp_path, **{**inputs, **overrides})
 
 
 def _cells(plan) -> dict[str, list]:
@@ -391,12 +405,175 @@ def test_the_engine_limits_an_sglang_cell_can_take_are_admitted(tmp_path):
     assert [cell.workload_kind for cell in plan.cells] == ["prefill", "prefill"]
 
 
-def test_an_moe_model_is_refused(tmp_path):
+def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(tmp_path):
+    plan = build_collection_plan(**_moe_plan_inputs(tmp_path))
+
+    # The capability of the checkpoint: expert layers, and no pure TP for this backend.
+    assert (plan.capability.is_moe, plan.capability.allow_pure_tp) == (True, False)
+    # One cell per phase and GPU count. The one-GPU cell of the TEP preset has the strategy "single" and one
+    # expert-parallel rank; the two-GPU cell has one expert-parallel rank per tensor-parallel rank.
+    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.to_dict()) for cell in plan.cells] == [
+        (phase, strategy, {"tp": tp, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": tp, "cp": 1})
+        for phase in ("prefill", "decode")
+        for strategy, tp in (("single", 1), ("tep", 2))
+    ]
+    assert {cell.execution_identity for cell in plan.cells} == {LEGACY_EXECUTION_IDENTITY}
+    # Memory admission looked at both topologies and dropped none. The estimate is unavailable in this suite
+    # (_hermetic_plans); test_fpm_sglang_moe.py plans a packaged MoE model with the real estimate.
+    assert [(decision.topology, decision.disposition) for decision in plan.topology_memory_admission] == [
+        (topology, "unknown") for topology in plan.topologies
+    ]
+    assert [topology.to_dict()["tp"] for topology in plan.topologies] == [1, 2]
+    # The one backend policy is the automatic baseline: no engine flag, no vLLM marker, and the four backend
+    # identity columns of every row say that the engine decided.
+    (policy,) = plan.backend_policies
+    assert (policy.policy_id, policy.generator_overrides, policy.expected_markers) == ("baseline_auto", {}, {})
+    assert all(cell.backend_policy == policy for cell in plan.cells)
+    assert planner.backend_identity_columns(policy) == {
+        "moe_backend": "auto",
+        "attention_backend": "auto",
+        "enable_wideep": False,
+        "enable_eplb": False,
+    }
+
+    # The saved form names the strategies, and its reader recomputes the hash and rebuilds every cell.
+    saved = plan.to_dict()
+    assert [(topology["strategy"], topology["tp"], topology["moe_ep"]) for topology in saved["topologies"]] == [
+        ("single", 1, 1),
+        ("tep", 2, 2),
+    ]
+    assert saved["counts"]["memory_rejected_topologies"] == 0
+    assert saved["point_generation"]["owner"] == "collector.fpm_forward.runtime.sglbench_launcher"
+    identity = saved_plan_identity(json.loads(json.dumps(saved)))
+    assert (identity.backend, identity.sha256) == ("sglang", plan.sha256)
+    assert identity.cells == plan.cells
+
+
+def test_the_cli_plans_a_moe_collection_with_the_tep_preset(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MOE_MODEL)
+    arguments = [
+        *("--backend", "sglang", "--model-path", MOE_MODEL, "--model-architecture", "NewMoeDsaForCausalLM"),
+        *("--fpm-model-config", _config(tmp_path, MOE_CONFIG), "--gpu", SYSTEM, "--plan-only"),
+        *("--fpm-prefill-cudagraph-policy", "runtime"),
+        *("--fpm-backend-version", "0.5.23", "--fpm-runtime-backend-version", "0.5.23"),
+        *("--fpm-max-gpus", "2", "--fpm-gpu-counts", "1", "2"),
+    ]
+
+    assert cli.main([*arguments, "--fpm-parallel-presets", "tep"]) == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert [
+        (cell["workload_kind"], cell["parallel_strategy"], cell["topology"]["tp"], cell["topology"]["moe_ep"])
+        for cell in printed["cells"]
+    ] == [
+        ("prefill", "single", 1, 1),
+        ("prefill", "tep", 2, 2),
+        ("decode", "single", 1, 1),
+        ("decode", "tep", 2, 2),
+    ]
+    assert saved_plan_identity(printed).backend == "sglang"
+
+    # Without the preset the plan of a MoE model holds DEP cells, and the refusal names the flag to pass.
+    with pytest.raises(SystemExit) as refused:
+        cli.main(arguments)
+    assert refused.value.code == 2
+    assert "error: SGLang FPM collection does not support DP attention yet" in capsys.readouterr().err
+
+
+def test_memory_admission_still_drops_a_moe_cell_that_does_not_fit(tmp_path, monkeypatch):
+    # FAKE sizes: the weights do not fit one GPU of the FAKE capacity and fit when two ranks share them.
+    capacity = 100 * 2**30
+
+    def estimate(*_args, tp_size, moe_ep_size, **_kwargs):
+        assert moe_ep_size == tp_size
+        non_kv = 120 * 2**30 // tp_size
+        return SimpleNamespace(breakdown={"non_kv_bytes": non_kv, "gpu_memory_capacity_bytes": capacity})
+
+    monkeypatch.setattr("collector.fpm_forward.memory_admission.KVCacheEstimator.from_request", estimate)
+
+    plan = build_collection_plan(**_moe_plan_inputs(tmp_path))
+
+    assert [(decision.topology.tp, decision.disposition) for decision in plan.topology_memory_admission] == [
+        (1, "rejected"),
+        (2, "admitted"),
+    ]
+    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.tp) for cell in plan.cells] == [
+        ("prefill", "tep", 2),
+        ("decode", "tep", 2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("presets", "message"),
+    [
+        # The default preset "auto" plans TEP and DEP for a MoE model, and DEP needs DP attention.
+        (None, r"does not support DP attention yet \(topology \{'tp': 1, 'pp': 1, 'dp': 2, 'moe_tp': 1, 'moe_ep': 2"),
+        (["auto"], "does not support DP attention yet"),
+        (["dep"], "does not support DP attention yet"),
+        (["tep", "dep"], "does not support DP attention yet"),
+        # Refused before the SGLang check: pure TP is admitted for vLLM only, and plain TP for a dense model only.
+        (["pure_tp"], "pure TP was requested, but the AIC model/runtime capability profile does not explicitly admit"),
+        (["tp"], "MoE models use TEP or DEP; plain TP is not an independent typical preset"),
+    ],
+    ids=["default", "auto", "dep", "tep-and-dep", "pure-tp", "tp"],
+)
+def test_the_other_presets_of_a_moe_model_are_refused(tmp_path, presets, message):
+    _refused(tmp_path, message, **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
+
+
+@pytest.mark.parametrize("presets", [None, ["auto"], ["tep"], ["dep"]], ids=["default", "auto", "tep", "dep"])
+def test_a_one_gpu_plan_of_a_moe_model_holds_the_single_cell_under_these_presets(tmp_path, presets):
+    # On one GPU the TEP and the DEP preset give the same topology, so no preset plans a cell with DP attention.
+    options = _options(fpm_max_gpus=1, fpm_parallel_presets=presets)
+
+    plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=options))
+
+    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.to_dict()) for cell in plan.cells] == [
+        (phase, "single", {"tp": 1, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1, "cp": 1})
+        for phase in ("prefill", "decode")
+    ]
+
+
+def test_the_dp_attention_refusal_names_the_preset_to_pass(tmp_path):
+    with pytest.raises(ValueError) as refused:
+        build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options()))
+
+    assert str(refused.value) == (
+        "SGLang FPM collection does not support DP attention yet (topology "
+        "{'tp': 1, 'pp': 1, 'dp': 2, 'moe_tp': 1, 'moe_ep': 2, 'cp': 1}); pass --fpm-parallel-presets tep to "
+        "collect the tensor- and expert-parallel cells of a MoE model"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "DYN_BENCH_PREFILL_CONTENT",
+        "DYN_BENCH_KV_WARMUP_DATASET",
+        "DYN_BENCH_KV_WARMUP_CACHE_DIR",
+        "DYN_BENCH_KV_WARMUP_SHA256",
+    ],
+)
+def test_a_content_variable_of_the_deployment_inputs_is_part_of_the_plan_hash(tmp_path, name):
+    def plan(*environment: dict):
+        overrides = {"K8sConfig": {"k8s_image": "example/sglang:test", "extra_env": list(environment)}}
+        return build_collection_plan(**_moe_plan_inputs(tmp_path, generator_overrides=overrides))
+
+    # FAKE values: the planner does not read them, it freezes them. The launcher reads them in the pod.
+    plans = [plan(), plan({"name": name, "value": "first"}), plan({"name": name, "value": "second"})]
+
+    # K8sConfig.extra_env is the one way such a value reaches a cell, and each value is another plan.
+    assert len({saved.sha256 for saved in plans}) == 3
+    assert len({saved.generator_config_sha256 for saved in plans}) == 3
+    # The cells are the same cells: their ids name the backend, the model, the topology and the dtypes.
+    assert len({tuple(cell.cell_id for cell in saved.cells) for saved in plans}) == 1
+
+
+def test_the_tep_preset_of_a_dense_model_is_still_refused(tmp_path):
     _refused(
         tmp_path,
-        "does not support MoE models yet; only dense TP cells are collected",
-        model_architecture="NewMoeDsaForCausalLM",
-        model_config_path=_config(tmp_path, MOE_CONFIG),
+        r"dense models support only the TP typical preset, got \['tep'\]",
+        options=_options(fpm_parallel_presets=["tep"]),
     )
 
 
@@ -406,10 +583,16 @@ def test_a_model_with_an_execution_identity_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(planner, "execution_identity", lambda *_args, **_kwargs: identity)
 
     _refused(tmp_path, r"does not support a model with an FPM execution identity \(\{'model_config_sha256': '0000")
+    # The refusal does not depend on the model kind: a MoE model with such an identity is refused the same way.
+    _refused(
+        tmp_path,
+        r"does not support a model with an FPM execution identity \(\{'model_config_sha256': '0000",
+        **_moe_plan_inputs(tmp_path),
+    )
 
 
 @pytest.mark.parametrize("axis", ["pp", "dp", "moe_tp", "moe_ep", "cp"])
-def test_only_tensor_parallel_topologies_are_admitted(axis):
+def test_only_tensor_parallel_topologies_of_a_dense_model_are_admitted(axis):
     sizes = {"tp": 2, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1, "cp": 1}
     dense = {"is_moe": False, "execution": LEGACY_EXECUTION_IDENTITY}
     tensor_parallel = tuple(ParallelTopology(**{**sizes, "tp": tp}) for tp in (1, 2, 4, 8))
@@ -419,10 +602,60 @@ def test_only_tensor_parallel_topologies_are_admitted(axis):
     other = ParallelTopology(**{**sizes, axis: 2})
     with pytest.raises(ValueError, match=rf"supports tensor-parallel cells only .*got topology .*'{axis}': 2"):
         planner._require_sglang_launcher_cells(**dense, topologies=(*tensor_parallel, other))
-    # The MoE strategies are refused with the model, whatever the sizes are.
-    with pytest.raises(ValueError, match="does not support MoE models yet"):
-        planner._require_sglang_launcher_cells(
-            is_moe=True, execution=LEGACY_EXECUTION_IDENTITY, topologies=tensor_parallel
+
+
+def _moe_topology(**sizes: int) -> ParallelTopology:
+    """A topology of a MoE model: one expert-parallel rank per tensor-parallel rank unless ``sizes`` say otherwise."""
+    tp = sizes.get("tp", 2)
+    return ParallelTopology(**{"tp": tp, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": tp, "cp": 1, **sizes})
+
+
+def test_the_single_and_the_tep_topologies_of_a_moe_model_are_admitted():
+    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
+    admitted = tuple(_moe_topology(tp=tp) for tp in (1, 2, 4, 8))
+    assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["single", "tep", "tep", "tep"]
+
+    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
+
+    # A dense model has no expert-parallel rank to spread: the same topologies above one GPU are refused for it.
+    with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'moe_ep': 2"):
+        planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
+
+
+@pytest.mark.parametrize(
+    ("sizes", "message"),
+    [
+        # DEP at two and four GPUs, and DP attention beside tensor parallelism.
+        ({"tp": 1, "dp": 2, "moe_ep": 2}, r"does not support DP attention yet \(topology .*'dp': 2.*\); pass "),
+        ({"tp": 1, "dp": 4, "moe_ep": 4}, r"does not support DP attention yet \(topology .*'dp': 4.*\); pass "),
+        ({"tp": 2, "dp": 2, "moe_ep": 4}, r"does not support DP attention yet \(topology .*'dp': 2.*\); pass "),
+        # Pure TP, an expert-parallel size that is not the tensor-parallel size, and the two fixed axes.
+        ({"tp": 2, "moe_tp": 2, "moe_ep": 1}, r"moe_ep must equal tp\); got topology .*'moe_tp': 2, 'moe_ep': 1"),
+        ({"tp": 2, "moe_ep": 1}, r"moe_ep must equal tp\); got topology .*'tp': 2, .*'moe_ep': 1"),
+        ({"tp": 4, "moe_ep": 2}, r"moe_ep must equal tp\); got topology .*'tp': 4, .*'moe_ep': 2"),
+        ({"tp": 1, "moe_ep": 2}, r"moe_ep must equal tp\); got topology .*'tp': 1, .*'moe_ep': 2"),
+        ({"tp": 4, "moe_tp": 2, "moe_ep": 2}, r"moe_ep must equal tp\); got topology .*'moe_tp': 2, 'moe_ep': 2"),
+        # The expert-parallel size is the tensor-parallel size, and only moe_tp is not 1.
+        ({"tp": 2, "moe_tp": 2}, r"moe_ep must equal tp\); got topology .*'tp': 2, .*'moe_tp': 2, 'moe_ep': 2"),
+        ({"pp": 2}, r"moe_ep must equal tp\); got topology .*'pp': 2"),
+        ({"cp": 2}, r"moe_ep must equal tp\); got topology .*'cp': 2"),
+    ],
+    ids=[
+        *("dep-2", "dep-4", "dp-with-tp", "pure-tp", "no-ep", "ep-below-tp", "ep-above-tp", "mixed"),
+        *("moe-tp-beside-ep", "pp", "cp"),
+    ],
+)
+def test_every_other_topology_of_a_moe_model_is_refused(sizes, message):
+    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
+    admitted = (_moe_topology(tp=1), _moe_topology(tp=2))
+
+    with pytest.raises(ValueError, match=message) as refused:
+        planner._require_sglang_launcher_cells(**moe, topologies=(*admitted, _moe_topology(**sizes)))
+
+    if "DP attention" not in message:
+        assert str(refused.value).startswith(
+            "SGLang FPM collection supports the tensor- and expert-parallel cells of a MoE model only (pp, dp, cp "
+            "and moe_tp must be 1, and moe_ep must equal tp); got topology {"
         )
 
 
@@ -770,6 +1003,10 @@ def test_the_validator_accepts_sglang_provenance_only_when_it_is_asked_for(tmp_p
     _write_provenance(vllm_pod / "collector-provenance.json", cell_id=vllm_cell.cell_id)
     (vllm_pod / "benchmark.json").write_text(json.dumps(_native_payload(phase="prefill", rank=0, dp=1)))
     assert validate_native_collection(vllm_cell, tmp_path / "vllm").backend_version == "0.24.0"
+    # Whatever its plan says of expert layers: what an SGLang pod records is asked of an SGLang collection only.
+    for expected_moe in (True, False, None):
+        collection = validate_native_collection(vllm_cell, tmp_path / "vllm", expected_moe=expected_moe)
+        assert collection.backend_version == "0.24.0"
     with pytest.raises(ValueError, match="Collector provenance has invalid runtime identity"):
         validate_native_collection(vllm_cell, tmp_path / "vllm", expected_backend="sglang")
 

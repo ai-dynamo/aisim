@@ -259,6 +259,9 @@ def test_public_functions_keep_the_signatures_the_launcher_is_written_against():
         "build_engine": ["server_args", "scheduler_entry"],
         "generate_batch": ["engine", "prompts", "rids", "max_new_tokens", "timeout_seconds"],
         "vocabulary": ["engine"],
+        "model_vocabulary_size": ["engine"],
+        "encode_texts": ["engine", "texts"],
+        "tokenizer_class": ["engine"],
         "child_pids": ["engine"],
         "shutdown": ["engine"],
     }
@@ -1175,7 +1178,7 @@ def test_a_call_without_a_finite_time_limit_is_refused(loop, timeout_seconds):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# vocabulary, child_pids, shutdown
+# vocabulary, encode_texts, tokenizer_class, child_pids, shutdown
 # ---------------------------------------------------------------------------------------------------------------
 
 
@@ -1277,6 +1280,144 @@ def test_vocabulary_refuses_a_special_id_list_that_is_none_and_a_bad_model_size(
         compat.vocabulary(_fake_engine_with(_FakeTokenizer(), model_vocab_size=None))
     with pytest.raises(ValueError, match="model_config.vocab_size"):
         compat.vocabulary(_fake_engine_with(_FakeTokenizer(), model_vocab_size=-1))
+
+
+@pytest.mark.parametrize(("tokenizer_size", "model_size"), [(1000, 900), (900, 1000), (7, 7)])
+def test_model_vocabulary_size_is_the_models_bound_whatever_the_tokenizers_is(tokenizer_size, model_size):
+    engine = _fake_engine_with(_FakeTokenizer(vocab_size=tokenizer_size), model_vocab_size=model_size)
+    assert compat.model_vocabulary_size(engine) == model_size
+    # It reads the model config only: an engine without a tokenizer still has the bound.
+    assert compat.model_vocabulary_size(_fake_engine_with(None, model_vocab_size=model_size)) == model_size
+
+
+@pytest.mark.parametrize(
+    ("model_size", "error"),
+    [(None, TypeError), ("1000", TypeError), (True, TypeError), (1000.0, TypeError), (0, ValueError), (-1, ValueError)],
+)
+def test_model_vocabulary_size_refuses_a_value_that_is_not_a_positive_int(model_size, error):
+    with pytest.raises(error, match=r"^tokenizer_manager\.model_config\.vocab_size is "):
+        compat.model_vocabulary_size(_fake_engine_with(_FakeTokenizer(), model_vocab_size=model_size))
+
+
+class _FakeBatchTokenizer:
+    """FAKE tokenizer with the batch call ``encode_texts`` makes: ``tokenizer(texts, add_special_tokens=False)``.
+
+    Each text becomes one id per character, the character's code point plus ``FAKE_ID_BASE``. The real call
+    belongs to the transformers library and returns a mapping with ``input_ids``; ``answer`` puts another
+    object in its place.
+    """
+
+    FAKE_ID_BASE = 100
+
+    def __init__(self, answer=None):
+        self.calls = []
+        self.answer = answer
+
+    def __call__(self, texts, **kwargs):
+        self.calls.append((texts, kwargs))
+        if self.answer is not None:
+            return self.answer(texts)
+        return {"input_ids": [[self.FAKE_ID_BASE + ord(character) for character in text] for text in texts]}
+
+
+def test_encode_texts_makes_one_batch_call_without_special_tokens_and_returns_one_id_list_per_text():
+    tokenizer = _FakeBatchTokenizer()
+    texts = ["ab", "", "cab"]
+    ids = compat.encode_texts(_fake_engine_with(tokenizer), texts)
+    assert ids == [[197, 198], [], [199, 197, 198]]
+    assert all(type(token) is int for row in ids for token in row)
+    # One call for all texts, with the one keyword and the caller's own list, which is not changed.
+    assert len(tokenizer.calls) == 1
+    assert tokenizer.calls[0][0] is texts and tokenizer.calls[0][1] == {"add_special_tokens": False}
+    assert texts == ["ab", "", "cab"]
+
+
+def test_encode_texts_takes_a_mapping_that_is_not_a_dict():
+    class _FakeBatchEncoding:
+        """FAKE of the mapping a Hugging Face tokenizer returns: it answers ``["input_ids"]`` and is no dict."""
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __getitem__(self, key):
+            return {"input_ids": self.rows}[key]
+
+    tokenizer = _FakeBatchTokenizer(answer=lambda texts: _FakeBatchEncoding([[7, 8] for _text in texts]))
+    assert compat.encode_texts(_fake_engine_with(tokenizer), ["a", "b"]) == [[7, 8], [7, 8]]
+
+
+def test_encode_texts_refuses_an_engine_without_a_tokenizer():
+    with pytest.raises(ValueError, match="skip-tokenizer-init"):
+        compat.encode_texts(_fake_engine_with(None), ["some text"])
+
+
+@pytest.mark.parametrize(
+    ("texts", "error", "match"),
+    [
+        ("one text", TypeError, "texts must be a list"),
+        (("a", "b"), TypeError, "texts must be a list"),
+        (None, TypeError, "texts must be a list"),
+        ([], ValueError, "must not be empty"),
+        (["a", 7], TypeError, "text 1 is int"),
+        (["a", None], TypeError, "text 1 is NoneType"),
+        ([b"bytes"], TypeError, "text 0 is bytes"),
+    ],
+)
+def test_encode_texts_refuses_what_is_not_a_non_empty_list_of_strings_before_the_tokenizer_is_called(
+    texts, error, match
+):
+    tokenizer = _FakeBatchTokenizer()
+    with pytest.raises(error, match=match):
+        compat.encode_texts(_fake_engine_with(tokenizer), texts)
+    assert tokenizer.calls == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "error", "match"),
+    [
+        (lambda texts: {"ids": [[1] for _text in texts]}, TypeError, "returned dict without input_ids"),
+        (lambda texts: [[1] for _text in texts], TypeError, "returned list without input_ids"),
+        (lambda texts: None, TypeError, "returned NoneType without input_ids"),
+        (lambda texts: {"input_ids": tuple([1] for _text in texts)}, TypeError, "input_ids as tuple"),
+        (lambda texts: {"input_ids": None}, TypeError, "input_ids as NoneType"),
+        (lambda texts: {"input_ids": [[1]]}, ValueError, "returned 1 id lists for 2 texts"),
+        (lambda texts: {"input_ids": [[1], [2], [3]]}, ValueError, "returned 3 id lists for 2 texts"),
+        (lambda texts: {"input_ids": [[1], (2, 3)]}, TypeError, "returned tuple for text 1"),
+        (lambda texts: {"input_ids": [[1], 2]}, TypeError, "returned int for text 1"),
+        (lambda texts: {"input_ids": [[1, "2"], [3]]}, TypeError, "returned '2' among the ids of text 0"),
+        (lambda texts: {"input_ids": [[1], [3, True]]}, TypeError, "returned True among the ids of text 1"),
+        (lambda texts: {"input_ids": [[1], [3.0]]}, TypeError, r"returned 3\.0 among the ids of text 1"),
+        (lambda texts: {"input_ids": [[1], [None]]}, TypeError, "returned None among the ids of text 1"),
+    ],
+)
+def test_encode_texts_refuses_a_result_that_is_not_one_list_of_plain_ints_per_text(answer, error, match):
+    tokenizer = _FakeBatchTokenizer(answer=answer)
+    with pytest.raises(error, match=match) as caught:
+        compat.encode_texts(_fake_engine_with(tokenizer), ["a", "b"])
+    assert "_FakeBatchTokenizer" in str(caught.value), "the message names the kind of tokenizer"
+    assert len(tokenizer.calls) == 1
+
+
+def test_encode_texts_lets_the_error_of_a_tokenizer_that_cannot_be_called_this_way_pass():
+    failure = RuntimeError("FAKE: this tokenizer has no batch call")
+
+    def fail(texts):
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        compat.encode_texts(_fake_engine_with(_FakeBatchTokenizer(answer=fail)), ["a"])
+    assert caught.value is failure
+    # The tokenizer of the other fake has no call at all, as a tokenizer that is not a Hugging Face one may.
+    with pytest.raises(TypeError, match="not callable"):
+        compat.encode_texts(_fake_engine_with(_FakeTokenizer()), ["a"])
+
+
+def test_tokenizer_class_names_the_module_and_the_class_of_the_served_tokenizer():
+    name = compat.tokenizer_class(_fake_engine_with(_FakeBatchTokenizer()))
+    assert name == f"{_FakeBatchTokenizer.__module__}._FakeBatchTokenizer"
+    assert compat.tokenizer_class(_fake_engine_with(7)) == "builtins.int"
+    with pytest.raises(ValueError, match="skip-tokenizer-init"):
+        compat.tokenizer_class(_fake_engine_with(None))
 
 
 def test_child_pids_is_a_copy_of_the_engines_list():
@@ -1405,7 +1546,8 @@ def test_module_level_imports_are_standard_library_and_sglang_is_imported_inside
                 if name.split(".")[0] == "sglang":
                     sglang_importers.add(function.name)
     assert everywhere == {"sglang"}, "inside functions only SGLang is imported"
-    # resolved_dict, generate_batch, vocabulary, child_pids and shutdown work on objects they are given.
+    # resolved_dict, generate_batch, vocabulary, encode_texts, tokenizer_class, child_pids and shutdown work on
+    # objects they are given.
     assert sglang_importers == set(SGLANG_CALLERS)
 
     for node in ast.walk(tree):

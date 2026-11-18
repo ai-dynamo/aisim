@@ -17,8 +17,12 @@ only. An SGLang cell is therefore the vLLM FPM render of the same cell with thre
 made to the Generator, which is a vLLM request.
 
 Whatever cannot be translated refuses the cell with a ``ValueError`` that names what was found. Nothing is
-passed on untranslated. A cell that is refused after the render keeps the vLLM files in its directory; the
-runner fails the cell before it stages anything.
+passed on untranslated. A value of the two real-state switches or of the content variable that the inputs of
+the cell or its rendered ``run.sh`` hold, and that the launcher would refuse in the pod, refuses the cell in
+the same way, before a pod is scheduled. Two cases stay with the launcher: a value that reaches the pod in
+another way, for example from the image, and the seeded content word for a model that the plan does not take
+for an MoE model. A cell that is refused after the render keeps the vLLM files in its directory; the runner
+fails the cell before it stages anything.
 
 Where the flag names come from
     The launcher's own flags are those ``runtime/sglbench_launcher.py`` declares (``_build_parser``). Every
@@ -30,9 +34,9 @@ Where the flag names come from
         v0.5.23  https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
 
     A field is the flag of its name with dashes (``python/sglang/srt/arg_groups/arg_utils.py``). The fields
-    used here are ``model_path``, ``context_length`` and ``kv_cache_dtype`` (``model.py``), ``tp_size``
-    (``parallel.py``), ``mem_fraction_static``, ``max_running_requests``, ``chunked_prefill_size`` and
-    ``max_prefill_tokens`` (``schedule.py``) and ``served_model_name`` (``serving.py``). No SGLang code is
+    used here are ``model_path``, ``context_length`` and ``kv_cache_dtype`` (``model.py``), ``tp_size`` and
+    ``ep_size`` (``parallel.py``), ``mem_fraction_static``, ``max_running_requests``, ``chunked_prefill_size``
+    and ``max_prefill_tokens`` (``schedule.py``) and ``served_model_name`` (``serving.py``). No SGLang code is
     copied.
 """
 
@@ -101,6 +105,7 @@ _DEADLINE_LEAD_SECONDS = 600
 _MIN_DEADLINE_SECONDS = 60
 
 _MODE_FLAG = "--benchmark-mode"
+_TENSOR_PARALLEL_FLAG = "--tensor-parallel-size"
 _POINTS_FILE_FLAG = "--benchmark-points-file"
 _TOKEN_BUDGET_FLAG = "--max-num-batched-tokens"
 # The cap of the prefill new-token axis. An SGLang plan has the runtime graph policy, under which the vLLM
@@ -135,6 +140,23 @@ _REAL_STATE_SWITCHES = {
     "DYN_BENCH_KV_WARMUP": ("on", "1", "true"),
     "DYN_BENCH_PREFILL_REAL_SEED": ("on", "1", "true", "auto"),
 }
+
+# The variable that chooses the content of a cell, and the two words the launcher accepts for it
+# (runtime/sglbench_launcher.py ``ENV_PREFILL_CONTENT``, ``SEEDED_CONTENT`` and ``TEXT_CONTENT``; a test
+# compares the constants and the two refusals). The launcher takes the value as it stands, so another
+# spelling of a word is another word, and an empty value counts as unset. It refuses the seeded word for a
+# model with expert layers once it has read the model config in the pod. The plan has its own answer before
+# (``capability.is_moe``, capabilities.py: one of three expert counts of the decoder config is above 1, or
+# the model cases select the DSA op pair), and the host refuses the word for an MoE plan here. The
+# launcher's test, a truthy value of any of six keys on the config SGLang loads
+# (runtime/sglbench_compat.py ``EXPERT_KEYS``), is wider than the count test, so the launcher also refuses
+# the word for some models that the plan takes for dense. A plan that is MoE by the DSA op pair alone would
+# be refused here although the launcher finds no expert key; every packaged config of the two DSA
+# architectures has an expert count above 1. Without these checks the launcher would refuse the cell only
+# after the pod was scheduled.
+_CONTENT_VARIABLE = "DYN_BENCH_PREFILL_CONTENT"
+_SEEDED_CONTENT = "random"
+_TEXT_CONTENT = "sharegpt_chain"
 
 
 def _refused(reason: str) -> ValueError:
@@ -204,6 +226,9 @@ class _Row:
     # Checks the value and returns the one to write, or None when this value writes nothing. Without it the
     # value is written as it is.
     value: Callable[[str, str], str | None] | None = None
+    # For a switch that SGLang takes as a size: the vLLM flag whose written value it is written with. Its
+    # flags follow the flags of that one directly, and a command in which that flag wrote nothing is refused.
+    value_of: str | None = None
 
 
 def _unchanged(flag: str) -> _Row:
@@ -228,10 +253,19 @@ _DROPPED_SWITCH = _Row(takes_value=False)
 _TRANSLATION: dict[str, _Row] = {
     "--model": _Row(writes=("--model-path",)),
     "--served-model-name": _unchanged("--served-model-name"),
-    "--tensor-parallel-size": _Row(writes=("--tp-size",)),
+    _TENSOR_PARALLEL_FLAG: _Row(writes=("--tp-size",)),
     # SGLang's defaults are 1, and the launcher refuses any other resolved value.
     "--pipeline-parallel-size": _Row(value=_one_rank),
     "--data-parallel-size": _Row(value=_one_rank),
+    # vLLM's switch carries no size: it spreads the experts of a MoE model over the ranks of the engine, and a
+    # cell has one data-parallel replica, so those are its tensor-parallel ranks. SGLang takes the size
+    # (``ep_size`` in ``fields/parallel.py``, default 1), so the switch is written as --ep-size with the
+    # tensor-parallel size. AISim's generated SGLang serving deployment passes the same size under the alias
+    # --expert-parallel-size (backend_config_mapping.yaml, ``moe_expert_parallel_size``). The Generator sets
+    # the switch only for an expert-parallel size above 1 (src/aisim/generator/rule_plugin/vllm.rule), so a
+    # one-GPU MoE cell writes no --ep-size and runs with SGLang's default. No other MoE flag has a row:
+    # --kernel-config, --enable-eplb and --data-parallel-backend refuse the cell like any unknown flag.
+    "--enable-expert-parallel": _Row(writes=("--ep-size",), takes_value=False, value_of=_TENSOR_PARALLEL_FLAG),
     "--kv-cache-dtype": _Row(writes=("--kv-cache-dtype",), value=_kv_cache_dtype),
     # The same pair as the Generator's (backend_config_mapping.yaml, ``kv_cache_free_gpu_memory_fraction``).
     # The number is passed as it is. In SGLang it is the share of the memory that the weights and the KV pool
@@ -270,12 +304,16 @@ def _translate_command(tokens: list[str]) -> list[str]:
     """The launcher's command for the vLLM worker command of the same cell, in the order of the vLLM flags.
 
     A flag may carry its value as the next token or after ``=``. A flag that is given twice is refused: the
-    Generator and the two parsers each read the last one, and this module would have to guess the same.
+    Generator and the two parsers each read the last one, and this module would have to guess the same. What a
+    row with ``value_of`` writes stands directly after the flags of the flag it names, wherever the switch
+    itself stands in the vLLM command.
     """
     if tuple(tokens[:3]) != _VLLM_COMMAND:
         raise _refused(f"the command starts with {shlex.join(tokens[:3])!r}, not with {shlex.join(_VLLM_COMMAND)!r}")
-    command = list(LAUNCHER_COMMAND)
     given: dict[str, str | None] = {}
+    # The tokens written for each vLLM flag, in the order of the vLLM flags, and the value they carry.
+    written: dict[str, list[str]] = {}
+    written_values: dict[str, str] = {}
     position = len(_VLLM_COMMAND)
     while position < len(tokens):
         flag, joined, value = tokens[position].partition("=")
@@ -296,10 +334,19 @@ def _translate_command(tokens: list[str]) -> list[str]:
             value = tokens[position]
             position += 1
         given[flag] = value
-        written = value if row.value is None else row.value(flag, value)
-        if written is not None:
-            for name in row.writes:
-                command.extend([name, written])
+        translated = value if row.value is None else row.value(flag, value)
+        if translated is not None and row.writes:
+            written[flag] = [token for name in row.writes for token in (name, translated)]
+            written_values[flag] = translated
+
+    for flag, row in _TRANSLATION.items():
+        if row.value_of is None or flag not in given:
+            continue
+        if row.value_of not in written:
+            raise _refused(f"{flag} is written with the value of {row.value_of}, which the command does not give")
+        size = written_values[row.value_of]
+        written[row.value_of].extend(token for name in row.writes for token in (name, size))
+    command = [*LAUNCHER_COMMAND, *(token for flag_tokens in written.values() for token in flag_tokens)]
 
     if _MODE_FLAG not in given:
         raise _refused(f"the command has no {_MODE_FLAG}")
@@ -323,6 +370,22 @@ def _check_real_state_switch(name: str, value: object, source: str) -> None:
         )
 
 
+def _check_content_word(value: object, source: str, *, is_moe: bool) -> None:
+    """Refuse a value of the content variable that the launcher would refuse in the pod."""
+    if value == "":
+        return
+    if value not in (_SEEDED_CONTENT, _TEXT_CONTENT):
+        raise _refused(
+            f"{_CONTENT_VARIABLE}={value!r} in {source}: the launcher does not support it (accepted: "
+            f"{_SEEDED_CONTENT}, {_TEXT_CONTENT})"
+        )
+    if value == _SEEDED_CONTENT and is_moe:
+        raise _refused(
+            f"{_CONTENT_VARIABLE}={_SEEDED_CONTENT} in {source}: the launcher does not support it for a model "
+            "with expert layers, whose cells send dataset text"
+        )
+
+
 def _check_overrides(plan: FPMCollectionPlan, cell: FPMCell, generator_overrides: dict[str, Any]) -> None:
     """Refuse, before anything is rendered, what the deployment inputs of the cell already show."""
     # The backend policy of a cell is merged over the inputs of the campaign (runner.py
@@ -337,8 +400,12 @@ def _check_overrides(plan: FPMCollectionPlan, cell: FPMCell, generator_overrides
         raise _refused("K8sConfig.k8s_image must name the SGLang image; the Generator's default is a Dynamo vLLM image")
     for deployment in deployments:
         for item in deployment.get("extra_env") or []:
-            if isinstance(item, dict) and item.get("name") in _REAL_STATE_SWITCHES:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name") in _REAL_STATE_SWITCHES:
                 _check_real_state_switch(item["name"], item.get("value"), "K8sConfig.extra_env")
+            elif item.get("name") == _CONTENT_VARIABLE:
+                _check_content_word(item.get("value"), "K8sConfig.extra_env", is_moe=plan.capability.is_moe)
 
 
 def _require_one_node(env_script: str) -> None:
@@ -381,8 +448,11 @@ def _require_known_array_lines(lines: list[str], command_line: int) -> None:
             )
 
 
-def _sglang_run_script(run_script: str) -> str:
-    """``run.sh`` with its one ``engine_command=(...)`` line translated and every other line as it was."""
+def _sglang_run_script(run_script: str, *, is_moe: bool) -> str:
+    """``run.sh`` with its one ``engine_command=(...)`` line translated and every other line as it was.
+
+    ``is_moe`` says whether the model of the plan has expert layers; the content variable is tested with it.
+    """
     # Deviation note (the hardware environment of the vLLM render is kept).
     # What differs: the lines that stay hold the environment the Generator renders for the hardware of the
     # cell, for example NCCL_CUMEM_ENABLE=1 on Hopper systems (src/aisim/generator/facts/hardware.yaml).
@@ -420,6 +490,16 @@ def _sglang_run_script(run_script: str) -> str:
     for name in _REAL_STATE_SWITCHES:
         for quoted in re.findall(rf"^export {name}=(.*)$", run_script, flags=re.MULTILINE):
             _check_real_state_switch(name, _shell_word(quoted), FPM_RUN_SCRIPT_FILENAME)
+    # The shell keeps the last export of a name, so that line holds the value the launcher reads. Two lines
+    # arise when ``K8sConfig.worker_extra_pod_spec`` names the variable too: the Generator writes those
+    # entries before the ones of ``K8sConfig.extra_env``.
+    # The script is read line by line, as for the two switches above. A value that holds a line break is
+    # therefore not read as the shell reads it: the Generator writes it over several lines, and a line of it
+    # that looks like an export of the variable is taken for one. Such a cell can be refused here although
+    # the launcher would run it, or pass here and be refused by the launcher in the pod.
+    content_words = re.findall(rf"^export {_CONTENT_VARIABLE}=(.*)$", run_script, flags=re.MULTILINE)
+    if content_words:
+        _check_content_word(_shell_word(content_words[-1]), FPM_RUN_SCRIPT_FILENAME, is_moe=is_moe)
     lines[found[0]] = f"{_COMMAND_LINE_START}{shlex.join(_translate_command(tokens))})"
     return "\n".join(lines)
 
@@ -458,7 +538,7 @@ def render_cell(
 
     # Every check passes before the first file is written, so the directory never holds a mix of the two.
     _require_one_node((cell_dir / FPM_ENV_FILENAME).read_text())
-    run_script = _sglang_run_script(run_path.read_text())
+    run_script = _sglang_run_script(run_path.read_text(), is_moe=plan.capability.is_moe)
     manifest = _without_working_dir(manifest_path.read_text())
     runtime_env = runtime_env_path.read_text()
     if not runtime_env.endswith("\n"):

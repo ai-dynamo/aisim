@@ -24,6 +24,12 @@ Files
     validator calls, and ``_runtime_timing_summary`` in ``collector/fpm_forward/runner.py``) parse the merged
     file as JSON, must find a JSON object, and then skip it.
 
+    A decode or agg artifact carries a ``kvwarm`` block, which says how the decode contexts were produced:
+    the four keys ``enabled``, ``warm_eligible``, ``skip_reason`` and ``method`` with fixed values. When the
+    prompts of the run were dataset text, the caller hands over the record of that dataset and the block
+    carries it as a fifth key, ``dataset`` (``path``, ``sha256``, ``collection_pool``, ``conversations``).
+    Every rank file of a run and its merged file carry the same block. A prefill artifact has none.
+
 Statuses
     ``complete``  every planned point was measured. Both checkers accept it for the modes ``prefill`` and
                   ``decode``.
@@ -63,7 +69,9 @@ Checked against
     - Dynamo's vLLM self-benchmark, in the files and at the revision the header of this file names. The key
       names of the envelope are its names, as the AISim readers above expect them, with five exceptions that
       it does not write: the top-level keys ``errors`` and ``producer``, ``method`` in the ``kvwarm`` block,
-      ``size`` in the ``dp`` block of the merged file, and the fpm key ``sglbench_decode_steps``.
+      ``size`` in the ``dp`` block of the merged file, and the fpm key ``sglbench_decode_steps``. The
+      ``dataset`` record of the ``kvwarm`` block has the four keys Dynamo writes there
+      (``_kvwarm_load_texts``); Dynamo fills them from the file it loaded, here the caller supplies them.
 
 No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header of this
 file and recorded in THIRD_PARTY_NOTICES.md. For this module that is Dynamo alone; SGLang is named in comments and
@@ -178,9 +186,21 @@ REGIME_REAL_KV = "real_kv"  # decode
 PRODUCER_NAME = "aisim_sglbench"
 ARTIFACT_FORMAT = 1
 
-# The "kvwarm" block of every decode and agg artifact. Why it is written is said where build_rank_artifact
-# writes it; _check_complete_payload requires it before such an artifact is written as complete.
+# The four fixed keys of the "kvwarm" block of every decode and agg artifact. Why the block is written is said
+# where build_rank_artifact writes it; _check_complete_payload requires it before such an artifact is written
+# as complete.
 _KVWARM_BLOCK = {"enabled": True, "warm_eligible": True, "skip_reason": None, "method": "radix_cache_seed"}
+
+# The one key a kvwarm block may carry beside the fixed four, and the keys of the record under it, in the
+# order they are written. The record names the dataset whose text the prompts of the run were made of: the
+# local path of the file, the SHA-256 of the file, the name of the part of its conversations that was used,
+# and how many conversations that part holds. These are the keys of the record that Dynamo's vLLM producer
+# writes under the same key (_kvwarm_load_texts). No AISim reader parses the record: the validator reads
+# three of the fixed keys and carries the rest of the block along (_validate_kvwarm_contract).
+_KVWARM_DATASET_KEY = "dataset"
+_KVWARM_DATASET_FIELDS = ("path", "sha256", "collection_pool", "conversations")
+_SHA256_HEX_DIGITS = 64
+_LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
 
 # Top-level key names that already have an AISim reader with vLLM-shaped expectations
 # (measurement_evidence.py, execution_evidence.py, database.py, the gate's worker-probe branch, and in
@@ -308,6 +328,33 @@ def _require_json(value: Any, name: str) -> None:
         raise TypeError(f"{name} is not JSON data: {error}") from error
     except ValueError as error:
         raise ValueError(f"{name} is not JSON data: {error}") from error
+
+
+def _check_kvwarm_dataset(dataset: Any, name: str) -> None:
+    """Raise unless ``dataset`` is the dataset record a kvwarm block may carry; ``name`` says where it stands.
+
+    The record is a dict with exactly the four keys of ``_KVWARM_DATASET_FIELDS``: ``path`` and
+    ``collection_pool`` are non-empty strings, ``sha256`` is the 64 lower-case hexadecimal digits of a SHA-256,
+    and ``conversations`` is an int above zero (a run cannot have taken its text from no conversation). A
+    value of the wrong type raises TypeError, any other fault ValueError.
+    """
+    if not isinstance(dataset, dict):
+        raise TypeError(f"{name} must be a dict, got {type(dataset).__name__}")
+    if set(dataset) != set(_KVWARM_DATASET_FIELDS):
+        raise ValueError(
+            f"{name} must have exactly the keys {list(_KVWARM_DATASET_FIELDS)}, got {sorted(dataset, key=repr)}"
+        )
+    _require_text(dataset["path"], f"{name}['path']")
+    digest = dataset["sha256"]
+    if not isinstance(digest, str):
+        raise TypeError(f"{name}['sha256'] must be a str, got {digest!r}")
+    if len(digest) != _SHA256_HEX_DIGITS or not set(digest) <= _LOWER_HEX_DIGITS:
+        raise ValueError(
+            f"{name}['sha256'] must be the {_SHA256_HEX_DIGITS} lower-case hexadecimal digits of a SHA-256, "
+            f"got {digest!r}"
+        )
+    _require_text(dataset["collection_pool"], f"{name}['collection_pool']")
+    _require_int(dataset["conversations"], f"{name}['conversations']", minimum=1)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -702,11 +749,14 @@ def build_rank_artifact(
     missing_phases: Any = (),
     stop_reason: str | None = None,
     failure: dict[str, Any] | None = None,
+    kvwarm_dataset: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the artifact of one attention-DP rank.
 
     Call it once per rank with the SAME measurements: every rank file must carry identical ``iteration_groups``
-    and differs only in ``dp.rank``, its own fpm per row, and possibly its elapsed time.
+    and differs only in ``dp.rank``, its own fpm per row, and possibly its elapsed time. The other arguments
+    are the same for every rank as well; ``build_merged_artifact`` and ``write_artifacts`` refuse ranks that
+    differ in the run identity, the mode, the status, the coverage or the ``kvwarm`` block.
 
     measurements
         The completed points in execution order, from ``build_measurement``. Their ids must be exactly
@@ -728,10 +778,22 @@ def build_rank_artifact(
         ``mode`` is added here and may not be supplied.
     producer
         Free-form evidence: timing metric and clock, staging method, page size, overlap and streaming settings,
-        content source and seed, limits record, SGLang version, run-specific values. One key has a reader: for a
-        cell of an SGLang plan, ``validate_native_collection`` (native_artifact.py) requires ``sglang_version``
-        in every rank artifact and compares it with the installed release in the pod's provenance file. No
-        reader parses the other keys.
+        content source and seed, limits record, SGLang version, run-specific values. Four keys have a reader.
+        For a cell of an SGLang plan, ``validate_native_collection`` (native_artifact.py) requires
+        ``sglang_version`` in every rank artifact and compares it with the installed release in the pod's
+        provenance file. For a cell of such a plan whose model has expert layers it also requires
+        ``content.source`` to name dataset text, and ``tp_size`` and ``moe.ep_size`` to be the tensor-parallel
+        and the expert-parallel size of the cell (``_validate_sglang_moe_producer``). No reader parses the
+        other keys.
+    kvwarm_dataset
+        ``None`` for a run whose prompts were not dataset text: the ``kvwarm`` block is then the four fixed
+        keys. Otherwise the record of the dataset the prompts were made of, a dict with exactly the keys
+        ``path`` (the local path of the file, a non-empty str), ``sha256`` (the 64 lower-case hexadecimal
+        digits of the file's SHA-256), ``collection_pool`` (the name of the part of its conversations that
+        was used, a non-empty str) and ``conversations`` (how many conversations that part holds, an int
+        above zero). It is written into the ``kvwarm`` block under ``dataset``, whatever the status of the
+        run. It may only be given for the modes ``decode`` and ``agg``: a prefill artifact has no ``kvwarm``
+        block, so there it raises ValueError. No reader parses the record.
 
     ``config`` and ``producer`` must be JSON data without NaN or infinity, with a str for every dict key at
     every depth; a tuple is accepted and is written as a list. They are serialised once here, so a value that
@@ -761,6 +823,10 @@ def build_rank_artifact(
         raise TypeError(f"benchmark_elapsed_seconds must be a number, got {benchmark_elapsed_seconds!r}")
     if not math.isfinite(benchmark_elapsed_seconds) or benchmark_elapsed_seconds < 0:
         raise ValueError(f"benchmark_elapsed_seconds must be finite and >= 0, got {benchmark_elapsed_seconds!r}")
+    if kvwarm_dataset is not None:
+        if mode == PREFILL:
+            raise ValueError("kvwarm_dataset was given for a prefill artifact, which has no kvwarm block")
+        _check_kvwarm_dataset(kvwarm_dataset, "kvwarm_dataset")
 
     config_block: dict[str, Any] = {"mode": mode}
     if config is not None:
@@ -909,7 +975,13 @@ def build_rank_artifact(
         # such block. Dynamo's vLLM producer writes none either in a prefill run with its default prompt
         # content: _bench_write_results writes the key only when the block exists. _kvwarm_meta_init creates
         # it, and _bench_make_local_capacity and _kvwarm_prepare reach that only for the modes decode and agg.
-        artifact["kvwarm"] = dict(_KVWARM_BLOCK)
+        kvwarm_block: dict[str, Any] = dict(_KVWARM_BLOCK)
+        if kvwarm_dataset is not None:
+            # The prompts were dataset text: the block names the dataset, under the key and with the keys of
+            # Dynamo's record (_kvwarm_load_texts). The four values are strings and an int, copied in the
+            # fixed order, so the block shares nothing with the caller's dict.
+            kvwarm_block[_KVWARM_DATASET_KEY] = {key: kvwarm_dataset[key] for key in _KVWARM_DATASET_FIELDS}
+        artifact["kvwarm"] = kvwarm_block
     return artifact
 
 
@@ -932,6 +1004,12 @@ def _check_complete_payload(payload: dict[str, Any]) -> None:
     agree with the number of results (fpm_exec.sh, ``check_result_files``). Without this check most edited
     payloads would therefore be written as ``complete``, pass the gate in the pod, and be rejected on the
     collector host after the run. Each violation raises ValueError naming the rank and the field.
+
+    The ``kvwarm`` block of a decode or agg artifact is one of the two forms the builder writes: the four
+    fixed keys with their values and types, alone or with a ``dataset`` record that ``build_rank_artifact``
+    accepts as ``kvwarm_dataset`` (``_check_kvwarm_dataset``). Any other added key is refused, and so is a
+    record with a missing, an added or a malformed value. Neither checker has a rule for the record: the
+    validator reads three of the fixed keys and carries the rest of the block along.
 
     The decode steps. For each row, once its envelope rules hold, every fpm of every rank entry of its group
     goes through ``_check_decode_steps`` with the point type of the row's point: a decode fpm must still carry
@@ -1034,11 +1112,23 @@ def _check_complete_payload(payload: dict[str, Any]) -> None:
     mode = payload["config"].get("mode")
     if mode in (DECODE, AGG):
         kvwarm = payload.get("kvwarm")
+        # The block is the four fixed keys, alone or with a dataset record: the two forms the builder writes.
+        # The record is set aside and what is left must be the fixed keys, so any other added key is refused.
+        fixed = kvwarm
+        if isinstance(kvwarm, dict) and _KVWARM_DATASET_KEY in kvwarm:
+            fixed = {key: value for key, value in kvwarm.items() if key != _KVWARM_DATASET_KEY}
         # Equal, and of the same types: 1 == True, but the validator wants real booleans.
-        if kvwarm != _KVWARM_BLOCK or any(type(kvwarm[key]) is not type(value) for key, value in _KVWARM_BLOCK.items()):
+        if fixed != _KVWARM_BLOCK or any(type(fixed[key]) is not type(value) for key, value in _KVWARM_BLOCK.items()):
             raise ValueError(
-                f"{label}: kvwarm must be {_KVWARM_BLOCK!r} in a complete {mode!r} artifact, got {kvwarm!r}"
+                f"{label}: kvwarm must be {_KVWARM_BLOCK!r}, alone or with a {_KVWARM_DATASET_KEY!r} record, "
+                f"in a complete {mode!r} artifact, got {kvwarm!r}"
             )
+        if fixed is not kvwarm:
+            try:
+                _check_kvwarm_dataset(kvwarm[_KVWARM_DATASET_KEY], f"kvwarm.{_KVWARM_DATASET_KEY}")
+            except (TypeError, ValueError) as error:
+                # An envelope rule like the others of this check: one exception type, the rank in front.
+                raise ValueError(f"{label}: {error}") from error
 
 
 def _check_rank_set(rank_payloads: list[Any]) -> tuple[int, list[int]]:
@@ -1046,9 +1136,11 @@ def _check_rank_set(rank_payloads: list[Any]) -> tuple[int, list[int]]:
 
     Returns ``(dp_size, ranks)``. The cross-rank rules are the validator's (run identity, grid and
     ``iteration_groups`` equal in every rank file) and the gate's (consecutive ranks, one fpm per row with the
-    file's own rank). A ``complete`` payload is then re-checked against the validator's envelope rules and
-    the decode step rule (``_check_complete_payload``); ``partial`` and ``failed`` payloads are rejected by
-    both checkers whatever they hold, so nothing more is checked for them.
+    file's own rank), and one that goes beyond both: the ``kvwarm`` block is the same in every rank file,
+    dataset record included, where the validator compares three of its keys. A ``complete`` payload is then
+    re-checked against the validator's envelope rules and the decode step rule (``_check_complete_payload``);
+    ``partial`` and ``failed`` payloads are rejected by both checkers whatever they hold, so nothing more is
+    checked for them.
     """
     if not rank_payloads:
         raise ValueError("there is no rank artifact")
@@ -1095,6 +1187,10 @@ def _check_rank_set(rank_payloads: list[Any]) -> tuple[int, list[int]]:
         ("dp.size", lambda payload: payload["dp"]["size"]),
         ("result points", lambda payload: [row.get("point") for row in payload["results"]]),
         ("iteration_groups", lambda payload: payload["iteration_groups"]),
+        # One run has one way of producing its decode contexts and one dataset, and the merged file takes
+        # the block of the first rank. The validator compares three keys of the block across ranks
+        # (validate_native_collection); here the whole block, absent in every rank of a prefill run.
+        ("kvwarm", lambda payload: payload.get("kvwarm")),
     )
     for name, read in shared:
         expected = read(first)
@@ -1116,7 +1212,8 @@ def build_merged_artifact(rank_payloads: Any, rank_paths: Any) -> dict[str, Any]
     ``merged_output_path`` and ``dp.source_ranks``. The host readers (native_artifact.py ``_rank_artifacts``,
     runner.py ``_runtime_timing_summary``) parse the file as JSON, must find a JSON object, and then skip it.
     The key ``worker_probe_path`` is never written: with it the gate would wait for a sidecar this producer
-    does not write.
+    does not write. The ``kvwarm`` block of the merged file is the first rank's, with its dataset record
+    when it has one; the ranks are required to carry the same block.
 
     A ``failed`` run has no merged file (raises). A ``partial`` run has one; the gate fails on the rank file
     before it reads the merged file.

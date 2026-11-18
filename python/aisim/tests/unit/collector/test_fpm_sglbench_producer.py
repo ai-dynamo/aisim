@@ -6,7 +6,8 @@
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
 # The simulated driver follows the staging procedure and two failure reason strings of ai-dynamo/dynamo (Apache-2.0,
 # https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/instrumented_scheduler.py at
-# b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.
+# b20fe6fe94021b854597965c7305931175e8f482, and the text runs restate its text recipe and use the keys of its
+# dataset record. See THIRD_PARTY_NOTICES.md.
 
 """Test of the three modules of the SGLang self-benchmark producer core together. No SGLang, no GPU.
 
@@ -41,6 +42,11 @@ Everything that stands in for an engine is FAKE and is named so:
   (``_bench_realseed_stage_point``, ``_bench_realseed_pending_step``), the one re-stage of such a point after
   its measured shot missed the cache, and the deadline check before the next point
   (``_bench_stop_at_timeout_boundary``).
+- The text of a text run is FAKE. ``_fake_dataset_records`` makes ShareGPT-style records out of a list of ten
+  words, ``_fake_encode`` stands in for a tokenizer (one id per character, and one id outside the token range
+  for the written form of a special token), and ``_fake_dataset_record`` is the record a launcher would make
+  of a dataset file: no file exists and nothing was hashed. The records go through the recipe and the pool of
+  ``sglbench_content`` as real ones would.
 
 The two checkers are used as shipped, through the helpers of ``test_fpm_sglbench_artifact.py``. Its ``_pod``
 writes the collected layout with the provenance file of an SGLang cell (``"backend": "sglang"`` and a tested
@@ -54,6 +60,7 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import hashlib
 import itertools
 import json
 import math
@@ -124,6 +131,19 @@ REASON_CACHED_TOKENS = "real_seed_cache_validation_failed"
 # FAKE reason of a stop that belongs to no point: the failed form ``{"point": None, "reason": ...}``.
 FAKE_FAULT_REASON = "fake_fault_outside_any_point"
 
+# FAKE text for the runs whose prompts are dataset text. The written form of a special token stands inside
+# some texts, and the FAKE tokenizer gives it one id outside [TOKEN_LOW, TOKEN_HIGH), as a served tokenizer
+# gives the id of the special token, which lies outside the ordinary range.
+FAKE_WORDS = ("cache", "prefix", "token", "page", "batch", "expert", "the", "a", "of", "and")
+FAKE_SPECIAL_TEXT = "<|endoftext|>"
+FAKE_SPECIAL_ID = 151_643
+# FAKE: the number of ids the FAKE model counts, above the id of the FAKE special token. A launcher gives the
+# text pool the range [0, this number), so the pool keeps the id of the special token as text.
+FAKE_MODEL_IDS = 151_936
+FAKE_CHARACTER_IDS = 64
+# The four keys of the dataset record that go into the kvwarm block, in the order they are written there.
+KVWARM_DATASET_KEYS = ("path", "sha256", "collection_pool", "conversations")
+
 
 def _small_limits(page_size: int, **overrides) -> grid.Limits:
     """Small limits that grow with the page size, so every page size has several cached prefixes and contexts.
@@ -162,6 +182,7 @@ class _FakeEngine:
         self.dp_size = dp_size
         self.caches = [PageCacheModel(page_size) for _ in range(dp_size)]
         self.request_ids: list[str] = []  # every id ever submitted, in order
+        self.prompt_token_ids: set[int] = set()  # every token id of every prompt ever submitted
         # FAKE model output. Real output is vocabulary tokens, so the ids are drawn inside the plan's range.
         self._fake_output = random.Random(20261114)
 
@@ -169,6 +190,7 @@ class _FakeEngine:
         """Submit one batch call to one rank; return the cached-token count of each request."""
         assert len(request_ids) == len(prompts)
         self.request_ids.extend(request_ids)
+        self.prompt_token_ids.update(token for prompt in prompts for token in prompt)
         cache = self.caches[rank]
         cached = [cache.cached(prompt) for prompt in prompts]
         for prompt in prompts:
@@ -231,6 +253,64 @@ def _fake_reader_seconds(point: dict) -> float:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Fake dataset, fake tokenizer
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _fake_dataset_records(count: int = 160) -> list[dict]:
+    """FAKE ShareGPT-style records: two to five turns of 8 to 40 words each.
+
+    Every seventh record holds the written form of a special token at the end of its second turn.
+    """
+    rng = random.Random(20261117)
+    records = []
+    for index in range(count):
+        turns = []
+        for turn in range(rng.randint(2, 5)):
+            value = " ".join(rng.choice(FAKE_WORDS) for _ in range(rng.randint(8, 40)))
+            if index % 7 == 0 and turn == 1:
+                value += FAKE_SPECIAL_TEXT
+            turns.append({"from": "human" if turn % 2 == 0 else "gpt", "value": value})
+        records.append({"id": f"fake-{index}", "conversations": turns})
+    return records
+
+
+def _fake_encode(text: str) -> list[int]:
+    """A FAKE tokenizer: one of 64 ids per character, and one id for the written form of the special token.
+
+    Ten words over 64 ids make very repetitive token sequences: every text begins with one of ten words.
+    """
+    ids: list[int] = []
+    for position, piece in enumerate(text.split(FAKE_SPECIAL_TEXT)):
+        if position:
+            ids.append(FAKE_SPECIAL_ID)
+        ids.extend(TOKEN_LOW + ord(character) % FAKE_CHARACTER_IDS for character in piece)
+    return ids
+
+
+def _fake_dataset_record(conversations: int) -> dict:
+    """The FAKE record a launcher would make of the dataset file: no such file exists, nothing was hashed."""
+    return {
+        "path": "/fake-cache/fpm_datasets/fake_dataset.json",
+        "sha256": "0123456789abcdef" * 4,
+        "collection_pool": content.COLLECTION_POOL,
+        "conversations": conversations,
+        "url": None,
+        "downloaded": False,
+    }
+
+
+def _fake_text_run_inputs() -> tuple[content.TextPool, dict]:
+    """A text pool made as a launcher makes one, and the record of its FAKE dataset.
+
+    FAKE records, the recipe of the content module, the FAKE tokenizer, the pool of the content module.
+    """
+    texts = content.conversation_texts(_fake_dataset_records())
+    pool = content.TextPool([_fake_encode(text) for text in texts], 0, FAKE_MODEL_IDS)
+    return pool, _fake_dataset_record(len(texts))
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Simulated driver
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -247,6 +327,7 @@ class _SimulatedRun:
     restaged: list[int]  # benchmark ids whose first attempt failed a validity check
     plan: content.ContentPlan  # the content plan after the run
     content_stats: dict  # what the plan had issued when the run ended
+    prompt_token_ids: set[int]  # every token id of every prompt sent
 
 
 def _request_ids(point: grid.Point, stage: str, attempt: int, rank: int) -> list[str]:
@@ -344,6 +425,8 @@ def _simulate_run(
     fake_deadline_after: int | None = None,
     fake_evictions: dict[int, int] | None = None,
     fake_fault_after: int | None = None,
+    text_pool: content.TextPool | None = None,
+    fake_dataset: dict | None = None,
 ) -> _SimulatedRun:
     """Plan a run, stage every point against the fake engine and build the rank artifacts.
 
@@ -355,10 +438,15 @@ def _simulate_run(
     fake_fault_after
         After this many completed points a FAKE fault that belongs to no point stops the run. 0 stops it before
         the first point; the number of planned points stops it after the last one.
+    text_pool, fake_dataset
+        Both or neither. With them every prompt of the run is text of the pool, the producer block says so,
+        and the kvwarm block of a decode or agg artifact names the dataset. Without them the prompts are
+        seeded token ids.
     """
+    assert (text_pool is None) == (fake_dataset is None)
     page = limits.page_size
     built = grid.build_grid(mode, limits, caps, manifest=manifest)
-    plan = content.ContentPlan(FAKE_CONTENT_SEED, TOKEN_LOW, TOKEN_HIGH)
+    plan = content.ContentPlan(FAKE_CONTENT_SEED, TOKEN_LOW, TOKEN_HIGH, text_pool)
     engine = _FakeEngine(page, dp_size)
     clock = _FakeClock()
     started = clock.now
@@ -418,6 +506,31 @@ def _simulate_run(
         assert failure is None and stop_reason is None
         failure = {"point": None, "reason": FAKE_FAULT_REASON}
 
+    content_record = {
+        "source": "seeded_token_ids",
+        "seed": plan.seed,
+        "token_range": [plan.token_low, plan.token_high],
+        "issued": plan.stats(),
+    }
+    kvwarm_dataset = None
+    if text_pool is not None:
+        # A text run records its source, the whole record of the dataset and the id range and the counts of the
+        # pool in the producer block. Four keys of the record go into the kvwarm block, which a prefill artifact
+        # lacks.
+        content_record.update(
+            source="dataset_text_chains",
+            dataset=fake_dataset,
+            pool={
+                "id_range": [text_pool.token_low, text_pool.token_high],
+                "conversations": text_pool.conversations,
+                "tokens": text_pool.tokens,
+                "dropped_tokens": text_pool.dropped_tokens,
+                "dropped_conversations": text_pool.dropped_conversations,
+            },
+        )
+        if mode != grid.PREFILL:
+            kvwarm_dataset = {key: fake_dataset[key] for key in KVWARM_DATASET_KEYS}
+    assert content_record["source"] == plan.source
     producer = {
         "timing_source": "FAKE: typed into test_fpm_sglbench_producer.py, never measured",
         "engine": "FAKE: a page-cache model, no SGLang",
@@ -425,12 +538,7 @@ def _simulate_run(
         "sglang_version": POD_SGLANG_VERSION,
         "page_size": page,
         "limits": limits.as_dict(),
-        "content": {
-            "source": "seeded_token_ids",
-            "seed": plan.seed,
-            "token_range": [plan.token_low, plan.token_high],
-            "issued": plan.stats(),
-        },
+        "content": content_record,
         "restaged_points": restaged,
     }
     payloads = [
@@ -448,10 +556,13 @@ def _simulate_run(
             missing_phases=built.missing_phases,
             stop_reason=stop_reason,
             failure=failure,
+            kvwarm_dataset=kvwarm_dataset,
         )
         for rank in range(dp_size)
     ]
-    return _SimulatedRun(built, payloads, engine.request_ids, observed, restaged, plan, plan.stats())
+    return _SimulatedRun(
+        built, payloads, engine.request_ids, observed, restaged, plan, plan.stats(), engine.prompt_token_ids
+    )
 
 
 def _expected_regime(point: grid.Point) -> str:
@@ -1291,6 +1402,229 @@ def test_agg_run_stages_prefill_before_decode_and_passes_the_gate_in_agg_mode(tm
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Text runs: every prompt is made of FAKE dataset text
+# ---------------------------------------------------------------------------------------------------------------
+
+# The four fixed keys of a kvwarm block, typed here independently of the artifact module.
+EXPECTED_KVWARM = {"enabled": True, "warm_eligible": True, "skip_reason": None, "method": "radix_cache_seed"}
+
+
+def _expected_kvwarm_with(dataset: dict) -> dict:
+    return {**EXPECTED_KVWARM, "dataset": {key: dataset[key] for key in KVWARM_DATASET_KEYS}}
+
+
+def test_fake_records_become_a_text_pool_through_the_recipe_and_the_fake_tokenizer():
+    records = _fake_dataset_records()
+    texts = content.conversation_texts(records)
+    pool, dataset = _fake_text_run_inputs()
+
+    # The recipe, restated: the values of the turns joined by newlines, texts of 64 characters and more, and
+    # of those the half whose SHA-256 begins with an even byte.
+    joined = ["\n".join(turn["value"] for turn in record["conversations"]) for record in records]
+    assert texts == [
+        text for text in joined if len(text) >= 64 and hashlib.sha256(text.encode("utf-8")).digest()[0] % 2 == 0
+    ]
+    assert 40 < len(texts) < 120  # about half of the 160 records
+    assert dataset["conversations"] == len(texts)
+    assert dataset["collection_pool"] == "conversation_sha256_even"
+
+    # One conversation per text, in the order of the texts. The id of the special token lies outside the token
+    # range and is one the FAKE model counts, so the pool keeps it in its place and drops nothing; every other
+    # id is one of the 64 ids of the characters.
+    special = sum(text.count(FAKE_SPECIAL_TEXT) for text in texts)
+    assert special > 3
+    assert TOKEN_HIGH <= FAKE_SPECIAL_ID < FAKE_MODEL_IDS
+    assert (pool.token_low, pool.token_high) == (0, FAKE_MODEL_IDS)
+    assert (pool.conversations, pool.dropped_conversations, pool.dropped_tokens) == (len(texts), 0, 0)
+    assert pool.tokens == sum(len(text) for text in texts) - special * (len(FAKE_SPECIAL_TEXT) - 1)
+    for index, text in enumerate(texts):
+        ids = _fake_encode(text)
+        assert ids.count(FAKE_SPECIAL_ID) == text.count(FAKE_SPECIAL_TEXT)
+        assert pool.conversation(index).tolist() == ids
+        assert set(ids) - {FAKE_SPECIAL_ID} <= set(range(TOKEN_LOW, TOKEN_LOW + FAKE_CHARACTER_IDS))
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "strategy"),
+    [(1, "single"), (1, "tep"), (2, "tep")],
+    ids=["dp1-single", "dp1-tep", "dp2-tep"],
+)
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("phase", PHASES)
+def test_complete_text_run_passes_the_validator_and_the_gate(tmp_path, phase, page_size, dp_size, strategy):
+    # "tep" is the strategy of a cell with expert parallelism; for it the validator needs the kvwarm block of a
+    # decode artifact. The run with seeded ids of the same grid is built beside the text run for comparison.
+    limits = _small_limits(page_size)
+    cell = _cell(phase=phase, dp=dp_size, strategy=strategy)
+    pool, dataset = _fake_text_run_inputs()
+
+    run = _simulate_run(phase, limits, dp_size=dp_size, text_pool=pool, fake_dataset=dataset)
+    seeded = _simulate_run(phase, limits, dp_size=dp_size)
+
+    points = run.built.points
+    assert run.built == seeded.built and len(points) > 40
+    assert run.restaged == []
+    # Every timed request found exactly the planned tokens in the cache and computed exactly the planned rest,
+    # although ten words over 64 ids make the prompts very much alike ...
+    for benchmark_id, stage, attempt, _rank, _slot, cached, extend in run.observed:
+        point = points[benchmark_id - 1]
+        assert attempt == 0
+        assert cached == grid.expected_cached_tokens(phase, point.cached_tokens, page_size), (benchmark_id, stage)
+        assert extend == grid.expected_extend_tokens(phase, point.new_tokens, point.cached_tokens, page_size)
+    # ... which is, request for request, what the run with seeded ids observed and issued.
+    assert run.observed == seeded.observed
+    assert run.request_ids == seeded.request_ids
+    assert run.content_stats == seeded.content_stats
+    # The prompts are text of the pool: after its allocated first token a slot holds ids of the FAKE tokenizer.
+    assert run.plan.source == "dataset_text_chains" and run.plan.pool is pool
+    fake_ids = set(range(TOKEN_LOW, TOKEN_LOW + FAKE_CHARACTER_IDS)) | {FAKE_SPECIAL_ID}
+    assert set(run.plan.slot_prefix(0, 0, 100)[1:]) <= fake_ids
+    # The id of the special token, which lies outside the token range, was in prompts of the text run: the
+    # counts above are exact with it. A run with seeded ids sends ids of the token range only.
+    assert FAKE_SPECIAL_ID in run.prompt_token_ids
+    assert all(TOKEN_LOW <= token < TOKEN_HIGH for token in seeded.prompt_token_ids)
+    assert seeded.plan.source == "seeded_token_ids" and seeded.plan.pool is None
+    assert not set(seeded.plan.slot_prefix(0, 0, 100)[1:]) <= fake_ids
+    assert run.plan.slot_prefix(0, 0, 1) == seeded.plan.slot_prefix(0, 0, 1)
+
+    for payload, seeded_payload in zip(run.payloads, seeded.payloads, strict=True):
+        assert (payload["status"], payload["valid"], payload["usable"]) == ("complete", True, True)
+        assert payload["producer"]["content"] == {
+            "source": "dataset_text_chains",
+            "seed": FAKE_CONTENT_SEED,
+            "token_range": [TOKEN_LOW, TOKEN_HIGH],
+            "issued": run.content_stats,
+            "dataset": dataset,
+            "pool": {
+                "id_range": [0, FAKE_MODEL_IDS],
+                "conversations": pool.conversations,
+                "tokens": pool.tokens,
+                "dropped_tokens": pool.dropped_tokens,
+                "dropped_conversations": 0,
+            },
+        }
+        # The run with seeded ids writes the content record and the kvwarm block it always wrote.
+        assert seeded_payload["producer"]["content"] == {
+            "source": "seeded_token_ids",
+            "seed": FAKE_CONTENT_SEED,
+            "token_range": [TOKEN_LOW, TOKEN_HIGH],
+            "issued": seeded.content_stats,
+        }
+        if phase == "decode":
+            assert payload["kvwarm"] == _expected_kvwarm_with(dataset)
+            assert seeded_payload["kvwarm"] == EXPECTED_KVWARM
+        else:
+            assert "kvwarm" not in payload and "kvwarm" not in seeded_payload
+        # In everything else the two artifacts are the same: the source of the prompts changes no row.
+        assert {**payload, "kvwarm": None, "producer": {**payload["producer"], "content": None}} == {
+            **seeded_payload,
+            "kvwarm": None,
+            "producer": {**seeded_payload["producer"], "content": None},
+        }
+
+    rows = {}
+    for label, each in (("text", run), ("ids", seeded)):
+        root = tmp_path / label
+        pod = _pod(root, cell)
+        written = artifact.write_artifacts(str(pod / "benchmark.json"), each.payloads)
+        for path, payload in zip(written["rank_files"], each.payloads, strict=True):
+            assert json.loads(Path(path).read_text(encoding="utf-8")) == payload
+        _assert_accepted(root, cell, each, written)
+        if phase == "decode":
+            # The validator hands the block on as it stands, and the merged file carries the first rank's.
+            expected_block = _expected_kvwarm_with(dataset) if label == "text" else EXPECTED_KVWARM
+            assert _validate(cell, root).kvwarm_meta == expected_block
+            merged = json.loads(Path(written["merged_output_path"]).read_text(encoding="utf-8"))
+            assert merged["kvwarm"] == expected_block
+        rows[label] = aggregate_cell(_sglang_plan(cell), cell, root, expected_attempt_id="attempt")
+
+    # Publication: the rows of the text run are those of the run with seeded ids, under the cell's strategy.
+    assert rows["text"] == rows["ids"] and len(rows["text"]) == len(points)
+    assert {row["kv_seed_regime"] for row in rows["text"]} == ({"real_kv"} if phase == "decode" else {"n/a"})
+    assert {row["parallel_strategy"] for row in rows["text"]} == {strategy}
+
+
+@pytest.mark.parametrize("ending", ["deadline", "fault", "failed-point"])
+@pytest.mark.parametrize("phase", [*PHASES, "agg"])
+def test_a_text_run_that_is_cut_short_or_fails_keeps_its_source_and_its_dataset(tmp_path, phase, ending):
+    limits = _small_limits(16)
+    pool, dataset = _fake_text_run_inputs()
+    if ending == "deadline":
+        stop = {"fake_deadline_after": 7}
+    elif ending == "fault":
+        stop = {"fake_fault_after": 7}
+    else:
+        # The sixth point that expects cached tokens loses its staged state on both attempts.
+        planned = grid.build_grid(phase, limits).points
+        victim = [point for point in planned if grid.expected_cached_tokens(point.phase, point.cached_tokens, 16)][5]
+        stop = {"fake_evictions": {victim.benchmark_id: 2}}
+
+    run = _simulate_run(phase, limits, dp_size=2, text_pool=pool, fake_dataset=dataset, **stop)
+
+    status = "partial" if ending == "deadline" else "failed"
+    for payload in run.payloads:
+        assert (payload["status"], payload["valid"]) == (status, False)
+        assert len(payload["results"]) >= 5
+        assert payload["producer"]["content"]["source"] == "dataset_text_chains"
+        assert payload["producer"]["content"]["dataset"] == dataset
+        # The kvwarm block says how the decode contexts were produced and from which text; it does not depend
+        # on the status. A prefill artifact has no such block, so its dataset is in the producer block only.
+        if phase == "prefill":
+            assert "kvwarm" not in payload
+        else:
+            assert payload["kvwarm"] == _expected_kvwarm_with(dataset)
+    written = artifact.write_artifacts(str(tmp_path / "benchmark.json"), run.payloads)
+    for path, payload in zip(written["rank_files"], run.payloads, strict=True):
+        assert json.loads(Path(path).read_text(encoding="utf-8")) == payload
+    if ending != "deadline":
+        assert written["merged_output_path"] is None
+        return
+    merged = json.loads(Path(written["merged_output_path"]).read_text(encoding="utf-8"))
+    assert merged.get("kvwarm") == run.payloads[0].get("kvwarm")
+    assert merged["producer"]["content"] == run.payloads[0]["producer"]["content"]
+
+
+def test_a_pool_with_more_tokens_than_the_longest_prompt_serves_a_whole_run_and_a_shorter_one_is_refused():
+    # Page size 1, where one token decides a count, and both phases. Under these limits the longest prompt of
+    # the run is the global warm-up, which is also the first prompt.
+    limits = _small_limits(1)
+    built = grid.build_grid("agg", limits)
+    prompts = [
+        point.cached_tokens + point.new_tokens
+        if point.phase == grid.PREFILL
+        else point.cached_tokens - grid.DECODE_PROMPT_LEAD
+        for point in built.points
+    ]
+    longest = max(WARMUP_PROMPT_TOKENS, *prompts)
+    assert longest == WARMUP_PROMPT_TOKENS and max(prompts) > 150
+
+    def one_token_pool(tokens: int) -> content.TextPool:
+        """A FAKE pool of ``tokens`` tokens in conversations of 40, in which every token is the same id."""
+        whole, rest = divmod(tokens, 40)
+        conversations = [[TOKEN_LOW + 5] * 40] * whole + [[TOKEN_LOW + 5] * rest]
+        pool = content.TextPool(conversations, TOKEN_LOW, TOKEN_HIGH)
+        assert pool.tokens == tokens
+        return pool
+
+    # One token more than the longest prompt is enough for every prompt of the run, and every count is exact
+    # although all the text is one id: the run observes what the run with seeded ids observes.
+    enough = one_token_pool(longest + 1)
+    run = _simulate_run("agg", limits, dp_size=2, text_pool=enough, fake_dataset=_fake_dataset_record(7))
+    seeded = _simulate_run("agg", limits, dp_size=2)
+    assert [payload["status"] for payload in run.payloads] == ["complete", "complete"]
+    assert run.restaged == [] and run.observed == seeded.observed
+    assert run.plan.slot_prefix(0, 0, longest)[1:] == [TOKEN_LOW + 5] * (longest - 1)
+
+    # A pool that is shorter than the longest prompt: the plan refuses the first prompt that does not fit, here
+    # the warm-up, and names the chain. A caller that compares the two numbers knows before the sweep.
+    short = one_token_pool(longest - 2)
+    assert short.tokens < longest
+    message = rf"^text pool exhausted: the chain zero:0:0 needs {longest - 1} tokens, .* holds {longest - 2} tokens "
+    with pytest.raises(ValueError, match=message):
+        _simulate_run("agg", limits, dp_size=2, text_pool=short, fake_dataset=_fake_dataset_record(7))
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Publication: the planned grid as a table in AISim's compiled reader
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -1496,7 +1830,9 @@ def test_default_h200_grid_published_with_fake_times_is_served_by_the_compiled_r
 # ---------------------------------------------------------------------------------------------------------------
 
 # Runs with "-I -S": no environment, no site-packages, no AISim. argv: runtime directory, limits record as
-# JSON, mode, output path, and the SGLang release the launcher would write. Its time values are FAKE.
+# JSON, mode, output path, the SGLang release the launcher would write, and "ids" or "text" for the source of
+# the prompts. Its time values are FAKE, and so are the records, the token ids and the dataset record of a
+# "text" run: the bare interpreter has no dataset file and no tokenizer.
 _POD_SCRIPT = """
 import json
 import sys
@@ -1526,7 +1862,21 @@ grid, content, artifact = modules
 limits = grid.Limits.from_mapping(json.loads(sys.argv[2]))
 mode = sys.argv[3]
 built = grid.build_grid(mode, limits)
-plan = content.ContentPlan("0", 1000, 51000)
+pool = None
+kvwarm_dataset = None
+if sys.argv[6] == "text":
+    # FAKE records through the recipe, one id per character in the place of a tokenizer, then the pool.
+    records = [{"conversations": [{"value": "fake text %d " % index * 8}]} for index in range(256)]
+    texts = content.conversation_texts(records)
+    pool = content.TextPool([[1000 + ord(character) for character in text] for text in texts], 1000, 51000)
+    if mode != grid.PREFILL:
+        kvwarm_dataset = {
+            "path": "/fake-cache/fpm_datasets/fake_dataset.json",
+            "sha256": "0123456789abcdef" * 4,
+            "collection_pool": content.COLLECTION_POOL,
+            "conversations": len(texts),
+        }
+plan = content.ContentPlan("0", 1000, 51000, pool)
 measurements = []
 for point in built.points:
     record = point.as_dict()
@@ -1563,22 +1913,27 @@ payload = artifact.build_rank_artifact(
         "sglang_version": sys.argv[5],
         "limits": limits.as_dict(),
         "content": plan.stats(),
+        "content_source": plan.source,
     },
+    kvwarm_dataset=kvwarm_dataset,
 )
 written = artifact.write_artifacts(sys.argv[4], [payload])
-print(json.dumps({"digest": built.digest, "points": len(built.points), "written": written}))
+summary = {"digest": built.digest, "points": len(built.points), "written": written, "source": plan.source}
+summary["dataset"] = kvwarm_dataset
+print(json.dumps(summary))
 """
 
 
+@pytest.mark.parametrize("source", ["ids", "text"])
 @pytest.mark.parametrize("phase", PHASES)
-def test_pod_imports_all_three_modules_with_the_standard_library_only_and_its_files_pass(tmp_path, phase):
+def test_pod_imports_all_three_modules_with_the_standard_library_only_and_its_files_pass(tmp_path, phase, source):
     """The pod has no AISim: the modules are loaded by flat name, and what they write there must be accepted here."""
     limits = _small_limits(64)
-    cell = _cell(phase=phase, dp=1, strategy="single")
+    cell = _cell(phase=phase, dp=1, strategy="single" if source == "ids" else "tep")
     pod = _pod(tmp_path, cell)
     output_path = str(pod / "benchmark.json")
 
-    argv = [str(RUNTIME), json.dumps(limits.as_dict()), phase, output_path, POD_SGLANG_VERSION]
+    argv = [str(RUNTIME), json.dumps(limits.as_dict()), phase, output_path, POD_SGLANG_VERSION, source]
     done = subprocess.run(
         [sys.executable, "-I", "-S", "-c", _POD_SCRIPT, *argv],
         capture_output=True,
@@ -1601,3 +1956,12 @@ def test_pod_imports_all_three_modules_with_the_standard_library_only_and_its_fi
     assert collection.runtime_grid_digest == built.digest
     gate = _gate([output_path], phase)
     assert gate.returncode == GATE_ACCEPT, gate.stderr
+    # The source of the prompts, and what the kvwarm block of the file says about it.
+    assert summary["source"] == {"ids": "seeded_token_ids", "text": "dataset_text_chains"}[source]
+    if phase == "prefill":
+        assert summary["dataset"] is None and collection.kvwarm_meta is None
+    elif source == "ids":
+        assert summary["dataset"] is None and collection.kvwarm_meta == EXPECTED_KVWARM
+    else:
+        assert summary["dataset"]["conversations"] > 16  # about half of the 256 FAKE records
+        assert collection.kvwarm_meta == {**EXPECTED_KVWARM, "dataset": summary["dataset"]}

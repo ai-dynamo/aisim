@@ -2726,9 +2726,19 @@ Repository-root files `python/aisim/collector/fpm_forward/runtime/sglbench_grid.
 re-implement rules of NVIDIA Dynamo's vLLM self-benchmark for an SGLang engine. They are
 modified re-implementations: no upstream function or block of source is copied; the flag,
 key and reason names and two short error-message phrases are upstream's.
-`python/aisim/collector/fpm_forward/runtime/sglbench_content.py` takes no code: its
+`python/aisim/collector/fpm_forward/runtime/sglbench_content.py`, with the test
+`python/aisim/tests/unit/collector/test_fpm_sglbench_content.py`, takes no code. Its
 docstring names Dynamo's content-seed variable and its default, and the caller passes the
-value in.
+value in. It restates two rules of the same source at the same revision for prompts made
+of dataset text: which conversations of a ShareGPT-style dataset are kept and how the text
+of one is formed (`_kvwarm_load_texts`, restated in `conversation_texts`, with the pool
+name `conversation_sha256_even`), and the chain of whole conversations in a seeded order
+that a prompt is cut from (`_kvwarm_chain_token_ids`). No upstream function or block of
+source is copied. Changes: the order of a chain comes from the module's own SHA-256
+counter stream and not from `random.Random`, a chain belongs to one prompt part and not to
+a batch position, the conversations are tokenized before the plan is built into a pool
+that leaves out a token id the served model does not count, and the first token of every
+prompt part is allocated and is not text.
 
 `python/aisim/collector/fpm_forward/runtime/sglbench_driver.py` and
 `python/aisim/collector/fpm_forward/runtime/sglbench_launcher.py`, with the tests
@@ -2746,6 +2756,29 @@ its own scheduler; it also looks at the soft deadline before the first point; th
 launcher requires a benchmark mode and refuses the options this producer does not
 implement.
 
+For a run whose prompts are dataset text the launcher also restates, from
+`instrumented_scheduler.py` at the same revision, the resolution of the dataset
+(`_kvwarm_resolve_dataset`): the three variables `DYN_BENCH_KV_WARMUP_DATASET`,
+`DYN_BENCH_KV_WARMUP_CACHE_DIR` and `DYN_BENCH_KV_WARMUP_SHA256`, the default cache folder
+beside `HF_HOME`, the download with `urllib` into a part file that is hashed before it is
+moved into place, and three constants with upstream's values: the default dataset URL,
+its pinned SHA-256 and the download timeout. The driver and the launcher use the names of
+the four verdicts of upstream's content probe (`_kvwarm_probe_content`):
+`dataset_unavailable`, `dataset_empty`, `tokenizer_unavailable` and `content_too_shallow`.
+The record of the dataset that `sglbench_artifact.py` writes into the `kvwarm` block of a
+decode or agg artifact has the four keys upstream writes there (`_kvwarm_load_texts`):
+`path`, `sha256`, `collection_pool` and `conversations`;
+`python/aisim/tests/unit/collector/test_fpm_sglang_moe.py` types a record with these keys.
+The value `sharegpt_chain` of `DYN_BENCH_PREFILL_CONTENT` is upstream's name
+(`_bench_synthetic_token_ids`). No upstream function or block of source is copied.
+Changes: an empty variable counts as unset; the hash of a local file is compared with the
+expected one too; a dataset that cannot be had, is empty, cannot be tokenized or is too
+short fails the run, where upstream skips its warm-up; the launcher tokenizes with the
+engine's tokenizer in batches until a bounded pool is full; and in such a run every prompt
+is text, where upstream's variable changes its prefill prompts only. The dataset itself is
+not part of this repository or of its distributions: the pod reads a file the deployment
+provides, or downloads the file from the URL at run time.
+
 Source: https://github.com/ai-dynamo/dynamo/tree/b20fe6fe94021b854597965c7305931175e8f482
 
 Original paths and what follows them:
@@ -2762,7 +2795,13 @@ Original paths and what follows them:
   (`ENV_BENCH_CONTENT_SEED`) and, in the simulated driver of
   `test_fpm_sglbench_producer.py`, the seed, warm shot, measured shot and single re-stage
   procedure (`_bench_realseed_stage_point`, `_bench_realseed_pending_step`) with two of
-  its failure reason strings.
+  its failure reason strings. For dataset text: the dataset resolution
+  (`_kvwarm_resolve_dataset`) with the default URL (`_KVWARM_DEFAULT_DATASET_URL`), its
+  pinned SHA-256 (`_KVWARM_DEFAULT_DATASET_SHA256`) and the download timeout
+  (`_KVWARM_DOWNLOAD_TIMEOUT_S`), the text recipe and the dataset record
+  (`_kvwarm_load_texts`), the chain of conversations (`_kvwarm_chain_token_ids`), the
+  verdict names of the content probe (`_kvwarm_probe_content`) and the content word
+  `sharegpt_chain` (`_bench_synthetic_token_ids`).
 - `components/src/dynamo/vllm/backend_args.py`: the names and defaults of the five
   sample-cap flags and of `--benchmark-max-batch-size`, and the bounds of the caps
   (`_validate_benchmark_sampling`).
@@ -2838,9 +2877,10 @@ SGLang. The tests model those interfaces with fakes.
 
 The collector path that starts the launcher follows the same two revisions.
 `python/aisim/collector/fpm_forward/sglang_fpm_builder.py`, with the test
-`python/aisim/tests/unit/collector/test_fpm_sglang_builder.py`, writes nine of SGLang's
-command-line flags under their upstream names and repeats the choice names of the
-`kv_cache_dtype` field; it imports no SGLang.
+`python/aisim/tests/unit/collector/test_fpm_sglang_builder.py`, writes ten of SGLang's
+command-line flags under their upstream names, among them `--ep-size` for the
+expert-parallel size of a MoE cell, and repeats the choice names of the `kv_cache_dtype`
+field; it imports no SGLang.
 `python/aisim/collector/fpm_forward/runtime/sglbench_preflight.py`, with the tests
 `python/aisim/tests/unit/collector/test_fpm_sglbench_{preflight,gate}.py`, types no SGLang
 name: it looks up the module, class, attribute and field names that `sglbench_compat.py`
@@ -2848,16 +2888,17 @@ and `sglbench_recorder.py` list in `SGLANG_SEAM_NAMES`.
 
 Upstream paths, under `python/sglang/`: `__init__.py`, `version.py` and, under `srt/`,
 `server_args.py`, `environ.py`, `runtime_context.py`,
-`arg_groups/{arg_utils.py,kv_cache_hook.py,model_override_base.py,overrides.py,parallel_hook.py,serving_hook.py,validation_hook.py}`,
+`arg_groups/{arg_utils.py,kv_cache_hook.py,model_override_base.py,moe_hook.py,overrides.py,parallel_hook.py,serving_hook.py,validation_hook.py}`,
 `arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,model.py,parallel.py,schedule.py,serving.py,spec.py}`,
-`configs/{model_config.py,step3_vl.py}`, `entrypoints/engine.py`,
+`configs/{model_config.py,step3_vl.py}`, `entrypoints/engine.py`, `eplb/expert_location.py`,
+`layers/moe/fused_moe_triton/layer.py`,
 `managers/{data_parallel_controller.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
 `managers/async_d2h_copy_worker.py` (v0.5.23 only),
 `managers/scheduler_components/{batch_result_processor.py,dp_attn.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
 `mem_cache/{common.py,kv_cache_builder.py,kv_cache_dtype.py,registry.py}`,
 `model_executor/{forward_batch_info.py,model_runner.py}`,
 `model_executor/runner/{decode_cuda_graph_runner.py,eager_runner.py,prefill_cuda_graph_runner.py}`,
-`model_loader/utils.py`, `models/{dbrx.py,step3_vl.py}`,
+`model_loader/utils.py`, `models/{dbrx.py,glm_image_vl.py,step3_vl.py}`,
 `plugins/{__init__.py,hook_registry.py}`,
 `sampling/{sampling_params.py,watermarking/core.py}` and
 `utils/{common.py,watchdog.py,hf_transformers/common.py}`.

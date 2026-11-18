@@ -4,8 +4,8 @@
 # The start-up checks read SGLang's resolved arguments at v0.5.22 and v0.5.23; see THIRD_PARTY_NOTICES.md.
 # Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
-# The benchmark flags, their defaults and their environment variables are re-implemented from ai-dynamo/dynamo
-# (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/backend_args.py and
+# The benchmark flags, their defaults, their environment variables and the dataset of a text run are re-implemented from
+# ai-dynamo/dynamo (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/backend_args.py and
 # instrumented_scheduler.py at b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.
 
 """Launcher of AISim's SGLang self-benchmark: flags, start-up checks, engine, run, result files, exit code.
@@ -29,12 +29,18 @@ What ``main`` does, in this order
        merged file, and nothing else. Creates the recorder directory and names it to the scheduler processes.
     5. Refuses an SGLang release that was not tested. Loads SGLang's plugins, parses and resolves SGLang's
        arguments, and refuses every setup the feasibility rules do not cover (``_RESOLVED_CHECKS``,
-       ``_check_sglang_environment``, the platform and the expert keys of the model).
+       ``_check_sglang_environment``, the platform and the expert-parallel layout). The expert keys of the
+       model config decide where the prompts come from: dataset text for a model with expert layers, seeded
+       token ids for any other, unless ``DYN_BENCH_PREFILL_CONTENT`` says which (``ENV_PREFILL_CONTENT``).
     6. Writes the dump of the resolved arguments when ``--dump-config-to`` is given.
-    7. Builds the engine with the recorder's scheduler entry.
-    8. Takes the token range from the tokenizer.
-    9. Runs the benchmark (``sglbench_driver.BenchmarkRun.execute``).
-    10. Always, also after a failure or a stop: shuts the engine down, writes the result files, prints the
+    7. For a text run: finds the dataset file (a local file, the cached file or a download), hashes it, parses
+       it and takes its texts. This comes before the engine build, so a dataset that cannot be had costs
+       seconds and no model load.
+    8. Builds the engine with the recorder's scheduler entry.
+    9. Takes the token range from the tokenizer. For a text run: reads how many token ids the model counts
+       and turns texts into token ids with the served tokenizer until the text pool is large enough.
+    10. Runs the benchmark (``sglbench_driver.BenchmarkRun.execute``).
+    11. Always, also after a failure or a stop: shuts the engine down, writes the result files, prints the
         outcome, stays alive for ``FINAL_WAIT_SECONDS`` and returns the exit code.
 
 Exit codes
@@ -44,6 +50,10 @@ Exit codes
     an output path that names no file, or a directory that cannot be made or written to. The write error is
     then printed after the reason. An unknown value of ``DYN_BENCHMARK_MODE`` is refused with 64 and no
     artifact, because an artifact needs the mode.
+
+    A text run has no other content to fall back to. When its dataset cannot be had, gives no text, cannot be
+    turned into token ids or is shorter than the longest prompt, the run fails with 65 and the reason
+    ``dataset_unavailable``, ``dataset_empty``, ``tokenizer_unavailable`` or ``content_too_shallow``.
 
     Not covered: a scheduler process that dies. SGLang then kills the launcher's process with SIGKILL
     (srt/utils/watchdog.py ``SubprocessWatchdog``; srt/entrypoints/engine.py ``launch_phase_sigquit_handler``;
@@ -73,12 +83,18 @@ files under ``python/sglang`` at both tags::
     srt/arg_groups/fields/spec.py            Spec
     srt/arg_groups/fields/disagg.py          Disagg
     srt/arg_groups/fields/device.py          Device
-    srt/arg_groups/parallel_hook.py          handle_deprecated_dp_attention, handle_dwdp, handle_elastic_ep
+    srt/arg_groups/parallel_hook.py          handle_context_parallelism, handle_deprecated_dp_attention,
+                                             handle_dwdp, handle_elastic_ep, handle_eplb_and_dispatch
+    srt/arg_groups/overrides.py              _a2a_ep_size
+    srt/arg_groups/moe_hook.py               handle_a2a_moe
     srt/arg_groups/validation_hook.py        check_server_args
     srt/arg_groups/kv_cache_hook.py          the RuntimeError and NotImplementedError a resolution step raises
-    srt/runtime_context.py                   attn_dp_enabled_of, PlatformContext
+    srt/runtime_context.py                   attn_dp_enabled_of, PlatformContext, derive_parallel_widths
+    srt/eplb/expert_location.py              ExpertLocationMetadata._init_common
+    srt/layers/moe/fused_moe_triton/layer.py FusedMoE.__init__
     srt/environ.py                           EnvField.get, EnvBool.parse, EnvInt.parse and six variables of Envs
-    srt/utils/common.py                      get_bool_env_var, kill_process_tree
+    srt/utils/common.py                      get_bool_env_var, kill_process_tree, require_attn_tp_gather,
+                                             require_mlp_sync
     srt/mem_cache/common.py                  match_kv_cache
     srt/utils/watchdog.py                    SubprocessWatchdog
     srt/entrypoints/engine.py                Engine.__init__, Engine._launch_scheduler_processes,
@@ -112,11 +128,26 @@ launches. Four ran to a complete result (TP 1 and TP 2, page sizes 1 and 64, pre
 validator and the gate's checker accepted their files. The other four: a forced cache mismatch (failed
 artifact, exit code 65), a soft deadline (partial artifact, exit code 66), a killed scheduler process (SGLang
 killed the launcher, status 137, no file) and a SIGTERM in the sweep (failed artifact, exit code 65). The files
-of those launches are not kept in this repository.
+of those launches are not kept in this repository. Every one of them served a model without expert layers and
+sent seeded token ids.
+
+Text runs ran on engines on 2026-11-17, on H200 GPUs. A model with expert layers (``Qwen/Qwen1.5-MoE-A2.7B``)
+ran on one GPU with SGLang 0.5.22 and with ``--tp-size 2 --ep-size 2`` with SGLang 0.5.23, each as a prefill
+cell and a decode cell of AISim's default grid. A model without expert layers ran with
+``DYN_BENCH_PREFILL_CONTENT=sharegpt_chain`` and SGLang 0.5.23 in a smoke run. Every one of them ran to a
+complete result that AISim's validator accepted, with the default dataset found in the cache folder. The files
+are not kept in this repository. The texts of those runs gave no token id outside the token range: the pool
+of every one of them dropped nothing while it still left such ids out, and held the same tokens in a smoke
+run with SGLang 0.5.23 after it began to keep them. A prompt that holds such an id, a download of the
+dataset, and every way in which a text run or the check of the expert-parallel layout fails, rest on the
+source and on the tests.
 
 The flags, their defaults and their ``DYN_*`` variables are those of Dynamo's vLLM worker, in the files and at
 the revision the header of this file names: ``backend_args.py`` (the flag declarations and their value rules)
 and ``instrumented_scheduler.py`` (the variables the benchmark reads by itself, ``uuid4().hex`` as the run id).
+The dataset of a text run follows the same file: how the file is found, cached, downloaded and verified
+(``_kvwarm_resolve_dataset``), the default URL, its pinned SHA-256 and the download timeout, and the names of
+the four verdicts of its content probe (``_kvwarm_probe_content``).
 
 No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header of this
 file and recorded in THIRD_PARTY_NOTICES.md.
@@ -127,6 +158,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -135,11 +167,13 @@ import signal
 import sys
 import time
 import traceback
+import urllib.request
 import uuid
 from collections.abc import Callable, Mapping
 
 import sglbench_artifact as artifact
 import sglbench_compat as compat
+import sglbench_content as content
 import sglbench_driver as driver
 import sglbench_grid as grid
 import sglbench_recorder as recorder
@@ -296,13 +330,76 @@ _REAL_STATE_SWITCHES = (
     ("DYN_BENCH_KV_WARMUP", ("on", "1", "true")),
     ("DYN_BENCH_PREFILL_REAL_SEED", ("on", "1", "true", "auto")),
 )
-# Dynamo draws prompts from a text pool for the other values of this variable; here prompts are seeded ids.
+# Where the prompts of a run come from. Dynamo reads the variable in ``_bench_synthetic_token_ids``; here it has
+# three accepted values:
+# - unset or empty: dataset text when the model has expert layers, because the routing of a token to its
+#   experts depends on the content, and seeded token ids for every other model;
+# - ``random``: seeded token ids. A model with expert layers is then refused;
+# - ``sharegpt_chain``: dataset text for any model, one without expert layers included.
+# In a text run every prompt is text: seeds, shots, prompts without cached tokens, the self-test and the
+# warm-up. In Dynamo the variable changes the prefill prompts only, and the decode contexts are text whenever
+# its warm-up passes its gate. Dynamo's third value, ``sharegpt``, cuts windows out of one flat pool that
+# wraps around; that construction is not built here, so the word is refused like any other.
 ENV_PREFILL_CONTENT = "DYN_BENCH_PREFILL_CONTENT"
 SEEDED_CONTENT = "random"
-# Variables of Dynamo's text pool and of its repeated decode steps. Neither exists here.
+TEXT_CONTENT = "sharegpt_chain"
+# The dataset of a text run. The three variables mean what they mean in Dynamo (``_kvwarm_resolve_dataset``),
+# with two differences: an empty value counts as unset, and a local file is hashed and compared with the hash
+# variable too, where Dynamo never compares a local file.
+# - The dataset: a URL (http or https), downloaded into the cache directory unless the file is there already,
+#   or the path of a local file. Unset: DEFAULT_DATASET_URL.
+# - The cache directory. Unset: ``fpm_datasets`` beside the directory HF_HOME names, or
+#   DEFAULT_DATASET_CACHE_DIR when HF_HOME is unset as well. AISim's run script sets the variable to a scratch
+#   directory when the directory beside HF_HOME cannot be written (src/aisim/generator/builders/fpm_builder.py).
+# - The SHA-256 the file must have. Unset: DEFAULT_DATASET_SHA256 for the default URL and no check for
+#   any other dataset.
+# A run with seeded token ids reads none of them.
+ENV_KVWARM_DATASET = "DYN_BENCH_KV_WARMUP_DATASET"
+ENV_KVWARM_CACHE_DIR = "DYN_BENCH_KV_WARMUP_CACHE_DIR"
+ENV_KVWARM_SHA256 = "DYN_BENCH_KV_WARMUP_SHA256"
+ENV_HF_HOME = "HF_HOME"
+_DATASET_VARIABLES = (ENV_KVWARM_DATASET, ENV_KVWARM_CACHE_DIR, ENV_KVWARM_SHA256, ENV_HF_HOME)
+# The default dataset, its pinned digest and the socket timeout of a download, with the values of Dynamo's
+# ``_KVWARM_DEFAULT_DATASET_URL``, ``_KVWARM_DEFAULT_DATASET_SHA256`` and ``_KVWARM_DOWNLOAD_TIMEOUT_S``. The
+# directory is the one Dynamo's ``_kvwarm_resolve_dataset`` uses without HF_HOME.
+DEFAULT_DATASET_URL = (
+    "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/"
+    "ShareGPT_V3_unfiltered_cleaned_split.json"
+)
+DEFAULT_DATASET_SHA256 = "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4"
+DATASET_DOWNLOAD_TIMEOUT_SECONDS = 60
+DEFAULT_DATASET_CACHE_DIR = "/tmp/fpm_datasets"
+# Collector rule "rows depend only on the pin and the plan, never on environment variables". The default
+# dataset and its digest are constants of this file, so they belong to the pin, as does what AISim's run script
+# sets by itself. Any other dataset, cache directory, digest or content word must be given through
+# ``K8sConfig.extra_env`` of the collection, which AISim hashes into the plan with the other generator
+# overrides (collector/fpm_forward/planner.py). A value that reaches the pod in any other way is outside the
+# plan; the launcher cannot tell where a variable came from, so this is a rule for whoever sets one.
+#
+# Dynamo's ``DYN_BENCH_POOL_TAG`` draws the windows of its flat text pool again, and its two giant-KV variables
+# repeat a decode step. Neither construction exists here, so each is refused when it is set.
 _REFUSED_VARIABLES = ("DYN_BENCH_POOL_TAG", "DYN_BENCH_GIANT_KV_THRESHOLD", "DYN_BENCH_GIANT_KV_REPEATS")
-# Not read at all: DYN_BENCH_KV_WARMUP_DATASET, DYN_BENCH_KV_WARMUP_CACHE_DIR and DYN_BENCH_KV_WARMUP_SHA256
-# (AISim's collector sets the cache directory by itself), and every FPM_* variable.
+# Not read at all: every FPM_* variable. They belong to the gate of AISim's collector.
+
+# The text pool of a text run. Texts are turned into token ids in dataset order, POOL_ENCODE_BATCH texts in one
+# tokenizer call, until the pool holds POOL_TOKEN_TARGET tokens or the texts run out. A prompt part is a chain
+# of whole conversations, each used once, so it can give at most the tokens of the whole pool; the driver
+# compares the pool with the longest prompt once the grid exists. The target is this module's own choice. It
+# is about two hundred times an input limit of 40954 tokens, the limit in every recorder header of
+# benchmarks/evidence/collector/sglbench-engine-probe-20261113, and at four bytes a token the pool then takes
+# about 32 MB.
+#
+# Deviation note (the text of a run is the head of the dataset).
+# What differs: serving sees whatever text its clients send. A text run takes its text from the first
+# conversations of the dataset's collection half, in dataset order, as many as fill the pool; the rest of the
+# file is parsed and not used. Dynamo's vLLM self-benchmark shuffles all kept conversations for every chain.
+# Direction of the error: not measured. The pool decides which text a run can show to the expert layers, and a
+# larger pool would show more of the dataset.
+# How to retire it: raise POOL_TOKEN_TARGET, or draw the conversations of the pool from the whole file.
+POOL_TOKEN_TARGET = 8_000_000
+POOL_ENCODE_BATCH = 256
+# A file is hashed and downloaded in pieces of this size.
+_FILE_PIECE_BYTES = 1 << 20
 
 # Exceptions with which SGLang refuses a setup while it loads plugins, parses, resolves and reads the model
 # config: its hooks raise all four (srt/arg_groups, for example validation_hook.py and kv_cache_hook.py).
@@ -483,6 +580,10 @@ class _Options:
     output_path: str
     dump_config_to: str | None
     content_seed: str
+    # ``DYN_BENCH_PREFILL_CONTENT``: SEEDED_CONTENT, TEXT_CONTENT, or None when the model decides.
+    prefill_content: str | None
+    # The dataset variables and HF_HOME that are set and not empty, as text. Only a text run reads them.
+    dataset_environ: dict
     worker_id: str
     # What goes to SGLang's own parser.
     sglang_argv: list[str]
@@ -575,11 +676,9 @@ def _refused_variables(environ: Mapping[str, str]) -> list[str]:
                 f"{variable}={environ[variable]!r} is not supported: the benchmark stages real cached state only "
                 f"(accepted: {', '.join(accepted)})"
             )
-    content = environ.get(ENV_PREFILL_CONTENT, "")
-    if content and content != SEEDED_CONTENT:
-        problems.append(
-            f"{ENV_PREFILL_CONTENT}={content!r} is not supported: prompts are seeded token ids ({SEEDED_CONTENT})"
-        )
+    word = environ.get(ENV_PREFILL_CONTENT, "")
+    if word and word not in (SEEDED_CONTENT, TEXT_CONTENT):
+        problems.append(f"{ENV_PREFILL_CONTENT}={word!r} is not supported (accepted: {SEEDED_CONTENT}, {TEXT_CONTENT})")
     for variable in _REFUSED_VARIABLES:
         if environ.get(variable):
             problems.append(f"{variable} is not supported (it is set to {environ[variable]!r})")
@@ -687,6 +786,14 @@ def _read_options(argv: list[str], environ: Mapping[str, str]) -> _Options:
     if not usable_seed:
         problems.append(f"{ENV_CONTENT_SEED}={content_seed!r} must be a non-empty UTF-8 string")
     problems.extend(_refused_variables(environ))
+    # Unset and empty leave the choice to the model. A word that was refused above is not kept.
+    prefill_content = environ.get(ENV_PREFILL_CONTENT) or None
+    if prefill_content not in (SEEDED_CONTENT, TEXT_CONTENT):
+        prefill_content = None
+    # The dataset variables are kept as text and looked at only when the run turns out to be a text run, which
+    # is known once the model config was read. An empty value counts as unset. Whoever sets one of them must
+    # set it through ``K8sConfig.extra_env``, so that it is part of the plan; see the comment at the constants.
+    dataset_environ = {name: environ[name] for name in _DATASET_VARIABLES if environ.get(name)}
 
     points_file = text_value("benchmark_points_file", None)
     manifest, points_sha256 = None, None
@@ -713,6 +820,8 @@ def _read_options(argv: list[str], environ: Mapping[str, str]) -> _Options:
         output_path=output_path,
         dump_config_to=dump_config_to,
         content_seed=content_seed,
+        prefill_content=prefill_content,
+        dataset_environ=dataset_environ,
         worker_id=environ.get(ENV_WORKER_ID, ""),
         sglang_argv=sglang_argv,
         rejection=problems[0] if problems else None,
@@ -831,6 +940,11 @@ def _int_at_most(limit: int) -> Callable[[object], bool]:
     return accepts
 
 
+# The resolved fields of the expert layers that are written into the ``producer`` block of a model with expert
+# layers. ``moe_runner_backend`` is recorded and refuses nothing: which kernels run the expert layers is a
+# serving choice (srt/arg_groups/fields/exec_.py ``ExecMoe``).
+_MOE_RECORDED_FIELDS = ("ep_size", "moe_a2a_backend", "moe_runner_backend", "moe_dense_tp_size", "enable_eplb")
+
 _CACHE_TIER_TEXT = "only the built-in in-GPU radix cache is supported ({name}={v})"
 _ELASTIC_EP_TEXT = "elastic EP is not supported ({name}={v})"
 _DISAGGREGATION_TEXT = "disaggregated serving is not supported ({name}={v})"
@@ -878,6 +992,22 @@ _RESOLVED_CHECKS: tuple[tuple[str, Callable[[object], bool], str], ...] = (
     ("ep_join_mode", _only(None), _ELASTIC_EP_TEXT),
     ("max_ep_size", _only(None), _ELASTIC_EP_TEXT),
     ("enable_elastic_expert_backup", _only(False), _ELASTIC_EP_TEXT),
+    # ``ExecMoe``. With any other backend SGLang sends a token to the one rank that holds its expert, and
+    # resolution makes ``ep_size`` the TP size by itself (srt/arg_groups/overrides.py ``_a2a_ep_size``); three
+    # of those backends also need DP attention (srt/arg_groups/moe_hook.py ``handle_a2a_moe``). The one
+    # exception is "ascend_tp", which ``handle_a2a_moe`` resolves to "none" and which so passes here. With "none"
+    # every EP rank runs the expert layers over the same tokens and the partial outputs are summed (the
+    # comment in srt/arg_groups/parallel_hook.py ``handle_eplb_and_dispatch``).
+    ("moe_a2a_backend", _only("none"), "only the MoE all-to-all backend none is supported ({name}={v})"),
+    # ``Parallel``. Set, it gives the dense MLP layers a TP size of their own, and the scheduler then gathers
+    # and synchronises across ranks (srt/utils/common.py ``require_attn_tp_gather`` and ``require_mlp_sync``).
+    ("moe_dense_tp_size", _only(None), "moe_dense_tp_size must not be set (got {v})"),
+    # ``ExecMoe``. EPLB places the experts on the ranks anew every ``eplb_rebalance_num_iterations``
+    # iterations (the help text of that field), and redundant experts add copies of experts to the ranks
+    # (srt/eplb/expert_location.py ``ExpertLocationMetadata._init_common``). Where an expert runs would then
+    # depend on the requests that came before.
+    ("enable_eplb", _only(False), "EPLB is not supported ({name}={v})"),
+    ("ep_num_redundant_experts", _only(0), "redundant experts are not supported ({name}={v})"),
     # srt/arg_groups/fields/spec.py ``Spec`` and srt/arg_groups/fields/disagg.py ``Disagg``. A speculative
     # step commits several tokens and runs draft batches.
     ("speculative_algorithm", _only(None), "speculative decoding is not supported ({name}={v})"),
@@ -1004,11 +1134,53 @@ def _sglang_call(doing: str, call: Callable, *args: object):
         raise _rejected(f"SGLang raised {type(error).__name__} while {doing}: {_one_line(error)}") from error
 
 
-def _start_up_checks(sglang_argv: list[str], environ: Mapping[str, str], producer: dict) -> tuple[object, object]:
+def _check_expert_parallel(view: object, experts: dict) -> None:
+    """Refuse an expert-parallel size the benchmark does not cover.
+
+    srt/arg_groups/fields/parallel.py ``Parallel``: ``ep_size`` is 1 unless the operator sets it. SGLang
+    derives the widths of the expert layers from it, ``moe_tp_size = tp_size // ep_size // moe_dp_size``
+    (srt/runtime_context.py ``derive_parallel_widths``). At 1 every TP rank holds a slice of every expert; at
+    the TP size every rank holds whole experts, its share of them
+    (srt/layers/moe/fused_moe_triton/layer.py ``FusedMoE.__init__``). Both keep one scheduler process for each
+    TP rank (srt/entrypoints/engine.py ``Engine._launch_scheduler_processes``), which is the number the driver
+    waits for. A size between the two mixes the layouts, and AISim plans no cell for it. A model without
+    expert layers has nothing the flag could spread, so any size but 1 is a mistake in its command.
+
+    ``moe_dp_size`` (``Parallel``) is not tested here. Both statements above need it to be 1, and SGLang's
+    resolution sees to that: it asserts ``moe_dp_size == 1`` whenever the value differs from ``attn_cp_size``
+    (srt/arg_groups/parallel_hook.py ``handle_context_parallelism``), and ``attn_cp_size`` must be 1
+    (``_RESOLVED_CHECKS``). The assert is SGLang's and is gone when Python runs with ``-O``.
+    """
+    ep_size, tp_size = _resolved(view, "ep_size"), _resolved(view, "tp_size")
+    if _only(1)(ep_size):
+        return
+    if not experts:
+        raise _rejected(f"expert parallelism needs a model with expert layers (ep_size={_shown(ep_size)})")
+    if type(ep_size) is not int or type(tp_size) is not int or ep_size != tp_size:
+        raise _rejected(f"ep_size must be 1 or the TP size (ep_size={_shown(ep_size)}, tp_size={_shown(tp_size)})")
+
+
+def _is_text_run(prefill_content: str | None, experts: dict) -> bool:
+    """Whether the prompts of this run are dataset text. ``ENV_PREFILL_CONTENT`` says what each value means."""
+    if prefill_content is None:
+        return bool(experts)
+    if prefill_content == SEEDED_CONTENT and experts:
+        key, value = next(iter(experts.items()))
+        raise _rejected(
+            f"{ENV_PREFILL_CONTENT}={SEEDED_CONTENT} is not supported for a model with expert layers "
+            f"({key}={_shown(value)}): the routing of a token to its experts depends on the content"
+        )
+    return prefill_content == TEXT_CONTENT
+
+
+def _start_up_checks(sglang_argv: list[str], environ: Mapping[str, str], producer: dict) -> tuple[object, object, dict]:
     """Parse and resolve SGLang's arguments and refuse what the benchmark does not cover.
 
-    Returns ``(server_args, view)``: SGLang's record and the view of its resolved values. Nothing is built
-    here, so a refused setup costs no model load. Resolution does probe the device and reads the model config.
+    Returns ``(server_args, view, experts)``: SGLang's record, the view of its resolved values, and the
+    expert keys of the model config. ``main`` decides from the keys where the prompts come from
+    (``_is_text_run``) and then tests the expert-parallel layout (``_check_expert_parallel``). Nothing is
+    built here, so a refused setup costs no model load. Resolution does probe the device and reads the model
+    config.
     """
     # The release is tested first, so that an untested one is refused by name and not by a field it lacks.
     version = compat.sglang_version()
@@ -1042,12 +1214,12 @@ def _start_up_checks(sglang_argv: list[str], environ: Mapping[str, str], produce
             f"only NVIDIA CUDA is supported (device={_shown(device)}, is_cuda={_shown(platform['is_cuda'])}, "
             f"is_hip={_shown(platform['is_hip'])}); SGLang has AMD-only admission rules"
         )
-    # Prompts are seeded token ids. In a model with expert layers the routing depends on the content, so its
-    # rows would not stand for served text.
+    # Whether the model has expert layers decides where the prompts come from: in such a model the routing of
+    # a token to its experts depends on the content, so rows measured with seeded ids would not stand for
+    # served text. Only the model config is read for this, never the weights.
     experts = _sglang_call("reading the model config", compat.model_expert_keys, server_args)
-    if experts:
-        key, value = next(iter(experts.items()))
-        raise _rejected(f"MoE models are not supported yet ({key}={_shown(value)})")
+    producer["expert_keys"] = _json_ready(experts)
+    producer["moe"] = _json_ready({name: _resolved(view, name) for name in _MOE_RECORDED_FIELDS}) if experts else None
 
     # How the output of a request is streamed: every request is sent with ``stream=True``
     # (sglbench_compat.py, ``generate_batch``), and the two server settings are the resolved ones.
@@ -1058,7 +1230,7 @@ def _start_up_checks(sglang_argv: list[str], environ: Mapping[str, str], produce
     }
     for name, absent in _ONE_RELEASE_FIELDS:
         producer[name] = getattr(view, name, absent)
-    return server_args, view
+    return server_args, view, experts
 
 
 def _resolved_settings(view: object, producer: dict) -> dict:
@@ -1173,6 +1345,196 @@ def _dump_resolved_arguments(options: _Options, run_id: str, version: str, serve
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# The dataset and the text pool of a text run
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _unavailable(what: str) -> _Failed:
+    return _Failed(f"{driver.REASON_DATASET_UNAVAILABLE}: {what}")
+
+
+def _sha256_of_file(path: str) -> str:
+    """The SHA-256 of a file as hex digits, read piece by piece."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            piece = handle.read(_FILE_PIECE_BYTES)
+            if not piece:
+                return digest.hexdigest()
+            digest.update(piece)
+
+
+def _require_sha256(path: str, wanted: str | None, what: str) -> str:
+    """Hash ``path`` and return the digest; fail the run when a digest is wanted and it is another one."""
+    digest = _sha256_of_file(path)
+    if wanted and digest != wanted:
+        raise _unavailable(f"{what} {path} has the SHA-256 {digest}, expected {wanted}")
+    return digest
+
+
+def _download(url: str, target: str) -> None:
+    """Write what ``url`` serves into the file ``target``.
+
+    ``urllib.request.urlopen`` with a socket timeout, as Dynamo's ``_kvwarm_resolve_dataset`` calls it: an
+    endpoint that stalls fails the download and does not hold the launcher. Nothing is tried a second time.
+    ``urllib`` takes proxy settings from the process environment by itself. ``target`` must not exist: the file
+    is created, never opened over another one.
+
+    A body that ends before the length the server announced is an ``OSError`` here. ``http.client`` itself
+    reports none for a read with a size: ``HTTPResponse.read(amt)`` returns an empty piece, as at the end of
+    a whole body (CPython 3.12, http/client.py).
+    """
+    with urllib.request.urlopen(url, timeout=DATASET_DOWNLOAD_TIMEOUT_SECONDS) as response, open(target, "xb") as out:
+        written = 0
+        while True:
+            piece = response.read(_FILE_PIECE_BYTES)
+            if not piece:
+                break
+            out.write(piece)
+            written += len(piece)
+        headers = getattr(response, "headers", None)
+        announced = None if headers is None else headers.get("Content-Length")
+        if announced is not None and announced.strip().isdigit() and int(announced) != written:
+            raise OSError(f"the transfer ended after {written} of the {announced.strip()} bytes the server announced")
+
+
+def _resolve_dataset(environ: Mapping[str, str]) -> dict:
+    """Find the dataset file of a text run and hash it: ``{"path", "sha256", "url", "downloaded"}``.
+
+    ``environ`` holds the three dataset variables and HF_HOME; the comment at ``ENV_KVWARM_DATASET`` says what
+    each means. The steps are those of Dynamo's ``_kvwarm_resolve_dataset``:
+
+    - a value that does not start with ``http://`` or ``https://`` is a local file. It must exist. It is hashed
+      and, when the hash variable is set, compared with it; Dynamo does not compare a local file;
+    - a URL is looked for in the cache directory under the last part of its path. A file that is there is
+      hashed and compared with the expected digest. A file with another digest fails the run; it is neither
+      deleted nor fetched again, as in Dynamo;
+    - otherwise the URL is downloaded into ``<file>.<pid>.<random>.part`` beside its place, hashed, and renamed
+      into place. Several launchers may fetch the same file into one directory at once, and the rename is
+      atomic. Dynamo's name carries the process id only, which tells the ranks of one host apart; launchers
+      in two pods that share a volume can have the same process id, so the name here has a random part too.
+      A part with another digest is deleted, and so is the part of a download that broke off or ended short.
+
+    Whatever goes wrong fails the run with ``dataset_unavailable: <what>``: a missing file, another digest, a
+    directory that cannot be made or written, and an ``OSError`` (``urllib.error.URLError`` and a socket
+    timeout are of that kind), a ``ValueError`` or an ``http.client`` exception of the download.
+    """
+    spec = environ.get(ENV_KVWARM_DATASET) or DEFAULT_DATASET_URL
+    given = environ.get(ENV_KVWARM_SHA256) or None
+    try:
+        if not spec.startswith(("http://", "https://")):
+            if not os.path.isfile(spec):
+                raise _unavailable(f"the dataset path {spec} is not an existing file")
+            digest = _require_sha256(spec, given, "the dataset file")
+            return {"path": spec, "sha256": digest, "url": None, "downloaded": False}
+        cache_root = environ.get(ENV_KVWARM_CACHE_DIR)
+        if not cache_root:
+            hf_home = environ.get(ENV_HF_HOME)
+            cache_root = os.path.join(hf_home, os.pardir, "fpm_datasets") if hf_home else DEFAULT_DATASET_CACHE_DIR
+        cache_root = os.path.abspath(cache_root)
+        os.makedirs(cache_root, exist_ok=True)
+        cached = os.path.join(cache_root, os.path.basename(spec.split("?")[0]) or "kvwarm_dataset.json")
+        wanted = given or (DEFAULT_DATASET_SHA256 if spec == DEFAULT_DATASET_URL else None)
+        if os.path.exists(cached):
+            digest = _require_sha256(cached, wanted, "the cached dataset file")
+            return {"path": cached, "sha256": digest, "url": spec, "downloaded": False}
+        part = f"{cached}.{os.getpid()}.{secrets.token_hex(8)}.part"
+        _say(f"downloading the dataset {spec} to {cached}")
+        try:
+            _download(spec, part)
+            digest = _require_sha256(part, wanted, "the downloaded dataset file")
+            os.replace(part, cached)
+        except BaseException:
+            try:
+                os.unlink(part)
+            except FileNotFoundError:
+                pass
+            raise
+        return {"path": cached, "sha256": digest, "url": spec, "downloaded": True}
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        raise _unavailable(_described(error)) from error
+
+
+def _load_dataset(environ: Mapping[str, str]) -> tuple[dict, list[str]]:
+    """The record of the dataset of a text run and its texts. It runs before the engine is built.
+
+    The file is found and hashed (``_resolve_dataset``), read whole and parsed as JSON, and its texts are
+    taken by ``sglbench_content.conversation_texts``, which restates the recipe of Dynamo's
+    ``_kvwarm_load_texts``. The record has the four keys Dynamo writes into its ``kvwarm`` block (``path``,
+    ``sha256``, ``collection_pool``, ``conversations``, the number of kept texts) and two of this module:
+    ``url``, the URL the dataset variable named or None for a local file, and ``downloaded``, whether this run
+    fetched it. A file this run did not fetch is whatever lay in the cache directory under that name; its
+    digest is recorded, and compared when a digest is expected. A file that cannot be read or parsed fails
+    the run with ``dataset_unavailable: <what>``, and one that gives no text with ``dataset_empty``.
+    """
+    resolved = _resolve_dataset(environ)
+    path = resolved["path"]
+    try:
+        with open(path, encoding="utf-8") as handle:
+            records = json.loads(handle.read())
+        texts = content.conversation_texts(records)
+    except (OSError, ValueError) as error:
+        raise _unavailable(f"{path}: {_described(error)}") from error
+    if not texts:
+        _say(f"the dataset {path} gives no text: no record has a text that the recipe keeps")
+        raise _Failed(driver.REASON_DATASET_EMPTY)
+    record = {
+        "path": path,
+        "sha256": resolved["sha256"],
+        "collection_pool": content.COLLECTION_POOL,
+        "conversations": len(texts),
+        "url": resolved["url"],
+        "downloaded": resolved["downloaded"],
+    }
+    return record, texts
+
+
+def _build_text_pool(engine: object, texts: list[str], id_limit: int) -> content.TextPool:
+    """Turn texts into token ids with the served tokenizer until the text pool is large enough.
+
+    The texts are taken in order, ``POOL_ENCODE_BATCH`` in one tokenizer call, until the pool holds
+    ``POOL_TOKEN_TARGET`` tokens or no text is left. The pool keeps the ids of a text as the tokenizer returns
+    them, the id of a special token included, which a tokenizer gives for the written form of that token
+    inside a text. Dynamo's vLLM self-benchmark sends them in the same way (``_kvwarm_chain_token_ids``).
+    The pool leaves out, and counts, only an id at or above ``id_limit``, the number of ids the served model
+    counts: SGLang does not check input ids, and what the model does with such an id was not read. The
+    tokenizer is the engine's own, in the launcher's process; the scheduler processes are idle meanwhile,
+    because no request has been sent yet.
+
+    Whatever the tokenizer raises fails the run with ``tokenizer_unavailable: <what>``, and a pool that kept no
+    conversation with ``dataset_empty``. An ``id_limit`` the pool refuses is ``token_range_too_small``, the
+    reason the driver gives for a token range it refuses.
+    """
+    started = time.monotonic()
+    try:
+        pool = content.TextPool([], 0, id_limit)
+    except ValueError as error:
+        # The pool words its refusal for a token range. The range it was given here is the model's ids.
+        raise _Failed(
+            f"{driver.REASON_TOKEN_RANGE}: the model counts {id_limit} token ids, which a text pool refuses: "
+            f"{_one_line(error)}"
+        ) from error
+    encoded = 0
+    try:
+        tokenizer = compat.tokenizer_class(engine)
+        while encoded < len(texts) and pool.tokens < POOL_TOKEN_TARGET:
+            batch = texts[encoded : encoded + POOL_ENCODE_BATCH]
+            pool.add(compat.encode_texts(engine, batch))
+            encoded += len(batch)
+    except Exception as error:
+        raise _Failed(f"{driver.REASON_TOKENIZER_UNAVAILABLE}: {_described(error)}") from error
+    _say(
+        f"the text pool holds {pool.tokens} tokens in {pool.conversations} conversations: {encoded} of "
+        f"{len(texts)} texts went through {tokenizer} in {time.monotonic() - started:.1f} s, and "
+        f"{pool.dropped_tokens} token ids at or above {id_limit}, the number of ids the model counts, and "
+        f"{pool.dropped_conversations} conversations without an id below it were dropped"
+    )
+    if pool.conversations == 0:
+        raise _Failed(driver.REASON_DATASET_EMPTY)
+    return pool
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -1219,13 +1581,26 @@ def _build_engine(server_args: object) -> object:
 def _token_range(engine: object) -> tuple[int, int]:
     """The ordinary token ids of the served tokenizer, as ``(low, high)`` with ``high`` exclusive.
 
-    SGLang does not check input ids against the vocabulary, so the benchmark keeps to ids that are neither
-    special nor added tokens. A tokenizer that cannot say which those are is refused.
+    SGLang does not check input ids against the vocabulary, so the ids the benchmark makes up itself, the
+    seeded ids and the allocated first tokens, are neither special nor added tokens. A tokenizer that cannot
+    say which those are is refused. The ids of dataset text are not held to this range (``_text_id_limit``).
     """
     try:
         return driver.ordinary_token_range(**compat.vocabulary(engine))
     except Exception as error:
         raise _rejected(f"the token range cannot be taken from the tokenizer: {_described(error)}") from error
+
+
+def _text_id_limit(engine: object) -> int:
+    """The number of token ids the served model counts: the ids of a text must lie below it.
+
+    A text keeps every id its tokenizer returned, as in Dynamo's vLLM self-benchmark. This is the one bound
+    left: a tokenizer can hold more ids than the model counts.
+    """
+    try:
+        return compat.model_vocabulary_size(engine)
+    except Exception as error:
+        raise _rejected(f"the vocabulary size cannot be taken from the model config: {_described(error)}") from error
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1369,6 +1744,10 @@ def main(argv: list[str] | None = None) -> int:
         max_queued_requests=None,
         config=_config_block(options),
         producer=producer,
+        # What the operator asked for by name. Without that word the model decides, once its config was read.
+        content_source=(
+            content.CONTENT_TEXT_CHAINS if options.prefill_content == TEXT_CONTENT else content.CONTENT_SEEDED_IDS
+        ),
     )
     # The recorder directory is new for every run and absolute: the scheduler processes read its name from
     # the environment.
@@ -1394,16 +1773,47 @@ def main(argv: list[str] | None = None) -> int:
             os.environ[recorder.ENV_RECORDER_DIR] = recorder_dir
             _say(f"run {run_id}: mode {options.mode}, output {options.output_path}, recorder logs in {recorder_dir}")
 
-            server_args, view = _start_up_checks(options.sglang_argv, os.environ, producer)
+            server_args, view, experts = _start_up_checks(options.sglang_argv, os.environ, producer)
+            text_run = _is_text_run(options.prefill_content, experts)
+            # From here on the run knows its content source, so that a text run that is refused for its layout
+            # or fails on its dataset, before any prompt exists, is still written as a text run.
+            source = content.CONTENT_TEXT_CHAINS if text_run else content.CONTENT_SEEDED_IDS
+            settings = dataclasses.replace(settings, content_source=source)
+            run = new_run(settings)
+            _check_expert_parallel(view, experts)
             run = new_run(dataclasses.replace(settings, **_resolved_settings(view, producer)))
             if options.dump_config_to is not None:
                 _dump_resolved_arguments(options, run_id, producer["sglang_version"], server_args)
 
+            dataset, texts, pool = None, None, None
+            if text_run:
+                # Before the engine is built: a dataset that cannot be had then costs seconds and no model load.
+                dataset, texts = _load_dataset(options.dataset_environ)
+                _say(
+                    f"text run: the dataset {dataset['path']} (SHA-256 {dataset['sha256']}) gives "
+                    f"{dataset['conversations']} texts"
+                )
             _say(f"SGLang {producer['sglang_version']}: the start-up checks passed; building the engine")
             engine = _build_engine(server_args)
             token_low, token_high = _token_range(engine)
-            _say(f"the engine is built; prompts use the token ids [{token_low}, {token_high})")
-            run.execute(_EngineAdapter(engine, stops), token_low=token_low, token_high=token_high)
+            if text_run:
+                # Only the allocated first tokens come from the token range: a text keeps its own ids.
+                _say(
+                    "the engine is built; the first token of each prompt part comes from the token ids "
+                    f"[{token_low}, {token_high}), the other tokens are dataset text"
+                )
+                pool = _build_text_pool(engine, texts, _text_id_limit(engine))
+                # The pool holds the token ids; the texts are not needed again.
+                texts = None
+            else:
+                _say(f"the engine is built; prompts use the token ids [{token_low}, {token_high})")
+            run.execute(
+                _EngineAdapter(engine, stops),
+                token_low=token_low,
+                token_high=token_high,
+                text_pool=pool,
+                dataset=dataset,
+            )
         finally:
             # From here on a signal is noted and no longer raised, so that what follows cannot be interrupted.
             stops.disarm()

@@ -55,6 +55,10 @@ class NativePointMeasurement:
 _KVWARM_UNSEEN = object()
 # The value of a rank whose serving configuration holds no checkpoint evidence, so that it differs from any record.
 _NO_CHECKPOINT_EVIDENCE = object()
+# What the SGLang launcher writes as ``producer.content.source`` when every prompt of the run was dataset text
+# (runtime/sglbench_content.py, CONTENT_TEXT_CHAINS). The runtime modules are staged into the pod and are not
+# imported here; a test holds the two values together.
+_SGLANG_TEXT_CONTENT_SOURCE = "dataset_text_chains"
 
 
 def _validate_seed_regime(row: dict[str, Any], path: Path) -> str | None:
@@ -859,6 +863,57 @@ def _rank_artifacts(raw_root: Path) -> list[tuple[Path, dict[str, Any]]]:
     return artifacts
 
 
+def plan_is_moe(plan: object) -> bool | None:
+    """Whether the model of ``plan`` has expert layers, for ``expected_moe`` of ``validate_native_collection``.
+
+    None for a plan that does not say: the capability record of a plan is optional for the callers that hand
+    over a stand-in.
+    """
+    is_moe = getattr(getattr(plan, "capability", None), "is_moe", None)
+    return is_moe if isinstance(is_moe, bool) else None
+
+
+def _validate_sglang_moe_producer(cell: FPMCell, producer: object, path: Path) -> None:
+    """Refuse an SGLang rank artifact whose pod did not run a MoE cell the way its plan describes it.
+
+    The rows of a cell take their labels from the plan: the parallel strategy, the tensor-parallel size and the
+    expert-parallel size are the cell's. The pod decides two things by itself (runtime/sglbench_launcher.py,
+    ``main``) and records them in the producer block: ``moe`` in ``_start_up_checks`` and ``tp_size`` in
+    ``_resolved_settings`` of that file, ``content`` in runtime/sglbench_driver.py, ``_own_producer_facts``:
+
+    - the content. Without a content word the launcher sends dataset text only when the model config it loaded
+      shows expert layers. A pod that finds none sends seeded token ids, whose routing to the experts is not
+      that of text;
+    - the layout of the expert layers. The launcher accepts an expert-parallel size of 1 at any tensor-parallel
+      size, so a command that reached the pod without ``--ep-size`` runs every expert on every rank.
+
+    Either run completes and passes every other rule of this module. This rule holds them against the cell: the
+    content source must be dataset text, and the recorded tensor-parallel and expert-parallel sizes must be the
+    cell's. A pod that found no expert layers records no ``moe`` block and is refused here as well.
+
+    The two sizes are compared as they are for the cells planning admits for this backend today, which have one
+    data-parallel replica (planner.py, ``_require_sglang_launcher_cells``): SGLang's ``tp_size`` is then the
+    cell's ``tp`` and its ``ep_size`` the cell's ``moe_ep``. A cell with DP attention needs its own mapping.
+    """
+    content = producer.get("content") if isinstance(producer, dict) else None
+    source = content.get("source") if isinstance(content, dict) else None
+    if source != _SGLANG_TEXT_CONTENT_SOURCE:
+        raise ValueError(
+            "native SGLang rank artifact of a MoE plan did not send dataset text: "
+            f"expected producer.content.source {_SGLANG_TEXT_CONTENT_SOURCE!r}, found {source!r}: {path}"
+        )
+    moe = producer.get("moe")
+    found = (producer.get("tp_size"), moe.get("ep_size") if isinstance(moe, dict) else None)
+    expected = (cell.topology.tp, cell.topology.moe_ep)
+    # ``type`` and not ``isinstance``: True equals 1, and a size is never a bool.
+    if any(type(size) is not int for size in found) or found != expected:
+        raise ValueError(
+            "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
+            f"expected producer.tp_size {expected[0]} and producer.moe.ep_size {expected[1]}, "
+            f"found {found[0]!r} and {found[1]!r}: {path}"
+        )
+
+
 def validate_native_collection(
     cell: FPMCell,
     raw_root: Path,
@@ -866,11 +921,18 @@ def validate_native_collection(
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
     expected_backend: str = "vllm",
+    expected_moe: bool | None = None,
 ) -> NativeCollection:
     """Validate a complete native rank set and return synchronized measurements.
 
     ``expected_backend`` is the backend of the plan the cell belongs to. A cell carries none, so a caller without
     a plan validates a vLLM collection.
+
+    ``expected_moe`` says whether the model of that plan has expert layers (``plan_is_moe``). A cell does not
+    carry that either: the one-GPU cell of a plan has the strategy ``single`` for a dense and for a MoE model.
+    When it is True and the backend is ``sglang``, the content and the layout the pod recorded are held against
+    the cell (``_validate_sglang_moe_producer``). A caller without a plan passes nothing, and that comparison is
+    then not made.
     """
 
     rank_payloads = _rank_artifacts(raw_root)
@@ -1151,6 +1213,10 @@ def validate_native_collection(
     for rank, _elapsed, measured in rank_timings:
         if not math.isclose(measured, measured_iteration_seconds, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError(f"native measured timing mismatch for rank={rank}")
+    if expected_backend == "sglang" and expected_moe is True:
+        # The last rule, so that a file set another rule refuses keeps the refusal it had.
+        for path, payload in rank_payloads:
+            _validate_sglang_moe_producer(cell, payload.get("producer"), path)
     if power_statuses:
         skipped = {status: count for status, count in sorted(power_statuses.items()) if status != "measured"}
         logger.info(

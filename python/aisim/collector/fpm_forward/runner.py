@@ -57,7 +57,7 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
-from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
+from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, plan_is_moe, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
@@ -1918,8 +1918,12 @@ def _runtime_collection_summary(
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
     backend: str = "vllm",
+    is_moe: bool | None = None,
 ) -> dict[str, Any]:
-    """Return auditable unique-axis counts from a validated native grid."""
+    """Return auditable unique-axis counts from a validated native grid.
+
+    ``backend`` and ``is_moe`` are those of the plan the cell belongs to (``validate_native_collection``).
+    """
 
     collection = validate_native_collection(
         cell,
@@ -1927,6 +1931,7 @@ def _runtime_collection_summary(
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
         expected_backend=backend,
+        expected_moe=is_moe,
     )
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
@@ -2086,6 +2091,7 @@ def _recover_completed_attempt(
             expected_plan_sha256=plan.sha256,
             expected_attempt_id=attempt_id,
             backend=getattr(plan, "backend", "vllm"),
+            is_moe=plan_is_moe(plan),
         )
     except (OSError, TypeError, ValueError) as error:
         logger.info(
@@ -2408,6 +2414,7 @@ def _run_collection_impl(
                     expected_plan_sha256=plan.sha256,
                     expected_attempt_id=_required_attempt_id(entry, cell.cell_id),
                     backend=getattr(plan, "backend", "vllm"),
+                    is_moe=plan_is_moe(plan),
                 )
             )
         except (OSError, TypeError, ValueError) as error:
@@ -2608,6 +2615,7 @@ def _run_collection_impl(
                 expected_plan_sha256=plan.sha256,
                 expected_attempt_id=attempt_id,
                 backend=getattr(plan, "backend", "vllm"),
+                is_moe=plan_is_moe(plan),
             )
             checkpoint["cells"][cell.cell_id] = {
                 **base_record,

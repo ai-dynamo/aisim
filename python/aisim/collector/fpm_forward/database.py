@@ -24,7 +24,13 @@ from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDEN
 
 from .capabilities import GENERIC_RUNTIME_TEMPLATE_ID
 from .measurement_evidence import extract_measurement_evidence
-from .native_artifact import NativeCollection, _rank_artifacts, select_native_measurements, validate_native_collection
+from .native_artifact import (
+    NativeCollection,
+    _rank_artifacts,
+    plan_is_moe,
+    select_native_measurements,
+    validate_native_collection,
+)
 from .planner import FPMCell, FPMCollectionPlan, backend_identity_columns
 
 logger = logging.getLogger(__name__)
@@ -232,6 +238,7 @@ def aggregate_cell(
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
         expected_backend=plan.backend,
+        expected_moe=plan_is_moe(plan),
     )
     if collection.execution_mode == "native_graph_policy":
         # Raises on a malformed or contradictory record. A gap that the reader reports, such as prompt hashes that

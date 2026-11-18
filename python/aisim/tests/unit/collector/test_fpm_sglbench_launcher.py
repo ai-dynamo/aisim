@@ -5,8 +5,8 @@
 # THIRD_PARTY_NOTICES.md.
 # Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
-# The expected benchmark flags, their defaults and their environment variables follow ai-dynamo/dynamo
-# (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/backend_args.py and
+# The expected benchmark flags, their defaults, their environment variables and the dataset of a text run follow
+# ai-dynamo/dynamo (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/backend_args.py and
 # instrumented_scheduler.py at b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.
 
 """CPU-only test of ``runtime/sglbench_launcher.py``. No SGLang, no GPU and no engine are involved.
@@ -44,6 +44,11 @@ is named so:
   temporary directory.
 - Signals are real, sent to the test process with ``signal.raise_signal``, and only while a handler of the
   launcher or ``SIG_IGN`` is in place. A fixture restores the handlers after every test.
+- The dataset of a text run is FAKE: ``_fake_dataset_records`` types in records in the layout of the default
+  dataset, and a test writes them to a file under pytest's temporary directory. ``_FakeTokenizer`` turns
+  every word into one FAKE id; no tokenizer is involved. No test opens a connection: a fixture puts a
+  refusal in the place of ``urllib.request.urlopen``, and the tests of a download put a FAKE response there.
+  The same fixture points the default cache directory into the temporary directory.
 
 The two checkers are used as shipped, through the helpers of ``test_fpm_sglbench_artifact.py``: the validator
 (``validate_native_collection``, called as the host calls it for a cell of an SGLang plan) and the gate (the
@@ -65,6 +70,7 @@ import dataclasses
 import enum
 import fnmatch
 import hashlib
+import http.client
 import inspect
 import json
 import os
@@ -73,9 +79,12 @@ import signal
 import subprocess
 import sys
 import types
+import urllib.error
 from pathlib import Path
 
 import pytest
+from collector.fpm_forward.native_artifact import validate_native_collection
+from collector.fpm_forward.types import ParallelTopology
 
 from .test_fpm_runner import _cell
 from .test_fpm_sglbench_artifact import GATE_ACCEPT, GATE_INVALID, _gate, _pod, _validate
@@ -114,6 +123,9 @@ REAL_COMPAT = {
         "build_engine",
         "generate_batch",
         "vocabulary",
+        "model_vocabulary_size",
+        "encode_texts",
+        "tokenizer_class",
         "shutdown",
     )
 }
@@ -173,6 +185,8 @@ LAUNCHER_PRODUCER_KEYS = (
     "streaming",
     "enable_nvidia_megakernel",
     "tp_size",
+    "expert_keys",
+    "moe",
 )
 DRIVER_PRODUCER_KEYS = (
     "timing_metric",
@@ -193,7 +207,8 @@ DRIVER_PRODUCER_KEYS = (
 # setup resolves to. Typed from the field files of SGLang at both tags (srt/arg_groups/fields: parallel.py,
 # schedule.py, memory.py, serving.py, exec_.py, spec.py, disagg.py, device.py); ``device`` and
 # ``prefill_decode_interval`` are None there and resolution fills them in. ``enable_nvidia_megakernel`` exists
-# at v0.5.23 only.
+# at v0.5.23 only. The six fields of the expert layers have these defaults for every model (``ep_size`` and
+# ``moe_dense_tp_size`` in parallel.py, the other four in exec_.py ``ExecMoe``).
 FAKE_RESOLVED_ARGUMENTS = {
     "nnodes": 1,
     "node_rank": 0,
@@ -209,6 +224,12 @@ FAKE_RESOLVED_ARGUMENTS = {
     "ep_join_mode": None,
     "max_ep_size": None,
     "enable_elastic_expert_backup": False,
+    "moe_a2a_backend": "none",
+    "moe_dense_tp_size": None,
+    "enable_eplb": False,
+    "ep_num_redundant_experts": 0,
+    "ep_size": 1,
+    "moe_runner_backend": "auto",
     "speculative_algorithm": None,
     "decoupled_spec_role": "null",
     "disaggregation_mode": "null",
@@ -249,6 +270,7 @@ _ELASTIC = "elastic EP is not supported"
 _DISAGG = "disaggregated serving is not supported"
 _POLICY = "schedule policy must be fcfs without priority scheduling"
 _SPEC = "speculative decoding is not supported"
+_A2A = "only the MoE all-to-all backend none is supported"
 _CP = "attention context parallelism is not supported"
 
 # One refused value for every field the launcher tests on the resolved arguments, with the whole refusal.
@@ -266,6 +288,10 @@ STAGE_S_REFUSALS = [
     ("ep_join_mode", "scale", f"{_ELASTIC} (ep_join_mode=scale)"),
     ("max_ep_size", 8, f"{_ELASTIC} (max_ep_size=8)"),
     ("enable_elastic_expert_backup", True, f"{_ELASTIC} (enable_elastic_expert_backup=true)"),
+    ("moe_a2a_backend", "deepep", f"{_A2A} (moe_a2a_backend=deepep)"),
+    ("moe_dense_tp_size", 1, "moe_dense_tp_size must not be set (got 1)"),
+    ("enable_eplb", True, "EPLB is not supported (enable_eplb=true)"),
+    ("ep_num_redundant_experts", 2, "redundant experts are not supported (ep_num_redundant_experts=2)"),
     ("speculative_algorithm", "EAGLE", f"{_SPEC} (speculative_algorithm=EAGLE)"),
     ("decoupled_spec_role", "draft", f"{_SPEC} (decoupled_spec_role=draft)"),
     ("disaggregation_mode", "prefill", f"{_DISAGG} (disaggregation_mode=prefill)"),
@@ -331,6 +357,16 @@ STAGE_S_MORE_REFUSALS = [
     ("elastic_ep_backend", "none", f"{_ELASTIC} (elastic_ep_backend=none)"),
     ("elastic_ep_backend", False, f"{_ELASTIC} (elastic_ep_backend=false)"),
     ("enable_elastic_expert_backup", None, f"{_ELASTIC} (enable_elastic_expert_backup=null)"),
+    ("moe_a2a_backend", None, f"{_A2A} (moe_a2a_backend=null)"),
+    ("moe_a2a_backend", "None", f"{_A2A} (moe_a2a_backend=None)"),
+    ("moe_a2a_backend", "flashinfer", f"{_A2A} (moe_a2a_backend=flashinfer)"),
+    # SGLang itself allows 1 and the TP size; either gives the dense layers a TP size of their own.
+    ("moe_dense_tp_size", 2, "moe_dense_tp_size must not be set (got 2)"),
+    ("moe_dense_tp_size", 0, "moe_dense_tp_size must not be set (got 0)"),
+    ("enable_eplb", None, "EPLB is not supported (enable_eplb=null)"),
+    ("enable_eplb", 0, "EPLB is not supported (enable_eplb=0)"),
+    ("ep_num_redundant_experts", None, "redundant experts are not supported (ep_num_redundant_experts=null)"),
+    ("ep_num_redundant_experts", False, "redundant experts are not supported (ep_num_redundant_experts=false)"),
     ("speculative_algorithm", "", f"{_SPEC} (speculative_algorithm=)"),
     ("decoupled_spec_role", None, f"{_SPEC} (decoupled_spec_role=null)"),
     ("disaggregation_mode", None, f"{_DISAGG} (disaggregation_mode=null)"),
@@ -411,6 +447,12 @@ _IMBALANCED = "is not supported: every request of a point is the same here"
 _KDA = "is not supported: every decode context here is computed by real requests"
 _HYBRID = "is not supported: models with a recurrent state are refused"
 _REAL_STATE = "is not supported: the benchmark stages real cached state only"
+_CONTENT_WORDS = "is not supported (accepted: random, sharegpt_chain)"
+# The refusal of seeded ids for a model with expert layers; the braces take the first expert key and its value.
+_SEEDED_WITH_EXPERTS = (
+    "DYN_BENCH_PREFILL_CONTENT=random is not supported for a model with expert layers ({}): the routing of a "
+    "token to its experts depends on the content"
+)
 _LEGACY = [
     ("--benchmark-prefill-granularity", "DYN_BENCHMARK_PREFILL_GRANULARITY", "--prefill-max-new-token-samples"),
     (
@@ -509,13 +551,17 @@ OWN_REFUSALS = [
     (
         [],
         {"DYN_BENCH_PREFILL_CONTENT": "sharegpt"},
-        "DYN_BENCH_PREFILL_CONTENT='sharegpt' is not supported: prompts are seeded token ids (random)",
+        f"DYN_BENCH_PREFILL_CONTENT='sharegpt' {_CONTENT_WORDS}",
     ),
+    # The word is compared as it stands: no other letter case and no blank around it.
+    ([], {"DYN_BENCH_PREFILL_CONTENT": "Random"}, f"DYN_BENCH_PREFILL_CONTENT='Random' {_CONTENT_WORDS}"),
     (
         [],
-        {"DYN_BENCH_PREFILL_CONTENT": "Random"},
-        "DYN_BENCH_PREFILL_CONTENT='Random' is not supported: prompts are seeded token ids (random)",
+        {"DYN_BENCH_PREFILL_CONTENT": "SHAREGPT_CHAIN"},
+        f"DYN_BENCH_PREFILL_CONTENT='SHAREGPT_CHAIN' {_CONTENT_WORDS}",
     ),
+    ([], {"DYN_BENCH_PREFILL_CONTENT": " random"}, f"DYN_BENCH_PREFILL_CONTENT=' random' {_CONTENT_WORDS}"),
+    ([], {"DYN_BENCH_PREFILL_CONTENT": "zeros"}, f"DYN_BENCH_PREFILL_CONTENT='zeros' {_CONTENT_WORDS}"),
     ([], {"DYN_BENCH_POOL_TAG": "a"}, "DYN_BENCH_POOL_TAG is not supported (it is set to 'a')"),
     (
         [],
@@ -547,9 +593,11 @@ OWN_ACCEPTED = [
     ([], {"DYN_BENCH_PREFILL_REAL_SEED": "auto"}),
     ([], {"DYN_BENCH_PREFILL_REAL_SEED": "TRUE"}),
     ([], {"DYN_BENCH_PREFILL_CONTENT": "random"}),
+    ([], {"DYN_BENCH_PREFILL_CONTENT": "sharegpt_chain"}),
     ([], {"DYN_BENCH_PREFILL_CONTENT": ""}),
     ([], {"DYN_BENCH_POOL_TAG": "", "DYN_BENCH_GIANT_KV_THRESHOLD": "", "DYN_BENCH_GIANT_KV_REPEATS": ""}),
-    # Ignored in this version, and the FPM_* variables of the gate are never read.
+    # The dataset variables are kept as text for a text run and refuse nothing by themselves; the FPM_*
+    # variables of the gate are never read.
     (
         [],
         {
@@ -778,6 +826,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         parser = argparse.ArgumentParser(prog="sglang serve (FAKE)")
         parser.add_argument("--model-path", required=True)
         parser.add_argument("--tp-size", type=int, default=1)
+        parser.add_argument("--ep-size", type=int, default=1)
         parser.add_argument("--page-size", type=int, default=1)
         parser.add_argument("--stream-interval", type=int, default=1)
         parser.add_argument(STREAMING_FLAG, action="store_true")
@@ -785,6 +834,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
         world.sglang_argv = list(argv)
         # The FAKE engine follows the flags, so a flag that does not reach this parser shows in the run.
         world.use(parsed.page_size, parsed.tp_size)
+        world.resolved["ep_size"] = parsed.ep_size
         world.resolved["stream_interval"] = parsed.stream_interval
         world.resolved["incremental_streaming_output"] = parsed.incremental_streaming_output
         world.server_args = FakeSglangServerArgs(world, list(argv))
@@ -821,7 +871,7 @@ def _fake_sglang_modules(world: _FakeWorld) -> dict[str, types.ModuleType]:
             self.loop = asyncio.new_event_loop()
             self.fake = _FakeEngine(world, server_args, self.run_scheduler_process_func)
             self.tokenizer_manager = types.SimpleNamespace(
-                tokenizer=_FakeTokenizer(), model_config=types.SimpleNamespace(vocab_size=FAKE_MODEL_VOCAB_SIZE)
+                tokenizer=_FakeTokenizer(world), model_config=types.SimpleNamespace(vocab_size=FAKE_MODEL_VOCAB_SIZE)
             )
 
         async def async_generate(
@@ -971,14 +1021,44 @@ class _FakeResolvingView:
 
 
 class _FakeTokenizer:
-    """FAKE of the tokenizer SGLang serves with: the four attributes sglbench_compat reads."""
+    """FAKE of the tokenizer SGLang serves with: the four attributes sglbench_compat reads and the batch call.
+
+    The batch call turns every word of a text into one FAKE id inside the token range of the prompts. Three
+    written forms stand for tokens outside it, as a real tokenizer gives the id of a special token for its
+    written form inside a text: ``<FAKE-special>`` and ``<FAKE-added>``, whose ids the FAKE model counts, and
+    ``<FAKE-beyond>``, whose id is the first one the FAKE model does not count.
+    """
 
     vocab_size = FAKE_VOCABULARY["size"]
     all_special_ids = (0, 1, 2)
     additional_stop_token_ids = frozenset({59_999})
 
+    def __init__(self, world: _FakeWorld | None = None) -> None:
+        self.world = world
+
     def get_added_vocab(self) -> dict:
         return {"<FAKE added a>": 50_000, "<FAKE added b>": 50_001, "<FAKE special>": 2}
+
+    @staticmethod
+    def fake_id(word: str) -> int:
+        if word == "<FAKE-special>":
+            return 2
+        if word == "<FAKE-added>":
+            return 50_000
+        if word == "<FAKE-beyond>":
+            return FAKE_MODEL_VOCAB_SIZE
+        return 100 + int.from_bytes(hashlib.sha256(word.encode()).digest()[:4], "big") % 49_000
+
+    def __call__(self, texts, add_special_tokens=True) -> dict:
+        assert add_special_tokens is False, "the benchmark asks for no BOS or EOS around a text"
+        world = self.world
+        if world is not None:
+            world.tokenizer_batches.append(list(texts))
+            world.note("tokenizer")
+            if world.tokenizer_ids_outside:
+                # FAKE: a tokenizer whose every id lies above the ids the model counts.
+                return {"input_ids": [[FAKE_MODEL_VOCAB_SIZE + 5 for _word in text.split()] for text in texts]}
+        return {"input_ids": [[self.fake_id(word) for word in text.split()] for text in texts]}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1069,6 +1149,11 @@ class _FakeWorld:
         self.scheduler_attributes: dict[str, object] = {}
         self.sglang_takes_sigterm = False
         self.sglang_sigterm_notes: list[int] = []
+        # The texts of every batch call of the FAKE tokenizer, a switch that puts all its ids above the ids the
+        # model counts, and that count.
+        self.tokenizer_batches: list[list[str]] = []
+        self.tokenizer_ids_outside = False
+        self.model_vocab_size = FAKE_MODEL_VOCAB_SIZE
 
         self.sglang_argv: list[str] | None = None
         self.server_args: object = None
@@ -1260,8 +1345,9 @@ class _FakeEngine:
         self._run_batches(batches, call.key[1])
         for prompt in call.prompts:
             # A finished request stores its prompt and the generated tokens that have KV: all but the last.
-            # The FAKE output tokens lie below the token range of the prompts, so they equal no planned token.
-            world.cache.finish_prefill([*prompt, *range(max_new_tokens - 1)])
+            # The FAKE output tokens are negative numbers, so they equal no token id: not an allocated one, not
+            # a seeded one and not an id of a text, which the pool keeps from 0 upwards.
+            world.cache.finish_prefill([*prompt, *range(-1, -max_new_tokens, -1)])
         if fault == "deadline":
             world.clock.advance(FAKE_TIMEOUT_SECONDS * TICKS_PER_SECOND)
         return [
@@ -1341,6 +1427,21 @@ def _install_fakes(monkeypatch, world: _FakeWorld, *, real_compat: bool = False,
         step("vocabulary")
         return {key: (list(value) if isinstance(value, list) else value) for key, value in world.vocabulary.items()}
 
+    def model_vocabulary_size(engine) -> int:
+        assert isinstance(engine, _FakeEngine)
+        step("model_vocabulary_size")
+        return world.model_vocab_size
+
+    def encode_texts(engine, texts):
+        assert isinstance(engine, _FakeEngine)
+        step("encode_texts")
+        return _FakeTokenizer(world)(texts, add_special_tokens=False)["input_ids"]
+
+    def tokenizer_class(engine) -> str:
+        assert isinstance(engine, _FakeEngine)
+        step("tokenizer_class")
+        return "fake_tokenizers.FakeTokenizer"
+
     def shutdown(engine) -> None:
         assert isinstance(engine, _FakeEngine)
         world.shutdowns += 1
@@ -1357,6 +1458,9 @@ def _install_fakes(monkeypatch, world: _FakeWorld, *, real_compat: bool = False,
         build_engine,
         generate_batch,
         vocabulary,
+        model_vocabulary_size,
+        encode_texts,
+        tokenizer_class,
         shutdown,
     )
     assert [fake.__name__ for fake in fakes] == list(REAL_COMPAT)
@@ -1405,12 +1509,23 @@ def _install_fakes(monkeypatch, world: _FakeWorld, *, real_compat: bool = False,
 # ---------------------------------------------------------------------------------------------------------------
 
 
+def _refuse_the_network(*args, **kwargs):
+    raise AssertionError(f"a test tried to open a connection: urlopen{args!r}")
+
+
 @pytest.fixture(autouse=True)
-def _process_state(monkeypatch):
-    """Every test starts without the variables the launcher reads and gets its signal handlers back."""
+def _process_state(monkeypatch, tmp_path):
+    """Every test starts without the variables the launcher reads and gets its signal handlers back.
+
+    No test may reach the network or write outside pytest's temporary directory. ``urlopen`` is a refusal
+    unless a test puts a FAKE response in its place, HF_HOME is unset, and the default cache directory of the
+    dataset lies in the temporary directory.
+    """
     for name in list(os.environ):
-        if name.startswith(("DYN_", "SGLANG_", "FPM_", "AISIM_SGLBENCH_")):
+        if name.startswith(("DYN_", "SGLANG_", "FPM_", "AISIM_SGLBENCH_")) or name == "HF_HOME":
             monkeypatch.delenv(name)
+    monkeypatch.setattr(launcher.urllib.request, "urlopen", _refuse_the_network)
+    monkeypatch.setattr(launcher, "DEFAULT_DATASET_CACHE_DIR", str(tmp_path / "FAKE-default-cache"))
     # The launcher sets this variable for the life of its process. Setting and deleting it here makes pytest
     # take the launcher's value out again after the test.
     monkeypatch.setenv(RECORDER_ENV, "")
@@ -1434,6 +1549,8 @@ class _Launch:
     pod: Path
     caps: grid.SampleCaps
     manifest: dict | None = None
+    # The record of the FAKE dataset a text run must write, as the test worked it out; None otherwise.
+    dataset: dict | None = None
 
     @property
     def rank_path(self) -> Path:
@@ -1504,6 +1621,174 @@ def _launch(
     ]
     code = launcher.main(argv)
     return _Launch(code, world, mode, cell, tmp_path, pod_dir, caps, manifest)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# FAKE dataset of a text run
+# ---------------------------------------------------------------------------------------------------------------
+
+# The variables of a text run, typed here on their own.
+ENV_CONTENT = "DYN_BENCH_PREFILL_CONTENT"
+ENV_DATASET = "DYN_BENCH_KV_WARMUP_DATASET"
+ENV_CACHE_DIR = "DYN_BENCH_KV_WARMUP_CACHE_DIR"
+ENV_SHA256 = "DYN_BENCH_KV_WARMUP_SHA256"
+# A FAKE address. The top-level name ``invalid`` is reserved and resolves nowhere; no test connects to it.
+FAKE_DATASET_URL = "https://datasets.fake.invalid/FAKE/resolve/main/FAKE_conversations.json?download=true"
+FAKE_DATASET_NAME = "FAKE_conversations.json"
+
+
+def _fake_dataset_records(count: int = 160) -> list[dict]:
+    """FAKE records in the layout of the default dataset: an id and a list of turns with ``from`` and ``value``.
+
+    Every record has two turns of numbered FAKE words. Some hold the written form of a FAKE special token, and
+    some that of a FAKE token the model does not count.
+    Three more records are ones the recipe drops or shortens: a text below 64 characters, a record without
+    turns and a turn without a value.
+    """
+    records = []
+    for index in range(count):
+        words = [f"fake{(index * 31 + step * 7) % 400}" for step in range(40 + index % 30)]
+        if index % 9 == 0:
+            words.insert(5, "<FAKE-special>")
+        if index % 13 == 4:
+            words.insert(7, "<FAKE-beyond>")
+        half = len(words) // 2
+        turns = [
+            {"from": "human", "value": " ".join(words[:half])},
+            {"from": "gpt", "value": " ".join(words[half:])},
+        ]
+        if index % 11 == 0:
+            turns.insert(1, {"from": "system"})
+        records.append({"id": f"FAKE-{index}", "conversations": turns})
+    records.append({"id": "FAKE-short", "conversations": [{"from": "human", "value": "FAKE: too short"}]})
+    records.append({"id": "FAKE-no-turns"})
+    return records
+
+
+def _fake_kept_texts(records: list[dict]) -> list[str]:
+    """The texts the recipe keeps of FAKE records, worked out here on its own.
+
+    The values of a record joined by a newline; a text of at least 64 characters whose SHA-256 starts with an
+    even byte is kept (Dynamo's ``_kvwarm_load_texts``).
+    """
+    texts = []
+    for record in records:
+        text = "\n".join(turn["value"] for turn in record.get("conversations", []) if turn.get("value"))
+        if len(text) >= 64 and hashlib.sha256(text.encode()).digest()[0] % 2 == 0:
+            texts.append(text)
+    return texts
+
+
+def _write_fake_dataset(directory: Path, records: object = None, name: str = FAKE_DATASET_NAME) -> tuple[Path, str]:
+    """Write FAKE records as a JSON file under ``directory``; returns its path and its SHA-256."""
+    directory.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(_fake_dataset_records() if records is None else records).encode()
+    path = directory / name
+    path.write_bytes(data)
+    return path, hashlib.sha256(data).hexdigest()
+
+
+class _FakeResponse:
+    """FAKE of what ``urllib.request.urlopen`` returns: a context manager with ``read``."""
+
+    def __init__(self, data: bytes, fail_after: BaseException | None = None, on_read=None) -> None:
+        self.data = data
+        self.fail_after = fail_after
+        self.on_read = on_read
+        self.offset = 0
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *_error: object) -> bool:
+        return False
+
+    def read(self, size: int) -> bytes:
+        if self.on_read is not None:
+            self.on_read()
+        piece = self.data[self.offset : self.offset + size]
+        self.offset += len(piece)
+        if not piece and self.fail_after is not None:
+            # FAKE: the transfer breaks off after its last piece.
+            raise self.fail_after
+        return piece
+
+
+class _FakeUrlopen:
+    """FAKE ``urlopen``: it answers with FAKE bytes or raises, and notes how it was called. No connection."""
+
+    def __init__(self, data: bytes = b"", error: BaseException | None = None, fail_after=None, on_read=None) -> None:
+        self.data = data
+        self.error = error
+        self.fail_after = fail_after
+        self.on_read = on_read
+        self.calls: list[tuple] = []
+
+    def __call__(self, *args, **kwargs) -> _FakeResponse:
+        self.calls.append((args, kwargs))
+        if self.error is not None:
+            raise self.error
+        return _FakeResponse(self.data, self.fail_after, self.on_read)
+
+
+def _launch_text(
+    tmp_path: Path,
+    monkeypatch,
+    mode: str = "decode",
+    *,
+    records: object = None,
+    word: str | None = "sharegpt_chain",
+    env: dict | None = None,
+    **options,
+) -> _Launch:
+    """``_launch`` for a text run: a FAKE dataset file as a local path, and the content word ``word``.
+
+    ``word`` None leaves the content variable unset. ``env`` is put over both variables, so a test can point
+    the dataset elsewhere. The launch carries the dataset record the artifact must hold.
+    """
+    records = _fake_dataset_records() if records is None else records
+    path, digest = _write_fake_dataset(tmp_path / "FAKE-datasets", records)
+    variables = {ENV_DATASET: str(path), **({} if word is None else {ENV_CONTENT: word}), **(env or {})}
+    launch = _launch(tmp_path, monkeypatch, mode, env=variables, **options)
+    launch.dataset = {
+        "path": str(path),
+        "sha256": digest,
+        "collection_pool": "conversation_sha256_even",
+        "conversations": len(_fake_kept_texts(records)) if isinstance(records, list) else 0,
+        "url": None,
+        "downloaded": False,
+    }
+    return launch
+
+
+def _fake_pool_counts(texts: list[str]) -> dict:
+    """The record of a pool over these texts as the result file holds it: its id range and its four counts.
+
+    Worked out here from the FAKE tokenizer and the FAKE model's ids. A pool keeps every id the model counts,
+    also one outside the token range of the prompts.
+    """
+    low, high = 0, FAKE_MODEL_VOCAB_SIZE
+    counts = {
+        "id_range": [low, high],
+        "conversations": 0,
+        "tokens": 0,
+        "dropped_tokens": 0,
+        "dropped_conversations": 0,
+    }
+    for text in texts:
+        ids = [_FakeTokenizer.fake_id(word) for word in text.split()]
+        kept = [token for token in ids if low <= token < high]
+        counts["dropped_tokens"] += len(ids) - len(kept)
+        counts["tokens"] += len(kept)
+        counts["conversations" if kept else "dropped_conversations"] += 1
+    return counts
+
+
+def _tep_cell(mode: str, tp_size: int = 2):
+    """A cell of the tensor- and expert-parallel layout: ``tp_size`` GPUs, one expert group per GPU."""
+    cell = _cell(phase=mode, dp=1, strategy="tep")
+    topology = ParallelTopology(tp=tp_size, pp=1, dp=1, moe_tp=1, moe_ep=tp_size, cp=1)
+    return dataclasses.replace(cell, topology=topology)
 
 
 def _fake_sglang_argv(page_size: int = 1, tp_size: int = 1) -> list[str]:
@@ -1619,6 +1904,7 @@ def _assert_no_module_of_the_benchmark_is_replaced() -> None:
     assert artifact.write_artifacts is REAL_WRITE_ARTIFACTS
     assert launcher.compat is compat and launcher.driver is driver and launcher.recorder is recorder
     assert launcher.artifact is artifact and launcher.grid is grid and driver.content is content
+    assert launcher.content is content
 
 
 @pytest.mark.parametrize("page_size", [1, 64])
@@ -1707,8 +1993,14 @@ def test_end_to_end_run_passes_the_validator_and_the_gate(tmp_path, monkeypatch,
         "sglang_version": "0.5.23",
         "enable_nvidia_megakernel": False,
         "tp_size": 1,
+        # A model without expert layers: no expert key, and no layout of expert layers to record.
+        "expert_keys": {},
+        "moe": None,
     }
     assert set(producer) == {*LAUNCHER_PRODUCER_KEYS, *DRIVER_PRODUCER_KEYS, "name", "artifact_format"}
+    # A run with seeded ids writes the content block it always wrote.
+    assert set(producer["content"]) == {"source", "seed", "token_range", "issued"}
+    assert (producer["content"]["source"], producer["content"]["seed"]) == ("seeded_token_ids", "0")
     assert (producer["name"], producer["scheduler_processes"], producer["recorder_format"]) == ("aisim_sglbench", 1, 1)
     assert (producer["limits"], producer["page_size"]) == (world.limits.as_dict(), page_size)
     assert (producer["enable_overlap"], producer["restaged_points"]) == (True, [])
@@ -2198,14 +2490,15 @@ def test_a_failed_write_is_printed_and_ends_with_exit_code_70(tmp_path, monkeypa
 
 def test_a_failed_write_does_not_hide_the_first_reason(tmp_path, monkeypatch, capsys):
     def prepare(world, pod_dir):
+        # A model with expert layers is refused when seeded ids are asked for, right after its config was read.
         world.experts = {"num_experts": 8}
         world.hooks["model_expert_keys"] = lambda: shutil.rmtree(pod_dir)
 
-    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare)
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, env={"DYN_BENCH_PREFILL_CONTENT": "random"})
 
     assert launch.code == 64
     lines = _stderr_lines(capsys)
-    assert lines[-2] == "[sglbench] FAILED: rejected: MoE models are not supported yet (num_experts=8)"
+    assert lines[-2] == f"[sglbench] FAILED: rejected: {_SEEDED_WITH_EXPERTS.format('num_experts=8')}"
     assert lines[-1].startswith("[sglbench] the failed artifact could not be written: FileNotFoundError")
 
 
@@ -2403,6 +2696,8 @@ def test_flag_defaults():
     assert (options.points_file, options.manifest, options.points_sha256) == (None, None, None)
     assert options.dump_config_to is None
     assert (options.content_seed, options.worker_id) == ("0", "")
+    # No content word: the model decides. No dataset variable: the defaults of a text run apply.
+    assert (options.prefill_content, options.dataset_environ) == (None, {})
     assert (options.rejection, options.output_problem) == (None, None)
     assert launcher._config_block(options) == {
         "warmup_iterations": 5,
@@ -2699,14 +2994,18 @@ def test_other_values_of_the_resolved_arguments_that_pass(field, value):
 def test_every_field_the_launcher_tests_has_a_refused_value_here():
     tested = [name for name, _accepts, _text in launcher._RESOLVED_CHECKS]
     assert tested == [field for field, _value, _refusal in STAGE_S_REFUSALS]
-    assert len(set(tested)) == len(tested) == 42
-    # The fields the launcher reads besides: the platform, the three run settings and the recorded field.
+    assert len(set(tested)) == len(tested) == 46
+    # The fields the launcher reads besides: the platform, the three run settings, the recorded field, the
+    # expert-parallel size, which is tested against the TP size and the model, and the runner of the expert
+    # layers, which is recorded for a model that has them.
     assert set(FAKE_RESOLVED_ARGUMENTS) - set(tested) == {
         "device",
         "tp_size",
         "prefill_max_requests",
         "max_queued_requests",
         "enable_nvidia_megakernel",
+        "ep_size",
+        "moe_runner_backend",
     }
 
 
@@ -2719,8 +3018,17 @@ def test_a_field_sglang_does_not_have_is_an_error_and_not_a_pass(field):
         launcher._check_resolved(_FakeView(fields))
 
 
+_REFUSED_AT_LAUNCH = (
+    "attn_dp_size",
+    "moe_a2a_backend",
+    "enable_eplb",
+    "disable_radix_cache",
+    "incremental_streaming_output",
+)
+
+
 @pytest.mark.parametrize(
-    ("field", "value", "refusal"), [STAGE_S_REFUSALS[2], STAGE_S_REFUSALS[21], STAGE_S_REFUSALS[39]]
+    ("field", "value", "refusal"), [row for row in STAGE_S_REFUSALS if row[0] in _REFUSED_AT_LAUNCH]
 )
 def test_a_refused_setting_ends_the_launch_before_the_engine_is_built(
     tmp_path, monkeypatch, capsys, field, value, refusal
@@ -2769,7 +3077,7 @@ def test_a_missing_field_ends_the_launch_as_an_internal_error(tmp_path, monkeypa
     assert "build_engine" not in launch.world.events
 
 
-@pytest.mark.parametrize("missing", ["tp_size", "prefill_max_requests", "max_queued_requests", "device"])
+@pytest.mark.parametrize("missing", ["tp_size", "ep_size", "prefill_max_requests", "max_queued_requests", "device"])
 def test_the_fields_read_after_the_checks_must_exist_too(tmp_path, monkeypatch, missing):
     def prepare(world, _pod_dir):
         del world.resolved[missing]
@@ -2906,22 +3214,49 @@ def test_a_platform_that_is_not_nvidia_cuda_is_refused(tmp_path, monkeypatch, pl
     assert launch.world.events[-3:] == ["platform_facts", "write", "sleep"]
 
 
-@pytest.mark.parametrize(
-    ("experts", "shown"),
-    [
-        ({"num_local_experts": 8}, "num_local_experts=8"),
-        ({"n_routed_experts": 256, "num_experts_per_tok": 8}, "n_routed_experts=256"),
-        ({"moe_intermediate_size": 1408}, "moe_intermediate_size=1408"),
-    ],
-)
-def test_a_model_with_expert_layers_is_refused(tmp_path, monkeypatch, experts, shown):
+EXPERT_KEY_SETS = [
+    ({"num_local_experts": 8}, "num_local_experts=8"),
+    ({"n_routed_experts": 256, "num_experts_per_tok": 8}, "n_routed_experts=256"),
+    ({"moe_intermediate_size": 1408}, "moe_intermediate_size=1408"),
+]
+
+
+@pytest.mark.parametrize(("experts", "shown"), EXPERT_KEY_SETS)
+def test_seeded_ids_are_refused_for_a_model_with_expert_layers(tmp_path, monkeypatch, experts, shown):
     def prepare(world, _pod_dir):
         world.experts = experts
 
-    launch = _launch(tmp_path, monkeypatch, "decode", prepare=prepare)
+    launch = _launch(tmp_path, monkeypatch, "decode", prepare=prepare, env={"DYN_BENCH_PREFILL_CONTENT": "random"})
 
-    _assert_failed_before_the_grid(launch, 64, f"rejected: MoE models are not supported yet ({shown})")
+    on_disk = _assert_failed_before_the_grid(launch, 64, f"rejected: {_SEEDED_WITH_EXPERTS.format(shown)}")
     assert launch.world.events[-3:] == ["model_expert_keys", "write", "sleep"]
+    # The keys were recorded before the refusal.
+    assert on_disk["producer"]["expert_keys"] == experts
+
+
+@pytest.mark.parametrize(("experts", "_shown"), EXPERT_KEY_SETS)
+def test_a_model_with_expert_layers_runs_with_dataset_text(tmp_path, monkeypatch, experts, _shown):
+    def prepare(world, _pod_dir):
+        world.experts = experts
+
+    # The variable is unset: the expert keys alone make the run a text run.
+    launch = _launch_text(tmp_path, monkeypatch, "decode", prepare=prepare, word=None)
+
+    on_disk = _assert_accepted(launch)
+    producer = on_disk["producer"]
+    assert producer["content"]["source"] == "dataset_text_chains"
+    assert producer["content"]["dataset"] == launch.dataset
+    assert producer["expert_keys"] == experts
+    # One GPU: every rank holds every expert, and SGLang's defaults for the expert layers are recorded.
+    assert producer["moe"] == {
+        "ep_size": 1,
+        "moe_a2a_backend": "none",
+        "moe_runner_backend": "auto",
+        "moe_dense_tp_size": None,
+        "enable_eplb": False,
+    }
+    events = launch.world.events
+    assert events.index("model_expert_keys") < events.index("build_engine") < events.index("encode_texts")
 
 
 SGLANG_STEPS = {
@@ -3112,7 +3447,9 @@ def test_only_the_launchers_own_old_files_are_deleted(tmp_path, monkeypatch, fai
         if failing:
             world.experts = {"num_experts": 4}
 
-    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, pod=(cell, pod_dir))
+    # The failing launch asks for seeded ids with a model that has expert layers, which is refused.
+    env = {"DYN_BENCH_PREFILL_CONTENT": "random"} if failing else None
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, pod=(cell, pod_dir), env=env)
 
     # Both old result files were gone before SGLang was touched; nothing else was.
     assert seen["at_start"] == ["benchmark_dp1.json", "benchmark_merged_worker_probe.json"]
@@ -3491,8 +3828,10 @@ def test_the_header_and_the_docstring_of_the_module():
         "The start-up checks read SGLang's resolved arguments at v0.5.22 and v0.5.23; see THIRD_PARTY_NOTICES.md.",
         "Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d",
         "Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90",
-        "The benchmark flags, their defaults and their environment variables are re-implemented from ai-dynamo/dynamo",
-        "(Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/backend_args.py and",
+        "The benchmark flags, their defaults, their environment variables and the dataset of a text run are "
+        "re-implemented from",
+        "ai-dynamo/dynamo (Apache-2.0, https://github.com/ai-dynamo/dynamo), "
+        "components/src/dynamo/vllm/backend_args.py and",
         "instrumented_scheduler.py at b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.",
     ]
     assert all(line.startswith("# ") for line in lines[:9])
@@ -3520,12 +3859,14 @@ def test_the_header_and_the_docstring_of_the_module():
         "collections.abc",
         "dataclasses",
         "hashlib",
+        "http.client",
         "json",
         "math",
         "os",
         "secrets",
         "sglbench_artifact",
         "sglbench_compat",
+        "sglbench_content",
         "sglbench_driver",
         "sglbench_grid",
         "sglbench_recorder",
@@ -3533,6 +3874,7 @@ def test_the_header_and_the_docstring_of_the_module():
         "sys",
         "time",
         "traceback",
+        "urllib.request",
         "uuid",
     ]
     # Comments and docstrings name sources the repository can resolve, never the notes of the build.
@@ -3723,3 +4065,1322 @@ def test_sglangs_variables_are_tested_as_they_stand_after_sglang_was_imported(tm
     launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, env={"SGL_RADIX_FORCE_MISS": "1"})
 
     _assert_failed_before_the_grid(launch, 64, "rejected: SGLANG_RADIX_FORCE_MISS disables every cache hit")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Text runs: the content word
+# ---------------------------------------------------------------------------------------------------------------
+
+# Whether a run is a text run: (the content variable, the expert keys of the model, text run).
+CONTENT_TABLE = [
+    (None, {}, False),
+    ("", {}, False),
+    ("random", {}, False),
+    ("sharegpt_chain", {}, True),
+    (None, {"num_experts": 8}, True),
+    ("", {"num_experts": 8}, True),
+    ("sharegpt_chain", {"num_experts": 8}, True),
+]
+
+
+@pytest.mark.parametrize(("word", "experts", "text"), CONTENT_TABLE)
+def test_the_content_word_and_the_expert_keys_decide_whether_a_run_is_a_text_run(word, experts, text):
+    variables = {} if word is None else {ENV_CONTENT: word}
+    options = _options([], variables)
+    assert options.rejection is None
+    # Unset and empty are the same: the model decides.
+    assert options.prefill_content == (word or None)
+    assert launcher._is_text_run(options.prefill_content, experts) is text
+
+
+def test_seeded_ids_with_expert_keys_are_refused_and_an_unknown_word_is_not_kept():
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._is_text_run("random", {"num_experts_per_tok": 4, "num_experts": 60})
+    assert raised.value.reason == f"rejected: {_SEEDED_WITH_EXPERTS.format('num_experts_per_tok=4')}"
+    # A word that is refused is not kept as the choice, so nothing later takes it for one.
+    refused = _options([], {ENV_CONTENT: "sharegpt"})
+    assert (refused.rejection, refused.prefill_content) == (
+        f"DYN_BENCH_PREFILL_CONTENT='sharegpt' {_CONTENT_WORDS}",
+        None,
+    )
+    assert (launcher.SEEDED_CONTENT, launcher.TEXT_CONTENT) == ("random", "sharegpt_chain")
+
+
+@pytest.mark.parametrize(("word", "experts", "text"), CONTENT_TABLE)
+def test_a_launch_sends_what_the_content_word_and_the_model_ask_for(tmp_path, monkeypatch, word, experts, text):
+    def prepare(world, _pod_dir):
+        world.experts = experts
+
+    if text:
+        launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare, word=word)
+    else:
+        # A run with seeded ids does not look at the dataset variables: these name nothing that exists.
+        env = {
+            ENV_DATASET: str(tmp_path / "FAKE-no-such-file.json"),
+            ENV_SHA256: "0" * 64,
+            ENV_CACHE_DIR: "/FAKE/no/cache",
+        }
+        launch = _launch(
+            tmp_path,
+            monkeypatch,
+            "prefill",
+            prepare=prepare,
+            env={**env, **({} if word is None else {ENV_CONTENT: word})},
+        )
+
+    on_disk = _assert_accepted(launch)
+    content_block = on_disk["producer"]["content"]
+    assert content_block["source"] == ("dataset_text_chains" if text else "seeded_token_ids")
+    assert set(content_block) == {"source", "seed", "token_range", "issued", *(("dataset", "pool") if text else ())}
+    assert ("encode_texts" in launch.world.events) is text and ("tokenizer_class" in launch.world.events) is text
+    assert on_disk["producer"]["expert_keys"] == experts
+    assert (on_disk["producer"]["moe"] is None) is (not experts)
+    # The config block, which AISim compares between two launches of a cell, is the same for both sources.
+    assert "content_seed" in on_disk["config"] and "dataset" not in json.dumps(on_disk["config"])
+
+
+def test_the_options_keep_the_dataset_variables_as_text_and_take_an_empty_one_for_unset():
+    variables = {
+        ENV_DATASET: "/FAKE/datasets/conversations.json",
+        ENV_CACHE_DIR: "",
+        ENV_SHA256: "FAKE-digest",
+        "HF_HOME": "/FAKE/models/hf-home",
+        ENV_CONTENT: "sharegpt_chain",
+    }
+    options = _options([], variables)
+
+    assert options.rejection is None
+    assert options.dataset_environ == {
+        ENV_DATASET: "/FAKE/datasets/conversations.json",
+        ENV_SHA256: "FAKE-digest",
+        "HF_HOME": "/FAKE/models/hf-home",
+    }
+    assert _options([], {ENV_DATASET: "", ENV_CACHE_DIR: "", ENV_SHA256: "", "HF_HOME": ""}).dataset_environ == {}
+    assert (launcher.ENV_KVWARM_DATASET, launcher.ENV_KVWARM_CACHE_DIR, launcher.ENV_KVWARM_SHA256) == (
+        ENV_DATASET,
+        ENV_CACHE_DIR,
+        ENV_SHA256,
+    )
+    assert launcher.ENV_PREFILL_CONTENT == ENV_CONTENT and launcher.ENV_HF_HOME == "HF_HOME"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Text runs: finding the dataset file
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _unavailable(environ: dict) -> str:
+    """The dataset cannot be had: the text after ``dataset_unavailable: ``, which is one line."""
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._resolve_dataset(environ)
+    reason = raised.value.reason
+    assert reason.startswith("dataset_unavailable: ") and "\n" not in reason
+    return reason.removeprefix("dataset_unavailable: ")
+
+
+def _fake_download(monkeypatch, data: bytes = b"[]", **options) -> _FakeUrlopen:
+    """Put a FAKE ``urlopen`` in place that serves ``data``. Nothing is fetched."""
+    fake = _FakeUrlopen(data, **options)
+    monkeypatch.setattr(launcher.urllib.request, "urlopen", fake)
+    return fake
+
+
+# The random part in the name of a part file, made FAKE and fixed where a test has to name the file.
+FAKE_PART_TOKEN = "FAKE0123456789ab"
+
+
+def _fake_part_name(monkeypatch, cached: object) -> str:
+    """Fix the random part of the next part files and return the name of the part file of ``cached``."""
+    monkeypatch.setattr(launcher.secrets, "token_hex", lambda _bytes: FAKE_PART_TOKEN)
+    return f"{cached}.{os.getpid()}.{FAKE_PART_TOKEN}.part"
+
+
+def test_a_local_dataset_file_is_hashed_and_compared_with_the_hash_variable(tmp_path):
+    path, digest = _write_fake_dataset(tmp_path)
+    expected = {"path": str(path), "sha256": digest, "url": None, "downloaded": False}
+
+    # No pinned digest applies to a local file: without the hash variable any content is taken.
+    assert launcher._resolve_dataset({ENV_DATASET: str(path)}) == expected
+    assert launcher._resolve_dataset({ENV_DATASET: str(path), ENV_SHA256: digest}) == expected
+    # The cache directory and HF_HOME mean nothing for a local file, and neither directory is made.
+    elsewhere = {ENV_CACHE_DIR: str(tmp_path / "cache"), "HF_HOME": str(tmp_path / "models" / "hf-home")}
+    assert launcher._resolve_dataset({ENV_DATASET: str(path), **elsewhere}) == expected
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == [FAKE_DATASET_NAME]
+    # Dynamo does not compare a local file; here another digest fails the run, and the file is left alone.
+    wrong = "0" * 64
+    reason = _unavailable({ENV_DATASET: str(path), ENV_SHA256: wrong})
+    assert reason == f"the dataset file {path} has the SHA-256 {digest}, expected {wrong}"
+    assert _sha256(path.read_bytes()) == digest
+
+
+def test_a_local_path_that_is_not_an_existing_file_is_unavailable(tmp_path):
+    missing = tmp_path / "FAKE-none.json"
+    assert _unavailable({ENV_DATASET: str(missing)}) == f"the dataset path {missing} is not an existing file"
+    assert _unavailable({ENV_DATASET: str(tmp_path)}) == f"the dataset path {tmp_path} is not an existing file"
+    # Only http and https are fetched: any other word is a path.
+    other = "ftp://datasets.fake.invalid/FAKE.json"
+    assert _unavailable({ENV_DATASET: other}) == f"the dataset path {other} is not an existing file"
+
+
+def test_a_url_is_downloaded_once_into_the_cache_directory(tmp_path, monkeypatch):
+    data = json.dumps(_fake_dataset_records(12)).encode()
+    cache = tmp_path / "cache" / "deeper"
+    seen = {}
+    fake = _fake_download(monkeypatch, data, on_read=lambda: seen.setdefault("during", sorted(os.listdir(cache))))
+    environ = {ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(cache)}
+    part = _fake_part_name(monkeypatch, FAKE_DATASET_NAME)
+
+    first = launcher._resolve_dataset(environ)
+
+    cached = cache / FAKE_DATASET_NAME
+    assert first == {"path": str(cached), "sha256": _sha256(data), "url": FAKE_DATASET_URL, "downloaded": True}
+    assert cached.read_bytes() == data
+    # One call with the address and the socket timeout, and nothing else.
+    assert fake.calls == [((FAKE_DATASET_URL,), {"timeout": 60})]
+    assert launcher.DATASET_DOWNLOAD_TIMEOUT_SECONDS == 60
+    # The bytes went into a part file named after this process and a random part, and were renamed into place.
+    assert seen["during"] == [part]
+    assert sorted(os.listdir(cache)) == [FAKE_DATASET_NAME]
+
+    # The file is there now: it is hashed again and not fetched again.
+    second = launcher._resolve_dataset(environ)
+    assert second == {**first, "downloaded": False} and len(fake.calls) == 1
+    # A dataset of one's own has no pinned digest: without the hash variable the cached file is taken as it is.
+    cached.write_bytes(b"[]")
+    assert launcher._resolve_dataset(environ) == {**second, "sha256": _sha256(b"[]")}
+    assert len(fake.calls) == 1
+
+
+def test_the_hash_variable_is_compared_with_a_download_and_with_a_cached_file(tmp_path, monkeypatch):
+    data = json.dumps(_fake_dataset_records(12)).encode()
+    digest, wrong = _sha256(data), "f" * 64
+    cache = tmp_path / "cache"
+    fake = _fake_download(monkeypatch, data)
+    environ = {ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(cache)}
+    cached = cache / FAKE_DATASET_NAME
+    part = _fake_part_name(monkeypatch, cached)
+
+    # A download with another digest is deleted and nothing is cached.
+    reason = _unavailable({**environ, ENV_SHA256: wrong})
+    assert reason == f"the downloaded dataset file {part} has the SHA-256 {digest}, expected {wrong}"
+    assert os.listdir(cache) == [] and len(fake.calls) == 1
+    # With its own digest the same download is kept.
+    assert launcher._resolve_dataset({**environ, ENV_SHA256: digest})["downloaded"] is True
+    assert os.listdir(cache) == [FAKE_DATASET_NAME] and len(fake.calls) == 2
+    # A cached file with another digest fails the run. It is neither deleted nor fetched again.
+    reason = _unavailable({**environ, ENV_SHA256: wrong})
+    assert reason == f"the cached dataset file {cached} has the SHA-256 {digest}, expected {wrong}"
+    assert cached.read_bytes() == data and len(fake.calls) == 2
+
+
+def test_the_default_dataset_is_dynamos_address_with_its_pinned_digest(tmp_path, monkeypatch):
+    # The two constants of Dynamo's vLLM self-benchmark, typed here on their own.
+    url = (
+        "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/"
+        "resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+    )
+    pinned = "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4"
+    name = "ShareGPT_V3_unfiltered_cleaned_split.json"
+    assert (url, pinned) == (launcher.DEFAULT_DATASET_URL, launcher.DEFAULT_DATASET_SHA256)
+
+    data = b'[{"FAKE": "these bytes are not the default dataset"}]'
+    cache = tmp_path / "cache"
+    fake = _fake_download(monkeypatch, data)
+    part = _fake_part_name(monkeypatch, cache / name)
+    # No dataset variable, or an empty one: the default address. The FAKE bytes do not have the pinned digest,
+    # so the download is refused and deleted.
+    for environ in ({ENV_CACHE_DIR: str(cache)}, {ENV_DATASET: "", ENV_SHA256: "", ENV_CACHE_DIR: str(cache)}):
+        reason = _unavailable(environ)
+        assert reason == f"the downloaded dataset file {part} has the SHA-256 {_sha256(data)}, expected {pinned}"
+    assert [call[0] for call in fake.calls] == [(url,), (url,)] and os.listdir(cache) == []
+
+    # FAKE: with the digest of the FAKE bytes in the place of the pinned one, the default is fetched and kept.
+    monkeypatch.setattr(launcher, "DEFAULT_DATASET_SHA256", _sha256(data))
+    record = launcher._resolve_dataset({ENV_CACHE_DIR: str(cache)})
+    assert record == {"path": str(cache / name), "sha256": _sha256(data), "url": url, "downloaded": True}
+    # A cached default with other content fails the run, and the hash variable decides over the pinned digest.
+    (cache / name).write_bytes(b"[]")
+    reason = _unavailable({ENV_CACHE_DIR: str(cache)})
+    assert (
+        reason == f"the cached dataset file {cache / name} has the SHA-256 {_sha256(b'[]')}, expected {_sha256(data)}"
+    )
+    assert (cache / name).read_bytes() == b"[]" and len(fake.calls) == 3
+    assert launcher._resolve_dataset({ENV_CACHE_DIR: str(cache), ENV_SHA256: _sha256(b"[]")})["downloaded"] is False
+
+
+@pytest.mark.parametrize(
+    ("url", "name"),
+    [
+        (FAKE_DATASET_URL, FAKE_DATASET_NAME),
+        ("http://datasets.fake.invalid/a/b/FAKE.json", "FAKE.json"),
+        ("https://datasets.fake.invalid/FAKE.json?revision=main&download=true", "FAKE.json"),
+        # An address that ends in a slash names no file: Dynamo's stand-in name.
+        ("https://datasets.fake.invalid/FAKE/", "kvwarm_dataset.json"),
+        ("https://datasets.fake.invalid/FAKE/?download=true", "kvwarm_dataset.json"),
+    ],
+)
+def test_the_cached_file_is_named_after_the_last_part_of_the_address(tmp_path, monkeypatch, url, name):
+    fake = _fake_download(monkeypatch)
+
+    record = launcher._resolve_dataset({ENV_DATASET: url, ENV_CACHE_DIR: str(tmp_path)})
+
+    assert record == {"path": str(tmp_path / name), "sha256": _sha256(b"[]"), "url": url, "downloaded": True}
+    assert fake.calls == [((url,), {"timeout": 60})]
+
+
+def test_the_cache_directory_is_the_variable_then_beside_hf_home_then_the_default(tmp_path, monkeypatch):
+    _fake_download(monkeypatch)
+    url = {ENV_DATASET: FAKE_DATASET_URL}
+    monkeypatch.chdir(tmp_path)
+
+    # The variable decides, also over HF_HOME. It is made absolute and created with its parents.
+    hf_home = tmp_path / "models" / "hf-home"
+    record = launcher._resolve_dataset({**url, ENV_CACHE_DIR: "relative/cache", "HF_HOME": str(hf_home)})
+    assert record["path"] == str(tmp_path / "relative" / "cache" / FAKE_DATASET_NAME)
+    assert not (tmp_path / "models").exists()
+    # Without it: ``fpm_datasets`` beside the directory HF_HOME names, which itself is not made.
+    record = launcher._resolve_dataset({**url, ENV_CACHE_DIR: "", "HF_HOME": str(hf_home)})
+    assert record["path"] == str(tmp_path / "models" / "fpm_datasets" / FAKE_DATASET_NAME)
+    assert sorted(entry.name for entry in (tmp_path / "models").iterdir()) == ["fpm_datasets"]
+    # With neither: the default directory, which a fixture of this file points into the temporary directory.
+    record = launcher._resolve_dataset(url)
+    assert record["path"] == str(tmp_path / "FAKE-default-cache" / FAKE_DATASET_NAME)
+    assert _resolve_through_options(url)["path"] == record["path"]
+    # The default of the module itself is Dynamo's, read here from the source because the fixture replaced it.
+    assert '\nDEFAULT_DATASET_CACHE_DIR = "/tmp/fpm_datasets"\n' in MODULE_PATH.read_text(encoding="utf-8")
+
+
+def _resolve_through_options(variables: dict) -> dict:
+    """Resolve the dataset from the variables as ``main`` does: through the options."""
+    return launcher._resolve_dataset(_options([], variables).dataset_environ)
+
+
+FAKE_DOWNLOAD_ERRORS = [
+    (urllib.error.URLError("FAKE: no route to host"), "URLError: <urlopen error FAKE: no route to host>"),
+    (TimeoutError("FAKE: the read timed out"), "TimeoutError: FAKE: the read timed out"),
+    (ConnectionResetError("FAKE: reset by peer"), "ConnectionResetError: FAKE: reset by peer"),
+    (
+        PermissionError("FAKE: the part file\ncannot be written"),
+        "PermissionError: FAKE: the part file cannot be written",
+    ),
+    (ValueError("FAKE: unknown url type"), "ValueError: FAKE: unknown url type"),
+    (
+        http.client.RemoteDisconnected("FAKE: closed without response"),
+        "RemoteDisconnected: FAKE: closed without response",
+    ),
+    (http.client.IncompleteRead(b"FAKE"), "IncompleteRead: IncompleteRead(4 bytes read)"),
+]
+
+
+@pytest.mark.parametrize(
+    ("error", "shown"), FAKE_DOWNLOAD_ERRORS, ids=[row[1].split(":")[0] for row in FAKE_DOWNLOAD_ERRORS]
+)
+@pytest.mark.parametrize("when", ["at the start", "in the transfer"])
+def test_a_download_that_fails_is_unavailable_and_leaves_no_part_file(tmp_path, monkeypatch, error, shown, when):
+    data = json.dumps(_fake_dataset_records(12)).encode()
+    if when == "at the start":
+        fake = _fake_download(monkeypatch, data, error=error)
+    else:
+        # FAKE: every byte arrives, and then the transfer breaks off.
+        fake = _fake_download(monkeypatch, data, fail_after=error)
+
+    reason = _unavailable({ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(tmp_path)})
+
+    assert reason == shown
+    # Nothing is tried a second time, and neither a part file nor a cached file is left.
+    assert len(fake.calls) == 1 and os.listdir(tmp_path) == []
+
+
+def test_an_http_error_of_the_download_is_unavailable(tmp_path, monkeypatch):
+    error = urllib.error.HTTPError(FAKE_DATASET_URL, 404, "FAKE: Not Found", None, None)
+    _fake_download(monkeypatch, error=error)
+
+    reason = _unavailable({ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(tmp_path)})
+
+    assert reason == "HTTPError: HTTP Error 404: FAKE: Not Found" and os.listdir(tmp_path) == []
+
+
+def test_a_stop_during_a_download_passes_and_leaves_no_part_file(tmp_path, monkeypatch):
+    _fake_download(monkeypatch, b"FAKE bytes", fail_after=KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        launcher._resolve_dataset({ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(tmp_path)})
+
+    assert os.listdir(tmp_path) == []
+
+
+def test_two_launchers_with_one_process_id_do_not_share_a_part_file(tmp_path, monkeypatch):
+    # FAKE: launchers in two pods that share the cache directory, both running as process 7. The second one
+    # starts and finishes while the first is in its third piece.
+    data = json.dumps(_fake_dataset_records(40)).encode()
+    monkeypatch.setattr(launcher, "_FILE_PIECE_BYTES", 512)
+    monkeypatch.setattr(launcher.os, "getpid", lambda: 7)
+    environ = {ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(tmp_path), ENV_SHA256: _sha256(data)}
+    seen: dict = {"reads": 0}
+
+    def on_read():
+        seen["reads"] += 1
+        if seen["reads"] == 3:
+            seen["parts"] = sorted(os.listdir(tmp_path))
+            monkeypatch.setattr(launcher.urllib.request, "urlopen", _FakeUrlopen(data))
+            seen["second"] = launcher._resolve_dataset(environ)
+
+    monkeypatch.setattr(launcher.urllib.request, "urlopen", _FakeUrlopen(data, on_read=on_read))
+    first = launcher._resolve_dataset(environ)
+
+    cached = tmp_path / FAKE_DATASET_NAME
+    expected = {"path": str(cached), "sha256": _sha256(data), "url": FAKE_DATASET_URL, "downloaded": True}
+    assert (first, seen["second"]) == (expected, expected)
+    assert os.listdir(tmp_path) == [FAKE_DATASET_NAME] and cached.read_bytes() == data
+    # The part file of the first launcher: the process id and sixteen random hex digits.
+    (part,) = seen["parts"]
+    assert fnmatch.fnmatch(part, f"{FAKE_DATASET_NAME}.7.{'[0-9a-f]' * 16}.part")
+
+
+def test_a_download_that_ends_before_the_announced_length_is_unavailable(tmp_path, monkeypatch):
+    data = json.dumps(_fake_dataset_records(12)).encode()
+    sent = len(data)
+
+    def answer_announcing(length: str):
+        # FAKE response with a ``Content-Length`` header; it serves every byte of ``data`` and then ends
+        # without an error, as ``http.client`` ends a read with a size.
+        response = _FakeResponse(data)
+        response.headers = {"Content-Length": length}
+        monkeypatch.setattr(launcher.urllib.request, "urlopen", lambda *_args, **_kwargs: response)
+
+    environ = {ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(tmp_path)}
+    answer_announcing(f" {sent + 100} ")
+    reason = _unavailable(environ)
+    assert reason == f"OSError: the transfer ended after {sent} of the {sent + 100} bytes the server announced"
+    # Nothing is cached, so a later run fetches the file again and does not find a part of it.
+    assert os.listdir(tmp_path) == []
+
+    answer_announcing(str(sent))
+    assert launcher._resolve_dataset(environ)["downloaded"] is True
+    assert (tmp_path / FAKE_DATASET_NAME).read_bytes() == data
+
+
+def test_a_cache_directory_or_a_cached_file_that_cannot_be_used_is_unavailable(tmp_path, monkeypatch):
+    fake = _fake_download(monkeypatch)
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    # A file in the place of the cache directory, or of one of its parents.
+    for cache in (blocker, blocker / "cache"):
+        reason = _unavailable({ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(cache)})
+        assert reason.split(":")[0] in ("FileExistsError", "NotADirectoryError")
+    # A directory in the place of the cached file.
+    (tmp_path / "cache" / FAKE_DATASET_NAME).mkdir(parents=True)
+    reason = _unavailable({ENV_DATASET: FAKE_DATASET_URL, ENV_CACHE_DIR: str(tmp_path / "cache")})
+    assert reason.split(":")[0] in ("IsADirectoryError", "PermissionError")
+    assert fake.calls == [] and blocker.read_text(encoding="utf-8") == "not a directory"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Text runs: the texts of the dataset
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_the_dataset_record_and_its_texts(tmp_path):
+    records = _fake_dataset_records()
+    path, digest = _write_fake_dataset(tmp_path, records)
+
+    record, texts = launcher._load_dataset({ENV_DATASET: str(path)})
+
+    kept = _fake_kept_texts(records)
+    # The recipe keeps about half of the long texts, in the order of the records, and drops the three others.
+    assert texts == kept and 50 < len(kept) < 110 and len(records) == 162
+    assert record == {
+        "path": str(path),
+        "sha256": digest,
+        "collection_pool": "conversation_sha256_even",
+        "conversations": len(kept),
+        "url": None,
+        "downloaded": False,
+    }
+    # Dynamo's four keys first, in its order, then the two of this producer.
+    assert list(record) == ["path", "sha256", "collection_pool", "conversations", "url", "downloaded"]
+    assert content.COLLECTION_POOL == "conversation_sha256_even"
+
+
+@pytest.mark.parametrize(
+    ("data", "shown"),
+    [
+        (b"FAKE: this is not JSON", "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"),
+        (b"", "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"),
+        (b"\xff\xfe[]", "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+        (b'{"records": []}', "ValueError: the dataset must be a list of records, got dict"),
+        (b'[{"conversations": []}, 7]', "ValueError: record 1 of the dataset must be a mapping, got int"),
+        (
+            b'[{"conversations": ["a turn"]}]',
+            "ValueError: record 0 of the dataset: turn 0 must be a mapping, got str",
+        ),
+    ],
+)
+def test_a_dataset_file_that_cannot_be_parsed_is_unavailable(tmp_path, data, shown):
+    path = tmp_path / FAKE_DATASET_NAME
+    path.write_bytes(data)
+
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._load_dataset({ENV_DATASET: str(path)})
+
+    assert raised.value.reason == f"dataset_unavailable: {path}: {shown}"
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [],
+        [{"id": "FAKE", "conversations": [{"from": "human", "value": "FAKE: too short"}]}] * 5,
+        [{"id": "FAKE"}, {"id": "FAKE", "conversations": None}, {"id": "FAKE", "conversations": [{"from": "gpt"}]}],
+    ],
+)
+def test_a_dataset_without_a_kept_text_is_empty(tmp_path, capsys, records):
+    path, _digest = _write_fake_dataset(tmp_path, records)
+
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._load_dataset({ENV_DATASET: str(path)})
+
+    # The reason is the bare word, as in Dynamo; the line before it says which file gave nothing.
+    assert raised.value.reason == "dataset_empty"
+    assert _stderr_lines(capsys) == [
+        f"[sglbench] the dataset {path} gives no text: no record has a text that the recipe keeps"
+    ]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Text runs: the text pool and the run
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _assert_free_calls_are_text(world: _FakeWorld, text_ids: set[int]) -> None:
+    """The seven calls before the first point are text after their allocated tokens.
+
+    Every prompt starts with an allocated token. The shots of the aligned-prefix check, the third call, also
+    have an allocated token after their cached unit.
+    """
+    unit = grid.cached_unit(world.limits.page_size)
+    for number, call in enumerate(world.calls[:7]):
+        assert call.key == (0, "free", number)
+        allocated = {0, unit} if number == 2 else {0}
+        for prompt in call.prompts:
+            assert all(token in text_ids for position, token in enumerate(prompt) if position not in allocated)
+
+
+def _longest_prompt(built: grid.Grid, page_size: int = 1) -> int:
+    """The longest prompt of a run with a warm-up, worked out here: the points, the self-test, the warm-up."""
+    lengths = [2 * grid.cached_unit(page_size) + 7, 256]
+    for point in built.points:
+        lengths.append(point.cached_tokens + point.new_tokens if point.phase == "prefill" else point.cached_tokens - 3)
+    return max(lengths)
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_text_run_of_a_model_without_expert_layers_passes_the_validator_and_the_gate(
+    tmp_path, monkeypatch, capsys, mode, page_size
+):
+    launch = _launch_text(tmp_path, monkeypatch, mode, page_size=page_size)
+
+    on_disk = _assert_accepted(launch)
+    world = launch.world
+    kept = _fake_kept_texts(_fake_dataset_records())
+    # The dataset was read before the engine was built, and the pool was made after the token range was taken:
+    # one tokenizer call, because the FAKE dataset has fewer texts than one batch holds.
+    assert world.events == [
+        "clock",
+        "sglang_version",
+        "load_plugins",
+        "parse_server_args",
+        "resolve",
+        "platform_facts",
+        "model_expert_keys",
+        "build_engine",
+        "vocabulary",
+        "model_vocabulary_size",
+        "tokenizer_class",
+        "encode_texts",
+        "tokenizer",
+        "shutdown",
+        "write",
+        "sleep",
+    ]
+    assert world.tokenizer_batches == [kept] and len(kept) < launcher.POOL_ENCODE_BATCH == 256
+    assert launcher.POOL_TOKEN_TARGET == 8_000_000
+
+    # The producer block: the source, the record of the dataset and the record of the pool, which is its id
+    # range and its four counts.
+    producer = on_disk["producer"]
+    counts = _fake_pool_counts(kept)
+    assert producer["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": FAKE_TOKEN_RANGE,
+        "issued": producer["content"]["issued"],
+        "dataset": launch.dataset,
+        "pool": counts,
+    }
+    # Some FAKE texts hold the written form of a FAKE token the model does not count. Those ids are dropped
+    # and no other: the ids of the FAKE special token, which lie outside the token range, are text.
+    beyond = sum(text.split().count("<FAKE-beyond>") for text in kept)
+    special = sum(text.split().count("<FAKE-special>") for text in kept)
+    assert counts["dropped_tokens"] == beyond > 0 and special > 0 and counts["dropped_conversations"] == 0
+    assert counts["tokens"] == sum(len(text.split()) for text in kept) - beyond
+    assert (producer["expert_keys"], producer["moe"]) == ({}, None)
+    assert set(producer) == {*LAUNCHER_PRODUCER_KEYS, *DRIVER_PRODUCER_KEYS, "name", "artifact_format"}
+    # The ``kvwarm`` block of a decode artifact names the dataset with Dynamo's four keys.
+    if mode == "decode":
+        assert on_disk["kvwarm"] == {
+            "enabled": True,
+            "warm_eligible": True,
+            "skip_reason": None,
+            "method": "radix_cache_seed",
+            "dataset": {key: launch.dataset[key] for key in ("path", "sha256", "collection_pool", "conversations")},
+        }
+    else:
+        assert "kvwarm" not in on_disk
+    # The config block is the one of a run with seeded ids: it holds nothing of the dataset.
+    assert list(on_disk["config"]) == [
+        "mode",
+        "warmup_iterations",
+        "timeout",
+        "prefill_max_new_token_samples",
+        "prefill_max_kv_read_token_samples",
+        "decode_max_kv_read_token_samples",
+        "decode_max_batch_size_samples",
+        "prefix_max_batch_size_samples",
+        "max_batch_size",
+        "points_source",
+        "content_seed",
+        "output_path",
+    ]
+
+    # Every prompt is made of ids the FAKE tokenizer gave for words of the dataset, apart from the allocated
+    # tokens: the first token of a prompt and the first new token of a shot with cached tokens.
+    text_ids = {_FakeTokenizer.fake_id(word) for text in kept for word in text.split()} - {FAKE_MODEL_VOCAB_SIZE}
+    assert 2 in text_ids and not FAKE_TOKEN_RANGE[0] <= 2 < FAKE_TOKEN_RANGE[1]
+    built = launch.planned()
+    _assert_free_calls_are_text(world, text_ids)
+    for point in built.points:
+        for call in launch.calls_of(point.benchmark_id):
+            skipped = {0, point.cached_tokens} if call.key[1] in ("warm", "meas") else {0}
+            for prompt in call.prompts:
+                assert all(token in text_ids for position, token in enumerate(prompt) if position not in skipped)
+                # The allocated tokens come from the token range. A token of the text can lie outside it.
+                assert all(FAKE_TOKEN_RANGE[0] <= prompt[position] < FAKE_TOKEN_RANGE[1] for position in skipped)
+    # No id the model does not count reached the engine, and the id of the FAKE special token did.
+    sent = {token for call in world.calls for prompt in call.prompts for token in prompt}
+    assert max(sent) < FAKE_MODEL_VOCAB_SIZE and 2 in sent
+
+    lines = _stderr_lines(capsys)
+    dataset = launch.dataset
+    assert (
+        f"[sglbench] text run: the dataset {dataset['path']} (SHA-256 {dataset['sha256']}) gives {len(kept)} texts"
+    ) in lines
+    (pool_line,) = [line for line in lines if line.startswith("[sglbench] the text pool holds ")]
+    assert pool_line.startswith(
+        f"[sglbench] the text pool holds {counts['tokens']} tokens in {counts['conversations']} conversations: "
+        f"{len(kept)} of {len(kept)} texts went through fake_tokenizers.FakeTokenizer in "
+    )
+    assert pool_line.endswith(
+        f" s, and {counts['dropped_tokens']} token ids at or above {FAKE_MODEL_VOCAB_SIZE}, the number of ids the "
+        "model counts, and 0 conversations without an id below it were dropped"
+    )
+    built_line = (
+        "[sglbench] the engine is built; the first token of each prompt part comes from the token ids [3, 50000), "
+        "the other tokens are dataset text"
+    )
+    assert lines.index(pool_line) > lines.index(built_line)
+    # Only a run with seeded ids says that its prompts use the token range.
+    assert not any("prompts use the token ids" in line for line in lines)
+
+
+def test_the_pool_is_filled_batch_by_batch_in_dataset_order_until_it_holds_its_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, "POOL_ENCODE_BATCH", 8)
+    monkeypatch.setattr(launcher, "POOL_TOKEN_TARGET", 1500)
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode")
+
+    on_disk = _assert_accepted(launch)
+    kept = _fake_kept_texts(_fake_dataset_records())
+    batches = launch.world.tokenizer_batches
+    # Batches of eight texts in the order of the dataset, and no text after the batch that reached the target.
+    assert all(len(batch) == 8 for batch in batches) and 2 < len(batches) < len(kept) // 8
+    encoded = [text for batch in batches for text in batch]
+    assert encoded == kept[: len(encoded)]
+    counts = _fake_pool_counts(encoded)
+    assert on_disk["producer"]["content"]["pool"] == counts
+    assert _fake_pool_counts(encoded[:-8])["tokens"] < 1500 <= counts["tokens"]
+    # The record of the dataset still counts every kept text of the file, not only those in the pool.
+    assert on_disk["producer"]["content"]["dataset"]["conversations"] == len(kept) > len(encoded)
+
+
+def test_the_pool_stops_with_the_batch_that_brings_it_to_its_target_exactly(tmp_path, monkeypatch):
+    kept = _fake_kept_texts(_fake_dataset_records())
+    # FAKE target: exactly the tokens of the first twenty texts, taken one text in a call.
+    target = _fake_pool_counts(kept[:20])["tokens"]
+    monkeypatch.setattr(launcher, "POOL_ENCODE_BATCH", 1)
+    monkeypatch.setattr(launcher, "POOL_TOKEN_TARGET", target)
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode")
+
+    on_disk = _assert_accepted(launch)
+    assert launch.world.tokenizer_batches == [[text] for text in kept[:20]]
+    assert on_disk["producer"]["content"]["pool"]["tokens"] == target
+
+
+def test_a_text_run_takes_a_downloaded_dataset_and_then_the_cached_file(tmp_path, monkeypatch):
+    records = _fake_dataset_records()
+    data = json.dumps(records).encode()
+    cache = tmp_path / "FAKE-cache"
+    fake = _FakeUrlopen(data)
+    env = {
+        ENV_CONTENT: "sharegpt_chain",
+        ENV_DATASET: FAKE_DATASET_URL,
+        ENV_CACHE_DIR: str(cache),
+        ENV_SHA256: _sha256(data),
+    }
+
+    def prepare(_world, _pod_dir):
+        monkeypatch.setattr(launcher.urllib.request, "urlopen", fake)
+
+    first = _launch(tmp_path / "first", monkeypatch, "prefill", env=env, prepare=prepare)
+    second = _launch(tmp_path / "second", monkeypatch, "prefill", env=env, prepare=prepare)
+
+    record = {
+        "path": str(cache / FAKE_DATASET_NAME),
+        "sha256": _sha256(data),
+        "collection_pool": "conversation_sha256_even",
+        "conversations": len(_fake_kept_texts(records)),
+        "url": FAKE_DATASET_URL,
+        "downloaded": True,
+    }
+    assert _assert_accepted(first)["producer"]["content"]["dataset"] == record
+    assert _assert_accepted(second)["producer"]["content"]["dataset"] == {**record, "downloaded": False}
+    assert fake.calls == [((FAKE_DATASET_URL,), {"timeout": 60})]
+    # Both launches sent the same prompts: the content is a function of the seed and of the pool.
+    assert [call.prompts for call in first.world.calls] == [call.prompts for call in second.world.calls]
+
+
+# The four reasons with which a text run fails. Each ends with exit code 65 and a failed artifact that carries
+# the reason. The launcher gives the first three and the driver the fourth.
+
+
+def test_a_dataset_that_cannot_be_had_fails_the_run_before_the_engine_is_built(tmp_path, monkeypatch, capsys):
+    missing = tmp_path / "FAKE-no-such-dataset.json"
+    reason = f"dataset_unavailable: the dataset path {missing} is not an existing file"
+    dump = tmp_path / "resolved-config-node0.json"
+
+    launch = _launch_text(
+        tmp_path, monkeypatch, "decode", flags=["--dump-config-to", str(dump)], env={ENV_DATASET: str(missing)}
+    )
+
+    on_disk = _assert_failed_before_the_grid(launch, 65, reason)
+    # SGLang's arguments were resolved and dumped; nothing was built, so nothing is shut down.
+    assert launch.world.events[-4:] == ["model_expert_keys", "resolved_dict", "write", "sleep"]
+    assert dump.exists() and launch.world.shutdowns == 0
+    # The artifact says what the run was started for, although no prompt was ever made.
+    assert on_disk["producer"]["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": None,
+        "issued": None,
+    }
+    assert _stderr_lines(capsys)[-2:] == [
+        f"[sglbench] FAILED: {reason}",
+        f"[sglbench] wrote the failed artifact {launch.rank_path}",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "shown"),
+    [
+        (urllib.error.URLError("FAKE: the pod has no route to the internet"), "URLError: <urlopen error FAKE: the pod"),
+        (TimeoutError("FAKE: timed out"), "TimeoutError: FAKE: timed out"),
+    ],
+)
+def test_a_download_that_fails_fails_the_run_as_dataset_unavailable(tmp_path, monkeypatch, error, shown):
+    def prepare(_world, _pod_dir):
+        monkeypatch.setattr(launcher.urllib.request, "urlopen", _FakeUrlopen(error=error))
+
+    # No dataset variable: the default address, into a cache directory beside the directory HF_HOME names.
+    env = {ENV_CONTENT: "sharegpt_chain", "HF_HOME": str(tmp_path / "FAKE-models" / "hf-home")}
+    launch = _launch(tmp_path, monkeypatch, "prefill", env=env, prepare=prepare)
+
+    assert launch.code == 65
+    on_disk = _assert_failed_before_the_grid(launch, 65, launch.artifact()["error"])
+    assert on_disk["error"].startswith(f"dataset_unavailable: {shown}")
+    assert "build_engine" not in launch.world.events
+    assert os.listdir(tmp_path / "FAKE-models" / "fpm_datasets") == []
+
+
+def test_a_dataset_with_another_digest_fails_the_run_as_dataset_unavailable(tmp_path, monkeypatch):
+    wrong = "0" * 64
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", env={ENV_SHA256: wrong})
+
+    path, digest = launch.dataset["path"], launch.dataset["sha256"]
+    reason = f"dataset_unavailable: the dataset file {path} has the SHA-256 {digest}, expected {wrong}"
+    _assert_failed_before_the_grid(launch, 65, reason)
+    assert "build_engine" not in launch.world.events
+
+
+def test_a_dataset_that_is_not_a_list_of_records_fails_the_run_as_dataset_unavailable(tmp_path, monkeypatch):
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", records={"FAKE": "not a list"})
+
+    reason = (
+        f"dataset_unavailable: {launch.dataset['path']}: ValueError: the dataset must be a list of records, got dict"
+    )
+    _assert_failed_before_the_grid(launch, 65, reason)
+    assert "build_engine" not in launch.world.events
+
+
+def test_a_dataset_without_a_kept_text_fails_the_run_as_dataset_empty(tmp_path, monkeypatch, capsys):
+    records = [{"id": "FAKE", "conversations": [{"from": "human", "value": "FAKE: too short"}]}] * 9
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", records=records)
+
+    _assert_failed_before_the_grid(launch, 65, "dataset_empty")
+    assert launch.world.events[-3:] == ["model_expert_keys", "write", "sleep"]
+    assert f"[sglbench] the dataset {launch.dataset['path']} gives no text: " in "\n".join(_stderr_lines(capsys))
+
+
+def test_texts_without_an_id_the_model_counts_fail_the_run_as_dataset_empty(tmp_path, monkeypatch, capsys):
+    def prepare(world, _pod_dir):
+        # FAKE: a tokenizer that gives an id above the ids the model counts for every word.
+        world.tokenizer_ids_outside = True
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    on_disk = _assert_failed_before_the_grid(launch, 65, "dataset_empty")
+    # The engine was built by then, so it is shut down.
+    assert launch.world.events[-5:] == ["encode_texts", "tokenizer", "shutdown", "write", "sleep"]
+    assert on_disk["producer"]["content"]["source"] == "dataset_text_chains"
+    # The line before the failure says what the pool dropped: every id and so every conversation.
+    kept = _fake_kept_texts(_fake_dataset_records())
+    words = sum(len(text.split()) for text in kept)
+    (pool_line,) = [line for line in _stderr_lines(capsys) if line.startswith("[sglbench] the text pool holds ")]
+    assert pool_line.startswith(
+        f"[sglbench] the text pool holds 0 tokens in 0 conversations: {len(kept)} of {len(kept)} "
+    )
+    assert pool_line.endswith(
+        f"and {words} token ids at or above {FAKE_MODEL_VOCAB_SIZE}, the number of ids the model counts, and "
+        f"{len(kept)} conversations without an id below it were dropped"
+    )
+
+
+@pytest.mark.parametrize(
+    ("step", "error", "shown"),
+    [
+        (
+            "encode_texts",
+            RuntimeError("FAKE: the tokenizer has\n no batch call"),
+            "RuntimeError: FAKE: the tokenizer has no batch call",
+        ),
+        (
+            "encode_texts",
+            TypeError("FAKE: the tokenizer returned str among the ids"),
+            "TypeError: FAKE: the tokenizer returned",
+        ),
+        (
+            "tokenizer_class",
+            ValueError("FAKE: engine.tokenizer_manager.tokenizer is None"),
+            "ValueError: FAKE: engine.",
+        ),
+    ],
+)
+def test_a_tokenizer_that_cannot_encode_the_texts_fails_the_run_as_tokenizer_unavailable(
+    tmp_path, monkeypatch, step, error, shown
+):
+    def prepare(world, _pod_dir):
+        world.raises[step] = error
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    assert launch.code == 65
+    on_disk = _assert_failed_before_the_grid(launch, 65, launch.artifact()["error"])
+    assert on_disk["error"].startswith(f"tokenizer_unavailable: {shown}")
+    assert launch.world.events[-4:] == [step, "shutdown", "write", "sleep"]
+
+
+def test_a_dataset_that_is_shorter_than_the_longest_prompt_fails_the_run_as_content_too_shallow(tmp_path, monkeypatch):
+    # FAKE: ten records, of which the recipe keeps about half: a few hundred tokens.
+    records = _fake_dataset_records(10)
+    kept = _fake_kept_texts(records)
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", records=records)
+
+    tokens = _fake_pool_counts(kept)["tokens"]
+    need = _longest_prompt(launch.planned()) + 1
+    assert 0 < tokens <= need == 426
+    reason = f"content_too_shallow: the text pool holds {tokens} tokens and the longest prompt needs {need}"
+    on_disk = _assert_failed(launch, 65, reason)
+    # The driver found it once the grid existed, before the first request.
+    assert launch.world.calls == [] and launch.world.events[-3:] == ["shutdown", "write", "sleep"]
+    assert on_disk["coverage"]["expected_points"] == len(launch.planned().points)
+    assert on_disk["producer"]["content"]["pool"]["tokens"] == tokens
+
+
+def test_the_four_reasons_of_a_text_run_are_the_drivers_and_end_with_exit_code_65():
+    reasons = (
+        driver.REASON_DATASET_UNAVAILABLE,
+        driver.REASON_DATASET_EMPTY,
+        driver.REASON_TOKENIZER_UNAVAILABLE,
+        driver.REASON_CONTENT_TOO_SHALLOW,
+    )
+    assert reasons == ("dataset_unavailable", "dataset_empty", "tokenizer_unavailable", "content_too_shallow")
+    for reason in reasons:
+        assert launcher._exit_code("failed", reason) == launcher._exit_code("failed", f"{reason}: FAKE") == 65
+        assert launcher._exit_code("failed", f"benchmark_id=3: benchmark point failed: {reason}: FAKE") == 65
+
+
+def test_a_token_range_that_is_too_small_fails_a_text_run_as_it_fails_a_run_with_seeded_ids(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.vocabulary = {"size": 5000, "excluded": [10, 4000]}
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    # The pool does not depend on the token range, so it is built; the driver then finds the range too small
+    # for a content plan, with the words it has for a run with seeded ids.
+    _assert_failed(launch, 65, launch.artifact()["error"])
+    assert launch.artifact()["error"].startswith(
+        "token_range_too_small: the token range [11, 4000) holds 3989 ids, the content plan needs at least 4096"
+    )
+    assert launch.world.calls == [] and launch.world.events[-3:] == ["shutdown", "write", "sleep"]
+    assert "encode_texts" in launch.world.events
+
+
+def test_a_model_that_counts_too_few_ids_for_a_pool_fails_the_run_before_a_text_is_encoded(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.model_vocab_size = 100
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    reason = (
+        "token_range_too_small: the model counts 100 token ids, which a text pool refuses: "
+        "the token range [0, 100) must hold at least 4096 ids, got 100"
+    )
+    _assert_failed_before_the_grid(launch, 65, reason)
+    assert launch.world.events[-4:] == ["model_vocabulary_size", "shutdown", "write", "sleep"]
+
+
+def test_a_model_config_without_a_vocabulary_size_is_rejected_in_a_text_run(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.raises["model_vocabulary_size"] = TypeError("FAKE: model_config.vocab_size is None, not an int")
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", prepare=prepare)
+
+    reason = (
+        "rejected: the vocabulary size cannot be taken from the model config: "
+        "TypeError: FAKE: model_config.vocab_size is None, not an int"
+    )
+    _assert_failed_before_the_grid(launch, 64, reason)
+    assert launch.world.events[-4:] == ["model_vocabulary_size", "shutdown", "write", "sleep"]
+
+
+def test_a_text_keeps_the_last_id_the_model_counts_and_loses_the_first_it_does_not(tmp_path, monkeypatch):
+    # FAKE: the written form of the FAKE special token gets the last id the FAKE model counts. That id lies
+    # above the size of the FAKE tokenizer, as the id of an added token does, and so above the token range.
+    last = FAKE_MODEL_VOCAB_SIZE - 1
+    assert FAKE_VOCABULARY["size"] <= last and FAKE_TOKEN_RANGE[1] <= last
+    fake_id = _FakeTokenizer.fake_id
+    monkeypatch.setattr(
+        _FakeTokenizer,
+        "fake_id",
+        staticmethod(lambda word: last if word == "<FAKE-special>" else fake_id(word)),
+    )
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill")
+
+    on_disk = _assert_accepted(launch)
+    kept = _fake_kept_texts(_fake_dataset_records())
+    counts = on_disk["producer"]["content"]["pool"]
+    assert counts == _fake_pool_counts(kept)
+    # Only the ids at the model's bound were dropped; the ids just below it are text and reached the engine.
+    assert counts["dropped_tokens"] == sum(text.split().count("<FAKE-beyond>") for text in kept) > 0
+    assert sum(text.split().count("<FAKE-special>") for text in kept) > 0
+    sent = {token for call in launch.world.calls for prompt in call.prompts for token in prompt}
+    assert max(sent) == last
+    assert on_disk["producer"]["content"]["token_range"] == FAKE_TOKEN_RANGE
+
+
+def test_the_id_range_of_the_pool_ends_at_the_number_of_ids_the_model_counts(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        # FAKE: a model that counts one id more than the FAKE model of the other tests.
+        world.model_vocab_size = FAKE_MODEL_VOCAB_SIZE + 1
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    recorded = _assert_accepted(launch)["producer"]["content"]
+    # The upper end is the number this model counts. With it the id of ``<FAKE-beyond>`` is one of the
+    # model's, so no id of a text is dropped. The token range of the prompts is what it was.
+    assert recorded["pool"]["id_range"] == [0, FAKE_MODEL_VOCAB_SIZE + 1]
+    assert (recorded["pool"]["dropped_tokens"], recorded["token_range"]) == (0, FAKE_TOKEN_RANGE)
+
+
+def test_a_run_with_seeded_ids_does_not_read_the_number_of_ids_the_model_counts(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        # FAKE: a model config whose size cannot be read. Only a text run holds the ids of a text against it.
+        world.raises["model_vocabulary_size"] = TypeError("FAKE: model_config.vocab_size is None, not an int")
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    _assert_accepted(launch)
+    assert "vocabulary" in launch.world.events and "model_vocabulary_size" not in launch.world.events
+
+
+def test_a_signal_while_the_texts_are_encoded_is_recorded_as_a_stop(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.hooks["encode_texts"] = lambda: _deliver(signal.SIGTERM)
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    _assert_failed_before_the_grid(launch, 65, "stopped: signal SIGTERM")
+    assert launch.world.events[-4:] == ["encode_texts", "shutdown", "write", "sleep"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Models with expert layers: the expert-parallel layout
+# ---------------------------------------------------------------------------------------------------------------
+
+FAKE_EXPERTS = {"num_experts": 60, "num_experts_per_tok": 4, "moe_intermediate_size": 1408}
+
+
+@pytest.mark.parametrize(
+    ("ep_size", "tp_size", "experts"),
+    [(1, 1, {}), (1, 4, {}), (1, 1, FAKE_EXPERTS), (1, 2, FAKE_EXPERTS), (2, 2, FAKE_EXPERTS), (8, 8, FAKE_EXPERTS)],
+)
+def test_an_expert_parallel_size_of_one_or_of_the_tp_size_passes(ep_size, tp_size, experts):
+    view = _FakeView({**FAKE_RESOLVED_ARGUMENTS, "ep_size": ep_size, "tp_size": tp_size})
+    launcher._check_expert_parallel(view, experts)
+
+
+_EP_WITHOUT_EXPERTS = "expert parallelism needs a model with expert layers (ep_size={})"
+_EP_NOT_TP = "ep_size must be 1 or the TP size (ep_size={}, tp_size={})"
+
+
+@pytest.mark.parametrize(
+    ("ep_size", "tp_size", "experts", "refusal"),
+    [
+        # A model without expert layers has nothing the flag could spread.
+        (2, 2, {}, _EP_WITHOUT_EXPERTS.format(2)),
+        (4, 2, {}, _EP_WITHOUT_EXPERTS.format(4)),
+        (None, 1, {}, _EP_WITHOUT_EXPERTS.format("null")),
+        # A size between 1 and the TP size mixes two layouts, and a size above it is none.
+        (2, 4, FAKE_EXPERTS, _EP_NOT_TP.format(2, 4)),
+        (4, 2, FAKE_EXPERTS, _EP_NOT_TP.format(4, 2)),
+        (2, 1, FAKE_EXPERTS, _EP_NOT_TP.format(2, 1)),
+        (0, 2, FAKE_EXPERTS, _EP_NOT_TP.format(0, 2)),
+        # A value of another type is never taken for an allowed one.
+        (True, 2, FAKE_EXPERTS, _EP_NOT_TP.format("true", 2)),
+        (2.0, 2, FAKE_EXPERTS, _EP_NOT_TP.format(2.0, 2)),
+        ("2", 2, FAKE_EXPERTS, _EP_NOT_TP.format(2, 2)),
+        (None, 2, FAKE_EXPERTS, _EP_NOT_TP.format("null", 2)),
+        (2, "2", FAKE_EXPERTS, _EP_NOT_TP.format(2, 2)),
+    ],
+)
+def test_any_other_expert_parallel_size_is_refused(ep_size, tp_size, experts, refusal):
+    view = _FakeView({**FAKE_RESOLVED_ARGUMENTS, "ep_size": ep_size, "tp_size": tp_size})
+
+    with pytest.raises(launcher._Failed) as raised:
+        launcher._check_expert_parallel(view, experts)
+
+    assert raised.value.reason == f"rejected: {refusal}"
+
+
+@pytest.mark.parametrize(
+    ("experts", "resolved", "refusal"),
+    [
+        ({}, {"ep_size": 2, "tp_size": 2}, _EP_WITHOUT_EXPERTS.format(2)),
+        (FAKE_EXPERTS, {"ep_size": 2, "tp_size": 4}, _EP_NOT_TP.format(2, 4)),
+        (FAKE_EXPERTS, {"moe_a2a_backend": "deepep"}, f"{_A2A} (moe_a2a_backend=deepep)"),
+        (FAKE_EXPERTS, {"moe_dense_tp_size": 1}, "moe_dense_tp_size must not be set (got 1)"),
+        (
+            FAKE_EXPERTS,
+            {"ep_num_redundant_experts": 4},
+            "redundant experts are not supported (ep_num_redundant_experts=4)",
+        ),
+    ],
+)
+def test_a_layout_of_expert_layers_the_benchmark_does_not_cover_ends_the_launch(
+    tmp_path, monkeypatch, experts, resolved, refusal
+):
+    def prepare(world, _pod_dir):
+        world.experts = experts
+        world.resolved.update(resolved)
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", prepare=prepare, word=None)
+
+    on_disk = _assert_failed_before_the_grid(launch, 64, f"rejected: {refusal}")
+    assert "build_engine" not in launch.world.events
+    if launch.world.events[-3] == "model_expert_keys":
+        # Refused after the model config was read: the keys and the layout are in the artifact.
+        assert on_disk["producer"]["expert_keys"] == experts
+        assert (on_disk["producer"]["moe"] is None) is (not experts)
+
+
+@pytest.mark.parametrize(
+    ("word", "experts", "resolved", "source"),
+    [
+        # The model has expert layers and no word was given: a text run, refused for its layout.
+        (None, FAKE_EXPERTS, {"ep_size": 2, "tp_size": 4}, "dataset_text_chains"),
+        # Text was asked for by name, and the setup is refused before the model config is read.
+        ("sharegpt_chain", {}, {"stream_interval": 2}, "dataset_text_chains"),
+        ("sharegpt_chain", {}, {"ep_size": 2, "tp_size": 2}, "dataset_text_chains"),
+        # Seeded ids were asked for by name.
+        ("random", FAKE_EXPERTS, {}, "seeded_token_ids"),
+        ("random", {}, {"ep_size": 2, "tp_size": 2}, "seeded_token_ids"),
+    ],
+)
+def test_a_refused_run_names_the_source_it_was_started_for(tmp_path, monkeypatch, word, experts, resolved, source):
+    def prepare(world, _pod_dir):
+        world.experts = experts
+        world.resolved.update(resolved)
+
+    launch = _launch_text(tmp_path, monkeypatch, "decode", prepare=prepare, word=word)
+
+    assert launch.code == 64 and "build_engine" not in launch.world.events
+    on_disk = launch.artifact()
+    assert on_disk["status"] == "failed" and on_disk["error"].startswith("rejected: ")
+    assert on_disk["producer"]["content"] == {"source": source, "seed": "0", "token_range": None, "issued": None}
+
+
+def test_the_layout_of_the_expert_layers_is_recorded(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+        world.resolved.update({"ep_size": 2, "moe_runner_backend": "FAKE-runner"})
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare, word=None, tp_size=2)
+
+    producer = _assert_accepted(launch)["producer"]
+    assert producer["expert_keys"] == FAKE_EXPERTS
+    assert producer["moe"] == {
+        "ep_size": 2,
+        "moe_a2a_backend": "none",
+        "moe_runner_backend": "FAKE-runner",
+        "moe_dense_tp_size": None,
+        "enable_eplb": False,
+    }
+    # Expert parallelism does not change the number of scheduler processes: one for each TP rank.
+    assert (producer["tp_size"], producer["scheduler_processes"]) == (2, 2)
+
+
+def test_the_recorded_fields_of_the_expert_layers_must_exist_for_a_model_that_has_them(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+        del world.resolved["moe_runner_backend"]
+
+    launch = _launch_text(tmp_path, monkeypatch, "prefill", prepare=prepare, word=None)
+
+    reason = (
+        "internal_error: AttributeError: SGLang's resolved arguments have no field 'moe_runner_backend'; the "
+        "start-up check that reads it cannot run"
+    )
+    _assert_failed_before_the_grid(launch, 70, reason)
+    assert "build_engine" not in launch.world.events
+
+
+def test_a_model_without_expert_layers_does_not_need_the_recorded_fields_of_the_expert_layers(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        del world.resolved["moe_runner_backend"]
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare)
+
+    producer = _assert_accepted(launch)["producer"]
+    assert (producer["expert_keys"], producer["moe"]) == ({}, None)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_end_to_end_a_model_with_expert_layers_and_expert_parallelism_passes_the_validator_and_the_gate(
+    tmp_path, monkeypatch, capsys, mode
+):
+    # The cell AISim plans for this layout: two GPUs, tensor and expert parallel, one expert group for each.
+    cell = _tep_cell(mode)
+    pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+
+    # No content word: the expert keys of the FAKE model config make this a text run.
+    launch = _launch_text(
+        tmp_path,
+        monkeypatch,
+        mode,
+        word=None,
+        tp_size=2,
+        flags=["--ep-size", "2"],
+        prepare=prepare,
+        pod=(cell, pod_dir),
+        real_compat=True,
+    )
+
+    _assert_no_module_of_the_benchmark_is_replaced()
+    assert (launch.cell.parallel_strategy, launch.cell.topology.moe_ep, launch.cell.topology.tp) == ("tep", 2, 2)
+    on_disk = _assert_accepted(launch)
+    world = launch.world
+    # ``--ep-size 2`` and ``--tp-size 2`` reached the FAKE parser as they were typed.
+    assert world.sglang_argv == ["--ep-size", "2", *_fake_sglang_argv(1, 2), STREAMING_FLAG]
+    assert world.entry_calls == [(0, 0, 0, None), (1, 1, 0, None)]
+
+    producer = on_disk["producer"]
+    assert set(producer) == {*LAUNCHER_PRODUCER_KEYS, *DRIVER_PRODUCER_KEYS, "name", "artifact_format"}
+    assert producer["expert_keys"] == FAKE_EXPERTS
+    assert producer["moe"] == {
+        "ep_size": 2,
+        "moe_a2a_backend": "none",
+        "moe_runner_backend": "auto",
+        "moe_dense_tp_size": None,
+        "enable_eplb": False,
+    }
+    assert (producer["tp_size"], producer["scheduler_processes"]) == (2, 2)
+    kept = _fake_kept_texts(_fake_dataset_records())
+    assert producer["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": FAKE_TOKEN_RANGE,
+        "issued": producer["content"]["issued"],
+        "dataset": launch.dataset,
+        "pool": _fake_pool_counts(kept),
+    }
+    dataset_keys = ("path", "sha256", "collection_pool", "conversations")
+    if mode == "decode":
+        # The block the validator demands of a decode cell with expert parallelism, with the dataset in it.
+        assert on_disk["kvwarm"] == {
+            "enabled": True,
+            "warm_eligible": True,
+            "skip_reason": None,
+            "method": "radix_cache_seed",
+            "dataset": {key: launch.dataset[key] for key in dataset_keys},
+        }
+        merged = json.loads(launch.merged_path.read_text(encoding="utf-8"))
+        assert merged["kvwarm"] == on_disk["kvwarm"]
+        collection = _validate(launch.cell, launch.root)
+        assert {measurement.kv_seed_regime for measurement in collection.points} == {"real_kv"}
+    else:
+        assert "kvwarm" not in on_disk
+
+    # What the launcher asked of the FAKE sglang package, in order: the model config before the engine, the
+    # tokenizer after it, one batch call for the texts of the FAKE dataset.
+    assert world.events == [
+        "clock",
+        "load_plugins",
+        "prepare_server_args",
+        "resolve_once",
+        "get_platform",
+        "from_server_args",
+        "Engine",
+        "tokenizer",
+        "Engine.shutdown",
+        "sleep",
+    ]
+    assert world.tokenizer_batches == [kept]
+    # Every request went out as token ids, as in a run with seeded ids: no text reaches the engine.
+    assert all(request["prompt"] is None and request["more"] == {} for request in world.engine_requests)
+    text_ids = {_FakeTokenizer.fake_id(word) for text in kept for word in text.split()}
+    _assert_free_calls_are_text(world, text_ids)
+    lines = _stderr_lines(capsys)
+    assert lines[-1] == f"[sglbench] complete: wrote {launch.rank_path}, {launch.merged_path}"
+    (pool_line,) = [line for line in lines if line.startswith("[sglbench] the text pool holds ")]
+    assert f"texts went through {__name__}._FakeTokenizer in " in pool_line
+
+
+def test_end_to_end_seeded_ids_with_a_model_that_has_expert_layers_are_refused(tmp_path, monkeypatch):
+    def prepare(world, _pod_dir):
+        world.experts = FAKE_EXPERTS
+
+    launch = _launch(tmp_path, monkeypatch, "prefill", prepare=prepare, env={ENV_CONTENT: "random"}, real_compat=True)
+
+    _assert_failed_before_the_grid(launch, 64, f"rejected: {_SEEDED_WITH_EXPERTS.format('num_experts=60')}")
+    assert launch.world.events[-2:] == ["from_server_args", "sleep"]
+
+
+_HOST_WANTS_TEXT = (
+    "native SGLang rank artifact of a MoE plan did not send dataset text: "
+    "expected producer.content.source 'dataset_text_chains', found 'seeded_token_ids': "
+)
+_HOST_WANTS_THE_LAYOUT = (
+    "native SGLang rank artifact of a MoE plan did not run the layout of its cell: "
+    "expected producer.tp_size {} and producer.moe.ep_size {}, found {} and {}: "
+)
+# name: (GPUs of the cell, the size flags that reach the pod, the expert keys the pod finds, the content word,
+# what the host says when it holds the result against the cell of a MoE plan; None when it accepts)
+_RUNS_OF_A_MOE_CELL = {
+    "tep": (2, ["--ep-size", "2"], FAKE_EXPERTS, None, None),
+    "one-gpu": (1, [], FAKE_EXPERTS, None, None),
+    "one-gpu-with-the-text-word": (1, [], FAKE_EXPERTS, "sharegpt_chain", None),
+    # The command reached the pod without --ep-size, and the launcher takes an expert-parallel size of 1.
+    "tep-without-ep-size": (2, [], FAKE_EXPERTS, None, _HOST_WANTS_THE_LAYOUT.format(2, 2, 2, 1)),
+    # The pod found no expert layers in the model config.
+    "no-experts-found": (1, [], {}, None, _HOST_WANTS_TEXT),
+    "no-experts-found-with-the-seeded-word": (1, [], {}, "random", _HOST_WANTS_TEXT),
+    "no-experts-found-with-the-text-word": (1, [], {}, "sharegpt_chain", _HOST_WANTS_THE_LAYOUT.format(1, 1, 1, None)),
+}
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize("name", list(_RUNS_OF_A_MOE_CELL))
+def test_end_to_end_the_host_holds_what_the_launcher_recorded_against_the_cell_of_a_moe_plan(
+    tmp_path, monkeypatch, mode, name
+):
+    gpus, size_flags, experts, word, refusal = _RUNS_OF_A_MOE_CELL[name]
+    # The cells AISim plans for a model with expert layers: the one-GPU cell and the TEP cell.
+    cell = _tep_cell(mode, gpus) if gpus > 1 else _cell(phase=mode, dp=1, strategy="single")
+    assert (cell.topology.tp, cell.topology.moe_ep) == (gpus, gpus)
+    pod_dir = _pod(tmp_path, cell, sglang_version=FAKE_SGLANG_VERSION)
+
+    def prepare(world, _pod_dir):
+        world.experts = experts
+
+    launch = _launch_text(
+        tmp_path,
+        monkeypatch,
+        mode,
+        word=word,
+        tp_size=gpus,
+        flags=size_flags,
+        prepare=prepare,
+        pod=(cell, pod_dir),
+        real_compat=True,
+    )
+
+    # Each run is complete: the launcher, the gate and the validator without the plan's answer accept it.
+    _assert_no_module_of_the_benchmark_is_replaced()
+    _assert_accepted(launch)
+
+    def held_against_the_cell():
+        """The validator as the host calls it for a cell of an SGLang plan whose model has expert layers."""
+        return validate_native_collection(
+            cell,
+            launch.root / "raw",
+            expected_plan_sha256="plan-sha",
+            expected_attempt_id="attempt",
+            expected_backend="sglang",
+            expected_moe=True,
+        )
+
+    if refusal is None:
+        assert len(held_against_the_cell().points) == len(launch.planned().points)
+    else:
+        with pytest.raises(ValueError) as refused:
+            held_against_the_cell()
+        assert str(refused.value) == refusal + str(launch.rank_path)
+
+
+def test_the_constants_of_a_text_run():
+    assert (launcher.POOL_TOKEN_TARGET, launcher.POOL_ENCODE_BATCH) == (8_000_000, 256)
+    assert launcher.DATASET_DOWNLOAD_TIMEOUT_SECONDS == 60
+    assert launcher._MOE_RECORDED_FIELDS == (
+        "ep_size",
+        "moe_a2a_backend",
+        "moe_runner_backend",
+        "moe_dense_tp_size",
+        "enable_eplb",
+    )
+    # The sources the launcher names to the driver are the content module's.
+    assert (content.CONTENT_SEEDED_IDS, content.CONTENT_TEXT_CHAINS) == ("seeded_token_ids", "dataset_text_chains")
+    # The pool is not refused or wrapped when a variable of Dynamo's flat pool is set: that variable is refused.
+    assert "DYN_BENCH_POOL_TAG" in launcher._REFUSED_VARIABLES

@@ -113,6 +113,29 @@ ALWAYS_WRITTEN_KEYS = {
 # The kvwarm block of a decode or agg artifact, typed here independently of the module.
 EXPECTED_KVWARM = {"enabled": True, "warm_eligible": True, "skip_reason": None, "method": "radix_cache_seed"}
 
+# A FAKE record of the dataset whose text the prompts of a run were made of, as a caller hands it over: no such
+# file exists and nothing was hashed. The keys are those of the record Dynamo's vLLM self-benchmark writes into
+# its kvwarm block (instrumented_scheduler.py at the revision in the header of this file, _kvwarm_load_texts).
+FAKE_KVWARM_DATASET = {
+    "path": "/fake-cache/fpm_datasets/fake_dataset.json",
+    "sha256": "0123456789abcdef" * 4,
+    "collection_pool": "conversation_sha256_even",
+    "conversations": 1234,
+}
+# The kvwarm block of a decode or agg artifact of such a run, typed here independently of the module.
+EXPECTED_KVWARM_WITH_DATASET = {
+    "enabled": True,
+    "warm_eligible": True,
+    "skip_reason": None,
+    "method": "radix_cache_seed",
+    "dataset": {
+        "path": "/fake-cache/fpm_datasets/fake_dataset.json",
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "collection_pool": "conversation_sha256_even",
+        "conversations": 1234,
+    },
+}
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # Helpers
@@ -281,7 +304,10 @@ def _pod(root: Path, cell, *, sglang_version: str = POD_SGLANG_VERSION) -> Path:
 
 
 def _validate(cell, root: Path):
-    """The validator as the host calls it for a cell of an SGLang plan."""
+    """The validator as the host calls it for a cell of an SGLang plan of a model without expert layers.
+
+    For the plan of a MoE model the host also passes ``expected_moe=True`` (test_fpm_sglang_moe.py).
+    """
     return validate_native_collection(
         cell, root / "raw", expected_plan_sha256="plan-sha", expected_attempt_id="attempt", expected_backend="sglang"
     )
@@ -451,6 +477,200 @@ def test_prefill_artifact_has_no_kvwarm_block_and_agg_has_one():
         {**point, "benchmark_id": point["benchmark_id"] + 4} for point in _decode_points()
     ]
     assert "kvwarm" in _rank_artifacts("agg", agg_points)[0]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The dataset record of a run whose prompts were dataset text
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _agg_points() -> list[dict]:
+    return _prefill_points() + [{**point, "benchmark_id": point["benchmark_id"] + 4} for point in _decode_points()]
+
+
+# name -> (mode, points of the grid, keyword arguments that end the run, status)
+DATASET_RUNS = {
+    "decode-complete": ("decode", _decode_points, {}, "complete"),
+    "agg-complete": ("agg", _agg_points, {}, "complete"),
+    "decode-partial": ("decode", _decode_points, {"completed": 1, "stop_reason": "timeout"}, "partial"),
+    "decode-failed": (
+        "decode",
+        _decode_points,
+        {"completed": 1, "failure": {"point": None, "reason": "fake reason"}},
+        "failed",
+    ),
+    "agg-missing-phase": ("agg", _prefill_points, {"missing_phases": ("decode",)}, "failed"),
+}
+
+
+@pytest.mark.parametrize("dp", [1, 2])
+@pytest.mark.parametrize("name", sorted(DATASET_RUNS))
+def test_the_kvwarm_block_carries_the_dataset_record_it_is_given_and_nothing_else_changes(name, dp):
+    mode, points, ending, status = DATASET_RUNS[name]
+    # The caller's dict, with its keys in another order than the artifact writes them.
+    given = {key: FAKE_KVWARM_DATASET[key] for key in ("conversations", "collection_pool", "sha256", "path")}
+
+    plain = _rank_artifacts(mode, points(), dp=dp, **ending)
+    with_none = _rank_artifacts(mode, points(), dp=dp, kvwarm_dataset=None, **ending)
+    with_record = _rank_artifacts(mode, points(), dp=dp, kvwarm_dataset=given, **ending)
+
+    for rank in range(dp):
+        assert plain[rank]["status"] == status
+        # Without a record the artifact is the one that is built without the argument, to the byte.
+        assert plain[rank]["kvwarm"] == EXPECTED_KVWARM
+        assert json.dumps(with_none[rank]) == json.dumps(plain[rank])
+        # With one, the block gains the key "dataset" and the artifact differs in nothing else.
+        block = with_record[rank]["kvwarm"]
+        assert block == EXPECTED_KVWARM_WITH_DATASET
+        assert json.dumps({**with_record[rank], "kvwarm": EXPECTED_KVWARM}) == json.dumps(plain[rank])
+        # The keys are written in one order, whatever the order of the caller's dict.
+        assert list(block) == ["enabled", "warm_eligible", "skip_reason", "method", "dataset"]
+        assert list(block["dataset"]) == ["path", "sha256", "collection_pool", "conversations"]
+        assert type(block["dataset"]["conversations"]) is int
+    # The artifact holds a copy of the record, and each rank a block of its own.
+    given.update(path="/fake-cache/edited.json", fake_note="added after the build")
+    assert [payload["kvwarm"] for payload in with_record] == [EXPECTED_KVWARM_WITH_DATASET] * dp
+    with_record[0]["kvwarm"]["dataset"]["conversations"] = 1
+    assert all(payload["kvwarm"] == EXPECTED_KVWARM_WITH_DATASET for payload in with_record[1:])
+
+
+@pytest.mark.parametrize("dp", [1, 2])
+@pytest.mark.parametrize("strategy", ["single", "tp", "tep"])
+def test_a_decode_artifact_with_a_dataset_record_passes_both_checkers_and_is_published_as_before(
+    tmp_path, strategy, dp
+):
+    # "tep" is the strategy of a cell with expert parallelism: for it the validator needs the kvwarm block.
+    cell = _cell(phase="decode", dp=dp, strategy=strategy)
+    points = _decode_points()
+    rows = {}
+    for label, dataset in (("ids", None), ("text", FAKE_KVWARM_DATASET)):
+        root = tmp_path / label
+        pod = _pod(root, cell)
+        payloads = _rank_artifacts("decode", points, dp=dp, kvwarm_dataset=dataset)
+        written = artifact.write_artifacts(str(pod / "benchmark.json"), payloads)
+        expected_block = EXPECTED_KVWARM if dataset is None else EXPECTED_KVWARM_WITH_DATASET
+
+        # Every rank file and the merged file carry the block.
+        for path in (*written["rank_files"], written["merged_output_path"]):
+            assert json.loads(Path(path).read_text(encoding="utf-8"))["kvwarm"] == expected_block
+        # The validator reads three keys of the block and hands the whole of it on, the record included.
+        collection = _validate(cell, root)
+        assert collection.kvwarm_meta == expected_block
+        assert [measurement.point for measurement in collection.points] == points
+        assert [measurement.kv_seed_regime for measurement in collection.points] == EXPECTED_REGIMES["decode"]
+        gate = _gate(written["rank_files"], "decode")
+        assert gate.returncode == GATE_ACCEPT, gate.stderr
+        rows[label] = aggregate_cell(_sglang_plan(cell), cell, root, expected_attempt_id="attempt")
+
+    # Publication does not read the record: the rows are those of the run without one.
+    assert rows["text"] == rows["ids"]
+    assert [row["kv_seed_regime"] for row in rows["text"]] == ["real_kv"] * len(points)
+    assert {row["parallel_strategy"] for row in rows["text"]} == {strategy}
+
+
+def test_an_agg_artifact_with_a_dataset_record_passes_the_gate_in_agg_mode(tmp_path):
+    payloads = _rank_artifacts("agg", _agg_points(), dp=2, kvwarm_dataset=FAKE_KVWARM_DATASET)
+    written = artifact.write_artifacts(str(tmp_path / "benchmark.json"), payloads)
+    assert _gate(written["rank_files"], "agg").returncode == GATE_ACCEPT
+    merged = json.loads(Path(written["merged_output_path"]).read_text(encoding="utf-8"))
+    assert merged["kvwarm"] == EXPECTED_KVWARM_WITH_DATASET
+
+
+def _dataset(**changes) -> dict:
+    return {**FAKE_KVWARM_DATASET, **changes}
+
+
+def _dataset_without(key: str) -> dict:
+    return {name: value for name, value in FAKE_KVWARM_DATASET.items() if name != key}
+
+
+NOT_A_SHA256 = r"\['sha256'\] must be the 64 lower-case hexadecimal digits of a SHA-256, got "
+EXACT_KEYS = r" must have exactly the keys \['path', 'sha256', 'collection_pool', 'conversations'\], got "
+
+# name -> (what is given as the record, exception, the message after the place of the record)
+BAD_KVWARM_DATASETS = {
+    "a-list-of-pairs": (list(FAKE_KVWARM_DATASET.items()), TypeError, r" must be a dict, got list$"),
+    "a-path": ("/fake-cache/fpm_datasets/fake_dataset.json", TypeError, r" must be a dict, got str$"),
+    "true": (True, TypeError, r" must be a dict, got bool$"),
+    "no-keys": ({}, ValueError, EXACT_KEYS + r"\[\]$"),
+    "path-missing": (
+        _dataset_without("path"),
+        ValueError,
+        EXACT_KEYS + r"\['collection_pool', 'conversations', 'sha256'\]$",
+    ),
+    "sha256-missing": (_dataset_without("sha256"), ValueError, EXACT_KEYS),
+    "collection-pool-missing": (_dataset_without("collection_pool"), ValueError, EXACT_KEYS),
+    "conversations-missing": (_dataset_without("conversations"), ValueError, EXACT_KEYS),
+    # A fifth key, as the launcher's own record of the dataset has: the artifact takes Dynamo's four only.
+    "a-fifth-key": (_dataset(url="https://example.invalid/fake_dataset.json"), ValueError, EXACT_KEYS),
+    "a-key-that-is-not-a-str": ({**FAKE_KVWARM_DATASET, 1: "x"}, ValueError, EXACT_KEYS),
+    "path-empty": (_dataset(path=""), ValueError, r"\['path'\] must not be empty$"),
+    "path-none": (_dataset(path=None), TypeError, r"\['path'\] must be a str, got None$"),
+    "path-bytes": (_dataset(path=b"/fake-cache/fake.json"), TypeError, r"\['path'\] must be a str, got b'"),
+    "sha256-none": (_dataset(sha256=None), TypeError, r"\['sha256'\] must be a str, got None$"),
+    "sha256-an-int": (_dataset(sha256=0x1234), TypeError, r"\['sha256'\] must be a str, got 4660$"),
+    "sha256-bytes": (_dataset(sha256=b"0123456789abcdef" * 4), TypeError, r"\['sha256'\] must be a str, got b'"),
+    "sha256-empty": (_dataset(sha256=""), ValueError, NOT_A_SHA256 + r"''$"),
+    "sha256-one-digit-short": (_dataset(sha256="0123456789abcdef" * 3 + "0123456789abcde"), ValueError, NOT_A_SHA256),
+    "sha256-one-digit-long": (_dataset(sha256="0123456789abcdef" * 4 + "0"), ValueError, NOT_A_SHA256),
+    "sha256-upper-case": (_dataset(sha256="0123456789ABCDEF" * 4), ValueError, NOT_A_SHA256),
+    "sha256-not-hexadecimal": (_dataset(sha256="g" * 64), ValueError, NOT_A_SHA256),
+    "sha256-with-a-prefix": (_dataset(sha256="sha256:" + "0" * 57), ValueError, NOT_A_SHA256),
+    "sha256-ends-with-a-newline": (_dataset(sha256="0" * 63 + "\n"), ValueError, NOT_A_SHA256),
+    "collection-pool-empty": (_dataset(collection_pool=""), ValueError, r"\['collection_pool'\] must not be empty$"),
+    "collection-pool-a-list": (
+        _dataset(collection_pool=["conversation_sha256_even"]),
+        TypeError,
+        r"\['collection_pool'\] must be a str, got \['conversation_sha256_even'\]$",
+    ),
+    "conversations-zero": (_dataset(conversations=0), ValueError, r"\['conversations'\] must be >= 1, got 0$"),
+    "conversations-negative": (_dataset(conversations=-1), ValueError, r"\['conversations'\] must be >= 1, got -1$"),
+    "conversations-a-bool": (_dataset(conversations=True), TypeError, r"\['conversations'\] must be an int, got True$"),
+    "conversations-a-float": (
+        _dataset(conversations=1234.0),
+        TypeError,
+        r"\['conversations'\] must be an int, got 1234\.0$",
+    ),
+    "conversations-a-str": (
+        _dataset(conversations="1234"),
+        TypeError,
+        r"\['conversations'\] must be an int, got '1234'$",
+    ),
+    "conversations-none": (_dataset(conversations=None), TypeError, r"\['conversations'\] must be an int, got None$"),
+}
+
+
+@pytest.mark.parametrize("mode", ["decode", "agg"])
+@pytest.mark.parametrize("name", sorted(BAD_KVWARM_DATASETS))
+def test_a_bad_dataset_record_is_refused_when_the_artifact_is_built(name, mode):
+    record, error, message = BAD_KVWARM_DATASETS[name]
+    kwargs = _build_kwargs(mode, _decode_points() if mode == "decode" else _agg_points())
+    # The baseline is sound, with the record and without it.
+    for sound in (None, dict(FAKE_KVWARM_DATASET)):
+        assert artifact.build_rank_artifact(**kwargs, kvwarm_dataset=sound)["status"] == "complete"
+    with pytest.raises(error, match=rf"^kvwarm_dataset{message}"):
+        artifact.build_rank_artifact(**kwargs, kvwarm_dataset=record)
+
+
+def test_a_prefill_artifact_refuses_a_dataset_record():
+    points = _prefill_points()
+    message = r"^kvwarm_dataset was given for a prefill artifact, which has no kvwarm block$"
+    endings = (
+        {},
+        {"completed": 1, "stop_reason": "timeout"},
+        {"completed": 1, "failure": {"point": None, "reason": "fake reason"}},
+    )
+    for ending in endings:
+        completed = ending.get("completed")
+        kwargs = {**_build_kwargs("prefill", points, completed=completed), **ending}
+        kwargs.pop("completed", None)
+        # A prefill artifact has no kvwarm block to put the record into, whatever the status of the run ...
+        for record in (dict(FAKE_KVWARM_DATASET), {}, "fake_dataset.json"):
+            with pytest.raises(ValueError, match=message):
+                artifact.build_rank_artifact(**kwargs, kvwarm_dataset=record)
+        # ... and it is built as before when none is given.
+        assert "kvwarm" not in artifact.build_rank_artifact(**kwargs, kvwarm_dataset=None)
+        assert artifact.build_rank_artifact(**kwargs, kvwarm_dataset=None) == artifact.build_rank_artifact(**kwargs)
 
 
 def test_prefill_rows_carry_prefill_counters():
@@ -2020,6 +2240,15 @@ MERGE_BUGS = {
         r"disagree on iteration_groups",
     ),
     "fewer-rows": (lambda ranks: ranks[1]["results"].pop(), r"disagree on result points"),
+    # The kvwarm block is one per run: a rank without it, and a rank that alone names a dataset.
+    "kvwarm-block-in-one-rank-only": (
+        lambda ranks: ranks[1].pop("kvwarm"),
+        r"^ranks disagree on kvwarm: rank 1 differs from rank 0$",
+    ),
+    "dataset-record-in-one-rank-only": (
+        lambda ranks: ranks[0]["kvwarm"].update(dataset=dict(FAKE_KVWARM_DATASET)),
+        r"^ranks disagree on kvwarm: rank 1 differs from rank 0$",
+    ),
     "row-with-another-ranks-fpm": (
         lambda ranks: ranks[1]["results"][0]["fpms"][0].update(dp_rank=0),
         r"a result row holds the fpm of rank 0",
@@ -2410,6 +2639,179 @@ def test_an_extra_key_in_the_kvwarm_block_is_refused_although_no_checker_rejects
         artifact.write_artifacts(str(refused / "benchmark.json"), [payload])
     with pytest.raises(ValueError, match=message):
         artifact.build_merged_artifact([payload], ["/results/benchmark.json"])
+    assert list(refused.iterdir()) == []
+
+
+NOT_THE_BUILDERS_BLOCK = r"kvwarm must be .*, alone or with a 'dataset' record, in a complete 'decode' artifact, got "
+
+# name -> (one edit of the kvwarm block of a complete decode rank artifact that names a dataset, the refusal)
+DATASET_RECORD_EDITS = {
+    "record-none": (lambda block: block.update(dataset=None), r"kvwarm\.dataset must be a dict, got NoneType$"),
+    "record-a-list": (
+        lambda block: block.update(dataset=list(block["dataset"].items())),
+        r"kvwarm\.dataset must be a dict, got list$",
+    ),
+    "record-emptied": (
+        lambda block: block["dataset"].clear(),
+        r"kvwarm\.dataset must have exactly the keys .* got \[\]$",
+    ),
+    "path-removed": (
+        lambda block: block["dataset"].pop("path"),
+        r"kvwarm\.dataset must have exactly the keys .* got \['collection_pool', 'conversations', 'sha256'\]$",
+    ),
+    "a-fifth-key-in-the-record": (
+        lambda block: block["dataset"].update(url="https://example.invalid/fake_dataset.json"),
+        r"kvwarm\.dataset must have exactly the keys ",
+    ),
+    "path-emptied": (lambda block: block["dataset"].update(path=""), r"kvwarm\.dataset\['path'\] must not be empty$"),
+    "sha256-upper-case": (
+        lambda block: block["dataset"].update(sha256=block["dataset"]["sha256"].upper()),
+        r"kvwarm\.dataset\['sha256'\] must be the 64 lower-case hexadecimal digits of a SHA-256, got '0123456789ABCDEF",
+    ),
+    "sha256-cut": (
+        lambda block: block["dataset"].update(sha256=block["dataset"]["sha256"][:40]),
+        r"kvwarm\.dataset\['sha256'\] must be the 64 lower-case hexadecimal digits of a SHA-256, got ",
+    ),
+    "collection-pool-none": (
+        lambda block: block["dataset"].update(collection_pool=None),
+        r"kvwarm\.dataset\['collection_pool'\] must be a str, got None$",
+    ),
+    "conversations-zero": (
+        lambda block: block["dataset"].update(conversations=0),
+        r"kvwarm\.dataset\['conversations'\] must be >= 1, got 0$",
+    ),
+    # 1234.0 == 1234 and True == 1: the record still compares equal to a sound one, its type is wrong.
+    "conversations-a-float": (
+        lambda block: block["dataset"].update(conversations=1234.0),
+        r"kvwarm\.dataset\['conversations'\] must be an int, got 1234\.0$",
+    ),
+    "conversations-a-bool": (
+        lambda block: block["dataset"].update(conversations=True),
+        r"kvwarm\.dataset\['conversations'\] must be an int, got True$",
+    ),
+    # A sound record does not open the block to other keys.
+    "another-key-beside-the-record": (
+        lambda block: block.update(fake_note="added after the build"),
+        NOT_THE_BUILDERS_BLOCK + r".*'fake_note': 'added after the build'",
+    ),
+    "the-record-under-another-key": (
+        lambda block: block.update(datasets=block.pop("dataset")),
+        NOT_THE_BUILDERS_BLOCK + r".*'datasets': ",
+    ),
+}
+
+
+@pytest.mark.parametrize("dp", [1, 2])
+@pytest.mark.parametrize("name", sorted(DATASET_RECORD_EDITS))
+def test_a_dataset_record_edited_after_the_build_is_refused_although_no_checker_rejects_it(tmp_path, name, dp):
+    """Neither checker has a rule for the record, so only the module keeps a ``complete`` artifact to its form."""
+    edit, refusal = DATASET_RECORD_EDITS[name]
+    cell = _cell(phase="decode", dp=dp, strategy="tep")
+    points = _decode_points()
+    # The same edit in every rank file, so that the ranks still agree with each other.
+    payloads = _rank_artifacts("decode", points, dp=dp, kvwarm_dataset=FAKE_KVWARM_DATASET)
+    for payload in payloads:
+        edit(payload["kvwarm"])
+        assert payload["status"] == "complete"
+
+    # Put on disk as they are, the rank files pass the validator, which hands the edited block on, and the
+    # gate finds no fault in them (there is no merged file here, so the gate says "pending").
+    pod = _pod(tmp_path, cell)
+    rank_paths = [artifact.rank_output_path(str(pod / "benchmark.json"), rank) for rank in range(dp)]
+    for path, payload in zip(rank_paths, payloads, strict=True):
+        artifact.atomic_write_json(path, payload)
+    collection = _validate(cell, tmp_path)
+    assert collection.kvwarm_meta == json.loads(json.dumps(payloads[0]["kvwarm"]))
+    assert len(collection.points) == len(points)
+    assert _gate(rank_paths, "decode").returncode == GATE_MERGED_PENDING
+
+    # The module refuses them, naming the rank and the field, and writes nothing.
+    refused = tmp_path / "refused"
+    refused.mkdir()
+    message = rf"^rank 0: {refusal}"
+    with pytest.raises(ValueError, match=message):
+        artifact.write_artifacts(str(refused / "benchmark.json"), payloads)
+    with pytest.raises(ValueError, match=message):
+        artifact.build_merged_artifact(payloads, [f"/results/benchmark_dp{rank}.json" for rank in range(dp)])
+    assert list(refused.iterdir()) == []
+
+
+# name -> one edit of the four fixed keys of a kvwarm block that names a dataset
+FIXED_KEY_EDITS = {
+    "method-removed": lambda block: block.pop("method"),
+    "method-changed": lambda block: block.update(method="fake_method"),
+    "not-eligible": lambda block: block.update(warm_eligible=False, skip_reason="dataset_unavailable"),
+    # 1 == True, so the fixed keys still compare equal to the builder's; the validator wants a real boolean.
+    "enabled-is-an-int": lambda block: block.update(enabled=1),
+}
+
+
+@pytest.mark.parametrize("name", sorted(FIXED_KEY_EDITS))
+def test_the_fixed_keys_of_a_kvwarm_block_are_held_to_the_builders_values_beside_a_dataset_record(tmp_path, name):
+    payloads = _rank_artifacts("decode", _decode_points(), dp=2, kvwarm_dataset=FAKE_KVWARM_DATASET)
+    assert artifact.build_merged_artifact(payloads, ["/results/b.json", "/results/b_dp1.json"])["kvwarm"] == (
+        EXPECTED_KVWARM_WITH_DATASET
+    )
+    for payload in payloads:
+        FIXED_KEY_EDITS[name](payload["kvwarm"])
+    with pytest.raises(ValueError, match=rf"^rank 0: {NOT_THE_BUILDERS_BLOCK}.*'dataset': "):
+        artifact.write_artifacts(str(tmp_path / "benchmark.json"), payloads)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_complete_artifact_may_carry_either_form_of_the_block_but_every_rank_the_same(tmp_path):
+    # The check knows the two forms the builder writes, not which of them the run was built with: a sound
+    # record that is put into every rank file after the build, or taken out of every one, leaves a block
+    # of the other form.
+    paths = ["/results/benchmark.json", "/results/benchmark_dp1.json"]
+    added = _rank_artifacts("decode", _decode_points(), dp=2)
+    for payload in added:
+        payload["kvwarm"]["dataset"] = dict(FAKE_KVWARM_DATASET)
+    assert artifact.build_merged_artifact(added, paths)["kvwarm"] == EXPECTED_KVWARM_WITH_DATASET
+    removed = _rank_artifacts("decode", _decode_points(), dp=2, kvwarm_dataset=FAKE_KVWARM_DATASET)
+    for payload in removed:
+        del payload["kvwarm"]["dataset"]
+    assert artifact.build_merged_artifact(removed, paths)["kvwarm"] == EXPECTED_KVWARM
+
+    # In one rank file only, it is two blocks for one run.
+    del added[1]["kvwarm"]["dataset"]
+    with pytest.raises(ValueError, match=r"^ranks disagree on kvwarm: rank 1 differs from rank 0$"):
+        artifact.build_merged_artifact(added, paths)
+    with pytest.raises(ValueError, match=r"^ranks disagree on kvwarm: rank 1 differs from rank 0$"):
+        artifact.write_artifacts(str(tmp_path / "benchmark.json"), added)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("status", ["complete", "partial", "failed"])
+def test_ranks_that_name_different_datasets_are_refused_whatever_the_status_of_the_run(tmp_path, status):
+    points = _decode_points()
+    ending = {
+        "complete": {},
+        "partial": {"completed": 1, "stop_reason": "timeout"},
+        "failed": {"completed": 1, "failure": {"point": points[1], "reason": "fake reason"}},
+    }[status]
+    cell = _cell(phase="decode", dp=3, strategy="tep")
+    ranks = _rank_artifacts("decode", points, dp=3, kvwarm_dataset=FAKE_KVWARM_DATASET, **ending)
+    # Rank 2 was built with the record of another file: a sound record, and not the one of ranks 0 and 1.
+    other = _rank_artifacts("decode", points, dp=3, kvwarm_dataset=_dataset(sha256="f" * 64), **ending)
+    ranks[2] = other[2]
+    assert [payload["status"] for payload in ranks] == [status] * 3
+
+    if status == "complete":
+        # The validator compares three of the fixed keys across ranks, so it accepts these files and hands on
+        # the block of the first one.
+        pod = _pod(tmp_path / "forced", cell)
+        for rank, payload in enumerate(ranks):
+            artifact.atomic_write_json(artifact.rank_output_path(str(pod / "benchmark.json"), rank), payload)
+        assert _validate(cell, tmp_path / "forced").kvwarm_meta == EXPECTED_KVWARM_WITH_DATASET
+
+    refused = tmp_path / "refused"
+    refused.mkdir()
+    message = r"^ranks disagree on kvwarm: rank 2 differs from rank 0$"
+    with pytest.raises(ValueError, match=message):
+        artifact.write_artifacts(str(refused / "benchmark.json"), ranks)
+    with pytest.raises(ValueError, match=message):
+        artifact.build_merged_artifact(ranks, [f"/results/benchmark_dp{rank}.json" for rank in range(3)])
     assert list(refused.iterdir()) == []
 
 

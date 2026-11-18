@@ -11,7 +11,12 @@
 This module is the only place where the launcher's process calls SGLang. It parses and resolves SGLang's
 server arguments, builds the in-process engine with another scheduler entry, sends one batch of prompts and
 returns what each request reported, and reads the vocabulary, the child processes and the model's expert
-keys. It decides nothing about the run: it rejects no setup, plans no point and reads no log.
+keys. It also turns texts into token ids with the served tokenizer and names the class of that tokenizer. It
+decides nothing about the run: it rejects no setup, plans no point and reads no log.
+
+Public functions: ``sglang_version``, ``load_plugins``, ``parse_server_args``, ``resolve``, ``resolved_dict``,
+``platform_facts``, ``model_expert_keys``, ``build_engine``, ``generate_batch``, ``vocabulary``,
+``model_vocabulary_size``, ``encode_texts``, ``tokenizer_class``, ``child_pids`` and ``shutdown``.
 
 It runs inside the SGLang pod, where AISim is not installed. At module level it imports the standard library
 only. Every function imports SGLang inside its body, so the module imports on a machine without SGLang, torch
@@ -41,7 +46,8 @@ v0.5.23 (297e54fd105e974cdf401e5b4d20253a22c16f90) of ``sgl-project/sglang`` (Ap
   and ``is_hip``;
 * ``srt/configs/model_config.py``, ``ModelConfig.from_server_args`` and ``ModelConfig.__init__``
   (``hf_config``, ``hf_text_config``, ``vocab_size``); ``srt/model_loader/utils.py``, ``_is_moe_model``;
-  ``srt/models/step3_vl.py``, ``Step3TextMoEMLP``;
+  ``srt/models/step3_vl.py``, ``Step3TextMoEMLP``; ``srt/models/glm_image_vl.py``, ``GlmImageTextModel``
+  (``embed_tokens``) and ``GlmImageForConditionalGeneration`` (the size of its output head);
 * ``srt/entrypoints/engine.py``, ``Engine``: ``run_scheduler_process_func``, ``__init__``,
   ``_ensure_event_loop``, ``async_generate``, ``get_all_child_pids`` and ``shutdown``;
 * ``srt/managers/io_struct.py``, ``GenerateReqInput._determine_batch_size`` and ``_normalize_rid``;
@@ -49,8 +55,8 @@ v0.5.23 (297e54fd105e974cdf401e5b4d20253a22c16f90) of ``sgl-project/sglang`` (Ap
   ``auto_create_handle_loop``, ``_handle_batch_request``, ``_send_batch_request``,
   ``_stream_batch_responses``, ``_stream_one_response``, ``_coalesce_streaming_chunks``,
   ``_handle_batch_output``, ``_handle_abort_req``, ``_release_req_states_on_failure``,
-  ``_validate_one_request``, ``sigterm_watchdog``, ``init_model_config`` and
-  ``init_tokenizer_and_processor``;
+  ``_validate_one_request``, ``sigterm_watchdog``, ``init_model_config``,
+  ``init_tokenizer_and_processor`` and ``_tokenize_texts`` (SGLang's own batch call of the tokenizer);
 * ``srt/managers/schedule_batch.py``: the ``to_json`` forms of ``FINISH_LENGTH``, ``FINISH_MATCHED_TOKEN``
   and ``FINISH_ABORT``, and ``Req._check_token_based_finish``;
 * ``srt/managers/scheduler_components/output_streamer.py``, ``_GenerationStreamAccumulator.accept``;
@@ -75,10 +81,19 @@ TP 1 and TP 2: ``load_plugins``, ``parse_server_args``, ``resolve``, ``resolved_
 ``vocabulary`` and ``shutdown``, which raised nothing. Four launches ran to a complete result. The files of
 those launches are not kept in this repository.
 
-Not run on any engine, and so resting on the source alone: an abort or a timeout of a call, and
-``child_pids``. The tokenizer interface (``vocab_size``,
-``all_special_ids``, ``get_added_vocab``) belongs to the transformers library, whose source was not read;
-SGLang's use of the three names was.
+Run on engines on 2026-11-17 through sglbench_launcher.py, in text runs with SGLang 0.5.22 and 0.5.23 on H200
+GPUs: ``encode_texts`` and ``tokenizer_class``, with the tokenizers of ``Qwen/Qwen1.5-MoE-A2.7B`` and
+``Qwen/Qwen3-0.6B``. ``model_vocabulary_size`` ran in two of them, smoke runs of the first model with SGLang
+0.5.23 at TP 2, whose text pools were built with the value it returned. The result file of the first does
+not hold the value: the launcher began to write it afterwards, as the upper end of
+``producer.content.pool.id_range``, wherever a result file has the ``pool`` record. The result file of the
+second holds it. At 0.5.22 it rests on the source, where it reads the attribute that ``vocabulary`` read on
+those engines.
+
+Not run on any engine, and so resting on the source alone: an abort or a timeout of a call and
+``child_pids``. The tokenizer interface (``vocab_size``, ``all_special_ids``,
+``get_added_vocab`` and the batch call ``tokenizer(texts, add_special_tokens=False)``) belongs to the
+transformers library, whose source was not read; SGLang's use of the three names and of the batch call was.
 
 No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header of this
 file and recorded in THIRD_PARTY_NOTICES.md. For this module that is SGLang alone: the names it imports and
@@ -114,9 +129,9 @@ TESTED_VERSIONS = ("0.5.22", "0.5.23")
 #   table of probes (srt/runtime_context.py), and reading ``is_cuda`` calls ``torch.cuda.is_available()``
 #   (srt/utils/common.py), which asks the device;
 # - what an engine and a model config set on themselves while they are built (``loop``,
-#   ``tokenizer_manager``, ``hf_config``, ``hf_text_config``, ``vocab_size``), the tokenizer's attributes, the
-#   request fields ``generate_batch`` sets and the chunk fields it reads. A change of one of these shows at
-#   the call that uses it.
+#   ``tokenizer_manager``, ``hf_config``, ``hf_text_config``, ``vocab_size``), the tokenizer's attributes and
+#   its batch call, the request fields ``generate_batch`` sets and the chunk fields it reads. A change of one
+#   of these shows at the call that uses it.
 SGLANG_SEAM_NAMES = (
     ("sglang", "__version__", "name"),
     ("sglang.srt.plugins", "load_plugins", "name"),
@@ -624,15 +639,25 @@ def _tokenizer_attribute(tokenizer, name: str):
     except AttributeError as error:
         raise AttributeError(
             f"the tokenizer {type(tokenizer).__name__} has no {name}; the benchmark needs it to keep special "
-            "ids out of its prompts"
+            "ids out of the token ids it makes up"
         ) from error
 
 
+def _served_tokenizer(engine):
+    """The tokenizer the engine serves with; ``ValueError`` when SGLang built none."""
+    tokenizer = engine.tokenizer_manager.tokenizer
+    if tokenizer is None:
+        raise ValueError("engine.tokenizer_manager.tokenizer is None; SGLang builds none with --skip-tokenizer-init")
+    return tokenizer
+
+
 def vocabulary(engine) -> dict:
-    """The id range of the served vocabulary and the ids a prompt must not use.
+    """The id range of the served vocabulary and the ids the benchmark must not make up.
 
     Returns ``{"size": int, "excluded": sorted list of ids}``. Ordinary token ids are those in ``[0, size)``
-    that are not in ``excluded``.
+    that are not in ``excluded``. The seeded ids and the allocated first tokens of the prompts are ordinary
+    ids. The ids of dataset text are not held to them: a text keeps what the tokenizer returned
+    (``model_vocabulary_size``).
 
     The tokenizer is ``engine.tokenizer_manager.tokenizer`` (srt/managers/tokenizer_manager.py
     ``TokenizerManager.init_tokenizer_and_processor``), ``None`` with ``--skip-tokenizer-init``.
@@ -656,9 +681,7 @@ def vocabulary(engine) -> dict:
     ``TypeError`` when a value is not what the names promise. No value is guessed.
     """
     manager = engine.tokenizer_manager
-    tokenizer = manager.tokenizer
-    if tokenizer is None:
-        raise ValueError("engine.tokenizer_manager.tokenizer is None; SGLang builds none with --skip-tokenizer-init")
+    tokenizer = _served_tokenizer(engine)
     sizes = {
         "tokenizer.vocab_size": _tokenizer_attribute(tokenizer, "vocab_size"),
         "tokenizer_manager.model_config.vocab_size": manager.model_config.vocab_size,
@@ -677,6 +700,83 @@ def vocabulary(engine) -> dict:
     if stop_ids is not None:
         excluded |= _token_ids(stop_ids, "additional_stop_token_ids")
     return {"size": min(sizes.values()), "excluded": sorted(excluded)}
+
+
+def model_vocabulary_size(engine) -> int:
+    """The number of token ids the served model counts: ``engine.tokenizer_manager.model_config.vocab_size``.
+
+    It is the model's bound that ``vocabulary`` reads, here without the tokenizer's: SGLang takes it from the
+    ``vocab_size`` of the text config (srt/configs/model_config.py ``ModelConfig``). One architecture differs:
+    for ``GlmImageForConditionalGeneration`` SGLang takes the ``vision_vocab_size`` of the text config, which
+    is the size of that model's output head and not of its input embedding (srt/models/glm_image_vl.py), so
+    for that model the value is not the bound of the input ids. The ids of a tokenized text are compared
+    with it, because a tokenizer can hold an id at or above the model's bound, and what the model does with
+    such an id was not read. ``TypeError`` when the value is not an int, ``ValueError`` when it is not
+    positive.
+    """
+    value = engine.tokenizer_manager.model_config.vocab_size
+    if not _is_count(value):
+        raise TypeError(f"tokenizer_manager.model_config.vocab_size is {value!r}, not an int")
+    if value <= 0:
+        raise ValueError(f"tokenizer_manager.model_config.vocab_size is {value}, not a positive size")
+    return value
+
+
+def encode_texts(engine, texts: list[str]) -> list[list[int]]:
+    """The token ids of each text: one list of ids per text, in the order of ``texts``.
+
+    ``texts`` is a non-empty list of ``str``. The tokenizer is ``engine.tokenizer_manager.tokenizer``, the one
+    ``vocabulary`` reads. The call is ``tokenizer(texts, add_special_tokens=False)`` and the result is its
+    ``"input_ids"``: one batch call for all texts, which a fast tokenizer spreads over the CPUs. SGLang's own
+    text path makes the same batch call and reads the same key for a fast tokenizer
+    (srt/managers/tokenizer_manager.py ``TokenizerManager._tokenize_texts``), there without the keyword; for a
+    tokenizer that is not a fast one it calls ``encode`` once for each text. ``add_special_tokens=False`` keeps the
+    tokenizer from putting a BOS or EOS id around a text. It does not keep special ids out: a tokenizer turns
+    the written form of a special token inside a text into that token's id, so the ids of a text can lie
+    outside the range ``vocabulary`` describes. Nothing is filtered here. The launcher keeps such an id, as
+    Dynamo's vLLM self-benchmark does, and leaves out only an id at or above ``model_vocabulary_size``.
+
+    Raises ``TypeError`` or ``ValueError`` when ``texts`` is not such a list, ``ValueError`` when there is no
+    tokenizer, and ``TypeError`` or ``ValueError`` that says what came back when the result is not a list of
+    ``len(texts)`` lists of plain ints. A tokenizer that cannot be called this way raises whatever it raises
+    (SGLang can also serve tokenizers that are not Hugging Face ones); that error passes through.
+    """
+    if not isinstance(texts, list):
+        raise TypeError(f"texts must be a list of str, got {type(texts).__name__}")
+    if not texts:
+        raise ValueError("texts must not be empty")
+    for position, text in enumerate(texts):
+        if type(text) is not str:
+            raise TypeError(f"text {position} is {type(text).__name__}, not a str")
+    tokenizer = _served_tokenizer(engine)
+    name = type(tokenizer).__name__
+    encoded = tokenizer(texts, add_special_tokens=False)
+    try:
+        batch = encoded["input_ids"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise TypeError(f"the tokenizer {name} returned {type(encoded).__name__} without input_ids") from error
+    if not isinstance(batch, list):
+        raise TypeError(f"the tokenizer {name} returned input_ids as {type(batch).__name__}, not as a list")
+    if len(batch) != len(texts):
+        raise ValueError(f"the tokenizer {name} returned {len(batch)} id lists for {len(texts)} texts")
+    for position, ids in enumerate(batch):
+        if not isinstance(ids, list):
+            raise TypeError(f"the tokenizer {name} returned {type(ids).__name__} for text {position}, not a list")
+        # One pass in C over the types: a text has thousands of ids, and a bool is not a plain int.
+        if not set(map(type, ids)) <= {int}:
+            wrong = next(token for token in ids if type(token) is not int)
+            raise TypeError(f"the tokenizer {name} returned {wrong!r} among the ids of text {position}")
+    return batch
+
+
+def tokenizer_class(engine) -> str:
+    """The module and the class name of the served tokenizer, as ``"module.ClassName"``.
+
+    The tokenizer is ``engine.tokenizer_manager.tokenizer``; ``ValueError`` when there is none. The name says
+    which kind of tokenizer made the ids of ``encode_texts``. It is a record and decides nothing.
+    """
+    kind = type(_served_tokenizer(engine))
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 
 def child_pids(engine) -> list[int]:

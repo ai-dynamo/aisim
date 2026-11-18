@@ -4,18 +4,18 @@
 """Tests of ``sglang_fpm_builder.py``, the cell builder of the SGLang self-benchmark. No SGLang, no GPU, no pod.
 
 Every cell is rendered by the real ``runner._render_cell``, so by the real Generator, from a real collection
-plan of one dense model on two GPUs. The plan is built as a vLLM plan and turned into an SGLang plan with
-``dataclasses.replace``: the tests therefore need neither the planner's admission of ``sglang`` nor the
-runner's branch that calls the builder.
+plan: one dense model on two GPUs, or one MoE model with the TEP preset on one and two GPUs. The plan is built
+as a vLLM plan and turned into an SGLang plan with ``dataclasses.replace``: the tests therefore need neither
+the planner's admission of ``sglang`` nor the runner's branch that calls the builder.
 
-What is FAKE is named so: the model (a config typed in here, no checkpoint), the image name, and the
+What is FAKE is named so: the models (configs typed in here, no checkpoint), the image name, and the
 ``python3`` that one test puts first on ``PATH`` to see how ``run.sh`` starts its command. Nothing of the
 launcher runs in a pod here; what the tests show is the text of the cell's files and that the launcher's own
 flag reader takes the command.
 
-The two tests that read SGLang's field declarations need a local checkout of SGLang for each release the
+The three tests that read SGLang's field declarations need a local checkout of SGLang for each release the
 launcher accepts. ``AISIM_SGLBENCH_SGLANG_SOURCES`` names a folder that holds them as ``v<version>``, the
-variable and the layout of ``test_fpm_sglbench_preflight.py``; without it those two tests are skipped.
+variable and the layout of ``test_fpm_sglbench_preflight.py``; without it those three tests are skipped.
 """
 
 from __future__ import annotations
@@ -44,7 +44,8 @@ from collector.fpm_forward.planner import BackendPolicy, FPMCell, FPMCollectionP
 from collector.fpm_forward.runner import _render_cell
 from collector.fpm_forward.types import ParallelTopology
 
-RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
+AISIM = Path(__file__).resolve().parents[3]
+RUNTIME = AISIM / "collector/fpm_forward/runtime"
 # In the pod the runtime files lie flat in one directory and import each other by bare name. The directory goes
 # to the END of sys.path, so that it shadows nothing.
 if str(RUNTIME) not in sys.path:
@@ -65,6 +66,19 @@ FAKE_MODEL_CONFIG = {
     "num_attention_heads": 24,
     "num_key_value_heads": 8,
     "vocab_size": 200064,
+}
+MOE_MODEL = "private-org/moe-model"
+FAKE_MOE_MODEL_CONFIG = {
+    "architectures": ["PrivateMoeForCausalLM"],
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "num_hidden_layers": 48,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 4,
+    "vocab_size": 151936,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 768,
 }
 FAKE_IMAGE = "example.invalid/sglang:test"
 DEPLOYMENT = {"K8sConfig": {"k8s_image": FAKE_IMAGE}}
@@ -101,6 +115,7 @@ SGLANG_FLAGS = {
     "--model-path",
     "--served-model-name",
     "--tp-size",
+    "--ep-size",
     "--kv-cache-dtype",
     "--mem-fraction-static",
     "--context-length",
@@ -130,8 +145,8 @@ REFUSED_BY_THE_LAUNCHER = {
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
-    """An SGLang plan of the FAKE dense model on two GPUs of one node: one prefill and one decode cell at TP 2.
+def _sglang_plan(tmp_path: Path, monkeypatch, model: str, config: dict, **options) -> FPMCollectionPlan:
+    """A vLLM plan of a FAKE model on one node, turned into an SGLang plan.
 
     The defaults are what an SGLang plan has: the runtime graph policy, under which the vLLM command holds no
     capture list. ``options`` are attributes of the parsed ``--fpm-*`` arguments.
@@ -142,20 +157,19 @@ def _plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
         raise RuntimeError("a unit test has no checkpoint")
 
     monkeypatch.setattr("collector.fpm_forward.memory_admission.KVCacheEstimator.from_request", unavailable)
-    config_dir = tmp_path / "model-config"
+    config_dir = tmp_path / f"model-config-{config['architectures'][0]}"
     config_dir.mkdir(exist_ok=True)
-    (config_dir / "config.json").write_text(json.dumps(FAKE_MODEL_CONFIG))
+    (config_dir / "config.json").write_text(json.dumps(config))
     arguments = {
         "fpm_max_gpus": 2,
-        "fpm_gpu_counts": [2],
         "fpm_kv_cache_dtypes": ["fp8"],
         "fpm_prefill_cudagraph_policy": "runtime",
         **options,
     }
     vllm_plan = build_collection_plan(
         backend="vllm",
-        model_path=MODEL,
-        model_architecture="PrivateDenseForCausalLM",
+        model_path=model,
+        model_architecture=config["architectures"][0],
         system="h200_sxm",
         selected_ops={"attention_context", "attention_generation"},
         has_model_cases=False,
@@ -163,15 +177,41 @@ def _plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
         collector_config={"aic_database_version": "0.5.22"},
         model_config_path=str(config_dir),
     )
-    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.tp) for cell in vllm_plan.cells] == [
-        ("prefill", "tp", 2),
-        ("decode", "tp", 2),
-    ]
     return dataclasses.replace(vllm_plan, backend="sglang")
 
 
-def _cell(plan: FPMCollectionPlan, phase: str) -> FPMCell:
-    return next(cell for cell in plan.cells if cell.workload_kind == phase)
+def _plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
+    """An SGLang plan of the FAKE dense model on two GPUs of one node: one prefill and one decode cell at TP 2."""
+    plan = _sglang_plan(tmp_path, monkeypatch, MODEL, FAKE_MODEL_CONFIG, **{"fpm_gpu_counts": [2], **options})
+    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.tp) for cell in plan.cells] == [
+        ("prefill", "tp", 2),
+        ("decode", "tp", 2),
+    ]
+    return plan
+
+
+def _moe_plan(tmp_path: Path, monkeypatch, **options) -> FPMCollectionPlan:
+    """An SGLang plan of the FAKE MoE model with the TEP preset: per phase a one-GPU cell and a TEP cell at TP 2."""
+    presets = {"fpm_gpu_counts": [1, 2], "fpm_parallel_presets": ["tep"]}
+    plan = _sglang_plan(tmp_path, monkeypatch, MOE_MODEL, FAKE_MOE_MODEL_CONFIG, **{**presets, **options})
+    assert [
+        (cell.workload_kind, cell.parallel_strategy, cell.topology.tp, cell.topology.moe_ep) for cell in plan.cells
+    ] == [
+        ("prefill", "single", 1, 1),
+        ("prefill", "tep", 2, 2),
+        ("decode", "single", 1, 1),
+        ("decode", "tep", 2, 2),
+    ]
+    return plan
+
+
+def _cell(plan: FPMCollectionPlan, phase: str, strategy: str | None = None) -> FPMCell:
+    """The cell of ``phase``; ``strategy`` picks one where the plan has several per phase."""
+    return next(
+        cell
+        for cell in plan.cells
+        if cell.workload_kind == phase and (strategy is None or cell.parallel_strategy == strategy)
+    )
 
 
 def _render(plan, cell, cell_dir: Path, overrides=None, *, smoke: bool = False, render=_render_cell) -> dict:
@@ -263,6 +303,110 @@ def test_dense_tp_cell_command(tmp_path, monkeypatch, phase, expected):
     _render(plan, _cell(plan, phase), tmp_path / "cell")
 
     assert _command(tmp_path / "cell") == expected
+
+
+MOE_ENGINE = f"--model-path {MOE_MODEL} --served-model-name {MOE_MODEL} --tp-size {{sizes}} --kv-cache-dtype fp8_e4m3"
+MOE_PREFILL = (
+    f"{LAUNCHER} {MOE_ENGINE} {BENCHMARK.format(phase='prefill')} --prefill-max-kv-read-token-samples 29"
+    f" {TOKEN_BUDGET} {RESULT_FILES} --prefill-max-new-token-samples 8192"
+)
+MOE_DECODE = f"{LAUNCHER} {MOE_ENGINE} {BENCHMARK.format(phase='decode')} {RESULT_FILES}"
+
+
+@pytest.mark.parametrize(
+    ("phase", "strategy", "expected"),
+    [
+        # The TEP cell: one expert-parallel rank per tensor-parallel rank, written right after --tp-size.
+        ("prefill", "tep", MOE_PREFILL.format(sizes="2 --ep-size 2")),
+        ("decode", "tep", MOE_DECODE.format(sizes="2 --ep-size 2")),
+        # The one-GPU cell of the same preset: no size is written, so SGLang's default of 1 applies.
+        ("prefill", "single", MOE_PREFILL.format(sizes="1")),
+        ("decode", "single", MOE_DECODE.format(sizes="1")),
+    ],
+    ids=["prefill-tep", "decode-tep", "prefill-single", "decode-single"],
+)
+def test_moe_cell_command(tmp_path, monkeypatch, phase, strategy, expected):
+    plan = _moe_plan(tmp_path, monkeypatch)
+    cell = _cell(plan, phase, strategy)
+    _render_vllm(plan, cell, tmp_path / "vllm")
+
+    _render(plan, cell, tmp_path / "sglang")
+
+    command = _command(tmp_path / "sglang")
+    assert command == expected.split()
+    # What was translated is the Generator's own vLLM command of the cell: the three parallel sizes, and then
+    # the expert-parallel switch exactly when the cell has more than one expert-parallel rank.
+    vllm = _command(tmp_path / "vllm")
+    sizes = f"--tensor-parallel-size {cell.topology.tp} --pipeline-parallel-size 1 --data-parallel-size 1".split()
+    start = vllm.index("--tensor-parallel-size")
+    assert vllm[start : start + 6] == sizes
+    assert (vllm[start + 6] == "--enable-expert-parallel") is (strategy == "tep")
+    assert ("--enable-expert-parallel" in vllm) is (strategy == "tep")
+    # The launcher's own reader of flags takes the command and hands both sizes to SGLang's parser.
+    environment = {"DYN_BENCH_KV_WARMUP": "on", "DYN_BENCH_PREFILL_REAL_SEED": "on"}
+    options = launcher._read_options(command[2:], environment)
+    assert (options.rejection, options.output_problem, options.mode) == (None, None, phase)
+    engine_arguments = MOE_ENGINE.format(sizes="2 --ep-size 2" if strategy == "tep" else "1").split()
+    assert options.sglang_argv[: len(engine_arguments)] == engine_arguments
+
+
+def test_moe_cell_changes_only_the_command_line_and_keeps_the_dataset_folder_block(tmp_path, monkeypatch):
+    plan = _moe_plan(tmp_path, monkeypatch)
+    cell = _cell(plan, "decode", "tep")
+    # The cell names a model cache, so the Generator exports HF_HOME and writes the block that makes the
+    # dataset folder beside it.
+    overrides = {"K8sConfig": {"k8s_image": FAKE_IMAGE, "k8s_hf_home": "/models/hub"}}
+    _render_vllm(plan, cell, tmp_path / "vllm", overrides)
+
+    _render(plan, cell, tmp_path / "sglang", overrides)
+
+    vllm_lines = (tmp_path / "vllm" / "run.sh").read_text().split("\n")
+    sglang_lines = (tmp_path / "sglang" / "run.sh").read_text().split("\n")
+    changed = [index for index, pair in enumerate(zip(vllm_lines, sglang_lines, strict=True)) if pair[0] != pair[1]]
+    assert len(changed) == 1
+    assert sglang_lines[changed[0]] == f"{COMMAND_LINE_START}{shlex.join(_command(tmp_path / 'sglang'))})"
+    # The launcher of a MoE cell reads the dataset from the folder this block prepares, or from the variable
+    # the block sets when that folder cannot be written.
+    assert "export HF_HOME=/models/hub" in sglang_lines
+    assert [line for line in sglang_lines if "fpm_datasets" in line] == [
+        line for line in vllm_lines if "fpm_datasets" in line
+    ]
+    assert any("DYN_BENCH_KV_WARMUP_CACHE_DIR" in line for line in sglang_lines)
+    subprocess.run(["bash", "-n", str(tmp_path / "sglang" / "run.sh")], check=True)
+
+
+# The variables a plan may set for the content of a cell, with FAKE values. The launcher reads them.
+CONTENT_ENVIRONMENT = (
+    ("DYN_BENCH_PREFILL_CONTENT", "sharegpt_chain"),
+    ("DYN_BENCH_KV_WARMUP_DATASET", "/models/datasets/fake-conversations.json"),
+    ("DYN_BENCH_KV_WARMUP_SHA256", "0" * 64),
+    ("DYN_BENCH_KV_WARMUP_CACHE_DIR", "/models/fpm_datasets"),
+)
+
+
+@pytest.mark.parametrize("model", ["dense", "moe"])
+def test_content_variables_of_the_plan_reach_run_script_and_nothing_the_gate_reads(tmp_path, monkeypatch, model):
+    if model == "moe":
+        plan = _moe_plan(tmp_path, monkeypatch)
+        cell = _cell(plan, "decode", "tep")
+    else:
+        plan = _plan(tmp_path, monkeypatch)
+        cell = _cell(plan, "decode")
+    _render(plan, cell, tmp_path / "plain")
+
+    _render(plan, cell, tmp_path / "cell", _with_environment(*CONTENT_ENVIRONMENT))
+
+    # run.sh starts the launcher, so the launcher's process gets the four values. The command is the same.
+    script = (tmp_path / "cell" / "run.sh").read_text().splitlines()
+    for name, value in CONTENT_ENVIRONMENT:
+        assert f"export {name}={value}" in script
+    assert _command(tmp_path / "cell") == _command(tmp_path / "plain")
+    # The gate sources the two other files before it starts run.sh. Neither names a content variable, so the
+    # gate and the preflight see none of them.
+    for name in ("collector-runtime-env.sh", "fpm_env.sh"):
+        text = (tmp_path / "cell" / name).read_text()
+        assert text == (tmp_path / "plain" / name).read_text()
+        assert not [variable for variable, _value in CONTENT_ENVIRONMENT if variable in text]
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -652,6 +796,237 @@ def test_real_state_switch_is_checked_again_in_the_rendered_run_script(tmp_path,
         _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=render)
 
 
+CONTENT_VARIABLE = "DYN_BENCH_PREFILL_CONTENT"
+# Values of the content variable: the three the launcher takes, then words and spellings it refuses.
+CONTENT_WORDS_ACCEPTED = ("", "random", "sharegpt_chain")
+CONTENT_WORDS_REFUSED = ("sharegpt", "zeros", "RANDOM", "Sharegpt_Chain", " random", "sharegpt_chain ", "0", "off")
+# FAKE expert keys, as the launcher reads them from the model config of a model with expert layers.
+FAKE_EXPERT_KEYS = {"num_experts": 60}
+
+
+def _launcher_refuses_content(value: str, experts: dict) -> bool:
+    """Whether the launcher refuses ``value`` of the content variable for a model with these expert keys."""
+    if launcher._refused_variables({launcher.ENV_PREFILL_CONTENT: value}):
+        return True
+    try:
+        launcher._is_text_run(value or None, experts)
+    except Exception as refusal:
+        assert str(refusal).startswith("rejected: ")
+        return True
+    return False
+
+
+@pytest.mark.parametrize("is_moe", [False, True], ids=["dense", "moe"])
+@pytest.mark.parametrize("value", [*CONTENT_WORDS_ACCEPTED, *CONTENT_WORDS_REFUSED])
+def test_content_word_is_refused_at_render_exactly_when_the_launcher_refuses_it(value, is_moe):
+    refused = False
+    try:
+        builder._check_content_word(value, "run.sh", is_moe=is_moe)
+    except ValueError:
+        refused = True
+
+    assert refused is _launcher_refuses_content(value, FAKE_EXPERT_KEYS if is_moe else {})
+    # What each side refuses: every word but the accepted three, and the seeded word for a model with expert layers.
+    assert refused is (value not in CONTENT_WORDS_ACCEPTED or (is_moe and value == "random"))
+
+
+@pytest.mark.parametrize("value", CONTENT_WORDS_ACCEPTED)
+def test_content_word_the_launcher_accepts_is_kept(tmp_path, monkeypatch, value):
+    plan = _plan(tmp_path, monkeypatch)
+
+    _render(plan, _cell(plan, "decode"), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
+
+    assert f"export {CONTENT_VARIABLE}={shlex.quote(value)}" in (tmp_path / "cell" / "run.sh").read_text().splitlines()
+
+
+@pytest.mark.parametrize("value", ["", "sharegpt_chain"])
+@pytest.mark.parametrize("strategy", ["single", "tep"])
+def test_content_word_of_a_text_run_is_kept_for_a_moe_plan(tmp_path, monkeypatch, strategy, value):
+    plan = _moe_plan(tmp_path, monkeypatch)
+
+    _render(plan, _cell(plan, "prefill", strategy), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
+
+    assert f"export {CONTENT_VARIABLE}={shlex.quote(value)}" in (tmp_path / "cell" / "run.sh").read_text().splitlines()
+
+
+@pytest.mark.parametrize("value", [*CONTENT_WORDS_REFUSED, 1, True, None])
+def test_content_word_the_launcher_refuses_is_refused_before_the_render(tmp_path, monkeypatch, value):
+    plan = _plan(tmp_path, monkeypatch)
+    text = (
+        f"{CONTENT_VARIABLE}={value!r} in K8sConfig.extra_env: the launcher does not support it (accepted: "
+        "random, sharegpt_chain)"
+    )
+
+    with _refusal(text):
+        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
+
+    assert list((tmp_path / "cell").iterdir()) == []
+
+
+@pytest.mark.parametrize("strategy", ["single", "tep"])
+def test_seeded_content_word_is_refused_for_a_moe_plan_before_the_render(tmp_path, monkeypatch, strategy):
+    plan = _moe_plan(tmp_path, monkeypatch)
+    text = (
+        f"{CONTENT_VARIABLE}=random in K8sConfig.extra_env: the launcher does not support it for a model with "
+        "expert layers, whose cells send dataset text"
+    )
+
+    with _refusal(text):
+        _render(
+            plan, _cell(plan, "decode", strategy), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, "random"))
+        )
+
+    assert list((tmp_path / "cell").iterdir()) == []
+
+
+def test_content_word_of_the_backend_policy_is_refused(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+    policy = _policy(extra_env=[{"name": CONTENT_VARIABLE, "value": "sharegpt"}])
+    cell = dataclasses.replace(_cell(plan, "prefill"), backend_policy=policy)
+
+    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in K8sConfig.extra_env"):
+        _render(plan, cell, tmp_path / "cell")
+
+
+def test_an_environment_entry_that_is_no_mapping_is_left_to_the_runner(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+    overrides = {"K8sConfig": {"k8s_image": FAKE_IMAGE, "extra_env": [f"{CONTENT_VARIABLE}=sharegpt"]}}
+
+    with pytest.raises(TypeError, match=re.escape("K8sConfig.extra_env entries must be {name, value} mappings")):
+        _render(plan, _cell(plan, "decode"), tmp_path / "cell", overrides)
+
+
+def test_a_content_entry_without_a_value_is_refused_by_the_builder(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+    overrides = {"K8sConfig": {"k8s_image": FAKE_IMAGE, "extra_env": [{"name": CONTENT_VARIABLE}]}}
+
+    with _refusal(f"{CONTENT_VARIABLE}=None in K8sConfig.extra_env"):
+        _render(plan, _cell(plan, "decode"), tmp_path / "cell", overrides)
+
+
+def _with_content_lines(*values: str):
+    """A render whose ``run.sh`` exports the content variable once per value, in this order.
+
+    The inputs of the cell do not name the variable, so only the check of the rendered script sees it.
+    """
+    lines = "\n".join(f"export {CONTENT_VARIABLE}={shlex.quote(value)}" for value in values)
+    return _edited_render(
+        _edit_file("run.sh", lambda text: text.replace("\nengine_command=(", f"\n{lines}\nengine_command=("))
+    )
+
+
+@pytest.mark.parametrize("value", ["sharegpt", "RANDOM", "sharegpt_chain "])
+def test_content_word_is_checked_again_in_the_rendered_run_script(tmp_path, monkeypatch, value):
+    plan = _plan(tmp_path, monkeypatch)
+    text = (
+        f"{CONTENT_VARIABLE}={value!r} in run.sh: the launcher does not support it (accepted: random, sharegpt_chain)"
+    )
+
+    with _refusal(text):
+        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_with_content_lines(value))
+
+
+def test_seeded_content_word_in_the_rendered_run_script_is_refused_for_a_moe_plan_only(tmp_path, monkeypatch):
+    dense = _plan(tmp_path, monkeypatch)
+    _render(dense, _cell(dense, "decode"), tmp_path / "dense-cell", render=_with_content_lines("random"))
+    assert f"export {CONTENT_VARIABLE}=random" in (tmp_path / "dense-cell" / "run.sh").read_text().splitlines()
+
+    moe = _moe_plan(tmp_path, monkeypatch)
+    with _refusal(f"{CONTENT_VARIABLE}=random in run.sh: the launcher does not support it for a model with expert"):
+        _render(moe, _cell(moe, "decode", "tep"), tmp_path / "moe-cell", render=_with_content_lines("random"))
+
+
+def test_a_later_export_line_of_the_content_variable_is_checked(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+
+    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in run.sh"):
+        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_with_content_lines("random", "sharegpt"))
+
+
+def test_the_last_export_line_of_the_content_variable_decides(tmp_path, monkeypatch):
+    # The shell keeps the last export of a name, so the launcher reads that one.
+    dense = _plan(tmp_path, monkeypatch)
+    _render(dense, _cell(dense, "decode"), tmp_path / "dense", render=_with_content_lines("sharegpt", "random"))
+
+    moe = _moe_plan(tmp_path, monkeypatch)
+    _render(moe, _cell(moe, "decode", "tep"), tmp_path / "moe", render=_with_content_lines("random", "sharegpt_chain"))
+    with _refusal(f"{CONTENT_VARIABLE}=random in run.sh: the launcher does not support it for a model with expert"):
+        _render(
+            moe, _cell(moe, "decode", "tep"), tmp_path / "moe-2", render=_with_content_lines("sharegpt_chain", "random")
+        )
+
+
+def test_an_empty_last_export_line_of_the_content_variable_decides(tmp_path, monkeypatch):
+    # An empty value counts as unset, also after a line with a word the launcher would refuse.
+    dense = _plan(tmp_path, monkeypatch)
+    _render(dense, _cell(dense, "decode"), tmp_path / "dense", render=_with_content_lines("sharegpt", ""))
+
+    moe = _moe_plan(tmp_path, monkeypatch)
+    _render(moe, _cell(moe, "decode", "tep"), tmp_path / "moe", render=_with_content_lines("random", ""))
+
+
+def test_a_variable_with_a_longer_name_is_not_the_content_variable(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+    longer = f"{CONTENT_VARIABLE}_SEED"
+
+    _render(plan, _cell(plan, "decode"), tmp_path / "cell", _with_environment((longer, "sharegpt")))
+
+    assert f"export {longer}=sharegpt" in (tmp_path / "cell" / "run.sh").read_text().splitlines()
+
+
+def test_content_word_is_refused_before_the_render_wherever_its_entry_stands(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+    entries = (("HF_HUB_OFFLINE", "1"), ("DYN_BENCH_KV_WARMUP", "on"), (CONTENT_VARIABLE, "sharegpt"))
+
+    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in K8sConfig.extra_env"):
+        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", _with_environment(*entries))
+
+    assert list((tmp_path / "cell").iterdir()) == []
+
+
+def test_content_word_is_refused_before_the_render_on_a_slurm_plan(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch, fpm_executor="slurm", fpm_slurm_container_image=FAKE_IMAGE)
+    overrides = {"K8sConfig": {"extra_env": [{"name": CONTENT_VARIABLE, "value": "sharegpt"}]}}
+
+    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in K8sConfig.extra_env"):
+        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", overrides)
+
+    assert list((tmp_path / "cell").iterdir()) == []
+
+
+def _with_worker_environment(*entries: tuple[str, str], extra_env: tuple[tuple[str, str], ...] = ()) -> dict:
+    """Deployment inputs that name variables in the worker's pod spec, and ``extra_env`` in ``K8sConfig.extra_env``."""
+    overrides = _with_environment(*extra_env)
+    overrides["K8sConfig"]["worker_extra_pod_spec"] = {
+        "mainContainer": {"env": [{"name": name, "value": value} for name, value in entries]}
+    }
+    return overrides
+
+
+def test_content_word_of_the_worker_pod_spec_is_replaced_by_the_one_of_extra_env(tmp_path, monkeypatch):
+    # The Generator writes the entries of the pod spec before those of K8sConfig.extra_env, so the shell and
+    # the launcher get the word of extra_env. The check before the render does not read the pod spec.
+    plan = _plan(tmp_path, monkeypatch)
+    overrides = _with_worker_environment((CONTENT_VARIABLE, "sharegpt"), extra_env=((CONTENT_VARIABLE, "random"),))
+
+    _render(plan, _cell(plan, "decode"), tmp_path / "cell", overrides)
+
+    script = (tmp_path / "cell" / "run.sh").read_text().splitlines()
+    assert [line for line in script if line.startswith(f"export {CONTENT_VARIABLE}=")] == [
+        f"export {CONTENT_VARIABLE}=sharegpt",
+        f"export {CONTENT_VARIABLE}=random",
+    ]
+
+
+def test_content_word_of_the_worker_pod_spec_alone_is_refused_in_the_rendered_run_script(tmp_path, monkeypatch):
+    plan = _plan(tmp_path, monkeypatch)
+
+    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in run.sh: the launcher does not support it"):
+        _render(
+            plan, _cell(plan, "decode"), tmp_path / "cell", _with_worker_environment((CONTENT_VARIABLE, "sharegpt"))
+        )
+
+
 def test_unknown_flag_is_refused_and_the_vllm_render_stays(tmp_path, monkeypatch):
     plan = _plan(tmp_path, monkeypatch)
     cell = dataclasses.replace(_cell(plan, "prefill"), backend_policy=_policy("--enable-something"))
@@ -864,8 +1239,8 @@ def test_every_row_of_the_table_in_one_command():
     assert (
         command
         == (
-            f"{LAUNCHER} --model-path 1 --served-model-name 1 --tp-size 1 --kv-cache-dtype auto --mem-fraction-static 1"
-            " --benchmark-mode decode --benchmark-warmup-iterations 1 --benchmark-points-file 1"
+            f"{LAUNCHER} --model-path 1 --served-model-name 1 --tp-size 1 --ep-size 1 --kv-cache-dtype auto"
+            " --mem-fraction-static 1 --benchmark-mode decode --benchmark-warmup-iterations 1 --benchmark-points-file 1"
             " --benchmark-output-path 1 --dump-config-to 1 --prefill-max-new-token-samples 1"
             " --prefill-max-kv-read-token-samples 1 --prefix-max-batch-size-samples 1"
             " --decode-max-kv-read-token-samples 1 --decode-max-batch-size-samples 1 --benchmark-timeout 6600"
@@ -893,6 +1268,23 @@ def test_every_row_of_the_table_in_one_command():
             "--benchmark-mode prefill --prefill-max-new-token-samples 7",
             "--benchmark-mode prefill --prefill-max-new-token-samples 7",
         ),
+        # The expert-parallel switch is written as the size, which is the tensor-parallel size, right after it:
+        # in the order of the Generator's command, with other flags between the two, and with the switch first.
+        (
+            "--tensor-parallel-size 4 --pipeline-parallel-size 1 --data-parallel-size 1 --enable-expert-parallel"
+            " --benchmark-mode decode",
+            "--tp-size 4 --ep-size 4 --benchmark-mode decode",
+        ),
+        (
+            "--tensor-parallel-size 2 --kv-cache-dtype fp8 --benchmark-mode decode --enable-expert-parallel",
+            "--tp-size 2 --ep-size 2 --kv-cache-dtype fp8_e4m3 --benchmark-mode decode",
+        ),
+        (
+            "--enable-expert-parallel --benchmark-mode decode --tensor-parallel-size=8",
+            "--benchmark-mode decode --tp-size 8 --ep-size 8",
+        ),
+        # Without the switch no size is written, and SGLang's default of one expert-parallel rank applies.
+        ("--benchmark-mode decode --tensor-parallel-size 2", "--benchmark-mode decode --tp-size 2"),
     ],
 )
 def test_translation_of_single_flags(flags, expected):
@@ -925,11 +1317,72 @@ def test_translation_of_single_flags(flags, expected):
         # What the runner adds for a vLLM cell with memory or execution observation, or with a runtime probe.
         ("--worker-cls fpm_memory_worker.FpmExecutionWorker", "the vLLM flag --worker-cls has no SGLang translation"),
         ("--revision main", "the vLLM flag --revision has no SGLang translation"),
+        # The expert-parallel switch has no size of its own.
+        (
+            "--benchmark-mode decode --enable-expert-parallel",
+            "--enable-expert-parallel is written with the value of --tensor-parallel-size, which the command does "
+            "not give",
+        ),
+        ("--enable-expert-parallel=true", "--enable-expert-parallel takes no value, got 'true'"),
+        (
+            "--tensor-parallel-size 2 --enable-expert-parallel --enable-expert-parallel",
+            "--enable-expert-parallel is given twice",
+        ),
+        # The command of a DEP cell: its experts are spread over data-parallel replicas.
+        (
+            "--tensor-parallel-size 1 --pipeline-parallel-size 1 --data-parallel-size 2 --enable-expert-parallel"
+            " --benchmark-mode decode",
+            "--data-parallel-size 2: the launcher runs one data-parallel replica and one pipeline stage",
+        ),
+        # The other MoE flags of a vLLM cell, and SGLang's own names, which are no vLLM flags.
+        ("--kernel-config {}", "the vLLM flag --kernel-config has no SGLang translation"),
+        ("--enable-eplb", "the vLLM flag --enable-eplb has no SGLang translation"),
+        ("--data-parallel-backend mp", "the vLLM flag --data-parallel-backend has no SGLang translation"),
+        ("--ep-size 2", "the vLLM flag --ep-size has no SGLang translation"),
+        ("--expert-parallel-size 2", "the vLLM flag --expert-parallel-size has no SGLang translation"),
+        ("--moe-a2a-backend deepep", "the vLLM flag --moe-a2a-backend has no SGLang translation"),
+        # What the runner adds for a model of the architecture GlmMoeDsaForCausalLM: its cells are refused.
+        ("--trust-remote-code", "the vLLM flag --trust-remote-code has no SGLang translation"),
+        ("--reasoning-parser=glm45", "the vLLM flag --reasoning-parser has no SGLang translation"),
     ],
 )
 def test_translation_refusals(flags, message):
     with _refusal(message):
         builder._translate_command(_vllm(*flags.split()))
+
+
+def test_only_the_expert_parallel_switch_is_written_with_the_value_of_another_flag():
+    borrowing = {flag: row for flag, row in builder._TRANSLATION.items() if row.value_of is not None}
+
+    assert list(borrowing) == ["--enable-expert-parallel"]
+    row = borrowing["--enable-expert-parallel"]
+    assert (row.writes, row.takes_value, row.value, row.value_of) == (
+        ("--ep-size",),
+        False,
+        None,
+        "--tensor-parallel-size",
+    )
+    # The flag it takes its value from is written unchanged, so the two sizes of a command are one text.
+    source = builder._TRANSLATION[row.value_of]
+    assert (source.writes, source.takes_value, source.value) == (("--tp-size",), True, None)
+    # No other MoE setting of SGLang can be written: the launcher pins them to SGLang's defaults.
+    assert not {flag for flag in _written_flags() if "moe" in flag or "eplb" in flag or "expert" in flag}
+
+
+def test_the_generators_sglang_serving_deployment_writes_the_same_size_under_sglangs_alias():
+    mapping = yaml.safe_load((AISIM / "src/aisim/generator/config/backend_config_mapping.yaml").read_text())
+    by_key = {entry["param_key"]: entry for entry in mapping["parameters"]}
+
+    # vLLM gets the switch and no size; SGLang gets the size. ``test_ep_size_and_its_serving_alias_are_one_field``
+    # shows that this name and --ep-size are one field of SGLang.
+    assert (by_key["enable_expert_parallel"]["vllm"], by_key["enable_expert_parallel"]["sglang"]) == (
+        "enable-expert-parallel",
+        None,
+    )
+    assert (by_key["moe_expert_parallel_size"]["vllm"], by_key["moe_expert_parallel_size"]["sglang"]) == (
+        None,
+        "expert-parallel-size",
+    )
 
 
 def test_written_flags_are_the_launchers_or_sglangs():
@@ -1018,6 +1471,27 @@ def test_sglang_flags_are_declared_at_each_tested_release(version):
 
 
 @pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
+def test_ep_size_and_its_serving_alias_are_one_field_at_each_tested_release(version):
+    files = _sglang_field_files(version)
+    declared = _declared_arguments(files)
+
+    # The flag the builder writes for vLLM's expert-parallel switch, and the name AISim's SGLang serving
+    # deployment uses for the same size.
+    assert "--ep-size" in declared
+    assert declared["--expert-parallel-size"] is declared["--ep-size"]
+    # It is declared beside ``tp_size``, in the file the module docstring names, and SGLang's default is one
+    # expert-parallel rank: a cell without the switch runs with no expert parallelism.
+    (parallel,) = [path for path in files if path.name == "parallel.py"]
+    assert {"--tp-size", "--ep-size"} <= set(_declared_arguments([parallel]))
+    defaults = {
+        node.target.id: ast.literal_eval(node.value)
+        for node in ast.walk(ast.parse(parallel.read_text()))
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ep_size"
+    }
+    assert defaults == {"ep_size": 1}
+
+
+@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
 def test_kv_cache_dtypes_are_sglangs_choices_at_each_tested_release(version):
     kv_cache_dtype = _declared_arguments(_sglang_field_files(version))["--kv-cache-dtype"]
 
@@ -1079,6 +1553,12 @@ def test_repeated_constants_equal_their_sources():
     assert list(builder.LAUNCHER_COMMAND) == LAUNCHER.split()
     assert (RUNTIME / Path(builder.LAUNCHER_COMMAND[1]).name).is_file()
     assert dict(launcher._REAL_STATE_SWITCHES) == builder._REAL_STATE_SWITCHES
+    assert (builder._CONTENT_VARIABLE, builder._SEEDED_CONTENT, builder._TEXT_CONTENT) == (
+        launcher.ENV_PREFILL_CONTENT,
+        launcher.SEEDED_CONTENT,
+        launcher.TEXT_CONTENT,
+    )
+    assert builder._CONTENT_VARIABLE == CONTENT_VARIABLE
     assert builder._MIN_SAMPLE_CAP == 2
     with pytest.raises(ValueError, match="prefill_max_new_token_samples"):
         grid.SampleCaps(prefill_max_new_token_samples=builder._MIN_SAMPLE_CAP - 1)

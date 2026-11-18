@@ -299,8 +299,10 @@ attempts; a no-op resume writes no historical attempts.
 
 ### SGLang cells
 
-`--backend sglang`, on either route, collects dense tensor-parallel cells from
-SGLang itself. A cell starts `runtime/sglbench_launcher.py` in an SGLang image,
+`--backend sglang`, on either route, collects cells from SGLang itself: the
+tensor-parallel cells of a dense model, and the one-GPU and the tensor- and
+expert-parallel cells of an MoE model ([MoE cells](#moe-cells)). A cell starts
+`runtime/sglbench_launcher.py` in an SGLang image,
 with no Dynamo worker and no etcd. The launcher builds SGLang's engine in its
 own process, plans the points from the limits and CUDA graph sizes that engine
 reports, and writes the rank and merged artifacts of the same result schema as
@@ -336,18 +338,21 @@ It may not give `--fpm-model-profile`, `--fpm-runtime-instrumentation`,
 `--fpm-cudagraph-capture-sizes`, `--fpm-max-cudagraph-capture-size`,
 `--fpm-enforce-eager`, `--fpm-decoder-replay`, or an explicit backend identity
 (`--fpm-moe-backend`, `--fpm-attention-backend`, `--fpm-enable-wideep true`,
-`--fpm-enable-eplb true`). Planning also refuses an MoE model and a model with
-an FPM execution identity (DeepSeek V4.1, GLM-5.3-Flash). Repeatability
-validation and the runtime probe remain vLLM only.
+`--fpm-enable-eplb true`). Planning also refuses a model with an FPM execution
+identity (DeepSeek V4.1, GLM-5.3-Flash) and, for an MoE model, every cell
+other than the one-GPU cell and the TEP cells ([MoE cells](#moe-cells)).
+Repeatability validation and the runtime probe remain vLLM only.
 
 An SGLang cell runs on one node. Planning does not know how many GPUs a node
 holds, so a plan whose `--fpm-max-gpus` exceeds one node is admitted and each
 of its multi-node cells is refused when it is rendered, before a pod is
 scheduled. Such a campaign stays incomplete and publishes only with
 `--fpm-publish-partial`. A cell is refused in the same way when its KV-cache
-dtype is one SGLang does not take (`int8`), or when `K8sConfig.extra_env`
-switches `DYN_BENCH_KV_WARMUP` or `DYN_BENCH_PREFILL_REAL_SEED` off: the
-launcher stages real cached state only.
+dtype is one SGLang does not take (`int8`), when `K8sConfig.extra_env`
+switches `DYN_BENCH_KV_WARMUP` or `DYN_BENCH_PREFILL_REAL_SEED` off (the
+launcher stages real cached state only), or when it sets
+`DYN_BENCH_PREFILL_CONTENT` to a word the launcher does not accept, or to
+`random` in the plan of an MoE model ([MoE cells](#moe-cells)).
 
 The resource Pod and the environment of an SGLang cell come from the
 Generator's vLLM FPM render of the same cell. `sglang_fpm_builder.py` asks for
@@ -384,6 +389,327 @@ serving deployment:
   accepts two SGLang releases, and neither is the collector's operator pin
   (`0.5.21` in `framework_manifest.yaml`). The formal FPM path does not consult
   that pin for any backend.
+
+#### MoE cells
+
+For an MoE model an SGLang plan holds two kinds of cell: the one-GPU cell
+(strategy `single`) and the TEP cell (strategy `tep`), which has one
+data-parallel replica and one expert-parallel rank per tensor-parallel rank.
+The default preset `auto` also plans a DEP cell for every GPU count above 1.
+DEP needs DP attention, which the launcher does not run, so planning refuses a
+plan that holds a DEP cell and names the option to pass,
+`--fpm-parallel-presets tep`. A plan of one GPU only holds the one-GPU cell
+under `auto`, `tep` and `dep` alike and is admitted. The plan of one and two
+GPUs:
+
+```bash
+python3 -m collector.fpm_forward \
+  --backend sglang \
+  --model-path Qwen/Qwen3-30B-A3B \
+  --gpu h200_sxm \
+  --fpm-max-gpus 2 \
+  --fpm-parallel-presets tep \
+  --fpm-prefill-cudagraph-policy runtime \
+  --fpm-runtime-backend-version 0.5.23 \
+  --fpm-backend-version 0.5.23 \
+  --generator-set K8sConfig.k8s_image=<SGLang 0.5.23 image> \
+  --fpm-database-root <systems data root> \
+  --plan-only
+```
+
+The vLLM render of a TEP cell carries the switch `--enable-expert-parallel`.
+The cell builder writes it as `--ep-size` with the tensor-parallel size, right
+after `--tp-size`. This is the size AISim's generated SGLang serving deployment
+passes under SGLang's alias `--expert-parallel-size`. A one-GPU cell gets no
+`--ep-size`, and no other MoE flag has a translation. The launcher then
+checks what SGLang resolved. It requires an expert-parallel size of 1 or of
+the tensor-parallel size, no all-to-all backend (`moe_a2a_backend` is `none`),
+no separate TP size for the dense MLP layers (`moe_dense_tp_size`), no EPLB
+and no redundant experts, and it refuses an expert-parallel size above 1 for a
+model without expert layers. Pure TP, DP attention, elastic EP, a model with
+hybrid sliding-window or state-space layers and a model with an FPM execution
+identity stay refused, each at its own step:
+
+- Planning refuses pure TP, DEP and an execution identity.
+- A cell whose vLLM command holds a flag without a translation is planned and
+  refused when it is rendered, before a pod is scheduled. The cells of a
+  `GlmMoeDsaForCausalLM` model are refused in this way (`--trust-remote-code`
+  and `--reasoning-parser`), and so are those of some other packaged MoE
+  models: some DeepSeek V4 checkpoints (`--trust-remote-code`) and MiniMax-M3
+  (`--block-size`).
+- The launcher refuses DP attention and elastic EP in the pod, when it checks
+  what SGLang resolved, before the engine is built.
+- A hybrid model is planned and rendered. The launcher refuses it in the pod
+  only after the engine is built, because SGLang decides by its own lists of
+  architectures, which planning does not read. By those lists about half of
+  the packaged MoE models that plan and render are hybrid at both releases,
+  among them Qwen3.5, Nemotron 3, Kimi K3, Llama 4, Gemma 4, DeepSeek V4,
+  MiMo-V2 and gpt-oss. Try one cell with `--smoke --limit 1` before a
+  campaign.
+- A TEP cell whose GPU count does not divide the model's number of experts is
+  planned and rendered and passes the launcher's checks. SGLang then stops
+  while it builds the engine, at an assertion of its MoE layer. This is read
+  in SGLang's source at both releases and was not run. No packaged MoE model
+  has a number of experts that 2, 4 or 8 does not divide.
+
+Which experts a token is sent to depends on the token, so the cells of an MoE
+model send dataset text. In such a run every prompt is text: the cached
+prefixes, the new tokens of a prefill point, the decode contexts, the warm-up
+and the self-test. A prompt part is a chain of whole conversations of the
+dataset, tokenized by the engine's tokenizer and put in an order that the
+content seed fixes, each conversation at most once per chain. The first token
+of each prompt part is not text: the launcher chooses it so that no two
+prompts share a cached prefix that the point did not ask for
+(`runtime/sglbench_content.py`).
+
+`DYN_BENCH_PREFILL_CONTENT` chooses the content of a cell:
+
+| Value | Content |
+|---|---|
+| unset or empty | Dataset text for a model with expert layers, seeded token ids for any other model. |
+| `random` | Seeded token ids. The launcher refuses this value for a model with expert layers. |
+| `sharegpt_chain` | Dataset text for any model. Set it to collect a dense model with text, for example to try the text path on a small model. |
+
+Any other value is refused, `sharegpt` and another spelling of the two words
+included. A cell whose `K8sConfig.extra_env` sets a refused value, or sets
+`random` in the plan of an MoE model, is refused when it is rendered, before a
+pod is scheduled. The launcher makes the same test in the pod and exits with
+status 64. Only that test catches `random` for a model that the plan does not
+take for an MoE model and the launcher does: the launcher counts a truthy
+value of any of six expert keys of the model config (`EXPERT_KEYS` in
+`runtime/sglbench_compat.py`), the plan only an expert count above 1. Only
+that test also sees a value that reaches the pod in another way than the
+cell's inputs, for example from the image. Three more variables name the
+dataset. They have the meaning they have in Dynamo's vLLM self-benchmark, with
+two differences: an empty value counts as unset, and the hash of a local path
+is compared too.
+
+| Variable | Meaning | When unset |
+|---|---|---|
+| `DYN_BENCH_KV_WARMUP_DATASET` | A URL (`http://` or `https://`), or the path of a file in the pod. | The file `ShareGPT_V3_unfiltered_cleaned_split.json` of the Hugging Face dataset `anon8231489123/ShareGPT_Vicuna_unfiltered`, the default of Dynamo's vLLM self-benchmark. |
+| `DYN_BENCH_KV_WARMUP_CACHE_DIR` | The folder where a URL's file is looked for under its own name, and where it is downloaded when it is not there. | `fpm_datasets` beside the folder `HF_HOME` names, or `/tmp/fpm_datasets` when `HF_HOME` is unset too. |
+| `DYN_BENCH_KV_WARMUP_SHA256` | The SHA-256 the file must have, whether it was downloaded, found in the cache folder or given as a path. | The pinned hash of the default file when the dataset is the default URL. For any other dataset nothing is compared. |
+
+A pod without access to the internet cannot download the file. Put it into the
+cache folder under its own name, or give its path as the dataset. Either goes
+into `K8sConfig.extra_env` of the file that `--generator-config` names:
+
+```yaml
+K8sConfig:
+  extra_env:
+    - name: DYN_BENCH_KV_WARMUP_CACHE_DIR
+      value: <folder in the pod that holds the file>
+```
+
+Name the cache folder in this way whenever the pod cannot write `fpm_datasets`
+beside `HF_HOME`, for example on a read-only model volume: Generator's
+`run.sh` then points the variable at a new, empty scratch folder unless the
+variable is already set ([A shared model-cache volume](#a-shared-model-cache-volume)).
+Give a dataset other than the default together with its hash. Without
+`DYN_BENCH_KV_WARMUP_SHA256` the launcher records the hash of the file it read
+and compares it with nothing.
+
+A text run never falls back to seeded token ids. When it cannot get its text,
+the launcher writes a failed artifact, exits with status 65, and the cell
+fails with one of four reasons, which are the names of Dynamo's vLLM
+self-benchmark:
+
+| Reason | What happened |
+|---|---|
+| `dataset_unavailable` | The file is missing, cannot be downloaded, cannot be read or parsed, or does not have the expected hash. |
+| `dataset_empty` | The dataset holds no conversation the launcher can use. |
+| `tokenizer_unavailable` | The engine's tokenizer could not turn the text into token ids. |
+| `content_too_shallow` | The text pool holds too few tokens for the longest prompt of the grid, or a prompt used up the pool. |
+
+The launcher finds, hashes and parses the dataset before it builds the engine,
+so a missing or damaged dataset costs seconds and no model load. Once the
+engine is built it tokenizes conversations in dataset order until its text
+pool holds 8,000,000 tokens or the conversations run out. The pool keeps the
+token ids of a text as the tokenizer returns them, as Dynamo's vLLM
+self-benchmark does. That includes the id of a special token, which a
+tokenizer returns for text that holds the written form of that token. The
+pool leaves out only an id the model does not count, one at or above the
+vocabulary size of its config, and counts what it left out
+(`dropped_tokens` in `producer.content.pool`). That count is 0 unless the
+tokenizer holds ids the model does not have. `dropped_conversations` counts
+the conversations of which no id was kept: those made only of such ids, and
+one for which the tokenizer returned no id at all. The token ids the
+launcher makes up itself, the first token of each prompt part and the seeded
+ids of a run without text, stay ordinary ids (`producer.content.token_range`).
+
+The result file says what was sent. Its `producer.content` block holds the
+content source, the dataset record and the record of the text pool: its four
+counts and `id_range`, the range of token ids the pool keeps, written as
+`[low, high]` for the ids from `low` up to and not including `high`, as
+`token_range` is. That range holds `token_range` and is wider when the model
+counts ids outside `token_range`.
+The `kvwarm` block of a decode artifact names the dataset with the four keys
+Dynamo writes (`path`, `sha256`, `collection_pool`, `conversations`). The
+checkpoint keeps that block as `native_kvwarm` in the record of a decode cell.
+The published rows have no column for the content: `kv_seed_regime` says how
+the cached state was produced, not which tokens it holds. The rows of a TEP
+cell carry `parallel_strategy: tep` and the cell's `moe_ep`.
+
+The rows take those labels from the plan, so for a cell of an MoE plan
+validation holds what the pod recorded against the cell:
+`producer.content.source` must be `dataset_text_chains`, and
+`producer.tp_size` and `producer.moe.ep_size` must be the cell's `tp` and
+`moe_ep`. Two runs complete in the pod and are refused by this comparison. A
+pod whose launcher finds no expert key in the model config (`EXPERT_KEYS`)
+sends seeded token ids unless `sharegpt_chain` is set, and records no
+`producer.moe` block. A
+command that reaches the pod without `--ep-size` runs with an expert-parallel
+size of 1, which the launcher accepts at any tensor-parallel size. The cell
+fails with `native SGLang rank artifact of a MoE plan did not send dataset
+text` or `... did not run the layout of its cell`. The comparison is made
+when a cell has run, when a resume looks at the files of a cell again, and
+when rows are built. The plan of a dense model makes no such comparison.
+
+A cell of a dense model has the same cell id and the same row labels whether
+it sent dataset text or seeded token ids: apart from the measured times, only
+`source_plan_sha256` and the two run ids (`collector_attempt_id`,
+`runtime_run_id`) of its rows differ. A table root that already holds the cell
+keeps the rows it has (first publisher wins, as described above), and the
+`database` block of the checkpoint still says `passed`. Publish the text run
+of a dense model into a root of its own.
+
+Rows depend only on the pin and the plan, never on environment variables. The
+default dataset and its hash are constants of the launcher's code, so they are
+part of the pin, as is the scratch folder `run.sh` chooses by itself. Every
+other dataset, cache folder, hash or content value must be given through
+`K8sConfig.extra_env`: the plan hash covers that input, so a changed value is a
+new campaign. A variable set in the image or in any other way is outside the
+plan.
+
+The unit tests cover this path without a GPU: the plan, the command of each
+cell, and the validation and publication of result files whose times were
+typed in. On H200, the cells of `Qwen/Qwen1.5-MoE-A2.7B` have been collected
+with the default grid: the one-GPU cells at SGLang 0.5.22 and the TEP cells on
+two GPUs at 0.5.23. The texts of those cells gave no token id outside the
+ordinary ids, so a prompt that holds the id of a special token has run in the
+unit tests only.
+
+### Prefill batch sizes
+
+A prefill cell of either backend collects few batch sizes
+([How individual points are selected](../../../docs/perf-model/fpm-self-service/implementation.md#how-individual-points-are-selected)).
+For each new-token count the self-benchmark takes the powers of two up to the
+largest batch that fits, adds that largest batch, and keeps the first N, three
+by default. The largest collected prefill batch is then 4. Dynamo's vLLM
+self-benchmark and the SGLang launcher share this rule, the flag
+`--prefix-max-batch-size-samples` and its default.
+
+You need this section when a simulation fails with
+`FPM prefill query batch_size=N is outside the collected domain [1, 4]`.
+With the `sol` method, the default for a registered architecture, FPM
+interpolation answers a prefill batch above the collected range only when the
+table passes the batch-flatness check (`prefill_batch_axis_is_flat` in
+[`fpm_forward.rs`](../../../crates/core/src/perfmodel/perf_database/fpm_forward.rs)):
+at equal token totals, the median difference between consecutive collected
+batches must be at most 5 percent. With the `direct` method it answers
+collected batch sizes only. For a table that misses the check, collect the
+batches the simulation needs.
+
+That number of kept batch sizes is the cap. The collector has no option for it.
+Set it in `K8sConfig.extra_env` through `--generator-config`; the plan hash
+covers that file:
+
+```yaml
+K8sConfig:
+  extra_env:
+    - name: DYN_PREFIX_MAX_BATCH_SIZE_SAMPLES
+      value: "5"
+```
+
+The entry is written into the `run.sh` of every cell, and the benchmark of a
+formal prefill cell takes it as the cap. A campaign with
+`--fpm-benchmark-points-file` ignores it: its points come from the manifest.
+The largest collected batch is `2^(cap - 1)`, up to the engine's sequence
+limit:
+
+| Cap | Largest collected batch | Reached for requests of at most |
+|---|---|---|
+| 3 (default) | 4 | 2,048 new tokens |
+| 4 | 8 | 1,024 new tokens |
+| 5 | 16 | 512 new tokens |
+| 6 | 32 | 256 new tokens |
+
+The last column holds for the default prefill token limit of 8,192
+(`--fpm-max-prefill-isl`), which a batch must fit as a whole. For a longer
+request the cell collects the largest batch that fits. For the SGLang cells
+run so far, a cap of 5 collected about one and a half times the points of the
+default.
+
+What to know before using it:
+
+- The entry changes the plan hash, so it starts a new campaign with its own
+  artifact directory, and the decode cells are collected again. `--resume`
+  against a checkpoint of the earlier plan is refused.
+- The cell ids do not change. Publish with a `--fpm-database-root` that does
+  not hold those cells yet. In a root that holds them the first publisher
+  wins, as described above: the rows of the new run are skipped, and the
+  `database` block of the checkpoint still says `passed`. Check
+  `published_cells` and `skipped_first_publisher_wins` in that block, not only
+  its `status`.
+- Above the new largest batch nothing changes. A table that missed the
+  batch-flatness check will very likely miss it again: almost all of the
+  check's comparisons are between batches 1 and 2, which a larger cap does not
+  change. Choose a cap that covers every batch that is needed.
+- Inside the range, the `sol` method estimates a batch that was collected at
+  few new-token counts, or not at all, from the neighbouring batches, with no
+  flatness check. It refuses the few queries that have no collected point near
+  enough. The `direct` method refuses a batch that was not collected.
+- A `--smoke` run does not exercise the cap: the collector passes
+  `--prefix-max-batch-size-samples 1` to a smoke prefill cell, and the flag
+  wins over the variable.
+- The cap is recorded in the benchmark result file, as
+  `config.prefix_max_batch_size_samples`, and in the `run.sh` of each cell.
+  The checkpoint and the published rows do not carry it.
+- `--fpm-max-prefill-batch-size` is a different setting. It narrows the
+  sequence limit of the prefill cell's engine, and no batch above that limit
+  can be collected.
+- A bad value (empty, not an integer, or below 1) is refused only when the
+  SGLang launcher starts, after the Pod has been scheduled.
+
+This route has been run once: one SGLang campaign on Kubernetes at a cap of 5,
+with one model on one GPU. No other cap has been run; the other rows of the
+table come from the launcher's grid code, and above 5 the cell may seed more
+prefix tokens than the KV cache holds. Dynamo's vLLM self-benchmark declares
+the same variable for its flag, so by the code the entry applies to a formal
+vLLM prefill cell as well, but no vLLM cell and no Slurm campaign has been run
+with it.
+
+### Two campaigns in one namespace
+
+The id of a cell, and with it the name of its Pod or workload, is derived from
+the backend, the model, the system, the phase, the topology, the dtypes and
+the backend identity. The backend version and the plan hash are not part of
+it. Before a cell starts, the collector deletes any workload of that name in
+the namespace, so that what an interrupted run left behind cannot write into
+the new attempt.
+
+Two campaigns that share a cell, for example one model collected at two
+backend versions, must therefore not run in one namespace at the same time:
+the second deletes the first one's Pod in the middle of its run. Run them one
+after the other, in separate namespaces, or with different GPU counts. This
+holds for both backends.
+
+### A shared model-cache volume
+
+Generator's `run.sh` sets `HF_HOME` to the model's path inside the model-cache
+volume, unless `K8sConfig.k8s_hf_home` names another path. Where it can write,
+it creates `flashinfer-cubins` under `HF_HOME` and `fpm_datasets` beside it, so
+that vLLM pods reuse downloaded kernels and the KV warm-up dataset. On a
+read-only volume it uses scratch directories in the pod.
+
+On a writable volume that other users share, set `K8sConfig.k8s_hf_home` to a
+path outside the volume, for example `/tmp/hf-home`. An SGLang cell loads the
+model from its path inside the volume. A cell that sends dataset text reads
+the dataset folder, which with this setting is an empty folder of the pod, so
+name the folder or the file as [MoE cells](#moe-cells) describes. A cell that
+sends seeded token ids does not read the dataset folder, so
+it needs neither directory there. SGLang cells on H200 have been collected
+with this setting.
 
 ## Failure philosophy: observe, don't predict
 

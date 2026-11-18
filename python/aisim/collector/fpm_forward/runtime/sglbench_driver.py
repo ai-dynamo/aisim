@@ -4,7 +4,7 @@
 # The batch-sequence checks follow SGLang's scheduler at v0.5.22 and v0.5.23; see THIRD_PARTY_NOTICES.md.
 # Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
-# The run lifecycle, the point procedures and five failure reason strings are re-implemented from ai-dynamo/dynamo
+# The run lifecycle, the point procedures and nine failure reason strings are re-implemented from ai-dynamo/dynamo
 # (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/instrumented_scheduler.py at
 # b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.
 
@@ -13,7 +13,9 @@
 This module runs in the launcher's process inside the SGLang pod, where AISim is not installed. It uses the
 standard library and the sibling modules ``sglbench_grid``, ``sglbench_content`` and ``sglbench_artifact``. It
 imports no SGLang and reads no environment variable. The engine is an object the caller hands over: anything
-with ``generate(prompts, rids, max_new_tokens) -> list[dict]``. Every setting is an argument.
+with ``generate(prompts, rids, max_new_tokens) -> list[dict]``. Every setting is an argument. For a run whose
+prompts are dataset text the caller also hands over the text pool (``sglbench_content.TextPool``) and the
+record of the dataset it was made from; the driver reads no file and tokenizes nothing.
 
 A run (``BenchmarkRun.execute``), in this order:
 
@@ -21,7 +23,8 @@ A run (``BenchmarkRun.execute``), in this order:
 2. refuse engine settings the feasibility rules do not cover (as each scheduler process reports them);
 3. build the limits record from the leader's header, and the grid from it;
 4. check the two request caps against the largest batch of the grid;
-5. build the content plan and compare the first tokens the run needs with the token range;
+5. compare the first tokens the run needs with the token range and, in a text run, the tokens of the text
+   pool with the longest prompt of the grid; then build the content plan;
 6. build one empty artifact, so that a setting that is not JSON fails before any request;
 7. run the self-test, then the global warm-up;
 8. stage, check and record every point in grid order. Before each point a recorder fault fails the run and
@@ -43,6 +46,19 @@ Failure reasons. Five are the strings of Dynamo's vLLM self-benchmark, with the 
     measured_prefill_tokens_mismatch   a prompt count differs, a request was chunked, or the computed tokens differ
     measured_decode_context_mismatch   a decode run is not extend batches and then six decode batches
     no_fpm_before_deadline             a log did not hold the batches of a stage in time
+
+Four more are the verdicts of the content probe of Dynamo's vLLM self-benchmark (``_kvwarm_probe_content``). There
+a verdict switches the real-text warm-up off and the run goes on with synthetic content; here each one fails
+the run, because a text run has no other content to fall back to:
+
+    dataset_unavailable                the dataset file cannot be had: no file, a wrong hash, a failed download
+    dataset_empty                      the dataset gives no text, or no token id of its texts is one the model
+                                       counts
+    tokenizer_unavailable              the served tokenizer could not turn the texts into token ids
+    content_too_shallow                the text pool does not hold more tokens than the longest prompt needs
+
+The driver itself gives the last one only. The launcher gives the other three through ``record_failure``,
+because it is the module that reads the dataset and calls the tokenizer.
 
 The others are this module's own: ``request_not_completed``, ``engine_call_failed``, ``recorder_fault``,
 ``recorder_header_invalid``, ``self_test_failed``, ``rejected``, ``token_range_too_small`` and
@@ -85,8 +101,9 @@ The lifecycle and the point procedures follow Dynamo's vLLM self-benchmark, in t
 header of this file names: the global warm-up of one 256-token prompt (``_bench_step_warmup``), seed, warm shot
 and measured shot of a prefill point with one re-stage after a missed cache hit (``_bench_realseed_stage_point``,
 ``_bench_realseed_pending_step``), the soft deadline looked at between two points
-(``_bench_stop_at_timeout_boundary``) and the comparison of the scheduled counters with the point
-(``_bench_fpm_validation_failure``). One difference: Dynamo always runs its first point, because that
+(``_bench_stop_at_timeout_boundary``), the comparison of the scheduled counters with the point
+(``_bench_fpm_validation_failure``) and the test that the dataset text is deep enough for the longest prompt
+(``_kvwarm_probe_content``). One difference: Dynamo always runs its first point, because that
 function does nothing while no point has completed; this driver also looks at the deadline before the first
 point, because its clock starts with the launcher and not with the first benchmark step.
 
@@ -146,6 +163,12 @@ REASON_CACHE = "real_seed_cache_validation_failed"
 REASON_PREFILL_TOKENS = "measured_prefill_tokens_mismatch"
 REASON_DECODE_CONTEXT = "measured_decode_context_mismatch"
 REASON_NO_BATCHES = "no_fpm_before_deadline"
+# The four verdicts of Dynamo's content probe (_kvwarm_probe_content), which fail a text run here. The driver
+# gives the last one; the launcher gives the other three and takes the strings from here.
+REASON_DATASET_UNAVAILABLE = "dataset_unavailable"
+REASON_DATASET_EMPTY = "dataset_empty"
+REASON_TOKENIZER_UNAVAILABLE = "tokenizer_unavailable"
+REASON_CONTENT_TOO_SHALLOW = "content_too_shallow"
 # This module's own reason strings.
 REASON_NOT_COMPLETED = "request_not_completed"
 REASON_ENGINE_CALL = "engine_call_failed"
@@ -170,6 +193,15 @@ _UNALIGNED_EXTRA_TOKENS = 7
 # Seeds and prefill shots ask for one output token. Each then stores its prompt and nothing after it, which
 # the planned cached counts assume (sglbench_content.py, "Conditions on the caller").
 _ONE_OUTPUT_TOKEN = grid.PREFILL_OUTPUT_TOKENS
+
+# The keys of the dataset record that go into the ``kvwarm`` block of a decode or agg artifact of a text run.
+# They are the four keys Dynamo's vLLM self-benchmark writes there (_kvwarm_load_texts); the launcher's record
+# holds two more, which stay in the ``producer`` block.
+_KVWARM_DATASET_KEYS = ("path", "sha256", "collection_pool", "conversations")
+
+# How the message of the content plan begins when a text chain has used every conversation of the pool
+# (sglbench_content.py). tests/unit/collector/test_fpm_sglbench_driver.py compares it with what the plan raises.
+_POOL_EXHAUSTED = "text pool exhausted"
 
 # The response keys of one request, as the engine object returns them.
 _RESPONSE_INT_KEYS = ("prompt_tokens", "cached_tokens", "completion_tokens", "num_retractions")
@@ -311,6 +343,11 @@ class RunSettings:
     log_wait_seconds: float = 30.0
     # How long the recorder headers may take to appear.
     header_wait_seconds: float = 60.0
+    # Where the prompts of the run come from, as far as the launcher knows it when it makes the run:
+    # ``sglbench_content.CONTENT_SEEDED_IDS`` or ``CONTENT_TEXT_CHAINS``. Only an artifact that is written
+    # before ``execute`` was called reads it, so that a text run whose dataset could not be had still says
+    # what it was started for. ``execute`` itself goes by the text pool it is given.
+    content_source: str = content.CONTENT_SEEDED_IDS
 
 
 def _require_setting_int(name: str, value: object, minimum: int) -> None:
@@ -592,6 +629,9 @@ class BenchmarkRun:
         self._grid: grid.Grid | None = None
         self._limits: grid.Limits | None = None
         self._plan: content.ContentPlan | None = None
+        # The text pool and the record of its dataset, both None in a run with seeded token ids.
+        self._text_pool: content.TextPool | None = None
+        self._dataset: dict | None = None
         self._leader: str | None = None
         self._followers: list[str] = []
         self._enable_overlap: bool | None = None
@@ -653,8 +693,26 @@ class BenchmarkRun:
 
     # ------------------------------------------------------------------ execute
 
-    def execute(self, engine: object, *, token_low: int, token_high: int) -> None:
-        """Run the benchmark against ``engine`` with prompts drawn from ``[token_low, token_high)``.
+    def execute(
+        self,
+        engine: object,
+        *,
+        token_low: int,
+        token_high: int,
+        text_pool: content.TextPool | None = None,
+        dataset: dict | None = None,
+    ) -> None:
+        """Run the benchmark against ``engine``. The ids the run makes up are in ``[token_low, token_high)``.
+
+        Without ``text_pool`` the prompts are seeded token ids of that range. With it the run is a text run:
+        every prompt is made of the pool's conversations, apart from the allocated first tokens, which come
+        from that range (sglbench_content.py). The ids of a conversation are the pool's and can lie outside
+        the range.
+        ``dataset`` is then the record of the file the pool was made from, a dict with at least the keys
+        ``path``, ``sha256``, ``collection_pool`` and ``conversations``. It is written into the ``producer``
+        block as it is, and those four keys into the ``kvwarm`` block of a decode or agg artifact. The two
+        arguments are given together or not at all: ``TypeError`` otherwise, and for a pool or a record of
+        another type.
 
         A failure of the run is recorded, not raised: see ``status`` and ``reason``. An exception that is not
         an ``Exception`` (``SystemExit``, ``KeyboardInterrupt``) passes through, for the caller to record as a
@@ -662,7 +720,19 @@ class BenchmarkRun:
         """
         if self._executed:
             raise RuntimeError("execute was already called for this run")
+        if (text_pool is None) != (dataset is None):
+            given, absent = ("text_pool", "dataset") if dataset is None else ("dataset", "text_pool")
+            raise TypeError(f"text_pool and dataset must be given together: {given} was given without {absent}")
+        if text_pool is not None:
+            if not isinstance(text_pool, content.TextPool):
+                raise TypeError(f"text_pool must be a TextPool, got {type(text_pool).__name__}")
+            if not isinstance(dataset, dict):
+                raise TypeError(f"dataset must be a dict, got {type(dataset).__name__}")
+            absent_keys = [key for key in _KVWARM_DATASET_KEYS if key not in dataset]
+            if absent_keys:
+                raise TypeError(f"dataset must have the keys {_KVWARM_DATASET_KEYS}, it has no {absent_keys}")
         self._executed = True
+        self._text_pool, self._dataset = text_pool, dataset
         if self._failure is not None:
             return
         self._execute_started_at = self._clock()
@@ -672,6 +742,13 @@ class BenchmarkRun:
         except _Failure as failure:
             self._fail(failure.reason, self._current_point)
         except Exception as error:
+            exhausted = isinstance(error, ValueError) and str(error).startswith(_POOL_EXHAUSTED)
+            if self._text_pool is not None and exhausted:
+                # A text chain used every conversation of the pool before a prompt was complete. That is a
+                # finding about the dataset and about the point that asked for the prompt, not a fault of the
+                # code. The check before the sweep is meant to make it impossible.
+                self._fail(f"{REASON_CONTENT_TOO_SHALLOW}: {error}", self._current_point)
+                return
             # An unexpected exception is not a finding about a point, so it names none in the artifact. The
             # point that was being staged is said in the text.
             point = self._current_point
@@ -722,6 +799,11 @@ class BenchmarkRun:
         for name in ("content_seed", "worker_id"):
             if type(getattr(settings, name)) is not str:
                 raise TypeError(f"settings.{name} must be a str, got {getattr(settings, name)!r}")
+        sources = (content.CONTENT_SEEDED_IDS, content.CONTENT_TEXT_CHAINS)
+        if settings.content_source not in sources:
+            raise ValueError(f"settings.content_source must be one of {sources}, got {settings.content_source!r}")
+        if settings.content_source == content.CONTENT_TEXT_CHAINS and self._text_pool is None:
+            raise TypeError("settings.content_source names dataset text, and execute was given no text pool")
 
     # ------------------------------------------------------------------ headers
 
@@ -908,8 +990,45 @@ class BenchmarkRun:
         need["total"] = sum(need.values())
         return need
 
+    def _longest_prompt(self) -> int:
+        """The length of the longest prompt the run sends: over the points, the self-test and the warm-up.
+
+        A prefill shot has its cached and its new tokens, a decode prompt its context less the three tokens
+        the run generates before the kept step, and the longest prompt of the self-test is the unaligned one.
+        """
+        lengths = [2 * grid.cached_unit(self._limits.page_size) + _UNALIGNED_EXTRA_TOKENS]
+        if self.settings.warmup_iterations:
+            lengths.append(WARMUP_PROMPT_TOKENS)
+        for point in self._grid.points:
+            if point.phase == grid.PREFILL:
+                lengths.append(point.cached_tokens + point.new_tokens)
+            else:
+                lengths.append(point.cached_tokens - grid.DECODE_PROMPT_LEAD)
+        return max(lengths)
+
+    def _require_deep_pool(self) -> None:
+        """Fail a text run whose pool does not hold more tokens than the longest prompt needs.
+
+        A prompt part is a chain of whole conversations, each used at most once, so one chain gives at most
+        the tokens of the whole pool and never wraps (sglbench_content.py). The need is the longest prompt and
+        one token more: a prefill shot makes the plan look at the slot's token after the cached prefix.
+        Dynamo's vLLM self-benchmark proves the same before its sweep, one chain at its depth cap
+        (``_kvwarm_probe_content``). There a shallow dataset switches the real text off; here it fails the
+        run before any request.
+        """
+        need = self._longest_prompt() + 1
+        tokens = self._text_pool.tokens
+        if tokens <= need:
+            raise _Failure(
+                f"{REASON_CONTENT_TOO_SHALLOW}: the text pool holds {tokens} tokens and the longest prompt needs {need}"
+            )
+
     def _content_plan(self, token_low: int, token_high: int) -> content.ContentPlan:
-        """Build the one content plan of the run, after the token range was compared with the planned need."""
+        """Build the one content plan of the run, after the token range was compared with the planned need.
+
+        In a text run the pool is compared with the longest prompt as well, and the plan draws every prompt
+        part from it. A run with seeded token ids builds its plan without a pool.
+        """
         if not _is_int(token_low) or not _is_int(token_high):
             raise TypeError(f"token_low and token_high must be ints, got {token_low!r} and {token_high!r}")
         need = self._first_token_need()
@@ -927,7 +1046,10 @@ class BenchmarkRun:
         self._first_tokens = need
         # What is left for re-stages of zero-cached points beyond the one the reserve covers.
         self._spare_first_tokens = size - need["total"] + need["restage_reserve"]
-        return content.ContentPlan(self.settings.content_seed, token_low, token_high)
+        if self._text_pool is None:
+            return content.ContentPlan(self.settings.content_seed, token_low, token_high)
+        self._require_deep_pool()
+        return content.ContentPlan(self.settings.content_seed, token_low, token_high, pool=self._text_pool)
 
     def _take_spare_first_tokens(self, point: grid.Point) -> None:
         """Account for the zero-cached prompts a re-staged prefill point without cached tokens issues again."""
@@ -1536,12 +1658,45 @@ class BenchmarkRun:
         return 0 if self._grid is None else len(self._grid.points)
 
     def _own_producer_facts(self) -> dict:
-        """What the driver knows about the run, for the ``producer`` block. No AISim reader parses these keys.
+        """What the driver knows about the run, for the ``producer`` block.
 
-        The one key of the block with a reader is the launcher's ``sglang_version``: the host validator compares
-        it with the pod's provenance file (native_artifact.py, ``validate_native_collection``).
+        One of these keys has a reader: for a cell of a plan whose model has expert layers, the host validator
+        requires ``content.source`` to be ``CONTENT_TEXT_CHAINS`` (native_artifact.py,
+        ``_validate_sglang_moe_producer``). The other keys of the block with a reader are the launcher's:
+        ``sglang_version``, which the validator compares with the pod's provenance file
+        (``validate_native_collection``), and for such a cell ``tp_size`` and ``moe.ep_size``, which it compares
+        with the sizes of the cell. No AISim reader parses the rest.
         """
-        limits, plan = self._limits, self._plan
+        limits, plan, pool = self._limits, self._plan, self._text_pool
+        if plan is not None:
+            source = plan.source
+        elif pool is not None:
+            # Before a plan exists: the source this run was started for.
+            source = content.CONTENT_TEXT_CHAINS
+        else:
+            # Before ``execute``: what the launcher said when it made the run.
+            source = self.settings.content_source
+        content_facts = {
+            "source": source,
+            "seed": self.settings.content_seed,
+            "token_range": None if plan is None else [plan.token_low, plan.token_high],
+            "issued": None if plan is None else plan.stats(),
+        }
+        if pool is not None:
+            # The record of the dataset is the launcher's. It is left out with the launcher's blocks when the
+            # artifact could not be written with them.
+            if self._omitted_blocks is None:
+                content_facts["dataset"] = dict(self._dataset)
+            # ``id_range`` is the range of ids the pool keeps, ``[low, high)`` written as two numbers like
+            # ``token_range``. It holds ``token_range`` and can be wider: the ids of a text are not held to the
+            # range of the ids the run makes up. ``dropped_tokens`` counts the ids of the texts outside it.
+            content_facts["pool"] = {
+                "id_range": [pool.token_low, pool.token_high],
+                "conversations": pool.conversations,
+                "tokens": pool.tokens,
+                "dropped_tokens": pool.dropped_tokens,
+                "dropped_conversations": pool.dropped_conversations,
+            }
         return {
             "timing_metric": "scheduler_wall_time",
             "timing_clock": "process_local_monotonic",
@@ -1551,12 +1706,7 @@ class BenchmarkRun:
             "limits": None if limits is None else limits.as_dict(),
             "page_size": None if limits is None else limits.page_size,
             "enable_overlap": self._enable_overlap,
-            "content": {
-                "source": "seeded_token_ids",
-                "seed": self.settings.content_seed,
-                "token_range": None if plan is None else [plan.token_low, plan.token_high],
-                "issued": None if plan is None else plan.stats(),
-            },
+            "content": content_facts,
             "restaged_points": list(self._restaged),
             "self_test": list(self._self_test_passed),
             "first_token_need": None if self._first_tokens is None else dict(self._first_tokens),
@@ -1567,7 +1717,8 @@ class BenchmarkRun:
         own = self._own_producer_facts()
         if self._omitted_blocks is not None:
             # The launcher's blocks could not be written. A failed artifact is written without them and
-            # says so, because no artifact at all would hide the failure from the gate.
+            # says so, because no artifact at all would hide the failure from the gate. The record of the
+            # dataset is the launcher's too: ``_own_producer_facts`` and ``_payload`` leave it out then.
             return {}, {**own, "omitted_launcher_blocks": self._omitted_blocks}
         launcher = self.settings.producer
         for name, block in (("config", self.settings.config), ("producer", launcher)):
@@ -1588,6 +1739,11 @@ class BenchmarkRun:
         """The rank artifact of the state now. The arguments replace single values for a trial build."""
         config, producer = self._blocks() if blocks is None else blocks
         built = self._grid
+        text_run: dict = {}
+        if self._dataset is not None and self.settings.mode != grid.PREFILL and self._omitted_blocks is None:
+            # The ``kvwarm`` block of a decode or agg artifact of a text run names the dataset; a prefill
+            # artifact has no such block. A run with seeded ids makes the call it always made.
+            text_run["kvwarm_dataset"] = {key: self._dataset[key] for key in _KVWARM_DATASET_KEYS}
         return artifact.build_rank_artifact(
             dp_rank=RANK,
             dp_size=DP_SIZE,
@@ -1602,6 +1758,7 @@ class BenchmarkRun:
             missing_phases=() if built is None else built.missing_phases,
             stop_reason=self._stop_reason,
             failure=self._failure if failure is None else failure,
+            **text_run,
         )
 
     def _elapsed(self) -> float:
@@ -1635,8 +1792,8 @@ class BenchmarkRun:
         If the artifact cannot be built or written as it stands (``TypeError`` or ``ValueError`` of the
         artifact module), the run becomes failed with that text and the failed artifact is written instead.
         If that one cannot be built either, it is written without the launcher's ``config`` and ``producer``
-        blocks and says so in ``producer``. A run without an outcome is written as failed. Other errors, such
-        as a missing directory, are raised.
+        blocks, and in a text run without the launcher's record of the dataset, and says so in ``producer``.
+        A run without an outcome is written as failed. Other errors, such as a missing directory, are raised.
 
         A second call returns the result of the first and touches no file. After a call that raised, a
         second call raises ``RuntimeError``: the files of a run are never written twice.

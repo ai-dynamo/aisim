@@ -5,7 +5,7 @@
 # THIRD_PARTY_NOTICES.md.
 # Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
-# The run lifecycle, the point procedures and five failure reason strings are re-implemented from ai-dynamo/dynamo
+# The run lifecycle, the point procedures and nine failure reason strings are re-implemented from ai-dynamo/dynamo
 # (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/instrumented_scheduler.py at
 # b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.
 
@@ -24,6 +24,9 @@ No SGLang and no GPU are involved. Everything that stands in for an engine is FA
   the few tests that make the driver leave those facts out hold no other claim about the times either.
 - A fault is something the fake engine does on purpose to one call: a wrong batch line, a wrong response, a
   dropped cache.
+- The text of a text run is FAKE. ``_fake_conversations`` types in lists of token ids in the place of tokenized
+  conversations, and ``FAKE_DATASET`` is a record of a dataset file that does not exist. No tokenizer and no
+  dataset are involved.
 
 The driver, the grid, the content plan and the artifact module are the real ones, loaded flat from the runtime
 directory as the pod loads them. The two checkers are used as shipped, through the helpers of
@@ -108,6 +111,22 @@ SMALL_CAPS = grid.SampleCaps(
     prefix_max_batch_size_samples=2,
 )
 
+# FAKE text of a text run. Every id of a FAKE conversation lies in a narrow band of the token range, so that a
+# token that came from the pool can be told from an allocated first token and from a seeded id.
+FAKE_TEXT_LOW, FAKE_TEXT_HIGH = 20_000, 20_050
+# FAKE record of the dataset file, with the six keys the launcher writes. No such file exists.
+FAKE_DATASET = {
+    "path": "/fake/datasets/FAKE_conversations.json",
+    "sha256": "0123456789abcdef" * 4,
+    "collection_pool": "conversation_sha256_even",
+    "conversations": 67,
+    "url": None,
+    "downloaded": False,
+}
+# The ``kvwarm`` block of a decode or agg artifact of a run with seeded ids, and what a text run adds to it.
+SEEDED_KVWARM = {"enabled": True, "warm_eligible": True, "skip_reason": None, "method": "radix_cache_seed"}
+FAKE_KVWARM_DATASET = {key: FAKE_DATASET[key] for key in ("path", "sha256", "collection_pool", "conversations")}
+
 # The order of the calls outside any point, which the request ids carry in place of the attempt.
 FREE_BATCH_SHAPE, FREE_ALIGNED_SEED, FREE_ALIGNED_SHOTS, FREE_UNALIGNED_SEED, FREE_UNALIGNED_AGAIN = range(5)
 FREE_SEVEN_TOKEN_RUN, FREE_WARMUP = 5, 6
@@ -131,6 +150,34 @@ def _limits(page_size: int, **overrides) -> grid.Limits:
     }
     record.update(overrides)
     return grid.Limits(**record)
+
+
+def _fake_conversations(count: int = 64) -> list[list[int]]:
+    """FAKE tokenized conversations, repetitive on purpose: all start with the same five ids of a 50-id band.
+
+    Three ids lie outside the token range of the run and one conversation holds nothing else, as the ids of a
+    special token written inside a text would. A pool over the token range drops them and counts them; a
+    wider pool, as the launcher builds it over the ids the model counts, keeps them.
+    """
+    band = FAKE_TEXT_HIGH - FAKE_TEXT_LOW
+    rows = []
+    for index in range(count):
+        length = 24 + (index * 7) % 40
+        row = [FAKE_TEXT_LOW + step for step in range(5)]
+        row += [FAKE_TEXT_LOW + (index * 13 + step * step) % band for step in range(length - 5)]
+        rows.append(row)
+    rows[3] = [*rows[3][:9], 5, *rows[3][9:], TOKEN_HIGH]
+    rows.insert(7, [TOKEN_HIGH + 7])
+    return rows
+
+
+def _fake_pool(conversations: list[list[int]] | None = None, tokens: tuple[int, int] = (TOKEN_LOW, TOKEN_HIGH)):
+    """A real text pool over FAKE conversations."""
+    return content.TextPool(_fake_conversations() if conversations is None else conversations, *tokens)
+
+
+def _is_fake_text(tokens: list[int]) -> bool:
+    return all(FAKE_TEXT_LOW <= token < FAKE_TEXT_HIGH for token in tokens)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -526,8 +573,9 @@ class _FakeEngine:
             self.pending.append({"mode": "DECODE", "rids": list(call.rids), "ticks": FAKE_DECODE_BASE_TICKS})
         for prompt in call.prompts:
             # A finished request stores its prompt and the generated tokens that have KV: all but the last.
-            # The FAKE output tokens lie below the plan's range, so they equal no planned token.
-            self.cache.finish_prefill([*prompt, *range(max_new_tokens - 1)])
+            # The FAKE output tokens are negative numbers, so they equal no token id: not an allocated one, not
+            # a seeded one and not an id of a text, which a pool can keep from 0 upwards.
+            self.cache.finish_prefill([*prompt, *range(-1, -max_new_tokens, -1)])
         if fault == "deadline":
             self.clock.advance(round(FAKE_TIMEOUT_SECONDS * TICKS_PER_SECOND))
 
@@ -580,6 +628,9 @@ class _FakeRun:
     limits: grid.Limits
     settings: driver.RunSettings
     tokens: tuple[int, int]
+    # The text pool and the dataset record of a text run; both None in a run with seeded ids.
+    text_pool: object = None
+    dataset: dict | None = None
 
     @property
     def built(self) -> grid.Grid:
@@ -587,7 +638,14 @@ class _FakeRun:
         return grid.build_grid(self.settings.mode, self.limits, self.settings.caps, manifest=self.settings.manifest)
 
     def execute(self) -> None:
-        self.run.execute(self.engine, token_low=self.tokens[0], token_high=self.tokens[1])
+        low, high = self.tokens
+        if self.text_pool is None:
+            # A run with seeded ids is started with the call it always had.
+            self.run.execute(self.engine, token_low=low, token_high=high)
+        else:
+            self.run.execute(
+                self.engine, token_low=low, token_high=high, text_pool=self.text_pool, dataset=self.dataset
+            )
 
     def payload(self) -> dict:
         (payload,) = self.run.payloads()
@@ -622,12 +680,14 @@ def _start(
     tokens: tuple[int, int] = (TOKEN_LOW, TOKEN_HIGH),
     execute: bool = True,
     started_before_seconds: float = 0.0,
+    text_pool: object = None,
+    dataset: dict | None = None,
     **overrides,
 ) -> _FakeRun:
     """Lay out a pod, start a fake engine, build a run and, unless told not to, execute it.
 
     ``started_before_seconds`` is the FAKE time between the start of the launcher and the run: what an engine
-    build would take.
+    build would take. ``text_pool`` and ``dataset`` make the run a text run.
     """
     limits = _limits(page_size) if limits is None else limits
     cell = _cell(phase="prefill" if mode == "agg" else mode, dp=1, strategy="single")
@@ -669,10 +729,17 @@ def _start(
     settings = driver.RunSettings(**values)
     started_at = clock.read() - started_before_seconds
     run = driver.BenchmarkRun(settings, recorder_dir, started_at=started_at, clock=clock.read, sleep=clock.sleep)
-    fake = _FakeRun(run, engine, clock, cell, tmp_path, pod, recorder_dir, limits, settings, tokens)
+    fake = _FakeRun(run, engine, clock, cell, tmp_path, pod, recorder_dir, limits, settings, tokens, text_pool, dataset)
     if execute:
         fake.execute()
     return fake
+
+
+def _start_text(tmp_path: Path, mode: str = "prefill", page_size: int = 1, **options) -> _FakeRun:
+    """``_start`` for a text run: a real pool over the FAKE conversations and the FAKE dataset record."""
+    options.setdefault("text_pool", _fake_pool())
+    options.setdefault("dataset", dict(FAKE_DATASET))
+    return _start(tmp_path, mode, page_size, **options)
 
 
 def _expected_sample(point: grid.Point) -> float:
@@ -840,6 +907,8 @@ def test_complete_run_of_the_default_grid_passes_the_validator_and_the_gate(tmp_
         "self_test": ["batch_shape", "aligned_prefix", "unaligned_prompt", "seven_token_run"],
         "first_token_need": need,
     }
+    # A run with seeded ids writes the ``kvwarm`` block it always wrote: four keys and no dataset.
+    assert on_disk.get("kvwarm") == (None if mode == "prefill" else SEEDED_KVWARM)
     assert ("kvwarm" in on_disk) == (mode != "prefill")
     # The first tokens the run was planned to take are the ones the content plan issued: no re-stage happened.
     zero_cached_batches = [
@@ -2678,7 +2747,12 @@ def test_the_public_names_have_the_agreed_shape(tmp_path):
         "max_queued_requests",
         "log_wait_seconds",
         "header_wait_seconds",
+        "content_source",
     ]
+    # The last one has a default, so a caller that names no source makes a run with seeded ids.
+    assert {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}["content_source"] == (
+        "seeded_token_ids"
+    )
     fake = _start(tmp_path, execute=False)
     with pytest.raises(dataclasses.FrozenInstanceError):
         fake.settings.mode = "decode"
@@ -2702,7 +2776,12 @@ def test_the_public_names_have_the_agreed_shape(tmp_path):
         ("engine", "POSITIONAL_OR_KEYWORD"),
         ("token_low", "KEYWORD_ONLY"),
         ("token_high", "KEYWORD_ONLY"),
+        ("text_pool", "KEYWORD_ONLY"),
+        ("dataset", "KEYWORD_ONLY"),
     ]
+    # A run with seeded ids is started without the last two.
+    parameters = inspect.signature(driver.BenchmarkRun.execute).parameters
+    assert (parameters["text_pool"].default, parameters["dataset"].default) == (None, None)
     assert kinds(driver.BenchmarkRun.record_failure) == [
         ("self", "POSITIONAL_OR_KEYWORD"),
         ("reason", "POSITIONAL_OR_KEYWORD"),
@@ -2734,6 +2813,13 @@ def test_the_reason_strings_and_the_staging_constants_are_the_shared_ones():
         "measured_decode_context_mismatch",
         "no_fpm_before_deadline",
     )
+    # The four verdicts of Dynamo's content probe, which the launcher takes from here.
+    assert (
+        driver.REASON_DATASET_UNAVAILABLE,
+        driver.REASON_DATASET_EMPTY,
+        driver.REASON_TOKENIZER_UNAVAILABLE,
+        driver.REASON_CONTENT_TOO_SHALLOW,
+    ) == ("dataset_unavailable", "dataset_empty", "tokenizer_unavailable", "content_too_shallow")
     assert (
         driver.REASON_NOT_COMPLETED,
         driver.REASON_ENGINE_CALL,
@@ -2892,3 +2978,448 @@ def test_the_request_caps_also_cover_the_pairs_of_the_self_test(tmp_path):
     queued = _start(tmp_path / "queued", "prefill", manifest=manifest, max_queued_requests=1)
     assert queued.run.reason == "rejected: max_queued_requests=1 is below the largest batch 2"
     assert _start(tmp_path / "two", "prefill", manifest=manifest, prefill_max_requests=2).run.status == "complete"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Text runs: prompts made of the conversations of a text pool
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _longest_prompt(fake: _FakeRun) -> int:
+    """The longest prompt a run sends, worked out here: the points, the self-test and the warm-up."""
+    unit = grid.cached_unit(fake.limits.page_size)
+    lengths = [2 * unit + 7, 256 if fake.settings.warmup_iterations else 0]
+    for point in fake.built.points:
+        lengths.append(point.cached_tokens + point.new_tokens if point.phase == "prefill" else point.cached_tokens - 3)
+    return max(lengths)
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("mode", ["prefill", "decode", "agg"])
+def test_a_text_run_of_a_small_grid_passes_the_validator_and_the_gate(tmp_path, mode, page_size):
+    fake = _start_text(tmp_path, mode, page_size)
+
+    built = fake.built
+    assert len(built.points) >= 8 and built.missing_phases == ()
+    # Every cached count the fake engine's cache model reported was the planned one, although every FAKE
+    # conversation starts with the same five ids: no point was staged twice.
+    on_disk = _assert_accepted(fake)
+    producer = on_disk["producer"]
+    assert producer["restaged_points"] == []
+
+    # The producer block names the source, the dataset and the pool beside what a seeded run writes.
+    pool = fake.text_pool
+    assert producer["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": [TOKEN_LOW, TOKEN_HIGH],
+        "issued": producer["content"]["issued"],
+        "dataset": FAKE_DATASET,
+        "pool": {
+            "id_range": [TOKEN_LOW, TOKEN_HIGH],
+            "conversations": 64,
+            "tokens": pool.tokens,
+            "dropped_tokens": 3,
+            "dropped_conversations": 1,
+        },
+    }
+    assert pool.tokens == sum(len(row) for row in _fake_conversations()) - 3
+    assert (driver.content.CONTENT_TEXT_CHAINS, driver.content.CONTENT_SEEDED_IDS) == (
+        "dataset_text_chains",
+        "seeded_token_ids",
+    )
+    seeded_keys = set(_start(tmp_path / "seeded", mode, page_size).payload()["producer"])
+    assert set(producer) == seeded_keys
+    # The ``kvwarm`` block of a decode or agg artifact names the dataset with Dynamo's four keys; a prefill
+    # artifact has no such block.
+    if mode == "prefill":
+        assert "kvwarm" not in on_disk
+    else:
+        assert on_disk["kvwarm"] == {**SEEDED_KVWARM, "dataset": FAKE_KVWARM_DATASET}
+        merged = json.loads((fake.pod / "benchmark_merged.json").read_text(encoding="utf-8"))
+        assert merged["kvwarm"] == on_disk["kvwarm"]
+    # The pool was frozen by the plan: nothing can be added to it under the run.
+    with pytest.raises(RuntimeError):
+        pool.add([[FAKE_TEXT_LOW]])
+
+    # Every prompt is text after its allocated tokens. A second plan over an equal pool gives the same prompts:
+    # the content is a function of the seed and the pool.
+    plan = content.ContentPlan("0", TOKEN_LOW, TOKEN_HIGH, pool=_fake_pool())
+    for call in fake.engine.calls:
+        assert all(TOKEN_LOW <= token < TOKEN_HIGH for prompt in call.prompts for token in prompt)
+    for point in built.points:
+        calls = fake.calls_of(point.benchmark_id)
+        if point.phase == "decode":
+            seed, run = calls
+            assert seed.prompts == run.prompts
+            assert run.prompts == [
+                plan.slot_prefix(0, slot, point.cached_tokens - 3) for slot in range(point.batch_size)
+            ]
+            assert all(_is_fake_text(prompt[1:]) for prompt in run.prompts)
+            continue
+        cached = point.cached_tokens
+        warm, meas = calls[-2:]
+        for slot in range(point.batch_size):
+            for shot in (warm, meas):
+                prompt = shot.prompts[slot]
+                assert len(prompt) == cached + point.new_tokens
+                if cached:
+                    # The slot's prefix, one allocated suffix token, then text again.
+                    assert prompt[:cached] == plan.slot_prefix(0, slot, cached) == calls[0].prompts[slot]
+                    assert _is_fake_text(prompt[1:cached]) and _is_fake_text(prompt[cached + 1 :])
+                else:
+                    assert _is_fake_text(prompt[1:])
+            assert warm.prompts[slot][cached] != meas.prompts[slot][cached]
+    # The self-test and the warm-up are text too.
+    free = [call for call in fake.engine.calls if call.key[0] == 0]
+    assert len(free) == 7
+    for number in (FREE_BATCH_SHAPE, FREE_UNALIGNED_SEED, FREE_SEVEN_TOKEN_RUN, FREE_WARMUP):
+        assert all(_is_fake_text(prompt[1:]) for prompt in free[number].prompts)
+    # A seeded run of the same grid sends other prompts of the same lengths.
+    seeded_calls = _start(tmp_path / "seeded-again", mode, page_size).engine.calls
+    assert [[len(prompt) for prompt in call.prompts] for call in seeded_calls] == [
+        [len(prompt) for prompt in call.prompts] for call in fake.engine.calls
+    ]
+    long_prompts = [prompt for call in seeded_calls for prompt in call.prompts if len(prompt) > 8]
+    assert long_prompts and not any(_is_fake_text(prompt[1:]) for prompt in long_prompts)
+
+
+def test_a_text_run_with_two_scheduler_processes_and_an_eviction_is_staged_again(tmp_path):
+    victim = _victim(_plan_only(tmp_path, "decode", processes=2))
+    fake = _start_text(tmp_path, "decode", processes=2, evictions={victim.benchmark_id: 1})
+
+    on_disk = _assert_accepted(fake)
+    assert on_disk["producer"]["restaged_points"] == [victim.benchmark_id]
+    # The second attempt sends the prompts of the first: a slot has one sequence for the whole run.
+    first, second = fake.calls_of(victim.benchmark_id, "run")
+    assert first.prompts == second.prompts and all(_is_fake_text(prompt[1:]) for prompt in first.prompts)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_text_pool_that_is_not_deeper_than_the_longest_prompt_fails_before_any_request(tmp_path, mode):
+    need = _longest_prompt(_plan_only(tmp_path, mode)) + 1
+    # Typed here on their own: the longest prefill prompt of this grid has 420 tokens, and the deepest decode
+    # context is the input limit of 428 tokens, whose prompt has three tokens less.
+    assert need == {"prefill": 421, "decode": 426}[mode]
+
+    def pool_of(tokens: int):
+        # Two FAKE conversations that hold ``tokens`` ids in all.
+        ids = [FAKE_TEXT_LOW + step % 50 for step in range(tokens)]
+        return _fake_pool([ids[:100], ids[100:]])
+
+    fake = _start_text(tmp_path / "shallow", mode, text_pool=pool_of(need))
+    reason = f"content_too_shallow: the text pool holds {need} tokens and the longest prompt needs {need}"
+    assert (fake.run.status, fake.run.reason) == ("failed", reason)
+    assert fake.engine.calls == []
+    on_disk = _assert_rejected(fake, "failed")
+    # The grid exists by then; the plan does not, and the artifact still names the source and the pool.
+    assert on_disk["coverage"]["expected_points"] == len(fake.built.points)
+    assert on_disk["producer"]["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": None,
+        "issued": None,
+        "dataset": FAKE_DATASET,
+        "pool": {
+            "id_range": [TOKEN_LOW, TOKEN_HIGH],
+            "conversations": 2,
+            "tokens": need,
+            "dropped_tokens": 0,
+            "dropped_conversations": 0,
+        },
+    }
+
+    # One token more is enough: every chain can then give the longest prompt and the token after it.
+    deep = _start_text(tmp_path / "deep", mode, text_pool=pool_of(need + 1))
+    assert (deep.run.status, deep.run.reason) == ("complete", None)
+    _assert_accepted(deep)
+    # Without the warm-up of 256 tokens the points alone decide, and they need as much here.
+    no_warmup = _start_text(tmp_path / "no-warmup", mode, text_pool=pool_of(need), warmup_iterations=0)
+    assert no_warmup.run.reason == reason
+
+
+@pytest.mark.parametrize(("warmup_iterations", "longest"), [(5, 256), (0, 39)])
+def test_the_warm_up_and_the_self_test_count_among_the_prompts_of_a_text_run(tmp_path, warmup_iterations, longest):
+    # One point of three four-token prompts. The longest prompt of the run is then the warm-up's 256 tokens,
+    # and without a warm-up the unaligned prompt of the self-test: two cached units of 16 tokens and 7 more.
+    manifest = grid.parse_points_manifest(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "prefill": [{"batch_size": 3, "total_prefill_tokens": 12, "total_kv_read_tokens": 0}],
+                "decode": [],
+            }
+        )
+    )
+
+    def start(name: str, tokens: int) -> _FakeRun:
+        # Two FAKE conversations that hold ``tokens`` ids in all.
+        ids = [FAKE_TEXT_LOW + step % 50 for step in range(tokens)]
+        pool = _fake_pool([ids[:20], ids[20:]])
+        return _start_text(
+            tmp_path / name, "prefill", manifest=manifest, warmup_iterations=warmup_iterations, text_pool=pool
+        )
+
+    need = longest + 1
+    shallow = start("shallow", need)
+    assert _longest_prompt(shallow) == longest
+    reason = f"content_too_shallow: the text pool holds {need} tokens and the longest prompt needs {need}"
+    assert (shallow.run.status, shallow.run.reason, shallow.engine.calls) == ("failed", reason, [])
+    # One token more and the self-test, the warm-up and the point all get their prompts.
+    assert start("deep", need + 1).run.status == "complete"
+
+
+def test_an_empty_text_pool_is_too_shallow_and_not_an_internal_error(tmp_path):
+    fake = _start_text(tmp_path, "decode", text_pool=_fake_pool([[TOKEN_HIGH], []]))
+
+    assert fake.run.reason == "content_too_shallow: the text pool holds 0 tokens and the longest prompt needs 426"
+    assert fake.engine.calls == []
+    assert fake.payload()["producer"]["content"]["pool"] == {
+        "id_range": [TOKEN_LOW, TOKEN_HIGH],
+        "conversations": 0,
+        "tokens": 0,
+        "dropped_tokens": 1,
+        "dropped_conversations": 2,
+    }
+
+
+def test_the_first_token_check_comes_before_the_too_shallow_check(tmp_path, monkeypatch):
+    # The content plan accepts a small range here, so that a small grid can need more first tokens than it has.
+    monkeypatch.setattr(content, "MIN_VOCAB_SIZE", 16)
+    need = _start(tmp_path / "need", "prefill").payload()["producer"]["first_token_need"]["total"]
+    tokens = (FAKE_TEXT_LOW, FAKE_TEXT_LOW + need - 1)
+    # FAKE: a pool of ten tokens, far too shallow, in a range that is one first token too small.
+    shallow = _fake_pool([[FAKE_TEXT_LOW + step for step in range(10)]], tokens)
+    fake = _start_text(tmp_path / "both", "prefill", tokens=tokens, text_pool=shallow)
+
+    assert fake.run.reason.startswith(f"token_range_too_small: the run needs {need} first tokens (")
+    assert fake.engine.calls == []
+    # With one id more the range is enough, and the pool is what fails the run.
+    wider = (FAKE_TEXT_LOW, FAKE_TEXT_LOW + need)
+    pool = _fake_pool([[FAKE_TEXT_LOW + step for step in range(10)]], wider)
+    enough = _start_text(tmp_path / "pool", "prefill", tokens=wider, text_pool=pool)
+    assert enough.run.reason == "content_too_shallow: the text pool holds 10 tokens and the longest prompt needs 421"
+
+
+def test_a_chain_that_runs_out_during_the_sweep_fails_its_point_as_too_shallow(tmp_path, monkeypatch):
+    # What the content plan raises when a chain has used every conversation, typed in here on its own.
+    plan = content.ContentPlan("0", TOKEN_LOW, TOKEN_HIGH, pool=_fake_pool([[FAKE_TEXT_LOW] * 40]))
+    with pytest.raises(ValueError, match="^text pool exhausted: ") as raised:
+        plan.free_prompt(0, 64)
+    assert str(raised.value).startswith(driver._POOL_EXHAUSTED) and driver._POOL_EXHAUSTED == "text pool exhausted"
+
+    victim = _victim(_plan_only(tmp_path, "decode"))
+    fake = _start_text(tmp_path, "decode", execute=False)
+    real = content.ContentPlan.decode_prompt
+
+    def decode_prompt_then_exhausted(self, rank, slot, context):
+        # FAKE: the chain of one slot of the victim runs out, which the check before the sweep rules out.
+        if fake.run._current_point["benchmark_id"] == victim.benchmark_id and slot == 1:
+            raise ValueError("text pool exhausted: FAKE chain of slot 1")
+        return real(self, rank, slot, context)
+
+    monkeypatch.setattr(content.ContentPlan, "decode_prompt", decode_prompt_then_exhausted)
+    fake.execute()
+
+    # The point failed with the reason of a shallow pool, before any of its requests was sent, and it is
+    # named in the artifact as a point that failed a check is.
+    reason = "content_too_shallow: text pool exhausted: FAKE chain of slot 1"
+    message = f"benchmark_id={victim.benchmark_id}: benchmark point failed: {reason}"
+    assert (fake.run.status, fake.run.reason) == ("failed", message)
+    assert fake.calls_of(victim.benchmark_id) == [] and max(fake.sent_benchmark_ids()) == victim.benchmark_id - 1
+    on_disk = _assert_rejected(fake, "failed")
+    assert on_disk["skipped_points"] == [{"point": victim.as_dict(), "kv_seed_regime": "real_kv", "reason": reason}]
+    assert on_disk["coverage"]["completed_points"] == victim.benchmark_id - 1
+
+
+def test_a_chain_that_runs_out_in_the_self_test_fails_the_run_as_too_shallow(tmp_path, monkeypatch):
+    def free_prompt_exhausted(self, rank, length):
+        raise ValueError("text pool exhausted: FAKE chain of a free prompt")
+
+    monkeypatch.setattr(content.ContentPlan, "free_prompt", free_prompt_exhausted)
+    fake = _start_text(tmp_path, "prefill")
+
+    reason = "content_too_shallow: text pool exhausted: FAKE chain of a free prompt"
+    assert (fake.run.status, fake.run.reason) == ("failed", reason)
+    assert fake.engine.calls == []
+    assert _assert_rejected(fake, "failed")["skipped_points"] == []
+
+
+def test_only_an_exhausted_pool_of_a_text_run_is_too_shallow(tmp_path, monkeypatch):
+    def decode_prompt_fails(text: str):
+        def decode_prompt(self, rank, slot, context):
+            raise ValueError(text)
+
+        return decode_prompt
+
+    # Another ValueError of the plan stays an internal error in a text run.
+    monkeypatch.setattr(content.ContentPlan, "decode_prompt", decode_prompt_fails("FAKE: another refusal"))
+    other = _start_text(tmp_path / "other", "decode")
+    assert other.run.reason == "internal_error: ValueError: FAKE: another refusal (while staging benchmark_id=1)"
+    # A run with seeded ids has no pool that could run out, so the same words are an internal error there.
+    monkeypatch.setattr(content.ContentPlan, "decode_prompt", decode_prompt_fails("text pool exhausted: FAKE"))
+    seeded = _start(tmp_path / "seeded", "decode")
+    assert seeded.run.reason == "internal_error: ValueError: text pool exhausted: FAKE (while staging benchmark_id=1)"
+
+
+def test_execute_takes_the_text_pool_and_the_dataset_together_or_not_at_all(tmp_path):
+    fake = _start(tmp_path, "decode", execute=False)
+    low, high = fake.tokens
+
+    def execute(**arguments):
+        fake.run.execute(fake.engine, token_low=low, token_high=high, **arguments)
+
+    with pytest.raises(TypeError, match="text_pool was given without dataset"):
+        execute(text_pool=_fake_pool())
+    with pytest.raises(TypeError, match="dataset was given without text_pool"):
+        execute(dataset=dict(FAKE_DATASET))
+    with pytest.raises(TypeError, match="text_pool must be a TextPool, got list"):
+        execute(text_pool=_fake_conversations(), dataset=dict(FAKE_DATASET))
+    with pytest.raises(TypeError, match="dataset must be a dict, got str"):
+        execute(text_pool=_fake_pool(), dataset=FAKE_DATASET["path"])
+    for absent in ("path", "sha256", "collection_pool", "conversations"):
+        record = {key: value for key, value in FAKE_DATASET.items() if key != absent}
+        with pytest.raises(TypeError, match=f"it has no \\['{absent}'\\]"):
+            execute(text_pool=_fake_pool(), dataset=record)
+    # A call that was refused for its arguments did not start the run: nothing was sent and it can still run.
+    assert (fake.run.status, fake.engine.calls) == (None, [])
+    execute(text_pool=_fake_pool(), dataset=dict(FAKE_DATASET))
+    assert fake.run.status == "complete"
+    with pytest.raises(RuntimeError, match="execute was already called"):
+        execute()
+
+
+def test_a_text_pool_that_does_not_hold_the_token_range_is_an_internal_error(tmp_path):
+    fake = _start_text(tmp_path, "decode", text_pool=_fake_pool(tokens=(TOKEN_LOW, TOKEN_HIGH - 1)))
+
+    reason = (
+        f"internal_error: ValueError: the text pool keeps the token ids [{TOKEN_LOW}, {TOKEN_HIGH - 1}), which does "
+        f"not hold the plan's token range [{TOKEN_LOW}, {TOKEN_HIGH})"
+    )
+    assert fake.run.reason == reason
+    assert fake.engine.calls == []
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_a_text_run_with_a_pool_wider_than_the_token_range_sends_the_ids_outside_it(tmp_path, mode, page_size):
+    # The launcher's pool keeps the ids the model counts, so a text can hold ids outside the token range of
+    # the run. Here the pool keeps the three FAKE ids that a pool over the token range drops.
+    outside = {5, TOKEN_HIGH, TOKEN_HIGH + 7}
+    pool = _fake_pool(tokens=(0, TOKEN_HIGH + 8))
+    assert (pool.conversations, pool.dropped_tokens, pool.dropped_conversations) == (65, 0, 0)
+    fake = _start_text(tmp_path, mode, page_size, text_pool=pool)
+
+    # Every cached count the fake engine's cache model reported was the planned one: no point was staged twice.
+    on_disk = _assert_accepted(fake)
+    producer = on_disk["producer"]
+    assert producer["restaged_points"] == []
+    assert producer["content"]["token_range"] == [TOKEN_LOW, TOKEN_HIGH]
+    # The pool's own range is written beside the token range, which it holds.
+    assert producer["content"]["pool"] == {
+        "id_range": [0, TOKEN_HIGH + 8],
+        "conversations": 65,
+        "tokens": sum(len(row) for row in _fake_conversations()),
+        "dropped_tokens": 0,
+        "dropped_conversations": 0,
+    }
+    prompts = [prompt for call in fake.engine.calls for prompt in call.prompts]
+    # The first token of every prompt is an allocated one, from the token range; the text after it is not
+    # held to the range, and ids outside it reached the engine.
+    assert all(TOKEN_LOW <= prompt[0] < TOKEN_HIGH for prompt in prompts)
+    sent_outside = {token for prompt in prompts for token in prompt if not TOKEN_LOW <= token < TOKEN_HIGH}
+    assert sent_outside and sent_outside <= outside
+
+
+def test_a_text_run_that_fails_before_its_plan_still_names_its_source(tmp_path):
+    fake = _start_text(tmp_path, "decode", headers=False)
+
+    on_disk = _assert_failed_before_the_grid(
+        fake, f"recorder_header_invalid: 0 of 1 recorder header(s) in {fake.recorder_dir} after 2.0 s"
+    )
+    assert on_disk["producer"]["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": None,
+        "issued": None,
+        "dataset": FAKE_DATASET,
+        "pool": {
+            "id_range": [TOKEN_LOW, TOKEN_HIGH],
+            "conversations": 64,
+            "tokens": fake.text_pool.tokens,
+            "dropped_tokens": 3,
+            "dropped_conversations": 1,
+        },
+    }
+    assert on_disk["kvwarm"] == {**SEEDED_KVWARM, "dataset": FAKE_KVWARM_DATASET}
+    # A run that was never executed has no pool: it writes the block of a run with seeded ids.
+    never = _start(tmp_path / "never", "decode", execute=False)
+    never.run.record_failure("rejected: FAKE refusal before the engine was built")
+    assert never.payload()["producer"]["content"] == {
+        "source": "seeded_token_ids",
+        "seed": "0",
+        "token_range": None,
+        "issued": None,
+    }
+    assert never.payload()["kvwarm"] == SEEDED_KVWARM
+
+
+def test_the_source_of_the_settings_is_what_an_artifact_names_before_execute(tmp_path):
+    # The launcher knows the source before it can call execute: a text run whose dataset cannot be had fails
+    # before there is a pool. The setting lets that artifact say what the run was started for.
+    fake = _start(tmp_path / "text", "decode", execute=False, content_source="dataset_text_chains")
+    fake.run.record_failure("dataset_unavailable: FAKE: no such file")
+
+    on_disk = _assert_rejected(fake, "failed")
+    assert on_disk["producer"]["content"] == {
+        "source": "dataset_text_chains",
+        "seed": "0",
+        "token_range": None,
+        "issued": None,
+    }
+    # No pool was handed over, so the ``kvwarm`` block names no dataset.
+    assert on_disk["kvwarm"] == SEEDED_KVWARM
+
+    # ``execute`` goes by the pool it is given. A run whose settings name dataset text and that gets no pool
+    # is a mistake of the caller; a run that gets a pool is a text run whatever the settings say.
+    no_pool = _start(tmp_path / "no-pool", "decode", content_source="dataset_text_chains")
+    assert no_pool.run.reason == (
+        "internal_error: TypeError: settings.content_source names dataset text, and execute was given no text pool"
+    )
+    assert no_pool.engine.calls == []
+    with_pool = _start_text(tmp_path / "with-pool", "decode", content_source="dataset_text_chains")
+    assert with_pool.run.status == "complete"
+    default = _start_text(tmp_path / "default", "decode")
+    assert default.settings.content_source == "seeded_token_ids"
+    assert default.payload()["producer"]["content"]["source"] == "dataset_text_chains"
+    unknown = _start(tmp_path / "unknown", "decode", content_source="FAKE-source")
+    assert unknown.run.reason == (
+        "internal_error: ValueError: settings.content_source must be one of ('seeded_token_ids', "
+        "'dataset_text_chains'), got 'FAKE-source'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "change"),
+    [
+        ("decode", {"sha256": "FAKE: not a digest"}),
+        ("decode", {"conversations": 0}),
+        ("agg", {"path": ""}),
+        ("prefill", {"url": object()}),
+    ],
+)
+def test_a_dataset_record_that_cannot_be_written_is_left_out_with_the_launcher_blocks(tmp_path, mode, change):
+    fake = _start_text(tmp_path, mode, dataset={**FAKE_DATASET, **change})
+
+    # The dry build refuses the record before any request, and the failed artifact is written without it.
+    assert fake.run.status == "failed" and fake.run.reason.startswith("internal_error: ")
+    assert fake.engine.calls == []
+    on_disk = _assert_rejected(fake, "failed")
+    producer = on_disk["producer"]
+    assert producer["omitted_launcher_blocks"] == fake.run.reason.removeprefix("internal_error: ")
+    assert "timing_source" not in producer and on_disk["config"] == {"mode": mode}
+    assert producer["content"]["source"] == "dataset_text_chains" and "dataset" not in producer["content"]
+    assert producer["content"]["pool"]["conversations"] == 64
+    # The record of the pool is the driver's own and stays whole, its id range included.
+    assert producer["content"]["pool"]["id_range"] == [TOKEN_LOW, TOKEN_HIGH]
+    assert on_disk.get("kvwarm") == (None if mode == "prefill" else SEEDED_KVWARM)

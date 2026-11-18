@@ -825,15 +825,13 @@ def _require_sglang_launcher_inputs(
 def _require_sglang_launcher_cells(
     *, is_moe: bool, execution: tuple[str, ...], topologies: tuple[ParallelTopology, ...]
 ) -> None:
-    """Refuse every cell the SGLang launcher cannot measure: it runs a dense model under tensor parallelism.
+    """Refuse every cell the SGLang launcher cannot measure.
 
+    The launcher runs one engine with one data-parallel replica and one pipeline stage: a dense model under
+    tensor parallelism, or a model with expert layers whose experts are spread over the tensor-parallel ranks.
     Each cell of a plan gets ``execution``, one of ``topologies`` and the strategy of that topology, so these
     arguments cover the cells before any is built.
     """
-    if is_moe:
-        # sglbench_launcher.py refuses a model with expert layers: its prompts are seeded token ids, and expert
-        # routing depends on the content. This also refuses the strategies tep, dep and pure_tp.
-        raise ValueError("SGLang FPM collection does not support MoE models yet; only dense TP cells are collected")
     if execution != LEGACY_EXECUTION_IDENTITY:
         # The launcher's artifact carries no execution_mode, which validate_native_collection demands of a cell
         # with an execution identity (DeepSeek V4.1 and GLM-5.3-Flash).
@@ -842,12 +840,34 @@ def _require_sglang_launcher_cells(
             f"({dict(zip(EXECUTION_COLUMNS, execution, strict=True))})"
         )
     for topology in topologies:
-        # What is left is the TP preset of a dense model: strategy "tp", or "single" for its one-GPU cell
-        # (topology.py, topology_strategy).
-        if any(getattr(topology, axis) != 1 for axis in PARALLEL_AXES if axis != "tp"):
+        if not is_moe:
+            # The TP preset of a dense model: strategy "tp", or "single" for its one-GPU cell (topology.py,
+            # topology_strategy).
+            if any(getattr(topology, axis) != 1 for axis in PARALLEL_AXES if axis != "tp"):
+                raise ValueError(
+                    "SGLang FPM collection supports tensor-parallel cells only (pp, dp, cp and the MoE sizes must "
+                    f"be 1); got topology {topology.to_dict()}"
+                )
+            continue
+        if topology.dp > 1:
+            # The DEP preset, which the default preset "auto" plans for a MoE model beside TEP. AISim's generated
+            # SGLang serving deployment runs it with DP attention (src/aisim/generator/rule_plugin/sglang.rule,
+            # ``enable_attention_dp``), and sglbench_launcher.py refuses a resolved attention DP size other than
+            # 1 (``_RESOLVED_CHECKS``): its result files hold one data-parallel rank.
             raise ValueError(
-                "SGLang FPM collection supports tensor-parallel cells only (pp, dp, cp and the MoE sizes must be "
-                f"1); got topology {topology.to_dict()}"
+                f"SGLang FPM collection does not support DP attention yet (topology {topology.to_dict()}); pass "
+                "--fpm-parallel-presets tep to collect the tensor- and expert-parallel cells of a MoE model"
+            )
+        # What is left for a MoE model is the TEP preset: strategy "tep" with one expert-parallel rank per
+        # tensor-parallel rank, or "single" for its one-GPU cell, where both sizes are 1. The cell builder
+        # writes that expert-parallel size as --ep-size (sglang_fpm_builder.py), and the launcher refuses a
+        # resolved ``ep_size`` that is neither 1 nor the tensor-parallel size. Pure TP (moe_tp above 1) is not
+        # planned for this backend (capabilities.py, ``allow_pure_tp``) and is refused here all the same.
+        fixed_sizes = (topology.pp, topology.dp, topology.cp, topology.moe_tp)
+        if any(size != 1 for size in fixed_sizes) or topology.moe_ep != topology.tp:
+            raise ValueError(
+                "SGLang FPM collection supports the tensor- and expert-parallel cells of a MoE model only (pp, dp, "
+                f"cp and moe_tp must be 1, and moe_ep must equal tp); got topology {topology.to_dict()}"
             )
 
 
