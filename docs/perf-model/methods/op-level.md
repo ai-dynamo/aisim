@@ -296,11 +296,15 @@ MoE keeps its own historical profile-distance ordering. These tie-breaks are
 observable prediction semantics, not opportunities to sort data arbitrarily.
 
 `fp8_static` has two paths. If the GEMM table has `fp8_static` rows, AISim reads
-them and needs no `compute_scale` table. It subtracts `scale_matrix` only for a
-low-precision input. Otherwise `fp8_static` is composite: it needs the base FP8
-and its overhead tables. Transfer reachability alone cannot admit it. On both
-paths, the support matrix lists `fp8_static` only when the `scale_matrix` table
-is present. Validation requires known precision profiles and the resolved
+them and needs no `compute_scale` table. This includes rows that the shared
+layer takes from a sibling version. It subtracts `scale_matrix` only for a
+low-precision input. So a `fp8_static` row must time the forward pass of the
+layer on a BF16 input with a static activation scale: the static quantization
+plus the GEMM. A row that times the GEMM alone makes that subtraction wrong.
+Otherwise `fp8_static` is composite: it needs the base FP8 and its overhead
+tables. Transfer reachability alone cannot admit it. On both paths, the list of
+supported GEMM modes contains `fp8_static` only when the `scale_matrix` table is
+present. Validation requires known precision profiles and the resolved
 transfer policy; a pure SILICON request still needs data. New precision support
 requires native profile levels, their exported Python reachability view, and
 tests described in [Extending](../extending.md).

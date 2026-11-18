@@ -18,9 +18,10 @@ deliberately differ from the retired raw-table facade semantics:
 
 - context attention includes the fused rope/kv-write extras the engine
   charges on top of the attention table (small shape-independent additive);
-- gemm ``fp8_static`` charts the engine's model (dynamic-fp8 row minus the
-  overhead tables); the facade's fp8_static curve was a duplicate of the
-  fp8 curve (its lookup normalized to the fp8 table).
+- gemm ``fp8_static`` charts the engine's model (its own rows when the
+  table has them, otherwise the dynamic-fp8 row minus the overhead tables);
+  the facade's fp8_static curve was a duplicate of the fp8 curve (its lookup
+  normalized to the fp8 table).
 
 Only the two modes the charts use are supported: ``DatabaseMode.SILICON``
 (the probe engine's configured mode) and ``DatabaseMode.SOL_FULL``. Rust
@@ -110,8 +111,9 @@ class EngineReference:
     # ------------------------------------------------------------------ #
 
     def query_gemm(self, m, n, k, quant_mode, database_mode):
-        # fp8_static charts the ENGINE's model for it (dynamic-fp8 row minus
-        # the collected overhead tables, floored at the roofline). The old
+        # fp8_static charts the ENGINE's model for it (its own rows when the
+        # table has them, otherwise the dynamic-fp8 row minus the collected
+        # overhead tables, floored at the roofline). The old
         # facade normalized the lookup to fp8, so its fp8_static curve was a
         # pixel-identical duplicate of the fp8 curve — no information lost.
         op = GEMM("gemm", 1.0, n, k, quant_mode)

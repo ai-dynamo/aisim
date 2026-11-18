@@ -2138,8 +2138,9 @@ class Task:
             raise ValueError("agg mode requires model_path")
         if not self.system_name:
             raise ValueError("agg mode requires system_name")
-        # fp8_static is not hard-gated to trtllm: it is derived from the dynamic
-        # fp8 GEMM minus compute_scale/scale_matrix overhead and works on any
+        # fp8_static is not hard-gated to trtllm: it is read from its own GEMM
+        # rows when the table has them, and is otherwise derived from the dynamic
+        # fp8 GEMM minus compute_scale/scale_matrix overhead; it works on any
         # backend whose perf DB carries those tables.  _validate_database_quant_modes
         # rejects it on backends/systems that lack the data.
 
@@ -2205,10 +2206,11 @@ class Task:
         database = self._try_load_role_database(role)
 
         if database is None:
-            # In SILICON mode the DB must exist; fp8_static is derived from
-            # compute_scale/scale_matrix overhead tables we can't confirm without it,
-            # so fail fast rather than defer to a late run() failure.  Other modes
-            # (and other quant modes) keep deferring to the sweep.
+            # In SILICON mode the DB must exist; fp8_static needs its own GEMM rows
+            # or the compute_scale/scale_matrix overhead tables, which we can't
+            # confirm without it, so fail fast rather than defer to a late run()
+            # failure.  Other modes (and other quant modes) keep deferring to
+            # the sweep.
             if self.database_mode in (None, common.DatabaseMode.SILICON.name) and (
                 self._role_attr(role, "gemm_quant_mode") == common.GEMMQuantMode.fp8_static
             ):

@@ -285,9 +285,12 @@ impl GemmTable {
     /// which is a missing-data error. A corrupt or schema-broken table
     /// therefore also gives `false`. Do not use this function to report a
     /// broken table. The callers in this file (`query`, `has_quant`,
-    /// `gemm_points`) load the table again and return the error. The last
-    /// match arm cannot run today. It stays as a guard in case `load_gemm`
-    /// keeps the error kind in the future.
+    /// `gemm_points`) load the table again and return the error. The callers
+    /// outside this file, `GemmOp::query` (`operators/gemm.rs`) and the
+    /// readiness check (`engine/readiness.rs`), use it only to choose the
+    /// direct or the derived path; the GEMM query of the operator then
+    /// returns the load error. The last match arm cannot run today. It stays
+    /// as a guard in case `load_gemm` keeps the error kind in the future.
     pub(crate) fn has_direct_fp8_static(&self) -> Result<bool, AicError> {
         match self.load_gemm() {
             Ok(grids) => Ok(grids.has_fp8_static),
