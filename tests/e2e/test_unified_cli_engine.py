@@ -547,12 +547,15 @@ def test_min_gpus_real_engine_ranks_and_round_trips(load_type: str, tmp_path: Pa
     result = SweepResult.from_json((output / "recommendation.json").read_text())
     counts = [candidate.used_gpus for candidate in result.selected_candidates]
     assert counts == sorted(counts)
-    assert set(counts) == {1, 2}
+    assert set(counts) <= {1, 2}
     candidate = result.selected_candidates[0]
     assert candidate.used_gpus == 1
     assert candidate.score == -1
     assert all(c.metrics["mean_e2e_latency_ms"] <= 100 for c in result.selected_candidates)
-    assert {row.used_gpus for row in result.candidates} == {1, 2}
+    # min_gpus tries the smallest shapes first and stops suggesting larger ones once
+    # 1 GPU qualifies, so 2-GPU shapes run only if suggested in the same round.
+    assert 1 in {row.used_gpus for row in result.candidates}
+    assert {row.used_gpus for row in result.candidates} <= {1, 2}
     if load_type != "concurrency":
         assert all(c.metrics["goodput_request_throughput_rps"] >= 5 for c in result.selected_candidates)
     selected_path = sorted((output / "recommendations").glob("*.yaml"))[0]

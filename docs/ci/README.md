@@ -106,6 +106,7 @@ Manual dispatches and site-change triggers are listed below.
 | --- | --- | --- |
 | [Fast CI](../../.github/workflows/fast-ci.yml) | PR open/update/reopen and ready-for-review; pushes to `main`, `release/*`, and trusted `pull-request/*`; manual dispatch with `expected_sha` | Quick checks and `Fast CI Success` |
 | [Full CI](../../.github/workflows/ci.yml) | Pushes to `main`, `release/*`, and trusted `pull-request/*`; manual dispatch with `expected_sha` | Selects and aggregates compiled validation |
+| [Full CI fail-fast](../../.github/workflows/full-ci-fail-fast.yml) | Full CI enters `in_progress`, including reruns | Cancels that attempt's remaining computation after a blocking job fails |
 | [Main branch nightly CI](../../.github/workflows/nightly-ci.yml) | Daily at 08:00 UTC; manual dispatch from `main` | Builds, stages, qualifies, and hands off artifacts for publication; skips unchanged scheduled `main` and requires approval for manual sources |
 | [Validate platform wheels](../../.github/workflows/validate-platform-wheels.yml) | Called by Full CI; manual dispatch | Linux x86-64/ARM64 and macOS ARM64 package validation |
 | [Collector Data Check](../../.github/workflows/collector-check.yml) | Called by Full CI; manual dispatch | Collector-data integrity and informational sanity reports |
@@ -231,6 +232,27 @@ skips. A skipped component is acceptable only when the selector explicitly
 marked it N/A.
 
 ### Validation components
+
+The separate **Full CI fail-fast** controller polls job results every minute and
+requests cancellation of the watched run after the first failed or timed-out
+blocking job. Validation groups retain their existing parallelism. The
+`Collector Data / Perf data sanity (informational)` job is advisory and cannot
+trigger cancellation. A canceled run is not successful Full CI evidence: the
+original failing job remains visible and the exact revision must pass
+`Full CI Success` before merging. Cancellation may leave the aggregate check
+canceled and takes time for runners to terminate work and perform cleanup.
+
+The controller uses a GitHub-hosted runner, outside the self-hosted validation
+pools. Only this separate workflow has cancellation permission. Its code is
+checked out at its immutable default-branch workflow commit; it never executes
+the watched revision's code or downloads its artifacts. It validates repository,
+workflow, branch, SHA and attempt, paginates the attempt's job list, and refreshes
+run identity immediately before requesting cancellation. It stops once
+`Full CI Success` completes, leaving protected wheel staging alone. API errors
+or its two-hour monitoring timeout leave Full CI running; they do not approve,
+skip, or cancel validation. It becomes active after its workflow is merged into
+the default branch. Changes to advisory-job names must update the controller's
+explicit exception and its workflow contract test.
 
 | Component | Coverage |
 | --- | --- |
@@ -499,6 +521,12 @@ qualification are outside that target. Compare exact run SHAs and selected
 components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
+
+The application wheel-build job allows ten minutes on AMD64 and fifteen on
+ARM64. The ARM64 build budget includes cold release compilation, manylinux
+repair, provenance checks, and wheel handoff; compilation can consume most of
+ten minutes before those final steps run. Application test shards retain their
+separate fifteen-minute job budget and all per-test timeouts.
 
 The implementation reduces repeated work through wheel reuse, 24 application
 shards, pytest workers, and uv installation. Wheel verification overlaps test
