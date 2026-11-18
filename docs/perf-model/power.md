@@ -26,8 +26,15 @@ because mixed-step FPM energy is suppressed while pure-decode energy is
 retained; the published `power_w` divides total energy by total active latency.
 Non-schema-8 FPM runs (schema 6 and 7) have no row-power evidence and publish
 null `power_w` (`None` in Python), rather than the previous `0.0` sentinel.
-A disaggregated result withholds power when either worker withholds it. FPM
-watts are also withheld for draft speculation schemes, models with encoder
+A disaggregated result withholds power when either worker withholds it. Missing
+`power_w` keys, explicit `None`, and NaN all mean withheld worker power. This
+also applies to SDK E+agg and E+P+D sweeps and single-point `Task` rows:
+the encoder overlay preserves `power_w: None` when any language worker lacks
+power, without changing latency or throughput. An omitted overlay power
+argument is withheld as well. Sweep rows without a coverage field also withhold
+watts when encoder coverage is below 1.0 or unavailable. Explicit zero worker
+watts remain numeric during composition; absence is never replaced with zero.
+FPM watts are also withheld for draft speculation schemes, models with encoder
 operations, and language-only EPD workers. Raw `InferenceSession` summaries
 provide coverage through `get_power_data_coverage()`; `Task.run_single_agg()`
 and `Task.run_single_disagg()` include `power_coverage` in their rows. The

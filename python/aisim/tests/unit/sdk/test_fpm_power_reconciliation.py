@@ -610,15 +610,17 @@ def test_legacy_aggregate_sweep_gates_fpm_power_and_keeps_v7_latency(fpm_power_r
     assert powered.best_throughputs == v7.best_throughputs
 
 
-def test_legacy_disagg_sweep_rows_reconcile_worker_watts(fpm_power_root, tmp_path, monkeypatch):
-    """Disaggregated sweep rows weight 300 W prefill and 450 W decode by their time."""
+@pytest.mark.parametrize("schema", ["v7", "v8_all_null"])
+def test_legacy_disagg_sweep_rows_reconcile_worker_watts(fpm_power_root, tmp_path, monkeypatch, schema):
+    """Disaggregated sweeps weight worker watts and keep latency-only power null."""
     import pandas as pd
 
     from aisim.sdk.picking import disagg_power_w
 
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     model = _qwen_fpm()
-    database = fpm_power_root(model, _watts_by_phase, rows=_sweep_rows(model, batches=(4, 8, 16, 32, 64)))
+    rows = _sweep_rows(model, batches=(4, 8, 16, 32, 64))
+    database = fpm_power_root(model, _watts_by_phase, rows=rows)
     result, saved_dir = _sweep(tmp_path, "v8", database, _experiment("disagg"))
 
     frame = result.pareto_fronts["fpm"]
@@ -630,6 +632,25 @@ def test_legacy_disagg_sweep_rows_reconcile_worker_watts(fpm_power_root, tmp_pat
         assert row["power_w"] == pytest.approx(disagg_power_w(_PREFILL_W, 450.0, row["ttft"], decode_ms), rel=1e-4)
     saved = pd.read_csv(saved_dir / "pareto.csv")
     assert saved["power_w"].notna().all()
+
+    if schema == "v8_all_null":
+        database = fpm_power_root(model, lambda row: None, rows=rows)
+    else:
+        database = fpm_power_root(model, None, rows=rows)
+        _rewrite_as_schema(database, rows, 7)
+    latency_only, latency_only_dir = _sweep(tmp_path, schema, database, _experiment("disagg"))
+    null_frame = latency_only.pareto_fronts["fpm"]
+    assert not null_frame.empty
+    assert null_frame["power_w"].isna().all()
+    null_saved = pd.read_csv(latency_only_dir / "pareto.csv")
+    assert not null_saved.empty
+    assert null_saved["power_w"].isna().all()
+    columns = [column for column in frame.columns if "power" not in column]
+    assert {"ttft", "tpot", "request_latency"} <= set(columns)
+    pd.testing.assert_frame_equal(frame[columns].reset_index(drop=True), null_frame[columns].reset_index(drop=True))
+    saved_columns = [column for column in saved.columns if "power" not in column]
+    assert {"ttft", "tpot", "request_latency"} <= set(saved_columns)
+    pd.testing.assert_frame_equal(saved[saved_columns], null_saved[saved_columns])
 
 
 def _watts_by_phase(row: dict) -> float:
