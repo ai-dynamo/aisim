@@ -175,6 +175,8 @@ def main() -> int:
         print("error: evaluation.sla has no bound; headroom against an SLA needs at least one", file=sys.stderr)
         return 2
     check, checker_name = sla_checker()
+    stop = (cfg.get("traffic") or {}).get("stop") or {}
+    arrival_window_s = max(300.0, (stop.get("requests") or 0) / base_rps)
 
     rows = []
     for step in steps:
@@ -189,6 +191,10 @@ def main() -> int:
             str(a.config),
             "--set",
             f"traffic.load.requests_per_second={rate!r}",
+            "--set",
+            f"traffic.stop.requests={math.ceil(rate * arrival_window_s)}",
+            "--set",
+            "traffic.stop.requests_per_load_unit=null",
             "--format",
             "json",
             "--output-dir",
