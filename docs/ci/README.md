@@ -230,7 +230,10 @@ the separate platform/Python compatibility matrices remain in place.
 The existing wheel-storage action checks the source SHA, producer run/attempt,
 architecture, scope, sizes, and checksums. The README job additionally verifies
 the build-input record and the complete three-package wheel set. Only the
-completion manifest is retained in GitHub Actions; wheels stay in Artifactory.
+completion manifest and provenance reports are retained in GitHub Actions; wheels stay in Artifactory.
+On a cache hit, the consumer identity is preserved as diagnostic evidence and
+then removed from the restore directory; verification requires the producer's
+checksum-verified build-input record, including when a manifest omits it.
 Every README command and result assertion still executes in a fresh environment
 on both cold and reused builds. Full CI selection, test suites, platforms,
 Python versions, and required gates are unchanged.

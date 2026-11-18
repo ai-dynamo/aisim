@@ -176,6 +176,43 @@ def test_rc_producer_reaches_verified_download_in_shared_test_repository(handoff
     assert handoff.requests == []
 
 
+@pytest.mark.parametrize("producer_record", [True, False], ids=["complete", "missing-producer-record"])
+def test_rc_restore_requires_downloaded_identity_not_consumer_preseed(handoff, producer_record):
+    expected = {"recipe": "fixed RC inputs"}
+    for package in ("aisim", "ai_dynamo", "ai_dynamo_runtime"):
+        with zipfile.ZipFile(handoff.source / f"{package}.whl", "w") as archive:
+            archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.0\n")
+    if producer_record:
+        (handoff.source / "rc-build-inputs.json").write_text(json.dumps(expected))
+    transfer.main()
+    handoff.output.mkdir()
+    (handoff.output / "rc-build-inputs.json").write_text(json.dumps(expected))
+    job = yaml.safe_load((ROOT / ".github/workflows/readme-checks.yml").read_text())["jobs"]["dynamo"]
+    guard = next(
+        step for step in job["steps"] if step.get("name") == "Require the producer build-input record on restore"
+    )
+    assert guard["if"] == "steps.rc-wheels.outputs.run-id != ''"
+    evidence = next(
+        i for i, step in enumerate(job["steps"]) if step.get("name") == "Preserve RC build-input and runner evidence"
+    )
+    restore = next(
+        i for i, step in enumerate(job["steps"]) if step.get("name") == "Restore verified pinned Dynamo RC wheels"
+    )
+    assert evidence < job["steps"].index(guard) < restore
+    subprocess.run(
+        ["bash", "-e", "-c", guard["run"]],
+        check=True,
+        env={**os.environ, "AISIM_RC_WHEELHOUSE": str(handoff.output)},
+    )
+    assert not (handoff.output / "rc-build-inputs.json").exists()
+    download(handoff, run="202")
+    if producer_record:
+        rc_wheels.verify(handoff.output, expected)
+    else:
+        with pytest.raises(FileNotFoundError, match="rc-build-inputs.json"):
+            rc_wheels.verify(handoff.output, expected)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

@@ -168,6 +168,9 @@ jobs:
             ${{ runner.temp }}/rc-runner-environment.txt
           overwrite: true
           if-no-files-found: error
+      - name: Require the producer build-input record on restore
+        if: steps.rc-wheels.outputs.run-id != ''
+        run: rm -- "$AISIM_RC_WHEELHOUSE/rc-build-inputs.json"
       - name: Restore verified pinned Dynamo RC wheels
         if: steps.rc-wheels.outputs.run-id != ''
         uses: ./.github/actions/wheel-storage
