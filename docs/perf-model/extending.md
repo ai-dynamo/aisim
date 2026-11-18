@@ -200,6 +200,8 @@ relations enabled by the chosen transfer policy and available reference data.
 
 Exercise SILICON failure without data, permitted HYBRID/EMPIRICAL transfer,
 restrictive-policy failure, reference ordering, and eventual own-data precedence.
-`fp8_static` additionally requires its overhead tables. Checkpoint-to-precision
+`fp8_static` additionally requires its overhead tables. A GEMM table with its own
+`fp8_static` rows requires only `scale_matrix`, for a low-precision input.
+Checkpoint-to-precision
 resolution and hardware compatibility are separate contracts; reachability of an
 estimate does not prove that the backend can execute the checkpoint.

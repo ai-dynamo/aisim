@@ -2321,8 +2321,8 @@ class Task:
             # fp8_static is a COMPOSITE mode: its base GEMM is transferable, but
             # it also requires compute_scale/scale_matrix overhead tables that
             # have no transfer ladder (by design). Its admission stays purely
-            # data-driven (fp8_static in modes iff all three tables exist, see
-            # _gemm_key_names).
+            # data-driven (see _gemm_key_names: its own GEMM rows plus
+            # scale_matrix, or fp8 plus both overhead tables).
             transfer_ok = profile_transfer and mode is not common.GEMMQuantMode.fp8_static
             if transfer_ok and xquant_enabled and _profile_reachable(mode, modes):
                 return  # XQUANT-reachable in HYBRID/EMPIRICAL (same-profile data)

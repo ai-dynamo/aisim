@@ -2346,15 +2346,22 @@ def _contains_quant_mode(data, quant_mode: common.GEMMQuantMode) -> bool:
 
 
 def _gemm_key_names(database) -> list[str]:
-    """Return GEMM modes, deriving static FP8 from dynamic FP8 plus overheads."""
-    names = set(_enum_key_names(getattr(database, "_gemm_data", None)))
+    """Return GEMM modes.
+
+    `fp8_static` comes from its own rows plus `scale_matrix`, or from dynamic FP8 plus both overhead tables.
+    """
+    gemm_data = getattr(database, "_gemm_data", None)
+    names = set(_enum_key_names(gemm_data))
     fp8_static_name = common.GEMMQuantMode.fp8_static.name
     names.discard(fp8_static_name)
-    if (
-        _contains_quant_mode(getattr(database, "_gemm_data", None), common.GEMMQuantMode.fp8)
+    has_scale_matrix = _contains_quant_mode(getattr(database, "_scale_matrix_data", None), common.GEMMQuantMode.fp8)
+    derived = (
+        _contains_quant_mode(gemm_data, common.GEMMQuantMode.fp8)
         and _contains_quant_mode(getattr(database, "_compute_scale_data", None), common.GEMMQuantMode.fp8)
-        and _contains_quant_mode(getattr(database, "_scale_matrix_data", None), common.GEMMQuantMode.fp8)
-    ):
+        and has_scale_matrix
+    )
+    direct = _contains_quant_mode(gemm_data, common.GEMMQuantMode.fp8_static) and has_scale_matrix
+    if derived or direct:
         names.add(fp8_static_name)
     return sorted(names)
 

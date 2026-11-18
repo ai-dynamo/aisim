@@ -110,6 +110,37 @@ def test_sglang_supported_quant_modes_include_fp8_static_only_when_base_and_over
     assert modes.count(common.GEMMQuantMode.fp8_static.name) == 1
 
 
+@pytest.mark.parametrize(
+    "backend",
+    [common.BackendName.trtllm.value, common.BackendName.vllm.value, common.BackendName.sglang.value],
+)
+def test_supported_quant_modes_admit_fp8_static_from_its_own_rows_with_scale_matrix(
+    mutable_comprehensive_perf_db, backend
+):
+    db = mutable_comprehensive_perf_db
+    db.backend = backend
+    fp8, fp8_static = common.GEMMQuantMode.fp8, common.GEMMQuantMode.fp8_static
+    scale_matrix = _overhead_loaded_data(common.PerfDataFilename.scale_matrix)
+    compute_scale = _overhead_loaded_data(common.PerfDataFilename.compute_scale)
+    cases = [
+        # (gemm keys, compute_scale, scale_matrix, fp8_static listed)
+        ((fp8_static,), None, None, False),
+        ((fp8_static,), None, scale_matrix, True),
+        ((fp8_static,), compute_scale, None, False),
+        ((fp8, fp8_static), None, scale_matrix, True),
+    ]
+    for gemm_keys, cs, sm, listed in cases:
+        db._gemm_data = _gemm_loaded_data(*gemm_keys)
+        db._compute_scale_data = cs
+        db._scale_matrix_data = sm
+        db._update_support_matrix()
+        modes = db.supported_quant_mode["gemm"]
+        assert (fp8_static.name in modes) is listed, (gemm_keys, cs, sm)
+        assert modes.count(fp8_static.name) <= 1
+        if fp8 in gemm_keys:
+            assert fp8.name in modes
+
+
 # ---------------------------------------------------------------------------
 # Retired with #1357 PR-5 (single oracle = the compiled engine):
 # - query_gemm fp8_static -> dynamic-fp8 table reuse, the structured miss, and
