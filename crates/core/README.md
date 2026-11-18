@@ -29,8 +29,18 @@ when reproducing a native SGLang request with `sampling_params.ignore_eos=true`.
 SGLang then reserves the running request's clipped remaining output without
 the early-EOS discount. Output length and exact generated IDs still come from
 the existing output limit/plan; this flag does not add EOS sampling. Other
-backends do not use it. Existing JSON without the field retains its behavior;
-Rust struct literals must supply the new field or use a default struct update.
+backends do not use it. Existing JSON without the field retains its behavior.
+
+### Release notes: breaking Rust API change (unreleased)
+
+Adding `ignore_eos` is a breaking source API change for external Rust callers
+constructing `engine::Request` or `replay::ReplayRequest` with struct literals.
+Set `ignore_eos: false` in each literal to retain the previous reservation
+behavior, or `ignore_eos: true` for fixed-length SGLang reservation. Alternatively,
+use functional-update syntax from an existing, fully initialized value, such as
+`Request { tokens, ..existing_request }`. The serde default applies only to
+deserialization, not Rust struct literals. `Request` does not implement `Default`,
+so `..Default::default()` is not a migration option for that type.
 
 ## Generated concurrency requests
 
