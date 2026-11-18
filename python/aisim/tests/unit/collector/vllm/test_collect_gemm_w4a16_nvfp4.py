@@ -123,8 +123,8 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
     n, k = 8, 64
     weight = torch.randn(n, k, generator=torch.Generator().manual_seed(1)).to(torch.bfloat16)
     calls = []
-    # Distinct, FP8-representable block scales, so their values and order are checked.
-    scales = torch.tensor([0.5, 1.0, 1.5, 2.0] * (n * k // 16 // 4)).reshape(n, k // 16)
+    # Distinct, FP8-representable block scales in every row and block, so their order is checked.
+    scales = torch.tensor([m * 2.0**e for e in range(-2, 6) for m in (1, 1.25, 1.5, 1.75)]).reshape(n, k // 16)
 
     def reference(x, global_scale, block_size):
         calls.append((x, global_scale, block_size))
@@ -159,10 +159,13 @@ def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm
     # Below SM100 a 1 Gi-element weight needs at least 6.5 GiB.
     n, k = gib, 1
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
-    assert collect_gemm._w4a16_nvfp4_does_not_fit(n, k, "cuda:0") is None  # 1 free + 6 reusable
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0") is None  # 1 free + 6 reusable
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 6 * gib)
-    refusal = collect_gemm._w4a16_nvfp4_does_not_fit(n, k, "cuda:0")  # 1 free + 4 reusable
+    refusal = collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0")  # 1 free + 4 reusable
     assert refusal.startswith("FIXME(kernel-limit): does not fit")
+    # The activation is budgeted too: 1 GiB more of it no longer fits in 1 free + 6 reusable.
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(gib // 2, n, 1, "cuda:0").startswith("FIXME(kernel-limit)")
 
 
 def test_blackwell_keeps_the_scaled_fp4_quant_kernel(torch, collect_gemm, monkeypatch):

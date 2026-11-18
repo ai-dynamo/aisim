@@ -194,9 +194,10 @@ class ModelConfig:
     def __setattr__(self, name: str, value) -> None:
         object.__setattr__(self, name, value)
         if name in ("gemm_quant_mode", "moe_quant_mode"):
-            # An assignment states intent, even of the value a resolver filled. __init__ assigns the
-            # provenance fields after the modes, so construction and replace() keep their own.
-            object.__setattr__(self, f"_{name}_is_explicit", True)
+            # An assignment states intent, even of the value a resolver filled; clearing it hands the
+            # mode back to inference. __init__ assigns the provenance fields after the modes, so
+            # construction and replace() keep their own.
+            object.__setattr__(self, f"_{name}_is_explicit", value is not None)
             object.__setattr__(self, f"_{name}_inferred", None)
 
     def _mark_quant_mode_inferred(self, kind: str) -> None:

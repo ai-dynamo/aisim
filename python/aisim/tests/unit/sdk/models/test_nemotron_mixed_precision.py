@@ -261,6 +261,20 @@ def test_projection_modes(raw, pattern, expected):
 def test_untargeted_projection_takes_the_system_nvfp4_lane():
     raw = {"quantization_config": {"config_groups": _groups(a=(4, ["backbone.layers.0.mixer.in_proj"]))}}
     assert _projection_modes(raw, "MM", NVFP4, "h200_sxm")["mamba_in_proj_gemm"] == {NVFP4_WO: 2}
+    # Without a system, the supplied default is kept.
+    assert _projection_modes(raw, "MM", NVFP4_WO)["mamba_in_proj_gemm"] == {NVFP4: 1, NVFP4_WO: 1}
+
+
+def test_regex_exclusions_keep_their_own_capture_groups():
+    raw = {
+        "quantization_config": {
+            "config_groups": _groups(all=(8, ["Linear"])),
+            "ignore": [r"re:^backbone\.(layers)\.0", r"re:^model\.(layers)\.1\.mixer\.\1"],
+        }
+    }
+    # The second pattern's \1 is its own group: model.layers.1.mixer.layers matches it alone.
+    checkpoint = checkpoint_precision(raw)
+    assert checkpoint._excluded("model.layers.1.mixer.layers") and checkpoint._excluded("backbone.layers.0.x")
 
 
 @pytest.mark.parametrize("prefix", ["model", "backbone", "language_model.backbone", "language_model.model"])
@@ -699,7 +713,7 @@ def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypat
         assert other.moe_quant_mode == MOE.fp8 and experts(other) == {MOE.fp8}
 
 
-def test_resolvers_keep_overrides_and_inferred_modes_apart(monkeypatch):
+def test_resolvers_keep_overrides_and_inferred_modes_apart(monkeypatch, tmp_path):
     import copy
 
     from aisim_core.sdk.models.helpers import resolve_nvfp4_for_system
@@ -721,6 +735,12 @@ def test_resolvers_keep_overrides_and_inferred_modes_apart(monkeypatch):
         task.gemm_quant_mode = gemm
         for ep in (1, 2):
             assert in_proj(task.build_model_config(role="agg", parallel=(ep, 1, 1, 1, ep, 1))) == expected
+    # Clearing an override hands the mode back to inference, also through the legacy resolver.
+    config = ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, system="gb200", moe_quant_mode=MOE.fp8)
+    config.moe_quant_mode = None
+    path = _super_with_fp8_experts(tmp_path)
+    resolve_nvfp4_for_system(config, "h200_sxm", path, backend_name="vllm")
+    assert _experts(get_model(path, config, "vllm")) == pytest.approx({MOE.fp8: 10, MOE.nvfp4_wo: 30})
     # Editing a shallow copy of a Task leaves the original's provenance alone.
     original = _task(SUPER)
     copy.copy(original).gemm_quant_mode = BF16

@@ -115,7 +115,8 @@ class CheckpointPrecision:
         # a bare module path also excludes its submodules.
         exclusions = quant_exclude_patterns(raw)
         self.excluded_exact = {t for t in exclusions if not _is_pattern(t)}
-        self.excluded_regex = _target_regex([t for t in exclusions if _is_pattern(t)])
+        # One matcher per pattern keeps each re: target's capture groups and backreferences its own.
+        self.excluded_regexes = [_target_regex([t]) for t in exclusions if _is_pattern(t)]
 
     def module(self, paths: Sequence[str]):
         """``(excluded, algos)`` of one module given its candidate checkpoint paths."""
@@ -133,7 +134,7 @@ class CheckpointPrecision:
         parts = path.split(".")
         if any(".".join(parts[:end]) in self.excluded_exact for end in range(1, len(parts) + 1)):
             return True
-        return bool(self.excluded_regex and self.excluded_regex.fullmatch(path))
+        return any(regex.fullmatch(path) for regex in self.excluded_regexes)
 
     def rows(
         self,
@@ -225,8 +226,8 @@ def projection_modes(
         "nvfp4": _nvfp4_lane(system, systems_path, gemm.nvfp4, gemm.nvfp4_wo),
         "w4a16_nvfp4": gemm.w4a16_nvfp4,
     }
-    # An inherited NVFP4 default takes the system's lane, as listed NVFP4 layers do.
-    inherited = modes["nvfp4"] if default in (gemm.nvfp4, gemm.nvfp4_wo) else default
+    # With a system, an inherited NVFP4 default takes its lane, as listed NVFP4 layers do.
+    inherited = modes["nvfp4"] if system and default in (gemm.nvfp4, gemm.nvfp4_wo) else default
     unlisted = gemm.bfloat16 if checkpoint.targets_only else inherited
 
     def resolve(algo, excluded):

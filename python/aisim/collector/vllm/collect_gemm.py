@@ -220,16 +220,17 @@ def _w4a16_nvfp4_checkpoint_weights(weight_bf16):
     return weight_fp4, weight_scale, weight_scale_2
 
 
-def _w4a16_nvfp4_does_not_fit(n, k, device):
+def _w4a16_nvfp4_does_not_fit(m, n, k, device):
     """Why W4A16_NVFP4 weight preparation cannot fit the device, or None; checked before allocating.
 
     Lower bound on what is live at once, per weight element: the layer's packed FP4 weight (0.5 B)
     and the BF16 weight (2 B), plus its full-size abs() temporary for the global scale (2 B) or,
     below SM100, the FP32 copy that ref_nvfp4_quant makes (4 B; nvfp4_emulation_utils.py
     :640-654 @0.31.0). Memory the allocator reserved but does not use is reusable, so it counts
-    as available alongside driver-free memory.
+    as available alongside driver-free memory. The BF16 activation (2 B per element) is
+    allocated before the weight, so it is counted too.
     """
-    needed = int(n * k * (4.5 if get_sm_version() >= 100 else 6.5))
+    needed = int(n * k * (4.5 if get_sm_version() >= 100 else 6.5)) + 2 * m * k
     available = (
         torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     )
@@ -267,10 +268,10 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="cuda:0"):
     # Reproducible synthetic inputs and weights; values do not select kernels.
     torch.manual_seed(GEMM_SEED)
 
-    x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
-
-    if gemm_type == "w4a16_nvfp4" and (refusal := _w4a16_nvfp4_does_not_fit(n, k, device)):
+    if gemm_type == "w4a16_nvfp4" and (refusal := _w4a16_nvfp4_does_not_fit(m, n, k, device)):
         raise RuntimeError(refusal)
+
+    x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
 
     if gemm_type == "fp8":
         # This row times dynamic per-tensor activations, and the perf model derives
