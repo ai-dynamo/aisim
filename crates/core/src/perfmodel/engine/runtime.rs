@@ -1362,6 +1362,17 @@ impl Engine {
                     )?;
                     Self::validate_mamba_ops(&o.fallback, decode_width, false, seen)?;
                 }
+                Op::Glm53Attention(o) => {
+                    Self::validate_mamba_ops(&o.measured, decode_width, false, seen)?
+                }
+                Op::Glm53Ffn(o) => {
+                    Self::validate_mamba_ops(&o.children, decode_width, false, seen)?;
+                    Self::validate_mamba_ops(&o.measured, decode_width, false, seen)?;
+                }
+                Op::Glm53Primitive(o) => {
+                    Self::validate_mamba_ops(&o.children, decode_width, false, seen)?;
+                    Self::validate_mamba_ops(&o.measured, decode_width, false, seen)?;
+                }
                 _ => {}
             }
         }
@@ -5133,6 +5144,34 @@ pub(crate) mod tests {
             let err = build(nextn, op).unwrap_err().to_string();
             assert!(err.contains(message), "{err}");
         }
+        // GLM-5.3 composites nest analytical and measured children: a qualified
+        // scan in either list is rejected at build, and valid children pass.
+        let glm = |children: Vec<Op>, measured: Vec<Op>| {
+            Op::Glm53Primitive(crate::operators::glm53flash::Glm53PrimitiveOp {
+                name: "final_norm".into(),
+                role: "final_norm".into(),
+                backend: "vllm".into(),
+                checkpoint_format: "fp8".into(),
+                tp_size: 1,
+                is_context: true,
+                hidden_size: 4096,
+                vocab_size: 154880,
+                token_selection: "all_scheduled".into(),
+                output_dtype: "bfloat16".into(),
+                collective: "none".into(),
+                children,
+                measured,
+            })
+        };
+        let validate = |op: Op| Engine::validate_mamba_ops(&[op], None, true, &mut [false; 2]);
+        for op in [
+            glm(vec![qualified_mamba(true, 1)], vec![]),
+            glm(vec![], vec![qualified_mamba(true, 1)]),
+        ] {
+            let err = validate(op).unwrap_err().to_string();
+            assert!(err.contains("nested"), "{err}");
+        }
+        validate(glm(vec![], vec![])).unwrap();
         // Mixed steps need both phases qualified or both unrecorded.
         let phases = |context: &str, generation: &str| {
             let op = |prefill, dtype: &str| match qualified_mamba(prefill, 1) {

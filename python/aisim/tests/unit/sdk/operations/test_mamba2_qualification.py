@@ -277,10 +277,13 @@ def test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode():
     try:
         shared.set_default_database_mode(common.DatabaseMode.HYBRID)
         backend = get_backend("trtllm", "b200_sxm")
-        run(backend, legacy, shared)
+        hybrid_ttft = run(backend, legacy, shared)
         shared.set_default_database_mode(common.DatabaseMode.SOL)
         sol = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
-        assert run(backend, legacy, shared) == cold(legacy, sol)
+        sol_ttft = cold(legacy, sol)
+        # The modes price differently, so a stale HYBRID result cannot pass.
+        assert hybrid_ttft != sol_ttft
+        assert run(backend, legacy, shared) == sol_ttft
     finally:
         shared.set_default_database_mode(original)
 

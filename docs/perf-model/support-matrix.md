@@ -97,9 +97,10 @@ identify the cold request, but this path does not read them. If a packed step
 has any cached prefill token, every qualified prefill scan in it uses the SOL
 estimate. For a step that mixes cold and
 cached requests, this choice of source is therefore approximate. Each prefill
-request must compute at least one new token. With a qualified Mamba2
-operation, a packed step with fewer new prefill tokens than prefill requests
-fails, with or without decode work.
+request must compute at least one new token. Take a graph with a qualified
+Mamba2 operation. If a packed step has new prefill tokens, but fewer than
+prefill requests, its estimate fails. Decode work does not change this. A step with no new
+prefill token skips prefill. It prices only its decode work, or zero.
 
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different
