@@ -190,15 +190,19 @@ def _align_token_budgets(param_values: dict[str, Any], backend: str) -> None:
     values injected past the rule engine. Never rounds down. Reject unaligned
     evaluated limits (``preserve_engine_limits``, the Sweeper): rounding them
     would deploy a configuration different from the one evaluated. TRT-LLM's
-    total-token budget must also align to an explicitly configured KV block."""
+    total-token budget must also align to an explicitly configured KV block.
+    Explicit SGLang chunks must meet the same alignment when limits are preserved."""
     params = param_values.get("params")
     if not isinstance(params, dict):
         return
     preserved = bool(param_values.get("preserve_engine_limits") or params.get("preserve_engine_limits"))
+    budget_keys = _TOKEN_BUDGET_KEYS
+    if backend == "sglang" and preserved:
+        budget_keys += ("chunked_prefill_size",)
     for role_name, role in params.items():
         if not isinstance(role, dict):
             continue
-        for key in _TOKEN_BUDGET_KEYS:
+        for key in budget_keys:
             v = role.get(key)
             if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
                 continue

@@ -24,6 +24,26 @@ def test_deployment_preserves_context_limit_for_all_backends(backend):
     assert deployment.agg_engine_args["max_model_len"] == 4096
 
 
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
+def test_explicit_chunk_payload_is_local_to_sglang(backend):
+    sample = unroll_sample(
+        search_space=_space(),
+        selection=_agg_selection(backend=backend),
+        parallel_config=AGG_MOE,
+    )
+    # Exercise the lowering boundary independently of SearchSpace validation.
+    sample["agg_chunked_prefill_size"] = 32768
+    deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
+
+    if backend == "sglang":
+        assert deployment.agg_engine_args["sglang"] == {
+            "chunked_prefill_size": 32768,
+            "max_prefill_tokens": 16384,
+        }
+    else:
+        assert "sglang" not in deployment.agg_engine_args
+
+
 def _space(**overrides) -> SearchSpace:
     values = {"model_name": "example/model", "hardware_sku": "example_sku"}
     values.update(overrides)

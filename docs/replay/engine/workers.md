@@ -42,7 +42,7 @@ engine:
 | `workers.<role>.parallelism.moe_expert` | `1` | Searched | MoE expert parallelism. Repartitions the worker's GPUs and does not add GPUs. |
 | `workers.<role>.parallelism.prefill_context` | Unset (1) | predict only | Prefill context parallelism (vLLM `-pcp`, SGLang `--attn-cp-size`). Adds GPUs. |
 | `workers.<role>.parallelism.decode_context` | Unset (1) | predict only | Decode context parallelism (vLLM `-dcp`, SGLang `--dcp-size`). Must divide `tensor`; adds no GPUs. |
-| `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass on one attention-DP rank. See [SGLang note](#batch-limits). |
+| `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass on one attention-DP rank. Also the SGLang prefill admission ceiling when a chunk is explicit. See [SGLang note](#batch-limits). |
 | `workers.<role>.scheduler.chunked_prefill_size` | Unset (backend default) | Fixed, choices, or integer range | SGLang only. Positive worker-wide prefill chunk budget, divided by `attention_data` inside replay. See [Batch limits](#batch-limits). |
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
@@ -159,6 +159,9 @@ you raise it.
 > chunk budget independently of `max_batched_tokens`. This is a **worker-wide**
 > budget: replay divides it by `attention_data` once. For example, 8192 with
 > two attention-DP ranks gives each rank a 4096-token chunk budget.
+> Each rank must receive at least one KV block. With an explicit chunk,
+> `max_batched_tokens` also sets the per-rank prefill admission ceiling
+> (`--max-prefill-tokens`), consistently in replay and generated deployments.
 > If omitted, existing behavior is unchanged: the budget defaults to 8192,
 > except with `host_loop` or worker-local image encoding, where it comes from
 > `max_batched_tokens`. An explicit chunk size overrides that fallback.

@@ -89,6 +89,7 @@ def test_chunk_domain_round_trip(role, domain, expected, bounds):
     # Keep the global chunk intact: the native scheduler divides it by DP once.
     assert args["aic_attention_dp_size"] == 2
     assert args["sglang"]["chunked_prefill_size"] == 128
+    assert args["sglang"]["max_prefill_tokens"] == 8192
     spec = ReplaySpec(backend_deployment=deployment, workload=smart.workload.model_dump(mode="json"), goal={})
     saved = _candidate_prediction(source, sample, spec, adapter_sections={})
     assert saved["engine"]["workers"][role]["scheduler"]["chunked_prefill_size"] == 128
@@ -134,6 +135,96 @@ def test_internal_search_space_rejects_invalid_chunks(value):
 def test_prediction_preserves_omitted_chunk(chunk, expected):
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_config(chunk=chunk)))
     assert spec.backend_deployment.agg_engine_args.get("sglang", {}).get("chunked_prefill_size") == expected
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+@pytest.mark.parametrize("dp,chunk", [(1, 63), (2, 64), (2, 127)])
+def test_prediction_rejects_sub_block_per_rank_chunks(role, dp, chunk):
+    raw = _config(role, chunk)
+    worker = raw["engine"]["workers"][role]
+    worker["kv_cache"]["block_size"] = 64
+    worker["parallelism"] = {"attention_data": dp}
+
+    with pytest.raises(ValueError, match="chunked_prefill_size=.*at least one block.*attention_data"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+@pytest.mark.parametrize("dp,chunk", [(1, 64), (2, 128), (2, 192), (2, None)])
+def test_prediction_accepts_at_least_one_block_per_rank_or_omitted_chunk(role, dp, chunk):
+    raw = _config(role, chunk)
+    worker = raw["engine"]["workers"][role]
+    worker["kv_cache"]["block_size"] = 64
+    worker["parallelism"] = {"attention_data": dp}
+
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    internal_role = "agg" if role == "aggregated" else role
+    args = getattr(spec.backend_deployment, f"{internal_role}_engine_args")
+    assert args.get("sglang", {}).get("chunked_prefill_size") == chunk
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+@pytest.mark.parametrize("chunk", [64, 128, 192])
+def test_sweeper_requires_at_least_one_block_per_rank(role, chunk):
+    raw = _config(role, chunk)
+    raw["engine"]["workers"][role]["kv_cache"]["block_size"] = 64
+    source = CoreRecommendationConfig.model_validate({**raw, "optimization": {}})
+    smart = recommendation_to_sweeper(source)
+    mode = "agg" if role == "aggregated" else "disagg"
+    replica = ReplicaParallelConfig(ParallelShape(tp=1, dp=2, moe_tp=1, moe_ep=1), replicas=1)
+    selection = {"deployment_mode": mode, "backend": "sglang"}
+    for name in ("agg",) if mode == "agg" else ("prefill", "decode"):
+        selection[f"{name}_max_num_batched_tokens"] = 8192
+        selection[f"{name}_max_num_seqs"] = 8
+    sample = unroll_sample(
+        search_space=smart.search_space,
+        selection=selection,
+        parallel_config=replica if mode == "agg" else DisaggParallelConfig(replica, replica),
+    )
+
+    if chunk < 128:
+        with pytest.raises(ValueError, match="chunked_prefill_size=.*at least one block.*attention_data"):
+            build_backend_deployment(sample, backend_version="0.5.22")
+    else:
+        deployment = build_backend_deployment(sample, backend_version="0.5.22")
+        internal_role = "agg" if role == "aggregated" else role
+        assert getattr(deployment, f"{internal_role}_engine_args")["sglang"]["chunked_prefill_size"] == chunk
+
+
+def test_explicit_chunk_replay_uses_evaluated_prefill_ceiling():
+    raw = _config(chunk=16384)
+    worker = raw["engine"]["workers"]["aggregated"]
+    worker["scheduler"]["max_sequences"] = 64
+    worker["kv_cache"].update(prefix_caching=False, capacity={"type": "fixed", "blocks": 65536})
+    raw["traffic"]["source"]["output_tokens"] = 1
+    raw["traffic"]["load"]["concurrency"] = 64
+    raw["traffic"]["stop"]["requests"] = 64
+    source = CoreRecommendationConfig.model_validate({**raw, "optimization": {}})
+    smart = recommendation_to_sweeper(source)
+    sample = unroll_sample(
+        search_space=smart.search_space,
+        selection={
+            "deployment_mode": "agg",
+            "backend": "sglang",
+            "agg_max_num_batched_tokens": 8192,
+            "agg_max_num_seqs": 64,
+        },
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1),
+    )
+    deployment = build_backend_deployment(sample, backend_version="0.5.22")
+    spec = ReplaySpec(backend_deployment=deployment, workload=smart.workload.model_dump(mode="json"), goal={})
+    saved = _candidate_prediction(source, sample, spec, adapter_sections={})
+    reloaded = prediction_to_replay_spec(CorePredictionConfig.model_validate(saved))
+
+    for replay in (spec, reloaded):
+        assert replay.backend_deployment.agg_engine_args["sglang"] == {
+            "chunked_prefill_size": 16384,
+            "max_prefill_tokens": 8192,
+        }
+        report = EngineReplayRunnerFactory().create(0).run(replay)
+        assert report.metrics["completed_requests"] == 64
+        # Two 8192-token batches, each containing 32 uncached 256-token prompts.
+        assert report.metrics["mean_ttft_ms"] == pytest.approx(15)
 
 
 @pytest.mark.parametrize("chunk,expected", [(None, 8192), (128, 128)])

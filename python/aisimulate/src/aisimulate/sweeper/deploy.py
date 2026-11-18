@@ -211,8 +211,14 @@ def _engine_args_payload(
         if sample.get("kv_transfer_timing_mode") is not None:
             payload["kv_transfer_timing_mode"] = sample["kv_transfer_timing_mode"]
     chunk = sample.get(f"{role}_chunked_prefill_size")
-    if chunk is not None:
+    if backend == "sglang" and chunk is not None:
+        if int(chunk) // attention_dp < block_size:
+            raise ValueError(
+                f"{role}_chunked_prefill_size={chunk} must provide at least one "
+                f"block ({block_size} tokens) per attention_data rank ({attention_dp})"
+            )
         payload.setdefault("sglang", {})["chunked_prefill_size"] = int(chunk)
+        payload["sglang"]["max_prefill_tokens"] = int(sample[f"{role}_max_num_batched_tokens"])
     return payload
 
 

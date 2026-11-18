@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import pytest
 
 from aisimulate.generator.api import generate_from_request
@@ -100,4 +102,38 @@ def test_generator_does_not_silently_round_an_evaluated_chunk():
             candidate,
             workload={"isl": 4000, "osl": 1000},
             model_facts=ModelFacts(is_moe=False, architecture="Qwen3ForCausalLM"),
+        )
+
+
+@pytest.mark.parametrize("mode", ["agg", "disagg"])
+@pytest.mark.parametrize("chunk", [65, 127, 128])
+@pytest.mark.parametrize("rule", [None, "benchmark"])
+def test_direct_request_preserves_or_rejects_evaluated_chunks(mode, chunk, rule):
+    candidate = (_agg_candidate if mode == "agg" else _disagg_candidate)(backend="sglang", backend_version="0.5.18")
+    candidate["config"].pop("adapters", None)
+    request = from_sweeper_candidate(
+        candidate,
+        workload={"isl": 4000, "osl": 1000},
+        model_facts=ModelFacts(is_moe=False, architecture="Qwen3ForCausalLM"),
+        generator_overrides={"K8sConfig": {"k8s_image": "example/sglang:0.5.18"}},
+    )
+    # Inject RoleSizing.extra directly, bypassing from_sweeper_candidate's chunk check.
+    role = "agg" if mode == "agg" else "decode"
+    roles = dict(request.topology.roles)
+    sizing = roles[role]
+    roles[role] = replace(sizing, extra={**sizing.extra, "chunked_prefill_size": chunk})
+    request = replace(
+        request,
+        topology=replace(request.topology, roles=roles),
+        overrides=replace(request.overrides, raw={**request.overrides.raw, "rule": rule}),
+    )
+
+    if chunk % 64:
+        with pytest.raises(ValueError, match=rf"Cannot preserve evaluated {role}\.chunked_prefill_size={chunk}"):
+            generate_from_request(request)
+    else:
+        artifacts = generate_from_request(request)
+        assert _cli_flag_value(artifacts[f"cli_args_{role}"], "--chunked-prefill-size") == str(chunk)
+        assert _cli_flag_value(artifacts[f"cli_args_{role}"], "--max-prefill-tokens") == str(
+            candidate["config"][f"{role}_max_num_batched_tokens"]
         )

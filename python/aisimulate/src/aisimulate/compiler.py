@@ -758,6 +758,12 @@ def _worker_engine_args(
     if capacity.type == "default" and memory_fraction is None:
         memory_fraction = 0.88 if backend == "sglang" else 0.9
     block_size = resolve_block_size(backend, cache.block_size)
+    chunk = worker.scheduler.chunked_prefill_size
+    if chunk is not None and chunk // parallel.attention_data < block_size:
+        raise ValueError(
+            f"workers.{role}.scheduler.chunked_prefill_size={chunk} must provide at least one "
+            f"block ({block_size} tokens) per attention_data rank ({parallel.attention_data})"
+        )
     payload: dict[str, JSONValue] = {
         "worker_type": role,
         "engine_type": backend,
@@ -974,8 +980,11 @@ def _worker_engine_args(
                 frontend=worker.frontend,
             )
         )
-    if worker.scheduler.chunked_prefill_size is not None:
-        payload.setdefault("sglang", {})["chunked_prefill_size"] = worker.scheduler.chunked_prefill_size
+    if chunk is not None:
+        payload.setdefault("sglang", {}).update(
+            chunked_prefill_size=chunk,
+            max_prefill_tokens=worker.scheduler.max_batched_tokens,
+        )
     if cache.hicache is not None:
         payload.setdefault("sglang", {})["hicache"] = cache.hicache.model_dump(mode="json")
     return payload
