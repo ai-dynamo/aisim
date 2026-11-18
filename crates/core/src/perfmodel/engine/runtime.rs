@@ -4772,6 +4772,22 @@ pub(crate) mod tests {
             17.0 * 18_560.0 + 2.0 * 2_097_152.0 + 5_317_120.0
         ));
         assert!(close(packed(16, 1, 0), 16.0 * 18_560.0 + 2_097_152.0));
+        // Three prefill requests with two new tokens leave one request without
+        // work: the mixed and pure-prefill packed paths both reject the payload.
+        for decodes in [8, 0] {
+            let short = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 3,
+                    sum_prefill_tokens: 2,
+                    num_decode_requests: decodes,
+                    sum_decode_kv_tokens: decodes * 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let err = engine.forward_pass_time_ms(&[short]).unwrap_err();
+            assert!(err.to_string().contains("new token"), "{decodes}: {err}");
+        }
         assert!(close(
             engine.decode_step_latency(2, 16, 1, 1.0).unwrap(),
             decode_bytes

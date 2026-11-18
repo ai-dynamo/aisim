@@ -678,6 +678,15 @@ pub(crate) fn get_mix_step_ops<'a>(
             // `r` requests carry one extra token. Never invent extra states.
             let n = prefill_batch.max(1);
             let (q, r) = (ctx_tokens / n, ctx_tokens % n);
+            // Every prefill request computes a token, as in the pure-prefill walk
+            // and `predict_prefill_latency_total`: reject, never price a zero chunk.
+            if q == 0 {
+                return Err(AicError::InvalidEngineConfig(format!(
+                    "Mamba op {}: each qualified prefill request needs a new token, but \
+                     {n} requests carry {ctx_tokens}",
+                    op.name()
+                )));
+            }
             // Totals cannot say which request is cold, so any cached token in
             // the step keeps every chunk off cold-state scan rows, even when
             // the integer mean prefix rounds to zero.
