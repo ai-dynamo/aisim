@@ -86,11 +86,24 @@
       "id": "e2e-only-sla",
       "question": "On eight B200s (b200_sxm), which configuration of Qwen/Qwen3.5-35B-A3B with vLLM gives the best goodput per GPU if every request must finish end to end within 3 seconds? 2048 input, 256 output tokens, concurrency 32, 320 requests, 16 trials.",
       "expected_skill": "aisim-deployment-search",
-      "ground_truth": "Uses evaluation.sla.e2e_ms: 3000 alone (it is mutually exclusive with ttft_ms and itl_ms), target goodput_per_gpu and strict_sla true. Every reported candidate's mean E2E latency is at most 3000 ms in recommendation.json.",
+      "ground_truth": "Uses evaluation.sla.e2e_ms: 3000 alone (it is mutually exclusive with ttft_ms and itl_ms), target goodput_per_gpu and strict_sla true. Every reported candidate must complete all 320 requests within 3000 ms each: require goodput_completed_requests == completed_requests == num_requests == 320 in recommendation.json, or verify complete per-request records for all 320 requests with every E2E latency at most 3000 ms. A qualifying mean or strict_sla true alone does not prove this requirement. If no candidate meets it, report that none qualifies.",
       "expected_behavior": [
         "SLA is expressed as e2e_ms only",
-        "Every reported candidate has mean E2E latency of at most 3000 ms in the artifacts",
+        "Every reported candidate has goodput_completed_requests == completed_requests == num_requests == 320, or complete per-request evidence that all 320 requests completed with E2E latency at most 3000 ms",
+        "Rejects candidates with any request above 3000 ms even when mean E2E latency is at most 3000 ms; reports no qualifying candidate if none meets the requirement",
         "Results labeled simulated"
+      ]
+    },
+    {
+      "id": "e2e-only-sla-mean-hides-failure",
+      "question": "An AISim candidate evaluated with evaluation.sla.e2e_ms: 3000 alone, target goodput_per_gpu and strict_sla true has two requests with E2E latencies of 1000 ms and 4000 ms. Its recommendation.json metrics are mean_e2e_latency_ms: 2500, goodput_completed_requests: 1, completed_requests: 2, num_requests: 2. Does this candidate satisfy the requirement that every request finish end to end within 3 seconds?",
+      "expected_skill": "aisim-deployment-search",
+      "ground_truth": "Rejects the candidate: the 4000 ms request exceeds 3000 ms even though the mean is 2500 ms. Only one of two completed requests meets the E2E SLA, so goodput_completed_requests != completed_requests == num_requests. strict_sla true and a qualifying mean do not establish that every request meets the limit.",
+      "expected_behavior": [
+        "Explicitly rejects the candidate as failing the every-request E2E requirement",
+        "Identifies the 4000 ms request as the violation and the 2500 ms mean as insufficient",
+        "Explains that full goodput requires goodput_completed_requests == completed_requests == num_requests (2 here), while this candidate has only 1 SLA-compliant request",
+        "Labels the supplied AISim metrics as simulated"
       ]
     },
     {
