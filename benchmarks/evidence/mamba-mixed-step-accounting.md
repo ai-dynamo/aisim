@@ -795,3 +795,11 @@ exact-head result.
   `predict_prefill_latency_total` does the same for a graph without a
   whole-model FPM. For example, 2 requests and 17 new tokens price 16 tokens.
   The mixed packed step keeps the remainder for qualified Mamba operations.
+- In the mixed step, shared token-major operations take
+  `ctx_tokens - prefix * floor(ctx_tokens / isl)` prefill tokens for every
+  graph, as main does. A remainder longer than `isl - prefix` therefore
+  prices more shared tokens than qualified Mamba and context attention
+  price. For example, `ctx_tokens = 6000`, `isl = 4096` and `prefix = 3000`
+  give 3000 shared prefill tokens, but 2 requests of 1096 tokens for Mamba
+  and attention. The shared count stays the same for legacy and qualified
+  graphs, so a Mamba qualification does not change non-Mamba prices.

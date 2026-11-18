@@ -271,19 +271,22 @@ def test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode():
         rust_engine_step._engine_handle_cache_clear()
         run(get_backend("trtllm", "b200_sxm"), first, hybrid)
         assert run(get_backend("trtllm", "b200_sxm"), second, hybrid) == expected[id(second)]
-    # A query mode changed in place on the same database object.
+    # A query mode changed in place on the same database object. The SOL
+    # reference comes first, so the HYBRID handle and result stay warm.
+    sol = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    sol_ttft = cold(legacy, sol)
     shared = get_database("b200_sxm", "trtllm", "1.3.0rc20", allow_unlisted_version=True)
     original = shared.get_default_database_mode()
     try:
         shared.set_default_database_mode(common.DatabaseMode.HYBRID)
         backend = get_backend("trtllm", "b200_sxm")
         hybrid_ttft = run(backend, legacy, shared)
-        shared.set_default_database_mode(common.DatabaseMode.SOL)
-        sol = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
-        sol_ttft = cold(legacy, sol)
         # The modes price differently, so a stale HYBRID result cannot pass.
         assert hybrid_ttft != sol_ttft
+        shared.set_default_database_mode(common.DatabaseMode.SOL)
+        # The backend's result cache, then a fresh backend over the handle cache.
         assert run(backend, legacy, shared) == sol_ttft
+        assert run(get_backend("trtllm", "b200_sxm"), legacy, shared) == sol_ttft
     finally:
         shared.set_default_database_mode(original)
 
