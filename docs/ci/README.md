@@ -206,6 +206,12 @@ conservatively. Hash-verified dependency installation and all other validation
 continue on every run. This reduces repeated resolver work; it is not a change
 to application-test coverage or a promise of a large latency reduction.
 
+The [PR #896 evidence record](../../benchmarks/evidence/ci-pr-896/README.md)
+contains the historical raw timing excerpts and their limitations. Quantified
+runner-work and elapsed-time savings remain unmeasured hypotheses: the
+unpaired runs do not establish a net improvement or exercise hosted lock
+skipping. The selector tests establish skip/regenerate behavior separately.
+
 Every standalone run publishes `Fast CI Success`. Full CI contains only a
 lightweight **Require Fast CI** job, which reads the standalone run and verifies
 all three substantive jobs plus its aggregate. The Fast checks are not rerun
