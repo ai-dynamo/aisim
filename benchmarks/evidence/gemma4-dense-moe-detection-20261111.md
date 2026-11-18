@@ -156,6 +156,19 @@ uses before it resolves the perf database. The support-matrix classifier matches
 it by the same anchored diagnostic
 (`tools/support_matrix/fpe_support_matrix.py`).
 
+The `estimate_kv_cache` re-raise is deliberately request-wide rather than
+Gemma-specific. It sits in the generic native-build `except` and re-raises every
+`InvalidEngineConfigurationError`, because pricing an invalid request naively
+would return a capacity for a configuration the native path just rejected.
+Missing performance data still takes the documented fallback. Measured
+before/after on a non-Gemma MoE model (`deepseek-ai/DeepSeek-V3`,
+`h200_sxm`/`vllm`, `tp_size=3`, `moe_tp_size=1`, `moe_ep_size=2`, 800 GiB
+override, `allow_naive_fallback=True`): `origin/main` `0809faae9` returns
+`source="naive_fallback"` with `total_kv_size_tokens=1840487`; this branch
+raises `InvalidEngineConfigurationError: Parallelism width mismatch ...`.
+Pinned by
+`test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error`.
+
 ## Regression tests added
 
 | Test | Contract |
@@ -171,6 +184,7 @@ it by the same anchored diagnostic
 | `test_estimate_kv_cache_rejects_corrupt_gemma4_metadata_before_the_database` | Classification precedes the perf-DB lookup: corrupt metadata raises even when the database is unavailable and the fallback is allowed |
 | `test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint` | A well-formed dense checkpoint with a missing database still takes the documented naive fallback |
 | `test_estimate_kv_cache_rejects_dense_gemma4_moe_ep_before_the_database` | A dense checkpoint with `moe_ep_size=2` and `allow_naive_fallback=True` is rejected before the perf-DB lookup and never priced by the naive estimator |
+| `test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error` | Outside Gemma 4: a `deepseek-ai/DeepSeek-V3` width mismatch with `allow_naive_fallback=True` raises instead of returning a `source="naive_fallback"` capacity |
 | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution` | Static CLI gate: no `resolve_model_config_moe_comm` call for dense Gemma 4 |
 | `test_dense_gemma4_disagg_estimate_skips_moe_comm_resolution` | Disagg CLI gate: neither role resolves MoE communication for dense Gemma 4 |
 | `test_routed_gemma4_static_estimate_still_resolves_moe_comm` | Routed Gemma 4 keeps the static-path resolution for both required phases |
@@ -277,17 +291,20 @@ Three checks keep the classification and the rejection from regressing.
      override, and requires the dense diagnostic instead of a naive estimate
      built from the same checkpoint metadata.
    - `dense_gemma4_num_gpu_blocks_rejects_instead_of_returning_a_count` calls
-     `aisim_core.sdk.memory.estimate_num_gpu_blocks` with the same request, which
-     is the entry point `python.rs::estimate_aic_num_gpu_blocks` invokes from the
-     replay bridge, and requires the dense diagnostic instead of a scheduler
-     block count.
+     `aisim_core.sdk.memory.estimate_num_gpu_blocks` with the same request. That
+     is the Python entry point behind `python.rs::estimate_aic_num_gpu_blocks`,
+     which `materialize_aic_capacity` installs as the replay path's capacity
+     estimator from `resolve_role_timing`; it must raise the dense diagnostic
+     instead of returning a scheduler block count.
    - `routed_gemma4_is_not_rejected_by_the_dense_guard` is the control: the
      routed checkpoint keeps `moe_ep_size=2` and must never produce the dense
      diagnostic.
 
    Each test prints a visible `SKIP` and returns when the SDK is not
    importable, and hard-fails instead when `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1`
-   is set, so a bare `cargo test` cannot read as coverage. The enforced run
+   is set, so a bare `cargo test` cannot read as coverage. The
+   `rust-feature-modes` job sets that variable in its embedded test step, so an
+   SDK import failure there fails CI rather than skipping. A local enforced run
    needs the maturin-built extension, the SDK sources on `PYTHONPATH`, and
    `PYO3_PYTHON` pointing at the same interpreter the extension was built for;
    the module header records the exact command.
