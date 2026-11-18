@@ -26,6 +26,9 @@ The answer is the smallest qualifying configuration found in the tested
 search space. Each budget is a sampled search (optimizer.max_trials), so a
 smaller configuration can still exist.
 
+Hardware and maximum GPU budget are managed by --hardware and --budgets.
+User --set overrides of those paths or their parent mappings are rejected.
+
 Exit status: 0 found; 1 nothing qualified up to the largest budget;
 2 input or configuration error; 3 resource, timeout or evaluation error;
 4 no AISim coverage for this model, GPU type and backend.
@@ -197,6 +200,11 @@ def main() -> int:
         return 2
 
     try:
+        for assignment in a.sets:
+            path = assignment.partition("=")[0]
+            for managed in ("engine.hardware", "optimization.constraints.max_candidate_gpus"):
+                if path == managed or path.startswith(managed + ".") or managed.startswith(path + "."):
+                    raise ValueError(f"--set {path!r} targets a value managed by --hardware or --budgets")
         # Match the first recommendation step's effective configuration and override order.
         cfg = apply_sets(
             yaml.safe_load(a.config.read_text()),

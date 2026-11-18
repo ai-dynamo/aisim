@@ -15,8 +15,10 @@ They were not run during testing.
 `recommendations/*.yaml` are prediction inputs, not deployments. Render a
 selected candidate into Dynamo launch scripts with the generator API that
 ships in the `aisim` wheel. Save as `render.py` and run
-`python3 render.py ./aisim-recommendation <candidate_id>`; take the
-candidate ID from the summarizer output.
+`python3 render.py ./aisim-recommendation <candidate_id> <head-node-ip>`;
+take the candidate ID from the summarizer output. Use the head node's address
+reachable from every serving node and the benchmark host. `127.0.0.1` is only
+appropriate when the deployment and benchmark client all run on one host.
 
 ```python
 import json
@@ -29,6 +31,7 @@ from aisim.generator.request import from_sweeper_candidate
 
 out = Path(sys.argv[1])
 candidate_id = sys.argv[2]
+head_node_ip = sys.argv[3]
 result = json.loads((out / "recommendation.json").read_text())
 candidate = next(r for r in result["candidates"] if r["candidate_id"] == candidate_id)
 assert candidate["status"] == "feasible"
@@ -41,7 +44,7 @@ request = from_sweeper_candidate(
         "ServiceConfig": {
             "model_path": "/workspace/models/<model-dir>",   # path inside the serving container
             "served_model_name": "<hf-model-id>",
-            "head_node_ip": "127.0.0.1",
+            "head_node_ip": head_node_ip,
         },
     },
 )
@@ -52,7 +55,7 @@ print(candidate_id, sorted(generate_from_request(request)))
 
 It writes deployment artifacts:
 
-- `run_0.sh`: frontend and workers;
+- `run_0.sh`, `run_1.sh`, ...: the launch script for each serving node;
 - `k8s_deploy.yaml`;
 - `sflow.yaml`;
 - per-role CLI argument files.
@@ -79,6 +82,27 @@ Run `bash -n` on every generated script.
   mounted read-only, check the Dynamo and backend versions inside the
   container, then `bash run_0.sh`. Confirm `GET /v1/models` before
   benchmarking.
+- Multiple hosts: inspect every generated `run_N.sh` and assign each script
+  to its corresponding node, preserving the generated GPU placement. Render
+  with a reachable head-node address, not loopback. Start etcd and NATS from
+  the matching Dynamo release on that head node and make their endpoints
+  reachable from every serving container. Copy the complete generated bundle
+  to the same container path on every node, and mount the model at the same
+  configured path with matching runtime/backend versions and the assigned GPUs.
+  In each serving container, set the same discovery endpoints before launch:
+
+  ```bash
+  export HEAD_NODE_IP="<head-node-ip-reachable-from-all-nodes>"
+  export ETCD_ENDPOINTS="${HEAD_NODE_IP}:2379"
+  export NATS_SERVER="nats://${HEAD_NODE_IP}:4222"
+  ```
+
+  On node 0 run `bash run_0.sh`; on node 1 run `bash run_1.sh`; continue with
+  each generated `run_N.sh` on node N. Keep all of them running concurrently;
+  do not run every script on node 0 or run `run_0.sh` on every node. Allow the
+  backend's generated inter-node communication ports as well as discovery.
+  Confirm all expected workers register, `GET /v1/models` succeeds from the
+  benchmark host, and a real completion succeeds before benchmarking.
 - Kubernetes: install the matching Dynamo platform and CRDs, set the
   namespace, model cache and image in the generator overrides, and review
   `k8s_deploy.yaml` with the user before applying it.
@@ -117,7 +141,7 @@ For a single point using the simulated request count, run:
 Closed loop (simulation used `concurrency: C`):
 
 ```bash
-aiperf profile -m <served-model-name> -u http://127.0.0.1:8000 \
+aiperf profile -m <served-model-name> -u http://<head-node-ip>:8000 \
   --endpoint-type chat --streaming --tokenizer <tokenizer-path-or-id> \
   --isl <input_tokens> --osl <output_tokens> --extra-inputs ignore_eos:true \
   --concurrency <C> --num-requests <requests in the simulation> \
@@ -128,7 +152,7 @@ Open loop (simulation used `poisson` or `constant_rate` at R requests per
 second):
 
 ```bash
-aiperf profile -m <served-model-name> -u http://127.0.0.1:8000 \
+aiperf profile -m <served-model-name> -u http://<head-node-ip>:8000 \
   --endpoint-type chat --streaming --tokenizer <tokenizer-path-or-id> \
   --isl <input_tokens> --osl <output_tokens> --extra-inputs ignore_eos:true \
   --request-rate <R> --arrival-pattern <poisson|constant> \

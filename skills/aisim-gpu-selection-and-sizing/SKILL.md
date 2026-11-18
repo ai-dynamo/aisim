@@ -154,6 +154,14 @@ python3 "$SKILL_DIR/scripts/size_ladder.py" sizing.yaml \
   --hardware b200_sxm --out-root ./sizing-b200_sxm
 ```
 
+Use `--hardware` for the GPU type and `--budgets` for the maximum GPU counts
+at each step. Do not override `engine.hardware` or
+`optimization.constraints.max_candidate_gpus` with `--set`, including through
+parent mappings such as `engine` or `optimization.constraints`. The script
+rejects those overrides with exit 2 before probing or searching, so its
+coverage probe, search steps and report refer to the same hardware and budgets.
+Other overrides, such as resource limits and `min_candidate_gpus`, remain available.
+
 The script works around an issue in AISim 0.14.0: one large-budget
 `min_gpus` search can miss smaller qualifying configurations. It is fixed on
 `main` after 0.14.0 (https://github.com/ai-dynamo/aisim/pull/913). Remove the
@@ -223,6 +231,13 @@ scan reports `pass`, `fail` or `unknown`:
   numbers;
 - it also reports completed and compliant counts, the arrival window and
   the run duration.
+
+Set `traffic.load`, `traffic.stop` and `evaluation.sla` in the prediction
+YAML before scanning. `--set` overrides of these sections, their children or
+parent mappings are rejected with exit 2 before any prediction; otherwise a
+late override could replace a scanned rate or make the verdict use a different
+SLA. Overrides for other settings, such as
+`--set execution.resources.memory_limit_gb=4`, remain available.
 
 It exits 3 if any load could not be evaluated.
 

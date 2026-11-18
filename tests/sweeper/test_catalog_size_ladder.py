@@ -251,3 +251,128 @@ def test_headroom_uses_agreed_throughput_floor(monkeypatch, sizing_config, tmp_p
     report = json.loads(capsys.readouterr().out)
     assert report["rows"][0]["status"] == expected
     assert report["rows"][0]["goodput_rps"] == 18.8
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "engine.hardware=h200_sxm",
+        "engine={hardware: h200_sxm}",
+        "optimization.constraints.max_candidate_gpus=64",
+        "optimization.constraints={max_candidate_gpus: 64, min_goodput_rps: 18}",
+        "optimization={target: min_gpus, constraints: {max_candidate_gpus: 64, min_goodput_rps: 18}}",
+    ],
+)
+def test_ladder_managed_overrides_stop_before_execution(ladder, monkeypatch, sizing_config, tmp_path, capsys, override):
+    monkeypatch.setattr(ladder, "run", lambda *args: pytest.fail("conflicting override must not start AISim"))
+    assert invoke(ladder, monkeypatch, sizing_config, tmp_path, "--set", override) == 2
+    assert "managed by --hardware or --budgets" in capsys.readouterr().err
+    assert not (tmp_path / "out/probe").exists()
+
+
+@pytest.fixture
+def headroom():
+    path = ROOT / "skills/aisim-gpu-selection-and-sizing/scripts/headroom_scan.py"
+    spec = importlib.util.spec_from_file_location("headroom_scan", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def prediction_config(sizing_config):
+    cfg = yaml.safe_load(sizing_config.read_text())
+    cfg.pop("optimization")
+    cfg["engine"]["backend"] = "vllm"
+    sizing_config.write_text(yaml.safe_dump(cfg))
+    return sizing_config
+
+
+def invoke_headroom(headroom, monkeypatch, prediction_config, tmp_path, *args):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "headroom_scan.py",
+            str(prediction_config),
+            "--min-compliant-share",
+            "0.99",
+            "--min-goodput-share",
+            "0.90",
+            "--steps",
+            "1.0,1.25",
+            "--workdir",
+            str(tmp_path / "headroom"),
+            *args,
+        ],
+    )
+    return headroom.main()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "traffic.load.requests_per_second=40",
+        "traffic.load={type: poisson, requests_per_second: 40}",
+        "traffic.stop.requests=12000",
+        "traffic.stop.requests_per_load_unit=1",
+        "traffic.stop={requests: 12000}",
+        "traffic={load: {type: poisson, requests_per_second: 40}}",
+        "evaluation.sla.ttft_ms=50",
+        "evaluation.sla={ttft_ms: 50}",
+        "evaluation={sla: {ttft_ms: 50}}",
+    ],
+)
+def test_headroom_managed_overrides_stop_before_execution(
+    headroom, monkeypatch, prediction_config, tmp_path, capsys, override
+):
+    monkeypatch.setattr(
+        headroom.subprocess, "run", lambda *args, **kwargs: pytest.fail("conflicting override must not start AISim")
+    )
+    assert invoke_headroom(headroom, monkeypatch, prediction_config, tmp_path, "--set", override) == 2
+    assert "set traffic.load, traffic.stop and evaluation.sla in the input YAML" in capsys.readouterr().err
+    assert not (tmp_path / "headroom").exists()
+
+
+def test_headroom_resource_override_keeps_report_and_prediction_inputs_aligned(
+    headroom, monkeypatch, prediction_config, tmp_path, capsys
+):
+    from aisim.cli_args import _apply_overrides
+    from aisim.config.cli import CorePredictionConfig
+
+    predictions = []
+
+    def fake_predict(cmd, **kwargs):
+        effective = yaml.safe_load(prediction_config.read_text())
+        overrides = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "--set"]
+        _apply_overrides(effective, overrides, command="predict")
+        parsed = CorePredictionConfig.model_validate(effective)
+        rate = parsed.traffic.load.requests_per_second
+        total = parsed.traffic.stop.requests
+        assert effective["execution"]["resources"]["memory_limit_gb"] == 4
+        assert effective["evaluation"]["sla"] == {"ttft_ms": 500, "itl_ms": 50}
+        predictions.append((rate, total))
+        metrics = {
+            "num_requests": total,
+            "completed_requests": total,
+            "goodput_completed_requests": total,
+            "goodput_request_throughput_rps": rate * 0.99,
+            "mean_ttft_ms": 100,
+            "num_ttft_samples": total,
+            "mean_tpot_ms": 10,
+            "num_tpot_samples": total,
+        }
+        return headroom.subprocess.CompletedProcess(cmd, 0, json.dumps(metrics), "")
+
+    monkeypatch.setattr(headroom.subprocess, "run", fake_predict)
+    assert (
+        invoke_headroom(
+            headroom, monkeypatch, prediction_config, tmp_path, "--set", "execution.resources.memory_limit_gb=4"
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert predictions == [(20, 6000), (25, 7500)]
+    assert [row["offered_rps"] for row in report["rows"]] == [rate for rate, _ in predictions]
+    assert [row["num_requests"] for row in report["rows"]] == [total for _, total in predictions]
+    assert [row["status"] for row in report["rows"]] == ["pass", "pass"]

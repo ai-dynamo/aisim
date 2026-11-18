@@ -23,7 +23,9 @@ it and every smaller tested multiplier passed. That is a statement about the
 tested points only, not a continuous capacity boundary.
 
 Scope: request-rate traffic only (traffic.load.type poisson or
-constant_rate). Concurrency and trace loads are rejected.
+constant_rate). Concurrency and trace loads are rejected. Configure the load,
+stop conditions and SLA in CONFIG.yaml; --set overrides of those sections
+(including their parent mappings) are rejected before any prediction.
 
 Exit status: 0 when every tested load is pass or fail; 2 for unusable input;
 3 when any load is unknown (execution error or timeout).
@@ -154,6 +156,14 @@ def main() -> int:
         return 2
 
     try:
+        for assignment in a.sets:
+            path = assignment.partition("=")[0]
+            for managed in ("traffic.load", "traffic.stop", "evaluation.sla"):
+                if path == managed or path.startswith(managed + ".") or managed.startswith(path + "."):
+                    raise ValueError(
+                        f"--set {path!r} conflicts with the scan; "
+                        "set traffic.load, traffic.stop and evaluation.sla in the input YAML"
+                    )
         cfg, parser = load_config(a.config)
     except Exception as exc:
         print(f"error: cannot use {a.config}: {exc}", file=sys.stderr)
