@@ -53,6 +53,18 @@ def test_release_project_layout_is_selected_without_mutating_source(tmp_path, la
         project_directory(tmp_path)
 
 
+def test_release_project_compatibility_symlink_prefers_canonical_path(tmp_path):
+    from scripts.release.package_identity import project_directory
+
+    project = tmp_path / "python/aisim"
+    project.mkdir(parents=True)
+    # Tracked release/0.14.0 layout at 77d82652b2f83fd67afefc3141d69a5f06e630be.
+    compatibility = project.with_name("aisimulate")
+    compatibility.symlink_to("aisim", target_is_directory=True)
+    assert project_directory(tmp_path) == project
+    assert compatibility.readlink() == Path("aisim")
+
+
 @pytest.mark.parametrize("canonical,historical", [("aisim", "aisimulate"), ("aisim_core", "aisimulate_core")])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_evaluators_import_the_namespace_of_the_installed_wheel(tmp_path, canonical, historical, legacy):
@@ -235,12 +247,15 @@ def test_discovery_does_not_silently_truncate_releases(tmp_path):
         RELEASE.list_releases(tmp_path)
 
 
-@pytest.mark.parametrize("layout", ["aisim", "aisimulate"])
+@pytest.mark.parametrize("layout", ["aisim", "aisimulate", "compatibility-symlink"])
 def test_harness_uses_release_inventory_and_current_probe_code(tmp_path, layout):
     source = tmp_path / "release"
-    inventory = source / "python" / layout / "tools/support_matrix/support_matrix.py"
+    project = source / "python" / ("aisim" if layout == "compatibility-symlink" else layout)
+    inventory = project / "tools/support_matrix/support_matrix.py"
     inventory.parent.mkdir(parents=True)
     inventory.write_text("release inventory\n")
+    if layout == "compatibility-symlink":
+        project.with_name("aisimulate").symlink_to("aisim", target_is_directory=True)
     destination = RELEASE.prepare_harness(source, tmp_path / "harness")
     copied = destination / "tools/support_matrix"
     assert (copied / "support_matrix.py").read_text() == "release inventory\n"

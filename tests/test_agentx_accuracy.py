@@ -843,6 +843,82 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         assert all(row["observed"] == {"state": "unknown", "count": None} for row in published["features"])
 
 
+@pytest.mark.parametrize("incomplete_first", [True, False])
+def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(tmp_path, monkeypatch, incomplete_first):
+    from test_benchmark_features import silicon_metadata
+
+    from scripts.pages import agentx_pages as publisher
+
+    release = "release/0.14.0"
+    incomplete = silicon_metadata("fresh-weka")
+    incomplete["features"][0].update(state="unknown", evidence=[])
+    archives, artifacts, jobs = {}, [], []
+    for identity, branch, files in (
+        (9, "main", bundle(result(id="fresh-weka", category="self_collected", feature_metadata=incomplete))),
+        (10, release, bundle()),
+    ):
+        for name in files.keys() - {"qualification.json"}:
+            value = json.loads(files[name])
+            value["snapshot"].update(branch=branch, driver_sha256=driver_digest())
+            files[name] = canonical(value)
+        seal(files)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            for name, content in files.items():
+                zipped.writestr(name, content)
+        archives[identity] = archive.getvalue()
+        key = publisher.artifact_key(branch)
+        artifacts.append({"id": identity, "name": f"e2e-agentx-web-{key}", "expired": False})
+        jobs.append(
+            {
+                "name": f"Qualify AgentX accuracy ({key})",
+                "status": "completed",
+                "conclusion": "success",
+                "run_id": 123,
+                "head_sha": "a" * 40,
+            }
+        )
+    if not incomplete_first:
+        artifacts.reverse()
+    run = {
+        "id": 123,
+        "run_attempt": 1,
+        "event": "schedule",
+        "head_branch": "main",
+        "head_sha": "a" * 40,
+        "path": ".github/workflows/e2e-accuracy.yml",
+        "conclusion": "success",
+        "repository": {"full_name": "ai-dynamo/aisim"},
+        "head_repository": {"full_name": "ai-dynamo/aisim"},
+    }
+
+    def api(path, **kwargs):
+        if path.endswith("/zip"):
+            return archives[int(path.split("/")[-2])]
+        return {"workflow_runs": [run]} if "workflows/" in path else run
+
+    def git(args, **kwargs):
+        if "for-each-ref" in args:
+            return release + "\n"
+        return (Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]).read_bytes()
+
+    monkeypatch.setattr(publisher, "api", api)
+    monkeypatch.setattr(publisher, "api_items", lambda path, _: artifacts if path.endswith("/artifacts") else jobs)
+    monkeypatch.setattr(publisher, "ancestor", lambda *args: True)
+    monkeypatch.setattr(publisher.subprocess, "check_output", git)
+    output = tmp_path / "published"
+    publisher.prepare(tmp_path, output)
+    assert not (output / publisher.artifact_key("main")).exists()
+    accepted = output / publisher.artifact_key(release)
+    assert validate_bundle(
+        {path.relative_to(accepted).as_posix(): path.read_bytes() for path in accepted.rglob("*.json")}
+    )
+    assert json.loads((output / "updates.json").read_text()) == {
+        "main": {"status": "failed", "run_id": "123"},
+        release: {"status": "success", "run_id": "123"},
+    }
+
+
 @pytest.mark.parametrize("incomplete_corruption", ["driver", "run", "job"])
 def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, monkeypatch, incomplete_corruption):
     from scripts.e2e_accuracy.agentx_contract import driver_digest

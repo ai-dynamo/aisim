@@ -52,9 +52,13 @@ class LearnedFpm5Predictor(ForwardPassTimePredictor):
     def fit(cls, context: PredictorContext, iterations: Sequence[ForwardPassIteration]) -> LearnedFpm5Predictor:
         try:
             fpm_learned = runtime_module("aisim_core.sdk.fpm_learned")
-            perf_model_type = runtime_module("aisim_core.sdk.rust_engine_step").RustForwardPassPerfModel
+            rust_engine_step = runtime_module("aisim_core.sdk.rust_engine_step")
         except ImportError as exc:  # pragma: no cover - depends on the evaluated wheel
             raise DependencyError("This AISim revision does not provide the learned forward-pass model.") from exc
+        try:
+            perf_model_type = rust_engine_step.RustForwardPassPerfModel
+        except AttributeError as exc:
+            raise DependencyError("This AISim revision does not export the learned forward-pass model.") from exc
         if FEATURE_PRESET not in getattr(fpm_learned, "FEATURE_PRESETS", {}):
             raise DependencyError(f"This AISim revision has no {FEATURE_PRESET!r} feature preset.")
         try:

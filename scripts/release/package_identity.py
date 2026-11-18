@@ -13,7 +13,12 @@ PACKAGE_NAMES = ("aisim", "aisimulate")
 
 def project_directory(source: Path) -> Path:
     """Find the unchanged Python project in a current or historical checkout."""
-    matches = [source / "python" / name for name in PACKAGE_NAMES if (source / "python" / name).is_dir()]
+    projects = {}
+    for name in PACKAGE_NAMES:
+        candidate = source / "python" / name
+        if candidate.is_dir():
+            projects.setdefault(candidate.resolve(), candidate)
+    matches = list(projects.values())
     if len(matches) != 1:
         raise ValueError(f"expected one AISim Python project in {source}, found {matches}")
     return matches[0]

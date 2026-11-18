@@ -194,6 +194,29 @@ def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_pat
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.parametrize("method", ["warmup", "learned"])
+@pytest.mark.parametrize("failure", ["missing_export", "initialization_error"])
+def test_predictor_export_absence_preserves_scoring_classification(case, monkeypatch, method, failure):
+    from scripts.fpm_accuracy.evaluate import score
+    from scripts.fpm_accuracy.models import learned_predictor
+
+    def load_runtime(name):
+        if failure == "initialization_error":
+            raise AttributeError("unrelated module initialization failure")
+        return SimpleNamespace()
+
+    adapter = aic_predictors if method == "warmup" else learned_predictor
+    monkeypatch.setattr(adapter, "runtime_module", load_runtime)
+    result = score(case, method, case.fpm_artifacts[0] if method == "warmup" else None)
+    failed = failure == "initialization_error"
+    assert result["status"] == ("predictor_error" if failed else "unsupported_predictor")
+    metrics = result["metrics"]["all"]
+    assert metrics["measured_count"] == len(case.observations) == 12
+    assert metrics["predicted_count"] == metrics["tuning_error_count"] == 0
+    assert metrics["error_count"] == (12 if failed else 0)
+    assert metrics["unavailable_count"] == (0 if failed else 12)
+
+
 def test_successful_dependency_exit_cannot_qualify_an_incomplete_campaign(case, monkeypatch):
     from scripts.fpm_accuracy import run_fpm_accuracy
 
