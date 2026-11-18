@@ -13,6 +13,25 @@ distributed with those packages.
 Unless otherwise stated, AISim file paths in this document are relative
 to `python/aisim/` in the repository source tree.
 
+## NVIDIA Agent Skills CI request workflow
+
+The repository-root `.github/workflows/request-nvskills-ci.yml` is a modified
+copy of `.github/workflows/request-nvskills-ci.yml` in NVIDIA/skills at immutable
+commit `bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f`.
+
+Upstream source:
+https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/.github/workflows/request-nvskills-ci.yml
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under Apache-2.0, as specified for source code in the upstream README.
+Upstream license:
+https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/LICENSE-APACHE
+
+The full Apache-2.0 license text is included here as `LICENSE`. The pinned
+upstream source has no separate NOTICE file on this workflow's ancestor paths.
+Modified for AISim by adding SPDX/provenance headers and pinning the reusable
+workflow reference to the same immutable commit instead of `main`.
+
 ## SGLang v0.5.22 HiCache residency and merged backups
 
 The merged backup submission in repository-root
