@@ -178,10 +178,15 @@ prefill does not change.
 
 ## Controls
 
-- Replay (`predict --stack engine`) does not change. It prices prefill and
-  decode as separate passes. Over 14 configurations, requests, output tokens,
-  cache reuse and per-request status match. Latency metrics differ only by
-  rounding, about 1e-16.
+- Replay (`predict --stack engine`) did not change between Baseline `49d93f5a`
+  and Candidate `686275e7`. At those revisions, Replay priced prefill and
+  decode as separate per-rank phase passes. Over 14 configurations, requests,
+  output tokens, cache reuse and per-request status matched. Latency metrics
+  differed only by rounding, about 1e-16. Current op-level Replay prices a
+  mixed rank as one mix-step iteration and then splits its evidence by phase,
+  so this control does not describe the current code. The replay regression
+  `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
+  covers the current path.
 - Main, Baseline and Candidate give identical results for unqualified ops.
 - Qualified and unqualified runs differ without the fix, because the analytical
   bound adds recurrent-state bytes. Compare Baseline with Candidate only.

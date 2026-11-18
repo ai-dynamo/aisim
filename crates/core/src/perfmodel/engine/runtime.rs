@@ -19,7 +19,7 @@
 //! orchestrated in Python — there is no Rust `run_agg`.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::FpmQueryCoverage;
@@ -1125,6 +1125,23 @@ impl Engine {
                 "qualified Mamba ops are not supported beside DSv4.1 stages".into(),
             ));
         }
+        // Replay attributes a mixed rank's operations to a phase by name.
+        if seen[0] {
+            let context: HashSet<&str> = spec.context_ops.iter().map(Op::name).collect();
+            let generation: HashSet<&str> = spec.generation_ops.iter().map(Op::name).collect();
+            let shared = |ops: &[Op], other: &HashSet<&str>| {
+                ops.iter()
+                    .find(|op| op.is_qualified_mamba() && other.contains(op.name()))
+                    .map(|op| op.name().to_owned())
+            };
+            if let Some(name) = shared(&spec.context_ops, &generation)
+                .or_else(|| shared(&spec.generation_ops, &context))
+            {
+                return Err(AicError::InvalidEngineConfig(format!(
+                    "qualified Mamba op {name} shares its name across phases"
+                )));
+            }
+        }
         super::readiness::validate_glm53_kv(
             &db,
             spec.context_ops.iter().chain(&spec.generation_ops),
@@ -1245,23 +1262,8 @@ impl Engine {
                 Op::Mamba2(m) => {
                     let qualified = op.is_qualified_mamba();
                     seen[usize::from(!qualified)] = true;
-                    if !matches!(
-                        m.state_dtype.as_str(),
-                        "unrecorded" | "float16" | "bfloat16" | "float32"
-                    ) {
-                        return invalid(
-                            &m.name,
-                            format!("unsupported state_dtype {:?}", m.state_dtype),
-                        );
-                    }
-                    if m.token_width == 0 || (!qualified && m.token_width != 1) {
-                        return invalid(
-                            &m.name,
-                            format!(
-                                "token_width {} must be positive, and 1 for an unrecorded state_dtype",
-                                m.token_width
-                            ),
-                        );
+                    if let Some(why) = m.field_error() {
+                        return invalid(&m.name, why);
                     }
                     // Only generation lists carry a decode width.
                     let expected = if decode_width.is_some() {
@@ -2565,12 +2567,16 @@ impl Engine {
                 // Each prefill chunk reads and writes its recurrent state once.
                 // Decode Mamba is priced in pass 3 at its own request shape.
                 // `ctx_tokens` packs `floor(ctx/isl)` complete requests (each
-                // `isl - prefix` new tokens) plus one trailing partial extend.
+                // `isl - prefix` new tokens) plus a trailing remainder of new
+                // tokens. A request has at most `isl - prefix` new tokens, so a
+                // longer remainder spans several requests, each with its state.
                 // shortcut: sum uniform timing rows until variable-length batches are
                 // calibrated; this can overcount launch overhead for ragged batches.
+                let per_request = isl.saturating_sub(prefix).max(1);
+                let remainder = ctx_tokens % isl;
                 for (batch, tokens) in [
-                    (ctx_tokens / isl, isl.saturating_sub(prefix)),
-                    (1, ctx_tokens % isl),
+                    (ctx_tokens / isl + remainder / per_request, per_request),
+                    (1, remainder % per_request),
                 ] {
                     if batch == 0 || tokens == 0 {
                         continue;
@@ -4653,8 +4659,10 @@ pub(crate) mod tests {
         // splits two requests, and no prefill.
         for (ctx, isl, prefix, requests, new_tokens) in [
             (512, 4096, 1024, 1, 512),
-            (6000, 4096, 3000, 2, 3000),
-            (8128, 4096, 1024, 2, 7104),
+            // 1904 remainder tokens exceed one request's 1096: 1096 + 808.
+            (6000, 4096, 3000, 3, 3000),
+            (8128, 4096, 1024, 3, 7104),
+            (2048, 4096, 3000, 2, 2048),
             (0, 4096, 1024, 0, 0),
         ] {
             let bytes =
@@ -4935,6 +4943,35 @@ pub(crate) mod tests {
         };
         phases("float16", "float16").unwrap();
         phases("unrecorded", "unrecorded").unwrap();
+        // Replay attributes by name, so qualified names stay phase-specific.
+        let named = |prefill| match qualified_mamba(prefill, 1) {
+            Op::Mamba2(mut m) => {
+                m.name = "ssm".into();
+                Op::Mamba2(m)
+            }
+            _ => unreachable!(),
+        };
+        let err = Engine::build(
+            EngineSpec::new(
+                fixture_engine_config(None),
+                vec![named(true)],
+                vec![named(false)],
+            ),
+            db.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shares its name across phases"), "{err}");
+        // A direct query fails loudly instead of pricing an invalid width.
+        let mut op = qualified_mamba(false, 1);
+        if let Op::Mamba2(m) = &mut op {
+            m.token_width = 0;
+        }
+        let err = op
+            .query(&db, &generation_op_runtime(2, 1, 16, 1.0, 0, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be positive"), "{err}");
         // A context list takes only an exact "context" phase.
         for phase in ["generation", "prefill"] {
             let mut op = qualified_mamba(true, 1);

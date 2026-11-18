@@ -48,12 +48,35 @@ fn default_token_width() -> u32 {
 }
 
 impl Mamba2Op {
+    /// Why this op's qualification fields are invalid, if they are.
+    pub(crate) fn field_error(&self) -> Option<String> {
+        if !matches!(
+            self.state_dtype.as_str(),
+            "unrecorded" | "float16" | "bfloat16" | "float32"
+        ) {
+            return Some(format!("unsupported state_dtype {:?}", self.state_dtype));
+        }
+        if self.token_width == 0 || (self.state_dtype == "unrecorded" && self.token_width != 1) {
+            return Some(format!(
+                "token_width {} must be positive, and 1 for an unrecorded state_dtype",
+                self.token_width
+            ));
+        }
+        None
+    }
+
     pub fn query(
         &self,
         db: &PerfDatabase,
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if let Some(why) = self.field_error() {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {}: {why}",
+                self.name
+            )));
+        }
         let requests = if self.phase == "generation" {
             batch_size.div_ceil(self.token_width.max(1))
         } else {
