@@ -2012,6 +2012,8 @@ class BaseBackend:
         )
         cache_key = (
             self._make_agg_cache_key(isl, osl, b, ctx_tokens, agg_extra),
+            # The cached prefix changes the uncached prefill work.
+            prefix,
             visual_cache_key,
             getattr(model, "forward_model", "op_level"),
             # Explicit progress and an omitted kwarg schedule identically at
@@ -2058,9 +2060,10 @@ class BaseBackend:
                 num_genonly_tokens = b
                 num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         elif b == 1:
-            # special case for b=1
+            # special case for b=1: the packed budget holds at most this one
+            # request (isl prompt tokens, prefix included), never unused budget.
             num_mix_steps = 1
-            num_mix_ctx_tokens = ctx_tokens
+            num_mix_ctx_tokens = min(ctx_tokens, isl)
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
             num_genonly_tokens = 1

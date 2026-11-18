@@ -36,6 +36,7 @@ MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 # (batch, isl, osl, prefix, ctx_tokens): ctx_tokens is run_agg's prefill budget per step.
 CASES = {
     "one_request_budget_above_new_tokens": (1, 4096, 64, 3000, 2048),
+    "one_request_budget_above_prompt": (1, 4096, 64, 3000, 8192),
     "two_complete_cached_requests": (16, 4096, 64, 3000, 8192),
     "split_budget_cached": (16, 4096, 64, 1024, 8128),
     "chunked_uncached": (16, 6000, 64, 0, 2048),
@@ -57,5 +58,20 @@ for name, (b, isl, osl, prefix, ctx) in CASES.items():
         "mix_step_mamba_ms": {k: float(v) for k, v in sorted(mix.items()) if "mamba" in k},
         "mix_step_non_mamba_ms": float(sum(v for k, v in mix.items() if "mamba" not in k)),
     }
+# One session, same batch, ISL and budget: prefix 0, then 3000, then 3000 again.
+db = get_database("b200_sxm", "trtllm", "1.3.0rc20")
+db.set_default_database_mode(common.DatabaseMode.HYBRID)
+mc = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+session = InferenceSession(get_model(MODEL, mc, "trtllm"), db, get_backend("trtllm", "b200_sxm"))
+calls = [
+    session.run_agg(config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=prefix), ctx_tokens=2048)
+    for prefix in (0, 3000, 3000)
+]
+out["same_session_prefixes"] = {
+    "inputs": {"batch_size": 1, "isl": 4096, "osl": 64, "ctx_tokens": 2048, "prefixes": [0, 3000, 3000]},
+    "context_mamba_ssm_ms": [float(c.get_per_ops_data()["mix_step"]["context_mamba_ssm"]) for c in calls],
+    "ttft_ms": [float(c.get_summary_df().iloc[0]["ttft"]) for c in calls],
+    "repeat_reuses_result": calls[2] is calls[1],
+}
 with open(sys.argv[1], "w") as f:
     json.dump(out, f, indent=1)
