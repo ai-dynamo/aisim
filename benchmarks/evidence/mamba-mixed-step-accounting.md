@@ -294,6 +294,47 @@ at `62293977`. `telem.py` at `62293977` gave output identical to
 `agg-62293977.json` for all four cases, the split budget included, and the same
 suites passed (56 Python tests).
 
+### `run_agg` caller corrections
+
+These two fixes change the `run_agg` caller, not the Mamba formulas above. They
+apply to every operation of every model.
+
+- **One request under a large budget.** With one request, `run_agg` passed
+  its whole prefill budget to the mixed step. A budget above one prompt then
+  priced extra requests. Commit `19e8daf6` schedules at most one packed
+  prompt, `min(ctx_tokens, isl)`.
+- **Cache identity.** The `run_agg` result cache omitted the prefix. A second
+  call on the same session with a different prefix returned the first result.
+  Commit `19e8daf6` adds the prefix to the cache key.
+
+`agg_caller.py` gained the large-budget case and a same-session prefix
+sequence. It ran from the `9a2bde6b` and `19e8daf6` builds. The raw outputs are
+[`caller-9a2bde6b.json`](mamba-mixed-step-accounting/caller-9a2bde6b.json) and
+[`caller-19e8daf6.json`](mamba-mixed-step-accounting/caller-19e8daf6.json).
+
+| Case | Value | `9a2bde6b` | `19e8daf6` | Oracle |
+| --- | --- | --- | --- | --- |
+| One request (1, 4096, 3000, 8192) | `context_mamba_ssm` ms | 0.147460 | 0.073730 | 0.073730 |
+| One request (1, 4096, 3000, 8192) | Non-Mamba sum ms | 18.053611 | 13.180794 | Equal to the 4096 budget |
+| One request (1, 4096, 3000, 8192) | TTFT ms | 41.048 | 29.010 | Equal to the 4096 budget |
+| Same session, prefix 0, then 3000 | `context_mamba_ssm` ms | 0.132332, 0.132332 | 0.132332, 0.073730 | 0.132332, 0.073730 |
+| Same session, prefix 0, then 3000 | TTFT ms | 79.852, 79.852 | 79.852, 77.844 | Second call equal to a fresh session |
+
+Before the fix, the large budget priced two requests and 2192 new tokens, as
+two complete prompts would. After it, the step prices one request and 1096
+new tokens. Every mixed-step operation then equals the result for an exact
+4096-token budget, and so does TTFT. The context convolution, both projection
+GEMMs and the norm also fall, so the non-Mamba sum drops by 27%. In the
+same-session sequence, the repeated third call returns the cached second
+result. The four earlier cases give output identical to `agg-62293977.json`.
+
+The regressions `test_run_agg_lone_request_ignores_unused_budget`,
+`test_run_agg_cache_separates_prefixes` and the large-budget case of
+`test_run_agg_prices_scheduled_prefill_requests_not_budget` fail on `9a2bde6b`
+and pass on `19e8daf6`. At `19e8daf6`, 727 Python tests in the backend,
+session, speculation, single-oracle and Mamba suites passed, with engine-step
+parity (305) and the golden set (121).
+
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
 `gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
 (26.013 to 26.328 ms) from Baseline to Candidate. The decode component rises
