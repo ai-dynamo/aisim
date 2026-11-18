@@ -3,14 +3,13 @@
 """AgentX arithmetic, complete accounting, and public publication boundaries."""
 
 import hashlib
-import importlib
 import io
 import json
 import posixpath
 import sys
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -143,6 +142,15 @@ def test_macro_points_micro_requests_and_no_error_of_means():
     assert combined["coverage"]["measured"] == 4
 
 
+def _fixture_systems_root(monkeypatch, root):
+    """Point the predictor at a fixture systems root without importing the real package."""
+    names = ("aisim_core", "aisim_core.data", "aisim_core.data.default_systems")
+    modules = {name: ModuleType(name) for name in names}
+    modules["aisim_core.data.default_systems"].default_systems_path = lambda: root
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
 @pytest.mark.parametrize("backend,version", [("sglang", "0.5.21"), ("vllm", "0.31.0")])
 def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp_path, monkeypatch, backend, version):
     config = tmp_path / "config.json"
@@ -191,8 +199,7 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     )
     # The predictor reads operation data from the default systems root; point it at the fixture
     # instead of downloading the pinned dataset.
-    default_systems = importlib.import_module("aisim_core.data.default_systems")
-    monkeypatch.setattr(default_systems, "default_systems_path", lambda: tmp_path / "systems")
+    _fixture_systems_root(monkeypatch, tmp_path / "systems")
     missing = agentx_predict.predict(config, tmp_path)
     assert missing["reason"] == "database_unavailable"
     assert missing["prediction_backend_version"] == version
@@ -250,6 +257,7 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
         SimpleNamespace(import_module=import_module, resources=SimpleNamespace(files=lambda _: tmp_path)),
     )
     monkeypatch.setattr(agentx_predict, "asdict", lambda value: value)
+    _fixture_systems_root(monkeypatch, tmp_path / "systems")
     data = tmp_path / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
     data.parent.mkdir(parents=True)
     data.write_bytes(b"synthetic op-data")
