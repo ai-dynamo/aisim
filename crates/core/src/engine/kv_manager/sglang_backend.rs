@@ -604,7 +604,8 @@ impl SglangKvManager {
     /// Cache a completed request's full sequence into the radix tree.
     ///
     /// Inserts the full token sequence so future requests can reuse it,
-    /// then unlocks the path.
+    /// then unlocks the path. A fully cached completion refreshes only the retained
+    /// endpoint in LRU order; adding a complete page refreshes the full path.
     fn cache_finished_hashes(
         &mut self,
         page_hashes: &[LocalBlockHash],
@@ -619,7 +620,7 @@ impl SglangKvManager {
             first_new_token,
             page_hashes,
             pages,
-            false,
+            first_new_token == page_hashes.len() * self.cache.page_size(),
         );
         self.free_pages(&insert.unretained_pages);
         self.cache.dec_lock_ref(last_node);
@@ -1408,6 +1409,40 @@ mod tests {
             .reserve_destination_lease(full_hit_lease.page_hashes(), aligned_tokens.len())
             .expect("fully cached destination reservation should fit");
         assert_eq!(full_hit.transferable_prompt_tokens(), 0);
+    }
+
+    #[test]
+    fn finish_refreshes_only_endpoint_unless_it_adds_a_complete_page() {
+        for suffix_tokens in [0, 1, 4] {
+            let mut mgr = SglangKvManager::new(32, 4, KvEventPublishers::default(), 0);
+            let tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+            // Separate inserts create a retained path with two nodes.
+            for len in [4, 8] {
+                let alloc = mgr.allocate_for_request(&tokens[..len]).unwrap();
+                mgr.finish(&tokens[..len], alloc.lease);
+            }
+            let len = 8 + suffix_tokens;
+            let alloc = mgr.allocate_for_request(&tokens[..len]).unwrap();
+            assert_eq!(alloc.prefix_len, 8);
+            let endpoint = alloc.lease.last_node();
+            let parent = mgr.cache().node(endpoint).parent.unwrap();
+            assert_ne!(parent, mgr.cache().root());
+            let parent_before = mgr.cache().node(parent).last_access_counter;
+            let endpoint_before = mgr.cache().node(endpoint).last_access_counter;
+
+            mgr.finish(&tokens[..len], alloc.lease);
+
+            assert!(mgr.cache().node(endpoint).last_access_counter > endpoint_before);
+            let parent_after = mgr.cache().node(parent).last_access_counter;
+            if suffix_tokens == 4 {
+                assert!(parent_after > parent_before);
+            } else {
+                assert_eq!(parent_after, parent_before);
+            }
+            assert_eq!(mgr.cache().protected_size(), 0);
+            assert_eq!(mgr.cache().evictable_size(), len / 4 * 4);
+            assert_eq!(mgr.cache().available_tokens(), 32 - len / 4 * 4);
+        }
     }
 
     #[test]
