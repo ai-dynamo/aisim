@@ -1517,6 +1517,23 @@ mod tests {
     }
 
     #[test]
+    fn learned_normalization_rejects_mtp_before_reading_the_artifact() {
+        let error = config(serde_json::json!({
+            "estimation_mode": "fpm_learned",
+            "speculation": {"kind": "mtp", "params": {"depth": 3}},
+            "estimator_config": {"fpm_learned": {"artifact_path": "missing-seed.json", "adaptation": "frozen"}}
+        }))
+        .normalize()
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fpm_learned does not support speculative decoding"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn learned_configuration_accepts_disabled_speculation_and_validates_its_parameters() {
         let mut config = config(serde_json::json!({
             "estimation_mode": "fpm_learned",

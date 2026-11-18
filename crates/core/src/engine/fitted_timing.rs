@@ -563,6 +563,30 @@ mod tests {
     }
 
     #[test]
+    fn mtp_replay_requires_a_vllm_regression() {
+        require_fitted_execution(
+            EstimationMode::FpmRegression,
+            "vllm",
+            true,
+            Some("mtp"),
+            false,
+        )
+        .unwrap();
+        for (mode, backend) in [
+            (EstimationMode::FpmLearned, "vllm"),
+            (EstimationMode::FpmRegression, "sglang"),
+        ] {
+            let error = require_fitted_execution(mode, backend, true, Some("mtp"), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("nextn > 0 or MTP is priced only by a vLLM fpm_regression snapshot, at the depth it was fitted at"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn a_mixed_pass_is_one_query_of_the_locally_mixed_store() {
         let timing = forest_timing(1);
         // One query of the mixed store, not a prefill pass plus a decode pass.

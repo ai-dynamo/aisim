@@ -401,6 +401,17 @@ _MTP = {"kind": "mtp", "params": {"depth": 3}}
 _NGRAM = {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
 
 
+@pytest.mark.parametrize("entrypoint", ["normalize_config", "best_available"])
+def test_learned_rejects_mtp_before_reading_the_artifact(entrypoint, tmp_path):
+    config = _config(
+        estimation_mode="fpm_learned",
+        speculation=_MTP,
+        estimator_config={"fpm_learned": {"artifact_path": str(tmp_path / "missing.json"), "adaptation": "frozen"}},
+    )
+    with pytest.raises(ValueError, match="fpm_learned does not support speculative decoding"):
+        getattr(RustForwardPassPerfModel, entrypoint)(config)
+
+
 @pytest.mark.parametrize(("mode", "backend"), [("fpm_interpolation", "vllm"), ("fpm_regression", "sglang")])
 def test_explicit_fpm_rejects_unimplemented_speculative_cost(mode, backend):
     with pytest.raises(ValueError, match="speculat.*op_level|op_level.*speculat"):

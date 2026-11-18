@@ -380,6 +380,33 @@ def test_runner_disabled_depth_normalization_preserves_input_validation(controls
         EngineReplayRunnerFactory().create(0).run(spec)
 
 
+@pytest.mark.parametrize("mode", ["op_level", "fpm_interpolation"])
+def test_runner_rejects_mtp_with_a_duplicate_timing_nextn(mode):
+    args = {
+        "backend": "vllm",
+        "block_size": 4,
+        "num_gpu_blocks": 16,
+        "speculation": {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1},
+        "timing_model": {
+            "type": "external",
+            "provider": "aic",
+            "config": {
+                "model": "Qwen/Qwen3-8B",
+                "system": "h200_sxm",
+                "backend": "vllm",
+                "backend_version": "0.24.0",
+                "worker_type": "aggregated",
+                "estimation_mode": mode,
+                "nextn": 2,
+            },
+        },
+    }
+    # Even an equal legacy depth is ambiguous alongside a scheme. The adapter
+    # must reject it instead of silently discarding the speculative cost.
+    with pytest.raises(ValueError, match="speculation conflicts with timing_model.config.nextn"):
+        _materialize_engine_role("vllm", "0.24.0", {}, {"rank": args}, "aggregated")
+
+
 def _canonical_speculation_deployment(speculation, *, backend="vllm"):
     version = {"vllm": "0.24.0", "sglang": "0.5.14", "trtllm": "1.3.0rc20"}[backend]
     timing = {

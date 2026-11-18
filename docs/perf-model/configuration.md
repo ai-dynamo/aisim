@@ -1551,7 +1551,7 @@ handled as follows:
 | `tp`, `pp`, `attention_dp`, `moe_tp_size` or `moe_ep_size` `unknown` | The role needs one explicit value for each unknown width, such as `parallelism: {preset: false, tensor: 1, pipeline: 1, attention_data: 1}`; known widths are still pinned. `tp * pp * attention_dp` must equal `deployment_limits.num_gpus` when known. |
 | `deployment_limits.max_kv_tokens` | Required. The role's KV capacity is fixed to that many tokens in whole `kv_block_size` blocks and KV memory is not searched; a different fixed capacity or a `memory_fraction` search is a conflict. |
 | `deployment_limits.max_num_batched_tokens`, `max_num_seqs` | Required. The role's `max_batched_tokens` and `max_sequences` domains keep only values at most the recorded limit; an empty domain is an error. |
-| `nextn > 0` | For a vLLM regression, pinned as for a native snapshot: `engine.nextn` takes the saved depth, and `engine.nextn_accepted` is required. Rejected for other backends. |
+| `nextn > 0` or `speculation: {kind: mtp, params: {depth: N}}` | For a vLLM `fpm_regression` snapshot fitted with either spelling, the depth is pinned as for a native snapshot. Recommendation uses `engine.nextn` and requires `engine.nextn_accepted`; prediction also accepts `engine.speculation: {kind: mtp, params: {depth: N}, expected_accepted_tokens: A}` at the same depth. Rejected for other backends and for `fpm_learned`. |
 
 A snapshot whose `backend_version` is unset (`null`) is rejected: save the
 deployed version or `"unknown"`. `deployment_limits.num_gpus` and

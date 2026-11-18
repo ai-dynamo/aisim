@@ -421,8 +421,11 @@ fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelC
             .speculation
             .as_ref()
             .filter(|speculation| speculation.kind == "mtp")
-            .and_then(|speculation| speculation.params.get("depth")?.as_u64())
-            .and_then(|depth| u32::try_from(depth).ok())
+            // The SDK accepts integer-valued JSON floats and preserves their
+            // spelling. All u32 depths are exactly representable as f64.
+            .and_then(|speculation| speculation.params.get("depth")?.as_f64())
+            .filter(|depth| depth.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(depth))
+            .map(|depth| depth as u32)
     {
         config.nextn = depth;
         config.speculation = None;
