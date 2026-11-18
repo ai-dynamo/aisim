@@ -43,7 +43,7 @@
 
 use super::grouped::{GroupLease, GroupStateLease, GroupedBlockLease, GroupedBlockPool};
 use super::vllm_backend::BlockRequestLease;
-use crate::engine::cache::vllm_block_pool::CacheKey;
+use crate::engine::cache::vllm_block_pool::{BlockCopyId, CacheKey};
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
 use anyhow::{bail, ensure};
 use rustc_hash::FxHashSet;
@@ -486,6 +486,9 @@ pub(crate) struct GroupedPrefixCoordinator {
     rules: GroupedPrefixRules,
     limits: AdmissionLimits,
     published_this_step: FxHashSet<CacheKey>,
+    /// The copy sources of the scheduling pass, each with its group. vLLM
+    /// keeps them referenced until the end of `schedule()`.
+    copy_sources: Vec<(usize, BlockCopyId)>,
 }
 
 /// The engine values behind vLLM's per-request admission cap of a
@@ -555,6 +558,7 @@ impl GroupedPrefixCoordinator {
             rules,
             limits,
             published_this_step: FxHashSet::default(),
+            copy_sources: Vec::new(),
         }
     }
 
@@ -563,7 +567,30 @@ impl GroupedPrefixCoordinator {
     }
 
     pub(crate) fn begin_step(&mut self) {
+        debug_assert!(
+            self.copy_sources.is_empty(),
+            "the copy sources leave before the next scheduling pass"
+        );
         self.published_this_step.clear();
+    }
+
+    /// Release the copy sources of the scheduling pass: group by group, and
+    /// inside a group in the order of the allocations, as vLLM collects the
+    /// copies manager by manager and frees them at the end of `schedule()`
+    /// (v0.31 `kv_cache_manager.py:894-909`, `sched:1434-1442`, v0.32
+    /// `kv_cache_manager.py:854-869`, `sched:1474-1482`). A cached source
+    /// enters the inactive LRU at the tail. Returns the number of blocks.
+    pub(crate) fn release_copy_sources(&mut self, pool: &mut GroupedBlockPool) -> usize {
+        self.copy_sources.sort_by_key(|(group, _)| *group);
+        let count = self.copy_sources.len();
+        pool.release_all(self.copy_sources.drain(..).map(|(_, id)| id));
+        count
+    }
+
+    /// The number of copy sources that the scheduling pass holds.
+    #[cfg(test)]
+    pub(crate) fn copy_source_count(&self) -> usize {
+        self.copy_sources.len()
     }
 
     /// An empty block lease with one entry per group.
@@ -927,9 +954,15 @@ impl GroupedPrefixCoordinator {
     /// takes every fresh block, or none. `prefill_end` is vLLM's prefill end
     /// `max(prompt, num_tokens - 1)`, which a resumed request extends over
     /// its output tokens (v0.32 `mgr:518-520`). Only a chunk that reaches it
-    /// takes a checkpoint block.
+    /// takes a checkpoint block. A first allocation after a hit inside a
+    /// block moves the copy sources, the shared tail block of a full-attention
+    /// group and the hit block of each state group, out of the lease. They
+    /// stay in use until `release_copy_sources`, as vLLM keeps their
+    /// references until the end of `schedule()` (v0.31 `single:307`,
+    /// `:387-397`, `:454-474`, `:1935-1937`, v0.32 `single:304`, `:387-397`,
+    /// `:454-474`, `:1899-1901`).
     pub(crate) fn allocate(
-        &self,
+        &mut self,
         pool: &mut GroupedBlockPool,
         lease: &mut GroupedBlockLease,
         prefill_end: usize,
@@ -1052,15 +1085,16 @@ impl GroupedPrefixCoordinator {
         let Some(mut reservation) = pool.reserve(&[], fresh) else {
             return false;
         };
-        for (item, group) in plan.into_iter().zip(lease.groups.iter_mut()) {
+        for (g, (item, group)) in plan.into_iter().zip(lease.groups.iter_mut()).enumerate() {
             match (item, group) {
                 (Plan::Attention { new, copy }, GroupLease::Attention { copies, .. }) => {
                     if copy {
                         // The shared tail block gives way to a private copy
-                        // (`single:387-409`).
+                        // (`single:387-409`), and it is the copy source.
                         let shared = copies.last_mut().expect("a partial hit has a tail block");
                         let old = shared.replace(pool.take_private(&mut reservation));
-                        pool.release(old.expect("a partial hit has a tail block"));
+                        self.copy_sources
+                            .push((g, old.expect("a partial hit has a tail block")));
                     }
                     copies.extend((0..new).map(|_| Some(pool.take_private(&mut reservation))));
                 }
@@ -1076,6 +1110,14 @@ impl GroupedPrefixCoordinator {
                     if cow_is_running {
                         debug_assert!(state.running.is_none());
                         state.running = Some(pool.take_private(&mut reservation));
+                    }
+                    // The hit block is the copy source. It leaves the lease,
+                    // as `_apply_cow` takes it out of the block table
+                    // (v0.31 `single:1935-1937`, v0.32 `:1899-1901`).
+                    if (copy || cow_is_running)
+                        && let Some((id, _)) = state.hit.take()
+                    {
+                        self.copy_sources.push((g, id));
                     }
                     if running {
                         let new = pool.take_private(&mut reservation);
@@ -1239,11 +1281,8 @@ impl GroupedPrefixCoordinator {
                     // async scheduling. vLLM 0.31.0 turns async scheduling on
                     // by default and then holds them one more pass
                     // (`kv_cache_manager.py:552-554` with `num_in_flight_tokens`).
-                    // A hit inside a block was copied in this step, so its
-                    // block goes now (`sched:1434-1442`).
                     if let Some((id, index)) = state.hit
-                        && (computed_after.div_ceil(block) - 1 > index
-                            || !hit.tokens.is_multiple_of(block))
+                        && computed_after.div_ceil(block) - 1 > index
                     {
                         pool.release(id);
                         state.hit = None;
@@ -1504,6 +1543,7 @@ mod tests {
             let target = computed + chunk;
             assert!(coordinator.allocate(pool, lease, prompt, computed, target, step));
             coordinator.finalize(pool, lease, request, prompt, target, hit, step);
+            coordinator.release_copy_sources(pool);
             computed = target;
             ends.push(target);
             step += 1;
@@ -1665,7 +1705,8 @@ mod tests {
         let mut groups = [attention("full", 16, None), attention("other", 16, None)];
         groups[1].prefix_cacheable = Some(false);
         for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
-            let coordinator = with_limits(GroupedPrefixRules::new(&groups, 16, version).unwrap());
+            let mut coordinator =
+                with_limits(GroupedPrefixRules::new(&groups, 16, version).unwrap());
             let mut kv = kv_pool(&groups, 8);
             let pool = kv.block_pool_mut().unwrap();
             seed_many(pool, 0, 16, &[16]);
@@ -2412,19 +2453,25 @@ mod tests {
         assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
         assert_eq!(pool.active_blocks(), 4);
         assert!(coordinator.allocate(pool, &mut block_lease, 50, 36, 50, 1));
-        // G0 holds blocks 0 to 3, with block 2 as a private copy. The shared
-        // block 2 is inactive again. The target 50 stays in the hit's block,
-        // so the state's copy-on-write block is its running block
-        // (single:1891-1895, `_apply_cow` at single:454-474); the hit block
-        // stays until the copy has run (sched:1434-1442).
+        // G0 holds blocks 0 to 3, with block 2 as a private copy. The target
+        // 50 stays in the hit's block, so the state's copy-on-write block is
+        // its running block (single:1891-1895, `_apply_cow` at
+        // single:454-474). The shared block 2 and the state's hit block are
+        // the copy sources. They leave the lease and stay active until the
+        // scheduling pass ends (sched:1434-1442).
         assert_eq!(attention_copies(&block_lease, 0), 4);
         let state = state_lease(&block_lease, 1);
-        assert!(state.hit.is_some() && state.running.is_some() && state.copy.is_none());
-        assert_eq!(pool.active_blocks(), 4 + 2);
-        assert_eq!(pool.inactive_cached_blocks(), 1);
+        assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_none());
+        assert_eq!(coordinator.copy_source_count(), 2);
+        assert_eq!(pool.active_blocks(), 4 + 1 + 2);
+        assert_eq!(pool.inactive_cached_blocks(), 0);
         coordinator.finalize(pool, &mut block_lease, &request, 50, 50, &hit, 1);
         let state = state_lease(&block_lease, 1);
         assert!(state.hit.is_none() && state.running.is_some());
+        assert_eq!(coordinator.copy_source_count(), 2);
+        assert_eq!(pool.active_blocks(), 4 + 1 + 2);
+        assert_eq!(pool.inactive_cached_blocks(), 0);
+        assert_eq!(coordinator.release_copy_sources(pool), 2);
         assert_eq!(pool.active_blocks(), 4 + 1);
         assert_eq!(pool.inactive_cached_blocks(), 2);
 
@@ -2447,11 +2494,14 @@ mod tests {
         assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
         assert!(coordinator.allocate(pool, &mut block_lease, 70, 36, 70, 1));
         let state = state_lease(&block_lease, 1);
-        assert!(state.hit.is_some() && state.running.is_some() && state.copy.is_some());
-        assert_eq!(pool.active_blocks(), 5 + 3);
+        assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_some());
+        assert_eq!(coordinator.copy_source_count(), 2);
+        assert_eq!(pool.active_blocks(), 5 + 2 + 2);
         coordinator.finalize(pool, &mut block_lease, &request, 70, 70, &hit, 1);
         let state = state_lease(&block_lease, 1);
         assert!(state.hit.is_none() && state.copy.is_some());
+        assert_eq!(pool.active_blocks(), 5 + 2 + 2);
+        assert_eq!(coordinator.release_copy_sources(pool), 2);
         assert_eq!(pool.active_blocks(), 5 + 2);
         coordinator.begin_step();
         assert!(coordinator.allocate(pool, &mut block_lease, 70, 70, 71, 2));
@@ -3581,5 +3631,265 @@ mod tests {
             }
         }
         assert!(hits > 150, "{hits} hits");
+    }
+
+    /// The hash block of the copy-source tests. A hit can then end inside a
+    /// 2,176-token block of the GLM groups.
+    const FINE: usize = 1088;
+
+    /// A request over `tokens` tokens that start at `base`. Two bases give
+    /// two prefixes that share no hash.
+    fn lease_from(base: u32, tokens: usize) -> BlockRequestLease {
+        let tokens: Vec<u32> = (base..base + tokens as u32).collect();
+        let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+        lease.configure_prefix_hashes(&tokens, FINE);
+        lease
+    }
+
+    /// Prefill a request of 3,500 tokens from no hit and release it. Its
+    /// chunks end at 2,176, 3,264 and 3,500, so it publishes a state at
+    /// 3,264, inside the second block of each 2,176-token group.
+    fn produce(coordinator: &mut GroupedPrefixCoordinator, pool: &mut GroupedBlockPool, base: u32) {
+        let request = lease_from(base, 3500);
+        let hit = coordinator.find_longest_hit(pool, &request, 3500);
+        assert_eq!(hit.tokens, 0);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        let ends = prefill(
+            coordinator,
+            pool,
+            &mut block_lease,
+            &request,
+            3500,
+            &hit,
+            BUDGET,
+        );
+        assert_eq!(ends, [2176, 3264, 3500]);
+        coordinator.release_request(pool, &mut block_lease);
+    }
+
+    /// Admit a request of 3,800 tokens on the prefix at `base` and allocate
+    /// its whole prompt. It hits 3,264 tokens, inside a block.
+    fn consume(
+        coordinator: &mut GroupedPrefixCoordinator,
+        pool: &mut GroupedBlockPool,
+        base: u32,
+    ) -> (BlockRequestLease, GroupedBlockLease, GroupedHit) {
+        let request = lease_from(base, 3800);
+        let hit = coordinator.find_longest_hit(pool, &request, 3800);
+        assert_eq!(hit.tokens, 3264);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert!(coordinator.allocate(pool, &mut block_lease, 3800, 3264, 3800, 1));
+        (request, block_lease, hit)
+    }
+
+    /// `None` when the key of `tokens` in `group` is not resident, else
+    /// whether a request holds its block.
+    fn key_state(
+        pool: &GroupedBlockPool,
+        group: u16,
+        request: &BlockRequestLease,
+        tokens: usize,
+    ) -> Option<bool> {
+        pool.key_hit(group, request.prefix_hash_at(tokens).unwrap())
+            .map(|hit| hit.is_active)
+    }
+
+    #[test]
+    fn copy_sources_of_a_hit_inside_a_block_stay_pinned_until_the_pass_ends() {
+        // A hit inside a block copies the cached block of the full-attention
+        // group (v0.31 and v0.32 single:387-397, `_apply_cow` at :454-474)
+        // and the hit block of each state group (v0.31 single:1935-1937,
+        // v0.32 :1899-1901). Each source keeps the reference that `touch`
+        // gave it (v0.31 single:307, v0.32 :304) until `schedule()` frees the
+        // copy endpoints at its end (v0.31 sched:1434-1442, v0.32
+        // :1474-1482). Until then a later request of the same step cannot
+        // take or evict it.
+        for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+            let mut coordinator = with_limits(rules_glm_hash(version, false, FINE));
+            let mut kv = kv_pool(&groups_glm(false), 32);
+            let pool = kv.block_pool_mut().unwrap();
+            produce(&mut coordinator, pool, 0);
+            assert_eq!(pool.active_blocks(), 0);
+            assert_eq!(pool.inactive_cached_blocks(), 10);
+            let (request, mut block_lease, hit) = consume(&mut coordinator, pool, 0);
+            // The lease holds 2 full-attention blocks, the ring block and a
+            // running block in each state group. The 5 sources are active
+            // too: 7 + 5 = 12.
+            assert_eq!(coordinator.copy_source_count(), 5);
+            assert_eq!(pool.active_blocks(), 12);
+            assert_eq!(pool.inactive_cached_blocks(), 4);
+            assert_eq!(attention_copies(&block_lease, 0), 2);
+            for group in GLM_STATES {
+                let state = state_lease(&block_lease, usize::from(group));
+                assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_none());
+            }
+            for group in [0, 2, 3, 4, 5] {
+                assert_eq!(key_state(pool, group, &request, 3264), Some(true));
+            }
+            // Only the blocks that are not active count as free.
+            let capacity = pool.capacity_blocks();
+            assert!(pool.reserve(&[], capacity - 12 + 1).is_none());
+            assert_eq!(pool.active_blocks(), 12);
+            assert_eq!(pool.inactive_cached_blocks(), 4);
+            let reservation = pool.reserve(&[], capacity - 12).unwrap();
+            pool.cancel(reservation);
+            assert_eq!(pool.inactive_cached_blocks(), 0);
+            assert_eq!(key_state(pool, 0, &request, 3264), Some(true));
+            coordinator.finalize(pool, &mut block_lease, &request, 3800, 3800, &hit, 1);
+            assert_eq!(coordinator.copy_source_count(), 5);
+            assert_eq!(pool.active_blocks(), 12);
+            assert_eq!(coordinator.release_copy_sources(pool), 5);
+            assert_eq!(coordinator.copy_source_count(), 0);
+            assert_eq!(pool.active_blocks(), 7);
+            for group in [0, 2, 3, 4, 5] {
+                assert_eq!(key_state(pool, group, &request, 3264), Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn copy_sources_leave_in_group_order_then_in_allocation_order() {
+        // vLLM collects the copies manager by manager, in group order, and
+        // each manager in the order of its allocations (v0.31
+        // kv_cache_manager.py:894-909). `free_blocks` puts a cached block
+        // that no request holds at the tail of the free queue, in that order
+        // (v0.31 block_pool.py:777-808). So the sources of two requests of
+        // one step leave group by group.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 40);
+        let pool = kv.block_pool_mut().unwrap();
+        produce(&mut coordinator, pool, 0);
+        produce(&mut coordinator, pool, 1_000_000);
+        let (first, mut first_lease, first_hit) = consume(&mut coordinator, pool, 0);
+        coordinator.finalize(pool, &mut first_lease, &first, 3800, 3800, &first_hit, 1);
+        let (second, mut second_lease, second_hit) = consume(&mut coordinator, pool, 1_000_000);
+        coordinator.finalize(pool, &mut second_lease, &second, 3800, 3800, &second_hit, 1);
+        assert_eq!(coordinator.copy_source_count(), 10);
+        assert_eq!(pool.active_blocks(), 24);
+        assert_eq!(pool.inactive_cached_blocks(), 8);
+        assert_eq!(coordinator.release_copy_sources(pool), 10);
+        assert_eq!(pool.active_blocks(), 14);
+        assert_eq!(pool.inactive_cached_blocks(), 18);
+        let free = pool.capacity_blocks() - 14 - 18;
+        assert_eq!(free, 8);
+        // The 8 free blocks and 11 evictions: the 8 states at 2,176 of the
+        // two producers, then the full-attention sources of both requests,
+        // then the source of group 2 of the first request, which allocated
+        // first.
+        let mut reservation = pool.reserve(&[], free + 11).unwrap();
+        let mut taken: Vec<_> = (0..free + 11)
+            .map(|_| pool.take_private(&mut reservation))
+            .collect();
+        pool.cancel(reservation);
+        assert_eq!(
+            GLM_STATES.map(|group| key_state(pool, group, &first, 3264).is_some()),
+            [false, true, true, true]
+        );
+        assert_eq!(
+            GLM_STATES.map(|group| key_state(pool, group, &second, 3264).is_some()),
+            [true, true, true, true]
+        );
+        // The 12th eviction takes the source of group 2 of the second request.
+        let mut reservation = pool.reserve(&[], 1).unwrap();
+        taken.push(pool.take_private(&mut reservation));
+        pool.cancel(reservation);
+        for request in [&first, &second] {
+            assert_eq!(
+                GLM_STATES.map(|group| key_state(pool, group, request, 3264).is_some()),
+                [false, true, true, true]
+            );
+        }
+        pool.release_all(taken);
+    }
+
+    #[test]
+    fn copy_sources_outlive_a_request_that_leaves_in_its_admission_pass() {
+        // Freeing a request leaves the pending copies alone (v0.31
+        // single:562-579, :1971-1988), so its sources stay referenced until
+        // `schedule()` ends (v0.31 sched:1434-1442).
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 32);
+        let pool = kv.block_pool_mut().unwrap();
+        produce(&mut coordinator, pool, 0);
+        let (request, mut block_lease, hit) = consume(&mut coordinator, pool, 0);
+        coordinator.finalize(pool, &mut block_lease, &request, 3800, 3800, &hit, 1);
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(coordinator.copy_source_count(), 5);
+        assert_eq!(pool.active_blocks(), 5);
+        assert_eq!(key_state(pool, 0, &request, 3264), Some(true));
+        let capacity = pool.capacity_blocks();
+        assert!(pool.reserve(&[], capacity - 5 + 1).is_none());
+        assert_eq!(coordinator.release_copy_sources(pool), 5);
+        assert_eq!(pool.active_blocks(), 0);
+    }
+
+    #[test]
+    fn a_hit_on_a_block_boundary_pins_no_copy_source() {
+        // A hit on a block boundary takes no copy (v0.31 single:321-327), so
+        // the hit block of a state group stays in the request until the hit
+        // rule releases it.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 32);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease_from(0, 4400);
+        let hit = coordinator.find_longest_hit(pool, &request, 4400);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        let ends = prefill(
+            &mut coordinator,
+            pool,
+            &mut block_lease,
+            &request,
+            4400,
+            &hit,
+            BUDGET,
+        );
+        assert_eq!(ends, [4352, 4400]);
+        coordinator.release_request(pool, &mut block_lease);
+        let request = lease_from(0, 4700);
+        let hit = coordinator.find_longest_hit(pool, &request, 4700);
+        assert_eq!(hit.tokens, 4352);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert_eq!(pool.active_blocks(), 6);
+        assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4352, 4700, 1));
+        assert_eq!(coordinator.copy_source_count(), 0);
+        assert_eq!(pool.active_blocks(), 12);
+        for group in GLM_STATES {
+            let state = state_lease(&block_lease, usize::from(group));
+            assert!(state.hit.is_some() && state.running.is_some() && state.copy.is_none());
+        }
+        coordinator.finalize(pool, &mut block_lease, &request, 4700, 4700, &hit, 1);
+        assert_eq!(coordinator.copy_source_count(), 0);
+        assert_eq!(pool.active_blocks(), 8);
+        assert_eq!(pool.inactive_cached_blocks(), 4);
+    }
+
+    #[test]
+    fn a_failed_first_allocation_pins_no_copy_source() {
+        // vLLM tests the free blocks before it touches the hit
+        // (v0.31 kv_cache_manager.py:572-589), so a refused request pins
+        // nothing.
+        let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_31_0, false, FINE));
+        let mut kv = kv_pool(&groups_glm(false), 11);
+        let pool = kv.block_pool_mut().unwrap();
+        produce(&mut coordinator, pool, 0);
+        assert_eq!(pool.active_blocks(), 0);
+        assert_eq!(pool.inactive_cached_blocks(), 6);
+        let request = lease_from(0, 3800);
+        let hit = coordinator.find_longest_hit(pool, &request, 3800);
+        assert_eq!(hit.tokens, 3264);
+        let mut block_lease = coordinator.new_lease();
+        assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
+        assert_eq!(pool.active_blocks(), 6);
+        // 6 fresh blocks are needed and 5 are left.
+        assert!(!coordinator.allocate(pool, &mut block_lease, 3800, 3264, 3800, 1));
+        assert_eq!(coordinator.copy_source_count(), 0);
+        assert_eq!(pool.active_blocks(), 6);
+        coordinator.release_request(pool, &mut block_lease);
+        assert_eq!(pool.active_blocks(), 0);
+        assert_eq!(pool.inactive_cached_blocks(), 6);
     }
 }
