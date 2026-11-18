@@ -174,8 +174,9 @@ The MTP3 column is historical and not valid for the current code. Commit
 `686275e7` multiplied the decode count by the verification width before the
 Mamba query. Packed telemetry already carries `requests * (nextn + 1)` decode
 requests, so that commit applied the width twice. The current code applies it
-once. No current MTP3 telemetry delta is published. Exact-value tests check the
-current path instead. `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`
+once. The original qualified Baseline-to-Candidate comparison has no
+corrected MTP3 delta. Exact-value tests check the current path instead, and the
+width-only comparison below isolates the width correction. `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`
 prices packed mixed steps, for example `num_prefill_requests: 1`,
 `sum_prefill_tokens: 512`, `num_decode_requests: 8` at width four, against
 their expected bytes. `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
@@ -187,8 +188,11 @@ sources table lists every scan as an analytical bound for both data sets, so
 the state dtype does not change a source in either variant. The `run_agg`,
 per-phase and replay results above and below do not use packed telemetry.
 
-Packed telemetry at the current code, TensorRT-LLM, MTP3, `HYBRID` mode. This
-compares `35944ae4` (before: the width applied twice) with `c3ed1513` (after).
+Width-only packed-telemetry comparison, TensorRT-LLM, MTP3, `HYBRID` mode.
+This compares `35944ae4` (before: the width applied twice) with `c3ed1513`
+(after). Both revisions already contain the per-phase accounting, so this is
+not a rerun of the Baseline-to-Candidate comparison. It measures only the width
+correction.
 Both commits sit on main `bf1b539f`. Each ran
 `python telem.py OUT.json` from its own `python/aisim` build. The script is
 [`telem.py`](mamba-mixed-step-accounting/telem.py), and it qualifies every
