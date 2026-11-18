@@ -161,7 +161,7 @@ def _download(selection: Selection, args: argparse.Namespace, repo: str, revisio
 
 
 def run_fetch(args: argparse.Namespace) -> int:
-    saved = load_config()
+    saved = load_config(config_path(cache_dir=args.cache_dir))
     repo, revision = resolve_source(args.repo, args.revision, config=saved)
     selection = build_selection(args)
     payload = _download(selection, args, repo, revision)
