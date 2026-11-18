@@ -427,7 +427,7 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     if args.command == "onboard":
@@ -450,10 +450,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except StackResolutionError as exc:
         parser.error(str(exc))
     try:
-        raw = _load_mapping(args.config)
-        # Paths written in the file start at the file's folder; --set paths start at the working directory.
-        raw = anchor_paths(raw, config_folder(args.config), args.command)
-        _apply_overrides(raw, args.overrides, command=args.command)
+        if _prepared_config is None:
+            raw = _load_mapping(args.config)
+            # Paths written in the file start at the file's folder; --set paths start at the working directory.
+            raw = anchor_paths(raw, config_folder(args.config), args.command)
+            _apply_overrides(raw, args.overrides, command=args.command)
+        else:
+            raw = _prepared_config
         if args.command == "predict":
             return _predict(args, raw, factory)
         return _recommend(args, raw, factory)

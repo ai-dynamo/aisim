@@ -253,6 +253,8 @@ stack does not advertise leave existing artifacts intact. So does a resource ref
 interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
 a run writes no resource reports. Errors raised while importing an installed plugin or inside an
 adapter occur after the known outputs are removed.
+If the configuration changes during the warmup support check, the command stops before cleanup;
+otherwise execution uses the checked configuration, including path anchoring and `--set` overrides.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so
 existing artifacts stay. A key written twice inside `engine.ais_perf_model` in the configuration

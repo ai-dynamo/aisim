@@ -3,6 +3,8 @@
 
 import json
 import os
+import pickle
+import signal
 import subprocess
 import sys
 from dataclasses import replace
@@ -229,7 +231,7 @@ class ReachedExecution(Exception):
     pass
 
 
-def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra, probe=None):
+def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra, probe=None, stack="legacy"):
     from aisim import cli_args, supervision
 
     raw = {
@@ -249,6 +251,8 @@ def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra, probe=Non
             raise ReachedExecution
         if isinstance(probe, Exception):
             raise probe
+        if callable(probe):
+            return probe(command, **kwargs)
         return probe or {"status": "completed", "exit_code": 0}
 
     monkeypatch.setattr(supervision, "run_process", observe_run)
@@ -258,7 +262,7 @@ def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra, probe=Non
             "--config",
             "unused.yaml",
             "--stack",
-            "legacy",
+            stack,
             "--output-dir",
             str(tmp_path),
             "--overwrite",
@@ -274,11 +278,12 @@ def test_supervisor_leaves_warmup_support_to_the_installed_stack(tmp_path, monke
 
 
 @pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
-def test_supervisor_rejects_online_warmup_before_overwrite(tmp_path, monkeypatch, capsys, policy):
+@pytest.mark.parametrize("stack", ["legacy", "engine"])
+def test_supervisor_rejects_online_warmup_before_overwrite(tmp_path, monkeypatch, capsys, policy, stack):
     prior = tmp_path / "prediction.json"
     prior.write_bytes(b"previous valid results\n")
     with pytest.raises(SystemExit) as exc:
-        supervise_warmup_prediction(tmp_path, monkeypatch, policy, "--online")
+        supervise_warmup_prediction(tmp_path, monkeypatch, policy, "--online", stack=stack)
     assert exc.value.code == 2
     assert f"{policy} requires offline execution" in capsys.readouterr().err
     assert prior.read_bytes() == b"previous valid results\n"
@@ -288,6 +293,7 @@ def test_supervisor_rejects_online_warmup_before_overwrite(tmp_path, monkeypatch
     "probe,code,reason",
     [
         ({"status": "cancelled", "reason": "execution cancelled"}, 130, "execution cancelled"),
+        ({"status": "failed", "exit_code": -signal.SIGINT}, 130, "warmup support check cancelled"),
         ({"status": "resource_limited", "reason": "memory budget"}, 3, "memory budget"),
         ({"status": "timed_out", "reason": "initialization timed out"}, 124, "initialization timed out"),
         (ResourceLimitError("no host memory remains"), 3, "no host memory remains"),
@@ -301,6 +307,215 @@ def test_supervisor_keeps_outputs_when_the_warmup_probe_cannot_answer(
     assert supervise_warmup_prediction(tmp_path, monkeypatch, "live_trajectory_v1", probe=probe) == code
     assert list(tmp_path.iterdir()) == [prior]
     assert f"aisim: {reason}" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX child signal return codes")
+def test_supervisor_keeps_outputs_when_only_the_probe_receives_sigint(tmp_path, monkeypatch, capsys):
+    from aisim import supervision
+
+    run_process = supervision.run_process
+
+    def interrupt_probe(command, **kwargs):
+        return run_process([sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGINT)"], **kwargs)
+
+    prior = tmp_path / "prediction.json"
+    prior.write_text("previous valid results")
+    assert supervise_warmup_prediction(tmp_path, monkeypatch, "live_trajectory_v1", probe=interrupt_probe) == 130
+    assert list(tmp_path.iterdir()) == [prior]
+    assert prior.read_text() == "previous valid results"
+    assert "warmup support check cancelled" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("diagnostic", ["missing", "unreadable"])
+def test_supervisor_keeps_outputs_when_policy_refusal_has_no_readable_diagnostic(
+    tmp_path, monkeypatch, capsys, diagnostic
+):
+    def refuse_probe(command, **kwargs):
+        if diagnostic == "unreadable":
+            Path(command[command.index("warmup-support") + 1]).mkdir()
+        return {"status": "failed", "exit_code": 2}
+
+    prior = tmp_path / "prediction.json"
+    prior.write_text("previous valid results")
+    with pytest.raises(SystemExit) as exc:
+        supervise_warmup_prediction(tmp_path, monkeypatch, "live_trajectory_v1", probe=refuse_probe)
+    assert exc.value.code == 2
+    assert "does not advertise this agentic warmup policy" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == [prior]
+    assert prior.read_text() == "previous valid results"
+
+
+def test_supervisor_preserves_outputs_when_config_changes_during_probe(tmp_path, monkeypatch, capsys):
+    from aisim import supervision
+
+    config = warmup_cli_config(tmp_path, "predict", "live_trajectory_v1")
+    output = tmp_path / "output"
+    output.mkdir()
+
+    def change_config(command, **kwargs):
+        assert "warmup-support" in command, "execution must not start"
+        raw = yaml.safe_load(config.read_text())
+        raw["traffic"]["load"]["agentic_warmup_policy"] = "primers_only"
+        config.write_text(yaml.safe_dump(raw))
+        return {"status": "completed", "exit_code": 0}
+
+    monkeypatch.setattr(supervision, "_installed_names", lambda _: ["advertising"])
+    monkeypatch.setattr(supervision, "run_process", change_config)
+    prior = output / "prediction.json"
+    prior.write_text("previous valid results")
+    with pytest.raises(SystemExit) as exc:
+        supervision.main(
+            ["predict", "--config", str(config), "--stack", "advertising", "--output-dir", str(output), "--overwrite"]
+        )
+    assert exc.value.code == 2
+    assert "configuration changed during the warmup support check" in capsys.readouterr().err
+    assert list(output.iterdir()) == [prior]
+    assert prior.read_text() == "previous valid results"
+
+
+@pytest.mark.parametrize("probe_status,probe_code", [("completed", 0), ("completed", 1), ("failed", 1)])
+def test_supervisor_snapshot_survives_later_file_edits_and_cleans_up(tmp_path, monkeypatch, probe_status, probe_code):
+    from aisim import cli_args, supervision
+
+    config = warmup_cli_config(tmp_path, "predict", "live_trajectory_v1")
+    original = yaml.safe_load(config.read_text())
+    output = tmp_path / "output"
+    output.mkdir()
+    prior = output / "prediction.json"
+    prior.write_text("previous valid results")
+    monkeypatch.setattr(supervision, "_installed_names", lambda _: ["advertising"])
+    snapshots = []
+
+    def observe_run(command, **kwargs):
+        if "warmup-support" in command:
+            return {"status": probe_status, "exit_code": probe_code}
+        assert not prior.exists()
+        snapshot = Path(command[command.index("cli-prepared") + 1])
+        snapshots.append(snapshot)
+        config.write_text("invalid: changed after cleanup")
+        with snapshot.open("rb") as source:
+            prepared = pickle.load(source)
+        assert prepared == original
+        assert cli_args._load_mapping(str(config)) != prepared
+        return {"status": "completed", "exit_code": 0}
+
+    monkeypatch.setattr(supervision, "run_process", observe_run)
+    assert (
+        supervision.main(
+            ["predict", "--config", str(config), "--stack", "advertising", "--output-dir", str(output), "--overwrite"]
+        )
+        == 0
+    )
+    assert len(snapshots) == 1
+    assert not snapshots[0].exists()
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_executes_the_checked_mapping_after_a_later_config_edit(tmp_path, monkeypatch, command):
+    from aisim import supervision
+
+    config = warmup_cli_config(tmp_path, command, "live_trajectory_v1")
+    metadata = tmp_path / "warmup_stack-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: warmup-stack\nVersion: 1.0\n")
+    (metadata / "entry_points.txt").write_text(
+        "[aisim.runner_factories]\nadvertising = aisim.runner:EngineReplayRunnerFactory\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))))
+    monkeypatch.setattr(supervision, "_installed_names", lambda _: ["advertising"])
+    run_process = supervision.run_process
+
+    def edit_before_execution(child_command, **kwargs):
+        if "cli-prepared" in child_command:
+            config.write_text("invalid: changed after cleanup")
+        return run_process(child_command, **kwargs)
+
+    monkeypatch.setattr(supervision, "run_process", edit_before_execution)
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "prediction.json").write_text("previous valid results")
+    assert (
+        supervision.main(
+            [
+                command,
+                "--config",
+                str(config),
+                "--stack",
+                "advertising",
+                "--output-dir",
+                str(output),
+                "--overwrite",
+                "--format",
+                "json",
+                "--set",
+                "traffic.load.agentic_warmup_policy=primers_only",
+            ]
+        )
+        == 0
+    )
+    result_name = "prediction.json" if command == "predict" else "recommendation.json"
+    assert json.loads((output / result_name).read_text())
+    assert json.loads((output / "resource-runtime.json").read_text())["status"] == "completed"
+
+
+@pytest.fixture
+def warmup_worker(monkeypatch, tmp_path):
+    from aisim import resource_worker
+
+    monkeypatch.setattr(resource_worker, "runtime_budget", lambda: {"cpu_limit": 1})
+    if hasattr(os, "sched_setaffinity"):
+        monkeypatch.setattr(os, "sched_setaffinity", lambda *args: None)
+    if hasattr(os, "nice"):
+        monkeypatch.setattr(os, "nice", lambda *args: None)
+    monkeypatch.setattr(
+        sys, "argv", ["resource_worker", "warmup-support", str(tmp_path / "refusal"), "silent", "live_trajectory_v1"]
+    )
+    return resource_worker
+
+
+@pytest.mark.parametrize("failure_at", ["resolution", "capabilities"])
+@pytest.mark.parametrize("resource_refusal", [False, True])
+def test_warmup_worker_distinguishes_resource_refusals_from_plugin_errors(
+    warmup_worker, tmp_path, monkeypatch, capsys, failure_at, resource_refusal
+):
+    from aisim import stack
+
+    def fail(*args):
+        raise ResourceLimitError("stack memory budget") if resource_refusal else RuntimeError("broken plugin")
+
+    class Factory:
+        capabilities = fail
+
+    monkeypatch.setattr(stack, "resolve_runner_factory", fail if failure_at == "resolution" else lambda _: Factory())
+    assert warmup_worker.main() == (3 if resource_refusal else 1)
+    assert not (tmp_path / "refusal").exists()
+    if resource_refusal:
+        assert "stack memory budget" in capsys.readouterr().err
+
+
+def test_warmup_worker_returns_policy_refusal_when_diagnostic_write_fails(warmup_worker, tmp_path, monkeypatch):
+    from aisim import stack
+
+    monkeypatch.setattr(stack, "resolve_runner_factory", lambda _: WarmupStack(False, tmp_path / "runner.log"))
+    (tmp_path / "refusal").mkdir()
+    assert warmup_worker.main() == 2
+    assert not (tmp_path / "runner.log").exists()
+
+
+@pytest.mark.parametrize("policy", ["repeated_prefixes", "live_trajectory_v1", "primers_only", "live_trajectory_v2"])
+@pytest.mark.parametrize("live,primers", [(False, False), (False, True), (True, False), (True, True)])
+def test_public_warmup_capability_check(policy, live, primers):
+    from aisim.sweeper.replay import RunnerCapabilities
+
+    capabilities = RunnerCapabilities(supports_agentic_live_warmup=live, supports_agentic_primers_only=primers)
+    if policy == "live_trajectory_v2":
+        with pytest.raises(ValueError, match="unknown agentic_warmup_policy"):
+            capabilities.require_agentic_warmup_policy(policy)
+    elif (policy == "live_trajectory_v1" and not live) or (policy == "primers_only" and not primers):
+        with pytest.raises(ValueError, match=f"before selecting {policy}"):
+            capabilities.require_agentic_warmup_policy(policy)
+    else:
+        capabilities.require_agentic_warmup_policy(policy)
 
 
 @pytest.mark.parametrize(
@@ -444,6 +659,13 @@ def run_installed_stack(tmp_path, command, stack, policy):
         "    def capabilities(self):\n"
         "        flags = {'supports_agentic_live_warmup': False, 'supports_agentic_primers_only': False}\n"
         "        return replace(super().capabilities(), **flags)\n"
+        "\nclass ResourceRefusal(EngineReplayRunnerFactory):\n"
+        "    def capabilities(self):\n"
+        "        from pathlib import Path\n"
+        "        from aisim.resources import ResourceLimitError\n"
+        "        with Path(__file__).with_name('capabilities.log').open('a') as log:\n"
+        "            log.write('called\\n')\n"
+        "        raise ResourceLimitError('stack memory budget')\n"
     )
     metadata = tmp_path / "warmup_stacks-1.0.dist-info"
     metadata.mkdir()
@@ -452,6 +674,7 @@ def run_installed_stack(tmp_path, command, stack, policy):
         "[aisim.runner_factories]\n"
         "advertising = aisim.runner:EngineReplayRunnerFactory\n"
         "silent = warmup_stacks:Silent\n"
+        "resource_refusal = warmup_stacks:ResourceRefusal\n"
     )
     output = tmp_path / "output"
     (output / "recommendations").mkdir(parents=True)
@@ -492,6 +715,30 @@ def test_overwrite_replaces_outputs_on_an_installed_stack_with_the_policy(tmp_pa
     assert result.returncode == 0, result.stderr
     assert outputs["prediction.json"] != original["prediction.json"]
     assert json.loads(outputs["resource-runtime.json"])["status"] == "completed"
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_keeps_outputs_when_installed_capabilities_refuse_resources(tmp_path, command):
+    result, original, outputs = run_installed_stack(tmp_path, command, "resource_refusal", "live_trajectory_v1")
+    assert result.returncode == 3, result.stderr
+    assert "stack memory budget" in result.stderr
+    assert outputs == original
+    assert (tmp_path / "capabilities.log").read_text() == "called\n"
+
+
+@pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
+def test_unsupervised_recommendation_wraps_unsupported_warmup_as_runtime_error(tmp_path, monkeypatch, policy):
+    from aisim.config.cli import CoreRecommendationConfig
+    from aisim.recommend import run_recommendation
+
+    monkeypatch.delenv("_AISIM_SUPERVISED_BUDGET", raising=False)
+    path = warmup_cli_config(tmp_path, "recommend", policy)
+    config = CoreRecommendationConfig.model_validate(yaml.safe_load(path.read_text()))
+    with pytest.raises(RuntimeError, match=f"before selecting {policy}"):
+        run_recommendation(
+            config, stack="silent", runner_factory=WarmupStack(False, tmp_path / "runner.log"), show_progress=False
+        )
+    assert not (tmp_path / "runner.log").exists()
 
 
 def test_supervisor_default_recommendation_without_traffic_keeps_existing_path(tmp_path, monkeypatch):

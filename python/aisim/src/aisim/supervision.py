@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -400,6 +401,11 @@ def _require_known_sections(raw: dict[str, Any], *, command: str, stack: str) ->
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    with ExitStack() as cleanup:
+        return _main(argv, cleanup)
+
+
+def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
     from .cli_args import _apply_overrides, _extract_output_configs, _load_mapping, build_parser
     from .config.ais_perf_model import anchor_paths, warn_old_keys
     from .config.cli import config_folder
@@ -493,23 +499,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         # into errors, the warning must not be reported as a configuration error.
         warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw)
     event_output = None
+    worker_command = [sys.executable, "-m", "aisim.resource_worker", "cli"]
     if raw is not None:
         warmup = "repeated_prefixes" if config.traffic is None else config.traffic.load.agentic_warmup_policy
         if args.overwrite and args.stack not in _BUILTIN_STACKS and warmup != "repeated_prefixes":
             # Only the stack knows its warmup support; ask a supervised process before --overwrite removes outputs.
-            with tempfile.TemporaryDirectory(prefix="aisim-warmup-") as directory:
-                refusal = Path(directory) / "refusal"
-                command = [sys.executable, "-m", "aisim.resource_worker", "warmup-support", str(refusal), args.stack]
+            directory = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="aisim-warmup-"))
+            refusal = Path(directory) / "refusal"
+            command = [sys.executable, "-m", "aisim.resource_worker", "warmup-support", str(refusal), args.stack]
+            try:
+                probe = run_process([*command, warmup], policy=policy)
+            except ResourceLimitError as exc:
+                probe = {"status": "resource_limited", "reason": str(exc)}
+            if probe.get("exit_code") == -signal.SIGINT:
+                probe = {"status": "cancelled", "reason": "warmup support check cancelled"}
+            if probe["status"] in _STOPPED_EXIT_CODES:
+                # Without the stack's answer, stop before cleanup with the execution run's exit code.
+                sys.stderr.write(f"aisim: {probe['reason']}\n")
+                return _STOPPED_EXIT_CODES[probe["status"]]
+            if probe.get("exit_code") == 2:
+                reason = "the selected stack does not advertise this agentic warmup policy"
                 try:
-                    probe = run_process([*command, warmup], policy=policy)
-                except ResourceLimitError as exc:
-                    probe = {"status": "resource_limited", "reason": str(exc)}
-                if probe["status"] in _STOPPED_EXIT_CODES:
-                    # Without the stack's answer, stop before cleanup with the execution run's exit code.
-                    sys.stderr.write(f"aisim: {probe['reason']}\n")
-                    return _STOPPED_EXIT_CODES[probe["status"]]
-                if probe.get("exit_code") == 2 and refusal.exists():
-                    parser.error(f"{args.config}: {refusal.read_text(encoding='utf-8')}")
+                    reason = refusal.read_text(encoding="utf-8") or reason
+                except OSError:
+                    pass
+                parser.error(f"{args.config}: {reason}")
+            try:
+                current = anchor_paths(_load_mapping(args.config), config_folder(args.config), args.command)
+                _apply_overrides(current, args.overrides, command=args.command)
+                if current != raw:
+                    raise ValueError("configuration changed during the warmup support check; retry the command")
+            except (OSError, ValueError, AttributeError) as exc:
+                parser.error(f"{args.config}: {exc}")
+            # Execute the exact checked mapping, including anchored paths and overrides.
+            # Keeping the snapshot alive through execution closes the later file-edit race too.
+            snapshot = Path(directory) / "config.pickle"
+            with snapshot.open("wb") as target:
+                pickle.dump(raw, target)
+            worker_command = [sys.executable, "-m", "aisim.resource_worker", "cli-prepared", str(snapshot)]
         try:
             output = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
         except (OSError, ValueError) as exc:
@@ -518,7 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     resource_plan = None
     try:
         report = run_process(
-            [sys.executable, "-m", "aisim.resource_worker", "cli", *arguments],
+            [*worker_command, *arguments],
             policy=policy,
             events_output=event_output,
         )

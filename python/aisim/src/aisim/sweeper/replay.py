@@ -524,6 +524,8 @@ class RunnerCapabilities:
     def require_agentic_warmup_policy(self, policy: str) -> None:
         """Raise when the runner does not advertise an agentic warmup policy."""
 
+        if policy not in {"repeated_prefixes", "live_trajectory_v1", "primers_only"}:
+            raise ValueError("unknown agentic_warmup_policy")
         if policy == "live_trajectory_v1" and not self.supports_agentic_live_warmup:
             raise ValueError(
                 "runner does not support live agentic warmup; update the adapter before selecting live_trajectory_v1"

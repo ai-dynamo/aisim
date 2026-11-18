@@ -32,21 +32,31 @@ def main() -> int:
     if hasattr(os, "nice"):
         os.nice(5)
     command = sys.argv[1]
-    if command == "cli":
+    if command in {"cli", "cli-prepared"}:
         from .main import main as _main
 
+        if command == "cli-prepared":
+            with Path(sys.argv[2]).open("rb") as source:
+                prepared_config = pickle.load(source)
+            return _main(sys.argv[3:], _prepared_config=prepared_config)
         return _main(sys.argv[2:])
     if command == "warmup-support":
         from .stack import resolve_runner_factory
 
         try:
             capabilities = resolve_runner_factory(sys.argv[3]).capabilities()
+        except ResourceLimitError as exc:
+            sys.stderr.write(f"aisim: {exc}\n")
+            return 3
         except Exception:
             return 1  # The execution process reports stack errors in their usual order.
         try:
             capabilities.require_agentic_warmup_policy(sys.argv[4])
         except ValueError as exc:
-            Path(sys.argv[2]).write_text(str(exc), encoding="utf-8")
+            try:
+                Path(sys.argv[2]).write_text(str(exc), encoding="utf-8")
+            except OSError:
+                pass  # The exit code carries the refusal even without a diagnostic file.
             return 2
         return 0
     if command != "recommend":
