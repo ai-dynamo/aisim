@@ -336,8 +336,11 @@ every case the two share.
 
 Before the fix, the large budget priced two requests and 2192 new tokens, as
 two complete prompts would. After it, the step prices one request and 1096
-new tokens. Every mixed-step operation then equals the result for an exact
-4096-token budget, and so does TTFT. Among the Mamba rows, the context
+new tokens. The saved outputs then record the same Mamba rows, the same
+non-Mamba sum and the same TTFT for the 8192- and 4096-token budgets. They do
+not record each non-Mamba row. The regression
+`test_run_agg_lone_request_ignores_unused_budget` compares the whole per-operation
+mixed-step dictionary of the two budgets and finds every row equal. Among the Mamba rows, the context
 convolution, both projection GEMMs and the norm also fall. Separately, the sum
 of the operations without `mamba` in their names falls by 27%, because they
 also price one request instead of two. In the
