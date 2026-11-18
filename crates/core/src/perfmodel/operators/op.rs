@@ -729,7 +729,7 @@ impl Op {
             Op::Dsv4Context(op) => op.query_context(db, ctx.batch_size, ctx.s, ctx.prefix),
             Op::Dsv4Generation(op) => op.query_generation(db, ctx.batch_size, ctx.s),
             Op::Mhc(op) => op.query(db, ctx.num_tokens),
-            Op::Mamba2(op) => op.query(db, ctx.batch_size, ctx.s),
+            Op::Mamba2(op) => op.query_with_prefix(db, ctx.batch_size, ctx.s, ctx.prefix),
             Op::Gdn(op) => op.query(db, ctx.batch_size, ctx.s),
             Op::WideEpContextMla(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
             Op::WideEpGenerationMla(op) => op.query(db, ctx.batch_size, ctx.s),

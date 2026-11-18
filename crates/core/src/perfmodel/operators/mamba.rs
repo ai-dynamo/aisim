@@ -90,6 +90,17 @@ impl Mamba2Op {
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        self.query_with_prefix(db, batch_size, seq_len, 0)
+    }
+
+    /// [`Self::query`] for a prefill whose first `prefix` tokens are cached.
+    pub fn query_with_prefix(
+        &self,
+        db: &PerfDatabase,
+        batch_size: u32,
+        seq_len: u32,
+        prefix: u32,
+    ) -> Result<PerformanceResult, AicError> {
         if let Some(why) = self.field_error() {
             return Err(AicError::InvalidEngineConfig(format!(
                 "Mamba op {}: {why}",
@@ -112,10 +123,13 @@ impl Mamba2Op {
         // hold a BF16 state (the collectors' dtype). A qualified op that
         // verifies several tokens or keeps another state dtype has no row, so
         // it takes the analytic SOL like a table miss. Convolution rows do not
-        // depend on the state dtype.
+        // depend on the state dtype. Scan rows start from a cold state, so they
+        // do not measure a prefill that restores a cached prefix's state.
         let no_measured_row = self.state_dtype != "unrecorded"
             && ((self.phase == "generation" && self.token_width > 1)
-                || (!self.is_conv() && self.state_dtype != "bfloat16"));
+                || (!self.is_conv()
+                    && (self.state_dtype != "bfloat16"
+                        || (self.phase == "context" && prefix > 0))));
         // SOL (and the retired SOL_FULL alias) never reads the table, as in
         // the GEMM, attention, MoE and mHC operators. Mamba2 has no util-space
         // empirical layer, so EMPIRICAL answers with the same analytic SOL
@@ -1062,6 +1076,69 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// A measured scan row starts from a cold state. A qualified BF16 prefill
+    /// with the same new-token count but a cached prefix restores a state, so
+    /// it takes SOL. The cold query and a legacy op keep the measured row.
+    #[test]
+    fn qualified_cached_prefill_scan_does_not_read_cold_rows() {
+        use crate::common::enums::{DatabaseMode, TransferPolicy};
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"]),
+                Col::Str("phase", vec!["context"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![512]),
+                Col::I64("d_model", vec![1024]),
+                Col::I64("d_state", vec![64]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("nheads", vec![16]),
+                Col::I64("head_dim", vec![64]),
+                Col::I64("n_groups", vec![4]),
+                Col::I64("chunk_size", vec![128]),
+                Col::F64("latency", vec![0.5]),
+            ],
+        );
+        let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+            .expect("load")
+            .with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        let op = |state_dtype: &str| Mamba2Op {
+            name: "context_ssm".into(),
+            scale_factor: 1.0,
+            kernel_source: "mamba_chunk_scan_combined".into(),
+            phase: "context".into(),
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            nheads: 16,
+            head_dim: 64,
+            n_groups: 4,
+            chunk_size: 128,
+            state_dtype: state_dtype.into(),
+            token_width: 1,
+        };
+        let qualified = op("bfloat16");
+        let cold = qualified.query_with_prefix(&db, 2, 512, 0).unwrap();
+        assert_eq!((cold.source, cold.latency_ms), (Source::Silicon, 0.5));
+        let cached = qualified.query_with_prefix(&db, 2, 512, 256).unwrap();
+        assert_eq!(cached.source, Source::Sol);
+        assert_eq!(
+            cached.latency_ms,
+            qualified.sol_total_bytes(2.0, 512.0) / 7.7e12 * 1000.0
+        );
+        let legacy = op("unrecorded")
+            .query_with_prefix(&db, 2, 512, 256)
+            .unwrap();
+        assert_eq!((legacy.source, legacy.latency_ms), (Source::Silicon, 0.5));
     }
 
     /// Mamba2 follows the database-mode semantics of the other table-backed

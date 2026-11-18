@@ -67,9 +67,11 @@ def test_ad_hoc_query_takes_the_op_width_and_rejects_partial_requests():
         state_dtype="bfloat16",
         token_width=4,
     )
-    # Eight tokens at width four are two whole requests.
+    # Eight tokens at width four are two whole requests: 8 * 18,560 activation
+    # bytes, plus each request's 1 MiB BF16 state read once and written four
+    # times, at b200_sxm's 7.7e12 B/s.
     result = op._engine_query(database, batch_size=8, s=16, x=8)
-    assert float(result) > 0
+    assert float(result) == pytest.approx(10_634_240 / 7.7e12 * 1000, rel=1e-9)
     assert result.source == "sol"
     with pytest.raises(Exception, match="not a multiple of token_width 4"):
         op._engine_query(database, batch_size=5, s=16, x=5)
@@ -77,19 +79,21 @@ def test_ad_hoc_query_takes_the_op_width_and_rejects_partial_requests():
 
 def _qualified_nano_session(monkeypatch):
     from aisim.sdk.inference_session import InferenceSession
-    from aisim_core.sdk import common, config
+    from aisim_core.sdk import config
     from aisim_core.sdk.backends.factory import get_backend
     from aisim_core.sdk.models import get_model, nemotron_h
-    from aisim_core.sdk.perf_database import get_database
+    from aisim_core.sdk.perf_database import get_database_view
 
-    database = get_database("b200_sxm", "trtllm", "1.3.0rc20", allow_unlisted_version=True)
+    # An isolated view: the shared cached database keeps its default mode.
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="HYBRID", allow_unlisted_version=True)
     if database is None:
         pytest.skip("b200_sxm/trtllm/1.3.0rc20 data missing")
-    database.set_default_database_mode(common.DatabaseMode.HYBRID)
     real_ops = nemotron_h.ops
 
     def kernel(name, scale, source, phase, *args, **kwargs):
-        return real_ops.Mamba2Kernel(name, scale, source, phase, *args, state_dtype="bfloat16", token_width=1, **kwargs)
+        # float16 keeps the 2-byte state and never reads BF16 scan rows, so
+        # the scan always takes the analytic estimate the oracle derives.
+        return real_ops.Mamba2Kernel(name, scale, source, phase, *args, state_dtype="float16", token_width=1, **kwargs)
 
     class QualifiedOps:
         def __getattr__(self, name):
@@ -114,7 +118,7 @@ def _qualified_nano_session(monkeypatch):
 def _scan_ms(requests, new_tokens):
     # Bytes / bandwidth for 23 Mamba layers at b200_sxm's 7.7e12 B/s. Per token the
     # scan moves (4096 + 2 * 8 * 128 + 64) * 2 + 4096 * 2 = 20,608 bytes; each
-    # request reads and writes its 1 MiB BF16 state once.
+    # request reads and writes its 1 MiB FP16 state once.
     return 23 * (new_tokens * 20_608 + requests * 2 * 1_048_576) / 7.7e12 * 1000
 
 

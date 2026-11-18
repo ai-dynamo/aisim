@@ -79,10 +79,12 @@ depend on the state dtype, so this rule does not apply to convolution,
 under either its logical or its physical TensorRT-LLM label. No collected
 data qualifies Mamba2 timing under MTP.
 
-The lookup key holds the batch size and the new-token count only. It omits
-the cached prefix. A prefill scan with a cached prefix can therefore read a
-row collected from a cold state. That result is labeled `silicon`, and it
-omits the recurrent-state traffic that the SOL estimate counts.
+Within a matching kernel, phase and model geometry, a prefill lookup uses the
+batch size and the new-token count. The collected scan rows start from a cold
+state, so they do not measure a prefill that restores a cached prefix. A
+qualified scan operation with a cached prefix therefore uses the SOL estimate,
+which counts the restored recurrent state. A legacy operation, one with no
+recorded state dtype, still reads the cold row and labels it `silicon`.
 
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different

@@ -19,9 +19,11 @@ class MixedStepInput:
     derived from the model's speculative draft depth.
 
     ``context_tokens`` is the packed prompt budget in full prompt tokens:
-    ``context_tokens // isl`` complete requests of ``isl`` tokens, prefix
-    included, plus one partial request. It is not the count of newly
-    scheduled tokens after prefix-cache hits.
+    ``context_tokens // isl`` complete requests of the effective ``isl``
+    tokens, prefix included. A nonzero remainder adds one partial request,
+    and an exact multiple of ``isl`` has none. A qualified Mamba op caps that
+    partial request at ``isl - prefix`` new tokens. The budget is not the
+    count of newly scheduled tokens after prefix-cache hits.
     """
 
     context_tokens: int
