@@ -218,7 +218,8 @@
     },
     "metric_scalar_tests": {
       "passed": 7,
-      "file": "tests/test_mamba_cache_accuracy_metrics.py"
+      "file": "https://github.com/ai-dynamo/aisim/blob/f2a460101cfb09bdb52c00ddf2680bc16b0dba84/tests/test_mamba_cache_accuracy_metrics.py",
+      "scope": "Historical scalar tests at the archived revision; not current-head test results."
     },
     "input_binding": "trace header native_prompt_map_sha256 equals actual native prompt capture SHA256",
     "conditional_geometry": "all 95 native first-prefill observations are singleton batches with extend=min(prompt-cached,16384)"
