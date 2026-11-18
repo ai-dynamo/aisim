@@ -4774,7 +4774,8 @@ pub(crate) mod tests {
             vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
             vec![],
         );
-        let mut db = Arc::try_unwrap(build_engine(None).db).unwrap();
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
         db.database_mode = DatabaseMode::Sol;
         let engine = Engine::build(spec, Arc::new(db)).unwrap();
         for (tokens, cached, scan_queries) in
@@ -4810,7 +4811,8 @@ pub(crate) mod tests {
 
     #[test]
     fn mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks() {
-        let mut db = Arc::try_unwrap(build_engine(None).db).unwrap();
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
         db.database_mode = DatabaseMode::Sol;
         let db = Arc::new(db);
         for qualified in [true, false] {
