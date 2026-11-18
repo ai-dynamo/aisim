@@ -411,7 +411,9 @@ their decode work as a separate decode pass. The CLI also saves
 error stops replay; the Python exception retains a `fpm_query_coverage`
 attribute for that failure path. A passing replay coverage status requires completed requests,
 nonempty resolved queries and no unsupported lookup. It is distinct from
-operation/energy evidence, which whole-model FPM does not provide. See
+operation-level evidence and from the [power coverage gate](../power.md):
+supported non-speculative schema-v8 whole-model FPM can provide energy,
+while v6/v7 and fitted estimators remain latency-only. See
 [FPM replay validation](../fpm-self-service/implementation.md#validate-fpm-query-coverage-with-agentx-replay)
 for the stricter whole-corpus completion checks and saved onboarding artifacts.
 

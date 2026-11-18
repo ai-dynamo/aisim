@@ -248,6 +248,15 @@ Mixed-step watts remain unqualified pending measured validation. The approved mi
 exception retains `power-metrics-v1`. Use the producer revision when
 comparing results across the change.
 
+The public Rust `aisim_core::FpmRankEstimate`
+(`crates/core/src/perfmodel/fpm/evidence.rs`) gains `prefill_energy_wms` and
+`decode_energy_wms`, both `Option<f64>`. These fields are optional in serde:
+missing fields deserialize as `None`, and `None` fields are omitted when
+serializing. Existing Rust struct literals that enumerate the old fields
+without a `..` update no longer compile. Callers should use
+`..Default::default()` for unspecified fields. This source compatibility
+change is separate from the additive JSON fields.
+
 Support and accuracy remain separate gates. Execution with sufficient data
 coverage establishes that a power result can be produced; parity with AIC and
 accuracy against target-hardware measurements require their own qualification.

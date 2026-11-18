@@ -645,6 +645,37 @@ def test_prediction_details_reject_malformed_fpm_evidence(native_prediction_repo
         assert str(error.value).startswith(expected_path)
 
 
+@pytest.mark.parametrize("field", ["prefill_energy_wms", "decode_energy_wms"])
+@pytest.mark.parametrize("energy", [0.0, 1250.5])
+def test_prediction_details_preserve_rank_energy(native_prediction_report, field, energy):
+    import jsonschema
+
+    operation = native_prediction_report["performance_diagnostics"]["phases"][0]["operations"][0]
+    operation["fpm_estimates"][0]["estimate"]["ranks"][0][field] = energy
+    original = deepcopy(native_prediction_report)
+    details = build_prediction_details(native_prediction_report, ("source", "time"))
+    schema = json.loads(
+        (Path(__file__).resolve().parents[1] / "docs/reference/schemas/prediction-details.schema.json").read_text()
+    )
+    jsonschema.validate(details, schema)
+    for section in (details["sections"]["source"], details["sections"]["time"]["diagnostics"]):
+        published = section["phases"][0]["operations"][0]["fpm_estimates"]
+        assert published[0]["estimate"]["ranks"][0][field] == energy
+    assert native_prediction_report == original
+
+
+@pytest.mark.parametrize("field", ["prefill_energy_wms", "decode_energy_wms"])
+@pytest.mark.parametrize("energy", [-1.0, float("inf"), float("-inf"), float("nan"), None, True, "1"])
+def test_prediction_details_reject_invalid_rank_energy(native_prediction_report, field, energy):
+    operation = native_prediction_report["performance_diagnostics"]["phases"][0]["operations"][0]
+    operation["fpm_estimates"][0]["estimate"]["ranks"][0][field] = energy
+    expected_path = f"performance_diagnostics.phases[0].operations[0].fpm_estimates[0].estimate.ranks[0].{field}"
+    for section in ("source", "time"):
+        with pytest.raises(ValueError) as error:
+            build_prediction_details(native_prediction_report, (section,))
+        assert str(error.value).startswith(expected_path)
+
+
 def test_prediction_details_reject_missing_and_unknown_fpm_fields(native_prediction_report):
     prefix = ("performance_diagnostics", "phases", 0, "operations", 0, "fpm_estimates", 0)
     for path in [
