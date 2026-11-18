@@ -564,6 +564,35 @@ def test_full_block_aligned_state_allows_mtp_through_engine_handoff(forbid_estim
     assert rank["prefix_match_unit"] == rank["block_size"] == 64
 
 
+@pytest.mark.parametrize("speculative_states,disable_drop,reused", [(None, False, 48), (1, False, 32), (1, True, 48)])
+@pytest.mark.parametrize("unit", [None, 16])
+def test_full_block_state_mtp_reuse_requires_scratch_states_to_drop_a_block(
+    forbid_estimators, speculative_states, disable_drop, reused, unit
+):
+    from aisim import _runtime
+
+    raw = _public(block_size=16, prefix_match_unit=unit)
+    raw["traffic"]["source"].update(input_tokens=64, cached_prefix_tokens=48)
+    raw["traffic"]["stop"]["requests"] = 2
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    native = runtime.execution_spec
+    rank = native["spec"]["engine"]["rank"]
+    # Fixed native timing isolates state reuse from FPM estimator availability.
+    rank.update(aic_nextn=1, disable_eagle_block_drop=disable_drop)
+    if speculative_states is not None:
+        rank["state_cache"]["num_speculative_states"] = speculative_states
+    native["spec"]["record_per_request"] = True
+    report = json.loads(_runtime.run_replay_json(json.dumps(native)))
+    assert report["completed_requests"] == 2
+    assert report["total_output_tokens"] == 2
+    assert [row["first_admission_reused_input_tokens"] for row in report["per_request"]] == [0, reused]
+    # With no scratch states, retain and reuse 48 = 64 - block_size tokens.
+    # Speculative dropping moves the resumable state one block earlier to 32.
+    assert report["committed_prefill_tokens"] == 128 - reused
+
+
 @pytest.mark.parametrize(
     "shared_prefix_tokens, expected_reused_tokens",
     [

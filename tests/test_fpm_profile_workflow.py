@@ -1703,8 +1703,10 @@ def test_recommendation_names_profile_context_budget(profile, timing_systems, mo
     assert "model maximum" not in caplog.text
 
 
-def test_observed_mamba_pool_reaches_native_replay(profile, timing_systems):
-    from aisim.runner import EngineReplayRunnerFactory
+@pytest.mark.parametrize("prefix_match_unit", [2, 8])
+def test_observed_mamba_pool_reaches_native_replay(profile, timing_systems, tmp_path, prefix_match_unit):
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory, _materialize_engine_execution_spec
 
     profile["deployments"] = profile["deployments"][:1]
     profile["deployments"][0]["resources"] = {
@@ -1714,7 +1716,7 @@ def test_observed_mamba_pool_reaches_native_replay(profile, timing_systems):
             "block_size_tokens": 8,
             "page_size_bytes": 64,
             "state_groups": 5,
-            "prefix_match_unit": 2,
+            "prefix_match_unit": prefix_match_unit,
             "num_speculative_states": 0,
         },
         "runtime_memory": {
@@ -1748,12 +1750,22 @@ def test_observed_mamba_pool_reaches_native_replay(profile, timing_systems):
     assert lowered["num_gpu_blocks"] == 99
     assert lowered["state_cache"] == {"bytes_per_request": 320}
     assert lowered["kv_cache_bytes_per_token"] == 8
-    assert lowered["prefix_match_unit"] == 2
+    assert lowered["prefix_match_unit"] == prefix_match_unit
     host = {"num_host_blocks": 4, "connector": "simple_cpu_v0_32"}
     with pytest.raises(ValueError, match="Mamba FPM cache supports HBM replay only"):
         materialize_aic_num_gpu_blocks({**spec.backend_deployment.agg_engine_args, "native_host_offload": host})
     result = EngineReplayRunnerFactory().create(0).run(spec)
     assert result.metrics["completed_requests"] == 1
+    native = _materialize_engine_execution_spec(spec, trace_block_size=8, record_per_request=True)
+    rank = native["spec"]["engine"]["rank"]
+    # Direct native callers can defer this unit to AIC capacity materialization.
+    # Missing timing data must not mask the artifact incompatibility at setup.
+    del rank["prefix_match_unit"]
+    error = "detailed replay artifacts require KV event export, which prefix_match_unit"
+    for systems_paths in ([timing_systems], [str(tmp_path / "no-timing-data")]):
+        rank["timing_model"]["config"]["systems_paths"] = systems_paths
+        with pytest.raises(RuntimeError, match=error):
+            _runtime.run_replay_with_artifacts_json(json.dumps(native))
     recommendation = {**_engine(profile), "mode": "aggregated"}
     recommendation["workers"]["aggregated"]["parallelism"] = {"preset": "default"}
     with pytest.raises(ValidationError, match="recommendation search is unsupported"):
