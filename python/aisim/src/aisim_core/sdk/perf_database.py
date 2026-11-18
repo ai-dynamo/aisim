@@ -146,10 +146,10 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
 
 
 def get_systems_paths() -> list[str]:
+    global _SYSTEMS_PATHS
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
     if not _SYSTEMS_PATHS_EXPLICIT and env_root and os.path.isdir(os.path.expanduser(env_root)):
         return [os.path.abspath(os.path.expanduser(env_root))]
-    global _SYSTEMS_PATHS
     if _SYSTEMS_PATHS is None:
         _SYSTEMS_PATHS = [_default_systems_path()]
     return list(_SYSTEMS_PATHS)
