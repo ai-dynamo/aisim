@@ -505,14 +505,15 @@ def test_task_yaml_round_trip_and_recommend_rebuild_keep_inferred_precision(
     path = _super_with_fp8_experts(tmp_path)
     overrides = {"gemm_quant_mode": BF16, "moe_quant_mode": MOE.fp8} if explicit else {}
     if serving_mode == "agg":
-        roles = ["agg"]
+        roles = explicit_roles = ["agg"]
         task = _task(path, **overrides)
     else:
-        roles = ["prefill", "decode"]
+        # Only decode takes the overrides, so swapping the roles' fields fails the per-role checks.
+        roles, explicit_roles = ["prefill", "decode"], ["decode"]
         kwargs = {"total_gpus": 2}
         for role in roles:
             kwargs |= {f"{role}_model_path": path, f"{role}_system_name": "gb200", f"{role}_backend_name": "vllm"}
-            kwargs |= {f"{role}_{key}": value for key, value in overrides.items()}
+        kwargs |= {f"decode_{key}": value for key, value in overrides.items()}
         task = Task(serving_mode="disagg", backend_version="0.31.0", database_mode="SOL", **kwargs)
     reloaded = Task.from_yaml(yaml.safe_load(task.to_yaml()))
     rebuilt = _build_recommend_tasks({serving_mode: task}, 8)[serving_mode]
@@ -523,7 +524,7 @@ def test_task_yaml_round_trip_and_recommend_rebuild_keep_inferred_precision(
         for other in (reloaded, rebuilt):
             other_model = _task_model(other, path, role)
             assert (_buckets(other_model.context_ops), _experts(other_model)) == before
-        if explicit:
+        if explicit and role in explicit_roles:
             assert all(set(modes) == {BF16} for modes in before[0].values())
             assert set(before[1]) == {MOE.fp8}
         else:
