@@ -2349,6 +2349,8 @@ def _gemm_key_names(database) -> list[str]:
     """Return GEMM modes.
 
     `fp8_static` comes from its own rows plus `scale_matrix`, or from dynamic FP8 plus both overhead tables.
+    The direct path also asks for `scale_matrix` `fp8` rows, although the Rust engine needs that table only for a
+    GEMM with a low-precision input: nearly every model has such a GEMM, so the listing asks for the table it needs.
     """
     gemm_data = getattr(database, "_gemm_data", None)
     names = set(_enum_key_names(gemm_data))

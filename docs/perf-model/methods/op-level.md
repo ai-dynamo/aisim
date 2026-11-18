@@ -295,13 +295,15 @@ distance: a weight-only mode therefore prefers the matching arithmetic family.
 MoE keeps its own historical profile-distance ordering. These tie-breaks are
 observable prediction semantics, not opportunities to sort data arbitrarily.
 
-`fp8_static` has two paths. If the GEMM table has `fp8_static` rows, AISim
-reads them and subtracts only `scale_matrix` for a low-precision input.
-Otherwise `fp8_static` is composite: it needs the base FP8 and its overhead tables.
-Transfer reachability alone cannot admit it. Validation requires known
-precision profiles and the resolved transfer policy; a pure SILICON request
-still needs data. New precision support requires native profile
-levels, their exported Python reachability view, and tests described in [Extending](../extending.md).
+`fp8_static` has two paths. If the GEMM table has `fp8_static` rows, AISim reads
+them and needs no `compute_scale` table. It subtracts `scale_matrix` only for a
+low-precision input. Otherwise `fp8_static` is composite: it needs the base FP8
+and its overhead tables. Transfer reachability alone cannot admit it. On both
+paths, the support matrix lists `fp8_static` only when the `scale_matrix` table
+is present. Validation requires known precision profiles and the resolved
+transfer policy; a pure SILICON request still needs data. New precision support
+requires native profile levels, their exported Python reachability view, and
+tests described in [Extending](../extending.md).
 
 ## Diagnostics and limits
 

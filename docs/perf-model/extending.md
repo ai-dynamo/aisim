@@ -199,9 +199,11 @@ with its derivation beside the native entry. Validation must admit only the
 relations enabled by the chosen transfer policy and available reference data.
 
 Exercise SILICON failure without data, permitted HYBRID/EMPIRICAL transfer,
-restrictive-policy failure, reference ordering, and eventual own-data precedence.
-`fp8_static` additionally requires its overhead tables. A GEMM table with its own
-`fp8_static` rows requires only `scale_matrix`, for a low-precision input.
-Checkpoint-to-precision
-resolution and hardware compatibility are separate contracts; reachability of an
-estimate does not prove that the backend can execute the checkpoint.
+restrictive-policy failure, reference ordering, and eventual own-data
+precedence. `fp8_static` additionally requires its overhead tables. A GEMM table
+with its own `fp8_static` rows needs no `compute_scale` table. The engine then
+needs `scale_matrix` only for a low-precision input, but the support matrix
+lists the mode only when the `scale_matrix` table is present.
+Checkpoint-to-precision resolution and hardware compatibility are separate
+contracts; reachability of an estimate does not prove that the backend can
+execute the checkpoint.
