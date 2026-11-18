@@ -74,6 +74,80 @@ fn tokens(prefix: std::ops::Range<u32>, suffix: std::ops::Range<u32>) -> Vec<u32
 }
 
 #[test]
+fn cold_aligned_admission_requires_the_state_rotation_peak() {
+    #[derive(Clone, Default)]
+    struct Warnings(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    );
+    struct Fields(std::collections::BTreeMap<String, String>);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(Default::default());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    for capacity in [4, 6] {
+        let mut config = args(false, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 900, (0..65).collect(), 1);
+        let warnings = Warnings::default();
+        let first = tracing::subscriber::with_default(warnings.clone(), || step(&mut core));
+        if capacity == 4 {
+            assert!(
+                first.admissions.is_empty(),
+                "reject before computing 64 tokens"
+            );
+            assert!(
+                first
+                    .output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+            assert!(
+                warnings.0.lock().unwrap().iter().any(|fields| {
+                    fields.get("required_blocks").map(String::as_str) == Some("6")
+                        && fields.get("available_blocks").map(String::as_str) == Some("4")
+                }),
+                "admission must report required and available capacity"
+            );
+        } else {
+            assert_eq!(first.admissions.len(), 1);
+            assert_eq!(core.state.requests[&id].num_computed_tokens, 64);
+            let last = step(&mut core);
+            assert!(
+                last.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
 fn prefill_checkpoint_finishes_the_prompt_in_one_pass() {
     // The final chunk runs to the prompt end and exports the state at
     // (P - 1) // B * B = 12 from inside its forward, in one extra state

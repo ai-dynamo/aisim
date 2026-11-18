@@ -712,17 +712,32 @@ impl VllmKvManager {
         }
         let checkpoint_blocks = self.admission_checkpoint_blocks(cost.cached_tokens, known_tokens);
         if let Some(state) = &self.state_cache {
-            let copies = if cost.cached_tokens > 0 { 2 } else { 1 };
-            if known_tokens == 0
-                || token_blocks
-                    .saturating_add(state.blocks_per_state.saturating_mul(copies))
-                    .saturating_add(state.speculative_blocks)
-                    .saturating_add(checkpoint_blocks)
-                    .saturating_add(usize::from(
-                        !cost.cached_tokens.is_multiple_of(self.block_size),
-                    ))
-                    > self.pool.capacity()
-            {
+            // Align mode rotates working allocations across physical blocks.
+            // The previous state remains an input until the next pass, even
+            // on a cold prompt. Price that peak before starting prefill.
+            let rotates = state
+                .align_block_size
+                .is_some_and(|block| known_tokens > block);
+            // An internal prefill checkpoint already supplies the second
+            // cold state; do not charge it twice on a one-pass prefill.
+            let copies = if cost.cached_tokens > 0 || (rotates && checkpoint_blocks == 0) {
+                2
+            } else {
+                1
+            };
+            let required_blocks = token_blocks
+                .saturating_add(state.blocks_per_state.saturating_mul(copies))
+                .saturating_add(state.speculative_blocks)
+                .saturating_add(checkpoint_blocks)
+                .saturating_add(usize::from(
+                    !cost.cached_tokens.is_multiple_of(self.block_size),
+                ));
+            if known_tokens == 0 || required_blocks > self.pool.capacity() {
+                tracing::warn!(
+                    required_blocks,
+                    available_blocks = self.pool.capacity(),
+                    "state_cache admission peak exceeds KV pool capacity"
+                );
                 return AllocationRequirement::Impossible;
             }
         }

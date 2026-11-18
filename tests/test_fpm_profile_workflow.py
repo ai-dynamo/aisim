@@ -1761,6 +1761,7 @@ def test_observed_mamba_pool_reaches_native_replay(profile, timing_systems, tmp_
     # Direct native callers can defer this unit to AIC capacity materialization.
     # Missing timing data must not mask the artifact incompatibility at setup.
     del rank["prefix_match_unit"]
+    assert json.loads(_runtime.run_replay_json(json.dumps(native)))["completed_requests"] == 1
     error = "detailed replay artifacts require KV event export, which prefix_match_unit"
     for systems_paths in ([timing_systems], [str(tmp_path / "no-timing-data")]):
         rank["timing_model"]["config"]["systems_paths"] = systems_paths

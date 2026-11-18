@@ -153,12 +153,17 @@ model quality, or measured hardware speedup; see [feature support](../features.m
 vLLM drops the last matched block from every prefix-cache hit of an EAGLE-like
 method, MTP included, and recomputes it so the drafter sees fresh hidden
 states. Replay applies the same drop when the engine's draft depth (`aic_nextn`)
-is set and `disable_eagle_block_drop` is false. With a `state_cache`, dropping
-also requires `state_cache.num_speculative_states` to be set. If it is unset,
+is set and `disable_eagle_block_drop` is false. With a `state_cache` whose
+`prefix_match_unit` is set (explicitly or by default), dropping also requires
+`state_cache.num_speculative_states` to be set. If it is unset,
 full-block state matching preserves the retained prefix: a matching follow-up
 can reuse a state at 48 tokens with `block_size: 16`, rather than dropping to
 32 tokens. This holds whether `prefix_match_unit` is explicit or resolved by
-default. Sub-block state matching under speculation requires
+default. Sliding-window state caches leave `prefix_match_unit` unset. Their
+lookup drops one block when logits are needed and the drop is enabled, even
+without `num_speculative_states`: a retained 48-token hit with `block_size: 16`
+is capped at 32 tokens. Direct unaligned recurrent engine arguments use the
+same lookup. Sub-block state matching under speculation requires
 `state_cache.num_speculative_states` and also applies the drop to state lookups. vLLM's
 `speculative_config.disable_eagle_block_drop` turns it off; set the same switch
 on the speculation block:

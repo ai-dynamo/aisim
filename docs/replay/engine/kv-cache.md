@@ -688,7 +688,7 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `state_cache.retention_interval` | Unset (every block boundary) | DeepSeek V4 with inferred bytes only. vLLM's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: `0` or a multiple of the resolved `block_size`. DeepSeek V4 rejects `prefix_match_unit`. |
 | `state_cache.sliding_window_lookahead_tokens` | Inferred (DeepSeek V4: 64) | Tokens past the full-attention hit that the MTP layer's sliding-window group reads; sizing fills it. Set it only with explicit `bytes_per_request`, to replay a state resolved earlier. |
-| `prefix_match_unit` | `block_size` for a recurrent state with prefix caching, otherwise unset | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. Rejects detailed native KV-event artifact capture. |
+| `prefix_match_unit` | `block_size` for a recurrent state with prefix caching, otherwise unset | Positive divisor of `block_size`. Requires chunked prefill with recurrent prefix caching. Rejects detailed native KV-event artifact capture. |
 
 `state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
 a requested page size (default 64) that is enlarged to fit one state per layer.
@@ -746,10 +746,22 @@ there.
 
 vLLM uses align mode for a recurrent state whenever prefix caching is on, so an
 unset `prefix_match_unit` resolves to `block_size`: prefill chunks stop at the
-block boundaries where the state is kept.
+block boundaries where the state is kept. This requires
+`engine.enable_chunked_prefill` to remain enabled; explicitly disabling it is
+rejected for both default and explicit units with recurrent prefix caching.
 
-Detailed native artifact capture (`run_replay_with_artifacts_json`) requires KV
-event export and rejects any set `prefix_match_unit` before engine construction.
+Fixed pools need room for the aligned prefill peak: token blocks plus both the
+previous and new working state while a request crosses a block boundary, as
+well as any speculative scratch states and internal prefill checkpoint. For
+example, a 65-token prompt with 64-token blocks, 16 KV bytes per token and a
+1,500-byte state needs two token blocks and two two-block states: six blocks.
+A four-block pool is rejected at admission, before prefill, with required and
+available block counts in the native admission warning.
+
+Detailed native artifact capture (`run_replay_with_artifacts_json`) requires an
+aggregated topology and KV event export. Disaggregated P/D deployments fail on
+topology first, including when prefix caching is disabled. For aggregated
+deployments, capture rejects any set `prefix_match_unit` before engine construction.
 This includes the default `block_size` unit for recurrent states with prefix
 caching: inferred Kimi K3 states, explicit `bytes_per_request` states, and
 DeepSeek V4 with explicit bytes and no `sliding_window_lookahead_tokens`.
@@ -757,6 +769,14 @@ Sliding-window states and recurrent states with prefix caching disabled do not
 receive that default. Ordinary CLI `--capture-telemetry` and `--export-html`
 use telemetry capture without native KV-event export and support the aligned
 recurrent-state default.
+
+Dynamo's [Router event observation](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs#L188)
+also requests engine KV events when its
+`use_kv_events` option is true. The same native `prefix_match_unit` rejection
+applies to aligned recurrent states, including the resolved default. Router
+replay must disable engine KV-event observation for this combination; setting
+that downstream option does not affect ordinary Engine-stack telemetry. See
+[Dynamo integration](../dynamo.md#router-configuration).
 
 ### State pool from recorded runtime memory
 
