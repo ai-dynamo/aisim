@@ -73,6 +73,7 @@ def invoke(ladder, monkeypatch, sizing_config, tmp_path, *args):
         "traffic.load.requests_per_second=.nan",
         "traffic.load.requests_per_second=fast",
         "optimizer.max_trials=0",
+        "optimization.constraints.min_candidate_gpus=2",
         "traffic.load.requests_per_second.bad=1",
     ],
 )
@@ -147,7 +148,11 @@ def test_valid_override_and_one_gpu_fit_failure_can_proceed(ladder, monkeypatch,
     assert report["answer"]["used_gpus"] == 1
 
 
-def test_retry_above_rejected_two_gpu_answer(ladder, monkeypatch, sizing_config, tmp_path, capsys):
+@pytest.mark.parametrize("file_max_gpus", [2, 16])
+def test_retry_above_rejected_two_gpu_answer(ladder, monkeypatch, sizing_config, tmp_path, capsys, file_max_gpus):
+    cfg = yaml.safe_load(sizing_config.read_text())
+    cfg["optimization"]["constraints"]["max_candidate_gpus"] = file_max_gpus
+    sizing_config.write_text(yaml.safe_dump(cfg))
     budgets = []
 
     def fake_run(cmd, timeout):
@@ -157,6 +162,7 @@ def test_retry_above_rejected_two_gpu_answer(ladder, monkeypatch, sizing_config,
         effective = ladder.apply_sets(yaml.safe_load(sizing_config.read_text()), overrides)
         constraints = CoreRecommendationConfig.model_validate(effective).optimization.constraints
         assert constraints.min_candidate_gpus == 3
+        assert constraints.max_candidate_gpus == 3
         budgets.append(constraints.max_candidate_gpus)
         allowed = enumerate_parallel_configs(
             is_moe=True,

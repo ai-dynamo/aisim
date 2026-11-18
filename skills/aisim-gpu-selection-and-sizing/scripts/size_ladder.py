@@ -197,7 +197,15 @@ def main() -> int:
         return 2
 
     try:
-        cfg = apply_sets(yaml.safe_load(a.config.read_text()), a.sets)
+        # Match the first recommendation step's effective configuration and override order.
+        cfg = apply_sets(
+            yaml.safe_load(a.config.read_text()),
+            [
+                f"engine.hardware={a.hardware}",
+                f"optimization.constraints.max_candidate_gpus={budgets[0]}",
+                *a.sets,
+            ],
+        )
         try:
             from aisim.config.cli import CoreRecommendationConfig  # validates the full schema
 
