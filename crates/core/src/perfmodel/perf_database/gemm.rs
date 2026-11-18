@@ -275,9 +275,16 @@ impl GemmTable {
     }
 
     /// Whether the merged GEMM table (all `gemm_sources`, after each
-    /// source's `kernel_source` filter) has rows under `fp8_static`. A
-    /// missing-data load error reads as "no such rows"; other errors
-    /// propagate.
+    /// source's `kernel_source` filter) has rows under `fp8_static`.
+    ///
+    /// Every load error of the GEMM table reads as `Ok(false)` ("no rows"):
+    /// `load_gemm` returns each cached load error as `AicError::PerfDatabase`,
+    /// which is a missing-data error. A corrupt or schema-broken table
+    /// therefore also gives `false`. Do not use this function to report a
+    /// broken table. The callers in this file (`query`, `has_quant`,
+    /// `gemm_points`) load the table again and return the error. The last
+    /// match arm cannot run today. It stays as a guard in case `load_gemm`
+    /// keeps the error kind in the future.
     pub fn has_direct_fp8_static(&self) -> Result<bool, AicError> {
         match self.load_gemm() {
             Ok(grids) => Ok(grids.by_quant.contains_key(GemmQuantMode::Fp8Static.name())),
@@ -1690,6 +1697,24 @@ mod tests {
             leaf_bits(b.query(GemmQuantMode::Fp8Static, 192, 1024, 1024).unwrap()),
             leaf_bits(b.query(GemmQuantMode::Fp8, 192, 1024, 1024).unwrap()),
         );
+    }
+
+    /// A table with ONLY the fp8_static rows of S: `has_quant` resolves
+    /// `fp8_static` to its own rows (present) and keeps `fp8` as `fp8`
+    /// (absent). The old `fp8_static -> fp8` normalization gives `false`
+    /// for `fp8_static` here.
+    #[test]
+    fn has_quant_resolves_fp8_static_on_a_table_with_only_fp8_static_rows() {
+        use crate::perf_database::energy_test_fixtures::energy_test_spec;
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_rows_s_gemm(
+            &tmp.path().join("gemm_perf.parquet"),
+            &["fp8_static"],
+            "kernel",
+        );
+        let table = GemmTable::new(tmp.path().to_path_buf(), energy_test_spec());
+        assert!(table.has_quant(GemmQuantMode::Fp8Static).unwrap());
+        assert!(!table.has_quant(GemmQuantMode::Fp8).unwrap());
     }
 
     #[test]
