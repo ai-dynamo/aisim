@@ -2200,8 +2200,9 @@ class BaseBackend:
             mtp_scaled_tokens = int(num_gen_requests)
         else:
             # b == 1 starts with a context-only step; the later decode peak is
-            # compared below when the workload schedules output tokens.
-            num_tokens = ctx_tokens
+            # compared below when the workload schedules output tokens. The
+            # step holds the capped prompt, not unused budget.
+            num_tokens = num_mix_ctx_tokens
             mtp_scaled_tokens = 0
 
         memory = self._get_memory_usage(

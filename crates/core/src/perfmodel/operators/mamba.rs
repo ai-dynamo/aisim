@@ -81,6 +81,26 @@ impl Mamba2Op {
                 self.phase
             ));
         }
+        // Known kernel labels run in one phase only.
+        let kernel_phase = match self.kernel_source.as_str() {
+            "causal_conv1d_fn" | "causal_conv1d_fn_token_major" | "mamba_chunk_scan_combined" => {
+                Some("context")
+            }
+            "causal_conv1d_update"
+            | "selective_state_update"
+            | "selective_state_update_flashinfer"
+            | "selective_state_update_triton" => Some("generation"),
+            _ => None,
+        };
+        if self.state_dtype != "unrecorded"
+            && let Some(phase) = kernel_phase
+            && phase != self.phase
+        {
+            return Some(format!(
+                "kernel {} runs in the {phase} phase, not {:?}",
+                self.kernel_source, self.phase
+            ));
+        }
         None
     }
 
@@ -730,8 +750,21 @@ mod tests {
         assert_eq!(op.field_error(), None);
         op.state_dtype = "float16".into();
         assert!(op.field_error().unwrap().contains("needs phase"));
+        // A known kernel label fixes its phase.
         op.phase = "generation".into();
+        assert!(
+            op.field_error()
+                .unwrap()
+                .contains("runs in the context phase")
+        );
+        op.kernel_source = "causal_conv1d_update".into();
         assert_eq!(op.field_error(), None);
+        op.phase = "context".into();
+        assert!(
+            op.field_error()
+                .unwrap()
+                .contains("runs in the generation phase")
+        );
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane

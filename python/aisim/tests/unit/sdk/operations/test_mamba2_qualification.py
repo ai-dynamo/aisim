@@ -149,6 +149,8 @@ def test_run_agg_lone_request_ignores_unused_budget(monkeypatch):
     exact, large = run(1, 4096, prefix=3000), run(1, 8192, prefix=3000)
     assert large.get_per_ops_data()["mix_step"] == exact.get_per_ops_data()["mix_step"]
     assert large.get_summary_df().iloc[0]["ttft"] == exact.get_summary_df().iloc[0]["ttft"]
+    # The step's activations follow the scheduled prompt, not the budget.
+    assert large.get_memory() == exact.get_memory()
 
 
 def test_run_agg_cache_separates_prefixes(monkeypatch):
