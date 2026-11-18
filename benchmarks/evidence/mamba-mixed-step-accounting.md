@@ -175,6 +175,15 @@ both backends:
 | Mixed, 1x2048 + 8 decode | +0.25% to +0.27% | +0.68% to +0.75% |
 | Mixed, 2 requests of 1500 tokens + 8 decode | +0.24% to +0.36% | +0.62% to +0.71% |
 
+These percentages are transcribed observations from `686275e7` and its
+Baseline. Their full `ForwardPassMetrics` payloads, decode KV totals included,
+and their commands and raw outputs were not saved, so they cannot be
+reproduced. `telem.py` below uses another revision pair, MTP3 and BF16 states,
+so it does not reproduce them either. The reproducible checks of the MTP0
+packed path are `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`,
+which prices width-one packed mixed steps against exact bytes, and the
+hand-derived oracle sections below.
+
 The MTP3 column is historical and not valid for the current code. Commit
 `686275e7` multiplied the decode count by the verification width before the
 Mamba query. Packed telemetry already carries `requests * (nextn + 1)` decode
