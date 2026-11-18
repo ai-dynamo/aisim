@@ -511,7 +511,7 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
                 probe = run_process([*command, warmup], policy=policy)
             except ResourceLimitError as exc:
                 probe = {"status": "resource_limited", "reason": str(exc)}
-            if probe.get("exit_code") == -signal.SIGINT:
+            if probe["status"] == "failed" and probe.get("exit_code", 0) < 0:
                 probe = {"status": "cancelled", "reason": "warmup support check cancelled"}
             if probe["status"] in _STOPPED_EXIT_CODES:
                 # Without the stack's answer, stop before cleanup with the execution run's exit code.
@@ -529,8 +529,11 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
 
                 current = anchor_paths(_load_mapping(args.config), config_folder(args.config), args.command)
                 _apply_overrides(current, args.overrides, command=args.command)
-                # YAML tags distinguish equal Python scalars such as True, 1, and 1.0.
-                if safe_dump(current, canonical=True) != safe_dump(raw, canonical=True):
+                # YAML tags distinguish equal Python scalars such as True, 1, and 1.0;
+                # mapping order also determines the order of adapter runtime hooks.
+                if safe_dump(current, canonical=True, sort_keys=False) != safe_dump(
+                    raw, canonical=True, sort_keys=False
+                ):
                     raise ValueError("configuration changed during the warmup support check; retry the command")
             except (OSError, ValueError, AttributeError) as exc:
                 parser.error(f"{args.config}: {exc}")

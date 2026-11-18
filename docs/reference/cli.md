@@ -251,9 +251,11 @@ configuration loading, overrides, core-schema validation, unknown top-level sect
 output adapters that are not installed, and, with `--overwrite`, agentic warmup policies that the
 stack does not advertise leave existing artifacts intact. So does a resource refusal, timeout or
 interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
-a run writes no resource reports. Errors raised while importing an installed plugin or inside an
+a run writes no resource reports. A signal-terminated support probe exits `130`, as does cancellation
+with Ctrl-C. Errors raised while importing an installed plugin or inside an
 adapter occur after the known outputs are removed.
-If the configuration changes during the warmup support check, the command stops before cleanup;
+If the effective configuration changes during the warmup support check, including scalar types or
+adapter section order, the command exits `2` before cleanup;
 otherwise execution uses the checked configuration, including path anchoring and `--set` overrides.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so

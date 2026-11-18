@@ -294,8 +294,15 @@ def test_supervisor_rejects_online_warmup_before_overwrite(tmp_path, monkeypatch
     [
         ({"status": "cancelled", "reason": "execution cancelled"}, 130, "execution cancelled"),
         ({"status": "failed", "exit_code": -signal.SIGINT}, 130, "warmup support check cancelled"),
+        ({"status": "failed", "exit_code": -signal.SIGTERM}, 130, "warmup support check cancelled"),
         ({"status": "resource_limited", "reason": "memory budget"}, 3, "memory budget"),
+        ({"status": "resource_limited", "exit_code": -signal.SIGTERM, "reason": "memory budget"}, 3, "memory budget"),
         ({"status": "timed_out", "reason": "initialization timed out"}, 124, "initialization timed out"),
+        (
+            {"status": "timed_out", "exit_code": -signal.SIGTERM, "reason": "initialization timed out"},
+            124,
+            "initialization timed out",
+        ),
         (ResourceLimitError("no host memory remains"), 3, "no host memory remains"),
     ],
 )
@@ -367,6 +374,41 @@ def test_supervisor_preserves_outputs_when_config_changes_during_probe(tmp_path,
     with pytest.raises(SystemExit) as exc:
         supervision.main(
             ["predict", "--config", str(config), "--stack", "advertising", "--output-dir", str(output), "--overwrite"]
+        )
+    assert exc.value.code == 2
+    assert "configuration changed during the warmup support check" in capsys.readouterr().err
+    assert list(output.iterdir()) == [prior]
+    assert prior.read_text() == "previous valid results"
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_supervisor_preserves_outputs_when_adapter_order_changes_during_probe(tmp_path, monkeypatch, capsys, command):
+    from aisim import supervision
+
+    config = warmup_cli_config(tmp_path, command, "live_trajectory_v1")
+    raw = yaml.safe_load(config.read_text())
+    raw.update(alpha={}, beta={})
+    config.write_text(yaml.safe_dump(raw, sort_keys=False))
+    output = tmp_path / "output"
+    output.mkdir()
+    prior = output / "prediction.json"
+    prior.write_text("previous valid results")
+
+    def reorder_adapters(child_command, **kwargs):
+        assert "warmup-support" in child_command, "execution must not start"
+        current = yaml.safe_load(config.read_text())
+        current["alpha"] = current.pop("alpha")
+        assert current == raw  # Mapping equality alone misses this runtime-hook order change.
+        config.write_text(yaml.safe_dump(current, sort_keys=False))
+        return {"status": "completed", "exit_code": 0}
+
+    monkeypatch.setattr(
+        supervision, "_installed_names", lambda _: ["advertising", "advertising.alpha", "advertising.beta"]
+    )
+    monkeypatch.setattr(supervision, "run_process", reorder_adapters)
+    with pytest.raises(SystemExit) as exc:
+        supervision.main(
+            [command, "--config", str(config), "--stack", "advertising", "--output-dir", str(output), "--overwrite"]
         )
     assert exc.value.code == 2
     assert "configuration changed during the warmup support check" in capsys.readouterr().err
@@ -677,7 +719,7 @@ def test_cli_runs_warmup_only_on_a_stack_that_advertises_it(tmp_path, monkeypatc
     assert f"before selecting {policy}" in capsys.readouterr().err
 
 
-def run_installed_stack(tmp_path, command, stack, policy):
+def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True):
     (tmp_path / "warmup_stacks.py").write_text(
         "from dataclasses import replace\n\n"
         "from aisim.runner import EngineReplayRunnerFactory\n\n\n"
@@ -699,6 +741,19 @@ def run_installed_stack(tmp_path, command, stack, policy):
         "        with Path(__file__).with_name('constructor.log').open('a') as log:\n"
         "            log.write('called\\n')\n"
         "        raise ResourceLimitError('stack constructor memory budget')\n"
+        "\nclass Interrupted(EngineReplayRunnerFactory):\n"
+        "    def capabilities(self):\n"
+        "        import os, signal\n"
+        "        from pathlib import Path\n"
+        "        with Path(__file__).with_name('capabilities.log').open('a') as log:\n"
+        "            log.write('called\\n')\n"
+        "        os.kill(os.getpid(), signal.SIGTERM)\n"
+        "\nclass Broken(EngineReplayRunnerFactory):\n"
+        "    def capabilities(self):\n"
+        "        from pathlib import Path\n"
+        "        with Path(__file__).with_name('capabilities.log').open('a') as log:\n"
+        "            log.write('called\\n')\n"
+        "        raise RuntimeError('broken plugin')\n"
     )
     metadata = tmp_path / "warmup_stacks-1.0.dist-info"
     metadata.mkdir()
@@ -709,23 +764,32 @@ def run_installed_stack(tmp_path, command, stack, policy):
         "silent = warmup_stacks:Silent\n"
         "resource_refusal = warmup_stacks:ResourceRefusal\n"
         "constructor_resource_refusal = warmup_stacks:ConstructorResourceRefusal\n"
+        "interrupted = warmup_stacks:Interrupted\n"
+        "broken = warmup_stacks:Broken\n"
     )
     output = tmp_path / "output"
-    (output / "recommendations").mkdir(parents=True)
-    original = {
-        "prediction.json": "old result",
-        "recommendation.json": "old result",
-        "recommendations/0001.yaml": "old config",
-        "resource-runtime.json": "old diagnostics",
-        "execution-events.jsonl": "old events\n",
-    }
+    output.mkdir()
+    if overwrite:
+        (output / "recommendations").mkdir()
+    original = (
+        {
+            "prediction.json": "old result",
+            "recommendation.json": "old result",
+            "recommendations/0001.yaml": "old config",
+            "resource-runtime.json": "old diagnostics",
+            "execution-events.jsonl": "old events\n",
+        }
+        if overwrite
+        else {}
+    )
     for name, contents in original.items():
         (output / name).write_text(contents)
     config = warmup_cli_config(tmp_path, command, policy)
     path = os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH"))))
     result = subprocess.run(
         [sys.executable, "-m", "aisim", command, "--config", str(config), "--stack", stack]
-        + ["--output-dir", str(output), "--overwrite", "--format", "json"],
+        + ["--output-dir", str(output), "--format", "json"]
+        + (["--overwrite"] if overwrite else []),
         env={**os.environ, "PYTHONPATH": path},
         capture_output=True,
         text=True,
@@ -742,6 +806,39 @@ def test_overwrite_keeps_outputs_when_the_installed_stack_lacks_the_policy(tmp_p
     assert result.returncode == 2, result.stderr
     assert f"before selecting {policy}" in result.stderr
     assert outputs == original
+
+
+@pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_cli_without_overwrite_refuses_an_unsupported_policy_with_exit_2(tmp_path, command, policy):
+    result, _, outputs = run_installed_stack(tmp_path, command, "silent", policy, overwrite=False)
+    assert result.returncode == 2, result.stderr
+    assert f"before selecting {policy}" in result.stderr
+    assert "prediction.json" not in outputs
+    assert "recommendation.json" not in outputs
+    assert json.loads(outputs["resource-runtime.json"])["exit_code"] == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX child signal return codes")
+@pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_keeps_outputs_when_installed_support_probe_receives_sigterm(tmp_path, command, policy):
+    result, original, outputs = run_installed_stack(tmp_path, command, "interrupted", policy)
+    assert result.returncode == 130, result.stderr
+    assert "warmup support check cancelled" in result.stderr
+    assert outputs == original
+    assert (tmp_path / "capabilities.log").read_text() == "called\n"
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_installed_plugin_failure_keeps_exit_1(tmp_path, command, overwrite):
+    result, _, outputs = run_installed_stack(tmp_path, command, "broken", "live_trajectory_v1", overwrite=overwrite)
+    assert result.returncode == 1, result.stderr
+    assert "broken plugin" in result.stderr
+    assert json.loads(outputs["resource-runtime.json"])["exit_code"] == 1
+    # A positive-exit probe failure still reaches the execution child for normal error reporting.
+    assert (tmp_path / "capabilities.log").read_text() == "called\n" * (2 if overwrite else 1)
 
 
 def test_overwrite_replaces_outputs_on_an_installed_stack_with_the_policy(tmp_path):
