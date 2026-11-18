@@ -426,5 +426,7 @@ shared:
     owners: [infra, maintainers]
   - glob: .github/workflows/codeowners.yml
     owners: [infra, maintainers]
+  - glob: .github/workflows/request-nvskills-ci.yml
+    owners: [infra, maintainers]
   - glob: CODEOWNERS
     owners: [infra, maintainers]
