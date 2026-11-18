@@ -596,46 +596,6 @@ pub(crate) fn generation_op_runtime(
     }
 }
 
-/// Telemetry carries decode request counts. A qualified Mamba op queries in
-/// flattened verification tokens (`requests * token_width`) and divides back.
-fn telemetry_decode_batch(op: &Op, requests: u32) -> u32 {
-    match op {
-        Op::Mamba2(m) if op.is_qualified_mamba() => requests.saturating_mul(m.token_width.max(1)),
-        _ => requests,
-    }
-}
-
-/// Decode-only telemetry walk: every generation op at the observed request
-/// count, with [`telemetry_decode_batch`] applied per op.
-pub(crate) fn run_telemetry_decode_ops<'a>(
-    ops: &'a [Op],
-    plan: Option<&OpListPlan>,
-    op_memo: Option<&OpMemo>,
-    db: &PerfDatabase,
-    requests: u32,
-    kv_per_request: u32,
-    mut on_op: impl FnMut(usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>),
-) -> Result<f64, AicError> {
-    let mut memo = QueryMemo::new(plan, ops);
-    let mut total = 0.0;
-    for (index, op) in ops.iter().enumerate() {
-        let runtime = generation_op_runtime(
-            telemetry_decode_batch(op, requests),
-            1,
-            kv_per_request,
-            1.0,
-            0,
-            None,
-        );
-        let result = memo.query(index, || {
-            shared_query(op_memo, db, OpList::Generation, index, op, &runtime)
-        })?;
-        total += result.latency_ms;
-        on_op(index, op, &runtime, result);
-    }
-    Ok(total)
-}
-
 /// FPM-telemetry mix-step composition (the Dynamo mocker contract). Consumed
 /// ONLY by `Engine::rank_latency_ms` (observed `ForwardPassMetrics`
 /// dispatch); the live SDK engine-step path (`Engine::mixed_step_latency`)
@@ -800,13 +760,12 @@ pub(crate) fn get_mix_step_ops<'a>(
             if !op.is_generation_attention() && !op.is_qualified_mamba() {
                 continue;
             }
-            let batch = telemetry_decode_batch(op, decode_batch);
             let ctx = RuntimeContext {
-                batch_size: batch,
+                batch_size: decode_batch,
                 beam_width: 1,
                 s: kv_per_decode_req.max(1),
                 prefix: 0,
-                num_tokens: batch,
+                num_tokens: decode_batch,
                 seq_imbalance_correction_scale: 1.0,
                 gen_seq_imbalance_correction_scale: 1.0,
                 num_image_tokens: 0,

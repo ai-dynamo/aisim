@@ -38,7 +38,7 @@ use crate::session::{
     ContextOpFilter, OpListPlan, OpMemo, QueryMemo, context_op_runtime, generation_op_runtime,
     get_mix_step_ops, query_context_op, query_generation_op, run_context_ops,
     run_context_ops_planned, run_context_ops_with, run_generation_ops_step,
-    run_generation_ops_step_beamed_with, run_generation_ops_step_planned, run_telemetry_decode_ops,
+    run_generation_ops_step_beamed_with, run_generation_ops_step_planned,
 };
 use crate::{ForwardPassMetrics, ForwardPassWorkerType, validate_forward_pass_metrics};
 
@@ -1646,8 +1646,9 @@ impl Engine {
         if self.fpm_split().is_some() || self.has_dsv41_stages() || !self.mixed_ops_supported {
             return None;
         }
+        // A qualified Mamba op prices only its own phase, like attention.
         let context = self.context_ops.iter().map(|op| {
-            let pass = if op.is_context_attention() {
+            let pass = if op.is_context_attention() || op.is_qualified_mamba() {
                 MixedPass::ContextAttention
             } else {
                 MixedPass::SharedNonAttention
@@ -1657,7 +1658,7 @@ impl Engine {
         let decode = self
             .generation_ops
             .iter()
-            .filter(|op| op.is_generation_attention())
+            .filter(|op| op.is_generation_attention() || op.is_qualified_mamba())
             .map(|op| (op, MixedPass::DecodeAttention));
         let mut passes = HashMap::new();
         for (op, pass) in context.chain(decode) {
@@ -4213,17 +4214,21 @@ impl Engine {
         if has_decode {
             let n_decode = sched.num_decode_requests.max(1);
             let kv_per_req = sched.sum_decode_kv_tokens / n_decode;
+            let runtime = generation_op_runtime(n_decode, 1, kv_per_req, 1.0, 0, None);
             operations.begin(Some(self.generation_plan.slot_names()));
-            total += run_telemetry_decode_ops(
+            total += run_generation_ops_step_planned(
                 &self.generation_ops,
                 Some(&self.generation_plan),
                 Some(op_memo),
                 &self.db,
                 n_decode,
+                1,
                 kv_per_req,
-                |index, op, runtime, result| {
+                1.0,
+                false,
+                |index, op, result| {
                     let slot = Some(self.generation_plan.name_slot(index));
-                    operations.add_lent("generation", slot, op, result, 1.0, || *runtime);
+                    operations.add_lent("generation", slot, op, result, 1.0, || runtime);
                 },
             )?;
         }
@@ -4579,6 +4584,17 @@ pub(crate) mod tests {
         })
     }
 
+    /// An engine whose only operations are a qualified context and
+    /// generation Mamba pair at MTP `nextn`.
+    pub(crate) fn qualified_mamba_engine(nextn: u32) -> Engine {
+        let spec = EngineSpec::new(
+            fixture_engine_config(Some(nextn)),
+            vec![qualified_mamba(true, 1)],
+            vec![qualified_mamba(false, nextn + 1)],
+        );
+        Engine::build(spec, build_engine(None).db).unwrap()
+    }
+
     #[test]
     fn qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes() {
         let mut engine = build_engine(Some(3));
@@ -4631,15 +4647,17 @@ pub(crate) mod tests {
                 .map(|row| row.1)
                 .sum();
             assert!((sum - mixed).abs() < 1e-12);
+            // Packed telemetry: two width-four decodes are 8 decode requests.
             assert!(
-                close(packed(new_tokens, requests, 2), bytes),
+                close(packed(new_tokens, requests, 8), bytes),
                 "telemetry chunk={ctx}"
             );
         }
-        // Telemetry carries request counts: two prefills of 17 tokens are two
-        // state pairs (9 + 8 tokens), never a third request from the average.
+        // Prefill telemetry carries request counts: two prefills of 17 tokens
+        // are two state pairs (9 + 8 tokens), never a third request from the
+        // average. One width-four decode packs as 4.
         assert!(close(
-            packed(17, 2, 1),
+            packed(17, 2, 4),
             17.0 * 18_560.0 + 2.0 * 2_097_152.0 + 5_317_120.0
         ));
         assert!(close(packed(16, 1, 0), 16.0 * 18_560.0 + 2_097_152.0));
@@ -4736,10 +4754,11 @@ pub(crate) mod tests {
             }
             let spec = EngineSpec::new(fixture_engine_config(nextn), vec![], vec![op]);
             let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+            // Operation-level telemetry packs decode as `requests * width`.
             let metrics = ForwardPassMetrics {
                 scheduled_requests: crate::ScheduledRequestMetrics {
-                    num_decode_requests: requests,
-                    sum_decode_kv_tokens: requests * 8,
+                    num_decode_requests: requests * width,
+                    sum_decode_kv_tokens: requests * width * 8,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4786,8 +4805,8 @@ pub(crate) mod tests {
                 scheduled_requests: crate::ScheduledRequestMetrics {
                     num_prefill_requests: 1,
                     sum_prefill_tokens: 16,
-                    num_decode_requests: 2,
-                    sum_decode_kv_tokens: 16,
+                    num_decode_requests: 2 * width,
+                    sum_decode_kv_tokens: 16 * width,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -5250,6 +5269,10 @@ pub(crate) mod tests {
         assert_eq!(passes, expected);
         // GLM-5.3 runs `attention_{layer}` in both attention passes, which
         // name folding merges; DSv4.1 stages compose their own mixed work.
+        // A qualified Mamba op prices only its own phase.
+        let mamba = qualified_mamba_engine(3).mix_step_passes().unwrap();
+        assert_eq!(mamba["context_ssm"], MixedPass::ContextAttention);
+        assert_eq!(mamba["generation_ssm"], MixedPass::DecodeAttention);
         assert!(glm_layer_engine().mix_step_passes().is_none());
         assert!(dsv41_probe_engine(false).mix_step_passes().is_none());
     }

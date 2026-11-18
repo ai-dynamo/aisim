@@ -74,6 +74,13 @@ both backends:
 | Mixed, 1x2048 + 8 decode | +0.25% to +0.27% | +0.68% to +0.75% |
 | Mixed, 2 requests of 1500 tokens + 8 decode | +0.24% to +0.36% | +0.62% to +0.71% |
 
+The MTP3 column is not valid for the current code. Commit `686275e7` multiplied
+the decode count by the verification width before the Mamba query. Packed
+telemetry already carries `requests * (nextn + 1)` decode requests, so that
+commit applied the width twice. The current code applies it once. The MTP0
+column has width one and does not change. The `run_agg`, per-phase and replay
+results above and below do not use packed telemetry.
+
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3: a 6000-token chunk with a
 3000-token prefix rises 1.21% (26.013 to 26.328 ms). The decode component rises
 from 0.20 to 0.35 ms because decode Mamba now runs at decode coordinates. Pure

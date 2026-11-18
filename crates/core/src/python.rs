@@ -10165,6 +10165,84 @@ mod tests {
     }
 
     #[test]
+    fn op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase() {
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        pyo3::prepare_freethreaded_python();
+        // MTP3: two requests verify four tokens each.
+        let native = Arc::new(crate::perfmodel::engine::runtime::tests::qualified_mamba_engine(3));
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::with_gil(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let decode = RankWork {
+            dp_rank: 0,
+            prefill: None,
+            decode: Some(crate::engine::DecodeWork {
+                batch_size: 2,
+                active_kv_tokens: 32,
+                mean_context_length: 16,
+                kv_bound_tokens: 1 << 20,
+                lengths: Vec::new(),
+                widths: Vec::new(),
+                verify_width: 4,
+            }),
+        };
+        let mixed = mixed_work(prefill_work(0, 1, 16, 0), decode.clone());
+        // Replay packs decode as 2 * 4 requests; the width applies once.
+        let static_decode = native.decode_step_latency(2, 16, 1, 1.0).unwrap();
+        let static_mixed = native
+            .mixed_step_latency(16, 2, 16, 1, 0, 1.0, 1.0)
+            .unwrap();
+        let find = |phase: &TimingPhaseEvidence, name: &str| {
+            phase
+                .operations
+                .iter()
+                .find(|operation| operation.name == name)
+                .map(|operation| operation.latency_ms)
+        };
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            timing.phase_memo.clear();
+            timing
+                .iteration
+                .as_ref()
+                .unwrap()
+                .memo
+                .as_ref()
+                .unwrap()
+                .clear();
+            let (pure, _) = priced_with_evidence(&timing, |timing| {
+                iteration_ms(timing, std::slice::from_ref(&decode))
+            });
+            assert!(close(pure, static_decode), "{pure} {static_decode}");
+            let (iteration, evidence) =
+                priced_with_evidence(&timing, |timing| iteration_ms(timing, &[mixed.clone()]));
+            assert!(close(iteration, static_mixed), "{iteration} {static_mixed}");
+            // Each qualified op prices only its phase, so it is wholly that
+            // phase's evidence.
+            assert_eq!(find(&evidence.prefill, "generation_ssm"), None);
+            assert_eq!(find(&evidence.decode, "context_ssm"), None);
+            assert!(close(
+                find(&evidence.decode, "generation_ssm").unwrap(),
+                static_decode
+            ));
+            assert!(close(
+                find(&evidence.prefill, "context_ssm").unwrap(),
+                static_mixed - static_decode
+            ));
+        }
+    }
+
+    #[test]
     fn tuned_op_level_decode_takes_its_correction_at_the_packed_coordinates() {
         pyo3::prepare_freethreaded_python();
         let Some(mut timing) = packaged_op_level_timing(
