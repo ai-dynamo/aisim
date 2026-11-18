@@ -156,7 +156,7 @@ def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 90)
     monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (1 * gib, 80 * gib))
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_allocated", lambda _device: 2 * gib)
-    # Below SM100 a 1 Gi-element weight needs at least 6 GiB.
+    # Below SM100 a 1 Gi-element weight needs at least 6.5 GiB.
     n, k = gib, 1
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(n, k, "cuda:0") is None  # 1 free + 6 reusable
