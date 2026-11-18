@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -196,16 +197,17 @@ def main() -> int:
         return 2
 
     try:
-        cfg = yaml.safe_load(a.config.read_text())
-        from aisim.config.cli import CoreRecommendationConfig  # validates the full schema
+        cfg = apply_sets(yaml.safe_load(a.config.read_text()), a.sets)
+        try:
+            from aisim.config.cli import CoreRecommendationConfig  # validates the full schema
 
-        CoreRecommendationConfig.from_yaml(a.config)
-    except ImportError:
-        pass
+        except ImportError:
+            pass
+        else:
+            CoreRecommendationConfig.model_validate(cfg)
     except Exception as exc:
         print(f"error: invalid recommendation config: {exc}", file=sys.stderr)
         return 2
-    cfg = apply_sets(cfg, a.sets)
     opt = cfg.get("optimization") or {}
     load = (cfg.get("traffic") or {}).get("load") or {}
     floor = (opt.get("constraints") or {}).get("min_goodput_rps")
@@ -219,9 +221,15 @@ def main() -> int:
     if problems:
         print("error: " + "; ".join(problems), file=sys.stderr)
         return 2
-    rate = float(load["requests_per_second"])
-    stop_requests = ((cfg.get("traffic") or {}).get("stop") or {}).get("requests")
-    window = (stop_requests / rate) if stop_requests else None
+    try:
+        rate = float(load["requests_per_second"])
+        if isinstance(load["requests_per_second"], bool) or not math.isfinite(rate) or rate <= 0:
+            raise ValueError("traffic.load.requests_per_second must be positive and finite")
+        stop_requests = ((cfg.get("traffic") or {}).get("stop") or {}).get("requests")
+        window = (stop_requests / rate) if stop_requests else None
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"error: invalid recommendation config: {exc}", file=sys.stderr)
+        return 2
 
     report = {
         "config": str(a.config),
@@ -247,11 +255,11 @@ def main() -> int:
     for backend in backends:
         state, msg = probe(cfg, a.hardware, backend, probe_dir, [], a.timeout)  # cfg already has --set applied
         report["probe"][backend] = {"state": state, "message": msg}
+        if state == "timeout":
+            report["stopped"] = "timeout during the coverage probe"
+            print(json.dumps(report, indent=2))
+            return 3
     states = [v["state"] for v in report["probe"].values()]
-    if "timeout" in states:
-        report["stopped"] = "timeout during the coverage probe"
-        print(json.dumps(report, indent=2))
-        return 3
     if "resource_error" in states:
         report["stopped"] = "local resource limit during the coverage probe"
         print(json.dumps(report, indent=2))

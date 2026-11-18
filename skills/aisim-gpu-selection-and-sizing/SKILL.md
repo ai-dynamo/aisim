@@ -207,11 +207,14 @@ performance data or templates for some operations.
 ```bash
 python3 "$SKILL_DIR/scripts/headroom_scan.py" \
   ./sizing-b200_sxm/<phase>-b<budget>/recommendations/0001.yaml \
-  --min-compliant-share 0.99 --min-goodput-share 0.95 \
+  --min-compliant-share 0.99 --min-goodput-share 0.90 \
   --steps 1.0,1.25,1.5,2.0 --workdir ./headroom-b200_sxm
 ```
 
-Use the `config_file` from the ladder's `answer`. For each tested load, the
+Use the `config_file` from the ladder's `answer`. Set `--min-goodput-share`
+to the agreed `min_goodput_rps` divided by the planned request rate: the
+template uses 18 / 20 = 0.90. This keeps the agreed floor at 1.0x and scales
+it with the offered rate at higher multiples. For each tested load, the
 scan reports `pass`, `fail` or `unknown`:
 
 - the SLA is checked with AISim's own aggregate check (all configured
@@ -224,8 +227,23 @@ scan reports `pass`, `fail` or `unknown`:
 It exits 3 if any load could not be evaluated.
 
 - If the 1.0x row fails, the configuration does not meet the user's
-  compliance rule at the planned load. Rerun the ladder with
-  `--budgets` starting just above its GPU count, and report that.
+  compliance rule at the planned load. To retry above its GPU count, set
+  `optimization.constraints.min_candidate_gpus` to that count + 1, start
+  `--budgets` at that minimum, and use `--no-refine` so refinement cannot
+  revisit smaller budgets. For a rejected two-GPU answer:
+
+  ```bash
+  python3 "$SKILL_DIR/scripts/size_ladder.py" sizing.yaml \
+    --hardware b200_sxm --out-root ./sizing-b200_sxm-retry \
+    --budgets 3,4,8,16 --no-refine \
+    --set optimization.constraints.min_candidate_gpus=3
+  ```
+
+  `--budgets` alone sets upper bounds and can select the rejected answer
+  again. Check that the new `answer.used_gpus` is above the rejected count
+  before running its headroom scan. If it is not, stop and report that the
+  retry made no progress. Only report a qualifying replacement after its
+  1.0x row passes the same compliance and throughput rules.
 - Report `highest_tested_passing_multiplier` as "qualifies at the tested
   loads up to N x the planned rate". It says nothing about loads between
   or beyond the tested points.
