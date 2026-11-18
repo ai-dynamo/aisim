@@ -560,10 +560,11 @@ impl MixStepPlan {
             })
         };
         let mut context_slot = vec![0; context.len()];
-        // Pass 1 skips context attention, which pass 2 runs alone.
+        // Pass 1 skips context attention, which pass 2 runs alone; a qualified
+        // Mamba scan stays in pass 1 whatever its name.
         for attention in [false, true] {
             for (index, op) in context.iter().enumerate() {
-                if op.is_context_attention() == attention {
+                if crate::perfmodel::session::in_packed_attention_pass(op) == attention {
                     context_slot[index] = slot_of(op);
                 }
             }
@@ -2309,6 +2310,9 @@ impl Engine {
     ///   speculative-round FPM one measured round per request. There,
     ///   `total_past_kv_tokens` excludes each request's current token,
     ///   matching the collector's `total_kv_read_tokens` axis.
+    /// - A schema-v1 legacy profile takes a homogeneous batch of requests. Its
+    ///   `total_past_kv_tokens` excludes each request's current token and must
+    ///   divide by `batch_size`: two requests at sequence length 5 are `(2, 8)`.
     ///
     /// [`Self::decode_step_latency`] always takes logical requests.
     pub fn predict_decode_latency_total(
@@ -4825,6 +4829,46 @@ pub(crate) mod tests {
                 .mixed_step_latency(4096, 2, 4096, 4097, 4097, 1.0, 1.0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn packed_mixed_step_prices_a_scan_named_context_attention_once() {
+        // A qualified scan named like context attention runs only in its own
+        // first-pass branch: the same value and diagnostics as any other name.
+        let engine = |scan_name: &str| {
+            let Op::Mamba2(mut scan) = qualified_mamba(true, 1) else {
+                unreachable!()
+            };
+            scan.name = scan_name.into();
+            let norm = Op::Elementwise(ElementwiseOp::new("norm", 2.0));
+            let spec = EngineSpec::new(
+                fixture_engine_config(None),
+                vec![norm, Op::Mamba2(scan)],
+                vec![qualified_mamba(false, 1)],
+            );
+            Engine::build(spec, build_engine(None).db).unwrap()
+        };
+        let mixed = [ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 1,
+                sum_prefill_tokens: 16,
+                num_decode_requests: 2,
+                sum_decode_kv_tokens: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let (named, plain) = (engine("context_attention"), engine("context_ssm"));
+        let latency = plain.forward_pass_time_ms(&mixed).unwrap();
+        assert_eq!(named.forward_pass_time_ms(&mixed).unwrap(), latency);
+        let rows = |engine: &Engine| {
+            assert_rank_operations_sum(engine, &mixed)[0]
+                .operations
+                .iter()
+                .map(|op| op.latency_ms)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&named), rows(&plain));
     }
 
     #[test]

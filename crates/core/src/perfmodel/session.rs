@@ -370,6 +370,13 @@ pub(crate) fn run_context_ops_planned<'a>(
     Ok(total)
 }
 
+/// Whether a context op runs in the packed step's context-attention pass.
+/// A qualified Mamba scan has its own branch in the first pass, whatever its
+/// name, so the walk and its slot plan must not also count it here.
+pub(crate) fn in_packed_attention_pass(op: &Op) -> bool {
+    op.is_context_attention() && !op.is_qualified_mamba()
+}
+
 /// The prefix a context op sees in a packed walk: a qualified Mamba scan must
 /// not read cold-state rows when any prefill token is cached, even when the
 /// integer mean `prefix` rounds to zero. Other ops keep `prefix`.
@@ -755,7 +762,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     let scale_factor = ((isl_eff_pass2 + ctx_tokens - 1) / ctx_tokens.max(1)).max(1) as f64;
     let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
-        if !op.is_context_attention() {
+        if !in_packed_attention_pass(op) {
             continue;
         }
         let ctx = RuntimeContext {
