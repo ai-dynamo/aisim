@@ -36,7 +36,9 @@ _FORBIDDEN_MAGIC: dict[str, bytes] = {
     "gzip archive": b"\x1f\x8b",
     "Windows executable": b"MZ",
 }
-_FORBIDDEN_SUFFIXES = frozenset({".pkl", ".pickle", ".pt", ".pth", ".bin", ".so", ".py", ".sh", ".exe", ".zip", ".gz"})
+_FORBIDDEN_SUFFIXES = frozenset({".pkl", ".pickle", ".pt", ".pth", ".bin", ".so", ".py", ".sh", ".exe", ".zip"})
+# Never loadable code or archives; ``.gz`` is data and is allowed only when a policy lists it
+# (the mirror policy does, for declared provenance artifacts).
 _RESERVED_NAMES = frozenset({".gitattributes", ".gitignore", ".gitmodules"})
 
 

@@ -3,6 +3,8 @@
 
 """Pure candidate-hygiene rules, tested with in-memory fixtures."""
 
+import dataclasses
+
 import pytest
 
 from aisim_core.data.hygiene import (
@@ -55,6 +57,15 @@ def test_listing_accepts_valid():
 )
 def test_listing_rejects(file, code):
     assert code in codes(check_listing(POLICY, [file]))
+
+
+def test_gz_suffix_follows_the_policy_allow_list():
+    gz = CandidateFile("data/trace.jsonl.gz", 1)
+    assert "suffix" in codes(check_listing(POLICY, [gz]))  # default candidates stay parquet and json
+    allowed = dataclasses.replace(POLICY, allowed_suffixes=POLICY.allowed_suffixes | {".gz"})
+    assert check_listing(allowed, [gz]) == []
+    pkl = dataclasses.replace(POLICY, allowed_suffixes=POLICY.allowed_suffixes | {".pkl"})
+    assert "suffix" in codes(check_listing(pkl, [CandidateFile("data/x.pkl", 1)]))  # code stays forbidden
 
 
 def test_listing_limits_and_duplicates():
