@@ -1,0 +1,127 @@
+{
+  "artifacts": [
+    {
+      "artifact_id": "requests",
+      "bytes": 6141,
+      "format": "parquet",
+      "path": "data/host-cost/vllm/0.31.0/h200_sxm/llama3/requests.parquet",
+      "role": "host-cost-requests",
+      "rows": 60,
+      "runtime_path": null,
+      "schema": "aisim-host-cost/v1",
+      "sha256": "ae44bad0e197f6c7b57544f52ce7526e69d434cf75941ba4050891a8edd4af18"
+    }
+  ],
+  "category": "host-cost",
+  "configuration_id": "cfg-7925de5e8c7a5387ea7b68df14328c602a00deb2f24e1c8b429280086aa472f2",
+  "evidence_gaps": [],
+  "identity": {
+    "deployment": null,
+    "dp_attention": null,
+    "effective_settings": {
+      "block_size": 16,
+      "cpu_model": "Intel(R) Xeon(R) Platinum 8468",
+      "endpoint": "chat",
+      "hash_algorithm": "sha256_cbor",
+      "tokenizer_class": "CachedTokenizersBackend",
+      "tokenizer_is_fast": true,
+      "tokenizer_key": "llama3",
+      "tokenizer_workers": 1
+    },
+    "framework": "vllm",
+    "framework_version": "0.31.0",
+    "hardware": "h200_sxm",
+    "model": "/workspace/tokenization-cost/tokenizers/llama3",
+    "multinode": null,
+    "offload_mode": null,
+    "operation_family": null,
+    "parallelism": null,
+    "parallelism_complete": null,
+    "precision": null,
+    "unresolved_identity": null
+  },
+  "provenance": {
+    "host_cost": {
+      "environment": {
+        "block_size": 16,
+        "framework": "vllm",
+        "framework_version": "0.31.0",
+        "hash_algorithm": "sha256_cbor",
+        "load_seconds": 6.94734001159668,
+        "merged_runs": 2,
+        "model": "/workspace/tokenization-cost/tokenizers/llama3",
+        "repeats": 3,
+        "requests": 60,
+        "timing_seconds": 25.18178653717041,
+        "tokenizer_class": "CachedTokenizersBackend",
+        "tokenizer_is_fast": true,
+        "tokenizer_key": "llama3",
+        "tokenizer_loader": "vllm.tokenizers.get_tokenizer",
+        "tokenizer_workers": 1,
+        "tokens_max": 155348,
+        "tokens_min": 2583,
+        "transformers_version": "5.17.0",
+        "warmup": 3,
+        "workload_sha256": "9db98c82c876d66e80b2c10735626f51ed723a96d72620f1af56de7ee648e5d2"
+      },
+      "fit": {
+        "base_ms": -5.154703790780147,
+        "components": [
+          "template",
+          "encode",
+          "hash"
+        ],
+        "n": 60,
+        "n_dropped": 0,
+        "per_input_token_us": 1.7875299385763237,
+        "per_input_token_us_ci95": [
+          1.7298518145186517,
+          1.8439045681668809
+        ],
+        "r": 0.9958311425475457,
+        "residual_p50_pct": 2.2013503966712964,
+        "residual_p90_pct": 7.113156629921767,
+        "tokens_max": 155348,
+        "tokens_min": 2583
+      },
+      "gpu_time": {
+        "authority": "measured",
+        "failed": null,
+        "gpu_count": 1,
+        "gpu_seconds": 65.0,
+        "gpu_type": "H200",
+        "node_hours": null,
+        "phases": null,
+        "retried": null,
+        "schema": "aisim-gpu-time/v1",
+        "source": {
+          "attribution": "entry wall time inside the job allocation, one GPU held",
+          "job_ids": "55676,55677",
+          "source": "slurm"
+        },
+        "wall_seconds": 65.0
+      },
+      "host": {
+        "affinity_cpus": 16,
+        "cpu_model": "Intel(R) Xeon(R) Platinum 8468",
+        "cpu_sockets": "2",
+        "cpu_threads": 128,
+        "hostname": "neb-cdg-slurm-1-gpu-3",
+        "load_average_1m": [
+          5.513671875,
+          4.22119140625
+        ],
+        "python": "3.12.3",
+        "slurm_job_id": "55676",
+        "slurm_job_ids": [
+          "55676",
+          "55677"
+        ],
+        "tokenizers_parallelism": "false"
+      }
+    }
+  },
+  "purpose": "host-cost-profile",
+  "requested_settings": null,
+  "schema_version": "aisim-artifact-manifest/v1"
+}

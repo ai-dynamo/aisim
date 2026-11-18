@@ -1,0 +1,8 @@
+system=b300_sxm job=1363468 node=pool0-0365 start=1794990638
+CPU(s):                                  192
+Model name:                              Intel(R) Xeon(R) Platinum 8559C
+Thread(s) per core:                      2
+Socket(s):                               2
+f7e564e350b7932e23c2d15703e85c2160ae59673f844b115988693d01bb7aa9  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec/tokenization-cost/workload/agentx-l1-60.jsonl
+450c6d888a796ec60e4b0e81418c2500d53d78cfc8e2f407c3346c77dfc4148b  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec/images/trtllm-130rc29-e9dab9fc.sqsh
+end=1794990829

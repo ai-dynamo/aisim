@@ -1,0 +1,9 @@
+system=b200_sxm job=2744840 node=nsc-svg-slurm-1-gpu-120 start=1794991713
+CPU(s):                               192
+Model name:                           INTEL(R) XEON(R) PLATINUM 8568Y+
+Thread(s) per core:                   2
+Socket(s):                            2
+CPU(s) scaling MHz:                   99%
+f7e564e350b7932e23c2d15703e85c2160ae59673f844b115988693d01bb7aa9  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec/tokenization-cost/workload/agentx-l1-60.jsonl
+f5587d2c04d469c87d51f47dd84521ab0bd32f6a6acaa859b8f3ef8e99170fe6  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec/images/pr664-cost-vllm0310-amd64-a4a4c043.sqsh
+end=1794991940
