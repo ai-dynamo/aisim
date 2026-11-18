@@ -15,13 +15,13 @@ chat template, tokenization, and for vLLM prefix-cache block hashing), fitted as
 | Method | Median of 3 timed passes per request per run; 2 independent Slurm jobs per (system, framework), merged by per-request median (4 runs for three entries that failed the first gate) |
 | Gate | An entry needs r ≥ 0.98 and at most 5% of requests dropped as outliers; failures are recorded, not averaged in. Three B200 entries failed on two runs and passed after two more runs |
 
-Request paths are in [`request-path.md`](request-path.md); every fit is in [`fits.md`](fits.md); the data is staged in
-[`dataset/`](dataset/) in `aisim-host-cost/v1` layout (`data/host-cost/<framework>/<version>/<system>/<tokenizer>/`).
+Request paths are in [`request-path.md`](https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2); every fit is in [`fits.md`](https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2); the data is staged in
+[`dataset/`](https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/4) in `aisim-host-cost/v1` layout (`data/host-cost/<framework>/<version>/<system>/<tokenizer>/`).
 
 ## GPU hours
 
 Each job holds 1 GPU for its whole wall time, because the host CPU must be the serving node's. The measurement runs no
-GPU kernels. Full per-entry and per-job table: [`cost.md`](cost.md).
+GPU kernels. Full per-entry and per-job table: [`cost.md`](https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2).
 
 | Phase | Jobs | GPU-hours |
 |---|---|---|
@@ -83,3 +83,11 @@ The measured coefficient alone brings the point TTFT error under 10% on both lan
 `slurm/collect.sbatch` (one job per system), `collector.host_cpu.stage` (merge, gate, GPU time, ledger), see the
 [`aisim-tokenization-cost-collect`](../../../.agents/skills/aisim-tokenization-cost-collect/SKILL.md) skill. Per-job metadata
 (`job.txt`, `entries.txt`, `sacct.txt`) is in [`jobs/`](jobs/).
+
+## Where the evidence lives
+
+The raw evidence (request-path audit, per-entry fits, cost ledger, Slurm job records, tokenizer manifest, cluster facts) and the
+84 staged entries were moved out of this repository, parked in two Hugging Face pull requests until #932 lands:
+
+- Public rows: https://huggingface.co/datasets/ai-dynamo/aisim-data/discussions/4
+- Private mirror and evidence (`evidence/data/host-cost/<framework>/<version>/`): https://huggingface.co/datasets/ai-dynamo/aisim-data-internal/discussions/2
