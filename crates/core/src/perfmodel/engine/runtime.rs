@@ -1264,10 +1264,18 @@ impl Engine {
                         );
                     }
                     // Only generation lists carry a decode width.
-                    if qualified && (m.phase == "generation") != decode_width.is_some() {
+                    let expected = if decode_width.is_some() {
+                        "generation"
+                    } else {
+                        "context"
+                    };
+                    if qualified && m.phase != expected {
                         return invalid(
                             &m.name,
-                            format!("qualified {} op in the wrong phase list", m.phase),
+                            format!(
+                                "qualified op phase {:?} does not match its {expected} list",
+                                m.phase
+                            ),
                         );
                     }
                     if qualified && !top_level {
@@ -4731,17 +4739,29 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains(message), "{err}");
         }
-        // A qualified generation op is not a context op.
-        let ops = with("float16", 1);
-        for err in [
-            engine
-                .evaluate_ops_json(&ops, true, 2, 16, 0, 1.0, None)
-                .unwrap_err(),
-            engine
-                .evaluate_ops_sol_json(&ops, true, 2, 16, 0, 1.0, None)
-                .unwrap_err(),
-        ] {
-            assert!(err.to_string().contains("wrong phase list"), "{err}");
+        // Context queries take only an exact "context" phase.
+        for phase in ["generation", "prefill"] {
+            let ops = match qualified_mamba(false, 1) {
+                Op::Mamba2(mut m) => {
+                    m.phase = phase.into();
+                    serde_json::to_string(&vec![Op::Mamba2(m)]).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            for err in [
+                engine
+                    .evaluate_ops_json(&ops, true, 2, 16, 0, 1.0, None)
+                    .unwrap_err(),
+                engine
+                    .evaluate_ops_sol_json(&ops, true, 2, 16, 0, 1.0, None)
+                    .unwrap_err(),
+            ] {
+                let err = err.to_string();
+                assert!(
+                    err.contains("does not match its context list"),
+                    "{phase}: {err}"
+                );
+            }
         }
     }
 
@@ -4886,7 +4906,11 @@ pub(crate) mod tests {
             (None, with("float16", 0), "must be positive"),
             (None, with("unrecorded", 4), "unrecorded"),
             (None, nested, "nested"),
-            (None, qualified_mamba(true, 1), "wrong phase list"),
+            (
+                None,
+                qualified_mamba(true, 1),
+                "does not match its generation list",
+            ),
         ] {
             let err = build(nextn, op).unwrap_err().to_string();
             assert!(err.contains(message), "{err}");
@@ -4911,17 +4935,23 @@ pub(crate) mod tests {
         };
         phases("float16", "float16").unwrap();
         phases("unrecorded", "unrecorded").unwrap();
-        let err = Engine::build(
-            EngineSpec::new(
-                fixture_engine_config(None),
-                vec![qualified_mamba(false, 1)],
-                vec![],
-            ),
-            db.clone(),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("wrong phase list"), "{err}");
+        // A context list takes only an exact "context" phase.
+        for phase in ["generation", "prefill"] {
+            let mut op = qualified_mamba(true, 1);
+            if let Op::Mamba2(m) = &mut op {
+                m.phase = phase.into();
+            }
+            let err = Engine::build(
+                EngineSpec::new(fixture_engine_config(None), vec![op], vec![]),
+                db.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("does not match its context list"),
+                "{phase}: {err}"
+            );
+        }
         // A qualified pair beside DSv4.1 stages would take the staged mixed
         // step, which has no per-phase Mamba pricing.
         let stage = |is_context| {
