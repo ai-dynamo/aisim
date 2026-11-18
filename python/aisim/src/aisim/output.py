@@ -260,15 +260,20 @@ class OutputDirectoryOwnership:
     """Run-scoped ownership of output-directory locks.
 
     Locks taken by ``prepare_output_directory`` inside the scope are held until
-    it ends. Re-entry for the same directory within one scope reuses the lock;
-    another scope, in this process or another, is refused.
+    it ends. Re-entry for the same directory within one scope reuses the lock.
+    A scope opened inside another (a command that runs ``predict`` in-process
+    on a directory it prepared) also reuses the enclosing scope's locks, which
+    stay owned by the enclosing scope. Any unrelated scope, in this process or
+    another, is refused.
     """
 
     def __init__(self) -> None:
         self._held: dict[tuple[int, int], int] = {}
         self._token: contextvars.Token | None = None
+        self._parent: OutputDirectoryOwnership | None = None
 
     def __enter__(self) -> OutputDirectoryOwnership:
+        self._parent = _owner.get()
         self._token = _owner.set(self)
         return self
 
@@ -276,15 +281,19 @@ class OutputDirectoryOwnership:
         if self._token is not None:
             _owner.reset(self._token)
             self._token = None
+        self._parent = None
         self.release()
 
     def descriptor_for(self, root: str | Path) -> int | None:
         """The held lock descriptor for ``root``, for handing to a worker."""
 
         try:
-            return self._held.get(_identity(os.stat(root)))
+            descriptor = self._held.get(_identity(os.stat(root)))
         except OSError:
             return None
+        if descriptor is None and self._parent is not None:
+            return self._parent.descriptor_for(root)
+        return descriptor
 
     def _holds(self, root: Path) -> bool:
         return self.descriptor_for(root) is not None

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import select
@@ -149,10 +150,31 @@ def test_scope_holds_until_exit_and_is_reentrant(tmp_path) -> None:
 
 def test_another_scope_in_the_same_process_is_refused(tmp_path) -> None:
     root = tmp_path / "out"
-    with OutputDirectoryOwnership():
-        prepare_output_directory(root, overwrite=False)
+
+    def unrelated_run() -> None:
         with OutputDirectoryOwnership(), pytest.raises(ValueError, match=_LOCK_MESSAGE):
             prepare_output_directory(root, overwrite=False)
+
+    with OutputDirectoryOwnership():
+        prepare_output_directory(root, overwrite=False)
+        # A fresh context has no enclosing scope, like another run in this process.
+        contextvars.Context().run(unrelated_run)
+
+
+def test_nested_scope_reuses_the_enclosing_lock(tmp_path) -> None:
+    # `onboard validate-fpm` prepares validation/prediction, then runs predict
+    # in-process on it; the inner command must not refuse its own caller.
+    root = tmp_path / "out"
+    with OutputDirectoryOwnership() as outer:
+        prepare_output_directory(root, overwrite=False)
+        held = outer.descriptor_for(root)
+        with OutputDirectoryOwnership() as inner:
+            prepare_output_directory(root, overwrite=True)
+            assert inner.descriptor_for(root) == held
+        # The enclosing scope still owns the lock after the inner one ends.
+        assert outer.descriptor_for(root) == held
+        assert _blocked(root)
+    assert not _blocked(root)
 
 
 def test_refused_preparation_releases_its_lock(tmp_path) -> None:

@@ -82,7 +82,8 @@ def test_supervisor_passes_the_actual_command_name_to_its_worker(monkeypatch, tm
     class StopWorker(Exception):
         pass
 
-    def popen(command, *, env, start_new_session):
+    def popen(command, *, env, start_new_session, pass_fds=()):
+        del pass_fds
         seen.update(env)
         # Execute the actual parser in a child with the supervisor's environment
         # and the worker's argv[0], before substituting resource enforcement.
