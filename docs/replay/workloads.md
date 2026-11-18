@@ -632,9 +632,12 @@ complete, plus the recorded delay; its authored offset no longer holds it
 back. A follow-up turn therefore starts its recorded think time after its
 predecessor actually completes, and a subagent starts from its parent's actual
 completion. A turn that joins children waits for both their completion and its
-own recorded delay after its predecessor. Only play roots and, after a snapshot
-cut, requests whose previous or spawning turn lies before the cut keep their
-source-clock timers. Live joins and replay barriers still gate dispatch. With
+own recorded delay after its predecessor. Only play roots keep a source-clock
+timer. After a snapshot cut, rows carrying `recorded_start_ms` also keep a timer
+relative to the cut when their previous or spawning turn lies before it.
+Legacy Agentic Mooncake dependent rows without this field gain no such timer:
+they can dispatch at the cut once dependency delays have elapsed. Live joins
+and replay barriers still gate dispatch. With
 `traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer rule
 also applies without a continuous profile.
 

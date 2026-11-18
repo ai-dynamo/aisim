@@ -61,9 +61,12 @@ plus the recorded delay, never at its authored source offset, so a server that
 answers faster than the recorded API shortens the play. A turn that joins
 children waits for them and for its own recorded delay after its predecessor.
 The first request of a detected chain, which the trace anchors only with a
-replay barrier, starts when that barrier clears. Only play roots and, after a
-snapshot cut, requests whose previous or spawning turn lies before the cut
-keep a source-clock timer. Live joins and replay barriers still gate dispatch.
+replay barrier, starts when that barrier clears. Only play roots keep a
+source-clock timer. After a snapshot cut, rows carrying `recorded_start_ms`
+also keep a timer relative to the cut when their previous or spawning turn
+lies before it. Legacy Agentic Mooncake dependent rows without this field
+gain no such timer: they can dispatch at the cut once dependency delays have
+elapsed. Live joins and replay barriers still gate dispatch.
 With `traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer
 rule also applies to finite replay without a profile; other AgentX requests
 follow dependency events. With `client: recorded`, finite replay still waits
