@@ -183,6 +183,30 @@ compares replay's pure-decode and mixed iterations with the static decode
 cost. The MTP0 column has width one and does not change. The `run_agg`, per-phase and replay
 results above and below do not use packed telemetry.
 
+Packed telemetry at the current code, TensorRT-LLM, MTP3, `HYBRID` mode. This
+compares `35944ae4` (before: the width applied twice) with `c3ed1513` (after).
+Both commits sit on main `bf1b539f`. Each ran
+`python telem.py OUT.json` from its own `python/aisim` build. The script is
+[`telem.py`](mamba-mixed-step-accounting/telem.py), and it qualifies every
+Mamba2 op with a `bfloat16` state and `token_width` 4. Its inputs use the packed
+decode convention: 8 requests at width 4 give `num_decode_requests: 32` and
+`sum_decode_kv_tokens: 32800` (1025 tokens each). The mixed case adds
+`num_prefill_requests: 1` and `sum_prefill_tokens: 2048`.
+
+| Case | Before ms | After ms | Change |
+| --- | --- | --- | --- |
+| Pure decode, 8 requests | 9.459918 | 9.033769 | -0.426149 (-4.50%) |
+| Mixed, 1x2048 + 8 requests | 21.171992 | 20.745843 | -0.426149 (-2.01%) |
+
+Only the generation Mamba rows change, both with source `sol`.
+`generation_mamba_conv1d` falls from 0.029815 to 0.007454 ms, and
+`generation_mamba_ssm` falls from 0.538383 to 0.134596 ms. Each is exactly
+four times smaller. Their sum is the 0.426149 ms total change. Every other row,
+context Mamba included, is identical. The raw outputs are
+[`35944ae4.json`](mamba-mixed-step-accounting/35944ae4.json) and
+[`c3ed1513.json`](mamba-mixed-step-accounting/c3ed1513.json). These are
+simulated latencies. Host runtime was not measured.
+
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
 `gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
 (26.013 to 26.328 ms) from Baseline to Candidate. The decode component rises
