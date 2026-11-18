@@ -79,6 +79,11 @@ depend on the state dtype, so this rule does not apply to convolution,
 under either its logical or its physical TensorRT-LLM label. No collected
 data qualifies Mamba2 timing under MTP.
 
+The lookup key holds the batch size and the new-token count only. It omits
+the cached prefix. A prefill scan with a cached prefix can therefore read a
+row collected from a cold state. That result is labeled `silicon`, and it
+omits the recurrent-state traffic that the SOL estimate counts.
+
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different
 quantization recipe. Its routed experts are NVFP4. Its Gated DeltaNet (GDN)

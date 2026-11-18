@@ -17,6 +17,11 @@ class MixedStepInput:
     ``num_decode_requests`` is the number of logical decode sequences. It is
     deliberately distinct from the target-model query-token count, which is
     derived from the model's speculative draft depth.
+
+    ``context_tokens`` is the packed prompt budget in full prompt tokens:
+    ``context_tokens // isl`` complete requests of ``isl`` tokens, prefix
+    included, plus one partial request. It is not the count of newly
+    scheduled tokens after prefix-cache hits.
     """
 
     context_tokens: int

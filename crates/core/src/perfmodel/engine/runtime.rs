@@ -1161,6 +1161,25 @@ impl Engine {
                 "operation name {name} belongs to two mixed-step passes beside qualified Mamba ops"
             )));
         }
+        // Per-op rows fold by name and only attention is amortized over
+        // chunks, so a qualified Mamba name may repeat only on qualified Mamba.
+        if let Some(op) = spec
+            .context_ops
+            .iter()
+            .chain(&spec.generation_ops)
+            .filter(|op| op.is_qualified_mamba())
+            .find(|m| {
+                spec.context_ops
+                    .iter()
+                    .chain(&spec.generation_ops)
+                    .any(|o| !o.is_qualified_mamba() && o.name() == m.name())
+            })
+        {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "qualified Mamba op {} shares its name with another operation",
+                op.name()
+            )));
+        }
         super::readiness::validate_glm53_kv(
             &db,
             spec.context_ops.iter().chain(&spec.generation_ops),
@@ -2264,6 +2283,9 @@ impl Engine {
 
     /// Predict one decode step from exact FPM iteration totals.
     ///
+    /// `batch_size` is `ForwardPassMetrics::num_decode_requests`: under
+    /// speculative decoding it counts verified rows, `requests * (nextn + 1)`.
+    /// [`Self::decode_step_latency`] takes logical requests instead.
     /// `total_past_kv_tokens` excludes the one current token processed by each
     /// decode request, matching the collector's `total_kv_read_tokens` axis.
     pub fn predict_decode_latency_total(
@@ -4719,6 +4741,12 @@ pub(crate) mod tests {
             engine.decode_step_latency(2, 16, 1, 1.0).unwrap(),
             decode_bytes
         ));
+        // Exact totals take packed rows: two width-four requests are 8 rows.
+        assert!(close(
+            engine.predict_decode_latency_total(8, 128).unwrap(),
+            decode_bytes
+        ));
+        assert!(engine.predict_decode_latency_total(2, 32).is_err());
         // A draft-named Mamba op is priced once.
         if let Op::Mamba2(op) = &mut engine.context_ops[0] {
             op.name = "draft_context_ssm".into();
@@ -5015,6 +5043,24 @@ pub(crate) mod tests {
             let err = build(context, generation).unwrap_err().to_string();
             assert!(err.contains("belongs to two mixed-step passes"), "{err}");
         }
+        // Same pass, different chunk amortization: folding by name would
+        // leave the attention row unamortized in per-op pricing.
+        let mut mamba_as_attention = qualified_mamba(true, 1);
+        mamba_as_attention.set_name("context_attention".into());
+        let context_attention = context_ops()
+            .into_iter()
+            .find(|op| op.is_context_attention())
+            .unwrap();
+        let err = build(
+            vec![mamba_as_attention, context_attention],
+            vec![qualified_mamba(false, 1)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("shares its name with another operation"),
+            "{err}"
+        );
         // Repeated names within one pass stay valid.
         build(
             vec![named(true), named(true)],
