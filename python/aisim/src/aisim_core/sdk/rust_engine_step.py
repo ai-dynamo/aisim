@@ -1810,17 +1810,21 @@ def engine_identity(model: Any, database: Any) -> str:
 
 
 def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
-    """Recorded Mamba2 qualification fields, which the model config does not
-    carry: the same config can compile qualified or legacy Mamba2 ops."""
+    """Each Mamba2 op's constructor arguments, by op list and position.
+
+    The model config does not carry the qualification fields: one config can
+    compile qualified or legacy ops, or assign different state dtypes to each
+    op. A legacy op has empty keyword arguments, so it stays explicit.
+    """
     import aisim_core._native as native
 
-    seen = set()
-    for op in (*getattr(model, "context_ops", ()), *getattr(model, "generation_ops", ())):
-        if isinstance(op, native.Mamba2Kernel):
-            args, kwargs = op.__getnewargs_ex__()
-            if kwargs:
-                seen.add((args[3], kwargs["state_dtype"], int(kwargs["token_width"])))
-    return [list(entry) for entry in sorted(seen)]
+    return [
+        [ops_name, index, list(args), dict(kwargs)]
+        for ops_name in ("context_ops", "generation_ops")
+        for index, op in enumerate(getattr(model, ops_name, ()))
+        if isinstance(op, native.Mamba2Kernel)
+        for args, kwargs in (op.__getnewargs_ex__(),)
+    ]
 
 
 def _cached_engine_handle(model: Any, database: Any) -> Any:

@@ -269,3 +269,86 @@ def test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode():
         assert run(backend, legacy, shared) == cold(legacy, sol)
     finally:
         shared.set_default_database_mode(original)
+
+
+def _nano_with_state_dtypes(**dtypes):
+    """A Nano graph whose Mamba2 ops take the state dtype named by op suffix
+    (``conv1d`` or ``ssm``) in both phases; a missing suffix stays legacy."""
+    from aisim_core.sdk import config
+    from aisim_core.sdk.models import get_model, nemotron_h
+
+    real_ops = nemotron_h.ops
+
+    def kernel(name, *args, **kwargs):
+        dtype = dtypes.get(name.rsplit("_", 1)[1])
+        if dtype is None:
+            return real_ops.Mamba2Kernel(name, *args, **kwargs)
+        return real_ops.Mamba2Kernel(name, *args, state_dtype=dtype, token_width=1, **kwargs)
+
+    class Ops:
+        def __getattr__(self, name):
+            return kernel if name == "Mamba2Kernel" else getattr(real_ops, name)
+
+    nemotron_h.ops = Ops()
+    try:
+        model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+        return get_model("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", model_config, "trtllm")
+    finally:
+        nemotron_h.ops = real_ops
+
+
+def _hybrid_trtllm_database():
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="HYBRID", allow_unlisted_version=True)
+    if database is None:
+        pytest.skip("b200_sxm/trtllm/1.3.0rc20 data missing")
+    return database
+
+
+def _agg_ttft(backend, model, database):
+    from aisim.sdk.inference_session import InferenceSession
+    from aisim_core.sdk import config
+
+    runtime = config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=3000)
+    return _ttft(InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=2048))
+
+
+def test_run_agg_reuse_keeps_each_mamba_op_state_dtype():
+    # Swapping float16 and float32 between the convolution and the scan keeps
+    # the same set of (phase, dtype, width) fields, but the scan's state traffic
+    # differs, so neither the result nor the compiled handle may be shared.
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+
+    database = _hybrid_trtllm_database()
+    first = _nano_with_state_dtypes(conv1d="float16", ssm="float32")
+    second = _nano_with_state_dtypes(conv1d="float32", ssm="float16")
+    rust_engine_step._engine_handle_cache_clear()
+    expected = _agg_ttft(get_backend("trtllm", "b200_sxm"), second, database)
+    rust_engine_step._engine_handle_cache_clear()
+    assert _agg_ttft(get_backend("trtllm", "b200_sxm"), first, database) != expected
+    # The handle cache is warm with the first graph: a fresh backend, then the
+    # aggregate cache of a backend that already priced the first graph.
+    assert _agg_ttft(get_backend("trtllm", "b200_sxm"), second, database) == expected
+    rust_engine_step._engine_handle_cache_clear()
+    backend = get_backend("trtllm", "b200_sxm")
+    _agg_ttft(backend, first, database)
+    assert _agg_ttft(backend, second, database) == expected
+
+
+def test_run_agg_reuse_keeps_the_partial_qualification_rejection():
+    # A graph with one legacy convolution must still fail the compiled engine's
+    # all-or-none qualification check after a fully qualified graph warmed both caches.
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+
+    database = _hybrid_trtllm_database()
+    full = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    partial = _nano_with_state_dtypes(ssm="float16")
+    rust_engine_step._engine_handle_cache_clear()
+    backend = get_backend("trtllm", "b200_sxm")
+    _agg_ttft(backend, full, database)
+    for warm in (backend, get_backend("trtllm", "b200_sxm")):
+        with pytest.raises(Exception, match="must all record a state_dtype"):
+            _agg_ttft(warm, partial, database)

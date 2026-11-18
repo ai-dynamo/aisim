@@ -88,6 +88,7 @@ def model():
     model.model_path = "test-model"
     model.model_name = "test-model"
     model.forward_model = "op_level"
+    model.architecture = "test-arch"  # run_agg keys its result cache by the engine identity
     model._nextn = 0
     model.get_resident_weights_bytes.return_value = 0.0
     model.get_additional_activation_bytes.return_value = 0.0
