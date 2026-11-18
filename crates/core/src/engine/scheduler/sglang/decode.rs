@@ -7,6 +7,7 @@
 // See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
+// SWA prefix reuse adapts v0.5.21 (e00930c5489053f26d86b179cee0d087f846acbb); see THIRD_PARTY_NOTICES.md.
 
 use std::cmp::Reverse;
 use std::time::Duration;
@@ -252,8 +253,9 @@ fn cache_prefix_through_ready(
         );
     }
 
-    let sequence = &req.sequence_tokens[..aligned_tokens];
-    kv_manager.extend_cached_prefix(sequence, &mut req.kv_lease);
+    // The unaligned forward end tells the backend which SWA pages the insert leaves cached.
+    let forward_end = tokens.min(req.materialized_tokens);
+    kv_manager.extend_cached_prefix(&req.sequence_tokens[..forward_end], &mut req.kv_lease);
     if backup_ready {
         kv_manager.backup_cached_prefix(&mut req.kv_lease, aligned_tokens);
     }
@@ -501,7 +503,12 @@ pub(super) fn cleanup_completed_request(
     if !request.kv_lease.is_active() {
         return;
     }
-    let lease = std::mem::take(&mut request.kv_lease);
+    let mut lease = std::mem::take(&mut request.kv_lease);
+    // A synthetic output never matches the next prompt, so the finished sequence keeps its
+    // SWA page at the prompt end. An exact output plan is what the next turn carries.
+    if request.planned_output_ids.is_none() {
+        lease.set_prompt_tokens(request.prompt_len());
+    }
     kv_manager.finish(request.sequence_prefix(tokens_to_cache), lease);
 }
 

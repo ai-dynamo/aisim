@@ -183,6 +183,7 @@ pub(crate) struct SglangArgs {
     pub disaggregation_decode_enable_radix_cache: bool,
     pub num_reserved_decode_tokens: Option<usize>,
     pub disaggregation_decode_extra_slots: Option<usize>,
+    pub swa_prefix_tails: Option<usize>,
     pub frontend: Option<FrontendConfig>,
 }
 
@@ -214,6 +215,9 @@ pub(crate) struct MockEngineArgs {
     /// `EngineConfig::max_concurrent_batches`.
     #[builder(default = "1")]
     pub max_concurrent_batches: usize,
+    /// `EngineConfig::launch`.
+    #[builder(default = "None")]
+    pub launch: Option<crate::engine::PassLaunchConfig>,
     #[builder(default = "true")]
     pub enable_prefix_caching: bool,
     #[builder(default = "true")]
@@ -222,6 +226,9 @@ pub(crate) struct MockEngineArgs {
     pub speedup_ratio: f64,
     #[builder(default = "1.0")]
     pub decode_speedup_ratio: f64,
+    /// Later pipeline stages a prefill forward still crosses after its pass retires (PP prefill).
+    #[builder(default = "0.0")]
+    pub pipeline_fill_passes: f64,
     #[builder(default = "WorkerType::Aggregated")]
     pub worker_type: WorkerType,
     #[builder(default = "Arc::new(PerfModel::Polynomial)")]
@@ -232,6 +239,9 @@ pub(crate) struct MockEngineArgs {
     pub aic_nextn_accept_rates: Option<String>,
     #[builder(default = "42")]
     pub aic_mtp_seed: u64,
+    /// MTP keeps vLLM's non-speculative prefix-cache rules.
+    #[builder(default = "false")]
+    pub disable_eagle_block_drop: bool,
     #[builder(default = "None")]
     pub kv_transfer_bytes_per_token: Option<usize>,
     #[builder(default = "None")]

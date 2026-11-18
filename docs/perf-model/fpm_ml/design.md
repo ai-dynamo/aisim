@@ -4,7 +4,7 @@ A gradient-boosted tree model that predicts the wall time of one engine forward 
 (one scheduler step of a prefill or decode worker) from the composition of the batch,
 trained on `ForwardPassMetrics` (FPM) recorded from real traffic. It is a third variant
 of `ForwardPassPerfModel` next to the native analytic model and the regression store,
-and is exposed today through the SDK (`aisimulate_core.sdk.fpm_learned` for training,
+and is exposed today through the SDK (`aisim_core.sdk.fpm_learned` for training,
 `RustForwardPassPerfModel.from_learned` for inference).
 
 Companion document in this directory: [`learned-forward-pass-model.md`](learned-forward-pass-model.md)
@@ -30,7 +30,7 @@ model turns that stream into a predictor with these goals:
    on 0 past.
 2. **No engine source changes.** Stock Dynamo FPM v1 carries aggregates only. The
    per-request lists are added at runtime by import hooks that live in this repo
-   (`aisimulate_core.fpm_hooks`), so any stock Dynamo image produces trainable data.
+   (`aisim_core.fpm_hooks`), so any stock Dynamo image produces trainable data.
 3. **Inference in Rust, microseconds per call.** The simulator calls the perf model
    once per simulated step; the model must be a pure function over a fixed feature
    vector, evaluated without Python.
@@ -54,8 +54,11 @@ One record = one FPM event from one engine worker:
 
 `wall_time` semantics differ by backend and matter for what is being learned:
 
-- **vLLM** (`InstrumentedScheduler`): host clock between two `schedule()` calls, i.e.
-  the engine step including scheduler overhead. Overlap is not an issue.
+- **vLLM** (`InstrumentedScheduler`): host clock between two model-output arrivals
+  (from `schedule()` after an idle step), i.e. the engine step including scheduler
+  overhead. With async scheduling on one GPU, a record also holds the part of the
+  next step's launch that its own step did not hide (see
+  [collecting the FPM stream](learned-forward-pass-model.md#1-collect-the-fpm-stream)).
 - **SGLang** (`SchedulerMetricsReporter` + `DeviceTimer`): CUDA events around the
   forward, accumulated and flushed when the batch result is processed. With the
   overlap scheduler on, the disaggregated prefill loop does KV hand-off work before
@@ -90,7 +93,7 @@ scheduled request, the pair
 
 Neither field exists in Dynamo main or SGLang main. Instead of patching either code
 base, the two lists are added at runtime inside the engine process by
-`aisimulate_core.fpm_hooks`; no engine source is changed.
+`aisim_core.fpm_hooks`; no engine source is changed.
 
 ### How the hooks work
 
@@ -102,13 +105,13 @@ base, the two lists are added at runtime inside the engine process by
    imported eagerly.
 2. **Extended `ScheduledRequestMetrics`.** FPM is a `msgspec` struct serialized to
    msgpack. The hook creates a frozen subclass of the producer's
-   `ScheduledRequestMetrics` with two extra `list[int]` fields (`_struct.extend_struct`),
+   `ScheduledRequestMetrics` with two extra `list[int]` fields (`_request_fields.extend_struct`),
    keeps the class name and module, and copies the original instance into it
-   (`_struct.with_pairs`). The msgpack payload keeps FPM `version` 1; aggregate-only
+   (`_request_fields.with_pairs`). The msgpack payload keeps FPM `version` 1; aggregate-only
    consumers ignore the two extra keys, the Dynamo runtime decodes the event
    unchanged and the Rust trace sink writes them out. If the producer's struct already
    has both fields (a patched image), the hook is a no-op.
-3. **SGLang** (`fpm_hooks/_sglang.py`; the leading underscore keeps the hook directory, which precedes site-packages on `PYTHONPATH`, from shadowing the real `sglang` package). The class that defines
+3. **SGLang** (`fpm_hooks/_sglang.py`; the leading underscore keeps the hook directory, which precedes the stdlib and site-packages on `PYTHONPATH`, from shadowing the real `sglang` package; no module there may share a stdlib name either, such as `_struct`). The class that defines
    `_build_scheduled_request_metrics` is found by method name (it is
    `SchedulerMetricsReporter` in the V4.1 runtime, a mixin in other versions). Its
    method is wrapped: the wrapper calls the original, then derives one `(extend, past)`
@@ -130,9 +133,9 @@ base, the two lists are added at runtime inside the engine process by
 5. **Reaching every process.** Engines fork scheduler subprocesses that do not run the
    parent's Python code. `fpm_hooks/sitecustomize.py` calls `install()` at interpreter
    start, so putting the package directory on `PYTHONPATH`
-   (`export PYTHONPATH=$(python -c 'import aisimulate_core.fpm_hooks as h; print(h.hook_path())'):$PYTHONPATH`)
+   (`export PYTHONPATH=$(python -c 'import aisim_core.fpm_hooks as h; print(h.hook_path())'):$PYTHONPATH`)
    installs the hooks in the launcher and in every spawned interpreter. Alternatively
-   `python -m aisimulate_core.fpm_hooks dynamo.sglang -- <args>` sets this up and
+   `python -m aisim_core.fpm_hooks dynamo.sglang -- <args>` sets this up and
    execs the module.
 6. **Consumers must not re-type the payload.** The relay sink writes the raw msgpack
    as JSON and keeps the two keys. Any consumer that decodes with the stock typed

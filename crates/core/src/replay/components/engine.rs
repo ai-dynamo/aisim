@@ -347,6 +347,16 @@ where
             .with_context(|| format!("offline replay selected unknown worker {worker_id}"))
     }
 
+    pub(crate) fn decode_load(&self, scheduler_id: usize) -> Result<(usize, usize)> {
+        let owner = self.scheduler_owner(scheduler_id)?;
+        self.required_worker(owner.worker_id)?
+            .engine
+            .ranks()
+            .nth(owner.dp_rank as usize)
+            .and_then(|rank| rank.decode_load())
+            .context("decode load snapshots require a live SGLang rank")
+    }
+
     fn scheduler_owner(&self, scheduler_id: usize) -> Result<SchedulerOwner> {
         self.scheduler_owners
             .get(scheduler_id)
@@ -1169,7 +1179,7 @@ where
                 completion.worker_id,
                 scheduler_id,
                 rank.dp_rank,
-                &pending,
+                pending.started_at_ms,
                 self.capture_artifact_kv_events,
                 rank.effects,
             ));
@@ -1180,6 +1190,79 @@ where
 
     pub(crate) fn in_flight(&self) -> usize {
         self.total_in_flight
+    }
+
+    /// Earliest instant at which a worker releases outputs it held past their
+    /// pass (vLLM `launch`). Not masked by a pass in flight.
+    pub(crate) fn next_emission_ms(&self) -> Option<f64> {
+        if !self.factory.can_hold_outputs() {
+            return None;
+        }
+        self.workers
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter_map(|worker| worker.engine.next_emission_ms())
+            .min_by(f64::total_cmp)
+    }
+
+    /// Release every worker's outputs due at `now_ms` as completion payloads
+    /// that carry only outputs. Request ownership ends when a completed
+    /// output is released, as at a pass completion.
+    pub(crate) fn take_due_emissions(
+        &mut self,
+        now_ms: f64,
+    ) -> Result<Vec<WorkerCompletionPayload<Observation::Batch>>> {
+        let mut payloads = Vec::new();
+        for worker_id in 0..self.workers.len() {
+            let due = self.workers[worker_id]
+                .as_ref()
+                .and_then(|worker| worker.engine.next_emission_ms())
+                .is_some_and(|at_ms| at_ms <= now_ms);
+            if !due {
+                continue;
+            }
+            let released = self
+                .required_worker_mut(worker_id)?
+                .engine
+                .take_due_emissions(now_ms)
+                .map_err(crate::replay::error::engine_boundary)?;
+            for rank in released.into_by_rank() {
+                let scheduler_id = self
+                    .required_worker(worker_id)?
+                    .scheduler_ids
+                    .get(rank.dp_rank as usize)
+                    .copied()
+                    .context("native emission returned an out-of-range DP rank")?;
+                let completed_request_ids = rank
+                    .effects
+                    .outputs
+                    .iter()
+                    .filter_map(|output| output.completed.then_some(output.request_id))
+                    .collect::<Vec<_>>();
+                self.apply_request_accounting(
+                    SchedulerOwner {
+                        worker_id,
+                        dp_rank: rank.dp_rank,
+                    },
+                    None,
+                    &completed_request_ids,
+                )?;
+                // Returned outputs belong to no pass: no forward-pass sample.
+                let mut payload = lower_completion::<Observation>(
+                    self.stage,
+                    worker_id,
+                    scheduler_id,
+                    rank.dp_rank,
+                    now_ms,
+                    self.capture_artifact_kv_events,
+                    rank.effects,
+                );
+                payload.fpm = None;
+                payloads.push(payload);
+            }
+            self.refresh_worker(worker_id);
+        }
+        Ok(payloads)
     }
 
     /// Earliest independently modeled deadline across every logical worker.
@@ -1328,7 +1411,7 @@ fn lower_completion<Observation: ReplayEngineObservation>(
     worker_id: usize,
     scheduler_id: usize,
     dp_rank: u32,
-    pass: &PendingPass,
+    pass_started_at_ms: f64,
     capture_artifact_kv_events: bool,
     effects: PassCompletionEffects,
 ) -> WorkerCompletionPayload<Observation::Batch> {
@@ -1371,7 +1454,7 @@ fn lower_completion<Observation: ReplayEngineObservation>(
             .collect(),
         lifecycle_events: effects.lifecycle_events,
         engine_events,
-        pass_started_at_ms: pass.started_at_ms,
+        pass_started_at_ms,
         artifact_pass_end_kv_events,
         progress: EngineProgress {
             made_progress,
@@ -1480,6 +1563,80 @@ mod tests {
             startup_time_ms,
         )
         .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case(Backend::Vllm)]
+    #[case(Backend::Sglang)]
+    #[case(Backend::Trtllm)]
+    fn passes_start_in_ascending_worker_then_rank_order(#[case] backend: Backend) {
+        const WORKERS: usize = 3;
+        const DP_SIZE: u32 = 2;
+        let config = ReplayEngineConfig {
+            dp_size: DP_SIZE,
+            rank: EngineConfig {
+                backend,
+                num_gpu_blocks: 32,
+                block_size: 4,
+                enable_prefix_caching: false,
+                timing_model: TimingModelConfig::Fixed {
+                    prefill_ms: 10.0,
+                    decode_ms: 1.0,
+                },
+                ..EngineConfig::for_backend(backend)
+            },
+            ..ReplayEngineConfig::default()
+        };
+        let factory = ReplayEngineFactory::new()
+            .role_factory(&config, WorkerStage::Aggregated, false)
+            .unwrap();
+        let mut component: EngineComponent = EngineComponent::new_with_factory(
+            SimulationWorkerStage::Aggregated,
+            EnginePassMode::Visible,
+            factory,
+            WORKERS,
+            None,
+        )
+        .unwrap();
+        // Reverse dispatch separates submission order from worker/rank start order.
+        let schedulers = WORKERS * DP_SIZE as usize;
+        for scheduler_id in (0..schedulers).rev() {
+            component
+                .dispatch(
+                    scheduler_id,
+                    DirectRequest {
+                        tokens: vec![scheduler_id as u32; 8],
+                        max_output_tokens: 2,
+                        uuid: Some(Uuid::from_u128(scheduler_id as u128 + 1)),
+                        ..Default::default()
+                    },
+                    None,
+                    0.0,
+                )
+                .unwrap();
+        }
+        let mut passes = Vec::new();
+        loop {
+            let effects = component.drive_ready(0.0, None).unwrap();
+            if effects.is_empty() {
+                break;
+            }
+            passes.push(
+                effects
+                    .admissions
+                    .iter()
+                    .map(|admission| admission.uuid.as_u128() as usize - 1)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let expected: Vec<Vec<usize>> = (0..WORKERS)
+            .map(|worker| {
+                (0..DP_SIZE as usize)
+                    .map(|rank| worker * DP_SIZE as usize + rank)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(passes, expected);
     }
 
     #[rstest::rstest]
