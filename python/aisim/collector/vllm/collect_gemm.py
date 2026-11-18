@@ -225,21 +225,19 @@ def _w4a16_nvfp4_does_not_fit(m, n, k, device):
 
     Lower bound on what is live at once, per weight element: the layer's packed FP4 weight and
     FP8 block scales (0.5 + 1/16 B), the BF16 weight (2 B), plus its full-size abs() temporary
-    for the global scale (2 B) or,
-    below SM100, the FP32 copy that ref_nvfp4_quant makes (4 B; nvfp4_emulation_utils.py
-    :640-654 @0.31.0). Memory the allocator reserved but does not use is reusable, so it counts
-    as available alongside driver-free memory. The BF16 activation (2 B per element) is
-    allocated before the weight, so it is counted too. The preparation tensors are freed after
-    loading, so the dry-run forward holds the layer's packed weight and scales and the BF16
-    output (m x n).
+    for the global scale (2 B) or, below SM100, the FP32 copy that ref_nvfp4_quant makes (4 B;
+    nvfp4_emulation_utils.py :640-654 @0.31.0). The preparation tensors are freed after loading,
+    so the dry-run forward holds the layer's packed weight and scales and the BF16 output
+    (m x n). The BF16 activation (2 B per element) is allocated first and counts in both phases.
+    Unused cached segments are released before reading driver-free memory, so split remainders
+    of used segments do not count as available.
     """
     layer = 0.5625 * n * k
     preparation = layer + n * k * (4 if get_sm_version() >= 100 else 6)
     forward = layer + 2 * m * n
     needed = int(max(preparation, forward)) + 2 * m * k
-    available = (
-        torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-    )
+    torch.cuda.empty_cache()
+    available = torch.cuda.mem_get_info(device)[0]
     if needed <= available:
         return None
     return (

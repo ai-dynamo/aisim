@@ -151,33 +151,40 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
     assert torch.equal(weight_scale.float(), scales)
 
 
-def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm, monkeypatch):
-    gib = 2**30
+def test_weight_preparation_fit_check_releases_cached_memory_first(torch, collect_gemm, monkeypatch):
+    gib, mib = 2**30, 2**20
+    cuda = collect_gemm.torch.cuda
+    state = {"free": 0, "cached": 0}
+
+    def device(free, cached=0):
+        state.update(free=free, cached=cached)
+
+    def empty_cache():
+        state["free"] += state.pop("cached", 0)
+
+    monkeypatch.setattr(cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(cuda, "mem_get_info", lambda _device: (state["free"], 80 * gib))
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 90)
-    monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (1 * gib, 80 * gib))
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_allocated", lambda _device: 2 * gib)
-    # Below SM100 a 1 Gi-element weight needs at least 6.5 GiB.
+    # Below SM100 a 1 Gi-element weight needs at least 6.5625 GiB: unused cached segments are
+    # released before the driver-free memory is read, so 1 free + 6 cached fits and 1 + 4 does not.
     n, k = gib, 1
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
-    assert collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0") is None  # 1 free + 6 reusable
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 6 * gib)
-    refusal = collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0")  # 1 free + 4 reusable
-    assert refusal.startswith("FIXME(kernel-limit): does not fit")
-    # The activation is budgeted too: preparation alone (3.25 MiB) fits in 4 MiB, but not with
+    device(1 * gib, cached=6 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0") is None
+    device(1 * gib, cached=4 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0").startswith("FIXME(kernel-limit): does not fit")
+    # The activation is budgeted too: preparation alone (3.28 MiB) fits in 4 MiB, but not with
     # the 2 MiB activation.
-    mib = 2**20
-    monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (4 * mib, 80 * gib))
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 2 * gib)
+    device(4 * mib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(1, 128, 4096, "cuda:0") is None
+    device(4 * mib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(256, 128, 4096, "cuda:0").startswith("FIXME(kernel-limit)")
     # The forward's BF16 output counts as well: a small weight with a 4 GiB output does not fit in 3 GiB.
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 4 * gib)
+    device(3 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 16, "cuda:0").startswith("FIXME(kernel-limit)")
     # The layer's FP8 block scales count too: activation, packed weight and output fit in 4192 MiB,
     # the 4 MiB of scales do not.
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 100)
-    monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (4192 * mib, 80 * gib))
-    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 2 * gib)
+    device(4192 * mib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 1024, "cuda:0").startswith("FIXME(kernel-limit)")
 
 
