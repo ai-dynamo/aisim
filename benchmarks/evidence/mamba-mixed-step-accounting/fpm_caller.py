@@ -17,11 +17,13 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(sys.argv[1], "python/aisim/tests/unit/sdk"))
 import test_fpm_forward as t
 
 from aisim.sdk.inference_session import InferenceSession
+from aisim_core import _native
 from aisim_core.sdk import models
 from aisim_core.sdk.backends.factory import get_backend
 from aisim_core.sdk.config import RuntimeConfig
@@ -54,6 +56,9 @@ try:
         "backend": t.BACKEND,
         "version": t.VERSION,
         "table_sha256": table_sha,
+        # The imported build: the helpers come from REPO_ROOT, the estimator from
+        # the active environment, so record which native extension priced the run.
+        "native_extension_sha256": hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
         "dispatch_ms": dispatch_ms,
         "cases": {},
     }

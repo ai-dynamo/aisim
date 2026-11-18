@@ -184,11 +184,12 @@ packed path are `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`
 which prices width-one packed mixed steps against exact bytes, and the
 hand-derived oracle sections below.
 
-The MTP3 column is historical and not valid for the current code. Commit
-`686275e7` multiplied the decode count by the verification width before the
-Mamba query. Packed telemetry already carries `requests * (nextn + 1)` decode
-requests, so that commit applied the width twice. The current code applies it
-once. The original qualified Baseline-to-Candidate comparison has no
+The MTP3 column is historical and not valid for the current code.
+`num_decode_requests` counts packed decode slots, not logical requests: 8
+logical requests at width 4 fill 32 slots. Commit `686275e7` multiplied that
+slot count by the width again before the Mamba query, so it priced 32
+logical requests and 128 tokens. The current code divides the 32 slots by
+the width once, which gives 8 requests and 32 tokens. The original qualified Baseline-to-Candidate comparison has no
 corrected MTP3 delta. Exact-value tests check the current path instead, and the
 width-only comparison below isolates the width correction. `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`
 prices packed mixed steps, for example `num_prefill_requests: 1`,
@@ -208,7 +209,10 @@ This compares `35944ae4` (before: the width applied twice) with `c3ed1513`
 not a rerun of the Baseline-to-Candidate comparison. It measures only the width
 correction.
 Both commits sit on main `bf1b539f`. Each ran
-`python telem.py OUT.json` from its own `python/aisim` build. The script is
+`python telem.py OUT.json` from its own `python/aisim` build, with the
+packaged performance data of that build. The `systems` data trees of the
+two commits are identical: `git diff 35944ae4 c3ed1513 --
+python/aisim/src/aisim_core/systems` is empty. The script is
 [`telem.py`](mamba-mixed-step-accounting/telem.py). It gives every Mamba2 op
 a `bfloat16` state. Generation ops get `token_width` 4, and context ops get
 `token_width` 1. Its inputs use the packed
@@ -442,6 +446,9 @@ The regressions ran against earlier builds:
 | `test_run_agg_ttft_counts_uncached_prefill_steps[3000-1-1.9]` | `1ea0211c` | TTFT 29.773 ms, expected 29.010 ms |
 | `test_run_agg_one_step_ttft_does_not_depend_on_the_budget` | `1ea0211c` | Prefix 3968: budget 128 TTFT 33.735 ms, budget 4096 18.579 ms |
 | `test_run_agg_reuse_keeps_a_wrapped_mamba_op_distinct` | `1ea0211c` | Wrapped graph did not raise |
+| `test_run_agg_reuse_keeps_a_nested_mamba_op_distinct` | `1db9b803` | Nested qualified scan did not raise after a warm cache |
+| `test_run_agg_b1_fully_cached_fpm_prompt_reaches_the_prefix_check` | `1db9b803` | `MixedStepInput` rejected a zero budget |
+| `test_compute_ttft_single_request_feeds_the_step_its_model_tokens[fpm-1096]` | `1db9b803` | XPU step got 4096 tokens, expected 1096 |
 
 The uncached case `[0-2]` and `test_run_agg_rejects_a_fully_cached_prompt`
 also passed on `9eaa66e8`. They pin behavior that did not change. At
@@ -456,7 +463,8 @@ Commits `79a9e652` and `1ea0211c` add four fixes:
   tokens. With one request, `run_agg` passed the prompt with its prefix, so
   isl 4096 and prefix 3000 priced `ceil(4096 / 1096) = 4` requests. The FPM
   now receives at most `isl - prefix` new tokens, one request. Op-level
-  pricing keeps the full prompt. No FPM latency comparison was run. The
+  pricing keeps the full prompt. No comparison used measured FPM data. The
+  synthetic-anchor comparison below runs the compiled estimator. The
   regression `test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens`
   checks the scheduled input.
 - **One-request activations.** The activation estimate now uses the new
@@ -469,6 +477,17 @@ Commits `79a9e652` and `1ea0211c` add four fixes:
 - **Exact-total prefill.** `predict_prefill_latency_total` passes whether
   any token is cached, as the packed metrics path does. Two 16-token
   prefills with one cached token now skip the cold scan row.
+
+Commit `108835ac` closes three gaps in the same paths. The XPU vLLM TTFT
+hook now feeds a whole-model FPM at most `isl - prefix` new tokens per
+request instead of the prompt with its prefix. Op-level pricing there is
+unchanged. A fully cached one-request FPM prompt again reaches the engine's
+prefix check instead of a zero step budget. The engine identity now reads
+the compiled spec of each op that holds a Mamba2 op, so a qualified scan
+nested in a composite fails cold and warm. At `108835ac`, the Python suites
+(744 tests), engine-step parity (305), the golden set (121), the public API
+(28) and the embedded Replay tests (9) passed. `agg_caller.py`, `telem.py`,
+`mem.py` and `fpm_caller.py` give the same values as before.
 
 Commit `59c4575a` adds two more checks. The compiled-engine identity
 records a Mamba2 op's draft query width, which compiles the op inside a
@@ -516,7 +535,11 @@ For one vLLM request, the queuing factor is 1 and the dispatch overhead is
 `28 layers * 0.8 = 22.4` ms, so TTFT is the step plus 22.4 ms. The script
 also prices both inputs directly in each build and gets the same anchors.
 The values are synthetic. They show that the estimator receives one request
-instead of two, not a latency on real hardware. The deprecated hybrid FPM
+instead of two, not a latency on real hardware. The script now also records
+the SHA-256 of the native extension that priced the run, because the
+estimator comes from the active environment, not from `REPO_ROOT`. At
+`108835ac` it reproduces the `1ea0211c` values,
+[`fpm-108835ac.json`](mamba-mixed-step-accounting/fpm-108835ac.json). The deprecated hybrid FPM
 path with draft ops takes the same input, and its draft ops use the same
 request count, but no fixture with draft-op data exercises it here.
 
@@ -554,6 +577,7 @@ python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
 | `1ea0211c` | `7cbe9c48`, `14ffdb4c` | 305 passed | 121 passed |
 | `59c4575a` | None | 305 passed | 121 passed |
 | `1db9b803` | None | 305 passed | 121 passed |
+| `108835ac` | None | 305 passed | 121 passed |
 
 Each result applies to the code revision in the first column. The later
 heads add only tests, documentation or evidence, but the parity suites were
@@ -680,6 +704,10 @@ gate on the published head remains the exact-head result.
 - Summing uniform-batch queries can overcount launch overhead for
   variable-length batches.
 - One model family, one modeled platform, synthetic shapes.
+- With one request whose uncached tokens exceed the budget, `run_agg`
+  counts one mix step in throughput and energy, as main does, although the
+  request takes several prefill chunks. This is part of the unresolved
+  multi-chunk TTFT limit above.
 - A pure-prefill packed step prices every operation at the integer mean of
   its new tokens per request, as main does. Two prefills of 8 and 9 new
   tokens price as two of 8. The mixed packed step keeps the remainder for

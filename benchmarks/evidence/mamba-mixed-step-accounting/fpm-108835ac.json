@@ -1,0 +1,59 @@
+{
+ "model": "Qwen/Qwen3-0.6B",
+ "forward_model": "fpm",
+ "interpolation": "sol (run_agg compiles every FpmForward op with it)",
+ "system": "h200_sxm",
+ "backend": "vllm",
+ "version": "test-fpm-version",
+ "table_sha256": "2071e17995569f17500acdec83fc28a0d92cd2a5a82ce2e6385f0f6fe3816849",
+ "native_extension_sha256": "66ebc2a4ae3baa47ca172492f6f41b656c9e2c430f3e08af12a9e082fa4ee473",
+ "dispatch_ms": 22.400000000000002,
+ "cases": {
+  "cached": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 512,
+    "osl": 2,
+    "prefix": 256,
+    "ctx_tokens": 512
+   },
+   "steps": {
+    "old_caller": {
+     "context_tokens": 512,
+     "expected_requests": 2,
+     "step_ms": 30.0
+    },
+    "corrected_caller": {
+     "context_tokens": 256,
+     "expected_requests": 1,
+     "step_ms": 12.0
+    }
+   },
+   "run_agg_mix_step_ms": 12.0,
+   "run_agg_ttft_ms": 34.4
+  },
+  "uncached": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 512,
+    "osl": 2,
+    "prefix": 0,
+    "ctx_tokens": 512
+   },
+   "steps": {
+    "old_caller": {
+     "context_tokens": 512,
+     "expected_requests": 1,
+     "step_ms": 22.0
+    },
+    "corrected_caller": {
+     "context_tokens": 512,
+     "expected_requests": 1,
+     "step_ms": 22.0
+    }
+   },
+   "run_agg_mix_step_ms": 22.0,
+   "run_agg_ttft_ms": 44.4
+  }
+ }
+}
