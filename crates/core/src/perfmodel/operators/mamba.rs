@@ -73,6 +73,14 @@ impl Mamba2Op {
                 self.token_width
             ));
         }
+        if self.state_dtype != "unrecorded"
+            && !matches!(self.phase.as_str(), "context" | "generation")
+        {
+            return Some(format!(
+                "a qualified op needs phase \"context\" or \"generation\", not {:?}",
+                self.phase
+            ));
+        }
         None
     }
 
@@ -703,6 +711,13 @@ mod tests {
         op.token_width = 1;
         op.state_dtype = "unrecorded".into();
         assert_eq!(op.sol_total_bytes(2.0, 16.0), 593_920.0);
+        // A qualified op needs an exact phase; a legacy op keeps its old checks.
+        op.phase = "generaton".into();
+        assert_eq!(op.field_error(), None);
+        op.state_dtype = "float16".into();
+        assert!(op.field_error().unwrap().contains("needs phase"));
+        op.phase = "generation".into();
+        assert_eq!(op.field_error(), None);
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane

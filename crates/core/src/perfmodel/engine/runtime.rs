@@ -4750,7 +4750,10 @@ pub(crate) mod tests {
             .to_string();
         assert!(err.contains("not a multiple of token_width 4"), "{err}");
         // Context queries take only an exact "context" phase.
-        for phase in ["generation", "prefill"] {
+        for (phase, message) in [
+            ("generation", "does not match its context list"),
+            ("prefill", "needs phase"),
+        ] {
             let ops = match qualified_mamba(false, 1) {
                 Op::Mamba2(mut m) => {
                     m.phase = phase.into();
@@ -4767,10 +4770,7 @@ pub(crate) mod tests {
                     .unwrap_err(),
             ] {
                 let err = err.to_string();
-                assert!(
-                    err.contains("does not match its context list"),
-                    "{phase}: {err}"
-                );
+                assert!(err.contains(message), "{phase}: {err}");
             }
         }
     }
@@ -4980,7 +4980,10 @@ pub(crate) mod tests {
             .to_string();
         assert!(err.contains("must be positive"), "{err}");
         // A context list takes only an exact "context" phase.
-        for phase in ["generation", "prefill"] {
+        for (phase, message) in [
+            ("generation", "does not match its context list"),
+            ("prefill", "needs phase"),
+        ] {
             let mut op = qualified_mamba(true, 1);
             if let Op::Mamba2(m) = &mut op {
                 m.phase = phase.into();
@@ -4991,10 +4994,7 @@ pub(crate) mod tests {
             )
             .unwrap_err()
             .to_string();
-            assert!(
-                err.contains("does not match its context list"),
-                "{phase}: {err}"
-            );
+            assert!(err.contains(message), "{phase}: {err}");
         }
         // A qualified pair beside DSv4.1 stages would take the staged mixed
         // step, which has no per-phase Mamba pricing.
