@@ -248,9 +248,11 @@ Specifically, overwrite may replace `prediction.json`, `report.html`, `recommend
 `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
 configuration loading, overrides, core-schema validation, unknown top-level sections, stacks or
-output adapters that are not installed, and agentic warmup policies that the stack does not
-advertise leave existing artifacts intact. Errors raised while importing an installed plugin or
-inside an adapter occur after the known outputs are removed.
+output adapters that are not installed, and, with `--overwrite`, agentic warmup policies that the
+stack does not advertise leave existing artifacts intact. So does a resource refusal, timeout or
+interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
+a run writes no resource reports. Errors raised while importing an installed plugin or inside an
+adapter occur after the known outputs are removed.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so
 existing artifacts stay. A key written twice inside `engine.ais_perf_model` in the configuration

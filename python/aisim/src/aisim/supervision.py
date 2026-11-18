@@ -357,6 +357,7 @@ def _save_report(output: str, filename: str, report: dict[str, Any], *, overwrit
 
 # Mirrors stack.py and output_adapter.py without importing runner or result modules here.
 _BUILTIN_STACKS = frozenset({"engine"})
+_STOPPED_EXIT_CODES = {"resource_limited": 3, "cancelled": 130, "timed_out": 124}
 _STACK_GROUP = "aisim.runner_factories"
 _OUTPUT_ADAPTER_GROUP = "aisim.output_adapters"
 
@@ -501,10 +502,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command = [sys.executable, "-m", "aisim.resource_worker", "warmup-support", str(refusal), args.stack]
                 try:
                     probe = run_process([*command, warmup], policy=policy)
-                except ResourceLimitError:
-                    probe = {}  # The execution run below reports the same limit.
-                if probe.get("status") == "cancelled":
-                    return 130
+                except ResourceLimitError as exc:
+                    probe = {"status": "resource_limited", "reason": str(exc)}
+                if probe["status"] in _STOPPED_EXIT_CODES:
+                    # Without the stack's answer, stop before cleanup with the execution run's exit code.
+                    sys.stderr.write(f"aisim: {probe['reason']}\n")
+                    return _STOPPED_EXIT_CODES[probe["status"]]
                 if probe.get("exit_code") == 2 and refusal.exists():
                     parser.error(f"{args.config}: {refusal.read_text(encoding='utf-8')}")
         try:
@@ -551,12 +554,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _save_report(args.output_dir, filename, payload, overwrite=args.overwrite)
                 except (OSError, ValueError) as exc:
                     sys.stderr.write(f"could not save {filename}: {exc}\n")
-    if report["status"] == "resource_limited":
-        return 3
-    if report["status"] == "cancelled":
-        return 130
-    if report["status"] == "timed_out":
-        return 124
+    if report["status"] in _STOPPED_EXIT_CODES:
+        return _STOPPED_EXIT_CODES[report["status"]]
     code = int(report.get("exit_code") or 0)
     return 1 if code < 0 else code
 

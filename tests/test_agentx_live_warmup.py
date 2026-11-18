@@ -16,6 +16,7 @@ from aisim.config.traffic import (
     TrafficPredictionConfig,
     TrafficRecommendationConfig,
 )
+from aisim.resources import ResourceLimitError
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper import (
     BackendDeploymentSpec,
@@ -244,9 +245,11 @@ def supervise_warmup_prediction(tmp_path, monkeypatch, policy, *extra, probe=Non
     monkeypatch.setattr(supervision, "_installed_names", lambda _: ["legacy"])
 
     def observe_run(command, **kwargs):
-        if "warmup-support" in command:
-            return probe or {"status": "completed", "exit_code": 0}
-        raise ReachedExecution
+        if "warmup-support" not in command:
+            raise ReachedExecution
+        if isinstance(probe, Exception):
+            raise probe
+        return probe or {"status": "completed", "exit_code": 0}
 
     monkeypatch.setattr(supervision, "run_process", observe_run)
     return supervision.main(
@@ -281,12 +284,23 @@ def test_supervisor_rejects_online_warmup_before_overwrite(tmp_path, monkeypatch
     assert prior.read_bytes() == b"previous valid results\n"
 
 
-def test_supervisor_stops_when_the_warmup_probe_is_cancelled(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "probe,code,reason",
+    [
+        ({"status": "cancelled", "reason": "execution cancelled"}, 130, "execution cancelled"),
+        ({"status": "resource_limited", "reason": "memory budget"}, 3, "memory budget"),
+        ({"status": "timed_out", "reason": "initialization timed out"}, 124, "initialization timed out"),
+        (ResourceLimitError("no host memory remains"), 3, "no host memory remains"),
+    ],
+)
+def test_supervisor_keeps_outputs_when_the_warmup_probe_cannot_answer(
+    tmp_path, monkeypatch, capsys, probe, code, reason
+):
     prior = tmp_path / "prediction.json"
     prior.write_bytes(b"previous valid results\n")
-    cancelled = {"status": "cancelled", "exit_code": None}
-    assert supervise_warmup_prediction(tmp_path, monkeypatch, "live_trajectory_v1", probe=cancelled) == 130
-    assert prior.read_bytes() == b"previous valid results\n"
+    assert supervise_warmup_prediction(tmp_path, monkeypatch, "live_trajectory_v1", probe=probe) == code
+    assert list(tmp_path.iterdir()) == [prior]
+    assert f"aisim: {reason}" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
