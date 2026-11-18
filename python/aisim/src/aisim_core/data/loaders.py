@@ -44,7 +44,6 @@ from aisim_core.data import (
     prepare_execution_profile,
 )
 from aisim_core.data.fetch import Selection
-from aisim_core.data.parquet import read_parquet
 from aisim_core.data.fpm_library import (
     EVALUATION_ROLES,
     PREDICTION_ROLES,
@@ -55,10 +54,12 @@ from aisim_core.data.fpm_library import (
     ResolvedResources,
     complete_fpm_profile,
     missing_memory_fields,
+    missing_resource_fields,
     resolve_resources,
     stage_fpm_library,
     with_estimator_path,
 )
+from aisim_core.data.parquet import read_parquet
 
 MANIFEST_SCHEMA = "aisim-artifact-manifest/v1"
 
@@ -221,12 +222,21 @@ class FpmData:
     resources: ResolvedResources | None = None  # first deployment, library kind
     resource_sources: tuple[str, ...] = ()  # per deployment of ``fpm_profile``
     diagnostics: Mapping[str, Any] | None = None
+    # Owner of the staged root (a temporary directory when no ``output_dir`` was given); keep this object alive
+    # while ``config`` is in use and call :meth:`close` to remove a temporary root.
+    _staged: Any = field(default=None, repr=False, compare=False)
+
+    def close(self) -> None:
+        if self._staged is not None:
+            self._staged.close()
 
     @property
     def memory_pending(self) -> tuple[str, ...]:
         """Fields still missing before cache sizing or replay (timing queries do not need them)."""
         if self.resources is None:
             return ()
+        if self.resources.resources is None:
+            return tuple(missing_resource_fields(None))
         return tuple(missing_memory_fields(self.resources.resources))
 
 
@@ -328,7 +338,15 @@ class FpmLoader(Loader):
         try:
             user_profile = out.get("fpm_profile")
             if user_profile is not None:
-                completed, sources = complete_fpm_profile(user_profile, staged.metadata)
+                completed, sources = complete_fpm_profile(
+                    user_profile,
+                    staged.metadata,
+                    identity={
+                        "system": identity.hardware,
+                        "backend": identity.framework,
+                        "backend_version": identity.framework_version,
+                    },
+                )
                 out["fpm_profile"] = completed
                 from aisim_core.fpm_profile import load_fpm_profile
 
@@ -348,6 +366,7 @@ class FpmLoader(Loader):
             resources=resources,
             resource_sources=tuple(sources),
             diagnostics=staged.diagnostics,
+            _staged=staged,
         )
 
 

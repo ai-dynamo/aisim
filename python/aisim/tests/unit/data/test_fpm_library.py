@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pyarrow as pa
@@ -19,14 +21,17 @@ from aisim_core.data.fetch import Cache, plan
 from aisim_core.data.fpm_checks import check_fpm_dataset, check_fpm_entry, check_fpm_identities
 from aisim_core.data.fpm_library import (
     EVALUATION_ROLES,
+    NATIVE_REQUIRED_COLUMNS,
     FpmContractError,
     FpmLibraryMetadata,
     FpmResourcesPendingError,
+    complete_fpm_profile,
     missing_resource_fields,
     read_library_metadata,
     recover_reconstructed_metadata,
     resolve_resources,
     stage_fpm_library,
+    with_estimator_path,
 )
 from aisim_core.data.loaders import FpmLoader, LoaderError
 from aisim_core.data.schemas import SCHEMA_MODELS, check_snapshots, render_snapshot
@@ -360,6 +365,7 @@ def test_old_entry_without_resources_still_loads_for_timing(root, profile, tmp_p
     assert data.resources.source == "pending" and data.resources.resources is None and data.profile is None
     with pytest.raises(FpmResourcesPendingError, match="cache_layout"):
         load(root, config, tmp_path / "again", require_resources=True)
+    assert "cache_layout" in data.memory_pending and "max_batch_size" in data.memory_pending
 
 
 def test_pending_memory_serves_timing_and_blocks_replay(root, profile, tmp_path):
@@ -410,6 +416,76 @@ def test_staging_links_files_and_reuses_a_verified_root(root, profile, tmp_path)
     assert root_dir.is_dir()
     temp.close()
     assert not root_dir.exists()
+
+
+def test_staging_reuse_follows_the_source_paths(root, profile, tmp_path):
+    make_entry(root, profile, resources=RESOURCES)
+    source = root / ENTRY / "fpm"
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    stage_fpm_library(source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json", **kwargs)
+    moved = tmp_path / "moved"
+    shutil.copytree(source, moved)
+    shutil.rmtree(source)
+    staged = stage_fpm_library(moved / "fpm_forward_perf.parquet", moved / "fpm_forward_perf.metadata.json", **kwargs)
+    assert staged.parquet_path.resolve() == (moved / "fpm_forward_perf.parquet").resolve()
+
+
+def test_restaging_a_returned_configuration_never_links_through_its_own_root(root, profile, tmp_path):
+    make_entry(root, profile, resources=RESOURCES)
+    source = root / ENTRY / "fpm"
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    args = (source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json")
+    first = stage_fpm_library(*args, **kwargs)
+    again = stage_fpm_library(*args, systems_paths=[first.systems_root], **kwargs)
+    links = [p for p in again.systems_root.rglob("*") if p.is_symlink()]
+    assert links and all(p.exists() for p in links)
+
+
+def test_systems_paths_use_the_canonical_default_and_home_forms(monkeypatch, tmp_path):
+    from aisim_core.data.fpm_library import _stageable_roots
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    roots = _stageable_roots(["default", "~/custom"], None)
+    assert roots[0].name == "systems" and roots[0].is_absolute() and roots[1] == tmp_path / "custom"
+    assert _stageable_roots(["~/custom", "/x"], tmp_path / "custom") == [Path("/x")]
+
+
+def test_sidecar_resources_need_the_library_identity(root, profile):
+    selector = {"tp": 4, "pp": 1, "dp": 1, "moe_tp": 4, "moe_ep": 1, "cp": 1, "backend_version": "0.25.1"}
+    metadata = {"configuration_selector": selector, "resources": RESOURCES}
+    draft = copy.deepcopy(profile)
+    draft["deployments"][0].pop("resources", None)
+    draft["deployments"][0].update(backend_version="0.25.1")
+    _, sources = complete_fpm_profile(draft, metadata, identity={"system": "h200_sxm", "backend_version": "0.25.1"})
+    assert sources == ["metadata"]
+    other_version = copy.deepcopy(draft)
+    other_version["deployments"][0]["backend_version"] = "0.26.0"
+    with pytest.raises(FpmResourcesPendingError):
+        complete_fpm_profile(other_version, metadata)
+    other_hardware = copy.deepcopy(draft)
+    other_hardware["deployments"][0]["system"] = "b200_sxm"
+    with pytest.raises(FpmResourcesPendingError):
+        complete_fpm_profile(other_hardware, metadata, identity={"system": "h200_sxm"})
+
+
+def test_estimator_path_insertion_leaves_the_callers_mapping_alone():
+    given = {"estimator_config": {"fpm_interpolation": {"k": 1}}}
+    out = dict(given)
+    with_estimator_path(out, Path("/staged/a.parquet"))
+    assert given == {"estimator_config": {"fpm_interpolation": {"k": 1}}}
+    assert out["estimator_config"]["fpm_interpolation"] == {"k": 1, "fpm_parquet_path": "/staged/a.parquet"}
+
+
+def test_temporary_staging_lives_as_long_as_the_loaded_data(root, profile):
+    make_entry(root, profile, resources=RESOURCES)
+    data = FpmLoader().load(root, MANIFEST, config=user_config(profile))
+    gc.collect()
+    assert (
+        data.systems_root.is_dir()
+        and Path(data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"]).exists()
+    )
+    data.close()
+    assert not data.systems_root.exists()
 
 
 def test_staging_rejects_unknown_system_and_unsafe_names(root, profile, tmp_path):
@@ -622,3 +698,48 @@ def test_sidecar_model_accepts_published_shapes_and_validates_resources():
     with pytest.raises(ValueError, match="max_num_tokens"):
         FpmLibraryMetadata.model_validate({**base, "resources": {**RESOURCES, "max_num_tokens": 0}})
     assert load_fpm_profile  # the profile class stays the single source for resources
+
+
+def test_entry_checks_report_unreadable_files_and_missing_native_columns(root, profile):
+    make_entry(root, profile)
+    library = root / ENTRY / "fpm/fpm_forward_perf.parquet"
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    table = pq.read_table(library)
+    assert set(NATIVE_REQUIRED_COLUMNS) <= set(table.column_names)
+    pq.write_table(table.drop(["cell_id"]), library)
+    sidecar = root / ENTRY / "fpm/fpm_forward_perf.metadata.json"
+    changed = json.loads(sidecar.read_text())
+    changed["parquet_sha256"] = _sha(library.read_bytes())
+    sidecar.write_text(json.dumps(changed))
+    for artifact in document["artifacts"]:
+        for target in (library, sidecar):
+            if artifact["path"].endswith(target.name):
+                artifact.update(sha256=_sha(target.read_bytes()), bytes=target.stat().st_size)
+        if artifact["path"].endswith(library.name):
+            artifact["rows"] = table.num_rows
+    path.write_text(json.dumps(document))
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ["library-columns"] and "cell_id" in findings[0].message
+
+
+def test_an_unreadable_artifact_is_a_finding_not_a_crash(root, profile, monkeypatch):
+    make_entry(root, profile)
+
+    def deny(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("aisim_core.data.fpm_checks._verify", deny)
+    assert {f.code for f in check_fpm_entry(root, MANIFEST)} == {"hash-mismatch"}
+
+
+def test_entries_differing_only_in_dp_attention_are_distinct(root, profile):
+    make_entry(root, profile)
+    manifest = Manifest.model_validate_json((root / MANIFEST).read_bytes())
+    on = manifest.model_copy(
+        update={"identity": manifest.identity.model_copy(update={"dp_attention": {"aggregated": True}})}
+    )
+    off = manifest.model_copy(
+        update={"identity": manifest.identity.model_copy(update={"dp_attention": {"aggregated": False}})}
+    )
+    assert check_fpm_identities([("a", on), ("b", off)]) == []

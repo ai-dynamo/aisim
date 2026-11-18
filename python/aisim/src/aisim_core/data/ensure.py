@@ -613,6 +613,17 @@ def _fetch_pinned(
         raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
 
 
+def _materialization_is_intact(systems: Path, manifest) -> bool:
+    """True when every runtime artifact of ``manifest`` is present under ``systems`` with its declared bytes."""
+    try:
+        for artifact in manifest.artifacts:
+            if artifact.runtime_path is not None:
+                _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
     manifest_path = entry.manifest.path
     if category == "fpm":
@@ -633,8 +644,14 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
             )
         output_dir = output_dir.with_name(f"{output_dir.name}-{content.hexdigest()[:16]}")
         cached = output_dir / "config.json"
-        if cached.is_file():  # materialized by an earlier verified load; config.json is written last
-            return FpmData(manifest, config=json.loads(cached.read_text()))
+        if cached.is_file():  # materialized by an earlier load; config.json is written last
+            try:
+                if _materialization_is_intact(output_dir / "systems", manifest):
+                    return FpmData(manifest, config=json.loads(cached.read_text()))
+            except ValueError:
+                pass
+        if output_dir.exists():  # partial, stale or edited: rebuild, never serve or trip over it
+            shutil.rmtree(output_dir)
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
         if data.config is None:

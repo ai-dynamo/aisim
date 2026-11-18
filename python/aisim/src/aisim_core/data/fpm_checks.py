@@ -20,12 +20,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import pyarrow.parquet as pq
 from pydantic import ValidationError
 
 from aisim_core.data import Manifest, _file, _verify
 from aisim_core.data.fpm_library import (
     EVALUATION_ROLES,
     LIBRARY_SCHEMA_ID,
+    NATIVE_REQUIRED_COLUMNS,
     ROLE_LIBRARY,
     ROLE_METADATA,
     FpmContractError,
@@ -57,7 +59,7 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
 
     try:
         manifest = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
-    except (ValueError, ValidationError) as exc:
+    except (OSError, ValueError, ValidationError) as exc:
         return [FpmFinding("invalid-manifest", manifest_path, str(exc).splitlines()[0])]
     if manifest.category != "fpm":
         add("wrong-category", f"expected category fpm, got {manifest.category!r}")
@@ -86,10 +88,17 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
     for artifact in checked:
         try:
             _verify(root, artifact)
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             add("hash-mismatch", f"{artifact.role}: {exc}")
     if any(f.code == "hash-mismatch" for f in found):
         return found
+    try:
+        columns = set(pq.ParquetFile(_file(root, library.path)).schema_arrow.names)
+    except (OSError, ValueError) as exc:
+        add("library-columns", f"cannot read the library columns: {exc}")
+        columns = None
+    if columns is not None and (absent := [c for c in NATIVE_REQUIRED_COLUMNS if c not in columns]):
+        add("library-columns", f"library lacks columns the native loader requires: {', '.join(absent)}")
     try:
         metadata = read_library_metadata(_file(root, sidecar.path))
     except (FpmContractError, ValueError) as exc:
@@ -113,6 +122,9 @@ def identity_key(manifest: Manifest) -> str:
             identity.framework_version,
             identity.parallelism,
             identity.precision,
+            identity.dp_attention,
+            identity.multinode,
+            identity.offload_mode,
         ],
         sort_keys=True,
         separators=(",", ":"),
@@ -143,7 +155,7 @@ def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list
         dataset = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
         reference = dataset.categories["fpm"]
         index = CategoryIndex.model_validate_json(_file(root, reference.index.path).read_bytes())
-    except (KeyError, ValueError, ValidationError) as exc:
+    except (KeyError, OSError, ValueError, ValidationError) as exc:
         return [FpmFinding("invalid-catalog", "catalog/dataset.json", f"cannot read the fpm category: {exc}")]
     found: list[FpmFinding] = []
     manifests = []
@@ -153,6 +165,6 @@ def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list
             manifests.append(
                 (entry.manifest.path, Manifest.model_validate_json(_file(root, entry.manifest.path).read_bytes()))
             )
-        except (ValueError, ValidationError):
+        except (OSError, ValueError, ValidationError):
             continue  # already reported as invalid-manifest
     return found + check_fpm_identities(manifests)
