@@ -346,8 +346,9 @@ one step had `num_prefill_requests: 2`, `sum_prefill_tokens: 17` and
 `num_decode_requests: 1`. Its latency went from 5.860174 to 5.853910 ms. Before
 the fix, the two prefills that total 17 tokens priced as two requests of 8
 tokens and one request of 1 token. After it, they price as one request of 9
-tokens and one of 8. The difference is one FP16 state pair (2 MiB) for each of
-23 Mamba layers at 7.7e12 B/s, within 1e-13. All other shapes were identical.
+tokens and one of 8. The difference, 0.006264 ms, matches one FP16 state pair
+(2 MiB) for each of 23 Mamba layers at 7.7e12 B/s (0.0062642 ms) to the six
+decimals shown. All other shapes were identical.
 These two latencies are transcribed observations. Their full vLLM configuration,
 metrics payload and command were not saved, so they cannot be reproduced. The
 reproducible check is `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`.
