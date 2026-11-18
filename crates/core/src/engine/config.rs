@@ -1696,7 +1696,12 @@ impl EngineConfig {
             self.sglang.scheduler_select_time_ms == 0.0
                 || (self.backend == Backend::Sglang
                     && !self.sglang.host_loop
-                    && self.afd.is_none()),
+                    && self.afd.is_none()
+                    && !matches!(
+                        &self.timing_model,
+                        TimingModelConfig::External { provider, .. }
+                            if matches!(provider.as_str(), "afd" | "aic-afd")
+                    )),
             "sglang.scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
         );
         ensure!(
@@ -3392,6 +3397,34 @@ mod tests {
                 ),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn sglang_scheduler_selection_cost_checks_external_provider_without_afd_metadata() {
+        for provider in ["afd", "aic-afd", "aic", "custom"] {
+            let mut config = EngineConfig {
+                timing_model: TimingModelConfig::External {
+                    provider: provider.to_string(),
+                    config: serde_json::json!({}),
+                },
+                ..EngineConfig::for_backend(Backend::Sglang)
+            };
+            assert!(config.afd.is_none());
+            config.validate().unwrap();
+
+            config.sglang.scheduler_select_time_ms = 1.5;
+            if matches!(provider, "afd" | "aic-afd") {
+                let error = config.validate().unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
+                    ),
+                    "{provider}: {error}"
+                );
+            } else {
+                config.validate().unwrap();
+            }
         }
     }
 
