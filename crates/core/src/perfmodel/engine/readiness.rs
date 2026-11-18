@@ -1724,8 +1724,8 @@ mod tests {
                 "{mode:?}: {err}"
             );
         }
-        // Second root, same rows with gemm_dtype "fp8": the derived path still
-        // needs compute_scale, as today (SILICON).
+        // Second root, same rows with gemm_dtype "fp8", checked in SILICON
+        // only: the derived path still needs compute_scale, as before.
         let root_fp8 = gemm_root("fp8");
         let db_fp8 = PerfDatabase::load(root_fp8.path(), "b200_sxm", "vllm", "0.24.0")
             .unwrap()
@@ -1733,6 +1733,19 @@ mod tests {
         let err = validate(&db_fp8, [&plain].into_iter()).unwrap_err();
         assert!(
             err.to_string().contains("computescale_perf.parquet"),
+            "{err}"
+        );
+        // With a computescale table on that root, the plain op passes and a
+        // low-precision input still needs scale_matrix, as before.
+        table(
+            &root_fp8
+                .path()
+                .join("data/b200_sxm/vllm/0.24.0/computescale_perf.parquet"),
+        );
+        validate(&db_fp8, [&plain].into_iter()).unwrap();
+        let err = validate(&db_fp8, [&low].into_iter()).unwrap_err();
+        assert!(
+            err.is_missing_perf_data() && err.to_string().contains("scale_matrix_perf.parquet"),
             "{err}"
         );
     }
