@@ -507,6 +507,22 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
 _MTP = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
 
 
+def test_cold_mtp_regression_with_allowed_fallback_requires_a_fit():
+    raw = _prediction(timing="default")
+    raw["engine"].update(
+        estimation_mode="fpm_regression",
+        fallback_policy="allow",
+        speculation=deepcopy(_MTP),
+    )
+    with pytest.raises(ValueError, match="fpm_regression estimator is not ready: no workload store has a usable fit"):
+        _run(raw)
+
+    raw["engine"]["estimation_mode"] = "op_level"
+    report = _run(raw)
+    assert report.metrics["completed_requests"] == 1
+    assert report.metadata["prediction_provenance"]["aggregated"]["estimator"] == "op_level"
+
+
 @pytest.mark.parametrize("fallback", ["allow", "deny"])
 @pytest.mark.parametrize(
     ("mode", "speculation"),

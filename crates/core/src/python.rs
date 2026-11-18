@@ -1089,16 +1089,21 @@ impl AicTimingModel {
             "{} cannot time a rank hosting the vision encoder; it prices only language-model iterations",
             wire_name(mode)
         );
+        let speculation_kind = config
+            .speculation
+            .as_ref()
+            .map(|speculation| speculation.kind.as_str());
+        // Reject schemes this estimator cannot price before the SDK resolves
+        // their draft checkpoints. MTP eligibility does not need its depth.
         require_fitted_execution(
             mode,
             &config.backend,
-            config.speculative_depth()? > 0,
-            config
-                .speculation
-                .as_ref()
-                .map(|speculation| speculation.kind.as_str()),
+            config.nextn > 0 || speculation_kind == Some("mtp"),
+            speculation_kind,
             config.decoder_replay,
-        )
+        )?;
+        config.speculative_depth()?;
+        Ok(())
     }
 
     /// The timing model of a regression or learned estimator: latency-only,
@@ -7624,10 +7629,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
         identity.nextn = 2;
+        identity.estimator_config = serde_json::from_value(serde_json::json!({
+            "fpm_regression": {"fit": {"linear": {"feature_axes": ["E"]}}}
+        }))
+        .unwrap();
         let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
-        model
-            .tune_with_fpms(&fitted_training_iterations(&[IterationKind::Decode], false))
-            .unwrap();
+        // Synthetic observations: 2 ms plus 0.25 ms per verified token.
+        let iterations: Vec<_> = (0..32)
+            .map(|i| {
+                let lengths: Vec<usize> = (0..1 + i % 4).map(|j| 50 + 10 * (i + j)).collect();
+                let mut rank = fitted_work(0, None, Some(&lengths));
+                let decode = rank.decode.as_mut().unwrap();
+                decode.verify_width = 3;
+                decode.widths = (0..lengths.len()).map(|j| 1 + (i + 2 * j) % 3).collect();
+                let tokens: usize = decode.widths.iter().sum();
+                let query = fitted_rank_query(&rank).unwrap();
+                let mut metrics = detailed_rank_metrics(&query, &rank).unwrap();
+                metrics.wall_time = (2.0 + 0.25 * tokens as f64) / 1000.0;
+                vec![metrics]
+            })
+            .collect();
+        model.tune_with_fpms(&iterations).unwrap();
         let mut legacy = snapshot_timing_config(&model, &dir.path().join("snapshot"));
         let mtp = |depth: u32| {
             let mut config = legacy.clone();
@@ -7650,10 +7672,12 @@ mod tests {
         assert_eq!(scheme.speculation.as_ref().unwrap().kind, "mtp");
         let mut rank = fitted_work(0, None, Some(&[700, 900]));
         rank.decode.as_mut().unwrap().verify_width = 3;
-        assert_eq!(
-            iteration_ms(&scheme_timing, &[rank.clone()]),
-            iteration_ms(&timing, &[rank])
-        );
+        rank.decode.as_mut().unwrap().widths = vec![3, 2];
+        // One full and one shortened round verify five tokens: 3.25 ms.
+        for timing in [&scheme_timing, &timing] {
+            let ms = iteration_ms(timing, &[rank.clone()]);
+            assert!((ms - (2.0 + 0.25 * 5.0)).abs() < 1e-9, "{ms}");
+        }
         // A scheme of another depth is another identity.
         let error = AicTimingModel::build(&mut deeper, ForwardPassWorkerType::Decode, false)
             .err()
@@ -7701,6 +7725,7 @@ mod tests {
                 let mut value = serde_json::json!({
                     "rank": {
                         "backend": "vllm", "num_gpu_blocks": 64, "block_size": 16,
+                        "kv_cache_bytes_per_token": 250_000,
                         "aic_nextn_accept_rates": "1,1",
                         "timing_model": {"type": "external", "provider": "aic", "config": timing}
                     }
@@ -7708,10 +7733,31 @@ mod tests {
                 if let Some(depth) = depth.clone() {
                     value["rank"]["aic_nextn"] = depth;
                 }
-                let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
                 if cpu_tier {
-                    role.rank.native_host_offload = Some(NativeHostOffloadConfig::new(4));
+                    value["rank"]["native_host_offload"] =
+                        serde_json::to_value(NativeHostOffloadConfig::new(4)).unwrap();
                 }
+                if depth.is_none() && cpu_tier {
+                    // Enter through the native descriptor with aic_nextn
+                    // omitted, including full engine/cache validation.
+                    let payload = serde_json::json!({
+                        "version": 1,
+                        "topology": {"kind": "aggregated", "workers": {"initial_workers": 1}},
+                        "engine": value,
+                        "requests": [{
+                            "id": "fitted-mtp-cpu", "arrival_time_ms": 0.0,
+                            "input_tokens": 32, "output_tokens": 7
+                        }],
+                        "record_per_request": true
+                    });
+                    let report: serde_json::Value =
+                        serde_json::from_str(&execute_json(&payload.to_string(), false).unwrap())
+                            .unwrap();
+                    assert_eq!(report["completed_requests"], 1);
+                    assert_eq!(report["total_output_tokens"], 7);
+                    assert_eq!(report["per_request"][0]["request_id"], "fitted-mtp-cpu");
+                }
+                let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
                 resolve_role_timing(
                     &mut role,
                     true,
@@ -7733,6 +7779,64 @@ mod tests {
                 assert_eq!(config["speculation"]["kind"], "mtp");
             }
         }
+    }
+
+    #[test]
+    fn fitted_roles_reject_draft_schemes_before_reading_the_checkpoint() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        // Reading this local checkpoint would fail JSON parsing. Unsupported
+        // fitted schemes must instead fail the execution eligibility check.
+        std::fs::write(dir.path().join("config.json"), "invalid checkpoint JSON").unwrap();
+        for mode in [EstimationMode::FpmRegression, EstimationMode::FpmLearned] {
+            let mut value =
+                serde_json::to_value(unknown_regression_identity(ForwardPassWorkerType::Decode))
+                    .unwrap();
+            value["estimation_mode"] = serde_json::to_value(mode).unwrap();
+            value["speculation"] = serde_json::json!({
+                "kind": "draft_model", "params": {"num_speculative_tokens": 2},
+                "draft_model_path": dir.path()
+            });
+            let mut config = serde_json::from_value(value).unwrap();
+            let error = AicTimingModel::build(&mut config, ForwardPassWorkerType::Decode, false)
+                .err()
+                .expect("fitted roles cannot price a draft model");
+            assert!(format!("{error:#}").contains("does not support speculative decoding"));
+        }
+    }
+
+    #[test]
+    fn fitted_mtp_snapshot_above_the_executor_depth_limit_cannot_replay() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
+        identity.speculation = Some(
+            serde_json::from_value(serde_json::json!({"kind": "mtp", "params": {"depth": 6}}))
+                .unwrap(),
+        );
+        let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
+        model
+            .tune_with_fpms(&fitted_training_iterations(&[IterationKind::Decode], false))
+            .unwrap();
+        let timing = snapshot_timing_config(&model, &dir.path().join("depth-six"));
+        let mut role = ReplayRoleConfig::default();
+        role.rank.block_size = 16;
+        role.rank.timing_model = TimingModelConfig::External {
+            provider: "aic".into(),
+            config: serde_json::to_value(timing).unwrap(),
+        };
+        let error = resolve_role_timing(
+            &mut role,
+            true,
+            ForwardPassWorkerType::Decode,
+            None,
+            false,
+            &mut Vec::new(),
+            &mut serde_json::Map::new(),
+        )
+        .err()
+        .expect("depth six is valid for cost prediction, but not replay");
+        assert!(format!("{error:#}").contains("1..5 draft tokens"));
     }
 
     #[test]
