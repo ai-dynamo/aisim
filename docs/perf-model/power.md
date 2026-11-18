@@ -311,7 +311,9 @@ An archived latency-only campaign has power disabled, including when its
 saved plan predates the `measure_power` field. Guided readiness rejects it
 against a request with `collection.measure_power: true` (also the default
 when omitted). Set the request field explicitly to `false` to reuse that
-campaign. To retain power collection, re-plan and collect in a new campaign
+campaign. Guided readiness supports this reuse only for schema-v11 plans;
+it rejects other schema versions before checking `collection.measure_power`.
+To retain power collection, re-plan and collect in a new campaign
 directory instead. For a direct collector resume of a pre-power campaign,
 pass `--no-fpm-measure-power` with its original arguments and `--resume`.
 
