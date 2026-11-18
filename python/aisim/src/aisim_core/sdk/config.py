@@ -90,14 +90,12 @@ class ModelConfig:
     _fmha_quant_mode_from_data: bool | None = field(default=None, repr=False, compare=False, kw_only=True)
     moe_quant_mode: common.MoEQuantMode | None = None
     _moe_quant_mode_is_explicit: bool | None = field(default=None, repr=False, compare=False, kw_only=True)
-    # Inferred-mode provenance. ``_inferred``: what Task/legacy resolvers filled (carried through
-    # dataclasses.replace for sweeps; a different value is an override). ``_filled``: what get_model
-    # filled (dropped by replace, so a replace that sets the mode is an override). ``_assigned``: set
-    # by any later assignment of the mode; default_factory makes __init__ reset it after the modes.
+    # Inferred-mode provenance. ``_inferred``: the mode a resolver (get_model, Task, legacy) filled,
+    # carried through dataclasses.replace so topology-only replacements stay inferred; a different
+    # value is an override. ``_assigned``: set by any later assignment of the mode; default_factory
+    # makes __init__ reset it after the modes.
     _gemm_quant_mode_inferred: object = field(default=None, repr=False, compare=False, kw_only=True)
     _moe_quant_mode_inferred: object = field(default=None, repr=False, compare=False, kw_only=True)
-    _gemm_quant_mode_filled: object = field(default=None, init=False, repr=False, compare=False)
-    _moe_quant_mode_filled: object = field(default=None, init=False, repr=False, compare=False)
     _gemm_quant_mode_assigned: bool = field(default_factory=bool, init=False, repr=False, compare=False)
     _moe_quant_mode_assigned: bool = field(default_factory=bool, init=False, repr=False, compare=False)
     kvcache_quant_mode: common.KVCacheQuantMode | None = None
@@ -202,9 +200,10 @@ class ModelConfig:
             object.__setattr__(self, f"_{name}_assigned", True)
         object.__setattr__(self, name, value)
 
-    def _mark_quant_mode_inferred(self, kind: str, marker: str = "inferred") -> None:
-        """Record the current ``{kind}_quant_mode`` as resolver-filled (inferred), not caller-assigned."""
-        object.__setattr__(self, f"_{kind}_quant_mode_{marker}", getattr(self, f"{kind}_quant_mode"))
+    def _mark_quant_mode_inferred(self, kind: str) -> None:
+        """Record the current ``{kind}_quant_mode`` as resolver-filled (inferred), not caller-chosen."""
+        object.__setattr__(self, f"_{kind}_quant_mode_inferred", getattr(self, f"{kind}_quant_mode"))
+        object.__setattr__(self, f"_{kind}_quant_mode_is_explicit", False)
         object.__setattr__(self, f"_{kind}_quant_mode_assigned", False)
 
     def _quant_mode_is_explicit(self, kind: str) -> bool:
@@ -214,13 +213,12 @@ class ModelConfig:
             return False
         if getattr(self, f"_{kind}_quant_mode_assigned") or getattr(self, f"_{kind}_quant_mode_is_explicit"):
             return True
-        if mode == getattr(self, f"_{kind}_quant_mode_filled"):
-            return False
-        if getattr(self, f"_{kind}_quant_mode_is_explicit") is False:
-            # shortcut: a replace() setting the value a Task resolver filled reads as inferred; assign instead.
-            inferred = getattr(self, f"_{kind}_quant_mode_inferred")
-            return inferred is not None and mode != inferred
-        return True
+        inferred = getattr(self, f"_{kind}_quant_mode_inferred")
+        if inferred is not None:
+            # shortcut: a replace() setting the value already inferred reads as inferred; assign it instead.
+            return mode != inferred
+        # Legacy rule: without provenance a set mode is explicit, unless a resolver flagged it inferred.
+        return getattr(self, f"_{kind}_quant_mode_is_explicit") is not False
 
     def __post_init__(self) -> None:
         validate_parallel_size("cp_size", self.cp_size)

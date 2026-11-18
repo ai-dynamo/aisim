@@ -222,7 +222,7 @@ def get_model(
     _apply_model_quant_defaults(model_config, raw_config, architecture, backend_name)
     for kind in ("gemm", "moe"):
         if not model_info[f"{kind}_quant_mode_is_explicit"]:
-            model_config._mark_quant_mode_inferred(kind, "filled")
+            model_config._mark_quant_mode_inferred(kind)
     # vLLM (nvfp4_ds_mla) and TRT-LLM store FP4 MLA caches in their own layouts, which nvfp4 doesn't model.
     language = raw_config.get(common.MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)) or raw_config
     if model_config.kvcache_quant_mode == common.KVCacheQuantMode.nvfp4 and (

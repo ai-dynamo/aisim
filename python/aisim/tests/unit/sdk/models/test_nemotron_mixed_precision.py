@@ -595,8 +595,9 @@ def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
     task = _task(SUPER).build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
     for config in (direct, task):
         inferred = build(config)
-        # An unchanged rebuild, also from a copy, keeps the checkpoint split (Mamba in_proj: FP8 and BF16).
-        assert build(config) == build(copy.copy(config)) == inferred
+        # An unchanged rebuild, from a copy or a topology-only replace, keeps the checkpoint split
+        # (Mamba in_proj: FP8 and BF16).
+        assert build(config) == build(copy.copy(config)) == build(dataclasses.replace(config, tp_size=1)) == inferred
         assert len(inferred[0]["mamba_in_proj_gemm"]) == 2
         # Overrides on a copy, or assigned to the config itself, are explicit on every later build.
         assert_uniform(build(dataclasses.replace(config, gemm_quant_mode=BF16, moe_quant_mode=MOE.fp8)), BF16, MOE.fp8)
@@ -606,9 +607,7 @@ def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
         # Clearing the overrides restores inference.
         config.gemm_quant_mode = config.moe_quant_mode = None
         assert build(config) == build(config) == inferred
-    # An explicit mode equal to the one the checkpoint fills is still explicit when assigned, and on a
-    # direct config also when set through replace.
-    assert_uniform(build(dataclasses.replace(direct, gemm_quant_mode=FP8, moe_quant_mode=MOE.nvfp4)), FP8, MOE.nvfp4)
+    # An explicit mode equal to the one the checkpoint fills is still explicit when assigned.
     for config in (direct, task):
         config.gemm_quant_mode, config.moe_quant_mode = FP8, MOE.nvfp4
         for _ in range(2):
@@ -641,3 +640,12 @@ def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypat
     rebuilt = _build_recommend_tasks({"agg": task}, 8)["agg"]
     for other in (task, reloaded, rebuilt):
         assert other.moe_quant_mode == MOE.fp8 and experts(other) == {MOE.fp8}
+
+
+def test_clearing_an_explicit_task_mode_restores_inference_on_every_build(monkeypatch):
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    config = _task(SUPER, gemm_quant_mode=BF16).build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
+    assert set(_buckets(get_model(SUPER, config, "vllm").context_ops)["mamba_in_proj_gemm"]) == {BF16}
+    config.gemm_quant_mode = None
+    builds = [_buckets(get_model(SUPER, config, "vllm").context_ops)["mamba_in_proj_gemm"] for _ in range(2)]
+    assert builds[0] == builds[1] == {FP8: 28, BF16: 12}
