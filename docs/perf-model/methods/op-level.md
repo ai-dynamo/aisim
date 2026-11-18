@@ -295,19 +295,23 @@ distance: a weight-only mode therefore prefers the matching arithmetic family.
 MoE keeps its own historical profile-distance ordering. These tie-breaks are
 observable prediction semantics, not opportunities to sort data arbitrarily.
 
-`fp8_static` has two paths. If the GEMM table has `fp8_static` rows, AISim reads
-them and needs no `compute_scale` table. This includes rows that the shared
-layer takes from a sibling version. It subtracts `scale_matrix` only for a
-low-precision input. So a `fp8_static` row must time the forward pass of the
-layer on a BF16 input with a static activation scale: the static quantization
-plus the GEMM. A row that times the GEMM alone makes that subtraction wrong.
-Without `fp8_static` rows, `fp8_static` is composite: it needs the base FP8 and
-its overhead tables. Transfer reachability alone cannot admit it. On both paths,
+`fp8_static` has two paths. In SILICON, HYBRID and EMPIRICAL, if the GEMM table
+has `fp8_static` rows, AISim reads them and needs no `compute_scale` table.
+This includes rows that the shared layer takes from a sibling version. It
+subtracts `scale_matrix` only for a low-precision input. So a `fp8_static` row
+must time the forward pass of the layer on a BF16 input with a static
+activation scale: the static quantization plus the GEMM. A row that times the
+GEMM alone makes that subtraction wrong. When the table has `fp8_static` rows,
+those rows alone give the coverage of the mode, also for a shape that `fp8`
+rows cover. A shape too far from them is a coverage error in SILICON, and
+HYBRID gives the empirical estimate that it builds from them. Without
+`fp8_static` rows, `fp8_static` is composite: it needs the base FP8 and its
+overhead tables. Transfer reachability alone cannot admit it. On both paths,
 the list of supported GEMM modes contains `fp8_static` only when the
-`scale_matrix` table is present. Validation requires known precision profiles
-and the resolved transfer policy; a pure SILICON request still needs data. New
-precision support requires native profile levels, their exported Python
-reachability view, and tests described in [Extending](../extending.md).
+`scale_matrix` table has `fp8` rows. Validation requires known precision
+profiles and the resolved transfer policy; a pure SILICON request still needs
+data. New precision support requires native profile levels, their exported
+Python reachability view, and tests described in [Extending](../extending.md).
 
 ## Diagnostics and limits
 

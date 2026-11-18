@@ -1363,6 +1363,89 @@ mod tests {
         assert_eq!(r.source, Source::Estimated);
     }
 
+    /// Coverage rule of the direct rows. When the table has `fp8_static` rows,
+    /// those rows alone give the coverage of the mode, also for a shape that
+    /// `fp8` rows cover. A far shape is a coverage error in SILICON and an
+    /// empirical estimate in HYBRID, while `fp8` keeps its own row there.
+    ///
+    /// Synthetic table: `fp8` rows at the far site (m=128, n=k=8192), with
+    /// the overhead tables, and `fp8_static` rows on a small grid
+    /// (n=k=1024, m=128 and 256).
+    #[test]
+    fn gemm_fp8_static_rows_alone_give_the_coverage_of_the_mode() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let data = write_energy_systems_root(tmp.path());
+        write_parquet(
+            &data.join("gemm_perf.parquet"),
+            &[
+                Col::Str("gemm_dtype", vec!["fp8", "fp8", "fp8_static", "fp8_static"]),
+                Col::I64("m", vec![128, 256, 128, 256]),
+                Col::I64("n", vec![8192, 8192, 1024, 1024]),
+                Col::I64("k", vec![8192, 8192, 1024, 1024]),
+                Col::F64("latency", vec![1.0, 3.0, 0.5, 1.5]),
+            ],
+        );
+        for (file, lat) in [
+            ("computescale_perf.parquet", [0.25, 0.75]),
+            ("scale_matrix_perf.parquet", [0.125, 0.375]),
+        ] {
+            write_parquet(
+                &data.join(file),
+                &[
+                    Col::Str("quant_dtype", vec!["fp8", "fp8"]),
+                    Col::I64("m", vec![128, 256]),
+                    Col::I64("k", vec![8192, 8192]),
+                    Col::F64("latency", lat.to_vec()),
+                ],
+            );
+        }
+        let load = |mode| {
+            PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0")
+                .expect("db must load")
+                .with_mode(mode, TransferPolicy::ALL)
+        };
+
+        // SILICON: the static rows sit at n=k=1024. The far site n=k=8192 is
+        // 3 octaves away on each axis, so the distance is 3 * sqrt(2) = 4.24,
+        // above the gate of 2.0. The fp8 rows at the far site do not help.
+        let silicon = load(DatabaseMode::Silicon);
+        match GemmOp::new("s", 8192, 8192, GemmQuantMode::Fp8Static).query(&silicon, 128, None) {
+            Err(AicError::InterpolationCoverage(_)) => {}
+            other => panic!("expected a coverage error, got {other:?}"),
+        }
+
+        // fp8 at the same shape reads its own row: latency 1.0, Silicon.
+        let f = GemmOp::new("f", 8192, 8192, GemmQuantMode::Fp8)
+            .query(&silicon, 128, None)
+            .expect("fp8 query");
+        assert!(
+            (f.latency_ms - 1.0).abs() < 1e-9,
+            "latency {}",
+            f.latency_ms
+        );
+        assert_eq!(f.source, Source::Silicon);
+
+        // HYBRID: the silicon miss is estimated from the own fp8_static util
+        // grid. The result is tagged Empirical. Its value comes from an
+        // interpolated utilization, so the tag and a positive latency are
+        // pinned, not the value. An estimate from the fp8 grid gives the fp8
+        // row at this shape, 1.0, so the result must differ from it.
+        let hybrid = load(DatabaseMode::Hybrid);
+        let h = GemmOp::new("s", 8192, 8192, GemmQuantMode::Fp8Static)
+            .query(&hybrid, 128, None)
+            .expect("hybrid fp8_static query");
+        assert_eq!(h.source, Source::Empirical);
+        assert!(h.latency_ms > 0.0, "latency {}", h.latency_ms);
+        assert!(
+            (h.latency_ms - 1.0).abs() > 1e-3,
+            "latency {}",
+            h.latency_ms
+        );
+    }
+
     /// fp8_static rows are never a transfer-ladder reference. Synthetic
     /// discrimination vehicle: fp8_static rows come FIRST in file order with
     /// latencies 1000x the bfloat16 rows. fp8, sq and fp8_block have no rows
