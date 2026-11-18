@@ -2570,16 +2570,16 @@ impl Engine {
                 // Each prefill chunk reads and writes its recurrent state once.
                 // Decode Mamba is priced in pass 3 at its own request shape.
                 // `ctx_tokens` packs `floor(ctx/isl)` complete requests (each
-                // `isl - prefix` new tokens) plus a trailing remainder of new
-                // tokens. A request has at most `isl - prefix` new tokens, so a
-                // longer remainder spans several requests, each with its state.
+                // `isl - prefix` new tokens) plus one request's partial extend,
+                // the `ceil(ctx/isl)` requests that context attention prices.
+                // `run_agg` passes its budget here, so the extend never exceeds
+                // one request's `isl - prefix` new tokens and never adds requests.
                 // shortcut: sum uniform timing rows until variable-length batches are
                 // calibrated; this can overcount launch overhead for ragged batches.
                 let per_request = isl.saturating_sub(prefix).max(1);
-                let remainder = ctx_tokens % isl;
                 for (batch, tokens) in [
-                    (ctx_tokens / isl + remainder / per_request, per_request),
-                    (1, remainder % per_request),
+                    (ctx_tokens / isl, per_request),
+                    (1, (ctx_tokens % isl).min(per_request)),
                 ] {
                     if batch == 0 || tokens == 0 {
                         continue;
@@ -4647,15 +4647,18 @@ pub(crate) mod tests {
                 }])
                 .unwrap()
         };
-        // (ctx, isl, prefix, prefill requests, new tokens): a partially cached
-        // chunk, a complete cached request plus a partial extend, a budget that
-        // splits two requests, and no prefill.
+        // (ctx, isl, prefix, prefill requests, new tokens): `ceil(ctx/isl)`
+        // requests, as context attention prices them. A partially cached chunk;
+        // a complete cached request plus a partial extend capped at its 1096 new
+        // tokens; a budget above one request's new tokens (`run_agg` with one
+        // request: 1096 tokens, never a second state); two complete requests;
+        // and no prefill.
         for (ctx, isl, prefix, requests, new_tokens) in [
             (512, 4096, 1024, 1, 512),
-            // 1904 remainder tokens exceed one request's 1096: 1096 + 808.
-            (6000, 4096, 3000, 3, 3000),
-            (8128, 4096, 1024, 3, 7104),
-            (2048, 4096, 3000, 2, 2048),
+            (6000, 4096, 3000, 2, 2192),
+            (8128, 4096, 1024, 2, 6144),
+            (2048, 4096, 3000, 1, 1096),
+            (8192, 4096, 3000, 2, 2192),
             (0, 4096, 1024, 0, 0),
         ] {
             let bytes =

@@ -10202,6 +10202,17 @@ mod tests {
         let static_mixed = native
             .mixed_step_latency(16, 2, 16, 1, 0, 1.0, 1.0)
             .unwrap();
+        // Independent oracle: bytes moved / memory bandwidth. Per token the scan
+        // moves (4096 + 2 * 4 * 128 + 64) * 2 + 4096 * 2 = 18,560 bytes, and one
+        // BF16 state is 4096 * 128 * 2 = 1 MiB. Pure decode: 2 requests verify
+        // 4 tokens each (8 tokens); each reads its state once and writes 4
+        // checkpoints. Mixed: one 16-token prefill reads and writes its state
+        // once, beside the same decode.
+        let ms = |bytes: f64| bytes / native.database().system_spec.gpu.mem_bw * 1000.0;
+        let decode_bytes = 8.0 * 18_560.0 + 2.0 * 1_048_576.0 * 5.0;
+        let prefill_bytes = 16.0 * 18_560.0 + 2.0 * 1_048_576.0;
+        assert!(close(static_decode, ms(decode_bytes)));
+        assert!(close(static_mixed, ms(prefill_bytes + decode_bytes)));
         let find = |phase: &TimingPhaseEvidence, name: &str| {
             phase
                 .operations
@@ -10238,6 +10249,16 @@ mod tests {
             assert!(close(
                 find(&evidence.prefill, "context_ssm").unwrap(),
                 static_mixed - static_decode
+            ));
+            assert!(close(pure, ms(decode_bytes)), "{pure}");
+            assert!(close(iteration, ms(prefill_bytes + decode_bytes)));
+            assert!(close(
+                find(&evidence.decode, "generation_ssm").unwrap(),
+                ms(decode_bytes)
+            ));
+            assert!(close(
+                find(&evidence.prefill, "context_ssm").unwrap(),
+                ms(prefill_bytes)
             ));
         }
     }
