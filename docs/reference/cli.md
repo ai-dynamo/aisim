@@ -58,8 +58,8 @@ export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CATEGORIES=op-latency \
 
 `AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins a predictor run: the data a
 configuration needs is taken from the cached revision (name the prefetched category with
-`AISIM_DATA_CATEGORIES`, as above: the default `fpm` would look for FPM data that was never cached), a missing or corrupt file is a precise error, and
-there is no fallback to other data. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
+`AISIM_DATA_CATEGORIES`; the default is `op-latency`), a missing or corrupt file is a precise error, and
+there is no fallback to other data. Other pin variables: `AISIM_DATA_CATEGORIES` (default `op-latency`),
 `AISIM_DATA_CONFIGURATION` (choose among several matches), `AISIM_DATA_MAX_BYTES` (auto-download
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.

@@ -125,7 +125,7 @@ class DataPin:
     repo: str | None = None
     revision: str | None = None  # full commit SHA recommended: it resolves with no network
     local_root: Path | None = None
-    categories: tuple[str, ...] = ("fpm",)
+    categories: tuple[str, ...] = ("op-latency",)
     configuration_id: str | None = None  # disambiguates several catalog matches
     max_bytes: int = DEFAULT_MAX_BYTES
     offline: bool = False

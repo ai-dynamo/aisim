@@ -5,6 +5,8 @@
 
 import json
 
+from pathlib import Path
+
 import pytest
 
 from aisim_core.data.ensure import (
@@ -44,7 +46,7 @@ def test_offline_cold_cache_is_a_precise_error(tmp_path, files):
 def test_over_threshold_refuses_with_size_and_command(tmp_path, files):
     transport = FakeTransport(files)
     with pytest.raises(DataTooLargeError) as e:
-        ensure_data(CONFIG, pin(tmp_path, max_bytes=1), transport=transport)
+        ensure_data(CONFIG, pin(tmp_path, max_bytes=1, categories=("fpm",)), transport=transport)
     msg = str(e.value)
     assert str(e.value.uncached_bytes) in msg and "aisim data fetch --category fpm" in msg
     assert "--model m1" in msg and f"--revision {SHA}" in msg
@@ -53,7 +55,7 @@ def test_over_threshold_refuses_with_size_and_command(tmp_path, files):
 
 def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
     with pytest.raises(MissingDataError, match=r"model=other.*system=h200|system=h200.*model=other"):
-        ensure_data({**CONFIG, "model": "other"}, pin(tmp_path), transport=FakeTransport(files))
+        ensure_data({**CONFIG, "model": "other"}, pin(tmp_path, categories=("fpm",)), transport=FakeTransport(files))
 
 
 def test_local_override_selection_needs_no_network_or_cache(tmp_path, files):
@@ -62,7 +64,7 @@ def test_local_override_selection_needs_no_network_or_cache(tmp_path, files):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
     with pytest.raises(MissingDataError, match="no fpm data"):
-        ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
 def test_pin_from_environment():
@@ -83,3 +85,7 @@ def test_check_manifest_accepts_fpm_execution_profile_only(tmp_path, files):
     assert check_manifest(root, "data/fpm/m1/manifest.json").category == "fpm"
     doc = json.loads(files["data/fpm/m1/manifest.json"])
     assert Manifest.model_validate(doc).category == "fpm"
+
+
+def test_default_pin_names_only_the_op_database():
+    assert DataPin(local_root=Path("x")).categories == ("op-latency",)
