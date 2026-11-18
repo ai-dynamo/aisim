@@ -771,6 +771,9 @@ def test_gemm_common_cases_expand_from_base_op_yaml_shape_specs():
         keys = {(case.x, case.n, case.k) for case in backend_cases}
         assert len(keys) == len(backend_cases)
         assert {x for x, n, k in keys if (n, k) == (7168, 384)} == {x for x, _, _ in keys}
+        # Nemotron-3.5-Lightning's six shared-expert shapes, at every token count.
+        for shape in [*((n, 2688) for n in (3712, 928, 464)), *((2688, k) for k in (3712, 928, 464))]:
+            assert {x for x, n, k in keys if (n, k) == shape} == {x for x, _, _ in keys}, shape
 
     compute_scale_cases = get_compute_scale_case_specs()
     assert len(compute_scale_cases) == 1628

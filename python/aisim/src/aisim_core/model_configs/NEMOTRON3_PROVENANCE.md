@@ -25,7 +25,8 @@ copies, trimmed by this transformation and nothing else:
 
 The NVFP4 files describe NVIDIA ModelOpt MIXED_PRECISION exports. The routed
 experts are NVFP4 with group size 16. The listed Mamba projections and shared
-experts are FP8. The KV cache is FP8. Modules absent from the upstream
+experts are FP8, except the Super layer 1 shared-expert `down_proj`, which is
+NVFP4 with group size 16. The KV cache is FP8. Modules absent from the upstream
 `quantized_layers`, or listed in `exclude_modules`, stay BF16. The routed
 experts that the trimming removes are not BF16: the expert 0 entries that the
 packaged files keep give the precision of every expert in their layer. The FP8 files describe a ModelOpt
@@ -115,9 +116,11 @@ END OF TERMS AND CONDITIONS
 
 ## OpenMDW License Agreement, version 1.1
 
-Reproduced verbatim from
-https://raw.githubusercontent.com/OpenMDW/OpenMDW/refs/heads/main/1.1/LICENSE.OpenMDW-1.1
-(retrieved 2026-10-28).
+Reproduced from `1.1/LICENSE.OpenMDW-1.1` in https://github.com/OpenMDW/OpenMDW
+at commit `9067ba54b2f84bc9e15a05734f570ec88e9f445d`, the last change to that
+file before retrieval on 2026-10-28:
+https://github.com/OpenMDW/OpenMDW/blob/9067ba54b2f84bc9e15a05734f570ec88e9f445d/1.1/LICENSE.OpenMDW-1.1.
+The wording is unchanged. The line wrapping and quotation marks differ.
 
 ```text
 OpenMDW License Agreement, version 1.1 (OpenMDW-1.1)

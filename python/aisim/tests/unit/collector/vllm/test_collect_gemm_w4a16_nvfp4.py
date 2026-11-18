@@ -123,11 +123,13 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
     n, k = 8, 64
     weight = torch.randn(n, k, generator=torch.Generator().manual_seed(1)).to(torch.bfloat16)
     calls = []
+    # Distinct, FP8-representable block scales, so their values and order are checked.
+    scales = torch.tensor([0.5, 1.0, 1.5, 2.0] * (n * k // 16 // 4)).reshape(n, k // 16)
 
     def reference(x, global_scale, block_size):
         calls.append((x, global_scale, block_size))
         values = torch.tensor(E2M1).repeat(n, k // len(E2M1))
-        return values, torch.full((n, k // block_size), 2.0)
+        return values, scales
 
     def blackwell_only(*args, **kwargs):
         raise AssertionError("scaled_fp4_quant needs an SM100+ kernel")
@@ -146,6 +148,21 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
     assert weight_fp4.dtype == torch.uint8 and weight_fp4.shape == (n, k // 2)
     assert torch.equal(_decode(torch, weight_fp4), torch.tensor(E2M1).repeat(n, k // len(E2M1)))
     assert weight_scale.dtype == torch.float8_e4m3fn and weight_scale.shape == (n, k // 16)
+    assert torch.equal(weight_scale.float(), scales)
+
+
+def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm, monkeypatch):
+    gib = 2**30
+    monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 90)
+    monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (1 * gib, 80 * gib))
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_allocated", lambda _device: 2 * gib)
+    # Below SM100 a 1 Gi-element weight needs at least 6 GiB.
+    n, k = gib, 1
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 8 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(n, k, "cuda:0") is None  # 1 free + 6 reusable
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 6 * gib)
+    refusal = collect_gemm._w4a16_nvfp4_does_not_fit(n, k, "cuda:0")  # 1 free + 4 reusable
+    assert refusal.startswith("FIXME(kernel-limit): does not fit")
 
 
 def test_blackwell_keeps_the_scaled_fp4_quant_kernel(torch, collect_gemm, monkeypatch):

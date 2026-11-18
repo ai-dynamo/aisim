@@ -293,6 +293,10 @@ def moe_modes(
     for layer, kind in enumerate(layer_kinds):
         declared = expert_modules.get(kind, ())
         blocks = {module.partition("experts.")[0] + "experts" for module in declared}
+        if any(checkpoint._excluded(path) for block in blocks for path in layer_paths(layer, block)):
+            # vLLM checks exclusions against the fused expert prefix itself.
+            block_modes[layer] = moe.bfloat16
+            continue
         if any(checkpoint.module(layer_paths(layer, module))[0] for module in declared):
             prefixes = tuple(f"{path}." for block in blocks for path in layer_paths(layer, block))
             # Rare path: scan the listing only for layers with an excluded expert.

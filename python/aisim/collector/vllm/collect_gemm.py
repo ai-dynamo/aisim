@@ -220,6 +220,25 @@ def _w4a16_nvfp4_checkpoint_weights(weight_bf16):
     return weight_fp4, weight_scale, weight_scale_2
 
 
+def _w4a16_nvfp4_does_not_fit(n, k, device):
+    """Why W4A16_NVFP4 weight preparation cannot fit the device, or None; checked before allocating.
+
+    Lower bound: the BF16 weight, plus the full FP32 copy that ref_nvfp4_quant makes below SM100
+    (nvfp4_emulation_utils.py :640-654 @0.31.0). Memory the allocator reserved but does not use
+    is reusable, so it counts as available alongside driver-free memory.
+    """
+    needed = n * k * (2 if get_sm_version() >= 100 else 6)
+    available = (
+        torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    )
+    if needed <= available:
+        return None
+    return (
+        f"FIXME(kernel-limit): does not fit: W4A16_NVFP4 weight preparation needs at least "
+        f"{needed / 2**30:.1f} GiB, the device has {available / 2**30:.1f} GiB available"
+    )
+
+
 def get_gemm_test_cases():
     return plan_cases("gemm", "vllm", get_sm_version())
 
@@ -248,16 +267,8 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="cuda:0"):
 
     x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
 
-    if gemm_type == "w4a16_nvfp4":
-        # Refuse before allocating the weight. Lower bound: the BF16 weight, plus the full FP32
-        # copy that ref_nvfp4_quant makes below SM100 (nvfp4_emulation_utils.py :640-654 @0.31.0).
-        needed = n * k * (2 if get_sm_version() >= 100 else 6)
-        free = torch.cuda.mem_get_info(device)[0]
-        if needed > free:
-            raise RuntimeError(
-                f"FIXME(kernel-limit): does not fit: W4A16_NVFP4 weight preparation needs at least "
-                f"{needed / 2**30:.1f} GiB, the device has {free / 2**30:.1f} GiB free"
-            )
+    if gemm_type == "w4a16_nvfp4" and (refusal := _w4a16_nvfp4_does_not_fit(n, k, device)):
+        raise RuntimeError(refusal)
 
     if gemm_type == "fp8":
         # This row times dynamic per-tensor activations, and the perf model derives

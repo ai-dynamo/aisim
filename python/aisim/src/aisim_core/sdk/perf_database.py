@@ -100,7 +100,7 @@ def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]
     if isinstance(raw_paths, str):
         entries = [part.strip() for part in raw_paths.split(",") if part.strip()]
     else:
-        entries = [os.fspath(entry) for entry in raw_paths if entry is not None]
+        entries = [os.fsdecode(entry) for entry in raw_paths if entry is not None]
     if not entries:
         return [default_path]
     resolved: list[str] = []

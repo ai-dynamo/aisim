@@ -524,6 +524,7 @@ def test_plan_only_reports_op_plans_and_writes_the_table(tmp_path, monkeypatch):
     rows = (tmp_path / "vllm_sm89_gemm.csv").read_text().splitlines()
     assert rows[0] == "gemm_type,m,n,k"
     assert len(rows) == 1 + gemm["cases"]
+    assert Counter(row.split(",")[0] for row in rows[1:]) == gemm["by_dtype"]
     for op in plans:
         assert len((tmp_path / f"vllm_sm89_{op}.csv").read_text().splitlines()) == 1 + plans[op]["cases"], op
 
