@@ -707,7 +707,7 @@ def test_public_mixed_draft_names_values_and_sources_match_native(draft, databas
     target = "Qwen/Qwen3.5-35B-A3B" if draft == "Qwen/Qwen3-0.6B" else "Qwen/Qwen3-8B"
     model = get_model(target, _model_config(speculation), "vllm")
     database = get_database_view("h100_sxm", "vllm", "0.24.0", database_mode=database_mode)
-    native = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
+    native, _ = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
         128, gen_requests, 4000, 64, 64
     )
     estimate = InferenceSession(model, database, get_backend("vllm")).run_mixed(
@@ -735,7 +735,7 @@ def test_public_mixed_ar_and_mtp_keep_legacy_names_and_defaults(real_database, g
     config = _model_config()
     config.nextn = depth
     model = get_model("Qwen/Qwen3-8B", config, "vllm")
-    native = _cached_engine_handle(model, real_database)._mixed_step_breakdown_per_op_with_metadata(
+    native, _ = _cached_engine_handle(model, real_database)._mixed_step_breakdown_per_op_with_metadata(
         128, gen_requests, 4000, 64, 0
     )
     estimate = InferenceSession(model, real_database, get_backend("vllm")).run_mixed(
@@ -774,7 +774,7 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
         ],
     )
     handle = SimpleNamespace(
-        _mixed_step_breakdown_per_op_with_metadata=lambda *args, **kwargs: native, last_provenance=lambda: None
+        _mixed_step_breakdown_per_op_with_metadata=lambda *args, **kwargs: (native, None), last_provenance=lambda: None
     )
     monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *args: handle)
     model = get_model("Qwen/Qwen3-8B", _model_config(), "vllm")
@@ -827,7 +827,7 @@ def test_public_mixed_draft_reports_only_executed_native_fallbacks(gen_requests)
     database = get_database_view("gb200", "sglang", "0.5.14")
     _engine_handle_cache_clear()
     try:
-        native = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
+        native, _ = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
             128, gen_requests, 1024, 32, 0
         )
         estimate = InferenceSession(model, database, get_backend("sglang")).run_mixed(

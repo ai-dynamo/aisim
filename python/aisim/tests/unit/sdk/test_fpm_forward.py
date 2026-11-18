@@ -990,7 +990,7 @@ class TestFPMStaticAndMixed:
         _fold_width(generation, 1, 4)
         model.generation_ops.append(generation)
         handle = _cached_engine_handle(model, database)
-        native = handle._mixed_step_breakdown_per_op_with_metadata(ctx_tokens, gen_requests, isl, osl, 0)
+        native, _ = handle._mixed_step_breakdown_per_op_with_metadata(ctx_tokens, gen_requests, isl, osl, 0)
         estimate = InferenceSession(model, database, backend).run_mixed(
             RuntimeConfig(isl=isl, osl=osl), MixedStepInput(ctx_tokens, gen_requests)
         )
@@ -2368,6 +2368,35 @@ class TestFPMPowerPublication:
         assert short.get_result_dict()["power_w"] is None
         assert short.get_e2e_power_avg() is None
         assert short.get_power_data_coverage() > 0.0
+
+    def test_chunked_aggregate_counts_only_powered_prefill_chunks(self, fpm_power_root):
+        from aisim.sdk.config import RuntimeConfig
+        from aisim.sdk.inference_session import InferenceSession
+        from aisim_core.sdk.step_estimate import MixedStepInput
+
+        model = _qwen_fpm()
+        rows = _agg_rows(model)
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        for kv in (0, 256):
+            row = _row("prefill", 1, 257, kv, 10.0, model_path=model.model_path, identity=identity)
+            rows.append(dict(row, backend_version=_POWER_VERSION, cell_id=f"fpm-chunk-{kv}"))
+
+        def power(row):
+            if row["workload_kind"] == "prefill" and row["total_kv_read_tokens"] == 0:
+                return 500.0
+            return None
+
+        database = fpm_power_root(model, power, rows=rows)
+        runtime = RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=2)
+        session = InferenceSession(model, database, get_backend(BACKEND))
+        step = session.run_mixed(runtime, MixedStepInput(256, 1))
+        assert step.latency_ms == pytest.approx(10.5)
+        assert step.energy_wms == pytest.approx(2500.0)
+        assert step.covered_latency_ms == pytest.approx(5.0)
+
+        summary = session.run_agg(runtime, ctx_tokens=256)
+        assert summary.get_power_data_coverage() == pytest.approx(5.0 / 10.5)
+        assert summary.get_result_dict()["power_w"] is None
 
     @pytest.mark.parametrize("forward_model", ["fpm", "op_level"])
     def test_epd_disagg_estimate_withholds_watts(self, fpm_power_root, cli_parser, monkeypatch, capfd, forward_model):

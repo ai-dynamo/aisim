@@ -3156,15 +3156,16 @@ impl Engine {
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
     ) -> Result<(Vec<PerOpValue>, Vec<PerOpValue>, Vec<PerOpValue>), AicError> {
-        let (shared, context_attention, decode_attention) = self.mixed_step_breakdown_per_op_impl(
-            ctx_tokens,
-            gen_tokens,
-            isl,
-            osl,
-            prefix,
-            seq_imbalance_correction_scale,
-            gen_seq_imbalance_correction_scale,
-        )?;
+        let ((shared, context_attention, decode_attention), _) = self
+            .mixed_step_breakdown_per_op_impl(
+                ctx_tokens,
+                gen_tokens,
+                isl,
+                osl,
+                prefix,
+                seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale,
+            )?;
         Ok((
             strip_per_op_metadata(shared),
             strip_per_op_metadata(context_attention),
@@ -3184,7 +3185,7 @@ impl Engine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<MixedStepPerOpValuesWithMetadata, AicError> {
+    ) -> Result<(MixedStepPerOpValuesWithMetadata, Option<f64>), AicError> {
         self.mixed_step_breakdown_per_op_impl(
             ctx_tokens,
             gen_tokens,
@@ -3206,7 +3207,7 @@ impl Engine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<MixedStepPerOpValuesWithMetadata, AicError> {
+    ) -> Result<(MixedStepPerOpValuesWithMetadata, Option<f64>), AicError> {
         self.reject_full_round_surface("per-operation mixed steps")?;
         // Preserve the FPM component contract while reporting the actual target
         // and draft operations independently. The same execution path supplies
@@ -3214,6 +3215,9 @@ impl Engine {
         if let Some((prefill_op, decode_op, ctx_tail, _gen_tail)) = self.fpm_split() {
             let mut shared = PerOpFold::new("context");
             let mut dec_attn = PerOpFold::new("generation");
+            let new_tokens = isl.max(1).saturating_sub(prefix);
+            let chunked = ctx_tokens > 0 && ctx_tokens < new_tokens;
+            let mut covered_prefill_ms = 0.0;
             self.fpm_mixed_step_components(
                 prefill_op,
                 decode_op,
@@ -3226,14 +3230,20 @@ impl Engine {
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
                 |pass, op, result| match pass {
-                    MixedPass::SharedNonAttention => shared.add(op, result),
+                    MixedPass::SharedNonAttention => {
+                        // A powered chunk does not cover other chunks folded into the same row.
+                        if chunked && result.energy_wms > 0.0 {
+                            covered_prefill_ms += result.latency_ms;
+                        }
+                        shared.add(op, result);
+                    }
                     MixedPass::DecodeAttention => dec_attn.add(op, result),
                     MixedPass::ContextAttention => unreachable!("FPM uses the prefill component"),
                 },
             )?;
             let mut shared = shared.into_values();
-            let new_tokens = isl.max(1).saturating_sub(prefix);
-            if ctx_tokens > 0 && ctx_tokens < new_tokens {
+            let decode = dec_attn.into_values();
+            let covered_latency_ms = if chunked {
                 // Fold each name before the same single division used by the
                 // scalar chunked-prefill path.
                 let chunks = new_tokens.div_ceil(ctx_tokens) as f64;
@@ -3241,8 +3251,16 @@ impl Engine {
                     row.1 /= chunks;
                     row.2 /= chunks;
                 }
-            }
-            return Ok((shared, Vec::new(), dec_attn.into_values()));
+                let covered_decode_ms: f64 = decode
+                    .iter()
+                    .filter(|row| row.2 > 0.0)
+                    .map(|row| row.1)
+                    .sum();
+                Some(covered_prefill_ms / chunks + covered_decode_ms)
+            } else {
+                None
+            };
+            return Ok(((shared, Vec::new(), decode), covered_latency_ms));
         }
         let mut shared = PerOpFold::new("context");
         let mut ctx_attn = PerOpFold::new("context");
@@ -3275,7 +3293,10 @@ impl Engine {
                 entry.2 /= scale2;
             }
         }
-        Ok((shared.into_values(), ctx_attn, dec_attn.into_values()))
+        Ok((
+            (shared.into_values(), ctx_attn, dec_attn.into_values()),
+            None,
+        ))
     }
 
     /// [`Self::decode_step_latency`] with the per-op values kept.
@@ -6739,9 +6760,10 @@ pub(crate) mod tests {
         });
         let spec = EngineSpec::new(config, vec![composite], vec![generation; 3]);
         let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), &systems_root()).unwrap();
-        let (shared, prefill, decode) = engine
+        let ((shared, prefill, decode), covered_latency_ms) = engine
             .mixed_step_breakdown_per_op_with_metadata(1, 1, 2, 2, 0, 1.0, 1.0)
             .unwrap();
+        assert_eq!(covered_latency_ms, None);
         assert!(shared.is_empty());
         for (rows, phase) in [(&prefill, "context"), (&decode, "generation")] {
             assert_eq!(rows.len(), 1);
