@@ -82,11 +82,22 @@ Run `bash -n` on every generated script.
 
 ## 3. Benchmark with the same arrival process as the simulation
 
-The generated `bench_run.sh` is closed-loop: it runs AIPerf with
-`--concurrency`. It validates a simulation that used
-`traffic.load.type: concurrency`. It does not validate a request-rate
-(Poisson or constant) simulation: matching token lengths is not enough when
-the arrival process differs.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:abd31d006b8b4daee25ec2d6be7157c62ea6dfdc8f73d9eaac98622f7c1e746e -->
+
+The generated `bench_run.sh` runs AIPerf in closed loop and, by default,
+sweeps multiple concurrency points. Each point sends 20 requests per unit
+of concurrency; the script does not use `BenchConfig.num_requests` to set
+that count. `AICONFIGURATOR_BENCH_CONCURRENCY` and
+`AICONFIGURATOR_BENCH_MULTI_ROUND` can override the points and multiplier.
+Compare the point matching the simulated concurrency. This sweep does not
+validate a request-rate (Poisson or constant) simulation because the arrival
+process differs.
+
+For a single point using the simulated request count, run:
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 Closed loop (simulation used `concurrency: C`):
 
