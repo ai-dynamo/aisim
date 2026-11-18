@@ -1114,6 +1114,17 @@ impl Engine {
                     .into(),
             ));
         }
+        // DSv4.1 staged mixed steps price every context op token-major.
+        if seen[0]
+            && spec
+                .context_ops
+                .iter()
+                .any(|op| matches!(op, Op::Dsv41Stage(_)))
+        {
+            return Err(AicError::InvalidEngineConfig(
+                "qualified Mamba ops are not supported beside DSv4.1 stages".into(),
+            ));
+        }
         super::readiness::validate_glm53_kv(
             &db,
             spec.context_ops.iter().chain(&spec.generation_ops),
@@ -4880,6 +4891,35 @@ pub(crate) mod tests {
         };
         phases("float16", "float16").unwrap();
         phases("unrecorded", "unrecorded").unwrap();
+        // A qualified pair beside DSv4.1 stages would take the staged mixed
+        // step, which has no per-phase Mamba pricing.
+        let stage = |is_context| {
+            Op::Dsv41Stage(crate::operators::Dsv41StageOp {
+                name: "encoder".into(),
+                is_context,
+                bounded: false,
+                decoder_replay: false,
+                window_size: 128,
+                children: vec![Op::Elementwise(ElementwiseOp {
+                    name: "norm".into(),
+                    scale_factor: 1.0,
+                    bytes_per_token: 8192.0,
+                    scale_num_tokens: 1,
+                    seq_split: 1,
+                })],
+            })
+        };
+        let err = Engine::build(
+            EngineSpec::new(
+                fixture_engine_config(None),
+                vec![stage(true), qualified_mamba(true, 1)],
+                vec![stage(false), qualified_mamba(false, 1)],
+            ),
+            db.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("DSv4.1 stages"), "{err}");
         for (context, generation) in [("unrecorded", "float16"), ("float16", "unrecorded")] {
             let err = phases(context, generation).unwrap_err().to_string();
             assert!(err.contains("all record a state_dtype"), "{err}");
