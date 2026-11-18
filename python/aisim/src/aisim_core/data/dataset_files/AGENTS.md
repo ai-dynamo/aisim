@@ -20,7 +20,7 @@ a reason to store them.
 ## 2. Run the checker and fix every finding
 
 ```bash
-aisim data check-names <your-data-directory>
+aisim data validate <your-data-directory>
 ```
 
 Each finding gives the location, the stored value and the canonical name to use. For a known alias (a finding
@@ -39,6 +39,6 @@ Never remove or rename an existing field, and never change a field's type or uni
 
 - State the category, the source of the data and the tool versions.
 - List every name you could not map, as a proposed registry addition (name, kind, unit if a metric, aliases).
-- Confirm that `aisim data check-names` printed `"ok": true`.
+- Confirm that `aisim data validate` printed `"ok": true`.
 - Do not include secrets, prompts, tokens, internal URLs or run URLs; follow the redaction rules in
   `CONTRIBUTING.md`.

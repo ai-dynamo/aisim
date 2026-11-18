@@ -93,7 +93,7 @@ def test_invalid_purpose_and_missing_category_are_usage_errors(run):
         run("--category", "fpm", "--purpose", "everything")
     assert exc.value.code == 2
     with pytest.raises(SystemExit) as exc:
-        run("--model", "m1")
+        run("--configuration")  # missing value
     assert exc.value.code == 2
 
 

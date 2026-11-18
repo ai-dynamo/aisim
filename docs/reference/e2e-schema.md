@@ -52,7 +52,7 @@ One canonical name per concept; stored data uses only canonical names (`b300_sxm
 | statistic | `mean`, `median`, `p90`, `std` | `p50` is an alias of `median` |
 | phase | `warmup`, `profile` | `preparation` is an alias of `warmup` |
 
-Check a directory before a pull request with [`aisim data check-names`](cli.md#check-canonical-names). A name that
+Check a directory before a pull request with [`aisim data validate`](cli.md#validate-dataset). A name that
 is not canonical is still stored, but it is reported with the canonical spelling to use, and consumers ignore it
 until the data is fixed. External contributors convert to canonical names first; the dataset's `AGENTS.md` and
 `CONTRIBUTING.md` instruct a contributor's agent to do it.
