@@ -37,6 +37,7 @@ MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 CASES = {
     "one_request_budget_above_new_tokens": (1, 4096, 64, 3000, 2048),
     "one_request_budget_above_prompt": (1, 4096, 64, 3000, 8192),
+    "one_request_exact_prompt_budget": (1, 4096, 64, 3000, 4096),
     "two_complete_cached_requests": (16, 4096, 64, 3000, 8192),
     "split_budget_cached": (16, 4096, 64, 1024, 8128),
     "chunked_uncached": (16, 6000, 64, 0, 2048),

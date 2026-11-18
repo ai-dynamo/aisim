@@ -45,6 +45,26 @@
    },
    "mix_step_non_mamba_ms": 18.053610817948734
   },
+  "one_request_exact_prompt_budget": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 4096,
+    "osl": 64,
+    "prefix": 3000,
+    "ctx_tokens": 4096
+   },
+   "ttft_ms": 29.01,
+   "tpot_ms": 2.616,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 0.3481049886206165,
+    "context_mamba_in_proj_gemm": 1.0659807007336703,
+    "context_mamba_norm": 0.15699883636363637,
+    "context_mamba_out_proj_gemm": 0.4427862161036474,
+    "context_mamba_ssm": 0.0737299948051948
+   },
+   "mix_step_non_mamba_ms": 13.180793682949433
+  },
   "two_complete_cached_requests": {
    "inputs": {
     "batch_size": 16,

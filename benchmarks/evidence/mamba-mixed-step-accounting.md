@@ -307,16 +307,21 @@ apply to every operation of every model.
   call on the same session with a different prefix returned the first result.
   Commit `19e8daf6` adds the prefix to the cache key.
 
-`agg_caller.py` gained the large-budget case and a same-session prefix
-sequence. It ran from the `9a2bde6b` and `19e8daf6` builds. The raw outputs are
-[`caller-9a2bde6b.json`](mamba-mixed-step-accounting/caller-9a2bde6b.json) and
-[`caller-19e8daf6.json`](mamba-mixed-step-accounting/caller-19e8daf6.json).
+`agg_caller.py` gained the large-budget case, its exact 4096-token control and
+a same-session prefix sequence. It ran from the `9a2bde6b`, `19e8daf6` and
+`70a8ea00` builds. The raw outputs are
+[`caller-9a2bde6b.json`](mamba-mixed-step-accounting/caller-9a2bde6b.json),
+[`caller-19e8daf6.json`](mamba-mixed-step-accounting/caller-19e8daf6.json) and
+[`caller-70a8ea00.json`](mamba-mixed-step-accounting/caller-70a8ea00.json). The
+`19e8daf6` run predates the control. `70a8ea00` gives the same values for
+every case the two share.
 
-| Case | Value | `9a2bde6b` | `19e8daf6` | Oracle |
+| Case | Value | `9a2bde6b` | `19e8daf6` and `70a8ea00` | Oracle |
 | --- | --- | --- | --- | --- |
 | One request (1, 4096, 3000, 8192) | `context_mamba_ssm` ms | 0.147460 | 0.073730 | 0.073730 |
-| One request (1, 4096, 3000, 8192) | Non-Mamba sum ms | 18.053611 | 13.180794 | Equal to the 4096 budget |
-| One request (1, 4096, 3000, 8192) | TTFT ms | 41.048 | 29.010 | Equal to the 4096 budget |
+| One request (1, 4096, 3000, 8192) | Non-Mamba sum ms | 18.053611 | 13.180794 | 13.180794, the control |
+| One request (1, 4096, 3000, 8192) | TTFT ms | 41.048 | 29.010 | 29.010, the control |
+| Control (1, 4096, 3000, 4096) | `context_mamba_ssm`, non-Mamba sum, TTFT | 0.073730, 13.180794, 29.010 | Same | Unchanged by the fix |
 | Same session, prefix 0, then 3000 | `context_mamba_ssm` ms | 0.132332, 0.132332 | 0.132332, 0.073730 | 0.132332, 0.073730 |
 | Same session, prefix 0, then 3000 | TTFT ms | 79.852, 79.852 | 79.852, 77.844 | Second call equal to a fresh session |
 
@@ -335,6 +340,12 @@ and pass on `19e8daf6`. At `19e8daf6`, 727 Python tests in the backend,
 session, speculation, single-oracle and Mamba suites passed, with engine-step
 parity (305) and the golden set (121).
 
+Commit `70a8ea00` prices a qualified scan with a cached prefix with the SOL
+estimate, because measured scan rows start from a cold state. The `1.3.0rc20`
+data has no scan rows, so every scan above already used SOL. At `70a8ea00`,
+`agg_caller.py` and `telem.py` reproduce the earlier outputs exactly, and 727
+Python tests, the public API (28) and the embedded Replay tests (9) passed.
+
 The two parity suites ran from the repository root of each build, with that
 build's `python/aisim` environment:
 
@@ -351,7 +362,8 @@ python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
 | --- | --- | --- | --- |
 | `62293977` | `6511a26d` | 305 passed | 121 passed |
 | `9a2bde6b` | `d321defd` | 305 passed | 121 passed |
-| `19e8daf6` | `879aebde` | 305 passed | 121 passed |
+| `19e8daf6` | `879aebde`, `35a323d6` | 305 passed | 121 passed |
+| `70a8ea00` | The head that adds this row | 305 passed | 121 passed |
 
 Each published head adds no product code to its code revision, only tests,
 documentation or evidence, so it carries that revision's parity results.
