@@ -732,6 +732,7 @@ from session order. It adds these fields:
 | `delay` / `delay_ms` | `0` | Delay after the last dependency completes. |
 | `tool_wait_ms` | `0` | Additional tool wait after dependencies; scheduling delay is `delay + tool_wait_ms`. |
 | `timestamp` / `created_time` | `0` for roots | Ready time for a node with an empty `wait_for`; dependent-node timestamps do not control release. |
+| `recorded_start_ms` | unset | Optional finite, nonnegative recorded start offset in milliseconds. AgentX producers preserve the recorded clock here while ordinary replay follows dependency edges. With `traffic.load.agentic_snapshot`, it determines the cut and the remaining timer of a request without a live-work dependency; live dependencies still gate dispatch. Unset for `client: recorded`, omitted when serializing, and ignored by ordinary replay. |
 | `request_kind`, `branches`, `prefix_reset`, `tool_events` | Empty | Producer metadata accepted by the format. Scheduling is controlled by `wait_for`, and cache identity is carried by `hash_ids`; these metadata fields do not independently change replay behavior. |
 
 A dependent node becomes ready after the latest request in `wait_for` completes, plus its `delay` and

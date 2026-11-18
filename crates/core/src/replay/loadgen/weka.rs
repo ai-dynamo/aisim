@@ -4192,6 +4192,10 @@ mod tests {
         let (_, recorded) = load_weka_agentic_rows(&path).unwrap();
         assert_eq!(row(&recorded, "outer:1:inner:0").not_before_ms, 900.0);
         assert_eq!(row(&recorded, "outer:2").not_before_ms, 1_200.0);
+        for request in &recorded {
+            let serialized = serde_json::to_value(request).unwrap();
+            assert!(serialized.get("recorded_start_ms").is_none());
+        }
 
         // AgentX keeps it only on the root; the rest follow their edges.
         let rows = agentx_rows(&path);
@@ -4221,6 +4225,55 @@ mod tests {
         // the historical spawning turn returned.
         assert_eq!(delay_ms(&requests, "outer:1:inner:0"), 300.0);
         assert_eq!(delay_ms(&requests, "outer:2"), 600.0);
+        // Exercise both sides of max(recorded timer, live join): the cut is
+        // 600 ms, the child starts at 900 - 600 = 300 ms, and the continuation
+        // waits until max(1200 - 600, actual child completion).
+        for (child_completion_ms, continuation_ms) in [(400.0, 600.0), (700.0, 700.0)] {
+            let cut = prepared.context().prepare_play(0, 0, Some(600.0)).unwrap();
+            let snapshots =
+                crate::replay::loadgen::PreparedAgenticSnapshots::from_plays(vec![cut]).unwrap();
+            let mut resumed = crate::replay::loadgen::WorkloadDriver::new_agentic_snapshots(
+                snapshots, 4, true, 1.0,
+            )
+            .unwrap();
+            assert_eq!(resumed.total_turns(), 2);
+            assert_eq!(resumed.next_ready_time_ms(), Some(300.0));
+            assert!(resumed.pop_ready(299.0, usize::MAX).is_empty());
+            let child = resumed.pop_ready(300.0, usize::MAX);
+            assert_eq!(child.len(), 1);
+            assert!(
+                child[0]
+                    .authored_request_id
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("outer:1:inner:0")
+            );
+            if child_completion_ms > 600.0 {
+                assert!(resumed.pop_ready(600.0, usize::MAX).is_empty());
+            }
+            resumed
+                .on_complete(child[0].request_uuid, child_completion_ms)
+                .unwrap();
+            assert_eq!(resumed.next_ready_time_ms(), Some(continuation_ms));
+            assert!(
+                resumed
+                    .pop_ready(continuation_ms - 1.0, usize::MAX)
+                    .is_empty()
+            );
+            let continuation = resumed.pop_ready(continuation_ms, usize::MAX);
+            assert_eq!(continuation.len(), 1);
+            assert!(
+                continuation[0]
+                    .authored_request_id
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("outer:2")
+            );
+            resumed
+                .on_complete(continuation[0].request_uuid, continuation_ms + 50.0)
+                .unwrap();
+            assert!(resumed.is_drained());
+        }
         let mut driver =
             crate::replay::loadgen::WorkloadDriver::new_agentic_trace(graph, 4).unwrap();
         let root = driver.pop_ready(0.0, usize::MAX);
