@@ -1,2 +1,0 @@
-JobID|State|ElapsedRaw|AllocTRES|NNodes
-1363724|COMPLETED|260|billing=1,cpu=16,gres/gpu=1,mem=507271M,node=1|1

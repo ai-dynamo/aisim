@@ -1,8 +1,0 @@
-system=h200_sxm job=55672 node=neb-cdg-slurm-1-gpu-3 start=1794990592
-CPU(s):                               128
-Model name:                           Intel(R) Xeon(R) Platinum 8468
-Thread(s) per core:                   2
-Socket(s):                            2
-f7e564e350b7932e23c2d15703e85c2160ae59673f844b115988693d01bb7aa9  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_lights-out-inf/users/simonec/tokenization-cost/workload/agentx-l1-60.jsonl
-adedaffe86fed74e5a43563f719b4b719f6c2cb2083254f88428c9634740bdc3  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_lights-out-inf/users/simonec/images/pr664-cost-sglang0521-amd64-2dbe4c7f.sqsh
-end=1794990975

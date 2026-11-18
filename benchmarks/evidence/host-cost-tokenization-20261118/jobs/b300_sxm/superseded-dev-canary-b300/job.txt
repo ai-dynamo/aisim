@@ -1,8 +1,0 @@
-system=b300_sxm job=1362854 node=pool0-0114 start=1794989001
-CPU(s):                                  192
-Model name:                              Intel(R) Xeon(R) Platinum 8559C
-Thread(s) per core:                      2
-Socket(s):                               2
-090f900932c935598de0d1112750c49ef9307663c101b474959182141a01145d  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec/results/qwen35-agentx-weka-20261102/full-normalized/qwen-weka-l1/raw.jsonl
-35b6881618f1ab48ef054126d659e18aebf2a009dd918b726f4220b32a274eae  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/simonec/images/vllm-0310-cu130-a4a4c043.sqsh
-end=1794989033
