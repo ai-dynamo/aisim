@@ -377,6 +377,12 @@ def test_routed_experts_of_one_layer_must_share_a_precision():
     # An exclusion that matches only the fused expert block also makes the layer BF16, as in vLLM.
     block = {"quantization_config": {**raw["quantization_config"], "ignore": ["backbone.layers.1.mixer.expert[s]"]}}
     assert _moe_modes(block, "ME", MOE.nvfp4, "gb200") == {MOE.bfloat16: 1}
+    # The block exclusion wins before expert 0's partial listing is validated.
+    partial_listing = _listing(
+        {"backbone.layers.1.mixer.experts.0.up_proj": {"quant_algo": "FP8"}},
+        ignore=["backbone.layers.1.mixer.expert[s]"],
+    )
+    assert _moe_modes(partial_listing, "ME", MOE.nvfp4, "gb200") == {MOE.bfloat16: 1}
     # Excluding expert 0 alone leaves expert 1 at FP8: still a mixed layer.
     partial = {"quantization_config": {**raw["quantization_config"], "ignore": ["backbone.layers.1.mixer.experts.0.*"]}}
     with pytest.raises(ValueError, match="Routed experts of layer 1 disagree"):

@@ -289,13 +289,13 @@ def moe_modes(
 
     # A layer is priced from its declared expert modules; reject a layer whose other listed experts disagree.
     # A layer whose declared experts are excluded is BF16 only if no listed expert escapes the exclusion.
-    block_modes = {}
+    block_modes, block_excluded = {}, set()
     for layer, kind in enumerate(layer_kinds):
         declared = expert_modules.get(kind, ())
         blocks = {module.partition("experts.")[0] + "experts" for module in declared}
         if any(checkpoint._excluded(path) for block in blocks for path in layer_paths(layer, block)):
-            # vLLM checks exclusions against the fused expert prefix itself.
-            block_modes[layer] = moe.bfloat16
+            # vLLM checks exclusions against the fused expert prefix itself; its children are not read.
+            block_excluded.add(layer)
             continue
         if any(checkpoint.module(layer_paths(layer, module))[0] for module in declared):
             prefixes = tuple(f"{path}." for block in blocks for path in layer_paths(layer, block))
@@ -321,6 +321,9 @@ def moe_modes(
             if algos:
                 block_modes[layer] = resolve(algos.pop(), False)
     experts = {kind: {"experts": modules} for kind, modules in expert_modules.items()}
-    rows = checkpoint.rows(layer_kinds, experts, layer_paths, resolve)
+    kinds = [None if layer in block_excluded else kind for layer, kind in enumerate(layer_kinds)]
+    rows = checkpoint.rows(kinds, experts, layer_paths, resolve)
     resolved = Counter(block_modes.get(layer, mode) for layer, *_, mode in rows)
+    if block_excluded:
+        resolved[moe.bfloat16] += len(block_excluded)
     return {} if set(resolved) <= {default} else dict(resolved)
