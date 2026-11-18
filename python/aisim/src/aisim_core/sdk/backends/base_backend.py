@@ -2045,8 +2045,10 @@ class BaseBackend:
         # Compute the mean-field number of engine iterations needed to consume
         # all context and commit the requested output tokens.
         steps_to_finish_ctx = np.ceil(isl * b / ctx_tokens)
-        # Budget whose ``ceil(isl / budget)`` counts one request's prefill steps.
+        # Budget whose ``ceil(isl / budget)`` counts one request's prefill
+        # steps, and the step count the TTFT queuing factor reads.
         ttft_ctx_tokens = ctx_tokens
+        ttft_steps_to_finish_ctx = steps_to_finish_ctx
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
@@ -2077,8 +2079,10 @@ class BaseBackend:
                 num_mix_ctx_tokens = isl if fits else min(ctx_tokens, isl)
             if fits:
                 # The uncached prompt fits the budget: one step schedules the
-                # whole request, and TTFT counts that one prefill step.
+                # whole request, and TTFT counts that one prefill step, in its
+                # chunk count and in the queuing factor's input.
                 ttft_ctx_tokens = isl
+                ttft_steps_to_finish_ctx = 1
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
             num_genonly_tokens = 1
@@ -2143,7 +2147,7 @@ class BaseBackend:
             prefill_step_ms=_prefill_step_ms,
             genonly_step_latency_ms=genonly_step_latency_ms,
             encoder_latency_ms=encoder_latency_ms,
-            steps_to_finish_ctx=steps_to_finish_ctx,
+            steps_to_finish_ctx=ttft_steps_to_finish_ctx,
             decode_iterations=decode_iterations,
         )
 

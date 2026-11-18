@@ -193,16 +193,26 @@ def _ttft(summary):
     return float(summary.get_summary_df().iloc[0]["ttft"])
 
 
-@pytest.mark.parametrize(("prefix", "chunks"), [(3000, 1), (0, 2)])
-def test_run_agg_ttft_counts_uncached_prefill_steps(monkeypatch, prefix, chunks):
+@pytest.mark.parametrize(("prefix", "chunks", "qf"), [(3000, 1, 1.90), (0, 2, 1.95)])
+def test_run_agg_ttft_counts_uncached_prefill_steps(monkeypatch, prefix, chunks, qf):
     # A 4096-token prompt under a 2048-token budget: with 3000 cached tokens the
     # 1096 uncached tokens finish in one step; uncached, the prompt needs two.
-    # TensorRT-LLM's TTFT is step * chunks * qf, with qf = 2 + (2 - 3) / 20 for
-    # ceil(4096 / 2048) = 2 budget steps and no dispatch or encoder term.
+    # TensorRT-LLM's TTFT is step * chunks * qf, with qf = 2 + (steps - 3) / 20
+    # for the prefill steps and no dispatch or encoder term.
     run = _qualified_nano_session(monkeypatch)
     summary = run(1, 2048, prefix=prefix)
     step_ms = sum(summary.get_per_ops_data()["mix_step"].values())
-    assert _ttft(summary) == pytest.approx(step_ms * chunks * 1.95, abs=1e-3)
+    assert _ttft(summary) == pytest.approx(step_ms * chunks * qf, abs=1e-3)
+
+
+def test_run_agg_one_step_ttft_does_not_depend_on_the_budget(monkeypatch):
+    # 128 uncached tokens fit a 128-token and a 4096-token budget alike: one
+    # step at the same coordinates, one chunk, and qf = 2 + (1 - 3) / 20.
+    run = _qualified_nano_session(monkeypatch)
+    tight, full = run(1, 128, prefix=3968), run(1, 4096, prefix=3968)
+    step_ms = sum(full.get_per_ops_data()["mix_step"].values())
+    assert tight.get_per_ops_data()["mix_step"] == full.get_per_ops_data()["mix_step"]
+    assert _ttft(tight) == _ttft(full) == pytest.approx(step_ms * 1.90, abs=1e-3)
 
 
 def test_run_agg_rejects_a_fully_cached_prompt(monkeypatch):
@@ -352,3 +362,25 @@ def test_run_agg_reuse_keeps_the_partial_qualification_rejection():
     for warm in (backend, get_backend("trtllm", "b200_sxm")):
         with pytest.raises(Exception, match="must all record a state_dtype"):
             _agg_ttft(warm, partial, database)
+
+
+def test_run_agg_reuse_keeps_a_wrapped_mamba_op_distinct():
+    # A draft query width wraps the op in TokenScale, and a qualified op may
+    # not be nested, so the wrapped graph fails cold and after the plain graph
+    # with the same constructor arguments warmed both caches.
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+
+    database = _hybrid_trtllm_database()
+    plain = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    wrapped = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    next(op for op in wrapped.context_ops if op._name == "context_mamba_ssm")._draft_token_width = (1, 1)
+    rust_engine_step._engine_handle_cache_clear()
+    with pytest.raises(Exception, match="nested"):
+        _agg_ttft(get_backend("trtllm", "b200_sxm"), wrapped, database)
+    rust_engine_step._engine_handle_cache_clear()
+    backend = get_backend("trtllm", "b200_sxm")
+    _agg_ttft(backend, plain, database)
+    for warm in (backend, get_backend("trtllm", "b200_sxm")):
+        with pytest.raises(Exception, match="nested"):
+            _agg_ttft(warm, wrapped, database)

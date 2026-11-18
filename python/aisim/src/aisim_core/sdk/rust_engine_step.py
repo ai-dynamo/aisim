@@ -1795,15 +1795,20 @@ def engine_identity(model: Any, database: Any) -> str:
 
     The memo is reused only for the same database object in the same query
     mode and transfer policy: ``set_default_database_mode`` changes both in
-    place, and the compiled engine bakes them into its query dispatch.
+    place, and the compiled engine bakes them into its query dispatch. The
+    setters replace the mode member and the frozen policy instead of mutating
+    them, so identity checks detect a change without rebuilding either key on
+    this per-query path.
     """
-    mode = (_database_mode_key(database), _transfer_policy_key(database))
+    get_mode = getattr(database, "get_default_database_mode", None)
+    mode = get_mode() if get_mode is not None else None
+    policy = getattr(database, "transfer_policy", None)
     memo = getattr(model, "_aic_engine_identity_memo", None)
-    if memo is not None and memo[0] is database and memo[1] == mode:
-        return memo[2]
+    if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy:
+        return memo[3]
     key = _engine_config_json(model, database)
     try:
-        model._aic_engine_identity_memo = (database, mode, key)
+        model._aic_engine_identity_memo = (database, mode, policy, key)
     except (AttributeError, TypeError):
         pass  # slotted/frozen model objects: recompute per call
     return key
@@ -1814,12 +1819,14 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
 
     The model config does not carry the qualification fields: one config can
     compile qualified or legacy ops, or assign different state dtypes to each
-    op. A legacy op has empty keyword arguments, so it stays explicit.
+    op. A legacy op has empty keyword arguments, so it stays explicit. A draft
+    query width compiles the op inside a ``TokenScale`` wrapper, so it is
+    part of the identity too.
     """
     import aisim_core._native as native
 
     return [
-        [ops_name, index, list(args), dict(kwargs)]
+        [ops_name, index, list(args), dict(kwargs), getattr(op, "_draft_token_width", None)]
         for ops_name in ("context_ops", "generation_ops")
         for index, op in enumerate(getattr(model, ops_name, ()))
         if isinstance(op, native.Mamba2Kernel)

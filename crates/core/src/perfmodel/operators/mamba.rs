@@ -139,6 +139,13 @@ impl Mamba2Op {
                 self.name, self.token_width
             )));
         }
+        // A qualified prefill with no new token has no scan work to price.
+        if self.state_dtype != "unrecorded" && self.phase == "context" && seq_len == 0 {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {}: a qualified prefill needs at least one new token",
+                self.name
+            )));
+        }
         let requests = if self.phase == "generation" {
             batch_size.div_ceil(self.token_width.max(1))
         } else {
@@ -1181,6 +1188,9 @@ mod tests {
             .query_with_prefix(&db, 2, 512, 256)
             .unwrap();
         assert_eq!((legacy.source, legacy.latency_ms), (Source::Silicon, 0.5));
+        // A fully cached qualified prefill has no new token to scan.
+        let err = qualified.query_with_prefix(&db, 2, 0, 512).unwrap_err();
+        assert!(err.to_string().contains("at least one new token"), "{err}");
     }
 
     /// Mamba2 follows the database-mode semantics of the other table-backed
