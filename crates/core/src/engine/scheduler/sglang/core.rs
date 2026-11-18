@@ -1421,27 +1421,30 @@ impl SglangCore {
         }
 
         let admission = AdmissionInvariant::new(self.pending_destinations.has_pending());
-        let mut admit = match admission.stage_for(materialized_waiting) {
-            AdmissionStage::Materialized | AdmissionStage::PendingDestinationHead => {
-                Default::default()
-            }
-            AdmissionStage::FreshKv
-                if !defer_prefill
-                    && !(self.config.worker_type == WorkerType::Decode
-                        && self.waiting.iter().any(|request| request.retracted)) =>
-            {
-                get_new_batch_prefill(
-                    &mut self.waiting,
-                    &mut self.kv_manager,
-                    &self.config,
-                    self.new_token_ratio,
-                    &self.running,
-                    self.batch_is_full,
-                    self.source_holds.held_len() + self.inflight_source.len(),
-                )
-            }
-            // Gate the entire prefill entry point, including chunk continuation.
-            AdmissionStage::FreshKv => Default::default(),
+        let stage = admission.stage_for(materialized_waiting);
+        let can_prefill = !defer_prefill
+            && match stage {
+                AdmissionStage::Materialized => false,
+                // A chunk already owns KV that the pending destination may need.
+                AdmissionStage::PendingDestinationHead => self.waiting.has_continuation(),
+                AdmissionStage::FreshKv => {
+                    !(self.config.worker_type == WorkerType::Decode
+                        && self.waiting.iter().any(|request| request.retracted))
+                }
+            };
+        let mut admit = if can_prefill {
+            get_new_batch_prefill(
+                &mut self.waiting,
+                &mut self.kv_manager,
+                &self.config,
+                self.new_token_ratio,
+                &self.running,
+                self.batch_is_full,
+                (stage == AdmissionStage::FreshKv)
+                    .then(|| self.source_holds.held_len() + self.inflight_source.len()),
+            )
+        } else {
+            Default::default()
         };
         self.batch_is_full |= admit.batch_is_full;
 
