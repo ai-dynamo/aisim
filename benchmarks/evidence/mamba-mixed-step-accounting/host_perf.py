@@ -11,6 +11,7 @@ and maps build -> case -> per-round cold and warm medians (us).
 """
 
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -21,12 +22,16 @@ root, rounds, out, builds = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sy
 sys.path.insert(0, str(root / builds[0] / "src/python/aisim"))
 from tools.forward_perf_gate.cases import expand_cases
 
-cases = [
-    c
-    for c in expand_cases()
-    if (c["model_id"] == "qwen3-32b" or c["model_id"].startswith("nemotron-3-super"))
-    and c["database_mode"] == "SILICON"
-]
+prefixes = os.environ.get("HOST_PERF_MODELS")
+
+
+def selected(model_id):
+    if prefixes:
+        return model_id.startswith(tuple(prefixes.split(",")))
+    return model_id == "qwen3-32b" or model_id.startswith("nemotron-3-super")
+
+
+cases = [c for c in expand_cases() if selected(c["model_id"]) and c["database_mode"] == "SILICON"]
 res = {b: {} for b in builds}
 orders = []
 for r in range(rounds):

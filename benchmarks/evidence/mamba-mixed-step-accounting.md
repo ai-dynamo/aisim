@@ -726,8 +726,8 @@ stored attributes directly, which takes 0.17 us. The setters replace both
 values, so the check still detects a mode or policy change.
 
 The gate's own `worker.py` ran each build on the 13 SILICON cases of
-Qwen3-32B and Nemotron-3-Super-120B FP8, with 10 warm-up and 100 timed
-queries per case. This local comparison is separate from the CI gate. The
+Qwen3-32B and Nemotron-3-Super-120B FP8. Each case ran 10 warm-up and 100
+timed queries. This local comparison is separate from the CI gate. The
 driver is [`host_perf.py`](mamba-mixed-step-accounting/host_perf.py). Put each
 build's checkout in `ROOT/BUILD/src` and its environment in
 `ROOT/BUILD/venv`, then run
@@ -761,7 +761,7 @@ An earlier five-round run, in
 [`host-perf-1db9b803.json`](mamba-mixed-step-accounting/host-perf-1db9b803.json),
 ran the builds in the same order every round, `1db9b803` last. It gave -7.4%
 to +2.3%. Because the order was fixed, it does not control for build
-position, and the rotated run replaces it. So does an earlier three-round
+position, and the rotated run replaces it. It also replaces an earlier three-round
 fixed-order run,
 [`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json),
 which measured `1ea0211c` at 17.08 us for the first case against 14.08 us
@@ -769,10 +769,12 @@ for main.
 
 The CI gate on `c425c61a` found one confirmed regression among 101 stable
 comparisons, DeepSeek-V3.2 TP8 generation from a cold query (+14.7%
-geometric mean). The rotated driver, run on the six DeepSeek-V3.2 gate
-cases, gives +0.2% and +3.2% for the two TP8 generation cold queries at
-`bf03c37d`, and -1.6% to +3.3% across all six. So it does not reproduce
-that result. The raw rounds are in
+geometric mean). The rotated driver also ran the six DeepSeek-V3.2 gate
+cases. At `bf03c37d`, the two TP8 generation cold queries change by +0.2%
+and +3.2%, and all six by -1.6% to +3.3%. So it does not reproduce that
+result. That run used
+`HOST_PERF_MODELS=deepseek-v3.2 python host_perf.py ROOT 6 OUT.json rbf1b539f r1db9b803 rbf03c37d`.
+The raw rounds are in
 [`host-perf-deepseek-bf03c37d.json`](mamba-mixed-step-accounting/host-perf-deepseek-bf03c37d.json). These are simulator host timings, not predicted
 serving latency. The paired CI gate on the published head remains the
 exact-head result.
