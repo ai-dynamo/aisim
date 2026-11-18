@@ -24,17 +24,20 @@ call with diagnostics checks that the workload exercises mixed ranks.
 From the candidate source root, use the Python environment with the project dev
 dependencies. Put the built baseline and candidate libraries at
 `$AISIM_BENCHMARK_DIR/base-runtime.so` and
-`$AISIM_BENCHMARK_DIR/change-runtime.so`, respectively. The actual run used:
+`$AISIM_BENCHMARK_DIR/change-runtime.so`, respectively. Set `PYTHON` to that
+environment's interpreter and `PYTHON_LIBDIR` to the directory holding its
+`libpython3.12.so` (needed by the `embed-python` builds). The run used Python
+3.12.15 from uv:
 
 ```bash
-export AISIM_BENCHMARK_DIR=/home/kaim/.cache/aisim-934-benchmark/measurement
+export AISIM_BENCHMARK_DIR=/path/to/benchmark-dir
 overlay=$(mktemp -d /tmp/aisim-934-benchmark-overlay.XXXXXX)
 mkdir -p "$overlay/aisim"
 cp -as "$PWD/python/aisim/src/aisim/." "$overlay/aisim/"
 ln -s "$AISIM_BENCHMARK_DIR/change-runtime.so" "$overlay/aisim/_runtime.so"
 export PYTHONPATH="$overlay:$PWD/python/aisim/src:$PWD/python/aisim"
-export LD_LIBRARY_PATH=/home/kaim/.local/share/uv/python/cpython-3.12.15-linux-x86_64-gnu/lib
-taskset -c 7 /home/kaim/venvs/aisim-2375/bin/python \
+export LD_LIBRARY_PATH="$PYTHON_LIBDIR"
+taskset -c 7 "$PYTHON" \
   benchmarks/evidence/aisim-2001-replay-power/benchmark.py --pairs 20 \
   > "$AISIM_BENCHMARK_DIR/paired.jsonl" 2> "$AISIM_BENCHMARK_DIR/replay.stderr"
 ```
