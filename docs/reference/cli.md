@@ -152,7 +152,7 @@ before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `fpm`; name `op-lat
 `RustForwardPassPerfModel.best_available`: the data a configuration needs is taken from the cached revision,
 a missing or corrupt file is a precise error, and there is no fallback to other data. A run that builds its
 operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an explicit `backend_version` in
-`aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
+`aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `op-latency`),
 `AISIM_DATA_CONFIGURATION` (choose among several matches; with several categories it constrains only the category that lists the ID), `AISIM_DATA_MAX_BYTES` (auto-download
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.

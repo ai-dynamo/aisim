@@ -32,7 +32,7 @@ module accepts, stores and prints no token.
 
 Environment (read by :func:`pin_from_environment`): ``AISIM_DATASET=<repo>@<revision>``
 (use a full commit SHA for offline reuse), ``AISIM_DATA_LOCAL``, ``AISIM_DATA_CATEGORIES``
-(default ``fpm``), ``AISIM_DATA_CONFIGURATION``, ``AISIM_DATA_MAX_BYTES``,
+(default ``op-latency``), ``AISIM_DATA_CONFIGURATION``, ``AISIM_DATA_MAX_BYTES``,
 ``AISIM_DATA_OFFLINE`` and ``AISIM_DATA_CACHE``.
 """
 
@@ -157,7 +157,7 @@ class DataPin:
     repo: str | None = None
     revision: str | None = None  # full commit SHA recommended: it resolves with no network
     local_root: Path | None = None
-    categories: tuple[str, ...] = ("fpm",)
+    categories: tuple[str, ...] = ("op-latency",)
     configuration_id: str | None = None  # disambiguates several catalog matches
     max_bytes: int = DEFAULT_MAX_BYTES
     offline: bool = False
