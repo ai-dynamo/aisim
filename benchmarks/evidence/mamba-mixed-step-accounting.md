@@ -739,6 +739,76 @@ load. Compare width runs only when their fingerprint method, system and
 SHA-256 agree; the resolved systems root remains visible in the diagnostics.
 Historical telemetry artifacts predate these provenance fields.
 
+### Validation at `d462dab8`
+
+These results come from a clean checkout of `d462dab8`, the head with the
+scoped corrections above. A fresh Python 3.13 environment installed
+`./python/aisim[dev]` from that checkout on a local macOS arm64 host.
+
+`fpm_caller.py` passed its build check. The imported `aisim` and
+`aisim_core` sources, the native source inventory and the committed-source
+check all matched `d462dab8`. The output is
+[`fpm-d462dab8.json`](mamba-mixed-step-accounting/fpm-d462dab8.json). Its
+`build` record holds the package fingerprints (`9123b44f3e2a` and
+`e44a59b9bd02`). It also holds the native source fingerprint
+(`baa6c328dd21`) and the extension hash (`ffda0496ea69`).
+Apart from these build fields, its output is identical to `fpm-1ea0211c.json`.
+
+`telem.py` gave cases identical to `c3ed1513.json`. Its new provenance fields
+are in [`telem-d462dab8.json`](mamba-mixed-step-accounting/telem-d462dab8.json).
+The performance-data fingerprint is `systems_tree_sha256_v1` over 340
+`b200_sxm` files, with SHA-256 prefix `0babf8aeb427`.
+
+`agg_caller.py` changed one case against `caller-71fcef7b.json`, the last
+published caller output. The output is
+[`caller-d462dab8.json`](mamba-mixed-step-accounting/caller-d462dab8.json).
+The split budget `(16, 4096, 1024, 8128)` holds one complete request and a
+4032-token remainder. The remainder is longer than `isl - prefix = 3072`
+new tokens, so qualified Mamba caps it at 3072 tokens. The shared
+token-major operations now see 6144 prefill tokens instead of
+`8128 - 1024 = 7104`:
+
+| Value (ms) | `71fcef7b` | `d462dab8` |
+| --- | --- | --- |
+| `context_mamba_in_proj_gemm` | 6.233198 | 5.378181 |
+| `context_mamba_norm` | 0.640511 | 0.563431 |
+| `context_mamba_out_proj_gemm` | 2.587059 | 2.320700 |
+| `context_mamba_conv1d`, `context_mamba_ssm` | 1.169136, 0.390731 | Same |
+| Non-Mamba sum | 32.445532 | 29.977341 |
+| TTFT | 100.376 | 91.943 |
+| TPOT | 9.968 | 9.607 |
+
+The three changed rows are shared projections and a norm, not Mamba2
+kernels. The other five cases and the same-session block are identical. Each
+of those cases has no remainder longer than `isl - prefix`. `run_agg` gives a
+single request its whole prompt, `8192` is an exact multiple of `isl`, and
+with no prefix the cap equals `isl`.
+
+[`shared_tokens.py`](mamba-mixed-step-accounting/shared_tokens.py) checks the
+6144-token count against an independent route. It prices the same step with
+13 decode requests three times: a qualified graph at budget 8128, a legacy
+graph at budget 8192 (`8192 - 2 * 1024 = 6144` shared tokens) and a legacy
+graph at budget 8128 (7104). Every shared operation of the qualified step
+equals the legacy 6144-token value and differs from the 7104-token value.
+Examples are `context_moe` (21.368810 against 22.994450 ms) and
+`context_mamba_in_proj_gemm` (5.377290 against 6.232308 ms). Attention and
+the logits GEMM are the same in all three runs. Only the Mamba2 kernels
+differ, because they keep their own chunk geometry.
+
+These suites passed at `d462dab8`:
+
+- The affected Python suites: 960 tests, including the four new constructor
+  checks.
+- Engine-step parity (305), the golden set (121) and the public API (28).
+- `cargo test -p aisim-core --lib`: 3273 passed and 2 ignored, including
+  `qualified_mamba_exact_totals_preserve_new_tokens`,
+  `mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks` and
+  `physical_vllm_scan_label_is_context_only`.
+- The embedded Replay tests (9) and `test_committed_sources.py` (4).
+
+This run did not measure host time. Full CI and the forward-prediction
+performance gate did not run on this head.
+
 ## Host cost
 
 Six alternating Baseline and Candidate pairs ran. The retained replay results
