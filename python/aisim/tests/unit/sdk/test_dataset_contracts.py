@@ -7,11 +7,11 @@ import shutil
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 from jsonschema import Draft202012Validator
 
 from aisim_core import _native
+from aisim_core.data.parquet import write_parquet
 from aisim_core.datasets import (
     Artifact,
     CategoryIndex,
@@ -65,7 +65,8 @@ def dataset(tmp_path, monkeypatch, request):
     (systems / runtime_path).parent.mkdir(parents=True)
     # A real Parquet artifact also retains the runtime version directory. The
     # replacement measured graph consumes no baseline GEMM/attention tables.
-    pq.write_table(pa.table({"latency": [2.0, 5.0]}), systems / runtime_path)
+    # Stamped with the schema ID the manifest declares: artifact verification compares the two.
+    write_parquet(pa.table({"latency": [2.0, 5.0]}), systems / runtime_path, "test/v1")
     model = "meta-llama/Meta-Llama-3.1-8B"
     if getattr(request, "param", "bundled") == "local":
         local = tmp_path / "local-model"
@@ -502,7 +503,7 @@ def test_table_identity_is_model_independent(dataset):
 
 def test_paths_are_canonical():
     for value in ("/absolute", "a//b", "a/./b", "../b", "a\\b"):
-        with pytest.raises(ValueError, match="repository-relative"):
+        with pytest.raises(ValueError, match="repository-relative|should match pattern"):
             Artifact(
                 artifact_id="a", path=value, role="test", format="json", schema="test/v1", sha256="a" * 64, bytes=0
             )

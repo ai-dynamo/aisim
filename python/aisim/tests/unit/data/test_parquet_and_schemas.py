@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import re
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -20,6 +21,7 @@ from aisim_core.data.schemas import (
     SCHEMA_MODELS,
     check_snapshots,
     render_all,
+    render_snapshot,
     snapshot_filename,
     write_snapshots,
 )
@@ -116,3 +118,100 @@ def test_gpu_time_schema_registered():
     from aisim_core.data.schemas import SCHEMA_MODELS
 
     assert "aisim-gpu-time/v1" in SCHEMA_MODELS
+
+
+# ---------------------------------------------------------------- schema constraints mirror the model validators
+
+
+def _validator(schema_id):
+    return Draft202012Validator(json.loads(render_snapshot(schema_id)))
+
+
+def _metric(**over):
+    row = {"observation_id": "o", "metric": "ttft", "statistic": "mean", "unit": "ms", "status": "valid", "value": 1.0}
+    return {**row, **over}
+
+
+@pytest.mark.parametrize(
+    ("document", "valid"),
+    [
+        (_metric(), True),
+        (_metric(status="missing", value=None), True),
+        (_metric(value=None), False),  # valid without a value
+        (_metric(status="missing", value=0), False),  # missing with a value
+    ],
+)
+def test_metric_schema_matches_status_value_rule(document, valid):
+    from aisim_core.data.e2e import MetricRow
+
+    assert _validator("aisim-e2e-metrics/v1").is_valid(document) is valid
+    try:
+        MetricRow.model_validate(document)
+        accepted = True
+    except ValueError:
+        accepted = False
+    assert accepted is valid
+
+
+@pytest.mark.parametrize(
+    ("document", "valid"),
+    [
+        ({"authority": "unknown"}, True),
+        ({"authority": "measured", "gpu_count": 8, "wall_seconds": 10.0}, True),
+        ({"authority": "measured"}, False),  # no GPU count or time
+        ({"authority": "unknown", "gpu_seconds": 12}, False),  # unknown must carry nothing
+    ],
+)
+def test_gpu_time_schema_matches_authority_contract(document, valid):
+    from aisim_core.data.gpu_time import GpuTime
+
+    assert _validator("aisim-gpu-time/v1").is_valid(document) is valid
+    try:
+        GpuTime.model_validate(document)
+        accepted = True
+    except ValueError:
+        accepted = False
+    assert accepted is valid
+
+
+@pytest.mark.parametrize("path", ["../outside", "/abs", "a//b", "a/./b", "a\\b", ""])
+def test_artifact_path_restriction_is_published(path):
+    from aisim_core.data import RELATIVE_PATH_PATTERN, Artifact
+
+    assert re.match(RELATIVE_PATH_PATTERN, path) is None
+    document = {
+        "artifact_id": "a",
+        "path": path,
+        "role": "r",
+        "format": "json",
+        "schema": "s/v1",
+        "sha256": "0" * 64,
+        "bytes": 0,
+    }
+    with pytest.raises(ValueError):
+        Artifact.model_validate(document)
+    schema = json.loads(render_snapshot("aisim-artifact-manifest/v1"))
+    assert not Draft202012Validator({"$ref": "#/$defs/Artifact", "$defs": schema["$defs"]}).is_valid(document)
+    document["path"] = "data/ok.json"
+    assert Draft202012Validator({"$ref": "#/$defs/Artifact", "$defs": schema["$defs"]}).is_valid(document)
+
+
+def test_verify_compares_the_stored_schema_id_with_the_manifest_declaration(tmp_path):
+    import hashlib
+
+    from aisim_core.data import Artifact, _verify
+
+    path = write_parquet(_table(), tmp_path / "t.parquet", SCHEMA)
+    data = path.read_bytes()
+    declared = dict(
+        artifact_id="t",
+        path="t.parquet",
+        role="r",
+        format="parquet",
+        sha256=hashlib.sha256(data).hexdigest(),
+        bytes=len(data),
+        rows=_table().num_rows,
+    )
+    assert _verify(tmp_path, Artifact(**declared, schema=SCHEMA)) == path
+    with pytest.raises(ValueError, match="schema ID differs"):
+        _verify(tmp_path, Artifact(**declared, schema="aisim-other/v1"))

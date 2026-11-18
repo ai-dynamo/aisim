@@ -27,3 +27,13 @@ def test_reentrancy_guard_skips(monkeypatch, tmp_path):
     monkeypatch.setenv("AISIM_DATA_LOCAL", str(tmp_path))
     with ensure_mod._guard():
         assert res._ensure_dataset({}, None) is None
+
+
+def test_snapshot_bearing_config_skips_the_pin(monkeypatch, tmp_path):
+    monkeypatch.setenv("AISIM_DATA_LOCAL", str(tmp_path))  # would raise MissingDataError for an ordinary config
+    config = {"system": "h200", "estimator_config": {"state_snapshot": {"path": str(tmp_path)}}}
+    assert res._ensure_dataset(config, None) is None
+
+
+def test_every_instance_has_dataset_revisions():
+    assert res.RustForwardPassPerfModel(object()).dataset_revisions == {}

@@ -25,6 +25,7 @@ from aisim_core.data.op_schema import (
     QUERY_VERSIONS_NAME,
     REUSE_MANIFEST_NAME,
     OpDeclaredReuseRow,
+    OpLatencyRow,
     OpQueryVersionsRow,
     OpReuseManifestRow,
     OpSourceMapRow,
@@ -70,7 +71,14 @@ overrides:
 
 
 def _table(rows=3):
-    return pa.table({"b": list(range(rows)), "s": [f"k{i}" if i % 2 else None for i in range(rows)], "f": [0.5] * rows})
+    return pa.table(
+        {
+            "b": list(range(rows)),
+            "s": [f"k{i}" if i % 2 else None for i in range(rows)],
+            "f": [0.5] * rows,
+            "kernel_source": ["torch_flow"] * rows,
+        }
+    )
 
 
 @pytest.fixture
@@ -234,3 +242,96 @@ def test_row_models_match_table_columns():
     assert set(op.query_versions_table(qv).column_names) == set(OpQueryVersionsRow.model_fields)
     assert set(op._MAP_COLUMNS) == set(OpSourceMapRow.model_fields)
     assert set(op._declared_reuse_table([]).column_names) == set(OpDeclaredReuseRow.model_fields)
+
+
+def test_published_table_validates_against_the_row_schema(tree, tmp_path):
+    """Every published table carries the column the registered row schema requires."""
+    out = tmp_path / "out"
+    _build(tree, out)
+    published = read_parquet(out / "data/op-latency/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet", OP_TABLE_SCHEMA_ID)
+    for row in published.to_pylist():
+        OpLatencyRow.model_validate(row)
+
+
+def test_build_refuses_a_table_without_kernel_source(tree, tmp_path):
+    pq.write_table(_table().drop(["kernel_source"]), tree / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet")
+    with pytest.raises(PublishError, match="kernel_source"):
+        _build(tree, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_packaged_reuse_manifest_converts_and_round_trips():
+    """The generated manifest omits the row counts; conversion must accept it and reproduce the document."""
+    systems = Path(op.__file__).resolve().parents[2] / "src/aisim_core/systems"
+    document = yaml.safe_load((systems / "perf_data_reuse_manifest.yaml").read_text())
+    table = op.reuse_manifest_table(document)
+    assert table.num_rows == len(document["groups"])
+    assert op.reuse_manifest_document(table) == document
+
+
+def test_audit_detects_a_deleted_catalog_shard(tree, tmp_path):
+    out = tmp_path / "out"
+    _build(tree, out)
+    assert _audit(tree, out).ok
+    (out / "catalog/op-latency/h200_sxm.parquet").unlink()
+    report = _audit(tree, out)
+    assert not report.ok and any("catalog" in p for p in report.problems)
+
+
+def test_source_path_stays_distinct_without_git(tree, tmp_path):
+    info = op.SourceInfo(tree / "data", None, None, {})
+    a = info.repo_path("h200_sxm/gemm/vllm/1.0/gemm_perf.parquet")
+    b = info.repo_path("h200_sxm/gemm/vllm/2.0/other_perf.parquet")
+    assert a != b and a.endswith("h200_sxm/gemm/vllm/1.0/gemm_perf.parquet")
+    assert info.absolute_repo_path(tree / "query_versions.yaml") == "query_versions.yaml"  # outside the data root
+
+
+def test_build_refuses_a_dirty_lookup_yaml(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    data = repo / "systems/data/h200_sxm/gemm/vllm/1.0"
+    data.mkdir(parents=True)
+    pq.write_table(_table(), data / "gemm_perf.parquet")
+    (repo / "systems/perf_data_reuse_manifest.yaml").write_text(REUSE_MANIFEST)
+    (repo / "systems/query_versions.yaml").write_text(QUERY_VERSIONS)
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run([*git[:3], "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    (repo / "systems/query_versions.yaml").write_text(QUERY_VERSIONS + "# edit\n")
+    reuse, versions = repo / "systems/perf_data_reuse_manifest.yaml", repo / "systems/query_versions.yaml"
+    with pytest.raises(PublishError, match="uncommitted"):
+        build_publish_tree(repo / "systems/data", reuse, versions, tmp_path / "out")
+    assert build_publish_tree(repo / "systems/data", reuse, versions, tmp_path / "out2", allow_dirty=True)
+
+
+def _ensure(out, cache):
+    from aisim_core.data.ensure import DataPin, ensure_data
+
+    config = {"system": "h200_sxm", "backend": "vllm", "backend_version": "1.0"}
+    pin = DataPin(local_root=out, categories=("op-latency",), cache_dir=cache)
+    return ensure_data(config, pin)
+
+
+def test_ensure_rebuilds_a_partial_or_edited_materialization(tree, tmp_path):
+    out, cache = tmp_path / "out", tmp_path / "cache"
+    _build(tree, out)
+    first = Path(_ensure(out, cache).config["systems_paths"][0])
+    table = first / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+    good = table.read_bytes()
+    table.write_bytes(good[:-8])  # a copy killed halfway
+    again = Path(_ensure(out, cache).config["systems_paths"][0])
+    assert again == first and (again / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == good
+    assert not list(first.parents[0].glob(".*.tmp"))  # no staging directory is left behind
+
+
+def test_ensure_rejects_a_manifest_changed_without_its_catalog_reference(tree, tmp_path):
+    from aisim_core.data.ensure import MissingDataError
+
+    out = tmp_path / "out"
+    _build(tree, out)
+    manifest = out / "data/op-latency/h200_sxm/gemm/vllm/1.0/manifest.json"
+    manifest.write_bytes(manifest.read_bytes().replace(b'"provenance": {', b'"provenance": {"x": 1,', 1))
+    with pytest.raises(MissingDataError, match="failed verification"):
+        _ensure(out, tmp_path / "cache")

@@ -67,7 +67,33 @@ class GpuTime(_Record):
     # Provenance of a measured value, e.g. {"source": "slurm", "job_ids": "123,124"}.
     source: dict[str, str] = Field(default_factory=dict)
 
-    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    # The authority contract as JSON Schema, so schema-only readers reject the records _authority_contract rejects.
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        populate_by_name=True,
+        json_schema_extra={
+            "if": {"properties": {"authority": {"const": "unknown"}}, "required": ["authority"]},
+            "then": {
+                "properties": {
+                    name: {"type": "null"}
+                    for name in (
+                        "gpu_count",
+                        "wall_seconds",
+                        "gpu_seconds",
+                        "node_hours",
+                        "phases",
+                        "failed",
+                        "retried",
+                    )
+                }
+            },
+            "else": {
+                "required": ["gpu_count", "wall_seconds"],
+                "properties": {"gpu_count": {"type": "integer"}, "wall_seconds": {"type": "number"}},
+            },
+        },
+    )
 
     @model_validator(mode="after")
     def _authority_contract(self) -> Self:

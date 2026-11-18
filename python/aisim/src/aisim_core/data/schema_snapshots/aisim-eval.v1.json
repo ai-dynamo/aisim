@@ -19,6 +19,7 @@
           "type": "string"
         },
         "path": {
+          "pattern": "^(?:[^./\\\\][^/\\\\]*|\\.[^./\\\\][^/\\\\]*|\\.\\.[^/\\\\]+)(?:/(?:[^./\\\\][^/\\\\]*|\\.[^./\\\\][^/\\\\]*|\\.\\.[^/\\\\]+))*$",
           "title": "Path",
           "type": "string"
         },
@@ -43,6 +44,7 @@
         "runtime_path": {
           "anyOf": [
             {
+              "pattern": "^(?:[^./\\\\][^/\\\\]*|\\.[^./\\\\][^/\\\\]*|\\.\\.[^/\\\\]+)(?:/(?:[^./\\\\][^/\\\\]*|\\.[^./\\\\][^/\\\\]*|\\.\\.[^/\\\\]+))*$",
               "type": "string"
             },
             {
@@ -162,6 +164,30 @@
     },
     "GpuTime": {
       "additionalProperties": false,
+      "else": {
+        "properties": {
+          "gpu_count": {
+            "type": "integer"
+          },
+          "wall_seconds": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "gpu_count",
+          "wall_seconds"
+        ]
+      },
+      "if": {
+        "properties": {
+          "authority": {
+            "const": "unknown"
+          }
+        },
+        "required": [
+          "authority"
+        ]
+      },
       "properties": {
         "authority": {
           "enum": [
@@ -287,6 +313,31 @@
       "required": [
         "authority"
       ],
+      "then": {
+        "properties": {
+          "failed": {
+            "type": "null"
+          },
+          "gpu_count": {
+            "type": "null"
+          },
+          "gpu_seconds": {
+            "type": "null"
+          },
+          "node_hours": {
+            "type": "null"
+          },
+          "phases": {
+            "type": "null"
+          },
+          "retried": {
+            "type": "null"
+          },
+          "wall_seconds": {
+            "type": "null"
+          }
+        }
+      },
       "title": "GpuTime",
       "type": "object"
     },
@@ -889,6 +940,19 @@
   },
   "$id": "aisim-eval/v1",
   "additionalProperties": false,
+  "if": {
+    "properties": {
+      "tier": {
+        "enum": [
+          "verified",
+          "qualified"
+        ]
+      }
+    },
+    "required": [
+      "tier"
+    ]
+  },
   "properties": {
     "assumptions": {
       "items": {
@@ -1006,6 +1070,16 @@
     "tier",
     "created_at"
   ],
+  "then": {
+    "properties": {
+      "verification": {
+        "type": "object"
+      }
+    },
+    "required": [
+      "verification"
+    ]
+  },
   "title": "EvalRecord",
   "type": "object"
 }

@@ -44,6 +44,7 @@ import json
 import shutil
 import subprocess
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -64,7 +65,7 @@ from aisim_core.data import (
     check_dataset,
     configuration_id,
 )
-from aisim_core.data.catalog import build_catalog
+from aisim_core.data.catalog import Catalog, build_catalog
 from aisim_core.data.op_schema import (
     CATEGORY_INDEX_PATH,
     DATA_PREFIX,
@@ -76,6 +77,7 @@ from aisim_core.data.op_schema import (
     OP_SOURCE_MAP_SCHEMA_ID,
     OP_TABLE_SCHEMA_ID,
     QUERY_VERSIONS_NAME,
+    REUSE_GROUP_KEYS,
     REUSE_MANIFEST_NAME,
     SKIPPED_NAMES,
     SOURCE_MAP_PATH,
@@ -86,16 +88,6 @@ from aisim_core.data.parquet import read_parquet, read_parquet_schema_id, write_
 
 # Recorded in every manifest; kept at its original value so rebuilt trees stay byte-comparable.
 PUBLISHER = "aisimulate_core.data.op_publish/v1"
-REUSE_GROUP_KEYS = {
-    "op_file",
-    "kernel_source",
-    "tier",
-    "systems",
-    "frameworks",
-    "total_raw_rows",
-    "within_framework_dedup_rows",
-    "median_pct_divergence",
-}
 
 
 class PublishError(ValueError):
@@ -143,7 +135,13 @@ class SourceInfo:
 
     def absolute_repo_path(self, path: Path) -> str:
         path = Path(path).resolve()
-        return path.relative_to(self.toplevel).as_posix() if self.toplevel else f"{self.root.name}/{path.name}"
+        if self.toplevel:
+            return path.relative_to(self.toplevel).as_posix()
+        # Outside git the path stays relative to the data root, so two tables with one file name stay distinct.
+        try:
+            return f"{self.root.name}/{path.relative_to(self.root).as_posix()}"
+        except ValueError:  # a file outside the data root, such as the lookup YAML files
+            return path.name
 
 
 def _git(root: Path, *args: str) -> str | None:
@@ -154,13 +152,18 @@ def _git(root: Path, *args: str) -> str | None:
     return done.stdout
 
 
-def inspect_source(root: Path, *, allow_dirty: bool = False) -> SourceInfo:
-    """Resolve git provenance for ``root``; require a clean tree so hashes belong to the commit."""
+def inspect_source(root: Path, *, allow_dirty: bool = False, extra_files: Sequence[Path] = ()) -> SourceInfo:
+    """Resolve git provenance for ``root``; require a clean tree so hashes belong to the commit.
+
+    ``extra_files`` are source files outside ``root`` (the lookup YAML files) that are held to the same rule.
+    """
     top = _git(root, "rev-parse", "--show-toplevel")
     if top is None:
         return SourceInfo(root, None, None, {})
     commit = (_git(root, "rev-parse", "HEAD") or "").strip() or None
-    dirty = (_git(root, "status", "--porcelain", "--", ".") or "").strip()
+    dirty = (
+        _git(root, "status", "--porcelain", "--", ".", *(str(Path(f).resolve()) for f in extra_files)) or ""
+    ).strip()
     if dirty and not allow_dirty:
         raise PublishError(f"source tree {root} has uncommitted changes; commit them or pass allow_dirty=True")
     blobs = {}
@@ -304,6 +307,8 @@ def _publish_copy(src: Path, out: Path, sf: SourceFile, info: SourceInfo, dest_r
 
 def _publish_table(src: Path, out: Path, sf: SourceFile, info: SourceInfo, dest_rel: str) -> MapRow:
     source_table = pq.read_table(src)
+    if "kernel_source" not in source_table.column_names:  # the one column the published row schema requires
+        raise PublishError(f"op table has no kernel_source column: {sf.relative}")
     source_hash = table_content_sha256(source_table)
     dst = out / dest_rel
     write_parquet(
@@ -372,8 +377,9 @@ def reuse_manifest_table(document: dict) -> pa.Table:
             "tier": pa.array([g["tier"] for g in groups], pa.string()),
             "systems": pa.array([list(g["systems"]) for g in groups], str_list),
             "frameworks": pa.array([list(g["frameworks"]) for g in groups], str_list),
-            "total_raw_rows": pa.array([g["total_raw_rows"] for g in groups], pa.int64()),
-            "within_framework_dedup_rows": pa.array([g["within_framework_dedup_rows"] for g in groups], pa.int64()),
+            # The generated manifest omits the row counts; absent stays null, never zero.
+            "total_raw_rows": pa.array([g.get("total_raw_rows") for g in groups], pa.int64()),
+            "within_framework_dedup_rows": pa.array([g.get("within_framework_dedup_rows") for g in groups], pa.int64()),
             "median_pct_divergence": pa.array([g.get("median_pct_divergence") for g in groups], pa.float64()),
         }
     )
@@ -383,9 +389,9 @@ def reuse_manifest_document(table: pa.Table) -> dict:
     """Inverse of :func:`reuse_manifest_table` (absent optional keys stay absent)."""
     groups = []
     for row in table.to_pylist():
-        group = {k: v for k, v in row.items() if k != "median_pct_divergence"}
-        if row["median_pct_divergence"] is not None:
-            group["median_pct_divergence"] = row["median_pct_divergence"]
+        optional = ("total_raw_rows", "within_framework_dedup_rows", "median_pct_divergence")
+        group = {k: v for k, v in row.items() if k not in optional}
+        group.update({k: row[k] for k in optional if row[k] is not None})
         groups.append(group)
     return {"groups": groups}
 
@@ -699,7 +705,7 @@ def build_publish_tree(
         raise PublishError(f"output directory already exists: {out}")
     if out == source or source in out.parents:
         raise PublishError("output must not be inside the source tree")
-    info = inspect_source(source, allow_dirty=allow_dirty)
+    info = inspect_source(source, allow_dirty=allow_dirty, extra_files=(Path(reuse_manifest), Path(query_versions)))
     files = scan_source(source)
     out.mkdir(parents=True)
     try:
@@ -875,13 +881,21 @@ class AuditReport:
         }
 
 
-def audit_tree(out: str | Path, source_root: str | Path, *, reuse_manifest: str | Path, query_versions: str | Path):
+def audit_tree(
+    out: str | Path,
+    source_root: str | Path,
+    *,
+    reuse_manifest: str | Path,
+    query_versions: str | Path,
+    systems_dir: str | Path | None = None,
+):
     """Re-verify every published file against its source from disk, independent of the build.
 
     Checks, per source-map row: destination bytes/SHA-256 on disk equal the recorded values, the source
     still has the recorded hash, and the per-basis content hashes agree (see module docstring). Also checks
-    that the destination inventory equals the map plus the generated metadata files, and that every source
-    file is mapped.
+    that the destination inventory equals the map plus the generated metadata files, that every source
+    file is mapped, and that the catalog shards equal a rebuild from the published indexes (a deleted or
+    edited shard is a problem). ``systems_dir`` defaults to the parent of ``source_root``, as in the build.
     """
     out, source = Path(out), Path(source_root).resolve()
     report = AuditReport()
@@ -940,4 +954,13 @@ def audit_tree(out: str | Path, source_root: str | Path, *, reuse_manifest: str 
         check_dataset(out)  # manifest/index hashes, sizes, row counts, identity IDs
     except ValueError as exc:
         report.problems.append(f"check_dataset: {exc}")
+    try:
+        expected = build_catalog(
+            out, systems_dir=systems_dir if systems_dir is not None else source.parent, write=False
+        )
+        actual = Catalog(out).rows()
+        if sorted(r.model_dump_json() for r in expected) != sorted(r.model_dump_json() for r in actual):
+            report.problems.append("catalog shards differ from a rebuild of the published indexes")
+    except (ValueError, OSError) as exc:
+        report.problems.append(f"catalog: {exc}")
     return report

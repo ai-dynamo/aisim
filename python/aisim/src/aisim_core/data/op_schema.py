@@ -51,8 +51,8 @@ class OpReuseManifestRow(_OpRow):
     tier: str
     systems: list[str]
     frameworks: list[str]
-    total_raw_rows: int
-    within_framework_dedup_rows: int
+    total_raw_rows: int | None = None  # the generated manifest omits the counts
+    within_framework_dedup_rows: int | None = None
     median_pct_divergence: float | None = None
 
 

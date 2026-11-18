@@ -378,6 +378,19 @@ class ObservationRow(_Record):
 
 
 class MetricRow(_Record):
+    # ``status_matches_value`` as JSON Schema: a valid row carries a number, any other row carries none.
+    model_config = ConfigDict(
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {"properties": {"status": {"const": "valid"}}, "required": ["status"]},
+                    "then": {"required": ["value"], "properties": {"value": {"type": "number"}}},
+                    "else": {"properties": {"value": {"type": "null"}}},
+                }
+            ]
+        }
+    )
+
     observation_id: str = Field(min_length=1)
     metric: str = Field(min_length=1)  # ttft, tpot, itl, e2el, output_throughput, ...
     statistic: str = Field(min_length=1)  # mean, median, p90, p99, std, min, max, value
@@ -400,6 +413,9 @@ class MetricRow(_Record):
             raise ValueError("a valid metric needs a finite value")
         if self.status != "valid" and self.value is not None:
             raise ValueError("a missing or invalid metric must not carry a value; missing is never zero")
+        expected = CANONICAL_UNIT.get(self.metric) or canonical_unit(self.metric)
+        if expected is not None and self.unit != expected:
+            raise ValueError(f"{self.metric}: unit {self.unit!r} is not the canonical unit {expected!r}")
         return self
 
 
@@ -815,7 +831,10 @@ class E2eConfigurationData:
 
 
 def _slug(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "--", text).strip("-") or "unknown"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "--", text).strip("-") or "unknown"
+    if slug in {".", ".."}:
+        raise ValueError(f"cannot use {text!r} as a path component")
+    return slug
 
 
 def parallelism_label(parallelism: Mapping[str, Mapping[str, int]]) -> str:
@@ -995,13 +1014,17 @@ class EvaluationPoint:
     per_device_throughput: dict[str, float]
 
 
+# Per-device throughput is the run's central value; other statistics (std, p99, ...) never stand in for it.
+_DEVICE_STATISTICS = ("mean", "value")
+
+
 def evaluation_points(dataset: E2eDataset) -> list[EvaluationPoint]:
     metrics: dict[str, list[MetricRow]] = {}
     for row in dataset.metrics:
         metrics.setdefault(row.observation_id, []).append(row)
     points = []
     for obs in dataset.observations:
-        values, unavailable, device = {}, set(), {}
+        values, unavailable, device_by_statistic = {}, set(), {}
         for row in metrics.get(obs.observation_id, []):
             if row.scope != "run":
                 continue
@@ -1017,10 +1040,16 @@ def evaluation_points(dataset: E2eDataset) -> list[EvaluationPoint]:
                 values[(f"{row.metric}:{row.normalization}", row.statistic)] = row.value
                 if row.normalization == "total" and row.device_count is None and obs.device_count:
                     row = row.model_copy(update={"device_count": obs.device_count})
-                if row.normalization == "per_device" or (row.normalization == "total" and row.device_count):
-                    device[row.metric] = throughput_per_device(row)
+                if row.statistic in _DEVICE_STATISTICS and (
+                    row.normalization == "per_device" or (row.normalization == "total" and row.device_count)
+                ):
+                    device_by_statistic.setdefault(row.metric, {})[row.statistic] = throughput_per_device(row)
             else:
                 values[key] = row.value
+        device = {
+            metric: next(by_statistic[s] for s in _DEVICE_STATISTICS if s in by_statistic)
+            for metric, by_statistic in device_by_statistic.items()
+        }
         points.append(
             EvaluationPoint(
                 obs.observation_id,

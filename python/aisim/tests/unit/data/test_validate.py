@@ -75,7 +75,7 @@ def build_dataset(tmp_path, claim_scale=1.0):
     rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, 5)] + [("bad", {"tokens": 1}, None)]
     art = write_truth_table(tmp_path / "t.parquet", rows)
     truth_bytes = (tmp_path / "t.parquet").read_bytes()
-    art = art.model_copy(update={"path": "eval/truth.parquet"})
+    art = art.model_copy(update={"path": "truth.parquet"})  # relative to the record directory
     cases = [(c, t, _predict(i) * claim_scale) for c, i, t in rows]
     pred = PredictionIdentity.build("fpm_interpolation", {"p": PIN}, SPEC)
     ident = _identity()

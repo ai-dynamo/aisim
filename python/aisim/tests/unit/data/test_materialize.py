@@ -84,7 +84,7 @@ def test_copy_failure_cleans_up(tmp_path, layout, stub_ensure, monkeypatch):
     def boom(source, target):
         raise OSError("disk full")
 
-    monkeypatch.setattr(mat, "_link_or_copy", boom)
+    monkeypatch.setattr(mat.shutil, "copyfile", boom)
     with pytest.raises(OSError, match="disk full"):
         mat.materialize_systems_root(
             CONFIG, DataPin(local_root=tmp_path), tmp_path / "root", packaged_systems=layout[0]
@@ -99,3 +99,27 @@ def test_root_has_specs_and_data_at_packaged_relative_paths(tmp_path, layout, st
     )
     rels = sorted(str(p.relative_to(out.root)) for p in out.root.rglob("*") if p.is_file())
     assert "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet" in rels and "h200_sxm.yaml" in rels
+
+
+def test_root_files_are_independent_copies_of_the_cached_tables(tmp_path, layout, stub_ensure):
+    """A write through the returned root must not change the shared materialized cache."""
+    _, loaded = layout
+    out = mat.materialize_systems_root(
+        CONFIG, DataPin(local_root=tmp_path), tmp_path / "root", packaged_systems=layout[0]
+    )
+    table = out.root / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+    table.write_bytes(b"edited")
+    assert (loaded / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == b"pinned-table"
+
+
+def test_python_database_selects_the_exported_root(tmp_path, layout, stub_ensure, monkeypatch):
+    """A Python SDK process that only has ``out.env`` searches the materialized root, not the packaged one."""
+    from aisim_core.sdk import perf_database
+
+    out = mat.materialize_systems_root(
+        CONFIG, DataPin(local_root=tmp_path), tmp_path / "root", packaged_systems=layout[0]
+    )
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS_EXPLICIT", False)
+    for key, value in out.env.items():
+        monkeypatch.setenv(key, value)
+    assert perf_database.get_systems_paths() == [str(out.root)]

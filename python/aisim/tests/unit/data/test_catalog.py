@@ -227,18 +227,23 @@ def test_exit_gate_worst_and_empty_cells_from_catalog_alone(built, tmp_path, mon
     monkeypatch.setattr(
         catalog_module, "read_parquet", lambda path, *a, **k: (opened.append(str(path)), real_read(path, *a, **k))[1]
     )
-    sys.addaudithook(lambda event, args: opened.append(str(args[0])) if event == "open" else None)
+    # An audit hook cannot be removed, so gate it: later tests in the session must not feed ``opened``.
+    active = [True]
+    sys.addaudithook(lambda event, args: opened.append(str(args[0])) if active[0] and event == "open" else None)
     cat = Catalog(only_catalog)
     worst = cat.worst_cells("b200_sxm", n=2)
+    worst_reads = [p for p in opened if str(only_catalog) in p]
     empty = cat.empty_cells("h200_sxm", layer="fpm")
+    active[0] = False
 
     assert [(r.model, r.layer, r.acc_mape_pct) for r in worst] == [(DSV4, "fpm", 12.0), (QWEN, "fpm", 9.0)]
     assert {r.model for r in empty} == {QWEN, DSV4}
     reads = [p for p in opened if str(only_catalog) in p]
     assert reads, "expected catalog files to be read"
     assert all(p.endswith(".parquet") and "/catalog/" in p for p in reads), reads
-    # hardware-scoped queries touch only that hardware's shards
-    assert not any("h200_sxm" in p for p in reads if "b200" in p)
+    # a b200 query touches no h200 shard (checked on its own reads, before the h200 query ran)
+    assert any(p.endswith("b200_sxm.parquet") for p in worst_reads), worst_reads
+    assert not any(p.endswith("h200_sxm.parquet") for p in worst_reads), worst_reads
 
 
 def test_size_check_against_configurable_budget(built):
@@ -274,3 +279,19 @@ def test_size_scales_with_cells_not_payload(tmp_path):
 def test_missing_catalog_dir(tmp_path):
     with pytest.raises(FileNotFoundError):
         Catalog(tmp_path)
+
+
+@pytest.mark.parametrize("hardware", ["/tmp/report", "../x", "a/b", "..", ""])
+def test_shard_path_rejects_hardware_that_escapes_the_catalog(tmp_path, hardware):
+    with pytest.raises(ValueError, match="plain name"):
+        shard_path(tmp_path, "fpm", hardware)
+
+
+def test_build_rejects_a_manifest_that_disagrees_with_its_index_entry(dataset):
+    root, systems = dataset
+    path = root / "data/fpm/m0.json"
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    other = manifest.identity.model_copy(update={"hardware": "h200_sxm"})
+    path.write_text(manifest.model_copy(update={"identity": other}).model_dump_json(by_alias=True))
+    with pytest.raises(ValueError, match="disagrees with its fpm index entry"):
+        build_catalog(root, systems_dir=systems)

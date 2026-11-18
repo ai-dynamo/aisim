@@ -231,6 +231,12 @@ def _moe_world(ctx: Context) -> str | None:
     """moe_tp * moe_ep (* moe_cluster) must cover the attention group. Model-scope seed and TRT-LLM rule."""
     tp, dp, cp = _get(ctx, "tp"), _get(ctx, "attention_dp"), _get(ctx, "cp")
     mtp, ep, cl = _get(ctx, "moe_tp"), _get(ctx, "ep"), _get(ctx, "moe_cluster")
+    if ctx.framework == "trtllm" and "moe_tp" not in ctx.parallelism and "ep" not in ctx.parallelism:
+        # TensorRT-LLM defaults moe_tp to tp*attention_dp*cp // moe_cluster when no MoE size is set, so the
+        # spelling {"tp": N} is complete. Only a moe_cluster that does not divide the attention group fails.
+        span = _need(tp=tp, attention_dp=dp, cp=cp, moe_cluster=cl)
+        group = span["tp"] * span["attention_dp"] * span["cp"]
+        return None if group % cl == 0 else f"moe_cluster ({cl}) must divide tp*attention_dp*cp = {group}"
     for name, v in (("tp", tp), ("attention_dp", dp), ("cp", cp), ("moe_tp", mtp), ("ep", ep), ("moe_cluster", cl)):
         if v is None:
             raise _Unknown(f"parallelism.{name}")
@@ -255,8 +261,8 @@ def _minimax_moe(ctx: Context) -> str | None:
 
 def _vllm_ep(ctx: Context) -> str | None:
     # vLLM expert parallelism spans TP x PCP x DP ranks; without it experts are TP-sharded (ep = 1).
-    ep = ctx.parallelism.get("ep", 1)
-    span = _need(tp=_get(ctx, "tp"), attention_dp=_get(ctx, "attention_dp"), cp=_get(ctx, "cp"))
+    span = _need(ep=_get(ctx, "ep"), tp=_get(ctx, "tp"), attention_dp=_get(ctx, "attention_dp"), cp=_get(ctx, "cp"))
+    ep = span["ep"]
     group = span["tp"] * span["attention_dp"] * span["cp"]
     if ep not in (1, group):
         return f"vLLM ep must be 1 or tp*attention_dp*cp = {group}, got {ep}"
@@ -264,8 +270,7 @@ def _vllm_ep(ctx: Context) -> str | None:
 
 
 def _vllm_dcp(ctx: Context) -> str | None:
-    dcp = ctx.parallelism.get("dcp", 1)
-    tp, pcp = _need(tp=_get(ctx, "tp"), cp=_get(ctx, "cp")).values()
+    dcp, tp, pcp = _need(dcp=_get(ctx, "dcp"), tp=_get(ctx, "tp"), cp=_get(ctx, "cp")).values()
     if pcp == 1:
         return f"tp ({tp}) must be divisible by dcp ({dcp})" if tp % dcp else None
     valid = sorted({1, pcp, tp * pcp})
@@ -292,9 +297,7 @@ def _trtllm_ep_cp(ctx: Context) -> str | None:
 
 
 def _sglang_moe_dp(ctx: Context) -> str | None:
-    mdp = ctx.parallelism.get("moe_dp", 1)
-    pp = _get(ctx, "pp")
-    _need(pp=pp)
+    mdp, pp = _need(moe_dp=_get(ctx, "moe_dp"), pp=_get(ctx, "pp")).values()
     return "SGLang moe_dp > 1 requires pp == 1" if mdp > 1 and pp != 1 else None
 
 

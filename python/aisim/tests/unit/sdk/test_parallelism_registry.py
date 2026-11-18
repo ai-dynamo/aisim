@@ -104,6 +104,29 @@ def test_unknown_input_is_gap_not_finding():
     assert any(g.rule_id == "F-vllm-ep" for g in report.gaps)
 
 
+def test_trtllm_implicit_moe_sizes_default_to_the_attention_group():
+    """TensorRT-LLM derives moe_tp from tp when no MoE size is spelled, so {"tp": N} is a valid dense/pure-TP map."""
+    assert not evaluate(ctx({"tp": 4}, framework="trtllm")).errors
+    assert not evaluate(ctx({"tp": 4, "moe_cluster": 2}, framework="trtllm")).errors
+    bad = evaluate(ctx({"tp": 4, "moe_cluster": 3}, framework="trtllm"))
+    assert any(f.rule_id == "F-trtllm-moe-world" for f in bad.errors)
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "par", "framework", "missing"),
+    [
+        ("F-vllm-ep", {"tp": 4, "attention_dp": 1, "cp": 1}, "vllm", "parallelism.ep"),
+        ("F-vllm-dcp", {"tp": 4, "cp": 1}, "vllm", "parallelism.dcp"),
+        ("F-sglang-moe-dp-pp", {"pp": 1}, "sglang", "parallelism.moe_dp"),
+    ],
+)
+def test_absent_dimension_of_an_incomplete_map_is_a_gap_not_a_pass(rule_id, par, framework, missing):
+    report = evaluate(Context(parallelism=par, framework=framework, parallelism_complete=False))
+    assert not [f for f in report.findings if f.rule_id == rule_id]
+    gaps = [g for g in report.gaps if g.rule_id == rule_id]
+    assert gaps and any(missing.split(".")[1] in m for m in gaps[0].missing)
+
+
 def test_gating_and_versioning():
     bad_universal = evaluate(ctx({"tp": 0}))
     assert bad_universal.blocks_import()
@@ -126,12 +149,12 @@ _FRAMEWORKS = {"vllm", "sglang"}
 
 def _published_profiles():
     root = Path(next(iter(_systems_pkg.__path__)))
-    files = sorted(root.glob("profiles/*/hf_dataset.json")) + [root / "dsv41_fpm_hf.json"]
+    files = sorted(root.glob("profiles/*/*hf_dataset.json")) + [root / "dsv41_fpm_hf.json"]
     for f in files:
         if not f.exists():
             continue
         for key in json.loads(f.read_text())["profiles"]:
-            yield f.name if f.parent == root else f.parent.name, key
+            yield f.name if f.parent == root else f"{f.parent.name}/{f.name}", key
 
 
 def test_published_fpm_profiles_pass_or_are_flagged():

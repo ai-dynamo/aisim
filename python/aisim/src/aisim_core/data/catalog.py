@@ -143,6 +143,8 @@ def _row_sort_key(row: CatalogRow) -> tuple:
 
 
 def shard_path(root: str | Path, layer: str, hardware: str) -> Path:
+    if not hardware or hardware in {".", ".."} or "/" in hardware or "\\" in hardware or "\0" in hardware:
+        raise ValueError(f"hardware must be a plain name, not a path: {hardware!r}")
     return Path(root) / CATALOG_DIR / LAYER_CATEGORY[layer] / f"{hardware}.parquet"
 
 
@@ -180,6 +182,13 @@ def _read_indexed_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
         for entry in entries.entries:
             ident = entry.identity
             manifest = Manifest.model_validate_json((root / entry.manifest.path).read_bytes())
+            if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
+                category,
+                entry.configuration_id,
+                ident,
+                entry.purpose,
+            ):
+                raise ValueError(f"manifest {entry.manifest.path} disagrees with its {category} index entry")
             cell = cells[(layer, None if layer == "op" else ident.model, ident.hardware, ident.framework)]
             cell.versions.add(ident.framework_version)
             cell.n_configs += 1

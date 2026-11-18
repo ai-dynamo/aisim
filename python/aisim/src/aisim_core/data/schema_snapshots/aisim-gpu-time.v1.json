@@ -91,6 +91,30 @@
   },
   "$id": "aisim-gpu-time/v1",
   "additionalProperties": false,
+  "else": {
+    "properties": {
+      "gpu_count": {
+        "type": "integer"
+      },
+      "wall_seconds": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "gpu_count",
+      "wall_seconds"
+    ]
+  },
+  "if": {
+    "properties": {
+      "authority": {
+        "const": "unknown"
+      }
+    },
+    "required": [
+      "authority"
+    ]
+  },
   "properties": {
     "authority": {
       "enum": [
@@ -216,6 +240,31 @@
   "required": [
     "authority"
   ],
+  "then": {
+    "properties": {
+      "failed": {
+        "type": "null"
+      },
+      "gpu_count": {
+        "type": "null"
+      },
+      "gpu_seconds": {
+        "type": "null"
+      },
+      "node_hours": {
+        "type": "null"
+      },
+      "phases": {
+        "type": "null"
+      },
+      "retried": {
+        "type": "null"
+      },
+      "wall_seconds": {
+        "type": "null"
+      }
+    }
+  },
   "title": "GpuTime",
   "type": "object"
 }

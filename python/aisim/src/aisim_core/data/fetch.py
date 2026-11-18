@@ -328,8 +328,13 @@ class Cache:
         if expected is None or expected.sha256 is None:
             return True
         try:
-            return _digest(target) == (expected.sha256, expected.bytes)
-        except OSError:
+            if _digest(target) != (expected.sha256, expected.bytes):
+                return False
+            if expected.format == "parquet":
+                # Same Parquet checks as a fresh download: one declaration gives one answer, cold or warm.
+                _verify_file(target, path, expected)
+            return True
+        except (OSError, DataFetchError):
             return False
 
     def store(

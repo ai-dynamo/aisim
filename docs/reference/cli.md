@@ -34,7 +34,8 @@ illustrate the output format. Captured detail examples are simulation results, n
 
 Prepare on a connected machine, then move the cache; the disconnected machine makes no
 network request. Pin the dataset to a full commit SHA, because a branch or tag cannot be
-resolved offline.
+resolved offline. Downloading needs the optional Hugging Face transport:
+`pip install 'aisim[hf]'`.
 
 ```python
 # 1. Connected: resolve once, check the size, download and verify into a cache.
@@ -51,11 +52,13 @@ print(plan(selection, offline=True, **common).to_dict())
 ```
 
 ```bash
-export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_OFFLINE=1
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CATEGORIES=op-latency \
+  AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_OFFLINE=1
 ```
 
 `AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins a predictor run: the data a
-configuration needs is taken from the cached revision, a missing or corrupt file is a precise error, and
+configuration needs is taken from the cached revision (name the prefetched category with
+`AISIM_DATA_CATEGORIES`, as above: the default `fpm` would look for FPM data that was never cached), a missing or corrupt file is a precise error, and
 there is no fallback to other data. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
 `AISIM_DATA_CONFIGURATION` (choose among several matches), `AISIM_DATA_MAX_BYTES` (auto-download
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
@@ -82,8 +85,8 @@ root = materialize_systems_root(
 # root.env == {"AICONFIGURATOR_SYSTEMS_PATH": "./systems-root"}; pass root.root as `systems_paths` / `systems_path`.
 ```
 
-The root holds the packaged specs and support files plus the verified pinned `data/` tables (hard-linked from
-the cache when possible); it never mixes in packaged tables. The call fails if the destination exists.
+The root holds the packaged specs and support files plus the verified pinned `data/` tables (copied from
+the cache, never linked to it); it never mixes in packaged tables. The call fails if the destination exists.
 
 | Consumer | Preparation |
 |---|---|
@@ -92,7 +95,7 @@ the cache when possible); it never mixes in packaged tables. The call fails if t
 | Rust `perf_database` crate users | Same root as `systems_paths`/`DataRoots`; no Python at run time. |
 | Rust tests (about 38 files resolve the in-tree `systems/` directory) | Prepare a root before `cargo test` and route the sites through one resolver; a Phase 6 task. |
 | Air-gapped hosts | Prefetch with a full-SHA pin, copy the cache, run with `AISIM_DATA_OFFLINE=1`. |
-| `pip install` users | A wheel without op data needs one `fetch()` (or the automatic first-use download below the size threshold) per system and framework. |
+| `pip install` users | Install the Hugging Face transport first (`pip install 'aisim[hf]'`; it is an optional extra). A wheel without op data needs one `fetch()` (or the automatic first-use download below the size threshold) per system and framework. |
 
 <a id="common-options"></a>
 

@@ -436,6 +436,7 @@ class RustForwardPassPerfModel:
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
+        self.dataset_revisions: dict[str, str] = {}  # best_available fills it when a dataset pin was applied
 
     @classmethod
     def best_available(
@@ -1032,6 +1033,8 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     if pin is None:
         return None
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    if _carries_state_snapshot(payload.get("estimator_config")):
+        return None  # a snapshot restores its own inputs; a pin selecting other data would only conflict with it
     return ensure_data(payload, pin)
 
 

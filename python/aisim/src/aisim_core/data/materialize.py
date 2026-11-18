@@ -17,7 +17,6 @@ Preparation is explicit and additive: nothing here changes how the packaged data
 from __future__ import annotations
 
 import json
-import os
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -93,7 +92,8 @@ def materialize_systems_root(
         for source in sorted(p for p in loaded_root.rglob("*") if p.is_file()):
             target = destination / source.relative_to(loaded_root)
             target.parent.mkdir(parents=True, exist_ok=True)
-            _link_or_copy(source, target)
+            # An independent copy, never a hard link: a write through this root must not change the shared cache.
+            shutil.copyfile(source, target)
             count, size = count + 1, size + source.stat().st_size
         (destination / MARKER).write_text(json.dumps({"dataset": provenance}, indent=2, sort_keys=True) + "\n")
     except BaseException:
@@ -106,12 +106,4 @@ def _copy(source: Path, target: Path) -> None:
     if source.is_dir():
         shutil.copytree(source, target)
     else:
-        shutil.copyfile(source, target)
-
-
-def _link_or_copy(source: Path, target: Path) -> None:
-    """Hard-link when the filesystem allows it (same device), else copy; never alias writes."""
-    try:
-        os.link(source, target)
-    except OSError:
         shutil.copyfile(source, target)

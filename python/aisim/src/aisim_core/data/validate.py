@@ -296,8 +296,10 @@ def run_validation(
             seen[_canonical_inputs(inputs)] = value
             return value
 
-        report = verify_record(record, result.root, recording, fingerprint)
-        table = read_parquet(result.root / table_art.path, TRUTH_SCHEMA_ID) if report.recomputed else None
+        # Truth artifact paths are relative to the record's own directory (see write_truth_table).
+        truth_root = local.parent
+        report = verify_record(record, truth_root, recording, fingerprint)
+        table = read_parquet(truth_root / table_art.path, TRUTH_SCHEMA_ID) if report.recomputed else None
     except (PrValidationError, ValueError, KeyError, OSError, ValidationError, StopIteration) as exc:
         return failed("fail", [f"record could not be verified: {type(exc).__name__}: {exc}"], dataset_sha=sha)
 

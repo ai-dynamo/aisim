@@ -6,6 +6,7 @@ import pytest
 from aisim_core.data import Identity
 from aisim_core.data.eval import (
     EvalRecord,
+    Exclusion,
     GpuTime,
     PredictionIdentity,
     attest,
@@ -173,3 +174,52 @@ def test_record_gpu_time_archival_warns_qualified_errors(built):
         EvalRecord.model_validate(doc)
     doc["gpu_time"] = GpuTime(authority="measured", gpu_count=4, wall_seconds=0.0).model_dump(by_alias=True)
     assert EvalRecord.model_validate(doc).tier == "qualified"  # zero is recorded, not missing
+
+
+def test_producer_cannot_choose_which_cases_are_scored(built):
+    """An exclusion of a row that would score is cherry-picking: verification fails and attest refuses."""
+    root, record = built
+    picked = record.model_copy(deep=True)
+    picked.results = compute_results(
+        [
+            (c, t, _predict({"tokens": 10 * int(c[1:])}) if c != "bad" else None)
+            for c, t in [(f"s{i}", 10.0 * i) for i in range(1, 6)] + [("bad", None)]
+        ],
+        exclusions=[Exclusion(case_id="s4", reason="outlier")],
+    )
+    report = verify_record(picked, root, _predict, picked.prediction.fingerprint)
+    assert not report.ok and any("would score" in p for p in report.problems)
+    with pytest.raises(ValueError, match="failed verification"):
+        attest(picked, report)
+
+
+def test_attest_refuses_a_report_for_another_record(built):
+    root, record = built
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    assert report.ok and report.record_id == record.record_id and report.fingerprint == record.prediction.fingerprint
+    other = record.model_copy(update={"created_at": "2026-11-08T00:00:00Z"})
+    assert other.record_id != record.record_id
+    with pytest.raises(ValueError, match="different record"):
+        attest(other, report)
+
+
+def test_eval_schema_requires_verification_above_the_submitted_tier(built):
+    import json
+
+    from jsonschema import Draft202012Validator
+
+    from aisim_core.data.schemas import render_snapshot
+
+    _, record = built
+    schema = Draft202012Validator(json.loads(render_snapshot("aisim-eval/v1")))
+    doc = record.model_dump(by_alias=True, mode="json")
+    assert schema.is_valid(doc)
+    for verification in ("omitted", None):
+        doc = {**record.model_dump(by_alias=True, mode="json"), "tier": "verified"}
+        if verification == "omitted":
+            doc.pop("verification")
+        else:
+            doc["verification"] = None
+        assert not schema.is_valid(doc)
+        with pytest.raises(ValueError, match="verification"):
+            EvalRecord.model_validate(doc)

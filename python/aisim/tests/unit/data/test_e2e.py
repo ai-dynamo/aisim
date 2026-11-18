@@ -9,7 +9,7 @@ import json
 import pyarrow.parquet as pq
 import pytest
 
-from aisim_core.data import check_manifest
+from aisim_core.data import Manifest, check_manifest
 from aisim_core.data.e2e import (
     LOG_CAP_BYTES,
     E2eManifestBody,
@@ -336,3 +336,101 @@ def test_loader_refuses_foreign_table_schema(tmp_path):
     path = write_configuration(tmp_path, _dev_config())
     with pytest.raises(LoaderError, match="unsupported table schema"):
         E2eLoader(accepted_schemas=("aisim-e2e-requests/v1",)).load(tmp_path, path)
+
+
+# ---------------------------------------------------------------- review hardening
+
+
+def test_metric_row_rejects_a_noncanonical_unit():
+    with pytest.raises(ValueError, match="canonical unit"):
+        MetricRow(observation_id="o", metric="ttft", statistic="mean", unit="s", value=1.0, status="valid")
+    # an unregistered metric keeps whatever unit it was reported in
+    assert MetricRow(observation_id="o", metric="x_custom", statistic="mean", unit="s", value=1.0, status="valid")
+
+
+def test_load_rejects_a_hash_correct_table_with_a_noncanonical_unit(tmp_path):
+    import dataclasses
+
+    cfg = _dev_config()
+    bad = dataclasses.replace(
+        cfg,
+        metrics=[
+            m.model_copy(update={"unit": "s"}) if (m.metric, m.statistic) == ("ttft", "mean") else m
+            for m in cfg.metrics
+        ],
+    )
+    # model_copy skips validation, so the writer produces a hash-correct table that carries the bad unit
+    path = write_configuration(tmp_path, bad)
+    with pytest.raises(ValueError, match="canonical unit"):
+        load_e2e(tmp_path, path)
+
+
+def test_a_path_component_cannot_escape_the_dataset_root(tmp_path):
+    import dataclasses
+
+    cfg = _dev_config()
+    hostile = dataclasses.replace(cfg, body=cfg.body.model_copy(update={"model_id": ".."}))
+    root = tmp_path / "root"
+    with pytest.raises(ValueError, match="path component"):
+        write_configuration(root, hostile)
+    assert not any(tmp_path.rglob("*.parquet"))  # nothing was written, inside or outside the root
+
+
+@pytest.mark.parametrize("order", ["mean-last", "std-last"])
+def test_device_throughput_uses_the_mean_whatever_the_row_order(tmp_path, order):
+    import dataclasses
+
+    cfg = _dev_config()
+    obs = cfg.observations[0].observation_id
+    rows = [
+        make_metric(obs, "total_throughput", "mean", 800.0, "tokens/s", normalization="total", device_count=8),
+        make_metric(obs, "total_throughput", "std", 80.0, "tokens/s", normalization="total", device_count=8),
+    ]
+    if order == "mean-last":
+        rows.reverse()
+    kept = [m for m in cfg.metrics if m.metric != "total_throughput"]
+    dataset = load_e2e(tmp_path, write_configuration(tmp_path, dataclasses.replace(cfg, metrics=kept + rows)))
+    (point,) = evaluation_points(dataset)
+    assert point.per_device_throughput["total_throughput"] == 100.0
+
+
+def test_check_dataset_checks_an_indexed_e2e_manifest(tmp_path):
+    import hashlib
+
+    from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, check_dataset
+
+    (cfg,) = inferencex_to_configurations([_infx_record()])
+    manifest_path = write_configuration(tmp_path, cfg)
+
+    def artifact(rel, artifact_id):
+        data = (tmp_path / rel).read_bytes()
+        return Artifact(
+            artifact_id=artifact_id, path=rel, role="index", format="json", schema="s/v1",
+            sha256=hashlib.sha256(data).hexdigest(), bytes=len(data),
+        )  # fmt: skip
+
+    manifest = Manifest.model_validate_json((tmp_path / manifest_path).read_bytes())
+    entry = {
+        "configuration_id": manifest.configuration_id,
+        "purpose": manifest.purpose,
+        "identity": manifest.identity.model_dump(),
+        "manifest": artifact(manifest_path, "m").model_dump(by_alias=True),
+    }
+    index = CategoryIndex.model_validate(
+        {"schema_version": "aisim-category-index/v1", "category": "e2e", "entries": [entry]}
+    )
+    (tmp_path / "catalog").mkdir()
+    (tmp_path / "catalog/e2e.json").write_text(index.model_dump_json(by_alias=True))
+    dataset = {
+        "schema_version": "aisim-dataset-index/v1",
+        "dataset_id": "o/n",
+        "categories": {
+            "e2e": {
+                "root": "e2e",
+                "layout": "category",
+                "index": artifact("catalog/e2e.json", "i").model_dump(by_alias=True),
+            }
+        },
+    }
+    (tmp_path / "catalog/dataset.json").write_text(DatasetIndex.model_validate(dataset).model_dump_json(by_alias=True))
+    assert check_dataset(tmp_path).categories["e2e"]

@@ -48,7 +48,7 @@ def test_over_threshold_refuses_with_size_and_command(tmp_path, files):
     msg = str(e.value)
     assert str(e.value.uncached_bytes) in msg and "aisim data fetch --category fpm" in msg
     assert "--model m1" in msg and f"--revision {SHA}" in msg
-    assert "fpm/m1/data.parquet" not in transport.opened  # nothing downloaded
+    assert "data/fpm/m1/data.parquet" not in transport.opened  # nothing downloaded
 
 
 def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
@@ -80,6 +80,6 @@ def test_check_manifest_accepts_fpm_execution_profile_only(tmp_path, files):
     for path, data in files.items():
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
-    assert check_manifest(root, "fpm/m1/manifest.json").category == "fpm"
-    doc = json.loads(files["fpm/m1/manifest.json"])
+    assert check_manifest(root, "data/fpm/m1/manifest.json").category == "fpm"
+    doc = json.loads(files["data/fpm/m1/manifest.json"])
     assert Manifest.model_validate(doc).category == "fpm"

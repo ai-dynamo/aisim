@@ -26,6 +26,9 @@ databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
 
 _SYSTEMS_PATHS: list[str] = [os.fspath(pkg_resources.files("aisim_core") / "systems")]
+# Until set_systems_paths is called, AICONFIGURATOR_SYSTEMS_PATH (for example the root exported by
+# materialize_systems_root) selects the one systems root, as it does for the Rust forward-pass path.
+_SYSTEMS_PATHS_EXPLICIT = False
 
 # Ad-hoc probe shapes must fit the op-list FFI's u32 token count; comm shims
 # factor an element count into ``x * per_token_elements`` with both in range
@@ -120,7 +123,7 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
     stale rows on a subsequent ``PerfDatabase`` construction that aliases
     a previously-loaded key tuple.
     """
-    global _SYSTEMS_PATHS
+    global _SYSTEMS_PATHS, _SYSTEMS_PATHS_EXPLICIT
     resolved_paths = _normalize_systems_paths(raw_paths)
     invalid_paths = [path for path in resolved_paths if not os.path.isdir(path)]
     if invalid_paths:
@@ -129,6 +132,7 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
             f"Invalid entries: {', '.join(invalid_paths)}"
         )
     _SYSTEMS_PATHS = resolved_paths
+    _SYSTEMS_PATHS_EXPLICIT = raw_paths is not None
     _load_system_spec_from_paths.cache_clear()
     _cached_configured_database_view.cache_clear()
     from aisim_core.sdk.operations.base import clear_all_op_caches
@@ -137,6 +141,9 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
 
 
 def get_systems_paths() -> list[str]:
+    env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
+    if not _SYSTEMS_PATHS_EXPLICIT and env_root and os.path.isdir(os.path.expanduser(env_root)):
+        return [os.path.abspath(os.path.expanduser(env_root))]
     return list(_SYSTEMS_PATHS)
 
 

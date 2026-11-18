@@ -38,6 +38,12 @@ _FIELDS_ADDED_AFTER = {1: _V2_FIELDS + _V3_FIELDS, 2: _V3_FIELDS, 3: ()}
 _DIMENSION = re.compile(r"^(x-)?[a-z][a-z0-9_]*$")
 
 
+# The JSON Schema form of _relative: non-empty "/"-separated segments, none of them "." or "..",
+# no backslash, no leading slash. Written without lookaround so every regex engine accepts it.
+_SEGMENT = r"(?:[^./\\][^/\\]*|\.[^./\\][^/\\]*|\.\.[^/\\]+)"
+RELATIVE_PATH_PATTERN = rf"^{_SEGMENT}(?:/{_SEGMENT})*$"
+
+
 def _relative(value: str) -> str:
     path = PurePosixPath(value)
     if not value or "\\" in value or path.is_absolute() or any(p in {"", ".", ".."} for p in value.split("/")):
@@ -51,7 +57,7 @@ class _Record(BaseModel):
 
 class Artifact(_Record):
     artifact_id: str = Field(min_length=1)
-    path: str
+    path: str = Field(pattern=RELATIVE_PATH_PATTERN)
     role: str = Field(min_length=1)
     format: str = Field(min_length=1)
     artifact_schema: str = Field(alias="schema", min_length=1)
@@ -59,7 +65,7 @@ class Artifact(_Record):
     bytes: int = Field(ge=0)
     rows: int | None = Field(default=None, ge=0)
     # Only runtime inputs have a destination in the materialized systems root.
-    runtime_path: str | None = None
+    runtime_path: str | None = Field(default=None, pattern=RELATIVE_PATH_PATTERN)
 
     @field_validator("path", "runtime_path")
     @classmethod
@@ -155,7 +161,7 @@ class CategoryIndex(_Record):
 
 
 class CategoryReference(_Record):
-    root: str
+    root: str = Field(pattern=RELATIVE_PATH_PATTERN)
     index: Artifact
     layout: Literal["category"]
 
@@ -212,23 +218,34 @@ def _verify(root: Path, artifact: Artifact) -> Path:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if path.stat().st_size != artifact.bytes or digest != artifact.sha256:
         raise ValueError(f"artifact integrity mismatch: {artifact.path}")
-    if artifact.format == "parquet" and (
-        artifact.rows is None or pq.ParquetFile(path).metadata.num_rows != artifact.rows
-    ):
-        raise ValueError(f"Parquet row count mismatch: {artifact.path}")
+    if artifact.format == "parquet":
+        metadata = pq.ParquetFile(path).metadata
+        if artifact.rows is None or metadata.num_rows != artifact.rows:
+            raise ValueError(f"Parquet row count mismatch: {artifact.path}")
+        stored = (metadata.metadata or {}).get(b"aisim.schema")
+        if stored is None or stored.decode() != artifact.artifact_schema:
+            raise ValueError(f"Parquet schema ID differs from the manifest declaration: {artifact.path}")
     return path
 
 
 def check_manifest(root: Path, path: str) -> Manifest:
-    """Check one manifest and all declared inputs without network access."""
+    """Check one op-latency or fpm manifest and all declared inputs without network access."""
     root = Path(root)
+    manifest = _check_envelope(root, path)
+    if manifest.category not in ("op-latency", "fpm"):
+        raise ValueError("use the existing category protocol for E2E manifests")
+    return _check_category_manifest(root, manifest)
+
+
+def _check_envelope(root: Path, path: str) -> Manifest:
     manifest = Manifest.model_validate_json(_file(root, path).read_bytes())
     if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
         raise ValueError("configuration identity hash mismatch")
-    # fpm manifests are execution-profile bundles (the shared-envelope FPM layout);
-    # e2e/eval/systems manifests have no offline checker here yet.
-    if manifest.category not in ("op-latency", "fpm"):
-        raise ValueError("use the existing category protocol for E2E manifests")
+    return manifest
+
+
+def _check_category_manifest(root: Path, manifest: Manifest) -> Manifest:
+    # fpm manifests are execution-profile bundles (the shared-envelope FPM layout).
     if manifest.category == "fpm" and manifest.purpose != "execution-profile":
         raise ValueError("fpm manifests must have purpose execution-profile")
     if manifest.purpose == "operation-tables" and manifest.identity.model is not None:
@@ -237,6 +254,24 @@ def check_manifest(root: Path, path: str) -> Manifest:
         values = [getattr(a, field) for a in manifest.artifacts if getattr(a, field) is not None]
         if len(values) != len(set(values)):
             raise ValueError(f"duplicate artifact {field}")
+    for artifact in manifest.artifacts:
+        _verify(root, artifact)
+    return manifest
+
+
+def _check_indexed_manifest(root: Path, path: str, category: str) -> Manifest:
+    """Check a manifest with its category's own protocol (e2e through its loader)."""
+    if category in ("op-latency", "fpm"):
+        return check_manifest(root, path)
+    manifest = _check_envelope(root, path)
+    if manifest.category != category:
+        raise ValueError("catalog and manifest identity mismatch")
+    if category == "e2e":
+        from aisim_core.data.e2e import load_e2e
+
+        return load_e2e(root, path).manifest
+    # eval and systems documents have no manifest-level checker here: the envelope hash, identity and
+    # every declared artifact are verified, and their own validators check the content.
     for artifact in manifest.artifacts:
         _verify(root, artifact)
     return manifest
@@ -257,7 +292,7 @@ def check_dataset(root: Path) -> DatasetIndex:
                 raise ValueError("duplicate configuration ID")
             seen.add(entry.configuration_id)
             _verify(root, entry.manifest)
-            manifest = check_manifest(root, entry.manifest.path)
+            manifest = _check_indexed_manifest(root, entry.manifest.path, category)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
                 entry.configuration_id,

@@ -35,6 +35,8 @@ import copy
 import hashlib
 import os
 import re
+import shutil
+import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -302,8 +304,13 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         )
     entry = entries[0]
     cache = Cache(pin.cache_dir)
+    if pin.local_root is not None:
+        # A local dataset can be edited in place: the manifest digest keys the materialization to its content.
+        source_key = f"{source_key}-{entry.manifest.sha256[:16]}"
     output_dir = cache.root / "materialized" / source_key / entry.configuration_id
     try:
+        # The catalog records the manifest's digest; a manifest changed without its reference must not load.
+        _verify(root, entry.manifest)
         loaded = _load(loader, category, root, entry, out.config, output_dir)
     except (LoaderError, ValueError) as exc:
         raise MissingDataError(
@@ -353,17 +360,41 @@ def _fetch_pinned(selection: Selection, pin: DataPin, transport: Transport | Non
         raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
 
 
+def _materialization_is_intact(systems: Path, manifest) -> bool:
+    """True when every runtime artifact of ``manifest`` is present under ``systems`` with its declared bytes."""
+    try:
+        for artifact in manifest.artifacts:
+            if artifact.runtime_path is not None:
+                _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
     manifest_path = entry.manifest.path
     if category != "op-latency":
         raise LoaderError(f"{category} data cannot be loaded into a predictor yet")
-    existing = output_dir / "systems"
-    if existing.is_dir():
-        manifest = loader.read_manifest(root, manifest_path, config)
-        files = tuple(sorted(a.runtime_path for a in manifest.artifacts if a.runtime_path))
-        return OpLatencyData(existing, manifest, files)
+    manifest = loader.read_manifest(root, manifest_path, config)
+    files = tuple(sorted(a.runtime_path for a in manifest.artifacts if a.runtime_path))
+    systems = output_dir / "systems"
+    # A cached materialization is reused only after it verifies against the manifest; a partial or outdated one
+    # (a killed copy, a hand edit) is rebuilt, never served.
+    if output_dir.exists():
+        if _materialization_is_intact(systems, manifest):
+            return OpLatencyData(systems, manifest, files)
+        shutil.rmtree(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    return loader.load(root, manifest_path, output_dir=output_dir, config=config)
+    # Build next to the destination and rename into place, so a crash never leaves a half-written root there.
+    staging = output_dir.parent / f".{output_dir.name}.{uuid.uuid4().hex}.tmp"
+    loader.load(root, manifest_path, output_dir=staging, config=config)
+    try:
+        os.replace(staging, output_dir)
+    except OSError:  # another process finished first: use its result if it verifies
+        shutil.rmtree(staging, ignore_errors=True)
+        if not _materialization_is_intact(systems, manifest):
+            raise
+    return OpLatencyData(systems, manifest, files)
 
 
 def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry) -> None:

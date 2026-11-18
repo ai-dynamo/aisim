@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         summary["source_map"] = SOURCE_MAP_PATH
         ok = True
     else:
-        report = audit_tree(args.out, data, reuse_manifest=reuse, query_versions=versions)
+        report = audit_tree(args.out, data, reuse_manifest=reuse, query_versions=versions, systems_dir=args.systems_dir)
         summary, ok = report.to_dict(), report.ok
     text = json.dumps(summary, indent=2, sort_keys=True)
     print(text)

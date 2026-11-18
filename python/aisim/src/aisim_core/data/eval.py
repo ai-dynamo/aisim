@@ -176,6 +176,14 @@ class Verification(_Record):
 
 
 class EvalRecord(_Record):
+    # ``consistent`` as JSON Schema: a verified or qualified record carries a verification block.
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {"properties": {"tier": {"enum": ["verified", "qualified"]}}, "required": ["tier"]},
+            "then": {"required": ["verification"], "properties": {"verification": {"type": "object"}}},
+        }
+    )
+
     schema_version: Literal["aisim-eval/v1"]
     prediction: PredictionIdentity
     truth: TruthIdentity
@@ -396,12 +404,21 @@ class VerificationReport(BaseModel):
     ok: bool
     problems: list[str]
     recomputed: Results | None = None
+    # The record and predictor this report is about; attest refuses a report for anything else.
+    record_id: str | None = None
+    fingerprint: str | None = None
 
 
 def _close(a: float | None, b: float | None) -> bool:
     if a is None or b is None:
         return a is b
     return math.isclose(a, b, rel_tol=REL_TOL, abs_tol=1e-6)
+
+
+def _failed(record: EvalRecord, problems: list[str]) -> VerificationReport:
+    return VerificationReport(
+        ok=False, problems=problems, record_id=record.record_id, fingerprint=record.prediction.fingerprint
+    )
 
 
 def verify_record(
@@ -420,30 +437,35 @@ def verify_record(
     """
     problems: list[str] = []
     if current_fingerprint != record.prediction.fingerprint:
-        return VerificationReport(ok=False, problems=["predictor fingerprint differs from the record's"])
+        return _failed(record, problems=["predictor fingerprint differs from the record's"])
     table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
     path = Path(truth_root) / table_art.path
     if not path.is_file():
-        return VerificationReport(ok=False, problems=[f"truth table missing: {table_art.path}"])
+        return _failed(record, problems=[f"truth table missing: {table_art.path}"])
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != table_art.sha256 or len(data) != table_art.bytes:
-        return VerificationReport(ok=False, problems=["truth table hash or size differs from record"])
+        return _failed(record, problems=["truth table hash or size differs from record"])
     table = read_parquet(path, TRUTH_SCHEMA_ID)
     if tuple(table.column_names) != TRUTH_COLUMNS:
-        return VerificationReport(ok=False, problems=[f"truth table columns {table.column_names}"])
+        return _failed(record, problems=[f"truth table columns {table.column_names}"])
     ids = table.column("case_id").to_pylist()
     if len(set(ids)) != len(ids):
-        return VerificationReport(ok=False, problems=["duplicate case_id in truth table"])
+        return _failed(record, problems=["duplicate case_id in truth table"])
     truths = table.column("truth_value").to_pylist()
     cases = []
     for case_id, inputs_json, truth in zip(ids, table.column("inputs_json").to_pylist(), truths, strict=True):
         cases.append((case_id, truth, predict(json.loads(inputs_json))))
-    # Exclusions recorded by the producer are honored only if they name real rows.
-    unknown = [e.case_id for e in record.results.exclusions if e.case_id not in set(ids)]
+    # Exclusions are derived from the data (missing or non-positive truth, missing prediction), never taken from
+    # the producer: a recorded exclusion of a row that would score is a cherry-picked subset.
+    got = compute_results(cases)
+    derived = {e.case_id for e in got.exclusions}
+    known = set(ids)
+    unknown = [e.case_id for e in record.results.exclusions if e.case_id not in known]
     if unknown:
         problems.append(f"exclusions name unknown cases: {unknown[:3]}")
-    recorded_excl = [e for e in record.results.exclusions if e.case_id in set(ids)]
-    got = compute_results(cases, recorded_excl)
+    scoreable = [e.case_id for e in record.results.exclusions if e.case_id in known and e.case_id not in derived]
+    if scoreable:
+        problems.append(f"exclusions remove cases that would score: {scoreable[:3]}")
     claimed = record.results
     for name in ("n_total", "n_scored"):
         if getattr(got, name) != getattr(claimed, name):
@@ -461,7 +483,13 @@ def verify_record(
         for a, b in zip(got.worst_n, claimed.worst_n, strict=True)
     ):
         problems.append("worst_n values differ from recomputation")
-    return VerificationReport(ok=not problems, problems=problems, recomputed=got)
+    return VerificationReport(
+        ok=not problems,
+        problems=problems,
+        recomputed=got,
+        record_id=record.record_id,
+        fingerprint=record.prediction.fingerprint,
+    )
 
 
 def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verified") -> EvalRecord:
@@ -471,6 +499,8 @@ def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verifie
     """
     if not report.ok:
         raise ValueError(f"cannot promote a record that failed verification: {report.problems}")
+    if report.record_id != record.record_id or report.fingerprint != record.prediction.fingerprint:
+        raise ValueError("verification report was produced for a different record or predictor")
     if tier == "submitted":
         raise ValueError("attest promotes to verified or qualified")
     if record.status != "complete":
