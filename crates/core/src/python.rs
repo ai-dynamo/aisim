@@ -2017,8 +2017,8 @@ fn fpm_rank_evidence(
 ) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
     #[derive(Default)]
     struct Totals {
-        latency_ms: f64,
         covered_ms: f64,
+        uncovered_ms: f64,
         energy_wms: f64,
     }
 
@@ -2035,13 +2035,14 @@ fn fpm_rank_evidence(
         for (phase, (latency, energy)) in phases.iter_mut().zip(components) {
             if let Some(latency_ms) = latency.filter(|&ms| ms > 0.0) {
                 let latency_ms = latency_ms * correction;
-                phase.latency_ms += latency_ms;
                 if let Some(energy_wms) = energy
                     .map(|value| value * correction)
                     .filter(|&value| value != 0.0)
                 {
                     phase.covered_ms += latency_ms;
                     phase.energy_wms += energy_wms;
+                } else {
+                    phase.uncovered_ms += latency_ms;
                 }
             }
         }
@@ -2052,20 +2053,31 @@ fn fpm_rank_evidence(
         .into_iter()
         .zip([(true, "fpm_prefill"), (false, "fpm_decode")])
     {
-        if phase.latency_ms == 0.0 {
-            continue;
+        let mut operations = Vec::with_capacity(2);
+        if phase.covered_ms > 0.0 {
+            operations.push(TimingOperationEvidence::new(
+                name,
+                phase.covered_ms,
+                Some(phase.energy_wms),
+                TimingEvidenceSource::Silicon,
+            )?);
         }
-        let mut operation = TimingOperationEvidence::new(
-            name,
-            phase.latency_ms,
-            (phase.energy_wms != 0.0).then_some(phase.energy_wms),
-            TimingEvidenceSource::Silicon,
-        )?;
-        operation.covered_latency_ms = phase.covered_ms;
-        evidence.push((
-            Arc::new(ValidatedTimingPhase::from_operations(vec![operation])?),
-            prefill,
-        ));
+        if phase.uncovered_ms > 0.0 {
+            // Distinct names preserve uncovered latency through name folding.
+            // Subtracting covered from a rounded total can move the 90% gate.
+            operations.push(TimingOperationEvidence::new(
+                format!("{name}_uncovered"),
+                phase.uncovered_ms,
+                None,
+                TimingEvidenceSource::Silicon,
+            )?);
+        }
+        if !operations.is_empty() {
+            evidence.push((
+                Arc::new(ValidatedTimingPhase::from_operations(operations)?),
+                prefill,
+            ));
+        }
     }
     Ok(evidence)
 }
@@ -8644,6 +8656,55 @@ mod tests {
         let power = replay_power_stats(&evidence).unwrap();
         assert_eq!(power.power_w, None);
         assert_eq!(power.coverage, 0.8);
+    }
+
+    #[test]
+    fn fpm_rank_power_preserves_coverage_boundary() {
+        // Hand oracle: 0.27 ms covered + 0.03 ms uncovered is exactly 90%.
+        // Decreasing only the covered duration by one ULP must withhold watts.
+        for covered_ms in [0.27_f64, 0.27_f64.next_down()] {
+            for prefill in [true, false] {
+                for missing_energy in [None, Some(0.0)] {
+                    let ranks = [(covered_ms, Some(135.0)), (0.03, missing_energy)]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, (latency_ms, energy))| crate::FpmRankEstimate {
+                            rank,
+                            latency_ms,
+                            prefill_ms: prefill.then_some(latency_ms),
+                            decode_ms: (!prefill).then_some(latency_ms),
+                            prefill_energy_wms: prefill.then_some(energy).flatten(),
+                            decode_energy_wms: (!prefill).then_some(energy).flatten(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let estimate = crate::ForwardPassEstimate {
+                        unavailable_reason: None,
+                        latency_ms: Some(0.27),
+                        native_latency_ms: Some(0.27),
+                        correction_factor: None,
+                        max_rank: Some(0),
+                        ranks,
+                    };
+                    let evidence = fpm_rank_evidence(&estimate).unwrap();
+                    let mut accumulated = TimingEvidenceAccumulator::default();
+                    for _ in 0..2 {
+                        for (phase, prefill) in &evidence {
+                            accumulated.record(phase, *prefill).unwrap();
+                        }
+                        let stats = replay_power_stats(&accumulated.snapshot()).unwrap();
+                        if covered_ms == 0.27 {
+                            assert_eq!(stats.coverage(), 0.9);
+                            // 135 W-ms / 0.30 ms = 450 W per invocation.
+                            assert!(close(stats.power_w().unwrap(), 450.0));
+                        } else {
+                            assert!(stats.coverage() < 0.9);
+                            assert_eq!(stats.power_w(), None);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
