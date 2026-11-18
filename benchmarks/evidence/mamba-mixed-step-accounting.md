@@ -726,34 +726,56 @@ stored attributes directly, which takes 0.17 us. The setters replace both
 values, so the check still detects a mode or policy change.
 
 The gate's own `worker.py` ran each build on the 13 SILICON cases of
-Qwen3-32B and Nemotron-3-Super-120B FP8. The builds ran in turn, in five
-rounds, with 10 warm-up and 100 timed queries per case. This local
-comparison is separate from the 89-case CI gate. The driver is
-[`host_perf.py`](mamba-mixed-step-accounting/host_perf.py). Put each build's
-checkout in `ROOT/BUILD/src` and its environment in `ROOT/BUILD/venv`, then
-run `python host_perf.py ROOT 5 OUT.json rbf1b539f r59c4575a r1db9b803`. The
-case list comes from the gate's `expand_cases`. The raw per-round cold and
-warm medians of every case are in
-[`host-perf-1db9b803.json`](mamba-mixed-step-accounting/host-perf-1db9b803.json).
+Qwen3-32B and Nemotron-3-Super-120B FP8, with 10 warm-up and 100 timed
+queries per case. This local comparison is separate from the CI gate. The
+driver is [`host_perf.py`](mamba-mixed-step-accounting/host_perf.py). Put each
+build's checkout in `ROOT/BUILD/src` and its environment in
+`ROOT/BUILD/venv`, then run
+`python host_perf.py ROOT 6 OUT.json rbf1b539f r1db9b803 rbf03c37d`. The case
+list comes from the gate's `expand_cases`. Round `r` rotates the build order
+by `r`, so in six rounds each build runs twice in each position. The output
+records each round's order and the per-round cold and warm medians of every
+case:
+[`host-perf-bf03c37d.json`](mamba-mixed-step-accounting/host-perf-bf03c37d.json).
 Warm medians over the rounds, in microseconds, with the range of the round
 medians:
 
-| Case | `bf1b539f` | `1db9b803` | Change |
+| Case | `bf1b539f` (main) | `bf03c37d` | Change |
 | --- | --- | --- | --- |
-| Qwen3-32B context, batch 1, isl 1024 | 14.44 (13.76 to 15.60) | 14.28 (14.06 to 15.88) | -1.1% |
-| Qwen3-32B context, batch 1, isl 32768 | 17.29 (15.43 to 17.47) | 16.01 (15.94 to 17.74) | -7.4% |
-| Qwen3-32B generation, batch 1, isl 1024 | 24.98 (24.83 to 27.86) | 25.26 (24.76 to 26.00) | +1.1% |
-| Qwen3-32B generation, batch 128, isl 1024 | 24.72 (24.42 to 25.17) | 25.20 (24.74 to 27.79) | +2.0% |
-| Nemotron Super context, batch 1, isl 1024 | 20.74 (20.42 to 23.19) | 21.22 (20.98 to 23.77) | +2.3% |
-| Nemotron Super generation, batch 128, isl 1024 | 43.19 (42.44 to 43.49) | 42.94 (42.72 to 48.25) | -0.6% |
+| Qwen3-32B context, batch 1, isl 1024 | 14.11 (13.80 to 14.27) | 14.57 (14.24 to 16.12) | +3.3% |
+| Qwen3-32B context, batch 1, isl 32768 | 15.59 (15.29 to 15.98) | 16.13 (15.80 to 18.09) | +3.5% |
+| Qwen3-32B generation, batch 1, isl 1024 | 24.83 (24.52 to 25.26) | 25.20 (24.75 to 25.95) | +1.5% |
+| Qwen3-32B generation, batch 128, isl 1024 | 24.83 (24.57 to 25.20) | 25.30 (24.87 to 27.77) | +1.9% |
+| Nemotron Super context, batch 1, isl 1024 | 20.83 (20.61 to 21.01) | 21.68 (21.24 to 23.92) | +4.1% |
+| Nemotron Super generation, batch 128, isl 1024 | 42.47 (42.06 to 43.17) | 43.24 (43.12 to 44.28) | +1.8% |
 
-Across the 13 cases, the change runs from -7.4% to +2.3%, and the ranges
-overlap. An earlier three-round run measured `1ea0211c`, the code of
-`14ffdb4c`, at 17.08 us for the first case against 14.08 us for main. Its
-raw rounds are in
-[`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json). These
-are simulator host timings, not predicted serving latency. The paired CI
-gate on the published head remains the exact-head result.
+`bf03c37d` is slower than main in all 13 cases, by +0.3% to +4.1% (median
++1.9%), about 0.07 to 0.86 us per query. The round ranges overlap in 11 cases.
+`1db9b803`, the code of the earlier comparison, gives +1.4% to +14.7%
+(median +2.1%). The compiled-engine handle lookup accounts for about 0.1 us:
+it takes 0.34 us on main and 0.45 us at `bf03c37d`. The rest of the
+difference has no change in Python function calls under cProfile. Inlining
+the lookup saved less than 0.04 us, so it was not kept.
+
+An earlier five-round run, in
+[`host-perf-1db9b803.json`](mamba-mixed-step-accounting/host-perf-1db9b803.json),
+ran the builds in the same order every round, `1db9b803` last. It gave -7.4%
+to +2.3%. Because the order was fixed, it does not control for build
+position, and the rotated run replaces it. So does an earlier three-round
+fixed-order run,
+[`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json),
+which measured `1ea0211c` at 17.08 us for the first case against 14.08 us
+for main.
+
+The CI gate on `c425c61a` found one confirmed regression among 101 stable
+comparisons, DeepSeek-V3.2 TP8 generation from a cold query (+14.7%
+geometric mean). The rotated driver, run on the six DeepSeek-V3.2 gate
+cases, gives +0.2% and +3.2% for the two TP8 generation cold queries at
+`bf03c37d`, and -1.6% to +3.3% across all six. So it does not reproduce
+that result. The raw rounds are in
+[`host-perf-deepseek-bf03c37d.json`](mamba-mixed-step-accounting/host-perf-deepseek-bf03c37d.json). These are simulator host timings, not predicted
+serving latency. The paired CI gate on the published head remains the
+exact-head result.
 
 ## Limits
 

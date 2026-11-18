@@ -5,7 +5,9 @@
 Nemotron-3-Super cases. Usage: host_perf.py ROOT ROUNDS OUT.json BUILD...
 
 Each BUILD is a directory under ROOT that holds the build's checkout in `src` and its
-environment in `venv`. OUT.json maps build -> case -> per-round cold and warm medians (us).
+environment in `venv`. Round r runs the builds rotated by r, so with ROUNDS a multiple of the
+build count each build runs in each position equally often. OUT.json holds each round's order
+and maps build -> case -> per-round cold and warm medians (us).
 """
 
 import json
@@ -26,8 +28,11 @@ cases = [
     and c["database_mode"] == "SILICON"
 ]
 res = {b: {} for b in builds}
-for _ in range(rounds):
-    for b in builds:  # builds run in turn within each round
+orders = []
+for r in range(rounds):
+    order = builds[r % len(builds) :] + builds[: r % len(builds)]
+    orders.append(order)
+    for b in order:
         request = {"protocol_version": 2, "revision": b, "cases": cases, "warmup": 10, "iterations": 100}
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(request, f)
@@ -45,6 +50,6 @@ for _ in range(rounds):
             row["cold"].append(c["cold_us"])
             row["warm"].append(c["warm"]["call_median_us"])
 with open(out, "w") as f:
-    json.dump(res, f, indent=1)
+    json.dump({"orders": orders, "results": res}, f, indent=1)
 for case in sorted(res[builds[0]]):
     print(case, *(f"{statistics.median(res[b][case]['warm']):.2f}" for b in builds))
