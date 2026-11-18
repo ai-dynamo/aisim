@@ -398,8 +398,10 @@ every model:
   prefix included. The count is too high whenever
   `ceil(isl / ctx_tokens) > ceil((isl - prefix) / ctx_tokens)`, for one
   request or more. For one legacy Nano request with isl 8192, prefix 3000
-  and a 2048-token budget, TTFT is `20.636 * 4 * 2.05 = 169.214` ms. The 3
-  chunks of uncached tokens would give 126.911 ms. This remains unresolved.
+  and a 2048-token budget, TTFT is `20.636 * 4 * 2.05 = 169.214` ms. With
+  the step latency held fixed, the 3 chunks of uncached tokens and the
+  three-step `qf = 2.00` give `20.636 * 3 * 2.00 = 123.815` ms. This remains
+  unresolved.
 - **Reuse scope.** The result cache key held neither the model graph nor the
   database mode, and the compiled-handle identity did not hold the Mamba
   qualification fields. A legacy and a qualified Nano graph on one backend,
