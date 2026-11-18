@@ -304,7 +304,28 @@ class SlidingWindowStateConfig(StrictModel):
     lookahead_tokens: NonNegativeU64
 
 
-def _validate_hybrid_host_offload(connector: str, prefix_match_unit: int | None, block_size: int | None) -> None:
+_PD_CONNECTOR_ERROR = "host_offload.connector other than offloading_v0_24 is supported only for the aggregated worker"
+
+
+def _require_block_drop_off(speculation) -> None:
+    # Replay does not model the EAGLE block drop hiding the last block, and the
+    # recurrent state, that a host load restored. A sliding window resumes one
+    # block lower instead.
+    if not speculation.disable_eagle_block_drop:
+        raise ValueError("mtp speculation with host_offload and state_cache requires disable_eagle_block_drop")
+
+
+def _validate_hybrid_host_offload(
+    connector: str, prefix_match_unit: int | None, block_size: int | None, *, window: bool, kvcr: bool
+) -> None:
+    if window:
+        # vLLM has sliding-window groups from v0.32 on: a rank-local pool
+        # follows that version's OffloadingConnector under either of its names.
+        if connector == "simple_cpu_v0_32":
+            raise ValueError("a sliding-window state_cache does not support host_offload.connector=simple_cpu_v0_32")
+        if kvcr:
+            raise ValueError("state_cache does not support kvcr")
+        return
     # vLLM's CPU connectors hit a hybrid model at block boundaries; vLLM 0.24's
     # connector stores no states.
     if prefix_match_unit is None or block_size not in (None, prefix_match_unit):
@@ -454,7 +475,17 @@ class KvCachePredictionConfig(StrictModel):
             if self.capacity.type != "fixed" and not infer_state:
                 raise ValueError("state_cache requires fixed capacity (blocks or bytes)")
             if self.host_offload is not None:
-                _validate_hybrid_host_offload(self.host_offload.connector, self.prefix_match_unit, block_size)
+                # An inferred state's family is known only after sizing, where
+                # the runner checks it.
+                window = self.state_cache.sliding_window_lookahead_tokens is not None
+                if window or self.state_cache.bytes_per_request is not None:
+                    _validate_hybrid_host_offload(
+                        self.host_offload.connector,
+                        self.prefix_match_unit,
+                        block_size,
+                        window=window,
+                        kvcr=self.kvcr is not None,
+                    )
             if self.g3_offload is not None:
                 raise ValueError("state_cache does not support g3_offload")
         if infer_state:
@@ -1635,13 +1666,12 @@ def _validate_speculation(engine, *, modes: set[str], backends: set[str]) -> Non
             if kind != "mtp":
                 raise ValueError(f"{kind} speculation does not support host_offload")
             cache = worker.kv_cache
-            if cache.state_cache is not None:
-                # Replay does not model the EAGLE block drop hiding the last
-                # block, and the state, that a host load restored.
-                if not engine.speculation.disable_eagle_block_drop:
-                    raise ValueError(
-                        "mtp speculation with host_offload and state_cache requires disable_eagle_block_drop"
-                    )
+            state = cache.state_cache
+            if state is not None and state.sliding_window_lookahead_tokens is None:
+                # An inferred state's family is known only after sizing, which
+                # checks a recurrent one there.
+                if state.bytes_per_request is not None:
+                    _require_block_drop_off(engine.speculation)
             elif worker.scheduler.async_scheduling is True:
                 raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
             elif backends != {"vllm"} or not cache.prefix_caching or cache.g3_offload is not None:
@@ -1841,10 +1871,17 @@ def _validate_prediction_host_offload(engine: EnginePredictionConfig) -> None:
     for role, worker in configured:
         if not worker.kv_cache.prefix_caching:
             raise ValueError("host_offload requires prefix_caching=true")
-        if worker.kv_cache.host_offload.connector != "offloading_v0_24" and role != "aggregated":
-            raise ValueError(
-                "host_offload.connector other than offloading_v0_24 is supported only for the aggregated worker"
-            )
+        state = worker.kv_cache.state_cache
+        # A sliding window runs the 0.32 offloading rules on every worker, so
+        # it may name them. Sizing checks a state with inferred geometry.
+        names_window_rules = (
+            worker.kv_cache.host_offload.connector == "offloading_v0_32"
+            and state is not None
+            and (state.sliding_window_lookahead_tokens is not None or state.bytes_per_request is None)
+        )
+        named_default = worker.kv_cache.host_offload.connector == "offloading_v0_24"
+        if not (named_default or role == "aggregated" or names_window_rules):
+            raise ValueError(_PD_CONNECTOR_ERROR)
         if worker.kv_cache.g3_offload is not None and (role != "aggregated" or worker.parallelism.attention_data != 1):
             raise ValueError("g3_offload is supported only for the aggregated worker with attention_data=1")
         if worker.kv_cache.kvcr is not None and role == "decode":
