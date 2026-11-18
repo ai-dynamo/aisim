@@ -25,11 +25,14 @@ class MixedStepInput:
     and an exact multiple of ``isl`` has none. A qualified Mamba op caps that
     partial request at ``isl - prefix`` new tokens. The budget is not the
     count of newly scheduled tokens after prefix-cache hits. A whole-model FPM
-    instead reads ``context_tokens`` as new tokens. It derives
+    instead reads ``context_tokens`` as new tokens. If the budget holds at
+    least one request's ``isl - prefix`` new tokens, it derives
     ``ceil(context_tokens / (isl - prefix))`` requests, each with ``prefix``
-    cached tokens, and its query holds ``context_tokens`` new tokens plus the
-    packed decode tokens. A budget below ``isl - prefix`` prices chunks of
-    one request.
+    cached tokens, and one query holds ``context_tokens`` new tokens plus the
+    packed decode tokens. A smaller budget splits one request into chunks of
+    at most ``context_tokens`` new tokens. Each chunk query holds its own new
+    tokens plus the packed decode tokens, with the prefix and the earlier
+    chunks cached, and the step averages the chunk prices.
     """
 
     context_tokens: int

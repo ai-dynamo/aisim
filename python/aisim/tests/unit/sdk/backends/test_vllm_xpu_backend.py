@@ -453,3 +453,22 @@ def test_direct_run_mixed_is_independent_of_call_history(monkeypatch) -> None:
     second = backend.run_mixed(MagicMock(), MagicMock(), rc, step)
     assert first == second == step
     assert [c for c in captured_direct if c == step] == [step, step]
+
+
+@pytest.mark.parametrize(("forward_model", "context_tokens"), [("op_level", 4096), ("fpm", 1096)])
+def test_compute_ttft_single_request_feeds_the_step_its_model_tokens(monkeypatch, forward_model, context_tokens):
+    # One request, isl 4096 with 3000 cached tokens, under run_agg's one-step TTFT
+    # budget of isl: op-level pricing reads the prompt, a whole-model FPM reads
+    # the 1096 new tokens, and either step is one request's whole prefill.
+    backend = VLLMXPUBackend()
+    model = MagicMock(forward_model=forward_model, _num_layers=10)
+    seen = []
+
+    def run_mixed(self, _model, _database, _runtime, step):
+        seen.append(step.context_tokens)
+        return StepEstimate(latency_ms=40.0, energy_wms=0.0, context_tokens=step.context_tokens)
+
+    monkeypatch.setattr(VLLMXPUBackend, "run_mixed", run_mixed)
+    ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 4096, 10, 4096, 3000, **_ttft_kwargs())
+    assert seen == [context_tokens]
+    assert ttft == pytest.approx(40.0 + 10 * 0.3)

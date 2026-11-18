@@ -2073,7 +2073,7 @@ class BaseBackend:
             # tokens (prefix included); a whole-model FPM reads new tokens.
             num_mix_steps = 1
             fits = 0 < isl - prefix <= ctx_tokens
-            if getattr(model, "forward_model", "op_level") == "fpm":
+            if getattr(model, "forward_model", "op_level") == "fpm" and isl > prefix:
                 num_mix_ctx_tokens = min(ctx_tokens, isl - prefix)
             else:
                 num_mix_ctx_tokens = isl if fits else min(ctx_tokens, isl)

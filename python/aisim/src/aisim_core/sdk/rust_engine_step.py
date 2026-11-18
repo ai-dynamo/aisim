@@ -1817,23 +1817,26 @@ def engine_identity(model: Any, database: Any) -> str:
 
 
 def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
-    """Each Mamba2 op's constructor arguments, by op list and position.
+    """The compiled spec of each op that holds a Mamba2 op, by op list and position.
 
     The model config does not carry the qualification fields: one config can
     compile qualified or legacy ops, or assign different state dtypes to each
-    op. A legacy op has empty keyword arguments, so it stays explicit. A draft
-    query width compiles the op inside a ``TokenScale`` wrapper, so it is
-    part of the identity too.
+    op. The spec is the representation ``Engine::build`` validates, so it keeps
+    a legacy op explicit, a draft query width's ``TokenScale`` wrapper, and a
+    Mamba2 op nested in a composite. It runs only when the memo misses.
     """
-    import aisim_core._native as native
+    # Lazy import: ``sdk.engine`` imports from this module at top level.
+    from aisim_core.sdk.engine import _as_engine_op
+    from aisim_core.sdk.operations.base import Operation
 
-    return [
-        [ops_name, index, list(args), dict(kwargs), getattr(op, "_draft_token_width", None)]
-        for ops_name in ("context_ops", "generation_ops")
-        for index, op in enumerate(getattr(model, ops_name, ()))
-        if isinstance(op, native.Mamba2Kernel)
-        for args, kwargs in (op.__getnewargs_ex__(),)
-    ]
+    entries = []
+    for ops_name in ("context_ops", "generation_ops"):
+        for index, op in enumerate(getattr(model, ops_name, ())):
+            if isinstance(op, Operation):
+                spec = _as_engine_op(op)._spec_json()
+                if '"Mamba2"' in spec:
+                    entries.append([ops_name, index, spec])
+    return entries
 
 
 def _cached_engine_handle(model: Any, database: Any) -> Any:

@@ -182,11 +182,15 @@ def test_run_agg_lone_request_memory_ignores_unused_budget():
         get_backend("vllm", "b200_sxm"),
     )
 
-    def memory(ctx_tokens):
-        runtime = config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=3000)
+    def memory(ctx_tokens, isl=4096, prefix=3000):
+        runtime = config.RuntimeConfig(batch_size=1, isl=isl, osl=64, prefix=prefix)
         return session.run_agg(runtime, ctx_tokens=ctx_tokens).get_memory()
 
     assert memory(8192) == memory(4096)
+    # The activations follow the step's 1096 new tokens, as for an uncached
+    # 1096-token prompt, not the 4096-token prompt with its cached prefix.
+    assert memory(4096)["activations"] == memory(1096, isl=1096, prefix=0)["activations"]
+    assert memory(4096)["activations"] < memory(4096, prefix=0)["activations"]
 
 
 def _ttft(summary):
@@ -384,3 +388,39 @@ def test_run_agg_reuse_keeps_a_wrapped_mamba_op_distinct():
     for warm in (backend, get_backend("trtllm", "b200_sxm")):
         with pytest.raises(Exception, match="nested"):
             _agg_ttft(warm, wrapped, database)
+
+
+def _nano_with_nested_scan(state_dtype):
+    """A legacy Nano graph whose context scan sits inside an ``Overlap`` composite."""
+    import json
+
+    import aisim_core
+
+    model = _nano_with_state_dtypes()
+    index = next(i for i, op in enumerate(model.context_ops) if op._name == "context_mamba_ssm")
+    scan = json.loads(model.context_ops[index]._spec_json())
+    scan["Mamba2"]["state_dtype"] = state_dtype
+    overlap = {"Overlap": {"name": "context_mamba_pair", "group_a": [scan], "group_b": []}}
+    model.context_ops[index] = aisim_core.op_from_spec_json(json.dumps(overlap))
+    return model
+
+
+def test_run_agg_reuse_keeps_a_nested_mamba_op_distinct():
+    # A qualified op may not sit in a composite. The identity reads the compiled
+    # spec, so a nested qualified scan fails cold and after a legacy graph with
+    # the same layout warmed both caches.
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+
+    database = _hybrid_trtllm_database()
+    legacy = _nano_with_nested_scan("unrecorded")
+    qualified = _nano_with_nested_scan("float16")
+    rust_engine_step._engine_handle_cache_clear()
+    with pytest.raises(Exception, match="nested"):
+        _agg_ttft(get_backend("trtllm", "b200_sxm"), qualified, database)
+    rust_engine_step._engine_handle_cache_clear()
+    backend = get_backend("trtllm", "b200_sxm")
+    _agg_ttft(backend, legacy, database)
+    for warm in (backend, get_backend("trtllm", "b200_sxm")):
+        with pytest.raises(Exception, match="nested"):
+            _agg_ttft(warm, qualified, database)

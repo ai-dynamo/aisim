@@ -2287,13 +2287,19 @@ impl Engine {
 
     /// Predict one decode step from exact FPM iteration totals.
     ///
-    /// `batch_size` is `ForwardPassMetrics::num_decode_requests`. For an
-    /// operation graph under speculative decoding, it counts verified rows,
-    /// `requests * (nextn + 1)`. A measured speculative-round FPM instead
-    /// takes logical requests, one measured round each.
+    /// The two arguments are `ForwardPassMetrics::num_decode_requests` and
+    /// `sum_decode_kv_tokens`, whose units depend on the engine:
+    ///
+    /// - An operation graph takes packed rows. Under speculative decoding,
+    ///   `batch_size` is `requests * (nextn + 1)`, and `total_past_kv_tokens`
+    ///   sums each row's attention length including its current token, so
+    ///   `B` requests at width `v` and length `s` give `B*v` and `B*v*s`.
+    /// - A whole-model FPM takes logical requests, and a measured
+    ///   speculative-round FPM one measured round per request. There,
+    ///   `total_past_kv_tokens` excludes each request's current token,
+    ///   matching the collector's `total_kv_read_tokens` axis.
+    ///
     /// [`Self::decode_step_latency`] always takes logical requests.
-    /// `total_past_kv_tokens` excludes the one current token processed by each
-    /// decode request, matching the collector's `total_kv_read_tokens` axis.
     pub fn predict_decode_latency_total(
         &self,
         batch_size: u32,

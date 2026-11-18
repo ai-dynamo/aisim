@@ -613,6 +613,27 @@ def test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens(
     assert [call["num_tokens"] for call in memory_calls] == [activation_tokens]
 
 
+def test_run_agg_b1_fully_cached_fpm_prompt_reaches_the_prefix_check(monkeypatch, backend, model, database) -> None:
+    # No new token to schedule: the step keeps a positive budget, so the engine's
+    # prefix check (not MixedStepInput) rejects the point, as for op-level graphs.
+    model.forward_model = "fpm"
+    steps: list[MixedStepInput] = []
+
+    def run_mixed(_model, _database, _runtime, step):
+        steps.append(step)
+        raise RuntimeError("isl must be greater than prefix")
+
+    monkeypatch.setattr(backend, "run_mixed", run_mixed)
+    with pytest.raises(RuntimeError, match="isl must be greater than prefix"):
+        backend.run_agg(
+            model,
+            database,
+            RuntimeConfig(batch_size=1, isl=8, osl=1, prefix=8, engine_step_backend="rust"),
+            ctx_tokens=4,
+        )
+    assert [step.context_tokens for step in steps] == [4]
+
+
 def test_run_mixed_returns_components_and_counts_speculative_query_tokens(
     monkeypatch,
     backend: BaseBackend,
