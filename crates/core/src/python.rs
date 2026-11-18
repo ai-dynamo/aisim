@@ -1070,7 +1070,8 @@ impl AicTimingModel {
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
             fpm_iteration_evidence: Mutex::default(),
-            phase_memo: Memo::clock(128),
+            // Per-rank phase pricing meets a new decode KV length on almost every pass.
+            phase_memo: Memo::clock(4096),
             vision,
             iteration,
         })
@@ -3263,6 +3264,25 @@ fn resolve_role_timing(
     );
     let mut config: AicTimingConfig =
         serde_json::from_value(config).context("invalid AIC timing provider configuration")?;
+    if let Some(launch) = &role.rank.launch
+        && let Some(fit) = config
+            .estimator_request(worker_type)?
+            .estimator_config
+            .fpm_regression
+            .fit
+            .linear
+            .and_then(|linear| linear.max_cudagraph_capture_size)
+    {
+        // Both describe vLLM's max_cudagraph_capture_size: the fit prices a
+        // pass as graph or eager, and `launch` times its launch the same way.
+        ensure!(
+            usize::try_from(fit).is_ok_and(|fit| fit == launch.max_cudagraph_capture_size),
+            "scheduler.launch.max_cudagraph_capture_size ({}) differs from \
+             estimator_config.fpm_regression.fit.linear.max_cudagraph_capture_size ({fit}); \
+             both are vLLM's max_cudagraph_capture_size",
+            launch.max_cudagraph_capture_size
+        );
+    }
     let resources = if config.backend == "vllm" && config.pp == 1 {
         config.estimator_request(worker_type)?.fpm_resources()?
     } else {
@@ -8011,6 +8031,46 @@ mod tests {
                 mid_chunk_mixed_lengths > 0,
                 "{backend:?} never cut a prompt beside another prefill"
             );
+        }
+    }
+
+    #[test]
+    fn launch_and_fit_must_agree_on_the_cuda_graph_capture_size() {
+        for launch_size in [4096, 512] {
+            let mut role = ReplayRoleConfig::default();
+            role.rank.launch = Some(crate::engine::PassLaunchConfig {
+                decode_ms: 1.0,
+                piecewise_ms: 1.0,
+                eager_ms: 1.0,
+                max_cudagraph_capture_size: launch_size,
+                eager_queue_fraction: 0.0,
+            });
+            role.rank.timing_model = TimingModelConfig::External {
+                provider: "aic".into(),
+                config: serde_json::json!({
+                    "model": "test-model", "backend": "vllm", "system": "test-system", "tp": 1,
+                    "estimator_config": {"fpm_regression": {"fit": {"linear": {
+                        "feature_axes": ["E"], "max_cudagraph_capture_size": 512
+                    }}}}
+                }),
+            };
+            // The test model has no estimator, so equal sizes fail only later.
+            let Err(error) = resolve_role_timing(
+                &mut role,
+                false,
+                ForwardPassWorkerType::Aggregated,
+                None,
+                false,
+                &mut Vec::new(),
+                &mut serde_json::Map::new(),
+            ) else {
+                panic!("the test model cannot build an estimator");
+            };
+            let error = error.to_string();
+            let rejected = error
+                .contains("scheduler.launch.max_cudagraph_capture_size (4096) differs")
+                && error.contains("fit.linear.max_cudagraph_capture_size (512)");
+            assert_eq!(rejected, launch_size != 512, "{error}");
         }
     }
 
