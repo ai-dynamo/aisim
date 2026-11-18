@@ -8,10 +8,14 @@
 //! the model graph is built; the query takes only `x` (the M dimension /
 //! number of tokens) and routes through the GEMM perf table.
 //!
-//! For `fp8_static` quant mode, subtracts `compute_scale` overhead from the
-//! GEMM latency (and additionally subtracts `scale_matrix` when the input
-//! is also low-precision). Post-subtraction latency is floored at the GEMM's
-//! own SOL roofline — mirroring Python's `max(latency_floor, latency)` where
+//! For `fp8_static` quant mode there are two paths. When the loaded GEMM
+//! table has `fp8_static` rows (direct path, SILICON / HYBRID / EMPIRICAL
+//! only), the price comes from those rows; only a low-precision input
+//! subtracts `scale_matrix`. Otherwise (derived path, and always in SOL /
+//! SOL_FULL), the price comes from the `fp8` rows minus `compute_scale`
+//! overhead (and minus `scale_matrix` when the input is also low-precision).
+//! Post-subtraction latency is floored at the GEMM's own SOL roofline —
+//! mirroring Python's `max(latency_floor, latency)` where
 //! `latency_floor = query_gemm(..., DatabaseMode.SOL)` — not at 0.
 
 use crate::common::enums::{DatabaseMode, GemmQuantMode, TransferKind};
@@ -91,8 +95,12 @@ impl GemmOp {
     /// Mirrors Python's `GEMM.query`:
     /// 1. `m = x // scale_num_tokens`
     /// 2. Query GEMM table at `(m, n, k, quant_mode)`.
-    /// 3. For `fp8_static`: subtract `compute_scale(m, k)` (and
-    ///    `scale_matrix(m, k)` when low-precision-input).
+    /// 3. For `fp8_static`: on the derived path (no `fp8_static` rows in the
+    ///    table, or SOL / SOL_FULL mode), subtract `compute_scale(m, k)` (and
+    ///    `scale_matrix(m, k)` when low-precision-input). On the direct path
+    ///    (the table has `fp8_static` rows), subtract only `scale_matrix(m, k)`
+    ///    when low-precision-input. A subtraction floors the latency at the
+    ///    GEMM roofline and tags the result `Estimated`.
     /// 4. Clamp to `>= 0`, scale by `scale_factor`.
     pub fn query(
         &self,
@@ -135,45 +143,60 @@ impl GemmOp {
         let mut latency_floor = 0.0_f64;
 
         if quant == GemmQuantMode::Fp8Static {
-            // The component sources are irrelevant: the whole fp8_static
-            // path is tagged Estimated below regardless of mode. Energy is
+            // Direct path: the merged GEMM table has `fp8_static` rows, so
+            // `base` already is the fp8_static price and no compute_scale
+            // overhead is subtracted. SOL / SOL_FULL read no table and keep
+            // the derived path.
+            let direct = !matches!(db.database_mode, DatabaseMode::Sol | DatabaseMode::SolFull)
+                && db.gemm.has_direct_fp8_static()?;
+            let mut subtracted = false;
+            // The component sources are irrelevant: a subtracted result is
+            // tagged Estimated below regardless of mode. Energy is
             // subtracted alongside latency (Python `GEMM.query`).
-            let cs = query_compute_scale_table(db, quant, m, self.k)?;
-            latency -= cs.latency_ms;
-            energy -= cs.energy_wms;
-            sol = subtract_sol(sol, cs.sol);
+            if !direct {
+                let cs = query_compute_scale_table(db, quant, m, self.k)?;
+                latency -= cs.latency_ms;
+                energy -= cs.energy_wms;
+                sol = subtract_sol(sol, cs.sol);
+                subtracted = true;
+            }
 
             if self.low_precision_input {
                 let sm = query_scale_matrix_table(db, quant, m, self.k)?;
                 latency -= sm.latency_ms;
                 energy -= sm.energy_wms;
                 sol = subtract_sol(sol, sm.sol);
+                subtracted = true;
             }
-            // Python (`operations/gemm.py`): the subtraction leaves a path
-            // that still contains the GEMM; independently interpolated
-            // component tables can cross, but that path cannot be faster than
-            // the GEMM's own roofline. Floor at the SOL (NOT at 0), and tag
-            // the result "estimated" (fp8_static is modeled from dynamic FP8
-            // plus overhead tables, not measured directly). Energy has no
-            // analogous SOL model, so it keeps the plain non-negative clamp.
-            let tc_flops = quant_tc_flops(&db.system_spec, quant.mapping())?;
-            let floor_components = gemm_sol_with_flops(
-                &db.system_spec,
-                quant,
-                tc_flops,
-                m as f64,
-                self.n as f64,
-                self.k as f64,
-            );
-            latency_floor = floor_components.time_ms();
-            // When the floor fires, the result IS the GEMM's own roofline —
-            // its decomposition replaces the subtracted one. (Under SOL mode
-            // the floor always fires: the subtrahends are non-negative SOL
-            // values taken off exactly this roofline.)
-            if sol.is_some() && latency < latency_floor {
-                sol = Some(floor_components);
+            if subtracted {
+                // Python (`operations/gemm.py`): the subtraction leaves a
+                // path that still contains the GEMM; independently
+                // interpolated component tables can cross, but that path
+                // cannot be faster than the GEMM's own roofline. Floor at the
+                // SOL (NOT at 0), and tag the result "estimated" (a
+                // subtraction of overhead tables is modeled, not measured
+                // directly). Without a subtraction, the direct path keeps the
+                // row's source. Energy has no analogous SOL model, so it keeps
+                // the plain non-negative clamp.
+                let tc_flops = quant_tc_flops(&db.system_spec, quant.mapping())?;
+                let floor_components = gemm_sol_with_flops(
+                    &db.system_spec,
+                    quant,
+                    tc_flops,
+                    m as f64,
+                    self.n as f64,
+                    self.k as f64,
+                );
+                latency_floor = floor_components.time_ms();
+                // When the floor fires, the result IS the GEMM's own roofline —
+                // its decomposition replaces the subtracted one. (Under SOL mode
+                // the floor always fires: the subtrahends are non-negative SOL
+                // values taken off exactly this roofline.)
+                if sol.is_some() && latency < latency_floor {
+                    sol = Some(floor_components);
+                }
+                source = Source::Estimated;
             }
-            source = Source::Estimated;
         }
 
         let mut result = PerformanceResult::with_energy(latency.max(latency_floor), energy, source);
@@ -314,10 +337,15 @@ fn xprofile_gemm_quants(
 /// Distinct quant names of the loaded GEMM table in first-seen (file row)
 /// order, parsed to the enum. A typed table miss yields an empty list —
 /// mirroring Python, where the ladder's table accesses happen inside
-/// `grid_from_reference`'s typed-miss catch.
+/// `grid_from_reference`'s typed-miss catch. `fp8_static` rows are left out:
+/// they are never an xquant or xprofile reference.
 fn gemm_table_quants(db: &PerfDatabase) -> Result<Vec<GemmQuantMode>, AicError> {
     match db.gemm.available_quants() {
-        Ok(names) => Ok(names.iter().filter_map(|n| gemm_quant_by_name(n)).collect()),
+        Ok(names) => Ok(names
+            .iter()
+            .filter_map(|n| gemm_quant_by_name(n))
+            .filter(|q| *q != GemmQuantMode::Fp8Static)
+            .collect()),
         Err(err) if err.is_missing_perf_data() => Ok(Vec::new()),
         Err(err) => Err(err),
     }
@@ -377,7 +405,10 @@ fn gemm_empirical(
     let spec = &db.system_spec;
     let tc_flops = quant_tc_flops(spec, quant.mapping())?;
     let sol = |c: &[f64]| gemm_sol_latency_ms_with_flops(spec, quant, tc_flops, c[0], c[1], c[2]);
-    let tqm = normalize_fp8_static_quant(quant);
+    // The table quant: `fp8_static` on the direct path, `fp8` for a
+    // fp8_static query without such rows, the quant itself otherwise. It
+    // names the grid key, so the two paths never share a util grid.
+    let tqm = db.gemm.gemm_lookup_quant(quant)?;
     let key = format!("gemm:{}", tqm.name());
     let mut grid = db.util_grids.get_or_try_build(&key, || {
         match db.gemm.gemm_points(quant) {
@@ -583,6 +614,7 @@ fn scale_matrix_empirical(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::enums::TransferPolicy;
     use std::path::PathBuf;
 
     const REPO_ROOT_HINT: &str = env!("CARGO_MANIFEST_DIR");
@@ -964,6 +996,7 @@ mod tests {
             ],
         );
         let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").expect("db must load");
+        assert!(!db.gemm.has_direct_fp8_static().unwrap());
 
         let op = GemmOp {
             name: "g".to_string(),
@@ -1044,5 +1077,312 @@ mod tests {
         let sm = query_scale_matrix_table(&db, quant, 512, 4096).expect("sm");
         assert_eq!(sm.latency_ms, 3.0 * 512.0 * 4096.0 / mem_bw * 1000.0);
         assert_eq!(sm.source, Source::Sol);
+    }
+
+    /// Synthetic GEMM rows "S", all at `n = k = 1024`, `(quant, m, latency
+    /// ms, power W)`. The m-curve lerps latency and power, and energy =
+    /// power x latency. At m=192: fp8 gives latency 2.0, power 150, energy
+    /// 300; fp8_static gives latency 1.0, power 140, energy 140.
+    const ROWS_S_GEMM: [(&str, i64, f64, f64); 4] = [
+        ("fp8", 128, 1.0, 100.0),
+        ("fp8", 256, 3.0, 200.0),
+        ("fp8_static", 128, 0.5, 120.0),
+        ("fp8_static", 256, 1.5, 160.0),
+    ];
+
+    /// Write the rows of S whose quant is in `quants` as `gemm_perf.parquet`.
+    fn write_rows_s_gemm(data: &std::path::Path, quants: &[&str]) {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        let rows: Vec<_> = ROWS_S_GEMM
+            .iter()
+            .filter(|row| quants.contains(&row.0))
+            .collect();
+        write_parquet(
+            &data.join("gemm_perf.parquet"),
+            &[
+                Col::Str("gemm_dtype", rows.iter().map(|r| r.0).collect()),
+                Col::I64("m", rows.iter().map(|r| r.1).collect()),
+                Col::I64("n", vec![1024; rows.len()]),
+                Col::I64("k", vec![1024; rows.len()]),
+                Col::F64("latency", rows.iter().map(|r| r.2).collect()),
+                Col::F64("power", rows.iter().map(|r| r.3).collect()),
+            ],
+        );
+    }
+
+    /// Write an fp8 `scale_matrix_perf.parquet` at k = 1024 from `(m,
+    /// latency ms, power W)` rows.
+    fn write_scale_matrix(data: &std::path::Path, rows: [(i64, f64, f64); 2]) {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+        write_parquet(
+            &data.join("scale_matrix_perf.parquet"),
+            &[
+                Col::Str("quant_dtype", vec!["fp8"; 2]),
+                Col::I64("m", rows.iter().map(|r| r.0).collect()),
+                Col::I64("k", vec![1024; 2]),
+                Col::F64("latency", rows.iter().map(|r| r.1).collect()),
+                Col::F64("power", rows.iter().map(|r| r.2).collect()),
+            ],
+        );
+    }
+
+    /// Fixture D: all rows of S, and the scale_matrix rows of S (fp8 m=128/256
+    /// @ k=1024: lat 0.125/0.375, power 20/60; at m=192 the lerp gives
+    /// latency 0.25, power 40, energy 10). No `computescale_perf.parquet`: a
+    /// path that still asks for compute_scale fails.
+    fn fixture_d_db(tmp: &tempfile::TempDir) -> PerfDatabase {
+        use crate::perf_database::energy_test_fixtures::write_energy_systems_root;
+        let data = write_energy_systems_root(tmp.path());
+        write_rows_s_gemm(&data, &["fp8", "fp8_static"]);
+        write_scale_matrix(&data, [(128, 0.125, 20.0), (256, 0.375, 60.0)]);
+        PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").expect("db must load")
+    }
+
+    fn fp8_static_op(name: &str, scale_factor: f64, low_precision_input: bool) -> GemmOp {
+        GemmOp {
+            name: name.to_string(),
+            scale_factor,
+            low_precision_input,
+            ..GemmOp::new(name, 1024, 1024, GemmQuantMode::Fp8Static)
+        }
+    }
+
+    /// Direct path, hand oracle on fixture D at x=192. The roofline floor of
+    /// the energy test spec at this shape is below 1e-3 ms, so it does not
+    /// fire.
+    #[test]
+    fn gemm_fp8_static_direct_rows_match_hand_oracle() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db = fixture_d_db(&tmp);
+        assert!(db.gemm.has_direct_fp8_static().unwrap());
+
+        // "g": scale_factor 2.0, low_precision_input true. The fp8_static
+        // row (1.0, 140) minus scale_matrix (0.25, 10), times 2:
+        // latency (1.0 - 0.25) * 2 = 1.5; energy (140 - 10) * 2 = 260;
+        // Estimated after a subtraction.
+        let r = fp8_static_op("g", 2.0, true)
+            .query(&db, 192, None)
+            .expect("fp8_static query");
+        assert!(
+            (r.latency_ms - 1.5).abs() < 1e-9,
+            "latency {}",
+            r.latency_ms
+        );
+        assert!(
+            (r.energy_wms - 260.0).abs() < 1e-9 * 260.0,
+            "energy {}",
+            r.energy_wms
+        );
+        assert_eq!(r.source, Source::Estimated);
+
+        // "g1": scale_factor 1.0, low_precision_input false. The row as is:
+        // no subtraction, no floor, the row's source.
+        let r1 = fp8_static_op("g1", 1.0, false)
+            .query(&db, 192, None)
+            .expect("fp8_static query");
+        let row = db
+            .gemm
+            .query(GemmQuantMode::Fp8Static, 192, 1024, 1024)
+            .unwrap();
+        assert_eq!(r1.latency_ms.to_bits(), row.latency.to_bits()); // 1.0
+        assert_eq!(r1.energy_wms.to_bits(), row.energy.to_bits()); // 140.0
+        assert!(
+            (r1.latency_ms - 1.0).abs() < 1e-9,
+            "latency {}",
+            r1.latency_ms
+        );
+        assert!((r1.energy_wms - 140.0).abs() < 1e-9 * 140.0);
+        assert_eq!(r1.source, Source::Silicon);
+
+        // fp8 on the same table is unchanged: the fp8 rows of S at m=192
+        // give latency 2.0, energy 300, Silicon.
+        let f = GemmOp::new("f", 1024, 1024, GemmQuantMode::Fp8)
+            .query(&db, 192, None)
+            .expect("fp8 query");
+        assert!(
+            (f.latency_ms - 2.0).abs() < 1e-9,
+            "latency {}",
+            f.latency_ms
+        );
+        assert!((f.energy_wms - 300.0).abs() < 1e-9 * 300.0);
+        assert_eq!(f.source, Source::Silicon);
+    }
+
+    /// Direct path, low-precision input, and a scale_matrix price larger
+    /// than the GEMM row: the latency stops at the GEMM roofline.
+    #[test]
+    fn gemm_fp8_static_direct_low_precision_input_keeps_the_roofline_floor() {
+        use crate::perf_database::energy_test_fixtures::write_energy_systems_root;
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let data = write_energy_systems_root(tmp.path());
+        // gemm_perf: fp8_static rows of S only (m=192: latency 1.0, energy 140).
+        write_rows_s_gemm(&data, &["fp8_static"]);
+        // scale_matrix: fp8 m=128/256 @ k=1024, lat 2.0/2.0, power 10/10
+        // (m=192: latency 2.0, energy 2.0 * 10 = 20).
+        write_scale_matrix(&data, [(128, 2.0, 10.0), (256, 2.0, 10.0)]);
+        let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").expect("db must load");
+
+        // At x=192: 1.0 - 2.0 < floor, so the result is the roofline.
+        let r = fp8_static_op("g", 1.0, true)
+            .query(&db, 192, None)
+            .expect("fp8_static query");
+        let tc = quant_tc_flops(&db.system_spec, GemmQuantMode::Fp8Static.mapping()).unwrap();
+        let floor = gemm_sol_with_flops(
+            &db.system_spec,
+            GemmQuantMode::Fp8Static,
+            tc,
+            192.0,
+            1024.0,
+            1024.0,
+        )
+        .time_ms();
+        assert!(floor > 0.0);
+        assert_eq!(r.latency_ms, floor);
+        assert_eq!(r.source, Source::Estimated);
+        // Energy keeps the plain subtraction: 140 - 2.0 * 10 = 120.
+        assert!(
+            (r.energy_wms - 120.0).abs() < 1e-9 * 120.0,
+            "energy {}",
+            r.energy_wms
+        );
+    }
+
+    /// Direct path with no scale_matrix table: a low-precision input is a
+    /// loud missing-data error, not a silent skip of the subtraction.
+    #[test]
+    fn gemm_fp8_static_direct_low_precision_input_without_scale_matrix_errors() {
+        use crate::perf_database::energy_test_fixtures::write_energy_systems_root;
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let data = write_energy_systems_root(tmp.path());
+        // gemm_perf: fp8_static rows of S only; no computescale, no
+        // scale_matrix file.
+        write_rows_s_gemm(&data, &["fp8_static"]);
+        let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").expect("db must load");
+
+        // low_precision_input false: the row of S at m=192 (latency 1.0).
+        let ok = fp8_static_op("g1", 1.0, false)
+            .query(&db, 192, None)
+            .expect("no scale table is needed");
+        assert!(
+            (ok.latency_ms - 1.0).abs() < 1e-9,
+            "latency {}",
+            ok.latency_ms
+        );
+        assert_eq!(ok.source, Source::Silicon);
+
+        // low_precision_input true: the scale_matrix table is missing.
+        match fp8_static_op("g", 1.0, true).query(&db, 192, None) {
+            Err(e) => assert!(e.is_missing_perf_data(), "error {e:?}"),
+            Ok(r) => panic!("expected a missing-data error, got {r:?}"),
+        }
+    }
+
+    /// EMPIRICAL keeps a separate util grid per mode on the direct path;
+    /// SOL reads no table and stays as today (derived path, Estimated).
+    #[test]
+    fn gemm_fp8_static_direct_rows_in_empirical_and_sol_modes() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db = fixture_d_db(&tmp);
+
+        // EMPIRICAL: price fp8 first, then fp8_static, both at x=128 (an
+        // exact sample, so SOL / (SOL / lat) returns the sample latency:
+        // fp8 1.0, fp8_static 0.5).
+        let emp = db
+            .silicon_view()
+            .with_mode(DatabaseMode::Empirical, TransferPolicy::ALL);
+        db.reset_provenance();
+        let f = GemmOp::new("f", 1024, 1024, GemmQuantMode::Fp8)
+            .query(&emp, 128, None)
+            .expect("fp8 empirical query");
+        assert!(
+            (f.latency_ms - 1.0).abs() < 1e-9,
+            "latency {}",
+            f.latency_ms
+        );
+        let s = GemmOp::new("s", 1024, 1024, GemmQuantMode::Fp8Static)
+            .query(&emp, 128, None)
+            .expect("fp8_static empirical query");
+        // Own grid, not the fp8 grid (a shared cache key would give 1.0).
+        assert!(
+            (s.latency_ms - 0.5).abs() < 1e-9,
+            "latency {}",
+            s.latency_ms
+        );
+        assert_eq!(s.source, Source::Empirical);
+        assert_eq!(
+            emp.worst_provenance(),
+            util_empirical::ProvenanceTier::Empirical
+        );
+
+        // SOL: no table is read; the result is the GEMM roofline with the
+        // tag of today.
+        let sol = db
+            .silicon_view()
+            .with_mode(DatabaseMode::Sol, TransferPolicy::ALL);
+        let r = GemmOp::new("s", 1024, 1024, GemmQuantMode::Fp8Static)
+            .query(&sol, 192, None)
+            .expect("fp8_static sol query");
+        let tc = quant_tc_flops(&db.system_spec, GemmQuantMode::Fp8Static.mapping()).unwrap();
+        let roofline = gemm_sol_with_flops(
+            &db.system_spec,
+            GemmQuantMode::Fp8Static,
+            tc,
+            192.0,
+            1024.0,
+            1024.0,
+        )
+        .time_ms();
+        assert_eq!(r.latency_ms, roofline);
+        assert_eq!(r.source, Source::Estimated);
+    }
+
+    /// fp8_static rows are never a transfer-ladder reference. Synthetic
+    /// discrimination vehicle: fp8_static rows come FIRST in file order with
+    /// latencies 1000x the bfloat16 rows. fp8, sq and fp8_block have no rows
+    /// and share the fp8_static profile (1, 2); they must borrow bfloat16
+    /// through xprofile (a fp8_static borrow would land near 1000).
+    #[test]
+    fn gemm_transfer_ladder_never_borrows_fp8_static_rows() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let data = write_energy_systems_root(tmp.path());
+        write_parquet(
+            &data.join("gemm_perf.parquet"),
+            &[
+                Col::Str(
+                    "gemm_dtype",
+                    vec!["fp8_static", "fp8_static", "bfloat16", "bfloat16"],
+                ),
+                Col::I64("m", vec![64, 128, 64, 128]),
+                Col::I64("n", vec![64, 64, 64, 64]),
+                Col::I64("k", vec![64, 64, 64, 64]),
+                Col::F64("latency", vec![1000.0, 2000.0, 1.0, 2.0]),
+            ],
+        );
+        let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0")
+            .expect("db")
+            .with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        for quant in [
+            GemmQuantMode::Fp8,
+            GemmQuantMode::Sq,
+            GemmQuantMode::Fp8Block,
+        ] {
+            db.reset_provenance();
+            let r = query_gemm_table(&db, quant, 64, 64, 64).expect("ladder query");
+            assert_eq!(r.source, Source::Empirical, "{quant:?}");
+            assert_eq!(
+                db.worst_provenance(),
+                util_empirical::ProvenanceTier::XProfile,
+                "{quant:?}"
+            );
+            assert!(
+                r.latency_ms < 100.0,
+                "{quant:?}: must borrow the bfloat16 donor (~O(1) ms), got {} \
+                 (a fp8_static donor would be ~O(1000))",
+                r.latency_ms
+            );
+        }
     }
 }
