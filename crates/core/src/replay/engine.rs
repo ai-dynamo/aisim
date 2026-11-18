@@ -770,7 +770,7 @@ mod disaggregated_tests {
             "rank": {
                 "num_gpu_blocks": 8, "block_size": 64, "kv_cache_bytes_per_token": 16,
                 "state_cache": {"bytes_per_request": 1500}, "prefix_match_unit": 64,
-                "timing_model": {"provider": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+                "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
             }
         }))
         .unwrap();
