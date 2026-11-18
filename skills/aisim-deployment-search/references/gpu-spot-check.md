@@ -50,13 +50,16 @@ request = replace(request, backend=replace(request.backend, dynamo_version="<dyn
 print(candidate_id, sorted(generate_from_request(request)))
 ```
 
-It writes:
+It writes deployment artifacts:
 
 - `run_0.sh`: frontend and workers;
-- `bench_run.sh`: an AIPerf run;
-- `k8s_deploy.yaml` and `k8s_bench.yaml`;
+- `k8s_deploy.yaml`;
 - `sflow.yaml`;
 - per-role CLI argument files.
+
+For a fixed-length workload, it also writes `bench_run.sh` (an AIPerf run)
+and `k8s_bench.yaml`. Trace workloads have different benchmark requirements;
+see the limitation in step 3.
 
 It worked for both aggregated and disaggregated picks.
 
@@ -80,7 +83,19 @@ Run `bash -n` on every generated script.
   namespace, model cache and image in the generator overrides, and review
   `k8s_deploy.yaml` with the user before applying it.
 
-## 3. Benchmark with the same arrival process as the simulation
+## 3. Benchmark a fixed-length workload with the same arrival process
+
+This spot-check cannot validate trace workloads, including mixed-length
+traces using concurrency load. The manual commands below use one fixed
+ISL/OSL pair; they do not replay the trace's per-request lengths or arrival
+process.
+
+By default, a trace candidate gets no `bench_run.sh` or `k8s_bench.yaml`, and
+`sflow.yaml` has no benchmark task. Explicitly setting both `BenchConfig.isl`
+and `BenchConfig.osl` generates fixed-length benchmarks, not trace replay;
+those measurements do not validate the original trace prediction. Trace
+validation requires a separate replay procedure preserving the original
+per-request lengths and arrival process, which this guide does not provide.
 
 <!-- coderabbit-ai-generated:v1 -->
 
