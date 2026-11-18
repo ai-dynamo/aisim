@@ -1,6 +1,6 @@
 {
   "skill": "aisim-gpu-selection-and-sizing",
-  "_draft_note": "Every case is self-contained. Pinned to aisim==0.14.0. Grade on the invariants in expected_behavior: reported GPU counts and metrics must match the artifacts the agent produced (size_ladder.py JSON, recommendation.json, headroom_scan.py JSON) within 1%. Do not grade on a specific GPU count. All models used have configs bundled with AISim (no Hugging Face access).",
+  "_draft_note": "Pinned to aisim==0.14.0. Grade on the invariants in expected_behavior: reported GPU counts and metrics must match the artifacts the agent produced (size_ladder.py JSON, recommendation.json, headroom_scan.py JSON) within 1%. Do not grade on a specific GPU count. The missing-coverage case requires HTTPS access to huggingface.co for the Granite config; the other cases use configs bundled with AISim.",
   "cases": [
     {
       "id": "size-two-gpu-types",
@@ -65,7 +65,7 @@
       "id": "missing-coverage",
       "question": "How many B200s (b200_sxm) would ibm-granite/granite-4.0-h-small need with vLLM at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms, at least 18 SLA-compliant requests per second?",
       "expected_skill": "aisim-gpu-selection-and-sizing",
-      "ground_truth": "AISim 0.14.0 does not model this architecture (GraniteMoeHybridForCausalLM). size_ladder.py's coverage probe reports no coverage and exits 4 without running the ladder. The agent says AISim cannot size this model. (This model's config is fetched from huggingface.co; it is not bundled.)",
+      "ground_truth": "Prerequisite: the eval environment must have HTTPS access to huggingface.co to fetch this model's config, which is not bundled. If the config cannot be fetched, the case is blocked and must not be graded as an architecture-coverage result. With the config available, AISim 0.14.0 does not model this architecture (GraniteMoeHybridForCausalLM). size_ladder.py's coverage probe reports no coverage and exits 4 without running the ladder. The agent says AISim cannot size this model.",
       "expected_behavior": [
         "Reports missing coverage, not a GPU count and not 'needs more than 16'",
         "Presents no fabricated numbers"
