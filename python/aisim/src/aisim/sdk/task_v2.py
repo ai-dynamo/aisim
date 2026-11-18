@@ -2231,7 +2231,8 @@ class Task:
         # shared quant-transfer primitive in operations/util_empirical.py) can
         # synthesize a quant from a collected sibling: XQUANT borrows within the
         # same (memory, compute) profile, XPROFILE borrows across profiles rescaled
-        # by the op's util-LEVEL ratio. This gate mirrors exactly what the resolved
+        # by the op's util-LEVEL ratio (a GEMM borrows from no fp8_static rows, so
+        # that name is never a donor here). This gate mirrors exactly what the resolved
         # policy + DB contents make reachable at query time — truly-unreachable
         # quants still fail early here rather than crashing late in the sweep.
         # Admission only holds if (a) we're in a non-SILICON mode AND (b) the
@@ -2324,9 +2325,13 @@ class Task:
             # data-driven (see _gemm_key_names: its own GEMM rows plus
             # scale_matrix, or fp8 plus both overhead tables).
             transfer_ok = profile_transfer and mode is not common.GEMMQuantMode.fp8_static
-            if transfer_ok and xquant_enabled and _profile_reachable(mode, modes):
+            # The engine never takes fp8_static GEMM rows as a ladder reference
+            # (gemm_table_quants in operators/gemm.rs), so the name is no donor
+            # here. It stays in ``modes`` for the direct ``name in modes`` test.
+            donors = [m for m in modes if m != "fp8_static"] if op == "gemm" else modes
+            if transfer_ok and xquant_enabled and _profile_reachable(mode, donors):
                 return  # XQUANT-reachable in HYBRID/EMPIRICAL (same-profile data)
-            if transfer_ok and xprofile_enabled and _xprofile_reachable(op, mode, modes):
+            if transfer_ok and xprofile_enabled and _xprofile_reachable(op, mode, donors):
                 return  # XPROFILE-reachable (calibrated level + any other-profile data)
             exc_type = UnsupportedWideepConfigError if op.startswith("wideep_") else ValueError
             raise exc_type(
