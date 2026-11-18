@@ -15,14 +15,14 @@ Why: a name is a join key. Two spellings of one GPU split a plot in two and sile
 Before you open a pull request, convert your data to canonical names and run:
 
 ```bash
-aisim data check-names <your-data-directory>
+aisim data validate <your-data-directory>
 ```
 
 An external contribution that still contains aliases will be sent back with the checker's output.
 
-`check-names` reads configuration manifests. It does not read content-addressed `aisim-eval/v1` records, so an
-eval-only directory can pass it with a non-canonical hardware or framework in `truth.identity`. For eval
-records, convert the names by hand and confirm them with `aisim_core.data.names.normalize` before you commit.
+The name check in `aisim data validate` reads configuration manifests. It does not read content-addressed
+`aisim-eval/v1` records, so an eval-only directory can pass it with a non-canonical hardware or framework in
+`truth.identity`. For eval records, convert the names by hand and confirm them with `aisim_core.data.names.normalize` before you commit.
 
 ## Schemas and compatibility
 

@@ -260,6 +260,7 @@ def _describe(selection: Selection) -> str:
 
 
 def _command(pin: DataPin, selection: Selection) -> str:
+    """A ``aisim data fetch`` command that is valid for ``selection`` (it needs a selector)."""
     flags = [f"--category {selection.category}"]
     for flag, value in (
         ("--model", selection.model),
@@ -269,11 +270,18 @@ def _command(pin: DataPin, selection: Selection) -> str:
         ("--operation-family", selection.operation_family),
         ("--repo", pin.repo),
         ("--revision", pin.revision),
+        ("--cache-dir", pin.cache_dir),
     ):
         if value:
             flags.append(f"{flag} {value}")
     # One flag per ID: without them the command would download every matching entry, not the one the pin names.
     flags.extend(f"--configuration {cid}" for cid in selection.configuration_ids)
+    has_selector = selection.configuration_ids or selection.hardware
+    if selection.select_all or (selection.category == "op-latency" and not has_selector):
+        flags.append("--all")
+    # The command line does not apply the auto-download threshold to an explicit fetch unless
+    # AISIM_DATA_MAX_BYTES is set; --no-limit makes the command valid in both cases.
+    flags.append("--no-limit")
     return "aisim data fetch " + " ".join(flags)
 
 

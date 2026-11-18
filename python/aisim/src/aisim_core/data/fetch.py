@@ -10,7 +10,8 @@ This is the internal library behind ``aisim data fetch`` (DEP #435,
   later read uses that SHA, so a moving ref can never mix revisions.
 * A selection is required. It must name configuration IDs or a hardware filter
   (plus a model for fpm/e2e/eval) and must match at least one catalog entry;
-  an empty selection is an error, never a whole-repository download.
+  an empty selection is an error, never a whole-repository download (``select_all`` is the
+  explicit, opt-in whole-category exception).
 * Files are verified (size, SHA-256, Parquet schema ID and row count) before
   they enter the cache. The cache is keyed by repo + commit + path and entries
   are renamed into place atomically, so an interrupted transfer leaves nothing
@@ -202,8 +203,13 @@ class Selection:
     # Artifact roles to leave out of the plan (for example ``fpm-provenance``,
     # 75 % of the FPM bytes, which no evaluation reads). Manifests are still read.
     exclude_roles: tuple[str, ...] = ()
+    # Whole-category selection (every matching entry, no identity filter required). The command line
+    # allows it for op-latency only; FPM, e2e and eval stay selective.
+    select_all: bool = False
 
     def validate(self) -> None:
+        if self.select_all:
+            return
         if not self.configuration_ids:
             if self.hardware is None:
                 raise SelectionError("selection needs configuration_ids or a hardware filter")

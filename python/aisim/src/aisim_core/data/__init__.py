@@ -268,8 +268,11 @@ def check_manifest(root: Path, path: str) -> Manifest:
     return manifest
 
 
-def check_dataset(root: Path) -> DatasetIndex:
-    """Verify shared discovery indexes and the manifests they reference."""
+def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> DatasetIndex:
+    """Verify shared discovery indexes and the manifests they reference.
+
+    Manifests of ``unchecked_categories`` (categories with no offline checker here) are only digest-verified.
+    """
     root = Path(root)
     index = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
     for category, reference in index.categories.items():
@@ -285,6 +288,8 @@ def check_dataset(root: Path) -> DatasetIndex:
                 raise ValueError("duplicate configuration ID")
             seen.add(entry.configuration_id)
             _verify(root, entry.manifest)
+            if category in unchecked_categories:
+                continue
             manifest = check_manifest(root, entry.manifest.path)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
