@@ -339,6 +339,9 @@ def test_routed_experts_of_one_layer_must_share_a_precision():
     )
     with pytest.raises(ValueError, match="Routed experts of layer 1 disagree"):
         _moe_modes(raw, "ME", MOE.nvfp4, "gb200")
+    # An excluded layer is BF16 whatever its experts list (a fresh dict: parses are cached per config).
+    excluded = {"quantization_config": {**raw["quantization_config"], "ignore": ["backbone.layers.1.mixer.experts.*"]}}
+    assert _moe_modes(excluded, "ME", MOE.nvfp4, "gb200") == {MOE.bfloat16: 1}
 
 
 def test_checkpoint_parse_is_indexed_and_cached(monkeypatch):
@@ -642,8 +645,11 @@ def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypat
     # Overriding the config Task built, before its first model build, is explicit.
     config = task.build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
     assert experts(dataclasses.replace(config, moe_quant_mode=MOE.fp8)) == {MOE.fp8}
-    # A mode assigned to the Task after construction is explicit for building, YAML and recommend.
+    # A mode assigned to the Task after construction is explicit for building, YAML and recommend,
+    # and drops that role's cached large-EP coverage, which depends on the MoE mode.
+    task._large_ep_coverage_cache.update(agg={"stale": {}}, prefill={"kept": {}})
     task.moe_quant_mode = MOE.fp8
+    assert task._large_ep_coverage_cache == {"prefill": {"kept": {}}}
     reloaded = Task.from_yaml(yaml.safe_load(task.to_yaml()))
     rebuilt = _build_recommend_tasks({"agg": task}, 8)["agg"]
     for other in (task, reloaded, rebuilt):

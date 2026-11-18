@@ -273,8 +273,12 @@ def moe_modes(
         return nvfp4 if mode in (moe.nvfp4, moe.nvfp4_wo) else mode
 
     # A layer is priced from its declared expert modules; reject a layer whose other listed experts disagree.
+    # An excluded layer is BF16 whatever its experts list.
     for layer, kind in enumerate(layer_kinds):
-        for block in {module.partition("experts.")[0] + "experts" for module in expert_modules.get(kind, ())}:
+        declared = expert_modules.get(kind, ())
+        if any(checkpoint.module(layer_paths(layer, module))[0] for module in declared):
+            continue
+        for block in {module.partition("experts.")[0] + "experts" for module in declared}:
             algos = {algo for path in layer_paths(layer, block) for algo in checkpoint.descendants.get(path, ())}
             if len(algos) > 1:
                 raise ValueError(f"Routed experts of layer {layer} disagree on precision: {algos}")

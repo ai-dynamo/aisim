@@ -1833,6 +1833,9 @@ class Task:
         explicit_by_role = self.__dict__.get(_QUANT_EXPLICIT_BY_ROLE.get(key, ""))
         if explicit_by_role is not None and role in explicit_by_role:
             explicit_by_role[role] = value is not None
+        coverage_cache = self.__dict__.get("_large_ep_coverage_cache")
+        if key == "moe_quant_mode" and coverage_cache is not None:
+            coverage_cache.pop(role, None)  # large-EP coverage depends on the MoE mode
 
     # =====================================================================
     # Builders consumed by sweep.py
