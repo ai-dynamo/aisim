@@ -1125,20 +1125,27 @@ impl Engine {
                 "qualified Mamba ops are not supported beside DSv4.1 stages".into(),
             ));
         }
-        // Replay attributes a mixed rank's operations to a phase by name.
+        // Replay attributes a mixed rank's operations to a pass by name, so a
+        // qualified Mamba name may repeat only on qualified Mamba ops of its phase.
         if seen[0] {
             let context: HashSet<&str> = spec.context_ops.iter().map(Op::name).collect();
             let generation: HashSet<&str> = spec.generation_ops.iter().map(Op::name).collect();
             let shared = |ops: &[Op], other: &HashSet<&str>| {
                 ops.iter()
-                    .find(|op| op.is_qualified_mamba() && other.contains(op.name()))
+                    .filter(|op| op.is_qualified_mamba())
+                    .find(|op| {
+                        other.contains(op.name())
+                            || ops
+                                .iter()
+                                .any(|o| !o.is_qualified_mamba() && o.name() == op.name())
+                    })
                     .map(|op| op.name().to_owned())
             };
             if let Some(name) = shared(&spec.context_ops, &generation)
                 .or_else(|| shared(&spec.generation_ops, &context))
             {
                 return Err(AicError::InvalidEngineConfig(format!(
-                    "qualified Mamba op {name} shares its name across phases"
+                    "qualified Mamba op {name} shares its name with an op of another pass"
                 )));
             }
         }
@@ -2565,6 +2572,8 @@ impl Engine {
             )));
         }
         let mut shared_non_attention = 0.0;
+        // Prefill-only, like context attention, but never amortized over chunks.
+        let mut context_mamba = 0.0;
         for op in &self.context_ops {
             if op.is_qualified_mamba() {
                 // Each prefill chunk reads and writes its recurrent state once.
@@ -2593,8 +2602,8 @@ impl Engine {
                         seq_imbalance_correction_scale,
                         None,
                     )?;
-                    shared_non_attention += result.latency_ms;
-                    on_op(MixedPass::SharedNonAttention, op, result);
+                    context_mamba += result.latency_ms;
+                    on_op(MixedPass::ContextAttention, op, result);
                 }
                 continue;
             }
@@ -2651,7 +2660,7 @@ impl Engine {
                 // fold-then-divide, `base_backend.py:1244-1246`).
                 on_op(MixedPass::ContextAttention, op, result);
             }
-            context_attention = attn / scale2;
+            context_attention = attn / scale2 + context_mamba;
         }
 
         // ---- Pass 3: decode attention and qualified Mamba ----
@@ -3415,7 +3424,17 @@ impl Engine {
             // division (`base_backend.py:1244-1246`): one `/ scale2` per
             // folded name, never a per-entry reciprocal multiply.
             let scale2 = isl.max(1).div_ceil(ctx_tokens) as f64;
-            for entry in &mut ctx_attn {
+            // Qualified Mamba prices this step's own chunks, so it is not amortized.
+            let mamba: HashSet<&str> = self
+                .context_ops
+                .iter()
+                .filter(|op| op.is_qualified_mamba())
+                .map(Op::name)
+                .collect();
+            for entry in ctx_attn
+                .iter_mut()
+                .filter(|e| !mamba.contains(e.0.as_str()))
+            {
                 entry.1 /= scale2;
                 entry.2 /= scale2;
             }
@@ -4677,6 +4696,19 @@ pub(crate) mod tests {
                 .map(|row| row.1)
                 .sum();
             assert!((sum - mixed).abs() < 1e-12);
+            // The prefill-only scan is context-attention work, never amortized
+            // over chunks; the decode scan is decode-attention work.
+            let prefill_bytes =
+                f64::from(new_tokens) * 18_560.0 + f64::from(requests) * 2_097_152.0;
+            let [_, shared_ms, context_ms, decode_ms] = engine
+                .mixed_step_breakdown(ctx, 2, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            assert_eq!(shared_ms, 0.0);
+            assert!(close(context_ms, prefill_bytes), "chunk={ctx}");
+            assert!(close(decode_ms, decode_bytes));
+            let context_rows: f64 = context.iter().map(|row| row.1).sum();
+            assert!(close(context_rows, prefill_bytes), "chunk={ctx}");
+            assert!(shared.is_empty());
             // Packed telemetry: two width-four decodes are 8 decode requests.
             assert!(
                 close(packed(new_tokens, requests, 8), bytes),
@@ -4961,17 +4993,30 @@ pub(crate) mod tests {
             }
             _ => unreachable!(),
         };
-        let err = Engine::build(
-            EngineSpec::new(
-                fixture_engine_config(None),
-                vec![named(true)],
-                vec![named(false)],
-            ),
-            db.clone(),
+        let build = |context: Vec<Op>, generation: Vec<Op>| {
+            Engine::build(
+                EngineSpec::new(fixture_engine_config(None), context, generation),
+                db.clone(),
+            )
+        };
+        let block = || Op::Elementwise(ElementwiseOp::new("ssm", 2.0));
+        for (context, generation) in [
+            (vec![named(true)], vec![named(false)]),
+            // A context op of another pass under the same name.
+            (vec![named(true), block()], vec![qualified_mamba(false, 1)]),
+        ] {
+            let err = build(context, generation).unwrap_err().to_string();
+            assert!(
+                err.contains("shares its name with an op of another pass"),
+                "{err}"
+            );
+        }
+        // Repeated names within one pass stay valid.
+        build(
+            vec![named(true), named(true)],
+            vec![qualified_mamba(false, 1)],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("shares its name across phases"), "{err}");
+        .unwrap();
         // A direct query fails loudly instead of pricing an invalid width.
         let mut op = qualified_mamba(false, 1);
         if let Op::Mamba2(m) = &mut op {
