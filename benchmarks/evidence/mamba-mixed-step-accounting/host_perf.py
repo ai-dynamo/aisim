@@ -5,8 +5,10 @@
 Nemotron-3-Super cases. Usage: host_perf.py ROOT ROUNDS OUT.json BUILD...
 
 Each BUILD is a directory under ROOT that holds the build's checkout in `src` and its
-environment in `venv`. Round r runs the builds rotated by r, so with ROUNDS a multiple of the
-build count each build runs in each position equally often. OUT.json holds each round's order
+environment in `venv`. `HOST_PERF_MODELS` selects model-id prefixes (comma-separated) and
+`HOST_PERF_MODES` database modes (default `SILICON`). Round r runs the builds rotated by
+r, so with ROUNDS a multiple of the build count each build runs in each position equally
+often. OUT.json holds each round's order
 and maps build -> case -> per-round cold and warm medians (us).
 """
 
@@ -23,6 +25,7 @@ sys.path.insert(0, str(root / builds[0] / "src/python/aisim"))
 from tools.forward_perf_gate.cases import expand_cases
 
 prefixes = os.environ.get("HOST_PERF_MODELS")
+modes = os.environ.get("HOST_PERF_MODES", "SILICON").split(",")
 
 
 def selected(model_id):
@@ -31,7 +34,7 @@ def selected(model_id):
     return model_id == "qwen3-32b" or model_id.startswith("nemotron-3-super")
 
 
-cases = [c for c in expand_cases() if selected(c["model_id"]) and c["database_mode"] == "SILICON"]
+cases = [c for c in expand_cases() if selected(c["model_id"]) and c["database_mode"] in modes]
 res = {b: {} for b in builds}
 orders = []
 for r in range(rounds):

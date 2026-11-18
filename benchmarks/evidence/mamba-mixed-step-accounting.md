@@ -780,6 +780,21 @@ The raw rounds are in
 serving latency. The paired CI gate on the published head remains the
 exact-head result.
 
+The CI gate on `5cd7655d` against `bf1b539f` reported one stable regression in
+128 comparisons: `qwen3-32b/empirical/context/bs1-isl8192` from a cold query,
+46.97 to 48.06 us (+2.3%, 4 of 5 rounds). It also reported 28 faster, 79
+unchanged and 20 noisy comparisons. Its DeepSeek-V3.2 TP8 generation cold
+cell was stable at -3.5%, so the earlier `c425c61a` result did not repeat.
+A paired workstation run of `bf1b539f` and `5cd7655d` over the 20 Qwen3-32B
+EMPIRICAL and SILICON gate cases, with six rotated rounds, does not confirm a
+consistent regression. The gated case changes by +1.6% (45.10 to 45.82 us),
+with the head slower in 2 of 6 rounds. The other EMPIRICAL context cold
+cases change by -1.7% to +2.3%, and every cold case by -4.2% to +2.3%. The
+cause of the gate's cold result is not identified. The run used
+`HOST_PERF_MODELS=qwen3-32b HOST_PERF_MODES=EMPIRICAL,SILICON python host_perf.py ROOT 6 OUT.json rbf1b539f r5cd7655d`.
+The raw rounds are in
+[`host-perf-qwen-5cd7655d.json`](mamba-mixed-step-accounting/host-perf-qwen-5cd7655d.json).
+
 ## Limits
 
 - Summing uniform-batch queries can overcount launch overhead for
