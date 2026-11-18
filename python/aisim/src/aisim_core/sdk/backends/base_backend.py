@@ -2067,13 +2067,17 @@ class BaseBackend:
                 num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         elif b == 1:
             # special case for b=1: the packed budget holds at most this one
-            # request (isl prompt tokens, prefix included), never unused budget.
+            # request, never unused budget. Op-level pricing reads prompt
+            # tokens (prefix included); a whole-model FPM reads new tokens.
             num_mix_steps = 1
-            num_mix_ctx_tokens = min(ctx_tokens, isl)
-            if 0 < isl - prefix <= ctx_tokens:
+            fits = 0 < isl - prefix <= ctx_tokens
+            if getattr(model, "forward_model", "op_level") == "fpm":
+                num_mix_ctx_tokens = min(ctx_tokens, isl - prefix)
+            else:
+                num_mix_ctx_tokens = isl if fits else min(ctx_tokens, isl)
+            if fits:
                 # The uncached prompt fits the budget: one step schedules the
                 # whole request, and TTFT counts that one prefill step.
-                num_mix_ctx_tokens = isl
                 ttft_ctx_tokens = isl
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
@@ -2211,9 +2215,9 @@ class BaseBackend:
             mtp_scaled_tokens = int(num_gen_requests)
         else:
             # b == 1 starts with a context-only step; the later decode peak is
-            # compared below when the workload schedules output tokens. The
-            # step holds the capped prompt, never more than the budget.
-            num_tokens = min(num_mix_ctx_tokens, ctx_tokens)
+            # compared below when the workload schedules output tokens. Its
+            # activations follow the new tokens it schedules, at most the budget.
+            num_tokens = min(isl - prefix, ctx_tokens)
             mtp_scaled_tokens = 0
 
         memory = self._get_memory_usage(
