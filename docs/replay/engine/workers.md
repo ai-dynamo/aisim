@@ -56,7 +56,7 @@ engine:
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
-| `workers.<role>.scheduler.scheduler_select_time_ms` | `0` | predict only | Built-in engine, SGLang without `host_loop` or AFD. See [SGLang batch-selection cost](#sglang-batch-selection-cost). |
+| `workers.<role>.scheduler.scheduler_select_time_ms` | `0` | predict only | A positive cost requires the built-in engine, `backend: sglang`, `host_loop: false`, and no AFD on the worker. See [SGLang batch-selection cost](#sglang-batch-selection-cost). |
 | `workers.decode.scheduler.load_balance_method` | `round_robin` | predict only | SGLang PD decode only (`--load-balance-method`). `total_tokens` places a request on the attention-DP rank with the smallest scheduler token budget; `round_robin` takes ranks in turn. |
 | `workers.<role>.scheduler.async_scheduling` | vLLM's default: on, off with ngram drafts or MTP + G2 | predict only | vLLM only. Boolean. `true` is rejected with ngram drafts or MTP + G2. See [vLLM async scheduling](#vllm-async-scheduling). |
 | `workers.aggregated.scheduler.launch` | Unset | predict only | vLLM only, with async scheduling, on one-GPU workers (`tensor`, `pipeline`, `attention_data` and `prefill_context` of 1) and `--stack engine`. `{decode_ms, piecewise_ms, eager_ms, max_cudagraph_capture_size, eager_queue_fraction}`: CPU launch costs measured on the deployment. Outputs leave once the next pass is launched, and an arrival joins the first pass decided after it. See [vLLM pass launch](#vllm-pass-launch). |
@@ -480,6 +480,12 @@ Use a cost representative of the deployment and workload. The engine clock
 includes the cost once per group. Active and idle ranks exclude the selection
 cost from forward-pass telemetry. Idle and same-timestamp retry passes with no
 model work take their usual time.
+
+Predict uses `type: afd` for AFD workers and rejects a positive selection cost
+on those workers. The public predict timing schema accepts `default`, `fixed`,
+and `polynomial`. Native replay configurations can also supply an external
+timing model. Native validation rejects a positive selection cost with either
+the `afd` or `aic-afd` external provider, including when AFD metadata is absent.
 
 Use this option with forward-only timing and exclude any time already priced
 by the configured timing provider, such as an observed whole-iteration cost.

@@ -416,6 +416,21 @@ def test_prediction_rejects_serial_selection_cost_with_sglang_host_loop() -> Non
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.parametrize("provider", ["afd", "aic-afd"])
+def test_prediction_schema_rejects_native_external_afd_timing(provider: str) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {
+        "scheduler": {"scheduler_select_time_ms": 1.5},
+        "timing": {"type": "external", "provider": provider},
+    }
+    with pytest.raises(ValidationError, match=r"timing\.type") as error:
+        CorePredictionConfig.model_validate({"engine": engine})
+    assert any(
+        item["loc"][-2:] == ("timing", "type") and item["type"] == "literal_error" for item in error.value.errors()
+    )
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> None:
     engine = _engine()
