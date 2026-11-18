@@ -84,7 +84,9 @@ batch size and the new-token count. The collected scan rows start from a cold
 state, so they do not measure a prefill that restores a cached prefix. A
 qualified scan operation with a cached prefix therefore uses the SOL estimate,
 which counts the restored recurrent state. A legacy operation, one with no
-recorded state dtype, still reads the cold row and labels it `silicon`.
+recorded state dtype, still looks up the cold row. In `SILICON` or `HYBRID`
+mode, a successful lookup labels its result `silicon`. A `HYBRID` lookup that
+misses the model geometry gives `sol`, and `SOL` mode reads no row.
 Packed `ForwardPassMetrics` carry only prefill totals, so they cannot say which
 request is cold. If a packed step has any cached prefill token, every qualified
 prefill scan in it uses the SOL estimate. For a step that mixes cold and

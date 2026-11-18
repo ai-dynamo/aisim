@@ -6,6 +6,8 @@
 import json
 import sys
 
+if len(sys.argv) != 2:
+    sys.exit("usage: telem.py OUT.json")
 NEXTN = 3
 import aisim_core.sdk.models.nemotron_h as nh
 
