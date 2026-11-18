@@ -175,18 +175,22 @@ supported topologies. The external Dynamo Python adapter's diagnostics export
 requires separate qualification: native Rust compatibility aliases do not establish
 adapter parity. If a selected runner exports no typed evidence, energy details
 state that reason. Native AFD exports operation-energy evidence; numeric power
-depends on operation-energy coverage. Native Replay and unified prediction keep
-FPM, fixed, polynomial, and analytical EPD energy unavailable; their `power_w`
-and `power_coverage` summary fields are explicit nulls where unsupported. This
-includes fully powered schema-8 FPM pairs. Separately, Python static FPM
-`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()` can return
-nonzero operation energy with SOL interpolation. Aggregated results retain
-pure-decode energy and suppress mixed-step energy. The SDK and legacy
-`aiconfigurator cli estimate` (`cli_estimate()`) publish `power_w` for static,
-aggregated, and disaggregated schema-8 FPM results when their latency-weighted
-coverage reaches 90%; below that gate they return null power with numeric
-`power_coverage`. See
-[FPM power](../perf-model/power.md).
+depends on operation-energy coverage. Supported schema-8 FPM runs report numeric
+`power_coverage` in native Replay and unified prediction and publish `power_w`
+at or above 90% coverage. Below the gate, `power_w` is null and coverage stays
+numeric. The SDK and legacy `aiconfigurator cli estimate` (`cli_estimate()`)
+apply the same coverage gate to supported static, aggregate, and disaggregated
+schema-8 FPM results. Static SDK callers can inspect operation energy through
+`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`.
+
+Aggregate mixed steps retain prefill energy and the positive decode marginal
+after subtracting the KV-floor baseline. The decode marginal contributes energy
+only when its latency is positive and both the target and baseline have power.
+Mixed-step watts are **unqualified** pending measured validation. FPM power
+remains unavailable for speculative runs, models with encoder operations,
+language-only EPD workers, v6/v7 profiles, and fitted estimators. Native
+fixed, polynomial, and analytical EPD timing also leave power and coverage
+unavailable. See [FPM power](../perf-model/power.md).
 
 <a id="prediction-directory"></a>
 
@@ -370,10 +374,11 @@ Memory without evidence is omitted from `details.sections` and listed with a rea
 section with only some estimated roles is `partial` and records
 why other roles are unavailable. Energy retains an explicit unavailable status and reason when
 the runner exports no typed evidence. Missing measurements are never invented as zero;
-energy-aware runs with no covered operations report numeric zero coverage. Native Replay
-with whole-model FPM can report timing/source evidence while its energy details remain
-unsupported and unified `power_w`/`power_coverage` stay null. Python static FPM summary
-energy is a separate path. Fixed/polynomial timing, analytical EPD overlays, and adapters
+energy-aware runs with no covered operations report numeric zero coverage. Supported
+schema-8 FPM Replay exports energy details alongside timing and source evidence.
+Unified prediction reports numeric `power_coverage` and publishes `power_w` at
+or above 90% coverage. Unsupported FPM configurations can still report timing
+and source evidence. Fixed/polynomial timing, analytical EPD overlays, and adapters
 without the native export report operation timing/source evidence unavailable. Serving
 time statistics remain available where exported. See
 [diagnostic availability](../aic-backward-compatibility/migration.md#prediction-details-and-power).
