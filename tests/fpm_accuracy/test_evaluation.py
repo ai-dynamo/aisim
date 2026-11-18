@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -12,7 +13,7 @@ import textwrap
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -282,6 +283,30 @@ def test_predictor_export_absence_preserves_scoring_classification(case, monkeyp
     assert metrics["predicted_count"] == metrics["tuning_error_count"] == 0
     assert metrics["error_count"] == (12 if failed else 0)
     assert metrics["unavailable_count"] == (0 if failed else 12)
+
+
+def test_lazy_sdk_export_with_missing_implementation_remains_unsupported(case, monkeypatch):
+    from scripts.fpm_accuracy.evaluate import score
+
+    root = ModuleType("aisim_core")
+    root.__path__ = []
+    sdk = ModuleType("aisim_core.sdk")
+    sdk.__path__ = []
+
+    def lazy_export(name):
+        if name == "RustForwardPassPerfModel":
+            return importlib.import_module("aisim_core.sdk.rust_engine_step").RustForwardPassPerfModel
+        raise AttributeError(name)
+
+    sdk.__getattr__ = lazy_export
+    monkeypatch.setitem(sys.modules, root.__name__, root)
+    monkeypatch.setitem(sys.modules, sdk.__name__, sdk)
+    monkeypatch.delitem(sys.modules, "aisim_core.sdk.rust_engine_step", raising=False)
+    result = score(case, "warmup", case.fpm_artifacts[0])
+    assert result["status"] == "unsupported_predictor"
+    metric = result["metrics"]["all"]
+    assert metric["measured_count"] == metric["unavailable_count"] == len(case.observations) == 12
+    assert metric["predicted_count"] == metric["error_count"] == metric["tuning_error_count"] == 0
 
 
 def test_successful_dependency_exit_cannot_qualify_an_incomplete_campaign(case, monkeypatch):

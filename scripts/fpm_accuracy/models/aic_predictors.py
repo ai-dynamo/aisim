@@ -229,7 +229,7 @@ def _import_aisim_forward_pass_perf_model() -> Any:
         ) from exc
     try:
         perf_model_type = sdk.RustForwardPassPerfModel
-    except AttributeError as exc:
+    except (AttributeError, ImportError) as exc:
         raise DependencyError("This AISim revision does not export RustForwardPassPerfModel.") from exc
     return perf_model_type
 
