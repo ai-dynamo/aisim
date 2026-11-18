@@ -229,12 +229,23 @@ for `recommendation.json`, CSV, selected YAML and partial-result semantics.
 
 ### Existing Output Directories
 
-Without `--overwrite`, the CLI rejects an existing nonempty output directory. With `--overwrite`, it
-replaces only the known output files listed below and preserves unrelated files.
+Without `--overwrite`, the CLI rejects an existing nonempty output directory, with one exception:
+a directory left by a failed run is cleared and reused, and the CLI prints one line saying so. This
+lets you retry a failed, resource-limited, timed-out or cancelled run in the same directory. It
+applies only when `resource-runtime.json` is a valid AISim runtime report whose status is `failed`,
+`resource_limited`, `timed_out` or `cancelled`, and every other entry is a regular AISim
+diagnostic file (`fpm-coverage.json`, `resource-plan.json`, `execution-events.jsonl`,
+`afd-replay-spec.json`, `afd-qualification.json`) or an empty `recommendations/`. A missing,
+unreadable or unrecognized runtime report, any symlink, any result file, and any file AISim did not
+write keep the directory as it is, and the error says which case applies. Each file is checked
+again just before it is removed; if one changed, nothing more is removed. With `--overwrite`, the
+CLI replaces only the known output files listed below and preserves unrelated files.
 
-Specifically, overwrite may replace `prediction.json`, `recommendation.json`, `recommendation.csv`,
-`requests.jsonl`, `resource-plan.json`, `resource-runtime.json`, `execution-events.jsonl`,
-`afd-replay-spec.json`, `afd-qualification.json`, and numbered `recommendations/NNNN.yaml` files.
+Specifically, overwrite may replace `prediction.json`, `report.html`, `recommendation.json`,
+`recommendation.csv`, `requests.jsonl`, `telemetry-requests.jsonl`, `telemetry-samples.jsonl`,
+`telemetry-lifecycle.jsonl`, `fpm-coverage.json`, `resource-plan.json`, `resource-runtime.json`,
+`execution-events.jsonl`, `afd-replay-spec.json`, `afd-qualification.json`, and numbered
+`recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
 configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or
 output adapters that are not installed leave existing artifacts intact. Errors raised while
@@ -664,7 +675,7 @@ Check KV capacity against request lengths, context limits, and traffic stop limi
 | `aisim: command not found` | The environment containing AISim must be active. | From the tutorial directory, run `source .venv/bin/activate`, then `python -m pip show aisim`. |
 | Installation reports an unsupported Python version | AISim requires Python 3.11–3.13. | Check `python3 --version` and create the environment with a supported interpreter. |
 | Configuration or trace file cannot be found | Check the path and the directory where you ran the command. | Run from the directory containing `prediction.yaml`, or use absolute paths. |
-| Output directory is not empty | Each run needs an empty directory or explicit overwrite. | Add `--output-dir ./another-prediction`, or `--overwrite` to replace known outputs. |
+| Output directory is not empty | The directory holds results, files AISim did not write, or diagnostics without a failed-run report. Leftovers from a failed run are reused automatically. | Add `--output-dir ./another-prediction`, or `--overwrite` to replace known outputs. |
 | Stack or config adapter is unavailable | Use the Python environment containing the selected integration. `router` and `planner` are Dynamo-owned sections. | Install a matched pair from the [installation guide](../getting-started/installation.md#optional-dynamo-integration) and use `--stack dynamo`. |
 | `predict` rejects a domain or `optimization` | A search input was passed to a concrete prediction command. | Run `recommend` first, then predict `recommendations/0001.yaml`. |
 | `--set` produces an unknown-field or load-validation error | Paths must be supported, and load fields must match the selected load type. | For the quick-start input, use `--set traffic.load.concurrency=8`. To change load type, replace the whole `traffic.load` mapping. |

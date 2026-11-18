@@ -3,8 +3,9 @@
 // Copyright contributors to the vLLM project.
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
 // scheduling contracts, of the v0.28.0 (2cf0a6915ce544dc493a0990f2ea38d81601128a)
-// async-scheduling batch queue and of the v0.29.0
-// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split;
+// async-scheduling batch queue, of the v0.29.0
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split and of the
+// v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP/G2 semantics additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -36,8 +37,8 @@ use crate::engine::kv_manager::{
 };
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
-    CompletedLoad, HostLookup, HostTransferProgress, StartLoad, VllmHostOffloadAdapter,
-    VllmHostRequestState,
+    CompletedLoad, HostLookup, HostLookupHit, HostTransferProgress, StartLoad, StateKind,
+    VllmHostOffloadAdapter, VllmHostRequestState,
 };
 use crate::engine::scheduler::vllm::policy::{self, AdmissionDecision, PolicySequence};
 use crate::engine::scheduler::vllm::request::RequestKvState;
@@ -51,7 +52,8 @@ use crate::engine::scheduler::{
 use crate::engine::trace::TraceCollector;
 use crate::engine::{
     CacheTierAttribution, DecodeAcceptance, DecodeWork, G2Scope, HandoffId, IterationMs,
-    KvHintSource, PrefillTotals, PrefillWork, PressureEvent, PressureKind, PressureState, RankWork,
+    KvHintSource, PassLaunchConfig, PrefillTotals, PrefillWork, PressureEvent, PressureKind,
+    PressureState, RankWork,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +77,9 @@ pub(crate) struct VllmRequestState {
     /// First pass, counted by `VllmCore::passes_executed`, that may admit the
     /// request: vLLM had already committed the passes before it on arrival.
     admissible_from_pass: u64,
+    /// `launch`: when the request reached the engine. vLLM decides a pass
+    /// with the requests that arrived before that decision.
+    arrival_ms: f64,
     is_decode_handoff: bool,
     pub(crate) num_computed_tokens: usize,
     /// Cleared on preemption: recomputation has no draft IDs to verify.
@@ -707,6 +712,21 @@ pub(crate) struct VllmCore {
     prefill_capacity_bound: bool,
     passes_executed: u64,
     belady_oracle: Option<BeladyOracle>,
+    /// With async scheduling, the boundary that completed the latest pass
+    /// that ran work: attention-DP ranks complete a pass together, at the end
+    /// of its slowest rank.
+    last_pass_end_ms: Option<f64>,
+    /// Whether the pass awaiting its boundary ran work, with async scheduling.
+    pass_ran_work: bool,
+    /// Requests that finished in the latest pass. vLLM frees their blocks when
+    /// it processes that pass's outputs, after it has formed the next pass.
+    finished_in_flight: Vec<HeldVllmPrefill>,
+    /// Requests the pass in flight runs, sorted, when vLLM defers freeing their
+    /// blocks until that pass ends: async scheduling with a CPU tier.
+    in_flight_requests: Vec<Uuid>,
+    /// `launch`: when vLLM decides the pass after the latest one, if that pass
+    /// follows it back to back.
+    next_decision_ms: f64,
     /// The scheduled pass awaiting its forward time.
     unpriced: Option<UnpricedPass>,
 }
@@ -718,10 +738,23 @@ struct UnpricedPass {
     now_ms: f64,
     compute_start_ms: f64,
     forward: ForwardWork,
-    /// Native host offload advanced its retry state during this pass, so an
-    /// instantaneous pass asks for a same-timestamp retry.
+    /// Native host offload advanced its retry state during this pass, or the
+    /// pass decided nothing while the previous one ran, so an instantaneous
+    /// pass asks for a same-timestamp retry.
     retry_if_instant: bool,
+    /// Async scheduling: vLLM decided this pass while the previous one ran.
+    previous_in_flight: bool,
+    /// `launch`: the scheduled work the launch cost depends on; `None` when
+    /// the pass scheduled nothing or `launch` is unset.
+    launch_shape: Option<LaunchShape>,
     result: EnginePassResult,
+}
+
+/// What a pass's `launch` cost depends on.
+#[derive(Clone, Copy, Debug)]
+struct LaunchShape {
+    tokens: usize,
+    prefill: bool,
 }
 
 /// The model work of one pass, as [`VllmCore::forward_time`] prices it.
@@ -936,6 +969,7 @@ impl VllmCore {
                 .as_ref()
                 .is_some_and(|host| host.scope == G2Scope::ClusterShared);
         let emit_token_ids = args.emit_kv_token_ids;
+        let eagle_block_drop = args.aic_nextn.is_some() && !args.disable_eagle_block_drop;
         let speculative_sampler = args.aic_nextn.map(|nextn| {
             let rates =
                 normalize_conditional_accept_rates(nextn, args.aic_nextn_accept_rates.as_deref())
@@ -966,14 +1000,24 @@ impl VllmCore {
         .with_state_cache(
             args.state_cache,
             args.kv_cache_bytes_per_token,
-            args.aic_nextn.is_some() && !args.disable_eagle_block_drop,
+            eagle_block_drop,
         )
         .with_prefix_match_unit(args.prefix_match_unit);
         let blocks_per_state = kv_manager.state_blocks_per_request();
         if let Some(adapter) = native_host_offload.as_mut()
             && blocks_per_state > 0
         {
-            adapter.set_hybrid(blocks_per_state);
+            let window = args
+                .state_cache
+                .is_some_and(|cache| cache.sliding_window.is_some());
+            let kind = if window {
+                StateKind::SlidingWindow {
+                    drops_drafter_block: eagle_block_drop,
+                }
+            } else {
+                StateKind::Recurrent
+            };
+            adapter.set_hybrid(blocks_per_state, kind);
             kv_manager.record_state_handoffs();
         }
         if let Some(order) = native_host_offload
@@ -1029,6 +1073,11 @@ impl VllmCore {
             attention_dp_size: 1,
             prefill_capacity_bound: false,
             passes_executed: 0,
+            last_pass_end_ms: None,
+            pass_ran_work: false,
+            finished_in_flight: Vec::new(),
+            in_flight_requests: Vec::new(),
+            next_decision_ms: 0.0,
             unpriced: None,
         })
     }
@@ -1142,7 +1191,11 @@ impl VllmCore {
                 let admissible_from_pass =
                     self.first_pass_admitting_arrival(!allow_destination_admission);
                 Ok(SchedulerCommandEffects::new(
-                    SchedulerCommandResult::Submitted(self.submit(request, admissible_from_pass)?),
+                    SchedulerCommandResult::Submitted(self.submit(
+                        request,
+                        admissible_from_pass,
+                        command_now_ms.unwrap_or_default(),
+                    )?),
                 ))
             }
             SchedulerCommand::CancelRequest { request_id } => {
@@ -1175,7 +1228,11 @@ impl VllmCore {
                 let admissible_from_pass =
                     self.first_pass_admitting_arrival(!allow_destination_admission);
                 let submitted = self
-                    .submit(request, admissible_from_pass)
+                    .submit(
+                        request,
+                        admissible_from_pass,
+                        command_now_ms.unwrap_or_default(),
+                    )
                     .expect("prevalidated handoff request must submit");
                 Ok(SchedulerCommandEffects::new(
                     SchedulerCommandResult::Submitted(submitted),
@@ -1514,6 +1571,7 @@ impl VllmCore {
         &mut self,
         mut request: DirectRequest,
         admissible_from_pass: u64,
+        arrival_ms: f64,
     ) -> anyhow::Result<Uuid> {
         let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
         request.uuid = Some(uuid);
@@ -1523,6 +1581,7 @@ impl VllmCore {
         let waiting_order = self.allocate_waiting_order();
         let mut request = self.make_request_state(request, RequestStatus::Waiting, waiting_order);
         request.admissible_from_pass = admissible_from_pass;
+        request.arrival_ms = arrival_ms;
         self.state.insert_waiting(uuid, request);
         if let Some(request) = self.state.requests.get(&uuid) {
             request.debug_assert_progress(uuid);
@@ -1602,6 +1661,7 @@ impl VllmCore {
             status,
             waiting_order,
             admissible_from_pass: 0,
+            arrival_ms: 0.0,
             is_decode_handoff: false,
             num_computed_tokens: 0,
             drafts_ready: false,
@@ -1669,6 +1729,12 @@ impl VllmCore {
             request,
         };
         match self.source_holds.complete_source(uuid, payload) {
+            // vLLM frees a finished request's blocks when it processes the
+            // pass's outputs; with async scheduling that comes after it has
+            // formed the next pass.
+            SourceCompletion::Release(payload) if self.args.max_concurrent_batches > 1 => {
+                self.finished_in_flight.push(payload);
+            }
             SourceCompletion::Release(payload) => {
                 self.cleanup_completed_prefill(payload);
             }
@@ -1696,6 +1762,16 @@ impl VllmCore {
         self.finish_host_request(request_id, &mut request);
         self.kv_manager
             .finish_native(request_id, request.sequence.lease);
+    }
+
+    fn free_finished(&mut self, finished: Vec<HeldVllmPrefill>) {
+        if finished.is_empty() {
+            return;
+        }
+        for payload in finished {
+            self.cleanup_completed_prefill(payload);
+        }
+        self.bump_capacity_generation();
     }
 
     /// The G2 connector's work when a request finishes or is dropped, before
@@ -1799,11 +1875,16 @@ impl VllmCore {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
+        self.has_schedulable_requests()
+            || self.destination_retry_ready
+            || self.has_unsubmitted_host_stores()
+    }
+
+    /// Requests the next pass can schedule.
+    fn has_schedulable_requests(&self) -> bool {
         !self.state.running_members.is_empty()
             || !self.state.waiting_members.is_empty()
             || self.state.has_ready_connector_waiter()
-            || self.destination_retry_ready
-            || self.has_unsubmitted_host_stores()
     }
 
     /// G2 stores a request prepared when it left between passes; the next
@@ -1851,11 +1932,18 @@ impl VllmCore {
     }
 
     pub(crate) fn complete_engine_boundary(&mut self, now_ms: f64) {
-        let Some(adapter) = self.native_host_offload.as_mut() else {
-            return;
-        };
-        let progress = adapter.complete_engine_boundary(&mut self.kv_manager, now_ms);
-        self.apply_host_progress(progress);
+        self.last_pass_end_ms = std::mem::take(&mut self.pass_ran_work).then_some(now_ms);
+        if let Some(adapter) = self.native_host_offload.as_mut() {
+            let progress = adapter.complete_engine_boundary(&mut self.kv_manager, now_ms);
+            self.apply_host_progress(progress);
+        }
+        // With nothing to schedule, vLLM's next step is empty and it processes
+        // this pass's outputs at once. A destination waiting for capacity
+        // schedules nothing: it needs the blocks these outputs free.
+        if !self.has_schedulable_requests() {
+            let finished = std::mem::take(&mut self.finished_in_flight);
+            self.free_finished(finished);
+        }
     }
 
     fn apply_host_progress(&mut self, progress: HostTransferProgress) {
@@ -2162,6 +2250,25 @@ impl VllmCore {
         let end_ms = forward_time.end_ms(pass.compute_start_ms);
         let mut result = pass.result;
         result.end_ms = end_ms;
+        // `launch`: vLLM returns the previous pass's outputs, then decides the
+        // next pass, once it has launched this pass and the previous pass has
+        // ended.
+        result.previous_returned_ms = self.args.launch.and_then(|launch| {
+            let decision_ms = if pass.previous_in_flight {
+                self.next_decision_ms
+            } else {
+                pass.now_ms
+            };
+            let launch_end_ms = self.launch_end_ms(
+                &launch,
+                pass.launch_shape,
+                decision_ms,
+                pass.compute_start_ms,
+                end_ms,
+            );
+            self.next_decision_ms = launch_end_ms.max(pass.now_ms);
+            pass.previous_in_flight.then_some(self.next_decision_ms)
+        });
         if let Some(fpm) = &mut result.fpm {
             fpm.wall_time_secs = (end_ms - pass.now_ms) / 1000.0;
         }
@@ -2199,6 +2306,16 @@ impl VllmCore {
             .is_some_and(VllmHostOffloadAdapter::admits_kv_holders_first);
         self.kv_manager.begin_step();
         self.state.compact_running();
+        // With async scheduling vLLM forms this pass while the previous one
+        // runs, and processes the previous pass's outputs only afterwards,
+        // unless that pass ran nothing or ended before now.
+        let previous_in_flight = self.last_pass_end_ms == Some(now_ms);
+        if !previous_in_flight {
+            let finished = std::mem::take(&mut self.finished_in_flight);
+            self.free_finished(finished);
+            self.in_flight_requests.clear();
+        }
+        let finished_in_flight = std::mem::take(&mut self.finished_in_flight);
         let mut token_budget = self.args.max_num_batched_tokens.unwrap_or(usize::MAX);
         let cadence_step = self.wave_step.is_multiple_of(
             u64::try_from(self.args.prefill_schedule_interval)
@@ -2316,6 +2433,9 @@ impl VllmCore {
         };
         let mut admit_queued_arrivals = false;
         let mut stopped_at_queued_arrival = false;
+        // Set once a window restore waits for room: the rest of the pass
+        // serves only waiters that already hold G1 for their load.
+        let mut g1_owners_only = false;
         while !preempted_any
             && self.state.running.len() < max_num_running
             // vLLM does not call connector lookup after the current batch has
@@ -2340,8 +2460,14 @@ impl VllmCore {
             let prioritize_connector_waiting = self.native_host_offload.is_some();
             // A connector waiter that holds no G1 can queue ahead of one that
             // already holds reserved G1 for its load; serve that owner first
-            // so the head cannot block the space it waits for.
-            let g1_owner = if kv_holders_first && self.state.has_ready_connector_waiter() {
+            // so the head cannot block the space it waits for. A window
+            // restore waiting for room also requires draining G1 owners.
+            // Activated handoffs still go first: a pending destination
+            // forbids fresh admission even after its G2 load has landed.
+            let g1_owner = if !prefer_materialized
+                && (kv_holders_first || g1_owners_only)
+                && self.state.has_ready_connector_waiter()
+            {
                 self.state.connector_waiting.iter().copied().find(|uuid| {
                     self.state.connector_waiting_members.contains(uuid)
                         && !self.state.connector_deadline_waiting_members.contains(uuid)
@@ -2356,8 +2482,12 @@ impl VllmCore {
                 None
             };
             let Some(uuid) = g1_owner.or_else(|| {
-                self.state
-                    .next_waiting_uuid(prefer_materialized, prioritize_connector_waiting)
+                (!g1_owners_only)
+                    .then(|| {
+                        self.state
+                            .next_waiting_uuid(prefer_materialized, prioritize_connector_waiting)
+                    })
+                    .flatten()
             }) else {
                 break;
             };
@@ -2366,7 +2496,7 @@ impl VllmCore {
                 .as_ref()
                 .map(|_| self.request_prefill_reservation_blocks(uuid))
                 .unwrap_or_default();
-            let (reject_before_admission, admission_stage, admissible_from_pass) = {
+            let (reject_before_admission, admission_stage, admissible_from_pass, arrival_ms) = {
                 let request = self
                     .state
                     .requests
@@ -2379,13 +2509,24 @@ impl VllmCore {
                             .accepts_sequence_length(request.sequence.len()),
                     admission.stage_for(request.prompt_is_prebuilt()),
                     request.admissible_from_pass,
+                    request.arrival_ms,
                 )
             };
             // vLLM committed this pass before the request arrived; FCFS keeps
-            // later arrivals behind it. A committed batch without other work
-            // runs no forward, so the arrivals then run in this pass.
-            if !admit_queued_arrivals && admissible_from_pass > self.passes_executed {
-                if !scheduled.is_empty() {
+            // later arrivals behind it. With `launch`, vLLM decided this pass
+            // at `next_decision_ms` if it followed the previous one back to
+            // back, and a request arriving at that instant is too late. A
+            // committed batch without other work runs no forward, so the
+            // arrivals then run at once. While a pass is in flight, that empty
+            // step processes it first, so this pass stays empty and replay
+            // decides again at the same instant.
+            let arrived_after_decision = if self.args.launch.is_some() {
+                previous_in_flight && arrival_ms >= self.next_decision_ms
+            } else {
+                admissible_from_pass > self.passes_executed
+            };
+            if !admit_queued_arrivals && arrived_after_decision {
+                if !scheduled.is_empty() || previous_in_flight {
                     stopped_at_queued_arrival = true;
                     break;
                 }
@@ -2591,7 +2732,16 @@ impl VllmCore {
                     }
                 }
             };
-            let decision = if native_mtp_depth.is_some() {
+            // A window checkpoint has many rows, and G1 counts two copies of
+            // them for a request that resumes from a state: here the landed
+            // checkpoint, which the request computes on in, and the window G1
+            // caches at the boundary when it has room. The load is admitted
+            // with room for both, so the request does not wait with its
+            // checkpoint landed.
+            let restores_window = host_hit.as_ref().is_some_and(HostLookupHit::restores_state)
+                && (self.native_host_offload.as_ref())
+                    .is_some_and(VllmHostOffloadAdapter::keeps_window_checkpoints);
+            let decision = if native_mtp_depth.is_some() || restores_window {
                 if let (AdmissionDecision::Admit { prefill_cost }, Some(hit)) =
                     (&decision, &host_hit)
                 {
@@ -2600,7 +2750,12 @@ impl VllmCore {
                         .as_deref()
                         .map(VllmHostRequestState::reserved_blocks)
                         .unwrap_or_default();
-                    let footprint = hit.request_footprint_blocks();
+                    let cached_copy = if restores_window {
+                        self.kv_manager.state_reserved_blocks_per_request()
+                    } else {
+                        0
+                    };
+                    let footprint = hit.request_footprint_blocks() + cached_copy;
                     let needed = footprint.saturating_sub(
                         (prefill_cost.active_cached_tokens / self.args.block_size).max(reserved),
                     );
@@ -2636,6 +2791,15 @@ impl VllmCore {
             let prefill_cost = match decision {
                 AdmissionDecision::Admit { prefill_cost } => prefill_cost,
                 AdmissionDecision::Wait => {
+                    // vLLM starts a load whose blocks fit and steps past the
+                    // request. Replay holds a window restore back until the
+                    // request's whole footprint fits beside the loads in
+                    // flight, so a waiter behind it that already holds G1 for
+                    // its load goes first: it frees that room.
+                    if restores_window && !g1_owners_only {
+                        g1_owners_only = true;
+                        continue;
+                    }
                     break;
                 }
                 AdmissionDecision::Reject => {
@@ -2798,7 +2962,7 @@ impl VllmCore {
         let store_after_emission = self
             .native_host_offload
             .as_ref()
-            .is_some_and(VllmHostOffloadAdapter::is_hybrid);
+            .is_some_and(VllmHostOffloadAdapter::keeps_recurrent_states);
         if !store_after_emission {
             self.store_pass_blocks(&scheduled, now_ms);
         }
@@ -2853,14 +3017,28 @@ impl VllmCore {
                 cached_tokens: None,
             });
         }
+        // vLLM processes the outputs of the pass in flight once it has formed
+        // this one, so the blocks of the requests that pass finished serve the
+        // next pass. A decision that formed nothing is an empty step: vLLM then
+        // processes the pass in flight at once and decides again.
+        let decide_again = previous_in_flight && scheduled.is_empty();
+        self.free_finished(finished_in_flight);
+        let launch_shape =
+            (self.args.launch.is_some() && !scheduled.is_empty()).then(|| LaunchShape {
+                tokens: scheduled.values().map(|work| work.total_tokens).sum(),
+                prefill: scheduled.values().any(|work| {
+                    work.prompt_tokens > 0 || work.total_tokens > work.draft_tokens + 1
+                }),
+            });
         if (!scheduled.is_empty() || !output_signals.is_empty())
             && let Some(adapter) = self.native_host_offload.as_mut()
         {
             adapter.note_rank_progress();
         }
 
-        // The wall time is the forward's duration, set when it is priced.
-        let fpm = self.compute_fpm(&scheduled, 0.0);
+        // The wall time is the forward's duration, set when it is priced. An
+        // empty step runs no forward, and Dynamo's vLLM recorder skips it.
+        let fpm = (!decide_again).then(|| self.compute_fpm(&scheduled, 0.0));
         // Speculative lookahead reservation may retract decode candidates after
         // scheduling. Keep already executed prefill, but only count surviving
         // decode work that actually produced an output token.
@@ -2884,13 +3062,20 @@ impl VllmCore {
         }
         committed_requests.sort_unstable();
         committed_requests.dedup();
+        if self.args.max_concurrent_batches > 1 {
+            self.pass_ran_work = !committed_requests.is_empty();
+            if self.native_host_offload.is_some() {
+                self.in_flight_requests.clone_from(&committed_requests);
+            }
+        }
         self.passes_executed += 1;
         self.state.debug_assert_invariants();
-        let retry_if_instant = retry_epoch_before.is_some()
-            && self.native_host_offload.as_ref().is_some_and(|a| {
-                a.retry_epoch() != retry_epoch_before
-                    || a.next_deadline().is_some_and(|d| d <= now_ms)
-            });
+        let retry_if_instant = decide_again
+            || (retry_epoch_before.is_some()
+                && self.native_host_offload.as_ref().is_some_and(|a| {
+                    a.retry_epoch() != retry_epoch_before
+                        || a.next_deadline().is_some_and(|d| d <= now_ms)
+                }));
         let verify_width = if self.speculative_sampler.is_some() {
             self.args.aic_nextn.map_or(1, |nextn| nextn + 1)
         } else {
@@ -2944,17 +3129,45 @@ impl VllmCore {
                 .as_ref()
                 .map(CapturedKvEventBuffer::drain)
                 .unwrap_or_default(),
-            fpm: Some(fpm),
+            fpm,
             decode_acceptance,
+            // Set when the pass is priced, with `launch`.
+            previous_returned_ms: None,
         };
         self.unpriced = Some(UnpricedPass {
             now_ms,
             compute_start_ms,
             forward,
             retry_if_instant,
+            previous_in_flight,
+            launch_shape,
             result,
         });
         Ok(work)
+    }
+
+    /// `launch`: when the CPU finishes launching a pass vLLM decided at
+    /// `decision_ms`. A launch never ends after its pass: the GPU waits for it.
+    fn launch_end_ms(
+        &self,
+        launch: &PassLaunchConfig,
+        shape: Option<LaunchShape>,
+        decision_ms: f64,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> f64 {
+        let Some(LaunchShape { tokens, prefill }) = shape else {
+            return decision_ms;
+        };
+        let launch_end_ms = if tokens > launch.max_cudagraph_capture_size {
+            (decision_ms + launch.eager_ms)
+                .max(start_ms + launch.eager_queue_fraction * (end_ms - start_ms))
+        } else if prefill {
+            decision_ms + launch.piecewise_ms
+        } else {
+            decision_ms + launch.decode_ms
+        };
+        launch_end_ms.min(end_ms)
     }
 
     fn drop_request_at(
@@ -3044,6 +3257,12 @@ impl VllmCore {
             break;
         }
         let selected = selected?;
+        // vLLM does not free the blocks of a request the pass in flight runs
+        // until that pass ends (async scheduling with a CPU tier), so it does
+        // not preempt such a request: the allocation stops instead.
+        if self.in_flight_requests.binary_search(&selected).is_ok() {
+            return None;
+        }
         let state_before = self.pressure_state();
         let request_active_blocks_before = self
             .state
@@ -4288,6 +4507,124 @@ mod waiting_queue_tests {
             Some(deadline_waiter)
         );
         assert_eq!(core.connector_waiting_selections(), selections + 1);
+    }
+
+    #[test]
+    fn a_landed_connector_load_cannot_block_a_materialized_handoff() {
+        use crate::engine::G2Connector;
+
+        for connector in [G2Connector::OffloadingV032, G2Connector::SimpleCpuV032] {
+            let args = MockEngineArgs::builder()
+                .num_gpu_blocks(8)
+                .block_size(4)
+                .max_num_seqs(Some(4))
+                .max_num_batched_tokens(Some(64))
+                .enable_prefix_caching(true)
+                .kv_cache_bytes_per_token(Some(250_000))
+                .native_host_offload(Some(
+                    NativeHostOffloadConfig::new(32)
+                        .with_bandwidths(0.0, 0.1)
+                        .with_connector(connector),
+                ))
+                .speedup_ratio(0.0)
+                .build()
+                .unwrap();
+            let mut core = VllmCore::new(args);
+            let request = |id, tokens| DirectRequest {
+                uuid: Some(Uuid::from_u128(id)),
+                tokens,
+                max_output_tokens: 1,
+                ..Default::default()
+            };
+            for (id, tokens) in [(1, (1..=9).collect()), (2, (101..=131).collect())] {
+                core.receive(request(id, tokens));
+                for _ in 0..8 {
+                    let pass = core.try_execute_hidden_pass(0.0).unwrap();
+                    core.complete_engine_boundary(pass.end_ms);
+                    if core.state.requests.is_empty() {
+                        break;
+                    }
+                }
+                assert!(core.state.requests.is_empty());
+            }
+            let owner = core.receive(request(3, (1..=9).collect()));
+            let load = core.try_execute_hidden_pass(100.0).unwrap();
+            core.complete_engine_boundary(load.end_ms);
+            assert!(load.admissions.is_empty());
+            let second = core.receive(request(8, (1..=9).collect()));
+            let retry = core.try_execute_hidden_pass(101.0).unwrap();
+            core.complete_engine_boundary(retry.end_ms);
+            if connector == G2Connector::SimpleCpuV032 {
+                // SimpleCPU neither waits for stores nor deduplicates loads:
+                // both queued requests own their destination G1 blocks.
+                assert_eq!(core.state.connector_waiting_members.len(), 2);
+                for uuid in [owner, second] {
+                    assert!(
+                        core.state.requests[&uuid]
+                            .host_offload
+                            .as_ref()
+                            .unwrap()
+                            .reserved_blocks()
+                            > 0
+                    );
+                }
+            } else {
+                assert_eq!(
+                    core.state.requests[&second]
+                        .host_offload
+                        .as_ref()
+                        .unwrap()
+                        .reserved_blocks(),
+                    0
+                );
+            }
+            let deadline = core.next_internal_deadline_ms().unwrap();
+            core.process_internal_work(deadline);
+            assert!(core.state.has_ready_connector_waiter());
+            assert!(
+                core.state.requests[&owner]
+                    .host_offload
+                    .as_ref()
+                    .unwrap()
+                    .reserved_blocks()
+                    > 0
+            );
+
+            // With no materialized handoff the prior queue selection picks
+            // this same ready owner; the SimpleCPU rule is a no-op here.
+            assert_eq!(core.state.next_waiting_uuid(false, true), Some(owner));
+
+            // Commands can reserve and activate remote KV on an aggregated
+            // rank too. A second, larger handoff cannot reserve beside the
+            // landed G2 load; it blocks fresh admission, not activated KV.
+            let ready_handoff = HandoffId::from(Uuid::from_u128(4));
+            let ready = Uuid::from_u128(5);
+            core.apply_command(SchedulerCommand::ReserveDestination {
+                handoff_id: ready_handoff,
+                request: request(5, vec![201]),
+            })
+            .unwrap();
+            assert!(core.destination_is_held(ready_handoff));
+            core.apply_command(SchedulerCommand::ActivateDestination {
+                handoff_id: ready_handoff,
+            })
+            .unwrap();
+            core.apply_command(SchedulerCommand::ReserveDestination {
+                handoff_id: HandoffId::from(Uuid::from_u128(6)),
+                request: request(7, (301..=331).collect()),
+            })
+            .unwrap();
+            assert!(core.pending_destinations.has_pending());
+            assert!(core.state.has_materialized_waiting());
+            assert_eq!(core.state.next_waiting_uuid(true, true), Some(ready));
+            let pass = core.try_execute_hidden_pass(deadline).unwrap();
+            assert_eq!(
+                pass.admissions.iter().map(|a| a.uuid).collect::<Vec<_>>(),
+                [ready],
+                "{connector:?}"
+            );
+            assert!(core.state.requests.contains_key(&owner));
+        }
     }
 
     fn core(blocks: usize) -> VllmCore {

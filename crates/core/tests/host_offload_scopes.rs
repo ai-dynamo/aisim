@@ -233,6 +233,115 @@ fn overlapping_mtp_requests_run_on_two_attention_dp_ranks() {
 }
 
 #[test]
+fn sliding_window_state_restores_on_another_prefill_worker_through_the_cluster_pool() {
+    // A sliding-window prompt resumes only where its state checkpoint is, so the
+    // second prefill worker needs the first one's checkpoint, not just its
+    // blocks. Under MTP the checkpoint one block lower is the one it can use;
+    // the drafter group drops a block of the hit, which for a block-aligned
+    // prompt is the one past the logits cap.
+    // A pass stores its prompt blocks and checkpoints whole or not at all:
+    // two blocks and two four-row checkpoints do not fit the eight-block pool.
+    for (mtp, tokens, state_bytes, reuse) in [
+        (false, 9, 1_000_000, 8),
+        (true, 9, 1_000_000, 4),
+        (true, 8, 1_000_000, 4),
+        (false, 9, 4_000_000, 0),
+    ] {
+        let with_state = |mut rank: Value| {
+            rank["state_cache"] = json!({
+                "bytes_per_request": state_bytes,
+                "sliding_window": {"lookahead_tokens": usize::from(mtp)},
+            });
+            if mtp {
+                canonical_mtp(&mut rank, 1);
+            }
+            json!({"dp_size": 2, "rank": rank})
+        };
+        let engine = json!({
+            "rank": rank(Value::Null),
+            "prefill": with_state(rank(host("cluster_shared"))),
+            "decode": with_state(rank(host("cluster_shared"))),
+        });
+        let mut requests = requests(2, "prefill_dp_rank");
+        for request in &mut requests {
+            request["input_tokens"] = json!(tokens);
+            request["input_token_ids"] = json!(PROMPT[..tokens]);
+        }
+        let report = run_with(&timed_factory(), disaggregated(2), engine, requests).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2);
+        assert_eq!(
+            host_reuse(&report),
+            [Some(0), Some(reuse)],
+            "mtp={mtp} tokens={tokens} state_bytes={state_bytes}"
+        );
+    }
+}
+
+#[test]
+fn a_state_restore_is_admitted_with_room_for_both_state_copies() {
+    // After its load a request computes on in the restored checkpoint, and G1
+    // counts a second copy of it: the window it caches at the boundary.
+    let state_rank = |host: Value, gpu_blocks: usize, state_bytes: usize, retention: Value| {
+        let mut rank = rank(host);
+        rank["num_gpu_blocks"] = json!(gpu_blocks);
+        rank["state_cache"] = json!({
+            "bytes_per_request": state_bytes,
+            "sliding_window": {"lookahead_tokens": 0, "retention_interval": retention},
+        });
+        rank
+    };
+    // Two restores arrive at once: three blocks and a two-row checkpoint each,
+    // then one more block and the cached copy. Each is admitted with room for
+    // eight of the twelve G1 blocks, so the second load waits for the first
+    // request.
+    // `evict` fills G1 first, so both prompts survive only in the host tier.
+    // A rank-local pool runs the v0.32 offloading connector under either name.
+    let local = |connector: &str| json!({"num_host_blocks": 64, "connector": connector});
+    for connector in ["offloading_v0_24", "offloading_v0_32"] {
+        let restores = trace(&[
+            ("a0", 0.0, 1, 12, 1),
+            ("b0", 20.0, 201, 12, 1),
+            ("evict", 40.0, 101, 40, 1),
+            ("a1", 200.0, 1, 13, 1),
+            ("b1", 200.0, 201, 13, 1),
+        ]);
+        let engine = json!({"rank": state_rank(local(connector), 12, 2_000_000, Value::Null)});
+        let report = run(aggregated(1), engine, restores).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 5);
+        assert_eq!(
+            host_reuse(&report),
+            [0, 12, 0, 12, 0].map(Some),
+            "{connector}"
+        );
+    }
+    // `short` leaves G1 the first block and its checkpoint; G2 has a deeper
+    // hit for `a1`. The load is admitted for the checkpoint it restores, not
+    // the one G1 holds: four token blocks and two two-row states fill the
+    // eight G1 blocks.
+    let deeper = trace(&[
+        ("a0", 0.0, 1, 13, 1),
+        ("evict", 100.0, 101, 20, 1),
+        ("short", 200.0, 1, 5, 1),
+        ("a1", 300.0, 1, 13, 1),
+    ]);
+    let engine = json!({"rank": state_rank(local("offloading_v0_24"), 8, 2_000_000, Value::Null)});
+    let report = run(aggregated(1), engine, deeper).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 4);
+    assert_eq!(host_reuse(&report), [0, 8, 0, 4].map(Some));
+    // A request that cannot fit beside the four-row checkpoint it would
+    // restore (three blocks and two state copies in eight) is admitted cold.
+    for (gpu_blocks, reuse) in [(12, 8), (8, 0)] {
+        let mut pool = host("cluster_shared");
+        pool["num_host_blocks"] = json!(32);
+        let role = || json!({"rank": state_rank(pool.clone(), gpu_blocks, 4_000_000, json!(0))});
+        let engine = json!({"rank": rank(Value::Null), "prefill": role(), "decode": role()});
+        let report = run(disaggregated(2), engine, requests(2, "prefill_dp_rank")).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2);
+        assert_eq!(host_reuse(&report), [0, reuse].map(Some), "G1={gpu_blocks}");
+    }
+}
+
+#[test]
 fn an_mtp_restore_keeps_its_loaded_prefix_on_a_prefill_worker_as_on_an_aggregated_one() {
     // vLLM adds a connector hit to the local hit; a uniform cache has no
     // drafter group that would lose a chunk. A restore reuses every stored
@@ -265,6 +374,118 @@ fn an_mtp_restore_keeps_its_loaded_prefix_on_a_prefill_worker_as_on_an_aggregate
         assert_eq!(report.request_counts.completed_requests, 3);
         let reuse = [0, tokens as usize - 1, 0].map(Some);
         assert_eq!(host_reuse(&report), reuse, "{tokens} tokens");
+    }
+}
+
+#[test]
+fn a_prefill_worker_restores_a_window_from_its_own_pool() {
+    // A rank-local pool with a sliding window runs the v0.32 rules on prefill
+    // and decode workers too, under either offloading name: the prompt's
+    // cohort is stored, survives G1's eviction, and restores with its
+    // checkpoint after the worker released the first request.
+    for connector in ["offloading_v0_24", "offloading_v0_32"] {
+        a_prefill_worker_restores(connector);
+    }
+}
+
+fn a_prefill_worker_restores(connector: &str) {
+    let role = || {
+        let mut rank = rank(json!({"num_host_blocks": 64, "connector": connector}));
+        rank["num_gpu_blocks"] = json!(12);
+        rank["state_cache"] = json!({
+            "bytes_per_request": 2_000_000, "sliding_window": {"lookahead_tokens": 0},
+        });
+        json!({"rank": rank})
+    };
+    let engine = json!({"rank": rank(Value::Null), "prefill": role(), "decode": role()});
+    let requests = trace(&[
+        ("a0", 0.0, 1, 12, 1),
+        ("evict", 40.0, 101, 40, 1),
+        ("a1", 200.0, 1, 13, 1),
+    ]);
+    let report = run(disaggregated(1), engine, requests).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 3, "{connector}");
+    assert_eq!(host_reuse(&report), [0, 12, 0].map(Some), "{connector}");
+}
+
+#[test]
+fn concurrent_state_restores_wait_their_turn_and_keep_their_checkpoints() {
+    // Two prompts restore from G2 while G1 has room for one of them. The
+    // second load starts only when G1 can also hold its checkpoint, and a
+    // restored checkpoint is not reclaimed before its request is admitted.
+    let state_rank = |host: Value| {
+        let mut rank = rank(host);
+        rank["num_gpu_blocks"] = json!(6);
+        rank["max_num_seqs"] = json!(2);
+        rank["max_num_batched_tokens"] = json!(16);
+        rank["state_cache"] = json!({
+            "bytes_per_request": 1_000_000, "sliding_window": {"lookahead_tokens": 0},
+        });
+        rank
+    };
+    let mut pool = host("cluster_shared");
+    pool["num_host_blocks"] = json!(16);
+    pool["d2h_bandwidth_gbps"] = json!(0.001);
+    pool["h2d_bandwidth_gbps"] = json!(1.0);
+    pool["shared_d2h_bandwidth_gbps"] = json!(0.0);
+    pool["shared_h2d_bandwidth_gbps"] = json!(0.0);
+    // Prompts A and B, then both again. The first case stalls if a load starts
+    // without room for its checkpoint; the second loses a restored checkpoint
+    // that is not held.
+    for (a, a_out, gap, reuse) in [(12, 1, 0.0, [0, 0, 8, 4]), (8, 6, 1.0, [0, 0, 4, 4])] {
+        let role = || json!({"rank": state_rank(pool.clone())});
+        let engine = json!({
+            "rank": state_rank(Value::Null), "prefill": role(), "decode": role(),
+        });
+        let requests = trace(&[
+            ("r0", 0.0, 101, a, a_out),
+            ("r1", gap, 1, 8, 1),
+            ("r2", 2.0 * gap, 101, a, a_out),
+            ("r3", 3.0 * gap, 1, 8, 1),
+        ]);
+        let report = run(disaggregated(1), engine, requests).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 4);
+        assert_eq!(host_reuse(&report), reuse.map(Some), "A={a}");
+    }
+}
+
+#[test]
+fn a_window_restore_that_waits_for_room_lets_a_landed_load_go_first() {
+    // B's load lands while A, ahead of it in the queue, still waits for room
+    // for its whole restore. B holds part of that room, so it goes first.
+    // Before, A blocked the queue and the replay stopped with an idle pass.
+    let role = || {
+        let mut pool = host("cluster_shared");
+        pool["num_host_blocks"] = json!(16);
+        // A block takes 1 ms each way, so the loads overlap.
+        for link in ["d2h_bandwidth_gbps", "h2d_bandwidth_gbps"] {
+            pool[link] = json!(1.0);
+        }
+        for link in ["shared_d2h_bandwidth_gbps", "shared_h2d_bandwidth_gbps"] {
+            pool[link] = json!(0.0);
+        }
+        let mut rank = rank(pool);
+        rank["num_gpu_blocks"] = json!(8);
+        rank["max_num_seqs"] = json!(2);
+        rank["max_num_batched_tokens"] = json!(16);
+        rank["state_cache"] = json!({
+            "bytes_per_request": 1_000_000, "sliding_window": {"lookahead_tokens": 1},
+        });
+        canonical_mtp(&mut rank, 1);
+        json!({"rank": rank})
+    };
+    // A waits in the restore's footprint check, then in G1's admission.
+    for (a, b, gap, reuse) in [(12, 8, 1.0, [0, 0, 8, 4]), (13, 9, 0.0, [0, 0, 8, 4])] {
+        let engine = json!({"rank": rank(Value::Null), "prefill": role(), "decode": role()});
+        let requests = trace(&[
+            ("r0", 0.0, 101, a, 1),
+            ("r1", gap, 1, b, 1),
+            ("r2", 2.0 * gap, 101, a, 1),
+            ("r3", 3.0 * gap, 1, b, 1),
+        ]);
+        let report = run_with(&timed_factory(), disaggregated(1), engine, requests).unwrap();
+        assert_eq!(report.request_counts.completed_requests, 4, "A={a}");
+        assert_eq!(host_reuse(&report), reuse.map(Some), "A={a}");
     }
 }
 
@@ -308,6 +529,25 @@ fn mtp_growth_waits_for_a_store_that_still_reads_its_block() {
 }
 
 #[test]
+fn a_state_rank_holds_a_store_source_until_its_copy_completes() {
+    // A store copies one block per second. `next` needs a G1 block that the
+    // first request's store still reads. A rank that offloads state
+    // checkpoints holds the source, so `next` waits for the store: the two
+    // prompt blocks and the one-row checkpoint in their cohort.
+    let mut rank = rank(json!({"num_host_blocks": 8, "d2h_bandwidth_gbps": 0.001}));
+    rank["num_gpu_blocks"] = json!(4);
+    rank["max_num_seqs"] = json!(2);
+    rank["max_num_batched_tokens"] = json!(16);
+    rank["state_cache"] = json!({
+        "bytes_per_request": 1_000_000,
+        "sliding_window": {"lookahead_tokens": 0, "retention_interval": 0},
+    });
+    let requests = trace(&[("stored", 0.0, 101, 8, 1), ("next", 10.0, 1, 8, 1)]);
+    let report = run(aggregated(1), json!({"rank": rank}), requests).unwrap();
+    assert_eq!(terminal_ms(&report, "next"), 3_002.0);
+}
+
+#[test]
 fn each_replay_starts_with_a_cold_cluster_pool() {
     // One factory drives two replays of each deployment; the second must not
     // inherit G2 blocks the first stored.
@@ -348,6 +588,11 @@ fn incompatible_shared_roles_and_unsupported_g3_topologies_fail_explicitly() {
     };
     let mut other_layout = host("cluster_shared");
     other_layout["kv_layout_id"] = json!("test-tp2");
+    // An eight-block state checkpoint in an eight-block pool.
+    let mut state_fills_pool = rank(host("dp_rank_local"));
+    state_fills_pool["state_cache"] = json!({
+        "bytes_per_request": 8_000_000, "sliding_window": {"lookahead_tokens": 0},
+    });
     for (topology, engine, expected) in [
         (
             disaggregated(1),
@@ -367,6 +612,11 @@ fn incompatible_shared_roles_and_unsupported_g3_topologies_fail_explicitly() {
             disaggregated(1),
             json!({"rank": with_g3(rank(host("dp_rank_local")))}),
             "g3_offload supports only aggregated replay",
+        ),
+        (
+            aggregated(1),
+            json!({"rank": state_fills_pool}),
+            "must exceed one state checkpoint",
         ),
     ] {
         let error = format!(
@@ -803,4 +1053,72 @@ fn v0_32_admits_a_waiter_that_holds_g1_before_one_that_holds_none() {
     // loads its third over [141, 151).
     assert_eq!(terminal_ms(&report, "c"), 141.0);
     assert_eq!(terminal_ms(&report, "b"), 152.0);
+}
+
+#[test]
+fn simple_cpu_duplicate_loads_keep_connector_waiter_order() {
+    // Unlike OffloadingConnector, SimpleCPU does not defer B behind A's
+    // in-flight load. Both reserve G1; B's extra block loads after A's two.
+    let mut rank = rank(json!({
+        "connector": "simple_cpu_v0_32", "num_host_blocks": 32,
+        "h2d_bandwidth_gbps": 0.1,
+    }));
+    rank["num_gpu_blocks"] = json!(6);
+    let report = run(aggregated(1), json!({"rank": rank}), waiter_contention()).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 6);
+    for (id, admit, terminal, host_tokens) in [
+        ("a", 120.0, 121.0, 8),
+        ("b", 130.0, 131.0, 4),
+        ("c", 151.0, 152.0, 8),
+    ] {
+        let record = report
+            .per_request
+            .iter()
+            .find(|r| r.request_id.as_deref() == Some(id))
+            .unwrap();
+        assert_eq!(record.first_admit_ms, Some(admit), "{id}");
+        assert_eq!(record.terminal_time_ms, terminal, "{id}");
+        assert_eq!(
+            record.first_admission_host_reused_input_tokens,
+            Some(host_tokens),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn v0_24_connector_waiters_keep_their_existing_admission_times() {
+    // One more G1 block than the v0.32 deadlock fixture lets B retry in
+    // place. No G3 or KVCR is configured, so the v0.24 rule stays FIFO.
+    let mut rank = rank(json!({
+        "connector": "offloading_v0_24", "num_host_blocks": 32,
+        "h2d_bandwidth_gbps": 0.1,
+    }));
+    rank["num_gpu_blocks"] = json!(7);
+    let report = run(aggregated(1), json!({"rank": rank}), waiter_contention()).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 6);
+    for (id, admit, terminal) in [
+        ("a", 120.0, 121.0),
+        ("b", 150.0, 151.0),
+        ("c", 140.0, 141.0),
+    ] {
+        let record = report
+            .per_request
+            .iter()
+            .find(|r| r.request_id.as_deref() == Some(id))
+            .unwrap();
+        assert_eq!(record.first_admit_ms, Some(admit), "{id}");
+        assert_eq!(record.terminal_time_ms, terminal, "{id}");
+    }
+}
+
+fn waiter_contention() -> Vec<Value> {
+    trace(&[
+        ("seed", 0.0, 1, 13, 1),
+        ("c_seed", 10.0, 21, 9, 1),
+        ("evict", 20.0, 41, 23, 1),
+        ("a", 100.0, 1, 9, 1),
+        ("b", 101.0, 1, 13, 1),
+        ("c", 102.0, 21, 9, 1),
+    ])
 }

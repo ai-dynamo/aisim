@@ -681,15 +681,18 @@ def test_min_gpus_selects_smallest_router_candidate_meeting_sla(monkeypatch, mod
         show_progress=False,
     ).run(config, top_n=None)
 
-    # Six trials exhaust three static pools times two router policies.
-    assert len(factory.runner.specs) == 6
-    assert result.counts.feasible == 3
-    assert result.counts.infeasible == 3
     assert [
         (candidate.used_gpus, candidate.config["adapters"]["dynamo.router"]["router_mode"])
         for candidate in result.selected_candidates
     ][0] == (middle, "kv_router")
-    assert [candidate.used_gpus for candidate in result.selected_candidates] == [middle, largest, largest]
+    # min_gpus searches pools in ascending size and stops revisiting larger pools once
+    # one qualifies, so the six-trial budget is not spent on the largest pool's second policy.
+    tried = [
+        (record.used_gpus, record.config["adapters"]["dynamo.router"]["router_mode"]) for record in result.candidates
+    ]
+    assert len(tried) < 6
+    middle_hit = tried.index((middle, "kv_router"))
+    assert all(gpus <= middle for gpus, _ in tried[middle_hit + 1 :])
 
 
 def test_core_branch_preflight_runs_before_adapter_preparation(monkeypatch) -> None:

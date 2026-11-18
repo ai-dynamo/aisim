@@ -300,11 +300,12 @@ def _kv_cache_scheme(quant: Mapping[str, Any]) -> dict[str, Any]:
     if scheme is None:
         return {}
     if isinstance(scheme, str):
-        if scheme.strip().upper() == "FP8":
-            return {"num_bits": 8, "type": "float"}
-        raise ValueError("unsupported quantization_config.kv_cache_scheme string; supported value is FP8")
+        bits = {"FP8": 8, "NVFP4": 4}.get(scheme.strip().upper())
+        if bits is None:
+            raise ValueError("unsupported quantization_config.kv_cache_scheme string; supported values are FP8, NVFP4")
+        return {"num_bits": bits, "type": "float"}
     if not isinstance(scheme, dict):
-        raise ValueError("quantization_config.kv_cache_scheme must be an object or FP8")
+        raise ValueError("quantization_config.kv_cache_scheme must be an object, FP8 or NVFP4")
     return scheme
 
 
@@ -841,7 +842,7 @@ def _precision_facts(config: ModelConfig) -> dict[str, tuple[str, str]]:
                 if key in modes
             )
         kv = inferred.get("kv_cache_quant_algo")
-        if kv in {"fp8", "bfloat16"}:
+        if kv in {"fp8", "nvfp4", "bfloat16"}:
             result["kv_cache_dtype"] = (
                 kv,
                 "explicit config/ModelOpt KV quantization metadata (independent of weight quantization)",
@@ -895,10 +896,15 @@ def _precision_facts(config: ModelConfig) -> dict[str, tuple[str, str]]:
         result = dict.fromkeys(("gemm_quant_mode", "moe_quant_mode"), ("nvfp4", source))
     scheme = _kv_cache_scheme(quant)
     if scheme.get("num_bits") == 8 and scheme.get("type") in {"float", "int"}:
-        result["kv_cache_dtype"] = (
-            "fp8" if scheme["type"] == "float" else "int8",
-            "explicit config quantization_config.kv_cache_scheme (independent of weight quantization)",
-        )
+        kv = "fp8" if scheme["type"] == "float" else "int8"
+    elif scheme.get("num_bits") == 4 and scheme.get("type") == "float" and method.startswith("modelopt"):
+        kv = "nvfp4"  # vLLM reads a 4-bit float scheme as NVFP4 only under ModelOpt
+    else:
+        return result
+    result["kv_cache_dtype"] = (
+        kv,
+        "explicit config quantization_config.kv_cache_scheme (independent of weight quantization)",
+    )
     return result
 
 

@@ -341,7 +341,7 @@ aisim predict --stack engine --config host-offload-prediction.yaml --capture-per
 | `latency_to_first_byte_ms` | `0.0` | Fixed delay before each transfer starts moving bytes. |
 | `shared_d2h_bandwidth_gbps` | `80.0` | Total GPU→host bandwidth of the pool. `cluster_shared` only. |
 | `shared_h2d_bandwidth_gbps` | `80.0` | Total host→GPU bandwidth of the pool. `cluster_shared` only. |
-| `connector` | `offloading_v0_24` | vLLM connector whose rules G2 follows: `offloading_v0_24`, `offloading_v0_32` or `simple_cpu_v0_32`. The last two need the aggregated worker, `dp_rank_local` and no `g3_offload` or `kvcr`; see [connector profiles](#g2-connector-profiles). |
+| `connector` | `offloading_v0_24` | vLLM connector whose rules G2 follows: `offloading_v0_24`, `offloading_v0_32` or `simple_cpu_v0_32`. The last two need the aggregated worker, `dp_rank_local` and no `g3_offload` or `kvcr`, except that a sliding-window [state cache](#state-cache) takes `offloading_v0_32` on prefill and decode workers too; see [connector profiles](#g2-connector-profiles). |
 
 `recommend` keeps `host_offload` fixed; its size and bandwidth are not searched.
 
@@ -375,7 +375,20 @@ eviction rules G2 follows:
 | A hit before its load | Not pinned | Not pinned | Pinned until the request loads it or looks it up again |
 | G1 blocks being copied | Freed with their request; a new owner waits for the copy | The same | Held until the copy completes, then freed first block first |
 | A preemption | Waits for the preempted request's stores | The same | Waits for every transfer in flight |
-| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | The same |
+| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | Loads do not wait for other loads or stores; queued loads hold G1 and keep their relative order |
+
+Activated handoffs retain precedence over fresh G2 restores. A pending
+destination reservation blocks fresh admission, including a landed load, but
+does not block a handoff whose KV has already been activated.
+
+The connector profile controls cache semantics independently of the timing
+model's `engine.backend_version`. For example, `offloading_v0_32` can use
+timing profiles collected for vLLM 0.24.0; this models v0.32.0 cache behavior
+with those measured operation timings, not a measured v0.32.0 deployment.
+
+A rank-local pool that keeps the checkpoints of a sliding-window
+[state cache](#state-cache) follows `offloading_v0_32` under either offloading
+name, as vLLM has sliding-window groups from v0.32.0 on.
 
 vLLM main has changed some of these rules since v0.32.0. Each profile models the
 rules of the version it names; none was compared with a running vLLM. The model
@@ -442,24 +455,27 @@ and shared bandwidths; otherwise the run is rejected. In `recommend` with
 
 ### Supported
 
-G2 supports vLLM aggregated and token-only disaggregated workers with prefix
-caching and any `attention_data`. A `state_cache` needs a v0.32.0 profile; see
-[hybrid models](#hybrid-g2). G2 is rejected with SGLang, TensorRT-LLM, ngram
-speculation and Belady eviction.
+G2 supports vLLM aggregated and disaggregated workers with prefix
+caching and any `attention_data`. It also keeps the states of a
+[state cache](#state-cache): a recurrent state on a v0.32.0 profile, see
+[hybrid models](#hybrid-g2), and a sliding-window state under either offloading
+connector name. G2
+is rejected with SGLang, TensorRT-LLM, ngram speculation and Belady eviction.
 
 Canonical `engine.speculation.kind: mtp` can combine with G2 on aggregated and
-token-only disaggregated vLLM workers, with any `attention_data`, prefix
-caching and no G3. An aggregated worker needs `scope: dp_rank_local`; prefill
-and decode workers take either scope. Use explicit fixed KV capacity and
-default timing. Scheduling is synchronous. Separate draft models and grouped
-caches are unsupported. See
+disaggregated vLLM workers, with any `attention_data`, prefix caching and no
+G3. An aggregated worker needs `scope: dp_rank_local`; prefill and decode
+workers take either scope. Use explicit fixed KV capacity and default timing.
+Scheduling is synchronous. Separate draft models and grouped caches are
+unsupported. See
 [speculation](speculation.md#registered-schemes) for the complete composition.
 A hybrid G2 takes MTP only with [`disable_eagle_block_drop`](speculation.md#prefix-caching):
 replay does not model the EAGLE block drop hiding the last block, and the state,
 that a G2 load restored.
 
-An aggregated worker models single-module MTP with one uniform shared
-FullAttention cache. This combined behavior is adapted and modified from the
+An aggregated worker with a uniform token cache models single-module MTP with
+one shared FullAttention cache. This combined behavior is adapted and modified
+from the
 [vLLM v0.32.0 scheduler](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py)
 and [OffloadingConnector](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py),
 Copyright contributors to the vLLM project, Apache-2.0. Prompt stores exclude
@@ -469,17 +485,23 @@ padded verification budget is rejected instead of retried indefinitely; this
 is a simulation capacity guard. The scheduling baseline does not change the
 version or provenance of the performance data used for timing.
 
-Prefill and decode workers keep the speculative lifecycle they have without
-G2. G2 stores complete prompt blocks only, so drafts never reach it. A restore
-resumes at the loaded prefix, as on an aggregated worker. Accepted drafts that
-take a G1 block a store still reads make the forward that writes it wait for
-that copy, and so does preempting a request whose store is in flight; a store
-prepared in that same pass delays the rank's next pass. A preempted request
-resumes once G1 has room for its tokens and its next one; a shared pool keeps
-the G1 blocks it copies until each copy completes, so its stores can delay
-that. The capacity guard above does not cover these workers: when G1 holds
-fewer than about two requests, a replay can end with a stall error or not
-terminate, with or without G2. Size G1 for several concurrent requests.
+Prefill and decode workers, and workers with a sliding-window state cache, keep
+the speculative lifecycle they have without G2. G2 stores complete prompt
+blocks only, so drafts never reach it. With a uniform token cache a restore
+resumes at the loaded prefix, as on an aggregated worker. With a sliding-window
+state cache it loads and resumes one block short of the G2 hit, as vLLM's
+drafter KV group loads a connector hit without its last block; with
+[`disable_eagle_block_drop`](speculation.md#prefix-caching) the hit follows the
+non-speculative rules. Accepted drafts that take a G1 block a store still
+reads make the forward that writes it wait for that copy, and so does
+preempting a request whose store is in flight; a store prepared in that same
+pass delays the rank's next pass. A preempted request resumes once G1 has room
+for its tokens, its state and its next token; a shared pool, and a rank that
+offloads state checkpoints, keep the G1 blocks they copy until each copy
+completes, so their stores can delay that. The capacity guard above does not
+cover these workers: when G1 holds fewer than about two requests, a replay can
+end with a stall error or not terminate, with or without G2. Size G1 for
+several concurrent requests.
 
 For shared pools, the report's `g2_domains` gives capacity and resident blocks.
 Workers that publish KV events report G2 changes with `"tier": "host_pinned"`;
@@ -781,9 +803,61 @@ Two align-mode behaviors of vLLM are opt-in and off by default:
   pass, as vLLM's allocation does. Without the switch, such states stay hidden
   and the lookup falls back to an older state.
 
+With [G2 host offload](#host-offload-g2), a sliding-window state's retained checkpoints
+follow the prompt blocks into the host cache, as vLLM's offloading connectors
+store the sliding-window blocks that retention keeps. A checkpoint is one G2
+entry that takes a block per state row (26 for DeepSeek-V4-Flash, 30 with one draft token), so
+`num_host_blocks` must exceed one checkpoint. With the default retention every
+prompt block retains a checkpoint. Replay copies a whole window per checkpoint
+where vLLM's overlapping windows share blocks, so state then takes about a
+checkpoint's rows times the G2 space and store time of the prompt blocks, more
+than in vLLM. Set `retention_interval` as the deployment does (`0`, or an
+interval of at least one checkpoint's tokens) to keep the pool for prompt
+blocks. The checkpoints a prompt pass retains are stored in one cohort with
+that pass's prompt blocks, as the connector issues one store per request and
+step. G2 takes the whole cohort or none of it, and evicts none of its blocks
+to make room for the rest. A cohort that found no room is offered again, with
+what later passes added, when the pool's room changes. One larger than the pool
+is not offered again before the request is readmitted; replay warns once and
+names `retention_interval` and `num_host_blocks`. A boundary reached during
+decode is not stored. A restore resumes at the highest boundary that has both
+its token blocks and its whole checkpoint in G2, below the logits cap. With
+speculative decoding that keeps the EAGLE block drop it is also one block below
+the last prompt block G2 holds, as vLLM's drafter group drops the last chunk it
+finds; a block-aligned prompt whose blocks are all in G2 therefore still
+resumes at the logits cap. If G2 evicted a checkpoint, the restore uses a lower
+boundary or recomputes. The load brings the token blocks up to that
+boundary and the checkpoint, which becomes the request's state there, as the
+state a prefill worker hands to a decode worker does. G1 also caches the window
+at that boundary when it has room, so a later request resumes there from G1.
+
+vLLM has sliding-window groups from v0.32.0 on, so a rank-local pool that
+offloads a sliding-window state follows the `offloading_v0_32`
+[profile](#connector-profiles), whether `connector` names it or keeps its
+default. `simple_cpu_v0_32` is rejected: vLLM's `SimpleCPUOffloadConnector`
+keeps sliding-window groups too, but replay does not model how it stores them
+block by block. Blocks and checkpoints are ranked when their store starts. A finishing request offers a cohort it could not store
+earlier and re-ranks what it stored, offered or loaded, each checkpoint just
+above the block that ends at its boundary. A prefill worker does the
+finish-time work when it releases the request after the KV transfer, later than
+vLLM; for other models that timing keeps `offloading_v0_32` to aggregated
+workers. A cluster-shared
+pool has no vLLM counterpart and keeps its own order: a lookup makes the
+prompt's blocks and the checkpoint it resumes at the newest, so checkpoints at
+lower boundaries are evicted first.
+
+The rank's stores keep the G1 token blocks they copy until the whole cohort is
+copied, as a shared pool's do, and the checkpoints in the cohort lengthen that
+copy. vLLM also flushes a store before a pass reuses one of its
+sliding-window blocks, so that pass waits for the copy. Replay holds no G1
+block for a checkpoint, so G2 can keep a checkpoint that G1 skipped or evicted. Ranks whose states differ in size (with
+and without draft tokens) do not read each other's checkpoints from a shared
+pool. G2 occupancy counts a checkpoint's rows as blocks; checkpoints publish no
+`host_pinned` KV events.
+
 Supported: aggregated and P/D vLLM, fixed `capacity` (or the
 [recorded pool](#state-pool-from-recorded-runtime-memory) of an FPM profile), `predict --stack engine`;
-inferred geometry for Kimi K3 and DeepSeek V4 at PP=1.
+inferred geometry for Kimi K3 and DeepSeek V4 at PP=1; G2 for a sliding-window state.
 Speculative decoding supports `prefix_match_unit` equal to `block_size`.
 For sub-block matching, supply `state_cache.num_speculative_states` equal to
 the draft depth, from positive `nextn` or `engine.speculation`.
@@ -794,8 +868,10 @@ EAGLE block drop.
 This explicit mode models full-state scratch storage, not ReplaySSM or
 RecoverSSM rings or temporary records.
 
-Rejected: `recommend`, G3 offload, G2 except as a [hybrid G2](#hybrid-g2), and
-speculative sub-block matching without an explicit full-state scratch count.
+Rejected: `recommend`, G3 offload, G2 for a recurrent state except as a
+[hybrid G2](#hybrid-g2), G2 for a sliding-window state with `kvcr` or a
+`host_offload.connector` other than `offloading_v0_24`, and speculative
+sub-block matching without an explicit full-state scratch count.
 
 ## Other cache modes
 
