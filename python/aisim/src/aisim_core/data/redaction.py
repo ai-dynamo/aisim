@@ -67,7 +67,10 @@ class RedactionPolicy:
     """Conservative defaults; widening any field is a recorded maintainer decision."""
 
     allow_provenance_artifacts: bool = False  # logs and raw tool output (tier 3)
-    allow_request_rows: bool = False  # per-request tables
+    allow_request_rows: bool = False  # per-request tables, for every configuration
+    # Per-request tables of self-collected configurations (body ``origin == "self-collected"``).
+    # InferenceX-derived and official (upstream-licensed) configurations never use this.
+    allow_self_collected_request_rows: bool = True
     allowed_run_url_prefixes: tuple[str, ...] = ()
     allowed_image_prefixes: tuple[str, ...] = ()
     # "aggregates-only": InferenceX-derived configurations and records are not promotable.
@@ -207,6 +210,17 @@ def _is_infx(source_kind: str | None) -> bool:
     return bool(source_kind) and any(m in source_kind.lower() for m in INFX_MARKERS)
 
 
+def _request_rows_allowed(body: E2eManifestBody | None, policy: RedactionPolicy) -> bool:
+    if policy.allow_request_rows:
+        return True
+    return (
+        policy.allow_self_collected_request_rows
+        and body is not None
+        and body.origin == "self-collected"
+        and not _is_infx(body.source_kind)
+    )
+
+
 def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionPolicy) -> list[Finding]:
     out: list[Finding] = []
     body: E2eManifestBody | None = None
@@ -230,7 +244,7 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
     for artifact in manifest.artifacts:
         if artifact.format == "gzip" and not policy.allow_provenance_artifacts:
             out.append(Finding("provenance-withheld", "logs and raw output are withheld", artifact.path))
-        if artifact.artifact_schema == REQUESTS_SCHEMA and not policy.allow_request_rows:
+        if artifact.artifact_schema == REQUESTS_SCHEMA and not _request_rows_allowed(body, policy):
             out.append(Finding("request-rows", "per-request rows are not published", artifact.path))
         if artifact.artifact_schema == OBSERVATIONS_SCHEMA:
             out.extend(_check_observations(root / artifact.path, artifact.path, policy))

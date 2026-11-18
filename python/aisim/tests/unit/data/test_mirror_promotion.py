@@ -4,6 +4,7 @@
 """Mirror validator, redaction rules and promotion procedure, on synthetic data only."""
 
 import dataclasses
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -46,6 +47,7 @@ from aisim_core.data.promote import (
     register_manifests,
 )
 from aisim_core.data.redaction import (
+    RedactionPolicy,
     VisibilityEntry,
     VisibilityLedger,
     check_disclosure,
@@ -269,8 +271,30 @@ def test_unredacted_run_url_image_digest_patch_and_logs_are_refused(tmp_path):
     path = write_configuration(root, dirty, prefix="data")
     files = [p.relative_to(root).as_posix() for p in (root / path).parent.iterdir()]
     codes = {f.code for f in check_publishable(root, files)}
-    assert {"run-url", "provenance-withheld", "request-rows"} <= codes
+    assert {"run-url", "provenance-withheld"} <= codes
+    assert "request-rows" not in codes  # self-collected per-request rows are publishable
     assert "image-digest" in codes or "image-name" in codes
+
+
+def _request_row_codes(tmp_path, *, origin="self-collected", source="developer", policy=None):
+    root = tmp_path / "r"
+    root.mkdir(parents=True)
+    body = _body(source=source).model_copy(update={"origin": origin})
+    cfg = aiperf_to_configuration(_summary(), _records(), body, observation_id="dev:m", device_count=8)
+    cfg = dataclasses.replace(cfg, observations=[o.model_copy(update=CLEAN) for o in cfg.observations], provenance=[])
+    assert cfg.requests
+    path = write_configuration(root, cfg, prefix="data")
+    files = [p.relative_to(root).as_posix() for p in (root / path).parent.iterdir()]
+    kwargs = {} if policy is None else {"policy": policy}
+    return {f.code for f in check_publishable(root, files, **kwargs)}
+
+
+def test_request_rows_published_only_for_self_collected_non_infx(tmp_path):
+    assert "request-rows" not in _request_row_codes(tmp_path / "a")
+    assert "request-rows" in _request_row_codes(tmp_path / "b", origin="official")
+    assert "request-rows" in _request_row_codes(tmp_path / "c", source="inferencex")
+    strict = RedactionPolicy(allow_self_collected_request_rows=False)
+    assert "request-rows" in _request_row_codes(tmp_path / "d", policy=strict)
 
 
 def test_text_rules_cover_patch_image_and_secret_values():
@@ -405,7 +429,7 @@ def test_dirty_content_blocks_promotion_even_if_labeled_public(tmp_path):
     directory = str(Path(path).parent)
     _public(root, directory)
     plan = plan_promotion(root, _request([directory]), _reviewers())
-    assert {"provenance-withheld", "request-rows"} <= {f.code for f in plan.findings}
+    assert "provenance-withheld" in {f.code for f in plan.findings}
     assert not plan.content_ok
 
 
@@ -493,3 +517,44 @@ def test_lineage_of_redacted_originals_is_recorded_privately(tmp_path):
     plan = plan_promotion(root, _request([directory], draft), _reviewers())
     ledger = apply_promotion(plan, root, _target(tmp_path))
     assert json.loads(ledger.read_text())["original_sha256"] == {path: original}
+
+
+# ---------------------------------------------------------------- evidence root
+
+
+def _evidence(root, files=None):
+    config = "data/e2e/m/h100_sxm/vllm/0.11.0/tp8/cfg-" + "a" * 64
+    directory = root / "evidence" / config
+    directory.mkdir(parents=True)
+    files = files or {"bundle.tar.gz": b"\x1f\x8bbundle", "capture.sh": b"#!/bin/sh\n"}
+    artifacts = []
+    for name, data in files.items():
+        (directory / name).write_bytes(data)
+        artifacts.append(
+            {"path": name, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "kind": "raw-bundle"}
+        )
+    manifest = {"configuration_id": "cfg-" + "a" * 64, "category": "e2e", "config_path": config, "artifacts": artifacts}
+    (directory / "evidence-manifest.json").write_text(json.dumps(manifest))
+    return directory
+
+
+def test_evidence_root_is_internal_only_and_hash_checked(tmp_path):
+    root, _ = _mirror(tmp_path)
+    directory = _evidence(root)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok
+    public = validate_tree(root, repo=INTERNAL_REPO, profile="public")
+    assert "path-root" in {f.code for f in public.errors}
+    (directory / "stray.log").write_text("x")
+    assert "evidence-undeclared" in {f.code for f in validate_tree(root, repo=INTERNAL_REPO).errors}
+    (directory / "stray.log").unlink()
+    (directory / "capture.sh").write_text("#!/bin/sh\necho changed\n")
+    assert "evidence-digest" in {f.code for f in validate_tree(root, repo=INTERNAL_REPO).errors}
+    (directory / "capture.sh").unlink()
+    assert "evidence-missing" in {f.code for f in validate_tree(root, repo=INTERNAL_REPO).errors}
+
+
+def test_evidence_is_never_promoted(tmp_path):
+    root, _ = _mirror(tmp_path)
+    _evidence(root)
+    plan = plan_promotion(root, _request(["evidence/data"]), _reviewers())
+    assert "selection-root" in {f.code for f in plan.findings}
