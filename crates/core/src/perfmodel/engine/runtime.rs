@@ -4769,11 +4769,12 @@ pub(crate) mod tests {
             // both take SOL and the independent byte count below applies.
             m.state_dtype = "float16".into();
         }
-        let spec = EngineSpec::new(
+        let mut spec = EngineSpec::new(
             fixture_engine_config(None),
             vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
             vec![],
         );
+        spec.engine.database_mode = DatabaseMode::Sol;
         let mut db = Arc::try_unwrap(build_engine(None).db)
             .unwrap_or_else(|_| panic!("test database is shared"));
         db.database_mode = DatabaseMode::Sol;
@@ -4820,11 +4821,12 @@ pub(crate) mod tests {
             if !qualified && let Op::Mamba2(m) = &mut scan {
                 m.state_dtype = "unrecorded".into();
             }
-            let spec = EngineSpec::new(
+            let mut spec = EngineSpec::new(
                 fixture_engine_config(Some(3)),
                 vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
                 vec![],
             );
+            spec.engine.database_mode = DatabaseMode::Sol;
             let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
             for (ctx, new_tokens) in [
                 (6000, 2192),
