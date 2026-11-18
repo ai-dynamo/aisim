@@ -1102,7 +1102,11 @@ impl AicTimingModel {
             speculation_kind,
             config.decoder_replay,
         )?;
-        config.speculative_depth()?;
+        if speculation_kind == Some("mtp") {
+            // Wait for scheme registration before canonical construction uses
+            // the base module. Executor depth is checked only after loading.
+            Python::with_gil(|py| PyModule::import(py, "aisim_core.sdk.speculation").map(|_| ()))?;
+        }
         Ok(())
     }
 
@@ -7694,17 +7698,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Aggregated);
         identity.nextn = 2;
+        identity.estimator_config = serde_json::from_value(serde_json::json!({
+            "fpm_regression": {"fit": {"linear": {"feature_axes": ["E"]}}}
+        }))
+        .unwrap();
         let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
-        model
-            .tune_with_fpms(&fitted_training_iterations(
-                &[
-                    IterationKind::Prefill,
-                    IterationKind::Decode,
-                    IterationKind::Mixed,
-                ],
-                false,
-            ))
-            .unwrap();
+        // Synthetic observations for all three stores: 2 ms plus 0.25 ms
+        // per scheduled token, including each request's verified drafts.
+        let mut iterations = Vec::new();
+        for i in 0..32 {
+            let lengths: Vec<usize> = (0..1 + i % 4).map(|j| 50 + 10 * (i + j)).collect();
+            let prefill = [(32 + i, 0)];
+            for mut rank in [
+                fitted_work(0, Some(&prefill), None),
+                fitted_work(0, None, Some(&lengths)),
+                fitted_work(0, Some(&prefill), Some(&lengths)),
+            ] {
+                let mut tokens = rank.prefill.as_ref().map_or(0, |p| p.totals.new_tokens);
+                if let Some(decode) = &mut rank.decode {
+                    decode.verify_width = 3;
+                    decode.widths = (0..lengths.len()).map(|j| 1 + (i + 2 * j) % 3).collect();
+                    tokens += decode.widths.iter().sum::<usize>();
+                }
+                let query = fitted_rank_query(&rank).unwrap();
+                let mut metrics = detailed_rank_metrics(&query, &rank).unwrap();
+                metrics.wall_time = (2.0 + 0.25 * tokens as f64) / 1000.0;
+                iterations.push(vec![metrics]);
+            }
+        }
+        model.tune_with_fpms(&iterations).unwrap();
         let mut timing = serde_json::to_value(
             model
                 .save_state_snapshot(
@@ -7756,6 +7778,12 @@ mod tests {
                     assert_eq!(report["completed_requests"], 1);
                     assert_eq!(report["total_output_tokens"], 7);
                     assert_eq!(report["per_request"][0]["request_id"], "fitted-mtp-cpu");
+                    let request = &report["per_request"][0];
+                    let decode_ms = request["last_token_ms"].as_f64().unwrap()
+                        - request["first_token_ms"].as_f64().unwrap();
+                    // Prefill emits one token; two width-three decode passes
+                    // emit the remaining six: 2 * (2 + 0.25 * 3) = 5.5 ms.
+                    assert!((decode_ms - 5.5).abs() < 1e-9, "{decode_ms}");
                 }
                 let mut role: ReplayRoleConfig = serde_json::from_value(value).unwrap();
                 resolve_role_timing(
@@ -7806,7 +7834,7 @@ mod tests {
     }
 
     #[test]
-    fn fitted_mtp_snapshot_above_the_executor_depth_limit_cannot_replay() {
+    fn fitted_mtp_snapshot_load_errors_precede_executor_depth_validation() {
         pyo3::prepare_freethreaded_python();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
@@ -7830,18 +7858,29 @@ mod tests {
             provider: "aic".into(),
             config: serde_json::to_value(saved).unwrap(),
         };
-        let error = resolve_role_timing(
-            &mut role,
-            true,
-            ForwardPassWorkerType::Decode,
-            None,
-            false,
-            &mut Vec::new(),
-            &mut serde_json::Map::new(),
-        )
-        .err()
-        .expect("depth six is valid for cost prediction, but not replay");
-        assert!(format!("{error:#}").contains("1..5 draft tokens"));
+        for missing_state in [false, true] {
+            if missing_state {
+                std::fs::remove_file(dir.path().join("depth-six/state.bin")).unwrap();
+            }
+            let error = resolve_role_timing(
+                &mut role.clone(),
+                true,
+                ForwardPassWorkerType::Decode,
+                None,
+                false,
+                &mut Vec::new(),
+                &mut serde_json::Map::new(),
+            )
+            .err()
+            .expect("depth six is valid for cost prediction, but not replay");
+            let error = format!("{error:#}");
+            if missing_state {
+                assert!(error.contains("state.bin"), "{error}");
+                assert!(!error.contains("1..5 draft tokens"), "{error}");
+            } else {
+                assert!(error.contains("1..5 draft tokens"), "{error}");
+            }
+        }
     }
 
     #[test]
