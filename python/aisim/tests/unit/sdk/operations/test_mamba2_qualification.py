@@ -160,3 +160,30 @@ def test_run_agg_cache_separates_prefixes(monkeypatch):
     assert cached.get_per_ops_data()["mix_step"]["context_mamba_ssm"] == pytest.approx(_scan_ms(1, 1096), rel=1e-9)
     # A repeated identical call reuses the matching result.
     assert run(1, 2048, prefix=3000) is cached
+
+
+def test_run_agg_lone_request_memory_ignores_unused_budget():
+    # vLLM sizes the step's activations from its scheduled tokens (TensorRT-LLM
+    # reserves max_num_tokens instead), so a budget above one prompt must not
+    # enlarge the footprint of the single request it schedules.
+    from aisim.sdk.inference_session import InferenceSession
+    from aisim_core.sdk import config
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="HYBRID", allow_unlisted_version=True)
+    if database is None:
+        pytest.skip("b200_sxm/vllm/0.24.0 data missing")
+    model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    session = InferenceSession(
+        get_model("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", model_config, "vllm"),
+        database,
+        get_backend("vllm", "b200_sxm"),
+    )
+
+    def memory(ctx_tokens):
+        runtime = config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=3000)
+        return session.run_agg(runtime, ctx_tokens=ctx_tokens).get_memory()
+
+    assert memory(8192) == memory(4096)
