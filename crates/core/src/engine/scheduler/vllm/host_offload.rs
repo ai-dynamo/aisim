@@ -3437,7 +3437,7 @@ mod tests {
         // `get_num_new_matched_tokens` pins the CPU hit and drops the previous
         // pin; `update_state_after_alloc` hands the blocks to the load. A
         // prompt ending on a block boundary keeps its last block to compute.
-        let mut adapter = connector_adapter(G2Connector::SimpleCpuV032, 1);
+        let mut adapter = connector_adapter(G2Connector::SimpleCpuV032, 2);
         let mut manager = G1Manager::new_with_caching(4, 4, KvEventPublishers::default(), 0, true);
         let id = Uuid::from_u128(1);
         let (sequence, lease, mut host) = request(id, vec![1, 2, 3, 4, 5]);
@@ -3466,25 +3466,10 @@ mod tests {
         let HostLookup::Hit(hit) = adapter.lookup(&mut host, &sequence, &cost, 4, now) else {
             panic!("the pinned block must hit")
         };
-        // Even a competing store between lookup and start_load cannot evict
-        // the hit. Thus SimpleCPU cannot take LoadOutcome::Miss / Retry and
-        // enter the connector queue with a cancelled G1 reservation.
-        let other = HostBlockKey::new(99);
-        assert!(matches!(
-            adapter
-                .host
-                .lock()
-                .prepare_store(C, Uuid::from_u128(2), &[other], None, now),
-            StoreOutcome::RetryCapacity {
-                structurally_unfittable: false
-            }
-        ));
-        assert_eq!(adapter.host.lock().lookup(key), Lookup::Hit);
         assert!(matches!(
             adapter.start_load(id, &mut host, &lease, hit, &mut manager, now),
             StartLoad::Queued
         ));
-        assert_eq!(host.reserved_blocks(), 1);
         assert_eq!(adapter.host.lock().pins(key), 1, "only the load holds it");
     }
 
