@@ -18,7 +18,7 @@ use crate::common::error::AicError;
 use crate::memo::Memo;
 use crate::operators::base::PerformanceResult;
 use crate::operators::op::MemoField;
-use crate::operators::{Op, RuntimeContext};
+use crate::operators::{Dsv41StageOp, Op, RuntimeContext};
 use crate::perf_database::PerfDatabase;
 
 /// The engine op list an [`OpMemo`] entry belongs to.
@@ -37,6 +37,9 @@ pub(crate) struct OpMemo {
     fields: [Box<[Option<MemoField>]>; 2],
     /// Keyed by list, index and field value ([`Self::key`]).
     results: Memo<u64, PerformanceResult>,
+    /// A generation stage's children that read only the token count, in
+    /// child order with `None` for the others; keyed like `results`.
+    stage_children: Memo<u64, Arc<[Option<PerformanceResult>]>>,
 }
 
 impl OpMemo {
@@ -47,12 +50,14 @@ impl OpMemo {
         Self {
             fields: [fields(context_ops), fields(generation_ops)],
             results: Memo::flat(capacity).verifying_hits(),
+            // One entry per generation stage and token count, about 1.5 KB each.
+            stage_children: Memo::flat(4096).verifying_hits(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.results.len()
+        self.results.len() + self.stage_children.len()
     }
 
     /// The entry key of the op at `index` of `list` with its field at `value`.
@@ -77,9 +82,37 @@ impl OpMemo {
         self.results
             .get_or_price(db, Self::key(list, index, field.of(ctx)), query)
     }
+
+    /// [`Dsv41StageOp::query`] of the generation stage at `index` of `list`,
+    /// which queries every child at `ctx` itself: the children that read
+    /// only the token count come from the walk that first reached this count.
+    fn query_stage(
+        &self,
+        db: &PerfDatabase,
+        list: OpList,
+        index: usize,
+        stage: &Dsv41StageOp,
+        ctx: &RuntimeContext,
+    ) -> Result<PerformanceResult, AicError> {
+        let key = Self::key(list, index, ctx.num_tokens);
+        // A child that fails is left out and queried again below, so the
+        // stage still reports its first failing child.
+        let shared = self.stage_children.get_or_price(db, key, || {
+            let children = stage.children.iter().map(|op| match op.memo_field() {
+                Some(MemoField::NumTokens) => op.query(db, ctx).ok(),
+                _ => None,
+            });
+            Ok::<_, AicError>(children.collect::<Arc<[_]>>())
+        })?;
+        stage.query_with(ctx, |i, op, child_ctx| match &shared[i] {
+            Some(result) => Ok(result.clone()),
+            None => op.query(db, child_ctx),
+        })
+    }
 }
 
-/// [`OpMemo::query`] through `op_memo` when there is one.
+/// [`OpMemo::query`] through `op_memo` when there is one, and
+/// [`OpMemo::query_stage`] for a DeepSeek-V4.1 generation stage.
 fn shared_query(
     op_memo: Option<&OpMemo>,
     db: &PerfDatabase,
@@ -88,9 +121,12 @@ fn shared_query(
     op: &Op,
     ctx: &RuntimeContext,
 ) -> Result<PerformanceResult, AicError> {
-    match op_memo {
-        Some(op_memo) => op_memo.query(db, list, index, ctx, || op.query(db, ctx)),
-        None => op.query(db, ctx),
+    match (op_memo, op) {
+        (Some(op_memo), Op::Dsv41Stage(stage)) if !stage.is_context => {
+            op_memo.query_stage(db, list, index, stage, ctx)
+        }
+        (Some(op_memo), _) => op_memo.query(db, list, index, ctx, || op.query(db, ctx)),
+        (None, _) => op.query(db, ctx),
     }
 }
 

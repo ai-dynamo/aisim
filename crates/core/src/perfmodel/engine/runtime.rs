@@ -976,8 +976,8 @@ pub struct Engine {
     /// Ranks priced without diagnostics or lookup coverage, by workload;
     /// allocated on first use. See [`Self::rank_pricing`].
     rank_memo: OnceLock<Memo<RankKey, Arc<RankPricing>>>,
-    /// Single-field op results shared by the rank memo's misses;
-    /// allocated on first use. See [`Self::operation_rank_latency_ms`].
+    /// Single-field op results shared by the rank memo's misses and DSv4.1
+    /// static generation walks; allocated on first use.
     op_memo: OnceLock<OpMemo>,
     /// Name lists of walks without name slots, shared across ranks.
     shared_names: Mutex<Vec<Arc<[String]>>>,
@@ -1897,6 +1897,8 @@ impl Engine {
             return Ok(0.0);
         }
         let plan = &self.generation_plan;
+        // DSv4.1 stages share their token-count children across steps and walks.
+        let op_memo = self.has_dsv41_stages().then(|| self.op_memo());
         // Per-step name fold, indexed by name slot; `order` keeps first encounter.
         let mut step_fold: Vec<Option<(&Op, PerformanceResult)>> = vec![None; plan.names()];
         let mut order = Vec::with_capacity(plan.names());
@@ -1913,7 +1915,7 @@ impl Engine {
             let step = run_generation_ops_step_planned(
                 &self.generation_ops,
                 Some(plan),
-                None,
+                op_memo,
                 &self.db,
                 bs,
                 runtime.beam_width,
@@ -2523,6 +2525,11 @@ impl Engine {
         self.context_ops
             .iter()
             .any(|op| matches!(op, Op::Dsv41Stage(_)))
+    }
+
+    fn op_memo(&self) -> &OpMemo {
+        self.op_memo
+            .get_or_init(|| OpMemo::new(OP_MEMO_CAPACITY, &self.context_ops, &self.generation_ops))
     }
 
     /// Scope every prefill extend before fusing token-major work with decode.
@@ -3920,9 +3927,7 @@ impl Engine {
         has_decode: bool,
         operations: &mut OperationObserver,
     ) -> Result<f64, AicError> {
-        let op_memo = self
-            .op_memo
-            .get_or_init(|| OpMemo::new(OP_MEMO_CAPACITY, &self.context_ops, &self.generation_ops));
+        let op_memo = self.op_memo();
         if self.has_dsv41_stages() {
             // Retain every scheduled token in balanced aggregate telemetry;
             // integer averages alone discard the remainder. FPM v1 does not
@@ -6290,6 +6295,38 @@ pub(crate) mod tests {
             let names: Vec<_> = values.iter().map(|value| value.0.as_str()).collect();
             assert_eq!(names, ["encoder", "decoder", "decoder_1"]);
             assert_eq!(values[2].1.to_bits(), values[1].1.to_bits());
+        }
+    }
+
+    #[test]
+    fn dsv41_generation_stages_reuse_token_count_children_across_kv_lengths() {
+        // Each stage runs the fixture's generation ops and its norm again:
+        // attention reads the KV length, the ops around it only the token count.
+        let mut engine = dsv41_probe_engine(true);
+        engine.db = build_engine(None).db;
+        for outer in &mut engine.generation_ops {
+            let Op::Dsv41Stage(stage) = outer else {
+                unreachable!()
+            };
+            stage.children = generation_ops();
+            stage.children.push(stage.children[0].clone());
+        }
+        engine.generation_plan = OpListPlan::new(&engine.generation_ops);
+        let memo_len = |engine: &Engine| engine.op_memo.get().map_or(0, OpMemo::len);
+        // The second walk changes only the KV length and adds no entry; the
+        // third changes the batch.
+        for (batch, isl, entries) in [(3, 700, 2), (3, 9000, 2), (5, 700, 4)] {
+            let (_, generation) = engine
+                .run_static_per_op(&runtime(batch, isl, 2), StaticMode::Generation, 32)
+                .unwrap();
+            assert_eq!(memo_len(&engine), entries);
+            // Each stage's value is its own query's, without the memo.
+            let ctx = generation_op_runtime(batch, 1, isl + 1, 1.0, 0, None);
+            for (value, op) in generation.iter().zip(&engine.generation_ops) {
+                let direct = op.query(engine.database(), &ctx).unwrap();
+                assert_eq!(value.1.to_bits(), direct.latency_ms.to_bits());
+                assert_eq!(value.2.to_bits(), direct.energy_wms.to_bits());
+            }
         }
     }
 
