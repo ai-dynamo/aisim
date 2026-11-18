@@ -485,12 +485,15 @@ def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str
     commit = revision
     if not _COMMIT_HASH.fullmatch(revision):
         # Branch and tag refs may contain slashes; the hub cache stores them as nested files.
+        ref_path = repo / "refs" / revision
         try:
-            commit = (repo / "refs" / revision).read_text(encoding="utf-8").strip()
-        except OSError:
+            commit = ref_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
             return None
+        except (OSError, UnicodeError) as error:
+            raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: {error}") from error
     if not _COMMIT_HASH.fullmatch(commit):
-        return None
+        raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: expected a 40-hex commit, got {commit!r}")
     path = repo / "snapshots" / commit / filename
     return (path, commit) if path.is_file() else None
 

@@ -291,31 +291,71 @@ def test_concurrent_loads_keep_their_own_snapshot_pins(monkeypatch):
     assert quant_revisions == {"org/cached": "c" * 40, "org/online": "main"}
 
 
-def test_processor_files_follow_the_cached_config_commit(monkeypatch):
+@pytest.mark.parametrize("architecture", ["Qwen3VLForConditionalGeneration", "KimiK25ForConditionalGeneration"])
+def test_processor_files_follow_the_cached_config_commit(monkeypatch, hf_cache, architecture):
     commit = "d" * 40
-    raw = {"architectures": ["Qwen3VLForConditionalGeneration"]}
-    utils._CONFIG_PROVENANCE[id(raw)] = (raw, commit)
+    model = f"org/pinned-processor-{architecture}"
+    _cache_file(hf_cache, model, "config.json", {"architectures": [architecture]}, commit=commit)
     requested = []
+    filenames = ["preprocessor_config.json"]
+    if architecture == "KimiK25ForConditionalGeneration":
+        filenames.append("video_preprocessor_config.json")
 
-    def companion(model_path, filename, *, raise_on_404=True, revision="main"):
-        requested.append((filename, revision))
-        return None
+    def remote(request, *, timeout):
+        url = request.full_url
+        requested.append(url)
+        if url.endswith("/main/config.json"):
+            raise utils.urllib.error.URLError("transient")
+        filename = url.rsplit("/", 1)[1]
+        if filename in filenames:
+            # Remote main deliberately contains different metadata.
+            source = "pinned" if f"/{commit}/" in url else "remote-main"
+            return io.BytesIO(json.dumps({"source": source}).encode())
+        raise utils.urllib.error.HTTPError(url, 404, "missing", {}, None)
 
-    class Stop(Exception):
-        pass
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    monkeypatch.setattr(utils, "_parse_hf_config_json", lambda raw: {"architecture": architecture})
+    loaded = utils.get_model_config_from_model_path.__wrapped__(model)
+    processor = loaded["raw_config"]["preprocessor_config"]
+    assert processor["source"] == "pinned"
+    if len(filenames) == 2:
+        assert processor["video_processor"]["source"] == "pinned"
+    for filename in filenames:
+        assert f"https://huggingface.co/{model}/raw/{commit}/{filename}" in requested
 
-    def stop(_raw):
-        raise Stop
 
-    monkeypatch.setattr(utils, "_load_model_config_from_model_path", lambda path: raw)
-    monkeypatch.setattr(utils, "_download_hf_json", companion)
-    monkeypatch.setattr(utils, "_parse_hf_config_json", stop)
+@pytest.mark.parametrize("ref_contents", [None, b"not-a-commit", b"\xff"])
+def test_loader_distinguishes_missing_and_corrupt_cache_refs(monkeypatch, hf_cache, ref_contents):
+    model = "org/ref-validation"
+    _cache_file(hf_cache, model, "config.json", {"architectures": ["LlamaForCausalLM"]})
+    ref = hf_cache / "models--org--ref-validation" / "refs" / "main"
+    if ref_contents is None:
+        ref.unlink()
+    else:
+        ref.write_bytes(ref_contents)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    message = "offline mode" if ref_contents is None else "Invalid cached ref"
+    with pytest.raises(utils.HuggingFaceDownloadError, match=message):
+        utils._load_model_config_from_model_path.__wrapped__(model)
+
+
+def test_pinned_profile_consumer_reports_offline_miss_and_loads_cached_config(monkeypatch, hf_cache):
+    from aisim_core.sdk import fpm_profile
+
+    model = "org/profile-offline-config"
+    commit = "d" * 40
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    profile = SimpleNamespace(model=model, model_revision=commit)
+    with pytest.raises(ValueError, match="cannot verify FPM profile architecture.*could not be resolved") as error:
+        fpm_profile._validate_checkpoint_architecture(profile)
+    assert isinstance(error.value.__cause__, utils.HuggingFaceDownloadError)
+    metadata = {"architectures": ["LlamaForCausalLM"], "hidden_size": 1024}
+    _cache_file(hf_cache, model, "config.json", metadata, commit=commit)
     try:
-        with pytest.raises(Stop):
-            utils.get_model_config_from_model_path.__wrapped__("org/qwen-vl-not-bundled")
+        assert fpm_profile._load_pinned_checkpoint_config(model, commit) == metadata
     finally:
-        utils._CONFIG_PROVENANCE.pop(id(raw), None)
-    assert requested == [("preprocessor_config.json", commit)]
+        fpm_profile._load_pinned_checkpoint_config.cache_clear()
 
 
 @pytest.mark.parametrize("contents", ["{broken", "[]", "null"])
