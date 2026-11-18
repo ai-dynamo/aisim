@@ -914,8 +914,11 @@ mod tests {
     #[test]
     fn lock_accounting_and_lru_eviction_follow_sglang() {
         let mut cache = RadixCache::new(64, 4);
-        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &[0, 1, 2, 3, 4, 5, 6, 7]);
-        cache.insert(&[9, 10, 11, 12], &[8, 9, 10, 11]);
+        let first = cache.page_pool.allocate(8).unwrap();
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &first);
+        let second = cache.page_pool.allocate(4).unwrap();
+        cache.insert(&[9, 10, 11, 12], &second);
+        assert_eq!(cache.available_tokens(), 52);
 
         let first_key = cache.page_hashes(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let (_, locked) = cache.match_prefix_hashes_and_lock(&first_key);
@@ -925,6 +928,7 @@ mod tests {
         let (evicted, pages) = cache.evict(4);
         assert_eq!(evicted, 4);
         assert_eq!(pages, vec![KvPageId(2)]);
+        assert_eq!(cache.available_tokens(), 56);
         assert_eq!(cache.match_prefix(&[9, 10, 11, 12]).0, 0);
         assert_eq!(cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]).0, 8);
 
