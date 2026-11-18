@@ -187,3 +187,85 @@ def test_run_agg_lone_request_memory_ignores_unused_budget():
         return session.run_agg(runtime, ctx_tokens=ctx_tokens).get_memory()
 
     assert memory(8192) == memory(4096)
+
+
+def _ttft(summary):
+    return float(summary.get_summary_df().iloc[0]["ttft"])
+
+
+@pytest.mark.parametrize(("prefix", "chunks"), [(3000, 1), (0, 2)])
+def test_run_agg_ttft_counts_uncached_prefill_steps(monkeypatch, prefix, chunks):
+    # A 4096-token prompt under a 2048-token budget: with 3000 cached tokens the
+    # 1096 uncached tokens finish in one step; uncached, the prompt needs two.
+    # TensorRT-LLM's TTFT is step * chunks * qf, with qf = 2 + (2 - 3) / 20 for
+    # ceil(4096 / 2048) = 2 budget steps and no dispatch or encoder term.
+    run = _qualified_nano_session(monkeypatch)
+    summary = run(1, 2048, prefix=prefix)
+    step_ms = sum(summary.get_per_ops_data()["mix_step"].values())
+    assert _ttft(summary) == pytest.approx(step_ms * chunks * 1.95, abs=1e-3)
+
+
+def test_run_agg_rejects_a_fully_cached_prompt(monkeypatch):
+    run = _qualified_nano_session(monkeypatch)
+    with pytest.raises(Exception, match="isl must be greater than"):
+        run(1, 2048, prefix=4096)
+
+
+def test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode():
+    from aisim.sdk.inference_session import InferenceSession
+    from aisim_core.sdk import common, config, rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model, nemotron_h
+    from aisim_core.sdk.perf_database import get_database, get_database_view
+
+    model_name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    hybrid = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="HYBRID", allow_unlisted_version=True)
+    if hybrid is None:
+        pytest.skip("b200_sxm/trtllm/1.3.0rc20 data missing")
+    model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    real_ops = nemotron_h.ops
+
+    class QualifiedOps:
+        def __getattr__(self, name):
+            if name != "Mamba2Kernel":
+                return getattr(real_ops, name)
+            return lambda *a, **k: real_ops.Mamba2Kernel(*a, state_dtype="float32", token_width=1, **k)
+
+    legacy = get_model(model_name, model_config, "trtllm")
+    nemotron_h.ops = QualifiedOps()
+    try:
+        qualified = get_model(model_name, model_config, "trtllm")
+    finally:
+        nemotron_h.ops = real_ops
+
+    def run(backend, model, database):
+        runtime = config.RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=3000)
+        return _ttft(InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=2048))
+
+    def cold(model, database):
+        rust_engine_step._engine_handle_cache_clear()
+        return run(get_backend("trtllm", "b200_sxm"), model, database)
+
+    expected = {id(legacy): cold(legacy, hybrid), id(qualified): cold(qualified, hybrid)}
+    assert expected[id(legacy)] != expected[id(qualified)]
+    for first, second in ((legacy, qualified), (qualified, legacy)):
+        # One backend for both graphs, and fresh backends over one handle cache.
+        rust_engine_step._engine_handle_cache_clear()
+        backend = get_backend("trtllm", "b200_sxm")
+        run(backend, first, hybrid)
+        assert run(backend, second, hybrid) == expected[id(second)]
+        rust_engine_step._engine_handle_cache_clear()
+        run(get_backend("trtllm", "b200_sxm"), first, hybrid)
+        assert run(get_backend("trtllm", "b200_sxm"), second, hybrid) == expected[id(second)]
+    # A query mode changed in place on the same database object.
+    shared = get_database("b200_sxm", "trtllm", "1.3.0rc20", allow_unlisted_version=True)
+    original = shared.get_default_database_mode()
+    try:
+        shared.set_default_database_mode(common.DatabaseMode.HYBRID)
+        backend = get_backend("trtllm", "b200_sxm")
+        run(backend, legacy, shared)
+        shared.set_default_database_mode(common.DatabaseMode.SOL)
+        sol = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+        assert run(backend, legacy, shared) == cold(legacy, sol)
+    finally:
+        shared.set_default_database_mode(original)

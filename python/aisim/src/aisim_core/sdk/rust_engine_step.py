@@ -1790,6 +1790,39 @@ def _engine_handle_cache_put(key: str, value: Any) -> None:
             _ENGINE_HANDLE_CACHE.popitem(last=False)
 
 
+def engine_identity(model: Any, database: Any) -> str:
+    """The compiled-engine identity of ``(model, database)``, memoized on the model.
+
+    The memo is reused only for the same database object in the same query
+    mode and transfer policy: ``set_default_database_mode`` changes both in
+    place, and the compiled engine bakes them into its query dispatch.
+    """
+    mode = (_database_mode_key(database), _transfer_policy_key(database))
+    memo = getattr(model, "_aic_engine_identity_memo", None)
+    if memo is not None and memo[0] is database and memo[1] == mode:
+        return memo[2]
+    key = _engine_config_json(model, database)
+    try:
+        model._aic_engine_identity_memo = (database, mode, key)
+    except (AttributeError, TypeError):
+        pass  # slotted/frozen model objects: recompute per call
+    return key
+
+
+def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
+    """Recorded Mamba2 qualification fields, which the model config does not
+    carry: the same config can compile qualified or legacy Mamba2 ops."""
+    import aisim_core._native as native
+
+    seen = set()
+    for op in (*getattr(model, "context_ops", ()), *getattr(model, "generation_ops", ())):
+        if isinstance(op, native.Mamba2Kernel):
+            args, kwargs = op.__getnewargs_ex__()
+            if kwargs:
+                seen.add((args[3], kwargs["state_dtype"], int(kwargs["token_width"])))
+    return [list(entry) for entry in sorted(seen)]
+
+
 def _cached_engine_handle(model: Any, database: Any) -> Any:
     """Return a cached ``EngineHandle`` for ``(model, database)``.
 
@@ -1809,15 +1842,7 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     # identity is immutable for a given (model, database) pair, so memoize the
     # computed key on the model object and only recompute when the database
     # object changes.
-    memo = getattr(model, "_aic_engine_identity_memo", None)
-    if memo is not None and memo[0] is database:
-        key = memo[1]
-    else:
-        key = _engine_config_json(model, database)
-        try:
-            model._aic_engine_identity_memo = (database, key)
-        except (AttributeError, TypeError):
-            pass  # slotted/frozen model objects: recompute per call
+    key = engine_identity(model, database)
     entry = _engine_handle_cache_get(key)
     if isinstance(entry, _CachedUnsupported):
         # Compilation already failed for this engine identity; raise a fresh
@@ -1982,6 +2007,7 @@ def _engine_config_json(model: Any, database: Any) -> str:
                         "enable_shared_layer": bool(getattr(database, "enable_shared_layer", False)),
                         "strict_provenance": bool(getattr(database, "strict_provenance", False)),
                     },
+                    "mamba_qualification": _mamba_qualification_identity(model),
                 },
                 sort_keys=True,
                 separators=(",", ":"),

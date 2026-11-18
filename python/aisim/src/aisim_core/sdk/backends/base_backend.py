@@ -31,6 +31,7 @@ from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.performance_result import MoECommFallback, merge_moe_comm_fallbacks
 from aisim_core.sdk.rust_engine_step import (
     _estimate_decode_step_with_rust,
+    engine_identity,
     estimate_decode_step_breakdown_with_rust,
     estimate_mixed_step_breakdown_with_rust,
     estimate_static_breakdown_with_power_coverage_with_rust,
@@ -2026,6 +2027,9 @@ class BaseBackend:
         # unknown values must still raise, ``python`` must still warn, and a
         # synthetic database must not inherit a prior PerfDatabase result.
         self._require_rust_engine_step(runtime_config, database, surface="aggregate")
+        # The compiled-engine identity scopes reuse to this model graph and
+        # this database in its current mode; it is memoized on the model.
+        cache_key = (cache_key, engine_identity(model, database))
         cached = self._agg_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -2041,6 +2045,8 @@ class BaseBackend:
         # Compute the mean-field number of engine iterations needed to consume
         # all context and commit the requested output tokens.
         steps_to_finish_ctx = np.ceil(isl * b / ctx_tokens)
+        # Budget whose ``ceil(isl / budget)`` counts one request's prefill steps.
+        ttft_ctx_tokens = ctx_tokens
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
@@ -2064,6 +2070,11 @@ class BaseBackend:
             # request (isl prompt tokens, prefix included), never unused budget.
             num_mix_steps = 1
             num_mix_ctx_tokens = min(ctx_tokens, isl)
+            if 0 < isl - prefix <= ctx_tokens:
+                # The uncached prompt fits the budget: one step schedules the
+                # whole request, and TTFT counts that one prefill step.
+                num_mix_ctx_tokens = isl
+                ttft_ctx_tokens = isl
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
             num_genonly_tokens = 1
@@ -2123,7 +2134,7 @@ class BaseBackend:
             b,
             isl,
             osl,
-            ctx_tokens,
+            ttft_ctx_tokens,
             prefix,
             prefill_step_ms=_prefill_step_ms,
             genonly_step_latency_ms=genonly_step_latency_ms,
@@ -2201,8 +2212,8 @@ class BaseBackend:
         else:
             # b == 1 starts with a context-only step; the later decode peak is
             # compared below when the workload schedules output tokens. The
-            # step holds the capped prompt, not unused budget.
-            num_tokens = num_mix_ctx_tokens
+            # step holds the capped prompt, never more than the budget.
+            num_tokens = min(num_mix_ctx_tokens, ctx_tokens)
             mtp_scaled_tokens = 0
 
         memory = self._get_memory_usage(
