@@ -388,3 +388,16 @@ def prepare_execution_profile(root: Path, manifest_path: str, output_dir: Path) 
         shutil.rmtree(output_dir)
         raise
     return config
+
+
+# The FPM library contract (staging, sidecar schema, resource precedence). Defined in a leaf module that does not
+# import this package, so the re-export is safe here.
+from aisim_core.data.fpm_library import (  # noqa: F401
+    FpmContractError,
+    FpmLibraryMetadata,
+    FpmResourcesPendingError,
+    StagedFpmLibrary,
+    complete_fpm_profile,
+    resolve_resources,
+    stage_fpm_library,
+)

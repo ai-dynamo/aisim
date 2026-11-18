@@ -202,6 +202,9 @@ class Selection:
     # Artifact roles to leave out of the plan (for example ``fpm-provenance``,
     # 75 % of the FPM bytes, which no evaluation reads). Manifests are still read.
     exclude_roles: tuple[str, ...] = ()
+    # Parallelism dimensions (degree 1 omitted), e.g. ``(("dp", 4), ("ep", 4))``; matches any worker role of an
+    # entry that declares parallelism. Parallelism is part of an FPM identity: ``dep4`` and ``tep4`` differ.
+    parallelism: tuple[tuple[str, int], ...] | None = None
 
     def validate(self) -> None:
         if not self.configuration_ids:
@@ -224,6 +227,10 @@ class Selection:
             (self.operation_family, identity.operation_family),
         ):
             if want is not None and want != have:
+                return False
+        if self.parallelism is not None and identity.parallelism is not None:
+            wanted = dict(self.parallelism)
+            if not any(dims == wanted for dims in identity.parallelism.values()):
                 return False
         return True
 

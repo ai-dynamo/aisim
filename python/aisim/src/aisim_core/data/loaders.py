@@ -15,8 +15,9 @@ an inconsistent category/purpose/identity and invalid paths.
 
 * :class:`OpLatencyLoader` materializes a ``systems`` root (``data/<system>/...``
   plus hardware specs) that can be appended to ``systems_paths``.
-* :class:`FpmLoader` reuses :func:`prepare_execution_profile` for execution
-  profiles and :func:`load_fpm_profile` for FPM model profiles.
+* :class:`FpmLoader` stages the published prediction tier (library plus sidecar, never ``measurements/``) into a
+  ``systems`` root and resolves resources (:mod:`aisim_core.data.fpm_library`). Entries that carry the older
+  ``execution-profile`` and ``predictor-config`` roles still load through :func:`prepare_execution_profile`.
 * :class:`E2eLoader` returns pyarrow table views.
 """
 
@@ -44,6 +45,20 @@ from aisim_core.data import (
 )
 from aisim_core.data.fetch import Selection
 from aisim_core.data.parquet import read_parquet
+from aisim_core.data.fpm_library import (
+    EVALUATION_ROLES,
+    PREDICTION_ROLES,
+    ROLE_LEGACY_MANIFEST,
+    ROLE_LIBRARY,
+    ROLE_METADATA,
+    FpmContractError,
+    ResolvedResources,
+    complete_fpm_profile,
+    missing_memory_fields,
+    resolve_resources,
+    stage_fpm_library,
+    with_estimator_path,
+)
 
 MANIFEST_SCHEMA = "aisim-artifact-manifest/v1"
 
@@ -83,8 +98,18 @@ class Loader(ABC):
         selection.validate()
         return selection
 
-    def read_manifest(self, root: Path, manifest_path: str, config: Mapping[str, Any] | None = None) -> Manifest:
-        """Parse and fully verify a manifest of this category (hashes, identity, paths)."""
+    def read_manifest(
+        self,
+        root: Path,
+        manifest_path: str,
+        config: Mapping[str, Any] | None = None,
+        *,
+        roles: tuple[str, ...] | None = None,
+    ) -> Manifest:
+        """Parse and verify a manifest of this category (hashes, identity, paths).
+
+        ``roles`` limits the hash check to artifacts of those roles; files of other roles may be absent.
+        """
         root = Path(root)
         manifest = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
         if manifest.schema_version not in self.manifest_schemas:
@@ -101,7 +126,8 @@ class Loader(ABC):
             if len(values) != len(set(values)):
                 raise LoaderError(f"duplicate artifact {name}")
         for artifact in manifest.artifacts:
-            _verify(root, artifact)
+            if roles is None or artifact.role in roles:
+                _verify(root, artifact)
         if config is not None:
             _check_identity(manifest.identity, config)
         return manifest
@@ -179,32 +205,55 @@ class OpLatencyLoader(Loader):
 
 @dataclass(frozen=True)
 class FpmData:
-    """Canonical ``best_available`` config and/or FPM model profile."""
+    """What an FPM entry provides for ``best_available``.
+
+    ``config`` is a complete ``best_available`` configuration: the user's configuration with the staged
+    ``systems_paths`` and interpolation library path, and ``fpm_profile`` completed with resolved resources when
+    the user supplied one. ``kind`` is ``"library"`` for the published library plus sidecar and
+    ``"execution-profile"`` for the older profile bundles (``config`` from :func:`prepare_execution_profile`).
+    """
 
     manifest: Manifest
-    config: dict | None = None  # from prepare_execution_profile
-    profile: Any | None = None  # FpmModelProfile from load_fpm_profile
+    config: dict | None = None
+    profile: Any | None = None  # FpmModelProfile from an ``fpm-profile`` artifact or a completed user profile
+    kind: str = "execution-profile"
+    systems_root: Path | None = None
+    resources: ResolvedResources | None = None  # first deployment, library kind
+    resource_sources: tuple[str, ...] = ()  # per deployment of ``fpm_profile``
+    diagnostics: Mapping[str, Any] | None = None
+
+    @property
+    def memory_pending(self) -> tuple[str, ...]:
+        """Fields still missing before cache sizing or replay (timing queries do not need them)."""
+        if self.resources is None:
+            return ()
+        return tuple(missing_memory_fields(self.resources.resources))
 
 
 class FpmLoader(Loader):
-    """FPM data through the existing profile machinery.
+    """FPM data from the published library, or from an older execution profile.
 
-    * ``execution-profile`` manifests go through :func:`prepare_execution_profile`,
-      which verifies, materializes and returns the canonical config. Both the
-      ``fpm`` stamp (shared-envelope layout) and the legacy ``op-latency``
-      stamp are accepted; ``check_manifest`` accepts ``fpm`` for
-      ``execution-profile`` manifests.
-    * An ``execution-profile`` manifest whose artifacts include one
-      ``fpm-profile`` JSON artifact (an FPM model profile) is read with
-      :func:`load_fpm_profile` instead.
+    * **Library** (roles ``fpm-library`` + ``fpm-library-metadata``): only those two files are verified and
+      staged; ``measurements/`` and ``legacy-configuration-manifest`` files may be absent. The user's
+      configuration supplies model, system, backend, estimator choice and the optional ``fpm_profile``; resources
+      resolve as user configuration, then sidecar ``resources``, then pending.
+    * **Execution profile** manifests go through :func:`prepare_execution_profile`; an ``fpm-profile`` JSON
+      artifact is read with :func:`load_fpm_profile`.
     """
 
     category: ClassVar[Category] = "fpm"
     manifest_categories: ClassVar[tuple[str, ...]] = ("fpm", "op-latency")
     purposes: ClassVar[tuple[str, ...]] = ("execution-profile",)
+    # Evaluation-tier files are never part of a prediction selection; the legacy manifest adds nothing to it.
+    excluded_roles: ClassVar[tuple[str, ...]] = (*EVALUATION_ROLES, ROLE_LEGACY_MANIFEST)
 
     def select(self, config: Mapping[str, Any]) -> Selection:
-        return self._selection(config, model=config.get("model"))
+        return self._selection(
+            config,
+            model=config.get("model"),
+            parallelism=_parallelism(config),
+            exclude_roles=self.excluded_roles,
+        )
 
     def load(
         self,
@@ -213,8 +262,19 @@ class FpmLoader(Loader):
         *,
         output_dir: Path | None = None,
         config: Mapping[str, Any] | None = None,
+        require_resources: bool = False,
+        systems_paths: tuple[str, ...] | None = None,
     ) -> FpmData:
+        """Verify and stage an entry; ``output_dir`` receives the staged ``systems`` root (library kind).
+
+        ``require_resources`` raises :class:`FpmResourcesPendingError` when neither the user's ``fpm_profile`` nor the
+        sidecar supplies resources, naming the fields to supply. Without it, a library without resources still loads
+        for timing queries.
+        """
         root = Path(root)
+        peek = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
+        if any(a.role == ROLE_LIBRARY for a in peek.artifacts):
+            return self._load_library(root, manifest_path, output_dir, config, require_resources, systems_paths)
         manifest = self.read_manifest(root, manifest_path, config)
         profiles = [a for a in manifest.artifacts if a.role == "fpm-profile"]
         if profiles:
@@ -224,6 +284,89 @@ class FpmLoader(Loader):
         if output_dir is None:
             raise LoaderError("output_dir is required to prepare an execution profile")
         return FpmData(manifest, config=prepare_execution_profile(root, manifest_path, Path(output_dir)))
+
+    def _load_library(
+        self,
+        root: Path,
+        manifest_path: str,
+        output_dir: Path | None,
+        config: Mapping[str, Any] | None,
+        require_resources: bool,
+        systems_paths: tuple[str, ...] | None,
+    ) -> FpmData:
+        manifest = self.read_manifest(root, manifest_path, config, roles=PREDICTION_ROLES)
+        if config is not None:
+            _check_parallelism(manifest.identity, config)
+        libraries = [a for a in manifest.artifacts if a.role == ROLE_LIBRARY]
+        sidecars = [a for a in manifest.artifacts if a.role == ROLE_METADATA]
+        if len(libraries) != 1 or len(sidecars) != 1:
+            raise LoaderError(f"exactly one {ROLE_LIBRARY} and one {ROLE_METADATA} artifact are required")
+        library, sidecar = libraries[0], sidecars[0]
+        identity = manifest.identity
+        user_paths = tuple(systems_paths or (config or {}).get("systems_paths") or ()) or None
+        try:
+            staged = stage_fpm_library(
+                _verify(root, library),
+                _verify(root, sidecar),
+                system=identity.hardware,
+                backend=identity.framework,
+                backend_version=identity.framework_version,
+                output_dir=output_dir,
+                systems_paths=user_paths,
+                parquet_sha256=library.sha256,
+                metadata_sha256=sidecar.sha256,
+                artifact_id=library.artifact_id,
+            )
+        except FpmContractError as exc:
+            raise LoaderError(str(exc)) from exc
+        out = dict(config or {})
+        out["systems_paths"] = list(
+            dict.fromkeys(str(p) for p in (staged.systems_root, *(out.get("systems_paths") or ())))
+        )
+        with_estimator_path(out, staged.parquet_path)
+        resources, sources, profile = None, (), None
+        try:
+            user_profile = out.get("fpm_profile")
+            if user_profile is not None:
+                completed, sources = complete_fpm_profile(user_profile, staged.metadata)
+                out["fpm_profile"] = completed
+                from aisim_core.fpm_profile import load_fpm_profile
+
+                profile = load_fpm_profile(completed)
+                resources = ResolvedResources(profile.deployments[0].resources, sources[0])  # type: ignore[arg-type]
+            else:
+                resources = resolve_resources(None, staged.metadata, required=require_resources)
+        except FpmContractError:
+            staged.close()
+            raise
+        return FpmData(
+            manifest,
+            config=out,
+            profile=profile,
+            kind="library",
+            systems_root=staged.systems_root,
+            resources=resources,
+            resource_sources=tuple(sources),
+            diagnostics=staged.diagnostics,
+        )
+
+
+def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | None:
+    """Catalog parallelism dimensions of a configuration (degree 1 dropped), or None when it names none."""
+    keys = {"tp": "tp", "attention_dp": "dp", "moe_tp_size": "moe_tp", "moe_ep_size": "ep", "dcp": "dcp"}
+    if not any(config.get(k) is not None for k in keys):
+        return None
+    dims = {dim: config[key] for key, dim in keys.items() if config.get(key) not in (None, 1)}
+    return tuple(sorted(dims.items()))
+
+
+def _check_parallelism(identity: Identity, config: Mapping[str, Any]) -> None:
+    wanted = _parallelism(config)
+    if wanted is None or identity.parallelism is None:
+        return
+    declared = [tuple(sorted(dims.items())) for dims in identity.parallelism.values()]
+    if wanted not in declared:
+        raise LoaderError(f"manifest parallelism {identity.parallelism} differs from configuration {dict(wanted)}")
 
 
 def _load_fpm_profile_artifact(root: Path, artifact: Artifact):

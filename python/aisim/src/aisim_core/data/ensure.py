@@ -55,7 +55,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
+from aisim_core.data import CategoryIndex, DatasetIndex, Entry, Manifest, _file, _verify
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
@@ -616,9 +616,14 @@ def _fetch_pinned(
 def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
     manifest_path = entry.manifest.path
     if category == "fpm":
-        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused),
-        # then every declared artifact.
-        manifest = read_entry_manifest(root, entry, config, loader)
+        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused);
+        # the peek hashes no artifact, so a library entry is not hashed twice.
+        peek = read_entry_manifest(root, entry, config, loader, roles=())
+        if any(a.role == "fpm-library" for a in peek.artifacts):
+            # Library tier: staging is cheap (links), so it is rebuilt from verified files each time.
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            return loader.load(root, manifest_path, output_dir=output_dir, config=config)
+        manifest = read_entry_manifest(root, entry, config, loader)  # then verifies every declared artifact
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
         # measurements must not be served from the preparation of the old ones.
         content = hashlib.sha256()
@@ -931,6 +936,11 @@ def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | Non
         config["systems_paths"] = [str(loaded.root)]
         return
     loaded_config = loaded.config
+    if loaded.kind == "library":
+        # The loader built this from the user's configuration, so every user choice is kept.
+        config.clear()
+        config.update(loaded_config)
+        return
     paths = [*(loaded_config.get("systems_paths") or ()), *(config.get("systems_paths") or ())]
     config["systems_paths"] = list(dict.fromkeys(str(p) for p in paths))
     wanted = loaded_config["estimator_config"]["op_level"]["execution_profile"]
