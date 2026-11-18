@@ -336,6 +336,10 @@ def test_installed_bytes_and_active_imports_must_belong_to_release_wheel(tmp_pat
     ]
     if application == "aisim":
         names += ["aisimulate/__init__.py", "aisimulate_core/__init__.py"]
+    else:
+        # 0.12 shims delegate to these implementation packages. Their bytes
+        # must be bound to the wheel as well as the public facade's bytes.
+        names += ["aiconfigurator/__init__.py", "aiconfigurator_core/sdk/engine.py"]
     wheel = tmp_path / f"{package}-test.whl"
     site = tmp_path / "site"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -563,6 +567,16 @@ def test_discovery_plan_round_trips_through_packaging_cli(tmp_path, monkeypatch,
     verified.assert_not_called()
     result = json.loads((destination / "fpe-qualification.json").read_text())
     assert result["required_probes"] == probe_plan["probes"]
+    commands = []
+    for path in (destination / RELEASE.DATA).glob("*.csv"):
+        with path.open(newline="") as handle:
+            commands.extend(row["Command"] for row in csv.DictReader(handle))
+    assert commands
+    assert all(
+        shlex.split(command)[3:6]
+        == ["release-source/python/aisimulate/.venv/bin/python", "scripts/fpe/run_release_fpe.py", "probe"]
+        for command in commands
+    )
 
 
 @pytest.mark.parametrize("branch", ["main", "release/0.12.0"])

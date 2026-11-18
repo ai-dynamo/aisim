@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import math
 import os
@@ -154,6 +155,72 @@ def test_cli_worker_exit_fails_without_publishing_partial_results(case, tmp_path
     )
     assert completed.returncode != 0, "an early native exit must fail the CLI"
     assert "FPM configuration did not complete" in completed.stderr
+    assert not (output / "summary.json").exists()
+    assert not (output / "qualification.json").exists()
+    assert not comparison.exists()
+
+
+def test_cli_duplicate_comparison_identity_cannot_publish_partial_results(case, tmp_path, monkeypatch):
+    from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for duplicate-comparison test")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "runtime_module", lambda _: SimpleNamespace(RustForwardPassPerfModel=object()))
+    monkeypatch.setattr(
+        cli,
+        "installed_distribution",
+        lambda: SimpleNamespace(read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})),
+    )
+    configurations = [
+        case.configuration,
+        SimpleNamespace(configuration_path="fixture/second-configuration", snapshot_id=case.configuration.snapshot_id),
+    ]
+    monkeypatch.setattr(
+        cli.HfDataset,
+        "from_hub",
+        lambda **_: SimpleNamespace(
+            revision="a" * 40,
+            configurations=lambda: configurations,
+            measurement_case=lambda *args, **kwargs: case,
+        ),
+    )
+    evaluated = []
+
+    def evaluate(*args):
+        evaluated.append(args)
+        return {}, [], None, {"duplicated-identity": {}}
+
+    monkeypatch.setattr(cli, "evaluate_isolated", evaluate)
+    output, comparison = tmp_path / "public", tmp_path / "comparison.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_fpm_accuracy",
+            "--branch",
+            "main",
+            "--commit",
+            "a" * 40,
+            "--evaluator-sha",
+            "a" * 40,
+            "--hf-revision",
+            "a" * 40,
+            "--wheel",
+            str(wheel),
+            "--run-id",
+            "1",
+            "--run-attempt",
+            "1",
+            "--output",
+            str(output),
+            "--comparison-output",
+            str(comparison),
+        ],
+    )
+    with pytest.raises(ValueError, match="duplicate configuration comparison identity"):
+        cli.main()
+    assert len(evaluated) == 2
     assert not (output / "summary.json").exists()
     assert not (output / "qualification.json").exists()
     assert not comparison.exists()
