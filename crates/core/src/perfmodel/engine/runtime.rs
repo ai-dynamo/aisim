@@ -4747,6 +4747,15 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains(message), "{err}");
         }
+        // A width-four decode prices whole requests: 8 tokens, never 5.
+        let mtp = build_engine(Some(3));
+        mtp.evaluate_ops_json(&with("float16", 4), false, 8, 16, 0, 1.0, None)
+            .unwrap();
+        let err = mtp
+            .evaluate_ops_json(&with("float16", 4), false, 5, 16, 0, 1.0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a multiple of token_width 4"), "{err}");
         // Context queries take only an exact "context" phase.
         for phase in ["generation", "prefill"] {
             let ops = match qualified_mamba(false, 1) {

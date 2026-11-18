@@ -65,9 +65,11 @@ measured decode row prices one token per request. A qualified Mamba2
 operation records its state dtype. Under MTP, its decode `token_width` is
 above one, because it verifies several tokens per request. No measured row
 covers that step, so the operation always uses the SOL estimate. This rule
-applies to the convolution update and to the state scan. The
-estimate counts every verified token and the state traffic of each request,
-and its source is `sol`. With `token_width` one, the operation reads the
+applies to the convolution update and to the state scan. The estimate
+counts every verified token, and its source is `sol`. For a state-scan
+operation, it also counts each request's recurrent-state traffic. The
+convolution update has no recurrent-state term. A decode batch must hold
+whole requests, so its token count must be a multiple of `token_width`. With `token_width` one, the operation reads the
 measured row as before. The collected state-scan rows use a BF16 state, so a
 qualified scan operation with a `float32` state also uses the SOL estimate.
 Convolution rows do not depend on the state dtype, so this second rule does

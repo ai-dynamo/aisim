@@ -77,6 +77,13 @@ impl Mamba2Op {
                 self.name
             )));
         }
+        // Each request verifies exactly `token_width` decode tokens.
+        if self.phase == "generation" && batch_size % self.token_width != 0 {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {}: decode batch {batch_size} is not a multiple of token_width {}",
+                self.name, self.token_width
+            )));
+        }
         let requests = if self.phase == "generation" {
             batch_size.div_ceil(self.token_width.max(1))
         } else {

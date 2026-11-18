@@ -102,9 +102,13 @@ analytical bound is an allowed result.
 
 Qualified Baseline to qualified Candidate.
 
-`InferenceSession.run_agg`, TensorRT-LLM. The script below (`agg.py`) ran each case with
-`python agg.py OUT.json --qual 1 --nextn {0,3}` at each commit, from the
-commit's `python/aisimulate` package environment, with `qual_patch.py` beside it:
+`InferenceSession.run_agg`, TensorRT-LLM. The script below (`agg.py`) ran each
+case with `python agg.py OUT0.json --qual 1 --nextn 0` and
+`python agg.py OUT3.json --qual 1 --nextn 3` at each commit, from the commit's
+`python/aisimulate` package environment, with `qual_patch.py` beside it. The
+measured runs reused one session for all cases. This version builds a fresh
+session per case, because `run_agg` caches results by a key that omits
+`prefix`:
 
 ```python
 import argparse, json, os, sys
@@ -123,8 +127,6 @@ from aisimulate_core.sdk.backends.factory import get_backend
 from aisimulate.sdk.inference_session import InferenceSession
 mc = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=a.nextn,
                         nextn_accept_rates=([0.8, 0.7, 0.6][:a.nextn] if a.nextn else None))
-sess = InferenceSession(get_model(a.model, mc, a.backend), get_database("b200_sxm", a.backend, a.version),
-                        get_backend(a.backend, "b200_sxm"))
 out = {}
 # (batch, isl, osl, prefix, ctx_tokens): ctx_tokens is the prefill budget per step.
 for name, (b, isl, osl, px, ctx) in {
@@ -132,6 +134,8 @@ for name, (b, isl, osl, px, ctx) in {
     "chunked_partial_cached": (16, 6000, 64, 3000, 2048),
     "split_budget_cached": (16, 4096, 64, 1024, 8128),
 }.items():
+    sess = InferenceSession(get_model(a.model, mc, a.backend), get_database("b200_sxm", a.backend, a.version),
+                            get_backend(a.backend, "b200_sxm"))
     kw = {"ctx_tokens": ctx}
     if a.nextn: kw["decode_tokens_per_iteration"] = 1 + 0.8 + 0.8 * 0.7 + 0.8 * 0.7 * 0.6
     s = sess.run_agg(config.RuntimeConfig(batch_size=b, isl=isl, osl=osl, prefix=px), **kw)
@@ -151,8 +155,9 @@ json.dump({"qual": a.qual, "nextn": a.nextn, "backend": a.backend, "runs": out},
 | 3 | split budget, 1024 cached | 101.51 to 102.40 (+0.87%) | 1820.7 to 1809.4 (-0.62%) |
 
 On vLLM, TTFT changes by +0.11% to +0.75% and tok/s/GPU by -0.12% to -1.28%.
-With a 3000-token cached prefix, `run_agg` returned the same values as without
-it in both variants, so it does not show partial-cache behavior.
+The measured runs did not measure `chunked_partial_cached`. The shared session
+returned the cached `chunked_uncached` summary for it, because the `run_agg`
+cache key omits `prefix`. The per-phase result below covers a cached prefix.
 
 Packed telemetry (`RustForwardPassPerfModel.estimate_forward_pass_time_ms`),
 both backends:
@@ -164,11 +169,17 @@ both backends:
 | Mixed, 1x2048 + 8 decode | +0.25% to +0.27% | +0.68% to +0.75% |
 | Mixed, 2 requests of 1500 tokens + 8 decode | +0.24% to +0.36% | +0.62% to +0.71% |
 
-The MTP3 column is not valid for the current code. Commit `686275e7` multiplied
-the decode count by the verification width before the Mamba query. Packed
-telemetry already carries `requests * (nextn + 1)` decode requests, so that
-commit applied the width twice. The current code applies it once. The MTP0
-column has width one and does not change. The `run_agg`, per-phase and replay
+The MTP3 column is historical and not valid for the current code. Commit
+`686275e7` multiplied the decode count by the verification width before the
+Mamba query. Packed telemetry already carries `requests * (nextn + 1)` decode
+requests, so that commit applied the width twice. The current code applies it
+once. No current MTP3 telemetry delta is published. Exact-value tests check the
+current path instead. `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`
+prices packed mixed steps, for example `num_prefill_requests: 1`,
+`sum_prefill_tokens: 512`, `num_decode_requests: 8` at width four, against
+their expected bytes. `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
+compares replay's pure-decode and mixed iterations with the static decode
+cost. The MTP0 column has width one and does not change. The `run_agg`, per-phase and replay
 results above and below do not use packed telemetry.
 
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3: a 6000-token chunk with a
