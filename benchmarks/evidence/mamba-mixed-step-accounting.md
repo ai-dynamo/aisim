@@ -70,8 +70,10 @@ git hash-object crates/core/src/perfmodel/engine/runtime.rs  # 28d8d759
          let err = engine
 ```
 
-No built-in model sets `state_dtype` or `token_width` yet, so every qualified run
-applied this wrapper (`qual_patch.py`) before it built the model:
+No built-in model sets `state_dtype` or `token_width` yet. The original
+Baseline-to-Candidate runs (`agg.py`, `phases.py` and the historical telemetry
+table) applied this `float16` wrapper (`qual_patch.py`) before they built the
+model:
 
 ```python
 def apply(nextn):
@@ -87,6 +89,9 @@ def apply(nextn):
         def __getattr__(self, n): return wrapped if n == "Mamba2Kernel" else getattr(self._o, n)
     nh.ops = _Shim()
 ```
+
+The later comparisons use their own scripts, `telem.py` and `agg_caller.py`,
+which give each qualified op a `bfloat16` state.
 
 ## Operation sources
 
@@ -184,8 +189,8 @@ compares replay's pure-decode and mixed iterations with the static decode
 cost. The width correction does not apply to the MTP0 column, because its
 decode width is one. Its mixed-shape deltas come from the per-phase accounting.
 Both variants give every qualified op the same `float16` state. The operation
-sources table lists every scan as an analytical bound for both data sets, so
-the state dtype does not change a source in either variant. The `run_agg`,
+sources table lists every scan as an analytical bound for both data sets.
+Therefore the state dtype does not change a source in either variant. The `run_agg`,
 per-phase and replay results above and below do not use packed telemetry.
 
 Width-only packed-telemetry comparison, TensorRT-LLM, MTP3, `HYBRID` mode.
@@ -195,9 +200,9 @@ not a rerun of the Baseline-to-Candidate comparison. It measures only the width
 correction.
 Both commits sit on main `bf1b539f`. Each ran
 `python telem.py OUT.json` from its own `python/aisim` build. The script is
-[`telem.py`](mamba-mixed-step-accounting/telem.py), and it qualifies every
-Mamba2 op with a `bfloat16` state, `token_width` 4 for generation ops and
-`token_width` 1 for context ops. Its inputs use the packed
+[`telem.py`](mamba-mixed-step-accounting/telem.py). It gives every Mamba2 op
+a `bfloat16` state. Generation ops get `token_width` 4, and context ops get
+`token_width` 1. Its inputs use the packed
 decode convention: 8 requests at width 4 give `num_decode_requests: 32` and
 `sum_decode_kv_tokens: 32800` (1025 tokens each). The mixed case adds
 `num_prefill_requests: 1` and `sum_prefill_tokens: 2048`.
@@ -207,15 +212,85 @@ decode convention: 8 requests at width 4 give `num_decode_requests: 32` and
 | Pure decode, 8 requests | 9.459918 | 9.033769 | -0.426149 (-4.50%) |
 | Mixed, 1x2048 + 8 requests | 21.171992 | 20.745843 | -0.426149 (-2.01%) |
 
-Only the generation Mamba rows change, both with source `sol`.
-`generation_mamba_conv1d` falls from 0.029815 to 0.007454 ms, and
+The outputs record each Mamba row and one sum of all non-Mamba rows. Of the
+recorded values, only the two generation Mamba rows change, both with source
+`sol`. `generation_mamba_conv1d` falls from 0.029815 to 0.007454 ms, and
 `generation_mamba_ssm` falls from 0.538383 to 0.134596 ms. Each is exactly
 four times smaller. Their sum is the 0.426149 ms total change. The context
-Mamba rows are identical. The outputs save the other rows only as one
-non-Mamba sum, and that sum is identical. The raw outputs are
+Mamba rows and the non-Mamba sum stay the same. The outputs do not show
+whether each non-Mamba row stays the same. The raw outputs are
 [`35944ae4.json`](mamba-mixed-step-accounting/35944ae4.json) and
 [`c3ed1513.json`](mamba-mixed-step-accounting/c3ed1513.json). These are
 simulated latencies. Host runtime was not measured.
+
+### Current evidence against a hand-derived oracle
+
+The values below come from the current code. Each changed value is checked
+against bytes moved divided by memory bandwidth, computed by hand. The oracle
+does not use the pricing code. These are simulated latencies, not prediction
+accuracy or host runtime.
+
+For Nemotron Nano, a qualified scan moves `(4096 + 2 * 8 * 128 + 64) * 2 +
+4096 * 2 = 20,608` bytes per token. One BF16 state is `4096 * 128 * 2 = 1 MiB`.
+The model has 23 Mamba layers, and `b200_sxm` has 7.7e12 B/s.
+
+**Width-only telemetry rows.** At MTP3, 8 decode requests verify 4 tokens
+each, so 32 tokens. Each request reads its state once and writes 4
+checkpoints. One layer of `generation_mamba_ssm` therefore moves
+`32 * 20,608 + 8 * 1 MiB * 5 = 42,602,496` bytes. AISim scales decode work by
+`(nextn + L) / L = 55 / 52` for the MTP layer. The result is 0.134596 ms, the
+`c3ed1513` value above. The convolution update moves
+`32 * 6144 * 5 * 2 + 32 * 6144 * 2 = 2,359,296` bytes per layer, which gives
+0.007454 ms. Before the fix, each term counted 32 requests instead of 8, so
+both rows were exactly four times larger.
+
+**`run_agg` caller.** `InferenceSession.run_agg` passes its per-step prefill
+budget `ctx_tokens` to the mixed step. It does not pass a prefill request
+count. In that contract, a step holds `ceil(ctx_tokens / isl)` requests, the
+same count that context attention prices. Commit `668e98fd` split a budget
+remainder longer than `isl - prefix` into extra requests. Commit `62293977`
+prices one partial request, capped at `isl - prefix` new tokens.
+[`agg_caller.py`](mamba-mixed-step-accounting/agg_caller.py) ran
+`python agg_caller.py OUT.json` from each commit's `python/aisim` build, in
+`HYBRID` mode at MTP0 with BF16 states. The raw outputs are
+[`agg-668e98fd.json`](mamba-mixed-step-accounting/agg-668e98fd.json) and
+[`agg-62293977.json`](mamba-mixed-step-accounting/agg-62293977.json).
+
+| Case (batch, isl, prefix, budget) | Requests and new tokens | `context_mamba_ssm` before ms | After ms | Oracle ms |
+| --- | --- | --- | --- | --- |
+| One request (1, 4096, 3000, 2048) | 2 and 2048 to 1 and 1096 | 0.138596 | 0.073730 | 0.073730 |
+| Split budget (16, 4096, 1024, 8128) | 3 and 7104 to 2 and 6144 | 0.456089 | 0.390731 | 0.390731 |
+| Two complete requests (16, 4096, 3000, 8192) | 2 and 2192, unchanged | 0.147460 | 0.147460 | 0.147460 |
+| Chunked, uncached (16, 6000, 0, 2048) | 1 and 2048, unchanged | 0.132332 | 0.132332 | 0.132332 |
+
+Each request reads and writes its state once, so a context layer moves
+`tokens * 20,608 + requests * 2 MiB`. The context convolution reads a measured
+table, so the oracle does not cover it. It changes with the same request
+shapes, from 0.670842 to 0.348105 ms and from 1.493353 to 1.338048 ms. The
+non-Mamba sum is identical in every case. TTFT changes from 79.355 to 77.844 ms
+for one request and from 101.272 to 100.765 ms for the split budget. The other
+cases do not change. The `run_agg` regression
+`test_run_agg_prices_scheduled_prefill_requests_not_budget` checks the first and
+third rows. It fails on `668e98fd` with 0.138596 ms.
+
+**Native Replay.** The regression
+`op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase` runs the
+op-level Replay timing path, with and without diagnostic capture. Its fixture
+has one qualified scan per phase, with `n_groups` 4, so a token moves 18,560
+bytes. A pure-decode iteration holds 2 requests at width 4, which Replay packs
+as 8 decode requests. The decode moves `8 * 18,560 + 2 * 1 MiB * 5 =
+10,634,240` bytes, 0.001381 ms at 7.7e12 B/s. A mixed iteration adds one
+16-token prefill, `16 * 18,560 + 2 * 1 MiB = 2,394,112` bytes or 0.000311 ms,
+for a total of 0.001692 ms. Replay must report the prefill bytes as prefill
+evidence and the decode bytes as decode evidence. The test asserts each value
+against these bytes. At `35944ae4`, the pure decode gave 0.005524 ms. That is
+the oracle for 8 requests and 32 tokens, `42,536,960` bytes, so the width was
+applied twice.
+
+The embedded Replay test, the public API, engine-step parity (305), the golden
+set (121) and the Python qualification tests (54 with the new regression) passed
+at `62293977`. `telem.py` at `62293977` gave output identical to
+`c3ed1513.json`.
 
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
 `gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
@@ -242,7 +317,8 @@ The same script at commit `50ded579`, with the `aisim_core` package names,
 gives 26.294 ms and a 0.345 ms decode component. That value is not a
 before/after delta, because main changed between the revisions. That commit
 also splits this shape's 1904-token remainder into two request chunks.
-One request has at most `isl - prefix = 1096` new tokens.
+Commit `62293977` prices that remainder as one request capped at
+`isl - prefix = 1096` new tokens.
 
 ## Controls
 
@@ -252,9 +328,8 @@ One request has at most `isl - prefix = 1096` new tokens.
   output tokens, cache reuse and per-request status matched. Latency metrics
   differed only by rounding, about 1e-16. Current op-level Replay prices a
   mixed rank as one mix-step iteration. It then splits the evidence by phase,
-  so this control does not describe the current code. The replay regression
-  `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
-  covers the current path.
+  so this control does not describe the current code. The native Replay
+  oracle above covers the current path.
 - Main, Baseline and Candidate give identical results for unqualified ops.
 - Qualified and unqualified runs differ without the fix, because the analytical
   bound adds recurrent-state bytes. Compare Baseline with Candidate only.
@@ -273,6 +348,11 @@ the fix, the two prefills that total 17 tokens priced as two requests of 8
 tokens and one request of 1 token. After it, they price as one request of 9
 tokens and one of 8. The difference is one FP16 state pair (2 MiB) for each of
 23 Mamba layers at 7.7e12 B/s, within 1e-13. All other shapes were identical.
+These two latencies are transcribed observations. Their full vLLM configuration,
+metrics payload and command were not saved, so they cannot be reproduced. The
+reproducible check is `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`.
+It prices `num_prefill_requests: 2` and `sum_prefill_tokens: 17` against
+17 token rows plus 2 state pairs, never 3.
 
 ## Host cost
 

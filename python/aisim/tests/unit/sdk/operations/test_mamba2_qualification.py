@@ -73,3 +73,52 @@ def test_ad_hoc_query_takes_the_op_width_and_rejects_partial_requests():
     assert result.source == "sol"
     with pytest.raises(Exception, match="not a multiple of token_width 4"):
         op._engine_query(database, batch_size=5, s=16, x=5)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "ctx_tokens", "requests", "new_tokens"),
+    [
+        # One request with 1096 new tokens under a 2048-token budget: one state.
+        (1, 2048, 1, 1096),
+        # Two complete cached requests keep both states.
+        (16, 8192, 2, 2192),
+    ],
+)
+def test_run_agg_prices_scheduled_prefill_requests_not_budget(
+    monkeypatch, batch_size, ctx_tokens, requests, new_tokens
+):
+    from aisim.sdk.inference_session import InferenceSession
+    from aisim_core.sdk import common, config
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model, nemotron_h
+    from aisim_core.sdk.perf_database import get_database
+
+    database = get_database("b200_sxm", "trtllm", "1.3.0rc20", allow_unlisted_version=True)
+    if database is None:
+        pytest.skip("b200_sxm/trtllm/1.3.0rc20 data missing")
+    database.set_default_database_mode(common.DatabaseMode.HYBRID)
+    real_ops = nemotron_h.ops
+
+    def kernel(name, scale, source, phase, *args, **kwargs):
+        return real_ops.Mamba2Kernel(name, scale, source, phase, *args, state_dtype="bfloat16", token_width=1, **kwargs)
+
+    class QualifiedOps:
+        def __getattr__(self, name):
+            return kernel if name == "Mamba2Kernel" else getattr(real_ops, name)
+
+    monkeypatch.setattr(nemotron_h, "ops", QualifiedOps())
+    model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    session = InferenceSession(
+        get_model("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", model_config, "trtllm"),
+        database,
+        get_backend("trtllm", "b200_sxm"),
+    )
+    summary = session.run_agg(
+        config.RuntimeConfig(batch_size=batch_size, isl=4096, osl=64, prefix=3000), ctx_tokens=ctx_tokens
+    )
+    # Bytes / bandwidth for 23 Mamba layers at b200_sxm's 7.7e12 B/s. Per token the
+    # scan moves (4096 + 2 * 8 * 128 + 64) * 2 + 4096 * 2 = 20,608 bytes; each
+    # request reads and writes its 1 MiB BF16 state once.
+    expected_ms = 23 * (new_tokens * 20_608 + requests * 2 * 1_048_576) / 7.7e12 * 1000
+    got = summary.get_per_ops_data()["mix_step"]["context_mamba_ssm"]
+    assert got == pytest.approx(expected_ms, rel=1e-9)
