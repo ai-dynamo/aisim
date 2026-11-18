@@ -429,6 +429,16 @@ rejected; measured DCP profiles without `fpm_profile` retain their existing rout
 Profile/schema and precision conflicts fail before estimator fallback. Omitted precision fields are filled
 from the profile and preserved in the resolved canonical configuration.
 
+A published FPM library (`fpm/fpm_forward_perf.parquet`, schema `aic_fpm_forward_perf/v6`) may declare an
+optional `resources` block in its `fpm_forward_perf.metadata.json` sidecar. The block uses the deployment
+`resources` schema (`runtime_memory`, `cache_layout`, `cache_groups`, `mamba_cache`, `max_num_tokens`,
+`max_batch_size`, `provenance`). When the data library loads an entry it resolves each deployment's resources as
+the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, then pending. The first block found
+is used whole, never merged field by field. Pending means missing: a deployment without any resources fails with
+the fields to supply. A block with valid geometry but no `runtime_memory` or declared bytes still serves timing
+queries; cache sizing and replay need the memory. Entries published without `resources` stay valid. Loading uses
+only the library and its sidecar and never reads `measurements/`.
+
 Each deployment may declare `worker_type: prefill`, `decode`, or `aggregated`.
 The canonical construction request selects only the matching role's precision,
 scheduler envelope, cache geometry and memory evidence. Separate P/D deployments
