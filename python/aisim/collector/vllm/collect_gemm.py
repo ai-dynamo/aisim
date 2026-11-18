@@ -223,16 +223,19 @@ def _w4a16_nvfp4_checkpoint_weights(weight_bf16):
 def _w4a16_nvfp4_does_not_fit(m, n, k, device):
     """Why W4A16_NVFP4 weight preparation cannot fit the device, or None; checked before allocating.
 
-    Lower bound on what is live at once, per weight element: the layer's packed FP4 weight (0.5 B)
-    and the BF16 weight (2 B), plus its full-size abs() temporary for the global scale (2 B) or,
+    Lower bound on what is live at once, per weight element: the layer's packed FP4 weight and
+    FP8 block scales (0.5 + 1/16 B), the BF16 weight (2 B), plus its full-size abs() temporary
+    for the global scale (2 B) or,
     below SM100, the FP32 copy that ref_nvfp4_quant makes (4 B; nvfp4_emulation_utils.py
     :640-654 @0.31.0). Memory the allocator reserved but does not use is reusable, so it counts
     as available alongside driver-free memory. The BF16 activation (2 B per element) is
     allocated before the weight, so it is counted too. The preparation tensors are freed after
-    loading, so the dry-run forward holds the layer's packed weight and the BF16 output (m x n).
+    loading, so the dry-run forward holds the layer's packed weight and scales and the BF16
+    output (m x n).
     """
-    preparation = n * k * (4.5 if get_sm_version() >= 100 else 6.5)
-    forward = 0.5 * n * k + 2 * m * n
+    layer = 0.5625 * n * k
+    preparation = layer + n * k * (4 if get_sm_version() >= 100 else 6)
+    forward = layer + 2 * m * n
     needed = int(max(preparation, forward)) + 2 * m * k
     available = (
         torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)

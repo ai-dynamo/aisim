@@ -173,6 +173,12 @@ def test_weight_preparation_counts_reusable_allocator_memory(torch, collect_gemm
     # The forward's BF16 output counts as well: a small weight with a 4 GiB output does not fit in 3 GiB.
     monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 4 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 16, "cuda:0").startswith("FIXME(kernel-limit)")
+    # The layer's FP8 block scales count too: activation, packed weight and output fit in 4192 MiB,
+    # the 4 MiB of scales do not.
+    monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(collect_gemm.torch.cuda, "mem_get_info", lambda _device: (4192 * mib, 80 * gib))
+    monkeypatch.setattr(collect_gemm.torch.cuda, "memory_reserved", lambda _device: 2 * gib)
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 1024, "cuda:0").startswith("FIXME(kernel-limit)")
 
 
 def test_blackwell_keeps_the_scaled_fp4_quant_kernel(torch, collect_gemm, monkeypatch):
