@@ -1,0 +1,8 @@
+system=h100_sxm job=42089 node=pool0-0006 start=1794991665
+CPU(s):                                  192
+Model name:                              AMD EPYC 7R13 Processor
+Thread(s) per core:                      2
+Socket(s):                               2
+f7e564e350b7932e23c2d15703e85c2160ae59673f844b115988693d01bb7aa9  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_lights-out-inf/users/simonec/tokenization-cost/workload/agentx-l1-60.jsonl
+ddcf54b1bafb63b3eac90c420b744fb5e6291c1e478015582145129d76b76201  /lustre/fsw/portfolios/coreai/projects/coreai_comparch_lights-out-inf/users/simonec/images/pr664-cost-vllm0310-amd64-a4a4c043.sqsh
+end=1794991975

@@ -17,13 +17,14 @@ import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-Category = Literal["op-latency", "fpm", "e2e", "eval", "systems"]
+Category = Literal["op-latency", "fpm", "e2e", "eval", "systems", "host-cost"]
 Purpose = Literal[
     "operation-tables",
     "execution-profile",
     "e2e-configuration",
     "evaluation-record",
     "system-spec",
+    "host-cost-profile",
 ]
 # Version 1 hashed only the original Identity fields. Version 2 adds the
 # first-class deployment fields below. Version 3 adds the deployment facts that
@@ -270,6 +271,10 @@ def _check_indexed_manifest(root: Path, path: str, category: str) -> Manifest:
         from aisim_core.data.e2e import load_e2e
 
         return load_e2e(root, path).manifest
+    if category == "host-cost":
+        from aisim_core.data.host_cost import check_entry
+
+        return check_entry(root, path)
     # eval and systems documents have no manifest-level checker here: the envelope hash, identity and
     # every declared artifact are verified, and their own validators check the content.
     for artifact in manifest.artifacts:

@@ -141,6 +141,10 @@ worker's engine. Servers are taken first come, first served.
 - With more workers, a short prompt can finish before a long one that arrived
   earlier and reach the engine first.
 
+Measured per-token costs by framework, tokenizer and host CPU are in the
+[host-cost data](../../reference/host-cost-schema.md); there is no default for a deployment that has not been
+measured.
+
 Without this block, requests reach each engine at their arrival time, and
 requests that arrive together keep their authored order; see
 [same-timestamp admission](../workloads.md#same-timestamp-admission).
