@@ -761,18 +761,19 @@ An earlier five-round run, in
 [`host-perf-1db9b803.json`](mamba-mixed-step-accounting/host-perf-1db9b803.json),
 ran the builds in the same order every round, `1db9b803` last. It gave -7.4%
 to +2.3%. Because the order was fixed, it does not control for build
-position, and the rotated run replaces it. It also replaces an earlier three-round
-fixed-order run,
-[`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json),
-which measured `1ea0211c` at 17.08 us for the first case against 14.08 us
-for main.
+position, and the rotated run replaces it. It also replaces an earlier three-round fixed-order run, in
+[`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json).
+That run measured `1ea0211c` at 17.08 us for the first case, against
+14.08 us for main.
 
 The CI gate on `c425c61a` found one confirmed regression among 101 stable
 comparisons, DeepSeek-V3.2 TP8 generation from a cold query (+14.7%
 geometric mean). The rotated driver also ran the six DeepSeek-V3.2 gate
 cases. At `bf03c37d`, the two TP8 generation cold queries change by +0.2%
 and +3.2%, and all six by -1.6% to +3.3%. So it does not reproduce that
-result. That run used
+result. That run used the `bc84a5fd` driver with its model filter replaced
+by `model_id.startswith("deepseek-v3.2")`. The checked-in driver selects
+the same six cases with
 `HOST_PERF_MODELS=deepseek-v3.2 python host_perf.py ROOT 6 OUT.json rbf1b539f r1db9b803 rbf03c37d`.
 The raw rounds are in
 [`host-perf-deepseek-bf03c37d.json`](mamba-mixed-step-accounting/host-perf-deepseek-bf03c37d.json). These are simulator host timings, not predicted
