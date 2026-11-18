@@ -203,6 +203,7 @@ pub(crate) struct PrefixMatchHint {
 pub struct RadixCache {
     nodes: SlotMap<NodeId, TreeNode>,
     root: NodeId,
+    mamba_checkpoints: usize,
     pub page_pool: PagePool,
     page_size: usize,
     #[cfg(test)]
@@ -270,6 +271,7 @@ impl RadixCache {
         Self {
             nodes,
             root,
+            mamba_checkpoints: 0,
             page_pool: PagePool::new(total_tokens, page_size),
             page_size,
             #[cfg(test)]
@@ -790,16 +792,14 @@ impl RadixCache {
     }
 
     pub(crate) fn mark_mamba_checkpoint(&mut self, node: NodeId) {
-        if node != self.root {
+        if node != self.root && !self.nodes[node].mamba_checkpoint {
             self.nodes[node].mamba_checkpoint = true;
+            self.mamba_checkpoints += 1;
         }
     }
 
     pub(crate) fn mamba_checkpoint_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|node| node.mamba_checkpoint)
-            .count()
+        self.mamba_checkpoints
     }
 
     /// Read-only prefix match length (does not mutate timestamps or split nodes).
@@ -1381,7 +1381,10 @@ impl RadixCache {
                 let victim_node = &mut nodes[victim_id];
                 victim_node.key.truncate(split_pos);
                 victim_node.edge_version += 1;
-                victim_node.mamba_checkpoint = false;
+                if victim_node.mamba_checkpoint {
+                    self.mamba_checkpoints -= 1;
+                    victim_node.mamba_checkpoint = false;
+                }
                 let evicted_values = &victim_node.value[split_pos..];
                 if let Some(belady) = &mut self.belady {
                     for page in evicted_values {
@@ -1403,6 +1406,9 @@ impl RadixCache {
                 .nodes
                 .remove(victim_id)
                 .expect("evictable leaf disappeared before removal");
+            if victim_node.mamba_checkpoint {
+                self.mamba_checkpoints -= 1;
+            }
             self.forget_swa_boundary(victim_id);
             let tokens = victim_node.key.len() * self.page_size;
             let parent_id = victim_node.parent;
@@ -1448,6 +1454,54 @@ mod tests {
     use super::*;
     use crate::engine::common::hashing::compute_seq_hash_for_block;
     use uuid::Uuid;
+
+    #[test]
+    fn mamba_checkpoints_survive_splits_but_not_endpoint_eviction() {
+        let mut cache = RadixCache::new(32, 1);
+        let tokens: Vec<u32> = (0..8).collect();
+        let pages = cache.page_pool.allocate(tokens.len()).unwrap();
+        let endpoint = cache.insert(&tokens, &pages);
+        cache.mark_mamba_checkpoint(cache.root());
+        cache.mark_mamba_checkpoint(endpoint);
+        cache.mark_mamba_checkpoint(endpoint);
+        assert_eq!(cache.mamba_checkpoint_count(), 1);
+
+        // A split creates KV at token 4, but no recurrent state there.
+        let (_, split) = cache.match_prefix(&tokens[..4]);
+        assert_ne!(split, endpoint);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&tokens[..6])),
+            (0, 6)
+        );
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&tokens)),
+            (8, 8)
+        );
+        cache.mark_mamba_checkpoint(split);
+        assert_eq!(cache.mamba_checkpoint_count(), 2);
+
+        // Extending a checkpoint must retain its original endpoint.
+        let extended: Vec<u32> = (0..10).collect();
+        let more = cache.page_pool.allocate(2).unwrap();
+        let mut all_pages = pages;
+        all_pages.extend(more);
+        let tail = cache.insert(&extended, &all_pages);
+        assert_ne!(tail, endpoint);
+        cache.mark_mamba_checkpoint(tail);
+        assert_eq!(cache.mamba_checkpoint_count(), 3);
+        cache.evict(1); // Partial eviction clears token 10's checkpoint.
+        assert_eq!(cache.mamba_checkpoint_count(), 2);
+        cache.evict(1); // Removing the unmarked remainder must not decrement again.
+        assert_eq!(cache.mamba_checkpoint_count(), 2);
+        cache.evict(4); // Removing the marked token-8 endpoint leaves token 4.
+        assert_eq!(cache.mamba_checkpoint_count(), 1);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&tokens)),
+            (4, 4)
+        );
+        cache.evict(4);
+        assert_eq!(cache.mamba_checkpoint_count(), 0);
+    }
 
     fn oracle_for_prompts(prompts: &[&[u32]]) -> BeladyOracle {
         BeladyOracle::new(

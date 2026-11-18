@@ -67,6 +67,8 @@ pub(crate) struct RadixRequestLease {
     pub(crate) request_id: Uuid,
 
     cache_salt: Option<String>,
+    /// A matched request retains its private state even if admission is deferred.
+    mamba_matched_copy: bool,
     mamba_branch_point: Option<usize>,
     mamba_prefill_checkpoint: Option<usize>,
     mamba_decode_checkpoint: Option<usize>,
@@ -190,6 +192,7 @@ impl RadixRequestLease {
             request_id: Uuid::nil(),
 
             cache_salt: None,
+            mamba_matched_copy: false,
             mamba_branch_point: None,
             mamba_prefill_checkpoint: None,
             mamba_decode_checkpoint: None,
@@ -228,6 +231,7 @@ pub struct SglangKvManager {
     hicache: Option<HiCache>,
     mamba_cache: Option<crate::engine::SglangMambaCacheConfig>,
     mamba_active_requests: usize,
+    mamba_waiting_copies: usize,
     mamba_capacity_error: Option<String>,
 }
 
@@ -325,6 +329,7 @@ impl SglangKvManager {
             hicache: None,
             mamba_cache: None,
             mamba_active_requests: 0,
+            mamba_waiting_copies: 0,
             mamba_capacity_error: None,
         }
     }
@@ -372,6 +377,7 @@ impl SglangKvManager {
         let required = self
             .mamba_active_requests
             .saturating_mul(3)
+            .saturating_add(self.mamba_waiting_copies)
             .saturating_add(self.cache.mamba_checkpoint_count())
             .saturating_add(additional);
         if required > config.max_states {
@@ -386,8 +392,28 @@ impl SglangKvManager {
 
     /// Matching a checkpoint creates the candidate's private live-state copy,
     /// before native admission decides whether the KV budget can fit it.
-    pub(crate) fn check_mamba_match_capacity(&mut self, matched_tokens: usize) -> bool {
-        self.mamba_cache.is_none() || matched_tokens == 0 || self.check_mamba_capacity(1)
+    pub(crate) fn check_mamba_match_capacity(
+        &mut self,
+        lease: &mut RadixRequestLease,
+        matched_tokens: usize,
+    ) -> bool {
+        if self.mamba_cache.is_none() || matched_tokens == 0 || lease.mamba_matched_copy {
+            return true;
+        }
+        if !self.check_mamba_capacity(1) {
+            return false;
+        }
+        lease.mamba_matched_copy = true;
+        self.mamba_waiting_copies += 1;
+        true
+    }
+
+    fn release_mamba_match(&mut self, lease: &mut RadixRequestLease) -> bool {
+        if !std::mem::take(&mut lease.mamba_matched_copy) {
+            return false;
+        }
+        self.mamba_waiting_copies -= 1;
+        true
     }
 
     pub(crate) fn prepare_prefill_checkpoint(
@@ -647,8 +673,10 @@ impl SglangKvManager {
         pages: usize,
     ) -> usize {
         let page_keys = &lease.page_hashes[..pages];
-        if self.mamba_cache.is_some() {
+        if let Some(config) = self.mamba_cache {
             let (checkpoint, branch) = self.cache.mamba_prefix_match(page_keys);
+            let branch =
+                branch / config.prefill_checkpoint_interval * config.prefill_checkpoint_interval;
             lease.mamba_branch_point = (branch > checkpoint).then_some(branch);
             return checkpoint;
         }
@@ -757,7 +785,8 @@ impl SglangKvManager {
         if required_tokens > available {
             self.evict(required_tokens - available);
         }
-        if self.mamba_cache.is_some() && !self.check_mamba_capacity(3) {
+        let new_states = 3 - usize::from(lease.mamba_matched_copy);
+        if self.mamba_cache.is_some() && !self.check_mamba_capacity(new_states) {
             self.cache.dec_lock_ref(last_node);
             return None;
         }
@@ -784,6 +813,7 @@ impl SglangKvManager {
         lease.admission_reused_tokens = prefix_len;
         lease.last_node = Some(last_node);
         if self.mamba_cache.is_some() {
+            self.release_mamba_match(lease);
             self.mamba_active_requests += 1;
             self.check_mamba_capacity(0);
         }
@@ -893,7 +923,12 @@ impl SglangKvManager {
         lease.cached_tokens = complete_len;
         if self.mamba_cache.is_some() {
             self.cache.mark_mamba_checkpoint(new_last_node);
-            lease.mamba_prefill_checkpoint = None;
+            if lease
+                .mamba_prefill_checkpoint
+                .is_some_and(|checkpoint| checkpoint <= complete_len)
+            {
+                lease.mamba_prefill_checkpoint = None;
+            }
         }
         self.mark_swa_insert(
             lease,
@@ -966,6 +1001,7 @@ impl SglangKvManager {
             debug_assert!(lease.pages.is_empty());
             debug_assert_eq!(lease.materialized_tokens, 0);
             debug_assert_eq!(lease.cached_tokens, 0);
+            self.release_mamba_match(&mut lease);
             return;
         };
         if !self.enable_prefix_caching {
@@ -1251,7 +1287,7 @@ impl SglangKvManager {
             debug_assert!(lease.pages.is_empty());
             debug_assert_eq!(lease.materialized_tokens, 0);
             debug_assert_eq!(lease.cached_tokens, 0);
-            return false;
+            return self.release_mamba_match(lease);
         };
         assert!(
             lease.cached_tokens <= lease.len(),
@@ -1644,6 +1680,143 @@ mod tests {
             self.events.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    fn mamba_manager(max_states: usize) -> SglangKvManager {
+        let mut manager = SglangKvManager::new(4096, 1, KvEventPublishers::default(), 0);
+        manager.enable_mamba_cache(crate::engine::SglangMambaCacheConfig {
+            prefill_checkpoint_interval: 64,
+            decode_checkpoint_interval: 256,
+            max_states,
+        });
+        manager
+    }
+
+    fn mamba_seed(manager: &mut SglangKvManager, tokens: &[u32]) {
+        let mut lease = RadixRequestLease::default();
+        lease.ensure_page_hashes(tokens, 1);
+        let prefix = manager.admission_prefix_match(&mut lease, tokens.len());
+        assert!(manager.check_mamba_match_capacity(&mut lease, prefix));
+        assert_eq!(
+            manager.allocate_for_request_lease(tokens, &mut lease),
+            Some(prefix)
+        );
+        manager.prepare_prefill_checkpoint(&mut lease, prefix, tokens.len());
+        manager.finish(tokens, lease);
+    }
+
+    #[test]
+    fn mamba_unaligned_branch_reuses_the_rounded_checkpoint() {
+        let mut manager = mamba_manager(16);
+        let first: Vec<u32> = (0..128).collect();
+        mamba_seed(&mut manager, &first);
+        let second: Vec<u32> = (0..100).chain(1000..1100).collect();
+        mamba_seed(&mut manager, &second);
+        let third: Vec<u32> = second[..150].iter().copied().chain(2000..2050).collect();
+        let mut lease = RadixRequestLease::default();
+        lease.ensure_page_hashes(&third, 1);
+        assert_eq!(manager.admission_prefix_match(&mut lease, third.len()), 64);
+        assert_eq!(
+            manager.allocate_for_request_lease(&third, &mut lease),
+            Some(64)
+        );
+        manager.abort(lease);
+    }
+
+    #[test]
+    fn mamba_waiting_copy_is_counted_once_and_transferred_or_cancelled() {
+        let mut manager = mamba_manager(4);
+        let tokens: Vec<u32> = (0..64).collect();
+        mamba_seed(&mut manager, &tokens);
+        let mut waiting = RadixRequestLease::default();
+        for _ in 0..3 {
+            assert!(manager.check_mamba_match_capacity(&mut waiting, 64));
+            assert_eq!(manager.mamba_waiting_copies, 1);
+        }
+        assert!(manager.abort(waiting));
+        assert_eq!(manager.mamba_waiting_copies, 0);
+
+        let mut waiting = RadixRequestLease::default();
+        assert!(manager.check_mamba_match_capacity(&mut waiting, 64));
+        assert_eq!(
+            manager.allocate_for_request_lease(&tokens, &mut waiting),
+            Some(64)
+        );
+        assert_eq!(manager.mamba_waiting_copies, 0);
+        assert_eq!(manager.mamba_active_requests, 1);
+        manager.validate_mamba_capacity().unwrap(); // one checkpoint + three active slots
+        manager.abort(waiting);
+        assert_eq!(manager.mamba_active_requests, 0);
+    }
+
+    #[test]
+    fn mamba_waiting_copy_blocks_checkpoint_publication_at_capacity() {
+        let mut manager = mamba_manager(5);
+        let cached: Vec<u32> = (0..64).collect();
+        mamba_seed(&mut manager, &cached);
+        let active: Vec<u32> = (1000..1128).collect();
+        let mut running = manager.allocate_for_request(&active).unwrap().lease;
+        let mut waiting = RadixRequestLease::default();
+        assert!(manager.check_mamba_match_capacity(&mut waiting, 64));
+        assert!(manager.check_mamba_match_capacity(&mut waiting, 64));
+        manager.prepare_prefill_checkpoint(&mut running, 0, 64);
+        manager.extend_cached_prefix(&active[..64], &mut running);
+        assert_eq!(manager.cache.mamba_checkpoint_count(), 1);
+        let error = manager.validate_mamba_capacity().unwrap_err().to_string();
+        assert!(error.contains("6 states required, max_states=5"), "{error}");
+        manager.abort(waiting);
+        manager.abort(running);
+    }
+
+    #[test]
+    fn mamba_rejected_allocation_retains_one_copy_until_retry() {
+        let mut manager = mamba_manager(5);
+        let cached: Vec<u32> = (0..64).collect();
+        mamba_seed(&mut manager, &cached);
+        let running = manager
+            .allocate_for_request(&(1000..5000).collect::<Vec<_>>())
+            .unwrap()
+            .lease;
+        let prompt: Vec<u32> = cached.iter().copied().chain(6000..6100).collect();
+        let mut waiting = RadixRequestLease::default();
+        waiting.ensure_page_hashes(&prompt, 1);
+        for _ in 0..2 {
+            let prefix = manager.admission_prefix_match(&mut waiting, prompt.len());
+            assert_eq!(prefix, 64);
+            assert!(manager.check_mamba_match_capacity(&mut waiting, prefix));
+            // Protected KV leaves too little room; the match's copy survives.
+            assert_eq!(
+                manager.allocate_for_request_lease(&prompt, &mut waiting),
+                None
+            );
+            assert_eq!(manager.mamba_waiting_copies, 1);
+            assert!(!waiting.is_active());
+            manager.validate_mamba_capacity().unwrap();
+        }
+        manager.abort(running);
+        assert_eq!(
+            manager.allocate_for_request_lease(&prompt, &mut waiting),
+            Some(64)
+        );
+        assert_eq!(manager.mamba_waiting_copies, 0);
+        assert_eq!(manager.mamba_active_requests, 1);
+        manager.abort(waiting);
+        assert_eq!(manager.mamba_active_requests, 0);
+    }
+
+    #[test]
+    fn mamba_kv_eviction_pressure_is_an_explicit_error() {
+        let mut manager = mamba_manager(4);
+        mamba_seed(&mut manager, &(0..64).collect::<Vec<_>>());
+        manager.evict(1);
+        assert!(
+            manager
+                .validate_mamba_capacity()
+                .unwrap_err()
+                .to_string()
+                .contains("KV pressure")
+        );
+        assert_eq!(manager.cache.mamba_checkpoint_count(), 1);
     }
 
     #[test]

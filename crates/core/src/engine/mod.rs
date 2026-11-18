@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
-// Copyright 2023-2024 SGLang Team and contributors.
+// Copyright 2023-2026 SGLang Team.
 // Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
 // See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 
@@ -48,8 +48,8 @@ pub use config::{AfdAPoolConfig, AfdEngineConfig, AfdFPoolConfig};
 pub use config::{
     Backend, EngineConfig, FrontendConfig, FrontendStage, G2Connector, G2Scope, G3OffloadConfig,
     G3Scope, KvcrConfig, NativeHostOffloadConfig, PassLaunchConfig, PreemptionMode, SglangConfig,
-    SglangHiCacheConfig, SglangHiCacheWritePolicy, SglangMambaCacheConfig, SglangSchedulePolicy, SlidingWindowStateConfig,
-    StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
+    SglangHiCacheConfig, SglangHiCacheWritePolicy, SglangMambaCacheConfig, SglangSchedulePolicy,
+    SlidingWindowStateConfig, StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig, WorkerType,
 };
 pub(crate) use config::{MAX_PIPELINE_FILL_PASSES, afd_total_gpus};
 pub use fitted_timing::FittedIterationTiming;

@@ -1536,7 +1536,16 @@ impl SglangCore {
         let mut chunk_commits = Vec::new();
         for mut req in admit.can_run {
             if req.materialized_tokens < req.current_sequence_len() {
-                cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
+                if self.config.mamba_cache.is_some() {
+                    super::decode::commit_materialized_prefix(
+                        &mut req,
+                        &mut self.kv_manager,
+                        &self.config,
+                        &mut chunk_commits,
+                    );
+                } else {
+                    cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
+                }
                 if self.host.is_some() && self.kv_manager.hicache_enabled() {
                     chunk_commits.push((req.uuid, req.materialized_tokens));
                 }
@@ -1719,8 +1728,17 @@ impl SglangCore {
                         if let Some(index) = self.waiting.iter().position(|r| r.uuid == request_id)
                         {
                             let mut request = self.waiting.remove(index).unwrap();
-                            self.kv_manager
-                                .backup_cached_prefix(&mut request.kv_lease, tokens);
+                            if self.config.mamba_cache.is_some() {
+                                cache_prefix_through(
+                                    &mut request,
+                                    &mut self.kv_manager,
+                                    &self.config,
+                                    tokens,
+                                );
+                            } else {
+                                self.kv_manager
+                                    .backup_cached_prefix(&mut request.kv_lease, tokens);
+                            }
                             self.waiting.insert(index, request);
                         }
                         continue;

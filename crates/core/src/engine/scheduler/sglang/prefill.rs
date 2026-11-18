@@ -103,7 +103,9 @@ pub(super) fn get_new_batch_prefill(
         } else {
             Default::default()
         };
-        if first_admission && !kv_manager.check_mamba_match_capacity(matched.device_tokens) {
+        if first_admission
+            && !kv_manager.check_mamba_match_capacity(&mut req.kv_lease, matched.device_tokens)
+        {
             waiting.push_front(req);
             break;
         }

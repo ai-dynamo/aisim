@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
 // Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
-// Copyright 2023-2024 SGLang Team and contributors.
+// Copyright 2023-2026 SGLang Team.
 // Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/runtime_context.py
 // See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
@@ -503,6 +503,10 @@ impl SglangMambaCacheConfig {
         ensure!(
             !engine.emit_kv_events,
             "sglang.mamba_cache does not support KV events"
+        );
+        ensure!(
+            engine.sglang.swa_prefix_tails.is_none(),
+            "sglang.mamba_cache does not support SWA prefix tails"
         );
         ensure!(
             self.prefill_checkpoint_interval > 0
@@ -2109,6 +2113,93 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mamba_native_config_round_trip_defaults_and_rejections() {
+        let base = serde_json::json!({
+            "backend": "sglang", "block_size": 64,
+            "sglang": {"mamba_cache": {"max_states": 994}}
+        });
+        let config: EngineConfig = serde_json::from_value(base.clone()).unwrap();
+        config.validate().unwrap();
+        let mamba = config.sglang.mamba_cache.unwrap();
+        assert_eq!(mamba.prefill_checkpoint_interval, 64);
+        assert_eq!(mamba.decode_checkpoint_interval, 256);
+        let round_trip: EngineConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(round_trip.sglang.mamba_cache, Some(mamba));
+        let off = EngineConfig::for_backend(Backend::Sglang);
+        assert!(off.sglang.mamba_cache.is_none());
+        let mut missing = base.clone();
+        missing["sglang"]["mamba_cache"] = serde_json::json!({});
+        assert!(serde_json::from_value::<EngineConfig>(missing).is_err());
+        let mut unknown = base.clone();
+        unknown["sglang"]["mamba_cache"]["typo"] = 1.into();
+        assert!(serde_json::from_value::<EngineConfig>(unknown).is_err());
+
+        for (path, value, expected) in [
+            (
+                "/sglang/mamba_cache/prefill_checkpoint_interval",
+                serde_json::json!(0),
+                "prefill_checkpoint_interval",
+            ),
+            (
+                "/sglang/mamba_cache/prefill_checkpoint_interval",
+                serde_json::json!(96),
+                "prefill_checkpoint_interval",
+            ),
+            (
+                "/sglang/mamba_cache/decode_checkpoint_interval",
+                serde_json::json!(0),
+                "decode_checkpoint_interval",
+            ),
+            (
+                "/sglang/mamba_cache/decode_checkpoint_interval",
+                serde_json::json!(100),
+                "decode_checkpoint_interval",
+            ),
+            (
+                "/sglang/mamba_cache/max_states",
+                serde_json::json!(3),
+                "max_states",
+            ),
+            (
+                "/sglang/chunked_prefill_size",
+                serde_json::json!(100),
+                "chunked_prefill_size",
+            ),
+            (
+                "/sglang/swa_prefix_tails",
+                serde_json::json!(8),
+                "SWA prefix tails",
+            ),
+            ("/backend", serde_json::json!("vllm"), "backend=sglang"),
+            (
+                "/worker_type",
+                serde_json::json!("prefill"),
+                "worker_type=aggregated",
+            ),
+            (
+                "/enable_prefix_caching",
+                serde_json::json!(false),
+                "enable_prefix_caching",
+            ),
+            ("/emit_kv_events", serde_json::json!(true), "KV events"),
+            ("/aic_nextn", serde_json::json!(2), "speculative"),
+            (
+                "/sglang/hicache",
+                serde_json::json!({"num_host_blocks": 10}),
+                "offload",
+            ),
+        ] {
+            let mut payload = serde_json::to_value(&config).unwrap();
+            let (parent, field) = path.rsplit_once('/').unwrap();
+            payload.pointer_mut(parent).unwrap()[field] = value;
+            let config: EngineConfig = serde_json::from_value(payload).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{path}: {error}");
+        }
+    }
 
     fn sample_afd_config() -> AfdEngineConfig {
         AfdEngineConfig {

@@ -780,6 +780,43 @@ mod disaggregated_tests {
     use super::*;
 
     #[test]
+    fn mamba_replay_rejects_dp_cp_pp_and_belady() {
+        let rank: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "sglang", "sglang": {"mamba_cache": {"max_states": 16}}
+        }))
+        .unwrap();
+        let base = ReplayEngineConfig {
+            rank,
+            ..Default::default()
+        };
+        let factory = ReplayEngineFactory::new();
+        assert!(
+            factory
+                .role_factory(&base, WorkerStage::Aggregated, false)
+                .is_ok()
+        );
+        for dimension in ["dp", "cp", "pp", "pp_size", "belady"] {
+            let mut config = base.clone();
+            match dimension {
+                "dp" => config.dp_size = 2,
+                "cp" => config.prefill_context_parallel_size = 2,
+                "belady" => config.kv_eviction_policy = KvEvictionPolicy::Belady,
+                pp => {
+                    config.rank.timing_model = crate::engine::TimingModelConfig::External {
+                        provider: "aic".into(),
+                        config: serde_json::json!({pp: 2}),
+                    }
+                }
+            }
+            let Err(error) = factory.role_factory(&config, WorkerStage::Aggregated, false) else {
+                panic!("Mamba cache must reject {dimension}");
+            };
+            assert!(matches!(error, ReplayError::InvalidSpec(_)), "{error}");
+            assert!(error.to_string().contains("sglang.mamba_cache"), "{error}");
+        }
+    }
+
+    #[test]
     fn gpu_accounting_rejects_zero_cp_and_overflow() {
         let mut config = ReplayEngineConfig {
             prefill_context_parallel_size: 0,
