@@ -7818,12 +7818,17 @@ mod tests {
         model
             .tune_with_fpms(&fitted_training_iterations(&[IterationKind::Decode], false))
             .unwrap();
-        let timing = snapshot_timing_config(&model, &dir.path().join("depth-six"));
+        let saved = model
+            .save_state_snapshot(
+                dir.path().join("depth-six"),
+                &crate::StateSnapshotOptions::default(),
+            )
+            .unwrap();
         let mut role = ReplayRoleConfig::default();
         role.rank.block_size = 16;
         role.rank.timing_model = TimingModelConfig::External {
             provider: "aic".into(),
-            config: serde_json::to_value(timing).unwrap(),
+            config: serde_json::to_value(saved).unwrap(),
         };
         let error = resolve_role_timing(
             &mut role,
