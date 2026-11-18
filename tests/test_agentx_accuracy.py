@@ -125,6 +125,42 @@ def seal(files, snapshot=None):
     )
 
 
+@pytest.mark.parametrize(
+    "corruption", ["later_identity", "later_provenance", "earlier_accounting", "later_feature_parameters"]
+)
+def test_incomplete_silicon_evidence_cannot_hide_bundle_corruption(corruption):
+    from test_benchmark_features import silicon_metadata
+
+    features = silicon_metadata("incomplete-silicon")
+    features["features"][0].update(state="unknown", evidence=[])
+    first = result(id="incomplete-silicon", category="self_collected", feature_metadata=features)
+    second = result(id="later-result")
+    if corruption == "later_feature_parameters":
+        offload = next(row for row in features["features"] if row["id"] == "cache.g2")
+        offload["parameters"] = [{"name": "scope", "value": "local"}]
+        expected_error = "Resolved offload scope required"
+    elif corruption == "earlier_accounting":
+        first["request_errors"]["ttft_ms"]["count"] += 1
+        expected_error = "Request denominator does not reconcile"
+    elif corruption == "later_provenance":
+        second["simulation_features"] = simulation_record("later-result", revision="f" * 40)
+        expected_error = "Simulation features differ"
+    else:
+        expected_error = "overview and detail disagree"
+    files = bundle(first)
+    other = bundle(second)
+    summary = json.loads(files["summary.json"])
+    summary["runs"].extend(json.loads(other["summary.json"])["runs"])
+    files["summary.json"] = canonical(summary)
+    detail = json.loads(other["details/later-result.json"])
+    if corruption == "later_identity":
+        detail["lanes"] += 1
+    files["details/later-result.json"] = canonical(detail)
+    seal(files)
+    with pytest.raises(ValueError, match=expected_error):
+        validate_bundle(files)
+
+
 def test_macro_points_micro_requests_and_no_error_of_means():
     a = score([observation()], [observation(ttft_ms=200)], "successful_profile_span")
     b = score(
@@ -807,7 +843,8 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         assert all(row["observed"] == {"state": "unknown", "count": None} for row in published["features"])
 
 
-def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, monkeypatch):
+@pytest.mark.parametrize("incomplete_corruption", ["driver", "run", "job"])
+def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, monkeypatch, incomplete_corruption):
     from scripts.e2e_accuracy.agentx_contract import driver_digest
     from scripts.pages import agentx_pages as publisher
 
@@ -878,9 +915,15 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, mo
     from test_benchmark_features import silicon_metadata
 
     job["head_sha"] = run["head_sha"]
+    job["conclusion"] = "success"
     features = silicon_metadata("fresh-weka")
     features["features"][0].update(state="unknown", evidence=[])
     files = bundle(result(id="fresh-weka", category="self_collected", feature_metadata=features))
+    for name in ("summary.json", "details/fresh-weka.json"):
+        value = json.loads(files[name])
+        value["snapshot"]["driver_sha256"] = driver_digest()
+        files[name] = canonical(value)
+    seal(files)
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as zipped:
         for name, content in files.items():
@@ -888,6 +931,27 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, mo
     publisher.prepare(tmp_path, tmp_path / "incomplete")
     assert not (tmp_path / "incomplete" / key).exists()
     assert json.loads((tmp_path / "incomplete/updates.json").read_text())["main"]["status"] == "failed"
+    # Recoverable receipt age cannot bypass exact producer verification.
+    corrupted = dict(files)
+    if incomplete_corruption == "job":
+        job["head_sha"] = "f" * 40
+        expected_error = "Untrusted AgentX qualification job"
+    else:
+        for name in ("summary.json", "details/fresh-weka.json"):
+            value = json.loads(corrupted[name])
+            value["snapshot"]["driver_sha256" if incomplete_corruption == "driver" else "run_id"] = (
+                "f" * 64 if incomplete_corruption == "driver" else "999"
+            )
+            corrupted[name] = canonical(value)
+        seal(corrupted)
+        expected_error = "driver differs" if incomplete_corruption == "driver" else "attempt mismatch"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, content in corrupted.items():
+            zipped.writestr(name, content)
+    with pytest.raises(ValueError, match=expected_error):
+        publisher.prepare(tmp_path, tmp_path / "incomplete-corrupt")
+    job["head_sha"] = run["head_sha"]
     # Structural corruption is still an error, independently of receipt age.
     files["summary.json"] += b" "
     archive = io.BytesIO()

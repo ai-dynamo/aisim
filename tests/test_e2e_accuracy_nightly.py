@@ -1338,13 +1338,14 @@ def test_predictor_layout_rejects_multiple_baseline_apis(adapters):
     "api,adapter_name",
     [
         ("aisim.legacy_cli.api", "aisim.sdk.config_adapter"),
+        ("aisimulate.legacy_cli.api", "aisimulate.sdk.config_adapter"),
         ("aiconfigurator.cli.api", "aiconfigurator.sdk.config_adapter"),
     ],
 )
 def test_predict_point_calls_selected_api_and_adapter(monkeypatch, api, adapter_name):
     files = [api.replace(".", "/") + ".py", adapter_name.replace(".", "/") + "/__init__.py"]
     monkeypatch.setattr(campaign, "installed_distribution", lambda: SimpleNamespace(files=files))
-    monkeypatch.setitem(sys.modules, "aisim.runner", SimpleNamespace(EngineReplayRunnerFactory=object))
+    application = "aisim" if api.startswith("aisim.") else "aisimulate"
     calls = []
     request = SimpleNamespace(
         topology=SimpleNamespace(kind="agg", worker=SimpleNamespace(replicas=1, gpus_per_replica=0))
@@ -1363,17 +1364,20 @@ def test_predict_point_calls_selected_api_and_adapter(monkeypatch, api, adapter_
         raise ValueError("test baseline failure")
 
     modules = {
+        application + ".runner": SimpleNamespace(EngineReplayRunnerFactory=object),
         api: SimpleNamespace(cli_estimate=estimate),
         adapter_name: SimpleNamespace(
             InferenceXSource=lambda **values: values, adapt_config=adapt, to_cli_estimate_kwargs=kwargs
         ),
     }
     original_import = campaign.importlib.import_module
-    monkeypatch.setattr(
-        campaign.importlib,
-        "import_module",
-        lambda name, *a, **kw: modules[name] if name in modules else original_import(name, *a, **kw),
-    )
+
+    def import_evaluated_wheel(name, *args, **kwargs):
+        if application == "aisimulate" and name == "aisim.runner":
+            raise ModuleNotFoundError("canonical namespace absent from historical wheel", name="aisim")
+        return modules[name] if name in modules else original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(campaign.importlib, "import_module", import_evaluated_wheel)
     result = campaign.predict_point({"id": "point", "config": {}, "benchmark": {}})
     assert result["outcome"] == "baseline_failed"
     assert calls == [("adapt", {"config": {}, "benchmark": {}}), ("estimate", {"test_input": 42})]

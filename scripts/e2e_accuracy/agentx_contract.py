@@ -683,18 +683,6 @@ def validate_result(run):
         "unsupported",
     }:
         raise ValueError("Invalid AgentX result fields")
-    historical = HISTORICAL_SELF_COLLECTED.get(run["id"])
-    legacy = (
-        historical is not None
-        and historical == tuple(run[k] for k in ("initial_input_tokens", "lanes", "cache_state", "repeat"))
-        and (run["model"], run["hardware"], run["backend"], run["tensor_parallel"], run["boundary"])
-        == ("Qwen/Qwen3.5-397B-A17B", "B300", "vllm", 8, "complete_finite_cohort")
-    )
-    complete_features = run["category"] == "self_collected" and not legacy
-    if "feature_metadata" in run:
-        validate_features(run["feature_metadata"], run["id"], require_complete=complete_features)
-    elif complete_features:
-        raise ValueError("New self-collected publications require silicon feature metadata")
     if "simulation_features" in run:
         validate_simulation(run["simulation_features"], run["id"])
     for item in run.get("op_data", []):
@@ -771,4 +759,19 @@ def validate_result(run):
         for metric in ("ttft_ms", "tpot_ms"):
             if comparison["phases"]["profile"]["request_scores"][metric] != run["request_errors"][metric]:
                 raise ValueError("Chart and overview request scores disagree")
+    # Check completeness only after every structural and arithmetic invariant.
+    # Publishers may reject an incomplete retained snapshot without blocking
+    # unrelated content, but corruption must always remain a hard error.
+    historical = HISTORICAL_SELF_COLLECTED.get(run["id"])
+    legacy = (
+        historical is not None
+        and historical == tuple(run[k] for k in ("initial_input_tokens", "lanes", "cache_state", "repeat"))
+        and (run["model"], run["hardware"], run["backend"], run["tensor_parallel"], run["boundary"])
+        == ("Qwen/Qwen3.5-397B-A17B", "B300", "vllm", 8, "complete_finite_cohort")
+    )
+    complete_features = run["category"] == "self_collected" and not legacy
+    if "feature_metadata" in run:
+        validate_features(run["feature_metadata"], run["id"], require_complete=complete_features)
+    elif complete_features:
+        raise ValueError("New self-collected publications require silicon feature metadata")
     return run

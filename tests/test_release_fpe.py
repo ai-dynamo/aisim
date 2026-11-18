@@ -87,6 +87,35 @@ def test_namespace_compatibility_does_not_hide_a_broken_canonical_dependency(mon
     importer.assert_called_once_with("aisim_core.sdk")
 
 
+@pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
+def test_fpe_probe_uses_the_unchanged_release_sdk(tmp_path, namespace):
+    package = tmp_path / namespace
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "sdk.py").write_text(
+        "class EngineHandle:\n    @staticmethod\n    def compile(*args, **kwargs):\n        return args, kwargs\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "from types import SimpleNamespace; "
+            "from scripts.fpe.run_release_fpe import load_tool; "
+            "probe = load_tool('fpe_support_matrix'); "
+            "plan = SimpleNamespace(model='fixture/model', system='fixture_gpu', backend='vllm', "
+            "compile_kwargs=lambda: {'worker_type': 'aggregated'}); "
+            "assert probe._default_engine_factory(plan) == "
+            "(('fixture/model', 'fixture_gpu', 'vllm'), {'worker_type': 'aggregated'})",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(ROOT)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.fixture
 def probe_plan():
     selectors = json.loads((ROOT / ".github/fpe-required-probes.json").read_text())["probes"]
