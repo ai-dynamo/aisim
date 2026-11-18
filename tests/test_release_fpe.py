@@ -99,6 +99,36 @@ def test_namespace_compatibility_does_not_hide_a_broken_canonical_dependency(mon
     importer.assert_called_once_with("aisim_core.sdk")
 
 
+@pytest.mark.parametrize("canonical,historical", [("aisim", "aisimulate"), ("aisim_core", "aisimulate_core")])
+def test_missing_canonical_submodule_cannot_select_a_historical_runtime(tmp_path, canonical, historical):
+    for name in (canonical, historical):
+        package = tmp_path / name
+        package.mkdir()
+        (package / "__init__.py").touch()
+    (tmp_path / historical / "sdk.py").write_text("identity = 'historical'\n")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "import sys\n"
+            "from scripts.release.package_identity import runtime_module\n"
+            "try:\n"
+            f"    runtime_module('{canonical}.sdk')\n"
+            "except ModuleNotFoundError as error:\n"
+            f"    assert error.name == '{canonical}.sdk', error\n"
+            "else:\n"
+            "    raise AssertionError('a broken canonical runtime must not fall back')\n"
+            f"assert '{historical}.sdk' not in sys.modules\n",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(tmp_path)))},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
 def test_fpe_probe_uses_the_unchanged_release_sdk(tmp_path, namespace):
     package = tmp_path / namespace

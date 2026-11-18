@@ -12,6 +12,7 @@ from pathlib import Path
 
 from scripts.e2e_accuracy.agentx_comparison import validate as validate_comparison
 from scripts.e2e_accuracy.agentx_inputs import safe_path
+from scripts.e2e_accuracy.benchmark_features import IncompleteSiliconEvidence
 from scripts.e2e_accuracy.benchmark_features import validate as validate_features
 from scripts.e2e_accuracy.simulation_features import validate as validate_simulation
 
@@ -773,5 +774,5 @@ def validate_result(run):
     if "feature_metadata" in run:
         validate_features(run["feature_metadata"], run["id"], require_complete=complete_features)
     elif complete_features:
-        raise ValueError("New self-collected publications require silicon feature metadata")
+        raise IncompleteSiliconEvidence("New self-collected publications require silicon feature metadata")
     return run

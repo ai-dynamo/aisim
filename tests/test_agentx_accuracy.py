@@ -844,7 +844,10 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
 
 
 @pytest.mark.parametrize("incomplete_first", [True, False])
-def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(tmp_path, monkeypatch, incomplete_first):
+@pytest.mark.parametrize("missing_metadata", [True, False])
+def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
+    tmp_path, monkeypatch, incomplete_first, missing_metadata
+):
     from test_benchmark_features import silicon_metadata
 
     from scripts.pages import agentx_pages as publisher
@@ -852,9 +855,12 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(t
     release = "release/0.14.0"
     incomplete = silicon_metadata("fresh-weka")
     incomplete["features"][0].update(state="unknown", evidence=[])
+    incomplete_run = result(id="fresh-weka", category="self_collected", feature_metadata=incomplete)
+    if missing_metadata:
+        del incomplete_run["feature_metadata"]
     archives, artifacts, jobs = {}, [], []
     for identity, branch, files in (
-        (9, "main", bundle(result(id="fresh-weka", category="self_collected", feature_metadata=incomplete))),
+        (9, "main", bundle(incomplete_run)),
         (10, release, bundle()),
     ):
         for name in files.keys() - {"qualification.json"}:
@@ -920,7 +926,10 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(t
 
 
 @pytest.mark.parametrize("incomplete_corruption", ["driver", "run", "job"])
-def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, monkeypatch, incomplete_corruption):
+@pytest.mark.parametrize("missing_metadata", [True, False])
+def test_publisher_requires_successful_trusted_job_and_exact_driver(
+    tmp_path, monkeypatch, incomplete_corruption, missing_metadata
+):
     from scripts.e2e_accuracy.agentx_contract import driver_digest
     from scripts.pages import agentx_pages as publisher
 
@@ -994,7 +1003,10 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, mo
     job["conclusion"] = "success"
     features = silicon_metadata("fresh-weka")
     features["features"][0].update(state="unknown", evidence=[])
-    files = bundle(result(id="fresh-weka", category="self_collected", feature_metadata=features))
+    incomplete_run = result(id="fresh-weka", category="self_collected", feature_metadata=features)
+    if missing_metadata:
+        del incomplete_run["feature_metadata"]
+    files = bundle(incomplete_run)
     for name in ("summary.json", "details/fresh-weka.json"):
         value = json.loads(files[name])
         value["snapshot"]["driver_sha256"] = driver_digest()
