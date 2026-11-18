@@ -45,6 +45,7 @@ from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, chec
 from aisim_core.data.catalog import CATALOG_DIR, _write, build_catalog, catalog_files, known_system_specs
 from aisim_core.data.e2e import load_e2e, read_snapshot
 from aisim_core.data.eval import load_record, record_dir
+from aisim_core.data.evidence import EVIDENCE_ROOT, check_evidence
 from aisim_core.data.hygiene import (
     CandidateFile,
     CandidatePolicy,
@@ -288,13 +289,20 @@ def validate_tree(
         report.add("root-missing", f"{root} is not a directory")
         return report
     listing = [f for f in list_tree(root) if not (profile == "mirror" and f.path.startswith(f"{MIRROR_CONTROL_DIR}/"))]
+    evidence: list[CandidateFile] = []
+    if profile == "mirror":  # internal-only root: hash-checked blobs, never loaded; the public profile rejects it
+        evidence = [f for f in listing if f.path.startswith(EVIDENCE_ROOT)]
+        listing = [f for f in listing if not f.path.startswith(EVIDENCE_ROOT)]
+        for f in evidence:
+            if f.is_symlink:
+                report.add("symlink", "symbolic links are not allowed", f.path)
     if profile == "mirror":
         control = [f for f in list_tree(root) if f.path.startswith(f"{MIRROR_CONTROL_DIR}/")]
         for f in control:
             if f.is_symlink or not f.path.endswith(".json"):
                 report.add("control-file", "mirror/ may hold plain .json files only", f.path)
-    report.files = len(listing)
-    if not listing and allow_empty:
+    report.files = len(listing) + len(evidence)
+    if not listing and not evidence and allow_empty:
         return report
 
     declared: set[str] = set()
@@ -303,6 +311,9 @@ def validate_tree(
     _check_snapshots(root, report, declared)
     _check_schema_snapshots(root, report, declared)
     _check_catalog_drift(root, report, declared)
+
+    evidence_findings, _ = check_evidence(root, [f.path for f in evidence if not f.is_symlink])
+    report.findings.extend(evidence_findings)
 
     gz_declared = {p for p in declared if p.endswith(".gz")}
     for finding in check_listing(_tree_policy(()), listing):
