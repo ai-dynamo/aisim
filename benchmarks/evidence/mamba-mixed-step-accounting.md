@@ -290,7 +290,9 @@ applied twice.
 The embedded Replay test, the public API, engine-step parity (305), the golden
 set (121) and the Python qualification tests (54 with the new regression) passed
 at `62293977`. `telem.py` at `62293977` gave output identical to
-`c3ed1513.json`.
+`c3ed1513.json`. At `9a2bde6b`, `agg_caller.py` gave output identical to
+`agg-62293977.json` for all four cases, the split budget included, and the same
+suites passed (56 Python tests).
 
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
 `gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
