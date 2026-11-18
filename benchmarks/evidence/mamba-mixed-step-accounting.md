@@ -259,9 +259,18 @@ count. In that contract, a step holds `ceil(ctx_tokens / isl)` requests, the
 same count that context attention prices. Commit `668e98fd` split a budget
 remainder longer than `isl - prefix` into extra requests. Commit `62293977`
 prices one partial request, capped at `isl - prefix` new tokens.
-[`agg_caller.py`](mamba-mixed-step-accounting/agg_caller.py) ran
-`python agg_caller.py OUT.json` from each commit's `python/aisim` build, in
-`HYBRID` mode at MTP0 with BF16 states. The raw outputs are
+These runs used the four-case version of `agg_caller.py`, published in commit
+`6511a26d`. The checked-in [`agg_caller.py`](mamba-mixed-step-accounting/agg_caller.py)
+adds later cases, so it does not reproduce these two outputs. Extract the
+four-case driver, then run it from each commit's `python/aisim` build. It uses
+`HYBRID` mode at MTP0 with BF16 states:
+
+```bash
+git show 6511a26d:benchmarks/evidence/mamba-mixed-step-accounting/agg_caller.py > agg_caller_4.py
+python agg_caller_4.py OUT.json
+```
+
+The raw outputs are
 [`agg-668e98fd.json`](mamba-mixed-step-accounting/agg-668e98fd.json) and
 [`agg-62293977.json`](mamba-mixed-step-accounting/agg-62293977.json).
 
@@ -316,9 +325,13 @@ apply to every operation of every model.
   call on the same session with a different prefix returned the first result.
   Commit `19e8daf6` adds the prefix to the cache key.
 
-`agg_caller.py` gained the large-budget case, its exact 4096-token control and
-a same-session prefix sequence. It ran from the `9a2bde6b`, `19e8daf6` and
-`70a8ea00` builds. The raw outputs are
+`agg_caller.py` gained the large-budget case and a same-session prefix
+sequence in commit `19e8daf6`, then the exact 4096-token control in commit
+`df8a4277`. `caller-19e8daf6.json` comes from the `19e8daf6` driver. The
+other `caller-*.json` outputs come from the `df8a4277` driver, which is the
+checked-in version. To run an earlier driver, extract it with
+`git show <commit>:benchmarks/evidence/mamba-mixed-step-accounting/agg_caller.py`.
+The drivers ran from the `9a2bde6b`, `19e8daf6` and `70a8ea00` builds. The raw outputs are
 [`caller-9a2bde6b.json`](mamba-mixed-step-accounting/caller-9a2bde6b.json),
 [`caller-19e8daf6.json`](mamba-mixed-step-accounting/caller-19e8daf6.json) and
 [`caller-70a8ea00.json`](mamba-mixed-step-accounting/caller-70a8ea00.json). The
@@ -341,9 +354,10 @@ non-Mamba sum and the same TTFT for the 8192- and 4096-token budgets. They do
 not record each non-Mamba row. The regression
 `test_run_agg_lone_request_ignores_unused_budget` compares the whole per-operation
 mixed-step dictionary of the two budgets and finds every row equal. Among the Mamba rows, the context
-convolution, both projection GEMMs and the norm also fall. Separately, the sum
-of the operations without `mamba` in their names falls by 27%, because they
-also price one request instead of two. In the
+convolution, both projection GEMMs and the norm also fall. Separately, the
+recorded sum of the operations without `mamba` in their names falls by 27%,
+from 18.053611 to 13.180794 ms. The saved outputs do not show which of those
+operations change, or at which coordinates. In the
 same-session sequence, the repeated third call returns the cached second
 result. The four earlier cases give output identical to `agg-62293977.json`.
 
@@ -359,6 +373,115 @@ estimate, because measured scan rows start from a cold state. The `1.3.0rc20`
 data has no scan rows, so every scan above already used SOL. At `70a8ea00`,
 `agg_caller.py` and `telem.py` reproduce the earlier outputs exactly, and 727
 Python tests, the public API (28) and the embedded Replay tests (9) passed.
+
+### Prefill step count and reuse scope
+
+Two more caller fixes, in commits `55d2821b` and `35e632cb`, also apply to
+every model:
+
+- **Prefill steps in TTFT.** With one request, `run_agg` counted
+  `ceil(isl / ctx_tokens)` prefill steps, the cached prefix included. If the
+  uncached tokens fit the budget (`0 < isl - prefix <= ctx_tokens`), the step
+  now schedules the whole request and TTFT counts one step. This changes
+  every one-request result with a prefix, an uncached part that fits the
+  budget and a budget below `isl`. Results without a prefix, with a budget of
+  at least `isl`, or with more than one request do not change. The
+  TensorRT-LLM queuing factor (qf) still uses the number of budget steps. If
+  the uncached tokens exceed the budget, TTFT still counts
+  `ceil(isl / ctx_tokens)` steps, the cached prefix included.
+- **Reuse scope.** The result cache key held neither the model graph nor the
+  database mode, and the compiled-handle identity did not hold the Mamba
+  qualification fields. A legacy and a qualified Nano graph on one backend,
+  or over one handle cache, returned each other's TTFT. A database mode
+  changed in place, from `HYBRID` to `SOL`, kept the `HYBRID` result. The
+  result key now carries the compiled-engine identity. That identity lists
+  the constructor arguments of each Mamba2 operation, legacy operations
+  included. Its memo is reused only for the same database mode and transfer
+  policy.
+
+`agg_caller.py` ran from the `55d2821b` build and from `35e632cb`. Both runs
+gave the same output,
+[`caller-55d2821b.json`](mamba-mixed-step-accounting/caller-55d2821b.json).
+Against `caller-70a8ea00.json`, only the cases below change:
+
+| Case (batch, isl, prefix, budget) | Value | `70a8ea00` | `55d2821b` |
+| --- | --- | --- | --- |
+| One request (1, 4096, 3000, 2048) | Non-Mamba sum ms | 16.855182 | 13.180794 |
+| One request (1, 4096, 3000, 2048) | TTFT ms | 77.844 | 29.773 |
+| Same session, prefix 0, then 3000 | TTFT ms | 79.852, 77.844 | 79.852, 29.773 |
+
+The context-phase Mamba GEMMs and norm in that case also fall. The step now
+holds the 4096-token request, not a 2048-token chunk with 2048 cached
+tokens. `context_mamba_ssm` stays 0.073730 ms. TTFT is
+`step * chunks * qf`, with `qf = 2 + (steps - 3) / 20` for
+`steps = ceil(4096 / 2048) = 2`. The step is the per-operation sum,
+15.268 ms, so TTFT is `15.268 * 1 * 1.95 = 29.773` ms, one chunk instead
+of two. The exact-prompt control (budget 4096) keeps 29.010 ms, with
+`steps = 1` and `qf = 1.9`. The 2.6% gap is the unchanged queuing factor. The
+uncached chunked case keeps two chunks and 79.852 ms. A fully cached prompt
+(prefix 4096) still fails with `isl must be greater than`.
+
+The regressions ran against earlier builds:
+
+| Regression | Earlier build | Failure |
+| --- | --- | --- |
+| `test_run_agg_ttft_counts_uncached_prefill_steps[3000-1]` | `9eaa66e8` | TTFT 77.844 ms, expected 38.922 ms from that build's step |
+| `test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode` | `9eaa66e8` | Second graph TTFT 78.669 ms, cold 77.868 ms |
+| `test_run_agg_reuse_keeps_each_mamba_op_state_dtype` | `55d2821b` | Swapped dtypes TTFT 29.786 ms, cold 29.773 ms |
+| `test_run_agg_reuse_keeps_the_partial_qualification_rejection` | `55d2821b` | Partially qualified graph did not raise |
+
+The uncached case `[0-2]` and `test_run_agg_rejects_a_fully_cached_prompt`
+also passed on `9eaa66e8`. They pin behavior that did not change. At
+`35e632cb`, the Python qualification, backend and session suites (734 tests)
+passed.
+
+### Review fixes after `35e632cb`
+
+Commits `79a9e652` and `1ea0211c` add four fixes:
+
+- **Whole-model FPM input.** An FPM reads the mixed-step budget as new
+  tokens. With one request, `run_agg` passed the prompt with its prefix, so
+  isl 4096 and prefix 3000 priced `ceil(4096 / 1096) = 4` requests. The FPM
+  now receives at most `isl - prefix` new tokens, one request. Op-level
+  pricing keeps the full prompt. No FPM latency comparison was run. The
+  regression `test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens`
+  checks the scheduled input.
+- **One-request activations.** The activation estimate now uses the new
+  tokens of the step, `min(isl - prefix, ctx_tokens)`, as the memory
+  helper's default does. TensorRT-LLM keeps its `max_num_tokens`
+  reservation, so `agg_caller.py` and `telem.py` give the same output.
+- **Kernel labels.** A qualified Mamba2 op must use a collected kernel
+  label in its own phase. A misspelled label now fails at build time.
+  Legacy ops keep any label.
+- **Exact-total prefill.** `predict_prefill_latency_total` passes whether
+  any token is cached, as the packed metrics path does. Two 16-token
+  prefills with one cached token now skip the cold scan row.
+
+[`mem.py`](mamba-mixed-step-accounting/mem.py) ran from the `35e632cb` and
+`1ea0211c` builds. It prices one vLLM `0.24.0` Nano request with isl 4096
+and osl 64. The raw outputs are
+[`mem-35e632cb.json`](mamba-mixed-step-accounting/mem-35e632cb.json) and
+[`mem-1ea0211c.json`](mamba-mixed-step-accounting/mem-1ea0211c.json).
+Values are in GiB:
+
+| Prefix and budget | Activations before | After | Total before | After |
+| --- | --- | --- | --- | --- |
+| 3000, 2048 | 0.156250 | 0.083618 | 62.542492 | 62.469860 |
+| 3000, 4096 | 0.312500 | 0.083618 | 62.698742 | 62.469860 |
+| 3000, 8192 | 0.312500 | 0.083618 | 62.698742 | 62.469860 |
+| 0, 2048 | 0.156250 | 0.156250 | 62.542492 | 62.542492 |
+
+The activations scale with the tokens: `0.15625 * 1096 / 2048 = 0.083618`.
+Weights, KV cache and the other terms do not change. The regression fails on
+`35e632cb` for the 8-token budget, with 8 scheduled tokens instead of 6, and
+passes on `1ea0211c`. At `1ea0211c`, `agg_caller.py` and `telem.py` give
+output identical to `caller-55d2821b.json` and `c3ed1513.json`. The Python
+suites (738 tests), the public API (28) and the embedded Replay tests (9)
+passed, and `cargo test -p aisim-core --lib` passed locally (3269, 2 ignored).
+The whole `-m unit` Python suite ran from a tarball of each build, which has
+no Git metadata. At `1ea0211c`, its failures are a subset of the `9eaa66e8`
+failures (286 against 287). The shared failures come from the tarball
+environment, for example a collector source revision that needs Git.
 
 The two parity suites ran from the repository root of each build, with that
 build's `python/aisim` environment:
@@ -377,7 +500,10 @@ python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
 | `62293977` | `6511a26d` | 305 passed | 121 passed |
 | `9a2bde6b` | `d321defd` | 305 passed | 121 passed |
 | `19e8daf6` | `879aebde`, `35a323d6` | 305 passed | 121 passed |
-| `70a8ea00` | The head that adds this row | 305 passed | 121 passed |
+| `70a8ea00` | `df8a4277` | 305 passed | 121 passed |
+| `9eaa66e8` | `663344ae` | 305 passed | 121 passed |
+| `35e632cb` | None | 305 passed | 121 passed |
+| `1ea0211c` | The head that adds this row | 305 passed | 121 passed |
 
 Each published head adds no product code to its code revision, only tests,
 documentation or evidence, so it carries that revision's parity results.
@@ -420,7 +546,10 @@ Commit `62293977` prices that remainder as one request capped at
   mixed rank as one mix-step iteration. It then splits the evidence by phase,
   so this control does not describe the current code. The native Replay
   oracle above covers the current path.
-- Main, Baseline and Candidate give identical results for unqualified ops.
+- At the measured revisions, Main, Baseline and Candidate gave identical
+  results for unqualified ops. The later `run_agg` caller corrections change
+  unqualified results too. See [`run_agg` caller corrections](#run_agg-caller-corrections)
+  and [Prefill step count and reuse scope](#prefill-step-count-and-reuse-scope).
 - Qualified and unqualified runs differ without the fix, because the analytical
   bound adds recurrent-state bytes. Compare Baseline with Candidate only.
 - Nemotron-3-Super-120B-A12B FP8 on TensorRT-LLM fails in both variants with a
@@ -465,3 +594,7 @@ Their raw log was not saved. No speed, memory or significance claim is made.
 - Summing uniform-batch queries can overcount launch overhead for
   variable-length batches.
 - One model family, one modeled platform, synthetic shapes.
+- A pure-prefill packed step prices every operation at the integer mean of
+  its new tokens per request, as main does. Two prefills of 8 and 9 new
+  tokens price as two of 8. The mixed packed step keeps the remainder for
+  qualified Mamba operations.

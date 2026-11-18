@@ -70,6 +70,9 @@ counts every verified token, and its source is `sol`. For a state-scan
 operation, it also counts each request's recurrent-state traffic. The
 convolution update has no recurrent-state term. A decode batch must hold
 whole requests, so its token count must be a multiple of `token_width`.
+Native op-level Replay packs every decode request at the configured width,
+`nextn + 1`. If its scheduler verifies fewer tokens for a request, the
+estimate counts more tokens than that request verifies.
 
 With `token_width` one, an operation can read a measured row when the state
 dtype allows it and the table covers its shape. The collected state-scan
