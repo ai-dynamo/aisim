@@ -140,6 +140,9 @@ impl SiteWalkOrder {
 struct GemmEngineGrids {
     by_quant: BTreeMap<String, (Node, SiteIndex)>,
     quant_order: Vec<String>,
+    /// Whether `by_quant` has rows under `fp8_static`, fixed at load so the
+    /// per-query presence check does not search the map.
+    has_fp8_static: bool,
 }
 
 /// 2-D scale tables keyed by quant name -> m -> k -> measured leaf
@@ -285,9 +288,9 @@ impl GemmTable {
     /// `gemm_points`) load the table again and return the error. The last
     /// match arm cannot run today. It stays as a guard in case `load_gemm`
     /// keeps the error kind in the future.
-    pub fn has_direct_fp8_static(&self) -> Result<bool, AicError> {
+    pub(crate) fn has_direct_fp8_static(&self) -> Result<bool, AicError> {
         match self.load_gemm() {
-            Ok(grids) => Ok(grids.by_quant.contains_key(GemmQuantMode::Fp8Static.name())),
+            Ok(grids) => Ok(grids.has_fp8_static),
             Err(err) if err.is_missing_perf_data() => Ok(false),
             Err(err) => Err(err),
         }
@@ -497,10 +500,12 @@ impl GemmTable {
                     let index = SiteIndex::build_with_site_order(&[1, 2], 0, &node, &site_order);
                     (quant_name, (node, index))
                 })
-                .collect();
+                .collect::<BTreeMap<_, _>>();
+            let has_fp8_static = by_quant.contains_key(GemmQuantMode::Fp8Static.name());
             Ok(GemmEngineGrids {
                 by_quant,
                 quant_order,
+                has_fp8_static,
             })
         });
         cell.as_ref().map_err(|err| clone_err(err))
