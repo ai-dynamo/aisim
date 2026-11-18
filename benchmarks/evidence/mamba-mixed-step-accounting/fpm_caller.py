@@ -15,6 +15,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -22,6 +23,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(sys.argv[1], "python/aisim/tests/unit/sdk"))
 import test_fpm_forward as t
 
+import aisim
+import aisim_core
 from aisim import _runtime
 from aisim.sdk.inference_session import InferenceSession
 from aisim_core.sdk import models
@@ -30,6 +33,48 @@ from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.step_estimate import MixedStepInput
 
+
+def verified_build(repo):
+    """Bind the imported Python and native code to a clean revision under test."""
+    repo = Path(repo).resolve()
+    revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    roots = ["Cargo.toml", "Cargo.lock", "crates/core", "python/aisim/src/aisim", "python/aisim/src/aisim_core"]
+    if subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", *roots], check=False).returncode:
+        raise ValueError("commit the sources under test before recording build evidence")
+    packages = {}
+    for module in (aisim, aisim_core):
+        imported = Path(module.__file__).resolve().parent
+        expected = repo / "python/aisim/src" / module.__name__
+        hashes = lambda root: {
+            path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*.py")
+        }
+        source = hashes(expected)
+        if not source or hashes(imported) != source:
+            raise ValueError(f"imported {module.__name__} at {imported} does not match {revision}")
+        packages[module.__name__] = {
+            "path": str(imported),
+            "source_sha256": hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest(),
+        }
+    native_inputs = [
+        repo / name for name in ("Cargo.toml", "Cargo.lock", "crates/core/Cargo.toml", "crates/core/build.rs")
+    ]
+    native_inputs += [path for path in (repo / "crates/core/src").rglob("*") if path.is_file()]
+    native = {
+        path.relative_to(repo).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in native_inputs
+    }
+    if json.loads(_runtime._build_source_files_json()) != native:
+        raise ValueError(f"imported native extension at {_runtime.__file__} does not match {revision}")
+    return {
+        "revision": revision,
+        "packages": packages,
+        "native_extension_path": _runtime.__file__,
+        "native_extension_sha256": hashlib.sha256(Path(_runtime.__file__).read_bytes()).hexdigest(),
+        "native_source_sha256": hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+build = verified_build(sys.argv[1])
 ISL, OSL = 512, 2
 PREFILL = {(1, 256, 256): 12.0, (2, 512, 512): 30.0, (1, 512, 0): 22.0}
 DECODE = {(1, 0, ISL + OSL // 2 + 1): 3.0, (1, 0, ISL + 1): 2.5}
@@ -56,6 +101,7 @@ try:
         "backend": t.BACKEND,
         "version": t.VERSION,
         "table_sha256": table_sha,
+        "build": build,
         # The imported build: the helpers come from REPO_ROOT, the estimator from
         # the active environment, so record which native extension priced the run.
         "native_extension_sha256": hashlib.sha256(Path(_runtime.__file__).read_bytes()).hexdigest(),

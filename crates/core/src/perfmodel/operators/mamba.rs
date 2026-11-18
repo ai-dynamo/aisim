@@ -84,9 +84,10 @@ impl Mamba2Op {
         // Each supported kernel label runs in one phase only. A qualified op
         // must use one of them; a legacy op keeps any label.
         let kernel_phase = match self.kernel_source.as_str() {
-            "causal_conv1d_fn" | "causal_conv1d_fn_token_major" | "mamba_chunk_scan_combined" => {
-                Some("context")
-            }
+            "causal_conv1d_fn"
+            | "causal_conv1d_fn_token_major"
+            | "mamba_chunk_scan_combined"
+            | "vllm_mamba_chunk_scan_combined_varlen" => Some("context"),
             "causal_conv1d_update"
             | "selective_state_update"
             | "selective_state_update_flashinfer"

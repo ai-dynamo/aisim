@@ -321,6 +321,7 @@ pub(crate) fn run_context_ops_with<'a>(
         seq_imbalance_correction_scale,
         filter,
         false,
+        None,
         |_, op, result| on_op(op, result.into_owned()),
     )
 }
@@ -330,6 +331,8 @@ pub(crate) fn run_context_ops_with<'a>(
 /// in `ops`. `any_cached` marks a walk whose integer mean `prefix` can round a
 /// cached prefill down to zero; qualified Mamba ops then see at least one
 /// cached token ([`mamba_cached_prefix`]), and every other op keeps `prefix`.
+/// `total_new_tokens` preserves an exact-total query's token sum for qualified
+/// Mamba, whose two balanced chunk lengths cannot be replaced by a mean.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_context_ops_planned<'a>(
     ops: &'a [Op],
@@ -342,6 +345,7 @@ pub(crate) fn run_context_ops_planned<'a>(
     seq_imbalance_correction_scale: f64,
     filter: ContextOpFilter,
     any_cached: bool,
+    total_new_tokens: Option<u32>,
     mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
@@ -352,6 +356,27 @@ pub(crate) fn run_context_ops_planned<'a>(
             ContextOpFilter::SkipContextAttention if op.is_context_attention() => continue,
             ContextOpFilter::OnlyContextAttention if !op.is_context_attention() => continue,
             _ => {}
+        }
+        if let Some(tokens) = total_new_tokens
+            && op.is_qualified_mamba()
+            && tokens % batch_size != 0
+        {
+            let (q, r) = (tokens / batch_size, tokens % batch_size);
+            let prefix = mamba_cached_prefix(op, prefix, any_cached);
+            for (batch, length) in [(batch_size - r, q), (r, q + 1)] {
+                let result = query_context_op(
+                    op,
+                    db,
+                    batch,
+                    length,
+                    prefix,
+                    seq_imbalance_correction_scale,
+                    None,
+                )?;
+                total += result.latency_ms;
+                on_op(index, op, Cow::Owned(result));
+            }
+            continue;
         }
         let result = memo.query(index, || {
             let ctx = context_op_runtime(

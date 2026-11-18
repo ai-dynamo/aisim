@@ -565,6 +565,14 @@ builds as `python fpm_caller.py REPO_ROOT OUT.json`. Both runs used the
 same table (SHA-256 prefix `2071e1799556`). The raw outputs are
 [`fpm-35e632cb.json`](mamba-mixed-step-accounting/fpm-35e632cb.json) and
 [`fpm-1ea0211c.json`](mamba-mixed-step-accounting/fpm-1ea0211c.json).
+Those historical artifacts record a native binary hash, without validating
+the imported Python packages against the named revision. For new runs, use
+`BUILD_VENV/bin/python fpm_caller.py BUILD_CHECKOUT OUT.json` with each build's
+own interpreter and clean checkout. The script now checks every imported
+`aisim` and `aisim_core` Python source and the native build-time source inventory
+against that checkout, failing before estimation on a mismatch. Its `build`
+record includes the verified revision, package paths and source fingerprints.
+Compare new artifacts only after both runs pass this check.
 The FPM derives `ceil(context_tokens / (isl - prefix))` requests:
 
 | Case (isl 512, budget 512) | Build | Caller input | Requests | Step ms | TTFT ms |
@@ -696,6 +704,38 @@ reproducible check is `qualified_mamba_mixed_steps_preserve_prefill_and_decode_s
 It prices `num_prefill_requests: 2` and `sum_prefill_tokens: 17` against
 17 token rows plus 2 state pairs, never 3.
 
+### Scoped exact-total and shared-token corrections
+
+The qualified exact-total prefill query now preserves the new-token sum even
+when cached-token rounding changes the mean. For
+`predict_prefill_latency_total(2, 17, 1)`, the old walk priced two 9-token
+scans; the corrected walk prices lengths 8 and 9. In the Rust fixture, each
+token moves 18,560 activation bytes, and each request reads and writes a
+1 MiB state. The scan therefore moves 4,509,824 bytes instead of 4,528,384,
+a reduction of 18,560 bytes, or 0.00000241039 ms at 7.7e12 B/s. Other
+operations retain their mean coordinates. Evenly divided scans still use one
+batch query. `qualified_mamba_exact_totals_preserve_new_tokens` checks these
+byte counts, cached and cold cases, and the number of scan queries.
+
+For a qualified mixed step with `ctx_tokens=6000`, `isl=4096`, `prefix=3000`
+and two width-four decode requests, both prefill suffixes cap at 1,096 tokens.
+Shared token-major operations now see `2192 + 8 = 2200` tokens instead of
+`6000 - 3000 + 8 = 3008`. A 2-byte-per-token elementwise operation moves
+4,400 bytes instead of 6,016. The regression
+`mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks` checks this
+independent linear oracle, partial extends, pure decode, and legacy routing.
+The classification is prepared once per compiled graph and the chunks once
+per mixed query; the change adds no allocation or growing cache. Attention
+keeps its existing geometry. These are accounting checks, not measurements
+of serving accuracy.
+
+New `telem.py` artifacts also record `model.diagnostics()` and the native
+snapshot's performance-data fingerprint (`performance_data`). The snapshot
+references the loaded data without copying tables and rejects changes since
+load. Compare width runs only when their fingerprint method, system and
+SHA-256 agree; the resolved systems root remains visible in the diagnostics.
+Historical telemetry artifacts predate these provenance fields.
+
 ## Host cost
 
 Six alternating Baseline and Candidate pairs ran. The retained replay results
@@ -806,10 +846,10 @@ The raw rounds are in
   multi-chunk TTFT limit above.
 - A pure-prefill packed step prices every operation at the integer mean of
   its new tokens per request, as main does. Two prefills of 8 and 9 new
-  tokens price as two of 8. The exact-total query
-  `predict_prefill_latency_total` does the same for a graph without a
-  whole-model FPM. For example, 2 requests and 17 new tokens price 16 tokens.
-  The mixed packed step keeps the remainder for qualified Mamba operations.
+  tokens price as two of 8. The mixed packed step and the exact-total query
+  `predict_prefill_latency_total` keep the remainder for qualified Mamba
+  operations. Other operations in the exact-total query still use integer
+  mean coordinates.
 - Replay prices a rank through `ForwardPassMetrics`, which carries prefill
   totals and request counts, not each chunk's length. A qualified Mamba scan
   therefore spreads the total evenly over the requests: chunks of 1000 and

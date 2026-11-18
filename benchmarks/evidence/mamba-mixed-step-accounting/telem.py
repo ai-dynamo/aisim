@@ -5,6 +5,8 @@
 
 import json
 import sys
+import tempfile
+from pathlib import Path
 
 if len(sys.argv) != 2:
     sys.exit("usage: telem.py OUT.json")
@@ -66,6 +68,13 @@ for name, fpm in cases.items():
         "mamba_ops": [{k: op.get(k) for k in ("name", "latency_ms", "source")} for op in ops if "mamba" in op["name"]],
         "non_mamba_ms": sum(op["latency_ms"] for op in ops if "mamba" not in op["name"]),
     }
+# Use the native snapshot fingerprint of the loaded data, without copying its
+# tables. Saving also rejects data changed since this model first loaded it.
+out["diagnostics"] = model.diagnostics()
+with tempfile.TemporaryDirectory() as temporary:
+    snapshot = Path(temporary) / "snapshot"
+    model.save_state_snapshot(snapshot)
+    out["performance_data"] = json.loads((snapshot / "manifest.json").read_text())["native"]["perf_db"]
 with open(sys.argv[1], "w") as f:
     json.dump(out, f, indent=1)
 print(json.dumps({k: v["total_ms"] for k, v in out["cases"].items()}))

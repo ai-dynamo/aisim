@@ -555,6 +555,7 @@ const SHARED_NAME_LISTS: usize = 16;
 #[derive(Debug)]
 struct MixStepPlan {
     names: Arc<[String]>,
+    qualified_mamba: bool,
     /// Slot of each context operation, which runs in the shared or the
     /// context-attention pass.
     context_slot: Vec<usize>,
@@ -592,6 +593,7 @@ impl MixStepPlan {
             .collect();
         Self {
             names: names.into(),
+            qualified_mamba: context.iter().any(Op::is_qualified_mamba),
             context_slot,
             generation_slot,
         }
@@ -1975,7 +1977,7 @@ impl Engine {
     /// Python `_run_context_phase` (`base_backend.py:144`): `effective_isl =
     /// isl - prefix`, validate `> 0`, then one full pass over `context_ops`.
     fn run_context_phase(&self, runtime: &RuntimeConfig) -> Result<f64, AicError> {
-        self.run_context_phase_with(runtime, false, None, |_, _| {})
+        self.run_context_phase_with(runtime, false, None, None, |_, _| {})
     }
 
     /// `any_cached` marks a prefill whose exact cached-token total is nonzero
@@ -1984,6 +1986,7 @@ impl Engine {
         &self,
         runtime: &RuntimeConfig,
         any_cached: bool,
+        total_new_tokens: Option<u32>,
         coverage: Option<&mut FpmQueryCoverage>,
         mut on_op: impl FnMut(&Op, PerformanceResult),
     ) -> Result<f64, AicError> {
@@ -2038,6 +2041,7 @@ impl Engine {
             runtime.seq_imbalance_correction_scale,
             ContextOpFilter::All,
             any_cached,
+            total_new_tokens,
             |_, op, result| on_op(op, result.into_owned()),
         )
     }
@@ -2161,7 +2165,7 @@ impl Engine {
             prefix,
             ..Default::default()
         };
-        self.run_context_phase_with(&rt, false, coverage, |_, _| {})
+        self.run_context_phase_with(&rt, false, None, coverage, |_, _| {})
     }
 
     /// Preserve static prefill geometry, including explicitly equal per-request
@@ -2182,9 +2186,10 @@ impl Engine {
             ..Default::default()
         };
         let mut queries = Vec::new();
-        let prefill_ms = self.run_context_phase_with(&runtime, false, coverage, |_, result| {
-            queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
-        })?;
+        let prefill_ms =
+            self.run_context_phase_with(&runtime, false, None, coverage, |_, result| {
+                queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
+            })?;
         Ok(static_prefill_estimate(prefill_ms, queries))
     }
 
@@ -2298,7 +2303,13 @@ impl Engine {
                     osl: 1,
                     ..Default::default()
                 };
-                self.run_context_phase_with(&runtime, total_kv_read_tokens > 0, coverage, on_op)
+                self.run_context_phase_with(
+                    &runtime,
+                    total_kv_read_tokens > 0,
+                    Some(total_prefill_tokens),
+                    coverage,
+                    on_op,
+                )
             }
         }
     }
@@ -2637,6 +2648,20 @@ impl Engine {
                 combined as i64 - prefix1 as i64
             )));
         }
+        // Qualified Mamba and the shared token-major ops compute the same new
+        // prefill tokens. Cache the graph classification in the plan and split
+        // the budget once per step, rather than once per Mamba operation.
+        let mamba_prefill = self.mix_plan.qualified_mamba.then(|| {
+            let per_request = isl.saturating_sub(prefix).max(1);
+            let (mut full, mut partial) = (ctx_tokens / isl, (ctx_tokens % isl).min(per_request));
+            if partial == per_request {
+                (full, partial) = (full + 1, 0);
+            }
+            (full, partial, per_request)
+        });
+        let shared_tokens = mamba_prefill.map_or(combined - prefix1, |(full, partial, length)| {
+            full * length + partial + decode_query_tokens
+        });
         let mut shared_non_attention = 0.0;
         // Prefill-only, like context attention, but never amortized over chunks.
         let mut context_mamba = 0.0;
@@ -2651,14 +2676,9 @@ impl Engine {
                 // one request's `isl - prefix` new tokens and never adds requests.
                 // shortcut: sum uniform timing rows until variable-length batches are
                 // calibrated; this can overcount launch overhead for ragged batches.
-                let per_request = isl.saturating_sub(prefix).max(1);
-                let (mut full, mut partial) =
-                    (ctx_tokens / isl, (ctx_tokens % isl).min(per_request));
                 // A partial extend as long as a full request joins its batch: one
                 // batch-of-n query, as packed telemetry prices it, not n batch-one rows.
-                if partial == per_request {
-                    (full, partial) = (full + 1, 0);
-                }
+                let (full, partial, per_request) = mamba_prefill.expect("qualified Mamba plan");
                 for (batch, tokens) in [(full, per_request), (1, partial)] {
                     if batch == 0 || tokens == 0 {
                         continue;
@@ -2686,7 +2706,7 @@ impl Engine {
                 op,
                 &self.db,
                 1,
-                combined - prefix1,
+                shared_tokens,
                 prefix1,
                 seq_imbalance_correction_scale,
                 None,
@@ -3351,6 +3371,7 @@ impl Engine {
                 runtime.seq_imbalance_correction_scale,
                 ContextOpFilter::All,
                 false,
+                None,
                 |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r.into_owned()),
             )?;
         }
@@ -4319,6 +4340,7 @@ impl Engine {
                     1.0,
                     ContextOpFilter::All,
                     any_cached,
+                    None,
                     |_, _, _| {},
                 )?,
                 operations => {
@@ -4336,6 +4358,7 @@ impl Engine {
                         1.0,
                         ContextOpFilter::All,
                         any_cached,
+                        None,
                         |index, op, result| {
                             let slot = Some(self.context_plan.name_slot(index));
                             operations.add_lent("context", slot, op, result, 1.0, || {
@@ -4736,6 +4759,131 @@ pub(crate) mod tests {
             vec![qualified_mamba(false, nextn + 1)],
         );
         Engine::build(spec, build_engine(None).db).unwrap()
+    }
+
+    #[test]
+    fn qualified_mamba_exact_totals_preserve_new_tokens() {
+        let mut scan = qualified_mamba(true, 1);
+        if let Op::Mamba2(m) = &mut scan {
+            // FP16 has no measured BF16 scan row, so cold and cached queries
+            // both take SOL and the independent byte count below applies.
+            m.state_dtype = "float16".into();
+        }
+        let spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+            vec![],
+        );
+        let mut db = Arc::try_unwrap(build_engine(None).db).unwrap();
+        db.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        for (tokens, cached, scan_queries) in
+            [(17, 1, 2), (17, 0, 2), (16, 1, 1), (16, 0, 1), (17, 4, 2)]
+        {
+            // Two requests read and write two 1 MiB states; 17 new tokens
+            // move 17 * 18,560 activation bytes, split as lengths 8 and 9.
+            // Other ops keep the legacy integer-mean coordinates (18 norm
+            // tokens for 17 new plus 1 cached, otherwise 16 here).
+            let mean_tokens = 2 * ((tokens + cached) / 2 - cached / 2);
+            let bytes =
+                f64::from(tokens) * 18_560.0 + 2.0 * 2_097_152.0 + f64::from(mean_tokens) * 2.0;
+            let expected = bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+            let mut seen = 0;
+            let total = engine
+                .run_context_phase_totals_with(2, tokens, cached, None, |op, _| {
+                    seen += usize::from(op.is_qualified_mamba());
+                })
+                .unwrap();
+            assert!(
+                (total - expected).abs() < 1e-12,
+                "tokens={tokens}, cached={cached}"
+            );
+            assert_eq!(seen, scan_queries);
+            assert_eq!(
+                engine
+                    .predict_prefill_latency_total(2, tokens, cached)
+                    .unwrap(),
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks() {
+        let mut db = Arc::try_unwrap(build_engine(None).db).unwrap();
+        db.database_mode = DatabaseMode::Sol;
+        let db = Arc::new(db);
+        for qualified in [true, false] {
+            let mut scan = qualified_mamba(true, 1);
+            if !qualified && let Op::Mamba2(m) = &mut scan {
+                m.state_dtype = "unrecorded".into();
+            }
+            let spec = EngineSpec::new(
+                fixture_engine_config(Some(3)),
+                vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+                vec![],
+            );
+            let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+            for (ctx, new_tokens) in [
+                (6000, 2192),
+                (5000, 2000),
+                (2048, 1096),
+                (8192, 2192),
+                (0, 0),
+            ] {
+                // Two width-four decode requests add eight shared tokens.
+                // The 6000-token budget schedules two 1096-token cached
+                // suffixes: exactly 2200 norm tokens, never 3008.
+                let norm_tokens = if qualified {
+                    new_tokens + 8
+                } else {
+                    ctx - 3000 * (ctx / 4096) + 8
+                };
+                let expected = f64::from(norm_tokens) * 2.0 / db.system_spec.gpu.mem_bw * 1000.0;
+                let mut norm_ms = 0.0;
+                let parts = engine
+                    .mixed_step_breakdown_with(ctx, 2, 4096, 1, 3000, 1.0, 1.0, |_, op, result| {
+                        if op.name() == "norm" {
+                            norm_ms += result.latency_ms;
+                        }
+                    })
+                    .unwrap();
+                assert!(
+                    (norm_ms - expected).abs() < 1e-12,
+                    "qualified={qualified}, ctx={ctx}"
+                );
+                assert_eq!(parts[0], parts[1] + parts[2] + parts[3]);
+                let (shared, _, _) = engine
+                    .mixed_step_breakdown_per_op(ctx, 2, 4096, 1, 3000, 1.0, 1.0)
+                    .unwrap();
+                assert_eq!(shared.iter().find(|op| op.0 == "norm").unwrap().1, norm_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn physical_vllm_scan_label_is_context_only() {
+        let db = build_engine(None).db;
+        let scan = |prefill| {
+            let mut op = qualified_mamba(prefill, if prefill { 1 } else { 4 });
+            if let Op::Mamba2(m) = &mut op {
+                m.kernel_source = "vllm_mamba_chunk_scan_combined_varlen".into();
+            }
+            op
+        };
+        let context = Engine::build(
+            EngineSpec::new(fixture_engine_config(Some(3)), vec![scan(true)], vec![]),
+            Arc::clone(&db),
+        )
+        .unwrap();
+        assert!(context.predict_prefill_latency_total(2, 16, 1).unwrap() > 0.0);
+        let err = Engine::build(
+            EngineSpec::new(fixture_engine_config(Some(3)), vec![], vec![scan(false)]),
+            db,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("runs in the context phase"), "{err}");
     }
 
     #[test]

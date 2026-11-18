@@ -16,6 +16,34 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize(
+    ("state_dtype", "token_width", "message"),
+    [
+        ("fp16", 1, "unsupported state_dtype"),
+        ("bfloat16", 0, "must be positive"),
+        ("unrecorded", 0, "must be positive"),
+        ("unrecorded", 4, "1 for an unrecorded state_dtype"),
+    ],
+)
+def test_constructor_rejects_invalid_qualification(state_dtype, token_width, message):
+    with pytest.raises(ValueError, match=message):
+        ops.Mamba2Kernel(
+            "generation_mamba_ssm",
+            1,
+            "selective_state_update",
+            "generation",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype=state_dtype,
+            token_width=token_width,
+        )
+
+
+@pytest.mark.parametrize(
     ("kwargs", "expected"),
     [
         ({"state_dtype": "float16", "token_width": 4}, {"state_dtype": "float16", "token_width": 4}),

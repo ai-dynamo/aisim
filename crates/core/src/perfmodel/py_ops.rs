@@ -2833,7 +2833,7 @@ impl PyMamba2Kernel {
         token_width: u32,
     ) -> PyResult<(Self, PyOperation)> {
         cp_audit_gate("Mamba2Kernel", false, seq_split)?;
-        let inner = Op::Mamba2(crate::operators::Mamba2Op {
+        let op = crate::operators::Mamba2Op {
             name,
             scale_factor,
             kernel_source,
@@ -2847,7 +2847,14 @@ impl PyMamba2Kernel {
             chunk_size,
             state_dtype,
             token_width,
-        });
+        };
+        if let Some(why) = op.field_error() {
+            return Err(PyValueError::new_err(format!(
+                "Mamba op {}: {why}",
+                op.name
+            )));
+        }
+        let inner = Op::Mamba2(op);
         Ok((PyMamba2Kernel, PyOperation { inner }))
     }
 
