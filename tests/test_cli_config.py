@@ -399,6 +399,23 @@ def test_prediction_rejects_invalid_prefill_decode_interval(value) -> None:
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.parametrize("value", [-1, float("inf"), True, "1.5"])
+def test_prediction_rejects_invalid_sglang_scheduler_selection_cost(value) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {"scheduler": {"scheduler_select_time_ms": value}}
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+def test_prediction_rejects_serial_selection_cost_with_sglang_host_loop() -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {"host_loop": True, "scheduler": {"scheduler_select_time_ms": 1.5}}
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms requires host_loop=false"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> None:
     engine = _engine()
@@ -413,6 +430,7 @@ def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> 
     [
         ("vllm", "prefill_decode_interval", 1, "sglang"),
         ("trtllm", "prefill_decode_interval", 1, "sglang"),
+        ("vllm", "scheduler_select_time_ms", 1.5, "sglang"),
         ("sglang", "prefill_schedule_interval", 2, "vllm"),
         ("trtllm", "prefill_schedule_interval", 2, "vllm"),
         ("sglang", "async_scheduling", True, "vllm"),

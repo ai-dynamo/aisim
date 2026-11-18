@@ -2221,6 +2221,39 @@ fn native_trtllm_disaggregated_replay_completes() {
 }
 
 #[test]
+fn sglang_scheduler_selection_delays_productive_passes_without_changing_forward_metrics() {
+    let mut config = sglang_interval_config(2);
+    config.sglang.scheduler_select_time_ms = 1.5;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    for rank in 0..2 {
+        submit_interval_request(&mut engine, rank, u128::from(rank) + 1, 8, 2, now_ms);
+    }
+    // Both ranks select work in parallel. Each productive pass adds 1.5 ms
+    // once to the group clock. Deferred rounds and forward metrics keep their
+    // existing boundaries.
+    let first = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(first.duration_ms, 8.5);
+    for rank in &first.ranks {
+        assert_eq!(rank.forward_pass_metrics.duration_ms, 7.0);
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            step_interval_engine(&mut engine, &mut now_ms).duration_ms,
+            0.0
+        );
+    }
+    let last_prefill = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(last_prefill.duration_ms, 8.5);
+    let decode = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(decode.duration_ms, 3.5);
+    for rank in &decode.ranks {
+        assert_eq!(rank.forward_pass_metrics.duration_ms, 2.0);
+    }
+    assert_eq!(now_ms, 20.5);
+}
+
+#[test]
 fn sglang_host_loop_reports_the_forward_duration_to_fpm_telemetry() {
     // Under the host loop a pass ends when the scheduler thread returns to its loop,
     // which is not when its forward ends; the forward-pass telemetry must carry the

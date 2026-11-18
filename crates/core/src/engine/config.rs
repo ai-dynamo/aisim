@@ -399,6 +399,8 @@ pub struct SglangConfig {
     /// any page, as for full attention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swa_prefix_tails: Option<usize>,
+    /// Measured serial batch-selection overhead for a pass with model work.
+    pub scheduler_select_time_ms: f64,
 }
 
 const fn default_reserved_decode_tokens() -> usize {
@@ -424,12 +426,17 @@ impl Default for SglangConfig {
             num_reserved_decode_tokens: default_reserved_decode_tokens(),
             disaggregation_decode_extra_slots: None,
             swa_prefix_tails: None,
+            scheduler_select_time_ms: 0.0,
         }
     }
 }
 
 impl SglangConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.scheduler_select_time_ms.is_finite() && self.scheduler_select_time_ms >= 0.0,
+            "sglang.scheduler_select_time_ms must be finite and non-negative"
+        );
         ensure!(
             self.max_prefill_tokens > 0,
             "sglang.max_prefill_tokens must be positive"
@@ -1684,6 +1691,13 @@ impl EngineConfig {
         ensure!(
             self.backend == Backend::Sglang || !self.sglang.host_loop,
             "sglang.host_loop is supported only for backend=sglang"
+        );
+        ensure!(
+            self.sglang.scheduler_select_time_ms == 0.0
+                || (self.backend == Backend::Sglang
+                    && !self.sglang.host_loop
+                    && self.afd.is_none()),
+            "sglang.scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
         );
         ensure!(
             !self.sglang.host_loop || self.worker_type != WorkerType::Decode,

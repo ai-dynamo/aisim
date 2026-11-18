@@ -1297,6 +1297,14 @@ impl SglangCore {
             .end_ms(stream_start_ms + pass.forward_start_ms - pass.selected_ms)
             .max(self.kv_manager.host_load_end_ms());
         let forward_ms = forward_end_ms - stream_start_ms;
+        let scheduler_ms = if self.model_work_in_pass {
+            self.config.scheduler_select_time_ms
+        } else {
+            0.0
+        };
+        // The configured interval is serial to the priced work. Keep it out
+        // of forward telemetry and out of repeated pipeline stages.
+        let forward_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
         // When this pass's forward leaves stage 0, and its time per stage.
         let mut stage0 = Some((forward_end_ms, forward_ms));

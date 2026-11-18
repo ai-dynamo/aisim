@@ -1782,6 +1782,27 @@ def test_sglang_prefill_pipeline_width_must_be_a_positive_integer(monkeypatch, w
         _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": width}, "prefill")
 
 
+def test_sglang_prediction_lowers_measured_scheduler_selection_cost():
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "backend": "sglang",
+                "model": "synthetic",
+                "hardware": "h200_sxm",
+                "workers": {
+                    "aggregated": {
+                        "scheduler": {"scheduler_select_time_ms": 1.5},
+                        "kv_cache": {"capacity": {"type": "fixed", "blocks": 64}},
+                        "timing": {"type": "fixed", "prefill_ms": 7, "decode_ms": 2},
+                    }
+                },
+            }
+        }
+    )
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    assert deployment.agg_engine_args["sglang"]["scheduler_select_time_ms"] == 1.5
+
+
 def test_sglang_pd_prefill_compiles_pipeline_stages():
     config = CorePredictionConfig.model_validate(
         {
