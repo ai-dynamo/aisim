@@ -375,12 +375,15 @@ eviction rules G2 follows:
 | A hit before its load | Not pinned | Not pinned | Pinned until the request loads it or looks it up again |
 | G1 blocks being copied | Freed with their request; a new owner waits for the copy | The same | Held until the copy completes, then freed first block first |
 | A preemption | Waits for the preempted request's stores | The same | Waits for every transfer in flight |
-| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | Loads do not wait for other loads or stores; queued loads hold G1 and keep their relative order |
+| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | Uses the same G1-holder-first rule; loads do not wait for other loads or stores, and pinned hits cannot disappear before loading, so queued loads all hold G1 and keep their relative order |
 
 On a decode rank with G2, or while a destination reservation is pending, an
 activated handoff is admitted before a fresh G2 restore, including one whose
 load has landed. A pending reservation blocks fresh admission but not a
 handoff whose KV has already been activated.
+This precedence also applies to a decode rank using `offloading_v0_24` with
+G3 or KVCR. On an aggregated rank without a pending destination, a landed
+connector load can precede an activated handoff.
 
 The connector profile controls cache semantics independently of the timing
 model's `engine.backend_version`. For example, `offloading_v0_32` can use

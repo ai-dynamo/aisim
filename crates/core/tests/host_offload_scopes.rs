@@ -1056,6 +1056,55 @@ fn v0_32_admits_a_waiter_that_holds_g1_before_one_that_holds_none() {
 }
 
 #[test]
+fn hybrid_v0_32_connector_waiters_complete_under_g1_contention() {
+    let mut rank = rank(json!({
+        "connector": "offloading_v0_32", "num_host_blocks": 32,
+        "h2d_bandwidth_gbps": 0.1,
+    }));
+    // G1 also accounts for the working and cached recurrent states. Seed
+    // both reusable state boundaries, then fill G1 before the three restores.
+    rank["num_gpu_blocks"] = json!(10);
+    rank["state_cache"] = json!({"bytes_per_request": 1_000_000});
+    rank["prefix_match_unit"] = json!(4);
+    let requests = trace(&[
+        ("a_seed", 0.0, 1, 9, 1),
+        ("seed", 5.0, 1, 13, 1),
+        ("c_seed", 10.0, 21, 9, 1),
+        ("evict", 20.0, 41, 31, 1),
+        ("a", 100.0, 1, 9, 1),
+        ("b", 101.0, 1, 13, 1),
+        ("c", 102.0, 21, 9, 1),
+    ]);
+    let report = run(aggregated(1), json!({"rank": rank}), requests).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 7);
+    for id in ["a", "b", "c"] {
+        let record = report
+            .per_request
+            .iter()
+            .find(|r| r.request_id.as_deref() == Some(id))
+            .unwrap();
+        assert!(
+            record.first_admission_host_reused_input_tokens.unwrap() > 0,
+            "{id}: {record:?}"
+        );
+    }
+    assert!(
+        terminal_ms(&report, "c") < terminal_ms(&report, "b"),
+        "{:?}",
+        report
+            .per_request
+            .iter()
+            .map(|r| (
+                &r.request_id,
+                r.first_admit_ms,
+                r.terminal_time_ms,
+                r.first_admission_host_reused_input_tokens
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn simple_cpu_duplicate_loads_keep_connector_waiter_order() {
     // Unlike OffloadingConnector, SimpleCPU does not defer B behind A's
     // in-flight load. Both reserve G1; B's extra block loads after A's two.

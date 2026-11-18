@@ -4511,13 +4511,33 @@ mod waiting_queue_tests {
 
     #[test]
     fn a_landed_connector_load_cannot_block_a_materialized_handoff() {
+        landed_load_and_handoff_order(false);
+    }
+
+    #[test]
+    fn a_decode_rank_with_g3_admits_an_activated_handoff_before_a_landed_load() {
+        landed_load_and_handoff_order(true);
+    }
+
+    fn landed_load_and_handoff_order(decode_with_g3: bool) {
         use crate::engine::G2Connector;
 
-        for connector in [G2Connector::OffloadingV032, G2Connector::SimpleCpuV032] {
+        // G3 supports offloading_v0_24; the v0.32 profiles are aggregated-only.
+        let connectors = if decode_with_g3 {
+            &[G2Connector::OffloadingV024][..]
+        } else {
+            &[G2Connector::OffloadingV032, G2Connector::SimpleCpuV032][..]
+        };
+        for &connector in connectors {
             let args = MockEngineArgs::builder()
                 .num_gpu_blocks(8)
                 .block_size(4)
-                .max_num_seqs(Some(4))
+                .max_num_seqs(Some(if decode_with_g3 { 1 } else { 4 }))
+                .worker_type(if decode_with_g3 {
+                    WorkerType::Decode
+                } else {
+                    WorkerType::Aggregated
+                })
                 .max_num_batched_tokens(Some(64))
                 .enable_prefix_caching(true)
                 .kv_cache_bytes_per_token(Some(250_000))
@@ -4594,6 +4614,34 @@ mod waiting_queue_tests {
             // this same ready owner; the SimpleCPU rule is a no-op here.
             assert_eq!(core.state.next_waiting_uuid(false, true), Some(owner));
 
+            if decode_with_g3 {
+                use crate::engine::g3_offload::G3Tier;
+                use crate::engine::{G3OffloadConfig, G3Scope};
+
+                let g3 = G3Tier::new(
+                    G3OffloadConfig {
+                        scope: G3Scope::WorkerLocal,
+                        num_g3_blocks: 64,
+                        latency_to_first_byte_ms: 0.0,
+                        read_bandwidth_gbps: 1.0,
+                        write_bandwidth_gbps: 1.0,
+                        shared_read_bandwidth_gbps: 0.0,
+                        shared_write_bandwidth_gbps: 0.0,
+                    },
+                    1,
+                    1_000_000,
+                )
+                .unwrap();
+                core.set_g3_offload(g3, 0);
+                assert!(
+                    core.native_host_offload
+                        .as_ref()
+                        .unwrap()
+                        .retry_epoch()
+                        .is_some()
+                );
+            }
+
             // Commands can reserve and activate remote KV on an aggregated
             // rank too. A second, larger handoff cannot reserve beside the
             // landed G2 load; it blocks fresh admission, not activated KV.
@@ -4609,12 +4657,19 @@ mod waiting_queue_tests {
                 handoff_id: ready_handoff,
             })
             .unwrap();
-            core.apply_command(SchedulerCommand::ReserveDestination {
-                handoff_id: HandoffId::from(Uuid::from_u128(6)),
-                request: request(7, (301..=331).collect()),
-            })
-            .unwrap();
-            assert!(core.pending_destinations.has_pending());
+            if !decode_with_g3 {
+                core.apply_command(SchedulerCommand::ReserveDestination {
+                    handoff_id: HandoffId::from(Uuid::from_u128(6)),
+                    request: request(7, (301..=331).collect()),
+                })
+                .unwrap();
+                assert!(core.pending_destinations.has_pending());
+            } else {
+                // No pending destination: the decode role alone must give
+                // the activated handoff precedence, even with G3 enabling
+                // the older owner scan for offloading_v0_24.
+                assert!(!core.pending_destinations.has_pending());
+            }
             assert!(core.state.has_materialized_waiting());
             assert_eq!(core.state.next_waiting_uuid(true, true), Some(ready));
             let pass = core.try_execute_hidden_pass(deadline).unwrap();
