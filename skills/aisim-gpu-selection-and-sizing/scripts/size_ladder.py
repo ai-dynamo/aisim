@@ -119,6 +119,8 @@ def probe(cfg, hardware, backend, workdir, sets, timeout):
     rc, _, err = run(cmd, timeout)
     failed = [ln for ln in err.splitlines() if "failed:" in ln or "error:" in ln]
     msg = (failed[-1] if failed else last_line(err))[:400]
+    if rc is None:
+        return "timeout", msg
     if rc == 0:
         return "covered", ""
     if any(marker in err for marker in NO_COVERAGE_MARKERS):
@@ -246,6 +248,10 @@ def main() -> int:
         state, msg = probe(cfg, a.hardware, backend, probe_dir, [], a.timeout)  # cfg already has --set applied
         report["probe"][backend] = {"state": state, "message": msg}
     states = [v["state"] for v in report["probe"].values()]
+    if "timeout" in states:
+        report["stopped"] = "timeout during the coverage probe"
+        print(json.dumps(report, indent=2))
+        return 3
     if "resource_error" in states:
         report["stopped"] = "local resource limit during the coverage probe"
         print(json.dumps(report, indent=2))
