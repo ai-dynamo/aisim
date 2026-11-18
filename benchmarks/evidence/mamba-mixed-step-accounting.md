@@ -570,7 +570,10 @@ the imported Python packages against the named revision. For new runs, use
 `BUILD_VENV/bin/python fpm_caller.py BUILD_CHECKOUT OUT.json` with each build's
 own interpreter and clean checkout. The script now checks every imported
 `aisim` and `aisim_core` Python source and the native build-time source inventory
-against that checkout, failing before estimation on a mismatch. Its `build`
+against that checkout, failing before estimation on a mismatch. It also
+rejects a hashed source file that the revision's tree does not contain, such
+as an untracked or ignored file
+([`test_committed_sources.py`](mamba-mixed-step-accounting/test_committed_sources.py)). Its `build`
 record includes the verified revision, package paths and source fingerprints.
 Compare new artifacts only after both runs pass this check.
 The FPM derives `ceil(context_tokens / (isl - prefix))` requests:
@@ -860,11 +863,11 @@ The raw rounds are in
   object, query mode and transfer policy, as main computes it per model and
   database object. Changing a model's operation lists after its first
   estimate is not detected. Build a new model object instead.
-- In the mixed step, shared token-major operations take
-  `ctx_tokens - prefix * floor(ctx_tokens / isl)` prefill tokens for every
-  graph, as main does. A remainder longer than `isl - prefix` therefore
-  prices more shared tokens than qualified Mamba and context attention
-  price. For example, `ctx_tokens = 6000`, `isl = 4096` and `prefix = 3000`
-  give 3000 shared prefill tokens, but 2 requests of 1096 tokens for Mamba
-  and attention. The shared count stays the same for legacy and qualified
-  graphs, so a Mamba qualification does not change non-Mamba prices.
+- In the mixed step of a legacy graph, shared token-major operations take
+  `ctx_tokens - prefix * floor(ctx_tokens / isl)` prefill tokens, as main
+  does. A remainder longer than `isl - prefix` therefore prices more shared
+  tokens than context attention prices. For example, `ctx_tokens = 6000`,
+  `isl = 4096` and `prefix = 3000` give 3000 shared prefill tokens, but 2
+  requests of 1096 tokens for attention. A qualified graph takes the capped
+  Mamba chunks instead, 2192 tokens here (see the scoped corrections above),
+  so a Mamba qualification changes the price of non-Mamba operations.

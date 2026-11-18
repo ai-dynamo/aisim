@@ -23,6 +23,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(sys.argv[1], "python/aisim/tests/unit/sdk"))
 import test_fpm_forward as t
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from committed_sources import require_committed
+
 import aisim
 import aisim_core
 from aisim import _runtime
@@ -49,6 +52,7 @@ def verified_build(repo):
             path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in root.rglob("*.py")
         }
+        require_committed(repo, revision, expected.rglob("*.py"))
         source = hashes(expected)
         if not source or hashes(imported) != source:
             raise ValueError(f"imported {module.__name__} at {imported} does not match {revision}")
@@ -60,6 +64,7 @@ def verified_build(repo):
         repo / name for name in ("Cargo.toml", "Cargo.lock", "crates/core/Cargo.toml", "crates/core/build.rs")
     ]
     native_inputs += [path for path in (repo / "crates/core/src").rglob("*") if path.is_file()]
+    require_committed(repo, revision, native_inputs)
     native = {
         path.relative_to(repo).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in native_inputs
     }
