@@ -418,6 +418,10 @@ class HuggingFaceDownloadError(Exception):
     pass
 
 
+class _HuggingFaceCacheError(HuggingFaceDownloadError):
+    """A present cache file is unreadable or invalid, rather than absent."""
+
+
 def _get_hf_auth_headers() -> dict[str, str]:
     """Respect Hugging Face token/cache settings for model metadata downloads."""
     if os.environ.get("HF_HUB_DISABLE_IMPLICIT_TOKEN", "").upper() in ("1", "ON", "YES", "TRUE"):
@@ -497,7 +501,13 @@ def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[d
         return None
     path, commit = found
     logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
-    return _load_json_with_infinity(path), commit
+    try:
+        data = _load_json_with_infinity(path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: expected a JSON object")
+    return data, commit
 
 
 def _load_cached_hf_json(hf_id: str, filename: str, revision: str) -> dict | None:
@@ -2165,6 +2175,8 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
         pinned = {"revision": commit} if commit else {}
         try:
             hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
+        except _HuggingFaceCacheError:
+            raise
         except Exception as exc:  # best-effort for optional quant config
             logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
             hf_quant_config = None

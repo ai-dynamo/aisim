@@ -318,6 +318,38 @@ def test_processor_files_follow_the_cached_config_commit(monkeypatch):
     assert requested == [("preprocessor_config.json", commit)]
 
 
+@pytest.mark.parametrize("contents", ["{broken", "[]", "null"])
+def test_corrupt_cached_quant_config_is_not_ignored(monkeypatch, hf_cache, contents):
+    model = "org/corrupt-quant"
+    _cache_file(hf_cache, model, "config.json", {"architectures": ["LlamaForCausalLM"]})
+    _cache_file(hf_cache, model, "hf_quant_config.json", {})
+    quant_file = hf_cache / "models--org--corrupt-quant" / "snapshots" / ("c" * 40) / "hf_quant_config.json"
+    quant_file.write_text(contents)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    with pytest.raises(utils.HuggingFaceDownloadError, match="Invalid cached hf_quant_config.json"):
+        utils._load_model_config_from_model_path.__wrapped__(model)
+    assert quant_file.read_text() == contents
+
+
+def test_corrupt_config_during_companion_fallback_keeps_download_error(monkeypatch, hf_cache):
+    model = "org/corrupt-config"
+    _cache_file(hf_cache, model, "config.json", {})
+    _cache_file(hf_cache, model, "hf_quant_config.json", {"quantization": {"quant_algo": "FP8"}})
+    config_file = hf_cache / "models--org--corrupt-config" / "snapshots" / ("c" * 40) / "config.json"
+    config_file.write_text("{broken")
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/main/config.json"):
+            return io.BytesIO(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 2048}).encode())
+        raise utils.urllib.error.URLError("transient")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    with pytest.raises(utils.HuggingFaceDownloadError, match="Invalid cached config.json") as error:
+        utils._load_model_config_from_model_path.__wrapped__(model)
+    assert isinstance(error.value.__cause__, json.JSONDecodeError)
+
+
 def test_remote_config_with_cached_quant_fallback_uses_one_snapshot(monkeypatch, hf_cache):
     cached = "a" * 40
     _cache_file(
