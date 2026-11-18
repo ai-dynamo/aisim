@@ -124,6 +124,7 @@
 /tests/test_bundled_configs.py                         @ai-dynamo/aisim-infra-codeowners
 /tests/test_ci_qualification.py                        @ai-dynamo/aisim-infra-codeowners
 /tests/test_e2e_accuracy_ui.mjs                        @ai-dynamo/aisim-infra-codeowners
+/tests/test_full_ci_fail_fast.py                       @ai-dynamo/aisim-infra-codeowners
 /tests/test_source_compliance.py                       @ai-dynamo/aisim-infra-codeowners
 /tests/test_benchmark_features.py                      @ai-dynamo/aisim-infra-codeowners
 /tests/test_cloud_agent_install.py                     @ai-dynamo/aisim-infra-codeowners

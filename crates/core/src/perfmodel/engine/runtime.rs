@@ -18,6 +18,7 @@
 //! embedded [`crate::AicEngineBuilder`] live in [`crate::py`]. The agg sweep is
 //! orchestrated in Python — there is no Rust `run_agg`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -309,15 +310,19 @@ impl PerOpSlotFold {
     }
 
     fn add(&mut self, slot: usize, r: PerformanceResult) {
-        let source = r.source.as_str();
+        self.add_value(slot, (r.latency_ms, r.energy_wms, r.source.as_str()));
+    }
+
+    /// Fold one value into `slot`.
+    fn add_value(&mut self, slot: usize, (latency_ms, energy_wms, source): PerOpSlotValue) {
         if let Some(entry) = self.entries.get_mut(slot) {
-            entry.0 += r.latency_ms;
-            entry.1 += r.energy_wms;
+            entry.0 += latency_ms;
+            entry.1 += energy_wms;
             if entry.2 != source {
                 entry.2 = "mixed";
             }
         } else if slot == self.entries.len() {
-            self.entries.push((r.latency_ms, r.energy_wms, source));
+            self.entries.push((latency_ms, energy_wms, source));
         } else {
             self.misordered = true;
         }
@@ -525,8 +530,8 @@ const RANK_MEMO_CAPACITY: usize = 4096;
 /// with 8192-token chunks reached about 56,000.
 const OP_MEMO_CAPACITY: usize = 131_072;
 
-/// Name lists of walks without name slots (DSv4.1 stages) that
-/// [`Engine::shared_names`] keeps shared.
+/// Name lists of walks without name slots (DSv4.1 stages without a
+/// [`StageWalkPlan`]) that [`Engine::shared_names`] keeps shared.
 const SHARED_NAME_LISTS: usize = 16;
 
 /// Name slots of the mix step's operations ([`get_mix_step_ops`]): every name
@@ -572,6 +577,104 @@ impl MixStepPlan {
             context_slot,
             generation_slot,
         }
+    }
+}
+
+/// Name slots of a DSv4.1 staged rank walk ([`Engine::dsv41_mixed_workload`]),
+/// which runs each stage's children in its place. Each walk's names are
+/// numbered in visit order, so slots arrive in first-encounter order like a
+/// phase walk's.
+#[derive(Debug)]
+struct StageWalkPlan {
+    /// Names of a decode-only walk, which runs every generation child.
+    generation_names: Arc<[String]>,
+    /// Slot of each generation child in `generation_names`.
+    generation_slot: Vec<usize>,
+    /// Names of a prefill-only walk, which runs every context child.
+    context_names: Arc<[String]>,
+    /// Names of a mixed walk: `context_names`, then the generation-attention
+    /// names new to them.
+    mixed_names: Arc<[String]>,
+    /// Slot of each context child in `context_names` and `mixed_names`.
+    context_slot: Vec<usize>,
+    /// Slot in `mixed_names` of each generation-attention child, in order;
+    /// a mixed walk runs no other generation child.
+    decode_attention_slot: Vec<usize>,
+}
+
+impl StageWalkPlan {
+    /// `None` without stages, and where a stage scopes a prefill to no
+    /// tokens: its children then run in no prefill pass, so the names a walk
+    /// first encounters depend on its workload and fold by name.
+    fn new(context: &[Op], generation: &[Op]) -> Option<Self> {
+        fn children(ops: &[Op]) -> impl Iterator<Item = &Op> {
+            ops.iter().flat_map(|op| match op {
+                Op::Dsv41Stage(stage) => stage.children.as_slice(),
+                _ => std::slice::from_ref(op),
+            })
+        }
+        fn slot_of<'a>(
+            slots: &mut HashMap<&'a str, usize>,
+            names: &mut Vec<String>,
+            op: &'a Op,
+        ) -> usize {
+            let name = op.name();
+            *slots.entry(name).or_insert_with(|| {
+                names.push(name.to_owned());
+                names.len() - 1
+            })
+        }
+        let mut stages = context
+            .iter()
+            .filter_map(|op| match op {
+                Op::Dsv41Stage(stage) => Some(stage),
+                _ => None,
+            })
+            .peekable();
+        if stages.peek().is_none() || stages.any(|stage| stage.scope(1.0, 0.0).0 < 1.0) {
+            return None;
+        }
+        let (mut slots, mut names) = (HashMap::new(), Vec::new());
+        let generation_slot = children(generation)
+            .map(|op| slot_of(&mut slots, &mut names, op))
+            .collect();
+        let generation_names = names.into();
+        let (mut slots, mut names) = (HashMap::new(), Vec::new());
+        let context_slot = children(context)
+            .map(|op| slot_of(&mut slots, &mut names, op))
+            .collect();
+        let context_names = names.as_slice().into();
+        let decode_attention_slot = children(generation)
+            .filter(|op| op.is_generation_attention())
+            .map(|op| slot_of(&mut slots, &mut names, op))
+            .collect();
+        Some(Self {
+            generation_names,
+            generation_slot,
+            context_names,
+            mixed_names: names.into(),
+            context_slot,
+            decode_attention_slot,
+        })
+    }
+
+    /// Names of the walk of a rank with `prefill` work, `decode` work or both.
+    fn names(&self, prefill: bool, decode: bool) -> &Arc<[String]> {
+        match (prefill, decode) {
+            (false, _) => &self.generation_names,
+            (true, false) => &self.context_names,
+            (true, true) => &self.mixed_names,
+        }
+    }
+
+    /// Slot, in that walk's names, of the `child` its `pass` ran.
+    fn slot(&self, prefill: bool, pass: MixedPass, child: usize) -> Option<usize> {
+        let slots = match (prefill, pass) {
+            (false, _) => &self.generation_slot,
+            (true, MixedPass::DecodeAttention) => &self.decode_attention_slot,
+            (true, _) => &self.context_slot,
+        };
+        slots.get(child).copied()
     }
 }
 
@@ -653,6 +756,39 @@ impl OperationObserver {
                 op.query(db, &runtime())
             }),
             Self::Values(fold) => fold.add(slot, op, result, divisor),
+        }
+    }
+
+    /// [`Self::add`] of a result its pass's [`QueryMemo`] may have lent. An
+    /// undivided slot fold reads it in place; anything else takes it.
+    fn add_lent(
+        &mut self,
+        inference_phase: &'static str,
+        slot: Option<usize>,
+        op: &Op,
+        result: Cow<'_, PerformanceResult>,
+        divisor: f64,
+        runtime: impl FnOnce() -> RuntimeContext,
+    ) {
+        match (&mut *self, slot) {
+            (Self::Latency, _) => {}
+            (
+                Self::Values(RankValueFold {
+                    slots: Some(slots), ..
+                }),
+                Some(slot),
+            ) if divisor == 1.0 => slots.add_value(
+                slot,
+                (result.latency_ms, result.energy_wms, result.source.as_str()),
+            ),
+            _ => self.add(
+                inference_phase,
+                slot,
+                op,
+                result.into_owned(),
+                divisor,
+                runtime,
+            ),
         }
     }
 }
@@ -835,6 +971,8 @@ pub struct Engine {
     spec_sha256: String,
     /// Name slots of a mixed rank's mix step.
     mix_plan: MixStepPlan,
+    /// Name slots of a DSv4.1 staged rank walk, when its names are fixed.
+    stage_plan: Option<StageWalkPlan>,
     /// Ranks priced without diagnostics or lookup coverage, by workload;
     /// allocated on first use. See [`Self::rank_pricing`].
     rank_memo: OnceLock<Memo<RankKey, Arc<RankPricing>>>,
@@ -1013,6 +1151,7 @@ impl Engine {
             mixed_ops_supported: Self::supports_mixed_ops(&spec.context_ops, &spec.generation_ops),
             spec_sha256,
             mix_plan: MixStepPlan::new(&spec.context_ops, &spec.generation_ops),
+            stage_plan: StageWalkPlan::new(&spec.context_ops, &spec.generation_ops),
             rank_memo: OnceLock::new(),
             op_memo: OnceLock::new(),
             shared_names: Mutex::default(),
@@ -1706,7 +1845,7 @@ impl Engine {
             runtime.prefix,
             runtime.seq_imbalance_correction_scale,
             ContextOpFilter::All,
-            |_, op, result| on_op(op, result),
+            |_, op, result| on_op(op, result.into_owned()),
         )
     }
 
@@ -1782,6 +1921,7 @@ impl Engine {
                 runtime.gen_seq_imbalance_correction_scale,
                 false,
                 |index, op, r| {
+                    let r = r.into_owned();
                     let slot = plan.name_slot(index);
                     if let Some((_, entry)) = &mut step_fold[slot] {
                         entry.latency_ms += r.latency_ms;
@@ -2258,7 +2398,7 @@ impl Engine {
                 isl.saturating_add(osl / 2).saturating_add(1),
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |pass, op, _, result| on_op(pass, op, result),
+                |pass, _, op, _, result| on_op(pass, op, result),
             );
         }
         // Python divides by `isl` (`floor(ctx/isl)`, `ceil(ctx/isl)`) without
@@ -2388,6 +2528,9 @@ impl Engine {
     /// Scope every prefill extend before fusing token-major work with decode.
     /// Applying a decoder tail to the combined batch would incorrectly discard
     /// decode tokens and other requests' tails. The tuple is (batch, new, prefix).
+    /// `on_op` takes each executed child with its position in its op list,
+    /// each stage counting as its children; decode attention after a prefill
+    /// counts only attention children.
     #[allow(clippy::too_many_arguments)]
     fn dsv41_mixed_workload(
         &self,
@@ -2396,13 +2539,14 @@ impl Engine {
         decode_kv: u32,
         context_scale: f64,
         generation_scale: f64,
-        mut on_op: impl FnMut(MixedPass, &Op, &RuntimeContext, PerformanceResult),
+        mut on_op: impl FnMut(MixedPass, usize, &Op, &RuntimeContext, PerformanceResult),
     ) -> Result<[f64; 4], AicError> {
         let mut totals = [0.0; 4];
         if prefills.is_empty() {
             if decode_batch > 0 {
                 // Generation can fuse or overlap children differently from
                 // prefill. Preserve that graph when no prefill is scheduled.
+                let mut index = 0;
                 for outer in &self.generation_ops {
                     let children: &[Op] = match outer {
                         Op::Dsv41Stage(stage) => &stage.children,
@@ -2424,7 +2568,8 @@ impl Engine {
                             (1, MixedPass::SharedNonAttention)
                         };
                         totals[bucket] += result.latency_ms;
-                        on_op(pass, child, &runtime, result);
+                        on_op(pass, index, child, &runtime, result);
+                        index += 1;
                     }
                 }
             }
@@ -2432,6 +2577,7 @@ impl Engine {
             return Ok(totals);
         }
         let prefill_requests: u32 = prefills.iter().map(|(batch, _, _)| batch).sum();
+        let mut index = 0;
         for outer in &self.context_ops {
             let (stage, children): (_, &[Op]) = match outer {
                 Op::Dsv41Stage(stage) => (Some(stage), &stage.children),
@@ -2464,7 +2610,7 @@ impl Engine {
                             context_op_runtime(child, batch, s, prefix, context_scale, None);
                         let result = child.query(&self.db, &runtime)?;
                         totals[2] += result.latency_ms;
-                        on_op(MixedPass::ContextAttention, child, &runtime, result);
+                        on_op(MixedPass::ContextAttention, index, child, &runtime, result);
                     }
                 } else if tokens > 0 {
                     let x = if child.is_logits_gemm() {
@@ -2475,11 +2621,19 @@ impl Engine {
                     let runtime = context_op_runtime(child, 1, tokens, 0, context_scale, Some(x));
                     let result = child.query(&self.db, &runtime)?;
                     totals[1] += result.latency_ms;
-                    on_op(MixedPass::SharedNonAttention, child, &runtime, result);
+                    on_op(
+                        MixedPass::SharedNonAttention,
+                        index,
+                        child,
+                        &runtime,
+                        result,
+                    );
                 }
+                index += 1;
             }
         }
         if decode_batch > 0 {
+            let mut index = 0;
             for outer in &self.generation_ops {
                 let children: &[Op] = match outer {
                     Op::Dsv41Stage(stage) => &stage.children,
@@ -2496,7 +2650,8 @@ impl Engine {
                     );
                     let result = child.query(&self.db, &runtime)?;
                     totals[3] += result.latency_ms;
-                    on_op(MixedPass::DecodeAttention, child, &runtime, result);
+                    on_op(MixedPass::DecodeAttention, index, child, &runtime, result);
+                    index += 1;
                 }
             }
         }
@@ -2946,7 +3101,7 @@ impl Engine {
                 runtime.prefix,
                 runtime.seq_imbalance_correction_scale,
                 ContextOpFilter::All,
-                |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r),
+                |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r.into_owned()),
             )?;
         }
         if matches!(mode, StaticMode::Generation | StaticMode::Both) {
@@ -3791,8 +3946,10 @@ impl Engine {
                     }
                 }
             }
-            // Stage children have no name slots.
-            operations.begin(None);
+            // Stage children fold by the slots of the walk their passes run.
+            let plan = self.stage_plan.as_ref();
+            operations
+                .begin(plan.map(|plan| plan.names(has_prefill, sched.num_decode_requests > 0)));
             return self
                 .dsv41_mixed_workload(
                     &prefills,
@@ -3800,14 +3957,15 @@ impl Engine {
                     sched.sum_decode_kv_tokens / sched.num_decode_requests.max(1),
                     1.0,
                     1.0,
-                    |pass, op, runtime, result| {
+                    |pass, child, op, runtime, result| {
                         // A decode-only rank runs the generation graph.
                         let phase = if has_prefill && pass != MixedPass::DecodeAttention {
                             "context"
                         } else {
                             "generation"
                         };
-                        operations.add(phase, None, op, result, 1.0, || *runtime);
+                        let slot = plan.and_then(|plan| plan.slot(has_prefill, pass, child));
+                        operations.add(phase, slot, op, result, 1.0, || *runtime);
                     },
                 )
                 .map(|parts| parts[0]);
@@ -3849,7 +4007,7 @@ impl Engine {
                     } else {
                         ("generation", plan.generation_slot[index])
                     };
-                    operations.add(phase, slot, op, result, divisor, || *runtime);
+                    operations.add_lent(phase, slot, op, result, divisor, || *runtime);
                 },
             );
         }
@@ -3886,7 +4044,7 @@ impl Engine {
                         ContextOpFilter::All,
                         |index, op, result| {
                             let slot = Some(self.context_plan.name_slot(index));
-                            operations.add("context", slot, op, result, 1.0, || {
+                            operations.add_lent("context", slot, op, result, 1.0, || {
                                 context_op_runtime(
                                     op,
                                     n_prefill,
@@ -3919,7 +4077,7 @@ impl Engine {
                 false,
                 |index, op, result| {
                     let slot = Some(self.generation_plan.name_slot(index));
-                    operations.add("generation", slot, op, result, 1.0, || runtime);
+                    operations.add_lent("generation", slot, op, result, 1.0, || runtime);
                 },
             )?;
         }
@@ -4867,6 +5025,23 @@ pub(crate) mod tests {
         let _ = memo.query(4, || Ok(PerformanceResult::new(2.0, Source::Silicon)));
     }
 
+    /// A query slot lends its one result to every op of the slot; an op
+    /// without a slot owns its own.
+    #[test]
+    fn a_shared_query_lends_the_result_of_its_slot() {
+        use crate::operators::base::Source;
+        let ops = glm_layer_ops(false);
+        let plan = OpListPlan::new(&ops);
+        let mut memo = QueryMemo::new(Some(&plan), &ops);
+        let price = || Ok(PerformanceResult::new(1.0, Source::Silicon));
+        // KDA attention of layers 0 and 1 (indices 1 and 4) share a slot;
+        // the generic op at index 5 has none.
+        for index in [1, 4] {
+            assert!(matches!(memo.query(index, price), Ok(Cow::Borrowed(_))));
+        }
+        assert!(matches!(memo.query(5, price), Ok(Cow::Owned(_))));
+    }
+
     #[test]
     fn per_op_fold_attaches_the_inference_phase_only_to_executed_fallbacks() {
         use crate::operators::base::{MoeCommFallback, Source};
@@ -5192,6 +5367,7 @@ pub(crate) mod tests {
         engine.generation_ops = vec![stage(false, false), stage(false, true)];
         engine.context_plan = OpListPlan::new(&engine.context_ops);
         engine.generation_plan = OpListPlan::new(&engine.generation_ops);
+        engine.stage_plan = StageWalkPlan::new(&engine.context_ops, &engine.generation_ops);
         engine
     }
 
@@ -5443,9 +5619,21 @@ pub(crate) mod tests {
             rank_names(&iteration, 2),
             &engine.mix_plan.names
         ));
-        // DSv4.1 stage children fold by name; equal lists are shared.
+        // DSv4.1 stage children fold by the slots of the walk their rank
+        // runs: prefill-only, decode-only or mixed. The second stage leads
+        // with a costlier child, so a child folded by its position in its
+        // stage would land under another name.
         for replay in [false, true] {
-            let engine = dsv41_probe_engine(replay);
+            let mut engine = dsv41_probe_engine(replay);
+            for ops in [&mut engine.context_ops, &mut engine.generation_ops] {
+                let Op::Dsv41Stage(stage) = &mut ops[1] else {
+                    unreachable!()
+                };
+                let mhc = ElementwiseOp::new("mhc", 16384.0);
+                stage.children.insert(0, Op::Elementwise(mhc));
+            }
+            engine.stage_plan = StageWalkPlan::new(&engine.context_ops, &engine.generation_ops);
+            let plan = engine.stage_plan.as_ref().unwrap();
             let first = assert_rank_values_match_diagnostics(
                 &engine,
                 &[
@@ -5454,20 +5642,69 @@ pub(crate) mod tests {
                     rank_fpm(1, 129, 1024, 2, 2 * 1025),
                 ],
             );
+            // Decoder replay prices one prefill request. Without it, uneven
+            // requests run context attention once per extend length.
+            let requests = if replay { 1 } else { 3 };
             let second = assert_rank_values_match_diagnostics(
                 &engine,
                 &[
-                    rank_fpm(1, 257, 512, 0, 0),
+                    rank_fpm(requests, 257, 512, 0, 0),
                     rank_fpm(0, 0, 0, 3, 3 * 2049),
-                    rank_fpm(1, 257, 512, 3, 3 * 2049),
+                    rank_fpm(requests, 257, 512, 3, 3 * 2049),
                 ],
             );
-            for rank in 0..3 {
-                assert!(Arc::ptr_eq(
-                    rank_names(&first, rank),
-                    rank_names(&second, rank)
-                ));
+            for iteration in [&first, &second] {
+                for (rank, names) in [
+                    (0, &plan.context_names),
+                    (1, &plan.generation_names),
+                    (2, &plan.mixed_names),
+                ] {
+                    assert!(Arc::ptr_eq(rank_names(iteration, rank), names), "{rank}");
+                }
             }
+            assert_eq!(
+                **rank_names(&first, 0),
+                ["norm", "context_attention", "mhc"]
+            );
+            assert_eq!(
+                **rank_names(&first, 1),
+                ["norm", "generation_attention", "mhc"]
+            );
+            assert_eq!(
+                **rank_names(&first, 2),
+                ["norm", "context_attention", "mhc", "generation_attention"]
+            );
+        }
+        // A bounded replay stage without a window runs none of its children
+        // in a prefill-only walk, so the names a walk reaches are not fixed:
+        // the graph has no slots and folds by name, sharing equal lists.
+        let mut engine = dsv41_probe_engine(true);
+        let Op::Dsv41Stage(stage) = &mut engine.context_ops[1] else {
+            unreachable!()
+        };
+        stage.window_size = 0;
+        stage.children[0].set_name("decoder_norm".into());
+        engine.stage_plan = StageWalkPlan::new(&engine.context_ops, &engine.generation_ops);
+        assert!(engine.stage_plan.is_none());
+        let first = assert_rank_values_match_diagnostics(
+            &engine,
+            &[
+                rank_fpm(1, 129, 1024, 0, 0),
+                rank_fpm(1, 129, 1024, 2, 2 * 1025),
+            ],
+        );
+        let second = assert_rank_values_match_diagnostics(
+            &engine,
+            &[
+                rank_fpm(1, 257, 512, 0, 0),
+                rank_fpm(1, 257, 512, 3, 3 * 2049),
+            ],
+        );
+        for rank in 0..2 {
+            assert!(Arc::ptr_eq(
+                rank_names(&first, rank),
+                rank_names(&second, rank)
+            ));
         }
     }
 
@@ -6026,6 +6263,33 @@ pub(crate) mod tests {
                 .unwrap();
             let decode = engine.decode_step_latency(257, 2048, 32, 1.0).unwrap();
             assert!((mixed - decode).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn repeated_dsv41_stages_share_queries_with_identical_per_op_values() {
+        let mut engine = dsv41_probe_engine(true);
+        // A second bounded layer: "decoder" again under its own name.
+        for ops in [&mut engine.context_ops, &mut engine.generation_ops] {
+            let mut layer = ops[1].clone();
+            layer.set_name("decoder_1".into());
+            ops.push(layer);
+        }
+        engine.context_plan = OpListPlan::new(&engine.context_ops);
+        engine.generation_plan = OpListPlan::new(&engine.generation_ops);
+        for plan in [&engine.context_plan, &engine.generation_plan] {
+            assert!(plan.query_slot(0).is_some());
+            assert_ne!(plan.query_slot(1), plan.query_slot(0), "bounded differs");
+            assert_eq!(plan.query_slot(2), plan.query_slot(1), "layers share");
+        }
+        // Debug builds re-price the lent result; each layer keeps its own name.
+        let (context, generation) = engine
+            .run_static_per_op(&runtime(3, 700, 2), StaticMode::Both, 32)
+            .unwrap();
+        for values in [context, generation] {
+            let names: Vec<_> = values.iter().map(|value| value.0.as_str()).collect();
+            assert_eq!(names, ["encoder", "decoder", "decoder_1"]);
+            assert_eq!(values[2].1.to_bits(), values[1].1.to_bits());
         }
     }
 

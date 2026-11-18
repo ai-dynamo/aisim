@@ -825,7 +825,11 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert jobs["prediction-regression"]["uses"] == "./.github/workflows/prediction-regression-gate.yml"
 
     application_test_wheel = jobs["application-test-wheel"]
-    assert application_test_wheel["timeout-minutes"] == "10"
+    assert application_test_wheel["timeout-minutes"] == "${{ matrix.build_timeout_minutes }}"
+    assert {
+        entry["arch"]: entry["build_timeout_minutes"]
+        for entry in application_test_wheel["strategy"]["matrix"]["include"]
+    } == {"amd64": "10", "arm64": "15"}
     assert {"fast-ci", "select-full-ci"}.issubset(application_test_wheel["needs"])
     assert "application-test-wheel" in jobs["application-tests"]["needs"]
     assert {shard["suite"] for shard in jobs["application-tests"]["strategy"]["matrix"]["shard"]} == {
