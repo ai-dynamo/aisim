@@ -5,34 +5,32 @@ SPDX-License-Identifier: Apache-2.0
 
 # Modeled power and energy
 
-Op-level FPE returns operation energy. Native Replay accumulates that evidence
-and computes the coverage-gated power summary. Unified prediction and
-recommendation preserve and display `power_w` and `power_coverage`; `predict
---detail energy` exposes available breakdown evidence. In native Replay and
-unified prediction, whole-forward FPM, fixed, and polynomial timing remain
-latency-only. EPD's combined report keeps unified power unavailable even when
-its encoder has separate analytical power.
+Native Replay accumulates op-level FPE energy and non-speculative
+schema-v8 FPM component energy. Unified prediction and recommendation display
+`power_w` and `power_coverage`. Use `predict --detail energy` for the
+breakdown. Combined EPD power remains unavailable.
 
-Python static FPM summaries have a separate operation-energy path: with SOL
-interpolation and powered schema-8 rows, `get_context_energy_wms_dict()` and
-`get_generation_energy_wms_dict()` return nonzero FPM energy. Direct
-interpolation stays latency-only. Mixed steps report zero FPM prefill and
-marginal-decode energy (D10, AISIM-2001), while retaining draft-operation energy.
-SDK and legacy `cli_estimate()` static, aggregated, and disaggregated results
-apply the 90% coverage gate to FPM watts: they publish numeric `power_w` for
-powered schema-8 pairs at or above the gate, and null power with numeric
-coverage below it. Aggregated coverage counts mixed-step latency as uncovered,
-because mixed-step FPM energy is suppressed while pure-decode energy is
-retained; the published `power_w` divides total energy by total active latency.
-Non-schema-8 FPM runs (schema 6 and 7) have no row-power evidence and publish
-null `power_w` (`None` in Python), rather than the previous `0.0` sentinel.
-A disaggregated result withholds power when either worker withholds it. FPM
-watts are also withheld for draft speculation schemes, models with encoder
-operations, and language-only EPD workers. Raw `InferenceSession` summaries
-provide coverage through `get_power_data_coverage()`; `Task.run_single_agg()`
-and `Task.run_single_disagg()` include `power_coverage` in their rows. The
-operation energy stays available below the gate, and static operation energy
-does not enable replay or unified `power_w` publication.
+SDK static, aggregate, and disaggregated results and legacy `cli_estimate()`
+use the same 90% coverage threshold. For mixed FPM, measured prefill energy
+is retained and decode marginal energy subtracts the measured KV-floor
+baseline. A marginal with zero latency or missing target or floor power
+contributes zero energy. A positive-latency marginal with zero energy is
+uncovered.
+
+FPM Replay with attention DP sums energy and covered component time across
+working ranks and divides each by summed modeled active rank time, as op-level
+Replay does. The scheduler still uses the slowest rank to price the step.
+[Attention-DP wait accounting](https://linear.app/nvidia/issue/AISIM-2452)
+tracks a later change to both paths.
+
+FPM v6/v7 have no row-power evidence. FPM watts are withheld for speculative
+schemes, models with encoder operations, and language-only EPD workers. The
+legacy disaggregated result withholds watts when either worker withholds them.
+`Task.run_single_agg()` and `Task.run_single_disagg()` include `power_coverage`.
+Raw SDK summaries expose it through `get_power_data_coverage()`. Below
+the gate, available operation energy remains accessible for diagnostics.
+Mixed-step watts are **unqualified** until the measured mixed-step campaign
+passes. The result uses the standard power fields.
 See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
 
 The current producers and consumers are
@@ -118,12 +116,9 @@ and sets `power_w` to `null`, allowing a consumer to distinguish insufficient
 data from an unsupported energy path. A provider with an energy channel but
 no covered operations therefore reports `power_coverage: 0` and `power_w: null`.
 
-Native Replay's fixed, polynomial, and forward-pass-metrics (FPM) timing
-providers do not supply an energy channel. A replay using any of those
-providers, or mixing an energy-aware role with an energy-unaware role, returns
-`power_w: null` and `power_coverage: null`, including with a fully powered
-schema-8 FPM pair. Unified prediction preserves these nulls. The null values
-never mean zero watts or zero coverage.
+Fixed, polynomial, fitted, and v6/v7 FPM timing do not supply an energy
+channel. A Replay with an energy-unaware role returns `power_w: null` and
+`power_coverage: null`. Unified prediction preserves these nulls.
 
 ## Aggregate and disaggregated deployments
 
@@ -244,6 +239,14 @@ the `0.9` gate is a breaking semantic change. It requires a versioned schema
 and an explicit converter or coordinated result-schema version bump. Adding
 new optional provenance details is backward-compatible when existing meanings
 do not change.
+
+**AISIM-2001 release note.** Supported schema-v8 FPM now reports power in
+Replay and prices mixed-step energy in legacy aggregate. This includes
+`method: direct`, which prices power from the anchors selected for latency.
+DP>1 Replay divides energy and covered time by summed active rank time.
+Mixed-step watts remain unqualified pending measured validation. The approved mixed-step
+exception retains `power-metrics-v1`. Use the producer revision when
+comparing results across the change.
 
 Support and accuracy remain separate gates. Execution with sufficient data
 coverage establishes that a power result can be produced; parity with AIC and

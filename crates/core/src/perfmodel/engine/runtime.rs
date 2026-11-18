@@ -744,9 +744,19 @@ fn operation_diagnostics(
     }
 }
 
+/// Subtract the measured shared pass only when both inputs have energy.
+fn fpm_marginal_energy(latency_ms: f64, target: f64, baseline: f64) -> f64 {
+    if latency_ms > 0.0 && target > 0.0 && baseline > 0.0 {
+        (target - baseline).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// One-rank estimate of a static prefill step and its direct FPM queries.
 fn static_prefill_estimate(
     prefill_ms: f64,
+    energy_wms: f64,
     queries: Vec<crate::DirectFpmQueryEvidence>,
 ) -> crate::ForwardPassEstimate {
     let latency_ms = prefill_ms + 0.0; // same context + generation sum as run_static
@@ -760,6 +770,7 @@ fn static_prefill_estimate(
             rank: 0,
             latency_ms,
             prefill_ms: Some(prefill_ms),
+            prefill_energy_wms: (energy_wms > 0.0).then_some(energy_wms),
             queries,
             ..Default::default()
         }],
@@ -1393,6 +1404,18 @@ impl Engine {
         self.fpm_split().map(|(p, d, _, _)| (p, d))
     }
 
+    pub(crate) fn supports_fpm_power(&self) -> Result<bool, AicError> {
+        if self.nextn != 0 || self.fpm_execution_profile.is_some() || self.profile_phase.is_some() {
+            return Ok(false);
+        }
+        match self.fpm_split() {
+            Some((prefill, decode, [], [])) => {
+                Ok(prefill.has_power_column(&self.db)? && decode.has_power_column(&self.db)?)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Whether this engine prices measured complete speculative rounds.
     pub(crate) fn is_measured_speculative_round(&self) -> bool {
         self.fpm_execution_profile.is_some()
@@ -1888,10 +1911,12 @@ impl Engine {
             ..Default::default()
         };
         let mut queries = Vec::new();
+        let mut energy_wms = 0.0;
         let prefill_ms = self.run_context_phase_with(&runtime, coverage, |_, result| {
+            energy_wms += result.energy_wms;
             queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
         })?;
-        Ok(static_prefill_estimate(prefill_ms, queries))
+        Ok(static_prefill_estimate(prefill_ms, energy_wms, queries))
     }
 
     /// Prefill-step latency at exact per-rank iteration totals: the tokens the
@@ -1938,16 +1963,18 @@ impl Engine {
         coverage: Option<&mut FpmQueryCoverage>,
     ) -> Result<crate::ForwardPassEstimate, AicError> {
         let mut queries = Vec::new();
+        let mut energy_wms = 0.0;
         let prefill_ms = self.run_context_phase_totals_with(
             batch_size,
             total_prefill_tokens,
             total_kv_read_tokens,
             coverage,
             |_, result| {
+                energy_wms += result.energy_wms;
                 queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
             },
         )?;
-        Ok(static_prefill_estimate(prefill_ms, queries))
+        Ok(static_prefill_estimate(prefill_ms, energy_wms, queries))
     }
 
     fn run_context_phase_totals_with(
@@ -2616,6 +2643,8 @@ impl Engine {
         mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult),
     ) -> Result<(PerformanceResult, PerformanceResult), AicError> {
         let mut prefill_component = PerformanceResult::zero();
+        let price_target_energy =
+            self.nextn == 0 && ctx_tail.is_empty() && self.fpm_execution_profile.is_none();
         let decode_query_tokens = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
         let mut price_prefill = |batch: u32, tokens: u32, prefix: u32, scheduled: u32| {
             let mut result = prefill_op.query_totals(
@@ -2626,10 +2655,9 @@ impl Engine {
                     batch as f64 * prefix as f64,
                 ],
             )?;
-            // Aggregate FPM energy is out of V1 (AISIM-1973 D10, AISIM-2001):
-            // the marginal decode below subtracts an unpowered KV-floor
-            // baseline, so the mixed step reports no whole-model FPM energy.
-            result.energy_wms = 0.0;
+            if !price_target_energy {
+                result.energy_wms = 0.0;
+            }
             on_op(
                 MixedPass::SharedNonAttention,
                 &self.context_ops[0],
@@ -2712,13 +2740,14 @@ impl Engine {
                 // so the current per-curve coverage policy chooses the same rows.
                 let baseline_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
                 let baseline_kv = gen_tokens as f64 * (rt.isl as f64 + 1.0);
-                let baseline_ms = decode_op
-                    .query_pass_baseline(&self.db, baseline_batch, baseline_kv)?
-                    .latency_ms;
-                target.latency_ms = (target.latency_ms - baseline_ms).max(0.0);
-                // D10 (AISIM-2001): no marginal FPM energy over an uncovered
-                // baseline. Draft work keeps its op-level energy.
-                target.energy_wms = 0.0;
+                let baseline =
+                    decode_op.query_pass_baseline(&self.db, baseline_batch, baseline_kv)?;
+                target.latency_ms = (target.latency_ms - baseline.latency_ms).max(0.0);
+                target.energy_wms = if price_target_energy {
+                    fpm_marginal_energy(target.latency_ms, target.energy_wms, baseline.energy_wms)
+                } else {
+                    0.0
+                };
             }
             // Draft work has no twin in the prefill pass and must survive
             // even when the target's marginal cost clamps to zero.
@@ -3755,6 +3784,8 @@ impl Engine {
                 total += result.latency_ms;
                 if let Some(evidence) = evidence.as_deref_mut() {
                     evidence.prefill_ms = Some(result.latency_ms);
+                    evidence.prefill_energy_wms =
+                        (result.energy_wms > 0.0).then_some(result.energy_wms);
                     evidence
                         .queries
                         .extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
@@ -3987,6 +4018,7 @@ impl Engine {
         let decode_ms = result.latency_ms;
         if let Some(evidence) = evidence.as_deref_mut() {
             evidence.decode_ms = Some(decode_ms);
+            evidence.decode_energy_wms = (result.energy_wms > 0.0).then_some(result.energy_wms);
             evidence
                 .queries
                 .extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
@@ -4005,6 +4037,9 @@ impl Engine {
         if let Some(evidence) = evidence {
             evidence.decode_baseline_ms = Some(baseline_ms);
             evidence.marginal_decode_ms = Some(marginal_decode_ms);
+            let energy_wms =
+                fpm_marginal_energy(marginal_decode_ms, result.energy_wms, baseline.energy_wms);
+            evidence.decode_energy_wms = (energy_wms > 0.0).then_some(energy_wms);
             evidence.queries.extend(
                 baseline
                     .fpm_queries
@@ -8586,13 +8621,19 @@ pub(crate) mod tests {
         assert_eq!(target.1, 0.0);
     }
 
-    /// AISIM-1973 D10 (aggregate FPM power is AISIM-2001): on a fully powered
-    /// v8 pair the operator prices energy, but the mixed step reports energy 0
-    /// for its FPM prefill and marginal-decode components. Every per-op value
-    /// matches the latency-only v6 pair bit for bit, so latencies are
-    /// unchanged and the draft tails keep their op-level energy.
     #[test]
-    fn fpm_mixed_step_zeroes_fpm_energy_and_keeps_draft_energy() {
+    fn fpm_marginal_energy_requires_positive_time_and_both_inputs() {
+        assert_eq!(fpm_marginal_energy(6.0, 5000.0, 2400.0), 2600.0);
+        assert_eq!(fpm_marginal_energy(6.0, 2400.0, 5000.0), 0.0);
+        assert_eq!(fpm_marginal_energy(6.0, 2400.0, 2400.0), 0.0);
+        assert_eq!(fpm_marginal_energy(0.0, 5000.0, 2400.0), 0.0);
+        assert_eq!(fpm_marginal_energy(6.0, 5000.0, 0.0), 0.0);
+        assert_eq!(fpm_marginal_energy(6.0, 0.0, 2400.0), 0.0);
+    }
+
+    /// Speculative mixed FPM preserves diagnostic draft energy and excludes target power.
+    #[test]
+    fn fpm_speculative_mixed_step_keeps_draft_energy() {
         use crate::perf_database::fpm_forward::tests::{
             PowerCell, RowSpec, default_rows, write_pair,
         };
@@ -8635,6 +8676,8 @@ pub(crate) mod tests {
                 write_pair(tmp.path(), &rows);
             }
             let engine = Engine::build(spec, Arc::new(db)).unwrap();
+            #[cfg(feature = "python")]
+            assert!(!engine.supports_fpm_power().unwrap());
             // The step's whole-model prefill query: (1, 2048 + 8 widened
             // decode tokens, 0).
             let Op::FpmForward(prefill) = &engine.context_ops[0] else {

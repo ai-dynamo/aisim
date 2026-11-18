@@ -1531,6 +1531,9 @@ def test_external_fpm_pair_drives_yaml_replay_without_backend_data(external_fpm_
     )
     assert not (systems_root / "data").exists()
     assert report.metrics["completed_requests"] == 1
+    for result in (report.metrics, report.metadata["native_report"]):
+        assert result["power_w"] is None
+        assert result["power_coverage"] is None
     record = report.metadata["native_report"]["per_request"][0]
     # The final prefill forward produces the first token; only later tokens decode.
     assert record["first_token_ms"] - record["arrival_time_ms"] == pytest.approx(22.0)
@@ -1747,10 +1750,10 @@ def test_schema8_fpm_static_summary_energy(schema8_fpm_database, context_energy,
 @pytest.mark.parametrize(
     "schema8_fpm_config,osl,energy_wms,coverage",
     [
-        (None, 2, 3000.0, 6 / 28),
+        (None, 2, 14000.0, 1.0),
         ("prefill", 2, 3000.0, 6 / 28),
-        ("decode", 2, 0.0, 0.0),
-        (None, 64, 63 * 3000.0, 378 / 400),
+        ("decode", 2, 11000.0, 22 / 28),
+        (None, 64, 11000.0 + 63 * 3000.0, 1.0),
     ],
     indirect=["schema8_fpm_config"],
     ids=["powered", "unpowered-prefill", "unpowered-decode", "sufficient-coverage"],
@@ -1763,9 +1766,8 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
     summary = InferenceSession(model, schema8_fpm_database, get_backend(BACKEND)).run_agg(
         sdk_config.RuntimeConfig(batch_size=1, isl=512, osl=osl), ctx_tokens=512
     )
-    # D10 suppresses the 22 ms mixed prefill. Only the (osl - 1) pure
-    # decode passes supply energy: 6 ms * 500 W per powered decode. Watts
-    # are total energy over total active latency, published at 0.9 coverage.
+    # The 22 ms prefill and (osl - 1) 6 ms decode passes cost 500 W
+    # where powered. The constant-latency fixture has no marginal decode time.
     expected = energy_wms / (22 + (osl - 1) * 6) if coverage >= 0.9 else None
     assert summary.get_result_dict()["power_w"] == (expected if expected is None else pytest.approx(expected))
     assert summary.get_power_data_coverage() == pytest.approx(coverage)
@@ -1791,10 +1793,10 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
         (None, "static", 2, 500.0, 1.0),
         ("prefill", "static", 2, None, 6 / 28),
         ("decode", "static", 2, None, 22 / 28),
-        (None, "agg", 2, None, 6 / 28),
+        (None, "agg", 2, 500.0, 1.0),
         ("prefill", "agg", 2, None, 6 / 28),
-        ("decode", "agg", 2, None, 0.0),
-        (None, "agg", 64, 472.5, 378 / 400),
+        ("decode", "agg", 2, None, 22 / 28),
+        (None, "agg", 64, 500.0, 1.0),
         (None, "disagg", 2, 500.0, 1.0),
         # Legacy disagg scales prefill by 1.1 and decode by 1.08 before
         # weighting coverage. The correction scales energy with latency.
@@ -1806,7 +1808,7 @@ def test_schema8_fpm_sdk_agg_power(schema8_fpm_database, osl, energy_wms, covera
         "static-powered",
         "static-unpowered-prefill",
         "static-unpowered-decode",
-        "agg-low-coverage",
+        "agg-powered",
         "agg-unpowered-prefill",
         "agg-unpowered-decode",
         "agg-sufficient-coverage",
@@ -1849,7 +1851,7 @@ def test_schema8_fpm_legacy_estimate_power(schema8_fpm_database, mode, osl, powe
         assert result.get()["power_w"] == pytest.approx(power_w)
 
 
-def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(schema8_fpm_config, tmp_path, capsys):
+def test_powered_fpm_pair_publishes_replay_and_prediction_power(schema8_fpm_config, tmp_path, capsys):
     config, systems_root = schema8_fpm_config
     powered = config.engine.workers.aggregated.timing.fpm_parquet_path
     raw = config.model_dump(mode="json", exclude_none=True)
@@ -1878,23 +1880,77 @@ def test_powered_fpm_pair_keeps_replay_and_prediction_power_unavailable(schema8_
         runner.close()
     assert report.metrics["completed_requests"] == 1
     for result in (report.metrics, report.metadata["native_report"]):
-        assert result["power_w"] is None
-        assert result["power_coverage"] is None
+        assert result["power_w"] == pytest.approx(500.0)
+        assert result["power_coverage"] == pytest.approx(1.0)
 
     path = tmp_path / "powered.yaml"
     path.write_text(yaml.safe_dump(raw))
     output_dir = tmp_path / "out"
     assert (
-        main(["predict", "-c", str(path), "--detail", "energy", "--format", "json", "--output-dir", str(output_dir)])
+        main(
+            [
+                "predict",
+                "-c",
+                str(path),
+                "--detail",
+                "energy,time,source",
+                "--format",
+                "json",
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
         == 0
     )
     prediction = json.loads(capsys.readouterr().out)
-    assert prediction["summary"]["power_w"] is None
-    assert prediction["summary"]["power_coverage"] is None
+    assert prediction["summary"]["power_w"] == pytest.approx(500.0)
+    assert prediction["summary"]["power_coverage"] == pytest.approx(1.0)
     energy = prediction["details"]["sections"]["energy"]
-    assert energy["status"] == "unsupported"
-    assert energy["diagnostics"]["power_w"] is None
-    assert energy["diagnostics"]["power_coverage"] is None
+    assert energy["diagnostics"]["power_w"] == pytest.approx(500.0)
+    assert energy["diagnostics"]["power_coverage"] == pytest.approx(1.0)
+    assert energy["diagnostics"]["energy_wms"] == pytest.approx(14_000.0)
+    assert all(op["energy_wms"] > 0 for phase in energy["diagnostics"]["phases"] for op in phase["operations"])
+    assert prediction["details"]["sections"]["source"]["status"] == "available"
+
+
+def test_powered_fpm_replay_rejects_generic_speculation(schema8_fpm_config):
+    from aisim import _runtime
+    from aisim.runner import _materialize_engine_execution_spec
+
+    config, _ = schema8_fpm_config
+    spec = prediction_to_replay_spec(config)
+    execution = _materialize_engine_execution_spec(spec, trace_block_size=512, record_per_request=False)
+    rank = execution.get("spec", execution)["engine"]["rank"]
+    rank["timing_model"]["config"]["speculation"] = {"kind": "ngram", "params": {"num_speculative_tokens": 1}}
+    with pytest.raises((ValueError, RuntimeError), match="ngram speculation requires op_level timing"):
+        _runtime.run_replay_json(json.dumps(execution))
+
+
+def test_schema7_fpm_replay_stays_latency_only(schema8_fpm_config, tmp_path):
+    config, _ = schema8_fpm_config
+    raw = config.model_dump(mode="json", exclude_none=True)
+    timing = raw["engine"]["workers"]["aggregated"]["timing"]
+    rows = pq.read_table(timing["fpm_parquet_path"]).to_pylist()
+    for row in rows:
+        for key in ("power_w", "measurement_policy", "measurement_repeats"):
+            row.pop(key)
+    timing["fpm_parquet_path"] = _write_pair(str(tmp_path / "schema7"), rows, sidecar_overrides={"schema_version": 7})
+    config = CorePredictionConfig.model_validate(raw)
+    runner = EngineReplayRunnerFactory().create(0)
+    try:
+        report = runner.run(
+            prediction_to_replay_spec(config),
+            output_requirements=ReplayOutputRequirements(include_raw_report=True, capture_per_request=True),
+        )
+    finally:
+        runner.close()
+    assert report.metrics["completed_requests"] == 1
+    native = report.metadata["native_report"]
+    assert native["power_w"] is None
+    assert native["power_coverage"] is None
+    record = native["per_request"][0]
+    assert record["first_token_ms"] - record["arrival_time_ms"] == pytest.approx(22.0)
+    assert record["last_token_ms"] - record["first_token_ms"] == pytest.approx(6.0)
 
 
 def test_fpm_selector_allows_fallback_to_untrained_regression(tmp_path):
@@ -2289,10 +2345,8 @@ class TestFPMPowerPublication:
             rc = RuntimeConfig(batch_size=2, beam_width=1, isl=512, osl=osl)
             return InferenceSession(model, database, get_backend(BACKEND)).run_agg(rc, ctx_tokens=512)
 
-        # Mixed steps carry no FPM energy (D10), but at osl 512 the powered
-        # pure decode steps cover more than 0.9 of the active latency. The
-        # watts are total energy over total active latency, uncovered mixed
-        # latency included.
+        # With both input queries powered, mixed and pure decode steps
+        # contribute energy. Published watts use all active latency.
         summary = run(_full_power, osl=512)
         result = summary.get_result_dict()
         groups = summary.get_aggregate_energy_breakdown().values()
@@ -2301,21 +2355,19 @@ class TestFPMPowerPublication:
         assert expected > 0
         assert result["power_w"] == pytest.approx(expected)
         assert summary.get_e2e_power_avg() == pytest.approx(expected)
-        # The CLI energy detail prints decode watts and no mixed-step watts.
+        # Both groups have measured energy.
         detail = "\n".join(_format_aggregate_energy_section(summary, bar_width=20, top_n=3))
         assert "Decode-only steps energy" in detail and "coverage = 100.0%" in detail
-        assert "Mixed steps energy" in detail and "avg P = unavailable" in detail
+        assert "Mixed steps energy" in detail and "avg P = unavailable" not in detail
         latency_only = run(None, osl=512).get_result_dict()
         assert (result["ttft"], result["tpot"]) == (latency_only["ttft"], latency_only["tpot"])
 
-        # A short output leaves the unpowered mixed steps dominant: below the
-        # gate the watts are withheld, and the evidence stays for diagnostics.
-        short = run(_full_power, osl=2)
+        # A short output with unpowered prefill falls below the gate.
+        short = run(lambda row: None if row["workload_kind"] == "prefill" else 450.0, osl=2)
         assert short.get_power_data_coverage() < 0.9
         assert short.get_result_dict()["power_w"] is None
         assert short.get_e2e_power_avg() is None
-        short_detail = "\n".join(_format_aggregate_energy_section(short, bar_width=20, top_n=3))
-        assert " W)" not in short_detail
+        assert short.get_power_data_coverage() > 0.0
 
     @pytest.mark.parametrize("forward_model", ["fpm", "op_level"])
     def test_epd_disagg_estimate_withholds_watts(self, fpm_power_root, cli_parser, monkeypatch, capfd, forward_model):

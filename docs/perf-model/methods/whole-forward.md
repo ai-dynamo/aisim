@@ -486,33 +486,23 @@ NaN rather than inventing a zero-watt measurement. Schema 6 and 7 remain
 latency-only and do not read `power_w`. Fake-KV healing retains the selected
 anchor's power, including unknown power.
 
-With SOL interpolation, FPM forward operators return operation energy in
-watt-milliseconds from schema-8 row power and resolved latency. Latency and
-power use the same interpolation weight; a prefill latency clamp also scales
-energy. If any selected anchor lacks power, the operation returns zero energy
-as the uncovered-data sentinel. Direct interpolation stays latency-only.
-For example, a 500 W, 7 ms SOL result carries 3500 W·ms of operation energy.
+FPM forward operators return operation energy in watt-milliseconds from
+schema-8 power and resolved latency. Direct interpolation uses the same
+measured anchors and weights for both values. SOL interpolation uses its
+resolved power, and a prefill latency clamp scales energy. If a selected
+anchor lacks power, the operation returns zero energy as the uncovered-data
+sentinel. For example, a 500 W, 7 ms result carries 3500 W·ms.
 
-Python static summaries expose this energy through
-`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`, which
-can now return nonzero FPM energy for schema-8 pairs. SDK and legacy
-`cli_estimate()` static, aggregated, and disaggregated results publish the
-resulting average `power_w` when coverage reaches 90%, and otherwise return null
-power with numeric `power_coverage`. Aggregated results combine zero-energy mixed
-steps with powered pure-decode steps, so their coverage counts mixed-step latency
-as uncovered. `Task.run_single_agg()` and `Task.run_single_disagg()` include
-numeric `power_coverage`; raw `InferenceSession` summaries expose coverage
-through `get_power_data_coverage()`. See the
-[power output contract](../power.md) for the other withholding rules; this
-operator change already affects these outputs for powered schema-8 pairs.
-Mixed steps suppress both FPM
-prefill and marginal-decode energy (decision D10, AISIM-2001), while retaining
-draft-operation energy. `FpmForwardOp::query_totals` returns SOL-based operation
-energy. `estimate_forward_pass_time_ms(metrics_by_rank)` returns latency only;
-its `ForwardPassMetrics` rank dispatch discards FPM energy. Native Replay's FPM
-timing provider also remains latency-only: replay and unified prediction reports keep
-`power_w` and `power_coverage` null even for a fully powered schema-8 pair. See
-the [power output contract](../power.md#publication-gate).
+In a mixed step, the prefill contributes its own energy. Effective decode
+energy subtracts the KV-floor result when both queries have power and the
+marginal latency is positive. Coverage is tracked per component. The
+detailed ForwardPassMetrics result carries the native component energies.
+The scalar iteration query still returns latency.
+
+Native Replay, SDK, and legacy CLI predictions publish numeric watts at 90%
+coverage or above for supported configurations. Mixed-step watts are
+unqualified until measured validation passes. See the
+[power output contract](../power.md#publication-gate) for publication guards.
 
 The accuracy dataset gate validates the schema-8 policy, row binding, DOUBLE
 column, and power values before admitting a pair. Its Gym worker adapter still
