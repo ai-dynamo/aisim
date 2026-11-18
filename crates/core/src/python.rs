@@ -3183,8 +3183,12 @@ fn checkpoint_requires_state_cache(model_path: &str) -> Result<bool> {
             .extract()?;
         if let Some(key) = decoder_key {
             let decoder = document
-                .get_item(key)?
-                .expect("selected decoder exists")
+                .get_item(&key)?
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "selected decoder config {key:?} is missing from the checkpoint"
+                    ))
+                })?
                 .downcast_into::<PyDict>()?;
             if let Some(value) = architecture(&decoder)? {
                 architectures.push(value);
@@ -7913,6 +7917,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fitted_replay_metadata_returns_error_when_selected_decoder_is_missing() {
+        pyo3::prepare_freethreaded_python();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["Qwen3ForCausalLM"]}"#,
+        )
+        .unwrap();
+        // Inject a helper/document disagreement at the Python boundary. Normal
+        // decoder selection only returns keys present in the document.
+        let error = Python::with_gil(|py| {
+            let module = py.import("aisimulate_core.decoder_config").unwrap();
+            let original = module.getattr("decoder_config_key").unwrap();
+            let namespace = PyDict::new(py);
+            let document = py
+                .import("aisimulate_core.sdk.utils")
+                .unwrap()
+                .call_method1(
+                    "_load_model_config_from_model_path",
+                    (dir.path().to_str().unwrap(),),
+                )
+                .unwrap();
+            namespace.set_item("target", document).unwrap();
+            namespace.set_item("original", &original).unwrap();
+            // Other embedded tests may run concurrently. Preserve their normal
+            // selection while injecting a failure only for this cached document.
+            let inconsistent = py
+                .eval(
+                    pyo3::ffi::c_str!(
+                        "lambda document: 'missing_decoder' if document is target else original(document)"
+                    ),
+                    Some(&namespace),
+                    None,
+                )
+                .unwrap();
+            module.setattr("decoder_config_key", inconsistent).unwrap();
+            let result = checkpoint_requires_state_cache(dir.path().to_str().unwrap());
+            module.setattr("decoder_config_key", original).unwrap();
+            result.unwrap_err()
+        });
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot verify replay cache architecture"));
+        assert!(message.contains("selected decoder config \"missing_decoder\" is missing"));
     }
 
     #[test]

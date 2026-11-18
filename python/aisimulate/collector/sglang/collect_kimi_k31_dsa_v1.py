@@ -30,6 +30,8 @@ import copy
 import importlib.metadata
 import json
 import logging
+import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -48,6 +50,9 @@ RUNTIME_VERSION = "0.0.0.dev1+g41208373c.d20261104"
 SOURCE_COMMIT = "afcd7d6b487a9cbe73e25941971b4cc107e6f9ae"
 NATIVE_HEADS = 96
 HISTORY_CHUNK_TOKENS = 8192
+# One point includes cold native initialization and up to 1M tokens of history
+# preparation. Allow an hour for that setup, but never wait forever on a TP rank.
+NATIVE_CASE_TIMEOUT_S = 3600
 
 
 def get_kimi_k31_dsa_context_test_cases():
@@ -203,7 +208,7 @@ def _run_native_case(case, device, perf_filename):
     phase = "context" if "context" in str(perf_filename) else "generation"
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
-    subprocess.run(
+    with subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -217,8 +222,32 @@ def _run_native_case(case, device, perf_filename):
             "--device",
             str(device),
         ],
-        check=True,
-    )
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        stderr = ""
+        try:
+            _, stderr = process.communicate(timeout=NATIVE_CASE_TIMEOUT_S)
+        except subprocess.TimeoutExpired as error:
+            # Kill the spawned TP ranks too: they can retain the stderr pipe
+            # and GPU allocation after the launcher dies.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _, stderr = process.communicate()
+            error.stderr = stderr
+            raise
+        finally:
+            if stderr:
+                sys.stderr.write(stderr)
+        if process.returncode:
+            for line in reversed(stderr.splitlines()):
+                reason = line.strip().removeprefix("RuntimeError: ")
+                if reason.startswith("FIXME(kernel-limit):"):
+                    raise RuntimeError(reason)
+            raise RuntimeError(f"native K31 worker exited {process.returncode}: {stderr[-2000:]}")
 
 
 def _assert_runtime() -> None:

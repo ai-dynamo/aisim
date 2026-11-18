@@ -4,7 +4,10 @@
 
 import copy
 import json
+import os
 import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -170,7 +173,7 @@ def test_multi_gpu_cases_require_standalone_exclusive_ownership(heads, tp, monke
     assert validate_case(case) == tp
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
 
-    monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: pytest.fail("launched an unowned GPU group"))
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_a, **_k: pytest.fail("launched an unowned GPU group"))
     with pytest.raises(RuntimeError, match="exclusive ownership"):
         run_kimi_k31_dsa_worker(*case, device="cuda:0", perf_filename="dsa_generation_module_perf.txt")
 
@@ -180,20 +183,109 @@ def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(mon
 
     cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (96, 48, 24)]
     observed = []
+    popen = subprocess.Popen
 
-    def run(command, *, check):
-        assert check
+    def launch(command, **kwargs):
         case = ModuleCase(*json.loads(command[command.index("--case") + 1]))
         assert command[command.index("--device") + 1] == "cuda:0"
         assert command[command.index("--phase") + 1] == "generation"
         observed.append(case)
-        if case.num_heads == 48:
-            raise subprocess.CalledProcessError(1, command)
+        return popen([sys.executable, "-c", f"raise SystemExit({int(case.num_heads == 48)})"], **kwargs)
 
-    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
     result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
     assert observed == cases
     assert result == {"succeeded": 2, "failed": [cases[1]]}
+
+
+@pytest.mark.parametrize(
+    ("reason", "classification"),
+    [
+        ("FIXME(kernel-limit): does not fit: native TP2 requires 2 available GPUs", "kernel_limit"),
+        ("native initialization failed", "unexpected"),
+        ("native failure mentioning FIXME(kernel-limit): is not a capacity refusal", "unexpected"),
+    ],
+)
+def test_native_child_preserves_failure_classification_and_output(reason, classification, monkeypatch, capfd, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    monkeypatch.syspath_prepend(str(Path(module.__file__).parents[1]))
+    from collect import _classify_exception
+
+    popen = subprocess.Popen
+
+    def launch(_command, **kwargs):
+        return popen(
+            [sys.executable, "-c", f"print('native stdout', flush=True); raise RuntimeError({reason!r})"], **kwargs
+        )
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    with pytest.raises(RuntimeError) as error:
+        run_kimi_k31_dsa_worker(*case, perf_filename=tmp_path / "dsa_generation_module_perf.txt")
+    assert _classify_exception(error.value) == classification
+    assert reason in str(error.value)
+    if classification == "kernel_limit":
+        assert str(error.value) == reason
+    else:
+        assert str(error.value).startswith("native K31 worker exited 1:")
+    output = capfd.readouterr()
+    assert "native stdout" in output.out
+    assert f"RuntimeError: {reason}" in output.err
+
+
+def test_native_success_keeps_stderr_visible(monkeypatch, capfd, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    popen = subprocess.Popen
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda _command, **kwargs: popen(
+            [sys.executable, "-c", "import sys; print('native warning', file=sys.stderr)"], **kwargs
+        ),
+    )
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    run_kimi_k31_dsa_worker(*case, perf_filename=tmp_path / "dsa_context_module_perf.txt")
+    assert "native warning" in capfd.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
+def test_native_timeout_kills_tp_children_and_fullnode_continues(monkeypatch, capfd, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    import psutil
+
+    popen = subprocess.Popen
+    children = []
+    rank_pid = tmp_path / "rank.pid"
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (48, 96)]
+
+    def launch(command, **kwargs):
+        case = ModuleCase(*json.loads(command[command.index("--case") + 1]))
+        code = ""
+        if case.num_heads == 48:
+            code = (
+                "import subprocess, sys, time; from pathlib import Path; "
+                "rank = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                f"Path({str(rank_pid)!r}).write_text(str(rank.pid)); "
+                "print('waiting on TP rank', file=sys.stderr, flush=True); time.sleep(60)"
+            )
+        child = popen([sys.executable, "-c", code], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 1)
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
+    assert result == {"succeeded": 1, "failed": [cases[0]]}
+    assert all(child.poll() is not None for child in children)
+    pid = int(rank_pid.read_text())
+    try:
+        status = psutil.Process(pid).status()
+    except psutil.NoSuchProcess:
+        status = None
+    assert status in (None, psutil.STATUS_ZOMBIE)
+    assert "waiting on TP rank" in capfd.readouterr().err
 
 
 def test_native_forward_batch_must_match_persisted_prefix_and_history():
