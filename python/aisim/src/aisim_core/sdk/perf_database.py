@@ -95,6 +95,8 @@ def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]
     default_path = os.fspath(pkg_resources.files("aisim_core") / "systems")
     if raw_paths is None:
         return [default_path]
+    if isinstance(raw_paths, os.PathLike):
+        raw_paths = [raw_paths]  # one root; a str would be split on commas
     if isinstance(raw_paths, str):
         entries = [part.strip() for part in raw_paths.split(",") if part.strip()]
     else:

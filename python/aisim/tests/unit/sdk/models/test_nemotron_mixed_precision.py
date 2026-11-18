@@ -329,6 +329,18 @@ def test_moe_modes(raw, default, system, expected):
     assert _moe_modes(raw, "MEMEMEME", default, system) == expected
 
 
+def test_routed_experts_of_one_layer_must_share_a_precision():
+    raw = _listing(
+        {
+            f"backbone.layers.1.mixer.experts.{expert}.{proj}_proj": {"quant_algo": algo}
+            for expert, algo in ((0, "NVFP4"), (1, "FP8"))
+            for proj in ("up", "down")
+        }
+    )
+    with pytest.raises(ValueError, match="Routed experts of layer 1 disagree"):
+        _moe_modes(raw, "ME", MOE.nvfp4, "gb200")
+
+
 def test_checkpoint_parse_is_indexed_and_cached(monkeypatch):
     import aisim_core.sdk.models.checkpoint_precision as precision
 
@@ -404,7 +416,12 @@ def test_published_exports_price_each_layer_at_its_listed_precision(model_path, 
     ],
 )
 def test_models_without_usable_per_layer_metadata_keep_the_global_modes(model_path):
-    model = get_model(model_path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
+    import contextlib
+
+    # The W4A16_NVFP4 fallback is reported, not silent.
+    lightning = "Lightning" in model_path
+    with pytest.warns(UserWarning, match="W4A16_NVFP4") if lightning else contextlib.nullcontext():
+        model = get_model(model_path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
     assert not model._moe_quant_modes
     for name, modes in _buckets(model.context_ops).items():
         assert set(modes) == {model.config.gemm_quant_mode}, name
@@ -552,6 +569,10 @@ def test_canonical_api_resolves_nvfp4_lanes_under_the_selected_systems_root(monk
     ).close()
     (model,) = built
     assert _buckets(model.context_ops)["shared_down_gemm"] == _PUBLISHED[SUPER](NVFP4)["shared_down_gemm"]
+    from aisim_core.sdk.perf_database import is_blackwell_system
+
+    # A pathlib root resolves like its string form.
+    assert is_blackwell_system("custom_bw", tmp_path) is is_blackwell_system("custom_bw", str(tmp_path)) is True
     assert set(_experts(model)) == {MOE.nvfp4}
 
 
@@ -592,3 +613,31 @@ def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
         config.gemm_quant_mode, config.moe_quant_mode = FP8, MOE.nvfp4
         for _ in range(2):
             assert_uniform(build(config), FP8, MOE.nvfp4)
+
+
+def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypatch):
+    import dataclasses
+
+    import yaml
+
+    from aisim.legacy_cli.api import _build_recommend_tasks
+    from aisim.sdk.task_v2 import Task
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    task = _task(SUPER)
+
+    def experts(task_or_config):
+        if isinstance(task_or_config, Task):
+            return set(_experts(_task_model(task_or_config, SUPER)))
+        return set(_experts(get_model(SUPER, task_or_config, "vllm")))
+
+    assert experts(task) == {MOE.nvfp4}
+    # Overriding the config Task built, before its first model build, is explicit.
+    config = task.build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
+    assert experts(dataclasses.replace(config, moe_quant_mode=MOE.fp8)) == {MOE.fp8}
+    # A mode assigned to the Task after construction is explicit for building, YAML and recommend.
+    task.moe_quant_mode = MOE.fp8
+    reloaded = Task.from_yaml(yaml.safe_load(task.to_yaml()))
+    rebuilt = _build_recommend_tasks({"agg": task}, 8)["agg"]
+    for other in (task, reloaded, rebuilt):
+        assert other.moe_quant_mode == MOE.fp8 and experts(other) == {MOE.fp8}

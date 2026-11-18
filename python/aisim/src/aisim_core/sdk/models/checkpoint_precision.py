@@ -250,9 +250,8 @@ def moe_modes(
     native mode, as on the canonical API path. Unlisted experts are BF16 only in a targets-only
     export; an excluded layer is always BF16.
 
-    shortcut: a layer's precision is read from the declared expert modules (expert 0);
-    per-expert precision within one layer is not modeled. Upgrade if an export quantizes
-    experts of a layer differently.
+    A layer's precision is read from its declared expert modules (expert 0); a layer whose
+    listed experts disagree is rejected, since per-expert precision is not modeled.
     """
     moe = common.MoEQuantMode
     nvfp4 = _nvfp4_lane(system, systems_path, moe.nvfp4, moe.nvfp4_wo)
@@ -273,6 +272,12 @@ def moe_modes(
         mode = execution_mode(modes[algo]) if algo else unlisted
         return nvfp4 if mode in (moe.nvfp4, moe.nvfp4_wo) else mode
 
+    # A layer is priced from its declared expert modules; reject a layer whose other listed experts disagree.
+    for layer, kind in enumerate(layer_kinds):
+        for block in {module.partition("experts.")[0] + "experts" for module in expert_modules.get(kind, ())}:
+            algos = {algo for path in layer_paths(layer, block) for algo in checkpoint.descendants.get(path, ())}
+            if len(algos) > 1:
+                raise ValueError(f"Routed experts of layer {layer} disagree on precision: {algos}")
     experts = {kind: {"experts": modules} for kind, modules in expert_modules.items()}
     resolved = Counter(mode for *_, mode in checkpoint.rows(layer_kinds, experts, layer_paths, resolve))
     return {} if set(resolved) <= {default} else dict(resolved)

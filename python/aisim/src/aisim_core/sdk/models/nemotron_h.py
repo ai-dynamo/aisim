@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import aisim_core.sdk.operations as ops
 from aisim_core.sdk import common
 from aisim_core.sdk.errors import InvalidEngineConfigurationError
@@ -100,6 +102,12 @@ class NemotronHModel(BaseModel):
         # shortcut: a checkpoint with W4A16_NVFP4 layers (Nemotron 3.5 Lightning) keeps the global
         # modes, because no packaged table has w4a16_nvfp4 MoE rows. Remove once those tables exist.
         per_layer = "w4a16_nvfp4" not in checkpoint.algos
+        if not per_layer:
+            warnings.warn(
+                f"{model_info['model_path']}: the checkpoint lists W4A16_NVFP4 layers, which no packaged "
+                "table measures; every projection and routed expert is priced at the global GEMM/MoE modes.",
+                stacklevel=2,
+            )
         # The system resolves under the caller's systems root (canonical API systems_paths).
         system, systems_path = model_config.system, model_config.systems_path
         if per_layer and not model_info["gemm_quant_mode_is_explicit"]:

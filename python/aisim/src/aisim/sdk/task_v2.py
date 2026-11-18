@@ -205,6 +205,12 @@ _QUANT_ENUM_TABLES: dict[str, type] = {
     "comm_quant_mode": common.CommQuantMode,
 }
 
+# Task attribute holding each mode's per-role explicit flags (set by _resolve_quant_modes).
+_QUANT_EXPLICIT_BY_ROLE = {
+    "gemm_quant_mode": "_gemm_quant_mode_explicit_by_role",
+    "moe_quant_mode": "_moe_quant_mode_explicit_by_role",
+    "fmha_quant_mode": "_fmha_explicit",
+}
 _QUANT_FALLBACKS: dict[str, object] = {
     "gemm_quant_mode": common.GEMMQuantMode.bfloat16,
     "moe_quant_mode": common.MoEQuantMode.bfloat16,
@@ -1816,7 +1822,17 @@ class Task:
         return getattr(self, name if role == "agg" else f"{role}_{name}")
 
     def _set_role_attr(self, role: str, name: str, value: Any) -> None:
-        setattr(self, name if role == "agg" else f"{role}_{name}", value)
+        # Internal resolution fills: not a caller choice, so not marked explicit.
+        object.__setattr__(self, name if role == "agg" else f"{role}_{name}", value)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # A caller assigning a GEMM, MoE or FMHA mode after resolution makes it explicit, so
+        # build_model_config, to_yaml and recommend rebuilds keep it.
+        object.__setattr__(self, name, value)
+        role, _, key = name.partition("_") if name.startswith(("prefill_", "decode_")) else ("agg", "", name)
+        explicit_by_role = self.__dict__.get(_QUANT_EXPLICIT_BY_ROLE.get(key, ""))
+        if explicit_by_role is not None and role in explicit_by_role:
+            explicit_by_role[role] = value is not None
 
     # =====================================================================
     # Builders consumed by sweep.py
