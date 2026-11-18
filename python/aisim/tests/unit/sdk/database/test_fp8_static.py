@@ -141,6 +141,72 @@ def test_supported_quant_modes_admit_fp8_static_from_its_own_rows_with_scale_mat
             assert fp8.name in modes
 
 
+def test_fp8_static_parquet_rows_reach_the_listing_and_validate(tmp_path):
+    """Final consumer of a table with fp8_static rows: a parquet file goes
+    through the engine table view to the GEMM listing and to Task.validate().
+    Synthetic systems root: the public b200_sxm spec with its own data folder
+    that holds only bfloat16 and fp8_static GEMM rows plus fp8 scale_matrix
+    rows (invented latencies). There is no fp8 GEMM row and no compute_scale
+    table, so only the direct rule can list fp8_static."""
+    import shutil
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisim.sdk.task_v2 import Task
+    from aisim_core.sdk import perf_database as pdb
+
+    shutil.copy(pdb.get_systems_paths()[0] + "/b200_sxm.yaml", tmp_path / "b200_sxm.yaml")
+    data = tmp_path / "data" / "b200_sxm"
+    gemm_dir = data / "gemm" / "vllm" / "0.30.0"
+    quantize_dir = data / "quantize" / "vllm" / "0.30.0"
+    gemm_dir.mkdir(parents=True)
+    quantize_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "gemm_dtype": ["bfloat16", "bfloat16", "fp8_static", "fp8_static"],
+                "m": [128, 256, 128, 256],
+                "n": [1024] * 4,
+                "k": [1024] * 4,
+                "latency": [1.0, 2.0, 0.5, 1.0],
+            }
+        ),
+        gemm_dir / "gemm_perf.parquet",
+    )
+    pq.write_table(
+        pa.table({"quant_dtype": ["fp8", "fp8"], "m": [128, 256], "k": [1024, 1024], "latency": [0.1, 0.2]}),
+        quantize_dir / "scale_matrix_perf.parquet",
+    )
+
+    previous = pdb.get_systems_paths()
+    pdb.set_systems_paths([str(tmp_path)])
+    try:
+        db = pdb.get_database("b200_sxm", "vllm", "0.30.0", database_mode="SILICON")
+        assert db.supported_quant_mode["gemm"] == ["bfloat16", "fp8_static"]
+        assert common.GEMMQuantMode.fp8_static in db._gemm_data  # the rows passed the engine table view
+
+        def task(quant, mode, policy=None):
+            return Task(
+                serving_mode="agg",
+                model_path="meta-llama/Meta-Llama-3.1-8B",
+                system_name="b200_sxm",
+                backend_name="vllm",
+                backend_version="0.30.0",
+                gemm_quant_mode=quant,
+                database_mode=mode,
+                transfer_policy=policy,
+            )
+
+        task(common.GEMMQuantMode.fp8_static, "SILICON").validate()
+        # fp8_static rows are no transfer donor: fp8 needs XPROFILE from bfloat16.
+        with pytest.raises(ValueError, match="Unsupported gemm quant mode 'fp8'"):
+            task(common.GEMMQuantMode.fp8, "HYBRID", "balanced").validate()
+        task(common.GEMMQuantMode.fp8, "HYBRID").validate()
+    finally:
+        pdb.set_systems_paths(previous)
+
+
 # ---------------------------------------------------------------------------
 # Retired with #1357 PR-5 (single oracle = the compiled engine):
 # - query_gemm fp8_static -> dynamic-fp8 table reuse, the structured miss, and

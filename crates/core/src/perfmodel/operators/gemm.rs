@@ -1412,4 +1412,197 @@ mod tests {
             );
         }
     }
+
+    /// HYBRID on a table with direct rows (fixture D). A silicon hit reads
+    /// the fp8_static rows; a silicon miss is estimated from the own
+    /// fp8_static util grid, never from the fp8 grid.
+    #[test]
+    fn gemm_fp8_static_direct_rows_in_hybrid_mode() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db = fixture_d_db(&tmp);
+        let hyb = db
+            .silicon_view()
+            .with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+
+        // Hit at (192, 1024, 1024): the fp8_static rows of S lerp to latency
+        // 1.0 and energy 140 (see ROWS_S_GEMM); no subtraction, row source.
+        hyb.reset_provenance();
+        let hit = fp8_static_op("g1", 1.0, false)
+            .query(&hyb, 192, None)
+            .expect("hybrid hit");
+        assert!(
+            (hit.latency_ms - 1.0).abs() < 1e-9,
+            "latency {}",
+            hit.latency_ms
+        );
+        assert!((hit.energy_wms - 140.0).abs() < 1e-9 * 140.0);
+        assert_eq!(hit.source, Source::Silicon);
+        assert_eq!(
+            hyb.worst_provenance(),
+            util_empirical::ProvenanceTier::Silicon
+        );
+
+        // Miss at (192, 32, 32): no row has n = k = 32. Every fp8_static row
+        // of S is half the fp8 row at the same (m, n, k) (0.5 vs 1.0, 1.5 vs
+        // 3.0), and the two modes share one roofline, so the fp8_static util
+        // (roofline / latency) is twice the fp8 util at every sample. The own
+        // grid estimate (roofline / util) is therefore half the fp8 estimate;
+        // a borrowed or shared fp8 grid would give the fp8 estimate itself.
+        hyb.reset_provenance();
+        let miss = GemmOp::new("s", 32, 32, GemmQuantMode::Fp8Static)
+            .query(&hyb, 192, None)
+            .expect("hybrid miss");
+        assert_eq!(miss.source, Source::Empirical);
+        assert_eq!(
+            hyb.worst_provenance(),
+            util_empirical::ProvenanceTier::Empirical
+        );
+        let fp8 = GemmOp::new("f", 32, 32, GemmQuantMode::Fp8)
+            .query(&hyb, 192, None)
+            .expect("fp8 hybrid miss");
+        assert_eq!(fp8.source, Source::Empirical);
+        assert!(
+            (2.0 * miss.latency_ms - fp8.latency_ms).abs() <= 1e-12 * fp8.latency_ms,
+            "fp8_static {} is not half of fp8 {}",
+            miss.latency_ms,
+            fp8.latency_ms
+        );
+    }
+
+    /// SOL_FULL on a table with direct rows reads no table: the result is the
+    /// GEMM roofline with the decomposition and the tag of today.
+    #[test]
+    fn gemm_fp8_static_direct_rows_in_sol_full_mode() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db = fixture_d_db(&tmp);
+        assert!(db.gemm.has_direct_fp8_static().unwrap());
+        let sol_full = db
+            .silicon_view()
+            .with_mode(DatabaseMode::SolFull, TransferPolicy::ALL);
+        for low_precision_input in [false, true] {
+            let r = fp8_static_op("s", 1.0, low_precision_input)
+                .query(&sol_full, 192, None)
+                .expect("fp8_static sol_full query");
+            assert_hand_roofline(r.latency_ms, "SOL_FULL latency");
+            let sol = r.sol.expect("SOL_FULL keeps the decomposition");
+            assert_hand_roofline(sol.time_ms(), "SOL_FULL decomposition");
+            assert_eq!(r.source, Source::Estimated);
+        }
+    }
+
+    /// Invariant: adding fp8_static rows to a table changes no answer of
+    /// another mode. Table X has bfloat16 rows and real same-profile siblings
+    /// of fp8_static (fp8_block, and fp8 in one variant); table Y is X with
+    /// fp8_static rows FIRST in file order at 1000x latency, so a leak into a
+    /// ladder reference or a shared key would move an answer by far.
+    #[test]
+    fn gemm_fp8_static_rows_change_no_answer_of_another_mode() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        const BALANCED: TransferPolicy = TransferPolicy {
+            xshape: true,
+            xquant: true,
+            xprofile: false,
+            xop: false,
+        };
+        type Row = (&'static str, i64, f64);
+        let siblings: [Row; 6] = [
+            ("bfloat16", 64, 1.0),
+            ("bfloat16", 128, 2.0),
+            ("fp8_block", 64, 3.0),
+            ("fp8_block", 128, 5.0),
+            ("fp8", 64, 7.0),
+            ("fp8", 128, 9.0),
+        ];
+        let statics: [Row; 2] = [("fp8_static", 64, 1000.0), ("fp8_static", 128, 2000.0)];
+        let write = |dir: &std::path::Path, rows: &[Row]| {
+            let data = write_energy_systems_root(dir);
+            write_parquet(
+                &data.join("gemm_perf.parquet"),
+                &[
+                    Col::Str("gemm_dtype", rows.iter().map(|r| r.0).collect()),
+                    Col::I64("m", rows.iter().map(|r| r.1).collect()),
+                    Col::I64("n", vec![64; rows.len()]),
+                    Col::I64("k", vec![64; rows.len()]),
+                    Col::F64("latency", rows.iter().map(|r| r.2).collect()),
+                ],
+            );
+            PerfDatabase::load(dir, "testsys", "vllm", "1.0").expect("db must load")
+        };
+        // One answer as text: bit patterns of the numbers, tag, provenance,
+        // or the error text without the folder and the list of quants.
+        let show = |r: Result<PerformanceResult, AicError>,
+                    tier: util_empirical::ProvenanceTier,
+                    root: &std::path::Path| {
+            match r {
+                Ok(v) => format!(
+                    "{:x} {:x} {:?} {:?} {tier:?}",
+                    v.latency_ms.to_bits(),
+                    v.energy_wms.to_bits(),
+                    v.source,
+                    v.sol.map(|s| (s.math_ms.to_bits(), s.mem_ms.to_bits())),
+                ),
+                Err(e) => {
+                    let text = format!("{e:?}").replace(&root.display().to_string(), "<root>");
+                    let text = text.split("; available:").next().unwrap_or("").to_string();
+                    format!("Err {text}")
+                }
+            }
+        };
+        let mut compared = 0;
+        for with_fp8 in [true, false] {
+            let x_rows: Vec<Row> = siblings
+                .iter()
+                .copied()
+                .filter(|r| with_fp8 || r.0 != "fp8")
+                .collect();
+            let y_rows: Vec<Row> = statics
+                .iter()
+                .copied()
+                .chain(x_rows.iter().copied())
+                .collect();
+            let (tmp_x, tmp_y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let x = write(tmp_x.path(), &x_rows);
+            let y = write(tmp_y.path(), &y_rows);
+            assert!(!x.gemm.has_direct_fp8_static().unwrap());
+            assert!(y.gemm.has_direct_fp8_static().unwrap());
+            for policy in [TransferPolicy::ALL, BALANCED, TransferPolicy::OFF] {
+                for mode in [
+                    DatabaseMode::Silicon,
+                    DatabaseMode::Hybrid,
+                    DatabaseMode::Empirical,
+                    DatabaseMode::Sol,
+                    DatabaseMode::SolFull,
+                ] {
+                    let vx = x.silicon_view().with_mode(mode, policy);
+                    let vy = y.silicon_view().with_mode(mode, policy);
+                    for quant in [
+                        GemmQuantMode::Fp8,
+                        GemmQuantMode::Sq,
+                        GemmQuantMode::Fp8Block,
+                        GemmQuantMode::Fp8Ootb,
+                        GemmQuantMode::Bfloat16,
+                        GemmQuantMode::Int4Wo,
+                    ] {
+                        for (m, n, k) in [(64u32, 64u32, 64u32), (100, 64, 64), (64, 128, 128)] {
+                            let op = GemmOp::new("g", n, k, quant);
+                            vx.reset_provenance();
+                            let rx =
+                                show(op.query(&vx, m, None), vx.worst_provenance(), tmp_x.path());
+                            vy.reset_provenance();
+                            let ry =
+                                show(op.query(&vy, m, None), vy.worst_provenance(), tmp_y.path());
+                            assert_eq!(
+                                rx, ry,
+                                "with_fp8={with_fp8} {policy:?} {mode:?} {quant:?} ({m}, {n}, {k})"
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 2 * 3 * 5 * 6 * 3);
+    }
 }
