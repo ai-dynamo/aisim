@@ -384,7 +384,10 @@ fn gemm_reference_grid(
 /// the quant-transfer ladder behind an own-data miss. Mirrors Python
 /// `_query_gemm_table::get_empirical` + `util_empirical.quant_transfer_grid`
 /// (grid depth 3; the own-grid SOL uses the ORIGINAL quant, numerically
-/// identical to the fp8_static->fp8 table quant since the profiles match):
+/// identical to the table quant since the profiles match). The table quant
+/// of a fp8_static query is `fp8_static` itself on a table with fp8_static
+/// rows (direct path), and `fp8` on a table without them (derived path,
+/// as before):
 ///
 /// 1. own-quant grid — inherently cross-shape (depth-3 over every collected
 ///    `(m, n, k)`), so GEMM's **xshape relation class is structurally
@@ -1138,6 +1141,26 @@ mod tests {
         PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").expect("db must load")
     }
 
+    /// The fp8 / fp8_static GEMM roofline at (m, n, k) = (192, 1024, 1024)
+    /// on the synthetic system of `write_energy_systems_root` (mem_bw
+    /// 7.7e12 B/s, fp8_tc_flops 4.5e15), computed by hand:
+    ///
+    /// - memory: 1 B/element x (m*n + m*k + n*k)
+    ///   = 196608 + 196608 + 1048576 = 1441792 B;
+    ///   1441792 / 7.7e12 x 1000 = 1.8724571428571426e-4 ms.
+    /// - math: 2 x 192 x 1024 x 1024 / 4.5e15 x 1000 = 8.947848533e-5 ms.
+    ///
+    /// The roofline is the larger term: memory bound, 1.8724571428571426e-4 ms.
+    const HAND_ROOFLINE_192_1024_1024_MS: f64 = 1.8724571428571426e-4;
+
+    fn assert_hand_roofline(got: f64, what: &str) {
+        let want = HAND_ROOFLINE_192_1024_1024_MS;
+        assert!(
+            (got - want).abs() <= 1e-9 * want,
+            "{what} {got} != hand roofline {want}"
+        );
+    }
+
     fn fp8_static_op(name: &str, scale_factor: f64, low_precision_input: bool) -> GemmOp {
         GemmOp {
             name: name.to_string(),
@@ -1237,7 +1260,9 @@ mod tests {
         )
         .time_ms();
         assert!(floor > 0.0);
+        assert_hand_roofline(floor, "floor");
         assert_eq!(r.latency_ms, floor);
+        assert_hand_roofline(r.latency_ms, "floored latency");
         assert_eq!(r.source, Source::Estimated);
         // Energy keeps the plain subtraction: 140 - 2.0 * 10 = 120.
         assert!(
@@ -1332,7 +1357,9 @@ mod tests {
             1024.0,
         )
         .time_ms();
+        assert_hand_roofline(roofline, "roofline");
         assert_eq!(r.latency_ms, roofline);
+        assert_hand_roofline(r.latency_ms, "SOL latency");
         assert_eq!(r.source, Source::Estimated);
     }
 
