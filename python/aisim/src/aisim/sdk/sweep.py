@@ -176,7 +176,7 @@ def _rate_match_dict(
     ttft = p["ttft"]
     tpot = d["tpot"]
     decode_time = tpot * max(osl - 1, 0)
-    disagg_power_avg = disagg_power_w(p.get("power_w", 0.0), d.get("power_w", 0.0), ttft, decode_time)
+    disagg_power_avg = disagg_power_w(p.get("power_w"), d.get("power_w"), ttft, decode_time)
 
     return {
         "model": p["model"],

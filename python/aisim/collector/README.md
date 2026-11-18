@@ -271,7 +271,19 @@ The default publication gate requires every frozen cell to pass.
 result. The database checkpoint also records
 `skipped_first_publisher_wins`. A validated completed schema-7 or 8 database
 is terminal on resume even if raw cell artifacts have since been pruned.
-Historical schema-6 publications cannot be finalized by this collector.
+A completed schema-6 commit record cannot be finalized by this collector.
+A latency-only publication into a destination containing a schema-6 pair
+merges its rows, assigns them legacy execution identity, and writes a
+schema-7 commit record. Publish to a fresh output directory to leave the
+schema-6 pair unchanged.
+
+To resume a campaign created before power collection was introduced, pass
+`--no-fpm-measure-power` along with its original arguments and `--resume`.
+The default now enables power, which changes the frozen plan and produces
+`FPM checkpoint does not match the current frozen plan` for that archived
+campaign. Keep power enabled only in a new campaign; do not edit the old
+plan or checkpoint to bypass the mismatch.
+
 `run-manifest.json` schema v2 is invocation-scoped: its `attempts` include the
 attempt ID, timestamps, final status, and partial phase timings for failed
 attempts; a no-op resume writes no historical attempts.

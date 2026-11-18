@@ -300,6 +300,14 @@ fails before model loading on an older image. Opt out with
 onboarding; see the
 [onboarding guide](fpm-self-service/implementation.md#how-the-collection-grid-is-determined).
 
+An archived latency-only campaign has power disabled, including when its
+saved plan predates the `measure_power` field. Guided readiness rejects it
+against a request with `collection.measure_power: true` (also the default
+when omitted). Set the request field explicitly to `false` to reuse that
+campaign. To retain power collection, re-plan and collect in a new campaign
+directory instead. For a direct collector resume of a pre-power campaign,
+pass `--no-fpm-measure-power` with its original arguments and `--resume`.
+
 ### Synthetic contract tests
 
 These tests write synthetic schema-6, 7 and 8 pairs. They check semantics,

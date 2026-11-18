@@ -144,6 +144,52 @@ def test_static_watts_equal_operation_energy_over_latency(fpm_power_root):
     assert _cli_static(database).power_w == pytest.approx(expected)
 
 
+def test_static_coverage_binding_and_adapter_scale_only_powered_query_latencies(fpm_power_root):
+    """Covered latency survives the native binding and a non-unit Python correction.
+
+    The first decode query is unpowered, while the last two are powered.
+    All three fold into one positive-energy entry, so coverage must be
+    counted before that fold: 32 * 7 + 8 = 232 ms of 424 decode ms.
+    """
+    from aisim.sdk.config import RuntimeConfig
+    from aisim_core.sdk.rust_engine_step import (
+        _cached_engine_handle,
+        _static_engine_kwargs,
+        estimate_static_breakdown_with_power_coverage_with_rust,
+    )
+
+    model = _qwen_fpm()
+    rows, watts = _decode_pair(model, {**_EXACT, 1026: (6.0, None)})
+    database = fpm_power_root(model, watts, rows=rows)
+    runtime = RuntimeConfig(batch_size=2, beam_width=1, isl=_ISL, osl=_OSL)
+    handle = _cached_engine_handle(model, database)
+    context, generation, ctx_covered, gen_covered = handle._run_static_per_op_with_coverage(
+        **_static_engine_kwargs(runtime, "static", _STRIDE)
+    )
+    assert ctx_covered == pytest.approx(40.0)
+    assert gen_covered == pytest.approx(232.0)
+    assert sum(entry[1] for entry in context if entry[2] > 0) == pytest.approx(ctx_covered)
+    assert sum(entry[1] for entry in generation) == pytest.approx(424.0)
+    assert sum(entry[2] for entry in generation) == pytest.approx(32 * 7 * 500 + 8 * 550)
+    covered_queries = 0.0
+    for s, repeats in _STEPS:
+        step = RuntimeConfig(batch_size=2, beam_width=1, isl=s - 1, osl=2)
+        _, queries, _, _ = handle._run_static_per_op_with_coverage(**_static_engine_kwargs(step, "static_gen", _STRIDE))
+        covered_queries += repeats * sum(entry[1] for entry in queries if entry[2] > 0)
+    assert gen_covered == pytest.approx(covered_queries)
+
+    scale = 2.5
+    breakdown, covered = estimate_static_breakdown_with_power_coverage_with_rust(
+        model, database, runtime, "static", _STRIDE, scale
+    )
+    ctx_latency, gen_latency, ctx_energy, gen_energy, *_ = breakdown
+    assert covered == pytest.approx((40.0 * scale, covered_queries * scale))
+    assert sum(ctx_latency.values()) == pytest.approx(40.0 * scale)
+    assert sum(gen_latency.values()) == pytest.approx(424.0 * scale)
+    assert sum(ctx_energy.values()) == pytest.approx(12_000.0 * scale)
+    assert sum(gen_energy.values()) == pytest.approx((32 * 7 * 500 + 8 * 550) * scale)
+
+
 def test_draft_scheme_static_cli_estimate_withholds_watts_at_full_coverage(fpm_power_root):
     """Step 5b through the public legacy route, where coverage alone would publish watts.
 
@@ -517,7 +563,11 @@ def test_legacy_aggregate_sweep_gates_fpm_power_and_keeps_v7_latency(fpm_power_r
     import pandas as pd
 
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
-    experiment = _experiment("agg")
+    # The synthetic plain bs=1 candidate has TPOT about 5.53 ms and clears
+    # the coverage gate; bs>=2 starts at 6.77 ms and withholds power. Keep
+    # the selected best configuration on the powered side of that boundary.
+    # Both EAGLE-3 candidates also meet this SLA, but must withhold watts.
+    experiment = _experiment("agg", tpot=6.0)
     if scheme == "eagle3":
         experiment["speculative"] = _EAGLE3
     model = _qwen_fpm()
@@ -540,7 +590,7 @@ def test_legacy_aggregate_sweep_gates_fpm_power_and_keeps_v7_latency(fpm_power_r
     for frames in (powered.pareto_fronts, powered.best_configs):
         assert not frames["fpm"].empty
     check_watts(pareto["power_w"], "pareto_fronts")
-    assert powered.best_configs["fpm"]["power_w"].dropna().between(0.9 * 450.0, 450.0).all()
+    check_watts(powered.best_configs["fpm"]["power_w"], "best_configs")
     saved = pd.read_csv(powered_dir / "pareto.csv")
     assert not saved.empty
     check_watts(saved["power_w"], "pareto.csv")
