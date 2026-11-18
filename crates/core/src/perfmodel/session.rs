@@ -663,6 +663,14 @@ pub(crate) fn get_mix_step_ops<'a>(
             // `r` requests carry one extra token. Never invent extra states.
             let n = prefill_batch.max(1);
             let (q, r) = (ctx_tokens / n, ctx_tokens % n);
+            // Totals cannot say which request is cold, so any cached token in
+            // the step keeps every chunk off cold-state scan rows, even when
+            // the integer mean prefix rounds to zero.
+            let prefix = if combined_prefix > 0 {
+                prefix_per_req.max(1)
+            } else {
+                0
+            };
             for (batch, tokens) in [(n - r, q), (r, q + 1)] {
                 if batch == 0 || tokens == 0 {
                     continue;
@@ -671,7 +679,7 @@ pub(crate) fn get_mix_step_ops<'a>(
                     batch_size: batch,
                     beam_width: 1,
                     s: tokens,
-                    prefix: prefix_per_req,
+                    prefix,
                     num_tokens: batch * tokens,
                     seq_imbalance_correction_scale: 1.0,
                     gen_seq_imbalance_correction_scale: 1.0,

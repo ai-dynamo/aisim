@@ -4768,6 +4768,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn packed_cached_prefill_never_reaches_mamba_as_cold() {
+        // One cached token over two prefill requests rounds the mean prefix to
+        // zero; a qualified scan must still see a cached prefix.
+        let engine = build_engine(None);
+        let ops = [qualified_mamba(true, 1)];
+        let prefixes = |combined_prefix: u32| {
+            let mut seen = Vec::new();
+            crate::perfmodel::session::get_mix_step_ops(
+                &ops,
+                &[],
+                None,
+                None,
+                None,
+                &engine.db,
+                32,
+                0,
+                16,
+                2,
+                combined_prefix / 2,
+                combined_prefix,
+                0,
+                0,
+                |_, _, _, ctx, _, _| seen.push(ctx.prefix),
+            )
+            .unwrap();
+            seen
+        };
+        assert_eq!(prefixes(1), vec![1]);
+        assert_eq!(prefixes(0), vec![0]);
+        assert_eq!(prefixes(64), vec![32]);
+    }
+
+    #[test]
     fn ad_hoc_op_queries_validate_mamba_fields() {
         let engine = build_engine(None);
         let with = |state_dtype: &str, token_width: u32| match qualified_mamba(false, token_width) {

@@ -85,6 +85,10 @@ state, so they do not measure a prefill that restores a cached prefix. A
 qualified scan operation with a cached prefix therefore uses the SOL estimate,
 which counts the restored recurrent state. A legacy operation, one with no
 recorded state dtype, still reads the cold row and labels it `silicon`.
+Packed `ForwardPassMetrics` carry only prefill totals, so they cannot say which
+request is cold. If a packed step has any cached prefill token, every qualified
+prefill scan in it uses the SOL estimate. For a step that mixes cold and
+cached requests, this choice of source is therefore approximate.
 
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different

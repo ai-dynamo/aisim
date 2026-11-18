@@ -337,8 +337,10 @@ every case the two share.
 Before the fix, the large budget priced two requests and 2192 new tokens, as
 two complete prompts would. After it, the step prices one request and 1096
 new tokens. Every mixed-step operation then equals the result for an exact
-4096-token budget, and so does TTFT. The context convolution, both projection
-GEMMs and the norm also fall, so the non-Mamba sum drops by 27%. In the
+4096-token budget, and so does TTFT. Among the Mamba rows, the context
+convolution, both projection GEMMs and the norm also fall. Separately, the sum
+of the operations without `mamba` in their names falls by 27%, because they
+also price one request instead of two. In the
 same-session sequence, the repeated third call returns the cached second
 result. The four earlier cases give output identical to `agg-62293977.json`.
 

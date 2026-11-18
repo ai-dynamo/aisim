@@ -1164,10 +1164,9 @@ mod tests {
         assert_eq!((cold.source, cold.latency_ms), (Source::Silicon, 0.5));
         let cached = qualified.query_with_prefix(&db, 2, 512, 256).unwrap();
         assert_eq!(cached.source, Source::Sol);
-        assert_eq!(
-            cached.latency_ms,
-            qualified.sol_total_bytes(2.0, 512.0) / 7.7e12 * 1000.0
-        );
+        // 1024 tokens of (1024 + 2 * 4 * 64 + 16) * 2 + 1024 * 2 = 5,152 bytes,
+        // plus two 128 KiB BF16 states each read and written once.
+        assert_eq!(cached.latency_ms, 5_799_936.0 / 7.7e12 * 1000.0);
         let legacy = op("unrecorded")
             .query_with_prefix(&db, 2, 512, 256)
             .unwrap();

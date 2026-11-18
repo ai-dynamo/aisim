@@ -18,12 +18,16 @@ class MixedStepInput:
     deliberately distinct from the target-model query-token count, which is
     derived from the model's speculative draft depth.
 
-    ``context_tokens`` is the packed prompt budget in full prompt tokens:
+    For op-level pricing, ``context_tokens`` is the packed prompt budget in
+    full prompt tokens:
     ``context_tokens // isl`` complete requests of the effective ``isl``
     tokens, prefix included. A nonzero remainder adds one partial request,
     and an exact multiple of ``isl`` has none. A qualified Mamba op caps that
     partial request at ``isl - prefix`` new tokens. The budget is not the
-    count of newly scheduled tokens after prefix-cache hits.
+    count of newly scheduled tokens after prefix-cache hits. A whole-model FPM
+    instead reads ``context_tokens`` as new tokens: it prices
+    ``ceil(context_tokens / (isl - prefix))`` requests of ``isl - prefix`` new
+    tokens each, or chunks of one request when the budget is smaller.
     """
 
     context_tokens: int
