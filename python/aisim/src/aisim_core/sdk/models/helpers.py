@@ -1495,6 +1495,12 @@ def check_is_moe(model_path: str, model_info: dict | None = None) -> bool:
         # are truthy, so a plain presence check would accept them too.
         num_experts = model_info.get("num_experts")
         topk = model_info.get("topk")
+        # Validate types before sentinel equality: False and 0.0 compare equal
+        # to zero, and a TypeError from range checks would allow fallback.
+        if any(value is not None and type(value) is not int for value in (num_experts, topk)):
+            raise InvalidEngineConfigurationError(
+                f"Gemma 4 checkpoint has inconsistent expert metadata: num_experts={num_experts!r}, topk={topk!r}"
+            )
         if num_experts in (None, 0) and topk in (None, 0):
             return False
         if num_experts is None or topk is None or num_experts < 1 or topk < 1 or topk > num_experts:
