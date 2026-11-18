@@ -227,6 +227,8 @@ def campaign(args, protocol):
     if active:
         raise RuntimeError(f"Start with an idle GPU; compute processes are present: {active}")
     write_json(args.output / "protocol.json", protocol)
+    with tarfile.open(args.output / "runner-source.tar.gz", "x:gz") as source:
+        source.add(__file__, arcname="run.py")
     environment = os.environ.copy()
     environment["COLLECTOR_MEASURE_POWER"] = "0"
     environment.setdefault("OMP_NUM_THREADS", "4")

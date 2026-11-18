@@ -39,6 +39,20 @@ def positive(values):
     require(all(math.isfinite(x) and x > 0 for x in values), "Nonpositive or nonfinite timing")
 
 
+def runner_ast(source):
+    # The bundled campaign predates automatic snapshotting. Ignore exactly
+    # that provenance-only addition; retain all measurement/orchestration checks.
+    tree = ast.parse(source)
+    snapshot = ast.parse(
+        'with tarfile.open(args.output / "runner-source.tar.gz", "x:gz") as source:\n'
+        '    source.add(__file__, arcname="run.py")\n'
+    ).body[0]
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "campaign":
+            node.body = [statement for statement in node.body if ast.dump(statement) != ast.dump(snapshot)]
+    return ast.dump(tree)
+
+
 def direct(root):
     protocol = read_json(root / "protocol.json")
     jobs = read_json(root / "jobs.json")
@@ -84,10 +98,9 @@ def direct(root):
     with tarfile.open(root / "runner-source.tar.gz") as source:
         original = source.extractfile("run.py").read()
     require(hashlib.sha256(original).hexdigest() == environments[0]["runner_sha256"], "Runner snapshot mismatch")
-    # The executable copy adds the repository-required SPDX copyright line;
-    # the archived copy preserves the exact bytes used for collection.
+    # The archived copy preserves the exact bytes used for collection.
     require(
-        ast.dump(ast.parse(original)) == ast.dump(ast.parse((HERE / "run.py").read_bytes())),
+        runner_ast(original) == runner_ast((HERE / "run.py").read_bytes()),
         "Packaged runner behavior differs from executed snapshot",
     )
     for dependency in ["helper.py", "vllm/utils.py"]:
