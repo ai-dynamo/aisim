@@ -51,8 +51,18 @@ def decoder_paths(sublayer: str = "") -> LayerPaths:
 
 def _target_regex(targets) -> re.Pattern | None:
     """One compiled matcher for ``Linear``, ``re:`` and glob targets."""
-    # ``re:`` targets keep re.match prefix semantics; globs match the whole path.
-    parts = [".*" if t == "Linear" else f"(?:{t[3:]}).*" if t.startswith("re:") else translate(t) for t in targets]
+
+    # ``re:`` targets keep re.match prefix semantics; globs match the whole path. A leading
+    # global flag group such as ``(?i)`` becomes a scoped group, valid inside the alternation.
+    def to_regex(target):
+        if target == "Linear":
+            return ".*"
+        if not target.startswith("re:"):
+            return translate(target)
+        flags, body = re.fullmatch(r"(?s)(?:\(\?([aiLmsux]+)\))?(.*)", target[3:]).groups()
+        return f"(?{flags or ''}:{body}).*"
+
+    parts = [to_regex(t) for t in targets]
     try:
         return re.compile("|".join(f"(?:{part})" for part in parts)) if parts else None
     except re.error as error:
@@ -215,7 +225,9 @@ def projection_modes(
         "nvfp4": _nvfp4_lane(system, systems_path, gemm.nvfp4, gemm.nvfp4_wo),
         "w4a16_nvfp4": gemm.w4a16_nvfp4,
     }
-    unlisted = gemm.bfloat16 if checkpoint.targets_only else default
+    # An inherited NVFP4 default takes the system's lane, as listed NVFP4 layers do.
+    inherited = modes["nvfp4"] if default in (gemm.nvfp4, gemm.nvfp4_wo) else default
+    unlisted = gemm.bfloat16 if checkpoint.targets_only else inherited
 
     def resolve(algo, excluded):
         if excluded:

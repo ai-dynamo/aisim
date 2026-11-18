@@ -53,8 +53,10 @@ experts from the checkpoint's per-layer metadata (`quantized_layers`,
 layers, and the MoE dispatch ops follow the routed-expert split. Other model
 families keep one precision per op kind.
 
-- A projection that a MIXED_PRECISION listing leaves out is BF16, the rule
-  vLLM and SGLang apply. Other metadata leaves it on the global mode.
+- A projection that a targets-only ModelOpt MIXED_PRECISION export leaves
+  out is BF16, the rule vLLM and SGLang apply. Other metadata, including a
+  MIXED_PRECISION export that declares a base lane such as block FP8, leaves it
+  on the global mode.
 - An excluded module, or a module inside an excluded parent, is BF16.
 - On non-Blackwell systems, NVFP4 runs weight-only (`nvfp4_wo`).
 - An explicit `gemm_quant_mode` or `moe_quant_mode` prices every projection

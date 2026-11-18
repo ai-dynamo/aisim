@@ -524,6 +524,19 @@ def test_compute_coverage_is_quant_specific(synth_systems):
     assert t.agg_moe_ep_candidates == [1, 2, 4, 8, 16]  # fused defaults
 
 
+def test_coverage_probes_the_weight_only_nvfp4_lane_off_blackwell(synth_systems, monkeypatch):
+    """Off Blackwell the Task runs native NVFP4 experts weight-only, so coverage probes that lane."""
+    import aisim.sdk.task_v2 as task_v2
+
+    t = _synth_task()
+    probed = []
+    monkeypatch.setattr(task_v2, "is_blackwell_system", lambda _system: False)
+    monkeypatch.setattr(task_v2, "moe_compute_coverage", lambda *_a, quant_mode, **_k: probed.append(quant_mode) or {})
+    t.moe_quant_mode = common.MoEQuantMode.nvfp4
+    t._large_ep_coverage("agg")
+    assert probed and set(probed) == {common.MoEQuantMode.nvfp4_wo}
+
+
 def test_eplb_prunes_deepep_ll_before_model_build(synth_systems):
     """Stage 1 must not generate a candidate that the LL op will reject."""
     t = _synth_task(enable_eplb=True)

@@ -1873,6 +1873,14 @@ def _speculation_identity(model_config: Any) -> str | None:
         return repr(spec)
 
 
+def _precision_split_identity(model: Any) -> list | None:
+    """Per-layer checkpoint precision buckets (Nemotron-H), which shape the op list beyond the global modes."""
+    buckets = {**(getattr(model, "_projection_quant_modes", None) or {})}
+    if getattr(model, "_moe_quant_modes", None):
+        buckets["moe"] = model._moe_quant_modes
+    return sorted((key, mode.name, count) for key, modes in buckets.items() for mode, count in modes.items()) or None
+
+
 def _engine_config_json(model: Any, database: Any) -> str:
     model_config = model.config
     fpm_config = getattr(model_config, "fpm_config", None)
@@ -1934,6 +1942,8 @@ def _engine_config_json(model: Any, database: Any) -> str:
         "extra": {
             "identity": json.dumps(
                 {
+                    # An inferred per-layer split and a uniform override can share the global modes.
+                    "precision_split": _precision_split_identity(model),
                     "raw_quant_modes": {
                         "gemm": _raw_quant_name(getattr(model_config, "gemm_quant_mode", None)),
                         "moe": _raw_quant_name(getattr(model_config, "moe_quant_mode", None)),

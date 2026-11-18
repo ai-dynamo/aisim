@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import json
 from importlib.resources import files
 
@@ -41,6 +42,8 @@ def _buckets(pipeline, names=PROJECTIONS, scale=1):
     for op in pipeline:
         name = op._name.split("_", 1)[1]
         if name in names:
+            # One op per (name, precision): a duplicate would add its cost twice.
+            assert op._quant_mode not in buckets.get(name, {}), (name, op._quant_mode)
             buckets.setdefault(name, {})[op._quant_mode] = op._scale_factor / scale
     return buckets
 
@@ -224,6 +227,17 @@ def _latencies(model, system="gb200", **modes):
             id="layers-are-counted-per-precision",
         ),
         pytest.param(
+            {
+                "quantization_config": {
+                    "config_groups": _groups(all=(8, ["Linear"])),
+                    "ignore": [r"re:(?i)^BACKBONE\.layers\.0\.mixer\.in_proj"],
+                }
+            },
+            "MM",
+            {"mamba_in_proj_gemm": {BF16: 1, FP8: 1}},
+            id="re-target-with-a-leading-flag",
+        ),
+        pytest.param(
             _listing(
                 {
                     # A listed descendant declares its module; an exact listing wins over descendants.
@@ -242,6 +256,11 @@ def test_projection_modes(raw, pattern, expected):
     buckets = _projection_modes(raw, pattern, FP8)
     got = {key: buckets[key] if isinstance(want, dict) else set(buckets[key]) for key, want in expected.items()}
     assert got == {key: want if isinstance(want, dict) else {want} for key, want in expected.items()}
+
+
+def test_untargeted_projection_takes_the_system_nvfp4_lane():
+    raw = {"quantization_config": {"config_groups": _groups(a=(4, ["backbone.layers.0.mixer.in_proj"]))}}
+    assert _projection_modes(raw, "MM", NVFP4, "h200_sxm")["mamba_in_proj_gemm"] == {NVFP4_WO: 2}
 
 
 @pytest.mark.parametrize("prefix", ["model", "backbone", "language_model.backbone", "language_model.model"])
@@ -417,7 +436,7 @@ def test_published_exports_price_each_layer_at_its_listed_precision(model_path, 
             assert sum(op.get_weights() for op in gemms) == pytest.approx(reference)
         # Every routed-expert layer is NVFP4: one MoE op on the system's lane, weight-only on Hopper.
         lane = MOE.nvfp4 if system == "gb200" else MOE.nvfp4_wo
-        assert {op._quant_mode for op in pipeline if op._name.split("_", 1)[1] == "moe"} == {lane}
+        assert _buckets(pipeline, ("moe",), scale)["moe"] == {lane: 40 if model_path == SUPER else 48}
     # Explicit modes price every projection and expert with one mode.
     config = ModelConfig(tp_size=2, moe_tp_size=2, system=system, gemm_quant_mode=BF16, moe_quant_mode=MOE.fp8)
     explicit = get_model(model_path, config, backend_name="vllm")
@@ -488,7 +507,8 @@ def test_entry_points_agree_on_per_layer_experts(monkeypatch, tmp_path, system, 
     weights = [sum(op.get_weights() for op in m.context_ops if op._name == "context_moe") for m in (canonical, legacy)]
     assert weights[0] == weights[1]
     # The canonical API prices the per-layer lanes; native FP4 on Hopper would raise MissingSystemFlopsError.
-    assert _latencies(path, system=system)
+    latencies = _latencies(path, system=system)
+    assert all(latencies[prefill]["moe"] > 0 for prefill in (True, False))
 
 
 @pytest.mark.parametrize("serving_mode", ["agg", "disagg"])
@@ -598,8 +618,6 @@ def test_canonical_api_resolves_nvfp4_lanes_under_the_selected_systems_root(monk
 
 
 def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
-    import dataclasses
-
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
 
     import copy
@@ -644,8 +662,6 @@ def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
 
 
 def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypatch):
-    import dataclasses
-
     import yaml
 
     from aisim.legacy_cli.api import _build_recommend_tasks
@@ -672,6 +688,48 @@ def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypat
     rebuilt = _build_recommend_tasks({"agg": task}, 8)["agg"]
     for other in (task, reloaded, rebuilt):
         assert other.moe_quant_mode == MOE.fp8 and experts(other) == {MOE.fp8}
+
+
+def test_resolvers_keep_overrides_and_inferred_modes_apart(monkeypatch):
+    import copy
+
+    from aisim_core.sdk.models.helpers import resolve_nvfp4_for_system
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+
+    def in_proj(config):
+        return set(_buckets(get_model(SUPER, config, "vllm").context_ops)["mamba_in_proj_gemm"])
+
+    # A replace() override stays explicit through the legacy resolver.
+    config = ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, system="gb200")
+    assert in_proj(config) == {FP8, BF16}
+    override = dataclasses.replace(config, gemm_quant_mode=BF16)
+    resolve_nvfp4_for_system(override, "h200_sxm", SUPER, backend_name="vllm")
+    assert in_proj(override) == in_proj(override) == {BF16}
+    # A cleared Task override stays inferred through MoE communication resolution, at any EP.
+    task = _task(SUPER, gemm_quant_mode=BF16)
+    for gemm, expected in ((None, {FP8, BF16}), (BF16, {BF16})):
+        task.gemm_quant_mode = gemm
+        for ep in (1, 2):
+            assert in_proj(task.build_model_config(role="agg", parallel=(ep, 1, 1, 1, ep, 1))) == expected
+    # Editing a shallow copy of a Task leaves the original's provenance alone.
+    original = _task(SUPER)
+    copy.copy(original).gemm_quant_mode = BF16
+    assert set(_buckets(_task_model(original, SUPER).context_ops)["mamba_in_proj_gemm"]) == {FP8, BF16}
+
+
+def test_engine_cache_identity_tells_the_precision_split_from_a_uniform_override():
+    from types import SimpleNamespace
+
+    from aisim_core.sdk.rust_engine_step import _engine_config_json
+
+    database = SimpleNamespace(system="gb200", backend="vllm", version="0.31.0")
+    inferred = get_model(SUPER, ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, system="gb200"), "vllm")
+    explicit_config = ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, system="gb200", gemm_quant_mode=FP8)
+    explicit = get_model(SUPER, explicit_config, "vllm")
+    # Same global modes, different graphs: the cached engines must not be shared, in either order.
+    assert inferred.config.gemm_quant_mode == explicit.config.gemm_quant_mode == FP8
+    assert _engine_config_json(inferred, database) != _engine_config_json(explicit, database)
 
 
 def test_clearing_an_explicit_task_mode_restores_inference_on_every_build(monkeypatch):

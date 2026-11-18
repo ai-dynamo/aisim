@@ -1303,6 +1303,10 @@ class Task:
         coverage: dict[str, dict[str, set[int]]] = {}
         if gpus_per_node and a2a_probe is not None:
             quant_mode = self._role_attr(role, "moe_quant_mode")
+            if quant_mode == common.MoEQuantMode.nvfp4 and not is_blackwell_system(system_name):
+                # Probe the lane the Task runs: _apply_fmha_data_fallback, after the search
+                # space, resolves native NVFP4 to weight-only on non-Blackwell systems.
+                quant_mode = common.MoEQuantMode.nvfp4_wo
             enable_eplb = bool(self._role_attr(role, "enable_eplb"))
             if quant_mode is not None and not isinstance(quant_mode, common.MoEQuantMode):
                 # The compute table is keyed by MoEQuantMode members; any
@@ -1830,12 +1834,15 @@ class Task:
         # build_model_config, to_yaml and recommend rebuilds keep it.
         object.__setattr__(self, name, value)
         role, _, key = name.partition("_") if name.startswith(("prefill_", "decode_")) else ("agg", "", name)
-        explicit_by_role = self.__dict__.get(_QUANT_EXPLICIT_BY_ROLE.get(key, ""))
+        # Replace the maps instead of mutating them: a shallow copy of the Task shares them.
+        explicit_attr = _QUANT_EXPLICIT_BY_ROLE.get(key, "")
+        explicit_by_role = self.__dict__.get(explicit_attr)
         if explicit_by_role is not None and role in explicit_by_role:
-            explicit_by_role[role] = value is not None
+            object.__setattr__(self, explicit_attr, {**explicit_by_role, role: value is not None})
         coverage_cache = self.__dict__.get("_large_ep_coverage_cache")
         if key == "moe_quant_mode" and coverage_cache is not None:
-            coverage_cache.pop(role, None)  # large-EP coverage depends on the MoE mode
+            # Large-EP coverage depends on the MoE mode.
+            object.__setattr__(self, "_large_ep_coverage_cache", {r: c for r, c in coverage_cache.items() if r != role})
 
     # =====================================================================
     # Builders consumed by sweep.py

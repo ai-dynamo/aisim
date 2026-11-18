@@ -25,8 +25,10 @@ copies, trimmed by this transformation and nothing else:
 
 The NVFP4 files describe NVIDIA ModelOpt MIXED_PRECISION exports. The routed
 experts are NVFP4 with group size 16. The listed Mamba projections and shared
-experts are FP8. The KV cache is FP8. Modules absent from `quantized_layers`,
-or listed in `exclude_modules`, stay BF16. The FP8 files describe a ModelOpt
+experts are FP8. The KV cache is FP8. Modules absent from the upstream
+`quantized_layers`, or listed in `exclude_modules`, stay BF16. The routed
+experts that the trimming removes are not BF16: the expert 0 entries that the
+packaged files keep give the precision of every expert in their layer. The FP8 files describe a ModelOpt
 FP8 export with an FP8 KV cache. Its 130 `exclude_modules` stay BF16.
 
 Copyright owner: NVIDIA CORPORATION & AFFILIATES. No upstream repository ships

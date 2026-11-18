@@ -1029,6 +1029,7 @@ def _apply_model_quant_defaults(
     original_config = dataclasses.replace(model_config)
     fmha_was_unset = model_config.fmha_quant_mode is None
     moe_was_unset = model_config.moe_quant_mode is None
+    unset_kinds = [kind for kind in ("gemm", "moe") if getattr(model_config, f"{kind}_quant_mode") is None]
 
     inferred = _infer_quant_modes_from_raw_config(raw_config, architecture)
     applied: list[str] = []
@@ -1083,6 +1084,9 @@ def _apply_model_quant_defaults(
         model_config.moe_quant_mode = resolve_vllm_moe_execution_mode(
             model_config.moe_quant_mode, backend_name, architecture
         )
+
+    # The fills above are assignments; keep the modes this call inferred marked inferred.
+    record_inferred_quant_modes(model_config, unset_kinds)
 
     # Only log if model_config was modified
     if original_config != model_config:
@@ -1206,7 +1210,13 @@ def resolve_dsv4_moe_arch(
 
 
 def _inferred_quant_kinds(model_config: config.ModelConfig) -> list[str]:
-    return [k for k in ("gemm", "moe") if getattr(model_config, f"_{k}_quant_mode_is_explicit", None) is False]
+    # A replace() override keeps the copied False flag; the value tells it apart.
+    return [
+        k
+        for k in ("gemm", "moe")
+        if getattr(model_config, f"_{k}_quant_mode_is_explicit", None) is False
+        and not model_config._quant_mode_is_explicit(k)
+    ]
 
 
 def record_inferred_quant_modes(model_config: config.ModelConfig, kinds: list[str] | None = None) -> None:
