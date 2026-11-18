@@ -48,10 +48,15 @@ fn default_token_width() -> u32 {
 }
 
 impl Mamba2Op {
-    /// A convolution kernel, by logical (`causal_conv1d_fn`,
-    /// `causal_conv1d_update`) or physical (`causal_conv1d_fn_token_major`) label.
+    /// A convolution kernel by logical label. The physical TRT-LLM
+    /// `causal_conv1d_fn_token_major` label counts only for qualified ops, so
+    /// legacy ops keep their SSM-formula SOL.
     fn is_conv(&self) -> bool {
-        self.kernel_source.starts_with("causal_conv1d")
+        match self.kernel_source.as_str() {
+            "causal_conv1d_fn" | "causal_conv1d_update" => true,
+            "causal_conv1d_fn_token_major" => self.state_dtype != "unrecorded",
+            _ => false,
+        }
     }
 
     /// Why this op's qualification fields are invalid, if they are.
@@ -694,6 +699,10 @@ mod tests {
         let unit = op.sol_total_bytes(2.0, 0.0);
         op.token_width = 4;
         assert_eq!(op.sol_total_bytes(2.0, 0.0), unit);
+        // A legacy op keeps main's SSM formula for the physical label: 32 tokens * 18,560 bytes.
+        op.token_width = 1;
+        op.state_dtype = "unrecorded".into();
+        assert_eq!(op.sol_total_bytes(2.0, 16.0), 593_920.0);
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane

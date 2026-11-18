@@ -180,15 +180,20 @@ prices packed mixed steps, for example `num_prefill_requests: 1`,
 `sum_prefill_tokens: 512`, `num_decode_requests: 8` at width four, against
 their expected bytes. `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
 compares replay's pure-decode and mixed iterations with the static decode
-cost. The MTP0 column has width one and does not change. The `run_agg`, per-phase and replay
-results above and below do not use packed telemetry.
+cost. The width correction does not apply to the MTP0 column, because its
+decode width is one. Its mixed-shape deltas come from the per-phase accounting.
+Both variants give every qualified op the same `float16` state. The operation
+sources table lists every scan as an analytical bound for both data sets, so
+the state dtype does not change a source in either variant. The `run_agg`,
+per-phase and replay results above and below do not use packed telemetry.
 
 Packed telemetry at the current code, TensorRT-LLM, MTP3, `HYBRID` mode. This
 compares `35944ae4` (before: the width applied twice) with `c3ed1513` (after).
 Both commits sit on main `bf1b539f`. Each ran
 `python telem.py OUT.json` from its own `python/aisim` build. The script is
 [`telem.py`](mamba-mixed-step-accounting/telem.py), and it qualifies every
-Mamba2 op with a `bfloat16` state and `token_width` 4. Its inputs use the packed
+Mamba2 op with a `bfloat16` state, `token_width` 4 for generation ops and
+`token_width` 1 for context ops. Its inputs use the packed
 decode convention: 8 requests at width 4 give `num_decode_requests: 32` and
 `sum_decode_kv_tokens: 32800` (1025 tokens each). The mixed case adds
 `num_prefill_requests: 1` and `sum_prefill_tokens: 2048`.
@@ -201,8 +206,9 @@ decode convention: 8 requests at width 4 give `num_decode_requests: 32` and
 Only the generation Mamba rows change, both with source `sol`.
 `generation_mamba_conv1d` falls from 0.029815 to 0.007454 ms, and
 `generation_mamba_ssm` falls from 0.538383 to 0.134596 ms. Each is exactly
-four times smaller. Their sum is the 0.426149 ms total change. Every other row,
-context Mamba included, is identical. The raw outputs are
+four times smaller. Their sum is the 0.426149 ms total change. The context
+Mamba rows are identical. The outputs save the other rows only as one
+non-Mamba sum, and that sum is identical. The raw outputs are
 [`35944ae4.json`](mamba-mixed-step-accounting/35944ae4.json) and
 [`c3ed1513.json`](mamba-mixed-step-accounting/c3ed1513.json). These are
 simulated latencies. Host runtime was not measured.
@@ -257,9 +263,12 @@ Commit `b2b489d999e97749c2932c3f91b1dddb544c81a8` spreads the telemetry prefill
 token sum over the observed request count. Before it, an uneven sum added a
 request. The shapes above divide evenly, so they do not change. A same-host check
 of `686275e7` against `b2b489d9` changed only qualified uneven shapes. On vLLM,
-2 prefills of 17 tokens plus 1 decode went from 5.860174 to 5.853910 ms. That
-difference is one FP16 state pair (2 MiB) for each of 23 Mamba layers at 7.7e12
-B/s, within 1e-13. All other shapes were identical.
+one step had `num_prefill_requests: 2`, `sum_prefill_tokens: 17` and
+`num_decode_requests: 1`. Its latency went from 5.860174 to 5.853910 ms. Before
+the fix, the two prefills that total 17 tokens priced as two requests of 8
+tokens and one request of 1 token. After it, they price as one request of 9
+tokens and one of 8. The difference is one FP16 state pair (2 MiB) for each of
+23 Mamba layers at 7.7e12 B/s, within 1e-13. All other shapes were identical.
 
 ## Host cost
 
