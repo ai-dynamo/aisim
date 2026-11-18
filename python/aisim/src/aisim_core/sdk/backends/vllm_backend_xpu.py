@@ -108,7 +108,11 @@ class VLLMXPUBackend(VLLMBackend):
         ctx_eff = step.context_tokens
         ctx_attn = step.per_op_latency_ms.get("context_attention (scaled)", 0.0)
         full_attn = ctx_attn * math.ceil(isl / ctx_eff)
-        return full_attn + (step.latency_ms - ctx_attn) * (isl / ctx_eff) + self._prefill_dispatch_overhead_ms(model)
+        scale = isl / ctx_eff
+        if getattr(model, "forward_model", "op_level") == "fpm" and ctx_eff < isl:
+            # A whole-model FPM prices the mean of one request's chunks: count every chunk.
+            scale = math.ceil(scale)
+        return full_attn + (step.latency_ms - ctx_attn) * scale + self._prefill_dispatch_overhead_ms(model)
 
     @staticmethod
     def _decode_tpot_ms(mix_lat, genonly_lat, b, isl, osl, ctx_tokens, steps_to_finish_ctx, all_mix=False) -> float:

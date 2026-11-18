@@ -2612,10 +2612,14 @@ impl Engine {
                 // shortcut: sum uniform timing rows until variable-length batches are
                 // calibrated; this can overcount launch overhead for ragged batches.
                 let per_request = isl.saturating_sub(prefix).max(1);
-                for (batch, tokens) in [
-                    (ctx_tokens / isl, per_request),
-                    (1, (ctx_tokens % isl).min(per_request)),
-                ] {
+                let (mut full, mut partial) =
+                    (ctx_tokens / isl, (ctx_tokens % isl).min(per_request));
+                // A partial extend as long as a full request joins its batch: one
+                // batch-of-n query, as packed telemetry prices it, not n batch-one rows.
+                if partial == per_request {
+                    (full, partial) = (full + 1, 0);
+                }
+                for (batch, tokens) in [(full, per_request), (1, partial)] {
                     if batch == 0 || tokens == 0 {
                         continue;
                     }
@@ -4747,6 +4751,18 @@ pub(crate) mod tests {
                 close(packed(new_tokens, requests, 8), bytes),
                 "telemetry chunk={ctx}"
             );
+        }
+        // A partial extend as long as a full request joins its batch: 6000 tokens
+        // at isl 4096 and prefix 3000 are one (2, 1096) query, as packed telemetry
+        // prices them. A shorter extend keeps its own query: (1, 1096) + (1, 904).
+        for (ctx, prefix, queries) in [(6000, 3000, 1), (8128, 1024, 1), (5000, 3000, 2)] {
+            let mut seen = 0;
+            engine
+                .mixed_step_breakdown_with(ctx, 2, 4096, 1, prefix, 1.0, 1.0, |pass, _, _| {
+                    seen += usize::from(matches!(pass, MixedPass::ContextAttention));
+                })
+                .unwrap();
+            assert_eq!(seen, queries, "chunk={ctx}, prefix={prefix}");
         }
         // Prefill telemetry carries request counts: two prefills of 17 tokens
         // are two state pairs (9 + 8 tokens), never a third request from the

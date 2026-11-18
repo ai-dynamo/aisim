@@ -1134,6 +1134,15 @@ class TestFPMStaticAndMixed:
         assert per_op["fpm_forward_prefill"] == pytest.approx((11.0 + 13.0) / 2) == pytest.approx(12.0)
         assert total == pytest.approx(12.0 + 1.0)
 
+    def test_run_agg_rejects_a_fully_cached_prompt_through_the_native_step(self, fpm_session):
+        # One fully cached request keeps a positive step budget, so the native FPM
+        # step, not MixedStepInput, rejects it; sweeps catch this error type.
+        from aisim.sdk.config import RuntimeConfig
+
+        model, database, backend, isl, osl = fpm_session
+        with pytest.raises(PerfDataNotAvailableError, match="isl must be greater than"):
+            backend.run_agg(model, database, RuntimeConfig(batch_size=1, isl=isl, osl=osl, prefix=isl), ctx_tokens=256)
+
     def test_mixed_step_gen_zero_prices_pure_chunk(self, fpm_session):
         # Spec test 5 (gen=0 degenerate): a pure-prefill step prices its own
         # totals with no decode marginal term.
