@@ -585,16 +585,13 @@ def test_silicon_requires_exact_runtime_glm_tables():
 
 @pytest.mark.parametrize(
     ("path", "system", "tp", "kv"),
-    [("nvidia/GLM-5.3-Flash-NVFP4", "gb300", 4, None), ("zai-org/GLM-5.3-Flash", "h200_sxm", 8, "bfloat16")],
+    [("nvidia/GLM-5.3-Flash-NVFP4", "b300_sxm", 4, None), ("zai-org/GLM-5.3-Flash", "h100_sxm", 8, "bfloat16")],
 )
-def test_packaged_silicon_prices_each_sparse_attention_layer_from_its_table(path, system, tp, kv, monkeypatch):
-    # The GLM-5.3-Flash attention and all-reduce tables are packaged for vLLM 0.31.0
-    # only. 0.31.0 is older than the current slot (0.32.0) and not queryable: these
-    # are raw data coordinates, as in the fixed-runtime tests below, until the two
-    # tables are collected at 0.32.0.
-    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+def test_packaged_silicon_prices_each_sparse_attention_layer_from_its_table(path, system, tp, kv):
+    # The current vLLM slot: the GLM-5.3-Flash attention and all-reduce tables are
+    # packaged for it on these systems. The Hopper table holds BF16-KV rows.
     config = replace(
-        _config("SILICON", backend_version="0.31.0", enable_shared_layer=False),
+        _config("SILICON", enable_shared_layer=False),
         model=path,
         system=system,
         tp=tp,
@@ -625,8 +622,9 @@ def test_fixed_hopper_fp8_runtimes_still_require_exact_silicon_tables(system, ba
     # Enabling the runtime's FP8 capability does not make analytical estimates
     # or rows from an older runtime eligible for strict measured prediction.
     # No data directory is packaged for SGLang 0.5.22, so loading fails before the
-    # per-table exact-runtime readiness check. vLLM 0.32.0 has generic tables but no
-    # GLM-5.3-Flash attention or all-reduce table: the exact-runtime check refuses it.
+    # per-table exact-runtime readiness check. At vLLM 0.32.0 the exact-runtime check
+    # refuses the configuration: the default shared layer also loads the 0.31.0
+    # all-reduce table (H100), or no GLM-5.3-Flash attention table is packaged (H200).
     with pytest.raises(PerfDataNotAvailableError, match=message) as error:
         RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**config))
     if message == "perf data directory not found":
@@ -641,8 +639,10 @@ def test_hybrid_is_constructible_and_labels_analytical_fallbacks(backend):
     try:
         ops = model.static_phase_diagnostics(batch_size=2, context_length=4096, prefix=0, prefill=True)
         sources = {op["name"]: op["source"] for op in ops}
-        # No GLM attention table ships yet: the sparse layers report SOL.
-        assert {sources[f"attention_{layer}"] for layer in range(3, 45, 4)} == {"sol"}
+        # The GB300 attention table ships for the current vLLM slot; none ships for
+        # the current SGLang slot, where the sparse layers report SOL.
+        expected = "silicon" if backend == "vllm" else "sol"
+        assert {sources[f"attention_{layer}"] for layer in range(3, 45, 4)} == {expected}
         assert all(op["latency_ms"] > 0 for op in ops if op["name"].startswith("attention_"))
     finally:
         model.close()
