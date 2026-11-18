@@ -525,9 +525,12 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
                     pass
                 parser.error(f"{args.config}: {reason}")
             try:
+                from yaml import safe_dump
+
                 current = anchor_paths(_load_mapping(args.config), config_folder(args.config), args.command)
                 _apply_overrides(current, args.overrides, command=args.command)
-                if current != raw:
+                # YAML tags distinguish equal Python scalars such as True, 1, and 1.0.
+                if safe_dump(current, canonical=True) != safe_dump(raw, canonical=True):
                     raise ValueError("configuration changed during the warmup support check; retry the command")
             except (OSError, ValueError, AttributeError) as exc:
                 parser.error(f"{args.config}: {exc}")

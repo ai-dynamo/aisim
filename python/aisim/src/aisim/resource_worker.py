@@ -41,13 +41,17 @@ def main() -> int:
             return _main(sys.argv[3:], _prepared_config=prepared_config)
         return _main(sys.argv[2:])
     if command == "warmup-support":
-        from .stack import resolve_runner_factory
+        from .stack import StackLoadError, resolve_runner_factory
 
         try:
             capabilities = resolve_runner_factory(sys.argv[3]).capabilities()
-        except ResourceLimitError as exc:
-            sys.stderr.write(f"aisim: {exc}\n")
-            return 3
+        except (ResourceLimitError, StackLoadError) as exc:
+            # Stack discovery wraps entry-point import and constructor failures.
+            refusal = exc if isinstance(exc, ResourceLimitError) else exc.__cause__
+            if isinstance(refusal, ResourceLimitError):
+                sys.stderr.write(f"aisim: {refusal}\n")
+                return 3
+            return 1
         except Exception:
             return 1  # The execution process reports stack errors in their usual order.
         try:

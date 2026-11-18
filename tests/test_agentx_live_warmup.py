@@ -345,7 +345,8 @@ def test_supervisor_keeps_outputs_when_policy_refusal_has_no_readable_diagnostic
     assert prior.read_text() == "previous valid results"
 
 
-def test_supervisor_preserves_outputs_when_config_changes_during_probe(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("field,value", [("agentic_warmup_policy", "primers_only"), ("agentic_warmup", 1)])
+def test_supervisor_preserves_outputs_when_config_changes_during_probe(tmp_path, monkeypatch, capsys, field, value):
     from aisim import supervision
 
     config = warmup_cli_config(tmp_path, "predict", "live_trajectory_v1")
@@ -355,7 +356,7 @@ def test_supervisor_preserves_outputs_when_config_changes_during_probe(tmp_path,
     def change_config(command, **kwargs):
         assert "warmup-support" in command, "execution must not start"
         raw = yaml.safe_load(config.read_text())
-        raw["traffic"]["load"]["agentic_warmup_policy"] = "primers_only"
+        raw["traffic"]["load"][field] = value
         config.write_text(yaml.safe_dump(raw))
         return {"status": "completed", "exit_code": 0}
 
@@ -415,18 +416,32 @@ def test_overwrite_executes_the_checked_mapping_after_a_later_config_edit(tmp_pa
     from aisim import supervision
 
     config = warmup_cli_config(tmp_path, command, "live_trajectory_v1")
+    (tmp_path / "logging_stack.py").write_text(
+        "from pathlib import Path\n"
+        "from aisim.runner import EngineReplayRunnerFactory\n\n"
+        "class LoggingRunner:\n"
+        "    def __init__(self, runner):\n"
+        "        self.runner = runner\n"
+        "    def run(self, spec, **kwargs):\n"
+        "        with Path(__file__).with_name('policy.log').open('a') as log:\n"
+        "            log.write(spec.workload['agentic_warmup_policy'] + '\\n')\n"
+        "        return self.runner.run(spec, **kwargs)\n"
+        "    def close(self):\n"
+        "        self.runner.close()\n\n"
+        "class LoggingStack(EngineReplayRunnerFactory):\n"
+        "    def create(self, worker_id):\n"
+        "        return LoggingRunner(super().create(worker_id))\n"
+    )
     metadata = tmp_path / "warmup_stack-1.0.dist-info"
     metadata.mkdir()
     (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: warmup-stack\nVersion: 1.0\n")
-    (metadata / "entry_points.txt").write_text(
-        "[aisim.runner_factories]\nadvertising = aisim.runner:EngineReplayRunnerFactory\n"
-    )
+    (metadata / "entry_points.txt").write_text("[aisim.runner_factories]\nadvertising = logging_stack:LoggingStack\n")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH")))))
     monkeypatch.setattr(supervision, "_installed_names", lambda _: ["advertising"])
     run_process = supervision.run_process
 
     def edit_before_execution(child_command, **kwargs):
-        if "cli-prepared" in child_command:
+        if "warmup-support" not in child_command:
             config.write_text("invalid: changed after cleanup")
         return run_process(child_command, **kwargs)
 
@@ -456,6 +471,7 @@ def test_overwrite_executes_the_checked_mapping_after_a_later_config_edit(tmp_pa
     result_name = "prediction.json" if command == "predict" else "recommendation.json"
     assert json.loads((output / result_name).read_text())
     assert json.loads((output / "resource-runtime.json").read_text())["status"] == "completed"
+    assert set((tmp_path / "policy.log").read_text().splitlines()) == {"primers_only"}
 
 
 @pytest.fixture
@@ -473,7 +489,7 @@ def warmup_worker(monkeypatch, tmp_path):
     return resource_worker
 
 
-@pytest.mark.parametrize("failure_at", ["resolution", "capabilities"])
+@pytest.mark.parametrize("failure_at", ["resolution", "wrapped_resolution", "capabilities"])
 @pytest.mark.parametrize("resource_refusal", [False, True])
 def test_warmup_worker_distinguishes_resource_refusals_from_plugin_errors(
     warmup_worker, tmp_path, monkeypatch, capsys, failure_at, resource_refusal
@@ -486,7 +502,17 @@ def test_warmup_worker_distinguishes_resource_refusals_from_plugin_errors(
     class Factory:
         capabilities = fail
 
-    monkeypatch.setattr(stack, "resolve_runner_factory", fail if failure_at == "resolution" else lambda _: Factory())
+    def resolve(_):
+        if failure_at == "capabilities":
+            return Factory()
+        if failure_at == "wrapped_resolution":
+            try:
+                fail()
+            except Exception as exc:
+                raise stack.StackLoadError("cannot load plugin") from exc
+        fail()
+
+    monkeypatch.setattr(stack, "resolve_runner_factory", resolve)
     assert warmup_worker.main() == (3 if resource_refusal else 1)
     assert not (tmp_path / "refusal").exists()
     if resource_refusal:
@@ -666,6 +692,13 @@ def run_installed_stack(tmp_path, command, stack, policy):
         "        with Path(__file__).with_name('capabilities.log').open('a') as log:\n"
         "            log.write('called\\n')\n"
         "        raise ResourceLimitError('stack memory budget')\n"
+        "\nclass ConstructorResourceRefusal(EngineReplayRunnerFactory):\n"
+        "    def __init__(self):\n"
+        "        from pathlib import Path\n"
+        "        from aisim.resources import ResourceLimitError\n"
+        "        with Path(__file__).with_name('constructor.log').open('a') as log:\n"
+        "            log.write('called\\n')\n"
+        "        raise ResourceLimitError('stack constructor memory budget')\n"
     )
     metadata = tmp_path / "warmup_stacks-1.0.dist-info"
     metadata.mkdir()
@@ -675,6 +708,7 @@ def run_installed_stack(tmp_path, command, stack, policy):
         "advertising = aisim.runner:EngineReplayRunnerFactory\n"
         "silent = warmup_stacks:Silent\n"
         "resource_refusal = warmup_stacks:ResourceRefusal\n"
+        "constructor_resource_refusal = warmup_stacks:ConstructorResourceRefusal\n"
     )
     output = tmp_path / "output"
     (output / "recommendations").mkdir(parents=True)
@@ -724,6 +758,17 @@ def test_overwrite_keeps_outputs_when_installed_capabilities_refuse_resources(tm
     assert "stack memory budget" in result.stderr
     assert outputs == original
     assert (tmp_path / "capabilities.log").read_text() == "called\n"
+
+
+@pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_keeps_outputs_when_installed_constructor_refuses_resources(tmp_path, command, policy):
+    result, original, outputs = run_installed_stack(tmp_path, command, "constructor_resource_refusal", policy)
+    assert result.returncode == 3, result.stderr
+    assert "stack constructor memory budget" in result.stderr
+    assert outputs == original
+    # A retry in an execution child would invoke the constructor a second time.
+    assert (tmp_path / "constructor.log").read_text() == "called\n"
 
 
 @pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
