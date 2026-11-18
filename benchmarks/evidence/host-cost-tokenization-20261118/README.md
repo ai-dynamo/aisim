@@ -50,6 +50,22 @@ GPU kernels. Full per-entry and per-job table: [`cost.md`](cost.md).
 - **Negative intercepts:** many fitted `base_ms` are slightly negative (to about -20 ms on H200 Qwen2 for SGLang); replay clamps
   `base_ms` at 0 in `LookupResult.engine_tokenization()`.
 
+## Replay check
+
+AgentX Weka l1 and l4 (Qwen3.5-397B-A17B BF16, vLLM 0.31.0, B300 TP8) replayed with the frozen learned forward-pass model and
+`engine.tokenization` set from the vLLM / Qwen2 / B300 entry (1.532 µs/token, `base_ms` 0, 1 worker). Errors are unsigned,
+from the AgentX scorer. The 35 ms unqueued overhead is the earlier hand-measured value (client TTFT minus vLLM server TTFT on l1,
+so in-sample); it is not part of this data.
+
+| Replay | l1 point TTFT | l4 point TTFT | l1 per-request TTFT MAPE | l4 per-request TTFT MAPE |
+|---|---|---|---|---|
+| No host cost (earlier run) | 39.1% | 40.9% | 39.2% | 40.9% |
+| Tokenization 1.46 µs/token (earlier benchmark) | 10.9% | 11.4% | 14.3% | 14.8% |
+| **Tokenization 1.532 µs/token (this data)** | **9.5%** | **9.4%** | 13.4% | 14.4% |
+| This data + 35 ms unqueued overhead | 1.8% | 1.8% | 11.8% | 12.9% |
+
+The measured coefficient alone brings the point TTFT error under 10% on both lanes. Per-request TTFT MAPE stays above 10%.
+
 ## Limits
 
 - Idle, single-thread cost. Contention under load, HTTP receive, streaming and detokenization are not measured.
