@@ -19,15 +19,16 @@ use crate::common::enums::{DatabaseMode, TransferPolicy};
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
 use crate::config::{PerfDbSources, PerfSource};
+use crate::operators::moe::MoeReferenceMemo;
 use crate::operators::util_empirical::{DeltaLookupCache, ProvenanceTier, UtilGridCache};
 
 /// The five known legacy/framework-agnostic backend directory names. Mirrors the
 /// SDK loader's `KNOWN_BACKEND_DIRS`
-/// (`python/aisimulate/src/aisimulate_core/sdk/perf_database.py`): any other
+/// (`python/aisim/src/aisim_core/sdk/perf_database.py`): any other
 /// first-level directory under a system's data dir is a family dir containing
 /// `<backend>/<version>` subtrees.
 /// Keep textually identical to the CANONICAL `_KNOWN_BACKEND_DIRS` in
-/// `python/aisimulate/src/aisimulate_core/sdk/operations/base.py`, which lists
+/// `python/aisim/src/aisim_core/sdk/operations/base.py`, which lists
 /// every copy that must stay in sync (Rust cannot import the Python set).
 const KNOWN_BACKEND_DIRS: [&str; 5] = ["trtllm", "sglang", "vllm", "nccl", "oneccl"];
 
@@ -333,6 +334,10 @@ pub struct PerfDatabase {
     /// Memo of zero-aware delta lookups (the `compute_scale` empirical
     /// mechanism); same keying/lifetime rationale as `util_grids`.
     pub delta_lookups: Arc<DeltaLookupCache>,
+    /// Memo of the references the MoE empirical path resolved (see
+    /// `operators::moe::MoeReferenceKey`); shared across mode views like
+    /// `util_grids`.
+    pub(crate) moe_references: Arc<MoeReferenceMemo>,
     /// Max-rank empirical provenance tier fired since the last
     /// [`PerfDatabase::reset_provenance`] (Rust mirror of Python's
     /// `capture_provenance` contextvar in `sdk/operations/util_empirical.py`).
@@ -340,6 +345,8 @@ pub struct PerfDatabase {
     /// notes made through a derived view land on the run's accumulator. The
     /// engine FFI resets it per `run_static`/step call and reads the worst
     /// tier back for the Python bridge / support-matrix HYBRID labelling.
+    /// Memo entries attribute tiers on the noting thread instead
+    /// ([`crate::memo`]), so they never read or clear this cell.
     provenance: Arc<AtomicU8>,
 }
 
@@ -365,7 +372,7 @@ impl PerfDatabase {
     /// Resolve and parse the system YAML, locate the per-version data
     /// directory, and construct lazy table owners.
     ///
-    /// `systems_root` points at `python/aisimulate/src/aisimulate_core/systems`. `system` is a
+    /// `systems_root` points at `python/aisim/src/aisim_core/systems`. `system` is a
     /// basename like `b200_sxm`. `backend` is `vllm` / `sglang` / `trtllm`.
     /// `version` is the backend version directory name (e.g. `0.24.0`).
     pub fn load(
@@ -795,6 +802,7 @@ impl PerfDatabase {
             transfer_policy: TransferPolicy::ALL,
             util_grids: Arc::new(UtilGridCache::new()),
             delta_lookups: Arc::new(DeltaLookupCache::new()),
+            moe_references: Arc::new(crate::operators::moe::reference_memo()),
             provenance: Arc::new(AtomicU8::new(ProvenanceTier::Silicon as u8)),
         }
     }
@@ -813,20 +821,11 @@ impl PerfDatabase {
     /// successful `util_empirical::estimate` with the tier the site knows
     /// (own-data "empirical", attention head_size ref grid "xshape", the MoE
     /// ladder's `reference_provenance`, communication rank-overflow "xshape",
-    /// MSA cross-op "xop", ...).
+    /// MSA cross-op "xop", ...). The tier also counts toward the memo miss
+    /// open on this thread ([`crate::memo`]).
     pub fn note_provenance(&self, tier: ProvenanceTier) {
         self.provenance.fetch_max(tier as u8, Ordering::Relaxed);
-    }
-
-    /// Clear the accumulator back to `Silicon`, returning the tier it held.
-    /// Noting that tier again afterwards leaves the accumulator as if it had
-    /// never been cleared, so a caller can observe the tiers one computation
-    /// fires.
-    pub(crate) fn take_provenance(&self) -> ProvenanceTier {
-        ProvenanceTier::from_rank(
-            self.provenance
-                .swap(ProvenanceTier::Silicon as u8, Ordering::Relaxed),
-        )
+        crate::memo::note_on_thread(tier);
     }
 
     /// Clear the accumulator back to `Silicon` (start of a run).
@@ -877,6 +876,7 @@ impl PerfDatabase {
             transfer_policy: self.transfer_policy,
             util_grids: Arc::clone(&self.util_grids),
             delta_lookups: Arc::clone(&self.delta_lookups),
+            moe_references: Arc::clone(&self.moe_references),
             provenance: Arc::clone(&self.provenance),
         }
     }
@@ -895,6 +895,7 @@ impl PerfDatabase {
             transfer_policy: self.transfer_policy,
             util_grids: Arc::clone(&self.util_grids),
             delta_lookups: Arc::clone(&self.delta_lookups),
+            moe_references: Arc::clone(&self.moe_references),
             provenance: Arc::clone(&self.provenance),
         }
     }
@@ -911,8 +912,8 @@ impl PerfDatabase {
 /// ```text
 /// cd <repo> && uv run python - <<'PY'
 /// import pandas as pd, yaml, tempfile, os
-/// from aisimulate_core.sdk.perf_database import PerfDatabase
-/// from aisimulate_core.sdk import common
+/// from aisim_core.sdk.perf_database import PerfDatabase
+/// from aisim_core.sdk import common
 /// root = tempfile.mkdtemp(); data = os.path.join(root, "data", "vllm", "1.0")
 /// os.makedirs(data)
 /// yaml.safe_dump({...the testsys spec below...},
@@ -1014,6 +1015,7 @@ pub(crate) mod energy_test_fixtures {
                 p2p_latency: 2e-6,
                 num_gpus_per_rack: None,
                 inter_rack_bw: None,
+                inter_rack_latency: None,
             },
             misc: MiscSpec::default(),
         }
@@ -1060,7 +1062,7 @@ mod tests {
     fn systems_root() -> PathBuf {
         PathBuf::from(REPO_ROOT_HINT)
             .join("../..")
-            .join("python/aisimulate/src/aisimulate_core/systems")
+            .join("python/aisim/src/aisim_core/systems")
     }
 
     #[test]
@@ -1227,6 +1229,7 @@ mod tests {
         assert_eq!(db2.worst_provenance(), ProvenanceTier::Silicon);
         assert!(!Arc::ptr_eq(&db1.util_grids, &db2.util_grids));
         assert!(!Arc::ptr_eq(&db1.delta_lookups, &db2.delta_lookups));
+        assert!(!Arc::ptr_eq(&db1.moe_references, &db2.moe_references));
     }
 
     #[test]

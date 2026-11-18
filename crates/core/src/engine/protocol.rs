@@ -527,6 +527,7 @@ pub struct PassCompletionEffects {
 #[doc(hidden)]
 pub struct PendingPass {
     pub(crate) started_at_ms: f64,
+    pub(crate) end_without_selection_ms: Option<f64>,
     pub(crate) effects: PassCompletionEffects,
 }
 

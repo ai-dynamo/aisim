@@ -12,6 +12,7 @@ from pathlib import Path
 
 from scripts.e2e_accuracy.agentx_comparison import validate as validate_comparison
 from scripts.e2e_accuracy.agentx_inputs import safe_path
+from scripts.e2e_accuracy.benchmark_features import IncompleteSiliconEvidence
 from scripts.e2e_accuracy.benchmark_features import validate as validate_features
 from scripts.e2e_accuracy.simulation_features import validate as validate_simulation
 
@@ -19,6 +20,15 @@ INPUT_SCHEMA = "aisimulate.agentx.inputs.v1"
 SUMMARY_SCHEMA = "aisimulate.agentx.accuracy.v1"
 INDEX = "catalog/e2e/agentx.json"
 METRICS = ("tpot_ms", "ttft_ms", "output_tokens_s")
+# The original, retained finite Qwen campaign predates complete silicon receipts.
+# Keep this compatibility exception finite; new IDs and Weka runs must qualify.
+HISTORICAL_SELF_COLLECTED = {
+    f"self-p{length}-l{lanes}-{cache}-r{repeat}": (length, lanes, cache, repeat)
+    for length in (4096, 32768)
+    for lanes in (1, 4, 16)
+    for cache in ("cold", "warm")
+    for repeat in range(3)
+}
 IDENTITY = (
     "id",
     "category",
@@ -59,6 +69,8 @@ def driver_digest(read_file=None):
             names += ("../../benchmarks/evidence/accuracy/qwen-weka/cache_probe.py",)
     if b'"simulation_features.py"' in read_file("scripts/e2e_accuracy/agentx_contract.py"):
         names += ("simulation_features.py",)
+    if b'"../release/package_identity.py"' in read_file("scripts/e2e_accuracy/agentx_contract.py"):
+        names += ("../release/package_identity.py",)
     return hashlib.sha256(
         canonical(
             {
@@ -672,10 +684,6 @@ def validate_result(run):
         "unsupported",
     }:
         raise ValueError("Invalid AgentX result fields")
-    if "feature_metadata" in run:
-        validate_features(run["feature_metadata"], run["id"])
-    elif run["id"].startswith("qwen-weka-l"):
-        raise ValueError("New Qwen Weka publications require silicon feature metadata")
     if "simulation_features" in run:
         validate_simulation(run["simulation_features"], run["id"])
     for item in run.get("op_data", []):
@@ -752,4 +760,19 @@ def validate_result(run):
         for metric in ("ttft_ms", "tpot_ms"):
             if comparison["phases"]["profile"]["request_scores"][metric] != run["request_errors"][metric]:
                 raise ValueError("Chart and overview request scores disagree")
+    # Check completeness only after every structural and arithmetic invariant.
+    # Publishers may reject an incomplete retained snapshot without blocking
+    # unrelated content, but corruption must always remain a hard error.
+    historical = HISTORICAL_SELF_COLLECTED.get(run["id"])
+    legacy = (
+        historical is not None
+        and historical == tuple(run[k] for k in ("initial_input_tokens", "lanes", "cache_state", "repeat"))
+        and (run["model"], run["hardware"], run["backend"], run["tensor_parallel"], run["boundary"])
+        == ("Qwen/Qwen3.5-397B-A17B", "B300", "vllm", 8, "complete_finite_cohort")
+    )
+    complete_features = run["category"] == "self_collected" and not legacy
+    if "feature_metadata" in run:
+        validate_features(run["feature_metadata"], run["id"], require_complete=complete_features)
+    elif complete_features:
+        raise IncompleteSiliconEvidence("New self-collected publications require silicon feature metadata")
     return run

@@ -17,11 +17,11 @@ const entry = (branch, revision, nightly = "") => ({ branch, sha: revision, nigh
 const run = {
   id: 123, head_sha: sha, head_branch: "main", event: "schedule",
   path: ".github/workflows/nightly-ci.yml", status: "waiting", conclusion: null,
-  repository: { full_name: "ai-dynamo/aisimulate" },
-  head_repository: { full_name: "ai-dynamo/aisimulate" },
+  repository: { full_name: "ai-dynamo/aisim" },
+  head_repository: { full_name: "ai-dynamo/aisim" },
 };
 
-async function resolve({ event = "schedule", runs = [run], built = true, expired = false, inputs = {}, branches = [], hfResponse = { ok: true, sha: "d".repeat(40) } } = {}) {
+async function resolve({ event = "schedule", runs = [run], built = true, expired = false, artifactName = "nightly-dist-amd64-manifest", inputs = {}, branches = [], hfResponse = { ok: true, sha: "d".repeat(40) } } = {}) {
   const outputs = {};
   const actions = {
     listWorkflowRuns: async (args) => {
@@ -35,7 +35,7 @@ async function resolve({ event = "schedule", runs = [run], built = true, expired
   const context = vm.createContext({
     fetch: async () => ({ok: hfResponse.ok, json: async () => ({sha: hfResponse.sha})}),
     require: createRequire(import.meta.url),
-    context: { eventName: event, sha, repo: { owner: "ai-dynamo", repo: "aisimulate" } },
+    context: { eventName: event, sha, repo: { owner: "ai-dynamo", repo: "aisim" } },
     process: { env: inputs },
     core: { notice() {}, setOutput: (name, value) => { outputs[name] = value; } },
     github: { rest: { actions, repos: { listBranches: "branches" } }, paginate: async (method, args) => {
@@ -50,7 +50,7 @@ async function resolve({ event = "schedule", runs = [run], built = true, expired
         { name: "Stage artifacts", conclusion: null, status: "waiting" },
       ];
       assert.equal(method, "artifacts");
-      return [{ name: "nightly-dist-amd64", expired }];
+      return [{ name: artifactName, expired }];
     } },
   });
   await vm.runInContext(`(async () => { ${source} })()`, context);
@@ -63,7 +63,7 @@ test("scheduled accuracy reuses the exact main wheel while release staging waits
 });
 
 test("missing, failed, and expired nightly builds fall back to building the scheduled SHA", async () => {
-  for (const scenario of [{ runs: [] }, { built: false }, { expired: true }]) {
+  for (const scenario of [{ runs: [] }, { built: false }, { expired: true }, { artifactName: "nightly-dist-amd64" }]) {
     assert.deepEqual(await resolve(scenario), [entry("main", sha)]);
   }
 });
