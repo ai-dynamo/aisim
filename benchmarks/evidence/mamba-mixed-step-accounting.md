@@ -14,12 +14,64 @@ not silicon measurements, calibration or accuracy claims.
 | Variant | Commit | Content |
 | --- | --- | --- |
 | Candidate | `686275e7350e4b4a39e88dec55c135312b671038` | The fix. |
-| Baseline | `49d93f5a4aec1ec6033ae63228548348167b4e12` (not published) | The Candidate with `session.rs` and the mixed-step hunks of `runtime.rs` reverted. |
+| Baseline | `49d93f5a4aec1ec6033ae63228548348167b4e12` (not published, rebuilt by the recipe below) | The Candidate with `session.rs` and the mixed-step hunks of `runtime.rs` reverted. |
 | Main | `bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c` | Unqualified control only. |
 
 Baseline and Candidate share all qualification code. The accounting code is the
-only difference. No built-in model sets `state_dtype` or `token_width` yet, so
-every qualified run applied this wrapper before it built the model:
+only difference. The Candidate is fetchable from the PR fork. To rebuild the
+Baseline, take the Main versions of the two accounting files and add back the
+`nextn + 1` width check:
+
+```bash
+git fetch https://github.com/milesial/aisimulate-public.git 686275e7350e4b4a39e88dec55c135312b671038
+git checkout 686275e7350e4b4a39e88dec55c135312b671038
+git checkout bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c -- \
+  crates/core/src/perfmodel/session.rs crates/core/src/perfmodel/engine/runtime.rs
+git apply baseline-width-check.patch   # the patch below
+git hash-object crates/core/src/perfmodel/session.rs        # 58952aa6
+git hash-object crates/core/src/perfmodel/engine/runtime.rs  # 28d8d759
+```
+
+`baseline-width-check.patch` against `bf373a13`'s `runtime.rs`:
+
+```diff
+--- a/crates/core/src/perfmodel/engine/runtime.rs
++++ b/crates/core/src/perfmodel/engine/runtime.rs
+@@ -495,6 +495,21 @@ impl Engine {
+             .as_ref()
+             .and_then(|s| s.nextn)
+             .unwrap_or(0);
++        // Generation Mamba queries carry `requests * (nextn + 1)` flattened
++        // tokens and the op divides by its own width; the two must agree.
++        for op in &spec.generation_ops {
++            if let Op::Mamba2(m) = op
++                && op.is_qualified_mamba()
++                && m.token_width != nextn.saturating_add(1)
++            {
++                return Err(AicError::InvalidEngineConfig(format!(
++                    "qualified Mamba op {} has token_width {} but speculative nextn+1 is {}",
++                    m.name,
++                    m.token_width,
++                    nextn.saturating_add(1)
++                )));
++            }
++        }
+         super::readiness::validate_glm53_kv(
+             &db,
+             spec.context_ops.iter().chain(&spec.generation_ops),
+@@ -6276,6 +6291,8 @@ pub(crate) mod tests {
+             head_dim: 64,
+             n_groups: 8,
+             chunk_size: 256,
++            state_dtype: "unrecorded".into(),
++            token_width: 1,
+         })];
+         let ops_json = serde_json::to_string(&ops).unwrap();
+         let err = engine
+```
+
+No built-in model sets `state_dtype` or `token_width` yet, so every qualified run
+applied this wrapper (`qual_patch.py`) before it built the model:
 
 ```python
 def apply(nextn):
@@ -50,8 +102,46 @@ analytical bound is an allowed result.
 
 Qualified Baseline to qualified Candidate.
 
-`InferenceSession.run_agg`, batch 16, output 64, 2048-token prefill budget
-(8128 for the split budget), TensorRT-LLM:
+`InferenceSession.run_agg`, TensorRT-LLM. The script below (`agg.py`) ran each case with
+`python agg.py OUT.json --qual 1 --nextn {0,3}` at each commit, from the
+commit's `python/aisimulate` package environment, with `qual_patch.py` beside it:
+
+```python
+import argparse, json, os, sys
+ap = argparse.ArgumentParser(); ap.add_argument("out"); ap.add_argument("--qual", type=int, default=0)
+ap.add_argument("--nextn", type=int, default=0); ap.add_argument("--backend", default="trtllm")
+ap.add_argument("--version", default="1.3.0rc20")
+ap.add_argument("--model", default="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+a = ap.parse_args()
+if a.qual:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import qual_patch; qual_patch.apply(a.nextn)
+from aisimulate_core.sdk import config
+from aisimulate_core.sdk.models import get_model
+from aisimulate_core.sdk.perf_database import get_database
+from aisimulate_core.sdk.backends.factory import get_backend
+from aisimulate.sdk.inference_session import InferenceSession
+mc = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=a.nextn,
+                        nextn_accept_rates=([0.8, 0.7, 0.6][:a.nextn] if a.nextn else None))
+sess = InferenceSession(get_model(a.model, mc, a.backend), get_database("b200_sxm", a.backend, a.version),
+                        get_backend(a.backend, "b200_sxm"))
+out = {}
+# (batch, isl, osl, prefix, ctx_tokens): ctx_tokens is the prefill budget per step.
+for name, (b, isl, osl, px, ctx) in {
+    "chunked_uncached": (16, 6000, 64, 0, 2048),
+    "chunked_partial_cached": (16, 6000, 64, 3000, 2048),
+    "split_budget_cached": (16, 4096, 64, 1024, 8128),
+}.items():
+    kw = {"ctx_tokens": ctx}
+    if a.nextn: kw["decode_tokens_per_iteration"] = 1 + 0.8 + 0.8 * 0.7 + 0.8 * 0.7 * 0.6
+    s = sess.run_agg(config.RuntimeConfig(batch_size=b, isl=isl, osl=osl, prefix=px), **kw)
+    d = s.get_summary_df().iloc[0].to_dict()
+    out[name] = {k: float(d[k]) for k in ("ttft", "tpot", "tokens/s/gpu")}
+json.dump({"qual": a.qual, "nextn": a.nextn, "backend": a.backend, "runs": out}, open(a.out, "w"), indent=1)
+```
+
+`chunked` is `chunked_uncached` and `split budget` is `split_budget_cached`.
+`--backend vllm --version 0.24.0` gives the vLLM rows.
 
 | MTP | Case | TTFT ms | tok/s/GPU |
 | --- | --- | --- | --- |
