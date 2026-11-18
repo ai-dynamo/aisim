@@ -48,6 +48,12 @@ fn default_token_width() -> u32 {
 }
 
 impl Mamba2Op {
+    /// A convolution kernel, by logical (`causal_conv1d_fn`,
+    /// `causal_conv1d_update`) or physical (`causal_conv1d_fn_token_major`) label.
+    fn is_conv(&self) -> bool {
+        self.kernel_source.starts_with("causal_conv1d")
+    }
+
     /// Why this op's qualification fields are invalid, if they are.
     pub(crate) fn field_error(&self) -> Option<String> {
         if !matches!(
@@ -90,17 +96,13 @@ impl Mamba2Op {
             batch_size
         };
         // A measured row prices one decode token per request, and the SSM rows
-        // hold a 16-bit state (the collectors use BF16). A qualified op that
-        // verifies several tokens or keeps an FP32 state has no row, so it
-        // takes the analytic SOL like a table miss. Convolution rows do not
+        // hold a BF16 state (the collectors' dtype). A qualified op that
+        // verifies several tokens or keeps another state dtype has no row, so
+        // it takes the analytic SOL like a table miss. Convolution rows do not
         // depend on the state dtype.
-        let is_conv = matches!(
-            self.kernel_source.as_str(),
-            "causal_conv1d_fn" | "causal_conv1d_update"
-        );
         let no_measured_row = self.state_dtype != "unrecorded"
             && ((self.phase == "generation" && self.token_width > 1)
-                || (!is_conv && self.state_dtype == "float32"));
+                || (!self.is_conv() && self.state_dtype != "bfloat16"));
         // SOL (and the retired SOL_FULL alias) never reads the table, as in
         // the GEMM, attention, MoE and mHC operators. Mamba2 has no util-space
         // empirical layer, so EMPIRICAL answers with the same analytic SOL
@@ -166,32 +168,27 @@ impl Mamba2Op {
         } else {
             batch_size * self.token_width as f64
         };
-        match self.kernel_source.as_str() {
-            "causal_conv1d_fn" | "causal_conv1d_update" => {
-                x * conv_dim * (d_conv + 1.0) * 2.0 + x * conv_dim * 2.0
-            }
-            _ => {
-                // SSM kernels (`mamba_chunk_scan_combined` etc.).
-                let state_bytes = if matches!(self.state_dtype.as_str(), "float16" | "bfloat16") {
-                    2.0
-                } else {
-                    4.0
-                };
-                let writes = if self.phase == "generation" {
-                    self.token_width as f64
-                } else {
-                    1.0
-                };
-                // Legacy ops use unsharded shapes and unknown state precision.
-                let recurrent = if self.state_dtype == "unrecorded" {
-                    0.0
-                } else {
-                    batch_size * d_inner * d_state * state_bytes * (1.0 + writes)
-                };
-                x * (d_inner + n_groups * d_state * 2.0 + nheads) * 2.0
-                    + x * d_inner * 2.0
-                    + recurrent
-            }
+        if self.is_conv() {
+            x * conv_dim * (d_conv + 1.0) * 2.0 + x * conv_dim * 2.0
+        } else {
+            // SSM kernels (`mamba_chunk_scan_combined` etc.).
+            let state_bytes = if matches!(self.state_dtype.as_str(), "float16" | "bfloat16") {
+                2.0
+            } else {
+                4.0
+            };
+            let writes = if self.phase == "generation" {
+                self.token_width as f64
+            } else {
+                1.0
+            };
+            // Legacy ops use unsharded shapes and unknown state precision.
+            let recurrent = if self.state_dtype == "unrecorded" {
+                0.0
+            } else {
+                batch_size * d_inner * d_state * state_bytes * (1.0 + writes)
+            };
+            x * (d_inner + n_groups * d_state * 2.0 + nheads) * 2.0 + x * d_inner * 2.0 + recurrent
         }
     }
 
@@ -683,6 +680,14 @@ mod tests {
         assert_eq!(op.sol_total_bytes(2.0, 0.0), 21_120_000.0);
         op.state_dtype = "unrecorded".into();
         assert_eq!(op.sol_total_bytes(2.0, 0.0), 8.0 * 18_560.0);
+        // The physical TRT-LLM convolution label prices as convolution.
+        op.phase = "context".into();
+        op.state_dtype = "float32".into();
+        op.token_width = 1;
+        op.kernel_source = "causal_conv1d_fn".into();
+        let logical = op.sol_total_bytes(2.0, 16.0);
+        op.kernel_source = "causal_conv1d_fn_token_major".into();
+        assert_eq!(op.sol_total_bytes(2.0, 16.0), logical);
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane

@@ -2870,9 +2870,13 @@ impl PyMamba2Kernel {
             o.chunk_size,
         )
             .into_pyobject(py)?;
+        // Legacy (unrecorded) ops keep the old positional-only rebuild, so a
+        // subclass with the pre-qualification `__new__` still unpickles.
         let kwargs = PyDict::new(py);
-        kwargs.set_item("state_dtype", &o.state_dtype)?;
-        kwargs.set_item("token_width", o.token_width)?;
+        if o.state_dtype != "unrecorded" || o.token_width != 1 {
+            kwargs.set_item("state_dtype", &o.state_dtype)?;
+            kwargs.set_item("token_width", o.token_width)?;
+        }
         Ok((args, kwargs))
     }
 

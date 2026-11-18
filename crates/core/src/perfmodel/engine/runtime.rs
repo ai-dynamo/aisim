@@ -4611,7 +4611,7 @@ pub(crate) mod tests {
             head_dim: 64,
             n_groups: 4,
             chunk_size: 128,
-            state_dtype: "float16".into(),
+            state_dtype: "bfloat16".into(),
             token_width,
         })
     }
@@ -4841,8 +4841,13 @@ pub(crate) mod tests {
             )
         };
         // Width one keeps the measured row.
-        let (total, op_ms, source) = decode_only(None, 1, 2, "float16");
+        let (total, op_ms, source) = decode_only(None, 1, 2, "bfloat16");
         assert_eq!((total, op_ms, source.as_str()), (0.25, 0.25, "silicon"));
+        // The BF16 row does not price an FP16 state either: same bytes, no row.
+        let (total, _, source) = decode_only(None, 1, 2, "float16");
+        let bytes = 2.0 * (18_560.0 + 2.0 * 1_048_576.0);
+        assert!((total - ms(bytes)).abs() < 1e-12, "fp16: {total}");
+        assert_eq!(source, "sol");
         // The 16-bit row does not price an FP32 state: one 2 MiB read and
         // one 2 MiB write per request.
         let (total, _, source) = decode_only(None, 1, 2, "float32");

@@ -69,12 +69,15 @@ applies to the convolution update and to the state scan. The estimate
 counts every verified token, and its source is `sol`. For a state-scan
 operation, it also counts each request's recurrent-state traffic. The
 convolution update has no recurrent-state term. A decode batch must hold
-whole requests, so its token count must be a multiple of `token_width`. With `token_width` one, the operation reads the
-measured row as before. The collected state-scan rows use a BF16 state, so a
-qualified scan operation with a `float32` state also uses the SOL estimate.
-Convolution rows do not depend on the state dtype, so this second rule does
-not apply to convolution. No collected data
-qualifies Mamba2 timing under MTP.
+whole requests, so its token count must be a multiple of `token_width`.
+
+With `token_width` one, an operation can read a measured row when the state
+dtype allows it and the table covers its shape. The collected state-scan
+rows use a BF16 state. A qualified scan operation with any other state
+dtype, `float16` or `float32`, uses the SOL estimate. Convolution rows do not
+depend on the state dtype, so this rule does not apply to convolution,
+under either its logical or its physical TensorRT-LLM label. No collected
+data qualifies Mamba2 timing under MTP.
 
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different
