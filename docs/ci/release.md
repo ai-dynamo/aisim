@@ -407,9 +407,7 @@ The action never forwards credentials to redirects. The existing environment-sco
 
 Persistent project and Dynamo wheel handoffs use Artifactory, including companion requirements, crate files, checksums, and build provenance in the same bundle. A wheel built, installed, and discarded within one job does not need a storage handoff or release credentials. Its result artifacts must select report directories rather than its build, dist, workspace, or virtual-environment directories.
 
-Every wheel-storage consumer, including FPE discovery and report packaging, runs
-in an admitted internal runner container. GitHub-hosted runners cannot resolve
-the internal Artifactory hostname. Historical release qualification resolves the
+Historical release qualification resolves the
 selected checkout's `python/aisim` or `python/aisimulate` project directory and
 keeps its source, locked dependencies, wheel, and inventory unchanged.
 

@@ -153,11 +153,15 @@ jobs:
     environment: automated-release
     name: Qualify release FPE artifact
     needs: [prepare, generate]
-    # Wheel payloads live on internal Artifactory; use the admitted network.
+    # Wheel payloads require NVIDIA-internal Artifactory DNS/network access.
     runs-on: prod-aisim-default-amd64-v1
+    timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-    timeout-minutes: 15
+      env:
+        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

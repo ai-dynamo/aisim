@@ -22,15 +22,6 @@ transfer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(transfer)
 
 
-def test_internal_wheel_transfers_use_admitted_runners_with_network_access():
-    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
-        for name, job in yaml.safe_load(workflow.read_text()).get("jobs", {}).items():
-            if any(step.get("uses") == "./.github/actions/wheel-storage" for step in job.get("steps", [])):
-                runner = job["runs-on"]
-                assert "ubuntu-" not in str(runner), (workflow.name, name)
-                assert "container" in job, (workflow.name, name)
-
-
 @pytest.fixture
 def handoff(tmp_path, monkeypatch):
     source = tmp_path / "build"
@@ -254,6 +245,33 @@ def test_curl_uses_private_config_without_redirects_or_token_arguments(tmp_path,
 
     monkeypatch.setattr(transfer.subprocess, "run", run)
     transfer.transfer("https://artifactory.invalid/wheel", token, payload, upload=True, checksum="a" * 64)
+
+
+def test_wheel_handoffs_require_internal_containerized_runners():
+    # NVIDIA Artifactory requires internal DNS/network access. Dedicated ARC
+    # runners also require a job container; a GitHub-hosted runner cannot
+    # consume a handoff just because its manifest is available in Actions.
+    internal_runners = {
+        "prod-aisim-default-amd64-v1",
+        "prod-aisim-default-arm64-v1",
+        "prod-aisim-default-${{ matrix.arch }}-v1",
+    }
+    violations = []
+    for path in (ROOT / ".github/workflows").glob("*.yml"):
+        for job_name, job in yaml.safe_load(path.read_text()).get("jobs", {}).items():
+            if not any(step.get("uses", "").endswith("/wheel-storage") for step in job.get("steps", [])):
+                continue
+            runner = job.get("runs-on")
+            runners = (
+                {entry["runner"] for entry in job["strategy"]["matrix"]["include"]}
+                if runner == "${{ matrix.runner }}"
+                else {runner}
+            )
+            if not runners or not runners <= internal_runners:
+                violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
+            if not job.get("container", {}).get("image"):
+                violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
+    assert not violations, "\n".join(violations)
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():
