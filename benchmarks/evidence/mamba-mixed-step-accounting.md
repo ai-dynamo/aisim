@@ -385,9 +385,11 @@ every model:
   now schedules the whole request and TTFT counts one step. This changes
   every one-request result with a prefix, an uncached part that fits the
   budget and a budget below `isl`. Results without a prefix, with a budget of
-  at least `isl`, or with more than one request do not change. The
-  TensorRT-LLM queuing factor (qf) still uses the number of budget steps.
-  This is not a general cached-prefix TTFT fix. If the uncached tokens exceed
+  at least `isl`, or with more than one request do not change. Commit
+  `59c4575a` also passes that one step to the TensorRT-LLM queuing factor
+  (qf), so the result no longer depends on the budget. The qf formula and
+  its coefficients do not change. This is not a general cached-prefix TTFT
+  fix. If the uncached tokens exceed
   the budget, TTFT still counts `ceil(isl / ctx_tokens)` steps, the cached
   prefix included. The count is too high whenever
   `ceil(isl / ctx_tokens) > ceil((isl - prefix) / ctx_tokens)`, for one
@@ -407,23 +409,26 @@ every model:
 `agg_caller.py` ran from the `55d2821b` build and from `35e632cb`. Both runs
 gave the same output,
 [`caller-55d2821b.json`](mamba-mixed-step-accounting/caller-55d2821b.json).
+At `59c4575a` it gave
+[`caller-59c4575a.json`](mamba-mixed-step-accounting/caller-59c4575a.json).
 Against `caller-70a8ea00.json`, only the cases below change:
 
-| Case (batch, isl, prefix, budget) | Value | `70a8ea00` | `55d2821b` |
-| --- | --- | --- | --- |
-| One request (1, 4096, 3000, 2048) | Non-Mamba sum ms | 16.855182 | 13.180794 |
-| One request (1, 4096, 3000, 2048) | TTFT ms | 77.844 | 29.773 |
-| Same session, prefix 0, then 3000 | TTFT ms | 79.852, 77.844 | 79.852, 29.773 |
+| Case (batch, isl, prefix, budget) | Value | `70a8ea00` | `55d2821b` | `59c4575a` |
+| --- | --- | --- | --- | --- |
+| One request (1, 4096, 3000, 2048) | Non-Mamba sum ms | 16.855182 | 13.180794 | 13.180794 |
+| One request (1, 4096, 3000, 2048) | TTFT ms | 77.844 | 29.773 | 29.010 |
+| Same session, prefix 0, then 3000 | TTFT ms | 79.852, 77.844 | 79.852, 29.773 | 79.852, 29.010 |
 
 The context-phase Mamba GEMMs and norm in that case also fall. The step now
 holds the 4096-token request, not a 2048-token chunk with 2048 cached
 tokens. `context_mamba_ssm` stays 0.073730 ms. TTFT is
-`step * chunks * qf`, with `qf = 2 + (steps - 3) / 20` for
-`steps = ceil(4096 / 2048) = 2`. The step is the per-operation sum,
-15.268 ms, so TTFT is `15.268 * 1 * 1.95 = 29.773` ms, one chunk instead
-of two. The exact-prompt control (budget 4096) keeps 29.010 ms, with
-`steps = 1` and `qf = 1.9`. The 2.6% gap is the unchanged queuing factor. The
-uncached chunked case keeps two chunks and 79.852 ms. A fully cached prompt
+`step * chunks * qf`, with `qf = 2 + (steps - 3) / 20`. The step is the
+per-operation sum, 15.268 ms. At `55d2821b`, qf still read the budget steps,
+`ceil(4096 / 2048) = 2`, so TTFT was `15.268 * 1 * 1.95 = 29.773` ms, one
+chunk instead of two. At `59c4575a`, qf reads the one step the request
+takes, so TTFT is `15.268 * 1 * 1.90 = 29.010` ms, the same as the
+exact-prompt control (budget 4096). The uncached chunked case keeps two
+chunks, `qf = 1.95` and 79.852 ms. A fully cached prompt
 (prefix 4096) still fails with `isl must be greater than`.
 
 The regressions ran against earlier builds:
@@ -434,6 +439,9 @@ The regressions ran against earlier builds:
 | `test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode` | `9eaa66e8` | Second graph TTFT 78.669 ms, cold 77.868 ms |
 | `test_run_agg_reuse_keeps_each_mamba_op_state_dtype` | `55d2821b` | Swapped dtypes TTFT 29.786 ms, cold 29.773 ms |
 | `test_run_agg_reuse_keeps_the_partial_qualification_rejection` | `55d2821b` | Partially qualified graph did not raise |
+| `test_run_agg_ttft_counts_uncached_prefill_steps[3000-1-1.9]` | `1ea0211c` | TTFT 29.773 ms, expected 29.010 ms |
+| `test_run_agg_one_step_ttft_does_not_depend_on_the_budget` | `1ea0211c` | Prefix 3968: budget 128 TTFT 33.735 ms, budget 4096 18.579 ms |
+| `test_run_agg_reuse_keeps_a_wrapped_mamba_op_distinct` | `1ea0211c` | Wrapped graph did not raise |
 
 The uncached case `[0-2]` and `test_run_agg_rejects_a_fully_cached_prompt`
 also passed on `9eaa66e8`. They pin behavior that did not change. At
@@ -461,6 +469,12 @@ Commits `79a9e652` and `1ea0211c` add four fixes:
 - **Exact-total prefill.** `predict_prefill_latency_total` passes whether
   any token is cached, as the packed metrics path does. Two 16-token
   prefills with one cached token now skip the cold scan row.
+
+Commit `59c4575a` adds two more checks. The compiled-engine identity
+records a Mamba2 op's draft query width, which compiles the op inside a
+`TokenScale` wrapper, so a wrapped qualified graph fails cold and warm
+instead of reusing the plain graph's engine. A qualified prefill query with
+no new token now fails instead of pricing state traffic.
 
 [`mem.py`](mamba-mixed-step-accounting/mem.py) ran from the `35e632cb` and
 `1ea0211c` builds. It prices one vLLM `0.24.0` Nano request with isl 4096
@@ -529,7 +543,7 @@ python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
   crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
 ```
 
-| Code revision | Published heads with this code | Engine-step parity | Golden set |
+| Code revision | Later heads with no product-code change | Engine-step parity | Golden set |
 | --- | --- | --- | --- |
 | `62293977` | `6511a26d` | 305 passed | 121 passed |
 | `9a2bde6b` | `d321defd` | 305 passed | 121 passed |
@@ -537,10 +551,14 @@ python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
 | `70a8ea00` | `df8a4277` | 305 passed | 121 passed |
 | `9eaa66e8` | `663344ae` | 305 passed | 121 passed |
 | `35e632cb` | None | 305 passed | 121 passed |
-| `1ea0211c` | The head that adds this row | 305 passed | 121 passed |
+| `1ea0211c` | `7cbe9c48`, `14ffdb4c` | 305 passed | 121 passed |
+| `59c4575a` | None | 305 passed | 121 passed |
+| `1db9b803` | None | 305 passed | 121 passed |
 
-Each published head adds no product code to its code revision, only tests,
-documentation or evidence, so it carries that revision's parity results.
+Each result applies to the code revision in the first column. The later
+heads add only tests, documentation or evidence, but the parity suites were
+not rerun at those heads. Their exact-head results are the published head's
+CI, not this table.
 
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
 `gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
@@ -622,6 +640,40 @@ record the in-process runner time (`wall_s`) and the process peak memory
 Six samples cannot separate the variants. The whole-process times (1.70 s and
 2.37 s) and the `run_agg` memory (about 700 MB) are transcribed observations.
 Their raw log was not saved. No speed, memory or significance claim is made.
+
+### Forward-prediction host time
+
+The advisory Forward Prediction Performance gate compared main `bf1b539f`
+with `14ffdb4c` and found 81 regressions among 89 stable comparisons. For
+example, Qwen3-32B SILICON context at batch 1 and isl 1024 went from 20.48
+to 24.23 us warm. The gate times `InferenceSession.run_static_latency_only`.
+Each query checks the compiled-engine identity memo once. Commit `55d2821b`
+made that check rebuild the database mode key and sort the transfer policy
+on every query. On the workstation, `engine_identity` took 0.30 us per call,
+against 0.10 us for main's object-only check. Commit `59c4575a` compares
+the mode and the policy by object identity, and `1db9b803` reads their
+stored attributes directly, which takes 0.17 us. The setters replace both
+values, so the check still detects a mode or policy change.
+
+The gate's own `worker.py` ran each build on the 13 SILICON cases of
+Qwen3-32B and Nemotron-3-Super-120B FP8. The builds ran in turn, in five
+rounds, with 10 warm-up and 100 timed queries per case. Warm medians over
+the rounds, in microseconds, with the range of the round medians:
+
+| Case | `bf1b539f` | `1db9b803` | Change |
+| --- | --- | --- | --- |
+| Qwen3-32B context, batch 1, isl 1024 | 14.44 (13.76 to 15.60) | 14.28 (14.06 to 15.88) | -1.1% |
+| Qwen3-32B context, batch 1, isl 32768 | 17.29 (15.43 to 17.47) | 16.01 (15.94 to 17.74) | -7.4% |
+| Qwen3-32B generation, batch 1, isl 1024 | 24.98 (24.83 to 27.86) | 25.26 (24.76 to 26.00) | +1.1% |
+| Qwen3-32B generation, batch 128, isl 1024 | 24.72 (24.42 to 25.17) | 25.20 (24.74 to 27.79) | +2.0% |
+| Nemotron Super context, batch 1, isl 1024 | 20.74 (20.42 to 23.19) | 21.22 (20.98 to 23.77) | +2.3% |
+| Nemotron Super generation, batch 128, isl 1024 | 43.19 (42.44 to 43.49) | 42.94 (42.72 to 48.25) | -0.6% |
+
+Across the 13 cases, the change runs from -7.4% to +2.3%, and the ranges
+overlap. An earlier three-round run measured `1ea0211c`, the code of
+`14ffdb4c`, at 17.08 us for the first case against 14.08 us for main. These
+are simulator host timings, not predicted serving latency. The paired CI
+gate on the published head remains the exact-head result.
 
 ## Limits
 
