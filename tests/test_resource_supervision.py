@@ -1017,6 +1017,27 @@ def test_overwrite_rejects_input_output_collisions_before_starting_worker(
     assert _output_bytes(output) == original
 
 
+def test_failed_run_retry_preserves_input_before_starting_worker(tmp_path, monkeypatch, capsys):
+    from aisim import supervision
+
+    output = tmp_path / "output"
+    output.mkdir()
+    config = _small_cli_config(tmp_path, "predict").replace(output / "resource-plan.json")
+    (output / "execution-events.jsonl").write_text("{}\n")
+    (output / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}))
+    before = _output_bytes(output)
+
+    def unexpected_worker(*args, **kwargs):
+        pytest.fail("reusing a failed run must preserve the active configuration")
+
+    monkeypatch.setattr(supervision, "run_process", unexpected_worker)
+    with pytest.raises(SystemExit) as error:
+        supervision.main(["predict", "--config", str(config), "--output-dir", str(output)])
+    assert error.value.code == 2
+    assert "would remove input file" in capsys.readouterr().err
+    assert _output_bytes(output) == before
+
+
 def test_overwrite_preserves_inputs_that_are_not_known_output_files(tmp_path):
     from aisimulate.output import prepare_output_directory
 

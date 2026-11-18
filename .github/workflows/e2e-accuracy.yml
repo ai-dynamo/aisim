@@ -192,6 +192,7 @@ jobs:
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     uses: ./.github/workflows/e2e-accuracy-branch.yml
     secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
       HF_READ_AISIM_INFX_CACHE: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
     permissions:
       contents: read

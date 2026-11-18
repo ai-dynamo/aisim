@@ -19,6 +19,7 @@ use crate::common::enums::{DatabaseMode, TransferPolicy};
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
 use crate::config::{PerfDbSources, PerfSource};
+use crate::operators::moe::MoeReferenceMemo;
 use crate::operators::util_empirical::{DeltaLookupCache, ProvenanceTier, UtilGridCache};
 
 /// The five known legacy/framework-agnostic backend directory names. Mirrors the
@@ -333,6 +334,10 @@ pub struct PerfDatabase {
     /// Memo of zero-aware delta lookups (the `compute_scale` empirical
     /// mechanism); same keying/lifetime rationale as `util_grids`.
     pub delta_lookups: Arc<DeltaLookupCache>,
+    /// Memo of the references the MoE empirical path resolved (see
+    /// `operators::moe::MoeReferenceKey`); shared across mode views like
+    /// `util_grids`.
+    pub(crate) moe_references: Arc<MoeReferenceMemo>,
     /// Max-rank empirical provenance tier fired since the last
     /// [`PerfDatabase::reset_provenance`] (Rust mirror of Python's
     /// `capture_provenance` contextvar in `sdk/operations/util_empirical.py`).
@@ -797,6 +802,7 @@ impl PerfDatabase {
             transfer_policy: TransferPolicy::ALL,
             util_grids: Arc::new(UtilGridCache::new()),
             delta_lookups: Arc::new(DeltaLookupCache::new()),
+            moe_references: Arc::new(crate::operators::moe::reference_memo()),
             provenance: Arc::new(AtomicU8::new(ProvenanceTier::Silicon as u8)),
         }
     }
@@ -870,6 +876,7 @@ impl PerfDatabase {
             transfer_policy: self.transfer_policy,
             util_grids: Arc::clone(&self.util_grids),
             delta_lookups: Arc::clone(&self.delta_lookups),
+            moe_references: Arc::clone(&self.moe_references),
             provenance: Arc::clone(&self.provenance),
         }
     }
@@ -888,6 +895,7 @@ impl PerfDatabase {
             transfer_policy: self.transfer_policy,
             util_grids: Arc::clone(&self.util_grids),
             delta_lookups: Arc::clone(&self.delta_lookups),
+            moe_references: Arc::clone(&self.moe_references),
             provenance: Arc::clone(&self.provenance),
         }
     }
@@ -1221,6 +1229,7 @@ mod tests {
         assert_eq!(db2.worst_provenance(), ProvenanceTier::Silicon);
         assert!(!Arc::ptr_eq(&db1.util_grids, &db2.util_grids));
         assert!(!Arc::ptr_eq(&db1.delta_lookups, &db2.delta_lookups));
+        assert!(!Arc::ptr_eq(&db1.moe_references, &db2.moe_references));
     }
 
     #[test]

@@ -289,7 +289,7 @@ Pinned upstream collection and preserved-file SHA-256:
 `5fb7a61a53f71f476169fa8e2419d3073c8d7e96206d8986b7d4fbb0f11fbcdd`
 
 AISim-modified root overlay SHA-256:
-`a70a21425533b419feaafcec67b176b3048a0893c4833bb802f46dc6e9a8f57e`
+`c2c927f49fc270c4ceb754b7e1cbca7e42ea4ecbb7247fce3c560742ccc1e89d`
 
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
@@ -538,31 +538,37 @@ The repository-root files `crates/core/src/engine/scheduler/vllm/core.rs`,
 `crates/core/src/engine/kv_manager/g1_manager.rs`,
 and `crates/core/src/engine/kv_manager/state_cache_tests.rs` adapt the align-mode
 prefill split, state-slot turnover/copy lifetimes and default checkpoint-retention
-behavior from vLLM v0.29.0,
+behavior from vLLM v0.29.0, and, when `junction_checkpoints` is set, its
+shared-prefix junction stop, junction retention and same-pass wait, from
 immutable commit `98dff2a81d747d1dba01a47f939f48c3526d4206`:
 
 - https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/sched/scheduler.py
 - https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/single_type_kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/worker/mamba_utils.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/LICENSE
 
-These are modified Rust simulation adaptations, restricted to no internal
-prefill checkpoints, no speculative decoding and no periodic retention.
+These are modified Rust simulation adaptations without periodic retention.
+Speculative scratch states and internal prefill checkpoints follow the later
+revisions named in the sections below.
 The identified upstream revision has no root NOTICE file. The repository's
 Apache-2.0 LICENSE supplies the license text; no upstream source file is vendored.
 
 The repository-root files
 `crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs`,
-`crates/core/src/engine/kv_manager/state_cache_tests.rs` and
+`crates/core/src/engine/kv_manager/state_cache_tests.rs`,
+`crates/core/src/engine/scheduler/vllm/host_offload.rs` (state checkpoints in
+the host tier) and
 `python/aisim/src/aisim_core/sdk/memory/deepseek_v4.py` model the
 sliding-window prefix-cache retention (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`,
 replay boundaries, the EAGLE/MTP block after a boundary and the DeepSeek V4 MTP
-group) of vLLM [`v0.32.0`](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be)
-(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). The modeled functions are
-unchanged at main commit `0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0.32.0:
+group) and its offload to the host tier of vLLM [`v0.32.0`](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be)
+(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). The modeled functions of the
+first four files below are unchanged at main commit
+`0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0.32.0:
 
 - [`vllm/v1/core/kv_cache_coordinator.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py)
   (`_validate_prefix_cache_retention_interval`, `replay_boundaries`,
@@ -575,6 +581,11 @@ unchanged at main commit `0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0
   (`_annotate_eagle_groups`; lines 2029-2085)
 - [`vllm/models/deepseek_v4/attention.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/deepseek_v4/attention.py)
   (MTP layer without a compressor; line 235)
+- [`vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py)
+  (`RequestOffloadState.storable_chunks`, `_sliding_window_lookup`,
+  `_lookup_complete_chunks`, `_reachable_store_block_mask`, `_build_store_jobs`:
+  the sliding-window blocks the connector stores in one job with a step's other
+  blocks, and the window it loads at a hit; lines 450-481, 708-952 and 1517-1844)
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0
 (https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE).
@@ -636,6 +647,17 @@ eviction order of the CPU cache, how long a store holds its G1 source blocks,
 what a preemption waits for, and the engine step that submits the stores of a
 finished request.
 
+With a state cache, the same profiles also keep recurrent states: the
+connectors' hybrid lookup and their stores of the states the scheduler hands
+off, with the G1 side in repository-root
+`crates/core/src/engine/kv_manager/{g1_manager,state_cache_manager,vllm_backend}.rs`.
+These follow the connector files above and, at the same commit, the boundary
+hand-off, its drain and the hybrid hit in:
+
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py
+
 The speculative scheduling/progress corrections in repository-root files
 `crates/core/src/engine/scheduler/vllm/{core,policy,tests}.rs` and
 `crates/core/src/engine/common/speculative.rs` are independently written,
@@ -668,6 +690,33 @@ No upstream method bodies or test fixtures are copied. The adaptation models,
 in virtual time, which committed batch an arriving request can join while the
 engine core keeps a queue of `max_concurrent_batches`; it does not reproduce
 asynchronous worker execution. That revision has no root NOTICE file.
+
+The async-scheduling block frees, preemption rules and engine-loop timing in
+repository-root files `crates/core/src/engine/scheduler/vllm/core.rs` and
+`crates/core/src/engine/scheduler/rank.rs` are an independently written,
+modified Rust simulation adaptation of behavioral contracts at vLLM tag
+`v0.30.0` (commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607`):
+
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/config/parallel.py
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/executor/uniproc_executor.py
+
+and of the CUDA-graph dispatch at vLLM tag `v0.32.0` (commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`):
+
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/cudagraph_utils.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/LICENSE
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
+No upstream method bodies or test fixtures are copied. The adaptation models,
+in virtual time, when a finished request's blocks return to the pool, which
+running request may be preempted while a pass is in flight, when the engine
+loop decides a pass and returns the previous pass's outputs, and which passes
+run without a CUDA graph; it does not reproduce asynchronous worker execution.
+Neither revision has a root NOTICE file.
 
 The following files are derived from vLLM's attention test utilities at tag
 `v0.11.0` (commit `b8b302cde434df8c9289a2b465406b47ebab1c2d`):
@@ -2407,3 +2456,50 @@ https://github.com/ai-dynamo/aiconfigurator/blob/a97c69677af23190eada7ee893afa6a
 
 Modified for AISim's current layout and contracts; source links are
 preserved beside the adapted content.
+
+## vLLM speculative Mamba state reservations
+
+The private scratch reservations in repository-root
+`crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs` adapt
+the align-mode allocation lifecycle from vLLM revision
+`db9527a46873454610df6dbedf79a36d6bf1a7f6`,
+`vllm/v1/core/single_type_kv_cache_manager.py` (`MambaManager`).
+AISim models ownership and capacity without allocating GPU tensors.
+
+Source: https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0.
+The full license text is reproduced in `LICENSE`.
+
+The same revision supplies the fine-grained MTP lookup and prefill-boundary
+behavior in repository-root `crates/core/src/engine/kv_manager/vllm_backend.rs`
+and `crates/core/src/engine/scheduler/vllm/core.rs`.
+The source paths are `vllm/v1/core/single_type_kv_cache_manager.py`,
+`vllm/v1/core/kv_cache_coordinator.py`, `vllm/v1/core/kv_cache_manager.py`,
+`vllm/v1/core/sched/scheduler.py`, and `vllm/v1/kv_cache_interface.py`.
+The modified tests in `crates/core/src/engine/kv_manager/state_cache_tests.rs`
+and the scheduler use synthetic fixtures derived from the same lookup and
+retention rules.
+The shared-pool geometry in `crates/core/src/perfmodel/fpm/resources.rs`
+adapts `vllm/v1/core/kv_cache_utils.py` at that revision.
+
+## vLLM Mamba2 prefill checkpoints and the EAGLE drop switch
+
+The internal prefill checkpoints in repository-root
+`crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs` and
+`crates/core/src/engine/scheduler/vllm/core.rs`, the
+`disable_eagle_block_drop` switch, and the tests in
+`crates/core/src/engine/scheduler/vllm/hybrid_prefix_tests.rs` (which also cover
+the v0.29.0 junction rules above) adapt vLLM at commit
+`43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5`:
+
+- https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5/vllm/config/speculative.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5/LICENSE
+
+These are modified Rust simulation adaptations; no upstream source file is
+vendored.

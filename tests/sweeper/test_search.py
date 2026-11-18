@@ -261,6 +261,55 @@ def test_min_gpus_gates_before_optimizer_feedback_and_top_n(monkeypatch, small_r
     assert result.selected_candidates[0].metrics["goodput_request_throughput_rps"] == 5
 
 
+@pytest.mark.parametrize("algorithm", ["bayesian", "random"])
+def test_min_gpus_default_sampler_finds_smallest_qualifying_shape(monkeypatch, algorithm):
+    # Regression: the Bayesian sampler ignored prefer_smallest, so a large budget
+    # and a small trial count could skip every 1-GPU shape and report 2 or more.
+    shapes = tuple(_pc(tp=1, replicas=replicas) for replicas in (8, 6, 4, 3, 2, 1))
+    branch = BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=shapes,
+        supported_backends={shape: frozenset({"trtllm"}) for shape in shapes},
+        knob_choices={
+            "backend": ["trtllm"],
+            "agg_max_num_batched_tokens": [8192],
+            "agg_max_num_seqs": [256, 512],
+        },
+    )
+    _stub(monkeypatch, branch)
+
+    class Runner(_FakeRunner):
+        def run(self, spec):
+            return ReplayReport(
+                metrics={
+                    "completed_requests": 10.0,
+                    "num_e2e_latency_samples": 10.0,
+                    "mean_e2e_latency_ms": 50.0,
+                    "goodput_request_throughput_rps": 5.0,
+                    "goodput_output_throughput_tok_s": 1000.0,
+                }
+            )
+
+    config = SmartSearchConfig(
+        search_space=_config().search_space,
+        workload={"isl": 1024, "osl": 128, "request_rate": 10, "num_request_ratio": 2},
+        sweep={
+            "max_trials": 2,
+            "parallel_evals": 1,
+            "candidates_per_round": 1,
+            "max_eval_seconds": None,
+            "algorithm": algorithm,
+        },
+        goal={"target": "min_gpus", "sla": {"e2e_ms": 100}, "min_goodput_rps": 5},
+    )
+    result = Sweeper(runner_factory=_FakeRunnerFactory(Runner()), show_progress=False).run(config, top_n=1)
+
+    assert [candidate.used_gpus for candidate in result.selected_candidates] == [1]
+    # The first qualifying 1-GPU shape prunes every larger shape; the remaining
+    # trial revisits knob settings at 1 GPU.
+    assert {candidate.used_gpus for candidate in result.candidates} == {1}
+
+
 def test_pinned_backend_version_bypasses_latest_resolution(monkeypatch):
     branch = _branch(_pc())
     monkeypatch.setattr(

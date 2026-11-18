@@ -33,6 +33,7 @@ verification round, including draft operations for schemes that model them.
 | `engine.speculation.num_speculative_tokens` | Required for flat ngram input | fixed | Integer from 1 to 5. |
 | `engine.speculation.acceptance_rates` | Required for flat ngram input | fixed | Exactly one conditional acceptance probability per draft token, each in `[0, 1]`. |
 | `engine.speculation.seed` | `42` | fixed | Unsigned 64-bit sampling seed. |
+| `engine.speculation.disable_eagle_block_drop` | `false` | Rejected | Registered schemes only. Prefix-cache hits keep their last matched block; see [prefix caching](#prefix-caching). |
 | `engine.nextn` | `0` (off) | fixed | MTP/EAGLE draft tokens, 0 to 5. For a measured SD-round FPM profile, must equal its recorded draft depth. AFD decode communication also uses the model’s MTP work scale. |
 | `engine.nextn_accepted` | Unset | fixed | Required when `nextn > 0`. Expected accepted **draft** tokens per round, excluding the base token, in `[0, nextn]`. |
 
@@ -119,14 +120,20 @@ an explicit FPM request with `fallback_policy: deny` fails, while an allowed
 fallback can select OP without discarding the scheme.
 
 `kind: mtp` also supports [G2 host offload](kv-cache.md#host-offload-g2)
-on aggregated vLLM with `attention_data: 1`, prefix caching enabled and
-`host_offload.scope: dp_rank_local`. This uses synchronous, single-module MTP
-with a uniform shared FullAttention cache. Agentic G2 additionally requires a
-single static worker. Separate draft models, other speculative schemes,
-asynchronous scheduling, P/D, shared G2 pools, and G3 are outside this combined
+on aggregated and P/D vLLM workers with prefix caching enabled and
+any `attention_data`, including agentic traffic on static workers. An
+aggregated worker needs `host_offload.scope: dp_rank_local`; with a uniform
+token cache it uses synchronous, single-module MTP with a uniform shared
+FullAttention cache. Prefill and decode workers take either scope. They, and
+workers with a sliding-window state cache, keep the lifecycle described
+under [MTP](#mtp); see [what G2 supports](kv-cache.md#supported). Separate
+draft models, other speculative schemes,
+asynchronous scheduling, and G3 are outside this combined
 scope. Keep the canonical `engine.speculation` block, fixed KV capacity and
 default timing; acceptance and seed remain workload assumptions. This composition
 defaults `scheduler.async_scheduling` to `false` and rejects an explicit `true`.
+A [hybrid G2](kv-cache.md#hybrid-g2) takes MTP separately: it needs
+`engine.speculation.disable_eagle_block_drop` and keeps vLLM's default asynchronous scheduling.
 It is supported by `--stack engine`; the optional Dynamo stack retains its
 independent G2/speculation rejection until its consumer and dependency pins are updated.
 
@@ -135,10 +142,39 @@ of [vLLM v0.32.0](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d82
 Copyright contributors to the vLLM project, Apache-2.0. It does not change the
 backend-version labels or provenance of the selected performance data.
 
-Grouped caches, other G2 speculation, G3 offload, sub-block state-cache `prefix_match_unit`, AFD/EPD,
+Grouped caches, other G2 speculation (except MTP for a [hybrid G2](kv-cache.md#hybrid-g2)), G3 offload,
+sub-block state-cache `prefix_match_unit` without `state_cache.num_speculative_states`, AFD/EPD,
 TensorRT-LLM, and optional Dynamo-stack execution are outside this generic
 replay path. Functional replay does not establish AgentX prediction accuracy,
 model quality, or measured hardware speedup; see [feature support](../features.md).
+
+### Prefix caching
+
+vLLM drops the last matched block from every prefix-cache hit of an EAGLE-like
+method, MTP included, and recomputes it so the drafter sees fresh hidden
+states. Replay applies the same drop; a `state_cache` with `prefix_match_unit`
+applies it only with `state_cache.num_speculative_states`. vLLM's
+`speculative_config.disable_eagle_block_drop` turns it off; set the same switch
+on the speculation block:
+
+```yaml
+engine:
+  speculation:
+    kind: mtp
+    params: {depth: 3}
+    expected_accepted_tokens: 1.5
+    disable_eagle_block_drop: true
+```
+
+Hits then follow the non-speculative rules: a hit is capped at
+`(len - 1) // block_size` blocks, and a hybrid model's state is retained at the
+prompt's last full block. A follow-up whose previous prompt ended mid-block
+resumes at that block instead of one block earlier. Speculative scratch states
+and burst scheduling are unchanged. The switch is not part of the cost
+configuration. This follows vLLM 43b4aaea.
+
+With a `state_cache`, the switch also lets `kind: mtp` run with G2; see
+[hybrid models](kv-cache.md#hybrid-g2).
 
 <a id="prompt-lookup-ngram"></a>
 <a id="prompt-lookup-ngram-speculative-decoding"></a>
@@ -243,8 +279,10 @@ compiled A-local TP collectives already carry the scale. Prefill and `nextn: 0`
 are unchanged. See [AFD batch pricing](../../sweeper/afd-topology.md#batch-pricing).
 
 For MTP with G2, use the scoped canonical `engine.speculation` composition
-above. Grouped caches, G3 offload, and state-cache prefix matching with
-`prefix_match_unit` smaller than `block_size` remain unsupported. Full-block alignment is supported. Combinations accepted by the
+above, or a [hybrid G2](kv-cache.md#hybrid-g2) with `engine.speculation.disable_eagle_block_drop`
+(legacy `nextn` cannot set the switch). Grouped caches, G3 offload, and state-cache prefix matching with
+`prefix_match_unit` smaller than `block_size` remain unsupported unless
+`state_cache.num_speculative_states` is set. Full-block alignment is supported. Combinations accepted by the
 timing model are not necessarily supported by Replay; see
 [feature support](../features.md).
 

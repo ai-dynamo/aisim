@@ -352,24 +352,24 @@ impl SglangKvManager {
     }
 
     /// Record the SWA pages an insert through `cached_pages` leaves cached, its forward
-    /// having ended at `end_tokens`. The first insert that reaches the fork point of an
-    /// SWA-truncated match ends there instead (SGLang `prepare_for_caching_req`), so the
-    /// next request forking there reuses it.
+    /// having ended at `end_tokens`. `tail` is the node the lease's path ends on, `tail_pages`
+    /// deep. The first insert that reaches the fork point of an SWA-truncated match ends there
+    /// instead (SGLang `prepare_for_caching_req`), so the next request forking there reuses it.
     fn mark_swa_insert(
         &mut self,
         lease: &mut RadixRequestLease,
+        tail: NodeId,
+        tail_pages: usize,
         cached_pages: usize,
         end_tokens: usize,
     ) {
         match lease.swa_fork_pages {
             Some(fork) if fork <= cached_pages => {
                 self.cache
-                    .mark_swa_window(&lease.page_hashes[..fork], fork * self.cache.page_size());
+                    .mark_swa_window(tail, tail_pages, fork * self.cache.page_size());
                 lease.swa_fork_pages = None;
             }
-            _ => self
-                .cache
-                .mark_swa_window(&lease.page_hashes[..cached_pages], end_tokens),
+            _ => self.cache.mark_swa_window(tail, tail_pages, end_tokens),
         }
     }
 
@@ -795,7 +795,13 @@ impl SglangKvManager {
         );
         lease.last_node = Some(new_last_node);
         lease.cached_tokens = complete_len;
-        self.mark_swa_insert(lease, complete_pages, token_ids.len());
+        self.mark_swa_insert(
+            lease,
+            new_last_node,
+            complete_pages,
+            complete_pages,
+            token_ids.len(),
+        );
     }
 
     /// Start a backup only after the forward that produced these pages is observed.
@@ -877,7 +883,7 @@ impl SglangKvManager {
             self.cache.dec_lock_ref(last_node);
             return;
         }
-        self.cache_finished_hashes(
+        let tail = self.cache_finished_hashes(
             &lease.page_hashes[..complete_pages],
             &mut lease.pages,
             last_node,
@@ -897,7 +903,7 @@ impl SglangKvManager {
             .prompt_tokens
             .map_or(end_tokens, |tokens| tokens.min(end_tokens));
         let end_pages = (end_tokens / self.cache.page_size()).min(complete_pages);
-        self.mark_swa_insert(&mut lease, end_pages, end_tokens);
+        self.mark_swa_insert(&mut lease, tail, complete_pages, end_pages, end_tokens);
     }
 
     pub(crate) fn abort(&mut self, mut lease: RadixRequestLease) -> bool {
@@ -918,7 +924,9 @@ impl SglangKvManager {
     /// Inserts the full token sequence so future requests can reuse it,
     /// publishes the pages the tree retained, frees the request's duplicates
     /// of pages the tree already held, starts the HiCache backup, then
-    /// unlocks the path.
+    /// unlocks the path. Returns the node the sequence ends on. It is unlocked
+    /// but still in the tree for the caller's SWA mark: nothing here evicts
+    /// device pages, and the backup reclaims only host-only leaves.
     fn cache_finished_hashes(
         &mut self,
         page_hashes: &[LocalBlockHash],
@@ -931,7 +939,7 @@ impl SglangKvManager {
         inserted_tokens: usize,
 
         cache_salt: Option<&str>,
-    ) {
+    ) -> NodeId {
         let complete_len = page_hashes.len() * self.cache.page_size();
         let new_last_node =
             self.cache
@@ -955,6 +963,7 @@ impl SglangKvManager {
             cache_salt,
         );
         self.cache.dec_lock_ref(last_node);
+        new_last_node
     }
 
     /// Cache a partial sequence after a chunked prefill step.

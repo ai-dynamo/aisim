@@ -21,6 +21,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.pre_merge, pytest.mark.gpu_0]
 FLASH = "deepseek-ai/DeepSeek-V4-Flash"
 
 STATE = {"bytes_per_request": 1500}
+WINDOW = {**STATE, "sliding_window_lookahead_tokens": 0}
 KV = {"block_size": 64, "bytes_per_token": 16, "capacity": {"type": "fixed", "bytes": 8192}, "state_cache": STATE}
 RANK = {"block_size": 64, "num_gpu_blocks": 8, "kv_cache_bytes_per_token": 16, "state_cache": STATE}
 
@@ -124,10 +125,25 @@ def test_manual_geometry_rejects_invalid_unsigned_integers(field, value):
         ({"block_size": None}, "explicit positive block_size"),
         ({"bytes_per_token": "auto"}, "explicit positive bytes_per_token"),
         ({"capacity": {"type": "default"}}, "requires fixed"),
-        ({"host_offload": {"num_host_blocks": 8}}, "G1 only"),
+        # A state cache with G2 needs block-sized matching and a vLLM 0.32 connector.
+        ({"host_offload": {"num_host_blocks": 8}}, "prefix_match_unit equal to block_size"),
+        ({"prefix_match_unit": 64, "host_offload": {"num_host_blocks": 8}}, "connector=offloading_v0_32"),
         (
-            {"host_offload": {"num_host_blocks": 8}, "g3_offload": {"scope": "worker_local", "num_g3_blocks": 8}},
-            "G1 only",
+            {
+                "prefix_match_unit": 64,
+                "host_offload": {"num_host_blocks": 8, "connector": "simple_cpu_v0_32"},
+                "g3_offload": {"scope": "worker_local", "num_g3_blocks": 8},
+            },
+            "g3_offload",
+        ),
+        # A sliding-window state is offloaded by an offloading connector and without KVCR.
+        (
+            {"state_cache": WINDOW, "host_offload": {"num_host_blocks": 8, "connector": "simple_cpu_v0_32"}},
+            "connector=simple_cpu_v0_32",
+        ),
+        (
+            {"state_cache": WINDOW, "host_offload": {"num_host_blocks": 8}, "kvcr": {}},
+            "does not support kvcr",
         ),
         ({"state_cache": {"bytes_per_request": 1500, "tokens_per_block": 64}}, "Extra inputs"),
     ],
@@ -135,6 +151,26 @@ def test_manual_geometry_rejects_invalid_unsigned_integers(field, value):
 def test_manual_geometry_rejects_unusable_capacity(overrides, error):
     with pytest.raises(ValidationError, match=error):
         KvCachePredictionConfig.model_validate({**KV, **overrides})
+
+
+@pytest.mark.parametrize("connector", ["offloading_v0_24", "offloading_v0_32"])
+def test_sliding_window_state_accepts_host_offload(connector, auto_k3_payload, forbid_estimators):
+    host_offload = {"num_host_blocks": 8, "connector": connector}
+    KvCachePredictionConfig.model_validate({**KV, "state_cache": WINDOW, "host_offload": host_offload})
+    # Prefill and decode workers take either name too: a window runs the 0.32 rules on every worker.
+    prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(_public_pd(state_cache=WINDOW, host_offload=host_offload))
+    )
+    if connector == "offloading_v0_32":
+        # A recurrent state keeps that name to the aggregated worker, also when sizing infers its kind.
+        error = "supported only for the aggregated worker"
+        with pytest.raises(ValidationError, match=error):
+            CorePredictionConfig.model_validate(_public_pd(prefix_match_unit=64, host_offload=host_offload))
+        auto_k3_payload["engine"]["workers"]["aggregated"]["kv_cache"].update(
+            block_size=768, prefix_match_unit=768, host_offload=host_offload
+        )
+        with pytest.raises(ValueError, match=error):
+            prediction_to_replay_spec(CorePredictionConfig.model_validate(_to_pd(auto_k3_payload)))
 
 
 @pytest.mark.parametrize(
@@ -689,6 +725,28 @@ def test_auto_dsv4_mtp_state_includes_draft_rows(auto_dsv4_payload, forbid_estim
     }
 
 
+@pytest.mark.parametrize("mtp", [False, True])
+def test_auto_dsv4_runs_with_host_offload_on_an_offloading_connector(auto_dsv4_payload, forbid_estimators, mtp):
+    """Sizing knows the state is a sliding window: G2 keeps it under either offloading name, MTP with its block drop."""
+    worker = auto_dsv4_payload["engine"]["workers"]["aggregated"]
+    if mtp:
+        # MTP needs default timing; B200 has the DeepSeek V4 vLLM data.
+        speculation = {"kind": "mtp", "params": {"depth": 1}, "expected_accepted_tokens": 1.0}
+        auto_dsv4_payload["engine"].update(hardware="b200_sxm", speculation=speculation)
+        worker.update(timing={"type": "default"}, parallelism={"tensor": 8, "moe_expert": 8})
+    kv_cache = worker["kv_cache"]
+    for connector in ("offloading_v0_24", "offloading_v0_32"):
+        kv_cache["host_offload"] = {"num_host_blocks": 64, "connector": connector}
+        spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
+        args = spec.backend_deployment.agg_engine_args
+        assert args["native_host_offload"]["num_host_blocks"] == 64
+        assert "sliding_window" in args["state_cache"]
+        assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 1
+    kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
+    with pytest.raises(ValueError, match="connector=simple_cpu_v0_32"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload))
+
+
 def test_auto_dsv4_pd_transfers_rows_and_state(auto_dsv4_payload, forbid_estimators):
     _to_pd(auto_dsv4_payload, kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50})
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_dsv4_payload)).backend_deployment
@@ -708,6 +766,33 @@ def test_auto_dsv4_pd_transfers_rows_and_state(auto_dsv4_payload, forbid_estimat
 )
 def test_auto_state_validates_capacity_and_prefix_after_resolution(auto_k3_payload, changes, error):
     auto_k3_payload["engine"]["workers"]["aggregated"]["kv_cache"].update(changes)
+    config = CorePredictionConfig.model_validate(auto_k3_payload)
+    with pytest.raises(ValueError, match=error):
+        prediction_to_replay_spec(config)
+
+
+def test_prefill_checkpoint_matches_the_resolved_block_size(auto_k3_payload, forbid_estimators):
+    # 64 is a requested page size that resolves to 768-token blocks.
+    kv = auto_k3_payload["engine"]["workers"]["aggregated"]["kv_cache"]
+    kv.update(block_size=64, prefix_match_unit=768, state_cache={"prefill_checkpoint": True})
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_k3_payload))
+    assert spec.backend_deployment.agg_engine_args["block_size"] == 768
+
+
+@pytest.mark.parametrize(
+    "changes,error",
+    [
+        ({"state_cache": {"prefill_checkpoint": True}}, "prefill_checkpoint requires prefix_match_unit equal"),
+        (
+            {"state_cache": {}, "host_offload": {"num_host_blocks": 8, "connector": "offloading_v0_32"}},
+            "host_offload requires prefix_match_unit equal",
+        ),
+    ],
+)
+def test_block_rules_reject_a_unit_below_the_resolved_block_size(auto_k3_payload, forbid_estimators, changes, error):
+    # 128 divides the resolved 768-token block but is not equal to it.
+    kv = auto_k3_payload["engine"]["workers"]["aggregated"]["kv_cache"]
+    kv.update(block_size=64, prefix_match_unit=128, **changes)
     config = CorePredictionConfig.model_validate(auto_k3_payload)
     with pytest.raises(ValueError, match=error):
         prediction_to_replay_spec(config)
@@ -807,3 +892,108 @@ def test_auto_dsv4_state_sizes_its_pool_from_profile_runtime_memory(auto_dsv4_pa
         change(invalid["engine"])
         with pytest.raises(ValueError, match=match):
             CorePredictionConfig.model_validate(invalid)
+
+
+def test_speculative_state_reservations_reach_native_rank(forbid_estimators):
+    state = {"bytes_per_request": 1500, "num_speculative_states": 2}
+    raw = _public(
+        timing="default",
+        state_cache=state,
+        prefix_match_unit=16,
+        capacity={"type": "fixed", "blocks": 32},
+    )
+    raw["engine"].update(nextn=2, nextn_accepted=2.0)
+    config = CorePredictionConfig.model_validate(raw)
+    spec = prediction_to_replay_spec(config)
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    assert runtime.execution_spec["spec"]["engine"]["rank"]["state_cache"] == state
+
+
+def test_speculative_states_require_capacity_and_matching_depth():
+    with pytest.raises(ValidationError, match="must fit"):
+        KvCachePredictionConfig.model_validate({**KV, "state_cache": {**STATE, "num_speculative_states": 3}})
+    raw = _public(state_cache={**STATE, "num_speculative_states": 1})
+    with pytest.raises(ValidationError, match="must match"):
+        CorePredictionConfig.model_validate(raw)
+
+
+def test_speculative_states_do_not_multiply_inferred_state_geometry():
+    raw = _public(timing="default", state_cache={"num_speculative_states": 1})
+    raw["engine"].update(nextn=1, nextn_accepted=1.0)
+    with pytest.raises(ValidationError, match="requires explicit bytes_per_request"):
+        CorePredictionConfig.model_validate(raw)
+
+
+MTP = {"kind": "mtp", "params": {"depth": 3}, "expected_accepted_tokens": 2.12}
+
+
+def test_hybrid_switches_and_g2_under_mtp_reach_the_native_rank(forbid_estimators):
+    state = {**STATE, "num_speculative_states": 3, "prefill_checkpoint": True, "junction_checkpoints": True}
+    host = {"num_host_blocks": 64, "connector": "simple_cpu_v0_32"}
+    raw = _public(
+        timing="default",
+        state_cache=state,
+        prefix_match_unit=64,
+        host_offload=host,
+        capacity={"type": "fixed", "blocks": 32},
+    )
+    raw["engine"]["speculation"] = {**MTP, "disable_eagle_block_drop": True}
+    config = CorePredictionConfig.model_validate(raw)
+    config = CorePredictionConfig.model_validate_json(config.model_dump_json())
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    rank = runtime.execution_spec["spec"]["engine"]["rank"]
+    assert rank["state_cache"] == state
+    assert rank["native_host_offload"]["connector"] == "simple_cpu_v0_32"
+    assert (rank["aic_nextn"], rank["disable_eagle_block_drop"]) == (3, True)
+
+
+def test_hybrid_prefix_cache_switches_default_off(forbid_estimators):
+    raw = _public(timing="default", prefix_match_unit=64)
+    raw["engine"]["speculation"] = MTP
+    config = CorePredictionConfig.model_validate(raw)
+    # Configs that do not use the switches keep their descriptor and rank.
+    engine = config.model_dump(mode="json")["engine"]
+    assert "disable_eagle_block_drop" not in engine["speculation"]
+    assert engine["workers"]["aggregated"]["kv_cache"]["state_cache"] == {
+        **STATE,
+        "mamba_cache_dtype": "auto",
+        "indexer_cache_dtype": "auto",
+        "retention_interval": None,
+        "sliding_window_lookahead_tokens": None,
+    }
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    rank = runtime.execution_spec["spec"]["engine"]["rank"]
+    assert rank["state_cache"] == STATE
+    assert "disable_eagle_block_drop" not in rank
+    with pytest.raises(ValidationError, match="requires an explicit prefix_match_unit"):
+        KvCachePredictionConfig.model_validate({**KV, "state_cache": {**STATE, "junction_checkpoints": True}})
+    checkpoint = {**KV, "state_cache": {**STATE, "prefill_checkpoint": True}, "prefix_match_unit": 32}
+    with pytest.raises(ValidationError, match="prefill_checkpoint requires prefix_match_unit equal to block_size"):
+        KvCachePredictionConfig.model_validate(checkpoint)
+
+
+def test_the_drop_switch_requires_vllm():
+    raw = _public(timing="default", state_cache=None)
+    raw["engine"]["backend"] = "sglang"
+    raw["engine"]["speculation"] = {**MTP, "disable_eagle_block_drop": True}
+    with pytest.raises(ValidationError, match="disable_eagle_block_drop requires backend=vllm"):
+        CorePredictionConfig.model_validate(raw)
+
+
+def test_mtp_with_g2_and_a_state_cache_needs_the_drop_off(auto_k3_payload, forbid_estimators):
+    error = "with host_offload and state_cache requires disable_eagle_block_drop"
+    host = {"num_host_blocks": 8, "connector": "simple_cpu_v0_32"}
+    raw = _public(timing="default", state_cache=STATE, prefix_match_unit=64, host_offload=host)
+    raw["engine"]["speculation"] = MTP
+    with pytest.raises(ValidationError, match=error):
+        CorePredictionConfig.model_validate(raw)
+    # An inferred state is known to be recurrent only at sizing.
+    auto_k3_payload["engine"]["speculation"] = MTP
+    worker = auto_k3_payload["engine"]["workers"]["aggregated"]
+    worker["timing"] = {"type": "default"}
+    worker["kv_cache"].update(block_size=768, prefix_match_unit=768, host_offload=host)
+    with pytest.raises(ValueError, match=error):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(auto_k3_payload))
