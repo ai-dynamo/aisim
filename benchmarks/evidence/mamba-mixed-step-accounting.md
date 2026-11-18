@@ -335,6 +335,27 @@ and pass on `19e8daf6`. At `19e8daf6`, 727 Python tests in the backend,
 session, speculation, single-oracle and Mamba suites passed, with engine-step
 parity (305) and the golden set (121).
 
+The two parity suites ran from the repository root of each build, with that
+build's `python/aisim` environment:
+
+```bash
+python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py
+python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
+  crates/core/parity_tests/perfmodel/test_compile_engine_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
+```
+
+| Code revision | Published heads with this code | Engine-step parity | Golden set |
+| --- | --- | --- | --- |
+| `62293977` | `6511a26d` | 305 passed | 121 passed |
+| `9a2bde6b` | `d321defd` | 305 passed | 121 passed |
+| `19e8daf6` | `879aebde` | 305 passed | 121 passed |
+
+Each published head adds no product code to its code revision, only tests,
+documentation or evidence, so it carries that revision's parity results.
+
 Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
 `gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
 (26.013 to 26.328 ms) from Baseline to Candidate. The decode component rises
