@@ -386,9 +386,14 @@ every model:
   every one-request result with a prefix, an uncached part that fits the
   budget and a budget below `isl`. Results without a prefix, with a budget of
   at least `isl`, or with more than one request do not change. The
-  TensorRT-LLM queuing factor (qf) still uses the number of budget steps. If
-  the uncached tokens exceed the budget, TTFT still counts
-  `ceil(isl / ctx_tokens)` steps, the cached prefix included.
+  TensorRT-LLM queuing factor (qf) still uses the number of budget steps.
+  This is not a general cached-prefix TTFT fix. If the uncached tokens exceed
+  the budget, TTFT still counts `ceil(isl / ctx_tokens)` steps, the cached
+  prefix included. The count is too high whenever
+  `ceil(isl / ctx_tokens) > ceil((isl - prefix) / ctx_tokens)`, for one
+  request or more. For one legacy Nano request with isl 8192, prefix 3000
+  and a 2048-token budget, TTFT is `20.636 * 4 * 2.05 = 169.214` ms. The 3
+  chunks of uncached tokens would give 126.911 ms. This remains unresolved.
 - **Reuse scope.** The result cache key held neither the model graph nor the
   database mode, and the compiled-handle identity did not hold the Mamba
   qualification fields. A legacy and a qualified Nano graph on one backend,
@@ -472,7 +477,36 @@ Values are in GiB:
 | 0, 2048 | 0.156250 | 0.156250 | 62.542492 | 62.542492 |
 
 The activations scale with the tokens: `0.15625 * 1096 / 2048 = 0.083618`.
-Weights, KV cache and the other terms do not change. The regression fails on
+Weights, KV cache and the other terms do not change.
+
+[`fpm_caller.py`](mamba-mixed-step-accounting/fpm_caller.py) checks the FPM
+input through the compiled whole-model estimator. It builds a Qwen3-0.6B FPM
+model and a synthetic vLLM table with the FPM unit-test helpers, with one
+anchor at each coordinate a caller queries. `run_agg` compiles every
+whole-model op with `interpolation: sol`, so this is the only FPM method
+that it reaches. Direct interpolation needs an `fpm_profile`, which
+`run_agg` does not pass. The script ran from the `35e632cb` and `1ea0211c`
+builds as `python fpm_caller.py REPO_ROOT OUT.json`. Both runs used the
+same table (SHA-256 prefix `2071e1799556`). The raw outputs are
+[`fpm-35e632cb.json`](mamba-mixed-step-accounting/fpm-35e632cb.json) and
+[`fpm-1ea0211c.json`](mamba-mixed-step-accounting/fpm-1ea0211c.json).
+The FPM derives `ceil(context_tokens / (isl - prefix))` requests:
+
+| Case (isl 512, budget 512) | Build | Caller input | Requests | Step ms | TTFT ms |
+| --- | --- | --- | --- | --- | --- |
+| Prefix 256 | `35e632cb` | 512 | 2 | 30.0, anchor (2, 512, 512) | 52.4 |
+| Prefix 256 | `1ea0211c` | 256 | 1 | 12.0, anchor (1, 256, 256) | 34.4 |
+| Prefix 0 | Both | 512 | 1 | 22.0, anchor (1, 512, 0) | 44.4 |
+
+For one vLLM request, the queuing factor is 1 and the dispatch overhead is
+`28 layers * 0.8 = 22.4` ms, so TTFT is the step plus 22.4 ms. The script
+also prices both inputs directly in each build and gets the same anchors.
+The values are synthetic. They show that the estimator receives one request
+instead of two, not a latency on real hardware. The deprecated hybrid FPM
+path with draft ops takes the same input, and its draft ops use the same
+request count, but no fixture with draft-op data exercises it here.
+
+The input regression fails on
 `35e632cb` for the 8-token budget, with 8 scheduled tokens instead of 6, and
 passes on `1ea0211c`. At `1ea0211c`, `agg_caller.py` and `telem.py` give
 output identical to `caller-55d2821b.json` and `c3ed1513.json`. The Python
