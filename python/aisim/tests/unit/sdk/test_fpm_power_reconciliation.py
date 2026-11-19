@@ -15,11 +15,11 @@ latency the engine returned:
 - unpowered low-KV decode rows (D2/D8) reduce coverage by the latency of
   the queries that touch them;
 - a draft-scheme static ``cli estimate`` withholds watts at full coverage;
-- Replay and unified ``aisim predict``/``recommend`` publish no FPM
-  power (D4), for one attention-DP rank, for several, and for a fitted
-  regression role restored from a snapshot;
+- Replay and unified ``aisim predict``/``recommend`` publish schema-8 FPM
+  power for one attention-DP rank and for several, while a fitted
+  regression role restored from a snapshot remains latency-only;
 - aggregate ``cli exp`` sweeps publish watts only at 0.9 coverage, with
-  mixed-step latency uncovered (D10), withhold them under a draft scheme, and
+  mixed-step energy retained, withhold them under a draft scheme, and
   keep v7 latency.
 
 The SDK publication gates are tested in ``test_fpm_forward.py``
@@ -332,10 +332,10 @@ def test_low_kv_unpowered_rows_reduce_coverage_by_their_query_latency(fpm_power_
 
 
 # ---------------------------------------------------------------------------
-# Replay and unified CLI: FPM power stays unsupported in V1 (D4, AISIM-2001)
+# Replay and unified CLI: schema-8 FPM power, with fitted roles unsupported
 # ---------------------------------------------------------------------------
 
-_UNSUPPORTED_REASON = "whole-model FPM and latency-only providers are unsupported"
+_UNSUPPORTED_REASON = "timing provider does not expose typed operation energy evidence"
 
 
 @pytest.fixture
@@ -397,7 +397,7 @@ def _assert_replay_power_unsupported(diagnostics: dict) -> None:
 
 
 @pytest.mark.parametrize("attention_data", [1, 2], ids=["dp1", "attention_dp2"])
-def test_unified_predict_keeps_powered_fpm_unsupported(powered_engine_config, tmp_path, capsys, attention_data):
+def test_unified_predict_publishes_powered_fpm(powered_engine_config, tmp_path, capsys, attention_data):
     path = tmp_path / "predict.yaml"
     path.write_text(yaml.safe_dump(powered_engine_config(attention_data)))
     out = tmp_path / "out"
@@ -406,20 +406,28 @@ def test_unified_predict_keeps_powered_fpm_unsupported(powered_engine_config, tm
     summary = payload["summary"]
     assert summary["completed_requests"] == 2
     assert summary["mean_ttft_ms"] > 0 and summary["mean_tpot_ms"] > 0
-    # Every row of the v8 pair carries power, yet the Replay summary keeps
-    # both values null (never 0 W or 0%) and states why.
-    assert summary["power_w"] is None
-    assert summary["power_coverage"] is None
+    # Every anchor is 450 W, so E = 450 * L for each component, including
+    # positive mixed decode marginals: E_target - E_floor = 450 * L_marginal.
+    # Summing working ranks preserves 450 W and complete coverage at either DP.
+    assert summary["power_w"] == pytest.approx(450.0)
+    assert summary["power_coverage"] == pytest.approx(1.0)
     energy = payload["details"]["sections"]["energy"]
-    assert energy["status"] == "unsupported"
-    _assert_replay_power_unsupported(energy["diagnostics"])
+    assert energy["status"] == "available"
+    diagnostics = energy["diagnostics"]
+    assert diagnostics["publication_status"] == "available"
+    assert diagnostics["power_w"] == pytest.approx(450.0)
+    assert diagnostics["power_coverage"] == pytest.approx(1.0)
+    assert diagnostics["latency_ms"] > 0
+    assert diagnostics["energy_wms"] == pytest.approx(450.0 * diagnostics["latency_ms"])
+    assert diagnostics["covered_latency_ms"] == pytest.approx(diagnostics["latency_ms"])
     [saved] = out.rglob("prediction.json")
     report = json.loads(saved.read_text())
-    assert (report["power_w"], report["power_coverage"]) == (None, None)
-    _assert_replay_power_unsupported(report["power_diagnostics"])
+    assert report["power_w"] == pytest.approx(450.0)
+    assert report["power_coverage"] == pytest.approx(1.0)
+    assert report["power_diagnostics"] == diagnostics
 
 
-def test_unified_recommend_publishes_no_fpm_power(powered_engine_config):
+def test_unified_recommend_publishes_powered_fpm(powered_engine_config):
     from aisim.config import CoreRecommendationConfig
     from aisim.recommend import run_recommendation
     from aisim.runner import EngineReplayRunnerFactory
@@ -439,12 +447,13 @@ def test_unified_recommend_publishes_no_fpm_power(powered_engine_config):
     [candidate] = result.selected_candidates
     assert candidate.config["forward_pass_estimators"]["agg"]["config"]["estimation_mode"] == "fpm_interpolation"
     assert candidate.metrics["mean_tpot_ms"] > 0
-    assert (candidate.metrics["power_w"], candidate.metrics["power_coverage"]) == (None, None)
+    assert candidate.metrics["power_w"] == pytest.approx(450.0)
+    assert candidate.metrics["power_coverage"] == pytest.approx(1.0)
     [record] = result.candidates
     power = record.provenance.power
-    assert power["power_w"] is None
-    assert power["publication_status"] == "unavailable"
-    assert power["unavailable_reason"] == "energy provider or topology unsupported"
+    assert power["power_w"] == pytest.approx(450.0)
+    assert power["power_coverage"] == pytest.approx(1.0)
+    assert power["publication_status"] == "available"
 
 
 def test_replay_of_restored_regression_role_keeps_power_unsupported(tmp_path):
@@ -552,10 +561,9 @@ def _sweep(tmp_path: Path, name: str, database, experiment: dict):
 def test_legacy_aggregate_sweep_gates_fpm_power_and_keeps_v7_latency(fpm_power_root, tmp_path, monkeypatch, scheme):
     """Aggregate FPM sweeps gate watts on coverage; a draft scheme withholds them.
 
-    Mixed steps carry no FPM energy (D10), so their latency is uncovered and
-    a plain aggregated row publishes ``energy / latency`` only when coverage
-    still reaches 0.9: its watts lie between 0.9 and 1.0 times the table's
-    450 W. Rows below the gate stay null. A draft-scheme (``eagle3``) sweep
+    Every anchor carries 450 W, so pure and mixed components have E = 450 * L
+    and a plain aggregated row publishes 450 W at complete coverage.
+    A draft-scheme (``eagle3``) sweep
     withholds every row and keeps its v7 latency; step 5b is also pinned by
     ``test_draft_scheme_static_cli_estimate_withholds_watts_at_full_coverage``
     and, at the SDK level, by ``TestFPMPowerPublication``.
@@ -563,9 +571,8 @@ def test_legacy_aggregate_sweep_gates_fpm_power_and_keeps_v7_latency(fpm_power_r
     import pandas as pd
 
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
-    # The synthetic plain bs=1 candidate has TPOT about 5.53 ms and clears
-    # the coverage gate; bs>=2 starts at 6.77 ms and withholds power. Keep
-    # the selected best configuration on the powered side of that boundary.
+    # The synthetic plain bs=1 candidate has TPOT about 5.53 ms;
+    # bs>=2 starts at 6.77 ms. Keep the same selected best configuration.
     # Both EAGLE-3 candidates also meet this SLA, but must withhold watts.
     experiment = _experiment("agg", tpot=6.0)
     if scheme == "eagle3":
@@ -584,7 +591,8 @@ def test_legacy_aggregate_sweep_gates_fpm_power_and_keeps_v7_latency(fpm_power_r
             return
         published = watts.dropna()
         assert not published.empty, label
-        assert published.between(0.9 * 450.0, 450.0).all(), label
+        assert len(published) == len(watts), label
+        assert published.tolist() == pytest.approx([450.0] * len(published)), label
 
     pareto = powered.pareto_fronts["fpm"]
     for frames in (powered.pareto_fronts, powered.best_configs):

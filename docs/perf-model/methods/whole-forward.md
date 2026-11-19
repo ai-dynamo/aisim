@@ -411,8 +411,9 @@ their decode work as a separate decode pass. The CLI also saves
 error stops replay; the Python exception retains a `fpm_query_coverage`
 attribute for that failure path. A passing replay coverage status requires completed requests,
 nonempty resolved queries and no unsupported lookup. It is distinct from
-operation/energy evidence, which whole-model FPM does not provide to Replay
-(see [measured power](#measured-power-schema-8)). See
+operation-level evidence and from the [power coverage gate](../power.md):
+supported non-speculative schema-v8 whole-model FPM can provide energy,
+while v6/v7 and fitted estimators remain latency-only. See
 [FPM replay validation](../fpm-self-service/implementation.md#validate-fpm-query-coverage-with-agentx-replay)
 for the stricter whole-corpus completion checks and saved onboarding artifacts.
 
@@ -614,9 +615,9 @@ and the opt-out are in the
 
 ### From rows to operation energy
 
-The SOL method blends each row's power with the same weights as its latency:
-exact hits, curve interpolation, SOL transfer, decode brackets and the decode
-pass baseline. The FPM operation then returns
+The SOL and direct methods blend each row's power with the same weights as its
+latency, using the anchors selected by that method: exact hits, curve
+interpolation, SOL transfer, decode brackets and the decode pass baseline. The FPM operation then returns
 `energy_wms = power_w * latency_ms` for the query. A prefill clamp scales
 latency and energy and leaves power unchanged.
 
@@ -626,9 +627,14 @@ energy 0. Its latency is unchanged. Energy 0 is the missing-data sentinel, so
 the query counts as uncovered and coverage drops by exactly its latency.
 Queries whose rows all carry power stay covered.
 
-The following return latency only:
+In a non-speculative mixed step, the prefill contributes its own energy.
+Effective decode energy is `max(0, E_target - E_floor)` only when the marginal
+latency is positive and both target and KV-floor baseline queries have power;
+otherwise it is zero. Coverage is tracked per component, so powered prefill
+cannot cover an unpowered decode marginal. Mixed-step watts remain unqualified
+until measured validation passes.
 
-- `method: direct` queries;
-- the FPM prefill and marginal-decode components of an aggregate mixed step;
-- `estimate_forward_pass_time_ms()` iteration queries, Replay pricing and
-  Replay's FPM evidence.
+Native Replay and the detailed forward-pass result carry component energy for
+supported schema-8 configurations. The scalar
+`estimate_forward_pass_time_ms()` iteration query still returns latency only.
+Schema-6/7, speculative and fitted providers remain latency-only.

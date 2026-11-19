@@ -2300,6 +2300,10 @@ impl VllmCore {
             .native_host_offload
             .as_ref()
             .and_then(|a| a.retry_epoch());
+        let kv_holders_first = self
+            .native_host_offload
+            .as_ref()
+            .is_some_and(VllmHostOffloadAdapter::admits_kv_holders_first);
         self.kv_manager.begin_step();
         self.state.compact_running();
         // With async scheduling vLLM forms this pass while the previous one
@@ -2454,25 +2458,29 @@ impl VllmCore {
                 && self.native_host_offload.is_some()
                 && self.state.has_materialized_waiting());
             let prioritize_connector_waiting = self.native_host_offload.is_some();
-            // A G3 or KVCR restore can wake a connector waiter ahead of one
-            // that already holds reserved G1 for its load; serve that owner
-            // first so the restored head cannot block the space it waits for.
-            // A rank without G3 that has never pulled keeps plain G2 order,
-            // until a window restore waits for room (`g1_owners_only`).
-            let g1_owner = (retry_epoch_before.is_some() || g1_owners_only)
-                .then(|| {
-                    self.state.connector_waiting.iter().copied().find(|uuid| {
-                        self.state.connector_waiting_members.contains(uuid)
-                            && !self.state.connector_deadline_waiting_members.contains(uuid)
-                            && self
-                                .state
-                                .requests
-                                .get(uuid)
-                                .and_then(|r| r.host_offload.as_deref())
-                                .is_some_and(|h| h.reserved_blocks() > 0)
-                    })
+            // A connector waiter that holds no G1 can queue ahead of one that
+            // already holds reserved G1 for its load; serve that owner first
+            // so the head cannot block the space it waits for. A window
+            // restore waiting for room also requires draining G1 owners.
+            // Activated handoffs still go first: a pending destination
+            // forbids fresh admission even after its G2 load has landed.
+            let g1_owner = if !prefer_materialized
+                && (kv_holders_first || g1_owners_only)
+                && self.state.has_ready_connector_waiter()
+            {
+                self.state.connector_waiting.iter().copied().find(|uuid| {
+                    self.state.connector_waiting_members.contains(uuid)
+                        && !self.state.connector_deadline_waiting_members.contains(uuid)
+                        && self
+                            .state
+                            .requests
+                            .get(uuid)
+                            .and_then(|r| r.host_offload.as_deref())
+                            .is_some_and(|h| h.reserved_blocks() > 0)
                 })
-                .flatten();
+            } else {
+                None
+            };
             let Some(uuid) = g1_owner.or_else(|| {
                 (!g1_owners_only)
                     .then(|| {
@@ -2539,7 +2547,10 @@ impl VllmCore {
                     .requests
                     .get_mut(&uuid)
                     .expect("waiting request missing from state");
-                let mut cost = request.sequence.prefill_cost(&self.kv_manager);
+                let mut cost = self.kv_manager.get_native_waiting_prefill_cost(
+                    &request.sequence.sequence,
+                    &mut request.sequence.lease,
+                );
                 if request.sequence.sequence.enable_prefix_caching()
                     && let Some(counts) = &mut self.g1_prefix_cache_lookup
                 {
@@ -4500,6 +4511,82 @@ mod waiting_queue_tests {
             Some(deadline_waiter)
         );
         assert_eq!(core.connector_waiting_selections(), selections + 1);
+    }
+
+    #[test]
+    fn a_landed_connector_load_cannot_block_a_materialized_handoff() {
+        use crate::engine::G2Connector;
+
+        let args = MockEngineArgs::builder()
+            .num_gpu_blocks(8)
+            .block_size(4)
+            .max_num_seqs(Some(4))
+            .max_num_batched_tokens(Some(64))
+            .enable_prefix_caching(true)
+            .kv_cache_bytes_per_token(Some(250_000))
+            .native_host_offload(Some(
+                NativeHostOffloadConfig::new(32)
+                    .with_bandwidths(0.0, 0.1)
+                    .with_connector(G2Connector::OffloadingV032),
+            ))
+            .speedup_ratio(0.0)
+            .build()
+            .unwrap();
+        let mut core = VllmCore::new(args);
+        let request = |id, tokens| DirectRequest {
+            uuid: Some(Uuid::from_u128(id)),
+            tokens,
+            max_output_tokens: 1,
+            ..Default::default()
+        };
+        // G2 keeps a 9-token prompt that a longer one then evicts from G1.
+        for (id, tokens) in [(1, (1..=9).collect()), (2, (101..=131).collect())] {
+            core.receive(request(id, tokens));
+            for _ in 0..8 {
+                let pass = core.try_execute_hidden_pass(0.0).unwrap();
+                core.complete_engine_boundary(pass.end_ms);
+                if core.state.requests.is_empty() {
+                    break;
+                }
+            }
+            assert!(core.state.requests.is_empty());
+        }
+        // The owner reserves G1 for its load and waits until the load lands.
+        let owner = core.receive(request(3, (1..=9).collect()));
+        let load = core.try_execute_hidden_pass(100.0).unwrap();
+        core.complete_engine_boundary(load.end_ms);
+        assert!(load.admissions.is_empty());
+        let deadline = core.next_internal_deadline_ms().unwrap();
+        core.process_internal_work(deadline);
+        assert!(core.state.has_ready_connector_waiter());
+
+        // Commands can reserve and activate remote KV on an aggregated
+        // rank too. A second, larger handoff cannot reserve beside the
+        // landed G2 load; it blocks fresh admission, not activated KV.
+        let ready_handoff = HandoffId::from(Uuid::from_u128(4));
+        let ready = Uuid::from_u128(5);
+        core.apply_command(SchedulerCommand::ReserveDestination {
+            handoff_id: ready_handoff,
+            request: request(5, vec![201]),
+        })
+        .unwrap();
+        core.apply_command(SchedulerCommand::ActivateDestination {
+            handoff_id: ready_handoff,
+        })
+        .unwrap();
+        core.apply_command(SchedulerCommand::ReserveDestination {
+            handoff_id: HandoffId::from(Uuid::from_u128(6)),
+            request: request(7, (301..=331).collect()),
+        })
+        .unwrap();
+        assert!(core.pending_destinations.has_pending());
+
+        let pass = core.try_execute_hidden_pass(deadline).unwrap();
+        assert_eq!(
+            pass.admissions.iter().map(|a| a.uuid).collect::<Vec<_>>(),
+            [ready]
+        );
+        assert!(core.state.requests.contains_key(&owner));
     }
 
     fn core(blocks: usize) -> VllmCore {

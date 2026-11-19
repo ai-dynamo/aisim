@@ -438,6 +438,8 @@ pub(crate) struct VllmBlockPool {
     // Fine token keys share a physical page; removed together at page eviction.
     token_aliases: Option<Box<FxHashMap<BlockCopyId, Vec<SequenceHash>>>>,
     state_index: Option<Box<StateIndex>>,
+    /// See [`Self::state_visibility_epoch`].
+    state_visibility_epoch: u64,
     /// Intrusive ordinary LRU: head is evicted first, tail was released last.
     inactive_head: Option<BlockCopyId>,
     inactive_tail: Option<BlockCopyId>,
@@ -467,6 +469,7 @@ impl VllmBlockPool {
             by_hash: FxHashMap::default(),
             token_aliases: None,
             state_index: None,
+            state_visibility_epoch: 0,
             inactive_head: None,
             inactive_tail: None,
             inactive_len: 0,
@@ -524,6 +527,12 @@ impl VllmBlockPool {
             // A held source is referenced by its transfer, not evictable.
             is_active: *refs > 0 || *pins > 0 || self.holds_source(id),
         })
+    }
+
+    /// Counts the state keys that became visible. While it stands still, no
+    /// state key's [`Self::key_hit`] has turned from a miss into a hit.
+    pub(crate) fn state_visibility_epoch(&self) -> u64 {
+        self.state_visibility_epoch
     }
 
     /// Blocks of capacity behind `key`'s visible copy: a grouped state copy's
@@ -909,10 +918,14 @@ impl VllmBlockPool {
         }
         let (became_visible, became_redundant) = match hash {
             CacheKey::Token(hash) => Self::index_copy(&mut self.by_hash, hash, id),
-            CacheKey::State { prefix, slot } => self
-                .state_index
-                .get_or_insert_with(Default::default)
-                .insert(prefix, slot, id),
+            CacheKey::State { prefix, slot } => {
+                let inserted = self
+                    .state_index
+                    .get_or_insert_with(Default::default)
+                    .insert(prefix, slot, id);
+                self.state_visibility_epoch += u64::from(inserted.0);
+                inserted
+            }
         };
         if became_redundant {
             self.refresh_belady_hash(hash.prefix_hash());

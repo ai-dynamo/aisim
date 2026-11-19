@@ -244,8 +244,11 @@ from the checkpoint, and the runtime measures every cell.
 
 Generator and Collector share the accepted Dynamo-native benchmark result
 schema versions (2, and 3 with a power window) through the rendered
-`fpm_env.sh`; the staged `fpm_exec.sh` validates that contract in-pod without
-a Collector-side text patch. `--fpm-measure-power` (default on; never run by
+`fpm_env.sh`; the staged `fpm_exec.sh` checks each rank result's schema version
+and completion in-pod without a Collector-side text patch. It does not inspect
+the power block: the pod preflight rejects an image that does not record window
+step timings, and the Collector's native artifact reader rejects a schema-3
+power block without `step_wall_times_s`. `--fpm-measure-power` (default on; never run by
 `--smoke`) requests the per-point power window and publishes `power_w`; see the
 [onboarding guide](../../../docs/perf-model/fpm-self-service/implementation.md#how-the-collection-grid-is-determined)
 for its requirements and publication rules. Formal

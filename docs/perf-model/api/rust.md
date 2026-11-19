@@ -70,10 +70,10 @@ per-op result tuple `(name, latency_ms, energy_wms, source)` returned by the
 energy is 0.0 wherever the perf tables carry no power columns. That zero is a
 missing-data sentinel, not evidence of a zero-power operation. See the
 [modeled-power contract](../power.md) for the latency-weighted coverage gate,
-aggregation rules, and public output boundary. A whole-forward FPM operation
-returns energy only from schema-8 rows with measured power, and never to
-Replay; fixed and polynomial providers remain latency-only. The power contract
-describes which paths can publish energy evidence.
+aggregation rules, and public output boundary. Supported non-speculative
+schema-v8 whole-forward FPM can publish energy evidence. Schema-v6/v7 FPM,
+fixed, polynomial, and fitted providers remain latency-only; the power contract
+describes the supported Replay paths and coverage gate.
 
 ## Wire and version boundary
 
