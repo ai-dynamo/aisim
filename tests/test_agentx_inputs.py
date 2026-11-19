@@ -432,8 +432,8 @@ def test_fetch_reports_malformed_input_and_later_acceptance(tmp_path, monkeypatc
     assert all(repo == agentx_run.REPO for repo, _ in downloads)
 
 
-@pytest.mark.parametrize("backend", ["sglang", "vllm"])
-def test_replay_rejects_empty_recorded_phases(tmp_path, cache_workers, backend):
+@pytest.mark.parametrize("backend,missing", [("sglang", "phases"), ("vllm", "phases"), ("vllm", "datasets")])
+def test_replay_rejects_empty_recorded_collections(tmp_path, cache_workers, backend, missing):
     run = (
         sglang_replay_inputs(tmp_path, acceptance={"verification_depth": 3, "accepted_draft_tokens": 1.25})
         if backend == "sglang"
@@ -466,11 +466,16 @@ def test_replay_rejects_empty_recorded_phases(tmp_path, cache_workers, backend):
         put("cache_receipt", {"workers": cache_workers})
         put("workload", {"silicon_reference": {"namespace_map": {"trace": "weka:1111111111111111"}}})
         put("snapshot_receipt", [{"lane_index": 0, "root_id": "trace", "snapshot": {"t_star_ms": 0}}])
-        put("harness_receipt", {"phases": [], "datasets": [{"random_seed": 42}]})
+        harness = {
+            "phases": [{"duration": 60, "system_idle_gap_cap_seconds": 2, "grace_period": 5}],
+            "datasets": [{"random_seed": 42}],
+        }
+        harness[missing] = []
+        put("harness_receipt", harness)
         registry = tmp_path / agentx_run.CORPORA
         registry.parent.mkdir(parents=True)
         registry.write_bytes(canonical({"sources": {"test-corpus": {"transformations": []}}}))
-    with pytest.raises(ValueError, match="phases"):
+    with pytest.raises(ValueError, match=missing):
         replay_config(tmp_path, run)
 
 

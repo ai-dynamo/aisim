@@ -505,6 +505,9 @@ def replay_config(root, run):
         if not isinstance(phases, list) or not phases:
             raise ValueError("Harness receipt has no valid phases")
         phase = phases[0]
+        datasets = harness["datasets"]
+        if not isinstance(datasets, list) or not datasets:
+            raise ValueError("Harness receipt has no valid datasets")
         traffic["source"].update(format="weka", block_size=64, nested_timestamp_basis="absolute")
         traffic["load"] = {
             "type": "trace_timestamps",
@@ -512,7 +515,7 @@ def replay_config(root, run):
             "agentic_warmup": True,
             "agentic_warmup_policy": "live_trajectory_v1",
             "agentic_snapshot": {
-                "seed": harness["datasets"][0]["random_seed"],
+                "seed": datasets[0]["random_seed"],
                 "corpus_cursor": max(positions.values()) + 1,
                 "initial_selections": [selections[i] for i in range(run["lanes"])],
             },
