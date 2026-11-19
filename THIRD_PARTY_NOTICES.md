@@ -751,6 +751,8 @@ at https://github.com/sgl-project/sglang/blob/0bcd822377da7b5718e674eaf9c870d349
 
 ## DeepSeek model configuration files
 
+SPDX license expression for the configuration files identified in this section: `MIT`.
+
 The following model configuration files are copied from, or formatting-only
 adaptations of, the named DeepSeek model repositories:
 
@@ -798,6 +800,8 @@ SOFTWARE.
 
 ## Meta Muse Glimmer model configuration
 
+SPDX license expression for the configuration files identified in this section: `Apache-2.0`.
+
 `src/aisim_core/model_configs/meta-models--Muse-Glimmer-30B_config.json`
 is an unmodified copy of `config.json` from the Meta Muse Glimmer model
 repository at immutable revision
@@ -814,6 +818,8 @@ The Apache License 2.0 terms are reproduced in this distribution's `LICENSE`
 file.
 
 ## Qwen3.8-Max model configuration files
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-Qwen3.8-Max`.
 
 The following model configuration files are copied byte-for-byte from the
 named Qwen model repositories at the immutable revisions shown:
@@ -851,6 +857,8 @@ For any questions regarding this license, please contact model-business@notice.q
 ```
 
 ## Meta Llama 4
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-Llama-4-Community`.
 
 The following bundled model configs are modified copies of Meta Llama 4
 checkpoint configuration files:
@@ -1295,6 +1303,8 @@ https://github.com/vllm-project/vllm/blob/a474da28131f61684849b31e29af0eebaaedc3
 
 ## GLM-5.3 model configuration files
 
+SPDX license expression for the configuration files identified in this section: `LicenseRef-GLM-5.3`.
+
 The same base license also governs the NVIDIA-derived configuration files `nvidia--GLM-5.3-NVFP4_config.json` and `nvidia--GLM-5.3-NVFP4_hf_quant_config.json`, whose source revision is `e3b8f9f2fad29727dfa95e766c5cac18ea1414bf`: https://huggingface.co/nvidia/GLM-5.3-NVFP4/tree/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf . NVIDIA CORPORATION & AFFILIATES contributes its export/quantization material; Z.AI retains the base rights. This cross-reference binds the base license separately from NVIDIA's own contribution; the combined recorded terms remain in the NVIDIA GLM-5.3-NVFP4 section.
 
 The following files are unmodified copies of the named Hugging Face
@@ -1389,6 +1399,8 @@ vendored. The upstream license is preserved by the repository and packaged
 Apache-2.0 `LICENSE` text.
 
 ## NVIDIA GLM-5.3-NVFP4 model configuration files
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement`.
 
 The following files are unmodified copies of the named Hugging Face
 configuration files at the immutable revision shown:
@@ -1764,6 +1776,8 @@ is observed, adapting `Scheduler.abort_request` and result-time
 The exact `deepseek-ai--DeepSeek-V3_config.json` source, copyright, complete terms and modification status are now recorded in the previously uncited configuration section below. This is source-side, untrained architecture metadata. The DeepSeek source repository identifies its code as MIT; the separate model agreement additionally grants distribution of Complementary Material in section II.2 and exempts it from the model-use restriction flow-down in III.4.a. This records the grant and source-material classification; it does not assert OSRB approval or distribute trained model weights. The upstream model/code texts are at https://huggingface.co/deepseek-ai/DeepSeek-V3/tree/e815299b0bcbac849fa540c768ef21845365c9eb . Source terms: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-CODE and https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/LICENSE-MODEL .
 
 ## StepFun Step-3.7-Flash model configuration files
+
+SPDX license expression for the configuration files identified in this section: `Apache-2.0`.
 
 The following files are modified adaptations of the named Hugging Face
 configuration files at the immutable revisions shown:
