@@ -1010,8 +1010,9 @@ jobs:
 
 
   release-artifact-contract:
+    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Release Artifact Contract (${{ matrix.arch }})
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, application-test-wheel]
     if: ${{ needs.select-full-ci.outputs.release_artifact_contract == 'true' }}
     strategy:
       fail-fast: false
@@ -1036,7 +1037,21 @@ jobs:
       - uses: ./.github/actions/setup-manylinux-python-rust
       - run: python -m pip install --require-hashes -r scripts/release/requirements.txt
       - run: python scripts/release/build_release_artifacts.py --check-only
-      - run: python scripts/release/build_release_artifacts.py --output-dir dist
+      - uses: ./.github/actions/wheel-storage
+        with:
+          scope: ${{ needs.select-full-ci.outputs.pr-number != '' && 'pr' || ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'official' || 'preview') }}
+          pr-number: ${{ needs.select-full-ci.outputs.pr-number }}
+          mode: download
+          name: application-test-wheel-${{ matrix.arch }}
+          path: application-test-dist
+          source-sha: ${{ github.sha }}
+          architecture: ${{ matrix.arch }}
+          url: ${{ vars.WHEEL_STORAGE_URL }}
+          repo: ${{ vars.WHEEL_STORAGE_REPO }}
+          token: ${{ secrets.ARTIFACTORY_TOKEN }}
+      - run: >-
+          python scripts/release/build_release_artifacts.py --output-dir dist
+          --prebuilt-wheel application-test-dist/*.whl
       - run: python -m venv release-smoke
       - run: >-
           release-smoke/bin/python -m pip install
@@ -1059,6 +1074,13 @@ jobs:
     needs: [verify-target, select-full-ci, fast-ci]
     if: ${{ needs.select-full-ci.outputs.readme_commands == 'true' }}
     uses: ./.github/workflows/readme-checks.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+    with:
+      pr_number: ${{ needs.select-full-ci.outputs.pr-number }}
 
   readiness:
     name: Full CI Success

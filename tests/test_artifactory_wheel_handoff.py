@@ -9,11 +9,14 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
+
+from scripts.ci import readme_rc_wheels as rc_wheels
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTION = ROOT / ".github/actions/wheel-storage"
@@ -112,6 +115,102 @@ def test_bundle_survives_consumer_only_rerun_and_cross_run(handoff, package):
     handoff.monkeypatch.setenv("GITHUB_REPOSITORY", "ai-dynamo/aisim")
     download(handoff, run="303")
     assert all("/1330347449/101/1/" in url for url, _, _ in handoff.requests)
+
+
+@pytest.mark.parametrize("producer_branch", ["main", "pull-request/42"])
+def test_rc_producer_reaches_verified_download_in_shared_test_repository(handoff, producer_branch):
+    expected = {"storage_repo": "sw-dynamo-aisimulate-pr-pypi-local", "recipe": "fixed RC inputs"}
+    name = rc_wheels.handoff_name(expected)
+    scope = "preview" if producer_branch == "main" else "pr"
+    for key, value in {
+        "STORAGE_NAME": name,
+        "STORAGE_REPO": expected["storage_repo"],
+        "STORAGE_SCOPE": scope,
+        "STORAGE_PR_NUMBER": "" if scope == "preview" else "42",
+    }.items():
+        handoff.monkeypatch.setenv(key, value)
+    for package in ("aisim", "ai_dynamo", "ai_dynamo_runtime"):
+        with zipfile.ZipFile(handoff.source / f"{package}.whl", "w") as archive:
+            archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.0\n")
+    (handoff.source / "rc-build-inputs.json").write_text(json.dumps(expected))
+    transfer.main()
+    env = {
+        **handoff.env,
+        "GITHUB_RUN_ID": "202",
+        "GITHUB_REF_NAME": "pull-request/42",
+        "RC_PR_NUMBER": "42",
+    }
+    producer = {
+        "id": 101,
+        "repository_id": 1330347449,
+        "head_repository_id": 1330347449,
+        "head_sha": env["GITHUB_SHA"],
+    }
+    run = {
+        "id": 101,
+        "repository": {"id": 1330347449},
+        "head_repository": {"id": 1330347449},
+        "head_sha": env["GITHUB_SHA"],
+        "head_branch": producer_branch,
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+    }
+
+    def request(endpoint):
+        if "/artifacts?" in endpoint:
+            return {"artifacts": [{"name": name + "-manifest", "expired": False, "workflow_run": producer}]}
+        return run
+
+    selected = rc_wheels.find_producer(name, env, request)
+    assert selected == {"run-id": "101", "scope": scope, "pr-number": "" if scope == "preview" else "42"}
+    handoff.monkeypatch.setenv("STORAGE_SCOPE", selected["scope"])
+    handoff.monkeypatch.setenv("STORAGE_PR_NUMBER", selected["pr-number"])
+    download(handoff, run="202")
+    rc_wheels.verify(handoff.output, expected)
+    handoff.requests.clear()
+    handoff.monkeypatch.setenv("STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
+    with pytest.raises(ValueError, match="producer mismatch"):
+        download(handoff, run="202")
+    assert handoff.requests == []
+
+
+@pytest.mark.parametrize("producer_record", [True, False], ids=["complete", "missing-producer-record"])
+def test_rc_restore_requires_downloaded_identity_not_consumer_preseed(handoff, producer_record):
+    expected = {"recipe": "fixed RC inputs"}
+    for package in ("aisim", "ai_dynamo", "ai_dynamo_runtime"):
+        with zipfile.ZipFile(handoff.source / f"{package}.whl", "w") as archive:
+            archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.0\n")
+    if producer_record:
+        (handoff.source / "rc-build-inputs.json").write_text(json.dumps(expected))
+    transfer.main()
+    handoff.output.mkdir()
+    (handoff.output / "rc-build-inputs.json").write_text(json.dumps(expected))
+    job = yaml.safe_load((ROOT / ".github/workflows/readme-checks.yml").read_text())["jobs"]["dynamo"]
+    guard = next(
+        step for step in job["steps"] if step.get("name") == "Require the producer build-input record on restore"
+    )
+    assert guard["if"] == "steps.rc-wheels.outputs.run-id != ''"
+    evidence = next(
+        i for i, step in enumerate(job["steps"]) if step.get("name") == "Preserve RC build-input and runner evidence"
+    )
+    restore = next(
+        i for i, step in enumerate(job["steps"]) if step.get("name") == "Restore verified pinned Dynamo RC wheels"
+    )
+    assert evidence < job["steps"].index(guard) < restore
+    subprocess.run(
+        ["bash", "-e", "-c", guard["run"]],
+        check=True,
+        env={**os.environ, "AISIM_RC_WHEELHOUSE": str(handoff.output)},
+    )
+    assert not (handoff.output / "rc-build-inputs.json").exists()
+    download(handoff, run="202")
+    if producer_record:
+        rc_wheels.verify(handoff.output, expected)
+    else:
+        with pytest.raises(FileNotFoundError, match="rc-build-inputs.json"):
+            rc_wheels.verify(handoff.output, expected)
 
 
 @pytest.mark.parametrize(
@@ -247,7 +346,7 @@ def test_curl_uses_private_config_without_redirects_or_token_arguments(tmp_path,
     transfer.transfer("https://artifactory.invalid/wheel", token, payload, upload=True, checksum="a" * 64)
 
 
-def test_wheel_handoffs_require_internal_containerized_runners():
+def _wheel_handoff_runner_violations(workflow_dir):
     # NVIDIA Artifactory requires internal DNS/network access. Dedicated ARC
     # runners also require a job container; a GitHub-hosted runner cannot
     # consume a handoff just because its manifest is available in Actions.
@@ -257,7 +356,7 @@ def test_wheel_handoffs_require_internal_containerized_runners():
         "prod-aisim-default-${{ matrix.arch }}-v1",
     }
     violations = []
-    for path in (ROOT / ".github/workflows").glob("*.yml"):
+    for path in workflow_dir.glob("*.yml"):
         for job_name, job in yaml.safe_load(path.read_text()).get("jobs", {}).items():
             if not any(step.get("uses", "").endswith("/wheel-storage") for step in job.get("steps", [])):
                 continue
@@ -269,9 +368,47 @@ def test_wheel_handoffs_require_internal_containerized_runners():
             )
             if not runners or not runners <= internal_runners:
                 violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
-            if not job.get("container", {}).get("image"):
+            container = job.get("container")
+            image = container.get("image") if isinstance(container, dict) else container
+            if not isinstance(image, str) or not image.strip():
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
+    return violations
+
+
+def test_wheel_handoffs_require_internal_containerized_runners():
+    violations = _wheel_handoff_runner_violations(ROOT / ".github/workflows")
     assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize("container", ["${{ vars.CI_JOB_CONTAINER_IMAGE }}", {"image": "example/image:tag"}])
+@pytest.mark.parametrize("runner", ["prod-aisim-default-amd64-v1", "ubuntu-24.04"])
+def test_wheel_handoff_container_forms_preserve_runner_guard(tmp_path, container, runner):
+    workflow = {
+        "jobs": {
+            "consumer": {
+                "runs-on": runner,
+                "container": container,
+                "steps": [{"uses": "./.github/actions/wheel-storage"}],
+            }
+        }
+    }
+    (tmp_path / "workflow.yml").write_text(yaml.safe_dump(workflow), encoding="utf-8")
+
+    violations = _wheel_handoff_runner_violations(tmp_path)
+    expected = (
+        [] if runner.startswith("prod-aisim-") else ["workflow.yml:consumer lacks an internal Artifactory runner"]
+    )
+    assert violations == expected
+
+
+@pytest.mark.parametrize("container", [None, "", " ", {}, {"image": ""}, {"image": None}, {"image": 123}, []])
+def test_wheel_handoff_rejects_missing_container_images(tmp_path, container):
+    job = {"runs-on": "prod-aisim-default-amd64-v1", "steps": [{"uses": "./.github/actions/wheel-storage"}]}
+    if container is not None:
+        job["container"] = container
+    (tmp_path / "workflow.yml").write_text(yaml.safe_dump({"jobs": {"consumer": job}}), encoding="utf-8")
+
+    assert _wheel_handoff_runner_violations(tmp_path) == ["workflow.yml:consumer lacks the required ARC job container"]
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():
@@ -280,6 +417,9 @@ def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary
         ("ci.yml", "application-tests", "download", "application-test-wheel-${{ matrix.arch }}"),
         ("ci.yml", "application-wheel", "download", "application-test-wheel-${{ matrix.arch }}"),
         ("ci.yml", "stage-application-wheel", "download", "application-test-wheel-${{ matrix.arch }}"),
+        ("ci.yml", "release-artifact-contract", "download", "application-test-wheel-${{ matrix.arch }}"),
+        ("readme-checks.yml", "dynamo", "upload", "${{ steps.rc-wheels.outputs.name }}"),
+        ("readme-checks.yml", "dynamo", "download", "${{ steps.rc-wheels.outputs.name }}"),
         ("nightly-ci.yml", "build-artifacts", "upload", "nightly-dist-${{ matrix.arch }}"),
         ("fpe-support-matrix.yml", "prepare-wheel", "download", "${{ inputs.wheel_artifact }}"),
         ("fpe-support-matrix.yml", "prepare-wheel", "upload", "fpe-qualified-wheel"),
@@ -351,7 +491,7 @@ def test_rerun_producer_keeps_old_objects_and_publishes_a_new_attempt(handoff):
 
 
 def selected_environment(job, *, ref="refs/heads/main", preview=False, pr_number=""):
-    expression = job["environment"]
+    expression = job.get("environment", "")
     if not expression.startswith("${{"):
         return expression
     expression = expression[3:-2].strip()
@@ -359,6 +499,57 @@ def selected_environment(job, *, ref="refs/heads/main", preview=False, pr_number
     expression = expression.replace("inputs.pr_number", repr(pr_number))
     expression = expression.replace("&&", " and ").replace("||", " or ")
     return eval(expression, {"__builtins__": {}, "startsWith": str.startswith})
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/release/0.13.0", "refs/heads/pull-request/903"])
+@pytest.mark.parametrize(
+    "daily,expected_profiles",
+    [(False, {"source", "dynamo"}), (True, {"development", "release", "macos", "dynamo"})],
+)
+def test_readme_profiles_keep_storage_environment_and_secret_access_isolated(ref, daily, expected_profiles):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/readme-checks.yml").read_text())
+    commands, dynamo = workflow["jobs"]["commands"], workflow["jobs"]["dynamo"]
+    expression = commands["strategy"]["matrix"]["include"][3:-2].strip()
+    expression = expression.replace("inputs.daily", repr(daily)).replace("&&", " and ").replace("||", " or ")
+    profiles = eval(expression, {"__builtins__": {}, "fromJSON": json.loads})
+    assert {entry["profile"] for entry in profiles} | {"dynamo"} == expected_profiles
+    for profile in profiles:
+        assert selected_environment(commands, ref=ref) == ""
+        assert "environment" not in commands and "container" not in commands
+        assert commands["runs-on"] == "${{ matrix.os }}"
+        assert profile["os"] == ("macos-15" if profile["profile"] == "macos" else "ubuntu-24.04")
+        assert "secrets." not in json.dumps(commands)
+    assert selected_environment(dynamo, ref=ref) == "pr-wheel-staging"
+    assert dynamo["runs-on"] == "prod-aisim-default-amd64-v1"
+    assert dynamo["container"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
+    assert commands["permissions"] == {"contents": "read"}
+    call = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["readme-commands"]
+    assert call["secrets"] == {"ARTIFACTORY_TOKEN": "${{ secrets.ARTIFACTORY_TOKEN }}"}
+    # PyYAML 1.1 parses the workflow's unquoted `on` key as True.
+    secrets = workflow[True]["workflow_call"]["secrets"]
+    assert set(secrets) == {"ARTIFACTORY_TOKEN"}
+    assert secrets["ARTIFACTORY_TOKEN"]["required"] is True
+
+
+@pytest.mark.parametrize("token,expected_code", [("", 1), ("dummy-test-token", 0)])
+def test_dynamo_fails_before_native_compilation_without_storage_credential(tmp_path, token, expected_code):
+    job = yaml.safe_load((ROOT / ".github/workflows/readme-checks.yml").read_text())["jobs"]["dynamo"]
+    guard = next(
+        step for step in job["steps"] if step.get("name") == "Verify the Dynamo storage credential is available"
+    )
+    assert guard["env"] == {"ARTIFACTORY_TOKEN": "${{ secrets.ARTIFACTORY_TOKEN }}"}
+    guard_index = job["steps"].index(guard)
+    native_index = next(i for i, step in enumerate(job["steps"]) if "apt-get install" in step.get("run", ""))
+    assert guard_index < native_index
+    result = subprocess.run(
+        ["bash", "-e", "-c", guard["run"]],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "ARTIFACTORY_TOKEN": token},
+    )
+    assert result.returncode == expected_code
+    assert "dummy-test-token" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("workflow", ["ci.yml", "fpe-support-matrix.yml"])
