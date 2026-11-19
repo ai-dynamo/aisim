@@ -21,6 +21,7 @@ from aisim import main as cli
 from aisim.compiler import prediction_to_replay_spec
 from aisim.config.cli import CorePredictionConfig, CoreRecommendationConfig
 from aisim.config.engine import KvCachePredictionConfig
+from aisim.predict import run_prediction
 from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.deploy import build_backend_deployment
@@ -741,6 +742,10 @@ def test_kvcr_defaults_and_overrides() -> None:
         cache["kvcr"] = {"local_g2": local_g2}
         with pytest.raises(ValidationError, match="local_g2"):
             KvCachePredictionConfig.model_validate(cache)
+    # KVCR-owned disk needs the memory it takes evicted blocks from.
+    cache["kvcr"] = {"g3": {"num_blocks": 8}}
+    with pytest.raises(ValidationError, match="kvcr.g3 requires kvcr.local_g2"):
+        KvCachePredictionConfig.model_validate(cache)
 
 
 def test_kvcr_defaults_match_the_rust_runtime() -> None:
@@ -757,6 +762,26 @@ def test_kvcr_defaults_match_the_rust_runtime() -> None:
     }
     launch = json.loads(_runtime.engine_launch_from_replay_role_json(json.dumps(role)))
     assert launch["engine"]["kvcr"] == KvcrConfig().model_dump() == _kvcr_defaults()
+    # The same holds for the tiers KVCR owns.
+    role["rank"]["kvcr"] = {"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}}
+    launch = json.loads(_runtime.engine_launch_from_replay_role_json(json.dumps(role)))
+    assert launch["engine"]["kvcr"] == KvcrConfig(**role["rank"]["kvcr"]).model_dump()
+
+
+def test_kvcr_g3_reaches_the_native_rank_and_is_rejected_outside_the_engine_stack() -> None:
+    engine = _prediction_engine()
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=131_072,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}},
+    )
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    rank = prediction_to_replay_spec(config).backend_deployment.agg_engine_args
+    assert rank["kvcr"]["g3"]["num_blocks"] == 8
+    # Another stack runs its own AISim core, with or without an adapter section.
+    for stack, adapters in (("dynamo", None), ("engine", {"router": {}})):
+        with pytest.raises(ValueError, match="kvcr.g3 requires the engine stack without adapters"):
+            run_prediction(config, adapter_configs=adapters, stack=stack, runner_factory=None)
 
 
 def test_kvcr_supports_the_prefill_role_and_rejects_the_decode_role() -> None:
@@ -807,7 +832,7 @@ def test_kvcr_recommendation_is_rejected_not_silently_dropped() -> None:
         CoreRecommendationConfig.model_validate({"engine": engine})
 
 
-def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys) -> None:
+def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys, monkeypatch) -> None:
     from aisim import _runtime
 
     assert callable(_runtime.run_replay_json)
@@ -836,6 +861,14 @@ def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys) -> Non
         "source_wait_ms": 0.0,
         "loaded_blocks": 0,
     }
+
+    # Another stack runs its own AISim core, so KVCR's disk tier is rejected there before anything runs.
+    engine["workers"]["aggregated"]["kv_cache"]["kvcr"] = {"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}}
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    monkeypatch.setattr(cli, "resolve_runner_factory", lambda _stack: None)
+    with pytest.raises(SystemExit):
+        cli.main([*argv[:1], "--stack", "dynamo", *argv[3:]])
+    assert "kvcr.g3 requires --stack engine without adapters" in capsys.readouterr().err
 
 
 def _hinted_replay(*, kvcr: bool) -> dict:

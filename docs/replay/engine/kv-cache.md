@@ -14,6 +14,7 @@ SPDX-License-Identifier: Apache-2.0
 | G3 | Storage shared by workers | `g3_offload` |
 | G2 peer fetch (KVCR) | Another rank's G2 | `kvcr` |
 | KVCR-owned memory | Host memory KVCR owns, behind each rank's G2 | `kvcr.local_g2` |
+| KVCR-owned disk | Local disk KVCR owns, behind each rank's KVCR-owned memory | `kvcr.g3` |
 
 Recurrent-state models also use `state_cache`; see
 [state cache](#state-cache).
@@ -573,6 +574,7 @@ kvcr:
   latency_to_first_byte_ms: 1.0
   bandwidth_gbps: 32.0
   # local_g2: {num_blocks: 4096}   # optional KVCR-owned memory per rank
+  # g3: {num_blocks: 65536}        # optional KVCR-owned disk per rank; requires local_g2
 ```
 
 | Knob (under `kvcr`) | Default | Rules |
@@ -583,6 +585,12 @@ kvcr:
 | `local_g2.num_blocks` | Required | Capacity of each rank, in the rank's G2 blocks (vLLM `secondary_g2_slots`). Must be positive; omit `local_g2` to turn it off. |
 | `local_g2.policy` | `lru` | `lru` or `fifo`, the block to drop when the memory is full. |
 | `local_g2.copy_bandwidth_gbps` | `6.0` | Rate of the copies between a rank's G2 and its KVCR-owned memory, decimal GB/s. `0` means the copies take no time. |
+| `g3` | Unset (off) | Local disk KVCR owns on each rank; requires `local_g2`. See [KVCR-owned disk](#kvcr-owned-disk). |
+| `g3.num_blocks` | Required | Capacity of each rank, in the rank's G2 blocks. Must be positive; omit `g3` to turn it off. |
+| `g3.latency_to_first_byte_ms` | `3.0` | Fixed delay of each read and each write. |
+| `g3.read_bandwidth_gbps` | `5.0` | Rate of reads from disk into the rank's G2, decimal GB/s. `0` means the bytes take no time. |
+| `g3.write_bandwidth_gbps` | `0.8` | Rate of writes from KVCR-owned memory to disk, decimal GB/s. `0` means the bytes take no time. |
+| `g3.spill_timeout_ms` | `1000.0` | How long a block of a completed G2 store waits for room in KVCR-owned memory (KVCR `operation_timeout_ms`). Must be positive. |
 
 `kvcr: {}` uses the defaults. The default `bandwidth_gbps` approximates pulls
 over RDMA between B200 nodes; set the rate of your transport.
@@ -698,7 +706,59 @@ With `local_g2` the `kvcr` summary gains a `local_g2` section of block counts:
 `evicted_blocks`, `promoted_blocks` and `loaded_blocks` (promoted blocks,
 counted when their first load into G1 starts).
 
-KVCR's G3 spill, Guard ownership and custom policies are not modeled.
+Guard ownership and custom policies are not modeled.
+
+<a id="kvcr-owned-disk"></a>
+
+### KVCR-owned disk
+
+With `kvcr.g3`, each rank also has a disk cache that KVCR owns: a block that
+KVCR-owned memory evicts is written there instead of dropped, and a lookup
+that misses G2 and that memory reads it back into G2. With `g3`, the
+`local_g2.policy` values `lru` and `fifo` stand for KVCR's `g3_lru` and
+`g3_fifo`.
+
+- **Write.** KVCR writes one block at a time. A block of a completed G2 store
+  that finds KVCR-owned memory full waits for the write that frees its slot,
+  up to `spill_timeout_ms`; after that it stays in G2 only. A rank sees a
+  finished write when its pass ends, so a busy rank admits about one waiting
+  block per pass. While a block waits, G2 cannot evict any block of its
+  store, so a long `spill_timeout_ms` with a slow disk can hold most of G2.
+- **Evict.** A full disk drops a block by the memory's policy, never one
+  being read. Under `lru` a block keeps the rank it had in memory and the
+  same uses count on disk; `fifo` drops the block unused longest since it was
+  written or last read.
+- **Read.** A block found only on disk is read into G2, like a promotion and
+  before the hinted peer. It stays on disk and does not return to KVCR-owned
+  memory.
+- **Peer pulls.** A peer cannot pull a block that is only on disk.
+- **Router events.** A block is published with tier `Disk` (`"tier": "disk"`
+  in serialized events) when its write ends and removed from that tier when
+  the disk drops it.
+
+The timing defaults describe a local NVMe drive; set the values of your
+storage. With them a 9.4 MB block, its KV for every GPU of the rank, is
+written in about 15 ms. Each rank's disk is modeled on its own, so lower
+`write_bandwidth_gbps` for ranks whose disk caches share a drive.
+
+The model simplifies the disk tier:
+
+- Reads do not fail or time out. KVCR fails a read that outlasts its
+  operation timeout, 1 s by default.
+- G2 ranks a waiting store's blocks as most recently used when it may evict
+  them again.
+
+Under `lru`, the order in memory and on disk can differ from KVCR's in corner
+cases, such as a store that gives up before copying all of its blocks.
+
+With `g3` the `kvcr` summary gains a `g3` section of block counts:
+`stored_blocks` (written to disk), `evicted_blocks` (dropped from disk) and
+`read_blocks` (read back into G2). In the `local_g2` section, `evicted_blocks`
+then includes the blocks written to disk, `dropped_blocks` the blocks that
+waited too long and `loaded_blocks` the blocks read from disk.
+
+`kvcr.g3` is rejected with an adapter stack such as `--stack dynamo`, whose
+own AISim core does not know the `disk` tier yet.
 
 ### Supported
 
@@ -706,7 +766,7 @@ KVCR supports vLLM aggregated workers with any `attention_data`, and pulls
 between the prefill ranks of P/D. Workers may be fixed or Planner-scaled; a
 draining worker is removed only after every pull from or into it has landed and
 been taken by its target. Rejected: missing or `cluster_shared` `host_offload`,
-a `host_offload.connector` other than `offloading_v0_24`, `g3_offload` together with `kvcr`, `kvcr` on the decode role, MTP on a prefill role with `kvcr`, `parallelism.pipeline` above 1,
+a `host_offload.connector` other than `offloading_v0_24`, `g3_offload` together with `kvcr`, `kvcr.g3` without `kvcr.local_g2`, `kvcr` on the decode role, MTP on a prefill role with `kvcr`, `parallelism.pipeline` above 1,
 `parallelism.prefill_context` above 1 (native `prefill_context_parallel_size`), and `recommend`.
 Everything G2 rejects is rejected too, including SGLang and TensorRT-LLM.
 

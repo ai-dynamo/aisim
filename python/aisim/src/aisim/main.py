@@ -25,6 +25,7 @@ from .config.cli import (
     prediction_mapping,
 )
 from .config.common import split_config_sections
+from .config.engine import has_kvcr_g3
 from .config_adapter import (
     ConfigAdapterResolutionError,
     PredictionAdapterContext,
@@ -179,6 +180,9 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         raise ValueError("ngram speculation requires offline --stack engine without adapters")
     if config.engine.speculation is not None and args.online:
         raise ValueError("speculation requires offline execution")
+    # Another stack runs its own AISim core, which has to know the disk tier's events.
+    if has_kvcr_g3(config.engine.workers) and (args.stack != "engine" or adapter_raw):
+        raise ValueError("kvcr.g3 requires --stack engine without adapters")
     plan = _resource_plan(args, config, factory)
     require_plan(plan)
     from .supervision import checkpoint, mark_execution_ready, mark_shutdown

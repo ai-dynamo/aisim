@@ -239,6 +239,8 @@ pub enum KvEventTier {
     /// The native G2 host cache reachable by the publishing rank: its private
     /// `dp_rank_local` cache or a `cluster_shared` pool.
     HostPinned,
+    /// The rank's KVCR-owned disk cache (`kvcr.g3`).
+    Disk,
 }
 
 impl KvEventTier {

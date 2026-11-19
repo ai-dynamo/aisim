@@ -115,6 +115,23 @@ pub(crate) struct HostBlockMeta {
     pub(crate) session_id: Option<Arc<str>>,
 }
 
+impl HostBlockMeta {
+    /// A `Stored` event of the one block `key` with this identity.
+    pub(crate) fn stored(&self, key: HostBlockKey) -> StoredBlocks {
+        StoredBlocks {
+            cache_salt: self.cache_salt.as_deref().map(str::to_owned),
+            parent_hash: self.parent,
+            start_position: Some(self.position),
+            blocks: vec![KvBlock {
+                block_hash: key.sequence_hash(),
+                tokens_hash: self.tokens_hash,
+                token_ids: None,
+            }],
+            session_id: self.session_id.as_deref().map(str::to_owned),
+        }
+    }
+}
+
 /// Visibility of one logical host block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Lookup {
@@ -776,6 +793,21 @@ impl HostTier {
         transfer_id
     }
 
+    /// The least recently used resident block that no pin holds and the
+    /// caller does not keep: the one a caller-managed pool evicts next.
+    pub(crate) fn oldest_evictable(
+        &self,
+        kept: impl Fn(HostBlockKey) -> bool,
+    ) -> Option<HostBlockKey> {
+        let evictable = |key: HostBlockKey| {
+            !kept(key)
+                && self.entries.get(&key).is_some_and(|entry| {
+                    entry.state == EntryState::Resident && entry.load_pins == 0
+                })
+        };
+        self.lru.victims(1, evictable).pop()
+    }
+
     /// Remove an unpinned resident in a caller-managed pool, publishing the same eviction effects
     /// as tier-managed admission. Pending transfers and pinned load sources cannot be removed.
     pub(crate) fn evict_resident(
@@ -1285,6 +1317,11 @@ impl HostTier {
             Some(EntryState::PendingStore { transfer_id }) => Lookup::Pending { transfer_id },
             Some(EntryState::Resident) => Lookup::Hit,
         }
+    }
+
+    /// The router identity retained for `key`, if the pool publishes residency.
+    pub(crate) fn meta(&self, key: HostBlockKey) -> Option<&HostBlockMeta> {
+        self.meta.get(&key)
     }
 
     /// Moves whenever an entry appears, disappears or becomes resident, the
@@ -1812,11 +1849,6 @@ impl HostTier {
             let Some(meta) = self.meta.get(key) else {
                 continue;
             };
-            let block = KvBlock {
-                block_hash: key.sequence_hash(),
-                tokens_hash: meta.tokens_hash,
-                token_ids: None,
-            };
             match events.last_mut() {
                 Some(KvEventData::Stored(stored))
                     if stored.blocks.last().map(|last: &KvBlock| last.block_hash)
@@ -1824,15 +1856,13 @@ impl HostTier {
                         && stored.session_id.as_deref() == meta.session_id.as_deref()
                         && stored.cache_salt.as_deref() == meta.cache_salt.as_deref() =>
                 {
-                    stored.blocks.push(block);
+                    stored.blocks.push(KvBlock {
+                        block_hash: key.sequence_hash(),
+                        tokens_hash: meta.tokens_hash,
+                        token_ids: None,
+                    });
                 }
-                _ => events.push(KvEventData::Stored(StoredBlocks {
-                    cache_salt: meta.cache_salt.as_deref().map(str::to_owned),
-                    parent_hash: meta.parent,
-                    start_position: Some(meta.position),
-                    blocks: vec![block],
-                    session_id: meta.session_id.as_deref().map(str::to_owned),
-                })),
+                _ => events.push(KvEventData::Stored(meta.stored(*key))),
             }
         }
         events

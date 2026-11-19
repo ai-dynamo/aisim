@@ -290,19 +290,37 @@ class KvcrLocalG2Config(StrictModel):
     copy_bandwidth_gbps: NonNegativeFloat = 6.0
 
 
+class KvcrG3Config(StrictModel):
+    """Local disk KVCR owns on each rank, behind its memory (`local_g2`)."""
+
+    num_blocks: PositiveInt
+    latency_to_first_byte_ms: NonNegativeFloat = 3.0
+    read_bandwidth_gbps: NonNegativeFloat = 5.0
+    write_bandwidth_gbps: NonNegativeFloat = 0.8
+    spill_timeout_ms: PositiveFloat = 1000.0
+
+
 class KvcrConfig(StrictModel):
     """KVCR peer G2 fetch: pull a hinted prefix from another rank's private G2."""
 
     latency_to_first_byte_ms: NonNegativeFloat = 1.0
     bandwidth_gbps: NonNegativeFloat = 32.0
     local_g2: KvcrLocalG2Config | None = None
+    g3: KvcrG3Config | None = None
+
+    @model_validator(mode="after")
+    def _g3_needs_local_g2(self) -> KvcrConfig:
+        if self.g3 is not None and self.local_g2 is None:
+            raise ValueError("kvcr.g3 requires kvcr.local_g2")
+        return self
 
     @model_serializer(mode="wrap")
-    def _omit_unset_local_g2(self, handler: Any) -> dict[str, Any]:
-        # Keep the peer-fetch-only descriptor shape unless KVCR owns memory.
+    def _omit_unset_tiers(self, handler: Any) -> dict[str, Any]:
+        # Keep the peer-fetch-only descriptor shape unless KVCR owns storage.
         payload = handler(self)
-        if payload.get("local_g2") is None:
-            payload.pop("local_g2", None)
+        for name in ("local_g2", "g3"):
+            if payload.get(name) is None:
+                payload.pop(name, None)
         return payload
 
 
@@ -857,6 +875,12 @@ def is_afd_worker(worker) -> bool:
 
 def has_afd(workers) -> bool:
     return any(is_afd_worker(getattr(workers, role)) for role in ("aggregated", "prefill", "decode"))
+
+
+def has_kvcr_g3(workers) -> bool:
+    """Whether a worker role configures KVCR's disk tier."""
+    caches = (getattr(getattr(workers, role), "kv_cache", None) for role in ("aggregated", "prefill", "decode"))
+    return any(cache is not None and cache.kvcr is not None and cache.kvcr.g3 is not None for cache in caches)
 
 
 def _default_worker_type(value):
