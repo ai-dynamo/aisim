@@ -651,6 +651,8 @@ def _download_hf_json_at(
     is read from the cache when present; other revisions are fetched so a moved
     branch is honored. The cache is the fallback when the network fails or Hugging
     Face answers with a rate limit or server error (HTTP 429 or 5xx).
+    An optional online file is absent only when HTTP 404 identifies EntryNotFound;
+    missing revisions, repositories, and unidentified 404s remain access errors.
     """
     _check_hf_model_id(hf_id)
     _check_hf_revision(revision)
@@ -702,7 +704,7 @@ def _download_hf_json_at(
             raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: expected a JSON object")
         return data, commit
     except urllib.error.HTTPError as e:
-        if e.code == 404 and not raise_on_404:
+        if e.code == 404 and not raise_on_404 and (e.headers or {}).get("X-Error-Code") == "EntryNotFound":
             return None, None
         if _is_transient_http_error(e):
             return _cached_after_network_failure(hf_id, filename, revision, url, f"HTTP error {e.code}: {e.reason}")

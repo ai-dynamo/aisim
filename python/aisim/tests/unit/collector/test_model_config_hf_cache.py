@@ -156,7 +156,9 @@ def test_collector_does_not_read_quant_from_another_cached_snapshot(monkeypatch,
         requested.append(url)
         if url.endswith("/main/config.json"):
             raise utils.urllib.error.URLError("transient")
-        raise utils.urllib.error.HTTPError(url, 404, "absent at selected commit", {}, None)
+        raise utils.urllib.error.HTTPError(
+            url, 404, "absent at selected commit", {"X-Error-Code": "EntryNotFound"}, None
+        )
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
     resolved = load_model_config(_MODEL)
@@ -184,7 +186,7 @@ def test_collector_network_config_does_not_invent_a_snapshot(monkeypatch, hub_ca
     def fetch(request, *, timeout):
         if request.full_url.endswith("/main/config.json"):
             return io.BytesIO(json.dumps(_CONFIG).encode())
-        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {"X-Error-Code": "EntryNotFound"}, None)
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
     resolved = load_model_config(_MODEL)

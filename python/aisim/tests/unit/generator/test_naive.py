@@ -4,6 +4,7 @@
 """Unit tests for generator naive module — nvbug 5941223."""
 
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -259,7 +260,8 @@ class TestEstimateModelWeightBytes:
     @pytest.mark.parametrize(
         "invalid_processor", [[], {"max_patches": 0, "resize_to_max_canvas": True, "add_global_tile": True}]
     )
-    def test_llama4_malformed_processor_reports_sizing_error(self, tmp_path, invalid_processor):
+    @pytest.mark.parametrize("log_level", [logging.ERROR, logging.DEBUG])
+    def test_llama4_malformed_processor_reports_sizing_error(self, tmp_path, invalid_processor, caplog, log_level):
         from aisim.sdk import utils
 
         raw = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
@@ -267,12 +269,24 @@ class TestEstimateModelWeightBytes:
         (tmp_path / "config.json").write_text(json.dumps(raw))
         (tmp_path / "preprocessor_config.json").write_text(json.dumps(invalid_processor))
         try:
-            with pytest.raises(RuntimeError, match="config unavailable") as error:
+            with (
+                caplog.at_level(log_level, logger="aisim.generator.naive"),
+                pytest.raises(RuntimeError, match="config unavailable") as error,
+            ):
                 _estimate_model_weight_bytes(str(tmp_path))
             expected_error = TypeError if isinstance(invalid_processor, list) else ValueError
             assert isinstance(error.value.__cause__, expected_error)
             expected_message = "image_processor_config" if isinstance(invalid_processor, list) else "max_patches"
             assert expected_message in str(error.value.__cause__)
+            records = [record for record in caplog.records if record.name == "aisim.generator.naive"]
+            error_record = next(record for record in records if record.levelno == logging.ERROR)
+            if expected_error is TypeError:
+                assert error_record.exc_info is not None
+            else:
+                assert error_record.exc_info is None
+                assert expected_message in error_record.getMessage()
+                debug_tracebacks = [record for record in records if record.levelno == logging.DEBUG and record.exc_info]
+                assert bool(debug_tracebacks) is (log_level == logging.DEBUG)
         finally:
             utils._load_model_config_from_model_path.cache_clear()
             utils.get_model_config_from_model_path.cache_clear()

@@ -469,6 +469,7 @@ def test_benchmark_request_matches_dynamo_protocol(backend, target, version, leg
 
 
 def test_naive_cli_input_preserves_benchmark_sizing_rule(monkeypatch):
+    monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
     monkeypatch.setattr(
         "aisim.generator.naive._get_system_config",
         lambda _: {"gpus_per_node": 8, "vram_per_gpu": 192 * 1024**3},

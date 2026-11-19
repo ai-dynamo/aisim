@@ -668,7 +668,7 @@ def test_model_loader_reads_quant_config_at_the_cached_config_commit(monkeypatch
         requested.append(request.full_url)
         if request.full_url.endswith("/main/config.json"):
             raise utils.urllib.error.URLError("transient")
-        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+        raise _http_error(404, "missing")
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", flaky)
     utils._load_model_config_from_model_path.__wrapped__("org/not-bundled")
@@ -727,7 +727,7 @@ def test_processor_files_follow_the_cached_config_commit(monkeypatch, hf_cache, 
             # Remote main deliberately contains different metadata.
             source = "pinned" if f"/{commit}/" in url else "remote-main"
             return io.BytesIO(json.dumps({"source": source}).encode())
-        raise utils.urllib.error.HTTPError(url, 404, "missing", {}, None)
+        raise _http_error(404, "missing")
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
     monkeypatch.setattr(utils, "_parse_hf_config_json", lambda raw: {"architecture": architecture})
@@ -856,7 +856,7 @@ def test_processor_only_cache_fallback_cannot_mix_with_remote_config(monkeypatch
             return io.BytesIO(json.dumps({"architectures": [architecture]}).encode())
         if request.full_url.endswith(f"/{filename}"):
             raise utils.urllib.error.URLError("transient")
-        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+        raise _http_error(404, "missing")
 
     def unexpected_parse(raw):
         pytest.fail("mixed-snapshot processor metadata reached the model parser")
@@ -1284,7 +1284,10 @@ def test_dangling_negative_cache_marker_is_corrupt(monkeypatch, hf_cache, consum
 
 
 @pytest.mark.parametrize("consumer", ["prescription", "optimized", "quantization"])
-def test_generator_rejects_unresolved_dsa_sidecar_instead_of_dropping_fp8(monkeypatch, hf_cache, consumer):
+@pytest.mark.parametrize("sidecar_status,error_code", [(503, None), (404, "RevisionNotFound"), (404, None)])
+def test_generator_rejects_unresolved_dsa_sidecar_instead_of_dropping_fp8(
+    monkeypatch, hf_cache, consumer, sidecar_status, error_code
+):
     from aisim.generator.module_bridge import _vllm_dsa_kv_cache_dtype
     from aisim.generator.utils import _bundled_quantization, vllm_dsa_kv_cache_dtype
 
@@ -1295,12 +1298,14 @@ def test_generator_rejects_unresolved_dsa_sidecar_instead_of_dropping_fp8(monkey
         "quant_algo": "NVFP4",
         "kv_cache_scheme": {"num_bits": 8, "type": "float"},
     }
-    sidecar_status = 503
 
     def remote(request, *, timeout):
         if request.full_url.endswith("/config.json"):
             return io.BytesIO(json.dumps(config).encode())
-        raise utils.urllib.error.HTTPError(request.full_url, sidecar_status, "sidecar unavailable", {}, None)
+        headers = Message()
+        if error_code is not None:
+            headers["X-Error-Code"] = error_code
+        raise utils.urllib.error.HTTPError(request.full_url, sidecar_status, "sidecar unavailable", headers, None)
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
     task = SimpleNamespace(primary_backend_name="vllm", primary_model_path=model)
@@ -1310,10 +1315,11 @@ def test_generator_rejects_unresolved_dsa_sidecar_instead_of_dropping_fp8(monkey
         "quantization": lambda: _bundled_quantization(model),
     }[consumer]
     try:
-        with pytest.raises(utils.HuggingFaceDownloadError, match="hf_quant_config.json.*503"):
+        with pytest.raises(utils.HuggingFaceDownloadError, match=f"hf_quant_config.json.*{sidecar_status}"):
             load()
         # Confirmed optional absence preserves the validated inline prescription.
         sidecar_status = 404
+        error_code = "EntryNotFound"
         result = load()
         if consumer == "quantization":
             assert result["kv_cache_scheme"] == {"num_bits": 8, "type": "float"}
@@ -1659,7 +1665,8 @@ def test_kimi_video_limits_follow_pinned_processor_through_real_parser(monkeypat
 
 
 def _http_error(code, reason):
-    return utils.urllib.error.HTTPError("https://huggingface.co/x", code, reason, {}, None)
+    headers = {"X-Error-Code": "EntryNotFound"} if code == 404 else {}
+    return utils.urllib.error.HTTPError("https://huggingface.co/x", code, reason, headers, None)
 
 
 @pytest.mark.parametrize("failure", ["server", "network", "auth"])
@@ -1802,12 +1809,21 @@ def test_auth_errors_keep_the_authentication_advice(monkeypatch, hf_cache, code)
         utils._download_hf_json("org/model", "config.json")
 
 
-def test_missing_optional_file_still_returns_none(monkeypatch, hf_cache):
+@pytest.mark.parametrize("error_code", ["EntryNotFound", "RevisionNotFound", "RepoNotFound", None])
+@pytest.mark.parametrize("required", [False, True])
+def test_only_confirmed_missing_optional_file_returns_none(monkeypatch, hf_cache, error_code, required):
     def failing(request, *, timeout):
-        raise _http_error(404, "Not Found")
+        headers = Message()
+        if error_code is not None:
+            headers["x-error-code"] = error_code
+        raise utils.urllib.error.HTTPError(request.full_url, 404, "Not Found", headers, None)
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", failing)
-    assert utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=False) is None
+    if not required and error_code == "EntryNotFound":
+        assert utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=False) is None
+    else:
+        with pytest.raises(utils.HuggingFaceDownloadError, match="HTTP error 404"):
+            utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=required)
 
 
 @pytest.mark.parametrize("offline", [True, False])

@@ -123,6 +123,10 @@ class TestBuildNaiveOptimizationType:
     _SYS: ClassVar[dict] = {"gpus_per_node": 8, "vram_per_gpu": 141 * 1024**3}
     _WEIGHT = 30 * 1024**3  # 30 GiB -> fits in 1 GPU
 
+    @pytest.fixture(autouse=True)
+    def _use_bundled_model_configs(self, monkeypatch):
+        monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
+
     @patch(
         "aisim.generator.naive._estimate_model_weight_bytes",
         return_value=30 * 1024**3,
