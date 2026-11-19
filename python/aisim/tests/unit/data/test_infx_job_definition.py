@@ -291,6 +291,8 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
         for key, value in os.environ.items()
         if key not in local_git_keys and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
     }
+    # Synthetic fixture commits never need a signing key, even when the developer enables signing globally.
+    git_env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"})
 
     def git(path, *args):
         return subprocess.check_output(

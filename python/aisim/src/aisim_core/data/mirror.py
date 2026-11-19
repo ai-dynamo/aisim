@@ -243,6 +243,8 @@ def _check_indexes(root: Path, report: TreeReport, declared: set[str], eligible:
                 report.add("duplicate-configuration", entry.configuration_id, path)
             seen.add(entry.configuration_id)
             try:
+                if path not in eligible:
+                    raise ValueError("manifest must be a listed dataset payload file")
                 _verify(root, entry.manifest)
                 manifest = _check_manifest_any(root, path, category)
                 if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
@@ -252,6 +254,9 @@ def _check_indexes(root: Path, report: TreeReport, declared: set[str], eligible:
                     entry.purpose,
                 ):
                     raise ValueError("catalog and manifest identity mismatch")
+                for artifact in manifest.artifacts:
+                    if artifact.path not in eligible:
+                        raise ValueError(f"artifact {artifact.path} must be a listed dataset payload file")
             except (ValueError, LoaderError, ValidationError, OSError) as exc:
                 report.add("manifest-invalid", str(exc).splitlines()[0], path)
                 continue
@@ -369,7 +374,7 @@ def _check_catalog_drift(root: Path, report: TreeReport, declared: set[str]) -> 
             have[name] = pq.read_table(path)
         except ValueError as exc:
             report.add("catalog-drift", f"invalid catalog shard: {str(exc).splitlines()[0]}", name)
-        except OSError as exc:
+        except (OSError, NotImplementedError) as exc:  # NotImplementedError: unsupported Parquet codec
             report.add("catalog-unreadable", str(exc).splitlines()[0], name)
     existing_names = {p.relative_to(root).as_posix() for p in existing}
     for name in sorted(set(want) | existing_names):

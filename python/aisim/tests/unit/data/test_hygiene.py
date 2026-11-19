@@ -234,3 +234,11 @@ def test_explicit_yaml_boolean_constructor_errors_are_findings(scalar, valid):
     assert (not findings) is valid
     if not valid:
         assert codes(findings) == {"yaml-invalid"}
+
+
+def test_yaml_equals_key_is_a_plain_string_and_still_detects_duplicates():
+    from aisim_core.data.hygiene import yaml_sidecar_value
+
+    assert yaml_sidecar_value(b"=: enabled\n") == {"=": "enabled"}
+    with pytest.raises(ValueError, match="duplicate YAML key"):
+        yaml_sidecar_value(b'=: 1\n"=": 2\n')

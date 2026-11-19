@@ -19,11 +19,13 @@
     },
     "schema_version": {
       "const": "aisim-catalog-coverage/v1",
-      "default": "aisim-catalog-coverage/v1",
       "title": "Schema Version",
       "type": "string"
     }
   },
+  "required": [
+    "schema_version"
+  ],
   "title": "CatalogCoverage",
   "type": "object"
 }

@@ -221,7 +221,10 @@ def _select(source: Path, directories: list[str], plan: PromotionPlan) -> None:
                 if f.is_symlink:
                     plan.findings.append(Finding("symlink", "symbolic links are not promoted", rel))
                 else:
-                    plan.files[rel] = _sha(source / rel)
+                    try:
+                        plan.files[rel] = _sha(source / rel)
+                    except OSError as exc:
+                        plan.findings.append(Finding("unreadable", f"selected file cannot be read: {exc}", rel))
 
 
 def _check_closure(source: Path, plan: PromotionPlan, manifests: Mapping[str, Manifest]) -> None:
@@ -390,7 +393,13 @@ def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str)
         by_category.setdefault(manifest.category, []).append((rel, manifest))
     categories = dict(dataset.categories)
     for category, items in sorted(by_category.items()):
-        index_rel = categories[category].index.path if category in categories else f"{CATALOG_DIR}/{category}.json"
+        if category in categories:
+            index_rel = categories[category].index.path
+        else:
+            reserved = {c.index.path for c in categories.values()}
+            index_rel = f"{CATALOG_DIR}/{category}.json"
+            if index_rel in reserved:  # another category already owns this path; never reuse it
+                index_rel = f"{CATALOG_DIR}/{category}-index.json"
         existing = (
             {
                 e.configuration_id: e
@@ -500,11 +509,17 @@ def _apply_promotion(
     _check_contained(target, list(index_paths))
     before = _snapshot(target, index_paths)
     added: list[Path] = []
+    created_dirs: list[Path] = []
+    preexisting_catalog_dirs = (
+        {d for d in (target / CATALOG_DIR).rglob("*") if d.is_dir()} if (target / CATALOG_DIR).is_dir() else None
+    )
     ledger: Path | None = None
     try:
         for rel in sorted(plan.files):
             dest = target / rel
             if not dest.exists():
+                missing = [p for p in (dest.parent, *dest.parent.parents) if not p.exists() and target in p.parents]
+                created_dirs.extend(reversed(missing))
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 added.append(dest)  # registered first so a partial copy is rolled back too
                 shutil.copyfile(source / rel, dest)
@@ -533,17 +548,21 @@ def _apply_promotion(
             ledger.unlink(missing_ok=True)
         for path in added:
             path.unlink(missing_ok=True)
-            for parent in path.parents:  # drop directories this promotion created
-                if parent == target or any(parent.iterdir()):
-                    break
-                parent.rmdir()
+        for directory in sorted(set(created_dirs), key=lambda d: len(d.parts), reverse=True):
+            if directory.is_dir() and not any(directory.iterdir()):  # only directories this promotion created
+                directory.rmdir()
         for rel in {p.relative_to(target).as_posix() for p in _index_paths(target, index_paths)} - set(before):
             (target / rel).unlink(missing_ok=True)
         for directory in sorted((target / CATALOG_DIR).rglob("*"), reverse=True):
-            if directory.is_dir() and not any(directory.iterdir()):
+            if (
+                directory.is_dir()
+                and not any(directory.iterdir())
+                and (preexisting_catalog_dirs is None or directory not in preexisting_catalog_dirs)
+            ):
                 directory.rmdir()
-        if (target / CATALOG_DIR).is_dir() and not any((target / CATALOG_DIR).iterdir()):
-            (target / CATALOG_DIR).rmdir()
+        if preexisting_catalog_dirs is None and (target / CATALOG_DIR).is_dir():
+            if not any((target / CATALOG_DIR).iterdir()):
+                (target / CATALOG_DIR).rmdir()
         for rel, data in before.items():
             restored = target / rel
             restored.parent.mkdir(parents=True, exist_ok=True)

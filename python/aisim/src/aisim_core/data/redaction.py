@@ -68,6 +68,7 @@ REDACTED = "[REDACTED]"
 INFX_MARKERS = ("inferencex", "infx")
 
 _RUN_URL = re.compile(r"https?://[^\s\"']+/(?:actions/runs|-/pipelines|-/jobs|pipelines|builds)/\d+", re.I)
+_URL = re.compile(r"\b[a-z][a-z0-9+.\-]*://", re.I)
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{16,}", re.I)
 _REGISTRY = re.compile(r"(?:nvcr\.io|gitlab-master|ghcr\.io|docker\.io|gcr\.io|\.dkr\.ecr\.|urm\.|artifactory)", re.I)
 _INTERNAL_HOST = re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.(?:nvidia\.com|nvidia\.net)\b|gitlab-master", re.I)
@@ -77,7 +78,8 @@ _SECRET = re.compile(
 )
 _CREDENTIAL_KEY = re.compile(
     r"^(password|passwd|secret|client_secret|api_key|access_token|auth_token|refresh_token|id_token|"
-    r"private_key|authorization|credential|credentials)$",
+    r"private_key|authorization|credential|credentials|"
+    r"aws_secret_access_key|aws_session_token|docker_auth_config)$",
     re.I,
 )
 _IMAGE_KEY = re.compile(r"(^|_)(image|images|container|docker_image)(_|$)", re.I)
@@ -264,6 +266,11 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
     return out
 
 
+def scan_json_file(path: Path, policy: RedactionPolicy, rel: str, where: str) -> list[Finding]:
+    """Scan a JSON file with the shared bounded, strict parser; ambiguous JSON raises ``ValueError``."""
+    return scan_value(json_sidecar_value(bounded_json_bytes(path)), policy, rel, where)
+
+
 def scan_yaml(data: bytes, policy: RedactionPolicy, path: str, where: str) -> list[Finding]:
     """Scan original mapping values, including overridden merge defaults, and source text."""
     yaml_sidecar_value(data)  # also require valid effective YAML merge semantics
@@ -342,11 +349,7 @@ def _check_manifest(
                 )
             )
         elif artifact.format == "json":
-            out.extend(
-                scan_value(
-                    json.loads(checked_path(root, artifact.path).read_bytes()), policy, artifact.path, "JSON sidecar"
-                )
-            )
+            out.extend(scan_json_file(checked_path(root, artifact.path), policy, artifact.path, "JSON sidecar"))
         elif artifact.format == "yaml":
             data = checked_path(root, artifact.path).read_bytes()
             out.extend(scan_yaml(data, policy, artifact.path, "YAML sidecar"))
@@ -378,8 +381,10 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
     """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid."""
     out = scan_value(pq.ParquetFile(path).metadata.created_by, policy, rel, "Parquet producer")
     metadata = [table.schema.metadata or {}]
+    field_names: dict[str, None] = {}
 
     def field_metadata(field: pa.Field) -> None:
+        field_names[field.name] = None
         metadata.append(field.metadata or {})
         if pa.types.is_struct(field.type):
             for child in field.type:
@@ -396,6 +401,8 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
 
     for field in table.schema:
         field_metadata(field)
+    # Field names are disclosure text even when the table has no rows or every cell is null.
+    out.extend(scan_value(field_names, policy, rel, f"{where} name"))
     for entry in metadata:
         decoded = {key.decode("utf-8"): value.decode("utf-8") for key, value in entry.items()}
         out.extend(scan_value(decoded, policy, rel, "Parquet metadata"))
@@ -459,7 +466,7 @@ def _check_eval_record(
                 )
             )
         elif artifact.format == "json":
-            out.extend(scan_value(json.loads(path.read_bytes()), policy, artifact_rel, "eval truth JSON"))
+            out.extend(scan_json_file(path, policy, artifact_rel, "eval truth JSON"))
         elif artifact.format != "gzip":
             out.append(Finding("artifact-format", f"unsupported eval truth format: {artifact.format}", artifact_rel))
     if record.findings and not policy.allow_provenance_artifacts:
@@ -467,11 +474,7 @@ def _check_eval_record(
     for artifact in record.findings:
         path = _verify((root / rel).parent, artifact)
         if policy.allow_provenance_artifacts and artifact.format == "json":
-            out.extend(
-                scan_value(
-                    json.loads(path.read_bytes()), policy, path.relative_to(root).as_posix(), "eval findings JSON"
-                )
-            )
+            out.extend(scan_json_file(path, policy, path.relative_to(root).as_posix(), "eval findings JSON"))
     if policy.inferencex_disclosure == "aggregates-only" and infx_ids & set(record.truth.configuration_ids):
         out.append(Finding("infx-aggregates-only", "record scores InferenceX-derived truth; publish aggregates", rel))
     return out
@@ -638,5 +641,8 @@ def check_disclosure(rows: Iterable[Mapping[str, Any]], policy: RedactionPolicy 
                 valid = isinstance(value, str) and not value.lstrip().startswith(("[", "{"))
             if not valid:
                 out.append(Finding("not-aggregate", f"invalid aggregate shape for {key!r}", where))
+        for key, value in row.items():
+            if key in AGGREGATE_FIELDS and isinstance(value, str) and _URL.search(value):
+                out.append(Finding("not-aggregate", f"aggregate text field {key!r} must not contain a URL", where))
         out.extend(scan_value({k: v for k, v in row.items() if k in AGGREGATE_FIELDS}, policy, where, where))
     return out

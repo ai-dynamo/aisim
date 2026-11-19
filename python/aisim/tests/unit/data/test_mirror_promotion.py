@@ -451,6 +451,7 @@ def test_oversized_catalog_grid_returns_a_cli_validation_report(tmp_path):
     (root / "catalog/coverage.json").write_text(
         json.dumps(
             {
+                "schema_version": "aisim-catalog-coverage/v1",
                 "expected_models": [f"model{i}" for i in range(1000)],
                 "expected_frameworks": [f"framework{i}" for i in range(1000)],
             }
@@ -1704,6 +1705,31 @@ def test_rollback_restores_a_removed_catalog_directory(tmp_path, monkeypatch):
         apply_promotion(plan, root, target)
     assert stale.read_bytes() == b"stale fixture shard"
     assert [p for p in target.rglob("*") if p.is_file()] == [stale]
+
+
+def test_rollback_keeps_a_preexisting_empty_target_directory(tmp_path, monkeypatch):
+    from aisim_core.data import promote as promotion
+    from aisim_core.data.hygiene import Finding
+    from aisim_core.data.mirror import TreeReport
+
+    root, _, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    (target / "data").mkdir()
+    monkeypatch.setattr(
+        promotion,
+        "validate_tree",
+        lambda *a, **k: TreeReport(repo=PUBLIC, profile="public", findings=[Finding("late", "rejected")]),
+    )
+    with pytest.raises(PromotionError, match="late"):
+        apply_promotion(plan, root, target)
+    assert (target / "data").is_dir() and not any((target / "data").iterdir())
+
+
+@pytest.mark.parametrize("value", ["{}", '{"schema_version":"aisim-catalog-coverage/v2"}'])
+def test_catalog_coverage_requires_the_supported_version(tmp_path, value):
+    root, _ = _mirror(tmp_path)
+    (root / "catalog/coverage.json").write_text(value)
+    assert "catalog-unbuildable" in {f.code for f in validate_tree(root).errors}
 
 
 def test_promotion_rechecks_visibility_without_selected_byte_changes(tmp_path):

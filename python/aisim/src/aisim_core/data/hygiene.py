@@ -309,6 +309,8 @@ class _SidecarLoader(yaml.SafeLoader):
                 continue
             if not isinstance(key, yaml.ScalarNode):
                 raise ValueError("YAML mapping keys must be scalar")
+            if key.tag == "tag:yaml.org,2002:value":  # an unquoted "=" key is the plain string "="
+                key.tag = "tag:yaml.org,2002:str"
             value = self.construct_object(key)
             if value is not None and not isinstance(value, (str, bool, int, float, date, datetime)):
                 raise ValueError("unsupported YAML mapping key")
