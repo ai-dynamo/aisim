@@ -765,6 +765,30 @@ mod disaggregated_tests {
     use super::*;
 
     #[test]
+    fn aligned_state_role_rejects_kv_event_observation_only() {
+        let config: ReplayEngineConfig = serde_json::from_value(serde_json::json!({
+            "rank": {
+                "num_gpu_blocks": 8, "block_size": 64, "kv_cache_bytes_per_token": 16,
+                "state_cache": {"bytes_per_request": 1500}, "prefix_match_unit": 64,
+                "timing_model": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0}
+            }
+        }))
+        .unwrap();
+        for stage in [WorkerStage::Aggregated, WorkerStage::Prefill] {
+            let factory = ReplayEngineFactory::new();
+            assert!(factory.role_factory(&config, stage, false).is_ok());
+            let Err(error) = factory.role_factory(&config, stage, true) else {
+                panic!("aligned state must not export KV events");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("prefix_match_unit does not yet support KV event export")
+            );
+        }
+    }
+
+    #[test]
     fn gpu_accounting_rejects_zero_cp_and_overflow() {
         let mut config = ReplayEngineConfig {
             prefill_context_parallel_size: 0,

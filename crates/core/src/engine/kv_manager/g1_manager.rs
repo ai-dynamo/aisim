@@ -185,9 +185,15 @@ impl G1Manager {
         known_tokens: usize,
         cost: &PrefillCost,
         reserved_blocks: usize,
+        prefill_token_budget: usize,
     ) -> AllocationRequirement {
-        self.inner
-            .admission_requirement(lease, known_tokens, cost, reserved_blocks)
+        self.inner.admission_requirement(
+            lease,
+            known_tokens,
+            cost,
+            reserved_blocks,
+            prefill_token_budget,
+        )
     }
 
     pub(crate) fn resolve_prefill_cost(

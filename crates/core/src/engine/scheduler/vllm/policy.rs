@@ -108,6 +108,7 @@ pub(super) trait PolicySequence {
         kv_manager: &G1Manager,
         cost: &PrefillCost,
         reserved_blocks: usize,
+        prefill_token_budget: usize,
     ) -> AllocationRequirement;
 }
 
@@ -149,8 +150,15 @@ impl PolicySequence for RequestKvState {
         kv_manager: &G1Manager,
         cost: &PrefillCost,
         reserved_blocks: usize,
+        prefill_token_budget: usize,
     ) -> AllocationRequirement {
-        kv_manager.admission_requirement(&self.lease, self.len(), cost, reserved_blocks)
+        kv_manager.admission_requirement(
+            &self.lease,
+            self.len(),
+            cost,
+            reserved_blocks,
+            prefill_token_budget,
+        )
     }
 }
 
@@ -203,6 +211,7 @@ pub(super) struct WaitingAdmissionConfig {
     pub(super) num_gpu_blocks: usize,
     pub(super) block_size: usize,
     pub(super) mtp_enabled: bool,
+    pub(super) prefill_token_budget: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -372,6 +381,7 @@ pub(super) fn decide_waiting_admission_with_adjusted_cost<'a, S: PolicySequence 
         num_gpu_blocks,
         block_size,
         mtp_enabled: _,
+        prefill_token_budget,
     } = config;
 
     if is_fresh {
@@ -403,8 +413,12 @@ pub(super) fn decide_waiting_admission_with_adjusted_cost<'a, S: PolicySequence 
     };
     let needed = match policy {
         SchedulingPolicy::Vllm => {
-            match sequence.admission_requirement(kv_manager, &prefill_cost, reserved_request_blocks)
-            {
+            match sequence.admission_requirement(
+                kv_manager,
+                &prefill_cost,
+                reserved_request_blocks,
+                prefill_token_budget,
+            ) {
                 AllocationRequirement::Blocks(count) => count,
                 AllocationRequirement::Impossible => return AdmissionDecision::Reject,
             }

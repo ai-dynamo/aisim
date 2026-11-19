@@ -1621,6 +1621,8 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                 cache = worker.kv_cache
                 if not cache.prefix_caching:
                     raise ValueError("Mamba FPM cache requires the recorded prefix caching policy")
+                if engine.enable_chunked_prefill is False:
+                    raise ValueError("Mamba FPM cache requires engine.enable_chunked_prefill to be true")
                 if role != "aggregated" or cache.host_offload is not None or cache.g3_offload is not None:
                     raise ValueError("Mamba FPM cache supports aggregated HBM replay only")
                 if cache.capacity.type == "fixed" or cache.bytes_per_token != "auto" or cache.state_cache is not None:

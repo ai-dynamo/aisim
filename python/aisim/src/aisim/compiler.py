@@ -396,11 +396,20 @@ def _resolve_state_cache(
             "sliding_window_lookahead_tokens": size.get("sliding_window_lookahead_tokens"),
         }
     )
+    unit = cache.prefix_match_unit
+    if unit is None and cache.prefix_caching and "sliding_window_lookahead_tokens" not in size:
+        # vLLM runs a recurrent state in align mode whenever prefix caching is on.
+        unit = size["block_size"]
+    if unit is not None and cache.prefix_caching and engine.enable_chunked_prefill is False:
+        raise ValueError(
+            f"{role}: align mode (prefix_match_unit={unit}) requires engine.enable_chunked_prefill to be true"
+        )
     resolved = cache.model_copy(
         update={
             "state_cache": state,
             "block_size": size["block_size"],
             "bytes_per_token": size["kv_bytes_per_token"],
+            "prefix_match_unit": unit,
         }
     )
     return worker.model_copy(update={"kv_cache": resolved}), size

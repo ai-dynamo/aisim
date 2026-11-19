@@ -2047,9 +2047,12 @@ impl VllmCore {
         let remaining =
             policy::remaining_generation_tokens(&request.sequence, self.args.max_model_len);
         let (AllocationRequirement::Blocks(resumed), AllocationRequirement::Blocks(emitted)) = (
-            request
-                .sequence
-                .admission_requirement(&self.kv_manager, cost, 0),
+            request.sequence.admission_requirement(
+                &self.kv_manager,
+                cost,
+                0,
+                self.args.max_num_batched_tokens.unwrap_or(usize::MAX),
+            ),
             self.kv_manager.decode_requirement(
                 &request.sequence.lease,
                 request.sequence.len(),
@@ -2719,6 +2722,10 @@ impl VllmCore {
                                         num_gpu_blocks: self.args.num_gpu_blocks,
                                         block_size: self.args.block_size,
                                         mtp_enabled: self.eagle_block_drop(),
+                                        prefill_token_budget: self
+                                            .args
+                                            .max_num_batched_tokens
+                                            .unwrap_or(usize::MAX),
                                     },
                                     &request.sequence,
                                     is_fresh,

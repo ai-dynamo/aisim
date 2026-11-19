@@ -65,7 +65,7 @@ engine:
 | `workers.{aggregated,prefill}.host_profile` | Unset | fixed | `{path, frontend}` with `frontend` `python` (SGLang's default HTTP server with its `TokenizerManager`) or `rust` (the embedded Rust server, `SGLANG_RUST_SERVER=1`, whose Rust extensions are built from an SGLang source tree). Frontend stages from a host cost table written by `python -m aisim.vl.collect`; a relative `path` resolves against the working directory of `collect` and `predict` alike. The table describes SGLang's CPU image-processor path (`--image-processor-backend pil`); SGLang 0.5.19's default `auto` on a GPU host runs the fast torchvision processor on the serving GPU, which is not priced, so a deployment matches its table only when launched with that flag. No table is read or measured unless this field is set. Unavailable on a monolithic prefill companion of an AFD role. |
 | `workers.{aggregated,prefill}.vision.cache_mib` | `100` | fixed | Non-negative MiB; `0` disables the embedding cache. SGLang multimodal embedding cache (`SGLANG_VLM_CACHE_SIZE_MB`) for images encoded on the worker. AFD deployments reject `vision`, including on an ordinary companion. |
 | `workers.{aggregated,prefill}.vision.encoder_parallel` | `tp` | fixed | `tp` shards the vision tower over the tensor-parallel group; `dp` (`--mm-enable-dp-encoder`) replicates it and splits the images. Sets encoder timing, collectives and per-rank tower weights. Adds no ranks; see the four parallelism knobs under [Compatibility and scope](sglang-vl-host-loop.md#compatibility-and-scope). |
-| `engine.enable_chunked_prefill` | Backend default (on) | fixed | Boolean. Applies to aggregated and prefill roles; `false` is rejected for SGLang and for AFD. |
+| `engine.enable_chunked_prefill` | Backend default (on) | fixed | Boolean. Applies to aggregated and prefill roles; `false` is rejected for SGLang, AFD, recurrent prefix caching with a resolved `prefix_match_unit`, and FPM profiles with `cache_layout: mamba_align`. |
 
 In mixed AFD/monolithic prediction, the ordinary prefill companion can use
 `host_loop` and explicit `frontend` stages. A frontend's `measured_for` must match
@@ -217,6 +217,9 @@ With chunked prefill (the default), a long prompt is split across passes that
 each respect the token budget. With `enable_chunked_prefill: false` on vLLM, a
 prompt larger than `max_batched_tokens` can never be scheduled and the run
 fails. Keep `max_batched_tokens` at least as large as the longest prompt.
+Recurrent prefix caching with a resolved `prefix_match_unit` requires chunked
+prefill, including when the unit defaults to `block_size`; disabling it is
+rejected during compilation.
 
 SGLang checks the whole remaining prompt before admitting its first chunk.
 The check protects the matched prefix from eviction and reserves one page

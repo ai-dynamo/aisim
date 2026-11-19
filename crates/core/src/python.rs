@@ -3185,12 +3185,14 @@ fn afd_prefill_memory_tokens(
     u32::try_from(bound).context("AFD prefill memory bound exceeds u32 range")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_role_timing(
     role: &mut ReplayRoleConfig,
     capacity_is_explicit: bool,
     worker_type: ForwardPassWorkerType,
     prefill_input_bound: Option<usize>,
     capture_performance_diagnostics: bool,
+    capture_artifacts: bool,
     coverage_sources: &mut Vec<(ForwardPassWorkerType, Arc<ForwardPassPerfModel>)>,
     afd_memory: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(Option<Arc<dyn TimingModel>>, Option<serde_json::Value>)> {
@@ -3312,6 +3314,13 @@ fn resolve_role_timing(
     };
     if let Some(resources) = &resources {
         resources.require_memory()?;
+        // Mamba capacity materialization always sets prefix_match_unit, even
+        // if the caller left it unset. Reject artifacts before building timing.
+        ensure!(
+            !capture_artifacts
+                || resources.cache_layout != crate::perfmodel::fpm::FpmCacheLayout::MambaAlign,
+            "detailed replay artifacts require KV event export, which prefix_match_unit does not yet support"
+        );
     }
     let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
     if let Some(fitted) = timing.fitted() {
@@ -4758,6 +4767,15 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
         serde_json::from_value(spec.engine.clone())
             .context("invalid native engine descriptor in execution ReplaySpec")?
     };
+    if capture_artifacts {
+        // Detailed artifacts export native KV events. Reject before timing or
+        // engine construction for units already resolved by the caller or
+        // compiler. resolve_role_timing checks units from FPM resources.
+        ensure!(
+            engine_config.rank.prefix_match_unit.is_none(),
+            "detailed replay artifacts require KV event export, which prefix_match_unit does not yet support"
+        );
+    }
     if telemetry_sample_interval_ms.is_some() {
         ensure!(
             spec.encoder.is_none(),
@@ -4850,6 +4868,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ForwardPassWorkerType::Aggregated,
                 afd_prefill_input_bound,
                 capture_performance_diagnostics,
+                capture_artifacts,
                 &mut coverage_sources,
                 &mut afd_memory,
             )?;
@@ -4957,6 +4976,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ForwardPassWorkerType::Prefill,
                 afd_prefill_input_bound,
                 capture_performance_diagnostics,
+                capture_artifacts,
                 &mut coverage_sources,
                 &mut afd_memory,
             )?;
@@ -4966,6 +4986,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ForwardPassWorkerType::Decode,
                 afd_prefill_input_bound,
                 capture_performance_diagnostics,
+                capture_artifacts,
                 &mut coverage_sources,
                 &mut afd_memory,
             )?;
@@ -7405,6 +7426,7 @@ mod tests {
                 ForwardPassWorkerType::Decode,
                 None,
                 false,
+                false,
                 &mut Vec::new(),
                 &mut serde_json::Map::new(),
             )
@@ -8085,6 +8107,7 @@ mod tests {
                 ForwardPassWorkerType::Aggregated,
                 None,
                 false,
+                false,
                 &mut Vec::new(),
                 &mut serde_json::Map::new(),
             )
@@ -8141,6 +8164,7 @@ mod tests {
             false,
             ForwardPassWorkerType::Aggregated,
             None,
+            false,
             false,
             &mut Vec::new(),
             &mut serde_json::Map::new(),
@@ -8338,6 +8362,7 @@ mod tests {
                 false,
                 ForwardPassWorkerType::Aggregated,
                 None,
+                false,
                 false,
                 &mut Vec::new(),
                 &mut serde_json::Map::new(),
@@ -8576,6 +8601,7 @@ mod tests {
                     true,
                     ForwardPassWorkerType::Aggregated,
                     None,
+                    false,
                     false,
                     &mut Vec::new(),
                     &mut serde_json::Map::new(),
