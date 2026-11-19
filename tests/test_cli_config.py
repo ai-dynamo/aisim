@@ -11,7 +11,7 @@ import yaml
 from pydantic import ValidationError
 
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
-from aisim.config.common import split_config_sections
+from aisim.config.common import load_config_with_text, split_config_sections
 from aisim.config.engine import (
     EngineRecommendationConfig,
     EstimatorPolicyConfig,
@@ -34,6 +34,137 @@ def _engine() -> dict:
         "hardware": "h200_sxm",
         "workers": {"aggregated": {}},
     }
+
+
+@pytest.mark.parametrize(
+    "filename", ["input.json", "input.JSON", ".json", ".JSON", "input.yaml", "input.yml", "input", "input.conf"]
+)
+@pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
+@pytest.mark.parametrize("sla", [{"ttft_ms": 1e-7, "itl_ms": 1e-6}, {"e2e_ms": 1e21}])
+def test_config_file_formats_preserve_numeric_slas(tmp_path, filename, config_type, sla):
+    from aisim.cli_args import _load_mapping
+
+    raw = {"engine": {**_engine(), "mode": "aggregated"}, "evaluation": {"sla": sla}}
+    if config_type is CoreRecommendationConfig:
+        raw["optimization"] = {"target": "throughput"}
+    path = tmp_path / filename
+    serialize = json.dumps if filename.lower().endswith(".json") else yaml.safe_dump
+    path.write_text(serialize(raw), encoding="utf-8")
+
+    expected = config_type.model_validate(raw)
+    assert config_type.from_yaml(path) == expected
+    assert config_type.model_validate(_load_mapping(str(path))) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ('{"engine":', "malformed JSON"),
+        ('{"engine": {},}', "malformed JSON"),
+        ("engine: {}", "malformed JSON"),
+        ("[]", "must contain one JSON object"),
+        ("null", "must contain one JSON object"),
+        ('"config"', "must contain one JSON object"),
+        ('{"value": NaN}', "NaN is not a valid JSON number"),
+        ('{"value": Infinity}', "Infinity is not a valid JSON number"),
+        ('{"value": -Infinity}', "-Infinity is not a valid JSON number"),
+    ],
+)
+def test_json_config_rejects_invalid_documents_with_filename(tmp_path, text, message):
+    from aisim.cli_args import _load_mapping
+
+    path = tmp_path / "bad.json"
+    path.write_text(text, encoding="utf-8")
+    for load in (load_config_with_text, _load_mapping):
+        with pytest.raises(ValueError, match=message) as error:
+            load(str(path))
+        assert str(path) in str(error.value)
+
+
+def test_yaml_parser_keeps_legacy_scalar_and_alias_semantics(tmp_path):
+    path = tmp_path / "input.yaml"
+    path.write_text("a: &value {tiny: 1e-7, numeric: 1.0e-7, enabled: yes}\nb: *value\n")
+    raw, text = load_config_with_text(path)
+    assert raw["a"] == {"tiny": "1e-7", "numeric": 1e-7, "enabled": True}
+    assert raw["b"] is raw["a"]
+    assert text == path.read_text()
+
+
+@pytest.mark.parametrize("filename", ["input.json", "input.JSON", "input.yaml"])
+def test_yaml_only_helpers_ignore_filename_extension(tmp_path, filename):
+    from aisim.config.common import load_yaml, load_yaml_with_text
+
+    path = tmp_path / filename
+    text = "tiny: 1e-7\nnumeric: 1.0e-7\nenabled: yes\n"
+    path.write_text(text, encoding="utf-8")
+    expected = {"tiny": "1e-7", "numeric": 1e-7, "enabled": True}
+    assert load_yaml(path) == expected
+    assert load_yaml_with_text(path) == (expected, text)
+
+
+@pytest.mark.parametrize("value", ['"1e-7"', "true", "1e999"])
+@pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
+def test_json_config_keeps_numeric_field_validation(tmp_path, value, config_type):
+    from aisim.cli_args import _load_mapping
+
+    raw = {"engine": {**_engine(), "mode": "aggregated"}}
+    if config_type is CoreRecommendationConfig:
+        raw["optimization"] = {"target": "throughput"}
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(raw)[:-1] + ', "evaluation": {"sla": {"ttft_ms": ' + value + "}}}")
+    with pytest.raises(ValidationError, match="ttft_ms"):
+        config_type.from_yaml(path)
+    with pytest.raises(ValidationError, match="ttft_ms"):
+        config_type.model_validate(_load_mapping(str(path)))
+
+
+@pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
+def test_json_config_preserves_perf_model_paths_and_repeated_key_checks(tmp_path, config_type):
+    from aisim.cli_args import _load_mapping
+
+    raw = {"engine": {**_engine(), "mode": "aggregated", "ais_perf_model": {"systems_paths": ["profiles"]}}}
+    if config_type is CoreRecommendationConfig:
+        raw["optimization"] = {"target": "throughput"}
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(raw))
+    assert config_type.from_yaml(path).engine.systems_paths == [str(tmp_path / "profiles")]
+
+    path.write_text('{"engine": {"ais_perf_model": {"systems_paths": [], "systems_paths": []}}}')
+    for load in (config_type.from_yaml, _load_mapping):
+        with pytest.raises(ValueError, match="systems_paths"):
+            load(str(path))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"engine": {"ais_perf_model": null}, "engine": {}}',
+        '{"engine": {"ais_perf_model": {}, "ais_perf_model": {}}}',
+        '{"engine": {"model": "\u007f\u0080\u009f\ufffe", '
+        '"ais_perf_model": {"systems_paths": [], "systems_paths": []}}}',
+        '{"engine": {"ais_perf_model": [{"estimator_config": {"\U0001f600": 1, "\\ud83d\\ude00": 2}}]}}',
+    ],
+)
+def test_json_repeated_perf_model_keys_use_json_string_semantics(tmp_path, text):
+    from aisim.cli_args import _load_mapping
+
+    path = tmp_path / "input.json"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="written twice"):
+        _load_mapping(str(path))
+
+
+def test_json_distinct_unicode_keys_and_unrelated_repeats_remain_valid(tmp_path):
+    from aisim.cli_args import _load_mapping
+
+    path = tmp_path / "input.json"
+    path.write_text(
+        '{"extra": 1, "extra": 2, "engine": {"ais_perf_model": {"estimator_config": {"a\u0085b": 1, "a b": 2}}}}',
+        encoding="utf-8",
+    )
+    raw = _load_mapping(str(path))
+    assert raw["extra"] == 2
+    assert raw["engine"]["ais_perf_model"]["estimator_config"] == {"a\u0085b": 1, "a b": 2}
 
 
 @pytest.mark.parametrize("config_type", [CorePredictionConfig, EngineRecommendationConfig])

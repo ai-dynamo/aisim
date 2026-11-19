@@ -6,8 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 # Sweeper Python SDK
 
 Use the public `Sweeper` execution interface with an explicit runner factory.
-`SmartSearchConfig` is the SDK schema. Do not pass its YAML directly to
+`SmartSearchConfig` is the SDK schema. Do not pass its configuration directly to
 `aisim recommend`, which accepts the [public CLI schema](../reference/configuration.md).
+
+`SmartSearchConfig.from_yaml()` accepts YAML or JSON: filenames ending in
+`.json` (case insensitive) use JSON parsing, while other filenames use YAML.
+Scientific-notation JSON numbers remain numeric; both formats use the same SDK schema.
 
 ## Execute a built-in engine sweep
 

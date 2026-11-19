@@ -13,6 +13,27 @@ distributed with those packages.
 Unless otherwise stated, AISim file paths in this document are relative
 to `python/aisim/` in the repository source tree.
 
+## NVIDIA Agent Skills CI request workflow
+
+The repository-root `.github/workflows/request-nvskills-ci.yml` is a modified
+copy of `.github/workflows/request-nvskills-ci.yml` in NVIDIA/skills at immutable
+commit `bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f`.
+
+Upstream source:
+https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/.github/workflows/request-nvskills-ci.yml
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under Apache-2.0, as specified for source code in the upstream README.
+Upstream license:
+https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/LICENSE-APACHE
+
+The full Apache-2.0 license text is included here as `LICENSE`. The pinned
+upstream source has no separate NOTICE file on this workflow's ancestor paths.
+Modified for AISim by adding SPDX/provenance headers and pinning the reusable
+workflow reference to the same immutable commit instead of `main`, and by
+disabling default token permissions while retaining the request job's explicit
+read scopes.
+
 ## SGLang v0.5.22 HiCache residency and merged backups
 
 The merged backup submission in repository-root
@@ -2649,3 +2670,22 @@ https://github.com/vllm-project/vllm/blob/43b4aaea3e40e20ef53ce2bfecfa1b72060bf2
 
 These are modified Rust simulation adaptations; no upstream source file is
 vendored.
+
+## AIConfigurator PR #1613 migration
+
+The following repository-root paths contain modified adaptations of the
+AIConfigurator contribution at immutable commit `d1fe4661bca3af24daab50300f196f6d9ff75d1f`:
+
+- `docs/perf-model/extending.md` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6d9ff75d1f/docs/add_a_new_model.md
+- `python/aisim/src/aisim_core/sdk/operations/README.md` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6d9ff75d1f/docs/add_a_new_model.md
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The contribution was submitted by xinjun.jiang. Licensed under Apache-2.0;
+the license text is included in the repository and Python distribution.
+Upstream license:
+https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6d9ff75d1f/LICENSE
+
+Modified for AISim's current layout and contracts; source links are
+preserved beside the adapted content.

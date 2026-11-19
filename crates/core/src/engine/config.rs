@@ -1596,8 +1596,16 @@ impl EngineConfig {
     /// holds the full prompt of `max_model_len` plus the state blocks of one
     /// request, summed per group as vLLM's startup check does (v0.31
     /// `kv_cache_utils.py:938-942`, v0.32 `:1043-1047`, v0.33
-    /// `kv_cache_planning.py:90-94`).
+    /// `kv_cache_planning.py:90-94`). The preemption order is vLLM's: under
+    /// the `fcfs` policy the victim is the last running request (v0.31
+    /// `scheduler.py:771`, `:803`, v0.32 `:802`, `:834`, v0.33 `:938`,
+    /// `:970`), and no vLLM policy takes the first running request by
+    /// position.
     fn validate_grouped_prefix_caching(&self) -> Result<()> {
+        ensure!(
+            self.preemption_mode == PreemptionMode::Lifo,
+            "kv_cache_groups with enable_prefix_caching=true follow vLLM's preemption order, which preempts the last running request; set preemption_mode=lifo"
+        );
         let groups = &self.kv_cache_groups;
         ensure!(
             groups.iter().all(|group| group.prefix_cacheable.is_some()),
@@ -3175,6 +3183,35 @@ mod tests {
                 .get("vllm_version")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn grouped_prefix_caching_refuses_fifo_preemption() {
+        // Only grouped prefix caching follows vLLM's preemption order. A
+        // grouped rank without prefix caching and a linear rank keep `fifo`.
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
+            let mut fifo = glm_prefix_wire(Some(version), Some(0));
+            fifo["preemption_mode"] = "fifo".into();
+            assert_eq!(
+                validation_error(fifo),
+                "kv_cache_groups with enable_prefix_caching=true follow vLLM's preemption order, which preempts the last running request; set preemption_mode=lifo",
+                "{version}"
+            );
+            let mut lifo = glm_prefix_wire(Some(version), Some(0));
+            lifo["preemption_mode"] = "lifo".into();
+            validates(lifo);
+        }
+        let mut byte_mode = glm_prefix_wire(Some("0.31.0"), None);
+        byte_mode["enable_prefix_caching"] = false.into();
+        byte_mode
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_match_unit");
+        byte_mode["preemption_mode"] = "fifo".into();
+        validates(byte_mode);
+        validates(serde_json::json!({
+            "backend": "vllm", "enable_prefix_caching": true, "preemption_mode": "fifo"
+        }));
     }
 
     #[test]
