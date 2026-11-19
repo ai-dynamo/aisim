@@ -3,6 +3,7 @@
 
 """Collector metadata intake through the real SDK downloader and an isolated cache."""
 
+import hashlib
 import io
 import json
 
@@ -56,6 +57,7 @@ def test_collector_offline_config_snapshot(monkeypatch, hub_cache, with_quant):
 
     resolved = load_model_config(_MODEL)
     assert resolved.source_kind == "huggingface"
+    assert resolved.source_reference == f"{_MODEL}@{_COMMIT}"
     assert resolved.payload["hidden_size"] == 1024
     assert resolved.payload.get("hf_quant_config") == (_QUANT if with_quant else None)
 
@@ -79,6 +81,7 @@ def test_collector_config_fallback_pins_quant_request(monkeypatch, hub_cache, qu
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
     resolved = load_model_config(_MODEL)
+    assert resolved.source_reference == f"{_MODEL}@{_COMMIT}"
     assert resolved.payload["hidden_size"] == 1024
     assert resolved.payload["hf_quant_config"] == _QUANT
     assert requested == [f"https://huggingface.co/{_MODEL}/raw/main/config.json"] + (
@@ -124,3 +127,31 @@ def test_collector_does_not_read_quant_from_another_cached_snapshot(monkeypatch,
     resolved = load_model_config(_MODEL)
     assert resolved.payload == _CONFIG
     assert requested[-1] == f"https://huggingface.co/{_MODEL}/raw/{_COMMIT}/hf_quant_config.json"
+
+
+def test_collector_retains_snapshot_identity_without_changing_payload_hash(monkeypatch, hub_cache):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    hub_cache("config.json", _CONFIG)
+    first = load_model_config(_MODEL)
+    hub_cache("config.json", _CONFIG, commit="b" * 40)
+    second = load_model_config(_MODEL)
+
+    assert first.source_reference == f"{_MODEL}@{_COMMIT}"
+    assert second.source_reference == f"{_MODEL}@{'b' * 40}"
+    assert first.payload == second.payload == _CONFIG
+    expected = hashlib.sha256(json.dumps(_CONFIG, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert first.sha256 == second.sha256 == expected
+
+
+def test_collector_network_config_does_not_invent_a_snapshot(monkeypatch, hub_cache):
+    hub_cache("config.json", _CONFIG)
+
+    def fetch(request, *, timeout):
+        if request.full_url.endswith("/main/config.json"):
+            return io.BytesIO(json.dumps(_CONFIG).encode())
+        raise utils.urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
+    resolved = load_model_config(_MODEL)
+    assert resolved.source_reference == _MODEL
+    assert resolved.payload == _CONFIG

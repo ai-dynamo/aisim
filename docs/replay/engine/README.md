@@ -113,16 +113,20 @@ Field tables on these pages use the following columns:
 | `engine.tokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Tokenizes each request on its worker before the engine; see [Request tokenization](#tokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and SGLang frontend stages (which already price the tokenizer) are rejected. |
 | `engine.detokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_output_us` (finite and non-negative, default `0`). Detokenizes each pass's outputs on the worker that emits tokens before the client receives them; see [Response detokenization](#detokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and `traffic.load.agentic_profile` are rejected. |
 
-<a id="tokenization"></a>
-
 For a cached config, the SDK and FPM Collector read `hf_quant_config.json` at
 that config's snapshot commit. A successful network config is never replaced
 with an older cached config when its quantization request fails: an unverified
 cached sidecar raises an error. To retry offline, first cache `config.json` and
-any needed quantization or processor files from the same revision, then set
-`HF_HUB_OFFLINE=1`; alternatively, supply a local model directory. Replay's
-`engine.model` takes an ID or directory; the separate FPM profile field
-`profile.model_revision` supports an explicit revision pin.
+any needed quantization or processor files under `main` (for example,
+`hf download org/model config.json --revision main`),
+then set `HF_HUB_OFFLINE=1`. An unpinned `engine.model: org/model` needs the
+cache's `refs/main`; downloading only with `--revision <commit>` does not create
+that ref. For an exact commit, cache all required files at that commit and set
+`engine.model` to its local snapshot directory, or supply another local model
+directory. Replay's `engine.model` takes an ID or directory; the separate FPM
+profile field `profile.model_revision` supports an explicit revision pin.
+
+<a id="tokenization"></a>
 
 ## Request tokenization
 

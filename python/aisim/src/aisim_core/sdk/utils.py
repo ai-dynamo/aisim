@@ -21,8 +21,10 @@ import re
 import stat
 import tempfile
 import urllib.request
-from functools import cache
+from collections import namedtuple
+from functools import cache, wraps
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote
 
 import yaml
@@ -452,7 +454,7 @@ def _hf_offline_variable() -> str | None:
 def _hf_hub_cache() -> Path:
     """Locate the Hugging Face hub cache with the same precedence as huggingface_hub."""
     for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
-        if configured := os.environ.get(name):
+        if (configured := os.environ.get(name)) is not None:
             return Path(os.path.expandvars(configured)).expanduser()
     default_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
     return Path(os.path.expandvars(str(os.environ.get("HF_HOME", default_home)))).expanduser() / "hub"
@@ -541,7 +543,7 @@ def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[d
     logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
     try:
         # Match the network JSON decoder, including quoted NaN/Infinity text.
-        with path.open(encoding="utf-8") as handle:
+        with path.open("rb") as handle:
             data = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: {error}") from error
@@ -626,7 +628,13 @@ def _download_hf_json_at(
         )
     url = f"https://huggingface.co/{hf_id}/raw/{quote(revision, safe='')}/{filename}"
     try:
-        req = urllib.request.Request(url, headers=_get_hf_auth_headers())
+        headers = _get_hf_auth_headers()
+    except (OSError, UnicodeError) as error:
+        raise HuggingFaceDownloadError(
+            f"Cannot read the Hugging Face token for {hf_id}'s {filename}: {error}"
+        ) from error
+    try:
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.load(response), None
     except urllib.error.HTTPError as e:
@@ -2195,12 +2203,12 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revisi
     else:
         processor_config = _download_hf_companion_json(model_path, "preprocessor_config.json", revision=revision)
     if processor_config is not None:
-        raw_config["image_processor_config"] = processor_config
+        raw_config = {**raw_config, "image_processor_config": processor_config}
     return raw_config
 
 
 def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, revision: str = "main") -> dict:
-    """Finish processor I/O before memoizing a raw config, so failed loads can retry."""
+    """Load processor metadata for parsing without modifying the cached base config."""
     architecture = (raw_config.get("architectures") or [None])[0]
     kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
     qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
@@ -2229,10 +2237,54 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
     return raw_config
 
 
-@cache
+def _cache_raw_model_config(load):
+    """Memoize base configs with per-model eviction for a failed parsed load."""
+    entries = {}
+    hits = misses = 0
+    lock = Lock()
+    info = namedtuple("CacheInfo", "hits misses maxsize currsize")
+
+    @wraps(load)
+    def cached(model_path):
+        nonlocal hits, misses
+        with lock:
+            if model_path in entries:
+                hits += 1
+                return entries[model_path]
+            misses += 1
+        config = load(model_path)
+        with lock:
+            entries[model_path] = config
+        return config
+
+    def clear():
+        nonlocal hits, misses
+        with lock:
+            entries.clear()
+            hits = misses = 0
+
+    def invalidate(model_path, config):
+        with lock:
+            # A concurrent successful load must not be evicted by an older failure.
+            if entries.get(model_path) is config:
+                del entries[model_path]
+
+    def cache_info():
+        with lock:
+            return info(hits, misses, None, len(entries))
+
+    cached.cache_clear = clear
+    cached.cache_invalidate = invalidate
+    cached.cache_info = cache_info
+    return cached
+
+
+@_cache_raw_model_config
 def _load_model_config_from_model_path(model_path: str) -> dict:
     """
-    Get model configuration from model path.
+    Get base and quantization configuration without reading separate processor files.
+
+    Processor metadata is loaded and validated by ``get_model_config_from_model_path``.
 
     The model_path can be:
     1. A HuggingFace model path (e.g., "Qwen/Qwen3-32B")
@@ -2250,13 +2302,12 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     """
     # Check if it's a local path
     if os.path.isdir(model_path):
-        config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
-        config = _attach_multimodal_processor_config(config, model_path)
+        config = _load_local_config(model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
-        config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
+        config = _load_pre_downloaded_hf_config(model_path)
         return _attach_inferred_quant_fields(
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
@@ -2269,21 +2320,15 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
         # transient failure cannot pair cached dimensions with newer remote metadata.
         commit = capture.get((model_path, "config.json"))
         pinned = {"revision": commit} if commit else {}
-        try:
-            hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
-        except _HuggingFaceCacheError:
-            raise
-        except Exception as exc:  # best-effort for optional quant config
-            logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-            hf_quant_config = None
+        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
+        if hf_quant_config is None:
+            logger.debug("No optional hf_quant_config.json for %s", model_path)
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
     _check_hf_companion_snapshot(
         model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
     )
-    config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
-    config = _attach_multimodal_processor_config(config, model_path, **pinned)
-    loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+    loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(raw_config, hf_quant_config))
     if commit:
         _CONFIG_PROVENANCE[id(loaded)] = (loaded, commit)
     return loaded
@@ -2302,7 +2347,22 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         Quantization metadata retains its original root or text_config scope.
     """
     raw_config = _load_model_config_from_model_path(model_path)
-    parsed = _parse_hf_config_json(raw_config)
+    base_config = raw_config
+    commit = _config_snapshot_commit(raw_config)
+    pinned = {"revision": commit} if commit else {}
+    try:
+        raw_config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
+        raw_config = _attach_multimodal_processor_config(raw_config, model_path, **pinned)
+        parsed = _parse_hf_config_json(raw_config)
+    except Exception:
+        # A retry may repair processor files or select an offline snapshot. The
+        # raw cache must not keep the base from the failed attempt in that case.
+        # Keep other models' base metadata paired with their parsed cache entries.
+        _load_model_config_from_model_path.cache_invalidate(model_path, base_config)
+        _CONFIG_PROVENANCE.pop(id(base_config), None)
+        raise
+    if commit:
+        _CONFIG_PROVENANCE[id(raw_config)] = (raw_config, commit)
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))
         logger.warning(

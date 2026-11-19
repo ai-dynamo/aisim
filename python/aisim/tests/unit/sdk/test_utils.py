@@ -63,7 +63,7 @@ def hf_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
 
     def no_network(request, *, timeout):
-        raise AssertionError(f"unexpected network access: {request.full_url}")
+        pytest.fail(f"unexpected network access: {request.full_url}")
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", no_network)
     return cache
@@ -387,6 +387,8 @@ def test_pinned_profile_consumer_reports_offline_miss_and_loads_cached_config(mo
     metadata = {"architectures": ["LlamaForCausalLM"], "hidden_size": 1024}
     _cache_file(hf_cache, model, "config.json", metadata, commit=commit)
     try:
+        profile.architecture = "LlamaForCausalLM"
+        fpm_profile._validate_checkpoint_architecture(profile)
         assert fpm_profile._load_pinned_checkpoint_config(model, commit) == metadata
     finally:
         fpm_profile._load_pinned_checkpoint_config.cache_clear()
@@ -505,6 +507,20 @@ def test_hub_cache_location_follows_huggingface_hub_precedence(monkeypatch, tmp_
     assert utils._hf_hub_cache() == tmp_path / expected
 
 
+@pytest.mark.parametrize("setting", ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"])
+def test_empty_hub_cache_override_uses_working_directory(monkeypatch, hf_cache, setting):
+    _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
+    monkeypatch.chdir(hf_cache)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(hf_cache / "legacy"))
+    monkeypatch.setenv("HF_HOME", str(hf_cache / "home"))
+    monkeypatch.setenv(setting, "")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    assert utils._hf_hub_cache() == Path(".")
+    assert utils._download_hf_json("org/model", "config.json") == {"cached": True}
+
+
 @pytest.mark.parametrize("setting", ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"])
 def test_offline_cache_expands_environment_variables(monkeypatch, hf_cache, setting):
     _cache_file(hf_cache, "org/model", "config.json", {"cached": True})
@@ -567,6 +583,20 @@ def test_cached_json_preserves_quoted_nan_and_infinity_like_network(monkeypatch,
     online = utils._download_hf_json("org/model", "config.json")
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     assert utils._download_hf_json("org/model", "config.json") == online == payload
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
+def test_cached_json_decodes_the_same_bytes_as_network(monkeypatch, hf_cache, encoding):
+    payload = {"architectures": ["LlamaForCausalLM"], "note": "\u00e9"}
+    _cache_file(hf_cache, "org/model", "config.json", payload)
+    contents = json.dumps(payload, ensure_ascii=False).encode(encoding)
+    path = hf_cache / "models--org--model" / "snapshots" / ("c" * 40) / "config.json"
+    path.write_bytes(contents)
+    monkeypatch.setattr(utils.urllib.request, "urlopen", lambda request, *, timeout: io.BytesIO(contents))
+
+    assert utils._download_hf_json("org/model", "config.json") == payload
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert utils._download_hf_json("org/model", "config.json") == payload
 
 
 def test_local_nonfinite_json_normalization_preserves_strings(tmp_path):
@@ -646,6 +676,110 @@ def test_kimi_video_limits_follow_pinned_processor_through_real_parser(monkeypat
 
 def _http_error(code, reason):
     return utils.urllib.error.HTTPError("https://huggingface.co/x", code, reason, {}, None)
+
+
+@pytest.mark.parametrize("failure", ["server", "network", "auth"])
+def test_failed_quant_sidecar_is_not_absence_and_can_retry(monkeypatch, hf_cache, failure):
+    model = f"org/quant-sidecar-failure-{failure}"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    quant = {"quantization": {"quant_algo": "FP8"}}
+    recovered = False
+    requests = []
+
+    def remote(request, *, timeout):
+        requests.append(request.full_url)
+        if request.full_url.endswith("/config.json"):
+            return io.BytesIO(json.dumps(config).encode())
+        if not recovered:
+            if failure == "network":
+                raise utils.urllib.error.URLError("transient")
+            raise _http_error(503 if failure == "server" else 403, "unavailable")
+        return io.BytesIO(json.dumps(quant).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        with pytest.raises(utils.HuggingFaceDownloadError):
+            utils.get_model_config_from_model_path(model)
+        recovered = True
+        loaded = utils.get_model_config_from_model_path(model)
+        assert loaded["raw_config"]["hf_quant_config"] == quant
+        assert loaded["raw_config"]["quant_algo"] == "fp8"
+        assert len(requests) == 4
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen3VLForConditionalGeneration", "KimiK25ForConditionalGeneration", "Llama4ForConditionalGeneration"],
+)
+def test_raw_config_and_quant_consumer_do_not_fetch_processors(monkeypatch, hf_cache, architecture):
+    from aisim.generator.utils import _bundled_quantization
+
+    model = f"org/base-only-{architecture}"
+    config = {"architectures": [architecture], "hidden_size": 1024}
+    quant = {"quantization": {"quant_algo": "FP8"}}
+    requests = []
+
+    def remote(request, *, timeout):
+        requests.append(request.full_url)
+        if request.full_url.endswith("/config.json"):
+            return io.BytesIO(json.dumps(config).encode())
+        if request.full_url.endswith("/hf_quant_config.json"):
+            return io.BytesIO(json.dumps(quant).encode())
+        raise _http_error(503, "processor unavailable")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        raw = utils._load_model_config_from_model_path(model)
+        assert raw["hidden_size"] == 1024
+        assert raw["hf_quant_config"] == quant
+        assert raw["quant_algo"] == "fp8"
+        assert _bundled_quantization(model)["quant_algo"] == "FP8"
+        assert len(requests) == 2
+        with pytest.raises(utils.HuggingFaceDownloadError, match="processor unavailable"):
+            utils.get_model_config_from_model_path(model)
+        assert requests[-1].endswith("/preprocessor_config.json")
+        assert "preprocessor_config" not in raw
+        assert "image_processor_config" not in raw
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_repaired_processor_retries_through_real_parser(monkeypatch, hf_cache, tmp_path, local):
+    model = str(tmp_path / "qwen") if local else "org/repaired-processor"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    processor = {"min_pixels": True, "max_pixels": 16777216}
+    if local:
+        Path(model).mkdir()
+        (Path(model) / "config.json").write_text(json.dumps(config))
+        path = Path(model) / "preprocessor_config.json"
+    else:
+        _cache_file(hf_cache, model, "config.json", config)
+        _cache_file(hf_cache, model, "preprocessor_config.json", processor)
+        path = hf_cache / "models--org--repaired-processor" / "snapshots" / ("c" * 40) / "preprocessor_config.json"
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    path.write_text(json.dumps(processor))
+    stable_model = tmp_path / "stable-model"
+    stable_model.mkdir()
+    (stable_model / "config.json").write_text('{"architectures": ["LlamaForCausalLM"]}')
+    stable_config = utils._load_model_config_from_model_path(str(stable_model))
+    try:
+        with pytest.raises(ValueError, match="pixel budget must be positive integers"):
+            utils.get_model_config_from_model_path(model)
+        assert utils._load_model_config_from_model_path(str(stable_model)) is stable_config
+        path.write_text(json.dumps({**processor, "min_pixels": 65536}))
+        loaded = utils.get_model_config_from_model_path(model)
+        assert loaded["raw_config"]["preprocessor_config"]["min_pixels"] == 65536
+        assert (loaded["extra_params"].min_pixels, loaded["extra_params"].max_pixels) == (65536, 16777216)
+        assert utils.get_model_config_from_model_path(model) is loaded
+        assert "preprocessor_config" not in utils._load_model_config_from_model_path(model)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
 
 
 @pytest.mark.parametrize("code,reason", [(429, "Too Many Requests"), (500, "Server Error"), (503, "Unavailable")])
@@ -752,6 +886,36 @@ def test_hf_metadata_can_disable_implicit_credentials(monkeypatch, tmp_path):
     assert token.read_text() == "cached-token"
     monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN")
     assert utils._get_hf_auth_headers() == {"Authorization": "Bearer environment-token"}
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize(
+    "failure", [PermissionError("token file denied"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")]
+)
+def test_token_read_error_is_not_a_network_failure(monkeypatch, tmp_path, caplog, cached, failure):
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HUB_DISABLE_IMPLICIT_TOKEN", *utils._OFFLINE_VARIABLES):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    token_path = tmp_path / "unreadable-token"
+    monkeypatch.setenv("HF_TOKEN_PATH", str(token_path))
+    if cached:
+        _cache_file(tmp_path, "org/model", "config.json", {"cached": True})
+    real_read = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path == token_path:
+            raise failure
+        return real_read(path, *args, **kwargs)
+
+    def no_network(request, *, timeout):
+        pytest.fail(f"token read failure must precede network access: {request.full_url}")
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(utils.urllib.request, "urlopen", no_network)
+    with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot read the Hugging Face token") as error:
+        utils._download_hf_json("org/model", "config.json")
+    assert error.value.__cause__ is failure
+    assert "using the cached copy" not in caplog.text
 
 
 class TestParseHFConfig:

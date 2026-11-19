@@ -256,7 +256,7 @@ def _download_model_config(model_path: str) -> ResolvedModelConfig:
     return ResolvedModelConfig(
         payload,
         source_kind="huggingface",
-        source_reference=model_path,
+        source_reference=f"{model_path}@{commit}" if commit else model_path,
     )
 
 

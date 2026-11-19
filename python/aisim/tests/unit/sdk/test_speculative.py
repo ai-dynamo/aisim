@@ -197,6 +197,40 @@ class TestResolveDsparkNextn:
         assert "some/model" in caplog.text
         assert "network error" in caplog.text
 
+    @pytest.mark.parametrize("offline", [False, True])
+    @pytest.mark.parametrize("contents", ["{broken", "[]"])
+    def test_corrupt_cached_config_propagates(self, monkeypatch, tmp_path, offline, contents):
+        from aisim_core.sdk import utils
+        from aisim_core.sdk.config_builders import resolve_dspark_nextn
+
+        model = "org/corrupt-kimi-k3"
+        repo = tmp_path / "models--org--corrupt-kimi-k3"
+        commit = "c" * 40
+        snapshot = repo / "snapshots" / commit
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(contents)
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text(commit)
+        for name in utils._OFFLINE_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+        monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
+        if offline:
+            monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+        def unavailable(request, *, timeout):
+            if offline:
+                pytest.fail(f"unexpected offline request: {request.full_url}")
+            raise utils.urllib.error.URLError("transient")
+
+        monkeypatch.setattr(utils.urllib.request, "urlopen", unavailable)
+        try:
+            with pytest.raises(utils._HuggingFaceCacheError, match="Invalid cached config.json"):
+                resolve_dspark_nextn(model)
+        finally:
+            utils._load_model_config_from_model_path.cache_clear()
+            utils.get_model_config_from_model_path.cache_clear()
+
     def test_unexpected_failure_propagates(self, monkeypatch):
         from aisim_core.sdk.config_builders import resolve_dspark_nextn
 
