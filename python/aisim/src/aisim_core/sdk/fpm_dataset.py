@@ -147,8 +147,9 @@ def _profile_files(entry: dict) -> list[dict]:
     if packaged_system is not None:
         if not isinstance(packaged_system, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", packaged_system):
             raise ValueError("packaged_system must name an installed system")
-        if f"{packaged_system}.yaml" in targets:
-            raise ValueError("packaged_system must not replace a dataset system YAML")
+        generated = f"{packaged_system}.yaml"  # materialization writes this file, so no target may be it or below it
+        if any(generated == target or generated in map(str, PurePosixPath(target).parents) for target in targets):
+            raise ValueError("packaged_system must not replace a dataset system YAML or contain a target")
     parquets = {target for target in targets if target.endswith("/fpm_forward_perf.parquet")}
     if not parquets or (packaged_system is None and not any(target.endswith(".yaml") for target in targets)):
         raise ValueError("FPM profile requires a system YAML and a parquet table")

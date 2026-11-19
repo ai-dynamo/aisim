@@ -268,7 +268,7 @@ def test_copied_system_yaml_is_verified_on_cache_reuse(dataset, packaged_dataset
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("mutation", ["missing", "escape", "collision"])
+@pytest.mark.parametrize("mutation", ["missing", "escape", "collision", "nested"])
 def test_invalid_packaged_system_fails_before_download(dataset, packaged_dataset, tmp_path, mutation):
     path, manifest, bodies, calls, cache = dataset
     source = packaged_dataset / "gb300.yaml"
@@ -279,16 +279,16 @@ def test_invalid_packaged_system_fails_before_download(dataset, packaged_dataset
         outside.write_bytes(bodies["gb300.yaml"])
         source.unlink()
         source.symlink_to(outside)
-    else:
+    else:  # a target equal to, or beneath, the YAML that materialization writes from the installed system
         manifest["profiles"]["gb300-full"]["files"].append(
             {
                 "path": "archive/gb300.yaml",
-                "target": "gb300.yaml",
+                "target": "gb300.yaml" if mutation == "collision" else "gb300.yaml/extra",
                 "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             }
         )
         path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="packaged_system" if mutation in {"collision", "nested"} else None):
         fpm_dataset.materialize_fpm_profile(path, "gb300-full", cache_dir=cache)
     assert not calls
     assert not cache.exists()
