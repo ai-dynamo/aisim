@@ -36,7 +36,7 @@ from aisim_core.data.fpm_library import (
 )
 from aisim_core.data.loaders import FpmLoader, LoaderError
 from aisim_core.data.schemas import SCHEMA_MODELS, check_snapshots, render_snapshot
-from aisim_core.sdk import RustForwardPassPerfModel, engine
+from aisim_core.sdk import RustForwardPassPerfModel, engine, memory
 from aisim_core.sdk.fpm_profile import _require_forward_pass_profile_memory, load_fpm_profile
 from tests.unit.sdk.test_fpm_profile import (  # noqa: F401
     _fail_graph,
@@ -379,8 +379,74 @@ def test_draft_profile_keeps_pending_resources_until_required(root, profile, tmp
     assert data.config["fpm_profile"] == config["fpm_profile"]
     assert "cache_layout" in data.memory_pending
     assert Path(data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"]).is_file()
+    # The synthetic table has a measured-shaped prefill cell at one request/one token with latency 2 ms.
+    model = RustForwardPassPerfModel.best_available(data.config)
+    try:
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_prefill_requests": 1, "sum_prefill_tokens": 1}}]
+        ) == pytest.approx(2.0)
+        saved = model.diagnostics()["provenance"]["config"]
+    finally:
+        model.close()
+    assert "resources" not in saved["fpm_profile"]["deployments"][0]
+    reloaded = RustForwardPassPerfModel.best_available(json.loads(json.dumps(saved)))
+    try:
+        assert reloaded.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_prefill_requests": 1, "sum_prefill_tokens": 1}}]
+        ) == pytest.approx(2.0)
+    finally:
+        reloaded.close()
+    with pytest.raises(ValueError, match="cache_layout.*max_num_tokens.*max_batch_size.*provenance"):
+        _require_forward_pass_profile_memory(saved)
+    with pytest.raises(ValueError, match="resources"):
+        load_fpm_profile(saved["fpm_profile"])  # Resource-dependent public profiles remain strict.
+    with pytest.raises(ValueError, match="cache_layout.*max_num_tokens.*max_batch_size.*provenance"):
+        memory.estimate_kv_cache(
+            CONFIG["model"],
+            CONFIG["system"],
+            CONFIG["backend"],
+            CONFIG["backend_version"],
+            tp_size=4,
+            moe_tp_size=4,
+            fpm_profile=saved["fpm_profile"],
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            max_num_tokens=8192,
+            max_batch_size=256,
+        )
+    with pytest.raises(ValueError, match="cache_layout.*max_num_tokens.*max_batch_size.*provenance"):
+        RustForwardPassPerfModel.estimate_cache_budget(
+            saved,
+            {
+                "total_gpu_capacity_bytes": 10**9,
+                "memory_fraction_kind": "of_total",
+                "memory_fraction_value": 0.9,
+                "max_num_tokens": 8192,
+                "max_batch_size": 256,
+            },
+        )
     with pytest.raises(FpmResourcesPendingError, match="cache_layout"):
         load(root, config, tmp_path, require_resources=True)
+
+
+@pytest.mark.parametrize("tp", [None, 4, 8])
+def test_resources_without_profile_require_the_selected_topology(root, profile, tmp_path, tp):
+    make_entry(root, profile, resources=RESOURCES)
+    manifest_path = root / MANIFEST
+    manifest = json.loads(manifest_path.read_text())
+    manifest["identity"]["parallelism"] = None
+    identity = Identity.model_validate(manifest["identity"])
+    manifest["configuration_id"] = configuration_id("fpm", "execution-profile", identity)
+    manifest_path.write_text(json.dumps(manifest))
+    config = {**CONFIG, "tp": tp, "moe_tp_size": tp} if tp is not None else None
+    data = load(root, config, tmp_path)
+    if tp == 4:
+        assert data.resources.source == "metadata"
+        assert load(root, config, tmp_path, require_resources=True).resources.source == "metadata"
+    else:
+        assert data.resources.source == "pending" and data.resources.resources is None
+        with pytest.raises(FpmResourcesPendingError, match="cache_layout"):
+            load(root, config, tmp_path, require_resources=True)
 
 
 @pytest.mark.parametrize(
@@ -437,6 +503,13 @@ def test_invalid_sidecar_resources_are_rejected_with_the_field(root, profile, tm
         resolve_resources({k: v for k, v in RESOURCES.items() if k != "max_batch_size"}, None)
 
 
+@pytest.mark.parametrize("invalid", [[1], 1, "invalid"])
+def test_non_object_user_resources_report_the_contract_and_deployment(profile, invalid):
+    profile["deployments"][0]["resources"] = invalid
+    with pytest.raises(FpmContractError, match=r"invalid resources from configuration for deployment 0 .*tp=4"):
+        complete_fpm_profile(profile, None)
+
+
 # ------------------------------------------------------------------ staging and recovery
 
 
@@ -462,6 +535,115 @@ def test_staging_links_files_and_reuses_a_verified_root(root, profile, tmp_path)
     assert root_dir.is_dir()
     temp.close()
     assert not root_dir.exists()
+
+
+@pytest.mark.parametrize("changed", ["parquet", "metadata"])
+def test_staging_verifies_supplied_hashes_before_build_and_reuse(root, profile, tmp_path, changed):
+    make_entry(root, profile, resources=RESOURCES)
+    source = root / ENTRY / "fpm"
+    parquet, sidecar = source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json"
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    pins = {"parquet_sha256": _sha(parquet.read_bytes()), "metadata_sha256": _sha(sidecar.read_bytes())}
+    with pytest.raises(FpmContractError, match="supplied hash"):
+        stage_fpm_library(parquet, sidecar, **kwargs, **{**pins, f"{changed}_sha256": "0" * 64})
+    assert not kwargs["output_dir"].exists()
+    first = stage_fpm_library(parquet, sidecar, **kwargs, **pins)
+    marker = (first.systems_root / ".staged.json").read_bytes()
+    altered = parquet if changed == "parquet" else sidecar
+    altered.write_bytes(altered.read_bytes() + b" ")
+    with pytest.raises(FpmContractError, match="supplied hash"):
+        stage_fpm_library(parquet, sidecar, **kwargs, **pins)
+    assert (first.systems_root / ".staged.json").read_bytes() == marker
+
+
+def test_staging_reuse_tracks_the_copied_system_definition(root, profile, tmp_path):
+    from aisim_core.data.fpm_library import _stageable_roots
+
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+    systems = tmp_path / "systems"
+    systems.mkdir()
+    definition = systems / "h200_sxm.yaml"
+    definition.write_bytes((_stageable_roots(None, None)[0] / definition.name).read_bytes())
+    args = (source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json")
+    kwargs = dict(
+        system="h200_sxm",
+        backend="vllm",
+        backend_version="0.25.1",
+        output_dir=tmp_path / "out",
+        systems_paths=[systems],
+    )
+    staged = stage_fpm_library(*args, **kwargs)
+    marker = staged.systems_root / ".staged.json"
+    inode = marker.stat().st_ino
+    stage_fpm_library(*args, **kwargs)
+    assert marker.stat().st_ino == inode
+    definition.write_text(definition.read_text() + "\n# Updated system definition\n")
+    stage_fpm_library(*args, **kwargs)
+    assert marker.stat().st_ino != inode
+    assert (staged.systems_root / definition.name).read_bytes() == definition.read_bytes()
+
+
+def test_failed_replacement_restores_the_previous_staged_root(root, profile, tmp_path, monkeypatch):
+    import os
+
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+    args = (source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json")
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    first = stage_fpm_library(*args, **kwargs)
+    before = {str(p.relative_to(first.systems_root)): p.read_bytes() for p in (first.parquet_path, first.metadata_path)}
+    marker = (first.systems_root / ".staged.json").read_bytes()
+    # Force a rebuild without changing the linked source files used by the earlier configuration.
+    systems = tmp_path / "other-systems"
+    systems.mkdir()
+    replace = os.replace
+
+    def fail_install(src, dst):
+        if str(src).endswith(".staging"):
+            raise PermissionError("injected final rename failure")
+        return replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_install)
+    with pytest.raises(PermissionError, match="final rename failure"):
+        stage_fpm_library(*args, **kwargs, systems_paths=[systems])
+    assert (first.systems_root / ".staged.json").read_bytes() == marker
+    assert all((first.systems_root / relative).read_bytes() == raw for relative, raw in before.items())
+    assert not list(tmp_path.glob(".out.*.staging"))
+
+
+def test_system_overlay_fills_missing_operation_files_from_fallback_roots(root, profile, tmp_path, monkeypatch):
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+    first, fallback = tmp_path / "first", tmp_path / "fallback"
+    first.mkdir()
+    (first / "h200_sxm.yaml").write_text("data_dir: data/custom\n")
+    for systems, files in (
+        (first, {"gemm.parquet": b"first"}),
+        (fallback, {"gemm.parquet": b"later", "moe.parquet": b"fallback"}),
+    ):
+        data = systems / "data/custom/vllm/0.25.1"
+        data.mkdir(parents=True)
+        for name, raw in files.items():
+            (data / name).write_bytes(raw)
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [str(fallback)])
+    staged = stage_fpm_library(
+        source / "fpm_forward_perf.parquet",
+        source / "fpm_forward_perf.metadata.json",
+        system="h200_sxm",
+        backend="vllm",
+        backend_version="0.25.1",
+        systems_paths=[first],
+    )
+    try:
+        target = staged.systems_root / "data/custom/vllm/0.25.1"
+        assert (target / "gemm.parquet").read_bytes() == b"first"
+        assert (target / "moe.parquet").read_bytes() == b"fallback"
+        assert (staged.systems_root / "h200_sxm.yaml").read_bytes() == (first / "h200_sxm.yaml").read_bytes()
+    finally:
+        staged.close()
 
 
 @pytest.mark.parametrize("marker", [None, "not json", "{}", "[]", '{"system": "h200_sxm"}'])
@@ -648,6 +830,11 @@ def test_staging_rejects_unknown_system_and_unsafe_names(root, profile, tmp_path
         stage_fpm_library(*files, system="no_such_gpu", backend="vllm", backend_version="1")
     with pytest.raises(FpmContractError, match="safe path component"):
         stage_fpm_library(*files, system="h200_sxm", backend="vllm", backend_version="../x")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("data_dir: data/outside\n")
+    for system in (str(outside.with_suffix("")), "../outside"):
+        with pytest.raises(FpmContractError, match="system must be one safe path component"):
+            stage_fpm_library(*files, system=system, backend="vllm", backend_version="1")
 
 
 def test_library_schema_versions(tmp_path):
@@ -855,6 +1042,10 @@ def test_dataset_check_runs_every_entry_check(root, profile):
     )
     assert [f.code for f in check_fpm_dataset(root)] == ["duplicate-identity"]
     assert [f.code for f in check_fpm_dataset(root / "nowhere")] == ["invalid-catalog"]
+    # A well-formed but tampered index must not hide all of its entries from validation.
+    index["entries"] = []
+    (root / "catalog/fpm/index.json").write_text(json.dumps(index))
+    assert [f.code for f in check_fpm_dataset(root)] == ["invalid-catalog"]
 
 
 # ------------------------------------------------------------------ schema snapshots
@@ -893,6 +1084,58 @@ def test_sidecar_version_is_constrained_in_model_and_packaged_snapshot():
             FpmLibraryMetadata.model_validate(unsupported)
         with pytest.raises(ValidationError):
             validator.validate(unsupported)
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {k: v for k, v in RESOURCES.items() if k != "kv_bytes_per_token"},
+        {**RESOURCES, "kv_bytes_per_token": None},
+        {**RESOURCES, "cache_layout": "grouped", "cache_groups": []},
+        {**RESOURCES, "cache_layout": "unmodeled"},
+        {**RESOURCES, "cache_layout": "mamba_align", "runtime_memory": RUNTIME_MEMORY},
+    ],
+)
+def test_resource_layout_requirements_agree_in_runtime_and_exported_schema(resources):
+    from aisim_core.data.schemas import PACKAGED_SNAPSHOT_DIR, snapshot_filename
+
+    schema = json.loads((PACKAGED_SNAPSHOT_DIR / snapshot_filename("aic_fpm_forward_perf.metadata/v6")).read_text())
+    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "resources": resources}
+    with pytest.raises(ValueError):
+        FpmLibraryMetadata.model_validate(document)
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+def test_resource_layout_schema_keeps_valid_and_absent_resources():
+    schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
+    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1}
+    group = {
+        "name": "attention",
+        "kind": "attention",
+        "num_layers": 1,
+        "block_size_tokens": 16,
+        "page_size_bytes": 1024,
+    }
+    grouped = {k: v for k, v in RESOURCES.items() if k != "kv_bytes_per_token"}
+    grouped.update(cache_layout="grouped", cache_groups=[group])
+    unmodeled = {**grouped, "cache_layout": "unmodeled", "cache_groups": [], "runtime_memory": RUNTIME_MEMORY}
+    mamba = {
+        **unmodeled,
+        "cache_layout": "mamba_align",
+        "runtime_memory": {**RUNTIME_MEMORY, "kv_cache_bytes": 1024},
+        "mamba_cache": {
+            "state_storage": "full_state",
+            "block_size_tokens": 16,
+            "page_size_bytes": 256,
+            "state_groups": 1,
+            "prefix_match_unit": 16,
+            "num_speculative_states": 0,
+        },
+    }
+    for document in (base, *({**base, "resources": value} for value in (RESOURCES, grouped, unmodeled, mamba))):
+        Draft202012Validator(schema).validate(document)
+        FpmLibraryMetadata.model_validate(document)
 
 
 def test_entry_checks_report_unreadable_files_and_missing_native_columns(root, profile):

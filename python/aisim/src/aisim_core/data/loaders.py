@@ -56,6 +56,7 @@ from aisim_core.data.fpm_library import (
     missing_memory_fields,
     missing_resource_fields,
     resolve_resources,
+    resource_metadata_for_deployment,
     stage_fpm_library,
     with_estimator_path,
 )
@@ -360,7 +361,26 @@ class FpmLoader(Loader):
                     first_resources = resolve_resources(completed["deployments"][0].get("resources"), None).resources
                 resources = ResolvedResources(first_resources, sources[0])  # type: ignore[arg-type]
             else:
-                resources = resolve_resources(None, staged.metadata, required=require_resources)
+                metadata = staged.metadata
+                if metadata.get("resources") is not None and metadata.get("configuration_selector"):
+                    if config is None:
+                        metadata = None  # No requested deployment to match against the selector.
+                    else:
+                        from aisim_core.sdk import RustForwardPassPerfModel
+
+                        # Canonical normalization owns defaults and aliases; do not assume omitted topology.
+                        normalized = RustForwardPassPerfModel.normalize_config(out)
+                        deployment = {
+                            **normalized,
+                            "dp": normalized["attention_dp"],
+                            "moe_tp": normalized.get("moe_tp_size"),
+                            "moe_ep": normalized.get("moe_ep_size"),
+                            "cp": normalized.get("cp_size"),
+                            "kv_cache_dtype": normalized.get("kvcache_quant_mode"),
+                        }
+                        deployment = {name: value for name, value in deployment.items() if value is not None}
+                        metadata = resource_metadata_for_deployment(normalized, deployment, metadata)
+                resources = resolve_resources(None, metadata, required=require_resources)
         except FpmContractError:
             staged.close()
             raise

@@ -27,7 +27,7 @@ import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
@@ -350,13 +350,16 @@ def stage_fpm_library(
     is used and removed by :meth:`StagedFpmLibrary.close`. Native validation still decides whether the staged
     table supports the requested estimator and workload.
     """
+    system = _safe_component(system, "system")
     parquet, sidecar = Path(parquet_path).resolve(), Path(metadata_path).resolve()
     systems_paths = _stageable_roots(systems_paths, output_dir)
     if not parquet.is_file() or not sidecar.is_file():
         raise FpmContractError(f"FPM library {artifact_id or parquet} is not materialized locally")
     metadata = read_library_metadata(sidecar)
-    parquet_sha256 = parquet_sha256 or sha256_file(parquet)
-    metadata_sha256 = metadata_sha256 or sha256_file(sidecar)
+    actual_parquet_sha256, actual_metadata_sha256 = sha256_file(parquet), sha256_file(sidecar)
+    if parquet_sha256 not in (None, actual_parquet_sha256) or metadata_sha256 not in (None, actual_metadata_sha256):
+        raise FpmContractError(f"FPM library {artifact_id or parquet} differs from its supplied hash")
+    parquet_sha256, metadata_sha256 = actual_parquet_sha256, actual_metadata_sha256
     metadata, recovered = recover_reconstructed_metadata(
         metadata, parquet, parquet_sha256=parquet_sha256, metadata_sha256=metadata_sha256
     )
@@ -370,6 +373,7 @@ def stage_fpm_library(
             "staged_metadata_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "recovered_fields": recovered,
         }
+    source_yaml = _system_definition(system, systems_paths)
     marker = {
         "system": system,
         "backend": backend,
@@ -379,6 +383,7 @@ def stage_fpm_library(
         "systems_paths": [str(p) for p in systems_paths] if systems_paths is not None else None,
         "parquet_path": str(parquet),
         "metadata_path": str(sidecar),
+        "system_definition": {"path": str(source_yaml), "sha256": sha256_file(source_yaml)},
     }
     temporary = None
     if output_dir is None:
@@ -394,7 +399,7 @@ def stage_fpm_library(
         shutil.rmtree(build, ignore_errors=True)
         build.mkdir(parents=True)
     try:
-        target = _prepare_system_overlay(build, system, backend, backend_version, systems_paths)
+        target = _prepare_system_overlay(build, source_yaml, backend, backend_version, systems_paths)
         (target / LIBRARY_FILE).symlink_to(parquet)
         if text is not None:
             (target / METADATA_FILE).write_text(text, encoding="utf-8")
@@ -402,10 +407,7 @@ def stage_fpm_library(
             (target / METADATA_FILE).symlink_to(sidecar)
         if output_dir is not None:
             (build / STAGED_MARKER).write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
-            if root.exists():
-                _check_staging_destination(root)
-                shutil.rmtree(root)
-            os.replace(build, root)
+            _replace_staged_root(build, root)
     except BaseException:
         if temporary is not None:
             temporary.cleanup()
@@ -444,6 +446,7 @@ class _StagingMarker(BaseModel):
     systems_paths: list[str] | None
     parquet_path: str = Field(min_length=1)
     metadata_path: str = Field(min_length=1)
+    system_definition: dict[str, str] | None = None
 
 
 def _staged_marker(root: Path) -> dict[str, Any] | None:
@@ -458,6 +461,24 @@ def _check_staging_destination(root: Path) -> dict[str, Any] | None:
     if root.is_symlink() or (root.exists() and (not root.is_dir() or (any(root.iterdir()) and marker is None))):
         raise FpmContractError(f"refusing to replace {root}: nonempty output_dir requires a valid staging marker")
     return marker
+
+
+def _replace_staged_root(build: Path, root: Path) -> None:
+    """Retain the previous root until installation succeeds, restoring it on failure."""
+    _check_staging_destination(root)
+    backup_dir = Path(mkdtemp(prefix=f".{root.name}.backup-", dir=root.parent))
+    backup = backup_dir / "previous"
+    try:
+        if root.exists():
+            os.replace(root, backup)
+        os.replace(build, root)
+    except BaseException:
+        if backup.exists():
+            # If restoration also fails, retain the backup for recovery.
+            os.replace(backup, root)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise
+    shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def _staged(root, metadata, recovery, parquet_sha256, artifact_id, temporary) -> StagedFpmLibrary:
@@ -479,32 +500,36 @@ def _staged(root, metadata, recovery, parquet_sha256, artifact_id, temporary) ->
     )
 
 
-def _prepare_system_overlay(
-    systems_root: Path, system: str, backend: str, backend_version: str, systems_paths: Sequence[str | Path]
-) -> Path:
-    import yaml
-
-    # The effective roots were resolved once for both the marker and the overlay.
+def _system_definition(system: str, systems_paths: Sequence[str | Path]) -> Path:
     source_yaml = next(
         (Path(root) / f"{system}.yaml" for root in systems_paths if (Path(root) / f"{system}.yaml").is_file()),
         None,
     )
     if source_yaml is None:
         raise FpmContractError(f"AISim has no system definition for {system!r}")
+    return source_yaml
+
+
+def _prepare_system_overlay(
+    systems_root: Path, source_yaml: Path, backend: str, backend_version: str, systems_paths: Sequence[str | Path]
+) -> Path:
+    import yaml
+
     target_yaml = systems_root / source_yaml.name
     shutil.copy2(source_yaml, target_yaml)
     spec = yaml.safe_load(target_yaml.read_text(encoding="utf-8"))
     if not isinstance(spec, dict) or not isinstance(spec.get("data_dir"), str):
         raise FpmContractError(f"AISim system definition {source_yaml} has no data_dir")
     data_dir = _safe_relative_path(spec["data_dir"], "system data_dir")
-    source_data_root = (source_yaml.parent / data_dir).resolve()
     target_data_root = systems_root / data_dir
     backend_name = _safe_component(backend, "backend")
     version = _safe_component(backend_version, "backend version")
     target_version = target_data_root / backend_name / version
     target_version.mkdir(parents=True)
-    if source_data_root.is_dir():
-        _link_overlay_entries(source_data_root, target_data_root, backend_name, version)
+    for root in systems_paths:
+        source_data_root = (Path(root) / data_dir).resolve()
+        if source_data_root.is_dir():
+            _link_overlay_entries(source_data_root, target_data_root, backend_name, version)
     return target_version
 
 
@@ -512,19 +537,24 @@ def _link_overlay_entries(source_root: Path, target_root: Path, backend: str, ve
     """Expose op/SOL data while keeping the selected FPM directory isolated."""
     for entry in source_root.iterdir():
         if entry.name != backend:
-            (target_root / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
+            _link_if_missing(entry, target_root / entry.name)
     source_backend, target_backend = source_root / backend, target_root / backend
     if not source_backend.is_dir():
         return
     for entry in source_backend.iterdir():
         if entry.name != version:
-            (target_backend / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
+            _link_if_missing(entry, target_backend / entry.name)
     source_version, target_version = source_backend / version, target_backend / version
     if not source_version.is_dir():
         return
     for entry in source_version.iterdir():
         if entry.name not in {LIBRARY_FILE, METADATA_FILE}:
-            (target_version / entry.name).symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
+            _link_if_missing(entry, target_version / entry.name)
+
+
+def _link_if_missing(source: Path, target: Path) -> None:
+    if not target.exists() and not target.is_symlink():
+        target.symlink_to(source.resolve(), target_is_directory=source.is_dir())
 
 
 def _safe_relative_path(value: Any, field_name: str) -> Path:
@@ -617,7 +647,7 @@ def _validated(value: Mapping[str, Any] | FpmResourceProfile, where: str, source
     try:
         return FpmResourceProfile.model_validate(value)
     except ValidationError as exc:
-        missing = missing_resource_fields(value)
+        missing = missing_resource_fields(value) if isinstance(value, Mapping) else []
         hint = f"; missing: {', '.join(missing)}" if missing else ""
         raise FpmContractError(f"invalid resources from {source} for {where}: {_first_error(exc)}{hint}") from exc
 
@@ -626,6 +656,39 @@ _TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 
 
 _IDENTITY_KEYS = ("system", "backend", "backend_version", "worker_type")
+
+
+def resource_metadata_for_deployment(
+    profile: Mapping[str, Any],
+    deployment: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None,
+    identity: Mapping[str, str] | None = None,
+) -> Mapping[str, Any] | None:
+    """Return sidecar resources only for the selected model and deployment."""
+    selector = (metadata or {}).get("configuration_selector") or {}
+    applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
+    wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
+    applies = applies and all(
+        deployment.get(name) in (None, value) for name, value in wanted.items() if name in _IDENTITY_KEYS
+    )
+    # Selectors also pin precision, implementation and model identity. Use the profile's own defaults for
+    # omitted deployment fields; never attach resources from a differently selected configuration.
+    selected_identity = {
+        **{name: value for name, value in profile.items() if name != "deployments"},
+        "model_path": profile.get("model"),
+        **{
+            name: info.get_default()
+            for name, info in FpmDeploymentProfile.model_fields.items()
+            if not info.is_required() and name not in {"resources", "execution_profile"}
+        },
+        **deployment,
+    }
+    applies = applies and all(
+        selected_identity.get(name) == value
+        for name, value in selector.items()
+        if name not in _TOPOLOGY and name not in _IDENTITY_KEYS and name in selected_identity
+    )
+    return metadata if applies else None
 
 
 def complete_fpm_profile(
@@ -645,7 +708,6 @@ def complete_fpm_profile(
     A deployment with neither raises :class:`FpmResourcesPendingError` when ``required``; otherwise its
     resources stay absent and its source is ``pending``.
     """
-    selector = (metadata or {}).get("configuration_selector") or {}
     out = json.loads(json.dumps(profile, allow_nan=False))
     deployments = out.get("deployments")
     if not isinstance(deployments, list) or not deployments:
@@ -657,31 +719,9 @@ def complete_fpm_profile(
         where = (
             f"deployment {index} (tp={deployment.get('tp')}, dp={deployment.get('dp')}, ep={deployment.get('moe_ep')})"
         )
-        applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
-        wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
-        applies = applies and all(
-            deployment.get(name) in (None, value) for name, value in wanted.items() if name in _IDENTITY_KEYS
-        )
-        # Selectors also pin precision, implementation and model identity. Use the profile's own defaults for
-        # omitted deployment fields; never attach resources from a differently selected configuration.
-        selected_identity = {
-            **{name: value for name, value in out.items() if name != "deployments"},
-            "model_path": out.get("model"),
-            **{
-                name: info.get_default()
-                for name, info in FpmDeploymentProfile.model_fields.items()
-                if not info.is_required() and name not in {"resources", "execution_profile"}
-            },
-            **deployment,
-        }
-        applies = applies and all(
-            selected_identity.get(name) == value
-            for name, value in selector.items()
-            if name not in _TOPOLOGY and name not in _IDENTITY_KEYS and name in selected_identity
-        )
         resolved = resolve_resources(
             deployment.get("resources"),
-            metadata if applies else None,
+            resource_metadata_for_deployment(out, deployment, metadata, identity),
             where=where,
             required=required,
         )
