@@ -46,7 +46,7 @@ variables:
       git fetch -q --depth 1 origin "$AISIM_REVIEWED_COMMIT"
       git checkout -q --detach FETCH_HEAD
       test "$(git rev-parse HEAD)" = "$AISIM_REVIEWED_COMMIT"
-      uv sync --project python/aisim --frozen
+      env -u INFX_CACHE_WRITE_TOKEN uv sync --project python/aisim --frozen
       cd "$CI_PROJECT_DIR"
   variables:
     JOB_PY: "uv run --project aisim/python/aisim python -m aisim_core.data.infx_job"

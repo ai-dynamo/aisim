@@ -40,17 +40,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aisim_core.data import Manifest, _verify
 from aisim_core.data.e2e import (
-    METRICS_SCHEMA,
     OBSERVATIONS_SCHEMA,
     REQUESTS_SCHEMA,
-    SERIES_SCHEMA,
     E2eManifestBody,
     body_from_manifest,
     read_snapshot,
 )
 from aisim_core.data.eval import load_record, record_paths
 from aisim_core.data.hygiene import Finding, checked_path, yaml_sidecar_value
-from aisim_core.data.op_schema import OP_TABLE_SCHEMA_ID
 from aisim_core.data.parquet import read_parquet
 
 Label = Literal["public", "internal", "restricted"]
@@ -273,7 +270,10 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
             out.extend(_check_observations(root / artifact.path, artifact.path, policy))
         elif artifact.artifact_schema == REQUESTS_SCHEMA and _request_rows_allowed(body, policy):
             out.extend(_check_requests(root / artifact.path, artifact.path, policy))
-        elif artifact.artifact_schema in (METRICS_SCHEMA, SERIES_SCHEMA, OP_TABLE_SCHEMA_ID):
+        elif artifact.format == "parquet":
+            # Metrics, series, op tables, snapshot members/acquisition and eval
+            # truth all have free-text columns. Scan every column, including
+            # extension schemas, rather than exempting unmatched schema IDs.
             out.extend(
                 _check_table_text(
                     read_parquet(root / artifact.path, artifact.artifact_schema), artifact.path, policy, "column"
@@ -395,7 +395,7 @@ def check_publishable(
         if rel.endswith("/manifest.json") and rel not in loaded:
             try:
                 loaded[rel] = Manifest.model_validate_json((root / rel).read_bytes())
-            except (OSError, ValidationError, ValueError) as exc:
+            except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     infx_ids = set()
     invalid = set()
@@ -413,19 +413,19 @@ def check_publishable(
         if rel in chosen_set and rel not in invalid:
             try:
                 findings.extend(_check_manifest(root, rel, manifest, policy))
-            except (OSError, ValidationError, ValueError) as exc:
+            except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
         # Match the snapshot documents declared by mirror._check_snapshots.
         if rel.startswith("data/") and Path(rel).match("*snapshot*.json"):
             try:
                 findings.extend(_check_snapshot(root, rel, policy))
-            except (OSError, ValidationError, ValueError) as exc:
+            except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel in eval_records:
             try:
                 findings.extend(_check_eval_record(root, rel, policy, infx_ids))
-            except (OSError, ValidationError, ValueError) as exc:
+            except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     return findings
 

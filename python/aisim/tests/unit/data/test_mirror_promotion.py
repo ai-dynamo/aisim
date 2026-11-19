@@ -8,6 +8,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pyarrow as pa
@@ -235,6 +236,7 @@ def _commit_source(root):
         "-c",
         "user.email=fixture@example.test",
         "commit",
+        "--no-gpg-sign",
         "-qm",
         "synthetic dataset",
     )
@@ -630,13 +632,23 @@ def test_approval_rules(tmp_path):
     assert not plan_promotion(root, _request(root, [directory], draft), PromotionPolicy()).ok
 
 
-def test_changed_bytes_invalidate_approval_and_apply(tmp_path):
+def test_changed_bytes_invalidate_approval_and_apply(tmp_path, monkeypatch):
+    from aisim_core.data import promote
+
     root, directory = _promotable(tmp_path)
     draft = plan_promotion(root, _request(root, [directory]), _reviewers())
     plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
-    (root / directory / "metrics.parquet").write_bytes(b"changed")
-    with pytest.raises(PromotionError, match="source changed"):
-        apply_promotion(plan, root, _target(tmp_path))
+    real_check = promote._check_source_checkout
+
+    def change_after_checkout_check(*args):
+        real_check(*args)
+        (root / directory / "metrics.parquet").write_bytes(b"changed")
+
+    monkeypatch.setattr(promote, "_check_source_checkout", change_after_checkout_check)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError, match="source changed since planning"):
+        apply_promotion(plan, root, target)
+    assert list(target.iterdir()) == []
 
 
 def test_dirty_content_blocks_promotion_even_if_labeled_public(tmp_path):
@@ -686,14 +698,13 @@ def test_snapshot_never_spans_private_and_public(tmp_path):
 
     root, manifests = _mirror(tmp_path, dev=("synthetic/model-a", "synthetic/model-b"))
     public_dir, private_dir = (str(Path(m).parent) for m in manifests)
-    from aisim_core.data import Manifest
-
     members = [
         SnapshotMember(
-            configuration_id=Manifest.model_validate_json((root / m).read_bytes()).configuration_id,
-            observation_id=f"o{i}", record_sha256="b" * 64, manifest_path=m,
+            configuration_id=observation.configuration_id,
+            observation_id=observation.observation_id, record_sha256=observation.record_sha256, manifest_path=m,
         )
-        for i, m in enumerate(manifests)
+        for m in manifests
+        for observation in load_e2e(root, m).observations
     ]  # fmt: skip
     snap_dir = root / "data" / "e2e-snapshots" / "s1"
     snap_dir.mkdir(parents=True)
@@ -702,6 +713,8 @@ def test_snapshot_never_spans_private_and_public(tmp_path):
         source_scope={"kind": "synthetic"}, selection_policy="p", completeness="complete",
     )  # fmt: skip
     _public(root, public_dir, "data/e2e-snapshots/s1")
+    report = validate_tree(root)
+    assert report.ok, report.errors
     plan = plan_promotion(root, _request(root, [public_dir, "data/e2e-snapshots/s1"]), _reviewers())
     assert "snapshot-spans" in {f.code for f in plan.findings}
     _ = private_dir
@@ -1163,9 +1176,12 @@ def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch)
     monkeypatch.setattr("aisim_core.data.promote.shutil.copyfile", real)
 
     real_write = Path.write_text
+    partial_ledgers = []
 
     def deny(self, *a, **k):
         if "promotions" in self.parts:
+            self.write_bytes(b'{"partial":')
+            partial_ledgers.append(self)
             raise PermissionError("read-only")
         return real_write(self, *a, **k)
 
@@ -1173,6 +1189,7 @@ def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch)
     with pytest.raises(PermissionError):
         apply_promotion(plan, root, target)
     assert not any(p.is_file() for p in target.rglob("*"))
+    assert len(partial_ledgers) == 1 and not partial_ledgers[0].exists()
 
 
 @pytest.mark.parametrize("case", ["alias", "configuration"])
@@ -1294,15 +1311,16 @@ def test_symlinked_documents_are_rejected_before_any_read(tmp_path, monkeypatch,
     outside = tmp_path / "external.json"
     index.replace(outside)
     index.symlink_to(outside)
-    original = Path.read_bytes
+    original = Path.open
     reads = []
 
-    def observe(path):
-        reads.append(path)
-        assert path.resolve() != outside.resolve(), "validator followed a document symlink"
-        return original(path)
+    def observe(path, *args, **kwargs):
+        if path.resolve() == outside.resolve():
+            reads.append(path)
+            pytest.fail("validator followed a document symlink")
+        return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", observe)
+    monkeypatch.setattr(Path, "open", observe)
     report = validate_tree(root, profile=profile)
     assert "symlink" in {f.code for f in report.errors} and not reads
     assert "symlink" in {f.code for f in check_publishable(root, ["catalog/dataset.json"])}
@@ -1673,6 +1691,100 @@ def test_unsupported_truth_artifact_format_blocks_publication(tmp_path):
     _public(root, directory, eval_dir)
     plan = plan_promotion(root, _request(root, [directory, eval_dir]), _reviewers())
     assert "artifact-format" in {f.code for f in plan.findings}
+
+
+@pytest.mark.parametrize(
+    "schema,column",
+    [
+        ("aisim-e2e-snapshot-members/v1", "observation_id"),
+        ("aisim-e2e-snapshot-acquisition/v1", "source_uri"),
+        ("aisim-eval-truth/v1", "inputs_json"),
+        ("synthetic-extension/v1", "attrs"),
+    ],
+)
+@pytest.mark.parametrize("dirty", [False, True])
+def test_every_manifest_parquet_artifact_is_scanned(tmp_path, schema, column, dirty):
+    root, directory, _ = _op_mirror(tmp_path, "kernel_source", "clean")
+    rel = f"{directory}/extension.parquet"
+    value = "Bearer " + "a" * 24 if dirty else "synthetic"
+    # Snapshot IDs/URIs and eval/extension JSON columns can all carry free text.
+    table = pa.table({column: [json.dumps({"authorization": value}) if column in ("inputs_json", "attrs") else value]})
+    artifact_path = write_parquet(table, root / rel, schema)
+    manifest_rel = f"{directory}/manifest.json"
+    manifest_path = root / manifest_rel
+    manifest = Manifest.model_validate_json(manifest_path.read_bytes())
+    artifact = Artifact(
+        artifact_id="extension",
+        path=rel,
+        role="metadata",
+        format="parquet",
+        schema=schema,
+        sha256=hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+        bytes=artifact_path.stat().st_size,
+        rows=1,
+    )
+    manifest_path.write_text(
+        manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+    )
+    register_manifests(root, [manifest_rel], INTERNAL_REPO)
+    build_catalog(root)
+    internal = validate_tree(root)
+    assert internal.ok, internal.errors
+    public_root = tmp_path / "public"
+    shutil.copytree(root, public_root)
+    shutil.rmtree(public_root / "mirror")
+    public = validate_tree(public_root, profile="public")
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert any(f.code == "secret" and f.path == rel for f in public.errors) == dirty
+    assert any(f.code == "secret" and f.path == rel for f in plan.findings) == dirty
+    assert public.ok == plan.content_ok == (not dirty)
+
+
+@pytest.mark.parametrize("kind", ["manifest", "eval"])
+def test_deep_json_sidecars_report_findings_without_aborting(tmp_path, kind):
+    depth = sys.getrecursionlimit() + 100
+    payload = b"[" * depth + b"0" + b"]" * depth
+    if kind == "eval":
+        root, manifests = _mirror(tmp_path)
+        record_rel = _extra_truth_artifact(root, manifests, "deep.json", payload, "json")
+        document_rel = record_rel
+        directories = [str(Path(manifests[0]).parent), str(Path(record_rel).parent)]
+        _public(root, *directories)
+    else:
+        root, directory, _ = _op_mirror(tmp_path, "kernel_source", "clean")
+        directories = [directory]
+        rel = f"{directory}/deep.json"
+        (root / rel).write_bytes(payload)
+        manifest_rel = f"{directory}/manifest.json"
+        document_rel = manifest_rel
+        path = root / manifest_rel
+        manifest = Manifest.model_validate_json(path.read_bytes())
+        artifact = Artifact(
+            artifact_id="deep",
+            path=rel,
+            role="metadata",
+            format="json",
+            schema="synthetic/v1",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            bytes=len(payload),
+        )
+        path.write_text(
+            manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+        )
+        register_manifests(root, [manifest_rel], INTERNAL_REPO)
+        build_catalog(root)
+    output = tmp_path / "report.json"
+    public_root = tmp_path / "public"
+    shutil.copytree(root, public_root)
+    shutil.rmtree(public_root / "mirror")
+    assert mirror_main(["validate", "--root", str(public_root), "--profile", "public", "--output", str(output)]) == 1
+    report = json.loads(output.read_bytes())
+    assert not report["ok"]
+    # JSON decoders differ in their nesting limit; the document scan must always
+    # turn either decoding or walking recursion failures into a finding.
+    assert any(f["code"] == "document-invalid" and f["path"] == document_rel for f in report["findings"])
+    plan = plan_promotion(root, _request(root, directories), _reviewers())
+    assert not plan.content_ok and "document-invalid" in {f.code for f in plan.findings}
 
 
 @pytest.mark.parametrize("failure", ["encoding", "io"])
