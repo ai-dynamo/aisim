@@ -669,8 +669,13 @@ def resource_metadata_for_deployment(
     applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
     wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
     applies = applies and all(
-        deployment.get(name) in (None, value) for name, value in wanted.items() if name in _IDENTITY_KEYS
+        deployment.get(name) in (None, value)
+        for name, value in wanted.items()
+        if name in _IDENTITY_KEYS and name != "worker_type"
     )
+    # A shared deployment can serve other roles, so it must not inherit role-specific evidence.
+    if "worker_type" in wanted:
+        applies = applies and deployment.get("worker_type") == wanted["worker_type"]
     # Selectors also pin precision, implementation and model identity. Use the profile's own defaults for
     # omitted deployment fields; never attach resources from a differently selected configuration.
     selected_identity = {
@@ -703,7 +708,8 @@ def complete_fpm_profile(
     ``profile`` is the user's ``fpm_profile`` dictionary (deployments may omit ``resources``). A sidecar block
     applies to the deployment its ``configuration_selector`` names (every incomplete deployment when the sidecar
     has no selector) and only to deployments of the library's own ``identity`` (system, backend, backend_version);
-    a deployment that names another hardware, version or role is left to its own resources.
+    a deployment that names another hardware, version or role is left to its own resources. A selector that names
+    a role requires that explicit deployment role; an omitted or null role cannot inherit role-specific resources.
     Returns the completed dictionary and the source of each deployment's resources.
     A deployment with neither raises :class:`FpmResourcesPendingError` when ``required``; otherwise its
     resources stay absent and its source is ``pending``.

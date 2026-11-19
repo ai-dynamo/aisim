@@ -435,10 +435,11 @@ optional `resources` block in its `fpm_forward_perf.metadata.json` sidecar. The 
 `max_batch_size`, `provenance`). When the data library loads an entry it resolves each deployment's resources as
 the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, then pending. The first block found
 is used whole, never merged field by field. Sidecar resources apply only when the selector matches the profile's
-model and deployment identity, including precision and implementation fields. Pending means missing: a
-timing-only data load keeps the draft profile and reports pending resources. The draft constructs through
-`best_available` and answers timing queries; cache sizing, replay, and a load that requires resources fail
-with the fields to supply. A block with valid geometry but no `runtime_memory` or declared bytes still serves timing
+model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
+requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
+Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. The draft
+constructs through `best_available` and answers timing queries; cache sizing, replay, and a load that requires
+resources fail with the fields to supply. A block with valid geometry but no `runtime_memory` or declared bytes still serves timing
 queries; cache sizing and replay need the memory. Entries published without `resources` stay valid. Loading uses
 only the library and its sidecar and never reads `measurements/`.
 
