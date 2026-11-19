@@ -140,6 +140,8 @@ from collector.op_plans import plan_cases
 from collector.vllm.utils import setup_distributed, with_exit_stack
 from vllm._custom_ops import scaled_fp4_quant as _scaled_fp4_quant
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
+from vllm.model_executor.kernels.linear.nvfp4.marlin import MarlinNvFp4LinearKernel
 from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
     FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
 )
@@ -149,6 +151,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    MARLIN_MAX_BLOCKS_PER_SM,
+    USE_FP32_REDUCE_DEFAULT,
+    marlin_padded_nk,
+)
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import ref_nvfp4_quant as _ref_nvfp4_quant
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.version import __version__ as vllm_version
@@ -251,9 +258,10 @@ def _w4a16_nvfp4_does_not_fit(m, n, k, device):
     (2 B), and the prepared packed weight/scales (0.5 + 1/16 B). Below SM100, allow 32 B per
     chunk element for the reference quantizer's live FP32 intermediates and packing scratch
     (nvfp4_emulation_utils.py ref_nvfp4_quant/cast_to_fp4 @0.31.0). The chunked abs reduction
-    fits that scratch too. The preparation tensors are freed after loading,
-    so the dry-run forward holds the layer's packed weight and scales and the BF16 output
-    (m x n). The BF16 activation (2 B per element) is allocated first and counts in both phases.
+    fits that scratch too. The preparation tensors are freed after loading. The forward
+    budget follows the selected kernel's physical weight, scales, activation and output,
+    including Marlin padding, reduction scratch and the contiguous output slice copy.
+    The logical BF16 activation (2 B per element) stays live in both phases.
     Unused cached segments are released before reading driver-free memory, so split remainders
     of used segments do not count as available.
     """
@@ -264,13 +272,33 @@ def _w4a16_nvfp4_does_not_fit(m, n, k, device):
         scratch = 32 * _w4a16_nvfp4_chunk_rows(n, k) * k
         preparation = 2 * layer + 2 * n * k + scratch
     forward = layer + 2 * m * n
+    # Use serving's selector in the same config context as the layer (modelopt.py,
+    # KNvfp4Static.select_linear_kernel @v0.31.0), including Marlin on Blackwell.
+    if isinstance(init_nvfp4_linear_kernel(use_a16=True), MarlinNvFp4LinearKernel):
+        # vLLM v0.31.0 marlin_utils_fp4.py prepare_fp4_layer_for_marlin pads
+        # weights/scales using this helper; nvfp4_marlin_process_scales returns FP8.
+        padded_n, padded_k = marlin_padded_nk(n, k, group_size=16)
+        physical_layer = 0.5625 * padded_n * padded_k
+        padded_input = 2 * m * padded_k if padded_k != k else 0
+        physical_output = 2 * m * padded_n
+        # csrc/libtorch_stable/quantization/marlin/marlin.cu marlin_gemm allocates
+        # FP32 reduction storage: SMs * min(ceil(M/16)*16, 64) * max_thread_n(256).
+        # marlin_utils.py get_marlin_workspace also allocates INT32 locks per SM.
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        reduction = 4 * sms * min((m + 15) // 16 * 16, 64) * 256 if USE_FP32_REDUCE_DEFAULT else 0
+        locks = 4 * sms * MARLIN_MAX_BLOCKS_PER_SM
+        # apply_fp4_marlin_linear retains the padded input/output while
+        # marlin_unpad_output makes the logical contiguous copy. Reduction
+        # scratch and locks are released before that copy, so budget the peak.
+        slice_copy = 2 * m * n if padded_n != n and m > 1 else 0
+        forward = physical_layer + padded_input + physical_output + max(reduction + locks, slice_copy)
     needed = int(max(preparation, forward)) + 2 * m * k
     torch.cuda.empty_cache()
     available = torch.cuda.mem_get_info(device)[0]
     if needed <= available:
         return None
     return (
-        f"FIXME(kernel-limit): does not fit: W4A16_NVFP4 weight preparation needs at least "
+        f"FIXME(kernel-limit): does not fit: W4A16_NVFP4 preparation/forward needs at least "
         f"{needed / 2**30:.1f} GiB, the device has {available / 2**30:.1f} GiB available"
     )
 
@@ -300,6 +328,15 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="cuda:0"):
     torch.set_default_device(device)
     # Reproducible synthetic inputs and weights; values do not select kernels.
     torch.manual_seed(GEMM_SEED)
+
+    vllm_config = VllmConfig()
+    if vllm_config.model_config is None:
+        vllm_config.model_config = SimpleNamespace(
+            dtype=dtype,
+            hf_text_config=SimpleNamespace(model_type=""),
+            model="collector_dummy",
+        )
+    exit_stack.enter_context(set_current_vllm_config(vllm_config))
 
     if gemm_type == "w4a16_nvfp4" and (refusal := _w4a16_nvfp4_does_not_fit(m, n, k, device)):
         raise RuntimeError(refusal)
@@ -413,15 +450,6 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="cuda:0"):
         gemm.forward(x)  # dry run to init
 
         return gemm
-
-    vllm_config = VllmConfig()
-    if vllm_config.model_config is None:
-        vllm_config.model_config = SimpleNamespace(
-            dtype=dtype,
-            hf_text_config=SimpleNamespace(model_type=""),
-            model="collector_dummy",
-        )
-    exit_stack.enter_context(set_current_vllm_config(vllm_config))
 
     outside_loop_count = 1 if gemm_type in ("fp8_block", "nvfp4", "w4a16_nvfp4") else 6
     op_list = []

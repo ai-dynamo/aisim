@@ -297,6 +297,8 @@ _GEMM_SURFACE = {
     "vllm.version": {"__version__": "0.0.0"},
     "vllm._custom_ops": {"scaled_fp4_quant": _dummy},
     "vllm.config": {"VllmConfig": _Dummy, "set_current_vllm_config": _null_context},
+    "vllm.model_executor.kernels.linear": {"init_nvfp4_linear_kernel": _dummy},
+    "vllm.model_executor.kernels.linear.nvfp4.marlin": {"MarlinNvFp4LinearKernel": _Dummy},
     "vllm.model_executor.kernels.linear.scaled_mm.flashinfer": {
         "FlashInferFp8DeepGEMMDynamicBlockScaledKernel": _Dummy
     },
@@ -307,6 +309,11 @@ _GEMM_SURFACE = {
     "vllm.model_executor.layers.quantization.fp8": {"Fp8Config": _Dummy},
     "vllm.model_executor.layers.quantization.modelopt": {"ModelOptMixedPrecisionConfig": _Dummy},
     "vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils": {"ref_nvfp4_quant": _dummy},
+    "vllm.model_executor.layers.quantization.utils.marlin_utils": {
+        "MARLIN_MAX_BLOCKS_PER_SM": 4,
+        "USE_FP32_REDUCE_DEFAULT": True,
+        "marlin_padded_nk": _dummy,
+    },
     "vllm.utils.deep_gemm": {"per_block_cast_to_fp8": _dummy},
 }
 

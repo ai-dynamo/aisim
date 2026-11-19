@@ -3,9 +3,9 @@
 
 """Checkpoint-weight preparation of the vLLM w4a16_nvfp4 GEMM lane.
 
-Real torch tensors; vLLM itself is replaced by a minimal import surface, so
-these tests check the collector-owned packing and branch selection, not
-vLLM's quantizer numerics.
+Packing uses real torch tensors; capacity checks use device metadata fakes.
+vLLM is replaced by a minimal import surface, so these tests check the
+collector-owned packing and branch selection, not vLLM's quantizer numerics.
 """
 
 import importlib
@@ -13,6 +13,7 @@ import importlib.metadata
 import importlib.util
 import sys
 import types
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -68,6 +69,18 @@ def torch(monkeypatch):
 
 @pytest.fixture
 def collect_gemm(torch, monkeypatch):
+    return _load_collect_gemm(torch, monkeypatch)
+
+
+@pytest.fixture
+def capacity_gemm(monkeypatch):
+    """Capacity accounting uses CUDA metadata only, so it needs no tensor library."""
+    torch = MagicMock()
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    return _load_collect_gemm(torch, monkeypatch)
+
+
+def _load_collect_gemm(torch, monkeypatch):
     for name in [
         "vllm",
         "vllm.envs",
@@ -77,6 +90,8 @@ def collect_gemm(torch, monkeypatch):
         "vllm.model_executor",
         "vllm.model_executor.kernels",
         "vllm.model_executor.kernels.linear",
+        "vllm.model_executor.kernels.linear.nvfp4",
+        "vllm.model_executor.kernels.linear.nvfp4.marlin",
         "vllm.model_executor.kernels.linear.scaled_mm",
         "vllm.model_executor.kernels.linear.scaled_mm.flashinfer",
         "vllm.model_executor.layers",
@@ -87,6 +102,7 @@ def collect_gemm(torch, monkeypatch):
         "vllm.model_executor.layers.quantization.fp8",
         "vllm.model_executor.layers.quantization.modelopt",
         "vllm.model_executor.layers.quantization.utils",
+        "vllm.model_executor.layers.quantization.utils.marlin_utils",
         "vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils",
         "vllm.utils",
         "vllm.utils.deep_gemm",
@@ -103,6 +119,28 @@ def collect_gemm(torch, monkeypatch):
     spec = importlib.util.spec_from_file_location("collect_gemm_under_test", COLLECT_GEMM)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+
+    # The memory tests supply framework dispatch/padding results, without loading CUDA.
+    class MarlinKernel:
+        pass
+
+    module.MarlinNvFp4LinearKernel = MarlinKernel
+    module.init_nvfp4_linear_kernel = lambda **kw: MarlinKernel() if module.get_sm_version() < 100 else object()
+    module.MARLIN_MAX_BLOCKS_PER_SM = 4
+    module.USE_FP32_REDUCE_DEFAULT = True
+    padded_shapes = {
+        (65536, 51200): (65536, 51200),
+        (128, 4096): (128, 4096),
+        (65536, 16): (65536, 128),
+        (65536, 1024): (65536, 1024),
+        (32, 1024): (64, 1024),
+        (64, 1040): (64, 1152),
+        (128, 16): (128, 64),
+    }
+    module.marlin_padded_nk = lambda n, k, group_size: padded_shapes[n, k]
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _d: types.SimpleNamespace(multi_processor_count=132)
+    )
     return module
 
 
@@ -156,7 +194,8 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
     assert torch.equal(weight_scale.float(), scales)
 
 
-def test_weight_preparation_fit_check_releases_cached_memory_first(torch, collect_gemm, monkeypatch):
+def test_weight_preparation_fit_check_releases_cached_memory_first(capacity_gemm, monkeypatch):
+    collect_gemm = capacity_gemm
     gib, mib = 2**30, 2**20
     cuda = collect_gemm.torch.cuda
     state = {"free": 0, "cached": 0}
@@ -193,21 +232,115 @@ def test_weight_preparation_fit_check_releases_cached_memory_first(torch, collec
     assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 1024, "cuda:0").startswith("FIXME(kernel-limit)")
 
 
-def test_capacity_refusal_precedes_tensor_allocation(torch, collect_gemm, monkeypatch):
+@pytest.mark.parametrize(
+    "m,n,k,sms,available_mib,fits_mib",
+    [
+        # Aligned output: 8.25 MiB FP32 reduction scratch plus locks.
+        (32768, 65536, 1024, 132, 4200, 4205),
+        # N=32 pads to 64: 4 MiB physical output, rather than 2 MiB.
+        (32768, 32, 1024, 132, 75, 77),
+        # With fewer SMs, the 2 MiB contiguous slice copy dominates reduction scratch.
+        (32768, 32, 1024, 1, 69, 71),
+        # K padding retains the logical activation and adds a 72 MiB padded activation.
+        (32768, 64, 1040, 132, 145, 150),
+        # A single row uses 16, rather than 64, rows of reduction storage.
+        (1, 128, 16, 132, 2, 3),
+    ],
+)
+def test_marlin_physical_forward_capacity(capacity_gemm, monkeypatch, m, n, k, sms, available_mib, fits_mib):
+    collect_gemm, torch = capacity_gemm, capacity_gemm.torch
+    monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 90)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _d: types.SimpleNamespace(multi_processor_count=sms)
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (available_mib * 2**20, 80 * 2**30))
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(m, n, k, "cuda:0").startswith("FIXME(kernel-limit): does not fit")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (fits_mib * 2**20, 80 * 2**30))
+    assert collect_gemm._w4a16_nvfp4_does_not_fit(m, n, k, "cuda:0") is None
+
+
+@pytest.mark.parametrize("sm,marlin", [(90, True), (100, True), (100, False)])
+def test_forward_budget_uses_selected_kernel(capacity_gemm, monkeypatch, sm, marlin):
+    collect_gemm, torch = capacity_gemm, capacity_gemm.torch
+    monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: sm)
+    selected = collect_gemm.MarlinNvFp4LinearKernel() if marlin else object()
+    selector = MagicMock(return_value=selected)
+    monkeypatch.setattr(collect_gemm, "init_nvfp4_linear_kernel", selector)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (75 * 2**20, 80 * 2**30))
+    refusal = collect_gemm._w4a16_nvfp4_does_not_fit(32768, 32, 1024, "cuda:0")
+    assert (refusal is not None) == marlin
+    selector.assert_called_once_with(use_a16=True)
+
+
+@pytest.mark.parametrize(
+    "m,n,k,available",
+    [(1, 65536, 51200, 8 * 2**30), (32768, 65536, 1024, 4200 * 2**20), (32768, 32, 1024, 75 * 2**20)],
+)
+def test_capacity_refusal_precedes_tensor_allocation(capacity_gemm, monkeypatch, m, n, k, available):
+    collect_gemm, torch = capacity_gemm, capacity_gemm.torch
     monkeypatch.setattr(collect_gemm.envs, "VLLM_BATCH_INVARIANT", False)
     monkeypatch.setattr(torch.cuda, "set_device", lambda *_a: None)
     monkeypatch.setattr(torch, "set_default_dtype", lambda *_a: None)
     monkeypatch.setattr(torch, "set_default_device", lambda *_a: None)
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 80)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (8 * 2**30, 40 * 2**30))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (available, 40 * 2**30))
+    stack = MagicMock()
+    monkeypatch.setattr(collect_gemm, "VllmConfig", lambda: types.SimpleNamespace(model_config=None))
 
     def unexpected_allocation(*_a, **_kw):
         raise AssertionError("must refuse before allocating the activation or layer weights")
 
     monkeypatch.setattr(torch, "randn", unexpected_allocation)
     with pytest.raises(RuntimeError, match="^FIXME\\(kernel-limit\\): does not fit"):
-        collect_gemm.run_gemm(None, "w4a16_nvfp4", 1, 65536, 51200, perf_filename="unused")
+        collect_gemm.run_gemm(stack, "w4a16_nvfp4", m, n, k, perf_filename="unused")
+
+
+def test_marlin_budget_keeps_serving_context_and_publishes_logical_shape(capacity_gemm, monkeypatch):
+    collect_gemm, torch = capacity_gemm, capacity_gemm.torch
+    state = {"in_context": False}
+    selected = collect_gemm.MarlinNvFp4LinearKernel()
+
+    @contextmanager
+    def config_context(config):
+        assert config.model_config.dtype is torch.bfloat16
+        state["in_context"] = True
+        yield
+        state["in_context"] = False
+
+    def select_kernel(**kwargs):
+        assert state["in_context"] and kwargs == {"use_a16": True}
+        return selected
+
+    monkeypatch.setattr(collect_gemm.envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 90)
+    monkeypatch.setattr(collect_gemm, "VllmConfig", lambda: types.SimpleNamespace(model_config=None))
+    monkeypatch.setattr(collect_gemm, "set_current_vllm_config", config_context)
+    monkeypatch.setattr(collect_gemm, "init_nvfp4_linear_kernel", select_kernel)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (80 * 2**30, 80 * 2**30))
+    layer = MagicMock(spec=["to", "weight", "weight_scale", "weight_scale_2", "quant_method", "forward"])
+    layer.quant_method.kernel = selected
+    monkeypatch.setattr(collect_gemm, "RowParallelLinear", lambda **kw: layer)
+    monkeypatch.setattr(collect_gemm, "_w4a16_nvfp4_checkpoint_weights", lambda _w: (object(), object(), 1.0))
+
+    @contextmanager
+    def benchmark(**kwargs):
+        kwargs["kernel_func"]()
+        yield {"used_cuda_graph": True, "latency_ms": 1.0, "power_stats": {}}
+
+    monkeypatch.setattr(collect_gemm, "benchmark_with_power", benchmark)
+    publish = MagicMock()
+    monkeypatch.setattr(collect_gemm, "log_perf", publish)
+    with ExitStack() as stack:
+        collect_gemm.run_gemm(stack, "w4a16_nvfp4", 32768, 32, 1024, perf_filename="unused")
+    assert not state["in_context"]
+    row = publish.call_args.kwargs["item_list"][0]
+    assert (row["m"], row["n"], row["k"]) == (32768, 32, 1024)
+    assert row["gemm_dtype"] == "w4a16_nvfp4"
+    assert publish.call_args.kwargs["kernel_source"] == type(selected).__name__
+    assert layer.forward.call_count == 2  # Dry run and fake benchmark.
 
 
 def test_blackwell_keeps_the_scaled_fp4_quant_kernel(torch, collect_gemm, monkeypatch):
