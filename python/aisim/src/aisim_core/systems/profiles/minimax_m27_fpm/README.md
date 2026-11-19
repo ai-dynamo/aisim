@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 [`hf_dataset.json`](hf_dataset.json) is an adapted index of NVIDIA-collected
 measurement metadata from
-[`ai-dynamo/aisim-data/data/fpm/MiniMaxAI--MiniMax-M2.7`](https://huggingface.co/datasets/ai-dynamo/aisim-data/tree/main/data/fpm/MiniMaxAI--MiniMax-M2.7)
+[`ai-dynamo/aisim-data/data/fpm/MiniMaxAI--MiniMax-M2.7`](https://huggingface.co/datasets/ai-dynamo/aisim-data/tree/07f0080d1ab09d36c7f8b4197b5b8b6e7490cd5b/data/fpm/MiniMaxAI--MiniMax-M2.7)
 at the immutable revision pinned in `hf_dataset.json` (the files moved byte-identically from `nvidia/aisimulate-fpm-dataset@dbfcdd9eb62ea733efbc3f0cbd78277f2960061a`, `data/<rest>` to `data/fpm/<rest>`). Each entry records the
 original artifact paths and SHA256 digests; table contents are fetched explicitly
 and are not bundled in this directory. The dataset card declares Apache-2.0.

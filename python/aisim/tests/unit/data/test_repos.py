@@ -147,3 +147,11 @@ def test_packaged_pins_old_and_new_all_parse():
         assert manifest["repo_id"] == NEW, path
         for entry in manifest["profiles"].values():
             assert all(f["path"].startswith("data/fpm/") for f in fpm_dataset._profile_files(entry)), path
+
+
+def test_minimax_readme_links_the_pinned_revision():
+    profile = SYSTEMS / "profiles" / "minimax_m27_fpm"
+    revision = json.loads((profile / "hf_dataset.json").read_text(encoding="utf-8"))["revision"]
+    readme = (profile / "README.md").read_text(encoding="utf-8")
+    assert f"/tree/{revision}/" in readme
+    assert "/tree/main" not in readme

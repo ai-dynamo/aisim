@@ -37,11 +37,10 @@ def test_only_the_history_profiles_stay_on_the_retired_layout():
     assert all(item["path"].startswith("data/history/") for e in document["profiles"].values() for item in e["files"])
 
 
-@pytest.mark.parametrize("revision", ["c" * 40])
-def test_set_pin_rewrites_every_consumer_and_check_agrees(tmp_path, monkeypatch, revision):
-    """Run against a copy so the checked-in pins are untouched."""
+def _pin_copy(tmp_path, monkeypatch):
+    """A copy of every pin consumer, so the checked-in pins stay untouched."""
     copy = tmp_path / "repo"
-    for source in [pin_tool.PIN_FILE, *pin_tool.consumers()]:
+    for source in [pin_tool.PIN_FILE, *pin_tool.consumers(), *pin_tool.revision_readmes()]:
         target = copy / source.relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
@@ -49,8 +48,45 @@ def test_set_pin_rewrites_every_consumer_and_check_agrees(tmp_path, monkeypatch,
     monkeypatch.setattr(pin_tool, "PIN_FILE", copy / "scripts/fpm_accuracy/dataset_pin.json")
     monkeypatch.setattr(pin_tool, "SYSTEMS", copy / "python/aisim/src/aisim_core/systems")
     monkeypatch.setattr(pin_tool, "RECIPES", copy / "python/aisim/collector/fpm_forward/recipes")
+
+
+@pytest.mark.parametrize("revision", ["c" * 40])
+def test_set_pin_rewrites_every_consumer_and_check_agrees(tmp_path, monkeypatch, revision):
+    _pin_copy(tmp_path, monkeypatch)
+    readmes = pin_tool.revision_readmes()
+    assert readmes  # the Minimax README links its profile's pinned revision
+    previous = {manifest: json.loads(manifest.read_text())["revision"] for manifest in readmes.values()}
+    assert all(f"/tree/{previous[manifest]}/" in readme.read_text() for readme, manifest in readmes.items())
     monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--revision", revision])
     assert pin_tool.main() == 0
     monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--check", "--require-set"])
     assert pin_tool.main() == 0
     assert {json.loads(p.read_text())["revision"] for p in pin_tool.consumers()} == {revision}
+    for readme, manifest in readmes.items():  # the README follows the manifest it describes
+        text = readme.read_text()
+        assert json.loads(manifest.read_text())["revision"] == revision
+        assert f"/tree/{revision}/" in text and f"/tree/{previous[manifest]}/" not in text
+
+
+def test_check_rejects_a_readme_that_lags_the_pin(tmp_path, monkeypatch, capsys):
+    _pin_copy(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--check", "--require-set"])
+    assert pin_tool.main() == 0
+    readme = next(iter(pin_tool.revision_readmes()))
+    revision = json.loads(pin_tool.PIN_FILE.read_text())["revision"]
+    readme.write_text(readme.read_text().replace(f"/tree/{revision}/", f"/tree/{'d' * 40}/"))
+    assert pin_tool.main() == 1
+    assert "does not link the pinned revision" in capsys.readouterr().err
+
+
+def test_an_unlinked_readme_stops_an_update_before_any_write(tmp_path, monkeypatch):
+    _pin_copy(tmp_path, monkeypatch)
+    readme = next(iter(pin_tool.revision_readmes()))
+    readme.write_text("no revision link here\n")
+    files = [pin_tool.PIN_FILE, *pin_tool.consumers(), readme]
+    before = {path: path.read_bytes() for path in files}
+    monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--revision", "c" * 40])
+    with pytest.raises(SystemExit) as raised:
+        pin_tool.main()
+    assert raised.value.code != 0
+    assert before == {path: path.read_bytes() for path in files}
