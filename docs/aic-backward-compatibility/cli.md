@@ -572,7 +572,9 @@ Let's run `aiconfigurator cli default --model-path Qwen/Qwen3-32B-FP8 --total-gp
     - TTFT: 202.65ms
     - TPOT: 8.07ms
 ```
-This shows that for model `Qwen/Qwen3-32B-FP8` to deploy on 32 H200, if you require your TTFT to be at most 1000ms and TPOT to be at most 10ms, and your problem is isl=3000 osl=512, then disagg will be 1.43x of agg. The target result is shown as Overall Best Configuration.
+This shows that for model `Qwen/Qwen3-32B-FP8` to deploy on 32 H200, if you require your TTFT to be less than 1000ms and TPOT to be at most 10ms, and your problem is isl=3000 osl=512, then disagg will be 1.43x of agg. The target result is shown as Overall Best Configuration.
+
+The disaggregated prefill filter requires corrected TTFT to be strictly below the target: a candidate exactly at 1000ms is excluded before rate matching. The aggregated sweep accepts TTFT equal to the target.
 
 **Python API equivalent:**
 ```python
