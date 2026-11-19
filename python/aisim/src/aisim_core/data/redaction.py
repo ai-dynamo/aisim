@@ -40,7 +40,7 @@ import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify
-from aisim_core.data.catalog import catalog_files
+from aisim_core.data.catalog import CATALOG_DIR, COVERAGE_FILE, catalog_files, read_catalog_coverage
 from aisim_core.data.e2e import (
     OBSERVATIONS_SCHEMA,
     REQUESTS_SCHEMA,
@@ -50,7 +50,14 @@ from aisim_core.data.e2e import (
     read_snapshot,
 )
 from aisim_core.data.eval import load_record, record_paths
-from aisim_core.data.hygiene import Finding, bounded_json_bytes, checked_path, yaml_sidecar_value
+from aisim_core.data.hygiene import (
+    DuplicateJsonKeyError,
+    Finding,
+    bounded_json_bytes,
+    checked_path,
+    json_sidecar_value,
+    yaml_sidecar_value,
+)
 from aisim_core.data.parquet import read_parquet
 
 Label = Literal["public", "internal", "restricted"]
@@ -206,7 +213,9 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
 
 def _json_text(text: str) -> Any:
     try:
-        return json.loads(text)
+        return json_sidecar_value(text.encode("utf-8"))
+    except DuplicateJsonKeyError:
+        raise
     except (ValueError, RecursionError):
         return text
 
@@ -223,7 +232,11 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
             continue
         if _CREDENTIAL_KEY.search(key):
             flag("secret", "credential field must be removed or [REDACTED]")
-        nested = _json_text(text) if text.lstrip(" \t\r\n")[:1] in ("{", "[") else None
+        try:
+            nested = _json_text(text) if text.lstrip(" \t\r\n")[:1] in ("{", "[") else None
+        except DuplicateJsonKeyError:
+            flag("duplicate-json-key", "JSON-encoded metadata repeats an object key")
+            continue
         if isinstance(nested, (dict, list)):
             out.extend(scan_value(nested, policy, path, where, _key=key))
             continue
@@ -520,6 +533,11 @@ def check_publishable(
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
+        if rel == f"{CATALOG_DIR}/{COVERAGE_FILE}":
+            try:
+                findings.extend(scan_value(read_catalog_coverage(root).model_dump(), policy, rel, "catalog coverage"))
+            except (OSError, ValueError, RecursionError) as exc:
+                findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel in catalog_shards:
             try:
                 parquet = pq.ParquetFile(checked_path(root, rel))

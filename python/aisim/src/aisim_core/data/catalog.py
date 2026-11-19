@@ -47,6 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest
 from aisim_core.data.eval import EvalRecord, Layer, current_records, record_paths
+from aisim_core.data.hygiene import bounded_json_bytes, json_sidecar_value
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
 
@@ -54,6 +55,7 @@ CATALOG_SCHEMA_ID = "aisim-catalog/v1"
 SYSTEMS_SCHEMA_ID = "aisim-catalog-systems/v1"
 CATALOG_DIR = "catalog"
 SYSTEMS_FILE = "systems.parquet"
+COVERAGE_FILE = "coverage.json"
 
 LAYERS: tuple[Layer, ...] = ("op", "fpm", "e2e")
 LAYER_CATEGORY: dict[str, str] = {"op": "op-latency", "fpm": "fpm", "e2e": "e2e"}
@@ -68,6 +70,23 @@ KIB = 1024
 
 class _Row(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+
+
+class CatalogCoverage(_Row):
+    """Explicit coverage universe, retained so validation rebuilds the same missing cells."""
+
+    schema_version: Literal["aisim-catalog-coverage/v1"] = "aisim-catalog-coverage/v1"
+    expected_models: list[str] = Field(default_factory=list)
+    expected_frameworks: list[str] = Field(default_factory=list)
+
+
+def read_catalog_coverage(root: Path) -> CatalogCoverage:
+    path = root / CATALOG_DIR / COVERAGE_FILE
+    return (
+        CatalogCoverage.model_validate(json_sidecar_value(bounded_json_bytes(path)))
+        if path.is_file()
+        else CatalogCoverage()
+    )
 
 
 class CatalogRow(_Row):
@@ -265,24 +284,33 @@ def build_catalog(
     dataset_root: str | Path,
     *,
     systems_dir: str | Path = PACKAGED_SYSTEMS_DIR,
-    expected_models: Iterable[str] = (),
-    expected_frameworks: Iterable[str] = (),
+    expected_models: Iterable[str] | None = None,
+    expected_frameworks: Iterable[str] | None = None,
     write: bool = True,
 ) -> list[CatalogRow]:
     """Build the catalog from a dataset root's category indexes, manifests and eval records.
 
     Returns every row (sorted by hardware, layer, model, framework). With
     ``write=True`` (default) it replaces the shards under ``<root>/catalog/``
-    and removes stale shards it no longer produces.
+    and removes stale shards it no longer produces. Explicit coverage is saved
+    in ``catalog/coverage.json``; omitted arguments reuse that declaration.
+    Pass an empty iterable to clear a previously declared dimension.
     """
     root = Path(dataset_root)
+    saved = read_catalog_coverage(root)
+    coverage = CatalogCoverage(
+        expected_models=sorted(set(saved.expected_models if expected_models is None else expected_models)),
+        expected_frameworks=sorted(
+            set(saved.expected_frameworks if expected_frameworks is None else expected_frameworks)
+        ),
+    )
     specs = known_system_specs(systems_dir)
     cells: dict[tuple, _Cell] = defaultdict(_Cell)
     _read_indexed_cells(root, cells)
     _read_eval_cells(root, cells)
 
-    models = {k[1] for k in cells if k[1] is not None} | set(expected_models)
-    frameworks = {k[3] for k in cells} | set(expected_frameworks)
+    models = {k[1] for k in cells if k[1] is not None} | set(coverage.expected_models)
+    frameworks = {k[3] for k in cells} | set(coverage.expected_frameworks)
     hardware = {k[2] for k in cells} | set(specs)
     keys = set(cells)
     for hw in hardware:
@@ -295,6 +323,9 @@ def build_catalog(
     rows.sort(key=lambda r: (r.hardware, *_row_sort_key(r)))
     if write:
         _write(root, rows, specs)
+        path = root / CATALOG_DIR / COVERAGE_FILE
+        if coverage.expected_models or coverage.expected_frameworks or path.exists():
+            path.write_text(coverage.model_dump_json(indent=2) + "\n", encoding="utf-8")
     return rows
 
 
