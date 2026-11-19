@@ -157,6 +157,9 @@ class PassLaunchConfig(StrictModel):
 class SchedulerPredictionConfig(StrictModel):
     max_batched_tokens: PositiveInt = 8192
     max_sequences: PositiveInt = 256
+    scheduler_select_time_ms: NonNegativeFloat = Field(
+        default=0.0, description="SGLang only: measured serial batch-selection cost per pass with model work."
+    )
     prefill_schedule_interval: PositiveInt = Field(
         default=1, description="vLLM only: admit prefill once every N attention-DP group passes."
     )
@@ -1934,12 +1937,19 @@ def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> No
         for field, backend, default in (
             ("prefill_schedule_interval", "vllm", 1),
             ("prefill_decode_interval", "sglang", 0),
+            ("scheduler_select_time_ms", "sglang", 0.0),
             ("async_scheduling", "vllm", None),
             ("launch", "vllm", None),
             ("load_balance_method", "sglang", "round_robin"),
         ):
             if engine.backend != backend and getattr(worker.scheduler, field) != default:
                 raise ValueError(f"workers.{role}.scheduler.{field} is supported only for backend={backend}")
+        if (
+            worker.scheduler.scheduler_select_time_ms
+            and isinstance(worker, HostWorkerPredictionConfig)
+            and worker.host_loop
+        ):
+            raise ValueError(f"workers.{role}.scheduler.scheduler_select_time_ms requires host_loop=false")
         if worker.scheduler.load_balance_method != "round_robin" and (
             role != "decode" or engine.mode != "disaggregated"
         ):

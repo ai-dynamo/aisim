@@ -378,6 +378,13 @@ pub trait RankEngine: Sized {
         end_ms: f64,
     ) -> Result<Self::PassCompletionEffects>;
 
+    /// This rank's contribution to the group boundary reported in idle-rank
+    /// forward telemetry. An implementation may exclude separately priced
+    /// host time while retaining it in the actual pass boundary.
+    fn idle_telemetry_end_ms(&self, _pending: &Self::PendingPass, end_ms: f64) -> f64 {
+        end_ms
+    }
+
     /// Cross the shared completion boundary without a rank-local pass.
     ///
     /// Attention-DP ranks that had no work when a sibling pass started still
@@ -392,6 +399,17 @@ pub trait RankEngine: Sized {
         _end_ms: f64,
     ) -> Result<Option<Self::PassCompletionEffects>> {
         Ok(None)
+    }
+
+    /// Like `complete_idle_group_pass`, with a separate modeled end time for
+    /// forward telemetry. Scheduling effects still advance to `end_ms`.
+    fn complete_idle_group_pass_with_telemetry(
+        &mut self,
+        started_at_ms: f64,
+        end_ms: f64,
+        _telemetry_end_ms: f64,
+    ) -> Result<Option<Self::PassCompletionEffects>> {
+        self.complete_idle_group_pass(started_at_ms, end_ms)
     }
 
     /// Earliest deadline for independently modeled internal work.

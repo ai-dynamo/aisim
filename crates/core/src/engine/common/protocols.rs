@@ -173,6 +173,7 @@ pub(crate) struct SglangArgs {
     pub chunked_prefill_size: Option<usize>,
     pub clip_max_new_tokens: Option<usize>,
     pub schedule_conservativeness: Option<f64>,
+    pub scheduler_select_time_ms: f64,
     pub vlm_cache_bytes: Option<u64>,
     pub host_loop: bool,
     pub disaggregation_decode_enable_radix_cache: bool,
