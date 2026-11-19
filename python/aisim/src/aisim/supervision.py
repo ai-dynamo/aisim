@@ -552,6 +552,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1 if code < 0 else code
 
 
+def _parent_transfer_budget(budget: dict[str, Any]) -> int:
+    """Bound serialized bytes with the existing 64x JSON expansion allowance."""
+    host = discover_host()
+    return (
+        max(
+            0,
+            min(
+                host.available_memory_bytes - budget["reserved_host_memory_bytes"],
+                budget["memory_limit_bytes"] - host.process_memory_bytes,
+            ),
+        )
+        // 64
+    )
+
+
 def supervised_recommendation(config, kwargs):
     from .sweeper.result import SweepResult
 
@@ -588,14 +603,19 @@ def supervised_recommendation(config, kwargs):
                 events = root / "events.jsonl"
                 report["partial_events"] = []
                 if events.exists():
+                    transfer_bytes = min(_CHECKPOINT_TOTAL_BYTES, _parent_transfer_budget(report["budget"]))
                     with events.open(encoding="utf-8") as source:
                         retained_bytes = 0
-                        while line := source.readline(_CHECKPOINT_RECORD_BYTES + 1):
+                        # Read at most the remaining allowance plus one character
+                        # to distinguish EOF from an unsafe next record.
+                        while line := source.readline(
+                            min(_CHECKPOINT_RECORD_BYTES, transfer_bytes - retained_bytes) + 1
+                        ):
                             retained_bytes += len(line)
                             if (
                                 not line.endswith("\n")
                                 or len(line) > _CHECKPOINT_RECORD_BYTES
-                                or retained_bytes > _CHECKPOINT_TOTAL_BYTES
+                                or retained_bytes > transfer_bytes
                             ):
                                 report["partial_evidence_truncated"] = True
                                 break
@@ -605,15 +625,7 @@ def supervised_recommendation(config, kwargs):
                 raise KeyboardInterrupt
             raise RuntimeError(message)
         # Bound parent-side JSON expansion before loading any result bytes.
-        host = discover_host()
-        safe_bytes = max(
-            0,
-            min(
-                host.available_memory_bytes - report["budget"]["reserved_host_memory_bytes"],
-                report["budget"]["memory_limit_bytes"] - host.process_memory_bytes,
-            ),
-        )
-        if result.stat().st_size * 64 > safe_bytes:
+        if result.stat().st_size > _parent_transfer_budget(report["budget"]):
             raise ResourceLimitError(
                 "recommendation result exceeds the bounded parent transfer budget",
                 plan={
