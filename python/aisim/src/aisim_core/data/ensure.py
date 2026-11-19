@@ -18,6 +18,12 @@ Source order, per category named by the :class:`DataPin`:
 3. packaged data: only for categories the pin does not name. A category the pin
    names is never served from packaged data; absent or invalid data is an error.
 
+``op-latency`` is composed, not selected: every operation family published for the configuration's
+system/backend/version is verified and written, with the packaged system specs, into one ``systems/`` root
+(:func:`~aisim_core.data.op_tree.load_op_latency_tree`) that leads ``systems_paths``. Two entries for the same family
+are a conflict resolved with ``AISIM_DATA_CONFIGURATION``; a family the dataset does not publish is absent, never
+filled from packaged tables by the pin.
+
 With no pin the whole step is a no-op and behavior is unchanged. Credentials are
 the standard Hugging Face ones (``HF_TOKEN`` / ``huggingface-cli login``); this
 module accepts, stores and prints no token.
@@ -36,6 +42,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -58,7 +65,8 @@ from aisim_core.data.fetch import (
     Transport,
     fetch,
 )
-from aisim_core.data.loaders import LOADERS, FpmData, LoaderError, OpLatencyData
+from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
+from aisim_core.data.op_tree import OpTreeLoad, load_op_latency_tree
 from aisim_core.data.repos import resolve_ref
 
 DEFAULT_MAX_BYTES = 256 * 1024 * 1024
@@ -295,6 +303,20 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
             selection=selection,
             source=where,
         )
+    if category == "op-latency":
+        entries = _one_entry_per_family(entries, selection, where)
+        loaded, entry_ids = _load_op_latency(
+            root, entries, out.config, Cache(pin.cache_dir), source_key, selection, where
+        )
+        _wire(out.config, category, loaded, None)
+        out.datasets[category] = {
+            "repo": pin.repo,
+            "revision": revision,
+            "source": source,
+            "configuration_ids": entry_ids,
+            "downloaded_bytes": downloaded,
+        }
+        return
     if len(entries) > 1:
         ids = ", ".join(sorted(e.configuration_id for e in entries))
         raise DataConflictError(
@@ -365,19 +387,67 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
         if data.config is None:
             raise LoaderError("an fpm-profile artifact cannot be built into a best_available configuration")
         return data
-    existing = output_dir / "systems"
-    if existing.is_dir():
-        manifest = loader.read_manifest(root, manifest_path, config)
-        files = tuple(sorted(a.runtime_path for a in manifest.artifacts if a.runtime_path))
-        return OpLatencyData(existing, manifest, files)
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    return loader.load(root, manifest_path, output_dir=output_dir, config=config)
+    raise ValueError(f"no loader for category {category!r}")
 
 
-def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry) -> None:
+def _one_entry_per_family(entries: list[Entry], selection: Selection, where: str) -> list[Entry]:
+    """Operation families are complementary inputs of one root; two entries for one family are a real conflict."""
+    by_family: dict[str | None, list[Entry]] = {}
+    for entry in entries:
+        by_family.setdefault(entry.identity.operation_family, []).append(entry)
+    clashes = {
+        family: sorted(e.configuration_id for e in group) for family, group in by_family.items() if len(group) > 1
+    }
+    if clashes:
+        detail = "; ".join(f"{family}: {', '.join(ids)}" for family, ids in sorted(clashes.items(), key=str))
+        raise DataConflictError(
+            f"several op-latency entries match one operation family for {_describe(selection)} in {where} ({detail}); "
+            "set AISIM_DATA_CONFIGURATION (DataPin.configuration_id) to choose one"
+        )
+    return sorted(entries, key=lambda e: e.configuration_id)
+
+
+def _load_op_latency(
+    root: Path,
+    entries: list[Entry],
+    config: Mapping[str, Any],
+    cache: Cache,
+    source_key: str,
+    selection: Selection,
+    where: str,
+) -> tuple[OpTreeLoad, list[str]]:
+    """Compose every selected family and the system specs into one verified ``systems/`` root."""
+    ids = [e.configuration_id for e in entries]
+    digest = hashlib.sha256("\n".join(ids).encode()).hexdigest()[:16]
+    output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
+    try:
+        loader = LOADERS["op-latency"]()
+        for entry in entries:  # verifies every artifact in the fetched tree, also when the composed root is reused
+            loader.read_manifest(root, entry.manifest.path, config)
+        if (output_dir / "systems").is_dir():
+            return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        # Build next to the destination and rename, so a concurrent worker never sees a half-written root.
+        staging = output_dir.with_name(f"{output_dir.name}.{os.getpid()}.tmp")
+        shutil.rmtree(staging, ignore_errors=True)
+        load_op_latency_tree(root, staging / "systems", entries=entries)
+        try:
+            staging.rename(output_dir)
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
+            if not (output_dir / "systems").is_dir():
+                raise
+        return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
+    except (LoaderError, ValueError) as exc:
+        raise MissingDataError(
+            f"op-latency data {', '.join(ids)} in {where} failed verification: {exc}", selection=selection, source=where
+        ) from exc
+
+
+def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | None) -> None:
     """Merge loaded inputs into ``config``, preserving explicit user choices."""
     if category == "op-latency":
-        paths = [str(loaded.systems_root), *(str(p) for p in config.get("systems_paths") or ())]
+        paths = [str(loaded.root), *(str(p) for p in config.get("systems_paths") or ())]
         config["systems_paths"] = list(dict.fromkeys(paths))
         return
     loaded_config = loaded.config
