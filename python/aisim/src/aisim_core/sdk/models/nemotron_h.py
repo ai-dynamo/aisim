@@ -96,41 +96,47 @@ class NemotronHModel(BaseModel):
         # extra_params is NemotronHConfig with hybrid layer configuration. Checkpoint metadata
         # prices each projection and routed-expert layer at its own precision; without
         # per-layer metadata every projection keeps the global mode.
-        raw = model_info.get("raw_config", {})
-        pattern = model_info["extra_params"].hybrid_override_pattern
-        checkpoint = checkpoint_precision(raw)
-        # shortcut: a checkpoint with W4A16_NVFP4 layers (Nemotron 3.5 Lightning) keeps the global
-        # modes, because no packaged table has w4a16_nvfp4 MoE rows. Remove once those tables exist.
-        per_layer = "w4a16_nvfp4" not in checkpoint.algos
-        if not per_layer:
-            warnings.warn(
-                f"{model_info['model_path']}: the checkpoint lists W4A16_NVFP4 layers, which no packaged "
-                "table measures; every projection and routed expert is priced at the global GEMM/MoE modes.",
-                stacklevel=2,
-            )
-        # The system resolves under the caller's systems root (canonical API systems_paths).
-        system, systems_path = model_config.system, model_config.systems_path
-        if per_layer and not model_info["gemm_quant_mode_is_explicit"]:
-            model._projection_quant_modes = projection_modes(
-                checkpoint,
-                pattern,
-                _LAYER_PROJECTIONS,
-                _LAYER_PATHS,
-                model_config.gemm_quant_mode,
-                system,
-                systems_path=systems_path,
-            )
-        if per_layer and not model_info["moe_quant_mode_is_explicit"]:
-            model._moe_quant_modes = moe_modes(
-                checkpoint,
-                pattern,
-                _EXPERT_MODULES,
-                _LAYER_PATHS,
-                model_config.moe_quant_mode,
-                system,
-                lambda mode: resolve_vllm_moe_execution_mode(mode, backend_name, model_info["architecture"]),
-                systems_path=systems_path,
-            )
+        # Invalid checkpoint metadata is a configuration error: estimator fallback must not hide it.
+        try:
+            raw = model_info.get("raw_config", {})
+            pattern = model_info["extra_params"].hybrid_override_pattern
+            checkpoint = checkpoint_precision(raw)
+            # shortcut: a checkpoint with W4A16_NVFP4 layers (Nemotron 3.5 Lightning) keeps the global
+            # modes, because no packaged table has w4a16_nvfp4 MoE rows. Remove once those tables exist.
+            per_layer = "w4a16_nvfp4" not in checkpoint.algos
+            if not per_layer:
+                warnings.warn(
+                    f"{model_info['model_path']}: the checkpoint lists W4A16_NVFP4 layers, which no packaged "
+                    "table measures; every projection and routed expert is priced at the global GEMM/MoE modes.",
+                    stacklevel=2,
+                )
+            # The system resolves under the caller's systems root (canonical API systems_paths).
+            system, systems_path = model_config.system, model_config.systems_path
+            if per_layer and not model_info["gemm_quant_mode_is_explicit"]:
+                model._projection_quant_modes = projection_modes(
+                    checkpoint,
+                    pattern,
+                    _LAYER_PROJECTIONS,
+                    _LAYER_PATHS,
+                    model_config.gemm_quant_mode,
+                    system,
+                    systems_path=systems_path,
+                )
+            if per_layer and not model_info["moe_quant_mode_is_explicit"]:
+                model._moe_quant_modes = moe_modes(
+                    checkpoint,
+                    pattern,
+                    _EXPERT_MODULES,
+                    _LAYER_PATHS,
+                    model_config.moe_quant_mode,
+                    system,
+                    lambda mode: resolve_vllm_moe_execution_mode(mode, backend_name, model_info["architecture"]),
+                    systems_path=systems_path,
+                )
+        except InvalidEngineConfigurationError:
+            raise
+        except ValueError as exc:
+            raise InvalidEngineConfigurationError(f"{model_info['model_path']}: {exc}") from exc
         model.set_hybrid_config(model_info["extra_params"])
         return model
 

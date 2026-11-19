@@ -647,6 +647,42 @@ def test_canonical_api_resolves_nvfp4_lanes_under_the_selected_systems_root(monk
     assert set(_experts(model)) == {MOE.nvfp4}
 
 
+def test_invalid_checkpoint_precision_stops_estimator_selection(monkeypatch, tmp_path):
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    root = files("aisim_core") / "model_configs"
+    data = json.loads((root / f"{SUPER.replace('/', '--')}_config.json").read_text())
+    hf_quant = json.loads((root / f"{SUPER.replace('/', '--')}_hf_quant_config.json").read_text())
+
+    def best_available(model):
+        return RustForwardPassPerfModel.best_available(
+            ForwardPassPerfModelConfig(
+                model=model,
+                system="gb200",
+                backend="vllm",
+                backend_version="0.30.0",
+                worker_type="decode",
+                tp=1,
+                moe_tp_size=1,
+                moe_ep_size=1,
+                database_mode="SOL",
+                estimation_mode="auto",
+                fallback_policy="deny",
+            )
+        )
+
+    best_available(SUPER).close()  # a valid mixed checkpoint resolves
+    # The two quantization files disagree on one module: auto selection must reject, not fall back.
+    key = "backbone.layers.0.mixer.in_proj"
+    data["quantization_config"]["quantized_layers"][key] = {"quant_algo": "FP8"}
+    hf_quant["quantization"]["quantized_layers"][key] = {"quant_algo": "NVFP4", "group_size": 16}
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(hf_quant))
+    with pytest.raises(ValueError, match="conflicting algorithms"):
+        best_available(str(tmp_path))
+
+
 def test_rebuilding_from_a_config_tracks_its_current_quant_modes(monkeypatch):
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
 
