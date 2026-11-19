@@ -10,10 +10,13 @@
 //!
 //! For `fp8_static` quant mode there are two paths. When the loaded GEMM
 //! table has `fp8_static` rows (direct path, SILICON / HYBRID / EMPIRICAL
-//! only), the price comes from those rows; only a low-precision input
-//! subtracts `scale_matrix`. Otherwise (derived path, and always in SOL /
-//! SOL_FULL), the price comes from the `fp8` rows minus `compute_scale`
-//! overhead (and minus `scale_matrix` when the input is also low-precision).
+//! only), SILICON looks up those rows and HYBRID / EMPIRICAL can use them
+//! to calibrate utilization; only a low-precision input subtracts
+//! `scale_matrix`. Without direct rows, these modes use the dynamic-FP8
+//! lookup or estimate minus `compute_scale` overhead (and minus
+//! `scale_matrix` when the input is also low-precision). SOL / SOL_FULL
+//! always use the derived path with analytic GEMM and overhead values,
+//! without reading any of these tables.
 //! Post-subtraction latency is floored at the GEMM's own SOL roofline —
 //! mirroring Python's `max(latency_floor, latency)` where
 //! `latency_floor = query_gemm(..., DatabaseMode.SOL)` — not at 0.

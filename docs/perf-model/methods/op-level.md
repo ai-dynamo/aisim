@@ -310,7 +310,9 @@ overhead tables. Transfer reachability alone cannot admit it. On both paths,
 the list of supported GEMM modes contains `fp8_static` only when the
 `scale_matrix` table has `fp8` rows. Validation requires known precision
 profiles and the resolved transfer policy; a pure SILICON request still needs
-data. New precision support requires native profile levels, their exported
+data. SOL and SOL_FULL always use the derived path with analytic GEMM and
+overhead values; neither mode reads GEMM or overhead tables, even when direct
+rows exist. New precision support requires native profile levels, their exported
 Python reachability view, and tests described in [Extending](../extending.md).
 
 ## Diagnostics and limits

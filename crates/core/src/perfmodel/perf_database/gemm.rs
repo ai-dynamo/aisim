@@ -1735,4 +1735,55 @@ mod tests {
         ));
         assert_eq!(query_cache_len(&table), 0);
     }
+
+    // Pin the existing cached-error contract (AISIM-2454): the presence
+    // probe returns false, but pricing must still surface the broken GEMM
+    // file rather than produce a price or hide its original diagnostic.
+    #[test]
+    fn has_direct_fp8_static_schema_error_remains_a_query_error() {
+        use crate::perf_database::energy_test_fixtures::{Col, write_parquet};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gemm_perf.parquet");
+        write_parquet(
+            &path,
+            &[
+                Col::I64("m", vec![128]),
+                Col::I64("n", vec![1024]),
+                Col::I64("k", vec![1024]),
+                Col::F64("latency", vec![0.5]),
+            ],
+        );
+        let table = GemmTable::new(tmp.path().to_path_buf(), b200_sxm_spec());
+        for _ in 0..2 {
+            assert!(!table.has_direct_fp8_static().unwrap());
+            let err = table
+                .query(GemmQuantMode::Fp8Static, 128, 1024, 1024)
+                .unwrap_err();
+            assert!(err.is_missing_perf_data(), "{err}");
+            assert!(err.to_string().contains("gemm_dtype"), "{err}");
+            assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
+            assert_eq!(query_cache_len(&table), 0);
+        }
+    }
+
+    #[test]
+    fn has_direct_fp8_static_unreadable_parquet_remains_a_query_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gemm_perf.parquet");
+        // Invalid Parquet bytes exercise a deterministic read failure without
+        // depending on filesystem permissions (CI may run as root).
+        std::fs::write(&path, b"not a parquet file").unwrap();
+        let table = GemmTable::new(tmp.path().to_path_buf(), b200_sxm_spec());
+        for _ in 0..2 {
+            assert!(!table.has_direct_fp8_static().unwrap());
+            let err = table
+                .query(GemmQuantMode::Fp8Static, 128, 1024, 1024)
+                .unwrap_err();
+            assert!(err.is_missing_perf_data(), "{err}");
+            assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
+            assert!(err.to_string().contains("Parquet"), "{err}");
+            assert_eq!(query_cache_len(&table), 0);
+        }
+    }
 }
