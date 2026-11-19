@@ -3130,6 +3130,21 @@ mod tests {
     }
 
     #[test]
+    fn grouped_prefix_caching_refuses_a_startup_count_above_usize() {
+        // Two full-attention groups of two-token blocks need 2^63 blocks each
+        // for a max_model_len of u64::MAX. vLLM sums Python integers, which
+        // cannot overflow, and refuses the pool.
+        let mut wire = glm_prefix_wire(Some("0.31.0"), None);
+        wire["prefix_match_unit"] = 2.into();
+        wire["max_model_len"] = u64::MAX.into();
+        wire["kv_cache_groups"] = serde_json::json!([
+            {"name": "a", "kind": "attention", "num_layers": 1, "block_size_tokens": 2, "page_size_bytes": GLM_PAGE, "prefix_cacheable": true},
+            {"name": "b", "kind": "attention", "num_layers": 1, "block_size_tokens": 2, "page_size_bytes": GLM_PAGE, "prefix_cacheable": true},
+        ]);
+        assert!(validation_error(wire).contains("need capacity for the full prompt"));
+    }
+
+    #[test]
     fn grouped_prefix_caching_refuses_fifo_preemption() {
         // Only grouped prefix caching follows vLLM's preemption order. A
         // grouped rank without prefix caching and a linear rank keep `fifo`.
