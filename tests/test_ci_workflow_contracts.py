@@ -3758,9 +3758,11 @@ def test_nightly_license_matrix_covers_the_smoked_python_versions():
     upload = next(
         step
         for step in compliance["steps"]
-        if step.get("with", {}).get("name", "").startswith("nightly-python-inventory-")
+        if "actions/upload-artifact@" in step.get("uses", "")
+        and step.get("with", {}).get("name", "").startswith("nightly-python-inventory-")
     )
     assert upload["with"]["name"] == "nightly-python-inventory-${{ matrix.arch }}-${{ matrix.python-version }}"
+    assert upload["with"]["path"] == "${{ runner.temp }}/python-inventory/*.csv"
 
 
 @pytest.mark.parametrize(

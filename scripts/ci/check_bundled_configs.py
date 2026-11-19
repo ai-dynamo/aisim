@@ -175,7 +175,10 @@ def read_wheel(wheel_path: Path, declared: dict[str, dict]) -> WheelContents:
                 is_legal = legal_file(name)
                 if not is_legal and PurePosixPath(name).suffix.lower() not in CONFIG_SUFFIXES:
                     continue
-                data = wheel.read(member)
+                try:
+                    data = wheel.read(member)
+                except NotImplementedError as error:
+                    raise InventoryError(f"unsupported wheel member {name}: {error}") from error
                 is_config = name in declared or model_config(name, data)
                 if not is_config and not is_legal:
                     continue

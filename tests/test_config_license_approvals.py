@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
+import struct
 import subprocess
 import sys
 import zipfile
@@ -288,10 +289,12 @@ def test_workflows_run_strict_gate_before_dependency_execution_and_keep_failure_
             assert "outputs.application_wheel" not in job["if"]
 
 
+@pytest.mark.parametrize("endpoint", ["blob", "resolve"])
 @pytest.mark.parametrize("change", ["repository", "revision", "missing_source"])
-def test_unrelated_nvidia_card_cannot_exempt_config(tmp_path, change):
+def test_unrelated_nvidia_card_cannot_exempt_config(tmp_path, change, endpoint):
     item = record("nvidia_developed", contribution=["LicenseRef-Example"])
     current = entry()
+    current["source"]["url"] = current["source"]["url"].replace("/blob/", f"/{endpoint}/")
     if change == "missing_source":
         current.pop("source")
     elif change == "repository":
@@ -411,6 +414,112 @@ def licensed_source(tmp_path):
     return root, config, current, item, texts, save
 
 
+@pytest.fixture
+def licensed_wheel(licensed_source, tmp_path):
+    root, config, _, _, _, _ = licensed_source
+    wheel = tmp_path / "synthetic.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(PATH, config.read_bytes())
+        for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+            archive.writestr(f"aisim-1.dist-info/licenses/{name}", (root / name).read_bytes())
+    return wheel
+
+
+@pytest.mark.parametrize("endpoint", ["blob", "resolve"])
+def test_same_pinned_nvidia_source_needs_no_cross_source_mapping(licensed_source, tmp_path, endpoint):
+    root, _, current, item, _, save = licensed_source
+    current["source"]["url"] = current["source"]["url"].replace("/blob/", f"/{endpoint}/")
+    item.update(
+        ownership="nvidia_developed",
+        nvidia_contribution_licenses=["LicenseRef-Example"],
+        approval={"status": "pending"},
+    )
+    save()
+    gate.provenance.validate(root, root / gate.provenance.INVENTORY)
+    output = tmp_path / "report"
+    assert gate.main(["--root", str(root), "--output-dir", str(output)]) == 0
+    report = json.loads((output / "config-license-approval.json").read_text())
+    assert report["files"][0]["approval_basis"] == "nvidia_own_contribution"
+
+
+@pytest.mark.parametrize("marker", ["UNKNOWN", "NOASSERTION"])
+@pytest.mark.parametrize("expression", ["MIT AND {marker}", "(MIT OR {marker})"])
+@pytest.mark.parametrize("location", ["reported", "underlying"])
+def test_unknown_terms_cannot_be_exempted_or_approved(licensed_source, tmp_path, marker, expression, location):
+    root, _, current, item, texts, save = licensed_source
+    expression = expression.format(marker=marker)
+    if location == "reported":
+        current["license"] = expression
+        texts[expression] = texts.pop("LicenseRef-Example")
+        underlying = ["MIT"] if expression.startswith("MIT AND ") else []
+        item.update(
+            ownership="nvidia_derivative" if underlying else "nvidia_developed",
+            underlying_licenses=underlying,
+            nvidia_contribution_licenses=[marker] if underlying else [expression],
+            approval={"status": "pending"},
+        )
+    else:
+        texts[expression] = "Synthetic base license with unresolved terms."
+        text_hash = gate.provenance.text_digest(texts[expression])
+        item.update(
+            ownership="nvidia_derivative",
+            underlying_licenses=[expression],
+            nvidia_contribution_licenses=["LicenseRef-Example"],
+            license_notices={expression: current["notice"] | {"license_text_sha256": text_hash}},
+        )
+        item["approval"].update(required_licenses=[expression], license_text_sha256_by_license={expression: text_hash})
+    save()
+    # These registered expressions reach the approval gate after valid provenance.
+    gate.provenance.validate(root, root / gate.provenance.INVENTORY)
+    output = tmp_path / "report"
+    assert gate.main(["--root", str(root), "--output-dir", str(output)]) == 1
+    report = json.loads((output / "config-license-approval.json").read_text())
+    problems = report["files"][0]["problems"]
+    expected = "unknown_license_or_provenance" if location == "reported" else "unknown_underlying_license"
+    assert expected in problems
+    assert "missing_or_invalid_required_license_text" not in problems
+    assert report["files"][0]["approval_basis"] == "none"
+
+
+@pytest.mark.parametrize("license_id", ["LicenseRef-UNKNOWN", "LicenseRef-NOASSERTION"])
+def test_unknown_substrings_in_identified_licenses_are_not_unknown_markers(license_id):
+    item = record("nvidia_developed", contribution=[license_id])
+    result = gate.assess([entry(license_id)], {PATH: item})[0]
+    assert result["passed"] and result["approval_basis"] == "nvidia_own_contribution"
+
+
+def test_cli_unsupported_wheel_compression_retains_failure_report(licensed_source, licensed_wheel, tmp_path):
+    root, _, _, _, _, _ = licensed_source
+    gate.provenance.validate(root, root / gate.provenance.INVENTORY, wheel_path=licensed_wheel)
+    data = bytearray(licensed_wheel.read_bytes())
+    # Set the config member's method in its local and central directory headers.
+    for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        struct.pack_into("<H", data, data.index(signature) + offset, 99)
+    licensed_wheel.write_bytes(data)
+    output = tmp_path / "report"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(gate.__file__)),
+            "--root",
+            str(root),
+            "--wheel",
+            str(licensed_wheel),
+            "--output-dir",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads((output / "config-license-approval.json").read_text())
+    assert report["passed"] is False and report["legal_approval_asserted"] is False
+    assert PATH in report["error"] and "compression" in report["error"].lower()
+    assert "Config license compliance failed" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
 @pytest.mark.parametrize("source", [None, [], "", 0, False], ids=["null", "array", "string", "integer", "boolean"])
 def test_cli_non_object_source_retains_ownership_failure_report(licensed_source, tmp_path, source):
     root, _, current, item, _, save = licensed_source
@@ -512,16 +621,11 @@ def test_minimax_unknown_base_cannot_be_approved_after_export_provenance_is_fixe
         assert not result["passed"] and "unknown_underlying_license" in result["problems"]
 
 
-def test_cli_wheel_digest_survives_missing_review(licensed_source, tmp_path):
-    root, config, _, _, _, _ = licensed_source
-    wheel = tmp_path / "synthetic.whl"
-    with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr(PATH, config.read_bytes())
-        for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
-            archive.writestr(f"aisim-1.dist-info/licenses/{name}", (root / name).read_bytes())
+def test_cli_wheel_digest_survives_missing_review(licensed_source, licensed_wheel, tmp_path):
+    root, _, _, _, _, _ = licensed_source
     (root / gate.REVIEW).unlink()
     output = tmp_path / "report"
-    assert gate.main(["--root", str(root), "--wheel", str(wheel), "--output-dir", str(output)]) == 1
+    assert gate.main(["--root", str(root), "--wheel", str(licensed_wheel), "--output-dir", str(output)]) == 1
     report = json.loads((output / "config-license-approval.json").read_text())
-    assert report["wheel_sha256"] == gate.provenance.digest(wheel.read_bytes())
+    assert report["wheel_sha256"] == gate.provenance.digest(licensed_wheel.read_bytes())
     assert "error" in report and report["passed"] is False

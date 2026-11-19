@@ -37,6 +37,11 @@ def license_terms(expression: str) -> set[str]:
     return {expression}
 
 
+def has_unknown_license(expression: str) -> bool:
+    """Recognize unknown terms without matching parts of identified licenses."""
+    return bool({"UNKNOWN", "NOASSERTION"} & set(re.findall(r"[A-Za-z0-9.+:-]+", expression)))
+
+
 def https_reference(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -58,6 +63,17 @@ def pinned_nvidia_card(evidence: dict) -> bool:
     )
 
 
+def pinned_huggingface_file(value: object) -> tuple[str, str, str] | None:
+    """Return repository, revision and path for either pinned HF endpoint."""
+    if not https_reference(value):
+        return None
+    url = urlsplit(value)
+    if url.hostname != "huggingface.co" or url.query or url.fragment:
+        return None
+    match = re.fullmatch(r"/([^/]+/[^/]+)/(?:blob|resolve)/([a-f0-9]{40})/(.+)", url.path)
+    return match.groups() if match else None
+
+
 def ownership_matches(entry: dict, record: dict) -> bool:
     evidence = record["ownership_evidence"]
     if evidence.get("status") != "recorded_source" or not pinned_nvidia_card(evidence):
@@ -65,8 +81,15 @@ def ownership_matches(entry: dict, record: dict) -> bool:
     source = entry.get("source", {})
     if not isinstance(source, dict):
         return False
-    card = evidence["url"].removesuffix("README.md")
-    if source.get("revision") == evidence["revision"] and source.get("url") == card + source.get("path", ""):
+    card = pinned_huggingface_file(evidence["url"])
+    config = pinned_huggingface_file(source.get("url"))
+    if (
+        card
+        and config
+        and config[:2] == card[:2]
+        and config[1] == source.get("revision")
+        and config[2] == source.get("path")
+    ):
         return True
     # Cross-source ownership needs a deliberate file/bytes/source-bound mapping.
     mapping = evidence.get("config_mapping", {})
@@ -197,6 +220,13 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
         reported = license_terms(entry["license"])
         required = [entry["license"]]
         approval_basis = "none"
+        # Unknown terms cannot be approved or subtracted as NVIDIA contributions.
+        if (
+            entry["origin"] == "legacy_unresolved"
+            or not entry["license"].strip()
+            or has_unknown_license(entry["license"])
+        ):
+            problems.append("unknown_license_or_provenance")
         if not record:
             problems.append("missing_review")
         elif record["sha256"] != entry["sha256"]:
@@ -204,6 +234,9 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
         else:
             ownership = record["ownership"]
             underlying = set(record["underlying_licenses"])
+            contribution = set(record.get("nvidia_contribution_licenses", []))
+            if any(has_unknown_license(license_id) for license_id in reported | underlying | contribution):
+                problems.append("unknown_underlying_license")
             # Preserve the original exact-identifier standard-license policy.
             # In particular, third-party SPDX expressions still need a decision.
             required = sorted({entry["license"]} | underlying)
@@ -213,7 +246,6 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
                 if not ownership_matches(entry, record):
                     problems.append("ownership_source_mismatch")
                 else:
-                    contribution = set(record.get("nvidia_contribution_licenses", []))
                     if (
                         not contribution <= reported
                         or contribution & underlying
@@ -225,10 +257,6 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
                 problems.append("inconsistent_license_obligations")
             if record["approval"]["status"] == "rejected":
                 problems.append("rejected")
-            if entry["origin"] == "legacy_unresolved" or entry["license"] in {"UNKNOWN", "NOASSERTION", ""}:
-                problems.append("unknown_license_or_provenance")
-            if any(license_id in {"UNKNOWN", "NOASSERTION"} for license_id in required):
-                problems.append("unknown_underlying_license")
             outside_policy = sorted(set(required) - STANDARD_LICENSES)
             try:
                 text_hashes = required_text_hashes(entry, record, outside_policy, root, registry)
@@ -253,9 +281,6 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
                     approval_basis = "recorded_decision"
             elif not outside_policy:
                 approval_basis = "nvidia_own_contribution" if not required else "standard_license_policy"
-        # Unknown provenance cannot be approved away, including for NVIDIA files.
-        if entry["origin"] == "legacy_unresolved" and "unknown_license_or_provenance" not in problems:
-            problems.append("unknown_license_or_provenance")
         results.append(
             {
                 "path": name,
