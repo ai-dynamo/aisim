@@ -214,6 +214,19 @@ def test_w4a16_nvfp4_moe_is_collected_on_vllm_only(monkeypatch, backend, model_p
     assert _planned_moe_modes(monkeypatch, backend, model_path, 100) == expected
 
 
+def test_w4a16_nvfp4_is_opted_into_by_the_model_row():
+    from collector.case_generator import moe_planned_modes
+
+    # A third checkpoint needs only a model-row declaration, never a second
+    # base-op allowlist entry. Undeclared rows keep their inherited modes.
+    model = "test/third-w4a16-checkpoint"
+    assert moe_planned_modes(model, ("w4a16_nvfp4",)) == ["w4a16_nvfp4"]
+    assert moe_planned_modes(model, ("fp8",)) == ["fp8"]
+    assert moe_planned_modes(model, None) == ["bfloat16", "fp8", "fp8_block", "nvfp4"]
+    with pytest.raises(ValueError, match="not in the shared axis"):
+        moe_planned_modes(model, ("unknown",))
+
+
 @pytest.mark.parametrize(
     "model_path",
     [

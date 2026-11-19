@@ -284,7 +284,9 @@ def test_checkpoint_path_aliases_and_algo_keys(prefix, key):
     assert _projection_modes(raw, "E", FP8)["shared_up_gemm"] == {NVFP4: 1}
 
 
-@pytest.mark.parametrize("modules", [("qkv_proj",), ("q_proj", "k_proj", "v_proj")])
+@pytest.mark.parametrize(
+    "modules", [("qkv_proj",), ("q_proj", "k_proj", "v_proj"), ("q_proj",), ("k_proj",), ("v_proj",)]
+)
 def test_qkv_precision_resolves_packed_and_agreeing_split_entries(modules):
     raw = _listing({f"model.layers.3.mixer.{name}": {"quant_algo": "FP8"} for name in modules})
     assert _projection_modes(raw, "MMM*", NVFP4)["qkv_gemm"] == {FP8: 1}
@@ -300,13 +302,14 @@ def test_packed_qkv_declaration_precedes_split_entries():
     assert _projection_modes(raw, "*", NVFP4)["qkv_gemm"] == {FP8: 1}
 
 
-def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path):
+@pytest.mark.parametrize("projection", ["qkv_proj", "q_proj", "k_proj", "v_proj"])
+def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path, projection):
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
 
     def packed_attention(section, _e_layers):
         # Super's first attention layer is 7; its other seven attention layers
         # remain unlisted (BF16). This synthetic edit prices one packed FP8 QKV.
-        section["quantized_layers"]["model.layers.7.mixer.qkv_proj"] = {"quant_algo": "FP8"}
+        section["quantized_layers"][f"model.layers.7.mixer.{projection}"] = {"quant_algo": "FP8"}
 
     path = _write_super(tmp_path, packed_attention)
     model = get_model(path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
@@ -341,7 +344,12 @@ def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path):
         ),
         ({"quantization_config": {"quantized_layers": {SHARED_UP: "int4_awq"}}}, "E", "Unsupported mixed precision"),
         (
-            _listing({f"backbone.layers.0.mixer.{p}_proj": {"quant_algo": "FP8"} for p in "qk"}),
+            _listing(
+                {
+                    "backbone.layers.0.mixer.q_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.0.mixer.k_proj": {"quant_algo": "NVFP4"},
+                }
+            ),
             "*",
             "disagree on precision",
         ),
@@ -351,6 +359,31 @@ def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path):
 def test_rejects_inconsistent_metadata(raw, pattern, match):
     with pytest.raises(ValueError, match=match):
         _projection_modes(raw, pattern, FP8)
+
+
+@pytest.mark.parametrize("excluded", [True, False])
+def test_targets_only_scope_does_not_validate_excluded_conflicts(monkeypatch, tmp_path, excluded):
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    key = "backbone.layers.0.mixer.in_proj"
+
+    def edit(section, _e_layers):
+        section["quantized_layers"][key] = {"quant_algo": "FP8"}
+        section["exclude_modules"] = [key] if excluded else []
+
+    path = _write_super(tmp_path, edit)
+    hf_path = tmp_path / "hf_quant_config.json"
+    hf = json.loads(hf_path.read_text())
+    hf["quantization"]["quantized_layers"][key] = {"quant_algo": "NVFP4"}
+    hf_path.write_text(json.dumps(hf))
+    raw = json.loads((tmp_path / "config.json").read_text()) | {"hf_quant_config": hf}
+    if excluded:
+        assert _projection_modes(raw, "M", FP8)["mamba_in_proj_gemm"] == {BF16: 1}
+        model = get_model(path, ModelConfig(tp_size=1, moe_tp_size=1, system="gb200"), "vllm")
+        # One formerly FP8 layer is now excluded, irrespective of conflicting metadata.
+        assert _buckets(model.context_ops)["mamba_in_proj_gemm"] == {FP8: 27, BF16: 13}
+    else:
+        with pytest.raises(ValueError, match="Conflicting checkpoint precisions"):
+            get_model(path, ModelConfig(tp_size=1, moe_tp_size=1, system="gb200"), "vllm")
 
 
 @pytest.mark.parametrize(
@@ -897,3 +930,97 @@ def test_clearing_an_explicit_task_mode_restores_inference_on_every_build(monkey
     config.gemm_quant_mode = None
     builds = [_buckets(get_model(SUPER, config, "vllm").context_ops)["mamba_in_proj_gemm"] for _ in range(2)]
     assert builds[0] == builds[1] == {FP8: 28, BF16: 12}
+
+
+@pytest.mark.parametrize("explicit_first", [False, True])
+def test_precision_split_engine_cache_is_independent_of_evaluation_order(monkeypatch, explicit_first):
+    from collections import OrderedDict
+
+    from aisim_core.sdk import perf_database, rust_engine_step
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(rust_engine_step, "_ENGINE_HANDLE_CACHE", OrderedDict())
+    database = perf_database.get_database_view("gb200", "vllm", "0.30.0", database_mode="SOL")
+    models = {
+        explicit: _task_model(_task(SUPER, **({"gemm_quant_mode": FP8} if explicit else {})), SUPER)
+        for explicit in (False, True)
+    }
+
+    def in_proj(handle):
+        context, _ = handle.run_static_per_op(batch_size=1, isl=1024, osl=2)
+        return next(latency for name, latency, *_ in context if name == "context_mamba_in_proj_gemm")
+
+    # Isolated compiles establish each graph's answer before either cache order.
+    references = {}
+    for explicit, model in models.items():
+        rust_engine_step._engine_handle_cache_clear()
+        references[explicit] = in_proj(rust_engine_step._cached_engine_handle(model, database))
+    assert references[False] != pytest.approx(references[True], rel=1e-6)
+    rust_engine_step._engine_handle_cache_clear()
+    handles = {}
+    for explicit in (explicit_first, not explicit_first):
+        handles[explicit] = rust_engine_step._cached_engine_handle(models[explicit], database)
+        assert in_proj(handles[explicit]) == pytest.approx(references[explicit], rel=1e-12)
+    assert handles[False] is not handles[True]
+
+
+def test_native_kv_sizing_uses_the_database_root_after_skipping_an_overlay(monkeypatch, tmp_path):
+    from aisim_core.sdk.memory.kv_cache import estimate_kv_cache
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    packaged = str(files("aisim_core") / "systems")
+    (tmp_path / "gb200.yaml").write_text("gpu: [")  # invalid YAML, skipped by get_database
+    kwargs = dict(
+        backend_version="0.30.0",
+        tp_size=2,
+        moe_tp_size=2,
+        max_num_tokens=1024,
+        max_batch_size=8,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+    )
+    expected = estimate_kv_cache(SUPER, "gb200", "vllm", systems_path=packaged, **kwargs)
+    actual = estimate_kv_cache(SUPER, "gb200", "vllm", systems_path=[str(tmp_path), packaged], **kwargs)
+    assert actual["source"] == "native"
+    assert actual == expected
+
+
+@pytest.mark.parametrize("system,mode", [("h100_sxm", NVFP4_WO), ("gb200", NVFP4)])
+@pytest.mark.parametrize("serving_mode", ["agg", "disagg"])
+def test_live_task_nvfp4_override_uses_the_same_hardware_lane_as_reload(monkeypatch, system, mode, serving_mode):
+    import yaml
+
+    from aisim.legacy_cli.api import _build_recommend_tasks
+    from aisim.sdk.task_v2 import Task
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    if serving_mode == "agg":
+        task = _task(SUPER, system=system)
+        role = "agg"
+    else:
+        role = "prefill"
+        task = Task(
+            serving_mode="disagg",
+            backend_version="0.31.0",
+            database_mode="SOL",
+            **{
+                f"{r}_{key}": value
+                for r in ("prefill", "decode")
+                for key, value in {"model_path": SUPER, "system_name": system, "backend_name": "vllm"}.items()
+            },
+        )
+    field = "gemm_quant_mode" if role == "agg" else f"{role}_gemm_quant_mode"
+    setattr(task, field, NVFP4)
+    assert getattr(task, field) == mode
+    for other in (
+        task,
+        Task.from_yaml(yaml.safe_load(task.to_yaml())),
+        _build_recommend_tasks({serving_mode: task}, 8)[serving_mode],
+    ):
+        other.validate()
+        assert other._gemm_quant_mode_explicit_by_role[role] is True
+        model = _task_model(other, SUPER, role)
+        assert all(set(modes) == {mode} for modes in _buckets(model.context_ops).values())
+    if serving_mode == "agg":
+        # Execute the real Task engine path; Hopper native FP4 would fail here.
+        task.run_single_agg(tp=2, moe_tp=2, batch_size=1, ctx_tokens=128)

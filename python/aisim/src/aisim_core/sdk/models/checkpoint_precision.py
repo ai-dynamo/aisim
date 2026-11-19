@@ -22,7 +22,7 @@ from functools import cached_property
 from aisim_core.sdk import common
 from aisim_core.sdk.models.helpers import (
     _iter_mixed_precision_layer_algos,
-    modelopt_mixed_precision_targets,
+    _modelopt_targets_only_layer_maps,
     quant_exclude_patterns,
 )
 from aisim_core.sdk.perf_database import is_blackwell_system
@@ -148,10 +148,10 @@ class CheckpointPrecision:
 
         ``layer_kinds[i]`` is layer ``i``'s kind; ``kinds_to_modules[kind]`` maps an op key to
         the checkpoint modules it prices. ``resolve(algo or None, excluded)`` is a module's
-        effective mode, so fused modules are compared after exclusion and unlisted rules
-        apply. Conflicting algorithms for one module, or fused modules whose modes differ,
+        effective mode. Conflicting algorithms for one module, or fused modules whose modes differ,
         are rejected. ``packed_modules`` maps an op key to its packed checkpoint module;
-        a declared or excluded packed module is resolved before its split names.
+        a declared or excluded packed module is resolved before its split names. Otherwise
+        listed shards resolve the fused projection before unlisted defaults apply.
         """
         rows = []
         for layer, kind in enumerate(layer_kinds):
@@ -163,12 +163,19 @@ class CheckpointPrecision:
                     # checkpoint names. Without a packed declaration, compare every split mode.
                     if excluded or algos:
                         modules = (packed,)
+                entries = [(module, *self.module(layer_paths(layer, module))) for module in modules]
+                if packed and self.listed:
+                    # ModelOpt resolves a packed projection from the algorithms of its
+                    # listed shards, even when only one shard is listed (vLLM v0.31.0
+                    # ModelOptMixedPrecisionConfig._resolve_quant_algo). Explicit
+                    # exclusions still participate in precision consistency checks.
+                    entries = [entry for entry in entries if entry[1] or entry[2]] or entries
                 modes = set()
-                for module in modules:
-                    excluded, algos = self.module(layer_paths(layer, module))
+                for module, excluded, algos in entries:
                     if len(algos) > 1:
                         raise ValueError(
-                            f"Conflicting checkpoint precisions for module {module} in layer {layer}: {algos}"
+                            f"Conflicting checkpoint precisions for module {module} in layer {layer}: "
+                            f"conflicting algorithms {algos}"
                         )
                     modes.add(resolve(next(iter(algos), None), excluded))
                 if len(modes) > 1:
@@ -183,7 +190,7 @@ class CheckpointPrecision:
 
     @cached_property
     def targets_only(self) -> bool:
-        return self.listed and modelopt_mixed_precision_targets(self.raw) is not None
+        return self.listed and bool(_modelopt_targets_only_layer_maps(self.raw))
 
 
 _CHECKPOINT_CACHE: OrderedDict[int, tuple[dict, CheckpointPrecision]] = OrderedDict()

@@ -1088,7 +1088,14 @@ class Task:
         self._kvcache_explicit = kvcache_explicit
         self._fmha_from_data: dict[str, bool] = {}
 
-    def _apply_fmha_data_fallback(self) -> None:
+    def _normalize_nvfp4_mode(self, role: str, key: str, value: Any) -> Any:
+        # Non-Blackwell runtimes dequantize NVFP4 weights before the MMA.
+        enum = _QUANT_ENUM_TABLES[key]
+        if value == enum.nvfp4 and not is_blackwell_system(self._role_attr(role, "system_name")):
+            return enum.nvfp4_wo
+        return value
+
+    def _apply_fmha_data_fallback(self, roles: list[str] | None = None) -> None:
         """Data-driven FMHA resolution (second half of quant resolution).
 
         Split out of ``_resolve_quant_modes`` because it consults the role's
@@ -1096,19 +1103,16 @@ class Task:
         tuple is large-EP -- i.e. on the search space, which is resolved in
         between (see ``__post_init__``).
         """
-        roles = ["agg"] if self.serving_mode == "agg" else ["prefill", "decode"]
+        if roles is None:
+            roles = ["agg"] if self.serving_mode == "agg" else ["prefill", "decode"]
         fmha_explicit = self._fmha_explicit
 
         # nvfp4 → nvfp4_wo on non-Blackwell: no native FP4 tensor cores, so all
         # runtimes dequantize to BF16 before the MMA. The transfer ladder models
         # the Marlin-class memory savings via the (0.5625, 1) util-level entry.
         for role in roles:
-            system = self._role_attr(role, "system_name")
-            if not is_blackwell_system(system):
-                if self._role_attr(role, "gemm_quant_mode") == common.GEMMQuantMode.nvfp4:
-                    self._set_role_attr(role, "gemm_quant_mode", common.GEMMQuantMode.nvfp4_wo)
-                if self._role_attr(role, "moe_quant_mode") == common.MoEQuantMode.nvfp4:
-                    self._set_role_attr(role, "moe_quant_mode", common.MoEQuantMode.nvfp4_wo)
+            for key in ("gemm_quant_mode", "moe_quant_mode"):
+                self._set_role_attr(role, key, self._normalize_nvfp4_mode(role, key, self._role_attr(role, key)))
 
         # TRT-LLM runs MLA attention in FP8 on an FP8 KV cache on SM90/100/103/120
         # (helpers.trtllm_mla_runs_fp8), so a bfloat16 FMHA there, explicit or not,
@@ -1832,13 +1836,24 @@ class Task:
     def __setattr__(self, name: str, value: Any) -> None:
         # A caller assigning a GEMM, MoE or FMHA mode after resolution makes it explicit, so
         # build_model_config, to_yaml and recommend rebuilds keep it.
-        object.__setattr__(self, name, value)
         role, _, key = name.partition("_") if name.startswith(("prefill_", "decode_")) else ("agg", "", name)
         # Replace the maps instead of mutating them: a shallow copy of the Task shares them.
         explicit_attr = _QUANT_EXPLICIT_BY_ROLE.get(key, "")
         explicit_by_role = self.__dict__.get(explicit_attr)
-        if explicit_by_role is not None and role in explicit_by_role:
+        resolved_role = explicit_by_role is not None and role in explicit_by_role
+        if resolved_role and key in ("gemm_quant_mode", "moe_quant_mode"):
+            value = self._normalize_nvfp4_mode(role, key, value)
+        object.__setattr__(self, name, value)
+        if resolved_role:
             object.__setattr__(self, explicit_attr, {**explicit_by_role, role: value is not None})
+            if key == "fmha_quant_mode":
+                object.__setattr__(
+                    self, "_fmha_from_data", {r: v for r, v in self._fmha_from_data.items() if r != role}
+                )
+                if value is None:
+                    base = _infer_quant_modes_from_raw_config(self._raw_config)
+                    self._set_role_attr(role, key, base.get(key, _QUANT_FALLBACKS[key]))
+                    self._apply_fmha_data_fallback([role])
         coverage_cache = self.__dict__.get("_large_ep_coverage_cache")
         if key == "moe_quant_mode" and coverage_cache is not None:
             # Large-EP coverage depends on the MoE mode.

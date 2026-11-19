@@ -231,6 +231,30 @@ def _mixed_precision_layer_algo(metadata: object) -> str | None:
     return _normalize_mixed_precision_layer_algo(metadata)
 
 
+def _modelopt_targets_only_layer_maps(raw_config: dict) -> tuple[dict, ...]:
+    """Listing sources in a targets-only export, without merging module algorithms.
+
+    Scope detection must not reject a conflict on a module that exclusions keep
+    unquantized. Consumers validate the algorithms of the modules they use.
+    """
+    hf_section = _hf_quant_section(raw_config)
+    quant_config = _language_quant_config(raw_config)
+    algo = _normalize_quant_algo(
+        hf_section.get("quant_algo")
+        or hf_section.get("quantization_algo")
+        or quant_config.get("quant_algo")
+        or quant_config.get("quantization_algo")
+    )
+    quant_method = _normalize_quant_algo(quant_config.get("quant_method"))
+    if algo != "mixed_precision" or quant_method not in (None, "modelopt", "modelopt_mixed", "mixed_precision"):
+        return ()
+    return tuple(
+        layers
+        for source in (hf_section, quant_config)
+        if isinstance(layers := source.get("quantized_layers"), dict) and layers
+    )
+
+
 def modelopt_mixed_precision_targets(raw_config: dict) -> dict[str, str | None] | None:
     """``{module_path: algo}`` of a targets-only ModelOpt MIXED_PRECISION export.
 
@@ -251,23 +275,8 @@ def modelopt_mixed_precision_targets(raw_config: dict) -> dict[str, str | None] 
     (see ``_MODELOPT_ATTENTION_PACKED_MODULES``). Returns ``None`` otherwise,
     and callers keep their exclusion-glob semantics unchanged.
     """
-    hf_section = _hf_quant_section(raw_config)
-    quant_config = _language_quant_config(raw_config)
-    algo = _normalize_quant_algo(
-        hf_section.get("quant_algo")
-        or hf_section.get("quantization_algo")
-        or quant_config.get("quant_algo")
-        or quant_config.get("quantization_algo")
-    )
-    if algo != "mixed_precision":
-        return None
-    quant_method = _normalize_quant_algo(quant_config.get("quant_method"))
-    if quant_method not in (None, "modelopt", "modelopt_mixed", "mixed_precision"):
-        return None
     targets: dict[str, str | None] = {}
-    for layer_map in (hf_section.get("quantized_layers"), quant_config.get("quantized_layers")):
-        if not isinstance(layer_map, dict):
-            continue
+    for layer_map in _modelopt_targets_only_layer_maps(raw_config):
         for module, metadata in layer_map.items():
             module = str(module)
             layer_algo = _mixed_precision_layer_algo(metadata)

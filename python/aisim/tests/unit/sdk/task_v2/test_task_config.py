@@ -787,6 +787,47 @@ def test_fmha_data_fallback_skips_generation_only_decode(caplog):
     assert len(fallback_msgs) == 1 and fallback_msgs[0].startswith("prefill ")
 
 
+@pytest.mark.parametrize("serving_mode", ["agg", "disagg"])
+def test_clearing_fmha_override_restores_task_data_fallback(serving_mode):
+    from aisim.legacy_cli.api import _build_recommend_tasks
+
+    model_path = "Qwen/Qwen3-32B-FP8-Static-PerTensor"
+    values = dict(
+        model_path=model_path,
+        system_name="a100_sxm",
+        backend_name="sglang",
+        gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+        kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    if serving_mode == "agg":
+        task = Task(**values)
+        role, field = "agg", "fmha_quant_mode"
+    else:
+        task = Task(
+            serving_mode="disagg",
+            **{f"{r}_{key}": value for r in ("prefill", "decode") for key, value in values.items()},
+        )
+        role, field = "prefill", "prefill_fmha_quant_mode"
+    # Clear an explicit field, then clear the inferred fallback again. Both
+    # builds and serialization must keep the same BF16 context-attention op.
+    for _ in range(2):
+        setattr(task, field, None)
+        assert getattr(task, field) == common.FMHAQuantMode.bfloat16
+        assert task._fmha_explicit[role] is False
+        assert task._fmha_from_data[role] is True
+        for other in (
+            task,
+            Task.from_yaml(yaml.safe_load(task.to_yaml())),
+            _build_recommend_tasks({serving_mode: task}, 8)[serving_mode],
+        ):
+            other.validate()
+            model = get_model(model_path, other.build_model_config(role=role, parallel=(1, 1, 1, 1, 1, 1)), "sglang")
+            attention = [op for op in model.context_ops if op._name == "context_attention"]
+            assert len(attention) == 1
+            assert attention[0]._fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+
 def test_fmha_data_fallback_without_bf16_slice_left_untouched(monkeypatch, caplog):
     """When the context table has fmha data but neither fp8 nor bf16 slices
     (e.g. wideep tables carry only fp8_block), the fallback must leave the
