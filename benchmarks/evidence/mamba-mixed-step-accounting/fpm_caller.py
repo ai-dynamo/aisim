@@ -20,7 +20,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(sys.argv[1], "python/aisim/tests/unit/sdk"))
+HELPER = "python/aisim/tests/unit/sdk/test_fpm_forward.py"
+sys.path.insert(0, os.path.join(sys.argv[1], os.path.dirname(HELPER)))
 import test_fpm_forward as t
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,7 +42,12 @@ def verified_build(repo):
     """Bind the imported Python and native code to a clean revision under test."""
     repo = Path(repo).resolve()
     revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    roots = ["Cargo.toml", "Cargo.lock", "crates/core", "python/aisim/src/aisim", "python/aisim/src/aisim_core"]
+    # The fixture rows come from the imported test helper, so it is a source too.
+    helper = Path(t.__file__).resolve()
+    if helper != repo / HELPER:
+        raise ValueError(f"imported fixture helper {helper} is not {HELPER} in {repo}")
+    require_committed(repo, revision, [helper])
+    roots = ["Cargo.toml", "Cargo.lock", "crates/core", "python/aisim/src/aisim", "python/aisim/src/aisim_core", HELPER]
     if subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", *roots], check=False).returncode:
         raise ValueError("commit the sources under test before recording build evidence")
     packages = {}
@@ -73,6 +79,7 @@ def verified_build(repo):
     return {
         "revision": revision,
         "packages": packages,
+        "fixture_helper": {"path": HELPER, "sha256": hashlib.sha256(helper.read_bytes()).hexdigest()},
         "native_extension_path": _runtime.__file__,
         "native_extension_sha256": hashlib.sha256(Path(_runtime.__file__).read_bytes()).hexdigest(),
         "native_source_sha256": hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(),
