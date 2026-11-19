@@ -49,6 +49,10 @@ def test_runs_the_shared_validator_from_a_pinned_checkout(text):
     doc = _load(text)
     run = "\n".join(s.get("run", "") for s in doc["jobs"]["validate"]["steps"])
     assert "aisim_core.data.mirror validate" in run and "--profile mirror" in run
+    validator = next(
+        s for s in doc["jobs"]["validate"]["steps"] if "aisim_core.data.mirror validate" in s.get("run", "")
+    )
+    assert validator.get("continue-on-error", False) is False  # a failed validator must fail the job
     assert re.fullmatch(r"[0-9a-f]{40}", doc["env"]["AISIM_VALIDATOR_REF"])
     steps = doc["jobs"]["validate"]["steps"]
     checkout = next(s for s in steps if s.get("with", {}).get("repository") == "ai-dynamo/aisim")

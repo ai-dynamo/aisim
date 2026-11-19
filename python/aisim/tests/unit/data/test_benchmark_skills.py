@@ -648,3 +648,19 @@ def test_attestation_confines_identity_directories(built_record, tmp_path, escap
         )
     assert not outside.exists() or not list(outside.iterdir())
     assert not list(destination.rglob("*.parquet")) and not list(destination.rglob("*.json"))
+
+
+def test_changed_source_is_not_published_to_the_final_path(tmp_path):
+    import hashlib
+
+    tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
+    source, target = tmp_path / "src.bin", tmp_path / "out" / "dst.bin"
+    source.write_bytes(b"original")
+    digest = hashlib.sha256(b"original").hexdigest()
+    source.write_bytes(b"changed after preflight")
+    with pytest.raises(ValueError, match="changed after verification"):
+        tool._publish_artifact(source, target, digest)
+    assert not target.exists() and not list(target.parent.iterdir())
+    source.write_bytes(b"original")  # restoring the source permits a retry without cleanup
+    tool._publish_artifact(source, target, digest)
+    assert target.read_bytes() == b"original"

@@ -16,6 +16,7 @@ a failed check.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -49,13 +50,16 @@ def _load_predictor(path: Path):
     return module.predict, module.fingerprint()
 
 
-def _publish_artifact(source: Path, target: Path) -> None:
-    """Publish complete bytes without replacing a competing writer's artifact."""
+def _publish_artifact(source: Path, target: Path, sha256: str) -> None:
+    """Publish complete, verified bytes without replacing a competing writer's artifact."""
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, pending = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as output, source.open("rb") as incoming:
             shutil.copyfileobj(incoming, output)
+        # A source that changed after preflight must never reach the final path, where every retry would reject it.
+        if hashlib.sha256(Path(pending).read_bytes()).hexdigest() != sha256:
+            raise ValueError(f"source changed after verification: {source}")
         try:
             os.link(pending, target)
         except FileExistsError:
@@ -120,9 +124,9 @@ def main(argv=None) -> int:
                     if target.exists():
                         _verify(destination, artifact)
                     copies[target] = (source, artifact.sha256)
-            for target, (source, _) in copies.items():
+            for target, (source, digest) in copies.items():
                 if not target.exists():
-                    _publish_artifact(source, target)
+                    _publish_artifact(source, target, digest)
             for item in [*history, verified]:
                 destination = destinations[item.record_id]
                 for artifact in [*item.truth.artifacts, *item.findings]:

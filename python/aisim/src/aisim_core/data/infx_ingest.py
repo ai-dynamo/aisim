@@ -423,9 +423,12 @@ class Acquirer:
                 if not isinstance(row["metrics"], dict):
                     raise IncompleteAcquisitionError(f"{url}: metrics must be a mapping")
                 for key, degree in row["metrics"].items():
-                    if _PARALLELISM_METRIC.fullmatch(key) and degree is not None:
-                        if type(degree) is not int or degree < 0:
-                            raise IncompleteAcquisitionError(f"{url}: metrics.{key} must be a non-negative integer")
+                    if (
+                        _PARALLELISM_METRIC.fullmatch(key)
+                        and degree is not None
+                        and (type(degree) is not int or degree < 0)
+                    ):
+                        raise IncompleteAcquisitionError(f"{url}: metrics.{key} must be a non-negative integer")
                 if row.get("run_url") is not None and not isinstance(row["run_url"], str):
                     raise IncompleteAcquisitionError(f"{url}: run_url must be a string or null")
                 if row["model"] not in valid_keys:
@@ -589,7 +592,7 @@ def _verify_planned_configuration(root: Path, manifest_path: str, expected: E2eC
     actual = load_e2e(root, manifest_path)
 
     def rows(items):
-        return sorted((row.model_dump_json() for row in items))
+        return sorted(row.model_dump_json() for row in items)
 
     if (
         actual.manifest.configuration_id != expected.body.configuration_id()
