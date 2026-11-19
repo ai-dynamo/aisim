@@ -603,7 +603,11 @@ def supervised_recommendation(config, kwargs):
                 events = root / "events.jsonl"
                 report["partial_events"] = []
                 if events.exists():
-                    transfer_bytes = min(_CHECKPOINT_TOTAL_BYTES, _parent_transfer_budget(report["budget"]))
+                    try:
+                        transfer_bytes = min(_CHECKPOINT_TOTAL_BYTES, _parent_transfer_budget(report["budget"]))
+                    except ResourceLimitError:
+                        report["partial_evidence_truncated"] = True
+                        raise ResourceLimitError(message, plan=report) from None
                     with events.open(encoding="utf-8") as source:
                         retained_bytes = 0
                         # Read at most the remaining allowance plus one character

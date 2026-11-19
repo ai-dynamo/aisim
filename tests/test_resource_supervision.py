@@ -216,6 +216,36 @@ def test_partial_event_reader_respects_parent_transfer_allowance(tmp_path, monke
         assert "partial_evidence_truncated" not in report
 
 
+def test_partial_event_recovery_preserves_report_when_host_discovery_fails(tmp_path, monkeypatch):
+    from aisim import supervision
+    from aisim.config import CoreRecommendationConfig
+    from aisim.resources import ResourceLimitError
+
+    original = {
+        "status": "resource_limited",
+        "reason": "worker memory limit",
+        "termination_complete": True,
+        "budget": {"reserved_host_memory_bytes": GB, "memory_limit_bytes": 8 * GB},
+    }
+
+    def limited_worker(command, *, policy, events_output):
+        Path(events_output).write_text(json.dumps({"event": "candidate_completed"}) + "\n", encoding="utf-8")
+        return original.copy()
+
+    def discovery_fails():
+        raise ResourceLimitError("cannot discover execution-host resources")
+
+    monkeypatch.setattr(supervision, "run_process", limited_worker)
+    monkeypatch.setattr(supervision, "discover_host", discovery_fails)
+    config = CoreRecommendationConfig.model_validate(
+        yaml.safe_load(_small_cli_config(tmp_path, "recommend").read_text())
+    )
+    with pytest.raises(ResourceLimitError, match="worker memory limit") as caught:
+        supervision.supervised_recommendation(config, {})
+
+    assert caught.value.plan == {**original, "partial_events": [], "partial_evidence_truncated": True}
+
+
 def test_watchdog_stops_small_allocation_and_reaps_child(tmp_path):
     pidfile = tmp_path / "pid"
     result = _run_script(
