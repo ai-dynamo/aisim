@@ -845,9 +845,7 @@ def test_cli_without_overwrite_refuses_an_unsupported_policy_with_exit_2(tmp_pat
 @pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
 @pytest.mark.parametrize("stack", ["silent", "advertising"])
 def test_recommendation_cli_checks_policy_before_output_adapter_callbacks(tmp_path, policy, stack):
-    result, _, outputs = run_installed_stack(
-        tmp_path, "recommend", stack, policy, overwrite=False, output_adapter=True
-    )
+    result, _, outputs = run_installed_stack(tmp_path, "recommend", stack, policy, overwrite=False, output_adapter=True)
     log = tmp_path / "adapter.log"
     if stack == "silent":
         assert result.returncode == 2, result.stderr
