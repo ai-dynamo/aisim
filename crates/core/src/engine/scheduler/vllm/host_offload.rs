@@ -136,20 +136,16 @@ impl RestoreRounds {
 }
 
 /// A lookup's walk over G2: the `matched` leading blocks of `range` that G2
-/// holds, and the first of them that waits for a store or load in flight
-/// (`matched` or more for none). The default is a walk of no blocks.
+/// holds, up to the deepest boundary whose state it also holds for a hybrid
+/// model, and whether one of them or a key of that state waits for a store
+/// or load in flight. The default is a walk of no blocks.
 #[derive(Debug, Default, PartialEq)]
 struct HitWalk {
     /// [`HostTier::lookup_epoch`] and the adapter's `load_keys_epoch`.
     epochs: (u64, u64),
     range: (usize, usize),
     matched: usize,
-    first_busy: usize,
-    /// With a state cache: the scan for a state below this walk, which reads
-    /// the tier and the loads like the walk. The deepest boundary it tried,
-    /// the one it found in blocks past the range start (0 for none), and
-    /// whether a key of that state is busy. `None` until a lookup scans.
-    state: Option<(usize, usize, bool)>,
+    busy: bool,
 }
 
 /// Request-local connector cursor and transient load ownership.
@@ -570,6 +566,13 @@ impl VllmHostOffloadAdapter {
             .or((self.shared || self.hybrid.is_some()).then_some(SourceReleaseOrder::TailFirst))
     }
 
+    /// Whether a waiting request that holds G1 for a load is admitted before
+    /// the others: the connector's rule, or any rank that G3 or a KVCR pull
+    /// can wake.
+    pub(super) fn admits_kv_holders_first(&self) -> bool {
+        self.rules.admits_kv_holders_first || self.retry_epoch().is_some()
+    }
+
     /// G1 has a state cache: lookups, loads and stores carry its states.
     pub(super) fn set_hybrid(&mut self, blocks_per_state: usize, kind: StateKind) {
         self.hybrid = Some(HybridStates {
@@ -723,41 +726,18 @@ impl VllmHostOffloadAdapter {
                     }
                     matched += 1;
                 }
-                HitWalk {
-                    epochs,
-                    range,
-                    matched,
-                    first_busy,
-                    state: None,
-                }
-            };
-            if (request.hit_walk.epochs, request.hit_walk.range) != (epochs, range) {
-                request.hit_walk = walk();
-            }
-            debug_assert!({
-                let fresh = walk();
-                (request.hit_walk.matched, request.hit_walk.first_busy)
-                    == (fresh.matched, fresh.first_busy)
-            });
-            let HitWalk {
-                mut matched,
-                first_busy,
-                ..
-            } = request.hit_walk;
-            // A hybrid hit ends at the deepest boundary that also holds every
-            // slot of its state. A state that is being loaded, or still being
-            // stored when the connector waits for stores, defers the hit.
-            let mut keys = Vec::new();
-            let mut states_busy = false;
-            if let Some(hybrid) = hybrid {
-                let busy = |key: HostBlockKey| match tier.lookup(key) {
-                    Lookup::Hit => Some(load_by_key.contains_key(&key)),
-                    Lookup::Pending { .. } => rules.waits_for_stores.then_some(true),
-                    Lookup::Miss => None,
-                };
-                let deepest = matched.saturating_sub(usize::from(drops_drafter_block));
-                let scan = || {
-                    (1..=deepest)
+                // A hybrid hit ends at the deepest boundary that also holds every
+                // slot of its state. A state that is being loaded, or still being
+                // stored when the connector waits for stores, defers the hit.
+                let mut states_busy = false;
+                if let Some(hybrid) = hybrid {
+                    let busy = |key: HostBlockKey| match tier.lookup(key) {
+                        Lookup::Hit => Some(load_by_key.contains_key(&key)),
+                        Lookup::Pending { .. } => rules.waits_for_stores.then_some(true),
+                        Lookup::Miss => None,
+                    };
+                    let deepest = matched.saturating_sub(usize::from(drops_drafter_block));
+                    (matched, states_busy) = (1..=deepest)
                         .rev()
                         .find_map(|blocks| {
                             let prefix = request.block_keys[base_g1_blocks + blocks - 1];
@@ -767,27 +747,30 @@ impl VllmHostOffloadAdapter {
                             }
                             Some((blocks, any_busy))
                         })
-                        .unwrap_or_default()
-                };
-                // A blocked queue head looks up again on every pass: reuse
-                // the scan with the walk it follows.
-                (matched, states_busy) = match request.hit_walk.state {
-                    Some((scanned, blocks, busy)) if scanned == deepest => (blocks, busy),
-                    _ => scan(),
-                };
-                debug_assert_eq!((matched, states_busy), scan());
-                request.hit_walk.state = Some((deepest, matched, states_busy));
-                if matched > 0 {
-                    keys = hybrid.keys(request.block_keys[base_g1_blocks + matched - 1]);
+                        .unwrap_or_default();
                 }
+                HitWalk {
+                    epochs,
+                    range,
+                    matched,
+                    busy: states_busy || first_busy < matched,
+                }
+            };
+            if (request.hit_walk.epochs, request.hit_walk.range) != (epochs, range) {
+                request.hit_walk = walk();
             }
-            let state_slots = keys.len();
-            keys.extend_from_slice(&request.block_keys[base_g1_blocks..base_g1_blocks + matched]);
+            debug_assert_eq!(request.hit_walk, walk());
+            let HitWalk { matched, busy, .. } = request.hit_walk;
             if matched == 0 {
                 HostLookup::Miss
-            } else if states_busy || first_busy < matched {
+            } else if busy {
                 HostLookup::Deferred
             } else {
+                let blocks = &request.block_keys[base_g1_blocks..base_g1_blocks + matched];
+                let mut keys =
+                    hybrid.map_or_else(Vec::new, |hybrid| hybrid.keys(blocks[matched - 1]));
+                let state_slots = keys.len();
+                keys.extend_from_slice(blocks);
                 HostLookup::Hit(HostLookupHit {
                     keys,
                     state_slots,
@@ -1486,7 +1469,7 @@ impl VllmHostOffloadAdapter {
         if dependencies.is_empty() {
             return;
         }
-        let tier = self.host.lock();
+        let tier = self.host.read();
         for dependency in dependencies {
             let store = transfer_id(*dependency);
             match tier.transfer_deadline(store) {
@@ -1507,7 +1490,7 @@ impl VllmHostOffloadAdapter {
     pub(super) fn preempt_request(&mut self, request: &mut VllmHostRequestState) {
         request.restore_rounds.reset();
         let deadline = {
-            let tier = self.host.lock();
+            let tier = self.host.read();
             if self.rules.preemption_waits_for_all {
                 tier.last_deadline(self.host.id())
             } else {
@@ -1569,8 +1552,7 @@ impl VllmHostOffloadAdapter {
 
     pub(super) fn next_deadline(&self) -> Option<f64> {
         self.host
-            .lock()
-            .next_deadline(self.host.id())
+            .next_deadline()
             .into_iter()
             .chain(self.g3.as_ref().and_then(|g3| g3.next_deadline()))
             .chain(self.kvcr.as_ref().and_then(|kvcr| kvcr.next_deadline()))
@@ -1578,7 +1560,7 @@ impl VllmHostOffloadAdapter {
     }
 
     pub(super) fn current_time_ms(&self) -> f64 {
-        self.host.lock().current_time_ms()
+        self.host.read().current_time_ms()
     }
 
     /// Stores a request prepared when it left between passes. Only the 0.32
@@ -1586,11 +1568,11 @@ impl VllmHostOffloadAdapter {
     /// next step, and `Scheduler.has_requests` keeps the engine stepping until
     /// it has, so an engine boundary submits them.
     pub(super) fn has_unsubmitted_stores(&self) -> bool {
-        self.rules.stores_at_finish && self.host.lock().has_prepared_stores(self.host.id())
+        self.rules.stores_at_finish && self.host.read().has_prepared_stores(self.host.id())
     }
 
     pub(super) fn has_work(&self) -> bool {
-        self.host.lock().has_pending_work(self.host.id())
+        self.host.read().has_pending_work(self.host.id())
             || self.g3.as_ref().is_some_and(|g3| g3.has_work())
             || self.kvcr.as_ref().is_some_and(|kvcr| kvcr.has_work())
     }
@@ -3866,6 +3848,23 @@ mod tests {
             };
             assert_eq!(hit.state_slots, 2, "{connector:?}");
             assert_eq!(hit.keys, [state(1, 0), state(1, 1), blocks[0], blocks[1]]);
+
+            // The request's next lookup sees a store that started since. With
+            // the deeper state's other slot pending, a connector that waits
+            // for stores defers the hit, and SimpleCPU keeps the one it had.
+            let pending =
+                adapter
+                    .host
+                    .lock()
+                    .prepare_store(C, Uuid::nil(), &[state(3, 1)], None, 0.0);
+            assert!(matches!(pending, StoreOutcome::Prepared { .. }));
+            let again = match adapter.lookup(&mut host, &sequence, &cost, 4, 0.0) {
+                HostLookup::Hit(hit) => Some(hit.keys.len()),
+                HostLookup::Miss => Some(0),
+                HostLookup::Deferred => None,
+            };
+            let expected = (connector == G2Connector::SimpleCpuV032).then_some(4);
+            assert_eq!(again, expected, "{connector:?}");
         }
     }
 
