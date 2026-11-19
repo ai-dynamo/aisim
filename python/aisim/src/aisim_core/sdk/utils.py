@@ -2361,6 +2361,10 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         _load_model_config_from_model_path.cache_invalidate(model_path, base_config)
         _CONFIG_PROVENANCE.pop(id(base_config), None)
         raise
+    # Preserve Llama 4's established raw-cache reuse, but only after its
+    # processor metadata has passed the parser. Raw loads never fetch it.
+    if "image_processor_config" in raw_config:
+        base_config["image_processor_config"] = raw_config["image_processor_config"]
     if commit:
         _CONFIG_PROVENANCE[id(raw_config)] = (raw_config, commit)
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:

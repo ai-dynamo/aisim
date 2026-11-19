@@ -127,6 +127,9 @@ def test_llama4_remote_processor_errors_are_not_silently_ignored(tmp_path, monke
     monkeypatch.setattr(utils_module, "_download_hf_config", lambda _: raw)
 
     def download(hf_id, filename, *, raise_on_404=True):
+        if filename == "hf_quant_config.json":
+            assert not raise_on_404
+            return None
         assert filename == "preprocessor_config.json"
         raise utils_module.HuggingFaceDownloadError("processor access denied")
 
