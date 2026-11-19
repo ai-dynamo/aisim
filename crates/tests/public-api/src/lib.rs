@@ -396,6 +396,34 @@ mod tests {
     }
 
     #[test]
+    fn rank_energy_evidence_is_an_additive_field() {
+        let rank = aisim_core::FpmRankEstimate {
+            rank: 0,
+            latency_ms: 1.0,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&rank).unwrap();
+        assert!(serialized.get("prefill_energy_wms").is_none());
+        assert!(serialized.get("decode_energy_wms").is_none());
+        let restored: aisim_core::FpmRankEstimate = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.prefill_energy_wms, None);
+        assert_eq!(restored.decode_energy_wms, None);
+
+        let powered = aisim_core::FpmRankEstimate {
+            prefill_energy_wms: Some(500.0),
+            decode_energy_wms: Some(0.0),
+            ..restored
+        };
+        let serialized = serde_json::to_value(&powered).unwrap();
+        assert_eq!(serialized["prefill_energy_wms"], 500.0);
+        assert_eq!(serialized["decode_energy_wms"], 0.0);
+        assert_eq!(
+            serde_json::from_value::<aisim_core::FpmRankEstimate>(serialized).unwrap(),
+            powered
+        );
+    }
+
+    #[test]
     fn power_statistics_require_validated_public_construction() {
         use aisim_core::replay::TracePowerStats;
 
