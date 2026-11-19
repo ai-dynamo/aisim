@@ -560,10 +560,13 @@ def plan(
         if manifest.identity != entry.identity or manifest.purpose != entry.purpose:
             raise IntegrityError(entry.manifest.path, "manifest identity or purpose differs from the catalog entry")
         excluded = selection.exclude_roles
-        if selection.library_exclude_roles and any(a.role == "fpm-library" for a in manifest.artifacts):
+        prediction_only = selection.library_exclude_roles and any(a.role == "fpm-library" for a in manifest.artifacts)
+        if prediction_only:
             excluded = (*excluded, *selection.library_exclude_roles)
         for artifact in manifest.artifacts:
-            if artifact.role not in excluded:
+            if artifact.role not in excluded and (
+                not prediction_only or artifact.role in ("fpm-library", "fpm-library-metadata")
+            ):
                 planner._add(_ref(artifact, "artifact"))
     out.files.sort(key=lambda f: f.path)
     if offline:

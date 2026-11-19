@@ -382,6 +382,15 @@ class FpmLoader(Loader):
             dict.fromkeys(str(p) for p in (staged.systems_root, *(out.get("systems_paths") or ())))
         )
         try:
+            if not foreign and explicit is not None:
+                # A same-library override must read the effective, possibly recovered sidecar.
+                out["estimator_config"] = {
+                    **base["estimator_config"],
+                    "fpm_interpolation": {
+                        **base["estimator_config"]["fpm_interpolation"],
+                        "fpm_parquet_path": str(staged.parquet_path),
+                    },
+                }
             with_estimator_path(out, staged.parquet_path)
             resources, sources, profile, resources_by_deployment = _resolve_library_resources(
                 out, user_profile, identity, staged.metadata, require_resources, config is not None, foreign

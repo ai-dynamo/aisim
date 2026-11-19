@@ -465,6 +465,7 @@ class _FpmTimingDeploymentProfile(_ProfileModel):
     execution_profile: FpmSpeculativeExecutionProfile | None = None
     # Identity and timing can be validated before cache geometry is collected.
     resources: FpmResourceProfile | None = None
+    resources_source: Literal["user", "metadata"] = "user"
 
     @model_serializer(mode="wrap")
     def _preserve_legacy_identity(self, handler):
@@ -475,6 +476,8 @@ class _FpmTimingDeploymentProfile(_ProfileModel):
             result.pop("execution_profile", None)
         if self.resources is None:
             result.pop("resources", None)
+        if self.resources_source == "user":
+            result.pop("resources_source", None)
         return result
 
     def require_resources(self) -> FpmResourceProfile:

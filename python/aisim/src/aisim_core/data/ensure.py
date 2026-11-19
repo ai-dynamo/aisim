@@ -645,9 +645,12 @@ def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) 
     with the old library. A path the user set elsewhere is a genuine override and stays.
     """
     out = dict(config)
-    interpolation = (out.get("estimator_config") or {}).get("fpm_interpolation")
+    estimator = out.get("estimator_config")
+    interpolation = estimator.get("fpm_interpolation") if isinstance(estimator, Mapping) else None
     path = interpolation.get("fpm_parquet_path") if isinstance(interpolation, Mapping) else None
-    if path is not None and Path(path).expanduser().resolve().is_relative_to(materialized.resolve()):
+    # The generated file itself is a symlink to the dataset source. Resolve its
+    # parent to identify the materialization without following that final link.
+    if path is not None and Path(path).expanduser().parent.resolve().is_relative_to(materialized.resolve()):
         interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
         out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
     return out
@@ -691,6 +694,7 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
                 if _materialization_is_intact(output_dir / "systems", manifest) and _cached_pin_is_valid(
                     output_dir, manifest, cached_config
                 ):
+                    cached_config["systems_paths"] = [str(output_dir / "systems")]
                     return FpmData(manifest, config=cached_config)
             except ValueError:
                 pass

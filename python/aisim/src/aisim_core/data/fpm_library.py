@@ -49,6 +49,7 @@ PREDICTION_ROLES = (ROLE_LIBRARY, ROLE_METADATA)
 EVALUATION_ROLES = ("measurement-data", "measurement-manifest", "measurement-provenance")
 
 MEASUREMENT_MANIFEST_VERSION = 5
+MAX_WORKLOAD_COORDINATE = 2**32 - 1
 _TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 
 
@@ -74,6 +75,17 @@ def _coordinate_schema(schema: dict[str, Any]) -> None:
     schema.update(type="string", const="iteration_totals_balanced_v1")
 
 
+def _selector_schema(schema: dict[str, Any]) -> None:
+    schema.pop("anyOf", None)
+    schema.pop("default", None)
+    schema.update(type="object", properties={name: {"type": "integer", "minimum": 1} for name in _TOPOLOGY})
+
+
+def _policy_schema(schema: dict[str, Any]) -> None:
+    schema.update(next(branch for branch in schema.pop("anyOf") if branch.get("type") != "null"))
+    schema.pop("default", None)
+
+
 class FpmLibraryMetadata(BaseModel):
     """``fpm/fpm_forward_perf.metadata.json`` for ``aic_fpm_forward_perf/v6``.
 
@@ -87,7 +99,7 @@ class FpmLibraryMetadata(BaseModel):
     schema_name: Literal["aic_fpm_forward_perf"]
     schema_version: Literal[6] = Field(description="Library schema version; only 6 is supported.")
     row_count: int = Field(gt=0, strict=True)
-    parquet_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    parquet_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     system: str | None = None
     backend: str | None = None
     backend_version: str | None = None
@@ -95,13 +107,20 @@ class FpmLibraryMetadata(BaseModel):
     coordinate_system: Literal["iteration_totals_balanced_v1"] | None = Field(
         default=None, json_schema_extra=_coordinate_schema
     )
-    measurement_policy: str | None = None
+    measurement_policy: (
+        Literal[
+            "dynamo_native_single_sample_v1",
+            "per_row_single_sample_or_median_of_3",
+            "per_row_single_sample_or_full_grid_median_v1",
+        ]
+        | None
+    ) = Field(default=None, json_schema_extra=_policy_schema)
     measurement_repeats: int | None = Field(default=None, strict=True)
     warmup_repeats: int | None = Field(default=None, strict=True)
     metadata_provenance: str | None = None
     configuration_selector: dict[str, JsonValue] | None = Field(
         default=None,
-        json_schema_extra={"properties": {name: {"type": "integer", "minimum": 1} for name in _TOPOLOGY}},
+        json_schema_extra=_selector_schema,
     )
     resources: FpmResourceProfile | None = None
 
@@ -110,6 +129,13 @@ class FpmLibraryMetadata(BaseModel):
     def _coordinate_system(cls, value):
         if value is None:
             raise ValueError("coordinate_system must be iteration_totals_balanced_v1; omit it for recovery")
+        return value
+
+    @field_validator("configuration_selector", "measurement_policy")
+    @classmethod
+    def _non_null_declaration(cls, value):
+        if value is None:
+            raise ValueError("omit an absent declaration instead of supplying null")
         return value
 
     @model_validator(mode="after")
@@ -144,9 +170,9 @@ class FpmLibraryRow(BaseModel):
     moe_ep: int
     cp: int
     workload_kind: str
-    batch_size: int = Field(ge=1)
-    total_prefill_tokens: int = Field(ge=0)
-    total_kv_read_tokens: int = Field(ge=0)
+    batch_size: int = Field(ge=1, le=MAX_WORKLOAD_COORDINATE)
+    total_prefill_tokens: int = Field(ge=0, le=MAX_WORKLOAD_COORDINATE)
+    total_kv_read_tokens: int = Field(ge=0, le=MAX_WORKLOAD_COORDINATE)
     partition_policy: str
     latency_ms: float
     gemm_quant_mode: str
@@ -264,6 +290,12 @@ def _first_error(exc: ValidationError) -> str:
     error = exc.errors()[0]
     where = ".".join(str(part) for part in error["loc"])
     return f"{where}: {error['msg']}"
+
+
+def check_effective_measurement_policy(metadata: Mapping[str, Any]) -> None:
+    """An omitted policy is only an input to reconstruction, never a native-ready declaration."""
+    if metadata.get("measurement_policy") is None:
+        raise FpmContractError("FPM sidecar measurement_policy is required after reconstruction")
 
 
 # --------------------------------------------------------------------------- schema-6 recovery
@@ -424,6 +456,7 @@ def stage_fpm_library(
     metadata, recovered = recover_reconstructed_metadata(
         metadata, parquet, parquet_sha256=parquet_sha256, metadata_sha256=metadata_sha256
     )
+    check_effective_measurement_policy(metadata)
     text = None
     recovery = None
     if recovered:
@@ -538,7 +571,7 @@ def _check_sidecar_describes_library(metadata: Mapping[str, Any], parquet: Path,
     """A declared digest and the row count must describe the staged table, not another one."""
     import pyarrow.parquet as pq
 
-    if metadata.get("parquet_sha256") not in (None, parquet_sha256):
+    if metadata.get("parquet_sha256") != parquet_sha256:
         raise FpmContractError("FPM sidecar parquet_sha256 differs from the library")
     try:
         rows = pq.ParquetFile(parquet).metadata.num_rows
@@ -874,9 +907,9 @@ def _resource_deployment_identity(profile, deployment) -> dict[str, Any]:
         **{
             name: info.get_default()
             for name, info in FpmDeploymentProfile.model_fields.items()
-            if not info.is_required() and name != "resources"
+            if not info.is_required() and name not in {"resources", "resources_source"}
         },
-        **{name: value for name, value in deployment.items() if name != "resources"},
+        **{name: value for name, value in deployment.items() if name not in {"resources", "resources_source"}},
     }
 
 
@@ -909,6 +942,8 @@ def complete_fpm_profile(
     a deployment that names another hardware, version or role is left to its own resources. A selector that names
     a role requires that explicit deployment role; an omitted or null role cannot inherit role-specific resources.
     Returns the completed dictionary and the source of each deployment's resources.
+    Metadata-derived blocks carry ``resources_source: metadata`` through serialization and are re-resolved on
+    subsequent loads. Untagged or explicitly user-tagged resource blocks retain user precedence.
     A deployment with neither raises :class:`FpmResourcesPendingError` when ``required``; otherwise its
     resources stay absent and its source is ``pending``.
     """
@@ -916,6 +951,10 @@ def complete_fpm_profile(
     deployments = out.get("deployments")
     if not isinstance(deployments, list) or not deployments:
         raise FpmContractError("fpm_profile requires at least one deployment")
+    for deployment in deployments:
+        if isinstance(deployment, dict) and deployment.get("resources_source") == "metadata":
+            deployment.pop("resources", None)
+            deployment.pop("resources_source")
     # Resolve ambiguity once, before adding resources, rather than rescanning the profile for each deployment.
     metadata = _unambiguous_resource_metadata(out, metadata, identity)
     sources: list[str] = []
@@ -933,6 +972,8 @@ def complete_fpm_profile(
         )
         if resolved.resources is not None:
             deployment["resources"] = resolved.resources.model_dump(mode="json")
+        if resolved.source == "metadata":
+            deployment["resources_source"] = "metadata"
         sources.append(resolved.source)
     return out, sources
 

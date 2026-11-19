@@ -5,6 +5,8 @@
 
 import hashlib
 import json
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -25,31 +27,64 @@ from tests.unit.data.test_fetch import REPO, SHA, FakeTransport, _artifact_json,
 pytestmark = pytest.mark.unit
 
 CONFIG = {"system": "h200", "backend": "vllm", "backend_version": "0.1", "model": "m1"}
-PROFILE = {"path": "/materialized/profile.json", "sha256": "f" * 64}
+PROFILE_BYTES = b'{"retained_files": []}'
+PROFILE_SHA = hashlib.sha256(PROFILE_BYTES).hexdigest()
 
 
 @pytest.fixture(autouse=True)
 def stub_prepare(monkeypatch):
     """Skip the Rust readiness check; the loader's verification still runs."""
+    calls = []
 
     def load(self, root, manifest_path, *, output_dir=None, config=None):
+        calls.append(output_dir)
         manifest = self.read_manifest(root, manifest_path, config)
         output_dir.mkdir(parents=True)
+        profile = next(a for a in manifest.artifacts if a.role == "execution-profile")
+        shutil.copyfile(root / profile.path, output_dir / "profile.json")
+        for artifact in manifest.artifacts:
+            if artifact.runtime_path is not None:
+                target = output_dir / "systems" / artifact.runtime_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(root / artifact.path, target)
         prepared = {
             "systems_paths": [str(output_dir / "systems")],
             "estimation_mode": "op_level",
             "enable_shared_layer": False,
-            "estimator_config": {"op_level": {"execution_profile": PROFILE}, "correction": {"enabled": False}},
+            "estimator_config": {
+                "op_level": {"execution_profile": {"path": str(output_dir / "profile.json"), "sha256": profile.sha256}},
+                "correction": {"enabled": False},
+            },
         }
         (output_dir / "config.json").write_text(json.dumps(prepared))
         return FpmData(manifest, config=prepared)
 
     monkeypatch.setattr(FpmLoader, "load", load)
+    return calls
 
 
 @pytest.fixture
 def files(tmp_path):
-    return build_repo(tmp_path)
+    files = build_repo(tmp_path)
+    index = json.loads(files["catalog/fpm/index.json"])
+    for entry in index["entries"]:
+        path = entry["manifest"]["path"]
+        manifest = json.loads(files[path])
+        manifest["artifacts"][0]["runtime_path"] = "data/h200/vllm/0.1/data.parquet"
+        profile_path = str(Path(path).with_name("profile.json"))
+        files[profile_path] = PROFILE_BYTES
+        profile = _artifact_json("profile", profile_path, PROFILE_BYTES, format="json", schema="unversioned")
+        profile["role"] = "execution-profile"
+        manifest["artifacts"].append(profile)
+        files[path] = json.dumps(manifest).encode()
+        entry["manifest"] = _artifact_json("m", path, files[path], format="json", schema="aisim-artifact-manifest/v1")
+    files["catalog/fpm/index.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"] = _artifact_json(
+        "i", "catalog/fpm/index.json", files["catalog/fpm/index.json"], format="json", schema="aisim-category-index/v1"
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    return files
 
 
 def pin(tmp_path, **kw):
@@ -68,13 +103,16 @@ def test_cold_cache_downloads_wires_config_and_reports_revision(tmp_path, files)
     assert out.revisions == {"fpm": SHA}
     assert out.datasets["fpm"]["source"] == "hf-download"
     assert out.datasets["fpm"]["downloaded_bytes"] > 0
-    assert out.config["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+    assert out.config["estimator_config"]["op_level"]["execution_profile"] == {
+        "path": str(_materialized_dir(tmp_path) / "profile.json"),
+        "sha256": PROFILE_SHA,
+    }
     assert out.config["systems_paths"][0].endswith("/systems")
     assert "fpm/m1/data.parquet" in transport.opened
     assert "fpm/m2/data.parquet" not in transport.opened  # selection excludes other models
 
 
-def test_warm_cache_works_offline_with_zero_network(tmp_path, files):
+def test_warm_cache_works_offline_with_zero_network(tmp_path, files, stub_prepare):
     ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
     cold = FakeTransport(files)
     out = ensure_data(CONFIG, pin(tmp_path, offline=True), transport=cold)
@@ -85,6 +123,7 @@ def test_warm_cache_works_offline_with_zero_network(tmp_path, files):
     warm = FakeTransport(files)
     ensure_data(CONFIG, pin(tmp_path), transport=warm)
     assert warm.opened == []
+    assert len(stub_prepare) == 1  # both intact warm calls bypass materialization
 
 
 def test_offline_cold_cache_is_a_precise_error(tmp_path, files):
@@ -511,18 +550,34 @@ def test_interrupted_legacy_materialization_is_rebuilt(tmp_path, files):
     directory = _materialized_dir(tmp_path)
     (directory / "config.json").unlink()  # a killed load left the directory without its last file
     out = ensure_data(CONFIG, pin(tmp_path, offline=True), transport=FakeTransport(files))
-    assert out.config["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+    assert out.config["estimator_config"]["op_level"]["execution_profile"]["sha256"] == PROFILE_SHA
     assert (directory / "config.json").is_file()
 
 
-def test_cached_materialization_is_verified_before_reuse(tmp_path, files, monkeypatch):
+def test_cached_materialization_is_verified_before_reuse(tmp_path, files, stub_prepare):
     ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
     directory = _materialized_dir(tmp_path)
     marker = directory / "stale.txt"
     marker.write_text("x")
-    monkeypatch.setattr(ensure_mod, "_materialization_is_intact", lambda systems, manifest: False)
+    assert len(stub_prepare) == 1
+    ensure_data(CONFIG, pin(tmp_path, offline=True))
+    assert len(stub_prepare) == 1
+    (directory / "systems/data/h200/vllm/0.1/data.parquet").unlink()
     ensure_data(CONFIG, pin(tmp_path, offline=True), transport=FakeTransport(files))
+    assert len(stub_prepare) == 2
     assert not marker.exists()  # the failed verification discarded the cache and rebuilt it
+
+
+@pytest.mark.parametrize("paths", [[], ["/unverified/root"]])
+def test_cached_systems_paths_are_reconstructed_from_the_verified_root(tmp_path, files, stub_prepare, paths):
+    original = ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    cached = _materialized_dir(tmp_path) / "config.json"
+    document = json.loads(cached.read_text())
+    document["systems_paths"] = paths
+    cached.write_text(json.dumps(document))
+    warm = ensure_data(CONFIG, pin(tmp_path, offline=True))
+    assert warm.config == original.config
+    assert len(stub_prepare) == 1
 
 
 def test_cached_pin_must_match_the_manifest_and_materialized_profile(tmp_path):

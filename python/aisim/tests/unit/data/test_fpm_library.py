@@ -18,7 +18,7 @@ import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
 from aisim_core.data import Entry, Identity, Manifest, configuration_id
-from aisim_core.data.fetch import Cache, plan
+from aisim_core.data.fetch import Cache, fetch, plan
 from aisim_core.data.fpm_checks import check_fpm_dataset, check_fpm_entry, check_fpm_identities
 from aisim_core.data.fpm_library import (
     EVALUATION_ROLES,
@@ -272,6 +272,11 @@ def test_loader_rejects_tampered_library_and_wrong_identity(root, profile, tmp_p
 
 def test_default_selection_and_plan_skip_measurements(root, profile, tmp_path):
     make_entry(root, profile, resources=RESOURCES, with_measurements=True)
+    note = f"{ENTRY}/publisher-note.txt"
+    (root / note).write_text("An optional publisher note, outside the prediction tier.")
+    document = json.loads((root / MANIFEST).read_text())
+    document["artifacts"].append(_artifact(root, note, "publisher-note", "text", "unversioned"))
+    (root / MANIFEST).write_text(json.dumps(document))
     cache_root = tmp_path / "cache"
     commit = Cache(cache_root).commit_root(REPO, SHA)
     commit.parent.mkdir(parents=True)
@@ -318,6 +323,10 @@ def test_default_selection_and_plan_skip_measurements(root, profile, tmp_path):
     assert {f.path for f in everything.files if f.role == "artifact"} > {
         f.path for f in default.files if f.role == "artifact"
     }
+    assert note in {f.path for f in everything.files}
+    (commit / note).unlink()
+    fetched = fetch(selection, repo=REPO, revision=SHA, cache=Cache(cache_root), offline=True)
+    assert note not in fetched.paths
 
 
 def test_parallelism_is_part_of_selection(root, profile):
@@ -1154,7 +1163,16 @@ def test_staging_rejects_unknown_system_and_unsafe_names(root, profile, tmp_path
 def test_library_schema_versions(tmp_path):
     def sidecar(version):
         path = tmp_path / f"v{version}.json"
-        path.write_text(json.dumps({"schema_name": "aic_fpm_forward_perf", "schema_version": version, "row_count": 1}))
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_name": "aic_fpm_forward_perf",
+                    "schema_version": version,
+                    "row_count": 1,
+                    "parquet_sha256": "0" * 64,
+                }
+            )
+        )
         return path
 
     assert read_library_metadata(sidecar(6))["schema_version"] == 6
@@ -1224,7 +1242,8 @@ def test_reconstructed_schema6_metadata_is_recovered_only_from_verified_rows(tmp
     )
 
 
-def test_recovered_staged_pair_answers_through_native_best_available(root, profile, tmp_path):
+@pytest.mark.parametrize("source_override", [False, True])
+def test_recovered_staged_pair_answers_through_native_best_available(root, profile, tmp_path, source_override):
     make_entry(root, profile)
     parquet, sidecar = _stage_args(root)
     rows = pq.read_table(parquet).to_pylist()
@@ -1241,15 +1260,18 @@ def test_recovered_staged_pair_answers_through_native_best_available(root, profi
         metadata.pop(name)
     sidecar.write_text(json.dumps(metadata))
     original = sidecar.read_bytes()
-    staged = stage_fpm_library(parquet, sidecar, **KWARGS, output_dir=tmp_path / "out")
+    _refresh_prediction_manifest(root)
+    config = user_config(profile)
+    if source_override:
+        config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] = str(parquet)
+    data = load(root, config, tmp_path)
+    staged = data._staged
     assert not staged.metadata_path.is_symlink()
     assert staged.diagnostics["fpm_metadata_recovery"]["recovered_fields"]["coordinate_system"] == (
         "iteration_totals_balanced_v1"
     )
-    config = user_config(profile)
-    config["systems_paths"] = [str(staged.systems_root)]
-    with_estimator_path(config, staged.parquet_path)
-    model = RustForwardPassPerfModel.best_available(config)
+    assert data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(staged.parquet_path)
+    model = RustForwardPassPerfModel.best_available(data.config)
     try:
         for query, expected in (
             ({"num_prefill_requests": 1, "sum_prefill_tokens": 1}, 2.0),
@@ -1310,7 +1332,14 @@ def test_staging_requires_an_integer_row_count(tmp_path, invalid):
     parquet = tmp_path / "one.parquet"
     pq.write_table(pa.Table.from_pylist([RECONSTRUCTED_ROW]), parquet)
     sidecar = tmp_path / "one.metadata.json"
-    metadata = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": invalid}
+    metadata = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": invalid,
+        "parquet_sha256": _sha(parquet.read_bytes()),
+        "coordinate_system": "iteration_totals_balanced_v1",
+        **{key: RECONSTRUCTED_ROW[key] for key in ("system", "backend", "backend_version", "measurement_policy")},
+    }
     sidecar.write_text(json.dumps(metadata))
     kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
     with pytest.raises(FpmContractError, match="row_count"):
@@ -1465,7 +1494,13 @@ def test_fpm_schema_snapshots_are_registered_and_current():
 
 
 def test_sidecar_model_accepts_published_shapes_and_validates_resources():
-    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 2, "future_key": {"a": 1}}
+    base = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 2,
+        "parquet_sha256": "0" * 64,
+        "future_key": {"a": 1},
+    }
     assert FpmLibraryMetadata.model_validate(base).resources is None  # entries published before `resources`
     assert FpmLibraryMetadata.model_validate({**base, "resources": RESOURCES}).resources.max_num_tokens == 8192
     with pytest.raises(ValueError, match="max_num_tokens"):
@@ -1476,7 +1511,7 @@ def test_sidecar_model_accepts_published_shapes_and_validates_resources():
 def test_sidecar_version_is_constrained_in_model_and_packaged_snapshot():
     from aisim_core.data.schemas import PACKAGED_SNAPSHOT_DIR, snapshot_filename
 
-    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 2}
+    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 2, "parquet_sha256": "0" * 64}
     schema = json.loads((PACKAGED_SNAPSHOT_DIR / snapshot_filename("aic_fpm_forward_perf.metadata/v6")).read_text())
     validator = Draft202012Validator(schema)
     validator.validate(base)
@@ -1522,7 +1557,13 @@ def test_resource_layout_requirements_agree_in_runtime_and_exported_schema(resou
     from aisim_core.data.schemas import PACKAGED_SNAPSHOT_DIR, snapshot_filename
 
     schema = json.loads((PACKAGED_SNAPSHOT_DIR / snapshot_filename("aic_fpm_forward_perf.metadata/v6")).read_text())
-    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "resources": resources}
+    document = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "parquet_sha256": "0" * 64,
+        "resources": resources,
+    }
     with pytest.raises(ValueError):
         FpmLibraryMetadata.model_validate(document)
     with pytest.raises(ValidationError):
@@ -1531,7 +1572,7 @@ def test_resource_layout_requirements_agree_in_runtime_and_exported_schema(resou
 
 def test_resource_layout_schema_keeps_valid_and_absent_resources():
     schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
-    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1}
+    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "parquet_sha256": "0" * 64}
     group = {
         "name": "attention",
         "kind": "attention",
@@ -1568,7 +1609,13 @@ def test_resource_layout_schema_keeps_valid_and_absent_resources():
 @pytest.mark.parametrize("limit", [2**32 - 1, 2**32])
 def test_scheduler_limit_bounds_match_schema_python_and_native(profile, field, limit):
     resources = {**RESOURCES, field: limit}
-    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "resources": resources}
+    document = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "parquet_sha256": "0" * 64,
+        "resources": resources,
+    }
     validator = Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6")))
     profile["deployments"][0]["resources"] = resources
     config = _request(profile, "direct")
@@ -1593,6 +1640,7 @@ def test_selector_topology_matches_exported_schema(tmp_path, dimension, degree):
         "schema_name": "aic_fpm_forward_perf",
         "schema_version": 6,
         "row_count": 1,
+        "parquet_sha256": "0" * 64,
         "configuration_selector": {dimension: degree, "future_selector": "kept open"},
     }
     sidecar = tmp_path / "metadata.json"
@@ -1652,7 +1700,13 @@ def test_selector_topology_matches_exported_schema(tmp_path, dimension, degree):
 def test_cache_group_conditions_match_exported_schema(group, valid):
     group = {**_STATE_GROUP_WITHOUT_BLOCKS, **group}
     resources = {**_NO_KV, "cache_layout": "grouped", "cache_groups": [group]}
-    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "resources": resources}
+    document = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "parquet_sha256": "0" * 64,
+        "resources": resources,
+    }
     validator = Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6")))
     if valid:
         validator.validate(document)
@@ -1908,7 +1962,7 @@ def test_topology_aliases_select_like_their_canonical_names():
 
 def test_sidecar_rejects_duplicate_keys_and_boolean_topology(tmp_path):
     path = tmp_path / "meta.json"
-    base = '"schema_name": "aic_fpm_forward_perf", "row_count": 1'
+    base = '"schema_name": "aic_fpm_forward_perf", "row_count": 1, "parquet_sha256": "' + "0" * 64 + '"'
     path.write_text("{" + base + ', "schema_version": 7, "schema_version": 6}')
     with pytest.raises(FpmContractError, match="duplicate JSON key"):
         read_library_metadata(path)
@@ -1935,16 +1989,17 @@ def test_staging_rejects_a_sidecar_that_describes_another_table(root, profile, t
                 backend_version="0.25.1",
                 output_dir=tmp_path / "out",
             )
-    document.pop("parquet_sha256")  # the digest is optional
+    document.pop("parquet_sha256")  # native v6 admission requires the digest
     sidecar.write_text(json.dumps(document))
-    stage_fpm_library(
-        source / "fpm_forward_perf.parquet",
-        sidecar,
-        system="h200_sxm",
-        backend="vllm",
-        backend_version="0.25.1",
-        output_dir=tmp_path / "out",
-    )
+    with pytest.raises(FpmContractError, match="parquet_sha256"):
+        stage_fpm_library(
+            source / "fpm_forward_perf.parquet",
+            sidecar,
+            system="h200_sxm",
+            backend="vllm",
+            backend_version="0.25.1",
+            output_dir=tmp_path / "out",
+        )
 
 
 def test_concurrent_staging_of_one_destination_does_not_collide(root, profile, tmp_path):
@@ -2193,7 +2248,7 @@ def test_sidecar_repeat_counts_agree_with_packaged_schema(tmp_path, field, value
     from aisim_core.data.schemas import PACKAGED_SNAPSHOT_DIR, snapshot_filename
 
     schema = json.loads((PACKAGED_SNAPSHOT_DIR / snapshot_filename("aic_fpm_forward_perf.metadata/v6")).read_text())
-    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1}
+    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "parquet_sha256": "0" * 64}
     if value != "omitted":
         document[field] = value
     sidecar = tmp_path / "metadata.json"
@@ -2363,7 +2418,9 @@ def test_shared_library_covers_multiple_manifest_models(root, profile, tmp_path,
     make_entry(root, profile)
     parquet, sidecar = _stage_args(root)
     rows = pq.read_table(parquet).to_pylist()
-    rows += [{**row, "cell_id": "other-" + row["cell_id"], "model_path": "other/model"} for row in rows]
+    rows += [
+        {**row, "cell_id": "other-" + row["cell_id"], "model_path": "other/model", "latency_ms": 17.0} for row in rows
+    ]
     pq.write_table(pa.Table.from_pylist(rows), parquet)
     metadata = json.loads(sidecar.read_text())
     metadata.update(row_count=len(rows), parquet_sha256=_sha(parquet.read_bytes()))
@@ -2415,6 +2472,7 @@ def test_runtime_version_nonblank_constraint_matches_sidecar_schema_and_reader(t
         "schema_name": "aic_fpm_forward_perf",
         "schema_version": 6,
         "row_count": 1,
+        "parquet_sha256": "0" * 64,
         "resources": {**RESOURCES, "runtime_memory": {**RUNTIME_MEMORY, "runtime_framework_version": version}},
     }
     schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
@@ -2432,7 +2490,11 @@ def test_runtime_version_nonblank_constraint_matches_sidecar_schema_and_reader(t
 
 def test_sidecar_reader_rejects_duplicate_keys_and_float_overflow(tmp_path):
     sidecar = tmp_path / "sidecar.json"
-    base = '{"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, %s}'
+    base = (
+        '{"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "parquet_sha256": "'
+        + "0" * 64
+        + '", %s}'
+    )
     sidecar.write_text(base % '"b": 1, "a": 1, "b": 2, "a": 3')
     with pytest.raises(FpmContractError, match="duplicate JSON key 'a'"):
         read_library_metadata(sidecar)
@@ -2498,3 +2560,223 @@ def test_sidecar_resources_do_not_attach_to_a_different_explicit_library(root, p
     explicit = user_config(profile, **RESOURCES)
     explicit["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] = "/user/other.parquet"
     assert load(root, explicit, tmp_path / "user").resource_sources == ("user",)
+
+
+def _refresh_prediction_manifest(root):
+    document = json.loads((root / MANIFEST).read_text())
+    for artifact in document["artifacts"][:2]:
+        path = root / artifact["path"]
+        artifact.update(sha256=_sha(path.read_bytes()), bytes=path.stat().st_size)
+        if artifact["role"] == "fpm-library":
+            artifact["rows"] = pq.ParquetFile(path).metadata.num_rows
+    (root / MANIFEST).write_text(json.dumps(document))
+
+
+def _write_entry_catalog(root):
+    manifest = Manifest.model_validate_json((root / MANIFEST).read_bytes())
+    (root / "catalog/fpm").mkdir(parents=True, exist_ok=True)
+    index = {
+        "schema_version": "aisim-category-index/v1",
+        "category": "fpm",
+        "entries": [
+            {
+                "configuration_id": manifest.configuration_id,
+                "purpose": manifest.purpose,
+                "identity": manifest.identity.model_dump(),
+                "manifest": _artifact(root, MANIFEST, "manifest", "json", "aisim-artifact-manifest/v1"),
+            }
+        ],
+    }
+    (root / "catalog/fpm/index.json").write_text(json.dumps(index))
+    (root / "catalog/dataset.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aisim-dataset-index/v1",
+                "dataset_id": REPO,
+                "categories": {
+                    "fpm": {
+                        "root": "data/fpm",
+                        "layout": "category",
+                        "index": _artifact(root, "catalog/fpm/index.json", "index", "json", "aisim-category-index/v1"),
+                    }
+                },
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("setting", [["bad"], "bad", 1])
+def test_ensure_rejects_a_non_mapping_estimator_with_a_field_error(root, profile, tmp_path, setting):
+    from aisim_core.data.ensure import DataPin, MissingDataError, ensure_data
+
+    make_entry(root, profile)
+    _write_entry_catalog(root)
+    config = {**user_config(profile), "estimator_config": setting}
+    with pytest.raises(MissingDataError, match="estimator_config must be a mapping"):
+        ensure_data(config, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("new_resources", [None, {**RESOURCES, "max_num_tokens": 1024}])
+def test_repin_resolves_metadata_resources_and_preserves_user_blocks(root, profile, tmp_path, explicit, new_resources):
+    from aisim_core.data.ensure import DataPin, ensure_data
+
+    other = tmp_path / "other"
+    for source, resources in ((root, RESOURCES), (other, new_resources)):
+        make_entry(source, profile, resources=resources)
+        _write_entry_catalog(source)
+    config = user_config(profile, **(RESOURCES if explicit else {}))
+    config["fpm_profile"]["deployments"].append(
+        {
+            **copy.deepcopy(config["fpm_profile"]["deployments"][0]),
+            "system": "b200_sxm",
+            "resources": {**RESOURCES, "max_num_tokens": 2048, "provenance": "Explicit other-deployment fixture."},
+        }
+    )
+    first = ensure_data(config, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
+    # Include native normalization and JSON persistence: derived resources must retain their origin.
+    saved = json.loads(json.dumps(RustForwardPassPerfModel.normalize_config(first.config)))
+    assert saved["fpm_profile"]["deployments"][0].get("resources_source", "user") == (
+        "user" if explicit else "metadata"
+    )
+    second = ensure_data(saved, DataPin(local_root=other, categories=("fpm",), cache_dir=tmp_path / "cache"))
+    deployment = second.config["fpm_profile"]["deployments"][0]
+    assert second.config["fpm_profile"]["deployments"][1]["resources"]["max_num_tokens"] == 2048
+    if explicit or new_resources is not None:
+        assert deployment["resources"]["max_num_tokens"] == (8192 if explicit else 1024)
+    else:
+        assert "resources" not in deployment
+        assert "resources_source" not in deployment
+
+
+def test_restaging_changed_library_does_not_reuse_a_live_native_table(root, profile, tmp_path):
+    make_entry(root, profile)
+    config = user_config(profile)
+    first = load(root, config, tmp_path)
+    model_a = RustForwardPassPerfModel.best_available(first.config)
+    query = [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 1}}]
+    try:
+        # Synthetic fixture cell: 3 ms before replacement, 7 ms afterwards.
+        assert model_a.estimate_forward_pass_time_ms(query) == pytest.approx(3.0)
+        other = tmp_path / "other"
+        make_entry(other, profile)
+        parquet, sidecar = _stage_args(other)
+        rows = pq.read_table(parquet).to_pylist()
+        for row in rows:
+            if row["workload_kind"] == "decode":
+                row["latency_ms"] = 7.0
+        pq.write_table(pa.Table.from_pylist(rows), parquet)
+        metadata = json.loads(sidecar.read_text())
+        metadata["parquet_sha256"] = _sha(parquet.read_bytes())
+        sidecar.write_text(json.dumps(metadata))
+        _refresh_prediction_manifest(other)
+        second = load(other, config, tmp_path)
+        assert second.systems_root == first.systems_root
+        model_b = RustForwardPassPerfModel.best_available(second.config)
+        try:
+            assert model_b.estimate_forward_pass_time_ms(query) == pytest.approx(7.0)
+            assert model_a.estimate_forward_pass_time_ms(query) == pytest.approx(3.0)
+            inode = second._staged.parquet_path.lstat().st_ino
+            again = load(other, config, tmp_path)
+            assert again._staged.parquet_path.lstat().st_ino == inode
+        finally:
+            model_b.close()
+    finally:
+        model_a.close()
+
+
+@pytest.mark.parametrize("policy", ["unknown_v1", None, "omitted"])
+def test_effective_sidecar_policy_must_be_native_v6(root, profile, tmp_path, policy):
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    metadata = json.loads(sidecar.read_text())
+    if policy == "omitted":
+        metadata.pop("measurement_policy")
+    else:
+        metadata["measurement_policy"] = policy
+    sidecar.write_text(json.dumps(metadata))
+    _refresh_prediction_manifest(root)
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ["invalid-sidecar"]
+    assert "measurement_policy" in findings[0].message
+    with pytest.raises(FpmContractError, match="measurement_policy"):
+        stage_fpm_library(parquet, sidecar, **KWARGS, output_dir=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_missing_sidecar_digest_fails_model_publication_and_staging(root, profile, tmp_path):
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    metadata = json.loads(sidecar.read_text())
+    metadata.pop("parquet_sha256")
+    schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
+    with pytest.raises(ValidationError, match="parquet_sha256"):
+        Draft202012Validator(schema).validate(metadata)
+    with pytest.raises(ValueError, match="parquet_sha256"):
+        FpmLibraryMetadata.model_validate(metadata)
+    sidecar.write_text(json.dumps(metadata))
+    _refresh_prediction_manifest(root)
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ["invalid-sidecar"]
+    assert "parquet_sha256" in findings[0].message
+    with pytest.raises(FpmContractError, match="parquet_sha256"):
+        stage_fpm_library(parquet, sidecar, **KWARGS, output_dir=tmp_path / "out")
+
+
+@pytest.mark.parametrize("selector", [None, "omitted"])
+def test_sidecar_selector_omission_and_null_match_native_admission(root, profile, tmp_path, selector):
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    metadata = json.loads(sidecar.read_text())
+    metadata.pop("configuration_selector")
+    if selector is None:
+        metadata["configuration_selector"] = None
+    schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
+    sidecar.write_text(json.dumps(metadata))
+    _refresh_prediction_manifest(root)
+    if selector is None:
+        with pytest.raises(ValidationError):
+            Draft202012Validator(schema).validate(metadata)
+        with pytest.raises(FpmContractError, match="configuration_selector"):
+            read_library_metadata(sidecar)
+        assert [f.code for f in check_fpm_entry(root, MANIFEST)] == ["invalid-sidecar"]
+    else:
+        Draft202012Validator(schema).validate(metadata)
+        assert read_library_metadata(sidecar) == metadata
+        assert check_fpm_entry(root, MANIFEST) == []
+        data = load(root, user_config(profile), tmp_path)
+        model = RustForwardPassPerfModel.best_available(data.config)
+        try:
+            assert model.estimate_forward_pass_time_ms(
+                [{"scheduled_requests": {"num_prefill_requests": 1, "sum_prefill_tokens": 1}}]
+            ) == pytest.approx(2.0)
+        finally:
+            model.close()
+
+
+@pytest.mark.parametrize("field", ["batch_size", "total_prefill_tokens", "total_kv_read_tokens"])
+@pytest.mark.parametrize("value", [2**32 - 1, 2**32])
+def test_workload_coordinate_u32_bounds_match_model_schema_and_publication(root, profile, field, value):
+    from aisim_core.data.fpm_library import FpmLibraryRow
+
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    rows = pq.read_table(parquet).to_pylist()
+    row = next(row for row in rows if row["workload_kind"] == "prefill")
+    row[field] = value
+    schema = json.loads(render_snapshot("aic_fpm_forward_perf/v6"))
+    if value == 2**32 - 1:
+        Draft202012Validator(schema).validate(row)
+        assert getattr(FpmLibraryRow.model_validate(row), field) == value
+    else:
+        with pytest.raises(ValidationError):
+            Draft202012Validator(schema).validate(row)
+        with pytest.raises(ValueError, match=field):
+            FpmLibraryRow.model_validate(row)
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    metadata = json.loads(sidecar.read_text())
+    metadata["parquet_sha256"] = _sha(parquet.read_bytes())
+    sidecar.write_text(json.dumps(metadata))
+    _refresh_prediction_manifest(root)
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ([] if value == 2**32 - 1 else ["library-coordinates"])
