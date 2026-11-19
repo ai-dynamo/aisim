@@ -8,7 +8,7 @@ you saved from the scheduler and prints the result with its check findings.
 It never contacts a scheduler. ``--gpu-type`` must come from an observed fact (node
 inventory, ``nvidia-smi``), not a guess; without it the type stays null.
 
-    sacct -j JOBIDS --parsable2 -o JobID,JobName,State,Submit,Start,End,ElapsedRaw,Elapsed,NNodes,AllocTRES > sacct.txt
+    sacct -D -j JOBIDS --parsable2 -o JobID,JobName,State,Submit,Start,End,ElapsedRaw,Elapsed,NNodes,AllocTRES > sacct.txt
     kubectl get job NAME -o json > job.json; kubectl get pods -l job-name=NAME -o json > pods.json
 """
 

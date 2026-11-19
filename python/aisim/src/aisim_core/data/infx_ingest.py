@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import email.utils
 import hashlib
+import http.client
 import json
 import os
 import tempfile
@@ -60,12 +61,14 @@ from aisim_core.data.e2e import (
 BASE_URL = "https://inferencex.semianalysis.com/api/v1/"
 USER_AGENT = "aisim-infx-ingest/1"
 SELECTION_POLICY = "inferencex-all-observations-in-scope/v1"
-REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics")
+REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl")
 # ``exact=true&date=D`` returns the logical snapshot as of D, so one benchmark id can reappear on later
 # dates. Only these per-view context fields differ between appearances (verified against the live API);
 # they are not measured content and are excluded from the stored record and from contradiction checks.
 VIEW_CONTEXT_PREFIX = "curve_"
-_AVAILABILITY_KEY = ("model", "hardware", "framework", "precision", "spec_method", "disagg", "benchmark_type")
+_AVAILABILITY_KEY = (
+    "model", "hardware", "framework", "precision", "spec_method", "disagg", "benchmark_type", "isl", "osl",
+)  # fmt: skip
 
 
 class InfxError(Exception):
@@ -177,8 +180,8 @@ class InfxClient:
             delay = min(self.policy.max_delay, self.policy.base_delay * 2 ** (attempt - 1))
             try:
                 response = self.transport(url, headers, self.policy.timeout)
-            except (OSError, TimeoutError) as exc:
-                last = f"transport error: {exc}"
+            except (OSError, TimeoutError, http.client.IncompleteRead) as exc:
+                last = f"transport error: {exc!r}"
             else:
                 status = response.status
                 if status in (200, 304):
@@ -304,6 +307,10 @@ class Acquirer:
                 by_key[key] = entry["name"]
         availability, _, _ = self._page("availability", None, list)
         wanted = set(models) if models else None
+        if wanted is not None:  # a misspelled selector must not read as "no data"
+            known = set(by_key) | set(by_key.values())
+            if unknown := sorted(wanted - known):
+                raise InfxError(f"unknown model selector(s) {unknown}; known: {sorted(set(by_key.values()))}")
         declared: dict[tuple[str, str], set[tuple]] = {}
         for row in availability:
             if not isinstance(row, dict) or not {*_AVAILABILITY_KEY, "date"} <= row.keys():
