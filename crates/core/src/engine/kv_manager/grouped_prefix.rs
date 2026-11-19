@@ -169,6 +169,17 @@ impl GroupedPrefixRules {
                         ));
                         GroupRuleKind::State
                     } else {
+                        // The count is a field of `MambaSpec` alone (v0.31
+                        // `iface:1049-1050`, v0.32 `iface:1042-1043`), and no
+                        // ring spec is a `MambaSpec` (v0.31 `iface:890`,
+                        // `:1016`, v0.32 `iface:909`). A ring that declares a
+                        // checkpoint block is refused, not run without it.
+                        ensure!(
+                            !group
+                                .prefill_checkpoint_blocks
+                                .is_some_and(|blocks| blocks > 0),
+                            "kv_cache_groups with enable_prefix_caching=true do not model a prefill checkpoint block on a state group with prefix_cacheable=false; set prefix_cacheable: true on a Mamba state group, or remove prefill_checkpoint_blocks and prefill_checkpoint_alignment from a ring buffer"
+                        );
                         GroupRuleKind::Ring
                     }
                 }

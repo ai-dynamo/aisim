@@ -215,7 +215,9 @@ import. A profile imported before these fields existed has neither of them, and
 an absent field is left out of the serialized group. Sizing and replay with
 prefix caching off do not read them. Grouped prefix caching on vLLM 0.32.0
 and 0.33.0 reads them for a prefix-cacheable `state` group, and on vLLM 0.31.0 it refuses
-a positive `prefill_checkpoint_blocks`.
+a positive `prefill_checkpoint_blocks`. On every modeled version it refuses a
+positive `prefill_checkpoint_blocks` on a `state` group with
+`prefix_cacheable: false`.
 
 - `prefill_checkpoint_blocks` is the number of prefill checkpoint blocks of a
   Mamba spec: 0 or 1. Only a `state` group can have it. A vLLM 0.33.0 import
