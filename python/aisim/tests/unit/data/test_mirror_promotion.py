@@ -15,6 +15,7 @@ from aisim_core.data import Identity
 from aisim_core.data.catalog import build_catalog
 from aisim_core.data.e2e import (
     E2eManifestBody,
+    SeriesRow,
     Setting,
     aiperf_to_configuration,
     inferencex_to_configurations,
@@ -621,6 +622,93 @@ def test_observation_text_blocks_promotion_and_public_validation(tmp_path, colum
     assert not plan.content_ok
     assert any(f.code == code and f"column {column}" in f.message for f in plan.findings)
     assert code in {f.code for f in validate_tree(root, profile="public").errors}
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [
+        ("metrics", "attrs"),
+        ("metrics", "source_name"),
+        ("metrics", "future_text"),
+        ("series", "source"),
+        ("series", "future_text"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        (json.dumps({"endpoint": "https://node7.corp.nvidia.com/v1"}), "internal-host"),
+        (json.dumps({"authorization": "Bearer " + "a" * 24}), "secret"),
+    ],
+)
+def test_metric_and_series_text_blocks_promotion_and_public_validation(tmp_path, table, column, value, code):
+    root = tmp_path / "mirror"
+    cfg = _config()
+    if table == "series":
+        cfg = dataclasses.replace(
+            cfg,
+            series=[
+                SeriesRow(
+                    observation_id=cfg.observations[0].observation_id,
+                    metric="running_requests",
+                    start_ms=0.0,
+                    end_ms=100.0,
+                    value=1.0,
+                )
+            ],
+        )
+    rows = list(getattr(cfg, table))
+    rows[0] = rows[0].model_copy(update={column: value})
+    cfg = dataclasses.replace(cfg, **{table: rows})
+    manifest = write_configuration(root, cfg, prefix="data")
+    register_manifests(root, [manifest], INTERNAL_REPO)
+    build_catalog(root)
+    directory = str(Path(manifest).parent)
+    _public(root, directory)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data, not an orphan or corrupt table
+    draft = plan_promotion(root, _request([directory]), _reviewers())
+    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok  # approval does not override disclosure checks
+    artifact_path = f"{directory}/{table}.parquet"
+    assert any(f.code == code and f.path == artifact_path and f"column {column}" in f.message for f in plan.findings)
+    assert any(f.code == code and f.path == artifact_path for f in validate_tree(root, profile="public").errors)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, _target(tmp_path))
+
+
+@pytest.mark.parametrize("value", [None, "", "[REDACTED]", '{"source": "public-benchmark"}'])
+def test_clean_metric_and_series_text_can_be_promoted(tmp_path, value):
+    root = tmp_path / "mirror"
+    cfg = _config()
+    cfg = dataclasses.replace(
+        cfg,
+        metrics=[row.model_copy(update={"attrs": value}) for row in cfg.metrics],
+        series=[
+            SeriesRow(
+                observation_id=cfg.observations[0].observation_id,
+                metric="running_requests",
+                start_ms=0.0,
+                end_ms=100.0,
+                value=1.0,
+                source=value,
+            )
+        ],
+    )
+    manifest = write_configuration(root, cfg, prefix="data")
+    register_manifests(root, [manifest], INTERNAL_REPO)
+    build_catalog(root)
+    directory = str(Path(manifest).parent)
+    _public(root, directory)
+    draft = plan_promotion(root, _request([directory]), _reviewers())
+    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    for table in ("metrics", "series"):
+        relative = f"{directory}/{table}.parquet"
+        assert (target / relative).read_bytes() == (root / relative).read_bytes()
+    report = validate_tree(target, repo=PUBLIC, profile="public")
+    assert report.ok, report.errors
 
 
 @pytest.mark.parametrize(
