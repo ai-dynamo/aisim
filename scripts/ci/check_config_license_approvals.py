@@ -63,6 +63,8 @@ def ownership_matches(entry: dict, record: dict) -> bool:
     if evidence.get("status") != "recorded_source" or not pinned_nvidia_card(evidence):
         return False
     source = entry.get("source", {})
+    if not isinstance(source, dict):
+        return False
     card = evidence["url"].removesuffix("README.md")
     if source.get("revision") == evidence["revision"] and source.get("url") == card + source.get("path", ""):
         return True

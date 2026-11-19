@@ -411,6 +411,28 @@ def licensed_source(tmp_path):
     return root, config, current, item, texts, save
 
 
+@pytest.mark.parametrize("source", [None, [], "", 0, False], ids=["null", "array", "string", "integer", "boolean"])
+def test_cli_non_object_source_retains_ownership_failure_report(licensed_source, tmp_path, source):
+    root, _, current, item, _, save = licensed_source
+    current.update(origin="project", description="Synthetic project configuration.", source=source)
+    item.update(ownership="nvidia_developed", nvidia_contribution_licenses=["LicenseRef-Example"])
+    save()
+    output = tmp_path / "report"
+    result = subprocess.run(
+        [sys.executable, str(Path(gate.__file__)), "--root", str(root), "--output-dir", str(output)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads((output / "config-license-approval.json").read_text())
+    assert report["passed"] is False
+    assert report["legal_approval_asserted"] is False
+    assert report["files"][0]["problems"] == ["ownership_source_mismatch"]
+    assert "Config license compliance failed" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
 @pytest.mark.parametrize("change", [None, "missing_notice", "wrong_text", "missing_text", "changed_text"])
 def test_each_nonstandard_base_text_is_validated_and_bound(licensed_source, tmp_path, change):
     root, _, current, item, texts, save = licensed_source
