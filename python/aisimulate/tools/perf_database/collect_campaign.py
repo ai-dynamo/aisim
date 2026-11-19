@@ -333,6 +333,31 @@ def _free_gpu(busy: dict[int, subprocess.Popen | None], gpus: list[int]) -> int 
     return None
 
 
+def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
+    """Refuse a native TP group before launching a one-device container."""
+    if plan.backend != "sglang" or shard.op not in (
+        "kimi_k31_dsa_context_module",
+        "kimi_k31_dsa_generation_module",
+    ):
+        return
+    from collector.op_plans import plan as plan_cases
+    from collector.sglang.collect_kimi_k31_dsa_v1 import validate_case
+
+    cases = plan_cases(shard.op, plan.backend, plan.sm, include_long_context=shard.include_long_context).cases
+    for case in cases:
+        if shard.model_path and case.model_path != shard.model_path:
+            continue
+        if shard.case_filter and shard.case_filter not in str(case):
+            continue
+        tp = validate_case(case)
+        if tp > 1:
+            raise SystemExit(
+                f"{shard.key}: TP{tp} needs {tp} GPUs, but campaign shards expose one GPU; "
+                "use collector/collect.py's full-node path (collector/fullnode.py) on a dedicated "
+                "allocation exposing the full TP group, or select only TP1 cases with case_filter"
+            )
+
+
 def run_campaign(
     plan: Plan, *, plan_path: Path, root: Path, gpus: list[int], checkout: Path, image_override: str | None, mode: str
 ) -> int:
@@ -345,6 +370,7 @@ def run_campaign(
             continue
         if mode == "finalize" and st != "done-no-parquet":
             continue
+        _validate_shard_allocation(plan, s)
         todo.append(s)
     print(f"{mode}: {len(todo)}/{len(plan.shards)} shards on gpus {gpus}")
     ref = collector_ref(checkout)  # once, before any shard starts: every shard records the same commit

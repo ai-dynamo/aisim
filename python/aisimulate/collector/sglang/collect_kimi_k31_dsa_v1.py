@@ -186,7 +186,7 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
     if cases is None:
         getter = (
             get_kimi_k31_dsa_context_test_cases
-            if "context" in str(perf_filename)
+            if "context" in Path(perf_filename).name
             else get_kimi_k31_dsa_generation_test_cases
         )
         cases = getter()
@@ -207,7 +207,7 @@ def _run_native_case(case, device, perf_filename):
     validate_case(case)
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
-    phase = "context" if "context" in str(perf_filename) else "generation"
+    phase = "context" if "context" in Path(perf_filename).name else "generation"
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
     with subprocess.Popen(

@@ -3295,14 +3295,16 @@ fn resolve_role_timing(
             || native
                 .as_ref()
                 .is_some_and(|engine| engine.requires_explicit_state_cache())
-    } else if let Some(native) = native {
-        native.requires_explicit_state_cache()
+    } else if native.is_some_and(|engine| engine.requires_explicit_state_cache()) {
+        true
     } else if role.rank.state_cache.is_some() {
         // An explicit manual allocation already covers request state; keep
         // its existing vLLM/G1 validation without another metadata requirement.
         role.rank.validate()?;
         false
     } else {
+        // A native graph can omit recurrent-state ops (notably K3's KDA
+        // layers). A negative leaf predicate is not checkpoint evidence.
         checkpoint_requires_state_cache(&config.model)?
     };
     validate_aic_state_cache(requires_state_cache, role, resources.as_ref())?;

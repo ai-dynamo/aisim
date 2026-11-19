@@ -192,3 +192,63 @@ def test_build_image_uses_model_scoped_runtime(monkeypatch):
     )
     assert c.main() == 0
     assert seen == [c.pinned_image("sglang", op, MODEL)]
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("model_path", [None, "moonshotai/Kimi-K3.1-Pro"])
+@pytest.mark.parametrize("case_filter", [None, ", 48, 'fp8',", ", 24, 'fp8',", ", 12, 'fp8',"])
+@pytest.mark.parametrize("mode", ["run", "finalize"])
+def test_k31_campaign_refuses_multi_gpu_cases_before_launch(
+    monkeypatch, tmp_path, phase, model_path, case_filter, mode
+):
+    c = _load()
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "native", case_filter=case_filter, model_path=model_path)
+    plan = c.Plan("sglang", 103, (shard,))
+    if mode == "finalize":
+        directory = c.shard_dir(tmp_path / "out", shard)
+        directory.mkdir(parents=True)
+        (directory / "DONE").touch()
+    monkeypatch.setattr(c, "collector_ref", lambda _: pytest.fail("admission must precede launch preparation"))
+    with pytest.raises(SystemExit, match=r"one GPU.*collector/collect.py.*full-node"):
+        c.run_campaign(
+            plan,
+            plan_path=tmp_path / "plan.yaml",
+            root=tmp_path / "out",
+            gpus=[0, 1, 2, 3],
+            checkout=tmp_path,
+            image_override=None,
+            mode=mode,
+        )
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
+    from types import SimpleNamespace
+
+    c = _load()
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',")
+    plan = c.Plan("sglang", 103, (shard,))
+    monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
+    monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
+    commands = []
+
+    def launch(argv):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda: 0)
+
+    monkeypatch.setattr(c.subprocess, "Popen", launch)
+    assert (
+        c.run_campaign(
+            plan,
+            plan_path=tmp_path / "plan.yaml",
+            root=tmp_path / "out",
+            gpus=[3],
+            checkout=tmp_path,
+            image_override="test-image",
+            mode="run",
+        )
+        == 0
+    )
+    assert len(commands) == 1
+    assert commands[0][commands[0].index("--gpu") + 1] == "3"
+    assert ", 96, 'fp8'," in c.collector_argv(plan, shard)

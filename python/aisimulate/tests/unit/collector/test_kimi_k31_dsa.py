@@ -182,7 +182,8 @@ def test_multi_gpu_cases_require_standalone_exclusive_ownership(heads, tp, monke
         run_kimi_k31_dsa_worker(*case, device="cuda:0", perf_filename="dsa_generation_module_perf.txt")
 
 
-def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(monkeypatch, tmp_path):
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(monkeypatch, tmp_path, phase):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
 
     cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (96, 48, 24)]
@@ -192,12 +193,18 @@ def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(mon
     def launch(command, **kwargs):
         case = ModuleCase(*json.loads(command[command.index("--case") + 1]))
         assert command[command.index("--device") + 1] == "cuda:0"
-        assert command[command.index("--phase") + 1] == "generation"
+        assert command[command.index("--phase") + 1] == phase
         observed.append(case)
         return popen([sys.executable, "-c", f"raise SystemExit({int(case.num_heads == 48)})"], **kwargs)
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
-    result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
+    # Directory names must not turn a generation run into a context run.
+    output = tmp_path / "context_sweep" / f"dsa_{phase}_module_perf.txt"
+    getter = f"get_kimi_k31_dsa_{phase}_test_cases"
+    monkeypatch.setattr(module, getter, lambda: cases)
+    other = "generation" if phase == "context" else "context"
+    monkeypatch.setattr(module, f"get_kimi_k31_dsa_{other}_test_cases", lambda: pytest.fail("wrong phase getter"))
+    result = run_kimi_k31_dsa_fullnode(perf_filename=output)
     assert observed == cases
     assert result["succeeded"] == 2
     assert result["failed"] == [cases[1]]

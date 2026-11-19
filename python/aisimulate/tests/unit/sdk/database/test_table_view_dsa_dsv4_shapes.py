@@ -591,7 +591,7 @@ def test_context_fmha_capability_filters_native_dsa_architecture_axis(systems_ro
     )
     db = _build_db(systems_root)
     assert context_fmha_supported_modes(
-        db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=architecture
+        db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=architecture, attention_backend="flashmla"
     ) == ["bfloat16"]
     assert context_fmha_supported_modes(
         db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=DEFAULT_DSA_ARCHITECTURE

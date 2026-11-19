@@ -470,7 +470,7 @@ def test_k31_context_capability_does_not_borrow_other_architecture_fp8(fake_mode
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
-def test_k31_context_capability_requires_requested_backend(fake_model_info, explicit, attention_backend):
+def test_k31_context_capability_requires_requested_backend(fake_model_info, explicit, attention_backend, monkeypatch):
     architecture = "KimiK31ForConditionalGeneration"
     fake_model_info(architecture, _V3_FP8_RAW)
     mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
@@ -487,6 +487,16 @@ def test_k31_context_capability_requires_requested_backend(fake_model_info, expl
             common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {architecture: {requested: {1: object()}}}}
         },
     }
+    from aisimulate.sdk.task_v2 import Task
+
+    # Exercise Task's capability consumer with the same resolved identity as
+    # the estimate resolver. No model construction or prediction is mocked.
+    task = object.__new__(Task)
+    task._architecture = architecture
+    task.attention_backend = attention_backend
+    task.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    assert task._context_fmha_supported_modes("agg", "dsa_context_module") == ["bfloat16"]
     if explicit:
         with pytest.raises(ValueError, match="fmha_quant_mode=fp8 has no 'dsa_context_module' perf data"):
             resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
@@ -502,3 +512,4 @@ def test_k31_context_capability_requires_requested_backend(fake_model_info, expl
     mc.fmha_quant_mode = common.FMHAQuantMode.fp8 if explicit else None
     resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
     assert mc.fmha_quant_mode == (common.FMHAQuantMode.fp8 if explicit else None)
+    assert task._context_fmha_supported_modes("agg", "dsa_context_module") == ["bfloat16", "fp8"]

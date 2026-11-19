@@ -1645,6 +1645,8 @@ class Task:
             database,
             ctx_op,
             self._role_attr(role, "kvcache_quant_mode"),
+            architecture=self._architecture,
+            attention_backend=self.attention_backend,
         )
 
     def _attention_quant_identity_mixed(self, role: str) -> bool:

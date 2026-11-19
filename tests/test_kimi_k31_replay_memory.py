@@ -126,6 +126,26 @@ def test_k31_explicit_manual_state_survives_reload_and_native_execution(k31_chec
     assert metrics["total_output_tokens"] == 4
 
 
+@pytest.mark.parametrize("state_bytes", [None, 2 * BLOCK_BYTES])
+def test_native_k3_fixed_blocks_require_manual_state(tmp_path, state_bytes):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K3")["raw_config"])
+    checkpoint = tmp_path / "renamed-k3"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(raw))
+    payload = _payload(str(checkpoint), state_bytes=state_bytes)
+    payload["engine"].pop("attention_backend")
+    spec = _saved_spec(payload)
+    capture = _WireCapture()
+    EngineReplayRunnerFactory(runtime=capture).create(0).run(spec)
+    # Bypass Python's memory guard and execute the real native-only SOL path.
+    if state_bytes is None:
+        with pytest.raises(RuntimeError, match="requires explicit state_cache geometry"):
+            _runtime.run_replay_json(capture.payload)
+    else:
+        metrics = json.loads(_runtime.run_replay_json(capture.payload))
+        assert metrics["completed_requests"] == 2
+
+
 def test_k31_manual_pd_transfer_charges_one_state_per_request(k31_checkpoint):
     def ttft(state_bytes):
         payload = _payload(k31_checkpoint, state_bytes=state_bytes)

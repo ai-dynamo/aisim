@@ -52,7 +52,7 @@ state is not charged again for every token. Decode context parallelism, when
 supported, partitions only the token KV, leaving each rank's recurrent state
 whole. K3.1 does not currently support decode context parallelism.
 
-For K3.1 FP8 KV, the selected attention backend determines the token geometry:
+For K3.1 FP8 KV at PP=1, the selected attention backend determines the token geometry:
 24 DSA layers use 18,912 bytes per token per rank with `flashmla`, or 16,992
 with `trtllm_mla`, including the indexer. These latent/indexer entries are
 replicated across attention-TP ranks. Sparse top-k selection does not discard
