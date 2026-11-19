@@ -131,6 +131,7 @@ areas:
       - tests/test_e2e_accuracy_workflow.mjs
       - tests/test_source_compliance.py
       - tests/test_bundled_configs.py
+      - tests/test_config_license_approvals.py
 
 # More-specific shared entries are emitted after base area rules, preserving
 # GitHub's last-match-wins behavior. As in AIConfigurator, the maintainer team

@@ -2460,6 +2460,13 @@ def test_full_ci_aggregate_accepts_only_explicit_na_results() -> None:
     passed = _run_full_ci_aggregate(results, plan)
     assert passed.returncode == 0, passed.stdout + passed.stderr
 
+    for compliance_result in ("failure", "skipped", "cancelled"):
+        results["python-compliance"] = compliance_result
+        blocked = _run_full_ci_aggregate(results, plan)
+        assert blocked.returncode != 0, blocked.stdout + blocked.stderr
+        assert "python-compliance=" in blocked.stdout
+    results["python-compliance"] = "success"
+
     results["application-tests"] = "skipped"
     missing_selected_job = _run_full_ci_aggregate(results, plan)
     assert missing_selected_job.returncode != 0
@@ -3069,7 +3076,9 @@ def test_nightly_dependency_execution_cannot_modify_staged_artifacts_or_inherit_
     assert "--inventory" in _run_commands(compliance)
     assert not any("download-artifact@" in s.get("uses", "") for s in compliance["steps"])
     assert all(
-        s["with"]["path"].endswith("/*.csv") for s in compliance["steps"] if "upload-artifact@" in s.get("uses", "")
+        s["with"]["path"].endswith(("/*.csv", "/config-license-approval.json"))
+        for s in compliance["steps"]
+        if "upload-artifact@" in s.get("uses", "")
     )
     build = jobs["build-artifacts"]
     assert "python-compliance" in build["needs"]
@@ -3746,7 +3755,11 @@ def test_nightly_license_matrix_covers_the_smoked_python_versions():
     assert set(matrix["arch"]) == {entry["arch"] for entry in jobs["build-artifacts"]["strategy"]["matrix"]["include"]}
     setup = next(step for step in compliance["steps"] if "setup-python@" in step.get("uses", ""))
     assert setup["with"]["python-version"] == "${{ matrix.python-version }}"
-    upload = next(step for step in compliance["steps"] if "upload-artifact@" in step.get("uses", ""))
+    upload = next(
+        step
+        for step in compliance["steps"]
+        if step.get("with", {}).get("name", "").startswith("nightly-python-inventory-")
+    )
     assert upload["with"]["name"] == "nightly-python-inventory-${{ matrix.arch }}-${{ matrix.python-version }}"
 
 

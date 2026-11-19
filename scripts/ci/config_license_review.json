@@ -1,0 +1,1861 @@
+{
+  "schema_version": 1,
+  "releasing_entity": "NVIDIA",
+  "scope": "OSS simulator config redistribution; no model serving; commercial/MaaS triggers are conditional, not automatic findings.",
+  "approved_standard_licenses": [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Zlib"
+  ],
+  "approval_policy": "Standard-license allowance is repository policy. Any other required third-party license needs an explicit path/hash/text-bound decision reference, reviewer, date and scope. No external OSRB approval is asserted by this seed.",
+  "files": [
+    {
+      "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M2.5_config.json",
+      "sha256": "3ff405539448d89e911d14d7f22eefe92c11b1294b74c1d7a0d100eb1bdd644c",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes under the express grant in the available model license, with its conditions; reconcile the different README license reference before labeling the config simply MIT. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M2.7_config.json",
+      "sha256": "697c30492781d55ac516011f937b5cdec045710b5b0c9ca39a6ea277785df9aa",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes for the stated noncommercial redistribution, subject to the MiniMax license. This does not make the copied config Apache-2.0 or give recipients an unrestricted commercial-use grant. Under the release owner's stated noncommercial scope, the MiniMax commercial authorization/notification/branding trigger is not established. The MiniMax definition is broader than MaaS, so absence of MaaS by itself would not answer it."
+    },
+    {
+      "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M3_config.json",
+      "sha256": "7726ac24cb99116b67275430374140fcebd0525e55869b80ce3acb53848bc636",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes for the stated noncommercial redistribution, subject to the MiniMax license. This does not make the copied config Apache-2.0 or give recipients an unrestricted commercial-use grant. Under the release owner's stated noncommercial scope, the MiniMax commercial authorization/notification/branding trigger is not established. The MiniMax definition is broader than MaaS, so absence of MaaS by itself would not answer it."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-0.6B_config.json",
+      "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-1.7B_config.json",
+      "sha256": "1ddb5b89ebc90dcb417a45c213d818577e65976454d29385c8f6140771d95197",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-235B-A22B-FP8_config.json",
+      "sha256": "f666a1099576294bf252b16a899d415425663ed1930b1482967ddd30b085bbc4",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-235B-A22B_config.json",
+      "sha256": "0ecd5d6fe6f2db6739e4e36ab06b88ebe7bd013ef31b9583f43796059a2b23a4",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-30B-A3B-FP8_config.json",
+      "sha256": "d33c579e6a0f520344712e22dfb9d6fa49ed23e43ce3f32f12daea43597eddae",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-30B-A3B_config.json",
+      "sha256": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-32B-FP8-Static-PerTensor_config.json",
+      "sha256": "b198935c1a28058dc92bbe402691948d8c9965316cd84aacac4a1c3efa48c1ca",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-32B-FP8-Static-PerTensor_hf_quant_config.json",
+      "sha256": "8b0a750ed2a9e81d1bec59ab11860b9d174f8e29a5c52cd5d24f2456ab7f9859",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-32B-FP8_config.json",
+      "sha256": "e546dacd2c772660270233f5579e9ab923cc2a7ec5ed3c58c27c2bc62cbf5169",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-32B_config.json",
+      "sha256": "97e295b63283935788fac5e4f8860862a56d4089538cafc93f0431f2ebe483bb",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-8B_config.json",
+      "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-Coder-480B-A35B-Instruct_config.json",
+      "sha256": "0c8da8dea4ef290b08290074f4c61c8cf10b998c073d9e5b778fe33862f8540b",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-235B-A22B-Instruct_config.json",
+      "sha256": "5f1c6d6b8e882070e72d5ea4a1ed132dd07da185a4a537ed091b98e54d32e5f2",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-2B-Instruct_config.json",
+      "sha256": "e8346dd5f0db75cc2f52ef0286cd8960c75479b721cca8ae919b5089904de289",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-30B-A3B-Instruct_config.json",
+      "sha256": "c92f442bae42407f2962908f157e8cdfe74dd398ee323885f81484acca871c6a",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-32B-Instruct_config.json",
+      "sha256": "d2dd0c60d01b9e195d9447c52da61c7302d28828524914c044d9c6e1b81d0427",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-32B-Thinking_config.json",
+      "sha256": "d2dd0c60d01b9e195d9447c52da61c7302d28828524914c044d9c6e1b81d0427",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-4B-Instruct_config.json",
+      "sha256": "b3236c654bfdf45728e761d536328d6ea88bc5d982c8af30ee25cbad41b5eb53",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3-VL-8B-Instruct_config.json",
+      "sha256": "c1c2ccb5226e1bdb4049e0b27a662ddefd438ba87fa0d316575ffed60938e264",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.5-122B-A10B_config.json",
+      "sha256": "b2698498bc15b8942e8a0fa0fefb362a2e2488b3da38f14b4701885feb0be526",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.5-27B_config.json",
+      "sha256": "f8d190c5b89c1521220f935d2567a587d6e291ed69066a45a106560b05a2174c",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.5-35B-A3B_config.json",
+      "sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.5-397B-A17B_config.json",
+      "sha256": "3ae7fa89c2f7d1354096418ddaf1331e9e0898a8ca11e804fb6dbaa087efb7da",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B-FP8_config.json",
+      "sha256": "b7396b749964c6afb5387c58e6425db8628e85f8ae66739d284eb1c8f42c4d4e",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Commercial branding and separate-license conditions are conditional. They are not established as triggered for this stated noncommercial release; the separate-license test is written at licensee/affiliate business level, not solely the behavior of AISim."
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B_config.json",
+      "sha256": "4e3819548967e319ab435d044a3a331dbe3b078590ce822e9d74b79430533987",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Commercial branding and separate-license conditions are conditional. They are not established as triggered for this stated noncommercial release; the separate-license test is written at licensee/affiliate business level, not solely the behavior of AISim."
+    },
+    {
+      "path": "aisim_core/model_configs/XiaomiMiMo--MiMo-7B-Base_config.json",
+      "sha256": "3e0849e97570c2a9f6efa30b801f69a9943e7022fbba99381fd6003a3562c442",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/XiaomiMiMo--MiMo-V2-Flash_config.json",
+      "sha256": "302eebf52fa0dae403ab6fd1783b932900246fc309db2cc9d486ec0b7471a217",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/deepseek-ai--DeepSeek-R1_config.json",
+      "sha256": "79ddea672a62e95d3f0be27be434375538e1988975971cffcf87c96c1de84a65",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/deepseek-ai--DeepSeek-V3.2_config.json",
+      "sha256": "c7fa8b191e9936d8e6a57d864baab82b792fae16a116416cdd3a75ba76bc5af1",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/deepseek-ai--DeepSeek-V3_config.json",
+      "sha256": "83c004ce1072723d175d384feff8d3a5d675aab7f7a902528e170a400a535314",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes: LICENSE-CODE grants redistribution of software/documentation, and independently the model agreement section II.2 expressly grants redistribution of Complementary Material. Section III.4.a expressly excludes Complementary Material from the model-use-restriction flow-down. No MaaS/commercial permission blocker identified for redistribution of this source-side config. The exact notice/license labeling remains to be reconciled."
+    },
+    {
+      "path": "aisim_core/model_configs/deepseek-ai--DeepSeek-V4-Flash_config.json",
+      "sha256": "1821e692ca68149e482538400dfb4fc5a0b4dc5da9d6659952c8a4934d5763f4",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/deepseek-ai--DeepSeek-V4-Pro_config.json",
+      "sha256": "6fccb45a06b59a94033d0c74ec23bf860e67bc0f4ebc18ea1e33d357fac3336c",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/deepseek-ai--DeepSeek-V4.1-Flash_config.json",
+      "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/google--gemma-4-26B-A4B_config.json",
+      "sha256": "0364256c5de7863a22b5dd666043d542d42b681c02fd83eb67dc7b483d859e96",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/meta-llama--Llama-4-Maverick-17B-128E-Instruct_config.json",
+      "sha256": "39f9056ad8911d045fc44a9174e9b4acb8b42f9fc583dc92e62a9e107491bd18",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/meta-llama--Llama-4-Scout-17B-16E-Instruct_config.json",
+      "sha256": "5eda6f9bdb2bd6b6959455679f75c4c107ea763b3cce0f9e0c74091ca80d1906",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-405B_config.json",
+      "sha256": "b75e46be030e920b46bc5e92de48554ce07937ced57b1b2fe1ba722cc94ffc76",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-70B_config.json",
+      "sha256": "5866f0abbb3050fd6948c0afde03651b2445a16480338ff01dc11d4a12ccd3f2",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
+      "sha256": "398adf8b93f20e64932517492099d4e471e36a1723b5bf4e1311638f6a13f909",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/meta-models--Muse-Glimmer-30B_config.json",
+      "sha256": "5a9df2d8a385b3d361ab6ae68d73586f4e775033933bd0cd863fb7f3820e6a14",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/mistralai--Mixtral-8x22B-v0.1_config.json",
+      "sha256": "76c13a9f976ff6389ed2c6b6c5e3a6b056a3778ac2e9666f04f9a8b693bf5e38",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/mistralai--Mixtral-8x7B-v0.1_config.json",
+      "sha256": "7a2531a01919d29c44b33515c16c63456b4ce853aa7ae1d7bd676f99c51afff7",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/moonshotai--Kimi-K2-Instruct_config.json",
+      "sha256": "17caf15bd0614a4580e066eec2f459f5b0b1372648e355e6d770305b092662ce",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. The base modified-MIT branding condition is tied to qualifying commercial products/services. It is not established as triggered by this stated release. NVIDIA model-specific conditions must be read from the identified agreement rather than presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/moonshotai--Kimi-K2.5_config.json",
+      "sha256": "1a8a4903e63893b0f5be0450a089cee4a36778900cafae913e0c21208b462ce0",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. The base modified-MIT branding condition is tied to qualifying commercial products/services. It is not established as triggered by this stated release. NVIDIA model-specific conditions must be read from the identified agreement rather than presumed."
+    },
+    {
+      "path": "aisim_core/model_configs/moonshotai--Kimi-K3_config.json",
+      "sha256": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. For the stated noncommercial release, neither the separate-agreement commercial-use condition nor commercial product branding threshold is established as triggered. The MaaS test itself is licensee/affiliate-wide; not running inference in AISim is not a universal waiver."
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V3.1-NVFP4_config.json",
+      "sha256": "29b950edfbf0d38ebb921f2007fb01e5a63afe33d7e096cc546ad93868e2d0a4",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V3.1-NVFP4/blob/68b4a17cce1482e94030ca00dacda3dec4c6359d/README.md",
+        "revision": "68b4a17cce1482e94030ca00dacda3dec4c6359d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V3.1"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V3.1-NVFP4_hf_quant_config.json",
+      "sha256": "59f3db248b2e81f9ab0ac51ca8eba1f2ac4449156df8659982f70a97d48b1b65",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V3.1-NVFP4/blob/68b4a17cce1482e94030ca00dacda3dec4c6359d/README.md",
+        "revision": "68b4a17cce1482e94030ca00dacda3dec4c6359d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V3.1"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V3.2-NVFP4_config.json",
+      "sha256": "6c15a56d351458fa62d2eb1b6fa6a56d150c48b9eb520bab00a85ae608b59488",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V3.2-NVFP4/blob/7c0f62c6da1da0c81c6e097010cc55854d206812/README.md",
+        "revision": "7c0f62c6da1da0c81c6e097010cc55854d206812",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V3.2"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V3.2-NVFP4_hf_quant_config.json",
+      "sha256": "f92c34c4bce4fb655705e7234a13d402d2735410d02a0c52c8bb080d052a91b9",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V3.2-NVFP4/blob/7c0f62c6da1da0c81c6e097010cc55854d206812/README.md",
+        "revision": "7c0f62c6da1da0c81c6e097010cc55854d206812",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V3.2"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V4-Flash-NVFP4_config.json",
+      "sha256": "0c5dc7303ff322d73e0cd5caf9cc1b65d6efeff68fab53514531c2e959b1d616",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4/blob/e3cd60e7de98e9867116860d522499a728de1cf9/README.md",
+        "revision": "e3cd60e7de98e9867116860d522499a728de1cf9",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V4-Flash"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V4-Flash-NVFP4_hf_quant_config.json",
+      "sha256": "1fbdb2bd9831a11cb822bc048fd45180927bcfb821ba32a3a7050f96a37b0b5f",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4/blob/e3cd60e7de98e9867116860d522499a728de1cf9/README.md",
+        "revision": "e3cd60e7de98e9867116860d522499a728de1cf9",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V4-Flash"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V4-Pro-NVFP4_config.json",
+      "sha256": "05e9f7d612bb89a9eef2e973af50d5d99e747668a76f398a13eed0d9b155ce09",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4/blob/1449d1e641023406daf6b432361486c768aad740/README.md",
+        "revision": "1449d1e641023406daf6b432361486c768aad740",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V4-Pro"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--DeepSeek-V4-Pro-NVFP4_hf_quant_config.json",
+      "sha256": "9f5773b597b3ab01ea9c3f2ddbbea6719bb455e58f53b23ae22c4aad69dc0451",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4/blob/1449d1e641023406daf6b432361486c768aad740/README.md",
+        "revision": "1449d1e641023406daf6b432361486c768aad740",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "deepseek-ai/DeepSeek-V4-Pro"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5-NVFP4_config.json",
+      "sha256": "308d3ceebe7bd9c2246d20550d5b793098dd03838d1e504f8236063ae152bcae",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5-NVFP4/blob/dc54ff55a7e9e71b85db953d8bc22eca894b44c6/README.md",
+        "revision": "dc54ff55a7e9e71b85db953d8bc22eca894b44c6",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5-NVFP4_hf_quant_config.json",
+      "sha256": "6ccd19d1220c1fffa24eb7af3e3273032d1b02c6b80b693fd31fbee3fa73ea56",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5-NVFP4/blob/dc54ff55a7e9e71b85db953d8bc22eca894b44c6/README.md",
+        "revision": "dc54ff55a7e9e71b85db953d8bc22eca894b44c6",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.1-NVFP4_config.json",
+      "sha256": "cdd21b8a536b06387c099363df529d6bebdd4c88a890686a7bbbcc32c196f0d6",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.1-NVFP4/blob/9116eb1c3ef24dd38dfe61e2eb71399ddd8070c8/README.md",
+        "revision": "9116eb1c3ef24dd38dfe61e2eb71399ddd8070c8",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.1"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.1-NVFP4_hf_quant_config.json",
+      "sha256": "d481bfd88c63196413458727eec6e91799b4c3850813794f5b7e27fc19b82e7a",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.1-NVFP4/blob/9116eb1c3ef24dd38dfe61e2eb71399ddd8070c8/README.md",
+        "revision": "9116eb1c3ef24dd38dfe61e2eb71399ddd8070c8",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.1"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.2-NVFP4_config.json",
+      "sha256": "d3783a603e5aa9cb58eff7a5d8ac9c42d83156b229efe185c72e9e2dc8444923",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.2-NVFP4/blob/53e0691e21895a3863a606dfd12910c69eba94ab/README.md",
+        "revision": "53e0691e21895a3863a606dfd12910c69eba94ab",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.2"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.2-NVFP4_hf_quant_config.json",
+      "sha256": "212394aabaa6a4e7823668e7a03d6295422aa2ca2cbdbfbfc519eab602ad20e6",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.2-NVFP4/blob/53e0691e21895a3863a606dfd12910c69eba94ab/README.md",
+        "revision": "53e0691e21895a3863a606dfd12910c69eba94ab",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.2"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.3-Flash-NVFP4_config.json",
+      "sha256": "e23c5d98f53e861d49a51bd3c68591621c5482ce829e42c31724152322fba03d",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4/blob/1d00738646cbb0c6d0a9eb403dac5f366f1473a7/README.md",
+        "revision": "1d00738646cbb0c6d0a9eb403dac5f366f1473a7",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.3-Flash"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.3-Flash-NVFP4_hf_quant_config.json",
+      "sha256": "1277df937b780e7de8eace66286ffad207f57d33b536b40c9c35635b235c17c6",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4/blob/1d00738646cbb0c6d0a9eb403dac5f366f1473a7/README.md",
+        "revision": "1d00738646cbb0c6d0a9eb403dac5f366f1473a7",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.3-Flash"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_config.json",
+      "sha256": "b0b6b9ab922a82e3688bc39a4117bc443e106fcf88969ef48b3627778f4bdf7b",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-GLM-5.3"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The packaged inventory and canonical notice identify an immutable source and modification status. Source-to-wheel bytes were verified; this does not independently reconstruct historical collection.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/README.md",
+        "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.3"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_hf_quant_config.json",
+      "sha256": "13799d4fed353c20dde2264fbdd7f68a780b514782f8d80bba96ac5e44aa9bba",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-GLM-5.3"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The packaged inventory and canonical notice identify an immutable source and modification status. Source-to-wheel bytes were verified; this does not independently reconstruct historical collection.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/README.md",
+        "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "zai-org/GLM-5.3"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_config.json",
+      "sha256": "4e379cc809c617a49179a49140f553a2d6a5ec538ed480832b0c54f6ace43d98",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4/blob/a19cfe00be84568a6867111c9a68c9c44fdcffe6/README.md",
+        "revision": "a19cfe00be84568a6867111c9a68c9c44fdcffe6",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "google/gemma-4-26B-A4B-it"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Gemma-4-26B-A4B-NVFP4_hf_quant_config.json",
+      "sha256": "fca2ea21cded31e6cff2c56ee83a162dcd5d3ff292cbf2f6083702e9fc324454",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4/blob/a19cfe00be84568a6867111c9a68c9c44fdcffe6/README.md",
+        "revision": "a19cfe00be84568a6867111c9a68c9c44fdcffe6",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "google/gemma-4-26B-A4B-it"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Gemma-4-31B-IT-NVFP4_config.json",
+      "sha256": "aa03a6a490fb743b8186f09c60ec39a30fdbaf7c3a18dfef8e52a62c2beb9ae4",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4/blob/4135a98a9b728a548947683219633b25682223ac/README.md",
+        "revision": "4135a98a9b728a548947683219633b25682223ac",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "google/gemma-4-31B-it"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Gemma-4-31B-IT-NVFP4_hf_quant_config.json",
+      "sha256": "7295b239347a50abc3888c4a8208b8644eb0bd3d92810117bdea1768e5f21129",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4/blob/4135a98a9b728a548947683219633b25682223ac/README.md",
+        "revision": "4135a98a9b728a548947683219633b25682223ac",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "google/gemma-4-31B-it"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Kimi-K2.5-NVFP4_config.json",
+      "sha256": "c375d7d566b6fa706ba46fec9ef938e829c5ba1accb20541d4f0c75dddefcd8f",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Moonshot-Modified-MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/0fd0a5e6879298d3476e3b61852a79792a35ae3d/README.md",
+        "revision": "0fd0a5e6879298d3476e3b61852a79792a35ae3d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "moonshotai/Kimi-K2.5"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Kimi-K2.6-NVFP4_config.json",
+      "sha256": "af4c0fea7ec43d5438532eeef8daa9fcabbdf97ddedc9da2319aa675f68f51ff",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Moonshot-Modified-MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Kimi-K2.6-NVFP4/blob/2fd3a800dedd098b8327eb49e93ebc75f85da19f/README.md",
+        "revision": "2fd3a800dedd098b8327eb49e93ebc75f85da19f",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "moonshotai/Kimi-K2.6"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Kimi-K2.6-NVFP4_hf_quant_config.json",
+      "sha256": "6ee4be1d46bf2b5204284b6641ed7bb5d9fc2fc7e8157a4eb06d5fe500dddc3a",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Moonshot-Modified-MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Kimi-K2.6-NVFP4/blob/2fd3a800dedd098b8327eb49e93ebc75f85da19f/README.md",
+        "revision": "2fd3a800dedd098b8327eb49e93ebc75f85da19f",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "moonshotai/Kimi-K2.6"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_config.json",
+      "sha256": "b203b07a34c3462df0b30eea7c99cc31b3d682c365cacc75edb8823a0ab97758",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Moonshot-Modified-MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Kimi-K2.7-Code-NVFP4/blob/9f28d60908c98034bb288e755566764eac77cc0d/README.md",
+        "revision": "9f28d60908c98034bb288e755566764eac77cc0d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "moonshotai/Kimi-K2.7-Code"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_hf_quant_config.json",
+      "sha256": "4baf41307796a29aa0dc67de3ab33d590b9ad20bac5042b22dac842b3ecb766c",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Moonshot-Modified-MIT"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Kimi-K2.7-Code-NVFP4/blob/9f28d60908c98034bb288e755566764eac77cc0d/README.md",
+        "revision": "9f28d60908c98034bb288e755566764eac77cc0d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "moonshotai/Kimi-K2.7-Code"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_config.json",
+      "sha256": "cfd56137fa9c0632c022a322e8e19e4dcc0474e1b2f0c7d9f7cc64d212c9fd18",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Llama-3.1-Community"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8/blob/07a08be3d8a8f5254c2aba375b79743bca8fd491/README.md",
+        "revision": "07a08be3d8a8f5254c2aba375b79743bca8fd491",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "meta-llama/Llama-3.1-70B-Instruct"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json",
+      "sha256": "8d26f1ffdd8b22de0f7b280923af5806dfaff6b0dc5aacc454782732cc0795dd",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Llama-3.1-Community"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8/blob/07a08be3d8a8f5254c2aba375b79743bca8fd491/README.md",
+        "revision": "07a08be3d8a8f5254c2aba375b79743bca8fd491",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "meta-llama/Llama-3.1-70B-Instruct"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json",
+      "sha256": "ea288aea647aa22e9a233aca6db14cd9ef0ee96773074dbf34cbcd9cc53a4747",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-Llama-3.3-Community"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/blob/387156d8d6868c19f3472fa607aa9bfc4f662333/README.md",
+        "revision": "387156d8d6868c19f3472fa607aa9bfc4f662333",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "meta-llama/Llama-3.3-70B-Instruct"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_config.json",
+      "sha256": "c59bf551a0c315a6d8101afaf441fd53108792e997796e0e3e9cfe75903362fd",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-MiniMax-M2.5-Scope-Unresolved"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4/blob/b6220d658389629b9d507d4b2bb314f41fea7898/README.md",
+        "revision": "b6220d658389629b9d507d4b2bb314f41fea7898",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "MiniMaxAI/MiniMax-M2.5"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_hf_quant_config.json",
+      "sha256": "253ea166454ff40d6a5387379973156c8bf9aee56e34d3d08e543925ab9f0b19",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-MiniMax-M2.5-Scope-Unresolved"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4/blob/b6220d658389629b9d507d4b2bb314f41fea7898/README.md",
+        "revision": "b6220d658389629b9d507d4b2bb314f41fea7898",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "MiniMaxAI/MiniMax-M2.5"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_config.json",
+      "sha256": "24abe73e3a7d4d2e8e0d20ea13f322b8823a804e6598a4d0f7bfc0d0d367ea9d",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-MiniMax-M2.7-Noncommercial"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/MiniMax-M2.7-NVFP4/blob/e79701cb1f9dce8fe5395b9ed2b20170beebecde/README.md",
+        "revision": "e79701cb1f9dce8fe5395b9ed2b20170beebecde",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "MiniMaxAI/MiniMax-M2.7"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_hf_quant_config.json",
+      "sha256": "b8c904443b70ab92b6c6ca3b54081cbce84c60a215e50a6ed59e28a4dcc45d0e",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-MiniMax-M2.7-Noncommercial"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/MiniMax-M2.7-NVFP4/blob/e79701cb1f9dce8fe5395b9ed2b20170beebecde/README.md",
+        "revision": "e79701cb1f9dce8fe5395b9ed2b20170beebecde",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "MiniMaxAI/MiniMax-M2.7"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--MiniMax-M3-NVFP4_config.json",
+      "sha256": "440d22038ffa0bcb93fa01e8d2d555e3840d939167c08eace81b9cce386fb117",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-MiniMax-M3-Community"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/MiniMax-M3-NVFP4/blob/901464083161bf8612a29ff7ad29914cd4ab4a85/README.md",
+        "revision": "901464083161bf8612a29ff7ad29914cd4ab4a85",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "MiniMaxAI/MiniMax-M3"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--MiniMax-M3-NVFP4_hf_quant_config.json",
+      "sha256": "11581ca203bcd77dae53cc77b49392cb17545b097586249dfac12e093bfaa1ec",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "LicenseRef-MiniMax-M3-Community"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/MiniMax-M3-NVFP4/blob/901464083161bf8612a29ff7ad29914cd4ab4a85/README.md",
+        "revision": "901464083161bf8612a29ff7ad29914cd4ab4a85",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "MiniMaxAI/MiniMax-M3"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16_config.json",
+      "sha256": "cf3cc01496f22ebc4f969e6ffbea75ff8796a94b406d16cc1e12520923f82474",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/bf77c3174f68ad409e1c2aa60daeb46e32d1c606/README.md",
+        "revision": "bf77c3174f68ad409e1c2aa60daeb46e32d1c606",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4_config.json",
+      "sha256": "f4fcbaaaed3ee215f86205a7600636cd930bde069f2b603d7ff908c046a0cd96",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/blob/6efb4a2a1c1fa277ce7b3df7a1416255011b1c99/README.md",
+        "revision": "6efb4a2a1c1fa277ce7b3df7a1416255011b1c99",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4_hf_quant_config.json",
+      "sha256": "e98beaf63ecc8d9fe07257984370549dfd637254fff477cc5cc8a00f446d5c3c",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/blob/6efb4a2a1c1fa277ce7b3df7a1416255011b1c99/README.md",
+        "revision": "6efb4a2a1c1fa277ce7b3df7a1416255011b1c99",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-FP8_config.json",
+      "sha256": "4e5eef674539c087f87eb24534cee57ee00219f18e5311eba8640d4d6bdd968a",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8/blob/744b1880a37996c5d56bf454ae164dfd74d77c4e/README.md",
+        "revision": "744b1880a37996c5d56bf454ae164dfd74d77c4e",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-FP8_hf_quant_config.json",
+      "sha256": "9419fe2913d51002bed43b4aebe1e71a48978645aa79f30d7f79720eb9cd58d5",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8/blob/744b1880a37996c5d56bf454ae164dfd74d77c4e/README.md",
+        "revision": "744b1880a37996c5d56bf454ae164dfd74d77c4e",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4_config.json",
+      "sha256": "ca3c3905933218c19214b2222473abda4c38a884b7f8d0f312b20d54b16251d6",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/blob/ff433f5493e25d631c9f12b5d55c674229923d02/README.md",
+        "revision": "ff433f5493e25d631c9f12b5d55c674229923d02",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4_hf_quant_config.json",
+      "sha256": "62a90df1fe0a7346f83db88da82ee5ee28dfa7cdded0dc949cfa428b94186700",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/blob/ff433f5493e25d631c9f12b5d55c674229923d02/README.md",
+        "revision": "ff433f5493e25d631c9f12b5d55c674229923d02",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16_config.json",
+      "sha256": "f0bdfbad05ddf17f50ca06c91696e17ebcc7a7fefd3bfb2ec5a088801a7a6d5e",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16/blob/77df655d5e9f8362164ed14dd8b48f8bce657498/README.md",
+        "revision": "77df655d5e9f8362164ed14dd8b48f8bce657498",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8_config.json",
+      "sha256": "f0bdfbad05ddf17f50ca06c91696e17ebcc7a7fefd3bfb2ec5a088801a7a6d5e",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Original config comparison unavailable: HTTP Error 401: Unauthorized. A public family license does not itself prove the source of these bytes.",
+      "ownership_evidence": {
+        "url": "",
+        "revision": "",
+        "status": "source_unverified"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8_hf_quant_config.json",
+      "sha256": "1ff70dcbe6be5d58b1b1fe6282e6dfd2bee4328c6c5a4df03160dbed963af11a",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Original config comparison unavailable: HTTP Error 401: Unauthorized. A public family license does not itself prove the source of these bytes.",
+      "ownership_evidence": {
+        "url": "",
+        "revision": "",
+        "status": "source_unverified"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4_config.json",
+      "sha256": "f0bdfbad05ddf17f50ca06c91696e17ebcc7a7fefd3bfb2ec5a088801a7a6d5e",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/blob/02462641f13d3af838b904f48195b9bb8a1e4ebc/README.md",
+        "revision": "02462641f13d3af838b904f48195b9bb8a1e4ebc",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4_hf_quant_config.json",
+      "sha256": "22afb7331a805475caebf8a9a3b6ad5e498a9abacb1c575c06423a728f3f76f7",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/blob/02462641f13d3af838b904f48195b9bb8a1e4ebc/README.md",
+        "revision": "02462641f13d3af838b904f48195b9bb8a1e4ebc",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4_config.json",
+      "sha256": "3440a8570e178cfc8a44e0877d48d6bc959cceed89a8e3a9afa7fa45790dea4e",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled config differs from the saved upstream candidate. The upstream license provides a lead; establish the actual source revision and explain the saved content differences before closing provenance.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4/blob/bee7596271d1495f6992ae224aefde4410e816b8/README.md",
+        "revision": "bee7596271d1495f6992ae224aefde4410e816b8",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4_hf_quant_config.json",
+      "sha256": "b680153193d9845c5320cc97aa3e9ca3a27d81709449b1c96eda199f6df9564a",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4/blob/bee7596271d1495f6992ae224aefde4410e816b8/README.md",
+        "revision": "bee7596271d1495f6992ae224aefde4410e816b8",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4_config.json",
+      "sha256": "35189a8038d1b1f934e58cba50eb7e97b42a4da569424e35b9fd1048058bc7ea",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA contribution identified in this branch's immutable config provenance; underlying third-party obligations remain separate.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/blob/da5b2650a835292c678994a1fa3fb653250fb508/README.md",
+        "revision": "da5b2650a835292c678994a1fa3fb653250fb508",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4_hf_quant_config.json",
+      "sha256": "b797654d89e25e9bd13617cb1d216ff5fad78cb6a8b99ba0cd0fbcf20050d75a",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA contribution identified in this branch's immutable config provenance; underlying third-party obligations remain separate.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/blob/da5b2650a835292c678994a1fa3fb653250fb508/README.md",
+        "revision": "da5b2650a835292c678994a1fa3fb653250fb508",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Nemotron-H-56B-Base-8K_config.json",
+      "sha256": "4db4f4ccd945ff562b01374c67c7a369ca691c04b3b000cbfa09e7b4f36d71bd",
+      "ownership": "nvidia_developed",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Nemotron-H-56B-Base-8K/blob/1fb09491e3aa62f5d9204fb63668ec600433c434/README.md",
+        "revision": "1fb09491e3aa62f5d9204fb63668ec600433c434",
+        "status": "recorded_source"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3-235B-A22B-NVFP4_config.json",
+      "sha256": "ae63d836960de3676f5a391e0cbf4e838f7bb6e53e4bb8056970c1e3177e74f9",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The bundled JSON values equal the retrieved pinned upstream JSON; serialization differs. Record the formatting modification.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3-235B-A22B-NVFP4/blob/21cfa2c9e152032eb60647ee7b46a2bbcd8d76d2/README.md",
+        "revision": "21cfa2c9e152032eb60647ee7b46a2bbcd8d76d2",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3-235B-A22B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3-235B-A22B-NVFP4_hf_quant_config.json",
+      "sha256": "6423e9dd81773597a783e1109ffeb8d8b6a30a85c0eb4e503524a4fdf5f7f98b",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3-235B-A22B-NVFP4/blob/21cfa2c9e152032eb60647ee7b46a2bbcd8d76d2/README.md",
+        "revision": "21cfa2c9e152032eb60647ee7b46a2bbcd8d76d2",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3-235B-A22B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.5-122B-A10B-NVFP4_config.json",
+      "sha256": "4bbd5a6e8662d412cb6e57efeee5dfd4f8e13dc07e2b43398994f85a58f9993d",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.5-122B-A10B-NVFP4/blob/98915d837c4e7c87ac8296d02e89de19b3207e6d/README.md",
+        "revision": "98915d837c4e7c87ac8296d02e89de19b3207e6d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.5-122B-A10B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.5-122B-A10B-NVFP4_hf_quant_config.json",
+      "sha256": "0ee08c97b6123d808734e28951385ce0722c61737ac8c14a9f9a9e3889646c83",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.5-122B-A10B-NVFP4/blob/98915d837c4e7c87ac8296d02e89de19b3207e6d/README.md",
+        "revision": "98915d837c4e7c87ac8296d02e89de19b3207e6d",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.5-122B-A10B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.5-397B-A17B-NVFP4-V2_config.json",
+      "sha256": "9408a9e559cc2f05f0b357738213666353e6651160ce8ff477b1c26982bc4f63",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA contribution identified in this branch's immutable config provenance; underlying third-party obligations remain separate.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/blob/8f590eae8f10bf55d9a46f79ea0280bde435c9f8/README.md",
+        "revision": "8f590eae8f10bf55d9a46f79ea0280bde435c9f8",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.5-397B-A17B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.5-397B-A17B-NVFP4-V2_hf_quant_config.json",
+      "sha256": "2be0a371edb1983ace9b776b12ff3a19e2b4841efc15c69df8d9f4aa5ec1c56c",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA contribution identified in this branch's immutable config provenance; underlying third-party obligations remain separate.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2/blob/8f590eae8f10bf55d9a46f79ea0280bde435c9f8/README.md",
+        "revision": "8f590eae8f10bf55d9a46f79ea0280bde435c9f8",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.5-397B-A17B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.5-397B-A17B-NVFP4_config.json",
+      "sha256": "8058591f5ffb5bdacf6cdd87a0d1db126a12cf19259257aec25a91ec22918779",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4/blob/12b28061efd8145b11226e4fab2528ee4f39ef09/README.md",
+        "revision": "12b28061efd8145b11226e4fab2528ee4f39ef09",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.5-397B-A17B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.5-397B-A17B-NVFP4_hf_quant_config.json",
+      "sha256": "f5f3730bc4233c54c7e632884d6d29a6e82bc3e66ae6da8e46e14ce441a1da1b",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4/blob/12b28061efd8145b11226e4fab2528ee4f39ef09/README.md",
+        "revision": "12b28061efd8145b11226e4fab2528ee4f39ef09",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.5-397B-A17B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.6-27B-NVFP4_config.json",
+      "sha256": "c04a19ba293737ad7be4f6e96d6666cb7e479cbe19ecc0c289fad267135b0338",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4/blob/0893e1606ff3d5f97a441f405d5fc541a6bdf404/README.md",
+        "revision": "0893e1606ff3d5f97a441f405d5fc541a6bdf404",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.6-27B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.6-27B-NVFP4_hf_quant_config.json",
+      "sha256": "fd7200cd8bca2a8a5d777061521abf83e2deb97ab6bc2f04e7a0a3d3f8ecd5c1",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4/blob/0893e1606ff3d5f97a441f405d5fc541a6bdf404/README.md",
+        "revision": "0893e1606ff3d5f97a441f405d5fc541a6bdf404",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.6-27B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.6-35B-A3B-NVFP4_config.json",
+      "sha256": "58aefa1c9eff7989f431d748f2ddec39446cb1fd2a69acc46e285c6a37b0cecc",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4/blob/1355db6a052410cfd62085d94b58866fd0f2c3c5/README.md",
+        "revision": "1355db6a052410cfd62085d94b58866fd0f2c3c5",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.6-35B-A3B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/nvidia--Qwen3.6-35B-A3B-NVFP4_hf_quant_config.json",
+      "sha256": "75fe7cc8d5836b58734e05ee67423a4ce91d602aaad45c8173a1b7597cd57663",
+      "ownership": "nvidia_derivative",
+      "underlying_licenses": [
+        "Apache-2.0"
+      ],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. Exact bundled SHA-256 matches the retrieved immutable upstream file; this establishes a source for the identical bytes, not necessarily the historical collection date.",
+      "ownership_evidence": {
+        "url": "https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4/blob/1355db6a052410cfd62085d94b58866fd0f2c3c5/README.md",
+        "revision": "1355db6a052410cfd62085d94b58866fd0f2c3c5",
+        "status": "recorded_source"
+      },
+      "base_models": [
+        "Qwen/Qwen3.6-35B-A3B"
+      ]
+    },
+    {
+      "path": "aisim_core/model_configs/openai--gpt-oss-120b_config.json",
+      "sha256": "16ab7c244969a11c430e3b01da1fca8e842f82b057db4c0a1397f8381bf7ac5a",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/openai--gpt-oss-20b_config.json",
+      "sha256": "afeaac8ba417e457b97e896dbaaed6f3b33870b968060b59453cda60c6adbd4c",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/sgl-project--DeepSeek-V4-Flash-FP8_config.json",
+      "sha256": "266d9d86331c1938a3341c23e4b369cd23ef017ab603c5cb86e61fd0ca3c95a3",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/sgl-project--DeepSeek-V4-Pro-FP8_config.json",
+      "sha256": "1e1d71e54a916e82d40147d7c4d05034766b5893766f780f1b7e15f4b5ce4be6",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "The candidate model license is permissive where identified, but the actual source/modification record for these exact bundled bytes remains unestablished. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/stepfun-ai--Step-3.7-Flash-FP8_config.json",
+      "sha256": "8854faaffaf4ed1cfe381d60f80a0bf3b0331aa7389f64decb803b55e038100a",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/stepfun-ai--Step-3.7-Flash_config.json",
+      "sha256": "aa08af47da044dfd74fe324b9bd6a0bb54fb030d24ff7a6235d24b9a5aa648c3",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5-FP8_config.json",
+      "sha256": "5ea2d79d3a77fe90836c18893de00996d096cd01516b52b88c6fc18993cb4df8",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.1-FP8_config.json",
+      "sha256": "69b4e81fafca7389fa1e102046ea13aa1c6ec9ed64a9a00f2056fe402034c8ec",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.1_config.json",
+      "sha256": "726e45e28d1be1636a5834048a4101a2cfe384819ad2ebe08d41f6fe04656526",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.2-FP8_config.json",
+      "sha256": "22e49334abf8562fecf70ca3292ba3f5b33f5602fb2bf10b52dd64a66cfe65ff",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.2_config.json",
+      "sha256": "185f93ee6d12548e16a847e279dc0c3c90b1524c970b0866b42fb545747d859a",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.3-BF16_config.json",
+      "sha256": "ca8f2f47b07919a514c0ca223dc2ea2bc7445afaa5ac76c013a3784e096426ca",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. The Z.AI security-review condition concerns qualifying licensee/affiliate MaaS businesses using the software commercially. No such commercial trigger is established for this release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.3-Flash_config.json",
+      "sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5.3_config.json",
+      "sha256": "3ac72612095574542f7fff847ada8e59d9199dd8af44bdf625d7e02615572e69",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. The Z.AI security-review condition concerns qualifying licensee/affiliate MaaS businesses using the software commercially. No such commercial trigger is established for this release."
+    },
+    {
+      "path": "aisim_core/model_configs/zai-org--GLM-5_config.json",
+      "sha256": "308d3ceebe7bd9c2246d20550d5b793098dd03838d1e504f8236063ae152bcae",
+      "ownership": "third_party",
+      "underlying_licenses": [],
+      "approval": {
+        "status": "pending"
+      },
+      "review_note": "Yes, subject to the identified license and retained notices. No commercial-use or Model-as-a-Service trigger established for the stated release."
+    }
+  ]
+}

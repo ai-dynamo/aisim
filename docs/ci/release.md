@@ -143,6 +143,29 @@ present must still match a catalog path/hash and its notices. A historical file
 with different or unrecorded bytes fails; backport its provenance rather than
 silently skipping the check.
 
+### Configuration license approval gate
+
+`python-compliance` now runs `scripts/ci/check_config_license_approvals.py` before installing dependencies in Full CI and every nightly architecture/Python job. It applies even when a PR's wheel/test components are N/A. A failure blocks dependent wheel/staging jobs and `Full CI Success`; nightly publication also remains gated. The findings JSON is uploaded with `always()` as `config-license-approval` (nightlies append the architecture and Python version). There is no `continue-on-error` or legacy UNKNOWN exception in this approval gate.
+
+The original provenance checker still preserves a byte-pinned legacy inventory for investigation. The approval gate first validates the exact source, and optionally `--wheel`, through that checker, then independently rejects unknown licenses/provenance, missing or stale review records, rejected decisions and unapproved required third-party licenses. NVIDIA ownership cannot turn an `UNKNOWN` source/license into known provenance. Missing/malformed policy inputs fail closed and write an error report.
+
+The review ledger is `scripts/ci/config_license_review.json`. Each file record binds its packaged path and SHA256, ownership, underlying third-party licenses, ownership evidence and approval status. This ledger supplements `bundled_configs.json`; it does not rewrite that inventory's license identifiers, canonical notices or frozen baseline. The standard repository allowance is exactly Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC and Zlib. SPDX/custom expressions outside that set need a recorded decision, not an inferred permissive classification. Dependency-specific Python/Cargo policies remain separate.
+
+An approved custom-license record needs `status: approved`, `approved_by`, ISO `approved_on`, an HTTPS decision `reference`, `scope: oss-config-redistribution`, the exact inventory `reported_license`, sorted `required_licenses`, and the inventory notice's `license_text_sha256`. The file review's SHA256 and these license/text fields must all match current provenance. Link the actual decision and scope; a generic request URL or a conversation's analysis is not proof that an approval happened. `pending` and `rejected` do not approve a nonstandard third-party license. No new external approval decision is seeded in this change.
+
+Ownership is contribution-specific. Explicit pinned evidence identifies NVIDIA-developed models and NVIDIA-produced derivatives; the `nvidia/` namespace, NVFP4 suffix or use of ModelOpt alone is not proof of exclusive ownership. NVIDIA releasing its own contribution needs no extra permission from NVIDIA to itself, so NVIDIA outbound evaluation/internal-R&D restrictions on licensees do not create a self-permission blocker. For NVIDIA derivatives, the gate still evaluates every recorded underlying third-party license. A Llama-derived Nemotron retains Meta's terms; NVIDIA-produced MiniMax quantization retains MiniMax's terms. Source-unverified ownership declarations cannot satisfy the gate.
+
+Run the same check locally (exit 1 means missing/unknown/unapproved evidence):
+
+```bash
+python scripts/ci/check_config_license_approvals.py --output-dir /tmp/config-license-approval
+python scripts/ci/check_config_license_approvals.py --wheel dist/aisim-example.whl --output-dir /tmp/config-wheel-approval
+```
+
+For a selected historical/nightly source, `--root SOURCE` reads that source's exact inventory and review ledger. A historical source without the required records fails; it cannot silently borrow another version's approvals. `--review` explicitly selects a trusted ledger, but its path set and file hashes must match the source exactly. Reports bind the optional workflow-verified `--source-sha` and exact wheel digest.
+
+The current seed deliberately leaves unresolved/custom records pending. Enabling this gate therefore exposes existing compliance debt as a failing job until accurate provenance/notices and real scoped approvals are supplied. A report with a complete inventory is not itself a passing approval result.
+
 Nightly builds stamp a dev suffix with `scripts/release/apply_dev_version.py` before
 building: the wheel becomes `0.15.0.devYYYYMMDD` (PEP 440) and the crate
 `0.15.0-dev.YYYYMMDD` (SemVer — cargo rejects the PEP 440 spelling, and the
