@@ -445,6 +445,24 @@ pub(crate) enum RankDetail {
     Diagnostics,
 }
 
+/// A whole-model FPM rank's prefill and decode terms, in that order, before
+/// correction: each one's latency and, where its lookups carried power,
+/// energy. The decode term is what the rank's decode requests add to the
+/// pass: the marginal decode beside prefill, else the full decode pass.
+pub(crate) type FpmRankTerms = [(Option<f64>, Option<f64>); 2];
+
+impl crate::FpmRankEstimate {
+    pub(crate) fn terms(&self) -> FpmRankTerms {
+        [
+            (self.prefill_ms, self.prefill_energy_wms),
+            (
+                self.marginal_decode_ms.or(self.decode_ms),
+                self.decode_energy_wms,
+            ),
+        ]
+    }
+}
+
 /// One rank of [`Engine::forward_pass_ranks`]: its native latency and, for an
 /// operation graph, the operations it executed, in the requested detail.
 #[derive(Debug)]
@@ -452,6 +470,8 @@ pub(crate) struct RankPricing {
     pub(crate) latency_ms: f64,
     /// [`RankDetail::Values`]; `None` for whole-model FPM.
     pub(crate) operations: Option<RankOperationValues>,
+    /// A whole-model FPM rank's phase terms; empty for an operation graph.
+    pub(crate) fpm_terms: FpmRankTerms,
     /// [`RankDetail::Diagnostics`] of an operation graph.
     pub(crate) diagnostics: Option<Vec<super::diagnostics::StaticOperationDiagnostics>>,
     /// What a caller derives from this pricing ([`Self::derived`]).
@@ -3782,8 +3802,8 @@ impl Engine {
     /// native latency and, for an operation graph, the operations it
     /// executed in `detail`: their values under names shared by every rank
     /// that runs the same walk, or the diagnostics the detailed estimate
-    /// reports. Whole-model FPM ranks report neither; their direct-lookup
-    /// evidence needs [`Self::forward_pass_estimate`].
+    /// reports. Whole-model FPM ranks report their phase terms as values;
+    /// their direct-lookup evidence needs [`Self::forward_pass_estimate`].
     pub(crate) fn forward_pass_ranks(
         &self,
         metrics_by_rank: &[ForwardPassMetrics],
@@ -3855,19 +3875,23 @@ impl Engine {
         detail: Option<RankDetail>,
         coverage: Option<&mut FpmQueryCoverage>,
     ) -> Result<RankPricing, AicError> {
+        let whole_model = self.fpm_split().is_some();
         let mut values = None;
         let mut evidence = crate::FpmRankEstimate::default();
         let observer = match detail {
             None => RankObserver::Latency,
-            Some(RankDetail::Values) => RankObserver::Values(&mut values),
-            Some(RankDetail::Diagnostics) => RankObserver::Diagnostics(&mut evidence),
+            // A whole-model rank's values are the phase terms of its estimate.
+            Some(RankDetail::Values) if !whole_model => RankObserver::Values(&mut values),
+            Some(_) => RankObserver::Diagnostics(&mut evidence),
         };
         let latency_ms = self.rank_latency_ms(metrics, observer, coverage)?;
-        let diagnostics = (detail == Some(RankDetail::Diagnostics) && self.fpm_split().is_none())
+        let fpm_terms = evidence.terms();
+        let diagnostics = (detail == Some(RankDetail::Diagnostics) && !whole_model)
             .then_some(evidence.operations);
         Ok(RankPricing {
             latency_ms,
             operations: values,
+            fpm_terms,
             diagnostics,
             derived: OnceLock::new(),
         })
@@ -5980,11 +6004,16 @@ pub(crate) mod tests {
                 expected
             );
         }
-        // Whole-model ranks keep no operation values.
+        // Whole-model ranks keep no operation values: the memo answers with
+        // their phase terms, here `full_round_spec`'s 13 ms prefill row.
         let iteration = engine
             .forward_pass_ranks(&prefill, RankDetail::Values, None)
             .unwrap();
         assert!(iteration.ranks[0].operations.is_none());
+        assert_eq!(
+            iteration.ranks[0].fpm_terms,
+            [(Some(13.0), None), (None, None)]
+        );
         assert_eq!(iteration.latency_ms, covered);
     }
 
@@ -5993,6 +6022,7 @@ pub(crate) mod tests {
         let rank = RankPricing {
             latency_ms: 2.0,
             operations: None,
+            fpm_terms: Default::default(),
             diagnostics: None,
             derived: OnceLock::new(),
         };
