@@ -1058,6 +1058,12 @@ def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None
     info_ids = {p.artifact_id for p in body.provenance_artifacts}
     if info_ids - artifact_ids or {a.artifact_id for a in tables.manifest.artifacts if a.format == "gzip"} - info_ids:
         raise LoaderError("provenance artifacts and manifest body disagree")
+    for artifact in tables.manifest.artifacts:
+        if artifact.format == "gzip":  # tables are verified by the loader; provenance bytes must be too
+            try:
+                _verify(root, artifact)
+            except (ValueError, OSError) as exc:
+                raise LoaderError(f"provenance artifact {artifact.artifact_id} failed verification: {exc}") from exc
     return E2eDataset(tables, body, observations, metrics, requests, series)
 
 
@@ -1551,6 +1557,7 @@ def inferencex_to_configurations(
             merged[cid] = E2eConfigurationData(body, observations, metrics, [], [])
             continue
         target = existing.body
+        target.evidence_gaps.extend(gap for gap in body.evidence_gaps if gap not in target.evidence_gaps)
         ids = set(target.source_fields.get("source_config_ids", [target.source_config_id]))  # type: ignore[arg-type]
         ids.add("hf:" + source_config)
         target.source_config_id = None

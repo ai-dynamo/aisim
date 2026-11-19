@@ -80,7 +80,7 @@ class _Row(BaseModel):
 class CatalogCoverage(_Row):
     """Explicit coverage universe, retained so validation rebuilds the same missing cells."""
 
-    schema_version: Literal["aisim-catalog-coverage/v1"] = "aisim-catalog-coverage/v1"
+    schema_version: Literal["aisim-catalog-coverage/v1"]  # required: an unidentified declaration is rejected
     expected_models: list[str] = Field(default_factory=list)
     expected_frameworks: list[str] = Field(default_factory=list)
 
@@ -91,7 +91,7 @@ def read_catalog_coverage(root: Path) -> CatalogCoverage:
         return (
             CatalogCoverage.model_validate(json_sidecar_value(bounded_json_bytes(path)))
             if path.is_file()
-            else CatalogCoverage()
+            else CatalogCoverage(schema_version="aisim-catalog-coverage/v1")
         )
     except RecursionError as exc:
         raise ValueError("catalog coverage JSON exceeds the nesting limit") from exc
@@ -317,6 +317,7 @@ def build_catalog(
     root = Path(dataset_root)
     saved = read_catalog_coverage(root)
     coverage = CatalogCoverage(
+        schema_version="aisim-catalog-coverage/v1",
         expected_models=sorted(set(saved.expected_models if expected_models is None else expected_models)),
         expected_frameworks=sorted(
             set(saved.expected_frameworks if expected_frameworks is None else expected_frameworks)
