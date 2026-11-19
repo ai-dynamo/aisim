@@ -809,6 +809,40 @@ These suites passed at `d462dab8`:
 This run did not measure host time. Full CI and the forward-prediction
 performance gate did not run on this head.
 
+### Fixes after `d462dab8`
+
+Commits `d9da2c60` to `c51eceaf` address review findings:
+
+- **Power coverage.** If a query's own energy is positive, its latency
+  counts as power-covered. The decode walk, the mixed and static per-op endpoints
+  and Replay's rank evidence now sum this per query before rows fold by name.
+  Before, a folded row with positive energy counted all of its latency as
+  covered. `fpm_decode_coverage_counts_each_same_name_draft_query` fails on
+  `274d0515` with 0.013189 ms covered instead of the powered query's
+  0.010178 ms. If evidence derives coverage from folded energy,
+  `op_level_replay_counts_split_mamba_power_coverage_per_query` fails.
+- **Pure-prefill remainder.** A packed pure-prefill step passes its exact
+  new-token total, so qualified Mamba splits a ragged total into two request
+  lengths, as the mixed step and `predict_prefill_latency_total` do. Two
+  prefills of 17 tokens scan 8 and 9 tokens, not two of 8.
+- **Cached convolution.** A qualified context convolution with a cached prefix
+  keeps its cold measured row as a proxy, labeled `estimated`.
+- **Guards.** A DSv4.1 stage in either phase is rejected beside qualified
+  Mamba. The SDK rejects a native operation named like a reported attention
+  row (`context_attention (scaled)` or `generation_attention`).
+  `fpm_caller.py` also checks its fixture helper, `test_fpm_forward.py`.
+
+The ragged split prices each request group as a uniform-batch query. This is
+a proxy for one ragged launch, not a measurement of it. The example uses Nano
+on the HYBRID TensorRT-LLM 1.3.0rc20 `b200_sxm` data. Two prefill requests with
+4096 new tokens price `context_mamba_conv1d` from the measured `(2, 2048)` row,
+at 0.853834 ms. With 4097 tokens, the split prices the measured `(1, 2048)` and
+`(1, 2049)` rows, 1.014955 ms in total. The SOL scan adds one token's bytes
+(0.264663 to 0.264725 ms). The step rises from 29.019380 to 29.180562 ms
+(+0.56%). The two queries have different batch shapes. The difference is
+therefore not a split into launch and token costs. It is also not an upper
+bound for other shapes.
+
 ## Host cost
 
 Six alternating Baseline and Candidate pairs ran. The retained replay results
@@ -908,10 +942,63 @@ cause of the gate's cold result is not identified. The run used
 The raw rounds are in
 [`host-perf-qwen-5cd7655d.json`](mamba-mixed-step-accounting/host-perf-qwen-5cd7655d.json).
 
+### Host time of the fixes after `d462dab8`
+
+The `d462dab8` and `d6b02759` builds ran on the workstation, with each build
+first in alternate rounds. This pair isolates `d9da2c60` to `d6b02759`. It
+does not cover the earlier maintainer changes.
+[`affected_perf.py`](mamba-mixed-step-accounting/affected_perf.py) times the
+changed native entry points in fresh processes. It primes each handle with
+another shape, then times one unseen query (cold) and the median of 100
+repeats (warm). In 12 rounds, warm medians changed by -9.5% to +2.5%. Cold
+medians changed by -10.9% to +6.5%:
+
+| Entry point | Cold `d462dab8` | Cold `d6b02759` |
+| --- | --- | --- |
+| Qualified pure prefill, 2 requests, 4097 tokens | 107.6 us | 114.6 us |
+| Qualified pure prefill, 4096 tokens (even control) | 9.9 us | 9.7 us |
+| Qwen3-32B pure prefill, 4097 tokens (non-Mamba control) | 25.8 us | 25.5 us |
+| Qualified Nano static per-op coverage | 179.0 us | 186.8 us |
+| Qwen3-32B static per-op coverage | 74.8 us | 77.1 us |
+| Whole-model FPM mixed coverage | 8.0 us | 7.7 us |
+
+The ragged qualified prefill adds a second scan query and convolution query,
+which keep the remainder token. Its simulated latency changes as described
+above. The other entry points return identical values. The 13 SILICON cases
+of the forward-prediction gate changed by -1.2% to +1.6% warm. A 12-round
+rerun of the 11 Qwen3-32B cases gave -1.1% to +4.1% cold, at most 2.1 us.
+The raw rounds are in
+[`affected-perf-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/affected-perf-d462dab8-d6b02759.json),
+[`host-perf-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/host-perf-d462dab8-d6b02759.json)
+and
+[`host-perf-qwen-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/host-perf-qwen-d462dab8-d6b02759.json).
+
+`c51eceaf` adds one covered-latency value per folded operation and per
+query, with no new traversal, query or cache. Native Replay ran
+`aisim predict --stack engine` with `d6b02759` and `c51eceaf` in 6 alternating
+rounds. Each run served 2000 synthetic requests (2048 input tokens, 512 cached,
+128 output) at concurrency 64 on `b200_sxm` TensorRT-LLM 1.3.0rc20. Both
+builds completed every request with identical TTFT and power coverage. Each
+cell gives the `d6b02759` median, then the `c51eceaf` median:
+
+| Model | CLI time | Peak RSS | `wall_time_ms` |
+| --- | --- | --- | --- |
+| Nemotron-3-Nano (Mamba, unqualified) | 1.96 s to 1.99 s | 225.4 to 227.8 MiB | 191.5 to 189.7 ms |
+| Qwen3-0.6B (control) | 1.64 s to 1.65 s | 195.9 to 196.7 MiB | 199.9 to 196.2 ms |
+
+One candidate Nano run took 3.53 s, and every other run
+stayed within the baseline range. These unqualified graphs do not exercise the
+qualified split. The raw runs are in
+[`replay-host-d6b02759-c51eceaf.csv`](mamba-mixed-step-accounting/replay-host-d6b02759-c51eceaf.csv).
+
 ## Limits
 
 - Summing uniform-batch queries can overcount launch overhead for
-  variable-length batches.
+  variable-length batches. A qualified Mamba ragged split uses this proxy
+  (see the 4096- and 4097-token example above).
+- Replay evidence from a model with `temporary_mixed_composition` reads public
+  estimates, so it still derives each folded operation's coverage from its
+  energy.
 - One model family, one modeled platform, synthetic shapes.
 - With one request whose uncached tokens exceed the budget, `run_agg`
   counts one mix step in throughput and energy, as main does, although the
