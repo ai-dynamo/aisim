@@ -191,6 +191,7 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_attention_dp() -> None:
     engine = _mtp_host_engine()
     engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
@@ -202,6 +203,7 @@ def test_canonical_mtp_host_config_takes_attention_dp() -> None:
     assert lowered["rank"]["aic_nextn"] == 2
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_canonical_mtp_host_config_takes_prefill_and_decode_workers_without_kvcr() -> None:
     engine = _mtp_host_engine(mode="disaggregated")
     # These workers take either pool scope; an aggregated worker only a local pool.

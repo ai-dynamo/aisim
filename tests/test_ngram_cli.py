@@ -511,6 +511,7 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
 _MTP = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_cold_mtp_regression_with_allowed_fallback_requires_a_fit():
     raw = _prediction(timing="default")
     raw["engine"].update(
