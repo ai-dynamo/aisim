@@ -100,6 +100,23 @@ def test_mixed_afd_companion_preserves_main_async_backend_validation():
         CorePredictionConfig.model_validate(raw)
 
 
+def test_afd_worker_rejects_vllm_launch():
+    from aisim.config import CorePredictionConfig
+
+    raw = _mixed_prediction()
+    raw["engine"]["workers"]["decode"]["scheduler"] = {
+        "launch": {
+            "decode_ms": 1.0,
+            "piecewise_ms": 1.0,
+            "eager_ms": 1.0,
+            "max_cudagraph_capture_size": 16,
+            "eager_queue_fraction": 0.0,
+        }
+    }
+    with pytest.raises(ValueError, match="vLLM scheduling controls are unsupported"):
+        CorePredictionConfig.model_validate(raw)
+
+
 def test_mixed_afd_companion_rejects_native_pipeline_parallelism_before_pool_loading(monkeypatch):
     from aisim import compiler
     from aisim.compiler import prediction_to_replay_spec

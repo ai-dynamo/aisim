@@ -399,6 +399,8 @@ pub struct SglangConfig {
     /// any page, as for full attention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swa_prefix_tails: Option<usize>,
+    /// Measured serial batch-selection overhead for a pass with model work.
+    pub scheduler_select_time_ms: f64,
 }
 
 const fn default_reserved_decode_tokens() -> usize {
@@ -424,12 +426,17 @@ impl Default for SglangConfig {
             num_reserved_decode_tokens: default_reserved_decode_tokens(),
             disaggregation_decode_extra_slots: None,
             swa_prefix_tails: None,
+            scheduler_select_time_ms: 0.0,
         }
     }
 }
 
 impl SglangConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.scheduler_select_time_ms.is_finite() && self.scheduler_select_time_ms >= 0.0,
+            "sglang.scheduler_select_time_ms must be finite and non-negative"
+        );
         ensure!(
             self.max_prefill_tokens > 0,
             "sglang.max_prefill_tokens must be positive"
@@ -723,6 +730,7 @@ impl G2Connector {
                 stores_at_finish: false,
                 reranks_at_finish: false,
                 preemption_waits_for_all: false,
+                admits_kv_holders_first: false,
             },
             Self::OffloadingV032 => ConnectorRules {
                 policy: HostPolicy::Ranked,
@@ -737,6 +745,7 @@ impl G2Connector {
                 stores_at_finish: true,
                 reranks_at_finish: true,
                 preemption_waits_for_all: false,
+                admits_kv_holders_first: true,
             },
             Self::SimpleCpuV032 => ConnectorRules {
                 policy: HostPolicy::FreeQueue,
@@ -751,6 +760,7 @@ impl G2Connector {
                 stores_at_finish: true,
                 reranks_at_finish: false,
                 preemption_waits_for_all: true,
+                admits_kv_holders_first: true,
             },
         }
     }
@@ -794,6 +804,10 @@ pub(crate) struct ConnectorRules {
     /// A preemption waits for every transfer in flight, not only the
     /// preempted request's stores.
     pub(crate) preemption_waits_for_all: bool,
+    /// The scheduler admits a waiting request that holds G1 for a load
+    /// before every other waiter (`kv_holding_waiting`). Otherwise skipped
+    /// requests keep the order of their first skip (`skipped_waiting`).
+    pub(crate) admits_kv_holders_first: bool,
 }
 
 const DEFAULT_SHARED_HOST_OFFLOAD_BANDWIDTH_GBPS: f64 = 80.0;
@@ -923,6 +937,53 @@ impl NativeHostOffloadConfig {
     }
 }
 
+/// CPU launch costs of vLLM's async engine loop (`scheduler.launch`).
+///
+/// vLLM decides and launches pass k+1 before it returns pass k's outputs, so a
+/// pass's outputs leave once the next pass is launched, and a request joins the
+/// first pass decided after it arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PassLaunchConfig {
+    /// From deciding a pass without prefill and with at most
+    /// `max_cudagraph_capture_size` scheduled tokens to the end of its launch,
+    /// in ms.
+    pub decode_ms: f64,
+    /// The same for such a pass with prefill (piecewise CUDA graphs).
+    pub piecewise_ms: f64,
+    /// The same for a larger pass, which runs eager with or without prefill.
+    pub eager_ms: f64,
+    /// vLLM's `max_cudagraph_capture_size`.
+    pub max_cudagraph_capture_size: usize,
+    /// The part of an eager pass the GPU has run before its launch can end:
+    /// the CPU waits once the CUDA launch queue is full.
+    pub eager_queue_fraction: f64,
+}
+
+impl PassLaunchConfig {
+    fn validate(&self) -> Result<()> {
+        for (field, ms) in [
+            ("decode_ms", self.decode_ms),
+            ("piecewise_ms", self.piecewise_ms),
+            ("eager_ms", self.eager_ms),
+        ] {
+            ensure!(
+                ms.is_finite() && ms >= 0.0,
+                "launch.{field} must be finite and non-negative"
+            );
+        }
+        ensure!(
+            self.max_cudagraph_capture_size > 0,
+            "launch.max_cudagraph_capture_size must be positive"
+        );
+        ensure!(
+            (0.0..1.0).contains(&self.eager_queue_fraction),
+            "launch.eager_queue_fraction must lie in [0, 1)"
+        );
+        Ok(())
+    }
+}
+
 /// Recurrent-state allocation size for one simulated rank/GPU.
 /// Token block geometry and pool capacity use the existing EngineConfig fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1043,6 +1104,14 @@ pub struct EngineConfig {
     /// misses. `None` selects vLLM's default: on, except with ngram drafts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub async_scheduling: Option<bool>,
+    /// vLLM async scheduling's CPU launch costs: a pass's outputs leave once
+    /// the next pass is launched, and an arrival joins the first pass decided
+    /// after it. `None` keeps outputs at the pass end and the pass-count rule.
+    /// A rank holds the outputs until the driver releases them through
+    /// `GeneralizedMockerEngine::take_due_emissions`, as offline replay does;
+    /// other drivers must leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<PassLaunchConfig>,
     /// Whether complete blocks remain reusable after request release.
     #[serde(default = "default_true")]
     pub enable_prefix_caching: bool,
@@ -1165,6 +1234,8 @@ struct EngineConfigWire {
     prefill_decode_interval: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     async_scheduling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch: Option<PassLaunchConfig>,
     #[serde(default = "default_true")]
     enable_prefix_caching: bool,
     #[serde(default = "default_true")]
@@ -1256,6 +1327,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             prefill_schedule_interval: wire.prefill_schedule_interval,
             prefill_decode_interval: wire.prefill_decode_interval,
             async_scheduling: wire.async_scheduling,
+            launch: wire.launch,
             enable_prefix_caching: wire.enable_prefix_caching,
             enable_chunked_prefill: wire.enable_chunked_prefill,
             speedup_ratio: wire.speedup_ratio,
@@ -1306,6 +1378,7 @@ impl Default for EngineConfig {
             prefill_schedule_interval: default_prefill_schedule_interval(),
             prefill_decode_interval: 0,
             async_scheduling: None,
+            launch: None,
             enable_prefix_caching: true,
             enable_chunked_prefill: true,
             speedup_ratio: 1.0,
@@ -1413,16 +1486,35 @@ impl EngineConfig {
         }
     }
 
+    /// A state cache without a sliding window: a recurrent state.
+    fn has_recurrent_state(&self) -> bool {
+        (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_none())
+    }
+
+    /// The G2 this rank runs. vLLM has sliding-window groups from v0.32 on,
+    /// so a rank-local pool that keeps their checkpoints follows that
+    /// version's `OffloadingConnector` under either of its names. A
+    /// cluster-shared pool has no vLLM counterpart and keeps its own rules.
+    pub(crate) fn resolved_host_offload(&self) -> Option<NativeHostOffloadConfig> {
+        let mut host = self.native_host_offload.clone()?;
+        let window =
+            (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_some());
+        if window && host.scope == G2Scope::DpRankLocal {
+            host.connector = G2Connector::OffloadingV032;
+        }
+        Some(host)
+    }
+
     /// Batches a busy vLLM engine keeps committed, its `max_concurrent_batches`:
     /// two with async scheduling and one without. Engine replay does not model
     /// pipeline parallelism, which would raise this depth. MTP with G2 runs
-    /// synchronously, except with a state cache.
+    /// synchronously, except with a recurrent state cache.
     pub(crate) fn max_concurrent_batches(&self) -> usize {
         if self.backend == Backend::Vllm
             && self.async_scheduling != Some(false)
             && !(self.native_host_offload.is_some()
                 && self.aic_nextn.is_some()
-                && self.state_cache.is_none())
+                && !self.has_recurrent_state())
         {
             2
         } else {
@@ -1451,16 +1543,29 @@ impl EngineConfig {
                 "state_cache is supported only for backend=vllm"
             );
             if let Some(host) = &self.native_host_offload {
-                // vLLM's CPU connectors hit a hybrid model at block boundaries
-                // (Mamba align mode); vLLM 0.24's connector stores no states.
-                ensure!(
-                    self.prefix_match_unit == Some(self.block_size),
-                    "state_cache with host_offload requires prefix_match_unit equal to block_size"
-                );
-                ensure!(
-                    host.connector != G2Connector::OffloadingV024,
-                    "state_cache with host_offload requires host_offload.connector=offloading_v0_32 or simple_cpu_v0_32"
-                );
+                if state_cache.sliding_window.is_some() {
+                    // See `resolved_host_offload`: the offloading connector
+                    // stores a window's checkpoints with its prompt blocks.
+                    // SimpleCPU stores a window block by block, which is not
+                    // modeled.
+                    ensure!(
+                        host.connector != G2Connector::SimpleCpuV032,
+                        "a sliding-window state_cache does not support host_offload.connector=simple_cpu_v0_32"
+                    );
+                    ensure!(self.kvcr.is_none(), "state_cache does not support kvcr");
+                } else {
+                    // vLLM's CPU connectors hit a hybrid model at block
+                    // boundaries (Mamba align mode); vLLM 0.24's connector
+                    // stores no states.
+                    ensure!(
+                        self.prefix_match_unit == Some(self.block_size),
+                        "state_cache with host_offload requires prefix_match_unit equal to block_size"
+                    );
+                    ensure!(
+                        host.connector != G2Connector::OffloadingV024,
+                        "state_cache with host_offload requires host_offload.connector=offloading_v0_32 or simple_cpu_v0_32"
+                    );
+                }
             }
             ensure!(
                 self.g3_offload.is_none(),
@@ -1503,6 +1608,16 @@ impl EngineConfig {
                 .kv_cache_bytes_per_token
                 .ok_or_else(|| anyhow::anyhow!("state_cache requires kv_cache_bytes_per_token"))?;
             let state_blocks = state_cache.state_blocks(self.block_size, bytes_per_token)?;
+            if let Some(host) = &self.native_host_offload
+                && state_cache.sliding_window.is_some()
+            {
+                // A checkpoint is one G2 entry of the state's rows.
+                ensure!(
+                    host.num_host_blocks > state_blocks,
+                    "native_host_offload.num_host_blocks ({}) must exceed one state checkpoint ({state_blocks} blocks)",
+                    host.num_host_blocks
+                );
+            }
             if let Some(depth) = state_cache.num_speculative_states {
                 ensure!(
                     depth > 0 && self.aic_nextn == Some(depth),
@@ -1569,9 +1684,32 @@ impl EngineConfig {
             self.backend == Backend::Vllm || self.async_scheduling.is_none(),
             "async_scheduling is supported only for backend=vllm"
         );
+        if let Some(launch) = &self.launch {
+            launch.validate()?;
+            ensure!(
+                self.max_concurrent_batches() > 1,
+                "launch requires vLLM async_scheduling"
+            );
+            ensure!(
+                self.worker_type == WorkerType::Aggregated,
+                "launch is supported only on aggregated workers"
+            );
+        }
         ensure!(
             self.backend == Backend::Sglang || !self.sglang.host_loop,
             "sglang.host_loop is supported only for backend=sglang"
+        );
+        ensure!(
+            self.sglang.scheduler_select_time_ms == 0.0
+                || (self.backend == Backend::Sglang
+                    && !self.sglang.host_loop
+                    && self.afd.is_none()
+                    && !matches!(
+                        &self.timing_model,
+                        TimingModelConfig::External { provider, .. }
+                            if matches!(provider.as_str(), "afd" | "aic-afd")
+                    )),
+            "sglang.scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
         );
         ensure!(
             !self.sglang.host_loop || self.worker_type != WorkerType::Decode,
@@ -1779,18 +1917,25 @@ impl EngineConfig {
                 "native_host_offload is supported only for backend=vllm"
             );
             // A held P/D source reaches the connector's finish hook only after
-            // its transfer, while vLLM finishes it before.
+            // its transfer, while vLLM finishes it before. A sliding window
+            // runs the 0.32 offloading rules there all the same (see
+            // `resolved_host_offload`), so it may name them.
+            let names_window_rules = host_offload.connector == G2Connector::OffloadingV032
+                && (self.state_cache.as_ref()).is_some_and(|cache| cache.sliding_window.is_some());
             ensure!(
-                host_offload.connector.is_default() || self.worker_type == WorkerType::Aggregated,
+                host_offload.connector.is_default()
+                    || self.worker_type == WorkerType::Aggregated
+                    || names_window_rules,
                 "native_host_offload.connector other than offloading_v0_24 is supported only for worker_type=aggregated"
             );
             ensure!(
                 self.enable_prefix_caching,
                 "native_host_offload requires enable_prefix_caching=true"
             );
-            if self.aic_nextn.is_some() && self.state_cache.is_some() {
+            if self.aic_nextn.is_some() && self.has_recurrent_state() {
                 // Replay does not model the EAGLE block drop hiding the last
-                // block, and the state, that a host load restored.
+                // block, and the recurrent state, that a host load restored.
+                // A sliding window resumes one block lower instead.
                 ensure!(
                     self.disable_eagle_block_drop,
                     "native_host_offload with aic_nextn and state_cache requires disable_eagle_block_drop"
@@ -2340,6 +2485,36 @@ mod tests {
             let error = serde_json::from_value::<EngineConfig>(input).unwrap_err();
             assert!(error.to_string().contains(message), "{field}: {error}");
         }
+        // A sliding-window state is offloaded with its prompt blocks, without
+        // KVCR. A rank-local pool follows the v0.32 offloading connector under
+        // either of its names; a shared pool keeps its own rules.
+        let mut input = state_cache_config_json();
+        input["state_cache"]["sliding_window"] = serde_json::json!({"lookahead_tokens": 0});
+        let resolved = |host: serde_json::Value| {
+            let mut input = input.clone();
+            input["native_host_offload"] = host;
+            serde_json::from_value::<EngineConfig>(input)
+                .map(|config| config.resolved_host_offload().unwrap().connector)
+                .map_err(|error| error.to_string())
+        };
+        let host =
+            |connector: &str| serde_json::json!({"num_host_blocks": 8, "connector": connector});
+        for connector in ["offloading_v0_24", "offloading_v0_32"] {
+            assert_eq!(resolved(host(connector)), Ok(G2Connector::OffloadingV032));
+        }
+        let shared = serde_json::json!({
+            "num_host_blocks": 8, "scope": "cluster_shared", "kv_layout_id": "tp1",
+        });
+        assert_eq!(resolved(shared), Ok(G2Connector::OffloadingV024));
+        assert!(
+            resolved(host("simple_cpu_v0_32"))
+                .unwrap_err()
+                .contains("simple_cpu_v0_32")
+        );
+        input["native_host_offload"] = host("offloading_v0_24");
+        input["kvcr"] = serde_json::json!({});
+        let error = serde_json::from_value::<EngineConfig>(input).unwrap_err();
+        assert!(error.to_string().contains("support kvcr"), "{error}");
     }
 
     #[test]
@@ -3183,6 +3358,84 @@ mod tests {
     }
 
     #[test]
+    fn sglang_scheduler_selection_cost_defaults_to_zero_and_validates() {
+        let legacy = serde_json::json!({"backend": "sglang", "sglang": {}});
+        let config: EngineConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.sglang.scheduler_select_time_ms, 0.0);
+        config.validate().unwrap();
+
+        for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+            let mut config = config.clone();
+            config.sglang.scheduler_select_time_ms = invalid;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("scheduler_select_time_ms must be finite and non-negative"),
+                "{error}"
+            );
+        }
+
+        let mut config = config;
+        config.sglang.scheduler_select_time_ms = 1.5;
+        config.validate().unwrap();
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: EngineConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.sglang.scheduler_select_time_ms, 1.5);
+
+        for mut unsupported in [
+            EngineConfig::for_backend(Backend::Vllm),
+            EngineConfig {
+                sglang: SglangConfig {
+                    host_loop: true,
+                    ..SglangConfig::default()
+                },
+                ..EngineConfig::for_backend(Backend::Sglang)
+            },
+            EngineConfig {
+                afd: Some(Arc::new(sample_afd_config())),
+                ..EngineConfig::for_backend(Backend::Sglang)
+            },
+        ] {
+            unsupported.validate().unwrap();
+            unsupported.sglang.scheduler_select_time_ms = 1.5;
+            let error = unsupported.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sglang_scheduler_selection_cost_checks_external_provider_without_afd_metadata() {
+        for provider in ["afd", "aic-afd", "aic", "custom"] {
+            let mut config = EngineConfig {
+                timing_model: TimingModelConfig::External {
+                    provider: provider.to_string(),
+                    config: serde_json::json!({}),
+                },
+                ..EngineConfig::for_backend(Backend::Sglang)
+            };
+            assert!(config.afd.is_none());
+            config.validate().unwrap();
+
+            config.sglang.scheduler_select_time_ms = 1.5;
+            if matches!(provider, "afd" | "aic-afd") {
+                let error = config.validate().unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
+                    ),
+                    "{provider}: {error}"
+                );
+            } else {
+                config.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn async_scheduling_defaults_to_vllm_and_sets_the_batch_queue_depth() {
         for (backend, depth) in [("vllm", 2), ("sglang", 1), ("trtllm", 1)] {
             let mut config: EngineConfig =
@@ -3216,6 +3469,50 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn launch_needs_async_scheduling_on_an_aggregated_vllm_worker() {
+        let launch = PassLaunchConfig {
+            decode_ms: 5.0,
+            piecewise_ms: 50.0,
+            eager_ms: 150.0,
+            max_cudagraph_capture_size: 512,
+            eager_queue_fraction: 0.4,
+        };
+        let config = EngineConfig {
+            launch: Some(launch),
+            ..EngineConfig::default()
+        };
+        config.validate().unwrap();
+        let decoded: EngineConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.launch, Some(launch));
+        for (edit, message) in [
+            (
+                (|config: &mut EngineConfig| config.async_scheduling = Some(false))
+                    as fn(&mut EngineConfig),
+                "launch requires vLLM async_scheduling",
+            ),
+            (
+                |config| config.worker_type = WorkerType::Decode,
+                "launch is supported only on aggregated workers",
+            ),
+            (
+                |config| config.launch.as_mut().unwrap().eager_queue_fraction = 1.0,
+                "launch.eager_queue_fraction must lie in [0, 1)",
+            ),
+        ] {
+            let mut invalid = config.clone();
+            edit(&mut invalid);
+            assert!(
+                invalid
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(message)
+            );
         }
     }
 

@@ -185,6 +185,16 @@ struct BlockLeaseEntry {
     capacity_write_pending: bool,
 }
 
+/// A hybrid lookup that found no restorable state, kept on its lease so that
+/// a repeat of it skips the prefix walk and the state scan.
+#[derive(Debug, Clone, Copy)]
+struct StateMiss {
+    /// [`StateCacheManager::lookup_epoch`] at the lookup.
+    epoch: (u64, u64),
+    /// Leading blocks that hit the prefix cache.
+    overlap_blocks: usize,
+}
+
 /// Move-only native-G1 ownership token attached to one scheduler request.
 #[derive(Debug)]
 #[must_use = "a native block lease must be finished, aborted, retracted, or moved into a hold"]
@@ -205,6 +215,8 @@ pub(crate) struct BlockRequestLease {
     /// Block-aligned shared-prefix junction recorded at admission (vLLM
     /// `Request.shared_prefix_boundary`).
     junction: Option<usize>,
+    /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
+    state_miss: Option<StateMiss>,
     pub(crate) session_id: Option<String>,
 }
 
@@ -228,6 +240,7 @@ impl BlockRequestLease {
             state: None,
             prefill_checkpoint: None,
             junction: None,
+            state_miss: None,
             session_id: None,
         }
     }
@@ -260,16 +273,21 @@ impl BlockRequestLease {
     }
 
     fn state_hash(&self, tokens: usize, block_size: usize) -> Option<SequenceHash> {
-        let (unit, hashes) = match &self.prefix_hashes {
-            Some(value) => value,
-            None => {
-                return tokens
-                    .checked_div(block_size)?
-                    .checked_sub(1)
-                    .and_then(|i| self.entries.get(i))
-                    .and_then(|e| e.identity.sequence_hash);
-            }
-        };
+        if self.prefix_hashes.is_some() {
+            return self.prefix_hash_at(tokens);
+        }
+        tokens
+            .checked_div(block_size)?
+            .checked_sub(1)
+            .and_then(|i| self.entries.get(i))
+            .and_then(|e| e.identity.sequence_hash)
+    }
+
+    /// The chained hash of the first `tokens` tokens, for a positive multiple
+    /// of the prefix hash unit. `None` otherwise, and without configured
+    /// prefix hashes.
+    pub(crate) fn prefix_hash_at(&self, tokens: usize) -> Option<SequenceHash> {
+        let (unit, hashes) = self.prefix_hashes.as_ref()?;
         if !tokens.is_multiple_of(*unit) {
             return None;
         }
@@ -875,6 +893,15 @@ impl VllmKvManager {
         let Some(manager) = &self.state_cache else {
             return 0;
         };
+        // A window a host load landed is resumed in place: its next write
+        // goes into the landed state, with no copy of the window G1 cached.
+        if manager.sliding_window.is_some()
+            && let Some(state) = lease.state.as_deref()
+            && !state.working.is_empty()
+            && state.computed_tokens == cached_tokens
+        {
+            return 0;
+        }
         let inactive_source_blocks =
             lease
                 .state_hash(cached_tokens, self.block_size)
@@ -1266,6 +1293,8 @@ impl VllmKvManager {
                 } else {
                     0
                 },
+            // A rank whose host tier stores state holds its store sources, so
+            // this capacity has no pending reader.
             dependencies: Vec::new(),
         }
     }
@@ -1486,11 +1515,12 @@ impl VllmKvManager {
                         computed_after,
                     )
                     .map(|boundary| {
-                        lease
+                        let hash = lease
                             .state_hash(boundary, self.block_size)
-                            .expect("completed boundary block has a hash")
+                            .expect("completed boundary block has a hash");
+                        (boundary, hash)
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             }
             _ => Vec::new(),
         };
@@ -1506,11 +1536,25 @@ impl VllmKvManager {
         let checkpoint_hash =
             checkpoint_position.and_then(|position| lease.state_hash(position, self.block_size));
         let junction = lease.junction;
+        // A prompt pass hands the window boundaries it retained to the host
+        // tier, which keeps no G1 block for them.
+        if let Some(handoffs) = &mut self.state_handoffs
+            && computed_before < sequence.num_input_tokens()
+        {
+            for &(position, hash) in &window_hashes {
+                handoffs.push(StateHandoff {
+                    owner,
+                    hash,
+                    position,
+                    copies: Vec::new(),
+                });
+            }
+        }
         if let (Some(manager), Some(state)) = (&mut self.state_cache, &mut lease.state)
             && manager.sliding_window.is_some()
         {
             let mut removed = Vec::new();
-            for hash in window_hashes {
+            for (_, hash) in window_hashes {
                 manager.publish_window(&mut self.pool, state, hash, &mut removed);
             }
             manager.commit(&mut self.pool, state, computed_after, None);
@@ -1834,12 +1878,14 @@ impl VllmKvManager {
             let tokens = lease.allocated_tokens;
             // vLLM's post-load `cache_blocks` also caches a loaded state where a
             // later lookup of this prompt can resume: the last boundary before
-            // its final token, or the junction.
+            // its final token, or the junction. A sliding window is cached as
+            // a window copy instead, see `cache_restored_window`.
             let last_boundary =
                 (sequence.num_input_tokens() - 1) / self.block_size * self.block_size;
-            let publish = (tokens == last_boundary || lease.junction() == Some(tokens))
-                .then(|| lease.state_hash(tokens, self.block_size))
-                .flatten();
+            let publish = (manager.sliding_window.is_none()
+                && (tokens == last_boundary || lease.junction() == Some(tokens)))
+            .then(|| lease.state_hash(tokens, self.block_size))
+            .flatten();
             let state = lease.state.get_or_insert_with(Default::default);
             state.working = (0..manager.blocks_per_state)
                 .map(|_| self.pool.allocate_private(&mut reservation.pool))
@@ -1863,10 +1909,25 @@ impl VllmKvManager {
         self.pool.cancel(reservation.pool);
     }
 
+    /// Cache the window a host load restored at its boundary, as the pass
+    /// that computed it did, so a later request resumes there from G1. Like
+    /// that pass, it skips the copy when G1 has no room for it.
+    pub(crate) fn cache_restored_window(&mut self, lease: &mut BlockRequestLease) {
+        let hash = lease.state_hash(lease.allocated_tokens, self.block_size);
+        if let (Some(manager), Some(state), Some(hash)) =
+            (&mut self.state_cache, &mut lease.state, hash)
+        {
+            let mut removed = Vec::new();
+            manager.publish_window(&mut self.pool, state, hash, &mut removed);
+            self.publish_removed(removed);
+        }
+    }
+
     pub(crate) fn preempt_lease(&mut self, owner: Uuid, lease: &mut BlockRequestLease) {
         lease.debug_assert_owner(owner);
         lease.prefill_checkpoint = None;
         lease.junction = None;
+        lease.state_miss = None;
         if let (Some(manager), Some(state)) = (&mut self.state_cache, &mut lease.state) {
             manager.preempt(&mut self.pool, state);
         }
@@ -2042,6 +2103,60 @@ impl VllmKvManager {
         sequence: &RequestSequence,
         lease: &BlockRequestLease,
     ) -> PrefillCost {
+        self.lookup_prefill_cost(sequence, lease).0
+    }
+
+    /// [`Self::get_lease_prefill_cost`] of a waiting request, which repeats
+    /// its lookup every pass and keeps a [`StateMiss`] between them.
+    pub(crate) fn get_waiting_lease_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        if let Some(cost) = self.repeated_state_miss(sequence, lease) {
+            debug_assert_eq!(self.lookup_prefill_cost(sequence, lease).0.cached_tokens, 0);
+            return cost;
+        }
+        let (cost, miss) = self.lookup_prefill_cost(sequence, lease);
+        lease.state_miss = miss;
+        cost
+    }
+
+    /// The cost of a hybrid lookup that repeats one which found no restorable
+    /// state. No state became visible since, the block after the old attention
+    /// hit still misses and no host load landed a state on the lease, so its
+    /// scan would find nothing again. Preemption clears the miss, so the
+    /// sequence, and with it the logits cap, is the one the miss was found for.
+    fn repeated_state_miss(
+        &self,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+    ) -> Option<PrefillCost> {
+        let miss = lease.state_miss?;
+        let manager = self.state_cache.as_ref()?;
+        let repeats = miss.epoch == manager.lookup_epoch(&self.pool)
+            && lease
+                .state
+                .as_deref()
+                .is_none_or(|state| state.working.is_empty())
+            && lease
+                .sequence_hash(miss.overlap_blocks)
+                .and_then(|hash| self.pool.prefix_hit(hash))
+                .is_none();
+        repeats.then(|| PrefillCost {
+            new_blocks: lease.entries.len(),
+            new_tokens: sequence.len(),
+            cached_tokens: 0,
+            active_cached_tokens: 0,
+        })
+    }
+
+    /// The lookup, and the [`StateMiss`] a waiting request may keep from it.
+    fn lookup_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+    ) -> (PrefillCost, Option<StateMiss>) {
         let (mut overlap_blocks, mut active_overlap_blocks): (usize, usize) =
             if self.enable_prefix_caching && sequence.enable_prefix_caching() {
                 let mut overlap = 0;
@@ -2109,26 +2224,52 @@ impl VllmKvManager {
                     })
                     .unwrap_or(0);
                 let full = cached_tokens / self.block_size;
-                let active = lease.entries[..full]
-                    .iter()
-                    .filter(|e| {
-                        e.identity
-                            .sequence_hash
-                            .and_then(|h| self.pool.prefix_hit(h))
-                            .is_some_and(|hit| hit.is_active)
-                    })
-                    .count();
-                return PrefillCost {
+                let active_in = |entries: &[BlockLeaseEntry]| {
+                    entries
+                        .iter()
+                        .filter(|e| {
+                            e.identity
+                                .sequence_hash
+                                .and_then(|h| self.pool.prefix_hit(h))
+                                .is_some_and(|hit| hit.is_active)
+                        })
+                        .count()
+                };
+                // The hit ends inside the overlap, whose active blocks the
+                // walk counted: a second look at the shorter side of the hit
+                // gives the hit's own.
+                let active = if full <= overlap_blocks - full {
+                    active_in(&lease.entries[..full])
+                } else {
+                    active_overlap_blocks - active_in(&lease.entries[full..overlap_blocks])
+                };
+                let cost = PrefillCost {
                     new_blocks: lease.entries.len() - full,
                     new_tokens: sequence.len() - cached_tokens,
                     cached_tokens,
                     active_cached_tokens: active * self.block_size,
                 };
+                // With block-aligned boundaries and no speculative drop, the
+                // scan depends only on what `repeated_state_miss` checks.
+                let miss =
+                    (cached_tokens == 0 && unit == self.block_size && !manager.speculative_drop())
+                        .then(|| StateMiss {
+                            epoch: manager.lookup_epoch(&self.pool),
+                            overlap_blocks,
+                        });
+                return (cost, miss);
             }
         }
         if let Some(manager) = &self.state_cache {
             // Token policy bounds must be applied BEFORE selecting an actual
             // state checkpoint: truncating a joint hit afterwards can invent one.
+            // A host load's window, landed at its prefix end, is resumed
+            // there: the host lookup that chose the boundary applied its own
+            // bounds.
+            let landed = (lease.state.as_deref())
+                .filter(|state| manager.sliding_window.is_some() && !state.working.is_empty())
+                .map(|state| state.computed_tokens / self.block_size)
+                .filter(|&blocks| blocks <= overlap_blocks);
             let needs_logits = sequence.generated_tokens() < sequence.max_output_tokens();
             if needs_logits {
                 overlap_blocks =
@@ -2151,7 +2292,7 @@ impl VllmKvManager {
             if needs_logits && manager.mtp_enabled {
                 overlap_blocks = overlap_blocks.saturating_sub(1);
             }
-            overlap_blocks = find(overlap_blocks);
+            overlap_blocks = landed.unwrap_or_else(|| find(overlap_blocks));
             active_overlap_blocks = lease.entries[..overlap_blocks]
                 .iter()
                 .filter(|entry| {
@@ -2166,12 +2307,13 @@ impl VllmKvManager {
         let new_blocks = lease.entries.len() - overlap_blocks;
         let cached_tokens = (overlap_blocks * self.block_size).min(sequence.len());
         let active_cached_tokens = (active_overlap_blocks * self.block_size).min(sequence.len());
-        PrefillCost {
+        let cost = PrefillCost {
             new_blocks,
             new_tokens: sequence.len() - cached_tokens,
             cached_tokens,
             active_cached_tokens,
-        }
+        };
+        (cost, None)
     }
 
     /// The shared-prefix junction of a fresh lookup: the attention hit when it

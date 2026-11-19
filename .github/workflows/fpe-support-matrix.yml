@@ -159,7 +159,15 @@ jobs:
     environment: ${{ inputs.pr_number == '' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Discover matrix shards
     needs: prepare-wheel
-    runs-on: ubuntu-24.04
+    # Wheel payloads require NVIDIA-internal Artifactory DNS/network access.
+    runs-on: prod-aisim-default-amd64-v1
+    timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
+    container:
+      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
+      env:
+        USER: runner
     outputs:
       shards: ${{ steps.shards.outputs.shards }}
       required-probes: ${{ steps.shards.outputs.required_probes }}
@@ -280,7 +288,14 @@ jobs:
     environment: ${{ inputs.pr_number == '' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Qualify and build FPE support matrix
     needs: [generate, discover-shards, prepare-wheel]
-    runs-on: ubuntu-24.04
+    runs-on: prod-aisim-default-amd64-v1
+    timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
+    container:
+      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
+      env:
+        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -295,6 +310,9 @@ jobs:
         with:
           pattern: fpe-support-matrix-*
           path: fpe-support-matrix
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
       - uses: ./.github/actions/wheel-storage
         with:
           scope: ${{ inputs.pr_number != '' && 'pr' || ((github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'official' || 'preview') }}

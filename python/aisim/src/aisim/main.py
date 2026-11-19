@@ -34,6 +34,9 @@ from .config_adapter import (
 from .detail import build_prediction_details, energy_diagnostics
 from .estimator_readiness import perf_data_missing_message
 from .output import (
+    OutputDirectoryOwnership,
+    adopt_inherited_output_lock,
+    discard_inherited_output_lock,
     format_recommendation_stdout,
     prepare_output_directory,
     write_fpm_coverage,
@@ -166,8 +169,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     capture_telemetry = args.capture_telemetry or args.export_html
     if capture_telemetry and (args.stack != "engine" or args.online):
         raise ValueError("telemetry capture requires offline --stack engine")
-    if config.traffic.load.agentic_warmup_policy != "repeated_prefixes" and (args.stack != "engine" or args.online):
-        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
+    if config.traffic.load.agentic_warmup_policy != "repeated_prefixes" and args.online:
+        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} requires offline execution")
     if (
         config.engine.speculation is not None
         and config.engine.speculation.kind == "ngram"
@@ -245,8 +248,8 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         telemetry = native.get("telemetry")
         if not isinstance(telemetry, dict):
             raise RuntimeError("selected stack did not provide replay telemetry")
-        native = {**native, "telemetry": write_telemetry(root, telemetry)}
-    report_path = write_prediction_report(root, native)
+        native = {**native, "telemetry": write_telemetry(root, telemetry, exclusive=True)}
+    report_path = write_prediction_report(root, native, exclusive=True)
     write_afd_qualification_artifacts(root, spec, memory=native.get("afd_memory"))
     if args.capture_per_request:
         records = native.get("per_request")
@@ -254,7 +257,7 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
             raise RuntimeError("selected stack did not provide per-request prediction records")
         if any(not isinstance(record, dict) for record in records):
             raise RuntimeError("per-request records must be JSON mappings")
-        write_requests(root, records)
+        write_requests(root, records, exclusive=True)
     phases = result.report.metadata.get("agentic_phases")
     preparation_aborted = isinstance(phases, dict) and phases.get("phase") == "aborted"
     if preparation_aborted:
@@ -319,12 +322,6 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     output_adapters = resolve_output_adapters(output_configs)
     core_raw, adapter_raw = split_config_sections(raw, command="recommend")
     config = CoreRecommendationConfig.model_validate(core_raw)
-    if (
-        config.traffic is not None
-        and config.traffic.load.agentic_warmup_policy != "repeated_prefixes"
-        and args.stack != "engine"
-    ):
-        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
     adapters = _resolve_section_adapters(adapter_raw, args.stack)
     result = run_recommendation(
         config,
@@ -376,8 +373,8 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         [(candidate_id, concrete) for candidate_id, _, concrete in selected]
     )
     root = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
-    result_path = write_recommendation_result(root, result)
-    write_recommendation_csv(root, result)
+    result_path = write_recommendation_result(root, result, exclusive=True)
+    write_recommendation_csv(root, result, exclusive=True)
     if folded:
         sys.stderr.write(
             f"Folded {folded} scheduler-limit variant(s) with identical predicted metrics; "
@@ -386,7 +383,7 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     if not selected:
         sys.stderr.write(f"no feasible candidate found; saved full result to: {result_path}\n")
         return 3 if getattr(result.counts, "resource_limited", 0) else 1
-    paths = write_recommendations(root, [config for _, _, config in selected])
+    paths = write_recommendations(root, [config for _, _, config in selected], exclusive=True)
     try:
         write_output_adapters(
             output_adapters,
@@ -433,7 +430,19 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
+    # A supervised worker writes under its supervisor's output-directory lock;
+    # a direct call takes its own. Either way the lock ends with this command.
+    with OutputDirectoryOwnership():
+        adopt_inherited_output_lock()
+        try:
+            return _main(argv, _prepared_config=_prepared_config)
+        finally:
+            # Parsing or validation can exit before any preparation claims it.
+            discard_inherited_output_lock()
+
+
+def _main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     if args.command == "onboard":
@@ -456,10 +465,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except StackResolutionError as exc:
         parser.error(str(exc))
     try:
-        raw = _load_mapping(args.config)
-        # Paths written in the file start at the file's folder; --set paths start at the working directory.
-        raw = anchor_paths(raw, config_folder(args.config), args.command)
-        _apply_overrides(raw, args.overrides, command=args.command)
+        if _prepared_config is None:
+            raw = _load_mapping(args.config)
+            # Paths written in the file start at the file's folder; --set paths start at the working directory.
+            raw = anchor_paths(raw, config_folder(args.config), args.command)
+            _apply_overrides(raw, args.overrides, command=args.command)
+        else:
+            raw = _prepared_config
         if args.command == "predict":
             return _predict(args, raw, factory)
         return _recommend(args, raw, factory)

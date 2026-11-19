@@ -472,6 +472,7 @@ class RunnerCapabilities:
     supports_generic_speculation: bool = False
     supports_tokenization: bool = False
     supports_detokenization: bool = False
+    supports_scheduler_launch: bool = False
     supports_deferred_encoder_overlay: bool = False
     supports_mtp_host_offload: bool = False
 
@@ -518,6 +519,20 @@ class RunnerCapabilities:
             raise ValueError(
                 f"ReplaySpec API version {api_version} is incompatible with "
                 f"runner version {self.replay_spec_api_version}"
+            )
+
+    def require_agentic_warmup_policy(self, policy: str) -> None:
+        """Raise when the runner does not advertise an agentic warmup policy."""
+
+        if policy not in {"repeated_prefixes", "live_trajectory_v1", "primers_only"}:
+            raise ValueError("unknown agentic_warmup_policy")
+        if policy == "live_trajectory_v1" and not self.supports_agentic_live_warmup:
+            raise ValueError(
+                "runner does not support live agentic warmup; update the adapter before selecting live_trajectory_v1"
+            )
+        if policy == "primers_only" and not self.supports_agentic_primers_only:
+            raise ValueError(
+                "runner does not support primers-only agentic warmup; update the adapter before selecting primers_only"
             )
 
     def require_compatible(self, spec: ReplaySpec) -> None:
@@ -688,6 +703,13 @@ class RunnerCapabilities:
                 raise ValueError("runner does not support engine.detokenization; use --stack engine")
             if spec.execution_mode != "offline":
                 raise ValueError("engine.detokenization requires offline replay")
+        agg_rank = (deployment.agg_engine_args or {}).get("rank", deployment.agg_engine_args)
+        if isinstance(agg_rank, Mapping) and agg_rank.get("launch") is not None:
+            # Only offline replay releases the outputs a vLLM rank holds until it returns them.
+            if not self.supports_scheduler_launch:
+                raise ValueError("runner does not support scheduler.launch; use --stack engine")
+            if spec.execution_mode != "offline":
+                raise ValueError("scheduler.launch requires offline replay")
         if deployment.encoder is not None and deployment.deployment_mode not in {"agg", "disagg"}:
             raise ValueError("encoder pools support only agg/disagg language deployments; AFD is unsupported")
         if deployment.encoder is not None:
@@ -757,22 +779,11 @@ class RunnerCapabilities:
             "primers_only",
         }:
             raise ValueError("unknown agentic_warmup_policy")
-        if warmup_policy == "live_trajectory_v1":
-            if not agentic_warmup or agentic_profile is None:
-                raise ValueError("live_trajectory_v1 requires agentic_warmup and agentic_profile")
-            if not self.supports_agentic_live_warmup:
-                raise ValueError(
-                    "runner does not support live agentic warmup; "
-                    "update the adapter before selecting live_trajectory_v1"
-                )
-        if warmup_policy == "primers_only":
-            if not agentic_warmup:
-                raise ValueError("primers_only requires agentic_warmup")
-            if not self.supports_agentic_primers_only:
-                raise ValueError(
-                    "runner does not support primers-only agentic warmup; "
-                    "update the adapter before selecting primers_only"
-                )
+        if warmup_policy == "live_trajectory_v1" and (not agentic_warmup or agentic_profile is None):
+            raise ValueError("live_trajectory_v1 requires agentic_warmup and agentic_profile")
+        if warmup_policy == "primers_only" and not agentic_warmup:
+            raise ValueError("primers_only requires agentic_warmup")
+        self.require_agentic_warmup_policy(warmup_policy)
         if agentic_snapshot is not None:
             try:
                 snapshot = AgenticSnapshotOptions.model_validate(agentic_snapshot)

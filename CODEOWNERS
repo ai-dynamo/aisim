@@ -74,6 +74,7 @@
 /tests/test_agentx_g2.py                               @ai-dynamo/aisim-replay-codeowners
 /tests/test_ngram_cli.py                               @ai-dynamo/aisim-replay-codeowners
 /tests/test_cli_config.py                              @ai-dynamo/aisim-replay-codeowners
+/tests/test_output_lock.py                             @ai-dynamo/aisim-replay-codeowners
 /tests/test_unified_cli.py                             @ai-dynamo/aisim-replay-codeowners
 /tests/test_shared_g2_cli.py                           @ai-dynamo/aisim-replay-codeowners
 /tests/test_aiperf_metrics.py                          @ai-dynamo/aisim-replay-codeowners
@@ -123,6 +124,7 @@
 /tests/test_bundled_configs.py                         @ai-dynamo/aisim-infra-codeowners
 /tests/test_ci_qualification.py                        @ai-dynamo/aisim-infra-codeowners
 /tests/test_e2e_accuracy_ui.mjs                        @ai-dynamo/aisim-infra-codeowners
+/tests/test_full_ci_fail_fast.py                       @ai-dynamo/aisim-infra-codeowners
 /tests/test_source_compliance.py                       @ai-dynamo/aisim-infra-codeowners
 /tests/test_benchmark_features.py                      @ai-dynamo/aisim-infra-codeowners
 /tests/test_cloud_agent_install.py                     @ai-dynamo/aisim-infra-codeowners
@@ -146,6 +148,7 @@
 
 # --- Shared ownership: multi-team (any one approves; wins via last-match) ---
 /pages/                                                @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
+/skills/                                               @ai-dynamo/access-aisim-maintain
 /.cursor/                                              @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /docs/ci/                                              @ai-dynamo/aisim-infra-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /scripts/                                              @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
@@ -207,6 +210,7 @@
 /tests/test_cli_config.py                              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_pages_site.py                              @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /crates/core/src/python.rs                             @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
+/tests/test_output_lock.py                             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_unified_cli.py                             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /crates/core/src/perfmodel/                            @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/.dockerignore                            @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
@@ -281,6 +285,7 @@
 /.claude/skills/aisim-replay-performance               @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/access-aisim-maintain
 /.agents/skills/aisim-replay-performance/              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/tools/simulation_perf_gate/              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
+/.github/workflows/request-nvskills-ci.yml             @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/resource_worker.py             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/resource_scheduler.py          @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/.github/workflows/codeowners.yml         @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain

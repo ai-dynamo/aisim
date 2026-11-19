@@ -143,8 +143,8 @@ class _Parent:
         self.child_commands: list[list[str]] = []
         monkeypatch.setattr(supervision, "run_process", self._child)
 
-    def _child(self, command, *, policy, events_output):
-        del policy, events_output
+    def _child(self, command, *, policy, events_output, output_lock=None):
+        del policy, events_output, output_lock
         self.child_commands.append(command)
         return {"status": "completed", "exit_code": self.child_exit_code}
 
@@ -979,9 +979,9 @@ def test_saved_dump_of_a_config_with_the_new_key_warns_when_read_back(config_dir
     assert f"{OLD_PATHS}, engine.systems_paths" in str(warning.message)
 
 
-def _child_in_process(command, *, policy, events_output):
+def _child_in_process(command, *, policy, events_output, output_lock=None):
     """Stand in for the supervised process: run the child CLI here and report its exit code."""
-    del policy, events_output
+    del policy, events_output, output_lock
     return {"status": "completed", "exit_code": cli.main(command[command.index("cli") + 1 :])}
 
 

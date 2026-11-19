@@ -173,6 +173,7 @@ pub(crate) struct SglangArgs {
     pub chunked_prefill_size: Option<usize>,
     pub clip_max_new_tokens: Option<usize>,
     pub schedule_conservativeness: Option<f64>,
+    pub scheduler_select_time_ms: f64,
     pub vlm_cache_bytes: Option<u64>,
     pub host_loop: bool,
     pub disaggregation_decode_enable_radix_cache: bool,
@@ -210,6 +211,9 @@ pub(crate) struct MockEngineArgs {
     /// `EngineConfig::max_concurrent_batches`.
     #[builder(default = "1")]
     pub max_concurrent_batches: usize,
+    /// `EngineConfig::launch`.
+    #[builder(default = "None")]
+    pub launch: Option<crate::engine::PassLaunchConfig>,
     #[builder(default = "true")]
     pub enable_prefix_caching: bool,
     #[builder(default = "true")]

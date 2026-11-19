@@ -267,13 +267,23 @@ where
         sink: ReplayTelemetryCaptureSink,
     ) -> Self {
         sink.set_preparing(self.admission.is_agentic_preparing());
-        let mut runtime = self.with_telemetry_observer(interval_ms, Box::new(sink.clone()));
+        let mut runtime = self.with_telemetry_runtime(interval_ms, Box::new(sink.clone()));
         runtime.telemetry_capture = Some(sink);
         runtime.collector.set_capture_per_request(true);
         runtime
     }
 
     pub(crate) fn with_telemetry_observer(
+        mut self,
+        sample_interval_ms: f64,
+        observer: Box<dyn ReplayTelemetryObserver>,
+    ) -> Self {
+        // Observers can drive closed-loop policies; capture exports stay unchanged.
+        self.collector.enable_completion_feedback();
+        self.with_telemetry_runtime(sample_interval_ms, observer)
+    }
+
+    fn with_telemetry_runtime(
         mut self,
         sample_interval_ms: f64,
         observer: Box<dyn ReplayTelemetryObserver>,
@@ -566,7 +576,10 @@ where
             next_event_ms
         };
         let next_internal_deadline_ms = choose_next_timestamp(
-            self.engine.next_internal_deadline_ms(),
+            choose_next_timestamp(
+                self.engine.next_internal_deadline_ms(),
+                self.engine.next_emission_ms(),
+            ),
             self.encoder
                 .as_ref()
                 .and_then(EncoderPool::next_deadline_ms),
@@ -765,6 +778,22 @@ where
             self.admission.defer_terminal(uuid, self.now_ms, status)?;
         }
         Ok(changed)
+    }
+
+    /// Deliver the outputs that workers held past their passes and release
+    /// now (vLLM `launch`).
+    fn apply_due_emissions(&mut self) -> anyhow::Result<bool> {
+        if self
+            .engine
+            .next_emission_ms()
+            .is_none_or(|at_ms| at_ms > self.now_ms)
+        {
+            return Ok(false);
+        }
+        for payload in self.engine.take_due_emissions(self.now_ms)? {
+            self.process_worker_completion_payload(payload)?;
+        }
+        Ok(true)
     }
 
     /// Drain all worker-completion events scheduled for the current logical timestamp.
@@ -1175,6 +1204,9 @@ where
             let released = self.placement.advance_clock(self.now_ms)?;
             changed |= !released.is_empty();
             self.dispatch_placements(released)?;
+            // Outputs held from an earlier pass leave before those of a pass
+            // that completes now.
+            changed |= self.apply_due_emissions()?;
             let completed = self.apply_worker_completions()?;
             changed |= completed;
             if completed {
@@ -1203,6 +1235,8 @@ where
             if self.admission.holds_passes() {
                 continue;
             }
+            // A pass formed now can release the previous pass's outputs at once.
+            changed |= self.apply_due_emissions()?;
             let removed = self
                 .engine
                 .try_remove_drained()
@@ -1294,6 +1328,10 @@ where
             })
             .collect();
         let snapshot = ReplayTelemetrySnapshot {
+            // A baseline is gauge-only: pending latency pairs wait for the next sample.
+            completion_feedback: self
+                .collector
+                .completion_feedback_snapshot(kind != ReplayTelemetrySampleKind::Baseline),
             host_caches,
             sample_ordinal,
             kind,
@@ -1524,6 +1562,7 @@ where
             || telemetry.has_observations()
             || self.traffic.telemetry_has_observations()
             || self.engine.telemetry_has_interval_observations()
+            || self.collector.completion_feedback_pending()
         {
             self.publish_telemetry_sample(ReplayTelemetrySampleKind::Final)?;
         }
@@ -2999,6 +3038,13 @@ mod agentic_warmup_tests {
                 );
                 let capture = sink.finish(&mut report, true);
                 assert_eq!(capture.requests.len(), 1);
+                // Completion feedback is an observer contract; capture exports omit it.
+                assert!(
+                    capture
+                        .samples
+                        .iter()
+                        .all(|sample| sample.sample.completion_feedback.is_none())
+                );
                 let request = &capture.requests[0].request;
                 let tokens: u64 = capture
                     .samples
