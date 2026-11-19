@@ -81,9 +81,19 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
             add("duplicate-role", f"role {ROLE_LEGACY_PROFILE!r} must appear exactly once")
         for artifact in manifest.artifacts:
             try:
-                _verify(root, artifact)
+                verified = _verify(root, artifact)
             except (OSError, ValueError) as exc:
                 add("hash-mismatch", f"{artifact.role}: {exc}")
+                continue
+            if artifact.role == ROLE_LEGACY_PROFILE:
+                from aisim_core.fpm_profile import load_fpm_profile
+
+                try:
+                    if artifact.format != "json":
+                        raise ValueError("fpm-profile artifact must be JSON")
+                    load_fpm_profile(verified.read_text())
+                except (OSError, ValueError) as exc:
+                    add("invalid-profile", f"{artifact.role}: {str(exc).splitlines()[0]}")
         return found
     for role in (ROLE_LIBRARY, ROLE_METADATA):
         count = len(by_role.get(role, ()))

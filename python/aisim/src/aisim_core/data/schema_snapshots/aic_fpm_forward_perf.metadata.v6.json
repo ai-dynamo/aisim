@@ -4,6 +4,13 @@
       "additionalProperties": false,
       "allOf": [
         {
+          "else": {
+            "properties": {
+              "blocks_per_request": {
+                "type": "null"
+              }
+            }
+          },
           "if": {
             "properties": {
               "kind": {
@@ -23,6 +30,28 @@
             },
             "required": [
               "blocks_per_request"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "convolution"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sliding_window": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "sliding_window"
             ]
           }
         }
@@ -430,11 +459,13 @@
         },
         "max_batch_size": {
           "exclusiveMinimum": 0,
+          "maximum": 4294967295,
           "title": "Max Batch Size",
           "type": "integer"
         },
         "max_num_tokens": {
           "exclusiveMinimum": 0,
+          "maximum": 4294967295,
           "title": "Max Num Tokens",
           "type": "integer"
         },
@@ -627,6 +658,32 @@
         }
       ],
       "default": null,
+      "properties": {
+        "cp": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "dp": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "moe_ep": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "moe_tp": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pp": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tp": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "title": "Configuration Selector"
     },
     "coordinate_system": {
