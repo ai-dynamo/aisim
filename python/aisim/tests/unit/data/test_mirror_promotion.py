@@ -1556,6 +1556,7 @@ def _manifest_sidecar(root, manifest_rel, name, payload, fmt, role, schema):
         (b'endpoint: "https://node.corp.nvidia.com"\n', "internal-host"),
         (b'authorization: "\\u0068f_aaaaaaaaaaaaaaaaaaaaaaaa"\n', "secret"),
         (b"bad: [\n", "yaml-invalid"),
+        (b"setting: !!bool unknown\n", "yaml-invalid"),
         (b'!!python/object/apply:os.system ["true"]\n', "yaml-invalid"),
     ],
 )
@@ -2269,3 +2270,179 @@ def test_promotion_preserves_noncanonical_category_index(tmp_path, monkeypatch, 
     assert updated.categories["e2e"].index.path == "data/indexes/existing.json"
     assert validate_tree(target, profile="public").configurations == 2
     assert (target / manifests[0]).is_file()
+
+
+def test_evidence_duplicate_keys_are_rejected(tmp_path):
+    root, _ = _mirror(tmp_path)
+    directory = _evidence(root)
+    path = directory / "evidence-manifest.json"
+    text = path.read_text()
+    assert validate_tree(root).ok
+    path.write_text(text.replace('"kind": "raw-bundle"', '"kind": "log", "kind": "raw-bundle"', 1))
+    report = validate_tree(root)
+    assert any(f.code == "document-invalid" and "duplicate JSON key" in f.message for f in report.errors)
+
+
+@pytest.mark.parametrize("name", ["snapshot.JSON", "frozen-view.JSON"])
+def test_uppercase_snapshot_documents_reach_publication_checks(tmp_path, name):
+    root, directories = _snapshot_mirror(tmp_path)
+    original = root / directories[1] / "snapshot.json"
+    renamed = original.with_name(name)
+    original.rename(renamed)
+    report = validate_tree(root)
+    assert report.ok, report.errors
+    assert not any(f.code == "orphan-file" for f in report.findings)
+    request = _request(root, directories)
+    draft = plan_promotion(root, request, _reviewers())
+    plan = plan_promotion(root, _request(root, directories, draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    assert (target / renamed.relative_to(root)).read_bytes() == renamed.read_bytes()
+    assert validate_tree(target, profile="public").ok
+
+
+@pytest.mark.parametrize("which", ["members", "acquisition"])
+def test_snapshot_artifacts_must_be_in_the_approved_selection(tmp_path, which):
+    from aisim_core.data.e2e import read_snapshot
+
+    root, directories = _snapshot_mirror(
+        tmp_path, acquisition={"acquired_at": "2026-11-07T00:00:00Z", "source_uri": "https://example.test"}
+    )
+    document = root / directories[1] / "snapshot.json"
+    snapshot, _ = read_snapshot(root, str(document.relative_to(root)))
+    artifact = getattr(snapshot, which)
+    outside = root / "data/elsewhere" / Path(artifact.path).name
+    outside.parent.mkdir(parents=True)
+    (root / artifact.path).rename(outside)
+    moved = artifact.model_copy(update={"path": str(outside.relative_to(root))})
+    document.write_text(snapshot.model_copy(update={which: moved}).model_dump_json(by_alias=True))
+    assert validate_tree(root).ok
+    plan = plan_promotion(root, _request(root, directories), _reviewers())
+    assert any(f.code == "closure" and moved.path in f.message for f in plan.findings)
+    assert not plan.content_ok
+
+
+def test_lineage_uses_the_governing_visibility_entry(tmp_path):
+    root, directory = _promotable(tmp_path)
+    relative = f"{directory}/metrics.parquet"
+    write_ledger(
+        root,
+        VisibilityLedger(
+            entries=[
+                VisibilityEntry(path=directory, label="public", original_sha256={relative: "a" * 64}),
+                VisibilityEntry(path=relative, label="public", original_sha256={relative: "b" * 64}),
+            ]
+        ),
+    )
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    ledger = apply_promotion(plan, root, _target(tmp_path))
+    assert json.loads(ledger.read_text())["original_sha256"] == {relative: "b" * 64}
+
+
+def test_observation_provenance_classifies_configuration_and_eval(tmp_path):
+    root = tmp_path / "mirror"
+    root.mkdir()
+    config = _config()
+    config = dataclasses.replace(
+        config, observations=[o.model_copy(update={"source_kind": "inferencex"}) for o in config.observations]
+    )
+    manifest = write_configuration(root, config, prefix="data")
+    register_manifests(root, [manifest], INTERNAL_REPO)
+    record = _eval(root, [config.body.configuration_id()])
+    build_catalog(root)
+    directories = [str(Path(manifest).parent), str(record.parent.relative_to(root))]
+    _public(root, *directories)
+    assert validate_tree(root).ok
+    plan = plan_promotion(root, _request(root, directories), _reviewers())
+    blocked = {f.path for f in plan.findings if f.code == "infx-aggregates-only"}
+    assert manifest in blocked and str(record.relative_to(root)) in blocked
+    report = validate_tree(root, profile="public")
+    blocked = {f.path for f in report.errors if f.code == "infx-aggregates-only"}
+    assert manifest in blocked and str(record.relative_to(root)) in blocked
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_operation_parquet_producer_reaches_both_publication_gates(tmp_path, dirty):
+    import pyarrow.parquet as pq
+
+    root, directory, relative = _op_mirror(tmp_path, "kernel_source", "synthetic-kernel")
+    path = root / relative
+    created_by = pq.ParquetFile(path).metadata.created_by.encode()
+    replacement = (b"node7.corp.nvidia.com" if dirty else b"public-writer").ljust(len(created_by), b" ")
+    assert len(replacement) == len(created_by)
+    path.write_bytes(path.read_bytes().replace(created_by, replacement))
+    _refresh_artifact(root, directory, relative)
+    assert validate_tree(root).ok
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert any(f.code == "internal-host" and f.path == relative for f in plan.findings) is dirty
+    shutil.rmtree(root / "mirror")  # the private visibility ledger is not part of the public dataset
+    report = validate_tree(root, profile="public")
+    assert report.ok is (not dirty)
+    assert any(f.code == "internal-host" and f.path == relative for f in report.errors) is dirty
+
+
+@pytest.mark.parametrize("location", ["dataset", "category", "noncanonical-category"])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_dataset_indexes_receive_public_disclosure_checks(tmp_path, location, dirty):
+    from aisim_core.data import DatasetIndex
+
+    root, _ = _mirror(tmp_path, repo=PUBLIC)
+    dataset_path = root / "catalog/dataset.json"
+    dataset = json.loads(dataset_path.read_bytes())
+    ref = dataset["categories"]["e2e"]["index"]
+    category_path = root / ref["path"]
+    value = "node7.corp.nvidia.com" if dirty else "public-index"
+    if location == "dataset":
+        ref["artifact_id"] = value
+    else:
+        category = json.loads(category_path.read_bytes())
+        category["entries"][0]["manifest"]["artifact_id"] = value
+        if location == "noncanonical-category":
+            old = category_path
+            category_path = root / "data/indexes/custom.JSON"
+            category_path.parent.mkdir(parents=True)
+            old.unlink()
+            ref["path"] = str(category_path.relative_to(root))
+        category_path.write_text(json.dumps(category))
+        ref.update(sha256=hashlib.sha256(category_path.read_bytes()).hexdigest(), bytes=category_path.stat().st_size)
+    dataset_path.write_text(DatasetIndex.model_validate(dataset).model_dump_json(by_alias=True))
+    assert validate_tree(root).ok
+    report = validate_tree(root, profile="public")
+    assert report.ok is (not dirty), report.errors
+    relative = str((dataset_path if location == "dataset" else category_path).relative_to(root))
+    assert any(f.code == "internal-host" and f.path == relative for f in report.errors) is dirty
+
+
+@pytest.mark.parametrize("mutation", ["remove-file", "replace-hash", "clear-findings"])
+def test_apply_rechecks_the_approved_digest_before_writing(tmp_path, mutation):
+    root, _, plan = _approved(tmp_path)
+    if mutation == "clear-findings":
+        plan = plan_promotion(root, plan.request.model_copy(update={"approvals": []}), _reviewers())
+        plan.findings.clear()
+    elif mutation == "remove-file":
+        plan.files.pop(next(iter(plan.files)))
+    else:
+        plan.files[next(iter(plan.files))] = "0" * 64
+    target = tmp_path / "target"
+    with pytest.raises(PromotionError, match="approved digest"):
+        apply_promotion(plan, root, target)
+    assert not target.exists()
+
+
+def test_apply_refuses_an_unapproved_configuration_added_to_the_plan(tmp_path):
+    root, manifests = _mirror(tmp_path, dev=("synthetic/model-a", "synthetic/model-b"))
+    directories = [str(Path(manifest).parent) for manifest in manifests]
+    _public(root, *directories)
+    draft = plan_promotion(root, _request(root, directories[:1]), _reviewers())
+    plan = plan_promotion(root, _request(root, directories[:1], draft), _reviewers())
+    assert plan.ok, plan.findings
+    for path in (root / directories[1]).rglob("*"):
+        if path.is_file():
+            plan.files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    plan.manifests.append(manifests[1])
+    target = tmp_path / "target"
+    with pytest.raises(PromotionError, match="approved digest"):
+        apply_promotion(plan, root, target)
+    assert not target.exists()

@@ -200,12 +200,7 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
                 if suffix == ".yaml":
                     yaml_sidecar_value(head)
                 else:
-                    json.loads(
-                        head.decode("utf-8"),
-                        parse_constant=_reject_constant,
-                        parse_float=_finite_float,
-                        object_pairs_hook=_unique_json_keys,
-                    )
+                    json_sidecar_value(head)
             except (UnicodeDecodeError, ValueError, RecursionError) as exc:
                 out.append(Finding(f"{kind}-invalid", f"not strict UTF-8 {kind.upper()}: {exc}", path))
     return out
@@ -220,7 +215,63 @@ def _unique_json_keys(pairs):
     return result
 
 
+def json_sidecar_value(data: bytes):
+    """Parse strict UTF-8 JSON, rejecting ambiguous keys and non-finite numbers."""
+    return json.loads(
+        data.decode("utf-8"),
+        parse_constant=_reject_constant,
+        parse_float=_finite_float,
+        object_pairs_hook=_unique_json_keys,
+    )
+
+
+def _check_yaml_merge_budget(root, limit=100_000):
+    """Bound the composed graph before SafeLoader materializes flattened merge pairs."""
+    sizes = {}
+    active = set()
+    total = 0
+
+    def visit(node):
+        nonlocal total
+        marker = id(node)
+        if marker in active:
+            raise ValueError("cyclic YAML aliases are not supported")
+        if marker in sizes:
+            return sizes[marker]
+        active.add(marker)
+        size = 0
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                visit(key)
+                visit(value)
+                if key.tag == "tag:yaml.org,2002:merge":
+                    sources = value.value if isinstance(value, yaml.SequenceNode) else [value]
+                    size += sum(visit(source) for source in sources)
+                else:
+                    size += 1
+                if size > limit:
+                    raise ValueError("YAML merge expansion exceeds the pair budget")
+            total += size
+            if total > limit:
+                raise ValueError("YAML merge expansion exceeds the pair budget")
+        elif isinstance(node, yaml.SequenceNode):
+            for child in node.value:
+                visit(child)
+        active.remove(marker)
+        sizes[marker] = size
+        return size
+
+    visit(root)
+
+
 class _SidecarLoader(yaml.SafeLoader):
+    def get_single_data(self):
+        node = self.get_single_node()
+        if node is None:
+            return None
+        _check_yaml_merge_budget(node)
+        return self.construct_document(node)
+
     def construct_mapping(self, node, deep=False):
         # Check explicit keys before flattening merges: an explicit override of a
         # merged default is valid YAML, while repeated explicit settings are ambiguous.
@@ -242,7 +293,7 @@ def yaml_sidecar_value(data: bytes):
     """Safely read operation metadata; retain shared YAML aliases without expanding them."""
     try:
         value = yaml.load(data.decode("utf-8"), Loader=_SidecarLoader)
-    except (yaml.YAMLError, RecursionError) as exc:
+    except (yaml.YAMLError, RecursionError, KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"invalid YAML sidecar: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("YAML sidecar must contain a mapping")

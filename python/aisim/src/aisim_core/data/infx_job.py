@@ -29,6 +29,7 @@ import sys
 import tempfile
 import urllib.request
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,11 +76,44 @@ def load_state(root: Path) -> dict[str, Any]:
     return state
 
 
-def save_state(root: Path, state: Mapping[str, Any]) -> None:
-    path = Path(root) / STATE_FILE
-    with tempfile.NamedTemporaryFile("w", dir=root, delete=False) as handle:
-        handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
-    os.replace(handle.name, path)
+@contextmanager
+def _state_lock(root: Path):
+    """Serialize state commits; stale locks after a crash need operator inspection."""
+    lock = root.resolve().parent / f".{root.resolve().name}.ingestion-state.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise InfxError("another writer is updating ingestion state; retry the operation") from exc
+    try:
+        yield
+    finally:
+        os.close(fd)
+        lock.unlink()
+
+
+def _check_state(root: Path, expected: Mapping[str, Any] | None) -> None:
+    if expected is not None and load_state(root) != expected:
+        raise InfxError("ingestion state changed during the operation; retry with current state")
+
+
+def _save_state(root: Path, state: Mapping[str, Any]) -> None:
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=root, delete=False) as handle:
+            pending = Path(handle.name)
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(pending, root / STATE_FILE)
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
+
+
+def save_state(root: Path, state: Mapping[str, Any], *, expected: Mapping[str, Any] | None = None) -> None:
+    """Replace state under a writer lock, refusing stale acquisition/promotion results."""
+    root = Path(root)
+    with _state_lock(root):
+        _check_state(root, expected)
+        _save_state(root, state)
 
 
 def _members_of(root: Path, entry: Mapping[str, Any] | None) -> dict[str, str]:
@@ -126,6 +160,7 @@ def run_ingestion(
     kwargs = {"sleep": sleep} if sleep else {}
     client = InfxClient(transport, policy, **kwargs)
     state = load_state(root)
+    expected = dict(state)
     qualified, candidate = state.get("qualified"), state.get("candidate")
     try:
         prior = _members_of(root, qualified)
@@ -149,14 +184,19 @@ def run_ingestion(
     if plan.snapshot_id in known:
         read_snapshot(root, snapshot_path(plan.snapshot_id))
         return RunResult("unchanged", plan.snapshot_id, requests_made=acq.requests_made)
-    path = write_candidate(root, acq, plan)
-    state["candidate"] = {
-        "snapshot_id": plan.snapshot_id,
-        "snapshot_path": path,
-        "created_at": _stamp(clock()),
-        "change_counts": {k: len(v) for k, v in changes.items()},
-    }
-    save_state(root, state)
+    try:
+        with _state_lock(root):
+            _check_state(root, expected)  # stale acquisitions must not stage any candidate bytes
+            path = write_candidate(root, acq, plan)
+            state["candidate"] = {
+                "snapshot_id": plan.snapshot_id,
+                "snapshot_path": path,
+                "created_at": _stamp(clock()),
+                "change_counts": {k: len(v) for k, v in changes.items()},
+            }
+            _save_state(root, state)
+    except InfxError as exc:
+        return RunResult("failed", error=str(exc), requests_made=acq.requests_made)
     warnings = [f"availability lags benchmarks: {u}" for u in acq.undeclared]
     return RunResult("candidate", plan.snapshot_id, changes, warnings, requests_made=acq.requests_made)
 
@@ -167,6 +207,7 @@ def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = 
     if not reviewer.strip():
         raise PromotionError("promotion requires a named reviewer")
     state = load_state(root)
+    expected = dict(state)
     candidate = state.get("candidate")
     if not candidate or candidate["snapshot_id"] != snapshot_id:
         raise PromotionError(f"{snapshot_id} is not the pending candidate")
@@ -174,7 +215,10 @@ def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = 
     verify_snapshot_members(root, members)
     state["qualified"] = {**candidate, "qualified_at": _stamp(now or datetime.now(UTC)), "reviewer": reviewer}
     state["candidate"] = None
-    save_state(root, state)
+    try:
+        save_state(root, state, expected=expected)
+    except InfxError as exc:
+        raise PromotionError(str(exc)) from exc
     return state["qualified"]
 
 

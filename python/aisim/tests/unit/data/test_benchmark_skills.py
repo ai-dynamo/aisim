@@ -530,3 +530,35 @@ def test_partial_accuracy_is_evaluate_only_and_catalog_download_is_sufficient(bu
         == 0
     )
     assert not json.loads(capsys.readouterr().out)["cells"]["reuse"]
+
+
+@pytest.mark.parametrize("escape", ["absolute", "parent", "symlink"])
+def test_attestation_confines_identity_directories(built_record, tmp_path, escape):  # noqa: F811
+    from aisim_core.data import Identity
+
+    root, record = built_record
+    outside = tmp_path / "outside"
+    destination = tmp_path / "attested"
+    hardware = str(outside) if escape == "absolute" else "../../outside" if escape == "parent" else "linked"
+    identity = Identity.model_validate(
+        {**record.truth.identity.model_dump(), "model": None, "hardware": hardware, "operation_family": "gemm"}
+    )
+    record = record.model_copy(update={"truth": record.truth.model_copy(update={"identity": identity})})
+    # The supplied record is valid and content addressed, but need not be stored at its identity path.
+    path = root / f"{record.record_id}.json"
+    path.write_text(record.model_dump_json(by_alias=True))
+    predictor = tmp_path / "predict.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    if escape == "symlink":
+        outside.mkdir()
+        (destination / "eval").mkdir(parents=True)
+        (destination / "eval/linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="unsafe|symlink|escapes"):
+        _script("aisim-benchmark-evaluate", "check_eval_record.py").main(
+            [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
+        )
+    assert not outside.exists() or not list(outside.iterdir())
+    assert not list(destination.rglob("*.parquet")) and not list(destination.rglob("*.json"))

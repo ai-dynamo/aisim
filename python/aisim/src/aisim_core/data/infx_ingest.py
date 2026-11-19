@@ -329,6 +329,8 @@ class Acquirer:
             ):
                 raise IncompleteAcquisitionError("views/options: model entries need a string name and string dbKeys")
             for key in entry["dbKeys"]:
+                if key in by_key and by_key[key] != entry["name"]:
+                    raise ContradictionError(f"views/options: model {key!r} has conflicting display names")
                 by_key[key] = entry["name"]
         availability, _, _ = self._page("availability", None, list)
         wanted = set(models) if models else None
@@ -572,3 +574,14 @@ def _check_availability_values(row: Mapping[str, Any], where: str, *, include_da
             valid = isinstance(value, str) and bool(value)
         if not valid:
             raise IncompleteAcquisitionError(f"{where}: invalid scalar value for {key}")
+    if not include_date:
+        for key in INFERENCEX_CONFIG_FIELDS:
+            value = row.get(key)
+            if key in {"is_multinode", "prefill_dp_attention", "decode_dp_attention"}:
+                valid = value is None or type(value) is bool
+            elif key.endswith(("_tp", "_ep", "_num_workers", "_gpu")):
+                valid = value is None or (type(value) is int and value >= 0)
+            else:
+                continue  # the shared availability fields were checked above
+            if not valid:
+                raise IncompleteAcquisitionError(f"{where}: invalid deployment value for {key}")
