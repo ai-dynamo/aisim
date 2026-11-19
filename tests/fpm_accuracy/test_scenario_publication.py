@@ -481,16 +481,14 @@ def test_cli_qualifies_only_complete_pinned_snapshots(
         return dataset
 
     monkeypatch.setattr(cli.HfDataset, "from_local" if mode == "local" else "from_hub", load_dataset)
-    original_import = cli.importlib.import_module
     monkeypatch.setattr(
-        cli.importlib,
-        "import_module",
-        lambda name: (
-            SimpleNamespace(RustForwardPassPerfModel=object())
-            if name == "aisimulate_core.sdk"
-            else original_import(name)
-        ),
+        cli,
+        "runtime_module",
+        lambda name: SimpleNamespace(RustForwardPassPerfModel=object()),
     )
+    # Keep this exporter contract on its recording predictors. The real spawn
+    # boundary and serialized case transport have their own integration test.
+    monkeypatch.setattr(cli, "evaluate_isolated", cli.evaluate_configuration)
     monkeypatch.setattr(
         cli,
         "installed_distribution",

@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig
-from aisimulate.replay.reporting import format_report_table
-from aisimulate.runner import EngineReplayRunnerFactory
-from aisimulate.sweeper.replay import ReplayOutputRequirements
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig
+from aisim.replay.reporting import format_report_table
+from aisim.runner import EngineReplayRunnerFactory
+from aisim.sweeper.replay import ReplayOutputRequirements
 
 _TRACE_FIXTURES = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces"
 
@@ -302,7 +302,7 @@ def test_prediction_preserves_context_limit_for_all_backends(backend: str, mode:
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 @pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
 def test_prediction_max_context_preserves_backend_defaults(backend: str, mode: str, monkeypatch) -> None:
-    monkeypatch.setattr("aisimulate.compiler.resolve_model_context_length", lambda _: 4096)
+    monkeypatch.setattr("aisim.compiler.resolve_model_context_length", lambda _: 4096)
     engine = _engine()
     worker = engine["workers"]["aggregated"]
     roles = ["aggregated"] if mode == "aggregated" else ["prefill", "decode"]
@@ -546,6 +546,31 @@ def test_sglang_prefill_decode_interval_reaches_native_scheduler(tmp_path, inter
     assert (running["output_length"], waiting["output_length"]) == (6, 2)
 
 
+@pytest.mark.parametrize("selection_ms", [0.0, 1.5])
+def test_sglang_scheduler_selection_cost_reaches_native_scheduler(selection_ms: float) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    worker = engine["workers"]["aggregated"]
+    worker["scheduler"] = {"scheduler_select_time_ms": selection_ms}
+    worker["timing"] = {"type": "fixed", "prefill_ms": 7, "decode_ms": 2}
+    report = _run(
+        {
+            "engine": engine,
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 8, "output_tokens": 2},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+
+    # One prefill emits the first token, and one decode emits the second.
+    # Each of these two productive passes pays the selection cost once.
+    assert report.metrics["completed_requests"] == 1
+    assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0 + selection_ms)
+    assert report.metrics["mean_tpot_ms"] == pytest.approx(2.0 + selection_ms)
+
+
 @pytest.mark.parametrize("seeded", [False, True], ids=["fresh", "completed_prior_wave"])
 def test_sglang_interval_idle_tail_does_not_relax_later_kv_admission(tmp_path, seeded) -> None:
     rows = [{"timestamp": 0, "input_length": 4, "output_length": 1, "hash_ids": [1] * 4}] if seeded else []
@@ -753,7 +778,7 @@ def test_prediction_spec_lowers_fpm_forward_model_into_canonical_timing() -> Non
 
 @pytest.mark.parametrize("explicit_mode", [False, True])
 def test_prediction_spec_omits_the_forward_model_rank_field_for_op_level(monkeypatch, explicit_mode: bool) -> None:
-    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisim_core.sdk import RustForwardPassPerfModel
 
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     engine = _fpm_engine()
@@ -923,6 +948,28 @@ def test_engine_stack_auto_infers_raw_weka_relative_timestamps(backend: str) -> 
     assert [outcome["status"] for outcome in native["agentic_play_outcomes"]] == ["completed"]
 
 
+def test_engine_stack_adds_weka_chat_template_tokens_to_every_prompt() -> None:
+    # Every request of the fixture opens its stream, so each prompt grows by
+    # exactly request_tokens; message and tail tokens apply to later requests only.
+    def input_lengths(chat_template: dict | None) -> list[int]:
+        source = {"type": "trace", "paths": [str(_TRACE_FIXTURES / "weka")], "format": "weka"}
+        if chat_template is not None:
+            source["chat_template"] = chat_template
+        report = _run(
+            {
+                "traffic": {"source": source, "load": {"type": "trace_timestamps", "agentic_lanes": 1}},
+                "engine": _engine(),
+            }
+        )
+        return sorted(record["input_length"] for record in report.metadata["native_report"]["per_request"])
+
+    plain = input_lengths(None)
+    templated = input_lengths(
+        {"request_tokens": 5, "user_tokens": 7, "assistant_tokens": 6, "tail_tokens": 2, "append_tail_tokens": 1}
+    )
+    assert templated == [length + 5 for length in plain]
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 def test_agentx_replay_default_python_result_retains_qualification_without_dynamo(backend: str) -> None:
     config = {
@@ -937,17 +984,17 @@ def test_agentx_replay_default_python_result_retains_qualification_without_dynam
         import json
         import sys
 
-        assert not any(name.split(".")[0] in {"aisimulate", "dynamo"} for name in sys.modules)
+        assert not any(name.split(".")[0] in {"aisim", "dynamo"} for name in sys.modules)
 
         class RejectDynamo(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
                 if fullname == "dynamo" or fullname.startswith("dynamo."):
-                    raise AssertionError("public AISimulate Weka replay must not import Dynamo")
+                    raise AssertionError("public AISim Weka replay must not import Dynamo")
 
         sys.meta_path.insert(0, RejectDynamo())
 
-        from aisimulate import CorePredictionConfig, EngineReplayRunnerFactory
-        from aisimulate.compiler import prediction_to_replay_spec
+        from aisim import CorePredictionConfig, EngineReplayRunnerFactory
+        from aisim.compiler import prediction_to_replay_spec
 
         config = CorePredictionConfig.model_validate(json.load(sys.stdin))
         runner = EngineReplayRunnerFactory().create(0)
@@ -994,7 +1041,7 @@ def test_agentx_replay_gate_config_preserves_local_source_block_size(backend: st
 def test_predict_detail_uses_real_native_evidence(tmp_path, capsys):
     import yaml
 
-    from aisimulate.main import main
+    from aisim.main import main
 
     config = {
         "traffic": {

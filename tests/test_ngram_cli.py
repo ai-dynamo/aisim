@@ -5,22 +5,23 @@
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from aisimulate import EngineReplayRunnerFactory, ReplayOutputRequirements
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.config.engine import NgramSpeculationConfig
-from aisimulate.main import main
-from aisimulate.recommend import recommendation_to_sweeper
-from aisimulate.sweeper.config import SearchSpace
+from aisim import EngineReplayRunnerFactory, ReplayOutputRequirements
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig, CoreRecommendationConfig
+from aisim.config.engine import NgramSpeculationConfig
+from aisim.main import main
+from aisim.recommend import recommendation_to_sweeper
+from aisim.sweeper.config import SearchSpace
 
 # Reuse the SDK's attributed checkpoint fixtures for actual draft cost graphs.
-from python.aisimulate.tests.unit.sdk.speculation.test_dense_draft_schemes import REPLAY_SCHEMES, REPLAY_TARGET
+from python.aisim.tests.unit.sdk.speculation.test_dense_draft_schemes import REPLAY_SCHEMES, REPLAY_TARGET
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = {"kind": "ngram", "num_speculative_tokens": 2, "acceptance_rates": [1.0, 1.0], "seed": 42}
@@ -200,6 +201,28 @@ def test_ngram_turns_vllm_async_scheduling_off_for_every_timing_model(mode, timi
         EngineReplayRunnerFactory(runtime=_RecordingRuntime()).create(0).run(prediction_to_replay_spec(config))
 
 
+def test_ngram_rejects_launch_before_turning_async_scheduling_off():
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    raw = _prediction()
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    deployment = spec.backend_deployment
+    deployment = replace(deployment, agg_engine_args={**deployment.agg_engine_args, "launch": launch})
+    with pytest.raises(ValueError, match="launch requires async scheduling, which vLLM turns off with ngram"):
+        EngineReplayRunnerFactory(runtime=_RecordingRuntime()).create(0).run(
+            replace(spec, backend_deployment=deployment)
+        )
+
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["launch"] = launch
+    with pytest.raises(ValidationError, match="scheduler.launch requires async scheduling, which vLLM turns off"):
+        CorePredictionConfig.model_validate(raw)
+
+
 def _busy_arrival(tmp_path, *, speculation=True, async_scheduling=None):
     """Admission time of a request that arrives while the engine is busy.
 
@@ -242,7 +265,7 @@ def test_ngram_admits_a_busy_engine_arrival_at_the_next_pass(tmp_path):
 
 
 def test_native_aic_compiles_ngram_cost_without_mtp_draft_layers(monkeypatch):
-    from aisimulate_core.sdk import engine
+    from aisim_core.sdk import engine
 
     calls = []
     original = engine.compile_engine
@@ -271,7 +294,7 @@ def test_native_aic_compiles_ngram_cost_without_mtp_draft_layers(monkeypatch):
 
 
 def test_canonical_estimator_round_trip_preserves_prompt_lookup_cost():
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     config = ForwardPassPerfModelConfig(
         model="meta-llama/Meta-Llama-3.1-8B",
@@ -295,7 +318,7 @@ def test_canonical_estimator_round_trip_preserves_prompt_lookup_cost():
 
 @pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
 def test_canonical_prompt_lookup_rejects_unsupported_estimators_without_fallback(mode):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     with pytest.raises(ValueError, match="ngram speculation requires op_level timing"):
         RustForwardPassPerfModel.best_available(
@@ -379,8 +402,8 @@ def test_lower_level_sweeper_rejects_legacy_mtp_combination():
     ],
 )
 def test_ngram_sweeper_ignores_inactive_roles_until_selected(mode, inactive_role, field, value, error):
-    from aisimulate.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
-    from aisimulate.sweeper.sample import unroll_sample
+    from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.sample import unroll_sample
 
     inactive_key = f"{inactive_role}_{field}"
     values = {
@@ -410,7 +433,7 @@ def test_ngram_sweeper_ignores_inactive_roles_until_selected(mode, inactive_role
 
 
 def test_generator_does_not_silently_drop_prompt_lookup():
-    from aisimulate.generator.request import SweeperCandidateError, from_sweeper_candidate
+    from aisim.generator.request import SweeperCandidateError, from_sweeper_candidate
 
     with pytest.raises(SweeperCandidateError, match="ngram deployment generation is unsupported"):
         from_sweeper_candidate({"config": {"speculation": _SPEC}})

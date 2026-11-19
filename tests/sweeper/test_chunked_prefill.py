@@ -6,16 +6,16 @@
 
 import pytest
 
-from aisimulate.compiler import prediction_to_replay_spec
-from aisimulate.config import CorePredictionConfig, CoreRecommendationConfig
-from aisimulate.recommend import _candidate_prediction, recommendation_to_sweeper
-from aisimulate.runner import EngineReplayRunnerFactory
-from aisimulate.sweeper.config import SearchSpace
-from aisimulate.sweeper.deploy import build_backend_deployment
-from aisimulate.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
-from aisimulate.sweeper.replay import ReplaySpec
-from aisimulate.sweeper.sample import unroll_sample
-from aisimulate.sweeper.search_space import branch_knob_choices
+from aisim.compiler import prediction_to_replay_spec
+from aisim.config import CorePredictionConfig, CoreRecommendationConfig
+from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
+from aisim.runner import EngineReplayRunnerFactory
+from aisim.sweeper.config import SearchSpace
+from aisim.sweeper.deploy import build_backend_deployment
+from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+from aisim.sweeper.replay import ReplaySpec
+from aisim.sweeper.sample import unroll_sample
+from aisim.sweeper.search_space import branch_knob_choices
 
 pytestmark = pytest.mark.unit
 
@@ -131,9 +131,11 @@ def test_internal_search_space_rejects_invalid_chunks(value):
         )
 
 
-@pytest.mark.parametrize("chunk,expected", [(None, None), (128, 128)])
+@pytest.mark.parametrize("chunk,expected", [(None, 4096), (128, 128)])
 def test_prediction_preserves_omitted_chunk(chunk, expected):
-    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_config(chunk=chunk)))
+    raw = _config(chunk=chunk)
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["max_batched_tokens"] = 4096
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     assert spec.backend_deployment.agg_engine_args.get("sglang", {}).get("chunked_prefill_size") == expected
 
 
@@ -160,7 +162,8 @@ def test_prediction_accepts_at_least_one_block_per_rank_or_omitted_chunk(role, d
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     internal_role = "agg" if role == "aggregated" else role
     args = getattr(spec.backend_deployment, f"{internal_role}_engine_args")
-    assert args.get("sglang", {}).get("chunked_prefill_size") == chunk
+    expected = 8192 if chunk is None and role != "decode" else chunk
+    assert args.get("sglang", {}).get("chunked_prefill_size") == expected
 
 
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])

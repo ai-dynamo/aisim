@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-import aisimulate.sweeper.search as search_module
-from aisimulate.sweeper.config import SmartSearchConfig
-from aisimulate.sweeper.parallel_enum import (
+import aisim.sweeper.search as search_module
+from aisim.sweeper.config import SmartSearchConfig
+from aisim.sweeper.parallel_enum import (
     DisaggParallelConfig,
     ParallelShape,
     ReplicaParallelConfig,
 )
-from aisimulate.sweeper.provider import (
+from aisim.sweeper.provider import (
     AdapterReplaySpec,
     AdapterSearchPlan,
     ConditionalSearchSpace,
@@ -22,10 +22,10 @@ from aisimulate.sweeper.provider import (
     RuntimeHookSpec,
     SearchSpaceFragment,
 )
-from aisimulate.sweeper.replay import HookCapability, ReplayReport, RunnerCapabilities
-from aisimulate.sweeper.result import ReasonCategory
-from aisimulate.sweeper.sampler import Suggestion
-from aisimulate.sweeper.search_space import BranchSpace
+from aisim.sweeper.replay import HookCapability, ReplayReport, RunnerCapabilities
+from aisim.sweeper.result import ReasonCategory
+from aisim.sweeper.sampler import Suggestion
+from aisim.sweeper.search_space import BranchSpace
 
 TRACE = str(Path(__file__).parent / "data" / "mooncake_tiny.jsonl")
 _HOOK = RuntimeHookSpec(
@@ -681,15 +681,18 @@ def test_min_gpus_selects_smallest_router_candidate_meeting_sla(monkeypatch, mod
         show_progress=False,
     ).run(config, top_n=None)
 
-    # Six trials exhaust three static pools times two router policies.
-    assert len(factory.runner.specs) == 6
-    assert result.counts.feasible == 3
-    assert result.counts.infeasible == 3
     assert [
         (candidate.used_gpus, candidate.config["adapters"]["dynamo.router"]["router_mode"])
         for candidate in result.selected_candidates
     ][0] == (middle, "kv_router")
-    assert [candidate.used_gpus for candidate in result.selected_candidates] == [middle, largest, largest]
+    # min_gpus searches pools in ascending size and stops revisiting larger pools once
+    # one qualifies, so the six-trial budget is not spent on the largest pool's second policy.
+    tried = [
+        (record.used_gpus, record.config["adapters"]["dynamo.router"]["router_mode"]) for record in result.candidates
+    ]
+    assert len(tried) < 6
+    middle_hit = tried.index((middle, "kv_router"))
+    assert all(gpus <= middle for gpus, _ in tried[middle_hit + 1 :])
 
 
 def test_core_branch_preflight_runs_before_adapter_preparation(monkeypatch) -> None:
@@ -865,6 +868,6 @@ def test_adapter_parameter_separator_collisions_are_rejected() -> None:
 def _isolate_estimator_data_for_orchestration(monkeypatch):
     # These tests use synthetic models/runners. Native construction is exercised
     # by the estimator contract tests and CLI round trips.
-    from aisimulate.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
+    from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
 
     monkeypatch.setattr(ForwardPassEstimatorResolver, "resolve_candidate", lambda self, sample: {})

@@ -3,20 +3,96 @@
 
 //! Per-phase op-list execution primitives.
 //!
-//! Mirrors `aisimulate.sdk.backends.base_backend`: iterates a context /
+//! Mirrors `aisim.sdk.backends.base_backend`: iterates a context /
 //! generation op list to compute per-phase latency, and composes the mix-step
 //! latency exactly the way Python's `_get_mix_step_latency` does — one combined
 //! non-attention pass plus per-phase attention. The compiled
 //! [`crate::perfmodel::engine::Engine`] drives these free functions over the precompiled
 //! op lists from an [`crate::perfmodel::engine::spec::EngineSpec`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::error::AicError;
+use crate::memo::Memo;
 use crate::operators::base::PerformanceResult;
+use crate::operators::op::MemoField;
 use crate::operators::{Op, RuntimeContext};
 use crate::perf_database::PerfDatabase;
+
+/// The engine op list an [`OpMemo`] entry belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpList {
+    Context = 0,
+    Generation = 1,
+}
+
+/// Results of ops whose result depends on one runtime field
+/// ([`Op::memo_field`]), kept across walks of one engine's op lists. Such a
+/// result is a pure function of the op and that field, so a walk at a new KV
+/// shape re-prices only the ops that read it. Debug builds re-price every hit.
+pub(crate) struct OpMemo {
+    /// Each op's field by list and index, computed once from the lists.
+    fields: [Box<[Option<MemoField>]>; 2],
+    /// Keyed by list, index and field value ([`Self::key`]).
+    results: Memo<u64, PerformanceResult>,
+}
+
+impl OpMemo {
+    /// A memo for walks of `context_ops` and `generation_ops`; it starts
+    /// over once it holds `capacity` results.
+    pub(crate) fn new(capacity: usize, context_ops: &[Op], generation_ops: &[Op]) -> Self {
+        let fields = |ops: &[Op]| ops.iter().map(Op::memo_field).collect();
+        Self {
+            fields: [fields(context_ops), fields(generation_ops)],
+            results: Memo::flat(capacity).verifying_hits(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.results.len()
+    }
+
+    /// The entry key of the op at `index` of `list` with its field at `value`.
+    fn key(list: OpList, index: usize, value: u32) -> u64 {
+        debug_assert!(index < 1 << 31, "op index {index}");
+        (list as u64) << 63 | (index as u64) << 32 | u64::from(value)
+    }
+
+    /// The result at `ctx` of the op at `index` of `list`: `query`'s, or the
+    /// one an earlier walk stored for the same value of the field it reads.
+    pub(crate) fn query(
+        &self,
+        db: &PerfDatabase,
+        list: OpList,
+        index: usize,
+        ctx: &RuntimeContext,
+        query: impl FnOnce() -> Result<PerformanceResult, AicError>,
+    ) -> Result<PerformanceResult, AicError> {
+        let Some(field) = self.fields[list as usize].get(index).copied().flatten() else {
+            return query();
+        };
+        self.results
+            .get_or_price(db, Self::key(list, index, field.of(ctx)), query)
+    }
+}
+
+/// [`OpMemo::query`] through `op_memo` when there is one.
+fn shared_query(
+    op_memo: Option<&OpMemo>,
+    db: &PerfDatabase,
+    list: OpList,
+    index: usize,
+    op: &Op,
+    ctx: &RuntimeContext,
+) -> Result<PerformanceResult, AicError> {
+    match op_memo {
+        Some(op_memo) => op_memo.query(db, list, index, ctx, || op.query(db, ctx)),
+        None => op.query(db, ctx),
+    }
+}
 
 /// Build-time facts about one immutable op list. Passes use them to skip
 /// repeated work; every op still reports its own name and value.
@@ -87,11 +163,12 @@ impl OpListPlan {
     }
 }
 
-/// Pricing key of a GLM-5.3-Flash boundary without its per-layer display
-/// names. These names, including those of generic children, never select
-/// data, so identical layers price identically; debug builds re-price every
-/// shared query to check this ([`QueryMemo::query`]). Other families return
-/// `None` and are always queried.
+/// Pricing key of a GLM-5.3-Flash boundary or a DeepSeek-V4.1 stage without
+/// its per-layer display names. These names, including those of GLM generic
+/// children, never select data, so identical layers price identically; debug
+/// builds re-price every shared query to check this ([`QueryMemo::query`]).
+/// A DeepSeek-V4.1 stage's children carry no layer in their names and keep
+/// them. Other families return `None` and are always queried.
 fn pricing_identity(op: &Op) -> Option<String> {
     if !matches!(
         op,
@@ -100,6 +177,7 @@ fn pricing_identity(op: &Op) -> Option<String> {
             | Op::Glm53Router(_)
             | Op::Glm53Ffn(_)
             | Op::Glm53Primitive(_)
+            | Op::Dsv41Stage(_)
     ) {
         return None;
     }
@@ -131,7 +209,8 @@ fn pricing_identity(op: &Op) -> Option<String> {
 
 /// Results of one pass, keyed by [`OpListPlan`] query slot. Every op in a
 /// pass shares the pass's runtime shape, so a slot's first result is exact
-/// for the rest of the slot.
+/// for the rest of the slot, and [`Self::query`] lends it to every op of the
+/// slot.
 pub(crate) struct QueryMemo<'p> {
     plan: Option<&'p OpListPlan>,
     results: Vec<Option<PerformanceResult>>,
@@ -150,24 +229,25 @@ impl<'p> QueryMemo<'p> {
         &mut self,
         index: usize,
         query: impl FnOnce() -> Result<PerformanceResult, AicError>,
-    ) -> Result<PerformanceResult, AicError> {
+    ) -> Result<Cow<'_, PerformanceResult>, AicError> {
         let Some(slot) = self.plan.and_then(|plan| plan.query_slot(index)) else {
-            return query();
+            return query().map(Cow::Owned);
         };
-        if let Some(result) = &self.results[slot] {
-            #[cfg(debug_assertions)]
-            {
-                let repriced = query();
-                assert!(
-                    repriced.as_ref().is_ok_and(|repriced| repriced == result),
-                    "op {index} shares query slot {slot} but prices as {repriced:?}, not {result:?}"
-                );
+        let result = match &mut self.results[slot] {
+            Some(result) => {
+                #[cfg(debug_assertions)]
+                {
+                    let repriced = query();
+                    assert!(
+                        repriced.as_ref().is_ok_and(|repriced| repriced == &*result),
+                        "op {index} shares query slot {slot} but prices as {repriced:?}, not {result:?}"
+                    );
+                }
+                &*result
             }
-            return Ok(result.clone());
-        }
-        let result = query()?;
-        self.results[slot] = Some(result.clone());
-        Ok(result)
+            empty => &*empty.insert(query()?),
+        };
+        Ok(Cow::Borrowed(result))
     }
 }
 
@@ -233,29 +313,32 @@ pub(crate) fn run_context_ops_with<'a>(
     run_context_ops_planned(
         ops,
         None,
+        None,
         db,
         batch_size,
         effective_isl,
         prefix,
         seq_imbalance_correction_scale,
         filter,
-        |_, op, result| on_op(op, result),
+        |_, op, result| on_op(op, result.into_owned()),
     )
 }
 
-/// [`run_context_ops_with`] over an op list with its [`OpListPlan`]. The sink
-/// also receives each op's index in `ops`.
+/// [`run_context_ops_with`] over an op list with its [`OpListPlan`], reusing
+/// `op_memo`'s results when given one. The sink also receives each op's index
+/// in `ops`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_context_ops_planned<'a>(
     ops: &'a [Op],
     plan: Option<&OpListPlan>,
+    op_memo: Option<&OpMemo>,
     db: &PerfDatabase,
     batch_size: u32,
     effective_isl: u32,
     prefix: u32,
     seq_imbalance_correction_scale: f64,
     filter: ContextOpFilter,
-    mut on_op: impl FnMut(usize, &'a Op, PerformanceResult),
+    mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
     let mut total = 0.0_f64;
@@ -267,15 +350,15 @@ pub(crate) fn run_context_ops_planned<'a>(
             _ => {}
         }
         let result = memo.query(index, || {
-            query_context_op(
+            let ctx = context_op_runtime(
                 op,
-                db,
                 batch_size,
                 effective_isl,
                 prefix,
                 seq_imbalance_correction_scale,
                 None,
-            )
+            );
+            shared_query(op_memo, db, OpList::Context, index, op, &ctx)
         })?;
         total += result.latency_ms;
         on_op(index, op, result);
@@ -411,47 +494,49 @@ pub(crate) fn run_generation_ops_step_beamed_with<'a>(
     run_generation_ops_step_planned(
         ops,
         None,
+        None,
         db,
         batch_size,
         beam_width,
         kv_seq_tokens,
         gen_seq_imbalance_correction_scale,
         only_generation_attention,
-        |_, op, result| on_op(op, result),
+        |_, op, result| on_op(op, result.into_owned()),
     )
 }
 
 /// [`run_generation_ops_step_beamed_with`] over an op list with its
-/// [`OpListPlan`]. The sink also receives each op's index in `ops`.
+/// [`OpListPlan`], reusing `op_memo`'s results when given one. The sink also
+/// receives each op's index in `ops`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_generation_ops_step_planned<'a>(
     ops: &'a [Op],
     plan: Option<&OpListPlan>,
+    op_memo: Option<&OpMemo>,
     db: &PerfDatabase,
     batch_size: u32,
     beam_width: u32,
     kv_seq_tokens: u32,
     gen_seq_imbalance_correction_scale: f64,
     only_generation_attention: bool,
-    mut on_op: impl FnMut(usize, &'a Op, PerformanceResult),
+    mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
+    let ctx = generation_op_runtime(
+        batch_size,
+        beam_width,
+        kv_seq_tokens,
+        gen_seq_imbalance_correction_scale,
+        0,
+        None,
+    );
     let mut total = 0.0_f64;
     for (index, op) in ops.iter().enumerate() {
         if only_generation_attention && !op.is_generation_attention() {
             continue;
         }
         let result = memo.query(index, || {
-            query_generation_op(
-                op,
-                db,
-                batch_size,
-                beam_width,
-                kv_seq_tokens,
-                gen_seq_imbalance_correction_scale,
-                0,
-                None,
-            )
+            shared_query(op_memo, db, OpList::Generation, index, op, &ctx)
         })?;
         total += result.latency_ms;
         on_op(index, op, result);
@@ -531,11 +616,16 @@ pub(crate) fn generation_op_runtime(
 /// `on_op` observes each queried op: whether it runs in a context pass
 /// (passes 1 and 2) or the decode pass, its index in its op list, the op,
 /// its runtime context, its RAW result and the divisor the total applies to
-/// it (pass 2's `scale_factor`, otherwise 1).
+/// it (pass 2's `scale_factor`, otherwise 1). `op_memo`, when given, answers
+/// single-field ops ([`OpMemo`]). With the op lists' [`OpListPlan`]s, each
+/// pass queries every query slot once ([`QueryMemo`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_mix_step_ops<'a>(
     context_ops: &'a [Op],
     generation_ops: &'a [Op],
+    context_plan: Option<&OpListPlan>,
+    generation_plan: Option<&OpListPlan>,
+    op_memo: Option<&OpMemo>,
     db: &PerfDatabase,
     ctx_tokens: u32,
     gen_tokens: u32,
@@ -545,7 +635,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     combined_prefix: u32,
     kv_per_decode_req: u32,
     decode_batch: u32,
-    mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, PerformanceResult, f64),
+    mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>, f64),
 ) -> Result<f64, AicError> {
     // ---- Pass 1: combined non-attention work (batch=1, isl=ctx+gen) ----
     // Python: `run_static` is called with `isl = num_tokens_combined`
@@ -566,6 +656,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     // ignored, so threading it through is harmless.
     let effective_isl_combined = (ctx_tokens + gen_tokens).max(1);
     let mut total = 0.0_f64;
+    let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
         if op.is_context_attention() {
             continue;
@@ -585,7 +676,9 @@ pub(crate) fn get_mix_step_ops<'a>(
             gen_seq_imbalance_correction_scale: 1.0,
             num_image_tokens: 0,
         };
-        let result = op.query(db, &ctx)?;
+        let result = memo.query(index, || {
+            shared_query(op_memo, db, OpList::Context, index, op, &ctx)
+        })?;
         total += result.latency_ms;
         on_op(true, index, op, &ctx, result, 1.0);
     }
@@ -607,6 +700,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     let isl_eff_pass2 = new_tokens_per_prefill_req.max(1);
     let ctx_attn_batch = prefill_batch.max(1);
     let scale_factor = ((isl_eff_pass2 + ctx_tokens - 1) / ctx_tokens.max(1)).max(1) as f64;
+    let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
         if !op.is_context_attention() {
             continue;
@@ -621,7 +715,9 @@ pub(crate) fn get_mix_step_ops<'a>(
             gen_seq_imbalance_correction_scale: 1.0,
             num_image_tokens: 0,
         };
-        let result = op.query(db, &ctx)?;
+        let result = memo.query(index, || {
+            shared_query(op_memo, db, OpList::Context, index, op, &ctx)
+        })?;
         total += result.latency_ms / scale_factor;
         on_op(true, index, op, &ctx, result, scale_factor);
     }
@@ -634,6 +730,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     // than query at the `decode_batch.max(1)` floor, which would add a spurious
     // batch-1 generation_attention and inflate the step latency.
     if decode_batch > 0 {
+        let mut memo = QueryMemo::new(generation_plan, generation_ops);
         for (index, op) in generation_ops.iter().enumerate() {
             if !op.is_generation_attention() {
                 continue;
@@ -648,7 +745,9 @@ pub(crate) fn get_mix_step_ops<'a>(
                 gen_seq_imbalance_correction_scale: 1.0,
                 num_image_tokens: 0,
             };
-            let result = op.query(db, &ctx)?;
+            let result = memo.query(index, || {
+                shared_query(op_memo, db, OpList::Generation, index, op, &ctx)
+            })?;
             total += result.latency_ms;
             on_op(false, index, op, &ctx, result, 1.0);
         }
