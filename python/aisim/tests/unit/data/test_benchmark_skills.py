@@ -439,10 +439,21 @@ def test_concurrent_attestations_never_replace_published_artifacts(built_record,
         assert verify_record(published, path.parent, _predict, published.prediction.fingerprint).ok
 
 
-def test_planner_requires_current_fingerprint_and_reads_only_selected_layer(built_catalog, capsys):
+def test_planner_requires_current_fingerprint_and_reads_only_selected_layer(built_catalog, capsys, monkeypatch):
     root, _ = built_catalog
     plan = _script("aisim-benchmark-plan", "plan_catalog.py")
-    record = next(load_record(p) for p in root.glob("eval/**/*.json") if load_record(p).truth.layer == "fpm")
+    original_glob = Path.glob
+
+    def glob(path, pattern):
+        paths = list(original_glob(path, pattern))
+        if path == root and pattern == "eval/**/*.json":
+            paths.sort(key=lambda p: load_record(p).truth.identity.model == QWEN)
+        return iter(paths)
+
+    monkeypatch.setattr(Path, "glob", glob)
+    records = [load_record(p) for p in root.glob("eval/**/*.json")]
+    assert records[0].truth.identity.model != QWEN
+    record = next(r for r in records if r.truth.layer == "fpm" and r.truth.identity.model == QWEN)
     base = ["--dataset-root", str(root), "--hardware", "b200_sxm", "--model", QWEN, "--layer", "fpm"]
     for fingerprints, reuse in [([], False), (["0" * 64], False), ([record.prediction.fingerprint], True)]:
         argv = [*base, *[v for f in fingerprints for v in ("--prediction-fingerprint", f)]]

@@ -12,6 +12,17 @@
 #   * promotion is manual and needs a named reviewer; failures never touch the last qualified snapshot;
 #   * failures and staleness alert Slack #swdl-dynamo-aisim-daily and the owner (Simone Chen) by email.
 
+spec:
+  inputs:
+    job:
+      description: Which reviewed job to run
+      default: ingest
+      options: [ingest, promote, staleness]
+    candidate-snapshot-id:
+      description: Snapshot to qualify (required for promote)
+      default: ""
+      regex: '^([0-9a-f]{64})?$'
+---
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
@@ -65,13 +76,13 @@ publish_candidate:
     name: infx-cache-writer
     action: access
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "ingest"'
-    - if: '$CI_PIPELINE_SOURCE == "web" && ($AISIM_JOB == null || $AISIM_JOB == "ingest")'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "ingest"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && "$[[ inputs.job ]]" == "ingest"'
   script:
     - set -eu
     - *cache_clone
     # Acquisition is public and needs no credential; the token is only used by git below.
-    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY run --root cache-repo --cache-dir "$CI_PROJECT_DIR/infx-acquisition" --report run-report.json
+    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY run --no-notify --root cache-repo --cache-dir "$CI_PROJECT_DIR/infx-acquisition" --report run-report.json
     - |
       cd cache-repo
       if [ -z "$(git status --porcelain)" ]; then echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
@@ -101,25 +112,25 @@ promote:
     name: infx-cache-writer
     action: access
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "web" && $AISIM_JOB == "promote"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && "$[[ inputs.job ]]" == "promote"'
       when: manual
   allow_failure: false
   script:
     - set -eu
-    - 'test -n "${CANDIDATE_SNAPSHOT_ID:-}" || { echo "set CANDIDATE_SNAPSHOT_ID" >&2; exit 2; }'
-    - git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "candidate/${CANDIDATE_SNAPSHOT_ID}" "$INFX_CACHE_REPO_URL" cache-repo
-    - $JOB_PY promote --root cache-repo --snapshot-id "$CANDIDATE_SNAPSHOT_ID" --reviewer "$GITLAB_USER_NAME"
+    - 'test -n "$[[ inputs.candidate-snapshot-id ]]" || { echo "set the candidate-snapshot-id input" >&2; exit 2; }'
+    - git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "candidate/$[[ inputs.candidate-snapshot-id ]]" "$INFX_CACHE_REPO_URL" cache-repo
+    - $JOB_PY promote --root cache-repo --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
     - |
       cd cache-repo
-      git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -qam "qualify: ${CANDIDATE_SNAPSHOT_ID} (reviewer ${GITLAB_USER_NAME})"
-      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "HEAD:refs/heads/candidate/${CANDIDATE_SNAPSHOT_ID}"
+      git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -qam "qualify: $[[ inputs.candidate-snapshot-id ]] (reviewer ${GITLAB_USER_NAME})"
+      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "HEAD:refs/heads/candidate/$[[ inputs.candidate-snapshot-id ]]"
     # Merging the candidate branch into the default branch stays a reviewed merge request, not this job.
 
 staleness:
   stage: staleness
   extends: .pinned
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "staleness"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "staleness"'
   script:
     - set -eu
     - *cache_read_clone
@@ -132,9 +143,9 @@ alert_failure:
   stage: notify
   when: on_failure
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "ingest"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "ingest"'
       when: on_failure
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "staleness"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "staleness"'
       when: on_failure
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: on_failure
@@ -150,6 +161,13 @@ alert_failure:
       from email.message import EmailMessage
 
       text = "pipeline " + os.environ["CI_PIPELINE_URL"] + "; last qualified snapshot retained"
+      try:
+          with open("run-report.json", encoding="utf-8") as handle:
+              report = json.load(handle)
+          if report.get("error"):
+              text += "\nIngestion error: " + str(report["error"])
+      except (OSError, ValueError):
+          pass  # setup failures may happen before a report can be written
       failures = []
       try:
           request = urllib.request.Request(

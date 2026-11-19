@@ -38,6 +38,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -107,6 +108,8 @@ class PromotionPolicy:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(raw, dict) or not isinstance(raw.get("reviewers"), list):
             raise ValueError("reviewers must be a list of non-empty strings")
+        if unknown := set(raw) - {"reviewers", "min_approvals"}:
+            raise ValueError(f"unknown approval-policy keys: {sorted(unknown)}")
         reviewers = raw["reviewers"]
         if any(not isinstance(name, str) or not name.strip() for name in reviewers):
             raise ValueError("reviewers must be a list of non-empty strings")
@@ -154,7 +157,30 @@ def _check_source_checkout(source: Path, commit: str) -> None:
     """Bind provenance to a clean checkout at the exact reviewed revision."""
 
     def git(*args: str) -> str:
-        result = subprocess.run(["git", "-C", str(source), *args], capture_output=True, text=True, check=True)
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_PREFIX",
+                "GIT_SHALLOW_FILE",
+                "GIT_GRAFT_FILE",
+                "GIT_IMPLICIT_WORK_TREE",
+                "GIT_REPLACE_REF_BASE",
+                "GIT_NO_REPLACE_OBJECTS",
+                "GIT_CONFIG",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+            }
+            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        }
+        result = subprocess.run(["git", "-C", str(source), *args], capture_output=True, text=True, check=True, env=env)
         return result.stdout.strip()
 
     try:
@@ -275,6 +301,8 @@ def plan_promotion(
     if any(f.code == "source-symlink" for f in plan.findings):
         return plan
     _select(source, request.directories, plan)
+    if not plan.files:
+        plan.findings.append(Finding("selection-empty", "selection contains no files"))
 
     ledger = load_ledger(source)
     for rel in sorted(plan.files):
@@ -380,11 +408,15 @@ def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str)
     index_path.write_text(_dump(updated), encoding="utf-8")
 
 
-def _snapshot(target: Path, index_paths: set[str]) -> dict[str, bytes]:
+def _index_paths(target: Path, index_paths: Iterable[str] = ()) -> set[Path]:
     base = target / CATALOG_DIR
     paths = {p for p in base.rglob("*") if p.is_file()} if base.is_dir() else set()
     paths.update(target / rel for rel in index_paths if (target / rel).is_file())
-    return {p.relative_to(target).as_posix(): p.read_bytes() for p in paths}
+    return paths
+
+
+def _snapshot(target: Path, index_paths: Iterable[str] = ()) -> dict[str, bytes]:
+    return {p.relative_to(target).as_posix(): p.read_bytes() for p in _index_paths(target, index_paths)}
 
 
 def apply_promotion(
@@ -476,7 +508,7 @@ def _apply_promotion(
                 if parent == target or any(parent.iterdir()):
                     break
                 parent.rmdir()
-        for rel in set(_snapshot(target, index_paths)) - set(before):
+        for rel in {p.relative_to(target).as_posix() for p in _index_paths(target, index_paths)} - set(before):
             (target / rel).unlink(missing_ok=True)
         for directory in sorted((target / CATALOG_DIR).rglob("*"), reverse=True):
             if directory.is_dir() and not any(directory.iterdir()):

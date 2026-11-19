@@ -58,9 +58,11 @@ from aisim_core.data.e2e import (
     load_e2e,
     read_snapshot,
     snapshot_id,
+    verify_snapshot_members,
     write_configuration,
     write_snapshot,
 )
+from aisim_core.data.hygiene import json_sidecar_value
 from aisim_core.data.names import normalize
 
 BASE_URL = "https://inferencex.semianalysis.com/api/v1/"
@@ -244,11 +246,23 @@ class AcquisitionCache:
 
     def get(self, url: str) -> tuple[dict[str, Any], bytes] | None:
         body_path, meta_path = self._paths(url)
-        if not (body_path.exists() and meta_path.exists()):
-            return None
-        meta, body = json.loads(meta_path.read_text()), body_path.read_bytes()
-        if meta.get("body_sha256") != _sha(body):  # corrupt entry: refetch instead of trusting it
-            return None
+        try:
+            meta = json_sidecar_value(meta_path.read_bytes())
+            if (
+                not isinstance(meta, dict)
+                or meta.get("url") != url
+                or not isinstance(meta.get("fetched_at"), str)
+                or not meta["fetched_at"]
+                or (meta.get("etag") is not None and not isinstance(meta["etag"], str))
+                or type(meta.get("bytes")) is not int
+            ):
+                return None
+            datetime.fromisoformat(meta["fetched_at"].replace("Z", "+00:00"))
+            body = body_path.read_bytes()
+            if meta.get("body_sha256") != _sha(body) or meta["bytes"] != len(body):
+                return None
+        except (OSError, ValueError, RecursionError):
+            return None  # a torn or unreadable cache entry is replaceable, never truth
         return meta, body
 
     def put(self, url: str, body: bytes, etag: str | None, fetched_at: str) -> dict[str, Any]:
@@ -279,7 +293,7 @@ class Acquisition:
 
 def _json(fetched: Fetched, body: bytes, expect: type) -> Any:
     try:
-        value = json.loads(body)
+        value = json_sidecar_value(body)
     except ValueError as exc:
         raise IncompleteAcquisitionError(f"{fetched.url}: body is not valid JSON ({exc})") from exc
     if not isinstance(value, expect):
@@ -316,6 +330,8 @@ class Acquirer:
         prior_observation_ids: Sequence[str] = (),
         prior_observation_models: Mapping[str, str] | None = None,
     ) -> Acquisition:
+        self.responses = {}
+        self.selected_models = None
         options, _, _ = self._page("views/options", None, dict)
         by_key: dict[str, str] = {}
         if not isinstance(options.get("models"), list):
@@ -382,6 +398,8 @@ class Acquirer:
                     raise IncompleteAcquisitionError(f"{url}: metrics must be a mapping")
                 if row["model"] not in valid_keys:
                     raise ContradictionError(f"{url}: row {row['id']} is for model {row['model']!r}, not {name!r}")
+                if wanted is not None and row["model"] not in wanted and name not in wanted:
+                    continue  # display-name requests may also return unselected sibling DB keys
                 row = {k: v for k, v in row.items() if not k.startswith(VIEW_CONTEXT_PREFIX)}
                 rid = str(row["id"])
                 if not rid.isascii() or not rid.isdigit():
@@ -410,7 +428,9 @@ class Acquirer:
             acquisitions=[acquired[k] for k in sorted(acquired, key=int)],
             undeclared=undeclared,
             requests_made=self.client.requests_made,
-            responses={url: body for url, body in self.responses.items() if "/benchmarks?" in url},
+            responses={
+                url: body for url, body in self.responses.items() if "/benchmarks?" in url or "/workflow-info?" in url
+            },
         )
 
     def _runs(self, dates: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -478,7 +498,11 @@ def plan_snapshot(acq: Acquisition) -> SnapshotPlan:
         artifact = ProvenanceFile(
             "raw-output", body, name=f"inferencex-response-{_sha(url.encode() + body)}", source_tool=url
         )
-        response_models = {normalize("model", row["model"]) for row in json.loads(body)}
+        response_models = (
+            models
+            if "/workflow-info?" in url
+            else {normalize("model", row["model"]) for row in json_sidecar_value(body)}
+        )
         if not response_models & models:
             raise IncompleteAcquisitionError(f"{url}: retained response matches no configuration")
         for model in response_models:
@@ -509,9 +533,10 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
     root = Path(root)
     path = snapshot_path(plan.snapshot_id)
     if (root / path).exists():
-        snapshot, _ = read_snapshot(root, path)
+        snapshot, members = read_snapshot(root, path)
         if snapshot.snapshot_id != plan.snapshot_id:
             raise ValueError("existing snapshot ID differs from the planned snapshot")
+        verify_snapshot_members(root, members)
         return path
     for data in plan.configurations:
         prefix = plan.configuration_prefixes[data.body.configuration_id()]

@@ -206,6 +206,16 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
     return out
 
 
+def bounded_json_bytes(path: Path) -> bytes:
+    """Read structured JSON within the shared limit, including files exempt from blob limits."""
+    limit = CandidatePolicy().max_json_bytes
+    with path.open("rb") as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"JSON exceeds the {limit}-byte limit")
+    return data
+
+
 def _unique_json_keys(pairs):
     result = {}
     for key, value in pairs:
@@ -270,23 +280,35 @@ class _SidecarLoader(yaml.SafeLoader):
         if node is None:
             return None
         _check_yaml_merge_budget(node)
+        self._checked_mapping_nodes = set()
         return self.construct_document(node)
 
-    def construct_mapping(self, node, deep=False):
+    def flatten_mapping(self, node):
+        # SafeLoader calls this recursively for merge sources, including inline
+        # mappings that never pass through construct_mapping. Aliases may revisit
+        # an already flattened node, whose inherited keys are no longer explicit.
+        marker = id(node)
+        if marker in self._checked_mapping_nodes:
+            return
+        self._checked_mapping_nodes.add(marker)
         # Check explicit keys before flattening merges: an explicit override of a
         # merged default is valid YAML, while repeated explicit settings are ambiguous.
         seen = set()
         for key, _ in node.value:
             if key.tag == "tag:yaml.org,2002:merge":
                 continue
-            value = self.construct_object(key, deep=deep)
+            if not isinstance(key, yaml.ScalarNode):
+                raise ValueError("YAML mapping keys must be scalar")
+            value = self.construct_object(key)
+            if value is not None and not isinstance(value, (str, bool, int, float, date, datetime)):
+                raise ValueError("unsupported YAML mapping key")
             try:
                 if value in seen:
                     raise ValueError(f"duplicate YAML key: {value!r}")
                 seen.add(value)
             except TypeError as exc:
                 raise ValueError("YAML mapping keys must be scalar") from exc
-        return super().construct_mapping(node, deep=deep)
+        super().flatten_mapping(node)
 
 
 def yaml_sidecar_value(data: bytes):
