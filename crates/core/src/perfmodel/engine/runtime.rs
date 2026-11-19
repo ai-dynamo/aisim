@@ -2060,7 +2060,7 @@ impl Engine {
     ///
     /// `osl <= 1` yields an empty loop and 0.0 (matches Python).
     fn run_generation_phase(&self, runtime: &RuntimeConfig, stride: u32) -> Result<f64, AicError> {
-        self.run_generation_phase_with(runtime, stride, |_, _, _| {})
+        self.run_generation_phase_with(runtime, stride, |_, _, _, _| {})
     }
 
     /// [`Self::run_generation_phase`] with a per-op sink. Python builds a
@@ -2071,12 +2071,14 @@ impl Engine {
     /// `repeat_count`, in that exact order: `(r1 + r2) * k`, not
     /// `r1*k + r2*k` (bit-identical for repeated-name model families).
     ///
-    /// The sink also receives the op's name slot in [`Self::generation_plan`].
+    /// The sink also receives the op's name slot in [`Self::generation_plan`]
+    /// and the step's power-covered latency for that name, summed per query
+    /// before the fold and weighted by `repeat_count`.
     fn run_generation_phase_with(
         &self,
         runtime: &RuntimeConfig,
         stride: u32,
-        mut on_op: impl FnMut(usize, &Op, PerformanceResult),
+        mut on_op: impl FnMut(usize, &Op, PerformanceResult, f64),
     ) -> Result<f64, AicError> {
         self.check_profile_phase(false)?;
         if self.legacy_profile && runtime.osl > 2 {
@@ -2095,7 +2097,7 @@ impl Engine {
         }
         let plan = &self.generation_plan;
         // Per-step name fold, indexed by name slot; `order` keeps first encounter.
-        let mut step_fold: Vec<Option<(&Op, PerformanceResult)>> = vec![None; plan.names()];
+        let mut step_fold: Vec<Option<(&Op, PerformanceResult, f64)>> = vec![None; plan.names()];
         let mut order = Vec::with_capacity(plan.names());
         let upper = runtime.osl - 1; // exclusive, matches Python `range(0, osl-1, stride)`
         let mut i = 0u32;
@@ -2120,7 +2122,9 @@ impl Engine {
                 |index, op, r| {
                     let r = r.into_owned();
                     let slot = plan.name_slot(index);
-                    if let Some((_, entry)) = &mut step_fold[slot] {
+                    let covered = covered_latency(&r);
+                    if let Some((_, entry, entry_covered)) = &mut step_fold[slot] {
+                        *entry_covered += covered;
                         entry.latency_ms += r.latency_ms;
                         entry.energy_wms += r.energy_wms;
                         if entry.source != r.source {
@@ -2128,14 +2132,15 @@ impl Engine {
                         }
                         entry.moe_comm_fallbacks.extend(r.moe_comm_fallbacks);
                     } else {
-                        step_fold[slot] = Some((op, r));
+                        step_fold[slot] = Some((op, r, covered));
                         order.push(slot);
                     }
                 },
             )?;
             for slot in order.drain(..) {
-                let (op, folded) = step_fold[slot].take().expect("visited name slot");
-                on_op(slot, op, folded.scaled(repeat_count as f64));
+                let (op, folded, covered) = step_fold[slot].take().expect("visited name slot");
+                let repeat = repeat_count as f64;
+                on_op(slot, op, folded.scaled(repeat), covered * repeat);
             }
             total += step * repeat_count as f64;
             i += stride;
@@ -2586,7 +2591,7 @@ impl Engine {
                 prefix,
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |_, _, _| {},
+                |_, _, _, _| {},
             )?;
             let prefill_ms = prefill_ms.latency_ms;
             let marginal_decode_ms = marginal_decode_ms.latency_ms;
@@ -3002,7 +3007,7 @@ impl Engine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-        mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult),
+        mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult, f64),
     ) -> Result<(PerformanceResult, PerformanceResult), AicError> {
         let mut prefill_component = PerformanceResult::zero();
         let decode_query_tokens = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
@@ -3023,6 +3028,7 @@ impl Engine {
                 MixedPass::SharedNonAttention,
                 &self.context_ops[0],
                 result.clone(),
+                0.0,
             );
             // Draft precompute is absent from the whole-model target curve.
             // Keep energy, provenance and executed fallback metadata together
@@ -3036,7 +3042,8 @@ impl Engine {
                 seq_imbalance_correction_scale,
                 ContextOpFilter::All,
                 |op, draft| {
-                    on_op(MixedPass::SharedNonAttention, op, draft.clone());
+                    let covered = covered_latency(&draft);
+                    on_op(MixedPass::SharedNonAttention, op, draft.clone(), covered);
                     result = std::mem::take(&mut result).plus(draft);
                 },
             )?;
@@ -3086,16 +3093,22 @@ impl Engine {
                 ..Default::default()
             };
             let mut target = PerformanceResult::zero();
+            let mut target_covered = 0.0;
             let mut draft = PerformanceResult::zero();
-            self.run_generation_phase_with(&rt, DEFAULT_STATIC_STRIDE, |_, op, result| {
-                let component = if matches!(op, Op::FpmForward(_)) {
-                    &mut target
-                } else {
-                    on_op(MixedPass::DecodeAttention, op, result.clone());
-                    &mut draft
-                };
-                *component = std::mem::take(component).plus(result);
-            })?;
+            self.run_generation_phase_with(
+                &rt,
+                DEFAULT_STATIC_STRIDE,
+                |_, op, result, covered| {
+                    let component = if matches!(op, Op::FpmForward(_)) {
+                        target_covered += covered;
+                        &mut target
+                    } else {
+                        on_op(MixedPass::DecodeAttention, op, result.clone(), covered);
+                        &mut draft
+                    };
+                    *component = std::mem::take(component).plus(result);
+                },
+            )?;
             if ctx_tokens > 0 {
                 // Use the equivalent-AR query's same batch and KV coordinates
                 // so the current per-curve coverage policy chooses the same rows.
@@ -3111,10 +3124,17 @@ impl Engine {
             }
             // Draft work has no twin in the prefill pass and must survive
             // even when the target's marginal cost clamps to zero.
+            // A zeroed marginal energy covers nothing.
+            let target_covered = if target.energy_wms > 0.0 {
+                target_covered
+            } else {
+                0.0
+            };
             on_op(
                 MixedPass::DecodeAttention,
                 &self.generation_ops[0],
                 target.clone(),
+                target_covered,
             );
             marginal_decode = target.plus(draft);
         }
@@ -3295,17 +3315,21 @@ impl Engine {
         let mut context = PerOpFold::for_plan("context", &self.context_plan);
         let mut generation = PerOpFold::for_plan("generation", &self.generation_plan);
         let (mut context_covered_ms, mut generation_covered_ms) = (0.0_f64, 0.0_f64);
-        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, op, r| {
-            // Decide coverage per result, before the name fold below.
-            let covered_ms = covered_latency(&r);
-            if is_context {
-                context_covered_ms += covered_ms;
-                context.add_slot(slot, op, r)
-            } else {
-                generation_covered_ms += covered_ms;
-                generation.add_slot(slot, op, r)
-            }
-        })?;
+        self.run_static_per_op_with(
+            runtime,
+            mode,
+            stride,
+            |is_context, slot, op, r, covered_ms| {
+                // Coverage is decided per query, before the name fold below.
+                if is_context {
+                    context_covered_ms += covered_ms;
+                    context.add_slot(slot, op, r)
+                } else {
+                    generation_covered_ms += covered_ms;
+                    generation.add_slot(slot, op, r)
+                }
+            },
+        )?;
         Ok((
             context.into_values(),
             generation.into_values(),
@@ -3333,7 +3357,7 @@ impl Engine {
             &self.generation_plan
         };
         let mut fold = PerOpSlotFold::for_plan(plan);
-        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, _, r| {
+        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, _, r, _| {
             if is_context == context {
                 fold.add(slot, r);
             }
@@ -3342,14 +3366,14 @@ impl Engine {
     }
 
     /// The static per-op walk: `on_op` observes whether each op is a context
-    /// op, its name slot and its result, in [`Self::run_static_per_op`] fold
-    /// order.
+    /// op, its name slot, its result and that result's power-covered latency,
+    /// in [`Self::run_static_per_op`] fold order.
     fn run_static_per_op_with(
         &self,
         runtime: &RuntimeConfig,
         mode: StaticMode,
         stride: u32,
-        mut on_op: impl FnMut(bool, usize, &Op, PerformanceResult),
+        mut on_op: impl FnMut(bool, usize, &Op, PerformanceResult, f64),
     ) -> Result<(), AicError> {
         self.reject_full_round_surface("per-operation static phases")?;
         if matches!(mode, StaticMode::Context | StaticMode::Both) {
@@ -3372,12 +3396,16 @@ impl Engine {
                 ContextOpFilter::All,
                 false,
                 None,
-                |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r.into_owned()),
+                |index, op, r| {
+                    let r = r.into_owned();
+                    let covered = covered_latency(&r);
+                    on_op(true, self.context_plan.name_slot(index), op, r, covered)
+                },
             )?;
         }
         if matches!(mode, StaticMode::Generation | StaticMode::Both) {
-            self.run_generation_phase_with(runtime, stride, |slot, op, r| {
-                on_op(false, slot, op, r)
+            self.run_generation_phase_with(runtime, stride, |slot, op, r, covered| {
+                on_op(false, slot, op, r, covered)
             })?;
         }
         Ok(())
@@ -3469,7 +3497,7 @@ impl Engine {
                 prefix,
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |pass, op, result| {
+                |pass, op, result, covered_ms| {
                     let (fold, covered) = match pass {
                         MixedPass::SharedNonAttention => (&mut shared, &mut shared_covered),
                         MixedPass::DecodeAttention => (&mut dec_attn, &mut dec_covered),
@@ -3477,7 +3505,8 @@ impl Engine {
                             unreachable!("FPM uses the prefill component")
                         }
                     };
-                    *covered += covered_latency(&result);
+                    // Decided per query, before any name fold.
+                    *covered += covered_ms;
                     fold.add(op, result);
                 },
             )?;
@@ -9960,6 +9989,70 @@ pub(crate) mod tests {
         assert!((draft.1 - expected).abs() < 1e-12);
         assert_eq!(draft.3, "empirical");
         assert_eq!(target.1, 0.0);
+    }
+
+    /// Two same-name draft decode ops, one powered and one not, fold into one
+    /// row with positive energy. Power coverage still counts only the powered
+    /// query's latency, in the mixed FPM step and in the static decode walk.
+    #[test]
+    fn fpm_decode_coverage_counts_each_same_name_draft_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let drafts: Vec<Op> = generation_ops()
+            .into_iter()
+            .map(|mut op| {
+                // `fpm_hybrid_spec` names each tail op `draft_<name>`.
+                op.set_name("dup".into());
+                op
+            })
+            .collect();
+        let (spec, _) = fpm_hybrid_spec(tmp.path(), Some(7), 8, drafts.clone(), vec![]);
+        // The b200 vLLM 0.22.0 attention table carries measured power.
+        let mut db = PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.22.0").unwrap();
+        db.set_fpm_forward_for_test(crate::perf_database::FpmForwardTable::new(
+            tmp.path().to_path_buf(),
+            "b200_sxm",
+            "vllm",
+            "0.25.1",
+        ));
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        // One decode request at width 8 and KV length 2048 + 1 + 1.
+        let queries: Vec<_> = drafts
+            .iter()
+            .map(|op| query_generation_op(op, &engine.db, 8, 1, 2050, 1.0, 0, None).unwrap())
+            .collect();
+        let powered: Vec<bool> = queries.iter().map(|r| r.energy_wms > 0.0).collect();
+        assert_eq!(
+            powered,
+            [false, true],
+            "the fixture needs one unpowered query"
+        );
+        let expected = queries[1].latency_ms;
+
+        let (_, _, decode, covered) = engine
+            .mixed_step_breakdown_per_op_with_metadata(2048, 1, 2048, 2, 0, 1.0, 1.0)
+            .unwrap();
+        let row = decode.iter().find(|row| row.0 == "draft_dup").unwrap();
+        assert!((row.1 - queries[0].latency_ms - queries[1].latency_ms).abs() < 1e-12);
+        assert!(row.2 > 0.0);
+        // The FPM components carry no energy, so only the powered draft counts.
+        assert!(
+            (covered - expected).abs() < 1e-12,
+            "{covered} vs {expected}"
+        );
+
+        let runtime = RuntimeConfig {
+            batch_size: 1,
+            isl: 2049,
+            osl: 2,
+            ..Default::default()
+        };
+        let (_, _, _, generation_covered) = engine
+            .run_static_per_op_with_coverage(&runtime, StaticMode::Generation, 1)
+            .unwrap();
+        assert!(
+            (generation_covered - expected).abs() < 1e-12,
+            "{generation_covered} vs {expected}"
+        );
     }
 
     /// AISIM-1973 D10 (aggregate FPM power is AISIM-2001): on a fully powered
