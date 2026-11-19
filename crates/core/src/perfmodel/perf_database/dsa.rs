@@ -1646,6 +1646,20 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k31_hopper_fa3_prefill_uses_flashmla_cache_bucket() {
+        // H100/H200 dense prefill executes FA3 over packed FlashMLA KV.
+        assert_eq!(
+            dsa_kernel_source_buckets(
+                "sglang_dsa_dense_mha_fa3_kv_flashmla_packed_eager",
+                "fp8",
+                "KimiK31ForConditionalGeneration",
+            )
+            .expect("native Hopper FP8 cache layout"),
+            &["flashmla_kv"]
+        );
+    }
+
+    #[test]
     fn kimi_k31_rows_require_unambiguous_fp8_cache_layout() {
         let architecture = "KimiK31ForConditionalGeneration";
         for (kv, source) in [

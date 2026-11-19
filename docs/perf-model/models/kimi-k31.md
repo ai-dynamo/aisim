@@ -72,10 +72,11 @@ maintained in a separate change.
 The model case declaration retains TP1/2/4/8 (96/48/24/12 local heads).
 The native full-node adapter owns its visible GPU group and runs each selected
 case in a fresh subprocess, using the standard selection, checkpoint and
-failure accounting. B300 (SM103) has native TP1/2/4 measurements with FP8 KV
-and eager forwards. TP8 remains unmeasured; other targeted SMs retain the
-registry's unverified marker. Graph serving is not qualified by these eager
-measurements.
+failure accounting. H100/H200 (SM90), B200/GB200 (SM100), and B300/GB300
+(SM103) have native TP1/2/4/8 measurements with FP8 KV and eager forwards.
+The registry admits these SMs; other targeted SMs remain unverified. Grace
+TP8 spans two four-GPU hosts in one NVLink fabric. Graph serving is not
+qualified by these eager measurements.
 
 Decode history is established by real native prefill through bounded request
 continuations, preserving every latent KV and index-K entry. The final native
@@ -95,17 +96,22 @@ from its mutable tag alone.
 
 ## Measured coverage and accuracy limits
 
-The November 9 B300 dataset contains 39 context and 33 generation points across
-TP1/2/4, with BF16 projections and FP8 packed FlashMLA KV. Context includes
-128–16384 new tokens and cached-prefix extensions; generation includes
-2048–131072 total history. The selected batch/length combinations, original
-12 preparation failures and their successful follow-up are documented in the
-[dataset README](../../../benchmarks/evidence/collector/kimi-k31-dsa-b300-20261109/README.md).
-All 72 published rows passed strict provenance and exact native Rust `silicon`
-lookup. This checks data integrity; it does not measure end-to-end prediction
-error against SemiAnalysis or qualify a trained full model.
+The November 9 expanded dataset covers H100, H200, B200, GB200 and GB300 at
+TP1/2/4/8, plus B300 TP8. Its 504 new points join the unchanged 72 B300
+TP1/2/4 points: 576 rows across 24 GPU/TP configurations, with 13 context and
+11 generation coordinates per configuration. Projections are BF16 with FP8
+packed FlashMLA KV. Context includes 128–16384 new tokens and cached-prefix
+extensions; generation includes 2048–131072 total history. The
+[expanded dataset README](../../../benchmarks/evidence/collector/kimi-k31-dsa-expanded-20261109/README.md)
+records the exact selected coordinates, platform runtimes, topology and
+provenance. The original 12 B300 preparation failures and successful follow-up
+remain in the [initial dataset README](../../../benchmarks/evidence/collector/kimi-k31-dsa-b300-20261109/README.md).
+The recorded strict-provenance, exact native Rust `silicon` lookups cover all
+576 rows. These are data-integrity checks, not end-to-end prediction error
+against SemiAnalysis, full-model qualification, or current-head CI evidence.
 
 The runtime uses one dummy-initialized DSA layer, eager execution, CP=1, DCP=1
-and no speculation. TP8, other GPU systems, serving graph/overlap behavior and
-SemiAnalysis configurations requiring speculation or context parallelism remain
-outside this measurement scope. No prediction-accuracy result is claimed.
+and no speculation. Systems beyond the six listed above, serving graph/overlap
+behavior and SemiAnalysis configurations requiring speculation or context
+parallelism remain outside this measurement scope. No prediction-accuracy
+result is claimed.

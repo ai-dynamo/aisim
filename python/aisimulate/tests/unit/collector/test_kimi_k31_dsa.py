@@ -5,6 +5,7 @@
 import copy
 import json
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -301,3 +302,116 @@ def test_native_tp_layout_rejects_incomplete_groups(nodes, rank):
 
     with pytest.raises(ValueError, match="divide evenly"):
         local_tp_size(8, nodes, rank)
+
+
+def _native_main_argv(tmp_path):
+    case = ModuleCase(4096, 1, 12, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    return [
+        "collect_kimi_k31_dsa_v1",
+        "--case",
+        json.dumps(case),
+        "--phase",
+        "context",
+        "--output",
+        str(tmp_path / "perf.txt"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (["--nnodes", "2"], "requires the same --dist-init-addr"),
+        (["--nnodes", "2", "--node-rank", "-1", "--dist-init-addr", "master:1234"], "valid node ranks"),
+        (["--nnodes", "2", "--node-rank", "2", "--dist-init-addr", "master:1234"], "valid node ranks"),
+        (["--node-rank", "1"], "valid node ranks"),
+    ],
+)
+def test_native_main_rejects_invalid_rendezvous_before_runtime_lookup(monkeypatch, tmp_path, options, message):
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    monkeypatch.setattr(sys, "argv", _native_main_argv(tmp_path) + options)
+    monkeypatch.setattr(native, "_assert_runtime", lambda: pytest.fail("invalid launch reached runtime lookup"))
+    with pytest.raises(ValueError, match=message):
+        native.main()
+
+
+@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize(("nodes", "rank"), [(1, 0), (2, 0), (2, 1)])
+def test_native_main_wires_platform_launch_and_offline_tokenizer(monkeypatch, tmp_path, config, offline, nodes, rank):
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    config_path = tmp_path / "checkpoint-config.json"
+    config_path.write_text(json.dumps(config))
+    tokenizer = str(tmp_path / "tokenizer")
+    calls = []
+
+    def hf_hub_download(model, filename, *, revision):
+        assert (model, filename, revision) == (MODEL, "config.json", native.MODEL_REVISION)
+        return str(config_path)
+
+    def snapshot_download(model, *, revision, local_files_only, allow_patterns):
+        assert (model, revision) == (MODEL, native.MODEL_REVISION)
+        assert local_files_only is offline
+        assert set(allow_patterns) == {
+            "tokenizer_config.json",
+            "tokenization_kimi.py",
+            "encoding_k3.py",
+            "tiktoken.model",
+        }
+        calls.append("tokenizer")
+        return tokenizer
+
+    class ServerArgs(SimpleNamespace):
+        def resolve_once(self):
+            # main() must write the single-layer config before native setup.
+            with open(self.model_path + "/config.json") as file:
+                assert json.load(file) == single_layer_config(config)
+            assert self.tokenizer_path == tokenizer
+            assert (self.tp_size, self.nnodes, self.node_rank) == (8, nodes, rank)
+            assert self.dist_init_addr == ("master:1234" if nodes > 1 else None)
+            calls.append("resolve")
+
+    ports = object()
+
+    def set_envs(server_args):
+        assert isinstance(server_args, ServerArgs)
+        calls.append("environment")
+
+    def init_ports(server_args):
+        assert isinstance(server_args, ServerArgs)
+        calls.append("ports")
+        return ports
+
+    def spawn(function, *, args, nprocs, join):
+        server_args, actual_ports, case_values, phase, output, first_gpu = args
+        assert function is native._rank_main
+        assert isinstance(server_args, ServerArgs)
+        assert actual_ports is ports
+        assert native.validate_case(ModuleCase(*case_values)) == 8
+        assert (phase, output, first_gpu, nprocs, join) == ("context", str(tmp_path / "perf.txt"), 1, 8 // nodes, True)
+        calls.append("spawn")
+
+    # Exercise parsing and orchestration without GPUs, model downloads, or a
+    # serving-framework install. The real single_layer_config still executes.
+    modules = {
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(device_count=lambda: 1 + 8 // nodes),
+            multiprocessing=SimpleNamespace(spawn=spawn),
+        ),
+        "huggingface_hub": SimpleNamespace(
+            constants=SimpleNamespace(HF_HUB_OFFLINE=offline),
+            hf_hub_download=hf_hub_download,
+            snapshot_download=snapshot_download,
+        ),
+        "sglang.srt.entrypoints.engine": SimpleNamespace(_set_envs_and_config=set_envs),
+        "sglang.srt.server_args": SimpleNamespace(ServerArgs=ServerArgs, PortArgs=SimpleNamespace(init_new=init_ports)),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(native, "_assert_runtime", lambda: None)
+    options = ["--device", "cuda:1"]
+    if nodes > 1:
+        options += ["--nnodes", str(nodes), "--node-rank", str(rank), "--dist-init-addr", "master:1234"]
+    monkeypatch.setattr(sys, "argv", _native_main_argv(tmp_path) + options)
+    native.main()
+    assert calls == ["tokenizer", "resolve", "environment", "ports", "spawn"]

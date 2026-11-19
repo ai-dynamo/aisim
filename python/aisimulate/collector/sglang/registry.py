@@ -16,10 +16,13 @@ REGISTRY: list[OpEntry] = [
         get_func="get_kimi_k31_dsa_context_test_cases",
         run_func="run_kimi_k31_dsa_fullnode",
         perf_filename=PerfFile.DSA_CONTEXT_MODULE,
-        # Native eager boundary verified on B300 SM103 TP1/2/4 and H100/H200
-        # SM90 TP1/2/4/8 (jobs 3174260/3174259: dense, sparse, prefix, decode).
-        # SM100 B200 TP1/2 passed the same four paths (job 5772967).
-        # TP4/8 and ARM GB200 still require their allocation-specific smoke.
+        # Native eager TP1/2/4/8 coverage: SM90 H100/H200, SM100 B200/GB200,
+        # SM103 B300/GB300. Receipts relative to benchmarks/evidence/collector/
+        # kimi-k31-dsa-expanded-20261109/: x86/smoke/*/*/validation.json;
+        # ARM arm/gb200/{tp1,tp24,tp8}/summary.json and
+        # arm/gb300/tp1248/summary.json bind formal observations and smoke
+        # hashes. The original ARM smoke payloads are outside the tree.
+        # See that campaign's README.md and the initial B300 campaign.
         unverified_sms=(80, 86, 89, 120),
     ),
     OpEntry(

@@ -19,9 +19,12 @@ Deviation: this initial lane explicitly configures eager serving. Its rows
 carry an ``_eager`` kernel_source suffix. Native graph replay/overlap can change
 latency in either direction; qualification must compare graph serving before
 removing this note or claiming default-serving prediction accuracy. The
-registry admits SM103 after native B300 TP1/2/4 boundary validation and SM90
-after H100/H200 TP1/2/4/8 dense/sparse/prefix/decode smoke, and SM100 after
-B200 TP1/2 smoke of those four paths. Other TP/topology runs need their own smoke.
+registry admits SM90 (H100/H200), SM100 (B200/GB200), and SM103 (B300/GB300)
+after native TP1/2/4/8 collection. The campaign README at
+benchmarks/evidence/collector/kimi-k31-dsa-expanded-20261109/README.md links
+x86 smoke and ARM formal receipts; ARM summaries bind the original smoke
+payloads by hash, but those payloads are outside the tree. Grace TP8 uses
+two four-GPU hosts within one NVLink fabric. Other topologies need their own smoke.
 """
 
 from __future__ import annotations
