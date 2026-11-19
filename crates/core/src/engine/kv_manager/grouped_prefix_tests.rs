@@ -188,7 +188,7 @@ fn prefill(
             computed,
             prompt,
             prompt,
-            budget,
+            budget.min(prompt - computed),
             hit.tokens + hit.junction_tokens,
             budget,
         );
