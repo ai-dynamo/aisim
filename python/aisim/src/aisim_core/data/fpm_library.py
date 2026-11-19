@@ -845,7 +845,12 @@ def complete_fpm_profile(
 
 def with_estimator_path(config: dict[str, Any], parquet_path: Path) -> None:
     """Point the interpolation estimator at the staged library unless the user chose a path."""
-    estimator = dict(config.get("estimator_config") or {})
+    estimator = config.get("estimator_config")
+    if estimator is None:
+        estimator = {}
+    elif not isinstance(estimator, Mapping):
+        raise FpmContractError("estimator_config must be a mapping")
+    estimator = dict(estimator)
     interpolation = estimator.get("fpm_interpolation")
     if interpolation is None:
         interpolation = {}

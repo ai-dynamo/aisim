@@ -8,6 +8,9 @@
             "properties": {
               "blocks_per_request": {
                 "type": "null"
+              },
+              "prefill_checkpoint_blocks": {
+                "type": "null"
               }
             }
           },

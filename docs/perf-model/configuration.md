@@ -446,6 +446,13 @@ need the memory. Speculative-round profiles require resources with observed `run
 Entries published without `resources` stay valid. Loading uses only the library and its sidecar and never reads
 `measurements/`.
 
+The sidecar's `row_count`, selector topology degrees and repeat counts, and measurement-file `bytes` require
+JSON integer literals; `1.0`, strings and booleans are rejected. JSON Schema treats `1.0` as an integer,
+so schema validation alone is insufficient for publication. Run
+`aisim_core.data.fpm_checks.check_fpm_dataset(root, include_measurements=True)` before publishing: it uses the
+strict sidecar and measurement-manifest readers in addition to artifact integrity checks. Prediction-only checks
+leave evaluation files optional.
+
 For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
 a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`
 order for other deployments. Without a profile, readiness describes the requested configuration.
