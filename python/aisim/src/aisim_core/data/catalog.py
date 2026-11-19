@@ -83,11 +83,14 @@ class CatalogCoverage(_Row):
 
 def read_catalog_coverage(root: Path) -> CatalogCoverage:
     path = root / CATALOG_DIR / COVERAGE_FILE
-    return (
-        CatalogCoverage.model_validate(json_sidecar_value(bounded_json_bytes(path)))
-        if path.is_file()
-        else CatalogCoverage()
-    )
+    try:
+        return (
+            CatalogCoverage.model_validate(json_sidecar_value(bounded_json_bytes(path)))
+            if path.is_file()
+            else CatalogCoverage()
+        )
+    except RecursionError as exc:
+        raise ValueError("catalog coverage JSON exceeds the nesting limit") from exc
 
 
 class CatalogRow(_Row):
