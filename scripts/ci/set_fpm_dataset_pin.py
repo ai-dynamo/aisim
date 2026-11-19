@@ -8,7 +8,7 @@ The single source is ``scripts/fpm_accuracy/dataset_pin.json``. ``--revision SHA
 (``systems/profiles/*/*hf_dataset.json``) and the collector recipes. A pin file that still points at the retired
 repository because its files do not exist at the migrated revision (``systems/dsv41_fpm_hf.json``) is left alone.
 ``--check`` fails when any consumer disagrees with the pin file; ``--require-set`` also fails while the pin is the
-all-zero placeholder.
+all-zero placeholder. A README that links its profile's pinned revision (``REVISION_READMES``) moves with the pin.
 """
 
 from __future__ import annotations
@@ -24,10 +24,18 @@ PIN_FILE = ROOT / "scripts/fpm_accuracy/dataset_pin.json"
 SYSTEMS = ROOT / "python/aisim/src/aisim_core/systems"
 RECIPES = ROOT / "python/aisim/collector/fpm_forward/recipes"
 PLACEHOLDER = "0" * 40
+# README -> the profile manifest whose pinned revision it links (``/tree/<revision>/``).
+REVISION_READMES = {"minimax_m27_fpm/README.md": "minimax_m27_fpm/hf_dataset.json"}
 
 
 def consumers() -> list[Path]:
     return sorted([*SYSTEMS.glob("profiles/*/*hf_dataset.json"), *RECIPES.glob("*.json")])
+
+
+def revision_readmes() -> dict[Path, Path]:
+    return {
+        SYSTEMS / "profiles" / readme: SYSTEMS / "profiles" / manifest for readme, manifest in REVISION_READMES.items()
+    }
 
 
 def _paths(document: dict) -> list[str]:
@@ -38,14 +46,14 @@ def _paths(document: dict) -> list[str]:
 
 def is_unified(path: Path) -> bool:
     """True when every pinned path is already physical (``data/fpm/...``)."""
-    return all(p.startswith("data/fpm/") for p in _paths(json.loads(path.read_text())))
+    return all(p.startswith("data/fpm/") for p in _paths(json.loads(path.read_text(encoding="utf-8"))))
 
 
 def _set_text(path: Path, repo_id: str, revision: str) -> bool:
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     new = re.sub(r'("repo_id": ")[^"]*(")', rf"\g<1>{repo_id}\g<2>", text, count=1)
     new = re.sub(r'("revision": ")[0-9a-f]{40}(")', rf"\g<1>{revision}\g<2>", new, count=1)
-    path.write_text(new)
+    path.write_text(new, encoding="utf-8")
     return new != text
 
 
@@ -56,7 +64,7 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--require-set", action="store_true", help="with --check: fail on the placeholder")
     args = parser.parse_args()
-    pin = json.loads(PIN_FILE.read_text())
+    pin = json.loads(PIN_FILE.read_text(encoding="utf-8"))
     if args.revision or args.repo_id:
         revision = args.revision or pin["revision"]
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
@@ -65,16 +73,31 @@ def main() -> int:
         pin["revision"] = revision
         if revision != PLACEHOLDER:
             pin.pop("note", None)
-        PIN_FILE.write_text(json.dumps(pin, indent=2) + "\n")
+        # Validate every README link before the first write.
+        moved = {}
+        for readme, manifest in revision_readmes().items():
+            current = json.loads(manifest.read_text(encoding="utf-8"))["revision"]
+            text = readme.read_text(encoding="utf-8")
+            moved[readme] = text.replace(f"/tree/{current}/", f"/tree/{revision}/")
+            if f"/tree/{revision}/" not in moved[readme]:
+                parser.error(f"{readme}: does not link the pinned revision {current}")
+        PIN_FILE.write_text(json.dumps(pin, indent=2) + "\n", encoding="utf-8")
         changed = [p for p in consumers() if is_unified(p) and _set_text(p, pin["repo_id"], pin["revision"])]
+        for readme, text in moved.items():
+            if text != readme.read_text(encoding="utf-8"):
+                readme.write_text(text, encoding="utf-8")
+                changed.append(readme)
         print(f"pin {pin['repo_id']}@{pin['revision']}: updated {len(changed)} consumer file(s)")
     problems = []
     for path in consumers():
-        document = json.loads(path.read_text())
+        document = json.loads(path.read_text(encoding="utf-8"))
         if not is_unified(path):
             problems.append(f"{path.relative_to(ROOT)}: still uses legacy data/ paths")
         elif (document["repo_id"], document["revision"]) != (pin["repo_id"], pin["revision"]):
             problems.append(f"{path.relative_to(ROOT)}: pin differs from {PIN_FILE.name}")
+    for readme in revision_readmes():
+        if f"/tree/{pin['revision']}/" not in readme.read_text(encoding="utf-8"):
+            problems.append(f"{readme.relative_to(ROOT)}: does not link the pinned revision")
     if args.require_set and pin["revision"] == PLACEHOLDER:
         problems.append("the dataset pin is still the placeholder")
     for problem in problems:
