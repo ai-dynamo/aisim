@@ -1669,13 +1669,27 @@ def _cell_generator_overrides(
             # illegal address. The mode is decode/agg only, so prefill cells
             # never receive it, and it is mutually exclusive with the
             # random-state mode that AISim does not render.
-            conflicting = policy_flags & {"--benchmark-hybrid-live-state", "--benchmark-randomize-kda-state"}
+            #
+            # The mode borrows recurrent state through a position-indexed block
+            # table: it reads the chain at the point's own block and forks the
+            # read/write span from the chain's live block. vLLM gives a Mamba
+            # group that row length only in align mode; with the default none
+            # the chain holds one state block and the first point fails with
+            # "chain ... too shallow for shadow". Align is also the mode vLLM
+            # documents as the prefix-caching default, so the collector selects
+            # it from the model config rather than leaving it to a model-config
+            # hook a checkpoint's architecture may not be wired to.
+            conflicting = policy_flags & {
+                "--benchmark-hybrid-live-state",
+                "--benchmark-randomize-kda-state",
+                "--mamba-cache-mode",
+            }
             if conflicting:
                 raise ValueError(
                     "recurrent cache layouts select the decode state mode from the model config; backend "
                     f"policy cannot supply {sorted(conflicting)}"
                 )
-            scheduler_args.append("--benchmark-hybrid-live-state")
+            scheduler_args.extend(["--benchmark-hybrid-live-state", "--mamba-cache-mode", "align"])
         workload_args = () if prefix_caching == "enabled" else _FPM_VLLM_DECODE_FAKE_KV_ARGS
     else:
         workload_args = _FPM_VLLM_PREFILL_ARGS

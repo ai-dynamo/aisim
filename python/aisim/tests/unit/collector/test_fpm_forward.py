@@ -3243,6 +3243,35 @@ def test_recurrent_decode_renders_hybrid_live_state(payload):
     assert args.count("--benchmark-randomize-kda-state") == 0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"architectures": [_HYBRID_ARCHITECTURE], "layer_types": ["linear_attention"] * 3 + ["full_attention"]},
+        {"architectures": [_HYBRID_ARCHITECTURE], "ssm_cfg": {"d_state": 128}},
+    ],
+    ids=["layer_types", "recurrent-state-field"],
+)
+def test_recurrent_decode_aligns_the_state_block_table(payload):
+    """Live-state borrowing reads a position-indexed state table, which only align mode provides.
+
+    vLLM gives a ``MambaSpec`` group ``cdiv(max_len, block_size)`` block-table
+    rows in align mode and one row otherwise (``v1/kv_cache_interface.py``).
+    Dynamo's ``recurrent_shadow_range`` indexes that row by position and raises
+    ``chain ... too shallow for shadow`` when the chain holds a single block.
+    The engine would reach align on its own only through the model-config hook
+    that a checkpoint's architecture may not be wired to, so the collector
+    selects it explicitly.
+    """
+    plan, cell = _plan_with_config(payload), _args_cell("decode", "tep")
+
+    from collector.fpm_forward.runner import _cell_generator_overrides
+
+    args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
+
+    assert args.count("--mamba-cache-mode") == 1
+    assert args[args.index("--mamba-cache-mode") + 1] == "align"
+
+
 def test_prefill_never_renders_hybrid_live_state():
     """The runtime validates the mode for decode/agg only, so prefill stays untouched."""
     plan, cell = (
@@ -3255,6 +3284,7 @@ def test_prefill_never_renders_hybrid_live_state():
     args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
 
     assert "--benchmark-hybrid-live-state" not in args
+    assert "--mamba-cache-mode" not in args
 
 
 def test_full_attention_decode_keeps_the_default_state_mode():
@@ -3269,6 +3299,7 @@ def test_full_attention_decode_keeps_the_default_state_mode():
     args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
 
     assert "--benchmark-hybrid-live-state" not in args
+    assert "--mamba-cache-mode" not in args
 
 
 def test_fake_kv_hybrid_decode_keeps_the_default_state_mode():
@@ -3282,9 +3313,14 @@ def test_fake_kv_hybrid_decode_keeps_the_default_state_mode():
 
     assert "--no-enable-prefix-caching" in args
     assert "--benchmark-hybrid-live-state" not in args
+    assert "--mamba-cache-mode" not in args
 
 
-def test_backend_policy_cannot_select_the_recurrent_state_mode():
+@pytest.mark.parametrize(
+    "flag",
+    ["--benchmark-randomize-kda-state", "--benchmark-hybrid-live-state", "--mamba-cache-mode=all"],
+)
+def test_backend_policy_cannot_select_the_recurrent_state_mode(flag):
     """The collector selects the mode from the model config; a policy that also did would be unverifiable."""
     from dataclasses import replace
 
@@ -3294,7 +3330,7 @@ def test_backend_policy_cannot_select_the_recurrent_state_mode():
     cell = _args_cell("decode", "tep")
     conflicting = BackendPolicy(
         "conflict",
-        {"params": {"agg": {"extra_cli_args": ["--benchmark-randomize-kda-state"]}}},
+        {"params": {"agg": {"extra_cli_args": [flag]}}},
         {},
     )
 
