@@ -689,7 +689,15 @@ impl ForwardPassPerfModelConfig {
                 self.kvcache_quant_mode = Some(facts.kvcache_quant_mode);
                 self.comm_quant_mode = Some(facts.comm_quant_mode);
                 self.attention_backend = Some(facts.attention_backend);
-                self.fpm_resources()?;
+                // A draft profile still identifies measured timing rows. Cache sizing
+                // and replay call fpm_resources themselves and require the missing block.
+                if self
+                    .fpm_deployment()?
+                    .is_some_and(|deployment| deployment.get("resources").is_some())
+                    || self.validate_fpm_execution()?.is_some()
+                {
+                    self.fpm_resources()?;
+                }
                 Some(facts.registered)
             }
             #[cfg(not(feature = "python"))]

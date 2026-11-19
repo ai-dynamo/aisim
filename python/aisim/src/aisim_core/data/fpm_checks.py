@@ -159,7 +159,7 @@ def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list
     try:
         dataset = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
         reference = dataset.categories["fpm"]
-        index = CategoryIndex.model_validate_json(_file(root, reference.index.path).read_bytes())
+        index = CategoryIndex.model_validate_json(_verify(root, reference.index).read_bytes())
     except (KeyError, OSError, ValueError, ValidationError) as exc:
         return [FpmFinding("invalid-catalog", "catalog/dataset.json", f"cannot read the fpm category: {exc}")]
     found: list[FpmFinding] = []

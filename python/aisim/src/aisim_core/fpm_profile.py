@@ -198,6 +198,47 @@ class FpmMambaCache(_ProfileModel):
         return self
 
 
+def _resource_layout_schema(schema: dict[str, Any]) -> None:
+    """Export the structural layout requirements also enforced by _exact_total."""
+    layouts = {
+        "linear": {
+            "required": ["kv_bytes_per_token"],
+            "properties": {"kv_bytes_per_token": {"type": "integer"}, "cache_groups": {"maxItems": 0}},
+        },
+        "grouped": {
+            "required": ["cache_groups"],
+            "properties": {"cache_groups": {"minItems": 1}, "kv_bytes_per_token": {"type": "null"}},
+        },
+        "unmodeled": {
+            "required": ["runtime_memory"],
+            "properties": {
+                "runtime_memory": {"type": "object"},
+                "kv_bytes_per_token": {"type": "null"},
+                "cache_groups": {"maxItems": 0},
+            },
+        },
+        "mamba_align": {
+            "required": ["runtime_memory", "mamba_cache"],
+            "properties": {
+                "runtime_memory": {"type": "object"},
+                "mamba_cache": {"type": "object"},
+                "kv_bytes_per_token": {"type": "null"},
+                "cache_groups": {"maxItems": 0},
+            },
+        },
+    }
+    for layout, constraints in layouts.items():
+        if layout != "mamba_align":
+            constraints["properties"]["mamba_cache"] = {"type": "null"}
+    schema["allOf"] = [
+        {
+            "if": {"properties": {"cache_layout": {"const": layout}}, "required": ["cache_layout"]},
+            "then": constraints,
+        }
+        for layout, constraints in layouts.items()
+    ]
+
+
 class FpmResourceProfile(_ProfileModel):
     """Rank-local cache geometry and optional memory evidence.
 
@@ -206,6 +247,8 @@ class FpmResourceProfile(_ProfileModel):
     non-KV bytes establish conservative bounds and exclude separate CUDA graph
     reservations. Runtime capacity instead requires the exact recorded settings.
     """
+
+    model_config = ConfigDict(json_schema_extra=_resource_layout_schema)
 
     weights_bytes: _Bytes | None = None
     activations_bytes: _Bytes | None = None
@@ -334,7 +377,7 @@ class FpmSpeculativeExecutionProfile(_ProfileModel):
         return value
 
 
-class FpmDeploymentProfile(_ProfileModel):
+class _FpmTimingDeploymentProfile(_ProfileModel):
     """One hardware, runtime, topology, precision and optional serving-role identity."""
 
     system: _Nonempty
@@ -360,7 +403,8 @@ class FpmDeploymentProfile(_ProfileModel):
     # Absent in historical shared profiles; never infer role-specific evidence.
     worker_type: Literal["prefill", "decode", "aggregated"] | None = None
     execution_profile: FpmSpeculativeExecutionProfile | None = None
-    resources: FpmResourceProfile
+    # Identity and timing can be validated before cache geometry is collected.
+    resources: FpmResourceProfile | None = None
 
     @model_serializer(mode="wrap")
     def _preserve_legacy_identity(self, handler):
@@ -369,7 +413,18 @@ class FpmDeploymentProfile(_ProfileModel):
             result.pop("worker_type", None)
         if self.execution_profile is None:
             result.pop("execution_profile", None)
+        if self.resources is None:
+            result.pop("resources", None)
         return result
+
+    def require_resources(self) -> FpmResourceProfile:
+        """Require cache geometry at the memory/replay boundary, never invent it for timing."""
+        if self.resources is None:
+            raise ValueError(
+                "FPM resources are pending; supply cache_layout, max_num_tokens, max_batch_size, provenance, "
+                "and kv_bytes_per_token (linear) or cache_groups (grouped) before cache sizing or replay"
+            )
+        return self.resources
 
     @field_validator("pp", "cp", mode="before")
     @classmethod
@@ -398,7 +453,7 @@ class FpmDeploymentProfile(_ProfileModel):
         return value
 
     @model_validator(mode="after")
-    def _deployment_identity(self) -> FpmDeploymentProfile:
+    def _deployment_identity(self) -> _FpmTimingDeploymentProfile:
         if self.execution_profile is not None and not (
             self.dp == 1 and self.pp == 1 and self.cp == 1 and self.moe_ep == 1 and self.moe_tp in (1, self.tp)
         ):
@@ -466,6 +521,12 @@ class FpmDeploymentProfile(_ProfileModel):
                     f"FPM profile identity conflict: {name}={supplied!r}, profile={expected!r}; "
                     "use matching measured precision and backend settings"
                 )
+
+
+class FpmDeploymentProfile(_FpmTimingDeploymentProfile):
+    """A complete deployment for resource-dependent configuration consumers."""
+
+    resources: FpmResourceProfile
 
 
 class FpmModelProfile(_ProfileModel):
@@ -577,3 +638,17 @@ def load_fpm_profile(value: dict[str, Any] | str | FpmModelProfile) -> FpmModelP
     if isinstance(value, str):
         value = json.loads(value)
     return FpmModelProfile.model_validate(value)
+
+
+class _FpmTimingModelProfile(FpmModelProfile):
+    """Internal timing admission keeps full identity while allowing pending resources."""
+
+    deployments: Annotated[list[_FpmTimingDeploymentProfile], Field(min_length=1)]
+
+
+def _load_fpm_timing_profile(value: dict[str, Any] | str | FpmModelProfile) -> _FpmTimingModelProfile:
+    if isinstance(value, FpmModelProfile):
+        value = value.model_dump(mode="json")
+    if isinstance(value, str):
+        value = json.loads(value)
+    return _FpmTimingModelProfile.model_validate(value)
