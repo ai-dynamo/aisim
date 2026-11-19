@@ -368,9 +368,32 @@ def test_wheel_handoffs_require_internal_containerized_runners():
             )
             if not runners or not runners <= internal_runners:
                 violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
-            if not job.get("container", {}).get("image"):
+            container = job.get("container") or {}
+            image = container if isinstance(container, str) else container.get("image")
+            if not image:
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
     assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize("runner", ["prod-aisim-default-amd64-v1", "ubuntu-24.04"])
+@pytest.mark.parametrize("container", ["test-image", {"image": "test-image"}, None, "", {}, {"image": ""}])
+def test_wheel_handoff_runner_policy_handles_container_syntax(tmp_path, monkeypatch, runner, container):
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    job = {
+        "runs-on": runner,
+        "container": container,
+        "steps": [{"uses": "./.github/actions/wheel-storage"}],
+    }
+    (workflows / "test.yml").write_text(yaml.safe_dump({"jobs": {"handoff": job}}))
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+
+    if container in ("test-image", {"image": "test-image"}) and runner == "prod-aisim-default-amd64-v1":
+        test_wheel_handoffs_require_internal_containerized_runners()
+    else:
+        reason = "internal Artifactory runner" if runner == "ubuntu-24.04" else "ARC job container"
+        with pytest.raises(AssertionError, match=reason):
+            test_wheel_handoffs_require_internal_containerized_runners()
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():
