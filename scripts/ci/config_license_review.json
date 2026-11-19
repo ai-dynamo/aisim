@@ -830,6 +830,9 @@
       },
       "base_models": [
         "zai-org/GLM-5.3"
+      ],
+      "nvidia_contribution_licenses": [
+        "LicenseRef-NVIDIA-Open-Model-Agreement"
       ]
     },
     {
@@ -850,6 +853,9 @@
       },
       "base_models": [
         "zai-org/GLM-5.3"
+      ],
+      "nvidia_contribution_licenses": [
+        "LicenseRef-NVIDIA-Open-Model-Agreement"
       ]
     },
     {
@@ -1097,7 +1103,7 @@
       "sha256": "c59bf551a0c315a6d8101afaf441fd53108792e997796e0e3e9cfe75903362fd",
       "ownership": "nvidia_derivative",
       "underlying_licenses": [
-        "LicenseRef-MiniMax-M2.5-Scope-Unresolved"
+        "UNKNOWN"
       ],
       "approval": {
         "status": "pending"
@@ -1117,7 +1123,7 @@
       "sha256": "253ea166454ff40d6a5387379973156c8bf9aee56e34d3d08e543925ab9f0b19",
       "ownership": "nvidia_derivative",
       "underlying_licenses": [
-        "LicenseRef-MiniMax-M2.5-Scope-Unresolved"
+        "UNKNOWN"
       ],
       "approval": {
         "status": "pending"
@@ -1435,7 +1441,10 @@
         "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/blob/da5b2650a835292c678994a1fa3fb653250fb508/README.md",
         "revision": "da5b2650a835292c678994a1fa3fb653250fb508",
         "status": "recorded_source"
-      }
+      },
+      "nvidia_contribution_licenses": [
+        "LicenseRef-OpenMDW-1.1"
+      ]
     },
     {
       "path": "aisim_core/model_configs/nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4_hf_quant_config.json",
@@ -1450,7 +1459,10 @@
         "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/blob/da5b2650a835292c678994a1fa3fb653250fb508/README.md",
         "revision": "da5b2650a835292c678994a1fa3fb653250fb508",
         "status": "recorded_source"
-      }
+      },
+      "nvidia_contribution_licenses": [
+        "LicenseRef-OpenMDW-1.1"
+      ]
     },
     {
       "path": "aisim_core/model_configs/nvidia--Nemotron-H-56B-Base-8K_config.json",
