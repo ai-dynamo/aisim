@@ -782,6 +782,13 @@ class RustForwardPassPerfModel:
         otherwise they return ``None`` even inside retained raw-feature bounds.
         Empty scheduled work returns ``0.0``.
 
+        Qualified Mamba op-level estimates accept optional
+        ``scheduled_requests.prefill_chunks`` groups of
+        ``[requests, new_tokens_per_request, prefix_tokens_per_request]``.
+        Their weighted totals must match the prefill counters. Native Replay
+        supplies observed groups; callers without groups retain balanced
+        aggregate pricing.
+
         On an ordinary STP FPM estimator, supplying a positive ``draft_length=d``
         estimates a complete SD decode iteration as
         ``(1.25 + 0.08*d) * F_STP((d+1)*B, K_total)``. B is each rank's logical

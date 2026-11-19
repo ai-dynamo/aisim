@@ -360,13 +360,18 @@ class BaseBackend:
         encoder_latency_ms: float,
         steps_to_finish_ctx: float,
         decode_iterations: float,
+        prefill_total_ms: float | None = None,
     ) -> float:
         """TTFT (ms) for an agg point. Default: per-request prefill time
         (chunk count x mix step) x queuing factor + dispatch + encoder. Subclasses
         with a different queue model override this whole computation."""
         qf = self._ttft_queuing_factor(b, steps_to_finish_ctx)
         logger.debug(f"ttft: prefill_step={prefill_step_ms:.2f}ms qf={qf:.2f}")
-        ttft_per_request = prefill_step_ms * np.ceil(isl / ctx_tokens) + self._prefill_dispatch_overhead_ms(model)
+        prefill_tokens = isl - prefix if b == 1 else isl
+        prefill_ms = (
+            prefill_total_ms if prefill_total_ms is not None else prefill_step_ms * np.ceil(prefill_tokens / ctx_tokens)
+        )
+        ttft_per_request = prefill_ms + self._prefill_dispatch_overhead_ms(model)
         return encoder_latency_ms + ttft_per_request * qf
 
     def _compute_tpot(
@@ -2071,7 +2076,8 @@ class BaseBackend:
             # special case for b=1: the packed budget holds at most this one
             # request, never unused budget. Op-level pricing reads prompt
             # tokens (prefix included); a whole-model FPM reads new tokens.
-            num_mix_steps = 1
+            num_mix_steps = max(1, math.ceil((isl - prefix) / ctx_tokens))
+            ttft_steps_to_finish_ctx = num_mix_steps
             fits = 0 < isl - prefix <= ctx_tokens
             if getattr(model, "forward_model", "op_level") == "fpm" and isl > prefix:
                 num_mix_ctx_tokens = min(ctx_tokens, isl - prefix)
@@ -2092,18 +2098,57 @@ class BaseBackend:
         per_ops_data: dict[str, dict] = {}
         per_ops_source: dict[str, dict] = {}
 
-        # run_mixed derives the image-augmented effective isl from the config's
-        # own image fields, so the raw runtime_config is passed unchanged (no
-        # pre-adjustment here, or the visual tokens would be counted twice).
-        mix_step_estimate = self.run_mixed(
-            model,
-            database,
-            runtime_config,
-            MixedStepInput(
-                context_tokens=num_mix_ctx_tokens,
-                num_decode_requests=num_mix_gen_tokens,
-            ),
-        )
+        # Text chunks have exact sequential shapes. Visual context retains the
+        # existing mean-field step, with every prefill iteration counted below;
+        # its image fields stay intact so run_mixed adds them exactly once.
+        if b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0:
+            # Fold each exact chunk immediately: retain O(operations) evidence,
+            # rather than O(chunks * operations) complete StepEstimate objects.
+            scalar_totals = dict.fromkeys(("latency_ms", "energy_wms", "covered_latency_ms"), 0.0)
+            maps = {
+                field: defaultdict(float)
+                for field in (
+                    "per_op_latency_ms",
+                    "per_op_energy_wms",
+                    "component_latency_ms",
+                    "component_energy_wms",
+                )
+            }
+            sources = {}
+            fallbacks = ()
+            # Each chunk has one request and its already computed prefix. The
+            # op-level budget includes that prefix; FPM consumes new tokens.
+            for done in range(0, isl - prefix, ctx_tokens):
+                length = min(ctx_tokens, isl - prefix - done)
+                past = prefix + done
+                chunk_runtime = copy.copy(runtime_config)
+                chunk_runtime.isl = past + length
+                chunk_runtime.prefix = past
+                budget = length if getattr(model, "forward_model", "op_level") == "fpm" else past + length
+                chunk = self.run_mixed(model, database, chunk_runtime, MixedStepInput(budget, 0))
+                for field in scalar_totals:
+                    scalar_totals[field] += getattr(chunk, field)
+                for field, totals in maps.items():
+                    for name, value in getattr(chunk, field).items():
+                        totals[name] += value
+                for name, source in chunk.per_op_source.items():
+                    sources[name] = source if name not in sources or sources[name] == source else "estimated"
+                fallbacks = merge_moe_comm_fallbacks(fallbacks, chunk.moe_comm_fallbacks)
+            # The summary API weights a mean step by its iteration count.
+            mix_step_estimate = dataclasses.replace(
+                chunk,
+                **{field: total / num_mix_steps for field, total in scalar_totals.items()},
+                **{
+                    field: {name: value / num_mix_steps for name, value in totals.items()}
+                    for field, totals in maps.items()
+                },
+                per_op_source=sources,
+                moe_comm_fallbacks=fallbacks,
+            )
+        else:
+            mix_step_estimate = self.run_mixed(
+                model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
+            )
         mix_step_latency_ms = mix_step_estimate.latency_ms
         mix_step_energy_wms = mix_step_estimate.energy_wms
         mix_per_ops = mix_step_estimate.per_op_latency_ms
@@ -2149,6 +2194,7 @@ class BaseBackend:
             encoder_latency_ms=encoder_latency_ms,
             steps_to_finish_ctx=ttft_steps_to_finish_ctx,
             decode_iterations=decode_iterations,
+            **({"prefill_total_ms": _prefill_step_ms * num_mix_steps} if b == 1 and num_mix_steps > 1 else {}),
         )
 
         # Guard against osl == 1 (no-decode), which makes both denominators zero.

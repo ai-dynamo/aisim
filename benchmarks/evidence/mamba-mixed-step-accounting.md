@@ -404,7 +404,8 @@ every model:
   and a 2048-token budget, TTFT is `20.636 * 4 * 2.05 = 169.214` ms. With
   the step latency held fixed, the 3 chunks of uncached tokens and the
   three-step `qf = 2.00` give `20.636 * 3 * 2.00 = 123.815` ms. This remains
-  unresolved.
+  unresolved at that revision. The repair below now prices the full
+  single-text-request schedule; multi-request mean-field behavior is unchanged.
 - **Reuse scope.** The result cache key held neither the model graph nor the
   database mode, and the compiled-handle identity did not hold the Mamba
   qualification fields. A legacy and a qualified Nano graph on one backend,
@@ -1007,22 +1008,15 @@ qualified split. The raw runs are in
   tokens, but a draft scan prices 2 requests of 256 tokens, 512 tokens. The
   scheduled chunks are 256 and 128 tokens. This change keeps one rule for all
   draft operations. It does not split only the qualified draft scan.
-- With one request whose uncached tokens exceed the budget, `run_agg`
-  counts one mix step in throughput and energy, as main does, although the
-  request takes several prefill chunks. This is part of the unresolved
-  multi-chunk TTFT limit above.
 - A pure-prefill packed step prices every operation except qualified Mamba
   at the integer mean of its new tokens per request, as main does. Two
   prefills of 8 and 9 new tokens price those operations as two of 8. The
   pure-prefill and mixed packed steps and the exact-total query
   `predict_prefill_latency_total` keep the remainder for qualified Mamba
   operations.
-- Replay prices a rank through `ForwardPassMetrics`, which carries prefill
-  totals and request counts, not each chunk's length. A qualified Mamba scan
-  therefore spreads the total evenly over the requests: chunks of 1000 and
-  500 tokens price as two chunks of 750. Other operations also see only the
-  totals. Per-chunk lengths would need a change to the shared telemetry
-  contract.
+- Totals-only `ForwardPassMetrics` still balance qualified Mamba prefill
+  lengths and cannot identify the cold request. Native Replay now supplies exact
+  `prefill_chunks`; the repair validation below covers the observed-shape path.
 - The compiled-engine identity is computed once per model object, database
   object, query mode and transfer policy, as main computes it per model and
   database object. Changing a model's operation lists after its first
@@ -1035,3 +1029,47 @@ qualified split. The raw runs are in
   requests of 1096 tokens for attention. A qualified graph takes the capped
   Mamba chunks instead, 2192 tokens here (see the scoped corrections above),
   so a Mamba qualification changes the price of non-Mamba operations.
+
+
+### Selected-review repair validation
+
+The repair after `3fb31295` changes single-text-request aggregate scheduling
+and qualified Mamba Replay geometry. `run_agg` now prices every uncached
+prefill chunk, with the already processed tokens as the next prefix, and keeps
+the final partial chunk. TTFT's queue input is the uncached chunk count. Its
+throughput and energy totals include the complete schedule. The summary still
+exposes a mean mix step, weighted by that count. This scheduling correction
+also affects legacy graphs and whole-model FPM; it does not change their
+per-operation formulas. Visual context retains mean-field step pricing.
+
+`test_run_agg_single_request_counts_every_prefill_chunk` uses an independent
+synthetic launch-and-token oracle: each prefill chunk costs `1 + 0.01 * new`
+ms and `10 + 0.2 * new` W-ms, then one decode costs 3 ms and 90 W-ms.
+For ISL 4096 and prefix 2048, budget 1024 gives two chunks, 22.48 ms and
+429.6 W-ms of prefill, and TTFT `22.48 * 1.95 = 43.836` ms. Prefix 1792
+adds a final 256-token chunk: three launches and 2304 new tokens give
+26.04 ms, with TTFT `26.04 * 2 = 52.08` ms. Prefix 3000 fits one chunk
+under budget 2048: 11.96 ms, with TTFT `11.96 * 1.90 = 22.724` ms.
+The test also checks throughput, active latency, covered latency and power.
+Chunk evidence is folded as it arrives, retaining O(operations) evidence
+rather than every chunk's complete dictionaries.
+
+Native Replay now groups its observed `(new length, cached prefix)` pairs
+before pricing qualified Mamba, and keys its memo by those groups. Rank
+pricing does the same. Totals-only telemetry keeps the documented balanced
+approximation. Grouping costs O(requests * log(distinct shapes)); pure decode
+and graphs without qualified Mamba keep their existing path. Memo entries
+with more than 256 distinct groups are not retained.
+
+The synthetic measured-row fixture in
+`qualified_mamba_uses_exact_prefill_groups_and_keys_the_rank_memo` deliberately
+sets `(batch=1, length=500)` to 2 ms, `(1,1000)` to 3 ms and `(2,750)` to
+11 ms. Actual `[1000,500]` chunks therefore cost 5 ms, instead of the
+balanced row's 11 ms. For two 16-token chunks with prefixes 0 and 64,
+the cold row contributes 5 ms with source `silicon`; the warm chunk contributes
+`2,394,112 / 7.7e12 * 1000` ms with source `sol`. The fixture checks both
+mixed and pure-prefill queries, source selection, cache separation and invalid
+group totals. `op_level_replay_preserves_observed_mamba_chunks_and_prefixes`
+checks those values through native iteration pricing, with and without
+captured diagnostics and with width-four decode. These are synthetic
+accounting oracles, not silicon accuracy measurements.

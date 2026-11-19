@@ -23,6 +23,11 @@ pub const FPM_VERSION: u32 = 1;
 /// AIC owns this Rust copy so AIC does not depend on Dynamo crates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledRequestMetrics {
+    /// Exact prefill groups `[requests, new_tokens_per_request, prefix_tokens_per_request]`.
+    /// Optional: op-level qualified Mamba uses these instead of balanced totals.
+    /// Unlike regression request features, these must agree with prefill totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_chunks: Option<Vec<[u32; 3]>>,
     /// Optional regression features: freshly computed tokens for each scheduled
     /// request (one for ordinary decode), aligned with `past_kv_lengths`.
     /// These additive fields are unnecessary for the default attention/MoE fit.
@@ -137,6 +142,36 @@ pub(crate) fn validate_forward_pass_metrics(metrics: &ForwardPassMetrics) -> Res
         return Err(AicError::InvalidForwardPassMetrics(
             "decode KV token sum requires num_decode_requests > 0".to_string(),
         ));
+    }
+    if let Some(groups) = &scheduled.prefill_chunks {
+        let mut totals = [0_u64; 3];
+        for &[count, new, prefix] in groups {
+            if count == 0 || new == 0 {
+                return Err(AicError::InvalidForwardPassMetrics(
+                    "prefill_chunks groups need positive request and new-token counts".into(),
+                ));
+            }
+            for (total, value) in totals.iter_mut().zip([
+                u64::from(count),
+                u64::from(count) * u64::from(new),
+                u64::from(count) * u64::from(prefix),
+            ]) {
+                *total = total.checked_add(value).ok_or_else(|| {
+                    AicError::InvalidForwardPassMetrics("prefill_chunks totals overflow".into())
+                })?;
+            }
+        }
+        if totals
+            != [
+                u64::from(scheduled.num_prefill_requests),
+                u64::from(scheduled.sum_prefill_tokens),
+                u64::from(scheduled.sum_prefill_kv_tokens),
+            ]
+        {
+            return Err(AicError::InvalidForwardPassMetrics(
+                "prefill_chunks must match prefill request, new-token and prefix totals".into(),
+            ));
+        }
     }
     match (&scheduled.extend_lengths, &scheduled.past_kv_lengths) {
         (None, None) => {}

@@ -53,8 +53,12 @@ class VLLMXPUBackend(VLLMBackend):
         encoder_latency_ms: float,
         steps_to_finish_ctx: float,
         decode_iterations: float,
+        prefill_total_ms: float | None = None,
     ) -> float:
         """encoder + own_prefill, x burst factor (eff_bs==b) or + admission wait (eff_bs<b); raw for b<=1."""
+        if b == 1 and prefill_total_ms is not None:
+            # run_agg already summed the actual sequential chunk prices.
+            return encoder_latency_ms + prefill_total_ms + self._prefill_dispatch_overhead_ms(model)
         d = 0 if b <= 1 else self._mix_step_gen_tokens(b, ctx_tokens, isl, decode_iterations)
         # Tokens one request feeds the step: op-level pricing reads prompt tokens (prefix
         # included), a whole-model FPM reads new tokens.

@@ -551,8 +551,8 @@ enum RankObserver<'a> {
 /// Every scheduled-work field a rank dispatch reads
 /// ([`Engine::rank_latency_ms`]): the five counters and the prefill-length
 /// variance bits, with the detail the entry keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct RankKey([u32; 5], u64, RankDetail);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RankKey([u32; 5], u64, RankDetail, Option<Vec<[u32; 3]>>);
 
 impl RankKey {
     fn of(metrics: &ForwardPassMetrics, detail: RankDetail) -> Self {
@@ -567,6 +567,7 @@ impl RankKey {
             ],
             sched.var_prefill_length.to_bits(),
             detail,
+            sched.prefill_chunks.clone(),
         )
     }
 }
@@ -2099,6 +2100,7 @@ impl Engine {
             ContextOpFilter::All,
             any_cached,
             total_new_tokens,
+            None,
             |_, op, _, result| on_op(op, result.into_owned()),
         )
     }
@@ -3483,6 +3485,7 @@ impl Engine {
                 ContextOpFilter::All,
                 false,
                 None,
+                None,
                 |index, op, _, r| {
                     let r = r.into_owned();
                     let covered = covered_latency(&r);
@@ -3960,6 +3963,11 @@ impl Engine {
         Ok(out.into_values())
     }
 
+    /// Whether observed prefill groups can affect this operation graph.
+    pub(crate) fn uses_prefill_chunks(&self) -> bool {
+        self.mix_plan.qualified_mamba
+    }
+
     /// Compute one forward-pass latency from a list of per-rank FPM entries.
     ///
     /// Re-platformed from the (deleted) `SessionEstimator::forward_pass_time_ms`
@@ -4100,6 +4108,11 @@ impl Engine {
         coverage: Option<&mut FpmQueryCoverage>,
     ) -> Result<Arc<RankPricing>, AicError> {
         if coverage.is_some()
+            || metrics
+                .scheduled_requests
+                .prefill_chunks
+                .as_ref()
+                .is_some_and(|groups| groups.len() > 256)
             || (detail == Some(RankDetail::Diagnostics) && self.fpm_split().is_some())
         {
             return self.price_rank(metrics, detail, coverage).map(Arc::new);
@@ -4434,6 +4447,7 @@ impl Engine {
                 sched.sum_prefill_kv_tokens,
                 kv_per_req,
                 n_decode,
+                sched.prefill_chunks.as_deref(),
                 |context, index, op, runtime, result, divisor| {
                     let (phase, slot) = if context {
                         ("context", Some(plan.context_slot[index]))
@@ -4465,6 +4479,7 @@ impl Engine {
                     ContextOpFilter::All,
                     any_cached,
                     Some(sched.sum_prefill_tokens),
+                    sched.prefill_chunks.as_deref(),
                     |_, _, _, _| {},
                 )?,
                 operations => {
@@ -4483,6 +4498,7 @@ impl Engine {
                         ContextOpFilter::All,
                         any_cached,
                         Some(sched.sum_prefill_tokens),
+                        sched.prefill_chunks.as_deref(),
                         |index, op, runtime, result| {
                             let slot = Some(self.context_plan.name_slot(index));
                             operations.add_lent("context", slot, op, result, 1.0, || *runtime);
@@ -4876,6 +4892,127 @@ pub(crate) mod tests {
         );
         spec.engine.database_mode = db.database_mode;
         Engine::build(spec, Arc::new(db)).unwrap()
+    }
+
+    /// Synthetic measured rows deliberately distinguish observed chunk groups
+    /// from their balanced mean. Latencies are fixture inputs, not predictions.
+    pub(crate) fn measured_mamba_engine() -> (Engine, tempfile::TempDir) {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().unwrap();
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).unwrap();
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"; 5]),
+                Col::Str("phase", vec!["context"; 5]),
+                Col::I64("batch_size", vec![1, 1, 1, 2, 1]),
+                Col::I64("seq_len", vec![500, 750, 1000, 750, 16]),
+                Col::I64("d_model", vec![4096; 5]),
+                Col::I64("d_state", vec![128; 5]),
+                Col::I64("d_conv", vec![4; 5]),
+                Col::I64("nheads", vec![64; 5]),
+                Col::I64("head_dim", vec![64; 5]),
+                Col::I64("n_groups", vec![4; 5]),
+                Col::I64("chunk_size", vec![128; 5]),
+                Col::F64("latency", vec![2.0, 7.0, 3.0, 11.0, 5.0]),
+            ],
+        );
+        let mut db = PerfDatabase::load(root.path(), "testsys", "test", "1.0").unwrap();
+        db.database_mode = DatabaseMode::Hybrid;
+        // State-space tables load lazily; keep their root alive for queries.
+        (qualified_mamba_engine_over(db, 3), root)
+    }
+
+    #[test]
+    fn qualified_mamba_uses_exact_prefill_groups_and_keys_the_rank_memo() {
+        let (engine, _root) = measured_mamba_engine();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let metrics = |groups, cached| ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 2,
+                sum_prefill_tokens: if cached { 32 } else { 1500 },
+                sum_prefill_kv_tokens: if cached { 64 } else { 0 },
+                prefill_chunks: Some(groups),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ragged = metrics(vec![[1, 500, 0], [1, 1000, 0]], false);
+        let balanced = metrics(vec![[2, 750, 0]], false);
+        // Same totals, different actual measured rows: 2 + 3 versus 11 ms.
+        for capture in [false, true] {
+            for (input, expected) in [(&ragged, 5.0), (&balanced, 11.0), (&ragged, 5.0)] {
+                let got = engine
+                    .forward_pass_estimate(&[input.clone()], capture, None)
+                    .unwrap();
+                assert!(close(got.latency_ms.unwrap(), expected));
+            }
+        }
+        let mut totals_only = balanced.clone();
+        totals_only.scheduled_requests.prefill_chunks = None;
+        assert!(close(
+            engine.forward_pass_time_ms(&[totals_only]).unwrap(),
+            11.0
+        ));
+        let warm_bytes = 16.0 * 18_560.0 + 2.0 * 1_048_576.0;
+        let warm_ms = warm_bytes / 7.7e12 * 1000.0;
+        let cold_warm = metrics(vec![[1, 16, 0], [1, 16, 64]], true);
+        for decode in [0, 8] {
+            let mut input = cold_warm.clone();
+            input.scheduled_requests.num_decode_requests = decode;
+            input.scheduled_requests.sum_decode_kv_tokens = decode * 16;
+            let detail = engine.forward_pass_estimate(&[input], true, None).unwrap();
+            let scan = detail.ranks[0]
+                .operations
+                .iter()
+                .find(|op| op.name == "context_ssm")
+                .unwrap();
+            assert!(close(scan.latency_ms, 5.0 + warm_ms));
+        }
+        let mut seen = Vec::new();
+        crate::session::get_mix_step_ops(
+            &engine.context_ops,
+            &engine.generation_ops,
+            None,
+            None,
+            None,
+            &engine.db,
+            32,
+            8,
+            16,
+            2,
+            32,
+            64,
+            16,
+            8,
+            cold_warm.scheduled_requests.prefill_chunks.as_deref(),
+            |context, _, _, runtime, result, _| {
+                if context {
+                    seen.push((runtime.prefix, result.source));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (0, crate::operators::base::Source::Silicon),
+                (64, crate::operators::base::Source::Sol)
+            ]
+        );
+        let mut invalid = ragged;
+        invalid.scheduled_requests.prefill_chunks.as_mut().unwrap()[0][1] = 499;
+        assert!(
+            engine
+                .forward_pass_time_ms(&[invalid])
+                .unwrap_err()
+                .to_string()
+                .contains("prefill_chunks must match")
+        );
     }
 
     pub(crate) fn qualified_mamba_engine(nextn: u32) -> Engine {
@@ -5313,6 +5450,7 @@ pub(crate) mod tests {
                 combined_prefix,
                 0,
                 0,
+                None,
                 |_, _, _, ctx, _, _| seen.push(ctx.prefix),
             )
             .unwrap();
@@ -10624,6 +10762,7 @@ pub(crate) mod tests {
                 requests * prefix,
                 kv,
                 generation,
+                None,
                 |_, _, _, _, _, _| {},
             )
             .unwrap();

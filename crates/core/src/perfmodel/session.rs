@@ -322,6 +322,7 @@ pub(crate) fn run_context_ops_with<'a>(
         filter,
         false,
         None,
+        None,
         |_, op, _, result| on_op(op, result.into_owned()),
     )
 }
@@ -347,6 +348,7 @@ pub(crate) fn run_context_ops_planned<'a>(
     filter: ContextOpFilter,
     any_cached: bool,
     total_new_tokens: Option<u32>,
+    prefill_chunks: Option<&[[u32; 3]]>,
     mut on_op: impl FnMut(usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
@@ -357,6 +359,24 @@ pub(crate) fn run_context_ops_planned<'a>(
             ContextOpFilter::SkipContextAttention if op.is_context_attention() => continue,
             ContextOpFilter::OnlyContextAttention if !op.is_context_attention() => continue,
             _ => {}
+        }
+        if let Some(groups) = prefill_chunks
+            && op.is_qualified_mamba()
+        {
+            for &[batch, length, past] in groups {
+                let ctx = context_op_runtime(
+                    op,
+                    batch,
+                    length,
+                    past,
+                    seq_imbalance_correction_scale,
+                    None,
+                );
+                let result = op.query(db, &ctx)?;
+                total += result.latency_ms;
+                on_op(index, op, &ctx, Cow::Owned(result));
+            }
+            continue;
         }
         if let Some(tokens) = total_new_tokens
             && op.is_qualified_mamba()
@@ -683,6 +703,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     combined_prefix: u32,
     kv_per_decode_req: u32,
     decode_batch: u32,
+    prefill_chunks: Option<&[[u32; 3]]>,
     mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>, f64),
 ) -> Result<f64, AicError> {
     // ---- Pass 1: combined non-attention work (batch=1, isl=ctx+gen) ----
@@ -724,7 +745,8 @@ pub(crate) fn get_mix_step_ops<'a>(
             // the step keeps every chunk off cold-state scan rows, even when
             // the integer mean prefix rounds to zero.
             let prefix = mamba_cached_prefix(op, prefix_per_req, combined_prefix > 0);
-            for (batch, tokens) in [(n - r, q), (r, q + 1)] {
+            let balanced = [[n - r, q, prefix], [r, q + 1, prefix]];
+            for &[batch, tokens, prefix] in prefill_chunks.unwrap_or(&balanced) {
                 if batch == 0 || tokens == 0 {
                     continue;
                 }

@@ -752,6 +752,7 @@ type FpmEvidenceKey = (FpmEvidencePhase, u32, u32, u32, u64);
 
 /// A group iteration: every rank's query in DP order.
 type IterationKey = Vec<RankQuery>;
+type PrefillIterationKey = (IterationKey, Vec<Vec<[u32; 3]>>, bool);
 
 /// A recorded rank estimate's kind, the rank's query and the bits of the
 /// iteration's correction.
@@ -772,6 +773,9 @@ struct IterationPricing {
     /// the phase memo's does. Absent while the model collects lookup coverage,
     /// which counts every invocation.
     memo: Option<Memo<IterationKey, Arc<PricedIteration>>>,
+    /// Qualified Mamba additionally keys pricing by observed prefill groups.
+    prefill_memo: Option<Memo<PrefillIterationKey, Arc<PricedIteration>>>,
+    uses_prefill_chunks: bool,
     /// How a mixed operation-graph rank's operations split into prefill and
     /// decode evidence, per operation-name list the model reports.
     mixed_splits: Mutex<Vec<Arc<MixedSplit>>>,
@@ -883,6 +887,9 @@ impl IterationPricing {
                 .fpm_query_coverage()?
                 .is_none()
                 .then(|| Memo::clock(256)),
+            prefill_memo: (native.uses_prefill_chunks() && model.fpm_query_coverage()?.is_none())
+                .then(|| Memo::clock(256)),
+            uses_prefill_chunks: native.uses_prefill_chunks(),
             mixed_splits: Mutex::default(),
         }))
     }
@@ -1563,10 +1570,24 @@ impl AicTimingModel {
         pricing: &IterationPricing,
         queries: &[RankQuery],
         capture: bool,
+        prefill_chunks: &[Vec<[u32; 3]>],
     ) -> Result<PricedIteration> {
         let dispatch = pricing.dispatch;
         let model = &pricing.model;
-        let metrics: Vec<_> = queries.iter().map(rank_metrics).collect();
+        let metrics: Vec<_> = queries
+            .iter()
+            .enumerate()
+            .map(|(index, query)| {
+                let mut metrics = rank_metrics(query);
+                if let Some(groups) = prefill_chunks
+                    .get(index)
+                    .filter(|groups| !groups.is_empty())
+                {
+                    metrics.scheduled_requests.prefill_chunks = Some(groups.clone());
+                }
+                metrics
+            })
+            .collect();
         let whole_model = matches!(dispatch, IterationDispatch::WholeModel { .. });
         if whole_model && !capture {
             let total_ms = model
@@ -2119,14 +2140,49 @@ impl TimingModel for AicTimingModel {
         }
         let capture = self.diagnostic_model.is_some();
         let price = || {
-            self.price_iteration(pricing, &queries, capture)
+            self.price_iteration(pricing, &queries, capture, &[])
                 .map(Arc::new)
         };
-        let priced = match &pricing.memo {
-            Some(memo) => {
-                memo.get_or_price_by(&OnThread, queries.as_slice(), <[RankQuery]>::to_vec, price)?
+        let priced = if pricing.uses_prefill_chunks && queries.iter().any(|query| query[1] > 0) {
+            // Group once per rank, outside the operation walk. Query shape is
+            // part of both this iteration memo and the native rank memo.
+            let groups = ranks
+                .iter()
+                .map(|rank| -> Result<Vec<[u32; 3]>> {
+                    let mut grouped = std::collections::BTreeMap::new();
+                    if let Some(prefill) = &rank.prefill {
+                        for &(new, past, _) in &prefill.requests {
+                            let new = checked_u32(new, "prefill chunk tokens")?;
+                            let past = checked_u32(past, "prefill chunk prefix")?;
+                            *grouped.entry((new, past)).or_insert(0_u32) += 1;
+                        }
+                    }
+                    Ok(grouped
+                        .into_iter()
+                        .map(|((new, past), count)| [count, new, past])
+                        .collect())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keep = groups.iter().map(Vec::len).sum::<usize>() <= 256;
+            let key = (queries.clone(), groups, capture);
+            let price = || {
+                self.price_iteration(pricing, &queries, capture, &key.1)
+                    .map(Arc::new)
+            };
+            match &pricing.prefill_memo {
+                Some(memo) if keep => memo.get_or_price_by(&OnThread, &key, Clone::clone, price)?,
+                _ => price()?,
             }
-            None => price()?,
+        } else {
+            match &pricing.memo {
+                Some(memo) => memo.get_or_price_by(
+                    &OnThread,
+                    queries.as_slice(),
+                    <[RankQuery]>::to_vec,
+                    price,
+                )?,
+                None => price()?,
+            }
         };
         self.record_iteration(&priced, &queries)?;
         Ok(Some(IterationMs {
@@ -10286,6 +10342,71 @@ mod tests {
     }
 
     #[test]
+    fn op_level_replay_preserves_observed_mamba_chunks_and_prefixes() {
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        pyo3::prepare_freethreaded_python();
+        let (native, _root) = crate::perfmodel::engine::runtime::tests::measured_mamba_engine();
+        let native = Arc::new(native);
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::with_gil(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let ragged = fitted_work(0, Some(&[(1000, 0), (500, 0)]), None);
+        let balanced = fitted_work(0, Some(&[(750, 0), (750, 0)]), None);
+        let cold_warm = fitted_work(0, Some(&[(16, 0), (16, 64)]), None);
+        // Fixture rows: (1,1000)=3 ms, (1,500)=2 ms, (2,750)=11 ms,
+        // and cold (1,16)=5 ms. Warm (1,16) moves 2,394,112 bytes.
+        let warm_ms = 2_394_112.0 / 7.7e12 * 1000.0;
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            for (rank, expected) in [
+                (&ragged, 5.0),
+                (&balanced, 11.0),
+                (&ragged, 5.0),
+                (&cold_warm, 5.0 + warm_ms),
+            ] {
+                for mixed in [false, true] {
+                    let mut rank = rank.clone();
+                    let decode_ms = if mixed {
+                        let mut decode = fitted_work(0, None, Some(&[16, 16])).decode.unwrap();
+                        decode.verify_width = 4;
+                        decode.widths = vec![4, 4];
+                        rank.decode = Some(decode);
+                        10_634_240.0 / 7.7e12 * 1000.0
+                    } else {
+                        0.0
+                    };
+                    let (latency, evidence) =
+                        priced_with_evidence(&timing, |timing| iteration_ms(timing, &[rank]));
+                    assert!(
+                        close(latency, expected + decode_ms),
+                        "{latency} != {}",
+                        expected + decode_ms
+                    );
+                    assert!(close(
+                        evidence
+                            .prefill
+                            .operations
+                            .iter()
+                            .map(|op| op.latency_ms)
+                            .sum(),
+                        expected
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn op_level_replay_counts_split_mamba_power_coverage_per_query() {
         use crate::common::enums::{DatabaseMode, TransferPolicy};
         use crate::perf_database::energy_test_fixtures::{
@@ -10767,7 +10888,7 @@ mod tests {
                 .map(|rank| AicTimingModel::rank_query(dispatch, rank).unwrap().unwrap())
                 .collect();
             let evidence = timing
-                .price_iteration(pricing, &queries, capture)
+                .price_iteration(pricing, &queries, capture, &[])
                 .unwrap()
                 .evidence;
             // One part per pure rank, in rank order; each rank's memo entry

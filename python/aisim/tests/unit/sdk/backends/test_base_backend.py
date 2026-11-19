@@ -579,11 +579,11 @@ def test_run_agg_b1_uses_scheduled_activation_peak(
     ("forward_model", "ctx_tokens", "context_tokens", "activation_tokens"),
     [
         # Op-level pricing reads prompt tokens: the whole 8-token prompt fits.
-        ("op_level", 8, 8, 6),
-        ("op_level", 4, 4, 4),
+        ("op_level", 8, [8], 6),
+        ("op_level", 4, [6, 8], 4),
         # A whole-model FPM reads new tokens: 6 is one request, not two.
-        ("fpm", 8, 6, 6),
-        ("fpm", 4, 4, 4),
+        ("fpm", 8, [6], 6),
+        ("fpm", 4, [4, 2], 4),
     ],
 )
 def test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens(
@@ -609,7 +609,7 @@ def test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens(
         RuntimeConfig(batch_size=1, isl=8, osl=1, prefix=2, engine_step_backend="rust"),
         ctx_tokens=ctx_tokens,
     )
-    assert [step.context_tokens for step in steps] == [context_tokens]
+    assert [step.context_tokens for step in steps] == context_tokens
     assert [call["num_tokens"] for call in memory_calls] == [activation_tokens]
 
 
@@ -1318,3 +1318,59 @@ def test_run_agg_zero_decode_steps_do_not_change_energy_coverage(
     assert summary.get_aggregate_energy_breakdown()["genonly_step"].latency_ms == 0
     assert summary.get_power_data_coverage() == pytest.approx(expected)
     assert (_apply_power_coverage_gate(summary, summary.get_result_dict())["power_w"] is not None) is published
+
+
+@pytest.mark.parametrize(
+    "prefix,budget,expected_chunks,qf",
+    [
+        (2048, 1024, [(3072, 2048), (4096, 3072)], 1.95),
+        (1792, 1024, [(2816, 1792), (3840, 2816), (4096, 3840)], 2.00),
+        (3000, 2048, [(4096, 3000)], 1.90),
+    ],
+)
+def test_run_agg_single_request_counts_every_prefill_chunk(
+    backend, model, database, monkeypatch, prefix, budget, expected_chunks, qf
+):
+    # A synthetic per-chunk oracle: 1 ms launch + 0.01 ms/new token, with
+    # 10 W-ms launch + 0.2 W-ms/new token. Decode is one 3 ms, 90 W-ms step.
+    # The last partial chunk pays its own launch and only its remaining tokens.
+    calls = []
+
+    def prefill(_model, _database, runtime, step):
+        calls.append((runtime.isl, runtime.prefix))
+        tokens = runtime.isl - runtime.prefix
+        latency, energy = 1 + tokens * 0.01, 10 + tokens * 0.2
+        return StepEstimate(
+            latency_ms=latency,
+            energy_wms=energy,
+            covered_latency_ms=latency,
+            per_op_latency_ms={"prefill": latency},
+            per_op_energy_wms={"prefill": energy},
+            per_op_source={"prefill": "silicon"},
+        )
+
+    monkeypatch.setattr(backend, "run_mixed", prefill)
+    monkeypatch.setattr(
+        backend,
+        "_get_genonly_step_estimate",
+        lambda *_: _decode_step(3.0, 90.0, {"decode": 3.0}, {"decode": "silicon"}, ()),
+    )
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(batch_size=1, isl=4096, prefix=prefix, osl=2, engine_step_backend="rust"),
+        ctx_tokens=budget,
+    )
+    assert calls == expected_chunks
+    count = len(expected_chunks)
+    prefill_ms, prefill_energy = count + (4096 - prefix) * 0.01, count * 10 + (4096 - prefix) * 0.2
+    result = summary.get_result_dict()
+    assert result["ttft"] == pytest.approx(
+        prefill_ms * qf
+    )  # unchanged base queue heuristic, at the uncached step count
+    assert result["tokens/s"] == pytest.approx(1000 / (prefill_ms + 3))
+    groups = summary.get_aggregate_energy_breakdown()
+    assert groups["mix_step"].latency_ms == pytest.approx(prefill_ms)
+    assert groups["mix_step"].energy_wms == pytest.approx(prefill_energy)
+    assert groups["mix_step"].covered_latency_ms == pytest.approx(prefill_ms)
+    assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))

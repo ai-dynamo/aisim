@@ -98,13 +98,15 @@ proxy, labeled `estimated`. A legacy operation, one with no recorded state
 dtype, still looks up the cold row. In `SILICON` or `HYBRID`
 mode, a successful lookup labels its result `silicon`. A `HYBRID` lookup that
 misses the model geometry gives `sol`, and `SOL` mode reads no row.
-The native Mamba2 pricing of a packed step reads only the prefill totals of its
-`ForwardPassMetrics`, so it cannot say which request is cold. This is a limit of
-the pricing path. The optional `extend_lengths` and `past_kv_lengths` fields can
-identify the cold request, but this path does not read them. If a packed step
-has any cached prefill token, every qualified prefill scan in it uses the SOL
-estimate. For a step that mixes cold and
-cached requests, this choice of source is therefore approximate. Each prefill
+Native op-level Replay supplies the observed prefill chunk lengths and prefixes
+as `scheduled_requests.prefill_chunks`. Qualified Mamba operations group and
+price those actual shapes, so cold scans keep their measured rows beside warm
+SOL scans. A caller with only prefill totals omits this field: qualified Mamba
+then distributes new tokens evenly across the requests. If such a totals-only
+step has any cached prefill token, every qualified prefill scan in it uses SOL;
+its measured-row eligibility is approximate. The regression feature fields
+`extend_lengths` and `past_kv_lengths` have no phase ordering contract and are
+not substituted for exact prefill groups. Each prefill
 request must compute at least one new token. Take a graph with a qualified
 context Mamba2 operation. If a packed step has new prefill tokens, but fewer
 than prefill requests, its estimate fails. Decode work does not change this.

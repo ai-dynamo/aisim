@@ -132,7 +132,13 @@ unweighted mean of already averaged power values.
 
 For an aggregated deployment, all prefill and decode forward-pass invocations
 from the aggregated role contribute their operation energy, active latency,
-and covered active latency.
+and covered active latency. For a single text request, `run_agg` prices every
+uncached prefill chunk in order, including a shorter final chunk, before its
+decode steps. Each chunk's already computed tokens become the next chunk's
+prefix. TTFT uses the complete prefill latency and its uncached chunk count in
+the existing queuing heuristic. This also applies to unqualified operation
+graphs and whole-model FPM. Visual context retains its existing mean-field
+step pricing, with the prefill iteration count applied to the aggregate totals.
 
 For a disaggregated deployment, the prefill and decode roles are combined by
 the same sums:
