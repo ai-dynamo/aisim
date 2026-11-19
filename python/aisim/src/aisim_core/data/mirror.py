@@ -409,10 +409,12 @@ def validate_tree(
         for f in control:
             if f.is_symlink or not f.path.endswith(".json"):
                 report.add("control-file", "mirror/ may hold plain .json files only", f.path)
-        from aisim_core.data.redaction import LEDGER_PATH, VisibilityLedger
+        from aisim_core.data.redaction import LEDGER_PATH, load_ledger
 
-        if (root / LEDGER_PATH).is_file():
-            _read_json(root, LEDGER_PATH, VisibilityLedger, report)
+        try:
+            load_ledger(root)
+        except (OSError, ValueError, RecursionError) as exc:
+            report.add("document-invalid", f"VisibilityLedger: {str(exc).splitlines()[0]}", LEDGER_PATH)
     report.files = len(listing) + len(evidence)
     if not listing and not evidence and allow_empty:
         return report
@@ -494,6 +496,7 @@ def validate_tree(
 
 
 def _check_system_bundles(root: Path, report: TreeReport) -> set[str]:
+    from aisim_core.data.hygiene import yaml_sidecar_value
     from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, check_published_system, copy_filename, read_manifest
 
     declared = set()
@@ -501,7 +504,11 @@ def _check_system_bundles(root: Path, report: TreeReport) -> set[str]:
         rel = path.relative_to(root).as_posix()
         system = path.parent.name
         try:
+            yaml_sidecar_value(bounded_json_bytes(checked_path(root, rel)))
             manifest = read_manifest(path)
+            for entry in manifest.history:
+                copy_rel = f"systems/{system}/{copy_filename(system, entry.spec_sha256)}"
+                yaml_sidecar_value(bounded_json_bytes(checked_path(root, copy_rel)))
             problems = check_published_system(system, root, PACKAGED_SYSTEMS_DIR / f"{system}.yaml")
             if problems:
                 raise ValueError("; ".join(problems))

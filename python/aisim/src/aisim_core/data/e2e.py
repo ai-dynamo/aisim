@@ -1280,6 +1280,8 @@ def _ifx_body(
     config: Mapping[str, Any], gaps: list[dict], metric_parallelism: Mapping[str, Mapping[str, int]] | None = None
 ) -> E2eManifestBody:
     disagg = bool(config["disagg"])
+    if not disagg and config.get("decode_num_workers") == 0:
+        raise ValueError("aggregated decode_num_workers must not be zero; a serving worker is required")
     roles = ("prefill", "decode") if disagg else ("decode",)
     # Aggregated InferenceX records carry the serving worker under the decode_* fields.
     parallelism: dict[str, dict[str, int]] = {}
