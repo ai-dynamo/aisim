@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check local Markdown file/directory destinations in user-facing docs.
+"""Check local Markdown file/directory destinations in user and agent guides.
 
 Uses markdown-it-py without network requests. Inline/image links and reference
 definitions are checked; code examples and HTML comments are ignored. Diagnostic
@@ -22,9 +22,19 @@ ENTRYPOINTS = {
     "README.md",
     "DEVELOPMENT.md",
     "CONTRIBUTING.md",
+    "REVIEW.md",
     "python/aisim/README.md",
 }
-DOC_ROOTS = ("docs/", "python/aisim/docs/")
+DOC_ROOTS = (
+    "docs/",
+    "python/aisim/docs/",
+    "skills/",
+    ".agents/skills/",
+    ".claude/skills/",
+    "python/aisim/.agents/skills/",
+    "python/aisim/.claude/skills/",
+    "python/aisim/.claude/rules/",
+)
 
 
 def local_links(text: str) -> list[tuple[int, str]]:
@@ -74,7 +84,8 @@ def documentation_files(root: Path) -> list[Path]:
     return sorted(
         root / name
         for name in set(names)
-        if name.endswith(".md") and (name in ENTRYPOINTS or name.startswith(DOC_ROOTS))
+        if name.endswith(".md")
+        and (name in ENTRYPOINTS or Path(name).name in {"AGENTS.md", "CLAUDE.md"} or name.startswith(DOC_ROOTS))
     )
 
 

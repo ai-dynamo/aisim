@@ -3,14 +3,33 @@
 
 """Behavioral coverage for local documentation destination checks."""
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.ci.check_documentation_links import check_file, local_links
+from scripts.ci.check_documentation_links import check_file, documentation_files, local_links
 
 
 class DocumentationLinksTest(unittest.TestCase):
+    def test_default_scan_finds_broken_links_in_agent_guides_and_skill_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            guides = [
+                "REVIEW.md",
+                "crates/example/AGENTS.md",
+                ".agents/skills/example/references/verification.md",
+                "skills/example/SKILL.md",
+                "python/aisim/.claude/rules/example.md",
+            ]
+            for name in [*guides, "scratch.md"]:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("[example](missing.md)")
+            failures = [failure for page in documentation_files(root) for failure in check_file(page, root)]
+            self.assertCountEqual(failures, [f"{name}:1: missing local destination: missing.md" for name in guides])
+
     def test_extracts_inline_images_references_and_balanced_destinations(self):
         cases = {
             "[guide](guide.md#setup)": "guide.md",
