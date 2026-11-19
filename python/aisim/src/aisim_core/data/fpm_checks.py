@@ -33,6 +33,7 @@ from aisim_core.data.fpm_library import (
     ROLE_LIBRARY,
     ROLE_METADATA,
     FpmContractError,
+    FpmMeasurementManifest,
     read_library_metadata,
     recover_reconstructed_metadata,
 )
@@ -69,6 +70,8 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         return [FpmFinding("invalid-manifest", manifest_path, str(exc).splitlines()[0])]
     if manifest.category != "fpm":
         add("wrong-category", f"expected category fpm, got {manifest.category!r}")
+    if manifest.purpose != "execution-profile":
+        add("wrong-purpose", f"expected purpose execution-profile, got {manifest.purpose!r}")
     if manifest.configuration_id != expected_id:
         add("configuration-identity", "configuration_id does not match the manifest identity")
     for name in ("artifact_id", "path", "runtime_path"):  # the structure the loader requires
@@ -90,6 +93,11 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
             except (OSError, ValueError) as exc:
                 add("hash-mismatch", f"{artifact.role}: {exc}")
                 continue
+            if artifact.role == "measurement-manifest":
+                try:
+                    _check_measurement_manifest(verified, artifact.format)
+                except (OSError, ValueError) as exc:
+                    add("invalid-measurement-manifest", str(exc))
             if artifact.role == ROLE_LEGACY_PROFILE:
                 from aisim_core.fpm_profile import load_fpm_profile
 
@@ -124,9 +132,15 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         checked += [a for role in EVALUATION_ROLES for a in by_role.get(role, [])]
     for artifact in checked:
         try:
-            _verify(root, artifact)
+            verified = _verify(root, artifact)
         except (OSError, ValueError) as exc:
             add("hash-mismatch", f"{artifact.role}: {exc}")
+            continue
+        if artifact.role == "measurement-manifest":
+            try:
+                _check_measurement_manifest(verified, artifact.format)
+            except (OSError, ValueError) as exc:
+                add("invalid-measurement-manifest", str(exc))
     if any(f.code == "hash-mismatch" for f in found):
         return found
     try:
@@ -172,6 +186,13 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         except (FpmContractError, OSError, ValueError) as exc:
             add("invalid-sidecar", str(exc))
     return found
+
+
+def _check_measurement_manifest(path: Path, fmt: str) -> None:
+    """Apply the strict v5 reader as well as the artifact's byte-level checks."""
+    if fmt != "json":
+        raise ValueError("measurement-manifest artifact must be JSON")
+    FpmMeasurementManifest.model_validate_json(path.read_bytes())
 
 
 def identity_key(manifest: Manifest) -> str:

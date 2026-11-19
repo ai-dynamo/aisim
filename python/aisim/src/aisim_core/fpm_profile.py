@@ -39,7 +39,12 @@ def _cache_group_schema(schema: dict[str, Any]) -> None:
                     "sliding_window": {"type": "null"},
                 },
             },
-            "else": {"properties": {"blocks_per_request": {"type": "null"}}},
+            "else": {
+                "properties": {
+                    "blocks_per_request": {"type": "null"},
+                    "prefill_checkpoint_blocks": {"type": "null"},
+                }
+            },
         }
     )
     schema["allOf"].append(

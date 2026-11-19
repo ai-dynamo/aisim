@@ -97,6 +97,27 @@ def _artifact(root: Path, relative: str, role: str, fmt: str, schema: str, **ext
     }
 
 
+def _measurement_document(size=1):
+    return {
+        "manifest_version": 5,
+        "measurement_artifact_id": "synthetic",
+        "measurement_protocol_id": "synthetic",
+        "model_id": "synthetic/model",
+        "framework": "vllm",
+        "framework_version": "0.25.1",
+        "files": [
+            {
+                "measurement_file_id": "truth",
+                "role": "truth",
+                "path": "measurements/truth.parquet",
+                "format": "parquet",
+                "sha256": "0" * 64,
+                "bytes": size,
+            }
+        ],
+    }
+
+
 @pytest.fixture
 def profile(profile_dict, monkeypatch):  # noqa: F811
     """A MiniMax pure-TP4 profile whose deployment omits ``resources`` (the user's draft)."""
@@ -1474,7 +1495,13 @@ def test_selector_topology_matches_exported_schema(tmp_path, dimension, degree):
         ({"kind": "convolution", "sliding_window": 16, "blocks_per_request": 1}, False),
         ({"kind": "attention", "blocks_per_request": None}, True),
         ({"kind": "attention"}, True),
+        ({"kind": "attention", "prefill_checkpoint_blocks": None}, True),
+        ({"kind": "attention", "prefill_checkpoint_blocks": 0}, False),
+        ({"kind": "attention", "prefill_checkpoint_blocks": 1}, False),
+        ({"kind": "convolution", "sliding_window": 16, "prefill_checkpoint_blocks": 1}, False),
         ({"kind": "state", "blocks_per_request": 1}, True),
+        ({"kind": "state", "blocks_per_request": 1, "prefill_checkpoint_blocks": 0}, True),
+        ({"kind": "state", "blocks_per_request": 1, "prefill_checkpoint_blocks": 1}, True),
         ({"kind": "state", "blocks_per_request": 1, "sliding_window": None}, True),
         ({"kind": "state", "blocks_per_request": 1, "sliding_window": 16}, False),
         ({"kind": "state", "blocks_per_request": 1, "prefill_checkpoint_alignment": 16}, False),
@@ -1559,6 +1586,167 @@ def test_entries_differing_only_in_dp_attention_are_distinct(root, profile):
 
 
 # ------------------------------------------------------------------ review follow-ups
+
+
+@pytest.mark.parametrize("schema", [None, "aic_fpm_forward_perf/v6", "aic_fpm_forward_perf/v7"])
+def test_loader_checks_library_schema_even_with_matching_stamp(root, profile, tmp_path, schema):
+    make_entry(root, profile, resources=RESOURCES)
+    parquet = root / ENTRY / "fpm/fpm_forward_perf.parquet"
+    table = pq.read_table(parquet)
+    pq.write_table(table.replace_schema_metadata({b"aisim.schema": schema.encode()} if schema else None), parquet)
+    sidecar = parquet.with_suffix(".metadata.json")
+    metadata = json.loads(sidecar.read_text())
+    metadata["parquet_sha256"] = _sha(parquet.read_bytes())
+    sidecar.write_text(json.dumps(metadata))
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    document["artifacts"][:2] = [
+        _artifact(
+            root,
+            parquet.relative_to(root).as_posix(),
+            "fpm-library",
+            "parquet",
+            schema or "aic_fpm_forward_perf/v6",
+            rows=table.num_rows,
+        ),
+        _artifact(root, sidecar.relative_to(root).as_posix(), "fpm-library-metadata", "json", "unversioned"),
+    ]
+    path.write_text(json.dumps(document))
+    if schema == "aic_fpm_forward_perf/v7":
+        with pytest.raises(ValueError, match="unsupported FPM library schema ID"):
+            load(root, user_config(profile), tmp_path)
+        assert not (tmp_path / "staged").exists()
+    else:
+        data = load(root, user_config(profile), tmp_path)
+        assert data.kind == "library" and data.systems_root.is_dir()
+
+
+@pytest.mark.parametrize("purpose", ["operation-tables", "execution-profile"])
+def test_entry_checker_requires_loadable_purpose(root, profile, purpose):
+    make_entry(root, profile)
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    document["purpose"] = purpose
+    document["configuration_id"] = configuration_id("fpm", purpose, Identity.model_validate(document["identity"]))
+    path.write_text(json.dumps(document))
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ([] if purpose == "execution-profile" else ["wrong-purpose"])
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("measurement", [{}, _measurement_document(), _measurement_document(1.0)])
+def test_entry_checks_measurement_manifest_contents_only_when_enabled(root, profile, legacy, measurement):
+    make_entry(root, profile)
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    if legacy:
+        profile_path = f"{ENTRY}/profile.json"
+        (root / profile_path).write_text(json.dumps(profile))
+        document["artifacts"] = [_artifact(root, profile_path, "fpm-profile", "json", "unversioned")]
+    else:
+        document["artifacts"] = document["artifacts"][:2]
+    measurement_path = f"{ENTRY}/measurements/manifest.json"
+    if measurement:
+        Draft202012Validator(json.loads(render_snapshot("measurement-manifest/v5"))).validate(measurement)
+    (root / measurement_path).write_text(json.dumps(measurement))
+    document["artifacts"].append(
+        _artifact(root, measurement_path, "measurement-manifest", "json", "measurement-manifest/v5")
+    )
+    path.write_text(json.dumps(document))
+    assert check_fpm_entry(root, MANIFEST) == []
+    findings = check_fpm_entry(root, MANIFEST, include_measurements=True)
+    valid = bool(measurement) and type(measurement["files"][0]["bytes"]) is int
+    assert [f.code for f in findings] == ([] if valid else ["invalid-measurement-manifest"])
+    if not valid:
+        expected_field = "manifest_version" if not measurement else "bytes"
+        assert expected_field in findings[0].message
+    # Prediction-tier checks must still work without any evaluation files on disk.
+    (root / measurement_path).unlink()
+    assert check_fpm_entry(root, MANIFEST) == []
+
+
+@pytest.mark.parametrize("field", ["row_count", "configuration_selector.tp", "measurement_repeats", "warmup_repeats"])
+def test_publication_checks_strict_integer_spellings_beyond_json_schema(root, profile, field):
+    make_entry(root, profile)
+    sidecar = root / ENTRY / "fpm/fpm_forward_perf.metadata.json"
+    metadata = json.loads(sidecar.read_text())
+    parent = metadata["configuration_selector"] if field.startswith("configuration_selector.") else metadata
+    key = field.rsplit(".", 1)[-1]
+    parent[key] = float(parent.get(key, 1))
+    # JSON Schema allows integral floats; publication must additionally apply the strict reader.
+    Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))).validate(metadata)
+    sidecar.write_text(json.dumps(metadata))
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    document["artifacts"][1] = _artifact(
+        root, sidecar.relative_to(root).as_posix(), "fpm-library-metadata", "json", "unversioned"
+    )
+    path.write_text(json.dumps(document))
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ["invalid-sidecar"]
+    assert field in findings[0].message
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+@pytest.mark.parametrize("key", ["pp", "pp_size"])
+def test_loader_selects_and_loads_pipeline_parallel_entry(root, profile, tmp_path, pp, key):
+    make_entry(root, profile)
+    # The optional typed resource profile supports PP1 only. Library rows and requests also support PP2.
+    parquet = root / ENTRY / "fpm/fpm_forward_perf.parquet"
+    table = pq.read_table(parquet)
+    table = table.set_column(table.schema.get_field_index("pp"), "pp", pa.array([pp] * table.num_rows))
+    pq.write_table(table, parquet)
+    sidecar = parquet.with_suffix(".metadata.json")
+    metadata = json.loads(sidecar.read_text())
+    metadata["configuration_selector"]["pp"] = pp
+    metadata["parquet_sha256"] = _sha(parquet.read_bytes())
+    sidecar.write_text(json.dumps(metadata))
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    for artifact in document["artifacts"][:2]:
+        data = (root / artifact["path"]).read_bytes()
+        artifact.update(sha256=_sha(data), bytes=len(data))
+    identity = Identity.model_validate(
+        {**document["identity"], "parallelism": {"aggregated": {"tp": 4, "moe_tp": 4, "pp": pp}}}
+    )
+    document.update(
+        identity=identity.model_dump(), configuration_id=configuration_id("fpm", "execution-profile", identity)
+    )
+    path.write_text(json.dumps(document))
+    entry = Entry.model_validate(
+        {
+            "configuration_id": document["configuration_id"],
+            "identity": document["identity"],
+            "purpose": document["purpose"],
+            "manifest": _artifact(root, MANIFEST, "manifest", "json", "aisim-artifact-manifest/v1"),
+        }
+    )
+    config = {**CONFIG, key: pp}
+    selection = FpmLoader().select(config)
+    assert selection.matches(entry)
+    data = load(root, config, tmp_path)
+    assert data.config[key] == pp
+    staged = data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"]
+    assert pq.read_table(staged, columns=["pp"]).column("pp").to_pylist() == [pp] * table.num_rows
+
+
+@pytest.mark.parametrize(
+    "setting", [[], "", False, 0, [["fpm_interpolation", {}]], None, {}, {"fpm_interpolation": {"k": 1}}]
+)
+def test_loader_validates_estimator_config_parent(root, profile, tmp_path, setting):
+    make_entry(root, profile, resources=RESOURCES)
+    config = {**user_config(profile), "estimator_config": setting}
+    before = copy.deepcopy(config)
+    if setting is not None and not isinstance(setting, dict):
+        with pytest.raises(FpmContractError, match="estimator_config must be a mapping"):
+            load(root, config, tmp_path)
+    else:
+        data = load(root, config, tmp_path)
+        interpolation = data.config["estimator_config"]["fpm_interpolation"]
+        assert Path(interpolation["fpm_parquet_path"]).is_file()
+        if setting:
+            assert interpolation["k"] == 1
+    assert config == before
 
 
 def test_stamp_exception_covers_only_the_supported_library_schema(tmp_path):
@@ -1873,24 +2061,7 @@ def test_measurement_bytes_agree_with_packaged_schema(value):
     from aisim_core.data.schemas import PACKAGED_SNAPSHOT_DIR, snapshot_filename
 
     schema = json.loads((PACKAGED_SNAPSHOT_DIR / snapshot_filename("measurement-manifest/v5")).read_text())
-    document = {
-        "manifest_version": 5,
-        "measurement_artifact_id": "synthetic",
-        "measurement_protocol_id": "synthetic",
-        "model_id": "synthetic/model",
-        "framework": "vllm",
-        "framework_version": "0.25.1",
-        "files": [
-            {
-                "measurement_file_id": "truth",
-                "role": "truth",
-                "path": "measurements/truth.parquet",
-                "format": "parquet",
-                "sha256": "0" * 64,
-                "bytes": value,
-            }
-        ],
-    }
+    document = _measurement_document(value)
     if type(value) is int:
         Draft202012Validator(schema).validate(document)
         assert FpmMeasurementManifest.model_validate(document).files[0].bytes == value

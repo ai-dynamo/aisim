@@ -427,10 +427,12 @@ def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | Non
         "attention_dp": "dp",
         "moe_tp_size": "moe_tp",
         "moe_ep_size": "ep",
+        "pp": "pp",
         "cp_size": "cp",
         "dcp": "dcp",
     }
-    aliases = {"tp": "tp_size", "attention_dp": "attention_dp_size"}  # the same aliases the Rust configuration accepts
+    # The same aliases the Rust configuration accepts.
+    aliases = {"tp": "tp_size", "pp": "pp_size", "attention_dp": "attention_dp_size"}
 
     def value(key: str) -> Any:
         found = config.get(key)
