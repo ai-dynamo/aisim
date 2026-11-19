@@ -1,0 +1,114 @@
+{
+  "evidence_type": "local source-only tests and static checks; prediction subprocesses are fake runners",
+  "source_head": "8ff6bea813be86762d2f3d4dc3ddb64cabe646bb",
+  "recorded_at_utc": "2026-11-19T00:12:31.200969+00:00",
+  "environment": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "Python 3.12.3",
+    "ruff": "ruff 0.14.1",
+    "native_runtime_built": false
+  },
+  "tests": [
+    {
+      "command": "python -m pytest tests/sweeper/test_catalog_size_ladder.py tests/sweeper/test_catalog_recommendation_summary.py tests/sweeper/test_score.py -q -p no:cacheprovider",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "........................................................................ [ 45%]\n........................................................................ [ 90%]\n................                                                         [100%]\n160 passed in 0.41s\n",
+      "stderr": ""
+    },
+    {
+      "command": "ruff check --config python/aisim/pyproject.toml python/aisim tests skills benchmarks/evidence/skills-catalog",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "All checks passed!\n",
+      "stderr": ""
+    },
+    {
+      "command": "ruff format --check --config python/aisim/pyproject.toml python/aisim tests skills benchmarks/evidence/skills-catalog",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "1283 files already formatted\n",
+      "stderr": ""
+    },
+    {
+      "command": "python scripts/ci/check_copyright.py",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "all 1890 tracked source files carry the required NVIDIA/Apache-2.0 SPDX header\n",
+      "stderr": ""
+    },
+    {
+      "command": "python .github/codeowners/build_codeowners.py --areas .github/codeowners/areas.yaml --repo . --strict",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "areas: 6 | tree files: 5247\nexplicitly owned: 5247/5247 (100.00%) | catch-all only: 0\n\nper-area glob counts:\n  replay                 37\n  infra                  37\n  maintainers            16\n  forward-pass-engine    12\n  sweeper                4\n  mocker                 1\n",
+      "stderr": ""
+    },
+    {
+      "command": "python scripts/ci/check_documentation_links.py",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "Checked local destinations in 87 Markdown files (anchors and remote URLs excluded).\n",
+      "stderr": ""
+    },
+    {
+      "command": "python skills/aisim-deployment-search/evals/fixtures/generate_mixed_lengths.py",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "synthetic trace bytes and anomaly summary verified\n",
+      "stderr": ""
+    },
+    {
+      "command": "python -m compileall -q python/aisim/src tests skills benchmarks/evidence/skills-catalog",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": "git diff --check 74988a97784f604d950c95e9b9ae8a13f2ab0981 HEAD",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": "python skills/aisim-deployment-search/scripts/summarize_recommendation.py --help",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "usage: summarize_recommendation.py [-h] [--top TOP] [--best-per-mode] [--json]\n                                   [--export CANDIDATE_ID] [--to FILE]\n                                   output_dir\n\npositional arguments:\n  output_dir\n\noptions:\n  -h, --help            show this help message and exit\n  --top TOP\n  --best-per-mode       also print the best feasible candidate of each\n                        deployment mode, ranked by score\n  --json\n  --export CANDIDATE_ID\n                        write this candidate's concrete prediction config\n  --to FILE             destination for --export\n",
+      "stderr": ""
+    },
+    {
+      "command": "python skills/aisim-gpu-selection-and-sizing/scripts/summarize_recommendation.py --help",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "usage: summarize_recommendation.py [-h] [--top TOP] [--best-per-mode] [--json]\n                                   [--export CANDIDATE_ID] [--to FILE]\n                                   output_dir\n\npositional arguments:\n  output_dir\n\noptions:\n  -h, --help            show this help message and exit\n  --top TOP\n  --best-per-mode       also print the best feasible candidate of each\n                        deployment mode, ranked by score\n  --json\n  --export CANDIDATE_ID\n                        write this candidate's concrete prediction config\n  --to FILE             destination for --export\n",
+      "stderr": ""
+    },
+    {
+      "command": "python skills/aisim-gpu-selection-and-sizing/scripts/headroom_scan.py --help",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "usage: headroom_scan.py [-h] --min-goodput-share MIN_GOODPUT_SHARE\n                        --min-compliant-share MIN_COMPLIANT_SHARE\n                        [--steps STEPS] [--stack STACK] [--timeout TIMEOUT]\n                        [--set PATH=VALUE] --workdir WORKDIR\n                        config\n\npositional arguments:\n  config\n\noptions:\n  -h, --help            show this help message and exit\n  --min-goodput-share MIN_GOODPUT_SHARE\n                        required SLA-compliant goodput as a share of the\n                        offered rate at each load (0-1], agreed with the user\n  --min-compliant-share MIN_COMPLIANT_SHARE\n                        required share of all requests that complete within\n                        the per-request SLA (0-1], agreed with the user\n  --steps STEPS\n  --stack STACK\n  --timeout TIMEOUT     seconds per prediction\n  --set PATH=VALUE      extra aisim --set override applied to every run (e.g.\n                        a memory cap)\n  --workdir WORKDIR     must not exist or be empty\n",
+      "stderr": ""
+    },
+    {
+      "command": "python skills/aisim-gpu-selection-and-sizing/scripts/size_ladder.py --help",
+      "exit_code": 0,
+      "passed": true,
+      "stdout": "usage: size_ladder.py [-h] --hardware HARDWARE --out-root OUT_ROOT\n                      [--budgets BUDGETS] [--no-refine] [--timeout TIMEOUT]\n                      [--set PATH=VALUE]\n                      config\n\npositional arguments:\n  config\n\noptions:\n  -h, --help           show this help message and exit\n  --hardware HARDWARE\n  --out-root OUT_ROOT  must not exist or be empty\n  --budgets BUDGETS\n  --no-refine\n  --timeout TIMEOUT    seconds per aisim run\n  --set PATH=VALUE\n",
+      "stderr": ""
+    }
+  ],
+  "development_failures_resolved": [
+    "15 initial oracle-test setup failures combined mutually exclusive E2E and TTFT/TPOT SLA bounds; corrected test configuration, all 160 current tests pass. Saved consumer-tests-first.log.",
+    "Initial documentation-link check lacked markdown-it-py in the isolated environment; installed the CI dependency and reran successfully. Saved verification-first.json.",
+    "Initial unformatted new files and adjacent zip lint corrected with pairwise and formatting; saved lint-first.log.",
+    "System Ruff 0.15.4 produced 9 lint and 7 formatting findings in unchanged files; required Ruff 0.14.1 passes full paths. Saved ruff-check.log and ruff-format.log; matching pinned reruns saved separately."
+  ],
+  "remaining_validation": [
+    "No native recommend/predict or agent eval run is claimed. Public aisim==0.14.0 is absent from PyPI (HTTP 404).",
+    "Final-head Full CI, NVSkills eval/signing and fresh bot review/reapproval remain with controller."
+  ]
+}

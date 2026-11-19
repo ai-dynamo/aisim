@@ -77,7 +77,10 @@ hosted CI. The first development test run had 15 test-setup failures because
 its new oracle case combined mutually exclusive E2E and TTFT/TPOT bounds. The
 case now constructs valid SLA modes and passes; production validation was not
 weakened. Initial lint findings in new files were corrected with `pairwise`
-and formatting. Full development logs are retained in the repair run's scratch
+and formatting. The system Ruff 0.15.4 also flagged unchanged files; the
+repository-pinned Ruff 0.14.1 passes the full paths. A missing documentation
+parser dependency in the isolated environment was installed and its check
+rerun successfully. Full development logs are retained in the repair run's scratch
 directory.
 
 ## Remaining external evidence
