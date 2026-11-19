@@ -1443,6 +1443,32 @@ def test_runner_preserves_native_host_offload_rank_config():
     assert rank["native_host_offload"] == engine_args["native_host_offload"]
 
 
+def test_prediction_wait_power_reaches_native_role_after_round_trip():
+    runtime = RecordingRuntime()
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "mode": "aggregated",
+                "model": "Qwen/Qwen3-0.6B",
+                "hardware": "h200_sxm",
+                "backend": "vllm",
+                "context_length": 4096,
+                "workers": {
+                    "aggregated": {
+                        "wait_power_w": 60,
+                        "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+                        "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                    }
+                },
+            }
+        }
+    )
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json(exclude_unset=True))
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(restored))
+    execution = runtime.execution_spec.get("spec", runtime.execution_spec)
+    assert execution["engine"]["rank"]["wait_power_w"] == 60.0
+
+
 def test_public_host_offload_config_reaches_native_execution_rank():
     runtime = RecordingRuntime()
     public = CorePredictionConfig.model_validate(

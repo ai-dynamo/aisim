@@ -908,6 +908,8 @@ impl IterationPricing {
 #[derive(Debug)]
 struct PricedIteration {
     total_ms: f64,
+    /// Step-local uncovered rank wait at the corrected provider duration.
+    wait_ms: f64,
     /// The detailed whole-model FPM estimate, when diagnostics are captured.
     estimate: Option<crate::ForwardPassEstimate>,
     /// Operation evidence of every working rank, corrected, each with whether
@@ -1333,8 +1335,12 @@ impl AicTimingModel {
         evidence.record(phase, prefill)
     }
 
-    fn record_pass_evidence(&self, phases: &[(Arc<ValidatedTimingPhase>, bool)]) -> Result<()> {
-        if phases.is_empty() {
+    fn record_pass_evidence(
+        &self,
+        phases: &[(Arc<ValidatedTimingPhase>, bool)],
+        wait_ms: f64,
+    ) -> Result<()> {
+        if phases.is_empty() && wait_ms == 0.0 {
             return Ok(());
         }
         let mut evidence = self
@@ -1344,6 +1350,7 @@ impl AicTimingModel {
         for (phase, prefill) in phases {
             evidence.record(phase, *prefill)?;
         }
+        evidence.iteration_wait_ms += wait_ms;
         Ok(())
     }
 
@@ -1364,7 +1371,7 @@ impl AicTimingModel {
             .latency_ms
             .context("native FPM returned no estimate")?;
         if self.fpm_power {
-            self.record_pass_evidence(&fpm_rank_evidence(&estimate)?)?;
+            self.record_pass_evidence(&fpm_rank_evidence(&estimate)?, 0.0)?;
         }
         if self.diagnostic_model.is_none() {
             return Ok(latency_ms);
@@ -1620,6 +1627,7 @@ impl AicTimingModel {
                 .context("canonical model returned no iteration estimate")?;
             return Ok(PricedIteration {
                 total_ms,
+                wait_ms: 0.0,
                 estimate: None,
                 evidence: Vec::new(),
             });
@@ -1636,6 +1644,11 @@ impl AicTimingModel {
         {
             return Ok(PricedIteration {
                 total_ms: iteration.latency_ms,
+                wait_ms: attention_dp_wait_ms(
+                    iteration.latency_ms,
+                    iteration.correction_factor,
+                    iteration.ranks.iter().map(|rank| rank.latency_ms),
+                ),
                 evidence: self.native_rank_evidence(pricing, &iteration, queries, capture)?,
                 estimate: None,
             });
@@ -1643,9 +1656,29 @@ impl AicTimingModel {
         let estimate = model
             .estimate_forward_pass_detailed(&metrics)
             .context("AIC iteration prediction failed")?;
+        self.price_detailed_iteration(pricing, queries, capture, estimate)
+    }
+
+    fn price_detailed_iteration(
+        &self,
+        pricing: &IterationPricing,
+        queries: &[RankQuery],
+        capture: bool,
+        estimate: crate::ForwardPassEstimate,
+    ) -> Result<PricedIteration> {
+        let whole_model = matches!(pricing.dispatch, IterationDispatch::WholeModel { .. });
         let total_ms = estimate
             .latency_ms
             .context("canonical model returned no iteration estimate")?;
+        let wait_ms = if !whole_model || self.fpm_power {
+            attention_dp_wait_ms(
+                total_ms,
+                estimate.correction_factor.unwrap_or(1.0),
+                estimate.ranks.iter().map(|rank| rank.latency_ms),
+            )
+        } else {
+            0.0
+        };
         if whole_model {
             let evidence = if self.fpm_power {
                 fpm_rank_evidence(&estimate)?
@@ -1654,12 +1687,14 @@ impl AicTimingModel {
             };
             return Ok(PricedIteration {
                 total_ms,
+                wait_ms,
                 estimate: capture.then_some(estimate),
                 evidence,
             });
         }
         Ok(PricedIteration {
             total_ms,
+            wait_ms,
             evidence: self.rank_operation_evidence(pricing, &estimate, queries)?,
             estimate: None,
         })
@@ -1956,7 +1991,7 @@ impl AicTimingModel {
     /// FPM estimate under the iteration's correction, as each rank recorded
     /// its own estimate when it priced its own phases.
     fn record_iteration(&self, priced: &PricedIteration, queries: &[RankQuery]) -> Result<()> {
-        self.record_pass_evidence(&priced.evidence)?;
+        self.record_pass_evidence(&priced.evidence, priced.wait_ms)?;
         let Some(estimate) = priced
             .estimate
             .as_ref()
@@ -2018,6 +2053,20 @@ fn rank_estimate(
             ..rank.clone()
         }],
     }
+}
+
+/// Each idle rank has zero active time and contributes the full step.
+fn attention_dp_wait_ms(
+    total_ms: f64,
+    correction: f64,
+    ranks: impl ExactSizeIterator<Item = f64>,
+) -> f64 {
+    if ranks.len() <= 1 {
+        return 0.0;
+    }
+    ranks
+        .map(|active_ms| total_ms - active_ms * correction)
+        .sum()
 }
 
 /// Fold active rank evidence once when pricing, so a cached iteration
@@ -2496,13 +2545,37 @@ impl TimingModel for AicTimingModel {
     }
 
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
-        if (self.use_fpm_decode_totals && !self.fpm_power) || self.is_fitted() {
+        if !self.tracks_attention_dp_wait() {
             return None;
         }
         self.evidence
             .lock()
             .ok()
             .map(|evidence| evidence.snapshot())
+    }
+
+    fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+        if !self.tracks_attention_dp_wait() {
+            return None;
+        }
+        let evidence = self.evidence.lock().ok()?;
+        Some((
+            evidence.snapshot(),
+            evidence.iteration_wait_ms,
+            evidence.phase_priced_wait_ms,
+        ))
+    }
+
+    fn tracks_attention_dp_wait(&self) -> bool {
+        (!self.use_fpm_decode_totals || self.fpm_power) && !self.is_fitted()
+    }
+
+    fn record_phase_priced_wait(&self, wait_ms: f64) -> Result<()> {
+        self.evidence
+            .lock()
+            .map_err(|_| anyhow!("AIC timing evidence accumulator was poisoned"))?
+            .phase_priced_wait_ms += wait_ms;
+        Ok(())
     }
 
     /// Time and source diagnostics use query history. Power uses the component accumulator.
@@ -4149,6 +4222,7 @@ struct TimingPowerSource {
     timing: Arc<dyn TimingModel>,
     prefill_speedup_ratio: f64,
     decode_speedup_ratio: f64,
+    wait_power_w: Option<f64>,
 }
 
 impl TimingPowerSource {
@@ -4159,35 +4233,66 @@ impl TimingPowerSource {
             timing,
             prefill_speedup_ratio: speedup_ratio,
             decode_speedup_ratio: speedup_ratio * config.decode_speedup_ratio,
+            wait_power_w: config.wait_power_w,
         })
     }
 }
 
-fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<TimingEvidenceSummary>> {
+#[derive(Default)]
+struct ReplayTimingEvidence {
+    active: TimingEvidenceSummary,
+    wait_ms: f64,
+    /// None when a role with positive wait has no configured watts.
+    wait_energy_wms: Option<f64>,
+}
+
+fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<ReplayTimingEvidence>> {
     replay_timing_evidence_with_fpm(sources, false)
 }
 
 fn replay_timing_evidence_with_fpm(
     sources: &[TimingPowerSource],
     include_fpm: bool,
-) -> Result<Option<TimingEvidenceSummary>> {
-    let mut combined = TimingEvidenceSummary::default();
+) -> Result<Option<ReplayTimingEvidence>> {
+    let mut combined = ReplayTimingEvidence {
+        wait_energy_wms: Some(0.0),
+        ..Default::default()
+    };
     for source in sources {
-        let Some(summary) = include_fpm
-            .then(|| source.timing.fpm_evidence_summary())
-            .flatten()
-            .or_else(|| source.timing.evidence_summary())
-        else {
+        let evidence = if include_fpm {
+            source
+                .timing
+                .fpm_evidence_summary()
+                .or_else(|| source.timing.evidence_summary())
+                .map(|summary| (summary, 0.0, 0.0))
+        } else {
+            source.timing.power_evidence_summary()
+        };
+        let Some((summary, iteration_wait_ms, phase_priced_wait_ms)) = evidence else {
             return Ok(None);
         };
-        combined.prefill.try_accumulate(scale_power_phase(
+        combined.active.prefill.try_accumulate(scale_power_phase(
             summary.prefill,
             source.prefill_speedup_ratio,
         )?)?;
-        combined.decode.try_accumulate(scale_power_phase(
+        combined.active.decode.try_accumulate(scale_power_phase(
             summary.decode,
             source.decode_speedup_ratio,
         )?)?;
+        // Whole-iteration pricing uses the same speedup for both phases.
+        let wait_ms = iteration_wait_ms * power_time_scale(source.prefill_speedup_ratio)
+            + phase_priced_wait_ms;
+        ensure!(
+            wait_ms.is_finite() && wait_ms >= 0.0,
+            "invalid attention-DP wait duration"
+        );
+        combined.wait_ms += wait_ms;
+        if wait_ms > 0.0 {
+            combined.wait_energy_wms = combined
+                .wait_energy_wms
+                .zip(source.wait_power_w)
+                .map(|(energy, watts)| energy + wait_ms * watts);
+        }
     }
     Ok(Some(combined))
 }
@@ -4228,9 +4333,9 @@ fn replay_fpm_query_evidence(sources: &[TimingPowerSource]) -> Result<Option<ser
     }))
 }
 
-fn replay_power_stats(summary: &TimingEvidenceSummary) -> Result<TracePowerStats> {
-    let mut combined = summary.prefill.clone();
-    combined.try_accumulate(summary.decode.clone())?;
+fn replay_power_stats(evidence: &ReplayTimingEvidence) -> Result<TracePowerStats> {
+    let mut combined = evidence.active.prefill.clone();
+    combined.try_accumulate(evidence.active.decode.clone())?;
     phase_power_stats(&combined)
 }
 
@@ -4313,10 +4418,10 @@ fn replay_performance_diagnostics(summary: Option<&TimingEvidenceSummary>) -> se
 }
 
 fn replay_power_diagnostics(
-    summary: Option<&TimingEvidenceSummary>,
+    evidence: Option<&ReplayTimingEvidence>,
     unavailable_reason: Option<&'static str>,
 ) -> Result<ReplayPowerDiagnostics> {
-    let Some(summary) = summary else {
+    let Some(evidence) = evidence else {
         return Ok(ReplayPowerDiagnostics {
             schema_version: "1.0",
             scope: "active_forward_pass_per_gpu",
@@ -4325,6 +4430,8 @@ fn replay_power_diagnostics(
             latency_unit: "ms",
             coverage_gate: POWER_DATA_COVERAGE_THRESHOLD,
             publication_status: "unsupported",
+            attention_dp_wait_ms: None,
+            step_power_w: None,
             energy_wms: None,
             latency_ms: None,
             covered_latency_ms: None,
@@ -4335,9 +4442,23 @@ fn replay_power_diagnostics(
         });
     };
 
-    let stats = replay_power_stats(summary)?;
+    let summary = &evidence.active;
     let mut combined = summary.prefill.clone();
     combined.try_accumulate(summary.decode.clone())?;
+    let stats = phase_power_stats(&combined)?;
+    let step_ms = combined.latency_ms + evidence.wait_ms;
+    ensure!(step_ms.is_finite(), "invalid attention-DP step duration");
+    let step_power_w = if evidence.wait_ms == 0.0 {
+        stats.power_w
+    } else if stats.power_w.is_some() {
+        combined
+            .energy_wms
+            .zip(evidence.wait_energy_wms)
+            .map(|(active, wait)| (active + wait) / step_ms)
+            .filter(|watts| watts.is_finite() && *watts > 0.0)
+    } else {
+        None
+    };
     let observed = combined.latency_ms > 0.0;
     Ok(ReplayPowerDiagnostics {
         schema_version: "1.0",
@@ -4350,6 +4471,8 @@ fn replay_power_diagnostics(
         energy_wms: combined.energy_wms.filter(|energy| *energy > 0.0),
         latency_ms: Some(combined.latency_ms),
         covered_latency_ms: Some(combined.covered_latency_ms),
+        attention_dp_wait_ms: Some(evidence.wait_ms),
+        step_power_w,
         power_w: stats.power_w,
         power_coverage: Some(stats.coverage),
         unavailable_reason: (!observed).then_some("no forward-pass timing evidence was observed"),
@@ -4474,11 +4597,7 @@ fn scale_power_phase(
         speedup_ratio.is_finite() && speedup_ratio >= 0.0,
         "modeled speedup ratio must be finite and non-negative, got {speedup_ratio}"
     );
-    let scale = if speedup_ratio > 0.0 {
-        speedup_ratio.recip()
-    } else {
-        1.0
-    };
+    let scale = power_time_scale(speedup_ratio);
     phase.energy_wms = phase.energy_wms.map(|energy| energy * scale);
     phase.latency_ms *= scale;
     phase.covered_latency_ms *= scale;
@@ -4495,6 +4614,14 @@ fn scale_power_phase(
         // remains an unscaled physical baseline.
     }
     Ok(phase)
+}
+
+fn power_time_scale(speedup_ratio: f64) -> f64 {
+    if speedup_ratio > 0.0 {
+        speedup_ratio.recip()
+    } else {
+        1.0
+    }
 }
 
 fn infer_aic_timing_topology(engine: &mut serde_json::Value) -> Result<()> {
@@ -4832,6 +4959,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             timing: Arc::clone(timing),
             prefill_speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
         });
     }
     let mut prediction_provenance = serde_json::Map::new();
@@ -5074,8 +5202,11 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
     }
     if capture_performance_diagnostics {
         let performance_evidence = replay_timing_evidence_with_fpm(&power_sources, true)?;
-        report_json["performance_diagnostics"] =
-            replay_performance_diagnostics(performance_evidence.as_ref());
+        report_json["performance_diagnostics"] = replay_performance_diagnostics(
+            performance_evidence
+                .as_ref()
+                .map(|evidence| &evidence.active),
+        );
     }
     if let Some(evidence) = replay_fpm_query_evidence(&power_sources)? {
         report_json["fpm_query_evidence"] = evidence;
@@ -8850,6 +8981,7 @@ mod tests {
             })),
             prefill_speedup_ratio: 2.0,
             decode_speedup_ratio: 4.0,
+            wait_power_w: None,
         };
         let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
         let power = replay_power_stats(&evidence).unwrap();
@@ -8889,6 +9021,7 @@ mod tests {
                     timing: Arc::new(PowerTiming(summary)),
                     prefill_speedup_ratio: speedup,
                     decode_speedup_ratio: speedup,
+                    wait_power_w: None,
                 };
                 // The final case overflows only when two phases are summed.
                 if energy == f64::MAX && speedup == 1.0 && !failing_prefill {
@@ -8917,6 +9050,7 @@ mod tests {
             })),
             prefill_speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
         };
         let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
         let power = replay_power_stats(&evidence).unwrap();
@@ -8958,7 +9092,12 @@ mod tests {
                         for (phase, prefill) in &evidence {
                             accumulated.record(phase, *prefill).unwrap();
                         }
-                        let stats = replay_power_stats(&accumulated.snapshot()).unwrap();
+                        let stats = replay_power_stats(&ReplayTimingEvidence {
+                            active: accumulated.snapshot(),
+                            wait_ms: 0.0,
+                            ..Default::default()
+                        })
+                        .unwrap();
                         if covered_ms == 0.27 {
                             assert_eq!(stats.coverage(), 0.9);
                             // 135 W-ms / 0.30 ms = 450 W per invocation.
@@ -9025,6 +9164,7 @@ mod tests {
                     timing,
                     prefill_speedup_ratio: speedup,
                     decode_speedup_ratio: speedup,
+                    wait_power_w: None,
                 });
             }
             let evidence = replay_timing_evidence(&sources).unwrap();
@@ -9064,6 +9204,52 @@ mod tests {
     }
 
     #[test]
+    fn corrected_rank_wait_preserves_single_rank_and_balanced_results() {
+        assert_eq!(attention_dp_wait_ms(20.0, 2.0, [10.0].into_iter()), 0.0);
+        assert_eq!(attention_dp_wait_ms(20.0, 2.0, [10.0; 3].into_iter()), 0.0);
+        assert_eq!(
+            attention_dp_wait_ms(20.0, 2.0, [10.0, 8.0].into_iter()),
+            4.0
+        );
+    }
+
+    #[test]
+    fn step_power_uses_assumed_wait_energy_and_preserves_active_coverage() {
+        let mut evidence = ReplayTimingEvidence {
+            active: TimingEvidenceSummary {
+                prefill: TimingPhaseEvidence::from_operations(vec![
+                    TimingOperationEvidence::new(
+                        "gemm",
+                        10.0,
+                        Some(4_000.0),
+                        TimingEvidenceSource::Silicon,
+                    )
+                    .unwrap(),
+                ]),
+                ..Default::default()
+            },
+            wait_ms: 10.0,
+            ..Default::default()
+        };
+        for (wait_energy_wms, expected) in [
+            (None, None),
+            (Some(0.0), Some(200.0)),
+            (Some(600.0), Some(230.0)),
+        ] {
+            evidence.wait_energy_wms = wait_energy_wms;
+            let output = replay_power_diagnostics(Some(&evidence), None).unwrap();
+            assert_eq!(output.attention_dp_wait_ms, Some(10.0));
+            assert_eq!(output.step_power_w, expected);
+            assert_eq!(output.power_w, Some(400.0));
+            assert_eq!(output.power_coverage, Some(1.0));
+            assert_eq!(output.phases.len(), 2);
+        }
+        evidence.wait_ms = 0.0;
+        let output = replay_power_diagnostics(Some(&evidence), None).unwrap();
+        assert_eq!(output.step_power_w, output.power_w);
+    }
+
+    #[test]
     fn replay_power_is_published_at_the_exact_coverage_gate() {
         let source = TimingPowerSource {
             timing: Arc::new(PowerTiming(TimingEvidenceSummary {
@@ -9077,6 +9263,7 @@ mod tests {
             })),
             prefill_speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
         };
         let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
         let power = replay_power_stats(&evidence).unwrap();
@@ -9114,7 +9301,15 @@ mod tests {
             ]),
         };
 
-        let diagnostics = replay_power_diagnostics(Some(&summary), None).unwrap();
+        let diagnostics = replay_power_diagnostics(
+            Some(&ReplayTimingEvidence {
+                active: summary,
+                wait_ms: 0.0,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
         let value = serde_json::to_value(diagnostics).unwrap();
 
         assert_eq!(value["publication_status"], "withheld");
@@ -9919,7 +10114,7 @@ mod tests {
     }
 
     #[test]
-    fn fpm_replay_powers_components_and_weights_active_ranks_on_every_execution() {
+    fn fpm_replay_counts_uncovered_components_and_rank_wait_on_cache_hits() {
         use crate::perf_database::fpm_forward::{
             FPM_FORWARD_POWER_MEASUREMENT_POLICY,
             tests::{PowerCell, RowSpec},
@@ -9974,12 +10169,22 @@ mod tests {
                 let pure_decode = decode_work(1, 1, 13, 1024);
                 for _ in 0..2 {
                     assert_eq!(
-                        iteration_ms(&timing, &[mixed.clone(), pure_decode.clone()]),
+                        iteration_ms(
+                            &timing,
+                            &[mixed.clone(), pure_decode.clone(), RankWork::idle(2)]
+                        ),
                         102.0
                     );
                 }
-                let summary = timing.evidence_summary().unwrap();
-                let stats = replay_power_stats(&summary).unwrap();
+                let (summary, wait_ms, _) = timing.power_evidence_summary().unwrap();
+                let evidence = ReplayTimingEvidence {
+                    active: summary,
+                    wait_ms,
+                    ..Default::default()
+                };
+                let diagnostics = replay_power_diagnostics(Some(&evidence), None).unwrap();
+                let stats = replay_power_stats(&evidence).unwrap();
+                let summary = &evidence.active;
                 assert_eq!(summary.prefill.latency_ms, 200.0);
                 assert_eq!(summary.decode.latency_ms, 12.0);
                 let covered_ms = if baseline_power.is_some() {
@@ -9987,6 +10192,14 @@ mod tests {
                 } else {
                     104.0
                 };
+                assert_eq!(wait_ms, 2.0 * (98.0 + 102.0));
+                assert_eq!(diagnostics.latency_ms, Some(212.0));
+                assert_eq!(diagnostics.attention_dp_wait_ms, Some(wait_ms));
+                assert_eq!(diagnostics.step_power_w, None);
+                assert_eq!(
+                    diagnostics.energy_wms,
+                    Some(2.0 * (52_000.0 + marginal_wms))
+                );
                 assert!(close(stats.coverage(), covered_ms / 106.0));
                 assert!(close(
                     stats.power_w().unwrap(),
@@ -10008,6 +10221,42 @@ mod tests {
                     phase.evidence_summary().unwrap().decode.energy_wms,
                     Some(2000.0 + marginal_wms)
                 );
+
+                let timing = Arc::new(timing) as Arc<dyn TimingModel>;
+                let mut roles =
+                    [(2.0, Some(60.0)), (4.0, Some(100.0))].map(|(speedup, wait_power_w)| {
+                        TimingPowerSource {
+                            timing: Arc::clone(&timing),
+                            prefill_speedup_ratio: speedup,
+                            decode_speedup_ratio: speedup,
+                            wait_power_w,
+                        }
+                    });
+                let pooled = replay_timing_evidence(&roles).unwrap().unwrap();
+                let diagnostics = replay_power_diagnostics(Some(&pooled), None).unwrap();
+                assert_eq!(diagnostics.attention_dp_wait_ms, Some(300.0));
+                assert_eq!(diagnostics.latency_ms, Some(159.0));
+                assert!(close(
+                    diagnostics.step_power_w.unwrap(),
+                    ((52_000.0 + marginal_wms) * 1.5 + 22_000.0) / 459.0
+                ));
+
+                roles[1].wait_power_w = None;
+                let pooled = replay_timing_evidence(&roles).unwrap().unwrap();
+                let missing = replay_power_diagnostics(Some(&pooled), None).unwrap();
+                assert_eq!(missing.step_power_w, None);
+                assert_eq!(missing.power_w, diagnostics.power_w);
+
+                timing.reset_evidence().unwrap();
+                let (_, iteration_wait_ms, _) = timing.power_evidence_summary().unwrap();
+                assert_eq!(iteration_wait_ms, 0.0);
+                let next = timing
+                    .predict_iteration_ms(&[mixed, pure_decode, RankWork::idle(2)])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(next.total_ms, 102.0);
+                let (_, iteration_wait_ms, _) = timing.power_evidence_summary().unwrap();
+                assert_eq!(iteration_wait_ms, 200.0);
             }
         }
     }
@@ -10969,6 +11218,8 @@ mod tests {
             // by the provider accumulator and by the checked accumulator.
             let mut named = TimingEvidenceAccumulator::default();
             let mut checked = TimingEvidenceSummary::default();
+            let mut rank_time_ms = 0.0;
+            let mut expected_wait_ms = 0.0;
             timing.reset_evidence().unwrap();
             for ranks in groups.iter().chain(&groups) {
                 let total_ms = iteration_ms(timing, ranks);
@@ -10979,10 +11230,21 @@ mod tests {
                 let metrics: Vec<_> = queries.iter().map(rank_metrics).collect();
                 let estimate = model.estimate_forward_pass_detailed(&metrics).unwrap();
                 assert_eq!(total_ms.to_bits(), estimate.latency_ms.unwrap().to_bits());
-                for (phase, prefill) in timing
-                    .rank_operation_evidence(pricing, &estimate, &queries)
-                    .unwrap()
-                {
+                let correction = estimate.correction_factor.unwrap_or(1.0);
+                let step_rank_ms = total_ms * ranks.len() as f64;
+                let reference_wait_ms = step_rank_ms
+                    - estimate
+                        .ranks
+                        .iter()
+                        .map(|rank| rank.latency_ms * correction)
+                        .sum::<f64>();
+                let detailed = timing
+                    .price_detailed_iteration(pricing, &queries, capture, estimate)
+                    .unwrap();
+                assert!((detailed.wait_ms - reference_wait_ms).abs() < 1e-9);
+                expected_wait_ms += reference_wait_ms;
+                rank_time_ms += step_rank_ms;
+                for (phase, prefill) in detailed.evidence {
                     named.record(&phase, prefill).unwrap();
                     let target = if prefill {
                         &mut checked.prefill
@@ -10994,7 +11256,23 @@ mod tests {
                         .unwrap();
                 }
             }
-            let actual = timing.evidence_summary().unwrap();
+            let (actual, wait_ms, _) = timing.power_evidence_summary().unwrap();
+            assert!((wait_ms - expected_wait_ms).abs() < 1e-9);
+            let diagnostics = replay_power_diagnostics(
+                Some(&ReplayTimingEvidence {
+                    active: actual.clone(),
+                    wait_ms,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+            assert!(
+                (diagnostics.latency_ms.unwrap() + diagnostics.attention_dp_wait_ms.unwrap()
+                    - rank_time_ms)
+                    .abs()
+                    < 1e-9
+            );
             let named = named.snapshot();
             for (actual, named, checked) in [
                 (&actual.prefill, &named.prefill, &checked.prefill),
@@ -11224,6 +11502,96 @@ mod tests {
     }
 
     #[test]
+    fn phase_priced_dp_wait_pools_roles_after_their_phase_speedups() {
+        use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
+        use crate::engine::{Command, EngineFactory, Request};
+
+        pyo3::prepare_freethreaded_python();
+        // The probe reports 10 ms of prefill and 4 ms per decode. Each
+        // pass schedules one rank while its DP peer waits the full pass.
+        let roles = [(2.0, 2.0, 60.0, 5.0, 1.0), (4.0, 0.5, 100.0, 2.5, 2.0)].map(
+            |(speedup_ratio, decode_speedup_ratio, wait_power_w, prefill_ms, decode_ms)| {
+                let probe = Python::with_gil(|py| {
+                    Py::new(py, PerOpEvidenceProbe::default())
+                        .unwrap()
+                        .into_any()
+                });
+                let timing = Arc::new(python_timing_model(probe, false)) as Arc<dyn TimingModel>;
+                let config = EngineConfig {
+                    num_gpu_blocks: 1024,
+                    block_size: 16,
+                    max_num_seqs: 16,
+                    max_num_batched_tokens: 128,
+                    enable_prefix_caching: false,
+                    speedup_ratio,
+                    decode_speedup_ratio,
+                    wait_power_w: Some(wait_power_w),
+                    ..EngineConfig::for_backend(Backend::Vllm)
+                };
+                let power = TimingPowerSource::new(Arc::clone(&timing), &config).unwrap();
+                let mut engine = EngineFactory::with_timing_model(config, timing)
+                    .unwrap()
+                    .build(
+                        EngineIdentity::new(0),
+                        std::num::NonZeroU32::new(2).unwrap(),
+                    )
+                    .unwrap();
+                engine
+                    .apply_command_effects(
+                        SchedulerCommand::new(
+                            0,
+                            Command::Submit(Request {
+                                cache_salt: None,
+                                request_id: uuid::Uuid::from_u128(1),
+                                tokens: vec![1; 32],
+                                max_output_tokens: 4,
+                                output_token_ids: None,
+                                session_id: None,
+                                images: Vec::new(),
+                                kv_hint: None,
+                            }),
+                        ),
+                        0.0,
+                    )
+                    .unwrap();
+
+                let mut now_ms = 0.0;
+                for forward_ms in [prefill_ms, decode_ms, decode_ms, decode_ms] {
+                    let started = engine.execute_pass(now_ms).unwrap().unwrap();
+                    assert_eq!(started.end_ms - now_ms, forward_ms);
+                    engine
+                        .complete_pass(started.pass_id, started.end_ms)
+                        .unwrap();
+                    now_ms = started.end_ms;
+                    let (_, iteration_wait, phase_wait) =
+                        power.timing.power_evidence_summary().unwrap();
+                    assert_eq!((iteration_wait, phase_wait), (0.0, now_ms));
+                }
+                power
+            },
+        );
+
+        let summary = replay_timing_evidence(&roles).unwrap().unwrap();
+        // The roles wait 8 and 8.5 ms at 60 and 100 W respectively.
+        assert_eq!(summary.wait_ms, 16.5);
+        assert_eq!(summary.wait_energy_wms, Some(1_330.0));
+        let diagnostics = replay_power_diagnostics(Some(&summary), None).unwrap();
+        assert_eq!(diagnostics.latency_ms, Some(16.5));
+        assert_eq!(diagnostics.attention_dp_wait_ms, Some(16.5));
+        assert_eq!(diagnostics.energy_wms, Some(6_000.0));
+        assert_eq!(diagnostics.covered_latency_ms, Some(15.0));
+        assert_eq!(diagnostics.power_coverage, Some(15.0 / 16.5));
+        assert_eq!(diagnostics.power_w, Some(6_000.0 / 16.5));
+        assert_eq!(diagnostics.step_power_w, Some(7_330.0 / 33.0));
+
+        for role in roles {
+            role.timing.reset_evidence().unwrap();
+            let (_, iteration_wait, phase_wait) = role.timing.power_evidence_summary().unwrap();
+            assert_eq!((iteration_wait, phase_wait), (0.0, 0.0));
+        }
+    }
+
+    #[test]
     fn aic_measurement_reset_clears_phase_provenance_without_clearing_shape_cache() {
         pyo3::prepare_freethreaded_python();
         let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());
@@ -11235,7 +11603,15 @@ mod tests {
         timing.predict_decode_ms(2, 258, 128, 1024).unwrap();
         let before = timing.evidence_summary().unwrap();
         assert_eq!(before.prefill.source, Some(TimingEvidenceSource::Mixed));
-        assert!(replay_power_stats(&before).unwrap().coverage() < 1.0);
+        assert!(
+            replay_power_stats(&ReplayTimingEvidence {
+                active: before.clone(),
+                ..Default::default()
+            })
+            .unwrap()
+            .coverage()
+                < 1.0
+        );
 
         timing.reset_evidence().unwrap();
         assert_eq!(
@@ -11246,8 +11622,14 @@ mod tests {
         let after = timing.evidence_summary().unwrap();
         assert_eq!(after.prefill, TimingPhaseEvidence::default());
         assert_eq!(after.decode, before.decode);
-        assert_eq!(replay_power_stats(&after).unwrap().coverage(), 1.0);
-        assert_eq!(replay_power_stats(&after).unwrap().power_w(), Some(400.0));
+        let stats = replay_power_stats(&ReplayTimingEvidence {
+            active: after,
+            wait_ms: 0.0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(stats.coverage(), 1.0);
+        assert_eq!(stats.power_w(), Some(400.0));
         Python::with_gil(|py| {
             assert_eq!(
                 engine

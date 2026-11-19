@@ -1313,6 +1313,7 @@ impl SglangCore {
         // of forward telemetry and out of repeated pipeline stages.
         let scheduled_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
+        result.forward_time = forward_time;
         // When this pass's forward leaves stage 0, and its time per stage.
         let mut stage0 = Some((scheduled_end_ms, forward_ms));
         let host_launch = pass.launch.is_some();
@@ -1966,6 +1967,7 @@ impl SglangCore {
                 .host_deadline_ms()
                 .is_some_and(|deadline| deadline > now_ms);
         let result = EnginePassResult {
+            forward_time: ForwardTime::default(),
             committed_requests,
             // The forward's end is set when it is priced; `now_ms` holds its place.
             end_ms: now_ms,

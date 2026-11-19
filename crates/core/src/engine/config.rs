@@ -1273,6 +1273,9 @@ pub struct EngineConfig {
     /// Additional divisor applied to decode latency.
     #[serde(default = "default_one")]
     pub decode_speedup_ratio: f64,
+    /// Assumed watts per GPU during in-pass attention-DP rank wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_power_w: Option<f64>,
     /// Later pipeline stages a prefill forward still crosses after its pass retires (PP size - 1
     /// on a PP prefill worker, whose passes retire at the per-stage rate); delays the KV handoff.
     #[serde(default)]
@@ -1400,6 +1403,8 @@ struct EngineConfigWire {
     #[serde(default = "default_one")]
     decode_speedup_ratio: f64,
     #[serde(default)]
+    wait_power_w: Option<f64>,
+    #[serde(default)]
     pipeline_fill_passes: f64,
     #[serde(default)]
     aic_nextn: Option<usize>,
@@ -1489,6 +1494,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             enable_chunked_prefill: wire.enable_chunked_prefill,
             speedup_ratio: wire.speedup_ratio,
             decode_speedup_ratio: wire.decode_speedup_ratio,
+            wait_power_w: wire.wait_power_w,
             pipeline_fill_passes: wire.pipeline_fill_passes,
             aic_nextn: wire.aic_nextn,
             aic_nextn_accept_rates: wire.aic_nextn_accept_rates,
@@ -1541,6 +1547,7 @@ impl Default for EngineConfig {
             enable_chunked_prefill: true,
             speedup_ratio: 1.0,
             decode_speedup_ratio: 1.0,
+            wait_power_w: None,
             pipeline_fill_passes: 0.0,
             aic_nextn: None,
             aic_nextn_accept_rates: None,
@@ -2014,6 +2021,11 @@ impl EngineConfig {
         ensure!(
             self.decode_speedup_ratio.is_finite() && self.decode_speedup_ratio >= 0.0,
             "decode_speedup_ratio must be finite and non-negative"
+        );
+        ensure!(
+            self.wait_power_w
+                .is_none_or(|watts| watts.is_finite() && watts >= 0.0),
+            "wait_power_w must be finite and non-negative"
         );
         ensure!(
             self.pipeline_fill_passes.is_finite()
