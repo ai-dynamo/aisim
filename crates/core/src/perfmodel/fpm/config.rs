@@ -2080,6 +2080,51 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embed-python")]
+    fn explicit_profile_accepts_text_only_but_rejects_unrecorded_quantization() {
+        pyo3::prepare_freethreaded_python();
+        let checkpoint = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkpoint.path().join("config.json"),
+            r#"{"architectures":["TestDecoderForCausalLM"]}"#,
+        )
+        .unwrap();
+        let model = checkpoint.path().to_str().unwrap();
+        let mut cfg = config(serde_json::json!({
+            "model": model, "system": "test_gpu", "backend_version": "0.27.0",
+            "estimation_mode": "fpm_interpolation",
+            "fpm_profile": {
+                "schema_version": 1, "model": model, "model_revision": "test-v1",
+                "architecture": "TestDecoderForCausalLM", "context_length": 4096,
+                "num_experts": 1, "provenance": "Synthetic validation fixture",
+                "deployments": [{
+                    "system": "test_gpu", "backend": "vllm", "backend_version": "0.27.0",
+                    "tp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1,
+                    "gemm_quant_mode": "bfloat16", "moe_quant_mode": "bfloat16",
+                    "fmha_quant_mode": "bfloat16", "comm_quant_mode": "half", "kv_cache_dtype": "fp8",
+                    "resources": {
+                        "weights_bytes": 100, "activations_bytes": 20, "runtime_overhead_bytes": 30,
+                        "comm_overhead_bytes": 10, "cache_layout": "linear", "kv_bytes_per_token": 10,
+                        "max_num_tokens": 4096, "max_batch_size": 32,
+                        "provenance": "Synthetic rank-local resource fixture"
+                    }
+                }]
+            },
+            "estimator_config": {"fpm_interpolation": {"text_only": true}}
+        }));
+        cfg.clone().resolve().unwrap();
+        cfg.estimator_config
+            .fpm_interpolation
+            .unrecorded_quant_modes = vec![super::super::UnrecordedFpmQuantMode::Fmha];
+        assert!(
+            cfg.resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("fpm_profile does not support unrecorded_quant_modes")
+        );
+    }
+
+    #[test]
     fn unrecorded_profile_quantization_rejects_explicit_overrides() {
         let mut cfg = config(serde_json::json!({"estimation_mode": "fpm_interpolation",
             "estimator_config": {"fpm_interpolation": {"text_only": true, "unrecorded_quant_modes": ["fmha", "comm"]}}}));

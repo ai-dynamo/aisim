@@ -12,13 +12,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-
-from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 from collector.fpm_forward import planner, runtime_probe
 from collector.fpm_forward.capabilities import resolve_model_capability
 from collector.fpm_forward.runtime_instrumentation import load_instrumentation, runtime_binding
 from collector.fpm_forward.runtime_observations import expected_ranks, validate_observations
 from collector.fpm_forward.types import ParallelTopology
+
+from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 
 from .test_fpm_forward import _kimi_k31_config
 from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401

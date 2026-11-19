@@ -298,6 +298,25 @@ impl KdaOp {
         batch_size: f64,
         seq_len: f64,
     ) -> Result<f64, AicError> {
+        if !matches!(
+            self.kernel_source.as_str(),
+            "causal_conv1d_fn_qkv3"
+                | "causal_conv1d_update"
+                | "chunk_kda"
+                | "chunk_kda_with_fused_gate"
+                | "flashkda_fwd"
+                | "fused_recurrent_kda_packed_decode"
+                | "fused_kda_decode"
+                | "fused_recurrent_kda"
+                | "fused_sigmoid_gating_delta_rule_update"
+                | "fused_kda_decode_mtp_dspark"
+                | "kda_fused_decode"
+        ) {
+            return Err(AicError::SolNotImplemented(format!(
+                "forward_model='fpm' KDA SOL has no byte model for kernel {:?}",
+                self.kernel_source
+            )));
+        }
         let seq_len = match self.phase.as_str() {
             "context" => seq_len,
             "generation" => 0.0,
@@ -697,6 +716,20 @@ mod tests {
             num_v_heads: 16,
             head_v_dim: 128,
             draft_tokens,
+        }
+    }
+
+    #[test]
+    fn fpm_kda_sol_rejects_unknown_kernels() {
+        let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
+        for phase in ["context", "generation"] {
+            let error = kda_op("unknown_kda", phase, 0)
+                .fpm_sol_latency_ms(&db, 2.0, 65.5)
+                .unwrap_err();
+            assert!(matches!(error, AicError::SolNotImplemented(_)));
+            assert!(error.to_string().contains("unknown_kda"));
         }
     }
 

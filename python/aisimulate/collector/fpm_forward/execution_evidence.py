@@ -173,14 +173,16 @@ def _matches_pinned_hub_snapshot(
     )
 
 
-def _runtime_worker_evidence(plan, cell, raw_root, collection):
+def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None):
     """Bind canonical initialized-worker evidence to this exact native attempt."""
-    from .runtime_instrumentation import contained_file, read_json
+    from .runtime_instrumentation import read_json
     from .runtime_observations import validate_observation_phase
 
     index_path = raw_root.parent.parent.parent / "runtime-observations.json"
     if index_path.is_symlink():
         raise ValueError("runtime model snapshot index cannot be a symlink")
+    if not index_path.exists():
+        raise _MissingExecutionEvidence("runtime model snapshot index is missing")
     index = read_json(index_path)
     name = plan.runtime_configuration
     entry = index["configurations"][name]
@@ -192,17 +194,22 @@ def _runtime_worker_evidence(plan, cell, raw_root, collection):
     if phase.get("cell_id") != cell.cell_id or phase.get("collector_attempt_id") != collection.collector_attempt_id:
         raise ValueError("runtime model snapshot belongs to a different cell or native attempt")
     result = validate_observation_phase(
-        index_path, name, plan.runtime_launch, phase=cell.workload_kind, attempt_id=attempt_id
+        index_path,
+        name,
+        plan.runtime_launch,
+        phase=cell.workload_kind,
+        attempt_id=attempt_id,
+        expected_cell_id=cell.cell_id,
+        expected_collector_attempt_id=collection.collector_attempt_id,
     )
+    if bundle is None:
+        bundle = plan.runtime_instrumentation
     if (
         result["status"] != "complete"
-        or result["provenance"]["bundle_sha256"] != plan.runtime_instrumentation.sha256
+        or result["provenance"]["bundle_sha256"] != bundle.sha256
         or result["provenance"]["instrumentation"].get("import_binding") != "verified"
     ):
         raise ValueError("runtime model snapshot lacks complete matching instrumentation evidence")
-    context = read_json(contained_file(index_path.parent, phase["launch_manifest"]["path"]))
-    if context.get("cell_id") != cell.cell_id or context.get("collector_attempt_id") != collection.collector_attempt_id:
-        raise ValueError("runtime model snapshot context belongs to a different cell or native attempt")
     models = {}
     for artifact in result["provenance"]["artifacts"]:
         worker = artifact["evidence"]
@@ -213,6 +220,58 @@ def _runtime_worker_evidence(plan, cell, raw_root, collection):
             raise ValueError("runtime model snapshot worker ranks are duplicated")
         models[rank] = worker
     return models, file_evidence(index_path)
+
+
+def _validate_native_attention_groups(groups, worker):
+    from .runtime_k31 import LAYOUT
+
+    cache = worker.get("cache", {})
+    if cache.get("allocation_layout") != LAYOUT:
+        return
+    # get_name() identities from the source files pinned by the K3.1 bundle.
+    # Execution records class names; native observations record get_name().
+    backends = {
+        "vllm.v1.attention.backends.mla.flashinfer_mla_sparse.FlashInferMLASparseTRTLLMBackend": (
+            "FLASHINFER_MLA_SPARSE"
+        ),
+        "vllm.v1.attention.backends.mla.flashmla_sparse.FlashMLASparseBackend": "FLASHMLA_SPARSE",
+        "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend": "DEEPSEEK_V32_INDEXER",
+        "vllm.models.kimi_k3.nvidia.kda_metadata.KimiK3KDAAttentionBackend": "KIMI_K3_KDA",
+    }
+    expected_layers = {(index, name) for index, group in enumerate(cache["groups"]) for name in group["layer_names"]}
+
+    def mapping(observed, *, native):
+        if not isinstance(observed, list) or not observed:
+            raise ValueError("native/execution attention group mapping is missing")
+        result = {}
+        for group in observed:
+            if not isinstance(group, dict):
+                raise ValueError("native/execution attention group mapping is malformed")
+            gid = group.get("group_id" if native else "kv_cache_group_id")
+            backend = group.get("backend" if native else "backend_class")
+            layers = group.get("layer_names")
+            if (
+                type(gid) is not int
+                or not isinstance(backend, str)
+                or not isinstance(layers, list)
+                or not layers
+                or any(not isinstance(name, str) or not name for name in layers)
+            ):
+                raise ValueError("native/execution attention group mapping is malformed")
+            backend = backends.get(backend, backend)
+            if backend not in backends.values():
+                raise ValueError("native/execution attention backend has no audited K3.1 mapping")
+            for name in layers:
+                key = (gid, name)
+                if key in result:
+                    raise ValueError("native/execution attention group layer mapping is duplicated")
+                result[key] = backend
+        if set(result) != expected_layers:
+            raise ValueError("native/execution attention groups differ from initialized cache layer mapping")
+        return result
+
+    if mapping(groups, native=False) != mapping(worker.get("attention_groups"), native=True):
+        raise ValueError("execution attention backends differ from the validated initialized worker")
 
 
 def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker=None):
@@ -489,7 +548,7 @@ def inspect_execution_evidence(
         if not isinstance(model, dict):
             model = {}
         native_worker = None
-        if getattr(plan, "runtime_instrumentation", None) is not None and (
+        if (
             release is None
             or model.get("quantization") == "mxfp4"
             or (
@@ -500,19 +559,26 @@ def inspect_execution_evidence(
             )
         ):
             try:
-                if snapshot_models is None:
-                    snapshot_models, snapshot_source = _runtime_worker_evidence(plan, cell, raw_root, collection)
-                native_worker = snapshot_models.get(rank)
-                if native_worker is None:
-                    raise ValueError("runtime evidence is missing this execution worker rank")
-                from .runtime_k31 import is_audited_runtime
+                bundle = getattr(plan, "runtime_instrumentation", None) if snapshot_models is None else None
+                if snapshot_models is None and bundle is not None:
+                    snapshot_models, snapshot_source = _runtime_worker_evidence(
+                        plan, cell, raw_root, collection, bundle=bundle
+                    )
+                if snapshot_models is not None:
+                    native_worker = snapshot_models.get(rank)
+                    if native_worker is None:
+                        raise ValueError("runtime evidence is missing this execution worker rank")
+                    from .runtime_k31 import is_audited_runtime
 
-                if (
-                    is_audited_runtime(native_worker.get("runtime"))
-                    and native_worker["runtime"]["version"] == collection.backend_version
-                ):
-                    audited_runtime_ranks.add(rank)
-                item["runtime_observation_binding"] = snapshot_source
+                    if (
+                        is_audited_runtime(native_worker.get("runtime"))
+                        and native_worker["runtime"]["version"] == collection.backend_version
+                    ):
+                        audited_runtime_ranks.add(rank)
+                    item["runtime_observation_binding"] = snapshot_source
+                    _validate_native_attention_groups(groups, native_worker)
+            except _MissingExecutionEvidence as error:
+                missing.append(f"runtime model snapshot evidence: {error}")
             except (OSError, ValueError, KeyError, TypeError) as error:
                 failures.append(f"runtime model snapshot evidence: {error}")
         _inspect_config(payload, cell, plan, flags, missing, failures, native_worker)

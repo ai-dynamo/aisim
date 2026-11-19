@@ -330,6 +330,56 @@ def test_native_component_or_allocation_corruption_is_rejected(monkeypatch, muta
         _physical_views(cache, scheduled, "fp8")
 
 
+def test_nonuniform_group_cannot_override_its_geometry_with_child_specs(monkeypatch):
+    cache, scheduled, _ = _native_fixture(monkeypatch)
+    for record in (cache, scheduled):
+        record["groups"][0]["layer_specs"] = {"mla.0": {"block_size_tokens": 1}}
+    cache["layer_components"]["mla.0"][0]["shape"][1] = 1
+    with pytest.raises(ValueError, match="per-layer specs require a native uniform group"):
+        _physical_views(cache, scheduled, "fp8")
+    with pytest.raises(ValueError, match="per-layer specs require a native uniform group"):
+        runtime_k31.validate_views(cache, "fp8", 10, 512)
+
+
+def test_kernel_offsets_reject_huge_geometry_without_allocating_from_it(monkeypatch):
+    cache, _ = _kernel_view_fixture(monkeypatch)
+    mapping = cache["kernel_block_views"]["indexer.0"]
+    mapping["kernel_block_size"] = 1
+    # Prevent a regression from attempting a multi-petabyte list in the test.
+    monkeypatch.setattr(
+        runtime_k31, "range", lambda *_: pytest.fail("range allocation from untrusted geometry"), raising=False
+    )
+    with pytest.raises(ValueError, match="kernel-block offsets"):
+        runtime_k31._kernel_view_geometry(mapping, {"block_size_tokens": 2**53}, {}, 10, 512, 64)
+
+
+@pytest.mark.parametrize("mutation", ["none", "out_of_bounds", "overlap"])
+def test_resource_resolver_validates_native_placements_like_the_importer(tmp_path, monkeypatch, mutation):
+    from .test_fpm_runtime_memory import _edit_memory, _evidence, _resolve
+
+    monkeypatch.setattr(legacy, "_offloader_type", lambda: "vllm.model_executor.offloader.base.NoopOffloader")
+    cell = replace(_evidence(tmp_path, monkeypatch), kv_cache_dtype="fp8")
+    cache, scheduled, _ = _native_fixture(monkeypatch)
+    if mutation == "out_of_bounds":
+        cache["tensor_allocations"][0]["offset"] = 512
+    elif mutation == "overlap":
+        cache["tensor_allocations"][0]["layer_stride"] = 64
+
+    def edit(record):
+        record["cache"] = copy.deepcopy(cache if record["kind"] == "worker" else scheduled)
+        record["resolved_config"]["cache_config"]["cache_dtype"] = "fp8"
+
+    _edit_memory(tmp_path, edit)
+    if mutation == "none":
+        assert _resolve(cell, tmp_path)["runtime_memory"]["kv_cache_bytes"] == 9 * 512
+    else:
+        match = "exceeds its pool block slot" if mutation == "out_of_bounds" else "within one group overlap"
+        with pytest.raises(ValueError, match=match):
+            _physical_views(cache, scheduled, "fp8")
+        with pytest.raises(ValueError, match=match):
+            _resolve(cell, tmp_path)
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
@@ -402,6 +452,18 @@ def test_initialized_precision_is_not_inferred_from_model_dtype(mutation, match)
     evidence = _moe()
     mutation(evidence)
     with pytest.raises(ValueError, match=match):
+        runtime_k31.moe_precision(evidence)
+
+
+@pytest.mark.parametrize("name", [None, "", " ", 42, [], {}])
+@pytest.mark.parametrize("target", ["both", "expected", "observed"])
+def test_initialized_moe_requires_actual_layer_names(name, target):
+    evidence = _moe()
+    if target in {"both", "expected"}:
+        evidence["expected_layer_names"] = [name]
+    if target in {"both", "observed"}:
+        evidence["layers"][0]["name"] = name
+    with pytest.raises(ValueError, match="layer names must be nonempty strings"):
         runtime_k31.moe_precision(evidence)
 
 
@@ -532,6 +594,11 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
         if record["kind"] == "worker":
             record["initialized_moe"] = _moe()
             record["attention_backend"] = ["FLASHINFER_MLA_SPARSE", "KIMI_K3_KDA", "DEEPSEEK_V32_INDEXER"]
+            record["attention_groups"] = [
+                {"group_id": 0, "backend": "FLASHINFER_MLA_SPARSE", "layer_names": ["mla.0", "mla.1"]},
+                {"group_id": 0, "backend": "DEEPSEEK_V32_INDEXER", "layer_names": ["indexer.0", "indexer.1"]},
+                {"group_id": 1, "backend": "KIMI_K3_KDA", "layer_names": ["kda.0", "kda.1"]},
+            ]
         record_path.write_text(json.dumps(record))
         ref["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
     path.write_text(json.dumps(index))
@@ -552,6 +619,35 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(tmp_
         evidence = artifact["evidence"]
         if evidence["kind"] == "worker":
             assert runtime_k31.moe_precision(evidence["initialized_moe"]) == "w4a8_mxfp4_mxfp8_trtllm"
+
+
+@pytest.mark.parametrize("role", ["worker", "scheduler"])
+@pytest.mark.parametrize("architectures", [None, [], ["OtherModel"], ["KimiK31ForConditionalGeneration", "OtherModel"]])
+def test_native_layout_requires_exact_k31_architecture_on_each_role(tmp_path, monkeypatch, role, architectures):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    index = json.loads(path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    for ref in phase["artifacts"]:
+        record_path = path.parent / ref["path"]
+        record = json.loads(record_path.read_text())
+        if record["kind"] != role:
+            continue
+        model = record["resolved_config"]["model_config"]
+        if architectures is None:
+            model.pop("architectures", None)
+        else:
+            model["architectures"] = architectures
+        # BF16 is valid generically and must not bypass the K3.1 baseline.
+        record["resolved_config"]["cache_config"]["enable_prefix_caching"] = True
+        ref["sha256"] = hashlib.sha256(json.dumps(record).encode()).hexdigest()
+        record_path.write_text(json.dumps(record))
+    path.write_text(json.dumps(index))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert any(
+        "requires the observed KimiK31ForConditionalGeneration architecture" in reason
+        for reason in result["diagnostics"]
+    )
 
 
 def test_one_rank_missing_initialized_precision_keeps_import_incomplete(tmp_path, monkeypatch):

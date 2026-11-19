@@ -761,15 +761,37 @@ def test_resolved_hub_snapshot_does_not_override_generated_revision(campaign, la
 def test_instrumented_execution_rejects_non_object_model_config(campaign, monkeypatch, model_config):
     plan, source, _ = campaign
     monkeypatch.setattr(type(plan), "runtime_instrumentation", property(lambda _plan: object()))
-    _mutate_workers(source, lambda payload: payload["resolved_config"].update(model_config=model_config))
     cell = plan.cells[0]
     raw = source / "cells" / cell.cell_id / "raw"
+    workers = [json.loads(path.read_text()) for path in raw.glob("**/fpm-execution-worker-*.json")]
+    snapshot = {tuple(worker[key] for key in ("dp_rank", "tp_rank", "pp_rank")): worker for worker in workers}
+    monkeypatch.setattr(execution_evidence, "_runtime_worker_evidence", lambda *a, **kw: (snapshot, {}))
+    _mutate_workers(source, lambda payload: payload["resolved_config"].update(model_config=model_config))
     collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
 
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
 
-    assert result["status"] == "failed"
+    assert result["status"] == "incomplete"
     assert "runtime model_config is unreported" in result["missing_evidence"]
+    assert not result["failures"]
+
+
+@pytest.mark.parametrize("needs_native", [False, True])
+def test_instrumentation_bundle_errors_are_scoped_to_workers_needing_evidence(campaign, monkeypatch, needs_native):
+    plan, source, _ = campaign
+
+    def changed_bundle(_plan):
+        raise ValueError("instrumentation changed after planning")
+
+    monkeypatch.setattr(type(plan), "runtime_instrumentation", property(changed_bundle))
+    if needs_native:
+        _mutate_workers(source, lambda payload: payload["resolved_config"]["model_config"].update(quantization="mxfp4"))
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("failed" if needs_native else "qualified")
+    assert any("instrumentation changed after planning" in failure for failure in result["failures"]) == needs_native
 
 
 def test_fallback_commit_satisfies_revision_and_model_evidence(campaign, tmp_path, monkeypatch):

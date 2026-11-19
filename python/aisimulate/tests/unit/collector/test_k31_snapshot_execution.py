@@ -10,9 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from collector.fpm_forward import execution_evidence
 
+from .test_fpm_repeatability import _write_campaign
 from .test_k31_planner_precision import inputs  # noqa: F401
 from .test_runtime_observations import _write
 
@@ -61,6 +61,154 @@ def test_snapshot_identity_uses_revalidated_same_attempt_worker(snapshot):
     native = dict(model)
     assert not execution_evidence._matches_pinned_hub_snapshot(public, model, {revision})
     assert execution_evidence._matches_pinned_hub_snapshot(public, model, {revision}, native)
+
+
+def test_snapshot_identity_is_checked_on_the_validated_manifest(snapshot, monkeypatch):
+    from collector.fpm_forward import runtime_observations
+
+    plan, cell, raw, collection, index_path = snapshot
+    index = json.loads(index_path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    manifest_path = index_path.parent / phase["launch_manifest"]["path"]
+    wrong = json.loads(manifest_path.read_text())
+    correct = copy.deepcopy(wrong)
+    wrong["collector_attempt_id"] = "different-native-attempt"
+    phase["launch_manifest"]["sha256"] = _write(manifest_path, wrong)["sha256"]
+    index_path.write_text(json.dumps(index))
+    read = runtime_observations.read_json
+
+    def replace_after_read(path, **kwargs):
+        value = read(path, **kwargs)
+        if Path(path) == manifest_path:
+            manifest_path.write_text(json.dumps(correct))
+        return value
+
+    monkeypatch.setattr(runtime_observations, "read_json", replace_after_read)
+    with pytest.raises(ValueError, match="launch manifest collector_attempt_id"):
+        execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
+
+
+@pytest.fixture
+def native_execution(snapshot, request):
+    from collector.fpm_forward import planner, runtime_probe
+    from collector.fpm_forward.native_artifact import validate_native_collection
+
+    bound = request.getfixturevalue("inputs")
+    _, _, _, collection, index_path = snapshot
+    generator_overrides = runtime_probe.probe_generator_overrides(bound["runtime_launch"])
+    plan = planner.build_collection_plan(
+        backend=bound["backend"],
+        model_path=bound["model_path"],
+        system=bound["system"],
+        selected_ops=set(),
+        options=bound["options"],
+        has_model_cases=False,
+        model_config_path=bound["runtime_launch"]["model_config"]["path"],
+        fpm_profile=bound["profile"],
+        runtime_instrumentation=bound["runtime_instrumentation"],
+        runtime_configuration="tp2",
+        runtime_launch=bound["runtime_launch"],
+        generator_overrides=generator_overrides,
+    )
+    root = index_path.parent
+    _write_campaign(
+        root,
+        root / "checkpoint.json",
+        plan,
+        attempt_id=collection.collector_attempt_id,
+        generator_overrides=generator_overrides,
+    )
+    cell = plan.cells[0]
+    raw = root / "cells" / cell.cell_id / "raw"
+    index = json.loads(index_path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    phase["cell_id"] = cell.cell_id
+    path = root / phase["launch_manifest"]["path"]
+    context = json.loads(path.read_text())
+    context["cell_id"] = cell.cell_id
+    phase["launch_manifest"]["sha256"] = _write(path, context)["sha256"]
+    index_path.write_text(json.dumps(index))
+    workers, _ = execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
+    classes = {
+        "FLASHINFER_MLA_SPARSE": (
+            "vllm.v1.attention.backends.mla.flashinfer_mla_sparse.FlashInferMLASparseTRTLLMBackend"
+        ),
+        "DEEPSEEK_V32_INDEXER": "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend",
+        "KIMI_K3_KDA": "vllm.models.kimi_k3.nvidia.kda_metadata.KimiK3KDAAttentionBackend",
+    }
+    for path in raw.glob("**/fpm-execution-worker-*.json"):
+        payload = json.loads(path.read_text())
+        worker = workers[tuple(payload[key] for key in ("dp_rank", "tp_rank", "pp_rank"))]
+        for section, values in worker["resolved_config"].items():
+            if isinstance(values, dict) and isinstance(payload["resolved_config"].get(section), dict):
+                payload["resolved_config"][section].update(copy.deepcopy(values))
+            else:
+                payload["resolved_config"][section] = copy.deepcopy(values)
+        payload["graph_config"] = copy.deepcopy(worker["resolved_config"]["compilation_config"])
+        payload["attention_groups"] = [
+            {
+                "kv_cache_group_id": group["group_id"],
+                "backend_class": classes[group["backend"]],
+                "layer_names": group["layer_names"],
+            }
+            for group in worker["attention_groups"]
+        ]
+        path.write_text(json.dumps(payload))
+    collection = validate_native_collection(
+        cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id=collection.collector_attempt_id
+    )
+    return plan, cell, raw, collection, index_path
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["none", "backend", "layers", "group", "duplicate", "absent_index", "bad_index", "bad_hash", "wrong_attempt"],
+)
+def test_execution_requires_consistent_native_attention_and_bound_evidence(native_execution, mutation, monkeypatch):
+    plan, cell, raw, collection, index_path = native_execution
+    if mutation in {"backend", "layers", "group", "duplicate"}:
+        path = next(raw.glob("**/fpm-execution-worker-*.json"))
+        payload = json.loads(path.read_text())
+        groups = payload["attention_groups"]
+        if mutation == "backend":
+            groups[0]["backend_class"] = "vllm.v1.attention.backends.mla.flashmla_sparse.FlashMLASparseBackend"
+        elif mutation == "layers":
+            groups[0]["layer_names"], groups[1]["layer_names"] = groups[1]["layer_names"], groups[0]["layer_names"]
+        elif mutation == "group":
+            groups[0]["kv_cache_group_id"] = 1
+        else:
+            groups.append(copy.deepcopy(groups[0]))
+        path.write_text(json.dumps(payload))
+    elif mutation == "absent_index":
+        index_path.unlink()
+    elif mutation == "bad_index":
+        index_path.write_text("{malformed")
+    elif mutation in {"bad_hash", "wrong_attempt"}:
+        index = json.loads(index_path.read_text())
+        phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+        if mutation == "bad_hash":
+            phase["launch_manifest"]["sha256"] = "0" * 64
+        else:
+            phase["collector_attempt_id"] = "wrong-attempt"
+        index_path.write_text(json.dumps(index))
+    reads = []
+    original = type(plan).runtime_instrumentation
+
+    def bundle_read(value):
+        reads.append(True)
+        return original.fget(value)
+
+    monkeypatch.setattr(type(plan), "runtime_instrumentation", property(bundle_read))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    expected = "qualified" if mutation == "none" else "incomplete" if mutation == "absent_index" else "failed"
+    assert result["status"] == expected, (result["missing_evidence"], result["failures"])
+    if mutation == "none":
+        assert len(reads) == 1
+    elif mutation == "absent_index":
+        assert not result["failures"]
+        assert any("snapshot index is missing" in reason for reason in result["missing_evidence"])
+    else:
+        assert result["failures"]
 
 
 @pytest.mark.parametrize("mutation", ["other_attempt", "other_cell", "wrong_context", "bad_config_hash", "symlink"])

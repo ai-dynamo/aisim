@@ -47,7 +47,9 @@ def moe_precision(evidence):
     expected = evidence.get("expected_layer_names")
     if not isinstance(layers, list) or not layers or not isinstance(expected, list) or not expected:
         raise ValueError("K3.1 initialized MoE layer coverage is incomplete")
-    names = [layer.get("name") for layer in layers]
+    names = [layer.get("name") if isinstance(layer, dict) else None for layer in layers]
+    if any(not isinstance(name, str) or not name.strip() for name in [*names, *expected]):
+        raise ValueError("K3.1 initialized MoE layer names must be nonempty strings")
     if len(set(names)) != len(names) or set(names) != set(expected) or len(expected) != len(set(expected)):
         raise ValueError("K3.1 initialized MoE layer coverage is inconsistent")
     modes = set()
@@ -89,6 +91,8 @@ def normalize_groups(cache, scheduled, page_bytes):
         raise ValueError("K3.1 cache group coverage is incomplete")
     names, result = set(), []
     for index, (group, scheduler) in enumerate(zip(raw, other, strict=True)):
+        if "layer_specs" in group and group.get("spec_type") != SPEC + "UniformTypeKVCacheSpecs":
+            raise ValueError("K3.1 per-layer specs require a native uniform group")
         expected = {key: value for key, value in group.items() if key not in {"kind", "layer_classes"}}
         if (
             group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs"
@@ -222,8 +226,8 @@ def _kernel_view_geometry(mapping, group, view, count, page, width):
     offsets = mapping.get("kernel_block_offsets")
     if (
         not isinstance(offsets, list)
-        or any(type(value) is not int for value in offsets)
-        or offsets != list(range(subdivisions))
+        or len(offsets) != subdivisions
+        or any(type(value) is not int or value != index for index, value in enumerate(offsets))
     ):
         raise ValueError("K3.1 native kernel-block offsets do not cover the manager block")
     table = mapping.get("kernel_block_table_shape")
@@ -268,8 +272,11 @@ def validate_views(cache, precision, count, page):
         raise ValueError("K3.1 backing storage identity is missing")
     by_name = {}
     for index, group in enumerate(cache["groups"]):
+        uniform = group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs"
+        if "layer_specs" in group and not uniform:
+            raise ValueError("K3.1 per-layer specs require a native uniform group")
         for name in group["layer_names"]:
-            spec = {**group, **group.get("layer_specs", {}).get(name, {})}
+            spec = {**group, **group["layer_specs"][name]} if uniform else group
             by_name[name] = (index, spec)
             if spec["kind"] == "attention" and spec.get("dtype") not in {"torch.uint8", "torch.float8_e4m3fn"}:
                 raise ValueError("K3.1 attention storage contradicts FP8 precision")

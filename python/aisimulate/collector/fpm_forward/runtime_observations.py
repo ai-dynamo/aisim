@@ -266,6 +266,14 @@ def _validate_record(
     elif lifecycle.get("measurement") != "scheduler_initialized":
         raise ValueError("scheduler initialization lifecycle evidence is missing")
     collection = launch["collection"]
+    native_layout = record["cache"].get("allocation_layout") == LAYOUT
+    observed_config = record.get("resolved_config", {})
+    observed_model = observed_config.get("model_config", {}) if isinstance(observed_config, dict) else {}
+    native_architecture = isinstance(observed_model, dict) and observed_model.get("architectures") == [
+        "KimiK31ForConditionalGeneration"
+    ]
+    if native_layout and not native_architecture:
+        raise ValueError("K3.1 native cache mapping requires the observed KimiK31ForConditionalGeneration architecture")
     config = runtime_memory._validate_config(
         record,
         cell,
@@ -274,7 +282,7 @@ def _validate_record(
         sequences=collection["max_num_seqs"],
         fraction=float(collection["gpu_memory_utilization"]),
     )
-    if config.get("model_config", {}).get("architectures") == ["KimiK31ForConditionalGeneration"]:
+    if native_architecture:
         if not is_audited_runtime(record.get("runtime")) or record["cache"].get("allocation_layout") != LAYOUT:
             raise ValueError("K3.1 initialization requires the exact audited runtime and native cache mapping")
         if (
@@ -659,6 +667,7 @@ def _configuration(
     *,
     phase: str | None = None,
     attempt_id: str | None = None,
+    collector_binding: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     _same(saved.get("launch"), launch, "reviewed configuration launch")
     ranks = expected_ranks(launch["topology"])
@@ -698,10 +707,13 @@ def _configuration(
         result = phases[phase]
         binding = {"attempt_id": active, "configuration": label, "phase": phase, "bundle_sha256": bundle.sha256}
         launch_path, digest = _artifact(root, result["launch_manifest"])
-        context = read_json(launch_path)
+        context = read_json(launch_path, expected_sha256=digest)
         if context.get("schema_version") != LAUNCH_SCHEMA:
             raise ValueError("unsupported runtime launch manifest schema")
         for name, value in {**binding, "launch": launch, "expected_ranks": ranks}.items():
+            _same(context.get(name), value, f"launch manifest {name}")
+        for name, value in (collector_binding or {}).items():
+            _same(result.get(name), value, f"selected phase {name}")
             _same(context.get(name), value, f"launch manifest {name}")
         launch_artifacts.append({**result["launch_manifest"], "sha256": digest})
         import_binding = context.get("instrumentation_binding")
@@ -837,6 +849,8 @@ def validate_observation_phase(
     *,
     phase: str,
     attempt_id: str,
+    expected_cell_id: str | None = None,
+    expected_collector_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate one explicitly bound active phase; does not qualify a serving role.
 
@@ -856,6 +870,14 @@ def validate_observation_phase(
         launch,
         phase=phase,
         attempt_id=_text(attempt_id, "selected phase attempt identity"),
+        collector_binding={
+            key: value
+            for key, value in {
+                "cell_id": expected_cell_id,
+                "collector_attempt_id": expected_collector_attempt_id,
+            }.items()
+            if value is not None
+        },
     )
     result["provenance"]["observations_index"] = {
         "path": str(index_path),
