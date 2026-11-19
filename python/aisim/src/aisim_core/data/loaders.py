@@ -463,7 +463,11 @@ def _resolve_library_resources(
 
 
 def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | None:
-    """Catalog parallelism dimensions of a configuration (degree 1 dropped), or None when it names none."""
+    """Catalog parallelism dimensions (degree 1 dropped), or None when none were requested.
+
+    Omitted topology leaves the catalog unfiltered; ensure_data rejects multiple matches rather than
+    choosing an entry using prediction defaults. Explicit all-ones topology selects the single-GPU identity.
+    """
     keys = {
         "tp": "tp",
         "attention_dp": "dp",

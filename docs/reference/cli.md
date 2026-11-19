@@ -126,6 +126,11 @@ does not publish is skipped. The root is rebuilt whenever the entries' artifact 
 change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
 dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
 
+For FPM dataset selection, omitted topology leaves parallelism unfiltered. If both TP1 and TP4 entries
+match, `ensure_data` raises an ambiguity error; supply an explicit topology or set
+`AISIM_DATA_CONFIGURATION` to choose an entry. Explicit all-ones topology selects TP1. Prediction-time
+topology defaults do not silently choose among dataset entries.
+
 <a id="non-python-consumers"></a>
 
 ### Operation data for consumers without the Python data library

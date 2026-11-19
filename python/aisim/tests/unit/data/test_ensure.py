@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from aisim_core.data import Identity, configuration_id
 from aisim_core.data import ensure as ensure_mod
 from aisim_core.data.ensure import (
     DataConflictError,
@@ -19,7 +20,7 @@ from aisim_core.data.ensure import (
 )
 from aisim_core.data.fetch import Cache, Selection
 from aisim_core.data.loaders import FpmData, FpmLoader
-from tests.unit.data.test_fetch import REPO, SHA, FakeTransport, build_repo
+from tests.unit.data.test_fetch import REPO, SHA, FakeTransport, _artifact_json, build_repo
 
 pytestmark = pytest.mark.unit
 
@@ -105,6 +106,39 @@ def test_over_threshold_refuses_with_size_and_command(tmp_path, files):
 def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
     with pytest.raises(MissingDataError, match=r"model=other.*system=h200|system=h200.*model=other"):
         ensure_data({**CONFIG, "model": "other"}, pin(tmp_path), transport=FakeTransport(files))
+
+
+def test_omitted_topology_keeps_ambiguous_catalog_entries_explicit(tmp_path, files):
+    index = json.loads(files["catalog/fpm/index.json"])
+    ids = []
+    for entry, tp in zip(index["entries"], (1, 4), strict=True):
+        path = entry["manifest"]["path"]
+        manifest = json.loads(files[path])
+        identity = Identity.model_validate(
+            {**manifest["identity"], "model": "m1", "parallelism": {"aggregated": {} if tp == 1 else {"tp": tp}}}
+        )
+        cfg_id = configuration_id("fpm", "execution-profile", identity)
+        ids.append(cfg_id)
+        manifest.update(configuration_id=cfg_id, identity=identity.model_dump())
+        files[path] = json.dumps(manifest).encode()
+        entry.update(
+            configuration_id=cfg_id,
+            identity=identity.model_dump(),
+            manifest=_artifact_json("m", path, files[path], format="json", schema="aisim-artifact-manifest/v1"),
+        )
+    files["catalog/fpm/index.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"] = _artifact_json(
+        "i", "catalog/fpm/index.json", files["catalog/fpm/index.json"], format="json", schema="aisim-category-index/v1"
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+
+    with pytest.raises(DataConflictError, match="2 fpm entries.*AISIM_DATA_CONFIGURATION"):
+        ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    explicit = ensure_data({**CONFIG, "tp": 1}, pin(tmp_path), transport=FakeTransport(files))
+    assert explicit.datasets["fpm"]["configuration_id"] == ids[0]
+    pinned = ensure_data(CONFIG, pin(tmp_path, configuration_id=ids[1]), transport=FakeTransport(files))
+    assert pinned.datasets["fpm"]["configuration_id"] == ids[1]
 
 
 def test_local_override_needs_no_network_or_cache(tmp_path, files):
