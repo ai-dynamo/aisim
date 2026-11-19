@@ -358,17 +358,18 @@ impl OperationValues {
         covered_latency_ms: f64,
         source: TimingEvidenceSource,
     ) -> Result<Self> {
-        let covered_latency_ms = if energy_wms.is_some_and(|energy| energy > 0.0) {
-            covered_latency_ms
-        } else {
-            0.0
-        };
         // A name that starts with a visible ASCII character is not blank; skip the trim.
         ensure!(
             name.as_bytes().first().is_some_and(u8::is_ascii_graphic) || !name.trim().is_empty(),
             "timing evidence operation name cannot be empty"
         );
+        // Check the supplied coverage before an unpowered row drops it.
         check_operation_values(name, latency_ms, energy_wms, covered_latency_ms)?;
+        let covered_latency_ms = if energy_wms.is_some_and(|energy| energy > 0.0) {
+            covered_latency_ms
+        } else {
+            0.0
+        };
         Ok(Self {
             latency_ms,
             energy_wms: energy_wms.filter(|energy| *energy > 0.0),
@@ -2404,8 +2405,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(phase.totals(), (3.0, Some(300.0), 1.5));
-        let over = [Ok((1.0, Some(1.0), 1.5, Sol)), Ok((1.0, None, 0.0, Sol))];
-        assert!(ValidatedTimingPhase::from_slot_values(&names, over.into_iter()).is_err());
+        // Over-coverage fails whether or not the slot has energy to keep it.
+        for energy in [Some(1.0), Some(0.0), None] {
+            let over = [Ok((1.0, energy, 2.0, Sol)), Ok((1.0, None, 0.0, Sol))];
+            assert!(
+                ValidatedTimingPhase::from_slot_values(&names, over.into_iter())
+                    .is_err_and(|e| e.to_string().contains("covered latency 2ms for 1ms total")),
+                "{energy:?}"
+            );
+        }
     }
 
     #[test]
