@@ -1113,8 +1113,10 @@ sub-block matching without an explicit full-state scratch count.
     and a prompt of 64 tokens, a repeat hits 0 tokens in replay and 60 in
     vLLM. A longer prompt, or a prompt whose length is not a multiple of the
     block, is not affected. The other way needs no hits inside a block:
-    every prefix-cacheable group is full attention, their blocks differ, and
-    the hash block is their greatest common divisor. A block that gets the
+    every prefix-cacheable group is full attention. The hash block is then
+    smaller than a block when the blocks differ, where it is their greatest
+    common divisor by default, or when `prefix_match_unit` sets a smaller
+    one. A block that gets the
     key of the last hash boundary first gets no full key when a later chunk
     fills it. A later, longer prompt can then hit one least common multiple
     of the group block sizes less than in vLLM. With blocks of 64 and 16
@@ -1122,8 +1124,9 @@ sub-block matching without an explicit full-state scratch count.
     makes a later prompt of 200 tokens hit 64 tokens in replay and 128 in
     vLLM. With hits inside a block this order gives the same hit as in vLLM,
     because the state group has its key at the same hash boundary. The
-    shipped GLM-5.3-Flash profile reaches neither case, because its hash
-    block equals its block. See vLLM v0.32.0
+    published GLM-5.3-Flash profiles reach neither case, because they are
+    vLLM 0.31.0 profiles. GLM-5.3-Flash at default serving reaches neither,
+    because its hash block then equals its block. See vLLM v0.32.0
     [`single_type_kv_cache_manager.py:838-884`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L838-L884),
     [`block_pool.py:286-299`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L286-L299),
     [`:502-523`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L502-L523)
