@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Local consumer contracts over synthetic artifacts, without native prediction."""
+"""Consumer contracts over synthetic and recorded native artifacts; no runtime build."""
 
 from __future__ import annotations
 
@@ -181,3 +181,87 @@ def test_export_and_best_per_mode(summarizer, artifact, monkeypatch, tmp_path, c
     dest = tmp_path / "export.yaml"
     assert invoke(summarizer, monkeypatch, tmp_path, ledger, "--export", "candidate-000001", "--to", str(dest)) == 0
     assert yaml.safe_load(dest.read_text()) == ledger["candidates"][0]["prediction_config"]
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_summary_reads_recorded_native_0140(summarizer, monkeypatch, tmp_path, capsys, json_mode):
+    # Replay producer bytes from the pinned native wheel, without running a model in CI.
+    native = EVIDENCE / "native-0.14.0"
+    ledger = json.loads((native / "recommendation/recommendation.json").read_text())
+    assert invoke(summarizer, monkeypatch, tmp_path, ledger, *(["--json"] if json_mode else [])) == 0
+    output = capsys.readouterr().out
+    selected_ids = ledger["views"]["top_n"][:5]
+    if json_mode:
+        summary = json.loads(output)
+        assert [row["candidate_id"] for row in summary["selected"]] == selected_ids
+        by_id = {candidate["candidate_id"]: candidate for candidate in ledger["candidates"]}
+        for row in summary["selected"]:
+            metrics = by_id[row["candidate_id"]]["metrics"]
+            assert row["completed_requests"] == metrics["completed_requests"]
+            assert row["mean_ttft_ms"] == metrics["mean_ttft_ms"]
+            assert row["output_tok_s_per_gpu"] == pytest.approx(
+                metrics["output_throughput_tok_s"] / by_id[row["candidate_id"]]["used_gpus"]
+            )
+    else:
+        assert output.count("completed=100") == len(selected_ids)
+        assert "ttft=" in output
+        assert "ttft=-" not in output
+        assert "sla_ok=-" in output
+
+
+def test_ladder_classifies_recorded_native_0140():
+    spec = importlib.util.spec_from_file_location(
+        "native_ladder", ROOT / "skills/aisim-gpu-selection-and-sizing/scripts/size_ladder.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    status, detail, result = module.classify(0, "", EVIDENCE / "native-0.14.0/recommendation")
+    assert status == "qualified"
+    assert not detail
+    assert result["views"]["top_n"]
+    assert result["counts"]["evaluated"] == len(result["candidates"])
+
+
+def test_headroom_parses_recorded_native_0140(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    native = EVIDENCE / "native-0.14.0"
+    spec = importlib.util.spec_from_file_location(
+        "native_headroom", ROOT / "skills/aisim-gpu-selection-and-sizing/scripts/headroom_scan.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = yaml.safe_load((native / "headroom-input.yaml").read_text())
+    # Input schema validation and native execution are recorded separately. This
+    # replay test exercises the consumer of the actual stdout metric envelope.
+    monkeypatch.setattr(module, "load_config", lambda path: (config, "recorded-native-input"))
+
+    def replay(cmd, **kwargs):
+        out = Path(cmd[cmd.index("--output-dir") + 1])
+        metrics = (native / "headroom" / out.name / "prediction.json").read_text()
+        return subprocess.CompletedProcess(cmd, 0, stdout=metrics, stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", replay)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "headroom_scan.py",
+            str(native / "headroom-input.yaml"),
+            "--min-goodput-share",
+            "0.9",
+            "--min-compliant-share",
+            "0.95",
+            "--steps",
+            "1.0,2.0",
+            "--workdir",
+            str(tmp_path / "scan"),
+        ],
+    )
+    assert module.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    captured = json.loads((native / "headroom.json").read_text())
+    for row, expected in zip(result["rows"], captured["rows"], strict=True):
+        assert row["status"] == expected["status"]
+        for key in ("num_requests", "sla_compliant_requests", "goodput_rps", "arrival_window_s", "mean_ttft_ms"):
+            assert row[key] == pytest.approx(expected[key])

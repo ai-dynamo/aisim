@@ -30,5 +30,6 @@
     "encoder_power_coverage",
     "encoder_power_w"
   ],
-  "aiperf_metrics_module": "absent at this release commit"
+  "aiperf_metrics_module": "absent at this release commit",
+  "scope": "Python score._METRIC_KEYS at the recorded release pin. Native engine artifacts can include additional raw report metrics; native-0.14.0 records the actual engine output."
 }
