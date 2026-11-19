@@ -336,7 +336,9 @@ def validate_tree(
         if f.path.endswith(".gz") and f.path not in gz_declared:
             report.add("undeclared-archive", "gzip file is not a declared provenance artifact", f.path)
         elif f.path not in declared and not f.path.endswith(".gz"):
-            report.add("orphan-file", "file is not referenced by any manifest, index or record", f.path, "warning")
+            # Unreferenced files escape the content checks, so the public profile rejects them.
+            severity = "error" if profile == "public" else "warning"
+            report.add("orphan-file", "file is not referenced by any manifest, index or record", f.path, severity)
 
     if profile == "public":
         from aisim_core.data.redaction import check_publishable

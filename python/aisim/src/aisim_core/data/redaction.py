@@ -111,6 +111,9 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+_LABEL_RANK = ("public", "restricted", "internal")  # least to most restrictive; unknown labels fail validation
+
+
 class VisibilityEntry(_Model):
     path: str = Field(min_length=1)  # a file or a directory prefix, repository-relative
     label: Label
@@ -126,7 +129,8 @@ class VisibilityLedger(_Model):
     def entry_for(self, path: str) -> VisibilityEntry | None:
         """Longest matching prefix wins, so a file can be narrower than its directory."""
         hits = [e for e in self.entries if path == e.path.rstrip("/") or path.startswith(e.path.rstrip("/") + "/")]
-        return max(hits, key=lambda e: len(e.path), default=None)
+        # Longest normalized prefix wins; equal prefixes resolve to the most restrictive label.
+        return max(hits, key=lambda e: (len(e.path.rstrip("/")), _LABEL_RANK.index(e.label)), default=None)
 
     def label_for(self, path: str) -> Label:
         entry = self.entry_for(path)
@@ -248,6 +252,8 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
             out.append(Finding("request-rows", "per-request rows are not published", artifact.path))
         if artifact.artifact_schema == OBSERVATIONS_SCHEMA:
             out.extend(_check_observations(root / artifact.path, artifact.path, policy))
+        elif artifact.artifact_schema == REQUESTS_SCHEMA and _request_rows_allowed(body, policy):
+            out.extend(_check_requests(root / artifact.path, artifact.path, policy))
     out.extend(scan_value(manifest.provenance, policy, rel, "manifest provenance"))
     out.extend(scan_value([manifest.requested_settings, manifest.evidence_gaps], policy, rel, "manifest"))
     return out
@@ -267,6 +273,21 @@ def _check_observations(path: Path, rel: str, policy: RedactionPolicy) -> list[F
         elif name in ("producer_id", "image", "source_config_json", "unmapped_metrics_json", "source_observation_id"):
             hits = scan_value({name: [v for v in values if isinstance(v, str)]}, policy, rel, f"column {name}")
             out.extend(hits[:1])  # one finding per column is enough to stop the copy
+    return out
+
+
+def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
+    """Scan every string column of an accepted request table; one finding per column stops the copy."""
+    table: pa.Table = read_parquet(path, REQUESTS_SCHEMA)
+    out: list[Finding] = []
+    for name in table.column_names:
+        if not (
+            pa.types.is_string(table.schema.field(name).type) or pa.types.is_large_string(table.schema.field(name).type)
+        ):
+            continue
+        values = [v for v in table.column(name).to_pylist() if isinstance(v, str) and v not in ("", REDACTED)]
+        if values:
+            out.extend(scan_value({name: values}, policy, rel, f"request column {name}")[:1])
     return out
 
 

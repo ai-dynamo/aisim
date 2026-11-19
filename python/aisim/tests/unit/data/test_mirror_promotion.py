@@ -504,8 +504,6 @@ def test_eval_record_is_promoted_with_its_configuration(tmp_path):
     apply_promotion(plan, root, target)
     report = validate_tree(target, repo=PUBLIC, profile="public")
     assert report.ok and report.eval_records == 1, report.errors
-    # An eval record scoring InferenceX truth is not promoted by default.
-    shutil.rmtree(target)
 
 
 def test_lineage_of_redacted_originals_is_recorded_privately(tmp_path):
@@ -558,3 +556,134 @@ def test_evidence_is_never_promoted(tmp_path):
     _evidence(root)
     plan = plan_promotion(root, _request(["evidence/data"]), _reviewers())
     assert "selection-root" in {f.code for f in plan.findings}
+
+
+def test_eval_record_scoring_infx_truth_is_aggregates_only(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    (infx,) = inferencex_to_configurations([_infx()])
+    infx = dataclasses.replace(
+        infx, observations=[o.model_copy(update=CLEAN) for o in infx.observations], provenance=[], requests=[]
+    )
+    manifest = write_configuration(root, infx, prefix="data")
+    register_manifests(root, [manifest], INTERNAL_REPO)
+    from aisim_core.data import Manifest
+
+    cid = Manifest.model_validate_json((root / manifest).read_bytes()).configuration_id
+    record = _eval(root, [cid])
+    build_catalog(root)
+    eval_dir = str(record.parent.relative_to(root))
+    cfg_dir = str(Path(manifest).parent)
+    _public(root, cfg_dir, eval_dir)
+    files = [p.relative_to(root).as_posix() for d in (cfg_dir, eval_dir) for p in (root / d).rglob("*") if p.is_file()]
+    codes = {f.code for f in check_publishable(root, files)}
+    assert "infx-aggregates-only" in codes
+    plan = plan_promotion(root, _request([cfg_dir, eval_dir]), _reviewers())
+    assert "infx-aggregates-only" in {f.code for f in plan.findings}
+    relaxed = RedactionPolicy(inferencex_disclosure="point-level")
+    assert "infx-aggregates-only" not in {f.code for f in check_publishable(root, files, policy=relaxed)}
+
+
+def test_request_table_text_is_scanned(tmp_path):
+    root = tmp_path / "r"
+    root.mkdir()
+    records = _records()
+    records[0]["error"] = "connect failed to node7.corp.nvidia.com with Bearer " + "a" * 24
+    body = _body()
+    cfg = aiperf_to_configuration(_summary(), records, body, observation_id="dev:m", device_count=8)
+    cfg = dataclasses.replace(cfg, observations=[o.model_copy(update=CLEAN) for o in cfg.observations], provenance=[])
+    path = write_configuration(root, cfg, prefix="data")
+    files = [p.relative_to(root).as_posix() for p in (root / path).parent.iterdir()]
+    found = check_publishable(root, files)
+    assert {"internal-host", "secret"} & {f.code for f in found}
+    assert any("request column error" in f.message for f in found)
+
+
+def test_conflicting_ledger_entries_resolve_to_the_most_restrictive_label():
+    for entries in (
+        [("data/a", "public"), ("data/a", "restricted")],
+        [("data/a", "restricted"), ("data/a/", "public")],
+    ):
+        ledger = VisibilityLedger(entries=[VisibilityEntry(path=p, label=lab) for p, lab in entries])
+        assert ledger.label_for("data/a/x") == "restricted"
+    narrow = VisibilityLedger(
+        entries=[VisibilityEntry(path="data/a", label="restricted"), VisibilityEntry(path="data/a/b", label="public")]
+    )
+    assert narrow.label_for("data/a/b/c") == "public"  # a narrower prefix still wins
+
+
+def test_unreferenced_file_blocks_promotion_and_public_validation(tmp_path):
+    root, directory = _promotable(tmp_path)
+    (root / directory / "notes.json").write_text('{"token": "private"}')
+    plan = plan_promotion(root, _request([directory]), _reviewers())
+    assert "orphan-file" in {f.code for f in plan.findings}
+    assert any(
+        f.code == "orphan-file" and f.severity == "error" for f in validate_tree(root, profile="public").findings
+    )
+    assert all(f.severity == "warning" for f in validate_tree(root).findings if f.code == "orphan-file")
+
+
+def test_one_reviewer_in_two_spellings_counts_once(tmp_path):
+    root, directory = _promotable(tmp_path)
+    draft = plan_promotion(root, _request([directory]), _reviewers())
+    two = _request([directory], draft).model_copy(
+        update={
+            "approvals": [
+                Approval(reviewer="alice", approved_at="d", content_digest=draft.digest),
+                Approval(reviewer="Alice", approved_at="d", content_digest=draft.digest),
+            ]
+        }
+    )
+    policy = PromotionPolicy(reviewers=frozenset({"alice", "bob"}), min_approvals=2)
+    assert "approval-missing" in {f.code for f in plan_promotion(root, two, policy).findings}
+    distinct = two.model_copy(
+        update={
+            "approvals": [Approval(reviewer=r, approved_at="d", content_digest=draft.digest) for r in ("alice", "bob")]
+        }
+    )
+    assert plan_promotion(root, distinct, policy).ok
+
+
+def _approved(tmp_path):
+    root, directory = _promotable(tmp_path)
+    draft = plan_promotion(root, _request([directory]), _reviewers())
+    return root, directory, plan_promotion(root, _request([directory], draft), _reviewers())
+
+
+def test_symlinked_target_directory_is_refused_without_writing_outside(tmp_path):
+    root, directory, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (target / "data").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(PromotionError, match="symlink"):
+        apply_promotion(plan, root, target)
+    assert list(outside.iterdir()) == []
+
+
+def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch):
+    root, directory, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    real = shutil.copyfile
+
+    def partial(src, dst, *a, **k):
+        Path(dst).write_bytes(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr("aisim_core.data.promote.shutil.copyfile", partial)
+    with pytest.raises(OSError, match="disk full"):
+        apply_promotion(plan, root, target)
+    assert not any(p.is_file() for p in target.rglob("*"))
+    monkeypatch.setattr("aisim_core.data.promote.shutil.copyfile", real)
+
+    real_write = Path.write_text
+
+    def deny(self, *a, **k):
+        if "promotions" in self.parts:
+            raise PermissionError("read-only")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", deny)
+    with pytest.raises(PermissionError):
+        apply_promotion(plan, root, target)
+    assert not any(p.is_file() for p in target.rglob("*"))
