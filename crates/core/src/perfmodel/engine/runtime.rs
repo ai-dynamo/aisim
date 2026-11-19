@@ -2121,9 +2121,7 @@ impl Engine {
             ));
         }
         self.reject_full_round_surface("static generation trajectories")?;
-        let bs = runtime
-            .batch_size
-            .saturating_mul(self.nextn.saturating_add(1));
+        let bs = self.packed_decode_tokens(runtime.batch_size)?;
         let stride = stride.max(1);
         let mut total = 0.0_f64;
         if runtime.osl <= 1 {
@@ -2580,6 +2578,21 @@ impl Engine {
     /// FOLDED entries (fold-then-divide, matching Python and the scalar
     /// bucket bit-for-bit).
     #[allow(clippy::too_many_arguments)]
+    /// `requests * (nextn + 1)` packed decode tokens. Qualified Mamba divides
+    /// this count by its token width, so a count that `u32` cannot hold fails
+    /// rather than saturating to fewer requests. Other graphs saturate.
+    fn packed_decode_tokens(&self, requests: u32) -> Result<u32, AicError> {
+        let width = self.nextn.saturating_add(1);
+        match requests.checked_mul(width) {
+            Some(tokens) => Ok(tokens),
+            None if self.mix_plan.qualified_mamba => Err(AicError::InvalidEngineConfig(format!(
+                "{requests} decode requests of {width} tokens overflow the u32 count \
+                 that qualified Mamba ops divide by their token width"
+            ))),
+            None => Ok(u32::MAX),
+        }
+    }
+
     fn mixed_step_breakdown_with(
         &self,
         ctx_tokens: u32,
@@ -2678,7 +2691,7 @@ impl Engine {
         // `gen * (nextn + 1)` decode tokens (mirrors Python `run_mixed`'s
         // `decode_query_tokens`). Acceptance does not reduce this
         // current-iteration work.
-        let decode_query_tokens = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        let decode_query_tokens = self.packed_decode_tokens(gen_tokens)?;
         let combined = ctx_tokens + decode_query_tokens;
         let prefix1 = prefix * (ctx_tokens / isl); // prefix * floor(ctx/isl)
         if prefix1 >= combined {
@@ -2795,7 +2808,7 @@ impl Engine {
         // ---- Pass 3: decode attention and qualified Mamba ----
         let mut decode_attention = 0.0_f64;
         if gen_tokens > 0 {
-            let bs = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+            let bs = decode_query_tokens;
             // `_run_generation_phase` queries at s = isl_pass3 + i + 1 with
             // isl_pass3 = isl + osl//2 and a single step (osl=2, i=0).
             let s = isl + osl / 2 + 1;
@@ -3003,7 +3016,7 @@ impl Engine {
             };
             return self.run_generation_phase(&rt, DEFAULT_STATIC_STRIDE);
         }
-        let effective_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        let effective_batch = self.packed_decode_tokens(gen_tokens)?;
         let s = isl.max(1).saturating_add(osl.max(1) / 2).saturating_add(1);
         run_generation_ops_step(
             &self.generation_ops,
@@ -3660,7 +3673,7 @@ impl Engine {
         if gen_tokens == 0 {
             return Ok(out.into_values());
         }
-        let effective_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        let effective_batch = self.packed_decode_tokens(gen_tokens)?;
         let s = isl.max(1).saturating_add(osl.max(1) / 2).saturating_add(1);
         run_generation_ops_step_beamed_with(
             &self.generation_ops,
@@ -4836,6 +4849,41 @@ pub(crate) mod tests {
             vec![qualified_mamba(false, nextn + 1)],
         );
         Engine::build(spec, build_engine(None).db).unwrap()
+    }
+
+    #[test]
+    fn qualified_mamba_rejects_packed_decode_counts_beyond_u32() {
+        // Two requests of width u32::MAX would saturate to one request's width,
+        // which qualified Mamba would divide back into a single request.
+        let wide = qualified_mamba_engine(u32::MAX - 1);
+        let rt = RuntimeConfig {
+            batch_size: 2,
+            isl: 64,
+            osl: 4,
+            ..Default::default()
+        };
+        for result in [
+            wide.mixed_step_breakdown(0, 2, 64, 2, 0, 1.0, 1.0)
+                .map(drop),
+            wide.mixed_step_breakdown(64, 2, 64, 2, 0, 1.0, 1.0)
+                .map(drop),
+            wide.decode_step_latency(2, 64, 2, 1.0).map(drop),
+            wide.run_generation_phase(&rt, 1).map(drop),
+        ] {
+            assert!(
+                matches!(&result, Err(AicError::InvalidEngineConfig(m)) if m.contains("overflow")),
+                "{result:?}"
+            );
+        }
+        // Two width-four requests stay representable.
+        let narrow = qualified_mamba_engine(3);
+        assert!(
+            narrow
+                .mixed_step_breakdown(0, 2, 64, 2, 0, 1.0, 1.0)
+                .is_ok()
+        );
+        assert!(narrow.decode_step_latency(2, 64, 2, 1.0).is_ok());
+        assert!(narrow.run_generation_phase(&rt, 1).is_ok());
     }
 
     #[test]
