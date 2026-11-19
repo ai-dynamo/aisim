@@ -180,6 +180,12 @@ When the user compares modes (aggregated against disaggregated), add
 `--best-per-mode`. The best candidate of a mode can rank below the top
 three; the script prints it anyway. If it has no YAML file, export one
 with `--export <candidate_id> --to best-<mode>.yaml`.
+When comparing modes, disclose that an omitted `engine.kv_transfer` (a null
+`kv_transfer_bandwidth` in the result) assumes zero KV-transfer delay, so the
+disaggregated result can be optimistic. For a deployment decision, rerun the
+disaggregated mode separately with a representative
+`engine.kv_transfer.bandwidth_gb_per_second`; aggregated mode rejects that block.
+
 
 At fixed concurrency, `throughput_per_gpu` favors the smallest pool that
 holds the load. If the user cares about latency too, say so and offer a

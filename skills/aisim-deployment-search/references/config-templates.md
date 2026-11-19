@@ -71,6 +71,14 @@ optimizer:
   max_trials: 16
 ```
 
+This shared input omits `engine.kv_transfer`, so disaggregated candidates assume
+zero KV-transfer delay (`kv_transfer_bandwidth: null` in the result). Their
+latency and throughput can be optimistic relative to a real deployment. Report
+that assumption with every `--best-per-mode` comparison. Before using the result
+for a deployment decision, rerun disaggregated mode separately with a
+representative `engine.kv_transfer.bandwidth_gb_per_second`. Keep that block out
+of the shared input: aggregated mode rejects KV-transfer settings.
+
 Read it with `summarize_recommendation.py --best-per-mode`. The best
 disaggregated candidate can rank below the overall top three. GB200 and
 GB300 are modeled as 4-GPU nodes in one NVLink domain; candidates up to 16

@@ -126,6 +126,14 @@ Both documented deployment templates ran successfully with the optional
 8 GiB/four-CPU resource cap. Template A produced 12 evaluated feasible candidates.
 The aggregate/disaggregate template produced 16 evaluated feasible candidates.
 Their complete ledgers are saved under `recommendation/` and `mode-comparison/`.
+The shared mode-comparison input omits `engine.kv_transfer`; all recorded
+`kv_transfer_bandwidth` values are null. Its disaggregated branch therefore
+assumes **zero KV-transfer delay** and can be optimistic. This is compatibility
+smoke evidence, not a deployment trade-off recommendation. A deployment decision
+needs a separate disaggregated-only run with a representative
+`engine.kv_transfer.bandwidth_gb_per_second`; the shared aggregated/disaggregated
+input cannot carry that block because aggregated mode rejects it.
+
 Only the first selected YAML is retained for each search; other concrete configs
 remain in the ledgers and can be exported with the summarizer.
 Both summarizers succeeded in text and JSON modes. `classify.json` records the
