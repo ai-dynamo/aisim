@@ -263,7 +263,7 @@ def moe_modes(
     native mode, as on the canonical API path. Unlisted experts are BF16 only in a targets-only
     export; an excluded layer is always BF16.
 
-    A layer's precision is read from its declared expert modules (expert 0). When they are
+    A layer's precision is read from its declared expert modules (expert 0). When any of them is
     unlisted, it is read from the expert block as vLLM resolves the FusedMoE prefix: the block's
     own listing or any listed expert (ModelOptMixedPrecisionConfig._resolve_quant_algo, vLLM
     v0.31.0). A layer whose listed experts disagree is rejected, since per-expert precision is
@@ -315,16 +315,18 @@ def moe_modes(
             algos = {algo for path in layer_paths(layer, block) for algo in checkpoint.descendants.get(path, ())}
             if len(algos) > 1:
                 raise ValueError(f"Routed experts of layer {layer} disagree on precision: {algos}")
-        if declared and not any(checkpoint.module(layer_paths(layer, module))[1] for module in declared):
+        if declared and not all(checkpoint.module(layer_paths(layer, module))[1] for module in declared):
             _, algos = checkpoint.module([path for block in blocks for path in layer_paths(layer, block)])
             if len(algos) > 1:
                 raise ValueError(f"Conflicting checkpoint precisions for the experts of layer {layer}: {algos}")
             if algos:
                 block_modes[layer] = resolve(algos.pop(), False)
     experts = {kind: {"experts": modules} for kind, modules in expert_modules.items()}
-    kinds = [None if layer in block_excluded else kind for layer, kind in enumerate(layer_kinds)]
-    rows = checkpoint.rows(kinds, experts, layer_paths, resolve)
-    resolved = Counter(block_modes.get(layer, mode) for layer, *_, mode in rows)
+    # Block-resolved layers skip the per-module comparison: vLLM reads the fused expert prefix.
+    skipped = block_excluded | set(block_modes)
+    kinds = [None if layer in skipped else kind for layer, kind in enumerate(layer_kinds)]
+    resolved = Counter(mode for *_, mode in checkpoint.rows(kinds, experts, layer_paths, resolve))
+    resolved.update(block_modes.values())
     if block_excluded:
         resolved[moe.bfloat16] += len(block_excluded)
     return {} if set(resolved) <= {default} else dict(resolved)

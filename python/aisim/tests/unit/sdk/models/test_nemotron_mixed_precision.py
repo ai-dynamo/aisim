@@ -375,6 +375,13 @@ def test_moe_modes(raw, default, system, expected):
     assert _moe_modes(raw, "MEMEMEME", default, system) == expected
 
 
+@pytest.mark.parametrize("proj", ["up", "down"])
+def test_a_sparse_expert_listing_resolves_the_fused_block(proj):
+    # Only one of expert 0's projections listed: vLLM resolves the fused experts prefix from it.
+    raw = _listing({f"backbone.layers.1.mixer.experts.0.{proj}_proj": {"quant_algo": "FP8"}})
+    assert _moe_modes(raw, "MEME", MOE.nvfp4, "gb200") == {MOE.fp8: 1, MOE.bfloat16: 1}
+
+
 def test_routed_experts_of_one_layer_must_share_a_precision():
     raw = _listing(
         {
