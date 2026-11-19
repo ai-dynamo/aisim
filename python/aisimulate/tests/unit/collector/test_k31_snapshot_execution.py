@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 from collector.fpm_forward import execution_evidence
+from collector.fpm_forward.runtime import fpm_memory_observer as observer
 
 from .test_fpm_repeatability import _write_campaign
+from .test_fpm_runtime_memory import _typed
 from .test_k31_planner_precision import inputs  # noqa: F401
 from .test_runtime_observations import _mutate, _replace_launch, _write
 
@@ -116,7 +118,7 @@ def test_snapshot_identity_is_checked_on_the_validated_manifest(snapshot, monkey
 
 
 @pytest.fixture
-def native_execution(snapshot, request):
+def native_execution(snapshot, request, monkeypatch):
     from collector.fpm_forward import planner, runtime_probe
     from collector.fpm_forward.native_artifact import validate_native_collection
 
@@ -169,6 +171,12 @@ def native_execution(snapshot, request):
         "DEEPSEEK_V32_INDEXER": "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend",
         "KIMI_K3_KDA": "vllm.models.kimi_k3.nvidia.kda_metadata.KimiK3KDAAttentionBackend",
     }
+    version = observer.importlib.metadata.version
+    monkeypatch.setattr(
+        observer.importlib.metadata,
+        "version",
+        lambda name: plan.capability.aic_database_version if name == "vllm" else version(name),
+    )
     for path in raw.glob("**/fpm-execution-worker-*.json"):
         payload = json.loads(path.read_text())
         worker = workers[tuple(payload[key] for key in ("dp_rank", "tp_rank", "pp_rank"))]
@@ -177,20 +185,61 @@ def native_execution(snapshot, request):
                 payload["resolved_config"][section].update(copy.deepcopy(values))
             else:
                 payload["resolved_config"][section] = copy.deepcopy(values)
-        payload["graph_config"] = copy.deepcopy(worker["resolved_config"]["compilation_config"])
-        payload["attention_groups"] = [
-            {
-                "kv_cache_group_id": group["group_id"],
-                "backend_class": classes[group["backend"]],
-                "layer_names": group["layer_names"],
-            }
+        # Recreate initialized runtime objects, then use the actual producer.
+        # Copying the native record into the execution JSON masks fields that
+        # the execution serializer omits.
+        resolved = payload["resolved_config"]
+        model = resolved["model_config"]
+        hf_config = {"architectures": model.pop("architectures")}
+        if "loaded_config_commit_hash" in model:
+            hf_config["_commit_hash"] = model.pop("loaded_config_commit_hash")
+        config = SimpleNamespace(
+            **{section: SimpleNamespace(**values) for section, values in resolved.items() if isinstance(values, dict)}
+        )
+        config.model_config.hf_config = SimpleNamespace(**hf_config)
+        quant = resolved["quantization_config"]
+        config.quant_config = _typed(*quant["type"].rsplit(".", 1))
+        for key, value in quant.items():
+            if key != "type":
+                setattr(config.quant_config, key, value)
+        groups = [
+            SimpleNamespace(
+                kv_cache_group_id=group["group_id"],
+                backend=type(_typed(*classes[group["backend"]].rsplit(".", 1))),
+                layer_names=group["layer_names"],
+            )
             for group in worker["attention_groups"]
         ]
-        path.write_text(json.dumps(payload))
+        owner = SimpleNamespace(vllm_config=config, model_runner=SimpleNamespace(attn_groups=[groups]))
+        path.unlink()
+        monkeypatch.setattr(observer, "RESULTS_DIR", path.parent)
+        observer.observe_execution(
+            owner,
+            **{key: payload[key] for key in ("dp_rank", "tp_rank", "pp_rank")},
+            audited_version=plan.capability.aic_database_version,
+        )
+        assert json.loads(path.read_text())["status"] == "observed"
     collection = validate_native_collection(
         cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id=collection.collector_attempt_id
     )
     return plan, cell, raw, collection, index_path
+
+
+@pytest.mark.parametrize("inputs", ["trtllm_mla", "flashmla"], indirect=True)
+@pytest.mark.usefixtures("inputs")
+def test_native_execution_producer_emits_required_model_and_attention_identity(native_execution):
+    plan, cell, raw, collection, _ = native_execution
+    for path in raw.glob("**/fpm-execution-worker-*.json"):
+        config = json.loads(path.read_text())["resolved_config"]
+        assert config["model_config"]["architectures"] == ["KimiK31ForConditionalGeneration"]
+        assert config["attention_config"] == {
+            "backend": "FLASHMLA_SPARSE"
+            if cell.backend_policy.aic_fields["attention_backend"] == "flashmla"
+            else "FLASHINFER_MLA_SPARSE",
+            "indexer_kv_dtype": "fp8",
+        }
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "qualified", (result["missing_evidence"], result["failures"])
 
 
 @pytest.mark.parametrize("inputs", ["flashmla"], indirect=True)

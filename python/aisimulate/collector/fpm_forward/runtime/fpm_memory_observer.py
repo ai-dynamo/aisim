@@ -227,6 +227,7 @@ _CONFIG_FIELDS = {
     ),
     "compilation_config": ("mode", "cudagraph_mode", "cudagraph_capture_sizes", "max_cudagraph_capture_size"),
     "kernel_config": ("moe_backend",),
+    "attention_config": ("backend", "indexer_kv_dtype"),
 }
 
 
@@ -568,6 +569,9 @@ def execution_config(config: Any) -> dict[str, Any]:
         if getattr(config, section, None) is not None
     }
     hf_config = getattr(config.model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures is not None:
+        result["model_config"]["architectures"] = _json_value(architectures)
     if hf_config is not None and hasattr(hf_config, "_commit_hash"):
         if hf_config._commit_hash is not None:
             result["model_config"]["loaded_config_commit_hash"] = hf_config._commit_hash
