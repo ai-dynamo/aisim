@@ -402,6 +402,7 @@ def observe(
     payload = {
         "schema_version": "aisimulate-runtime-observation/v1",
         **{key: context[key] for key in ("attempt_id", "configuration", "phase", "bundle_sha256", "launch")},
+        **{key: context[key] for key in ("cell_id", "collector_attempt_id") if key in context},
         "identity": context["launch"]["identity"],
         "kind": kind,
         "dp_rank": dp_rank,

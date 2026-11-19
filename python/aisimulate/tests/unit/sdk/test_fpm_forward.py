@@ -1298,6 +1298,9 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
         _row("prefill", 1, 128, 0, 7.0, model_path=str(checkpoint), identity=identity),
         _row("decode", 1, 0, 128, 3.0, model_path=str(checkpoint), identity=identity),
         _row("decode", 1, 0, 512, 5.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 1, 0, 4096, 9.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 4, 0, 512, 10.0, model_path=str(checkpoint), identity=identity),
+        _row("decode", 4, 0, 4096, 18.0, model_path=str(checkpoint), identity=identity),
     ]
     parquet = _write_pair(str(tmp_path / "measured"), rows)
     profile = {
@@ -1327,7 +1330,7 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                     "cache_layout": "linear",
                     "kv_bytes_per_token": 1,
                     "max_num_tokens": 128,
-                    "max_batch_size": 1,
+                    "max_batch_size": 4,
                     "provenance": "Synthetic timing-only fixture; memory unresolved and not queried.",
                 },
             }
@@ -1372,8 +1375,7 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                         }
                     }
                 ) == pytest.approx(3.0)
-                # An unseen coordinate invokes the original graph's KDA and
-                # backend-specific DSA SOL transfer, beyond exact row matching.
+                # Same-batch interpolation stays on the measured curve.
                 estimate = predictor.estimate_forward_pass_time_ms(
                     {
                         "scheduled_requests": {
@@ -1383,6 +1385,29 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                     }
                 )
                 assert 3.0 < estimate < 5.0
+                # Batch 3 has no measured curve or adjacent capture-rung pair.
+                # Transfer utilization from batches 1 and 4 at total KV=4096:
+                # their per-request contexts (4096 and 1024) straddle top-k.
+                # This requires KDA SOL and distinguishes native DSA layouts.
+                transferred = predictor.estimate_forward_pass_time_ms(
+                    [
+                        {
+                            "scheduled_requests": {
+                                "num_decode_requests": 3,
+                                "sum_decode_kv_tokens": 4096,
+                            }
+                        }
+                    ]
+                )
+                # Frozen synthetic-oracle results for the two native layouts:
+                # FlashMLA reads 656 bytes per cached entry; TRT-LLM reads 576.
+                # A plain latency interpolation, omitted KDA roofline, or a
+                # shared DSA cache layout cannot satisfy these values.
+                expected_transfer = {
+                    "flashmla": 15.947864475987338,
+                    "trtllm_mla": 15.947446285187084,
+                }
+                assert transferred == pytest.approx(expected_transfer[attention_backend], rel=1e-10)
         finally:
             restored.close()
     finally:

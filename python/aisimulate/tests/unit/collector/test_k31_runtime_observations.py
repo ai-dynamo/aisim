@@ -150,7 +150,7 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=False):
 
 def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkeypatch):
     cache, scheduled, _ = _native_fixture(monkeypatch)
-    groups, accounting = _physical_views(cache, scheduled, "fp8")
+    groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096)
     assert accounting["page_size_bytes"] == 512
     assert [group["kind"] for group in groups] == ["attention", "attention", "state"]
     assert groups[-1]["blocks_per_request"] == 1
@@ -163,7 +163,7 @@ def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkey
 
 def test_native_uniform_wrapper_preserves_one_attention_block_table(monkeypatch):
     cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
-    groups, accounting = _physical_views(cache, scheduled, "fp8")
+    groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096)
     assert len(groups) == 2
     assert groups[0]["kind"] == "attention" and groups[0]["num_layers"] == 4
     assert groups[1]["kind"] == "state" and groups[1]["blocks_per_request"] == 1
@@ -174,7 +174,7 @@ def test_native_uniform_wrapper_preserves_one_attention_block_table(monkeypatch)
     for name in ("indexer.0", "indexer.1"):
         cache["layer_components"][name][0]["storage_offset_bytes"] -= 128
     with pytest.raises(ValueError, match="within one group overlap"):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 def test_raw_uniform_wrapper_reads_children_without_abstract_scalar_property(monkeypatch):
@@ -214,9 +214,34 @@ def test_scheduler_projection_uses_observed_representative_not_serialized_key_or
     cache = json.loads(json.dumps(cache, sort_keys=True))
     assert next(iter(cache["groups"][0]["layer_specs"])) == "indexer.0"
     assert cache["groups"][0]["representative_layer"] == "mla.0"
-    groups, accounting = _physical_views(cache, scheduled, "fp8")
+    groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096)
     assert len(groups) == 2 and groups[0]["num_layers"] == 4
     assert accounting["page_size_bytes"] == 512
+
+
+@pytest.mark.parametrize("field", ["layer_names", "pool_id", "kind", "layer_classes"])
+def test_scheduler_projection_rejects_child_group_metadata(monkeypatch, field):
+    cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, scheduler_projection=True)
+    group = cache["groups"][0]
+    value = ["mla.0"] if field == "layer_names" else group[field]
+    group["layer_specs"][group["representative_layer"]][field] = value
+    if field == "layer_names":
+        scheduled["groups"][0][field] = value
+    with pytest.raises(ValueError, match="group metadata"):
+        _physical_views(cache, scheduled, "fp8", context=4096)
+
+
+@pytest.mark.parametrize("uniform", [False, True])
+@pytest.mark.parametrize("block,declared", [(32, 32), (32, 4096), (4096, 32)])
+def test_state_page_must_cover_reviewed_context(monkeypatch, uniform, block, declared):
+    cache, scheduled, _ = _native_fixture(monkeypatch, uniform=uniform)
+    for record in (cache, scheduled):
+        state = record["groups"][-1]
+        state["block_size_tokens"] = block
+        for spec in state.get("layer_specs", {"state": state}).values():
+            spec.update(block_size_tokens=block, max_model_len=declared)
+    with pytest.raises(ValueError, match="one non-speculative state page"):
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 @pytest.mark.parametrize(
@@ -233,7 +258,7 @@ def test_scheduler_projection_retains_exact_native_geometry_checks(monkeypatch, 
     cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, scheduler_projection=True)
     mutation(cache, scheduled)
     with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 def _kernel_view_fixture(monkeypatch):
@@ -257,7 +282,7 @@ def _kernel_view_fixture(monkeypatch):
 
 def test_native_indexer_kernel_view_charges_only_actual_shared_allocation(monkeypatch):
     cache, scheduled = _kernel_view_fixture(monkeypatch)
-    groups, accounting = _physical_views(cache, scheduled, "fp8")
+    groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096)
     assert len(groups) == 2
     assert accounting["num_blocks"] == 10 and accounting["page_size_bytes"] == 512
     assert cache["allocated_cache_bytes"] == 5120
@@ -289,7 +314,7 @@ def test_kernel_view_mapping_cannot_hide_pool_or_layer_corruption(monkeypatch, m
     cache, scheduled = _kernel_view_fixture(monkeypatch)
     mutation(cache)
     with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 @pytest.mark.parametrize(
@@ -305,7 +330,7 @@ def test_native_uniform_wrapper_requires_exact_child_geometry(monkeypatch, mutat
     for record in (cache, scheduled):
         mutation(record["groups"][0])
     with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 @pytest.mark.parametrize(
@@ -327,7 +352,7 @@ def test_native_component_or_allocation_corruption_is_rejected(monkeypatch, muta
     cache, scheduled, _ = _native_fixture(monkeypatch)
     mutation(cache, scheduled)
     with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 def test_uniform_attention_child_cannot_override_parent_kind_with_state_components(monkeypatch):
@@ -352,8 +377,8 @@ def test_uniform_attention_child_cannot_override_parent_kind_with_state_componen
         "storage_offset_bytes": 64,
     }
     cache["layer_components"]["mla.0"] = [convolution, recurrence]
-    with pytest.raises(ValueError, match="component count"):
-        _physical_views(cache, scheduled, "fp8")
+    with pytest.raises(ValueError, match="group metadata"):
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 def test_nonuniform_group_cannot_override_its_geometry_with_child_specs(monkeypatch):
@@ -362,7 +387,7 @@ def test_nonuniform_group_cannot_override_its_geometry_with_child_specs(monkeypa
         record["groups"][0]["layer_specs"] = {"mla.0": {"block_size_tokens": 1}}
     cache["layer_components"]["mla.0"][0]["shape"][1] = 1
     with pytest.raises(ValueError, match="per-layer specs require a native uniform group"):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
     with pytest.raises(ValueError, match="per-layer specs require a native uniform group"):
         runtime_k31.validate_views(cache, "fp8", 10, 512)
 
@@ -401,7 +426,7 @@ def test_resource_resolver_validates_native_placements_like_the_importer(tmp_pat
     else:
         match = "exceeds its pool block slot" if mutation == "out_of_bounds" else "within one group overlap"
         with pytest.raises(ValueError, match=match):
-            _physical_views(cache, scheduled, "fp8")
+            _physical_views(cache, scheduled, "fp8", context=4096)
         with pytest.raises(ValueError, match=match):
             _resolve(cell, tmp_path)
 
@@ -420,7 +445,7 @@ def test_native_state_mode_cannot_be_relabelled_fixed_one_page(monkeypatch, key,
     for record in (cache, scheduled):
         record["groups"][-1][key] = value
     with pytest.raises(ValueError, match="one non-speculative state page"):
-        _physical_views(cache, scheduled, "fp8")
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 def _moe():
@@ -689,3 +714,21 @@ def test_one_rank_missing_initialized_precision_keeps_import_incomplete(tmp_path
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None
     assert "initialized MoE backend" in str(result["diagnostics"])
+
+
+def test_import_rejects_state_context_shorter_than_reviewed_launch(tmp_path, monkeypatch):
+    from .test_runtime_observations import _mutate
+
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    assert launches["tp2"]["collection"]["max_model_len"] == 4096
+
+    def shorter_context(record):
+        state = record["cache"]["groups"][-1]
+        state["block_size_tokens"] = 32
+        for child in state["layer_specs"].values():
+            child.update(block_size_tokens=32, max_model_len=32)
+
+    _mutate(path, shorter_context)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert "one non-speculative state page" in str(result["diagnostics"])

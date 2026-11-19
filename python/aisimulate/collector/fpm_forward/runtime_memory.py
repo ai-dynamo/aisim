@@ -513,11 +513,13 @@ def _validate_revision(config: dict[str, Any], expected: str | None) -> None:
             raise ValueError(f"runtime memory model {key} contradicts the reviewed immutable revision")
 
 
-def _normalized_groups(cache: dict[str, Any], scheduler_cache: dict[str, Any], page_bytes: int) -> list[dict[str, Any]]:
+def _normalized_groups(
+    cache: dict[str, Any], scheduler_cache: dict[str, Any], page_bytes: int, *, context: int | None = None
+) -> list[dict[str, Any]]:
     from .runtime_k31 import LAYOUT, normalize_groups
 
     if cache.get("allocation_layout") == LAYOUT or scheduler_cache.get("allocation_layout") == LAYOUT:
-        return normalize_groups(cache, scheduler_cache, page_bytes)
+        return normalize_groups(cache, scheduler_cache, page_bytes, context=context)
     raw_groups = cache.get("groups")
     scheduler_groups = scheduler_cache.get("groups")
     if not isinstance(raw_groups, list) or not raw_groups or not isinstance(scheduler_groups, list):
@@ -763,7 +765,7 @@ def resolve_runtime_resources(
         count = accounting["num_blocks"]
         free = accounting["initial_free_blocks"]
         allocated = accounting["allocated_cache_bytes"]
-        groups = _normalized_groups(cache, scheduled, allocated // count)
+        groups = _normalized_groups(cache, scheduled, allocated // count, context=expected_context_length)
         from .runtime_k31 import LAYOUT, validate_views
 
         if cache.get("allocation_layout") == LAYOUT:

@@ -960,7 +960,10 @@ def _observed_k31_capability(
             scheduler = schedulers[key[:2]]
             observations.runtime_memory._validate_scheduler_config(worker, scheduler)
             groups, accounting = observations._physical_views(
-                worker["cache"], scheduler["cache"], deployment.kv_cache_dtype
+                worker["cache"],
+                scheduler["cache"],
+                deployment.kv_cache_dtype,
+                context=launch["collection"]["max_model_len"],
             )
             if canonical_groups is None:
                 canonical_groups = groups

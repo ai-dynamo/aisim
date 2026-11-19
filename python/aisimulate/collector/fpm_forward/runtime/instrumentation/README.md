@@ -59,6 +59,13 @@ Both logical K/V-plane-first and packed views retain their physical strides. The
 
 Independent collection errors are kept in `unresolved_fields` and `error` with available raw data. Duplicate records fail instead of overwriting earlier evidence. Native initialization/warm-up exceptions propagate unchanged. Formal collection also emits the unchanged `fpm-execution-worker-*.json` evidence for existing execution-quality consumers.
 
+Formal worker and scheduler observations also retain `cell_id` and
+`collector_attempt_id` from the launch context. Importing a selected Collector
+attempt requires both fields on every initialized record, as well as on the
+phase result and launch manifest. A valid artifact hash cannot substitute for
+this binding when a cell is retried. Standalone probes do not require these
+Collector fields.
+
 ## Checks for a new campaign-local adapter
 
 Check the frozen manifest's scheduler string through the pinned native benchmark argument consumer before direct class construction, and verify the exported class inherits the native scheduler. Exercise the runtime extension classes against small runtime-interface fakes before using GPUs. Cover actual backend block axes (including repeated dimension lengths), packed offsets, padded pages, declared aliases, source/version mismatches, actual config-byte hashes, absent fields, retention changes and native exceptions. Then use the normal probe command on the selected hardware and import both phases for every selected configuration. Preserve failed attempts and corroborating initialization logs. A source audit and fake-runtime test cannot replace that live campaign evidence.

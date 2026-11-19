@@ -20,6 +20,26 @@ ATTENTION_CLASSES = {
     "vllm.model_executor.layers.attention.mla_attention.MLAAttention",
     "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache",
 }
+_NATIVE_SPEC_FIELDS = {
+    "spec_type",
+    "block_size_tokens",
+    "spec_page_size_bytes",
+    "sliding_window",
+    "attention_chunk_size",
+    "extra_retained_tokens",
+    "state_shapes",
+    "state_dtypes",
+    "state_content_size_bytes",
+    "page_size_padded",
+    "mamba_cache_mode",
+    "num_speculative_blocks",
+    "num_prefill_checkpoint_blocks",
+    "prefill_checkpoint_alignment",
+    "max_model_len",
+    "blocks_per_request",
+    "dtype",
+    "cache_dtype_str",
+}
 
 
 def is_audited_runtime(runtime):
@@ -71,7 +91,7 @@ def moe_precision(evidence):
             raise ValueError("K3.1 initialized MoE backend has no audited precision mapping")
         modes.add("w4a8_mxfp4_mxfp8_trtllm")
         shapes = layer.get("weight_shapes", {})
-        if set(shapes) != {"w13_weight", "w2_weight"}:
+        if not isinstance(shapes, dict) or set(shapes) != {"w13_weight", "w2_weight"}:
             raise ValueError("K3.1 initialized expert weights are incomplete")
         for shape in shapes.values():
             if not isinstance(shape, list) or not shape:
@@ -83,7 +103,8 @@ def moe_precision(evidence):
     return modes.pop()
 
 
-def normalize_groups(cache, scheduled, page_bytes):
+def normalize_groups(cache, scheduled, page_bytes, *, context):
+    context = _positive(context, "reviewed maximum context")
     if cache.get("allocation_layout") != LAYOUT or scheduled.get("allocation_layout") != LAYOUT:
         raise ValueError("K3.1 worker/scheduler allocation mapping disagrees")
     raw, other = cache.get("groups"), scheduled.get("groups")
@@ -93,6 +114,19 @@ def normalize_groups(cache, scheduled, page_bytes):
     for index, (group, scheduler) in enumerate(zip(raw, other, strict=True)):
         if "layer_specs" in group and group.get("spec_type") != SPEC + "UniformTypeKVCacheSpecs":
             raise ValueError("K3.1 per-layer specs require a native uniform group")
+        if group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs":
+            children = group.get("layer_specs")
+            if (
+                not isinstance(children, dict)
+                or not children
+                or any(not isinstance(child, dict) for child in children.values())
+            ):
+                raise ValueError("K3.1 uniform group requires every native per-layer spec")
+            for child in children.values():
+                if child.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs":
+                    raise ValueError("nested K3.1 uniform specs are unsupported")
+                if set(child) - _NATIVE_SPEC_FIELDS:
+                    raise ValueError("K3.1 child spec contains non-native spec fields or group metadata")
         expected = {key: value for key, value in group.items() if key not in {"kind", "layer_classes"}}
         if (
             group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs"
@@ -142,8 +176,6 @@ def normalize_groups(cache, scheduled, page_bytes):
             children = group.get("layer_specs")
             if not isinstance(children, dict) or set(children) != set(layers):
                 raise ValueError("K3.1 uniform group requires every native per-layer spec")
-            if any(child.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs" for child in children.values()):
-                raise ValueError("nested K3.1 uniform specs are unsupported")
             if (
                 sum(_positive(child.get("spec_page_size_bytes"), "layer page bytes") for child in children.values())
                 != group["spec_page_size_bytes"]
@@ -161,6 +193,7 @@ def normalize_groups(cache, scheduled, page_bytes):
                 {"allocation_layout": LAYOUT, "groups": child_groups},
                 {"allocation_layout": LAYOUT, "groups": child_scheduled},
                 page_bytes,
+                context=context,
             )
             if any(child["block_size_tokens"] != block or child["kind"] != kind for child in normalized):
                 raise ValueError("K3.1 uniform group has incompatible per-layer retention")
@@ -176,7 +209,8 @@ def normalize_groups(cache, scheduled, page_bytes):
                 or type(group.get("num_speculative_blocks")) is not int
                 or group.get("blocks_per_request") != 1
                 or type(group.get("blocks_per_request")) is not int
-                or block < _positive(group.get("max_model_len"), "maximum context")
+                or _positive(group.get("max_model_len"), "maximum context") != context
+                or block < context
             ):
                 raise ValueError("K3.1 state requires native KDA, mamba none and one non-speculative state page")
             shapes, dtypes = group.get("state_shapes"), group.get("state_dtypes")

@@ -301,7 +301,15 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
     resolved_cache_dtype = None
     if "dtype" in model and "cache_dtype" in cache:
         try:
-            resolved_cache_dtype = _resolved_cache_dtype(config, cell)
+            cache_config = config
+            if native_model is not None:
+                if config["model_config"].get("architectures") != native_model.get("architectures"):
+                    failures.append("runtime execution architecture differs from the validated initialized worker")
+                cache_config = {
+                    **config,
+                    "model_config": {**config["model_config"], "architectures": native_model.get("architectures")},
+                }
+            resolved_cache_dtype = _resolved_cache_dtype(cache_config, cell)
         except ValueError as error:
             failures.append(str(error))
     if cache.get("gpu_memory_utilization", 1) > 1:
@@ -466,6 +474,16 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
             failures.append(str(error))
     if len(graphs) == 2 and graphs[0] != graphs[1]:
         failures.append("worker graph_config contradicts its resolved_config.compilation_config")
+    if native_worker is not None:
+        native_config = native_worker["resolved_config"]
+        native_graph = _validate_graph(
+            native_config["compilation_config"],
+            eager=native_model["enforce_eager"],
+            tokens=native_config["scheduler_config"]["max_num_batched_tokens"],
+            allow_unused_captures=True,
+        )
+        if any(graph != native_graph for graph in graphs):
+            failures.append("runtime execution graph settings differ from the validated initialized worker")
 
 
 def file_evidence(path: Path) -> dict[str, Any]:

@@ -14,7 +14,7 @@ from collector.fpm_forward import execution_evidence
 
 from .test_fpm_repeatability import _write_campaign
 from .test_k31_planner_precision import inputs  # noqa: F401
-from .test_runtime_observations import _write
+from .test_runtime_observations import _mutate, _replace_launch, _write
 
 pytestmark = pytest.mark.unit
 
@@ -26,6 +26,28 @@ def snapshot(request):
     proof = json.loads(memory["provenance"])
     index_path = Path(proof["observations_index"]["path"])
     root = index_path.parent
+    if getattr(request, "param", False):
+        # A locally loaded Hub snapshot can omit HF's config commit hash.
+        launch = bound_inputs["runtime_launch"]
+        revision = "a" * 40
+        launch["identity"]["model_revision"] = revision
+        _replace_launch(index_path, {"tp2": launch})
+
+        def pinned_snapshot(record):
+            model = record["resolved_config"]["model_config"]
+            model.update(
+                model=f"/cache/models--{launch['identity']['model'].replace('/', '--')}/snapshots/{revision}",
+                revision=revision,
+            )
+            model.pop("loaded_config_commit_hash", None)
+
+        _mutate(index_path, pinned_snapshot)
+        from collector.fpm_forward.runtime_observations import validate_observations
+
+        imported = validate_observations(index_path, {"tp2": launch})["tp2"]
+        assert imported["status"] == "complete", imported["diagnostics"]
+        bound_inputs["profile"]["model_revision"] = revision
+        bound_inputs["profile"]["deployments"][0]["resources"] = imported["resources"]
     # The canonical collector archive lives beside cells/<cell>/raw.
     target = root / "runtime-observations.json"
     index = json.loads(index_path.read_text())
@@ -37,6 +59,11 @@ def snapshot(request):
     context = json.loads(context_path.read_text())
     context.update(cell_id="native-cell", collector_attempt_id="native-attempt")
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
+    for ref in phase["artifacts"]:
+        path = root / ref["path"]
+        record = json.loads(path.read_text())
+        record.update(cell_id="native-cell", collector_attempt_id="native-attempt")
+        ref["sha256"] = _write(path, record)["sha256"]
     target.write_text(json.dumps(index))
     raw = root / "cells/native-cell/raw"
     raw.mkdir(parents=True)
@@ -127,6 +154,11 @@ def native_execution(snapshot, request):
     context = json.loads(path.read_text())
     context["cell_id"] = cell.cell_id
     phase["launch_manifest"]["sha256"] = _write(path, context)["sha256"]
+    for ref in phase["artifacts"]:
+        path = root / ref["path"]
+        record = json.loads(path.read_text())
+        record["cell_id"] = cell.cell_id
+        ref["sha256"] = _write(path, record)["sha256"]
     index_path.write_text(json.dumps(index))
     workers, _ = execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
     classes = {
@@ -323,3 +355,93 @@ def test_mxfp4_execution_requires_matching_initialized_native_evidence(snapshot,
         "different_"
     )
     assert any("planned GEMM/MoE identity" in failure for failure in failures) == (mode == "wrong_cell_gemm")
+
+
+@pytest.mark.parametrize("inputs", ["flashmla"], indirect=True)
+@pytest.mark.parametrize("architectures", [None, [], ["OtherModel"]])
+@pytest.mark.usefixtures("inputs")
+def test_execution_cannot_bypass_bound_native_architecture(native_execution, architectures):
+    plan, cell, raw, collection, _ = native_execution
+    path = next(raw.glob("**/fpm-execution-worker-*.json"))
+    payload = json.loads(path.read_text())
+    model = payload["resolved_config"]["model_config"]
+    if architectures is None:
+        model.pop("architectures")
+    else:
+        model["architectures"] = architectures
+    payload["resolved_config"]["cache_config"]["cache_dtype"] = "fp8"
+    path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed"
+    assert any("architecture differs" in reason for reason in result["failures"])
+    assert any("KV precision/layout differs" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("graph_mode", ["FULL_AND_PIECEWISE", "PIECEWISE"])
+def test_execution_graphs_must_match_bound_worker(native_execution, graph_mode):
+    plan, cell, raw, collection, _ = native_execution
+    path = next(raw.glob("**/fpm-execution-worker-*.json"))
+    payload = json.loads(path.read_text())
+    assert payload["graph_config"]["cudagraph_mode"] == "FULL_AND_PIECEWISE"
+    for graph in (payload["graph_config"], payload["resolved_config"]["compilation_config"]):
+        graph["cudagraph_mode"] = graph_mode
+        # Equivalent serialized compilation modes normalize before comparison.
+        graph["mode"] = 3
+    path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if graph_mode == "FULL_AND_PIECEWISE" else "failed"), result
+    if graph_mode == "PIECEWISE":
+        assert any("graph settings differ" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("shapes", [["w13_weight", "w2_weight"], None, "weights"])
+def test_execution_reports_malformed_initialized_weight_shapes(native_execution, shapes):
+    plan, cell, raw, collection, index_path = native_execution
+
+    def corrupt(record):
+        if record["kind"] == "worker":
+            record["initialized_moe"]["layers"][0]["weight_shapes"] = shapes
+
+    _mutate(index_path, corrupt)
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed"
+    assert any("initialized expert weights are incomplete" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("snapshot", [True], indirect=True)
+@pytest.mark.parametrize("has_native_evidence", [True, False])
+def test_hashless_hub_snapshot_alias_qualifies_only_with_bound_worker(native_execution, has_native_evidence):
+    plan, cell, raw, collection, index_path = native_execution
+    for path in raw.glob("**/fpm-execution-worker-*.json"):
+        model = json.loads(path.read_text())["resolved_config"]["model_config"]
+        assert model["model"].endswith("/snapshots/" + "a" * 40)
+        assert "loaded_config_commit_hash" not in model
+    if not has_native_evidence:
+        index_path.unlink()
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if has_native_evidence else "failed"), result
+    if has_native_evidence:
+        assert all(worker["runtime_observation_binding"] for worker in result["observed_workers"])
+    else:
+        assert any("snapshot index is missing" in reason for reason in result["missing_evidence"])
+        assert "runtime model_config.model differs from generated --model" in result["failures"]
+
+
+@pytest.mark.parametrize("role", ["worker", "scheduler"])
+@pytest.mark.parametrize("field", ["cell_id", "collector_attempt_id"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_each_initialized_record_is_bound_to_selected_collector_attempt(snapshot, role, field, stale):
+    plan, cell, raw, collection, index_path = snapshot
+
+    def unbind(record):
+        if record["kind"] == role and (role != "worker" or record["tp_rank"] == 1):
+            if stale:
+                record[field] = "previous-collector-value"
+            else:
+                record.pop(field)
+
+    # The phase and launch manifest retain the current binding. Rehashing an
+    # older record must not let it supply the retry's initialized evidence.
+    _mutate(index_path, unbind)
+    with pytest.raises(ValueError, match=field):
+        execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)

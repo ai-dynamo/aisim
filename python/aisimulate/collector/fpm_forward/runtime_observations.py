@@ -495,7 +495,7 @@ def _validate_alias_ownership(views: list[tuple[dict[str, Any], int]], count: in
 
 
 def _physical_views(
-    cache: dict[str, Any], scheduled: dict[str, Any], precision: str
+    cache: dict[str, Any], scheduled: dict[str, Any], precision: str, *, context: int | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     from .runtime_k31 import LAYOUT
 
@@ -515,7 +515,7 @@ def _physical_views(
         or scheduled["null_block_id"] not in reserved
     ):
         raise ValueError("scheduler permanent reservation IDs do not account for usable blocks")
-    groups = runtime_memory._normalized_groups(cache, scheduled, page)
+    groups = runtime_memory._normalized_groups(cache, scheduled, page, context=context)
     from .runtime_k31 import LAYOUT, validate_views
 
     if cache.get("allocation_layout") == LAYOUT:
@@ -732,7 +732,9 @@ def _configuration(
                 runtime_artifacts.append(copy.deepcopy(reference))
                 continue
             record = read_json(path)
-            config = _validate_record(record, launch=launch, bundle=bundle, binding=binding, cell=cell)
+            config = _validate_record(
+                record, launch=launch, bundle=bundle, binding={**binding, **(collector_binding or {})}, cell=cell
+            )
             if import_binding is not None:
                 _validate_import_binding(record, import_binding, bundle)
             elif "instrumentation_binding" in record:
@@ -783,6 +785,7 @@ def _configuration(
                 worker["cache"],
                 scheduler["cache"],
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"], cell),
+                context=launch["collection"]["max_model_len"],
             )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]

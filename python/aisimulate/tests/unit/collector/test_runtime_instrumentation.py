@@ -90,7 +90,8 @@ def test_version_unknown_keys_duplicate_keys_and_undeclared_modules_rejected(tmp
         load_instrumentation(path)
 
 
-def test_probe_observer_refuses_layer_strided_cache_records(tmp_path, monkeypatch):
+@pytest.mark.parametrize("formal", [False, True])
+def test_probe_observer_refuses_layer_strided_cache_records(tmp_path, monkeypatch, formal):
     import importlib.util
 
     from collector.fpm_forward.runtime import fpm_memory_observer as legacy
@@ -111,6 +112,8 @@ def test_probe_observer_refuses_layer_strided_cache_records(tmp_path, monkeypatc
         "bundle_sha256": "b" * 64,
         "launch": {"identity": {"gpu": "synthetic"}},
     }
+    if formal:
+        context.update(cell_id="selected-cell", collector_attempt_id="selected-collector-attempt")
     (tmp_path / "context.json").write_text(json.dumps(context))
     (tmp_path / "manifest.json").write_text(json.dumps({"runtime": {"source_files": {}}}))
     monkeypatch.setenv("AISIMULATE_RUNTIME_CONTEXT", str(tmp_path / "context.json"))
@@ -121,3 +124,9 @@ def test_probe_observer_refuses_layer_strided_cache_records(tmp_path, monkeypatc
     assert "cache" in record["unresolved_fields"]
     assert "cache" not in record
     assert "layer-strided cache tensor records need an audited instrumentation adapter" in record["error"]
+    for field in ("cell_id", "collector_attempt_id"):
+        assert record.get(field) == context.get(field)
+    probe.observe("scheduler", _scheduler, version="0.32.0", dp_rank=0, cache_config=_config)
+    record = json.loads(next((tmp_path / "out").glob("runtime-observation-scheduler-*.json")).read_text())
+    for field in ("cell_id", "collector_attempt_id"):
+        assert record.get(field) == context.get(field)
