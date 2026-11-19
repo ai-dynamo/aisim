@@ -149,6 +149,7 @@ jobs:
           ruff check
           --config python/aisim/pyproject.toml
           python/aisim/src
+          python/aisim/collector
           python/aisim/tests/e2e/cli/test_cli_experiments.py
           python/aisim/tests/e2e/cli/test_cli_recommend.py
           tests
@@ -157,6 +158,7 @@ jobs:
           ruff format --check
           --config python/aisim/pyproject.toml
           python/aisim/src
+          python/aisim/collector
           python/aisim/tests/e2e/cli/test_cli_experiments.py
           python/aisim/tests/e2e/cli/test_cli_recommend.py
           tests

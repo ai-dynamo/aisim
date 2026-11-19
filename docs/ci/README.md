@@ -184,8 +184,9 @@ Fast CI has three substantive jobs, followed by an aggregate result:
 Draft and non-draft PRs run the same Fast CI checks without a label requirement.
 The aggregate fails if any required job fails, is canceled, or is skipped.
 Ruff checks all Python packages under `python/aisim/src/`, including
-`aisim_core` and the legacy import shims. The [workflow](../../.github/workflows/fast-ci.yml)
-also lists the test paths checked by Ruff.
+`aisim_core` and the legacy import shims, plus `python/aisim/collector/`.
+The [workflow](../../.github/workflows/fast-ci.yml) also lists the test paths
+checked by Ruff.
 
 Every standalone run publishes `Fast CI Success`. Full CI contains only a
 lightweight **Require Fast CI** job, which reads the standalone run and verifies
