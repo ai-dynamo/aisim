@@ -169,6 +169,14 @@ where
     /// starve later workers. They are reconsidered on the next coordinator
     /// drive at the same or a later virtual timestamp.
     deferred_ready_workers: BTreeSet<usize>,
+    /// Every worker's earliest release of outputs held past their pass (vLLM
+    /// `launch`), as `(release time bits, worker id)`, so that the driver
+    /// finds the next one without visiting each worker. Release times are
+    /// never negative, so their bits order as the times do. Kept current by
+    /// `refresh_emission`.
+    pending_emissions: BTreeSet<(u64, usize)>,
+    /// The release time bits each worker has in `pending_emissions`, by worker id.
+    indexed_emission_bits: Vec<Option<u64>>,
     pending_removal: BTreeSet<usize>,
     pending_startup: BTreeSet<usize>,
     factory: ReplayRoleFactory,
@@ -213,6 +221,8 @@ where
             total_in_flight: 0,
             ready_workers: BTreeSet::new(),
             deferred_ready_workers: BTreeSet::new(),
+            pending_emissions: BTreeSet::new(),
+            indexed_emission_bits: Vec::new(),
             pending_removal: BTreeSet::new(),
             pending_startup: BTreeSet::new(),
             factory,
@@ -378,6 +388,34 @@ where
             self.ready_workers.insert(worker_id);
         } else {
             self.ready_workers.remove(&worker_id);
+        }
+        if self.factory.can_hold_outputs() {
+            self.refresh_emission(worker_id);
+        }
+    }
+
+    /// Index `worker_id`'s earliest held-output release again, after its
+    /// engine may have queued, dropped or released held outputs. Only for
+    /// workers that can hold outputs.
+    fn refresh_emission(&mut self, worker_id: usize) {
+        let next = self
+            .workers
+            .get(worker_id)
+            .and_then(Option::as_ref)
+            .and_then(|worker| worker.engine.next_emission_ms())
+            .map(f64::to_bits);
+        if self.indexed_emission_bits.len() <= worker_id {
+            self.indexed_emission_bits.resize(worker_id + 1, None);
+        }
+        let indexed = std::mem::replace(&mut self.indexed_emission_bits[worker_id], next);
+        if indexed == next {
+            return;
+        }
+        if let Some(bits) = indexed {
+            self.pending_emissions.remove(&(bits, worker_id));
+        }
+        if let Some(bits) = next {
+            self.pending_emissions.insert((bits, worker_id));
         }
     }
 
@@ -947,6 +985,10 @@ where
                 self.refresh_worker(worker_id);
                 continue;
             };
+            if self.factory.can_hold_outputs() {
+                // Forming a pass queues the outputs held from the one before it.
+                self.refresh_emission(worker_id);
+            }
             if let Some(registry) = &self.factory.kvcr {
                 registry
                     .lock()
@@ -1198,11 +1240,20 @@ where
         if !self.factory.can_hold_outputs() {
             return None;
         }
-        self.workers
-            .iter()
-            .filter_map(Option::as_ref)
-            .filter_map(|worker| worker.engine.next_emission_ms())
-            .min_by(f64::total_cmp)
+        let next = self
+            .pending_emissions
+            .first()
+            .map(|&(bits, _)| f64::from_bits(bits));
+        debug_assert_eq!(
+            next,
+            self.workers
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter_map(|worker| worker.engine.next_emission_ms())
+                .min_by(f64::total_cmp),
+            "held-output release index is out of date"
+        );
+        next
     }
 
     /// Release every worker's outputs due at `now_ms` as completion payloads
@@ -1213,14 +1264,15 @@ where
         now_ms: f64,
     ) -> Result<Vec<WorkerCompletionPayload<Observation::Batch>>> {
         let mut payloads = Vec::new();
-        for worker_id in 0..self.workers.len() {
-            let due = self.workers[worker_id]
-                .as_ref()
-                .and_then(|worker| worker.engine.next_emission_ms())
-                .is_some_and(|at_ms| at_ms <= now_ms);
-            if !due {
-                continue;
-            }
+        // Payloads leave in worker order, whatever the release times.
+        let mut due = self
+            .pending_emissions
+            .iter()
+            .take_while(|&&(bits, _)| f64::from_bits(bits) <= now_ms)
+            .map(|&(_, worker_id)| worker_id)
+            .collect::<Vec<_>>();
+        due.sort_unstable();
+        for worker_id in due {
             let released = self
                 .required_worker_mut(worker_id)?
                 .engine

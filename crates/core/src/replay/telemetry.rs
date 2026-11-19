@@ -161,6 +161,10 @@ pub struct ReplayTelemetryHostCache {
 /// Policy-neutral replay state sampled after a virtual timestamp has settled.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReplayTelemetrySnapshot {
+    /// Measured request outcomes and GPU time for closed-loop scaling policies.
+    /// Present for observers; absent from telemetry capture exports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_feedback: Option<crate::replay::CompletionFeedbackSnapshot>,
     pub host_caches: Vec<ReplayTelemetryHostCache>,
     pub sample_ordinal: u64,
     pub kind: ReplayTelemetrySampleKind,
@@ -802,6 +806,7 @@ mod tests {
         sampled_at_ms: f64,
     ) -> ReplayTelemetrySnapshot {
         ReplayTelemetrySnapshot {
+            completion_feedback: None,
             host_caches: Vec::new(),
             sample_ordinal,
             kind,
@@ -904,6 +909,7 @@ mod tests {
             assert!(value["traffic"][field].is_null(), "{field}");
         }
         assert_eq!(value["traffic"]["delivered_output_tokens"], 0);
+        assert!(value.get("completion_feedback").is_none());
     }
 
     #[test]
