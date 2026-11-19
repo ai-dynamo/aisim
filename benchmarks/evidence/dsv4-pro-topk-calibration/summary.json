@@ -1,0 +1,481 @@
+{
+  "base_commit": "9ff96cf9ee5c913160f00915d6bf1e89f6a19f6c",
+  "comparison": {
+    "base": {
+      "latency_ms_by_sequence_tokens": {
+        "16385": {
+          "Csa-128": 0.06106,
+          "Csa-64": 0.09175599999999999,
+          "Hca-128": 0.0997
+        },
+        "4097": {
+          "Csa-128": 0.118,
+          "Csa-64": 0.090659,
+          "Hca-128": 0.1008
+        },
+        "8192": {
+          "Csa-128": 0.06142160400390624,
+          "Csa-64": 0.09065023583984375,
+          "Hca-128": 0.1
+        },
+        "8193": {
+          "Csa-128": 0.06142199999999999,
+          "Csa-64": 0.09065000000000001,
+          "Hca-128": 0.1
+        }
+      },
+      "pro_v2_at_step_8192_ms": {
+        "v2_flat": 0.0651,
+        "v2_top_last": 0.003122
+      }
+    },
+    "head": {
+      "latency_ms_by_sequence_tokens": {
+        "16385": {
+          "Csa-128": 0.12093999999999999,
+          "Csa-64": 0.09175599999999999,
+          "Hca-128": 0.0997
+        },
+        "4097": {
+          "Csa-128": 0.118,
+          "Csa-64": 0.090659,
+          "Hca-128": 0.1008
+        },
+        "8192": {
+          "Csa-128": 0.12135160253906249,
+          "Csa-64": 0.09065023583984375,
+          "Hca-128": 0.1
+        },
+        "8193": {
+          "Csa-128": 0.121352,
+          "Csa-64": 0.09065000000000001,
+          "Hca-128": 0.1
+        }
+      },
+      "pro_v2_at_step_8192_ms": {
+        "v2_flat": 0.005172,
+        "v2_top_last": 0.003124
+      }
+    }
+  },
+  "coverage_note": "Ragged measured points, not the Cartesian product of axis values; v1=context, v2=decode.",
+  "data_head_commit": "abc4e92124ff63048ccfbc92e24d6ed6fd0bde63",
+  "key_columns": [
+    "num_heads",
+    "step",
+    "isl",
+    "batch_size",
+    "score_mode"
+  ],
+  "systems": {
+    "b200_sxm": {
+      "added_axis_values": {
+        "batch_size": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024
+        ],
+        "isl": [
+          1,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          1536,
+          2048,
+          3072,
+          4096,
+          6144,
+          8192,
+          10240,
+          12288,
+          16384
+        ],
+        "num_heads": [
+          128
+        ],
+        "step": [
+          0,
+          1,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          1536,
+          2048,
+          3072,
+          4096,
+          6144,
+          8192,
+          10240,
+          12288,
+          16384,
+          32768,
+          65536,
+          131072,
+          262144,
+          524288,
+          1048575
+        ]
+      },
+      "added_base_key_overlap": 0,
+      "added_mode_counts": {
+        "v1_flat": 563,
+        "v1_top_last": 563,
+        "v2_flat": 200,
+        "v2_top_last": 200
+      },
+      "added_paired_shapes_by_variant": {
+        "v1": 563,
+        "v2": 200
+      },
+      "added_rows": 1526,
+      "added_shape_count": 699,
+      "anomalies": {
+        "added_flat_below_top_last_pairs": 0,
+        "added_incomplete_pairs": 0,
+        "added_zero_latency_rows": 896,
+        "nonfinite_or_negative_latency_rows": 0,
+        "null_key_rows": 0
+      },
+      "base_rows": 5182,
+      "collection_event": {
+        "case_plan_hash": "sha256:c88624330173b68bfadd314e9a7c1e21026280db68c63fa273aa830c0dfb6dc1",
+        "collected_at": "2026-11-04",
+        "collector_hash": "sha256:7b344d6a876f3bd922efc37fd75349a2451c97f74a4121fcf80dc18c5c5dcf46",
+        "collector_ref": "eb04c6888cf33ef4f48a995511a23429127f3baa",
+        "rows": 1526,
+        "status": "complete"
+      },
+      "columns": {
+        "architecture": "string",
+        "batch_size": "int64",
+        "compress_ratio": "int64",
+        "device": "string",
+        "framework": "string",
+        "gemm_type": "string",
+        "isl": "int64",
+        "kernel_source": "string",
+        "kv_cache_dtype": "string",
+        "latency": "double",
+        "mla_dtype": "string",
+        "model": "string",
+        "num_heads": "int64",
+        "op_name": "string",
+        "score_mode": "string",
+        "step": "int64",
+        "tp_size": "int64",
+        "version": "string"
+      },
+      "donor_0514": {
+        "added_key_overlap": 1526,
+        "path": "python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/sparse_attention/sglang/0.5.14/dsv4_csa_topk_calib_perf.parquet",
+        "sha256": "e1c2ef2225316b434548532df88b4a1f680099f32f414f7c9f337a67c80935fe"
+      },
+      "duplicate_keys": 0,
+      "original_rows_preserved_in_order": true,
+      "path": "python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/sparse_attention/sglang/0.5.21/dsv4_csa_topk_calib_perf.parquet",
+      "removed_or_modified_rows": 0,
+      "sdk_added_rows_matched": 1526,
+      "sha256": "e46806698568c3f890ba7798c2ccbf626253dfb74c4eb540e5d38e72489381e8",
+      "shape": [
+        6708,
+        18
+      ],
+      "unique_keys": 6708
+    },
+    "b300_sxm": {
+      "added_axis_values": {
+        "batch_size": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024
+        ],
+        "isl": [
+          1,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          1536,
+          2048,
+          3072,
+          4096,
+          6144,
+          8192,
+          10240,
+          12288,
+          16384
+        ],
+        "num_heads": [
+          128
+        ],
+        "step": [
+          0,
+          1,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          1536,
+          2048,
+          3072,
+          4096,
+          6144,
+          8192,
+          10240,
+          12288,
+          16384,
+          32768,
+          65536,
+          131072,
+          262144,
+          524288,
+          1048575
+        ]
+      },
+      "added_base_key_overlap": 0,
+      "added_mode_counts": {
+        "v1_flat": 563,
+        "v1_top_last": 563,
+        "v2_flat": 200,
+        "v2_top_last": 200
+      },
+      "added_paired_shapes_by_variant": {
+        "v1": 563,
+        "v2": 200
+      },
+      "added_rows": 1526,
+      "added_shape_count": 699,
+      "anomalies": {
+        "added_flat_below_top_last_pairs": 0,
+        "added_incomplete_pairs": 0,
+        "added_zero_latency_rows": 896,
+        "nonfinite_or_negative_latency_rows": 0,
+        "null_key_rows": 0
+      },
+      "base_rows": 5182,
+      "collection_event": {
+        "case_plan_hash": "sha256:c88624330173b68bfadd314e9a7c1e21026280db68c63fa273aa830c0dfb6dc1",
+        "collected_at": "2026-11-04",
+        "collector_hash": "sha256:7b344d6a876f3bd922efc37fd75349a2451c97f74a4121fcf80dc18c5c5dcf46",
+        "collector_ref": "eb04c6888cf33ef4f48a995511a23429127f3baa",
+        "rows": 1526,
+        "status": "complete"
+      },
+      "columns": {
+        "architecture": "string",
+        "batch_size": "int64",
+        "compress_ratio": "int64",
+        "device": "string",
+        "framework": "string",
+        "gemm_type": "string",
+        "isl": "int64",
+        "kernel_source": "string",
+        "kv_cache_dtype": "string",
+        "latency": "double",
+        "mla_dtype": "string",
+        "model": "string",
+        "num_heads": "int64",
+        "op_name": "string",
+        "score_mode": "string",
+        "step": "int64",
+        "tp_size": "int64",
+        "version": "string"
+      },
+      "donor_0514": {
+        "added_key_overlap": 1526,
+        "path": "python/aisimulate/src/aisimulate_core/systems/data/b300_sxm/sparse_attention/sglang/0.5.14/dsv4_csa_topk_calib_perf.parquet",
+        "sha256": "6f79cb05126f587743b63057755357c91868671c92694ecdfe9e6e7460afb949"
+      },
+      "duplicate_keys": 0,
+      "original_rows_preserved_in_order": true,
+      "path": "python/aisimulate/src/aisimulate_core/systems/data/b300_sxm/sparse_attention/sglang/0.5.21/dsv4_csa_topk_calib_perf.parquet",
+      "removed_or_modified_rows": 0,
+      "sdk_added_rows_matched": 1526,
+      "sha256": "82d199d629fcb2585ed84911f81e209aef574c94600f7bef10d69690cdf123fd",
+      "shape": [
+        6708,
+        18
+      ],
+      "unique_keys": 6708
+    },
+    "h200_sxm": {
+      "added_axis_values": {
+        "batch_size": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024
+        ],
+        "isl": [
+          1,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          1536,
+          2048,
+          3072,
+          4096,
+          6144,
+          8192,
+          10240,
+          12288,
+          16384
+        ],
+        "num_heads": [
+          128
+        ],
+        "step": [
+          0,
+          1,
+          4,
+          8,
+          16,
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          1536,
+          2048,
+          3072,
+          4096,
+          6144,
+          8192,
+          10240,
+          12288,
+          16384,
+          32768,
+          65536,
+          131072,
+          262144,
+          524288,
+          1048575
+        ]
+      },
+      "added_base_key_overlap": 0,
+      "added_mode_counts": {
+        "v1_flat": 563,
+        "v1_top_last": 563,
+        "v2_flat": 200,
+        "v2_top_last": 200
+      },
+      "added_paired_shapes_by_variant": {
+        "v1": 563,
+        "v2": 200
+      },
+      "added_rows": 1526,
+      "added_shape_count": 699,
+      "anomalies": {
+        "added_flat_below_top_last_pairs": 0,
+        "added_incomplete_pairs": 0,
+        "added_zero_latency_rows": 896,
+        "nonfinite_or_negative_latency_rows": 0,
+        "null_key_rows": 0
+      },
+      "base_rows": 4502,
+      "collection_event": {
+        "case_plan_hash": "sha256:c88624330173b68bfadd314e9a7c1e21026280db68c63fa273aa830c0dfb6dc1",
+        "collected_at": "2026-11-04",
+        "collector_hash": "sha256:7b344d6a876f3bd922efc37fd75349a2451c97f74a4121fcf80dc18c5c5dcf46",
+        "collector_ref": "eb04c6888cf33ef4f48a995511a23429127f3baa",
+        "rows": 1526,
+        "status": "complete"
+      },
+      "columns": {
+        "architecture": "string",
+        "batch_size": "int64",
+        "compress_ratio": "int64",
+        "device": "string",
+        "framework": "string",
+        "gemm_type": "string",
+        "isl": "int64",
+        "kernel_source": "string",
+        "kv_cache_dtype": "string",
+        "latency": "double",
+        "mla_dtype": "string",
+        "model": "string",
+        "num_heads": "int64",
+        "op_name": "string",
+        "score_mode": "string",
+        "step": "int64",
+        "tp_size": "int64",
+        "version": "string"
+      },
+      "donor_0514": {
+        "added_key_overlap": 1334,
+        "path": "python/aisimulate/src/aisimulate_core/systems/data/h200_sxm/sparse_attention/sglang/0.5.14/dsv4_csa_topk_calib_perf.parquet",
+        "sha256": "e05b8d3714c9505265024a15fa228907083c54028d3787e9d6648315fa0d21ac"
+      },
+      "duplicate_keys": 0,
+      "original_rows_preserved_in_order": true,
+      "path": "python/aisimulate/src/aisimulate_core/systems/data/h200_sxm/sparse_attention/sglang/0.5.21/dsv4_csa_topk_calib_perf.parquet",
+      "removed_or_modified_rows": 0,
+      "sdk_added_rows_matched": 1526,
+      "sha256": "10e89b39f05c0fba42433d07237f7310eb2efb7b5bc6194e5f072d82f0668c92",
+      "shape": [
+        6028,
+        18
+      ],
+      "unique_keys": 6028
+    }
+  },
+  "unchanged_b200_generation_module_sha256": {
+    "python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/sparse_attention/sglang/0.5.21/dsv4_csa_generation_module_perf.parquet": "117b6ca4b84570ab5e534bb3b4998bedd76ac57748e8626030b40c71c9e35fea",
+    "python/aisimulate/src/aisimulate_core/systems/data/b200_sxm/sparse_attention/sglang/0.5.21/dsv4_hca_generation_module_perf.parquet": "9fb4ac94ecb94d9b41fd63f8523dbd9a269c5b0d7cc3f4ad4d8eea0b93c875c4"
+  },
+  "units": {
+    "batch_size": "requests",
+    "compress_ratio": "input tokens per compressed KV token",
+    "isl": "query tokens per request",
+    "latency": "ms",
+    "num_heads": "native model attention heads",
+    "step": "past KV tokens per request",
+    "tp_size": "tensor parallel ranks (calibration is TP-independent)"
+  }
+}
