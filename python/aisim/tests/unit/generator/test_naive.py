@@ -5,6 +5,8 @@
 
 import json
 import re
+import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -229,6 +231,47 @@ class TestBuildNaiveGeneratorParams:
 
 @pytest.mark.unit
 class TestEstimateModelWeightBytes:
+    def test_llama4_separate_processor_in_fresh_process(self, tmp_path):
+        from aisim.sdk import utils
+
+        # A non-bundled checkpoint with published Scout geometry and a separate
+        # processor. No parsed-loader call may prime the child's raw cache.
+        raw = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+        processor = raw.pop("image_processor_config")
+        (tmp_path / "config.json").write_text(json.dumps(raw))
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps(processor))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from aisim.generator.naive import _estimate_model_weight_bytes; "
+                "import sys; print(_estimate_model_weight_bytes(sys.argv[1]))",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # BF16 * [vocab*hidden + layers*(4*hidden^2 +
+        # 3*hidden*intermediate*experts + hidden*experts + 4*hidden)].
+        assert int(result.stdout.strip().splitlines()[-1]) == 205418659840
+
+    def test_llama4_malformed_processor_reports_sizing_error(self, tmp_path):
+        from aisim.sdk import utils
+
+        raw = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+        raw.pop("image_processor_config")
+        (tmp_path / "config.json").write_text(json.dumps(raw))
+        (tmp_path / "preprocessor_config.json").write_text("[]")
+        try:
+            with pytest.raises(RuntimeError, match="config unavailable") as error:
+                _estimate_model_weight_bytes(str(tmp_path))
+            assert isinstance(error.value.__cause__, TypeError)
+            assert "image_processor_config" in str(error.value.__cause__)
+        finally:
+            utils._load_model_config_from_model_path.cache_clear()
+            utils.get_model_config_from_model_path.cache_clear()
+
     def test_estimates_unsupported_architecture_from_raw_config(self, tmp_path):
         (tmp_path / "config.json").write_text(json.dumps(_UNSUPPORTED_GPT_NEOX_CONFIG))
 

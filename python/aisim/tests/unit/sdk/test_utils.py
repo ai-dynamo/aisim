@@ -115,6 +115,91 @@ def test_offline_mode_skips_optional_files(monkeypatch, hf_cache):
     assert utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=False) is None
 
 
+@pytest.mark.parametrize("confirmed_absent", [False, True])
+def test_offline_optional_absence_is_observable_through_public_loader(monkeypatch, hf_cache, caplog, confirmed_absent):
+    model = "org/optional-absence"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    _cache_file(hf_cache, model, "config.json", config)
+    if confirmed_absent:
+        marker = hf_cache / "models--org--optional-absence" / ".no_exist" / ("c" * 40) / "hf_quant_config.json"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    try:
+        with caplog.at_level(logging.WARNING):
+            loaded = get_model_config_from_model_path(model)
+        assert loaded["architecture"] == "Qwen3ForCausalLM"
+        assert "hf_quant_config" not in loaded["raw_config"]
+        if confirmed_absent:
+            assert not caplog.records
+        else:
+            assert "absence is unconfirmed" in caplog.text
+            assert f"hf download {model} hf_quant_config.json --revision {'c' * 40}" in caplog.text
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("payload", [None, [], 7, {"quantization": {"quant_algo": "FP8"}}])
+def test_network_quant_json_must_be_an_object_through_public_loader(monkeypatch, hf_cache, payload):
+    model = "org/network-quant-object"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+
+    def remote(request, *, timeout):
+        data = config if request.full_url.endswith("/config.json") else payload
+        return io.BytesIO(json.dumps(data).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        if isinstance(payload, dict):
+            loaded = get_model_config_from_model_path(model)
+            assert loaded["raw_config"]["hf_quant_config"] == payload
+            assert loaded["raw_config"]["quant_algo"] == "fp8"
+        else:
+            with pytest.raises(utils.HuggingFaceDownloadError, match="hf_quant_config.json.*expected a JSON object"):
+                get_model_config_from_model_path(model)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_llama4_missing_offline_processor_reports_revision_and_can_retry(monkeypatch, hf_cache):
+    model = "org/llama4-offline-processor"
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    processor = config.pop("image_processor_config")
+    _cache_file(hf_cache, model, "config.json", config)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    try:
+        with pytest.raises(utils.HuggingFaceDownloadError, match="preprocessor_config.json.*offline mode") as error:
+            get_model_config_from_model_path(model)
+        assert f"hf download {model} preprocessor_config.json --revision {'c' * 40}" in str(error.value)
+        _cache_file(hf_cache, model, "preprocessor_config.json", processor)
+        loaded = get_model_config_from_model_path(model)
+        assert loaded["extra_params"].vision_config.max_num_tiles == 16
+        assert utils._config_snapshot_commit(loaded["raw_config"]) == "c" * 40
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("sidecar", [None, {"min_pixels": 262144, "max_pixels": 2097152}])
+def test_local_qwen_inline_processor_bounds_and_sidecar_precedence(tmp_path, sidecar):
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    config["preprocessor_config"] = {"min_pixels": 131072, "max_pixels": 1048576}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if sidecar is not None:
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps(sidecar))
+    try:
+        loaded = get_model_config_from_model_path(str(tmp_path))
+        expected = sidecar or config["preprocessor_config"]
+        encoder = loaded["extra_params"]
+        assert (encoder.min_pixels, encoder.max_pixels) == (expected["min_pixels"], expected["max_pixels"])
+        assert loaded["raw_config"]["preprocessor_config"] == expected
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 def test_offline_value_zero_still_downloads(monkeypatch, hf_cache):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     monkeypatch.setattr(
@@ -265,11 +350,12 @@ def test_model_loader_reads_quant_config_at_the_cached_config_commit(monkeypatch
 
 
 def test_concurrent_loads_keep_their_own_snapshot_pins(monkeypatch):
-    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
 
-    barrier = threading.Barrier(2)
+    barrier = Barrier(2)
     quant_revisions: dict[str, str] = {}
-    lock = threading.Lock()
+    lock = Lock()
 
     def fake_at(hf_id, filename, *, raise_on_404=True, revision="main"):
         if filename == "config.json":
@@ -281,14 +367,14 @@ def test_concurrent_loads_keep_their_own_snapshot_pins(monkeypatch):
         return None, None
 
     monkeypatch.setattr(utils, "_download_hf_json_at", fake_at)
-    threads = [
-        threading.Thread(target=utils._load_model_config_from_model_path.__wrapped__, args=(model,))
-        for model in ("org/cached", "org/online")
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(30)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(utils._load_model_config_from_model_path.__wrapped__, model)
+            for model in ("org/cached", "org/online")
+        ]
+        loaded = [future.result(timeout=30) for future in futures]
+    assert all(raw["architectures"] == ["LlamaForCausalLM"] for raw in loaded)
+    assert [utils._config_snapshot_commit(raw) for raw in loaded] == ["c" * 40, None]
     assert quant_revisions == {"org/cached": "c" * 40, "org/online": "main"}
 
 
@@ -697,6 +783,14 @@ def test_failed_same_model_reader_preserves_active_readers_snapshot(monkeypatch,
             assert loaded["raw_config"]["hidden_size"] == 1024
             assert loaded["raw_config"]["preprocessor_config"] == {"source": "pinned"}
             assert not any(url.endswith("/main/preprocessor_config.json") for url in requests)
+            # A later raw reader must reuse A even after refs/main advances to B.
+            _cache_file(
+                hf_cache, model, "config.json", {"architectures": [architecture], "hidden_size": 2048}, commit="b" * 40
+            )
+            raw = utils._load_model_config_from_model_path(model)
+            parsed = utils.get_model_config_from_model_path(model)
+            assert utils._config_snapshot_commit(raw) == utils._config_snapshot_commit(parsed["raw_config"]) == commit
+            assert raw["hidden_size"] == parsed["raw_config"]["hidden_size"] == 1024
         finally:
             resume.set()
             utils._load_model_config_from_model_path.cache_clear()

@@ -62,6 +62,39 @@ def test_collector_offline_config_snapshot(monkeypatch, hub_cache, with_quant):
     assert resolved.payload.get("hf_quant_config") == (_QUANT if with_quant else None)
 
 
+@pytest.mark.parametrize("confirmed_absent", [False, True])
+def test_collector_offline_optional_absence_is_observable(monkeypatch, hub_cache, tmp_path, caplog, confirmed_absent):
+    hub_cache("config.json", _CONFIG)
+    if confirmed_absent:
+        marker = tmp_path / "models--test-org--collector-cache-model" / ".no_exist" / _COMMIT / "hf_quant_config.json"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    with caplog.at_level("WARNING"):
+        resolved = load_model_config(_MODEL)
+    assert resolved.payload == _CONFIG
+    if confirmed_absent:
+        assert not caplog.records
+    else:
+        assert "absence is unconfirmed" in caplog.text
+        assert f"hf download {_MODEL} hf_quant_config.json --revision {_COMMIT}" in caplog.text
+
+
+@pytest.mark.parametrize("payload", [None, {"quantization": {"quant_algo": "FP8"}}])
+def test_collector_network_quant_json_must_be_an_object(monkeypatch, hub_cache, payload):
+    def fetch(request, *, timeout):
+        data = _CONFIG if request.full_url.endswith("/config.json") else payload
+        return io.BytesIO(json.dumps(data).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
+    if payload is None:
+        with pytest.raises(ValueError, match="hf_quant_config.json.*expected a JSON object"):
+            load_model_config(_MODEL)
+    else:
+        resolved = load_model_config(_MODEL)
+        assert resolved.payload["hf_quant_config"] == payload
+
+
 @pytest.mark.parametrize("quant_cached", [False, True])
 def test_collector_config_fallback_pins_quant_request(monkeypatch, hub_cache, quant_cached):
     hub_cache("config.json", _CONFIG)

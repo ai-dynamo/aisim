@@ -17,6 +17,40 @@ from aisim.sdk.errors import NoFeasibleConfigError
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("nextn", [None, "auto"])
+def test_recommend_dspark_corrupt_cached_config_propagates(monkeypatch, tmp_path, nextn):
+    from aisim.legacy_cli import api
+    from aisim_core.sdk import utils
+
+    model = "org/cli-corrupt-kimi-k3"
+    repo = tmp_path / "models--org--cli-corrupt-kimi-k3"
+    commit = "c" * 40
+    snapshot = repo / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{broken")
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text(commit)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    def no_network(request, *, timeout):
+        pytest.fail(f"unexpected offline request: {request.full_url}")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", no_network)
+    try:
+        with pytest.raises(utils._HuggingFaceCacheError, match="Invalid cached config.json"):
+            api.cli_recommend(
+                model_path=model,
+                system="h200_sxm",
+                target_concurrency=16,
+                nextn=nextn,
+                nextn_accepted=3.0,
+            )
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 class TestCLIEstimateUnit:
     """Unit tests for cli_estimate API internals."""
 

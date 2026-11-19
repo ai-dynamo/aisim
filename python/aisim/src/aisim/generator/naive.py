@@ -216,7 +216,12 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
         raise RuntimeError(f"Model {model_path!r} not found or config unavailable") from e
 
     try:
-        config = _parse_hf_config_json(raw_config)
+        if (raw_config.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration":
+            # The raw loader deliberately omits separate processor files. Llama 4
+            # needs that metadata even when normalizing config for weight sizing.
+            config = get_model_config_from_model_path(model_path)
+        else:
+            config = _parse_hf_config_json(raw_config)
         weight_bytes = _estimate_weight_bytes_from_config(config, model_path)
 
         if model_metadata is not None:

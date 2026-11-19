@@ -22,6 +22,8 @@ import stat
 import tempfile
 import urllib.request
 from collections import namedtuple
+from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import cache, wraps
 from pathlib import Path
 from threading import Lock
@@ -415,8 +417,16 @@ class HuggingFaceDownloadError(Exception):
     pass
 
 
-class _HuggingFaceCacheError(HuggingFaceDownloadError):
+class _HuggingFaceMetadataError(HuggingFaceDownloadError):
+    """Present metadata is invalid; callers must not treat it as an access failure."""
+
+
+class _HuggingFaceCacheError(_HuggingFaceMetadataError):
     """A present cache file is unreadable or invalid, rather than absent."""
+
+
+class _HuggingFaceProvenanceError(_HuggingFaceMetadataError):
+    """Companion metadata cannot be bound to the selected config snapshot."""
 
 
 def _get_hf_auth_headers() -> dict[str, str]:
@@ -489,15 +499,10 @@ def _check_hf_revision(revision: str) -> None:
         )
 
 
-def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str] | None:
-    """Find ``filename`` for ``hf_id`` at ``revision`` in the local Hugging Face cache.
-
-    Returns the file and the snapshot commit it belongs to.
-    """
+def _hf_cache_snapshot(hf_id: str, revision: str) -> tuple[Path, str] | None:
+    """Resolve a cache ref to its immutable snapshot, validating present refs."""
     _check_hf_model_id(hf_id)
     _check_hf_revision(revision)
-    if ".." in Path(hf_id).parts or Path(filename).name != filename:
-        return None
     repo = _hf_hub_cache() / f"models--{hf_id.replace('/', '--')}"
     commit = revision
     if not _COMMIT_HASH.fullmatch(revision):
@@ -517,6 +522,15 @@ def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str
             raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: {error}") from error
     if not _COMMIT_HASH.fullmatch(commit):
         raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: expected a 40-hex commit, got {commit!r}")
+    return repo, commit
+
+
+def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str] | None:
+    """Find a regular cached file and the snapshot commit it belongs to."""
+    snapshot = _hf_cache_snapshot(hf_id, revision)
+    if snapshot is None or Path(filename).name != filename:
+        return None
+    repo, commit = snapshot
     path = repo / "snapshots" / commit / filename
     try:
         try:
@@ -619,7 +633,18 @@ def _download_hf_json_at(
             return cached
     if offline is not None:
         if not raise_on_404:
-            logger.debug("%s is set; skipping optional %s for %s", offline, filename, hf_id)
+            snapshot = _hf_cache_snapshot(hf_id, revision)
+            if snapshot is not None and (snapshot[0] / ".no_exist" / snapshot[1] / filename).is_file():
+                logger.debug("Confirmed absent optional %s for %s at %s", filename, hf_id, snapshot[1])
+            else:
+                logger.warning(
+                    "%s is set; optional %s for %s is not cached and its absence is unconfirmed. "
+                    "Continuing without this metadata. %s",
+                    offline,
+                    filename,
+                    hf_id,
+                    _local_config_hint(hf_id, filename, revision),
+                )
             return None, None
         raise HuggingFaceDownloadError(
             f"Cannot load {hf_id}'s {filename}: Hugging Face offline mode is on ({offline} is set) and the "
@@ -636,7 +661,10 @@ def _download_hf_json_at(
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
-            return json.load(response), None
+            data = json.load(response)
+        if not isinstance(data, dict):
+            raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: expected a JSON object")
+        return data, None
     except urllib.error.HTTPError as e:
         if e.code == 404 and not raise_on_404:
             return None, None
@@ -659,6 +687,10 @@ def _download_hf_json_at(
             raise
         except HuggingFaceDownloadError as missing:
             raise missing from e
+    except _HuggingFaceMetadataError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as e:
+        raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: {e}") from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 
@@ -2176,20 +2208,22 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
 def _check_hf_companion_snapshot(hf_id: str, filename: str, revision: str, cached_commit: str | None) -> None:
     """Cached metadata must belong to the selected config's verified snapshot."""
     if cached_commit is not None and cached_commit != revision:
-        raise HuggingFaceDownloadError(
+        raise _HuggingFaceProvenanceError(
             f"Cannot mix cached {filename} from snapshot {cached_commit} with {hf_id} config at {revision}. "
             "Cache config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1, "
             "or supply a local model directory."
         )
 
 
-def _download_hf_companion_json(hf_id: str, filename: str, *, revision: str = "main") -> dict | None:
+def _download_hf_companion_json(
+    hf_id: str, filename: str, *, revision: str = "main", raise_on_404: bool = False
+) -> dict | None:
     """Reject cached companion metadata unless the model config pins its snapshot."""
     capture: dict[tuple[str, str], str] = {}
     token = _SNAPSHOT_CAPTURE.set(capture)
     try:
         pinned = {} if revision == "main" else {"revision": revision}
-        data = _download_hf_json(hf_id, filename, raise_on_404=False, **pinned)
+        data = _download_hf_json(hf_id, filename, raise_on_404=raise_on_404, **pinned)
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
     _check_hf_companion_snapshot(hf_id, filename, revision, capture.get((hf_id, filename)))
@@ -2209,7 +2243,9 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revisi
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        processor_config = _download_hf_companion_json(model_path, "preprocessor_config.json", revision=revision)
+        processor_config = _download_hf_companion_json(
+            model_path, "preprocessor_config.json", revision=revision, raise_on_404=True
+        )
     if processor_config is not None:
         raw_config = {**raw_config, "image_processor_config": processor_config}
     return raw_config
@@ -2223,7 +2259,12 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
     if (kimi or qwen_vl) and model_path not in DefaultHFModels:
         # Bundled checkpoints use the pinned processor defaults. Other checkpoints
         # may override them with media_proc_cfg or native HF processor files.
-        processor = {}
+        inline = raw_config.get("preprocessor_config", {})
+        if not isinstance(inline, dict):
+            raise ValueError("preprocessor_config must be an object")
+        # Inline values survive absent sidecars; explicit sidecar fields override
+        # them. Copy the mapping so validation/retry never mutates the raw cache.
+        processor = dict(inline)
         files = [("preprocessor_config.json", None)]
         if kimi:
             files.append(("video_preprocessor_config.json", "video_processor"))
@@ -2245,8 +2286,15 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
     return raw_config
 
 
+@dataclass(slots=True)
+class _ModelConfigCacheEntry:
+    raw: dict
+    readers: int = 0
+    parsed: bool = False
+
+
 def _cache_raw_model_config(load):
-    """Memoize base configs with per-model eviction for a failed parsed load."""
+    """Keep a base until its parsed readers finish; evict only if all fail."""
     entries = {}
     hits = misses = 0
     lock = Lock()
@@ -2258,12 +2306,12 @@ def _cache_raw_model_config(load):
         with lock:
             if model_path in entries:
                 hits += 1
-                return entries[model_path]
+                return entries[model_path].raw
             misses += 1
         config = load(model_path)
         with lock:
-            entries[model_path] = config
-        return config
+            # Concurrent cold loads must all use the first published base.
+            return entries.setdefault(model_path, _ModelConfigCacheEntry(config)).raw
 
     def clear():
         nonlocal hits, misses
@@ -2271,18 +2319,37 @@ def _cache_raw_model_config(load):
             entries.clear()
             hits = misses = 0
 
-    def invalidate(model_path, config):
+    @contextmanager
+    def reader(model_path):
+        config = _load_model_config_from_model_path(model_path)
         with lock:
-            # A concurrent successful load must not be evicted by an older failure.
-            if entries.get(model_path) is config:
-                del entries[model_path]
+            # A failed reader may have evicted the base between lookup and
+            # acquisition. Join the currently published base or restore this one.
+            entry = entries.setdefault(model_path, _ModelConfigCacheEntry(config))
+            entry.readers += 1
+        succeeded = False
+        try:
+            yield entry.raw
+            succeeded = True
+        finally:
+            with lock:
+                entry.readers -= 1
+                entry.parsed |= succeeded
+                if not entry.readers and not entry.parsed and entries.get(model_path) is entry:
+                    del entries[model_path]
+
+    def clear_parsed():
+        with lock:
+            for entry in entries.values():
+                entry.parsed = False
 
     def cache_info():
         with lock:
             return info(hits, misses, None, len(entries))
 
     cached.cache_clear = clear
-    cached.cache_invalidate = invalidate
+    cached.cache_reader = reader
+    cached.cache_clear_parsed = clear_parsed
     cached.cache_info = cache_info
     return cached
 
@@ -2342,7 +2409,23 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     return loaded
 
 
-@cache
+_model_config_reader = _load_model_config_from_model_path.cache_reader
+
+
+def _cache_parsed_model_config(parse):
+    """Clear parsed publication state together with the parsed memoization."""
+    cached = cache(parse)
+    clear = cached.cache_clear
+
+    def clear_parsed():
+        clear()
+        _load_model_config_from_model_path.cache_clear_parsed()
+
+    cached.cache_clear = clear_parsed
+    return cached
+
+
+@_cache_parsed_model_config
 def get_model_config_from_model_path(model_path: str) -> dict:
     """
     Get model configuration from model path and parse it into model configuration parameters.
@@ -2354,21 +2437,18 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
-    raw_config = _load_model_config_from_model_path(model_path)
+    with _model_config_reader(model_path) as raw_config:
+        return _parse_model_config_from_raw(raw_config, model_path)
+
+
+def _parse_model_config_from_raw(raw_config: dict, model_path: str) -> dict:
+    """Parse one leased base; publication succeeds only after full validation."""
     base_config = raw_config
     commit = _config_snapshot_commit(raw_config)
     pinned = {"revision": commit} if commit else {}
-    try:
-        raw_config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
-        raw_config = _attach_multimodal_processor_config(raw_config, model_path, **pinned)
-        parsed = _parse_hf_config_json(raw_config)
-    except Exception:
-        # A retry may repair processor files or select an offline snapshot. The
-        # raw cache must not keep the base from the failed attempt in that case.
-        # Keep other models' base metadata paired with their parsed cache entries.
-        _load_model_config_from_model_path.cache_invalidate(model_path, base_config)
-        # Active readers retain the snapshot on their base object after eviction.
-        raise
+    raw_config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
+    raw_config = _attach_multimodal_processor_config(raw_config, model_path, **pinned)
+    parsed = _parse_hf_config_json(raw_config)
     # Preserve Llama 4's established raw-cache reuse, but only after its
     # processor metadata has passed the parser. Raw loads never fetch it.
     if "image_processor_config" in raw_config:

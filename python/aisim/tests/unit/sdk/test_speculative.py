@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import io
+import json
+
 import pandas as pd
 import pytest
 
@@ -227,6 +230,39 @@ class TestResolveDsparkNextn:
         try:
             with pytest.raises(utils._HuggingFaceCacheError, match="Invalid cached config.json"):
                 resolve_dspark_nextn(model)
+        finally:
+            utils._load_model_config_from_model_path.cache_clear()
+            utils.get_model_config_from_model_path.cache_clear()
+
+    def test_unverified_cached_quant_sidecar_propagates(self, monkeypatch, tmp_path):
+        from aisim_core.sdk import utils
+        from aisim_core.sdk.config_builders import resolve_dspark_nextn
+
+        model = "org/unverified-kimi-k3"
+        commit = "b" * 40
+        repo = tmp_path / "models--org--unverified-kimi-k3"
+        snapshot = repo / "snapshots" / commit
+        snapshot.mkdir(parents=True)
+        (snapshot / "hf_quant_config.json").write_text('{"quantization": {"quant_algo": "FP8"}}')
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text(commit)
+        for name in utils._OFFLINE_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+        monkeypatch.setattr(utils, "_get_hf_auth_headers", lambda: {})
+        requests = []
+
+        def remote(request, *, timeout):
+            requests.append(request.full_url)
+            if request.full_url.endswith("/config.json"):
+                return io.BytesIO(json.dumps({"architectures": ["KimiK3ForConditionalGeneration"]}).encode())
+            raise utils.urllib.error.URLError("sidecar unavailable")
+
+        monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+        try:
+            with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached hf_quant_config.json"):
+                resolve_dspark_nextn(model)
+            assert len(requests) == 2
         finally:
             utils._load_model_config_from_model_path.cache_clear()
             utils.get_model_config_from_model_path.cache_clear()
