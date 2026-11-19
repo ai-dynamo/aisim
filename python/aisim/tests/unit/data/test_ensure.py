@@ -702,3 +702,16 @@ def test_generated_library_path_is_dropped_but_a_user_override_stays(tmp_path):
         mine = config_for(path)
         assert ensure_mod._drop_generated_library_path(mine) == mine
     assert ensure_mod._drop_generated_library_path({}) == {}
+
+
+@pytest.mark.unit
+def test_pin_from_environment_uses_saved_init_source(tmp_path):
+    from aisim_core.data.config import InitConfig, save_config
+
+    env = {"AISIM_DATA_CACHE": str(tmp_path)}
+    assert pin_from_environment(env) is None
+    save_config(InitConfig(mode="on-demand", repo=REPO, revision=SHA), tmp_path / "config.json")
+    p = pin_from_environment(env)
+    assert (p.repo, p.revision) == (REPO, SHA)
+    other = pin_from_environment({**env, "AISIM_DATASET": f"{REPO}@{'b' * 40}"})
+    assert other.revision == "b" * 40

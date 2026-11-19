@@ -57,6 +57,7 @@ import yaml
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
+from aisim_core.data.config import FALLBACK_REVISION, ConfigError, config_path, load_config
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
@@ -192,11 +193,20 @@ class EnsuredData:
 
 
 def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None:
-    """Build a pin from ``AISIM_DATA*`` variables; ``None`` when none is set (the default)."""
+    """Build a pin from ``AISIM_DATA*`` variables, else the source saved by ``aisim init``.
+
+    ``None`` when neither names a source (the shipped default applies).
+    """
     env = os.environ if env is None else env
     spec, local = env.get("AISIM_DATASET"), env.get("AISIM_DATA_LOCAL")
     if not spec and not local:
-        return None
+        try:
+            saved = load_config(config_path(env))
+        except ConfigError:
+            saved = None
+        if not saved or not saved.repo:
+            return None
+        spec = f"{saved.repo}@{saved.revision or FALLBACK_REVISION}"
     repo = revision = None
     if spec:
         repo, sep, revision = spec.partition("@")
