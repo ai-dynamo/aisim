@@ -228,6 +228,10 @@ def _kv_geometry_args(
         "attention_backend": resolved.get("attention_backend", sample.get("attention_backend")),
         "kvcache_quant_mode": resolved.get("kvcache_quant_mode", sample.get("kvcache_quant_mode")),
     }
+    # Snapshot sentinels pin restoration identity, not physical cache geometry.
+    for name in ("attention_backend", "kvcache_quant_mode"):
+        if result[name] == "unknown":
+            result[name] = None
     profile = resolved.get("fpm_profile", sample.get("fpm_profile"))
     if profile is not None:
         result["fpm_profile"] = profile
