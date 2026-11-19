@@ -116,8 +116,8 @@ def _config(model="synthetic/model-a", *, clean=True, **kw):
     return cfg
 
 
-def _eval(root, configuration_ids, *, case_ids=5):
-    rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, case_ids + 1)]
+def _eval(root, configuration_ids, *, case_ids=5, inputs=None):
+    rows = [(f"s{i}", {"tokens": 10 * i, **(inputs or {})}, 10.0 * i) for i in range(1, case_ids + 1)]
     art = write_truth_table(root / "truth.parquet", rows)
     ident = Identity(
         hardware="h100_sxm", framework="vllm", framework_version="0.11.0", operation_family=None,
@@ -597,6 +597,52 @@ def test_request_table_text_is_scanned(tmp_path):
     found = check_publishable(root, files)
     assert {"internal-host", "secret"} & {f.code for f in found}
     assert any("request column error" in f.message for f in found)
+
+
+@pytest.mark.parametrize("column", ["attrs", "qualification", "future_text"])
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        (json.dumps({"benchmark_url": "https://node7.corp.nvidia.com/report"}), "internal-host"),
+        (json.dumps({"authorization": "Bearer " + "a" * 24}), "secret"),
+    ],
+)
+def test_observation_text_blocks_promotion_and_public_validation(tmp_path, column, value, code):
+    root = tmp_path / "mirror"
+    cfg = _config()
+    cfg = dataclasses.replace(cfg, observations=[o.model_copy(update={column: value}) for o in cfg.observations])
+    manifest = write_configuration(root, cfg, prefix="data")
+    register_manifests(root, [manifest], INTERNAL_REPO)
+    build_catalog(root)
+    directory = str(Path(manifest).parent)
+    _public(root, directory)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data, including extension columns
+    plan = plan_promotion(root, _request([directory]), _reviewers())
+    assert not plan.content_ok
+    assert any(f.code == code and f"column {column}" in f.message for f in plan.findings)
+    assert code in {f.code for f in validate_tree(root, profile="public").errors}
+
+
+@pytest.mark.parametrize(
+    ("inputs", "code"),
+    [
+        ({"endpoint": "https://node7.corp.nvidia.com/v1"}, "internal-host"),
+        ({"headers": {"authorization": "Bearer " + "a" * 24}}, "secret"),
+    ],
+)
+def test_eval_truth_text_blocks_promotion_and_public_validation(tmp_path, inputs, code):
+    root, manifests = _mirror(tmp_path)
+    cfg = _config()
+    record = _eval(root, [cfg.body.configuration_id()], inputs=inputs)
+    build_catalog(root)
+    cfg_dir = str(Path(manifests[0]).parent)
+    eval_dir = record.parent.relative_to(root).as_posix()
+    _public(root, cfg_dir, eval_dir)
+    assert validate_tree(root, repo=INTERNAL_REPO).ok  # hashes and schemas are valid
+    plan = plan_promotion(root, _request([cfg_dir, eval_dir]), _reviewers())
+    assert not plan.content_ok
+    assert any(f.code == code and f.path == f"{eval_dir}/truth.parquet" for f in plan.findings)
+    assert code in {f.code for f in validate_tree(root, profile="public").errors}
 
 
 def test_conflicting_ledger_entries_resolve_to_the_most_restrictive_label():
