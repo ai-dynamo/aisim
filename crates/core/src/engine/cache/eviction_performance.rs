@@ -131,6 +131,10 @@ fn forecast_retirement_refreshes_buried_victims_in_each_checkpoint() {
     }
     assert_eq!(cache.evict(1).1, vec![KvPageId(1023)]);
     let mut checkpoint = cache.admission_checkpoint();
+    // Saving a checkpoint does not copy the active candidate maps. Its first
+    // use reconstructs them once, before subsequent incremental retirement.
+    assert!(checkpoint.candidates.by_node.is_empty());
+    assert_winner(&mut checkpoint);
     forecast.retire_requests([Uuid::from_u128(1)]);
     for branch in [&mut cache, &mut checkpoint] {
         let before = branch.candidates.candidate_queries;

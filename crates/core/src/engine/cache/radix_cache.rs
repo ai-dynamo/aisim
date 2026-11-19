@@ -363,12 +363,13 @@ type VictimPriority = (Reverse<usize>, i64, NodeId);
 /// ticks only increase, so stale recency/eligibility can be checked lazily at
 /// the minimum. Forecast changes can improve a buried Belady victim's rank;
 /// the reverse hash index refreshes those entries before selection.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct EvictionIndex {
     ordered: BTreeSet<VictimPriority>,
     by_node: HashMap<NodeId, (VictimPriority, Option<SequenceHash>)>,
     by_hash: HashMap<SequenceHash, HashSet<NodeId>>,
     forecast_cursor: usize,
+    rebuild: bool,
     #[cfg(test)]
     candidate_queries: usize,
 }
@@ -444,7 +445,14 @@ impl RadixCache {
         Self {
             tree: self.tree.snapshot_full_device(),
             belady: self.belady.clone(),
-            candidates: self.candidates.clone(),
+            // This index is derived from the native tree and saved recency.
+            // Successful admissions discard their checkpoint; defer O(leaves)
+            // index construction until a restored/forked cache actually evicts.
+            candidates: EvictionIndex {
+                forecast_cursor: self.candidates.forecast_cursor,
+                rebuild: true,
+                ..Default::default()
+            },
             page_pool: self.page_pool.clone(),
             page_size: self.page_size,
         }
@@ -488,6 +496,9 @@ impl RadixCache {
     }
 
     fn refresh_candidate(&mut self, node: NodeId) {
+        if self.candidates.rebuild {
+            return;
+        }
         #[cfg(test)]
         {
             self.candidates.candidate_queries += 1;
@@ -529,6 +540,16 @@ impl RadixCache {
     }
 
     fn next_victim(&mut self) -> Option<(NodeId, i64)> {
+        if std::mem::take(&mut self.candidates.rebuild) {
+            let leaves: Vec<_> = self
+                .tree
+                .full_device_eviction_candidates()
+                .map(|candidate| candidate.node_id)
+                .collect();
+            for leaf in leaves {
+                self.refresh_candidate(leaf);
+            }
+        }
         loop {
             let priority = *self.candidates.ordered.first()?;
             let node = priority.2;
