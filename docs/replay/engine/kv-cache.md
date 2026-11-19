@@ -1202,7 +1202,10 @@ sub-block matching without an explicit full-state scratch count.
   times: the bytes and the number of blocks in use, the number of cached
   blocks, the set of cached keys and the number of running requests. If all
   of them are the same, replay waits for the next event. vLLM repeats that
-  recompute until a transfer finishes.
+  recompute until a transfer finishes. A prefill worker applies the same
+  rule. If a prefill pass takes 0 ms, a request can preempt itself twice at
+  one time there too. A native replay spec with a fixed prefill time of 0 ms
+  gives such a pass.
 
   When a request ends on a prefill or decode worker, the worker first
   releases the blocks that the request's next step does not need. Examples
