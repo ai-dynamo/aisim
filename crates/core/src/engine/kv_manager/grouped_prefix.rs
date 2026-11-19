@@ -379,7 +379,9 @@ impl GroupedPrefixRules {
                 GroupRuleKind::State => 2 + checkpoint,
                 GroupRuleKind::Ring => 1,
             })
-            .sum()
+            // vLLM sums Python integers, which cannot overflow. A sum above
+            // usize is more than any pool holds, so it saturates.
+            .fold(0, usize::saturating_add)
     }
 
     /// Whether hits land on hash boundaries inside a block (`coord:703`,
