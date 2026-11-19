@@ -3,6 +3,8 @@
 
 """The internal GitLab job definition keeps its safety properties (it is never executed here)."""
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,9 +15,27 @@ pytestmark = pytest.mark.unit
 JOB = Path(__file__).resolve().parents[5] / "scripts/ci/gitlab/aisim-infx-ingest.gitlab-ci.yml"
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        keys = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in keys:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark, f"duplicate key: {key}", key_node.start_mark
+                )
+            keys.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+def test_definition_parser_rejects_duplicate_keys():
+    with pytest.raises(yaml.constructor.ConstructorError, match="duplicate key: script"):
+        yaml.load("job:\n  script: first\n  script: second\n", Loader=UniqueKeyLoader)
+
+
 @pytest.fixture(scope="module")
 def definition():
-    return yaml.safe_load(JOB.read_text())
+    return yaml.load(JOB.read_text(), Loader=UniqueKeyLoader)
 
 
 def _text(job):
@@ -68,6 +88,16 @@ def test_staleness_only_uses_the_read_credential(definition):
     for name in ("publish_candidate", "promote"):
         assert definition[name]["environment"] == {"name": "infx-cache-writer", "action": "access"}
     assert "environment" not in definition["staleness"] and "environment" not in definition["alert_failure"]
+
+
+def test_dependency_setup_cannot_read_the_cache_write_token(definition, tmp_path):
+    setup = "\n".join(definition[".pinned"]["before_script"])
+    sync = next(line.strip() for line in setup.splitlines() if "uv sync" in line)
+    uv = tmp_path / "uv"
+    uv.write_text('#!/bin/sh\n[ "${INFX_CACHE_WRITE_TOKEN+x}" != x ]\n')
+    uv.chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "INFX_CACHE_WRITE_TOKEN": "synthetic"}
+    subprocess.run(["sh", "-eu", "-c", sync], env=env, cwd=tmp_path, check=True)
 
 
 @pytest.mark.parametrize("slack_fails", [False, True])

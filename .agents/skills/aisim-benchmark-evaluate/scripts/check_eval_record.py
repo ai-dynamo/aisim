@@ -9,8 +9,10 @@ hash) and reports ``gpu_time`` findings at archival and qualification level.
 With ``--predictor FILE.py`` (a module exposing ``predict(inputs) -> float | None``
 and ``fingerprint() -> str``, both built from the canonical ``best_available``
 predictor) it recomputes the prediction from the recorded truth table with
-``verify_record``. ``--attest-root DIR`` then writes the superseding ``verified``
-record with ``attest`` + ``write_record``. Exit code 1 means a failed check.
+``verify_record``. For a complete attempt, ``--attest-root DIR`` then writes the
+superseding ``verified`` record with ``attest`` + ``write_record``. Partial and
+failed attempts are reported and retained without attestation. Exit code 1 means
+a failed check.
 """
 
 import argparse
@@ -75,7 +77,7 @@ def main(argv=None) -> int:
         out["verification"] = {"ok": report.ok, "problems": report.problems}
         if not report.ok:
             code = 1
-        elif args.attest_root:
+        elif args.attest_root and record.status == "complete":
             verified = attest(record, report)
             history = [record]
             while history[-1].supersedes:

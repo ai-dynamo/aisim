@@ -56,8 +56,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          permission="$(gh api "repos/${GH_REPO}/collaborators/${GITHUB_ACTOR}/permission" --jq .permission)"
-          case "${permission}" in
+          role="$(gh api "repos/${GH_REPO}/collaborators/${GITHUB_ACTOR}/permission" --jq .role_name)"
+          case "${role}" in
             admin | maintain) ;;
             *) echo "::error::${GITHUB_ACTOR} is not a maintainer"; exit 1 ;;
           esac
