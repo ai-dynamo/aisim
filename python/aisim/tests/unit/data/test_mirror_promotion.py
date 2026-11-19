@@ -289,6 +289,67 @@ def test_installed_validation_workflow_is_repository_infrastructure(tmp_path, pr
 
 
 @pytest.mark.parametrize("profile", ["mirror", "public"])
+def test_root_dataset_metadata_is_not_a_payload(tmp_path, profile):
+    repo = INTERNAL_REPO if profile == "mirror" else PUBLIC
+    root, _ = _mirror(tmp_path, repo=repo)
+    payload_files = validate_tree(root, repo=repo, profile=profile).files
+    (root / "README.md").write_text("---\nlicense: apache-2.0\n---\n# Synthetic dataset\n")
+    (root / ".gitattributes").write_text("*.parquet filter=lfs diff=lfs merge=lfs -text\n")
+    report = validate_tree(root, repo=repo, profile=profile)
+    assert report.ok, report.errors
+    assert report.files == payload_files and report.configurations == 1
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+@pytest.mark.parametrize("name", ["README.md", ".gitattributes"])
+def test_root_dataset_metadata_symlinks_are_rejected(tmp_path, profile, name):
+    root, _ = _mirror(tmp_path)
+    (root / name).symlink_to(tmp_path / "missing")
+    report = validate_tree(root, profile=profile)
+    assert any(f.code == "symlink" and f.path == name for f in report.errors)
+
+
+@pytest.mark.parametrize("name", ["README.md", ".gitattributes"])
+@pytest.mark.parametrize(
+    "content,code",
+    [
+        (b"\x7fELFexecutable", "forbidden-content"),
+        (b"version https://git-lfs.github.com/spec/v1\n", "lfs-pointer"),
+        (b"\xff", "metadata-invalid"),
+        (b"Bearer " + b"a" * 24, "secret"),
+    ],
+)
+def test_public_root_metadata_receives_content_checks(tmp_path, name, content, code):
+    root, _ = _mirror(tmp_path, repo=PUBLIC)
+    (root / name).write_bytes(content)
+    report = validate_tree(root, repo=PUBLIC, profile="public")
+    assert any(f.code == code and f.path == name for f in report.errors)
+
+
+def test_root_metadata_does_not_bypass_bootstrap_or_disclosure_rules(tmp_path):
+    (tmp_path / "README.md").write_text("Bearer " + "a" * 24)
+    assert not validate_tree(tmp_path).ok  # metadata does not replace the dataset index
+    assert validate_tree(tmp_path, allow_empty=True).ok  # internal text remains private
+    public = validate_tree(tmp_path, profile="public", allow_empty=True)
+    assert any(f.code == "secret" and f.path == "README.md" for f in public.errors)
+
+
+def test_root_metadata_size_is_bounded_before_reading(tmp_path, monkeypatch):
+    from aisim_core.data.mirror import MAX_METADATA_BYTES
+
+    path = tmp_path / "README.md"
+    with path.open("wb") as handle:
+        handle.truncate(MAX_METADATA_BYTES + 1)
+
+    def refuse_read(path):
+        pytest.fail("oversized repository metadata was read")
+
+    monkeypatch.setattr(Path, "read_bytes", refuse_read)
+    report = validate_tree(tmp_path, allow_empty=True)
+    assert any(f.code == "metadata-too-large" and f.path == "README.md" for f in report.errors)
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
 def test_repository_workflow_symlinks_are_rejected(tmp_path, profile):
     root, _ = _mirror(tmp_path)
     workflow = root / ".github/workflows/validate.yml"
@@ -300,7 +361,17 @@ def test_repository_workflow_symlinks_are_rejected(tmp_path, profile):
 
 
 @pytest.mark.parametrize("profile", ["mirror", "public"])
-@pytest.mark.parametrize("path", [".github/workflows/other.yml", ".github/raw.json", "data/validate.yml"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/other.yml",
+        ".github/raw.json",
+        "data/validate.yml",
+        "data/README.md",
+        "readme.md",
+        ".gitmodules",
+    ],
+)
 def test_repository_infrastructure_exemption_is_narrow(tmp_path, profile, path):
     root, _ = _mirror(tmp_path)
     unexpected = root / path
@@ -509,6 +580,24 @@ def test_sample_configuration_is_promoted_by_copy_only_and_passes_public_validat
     assert entry["approved_by"] == ["alice"] and entry["source_commit"] == plan.request.source_commit
     # The source tree still validates as a mirror with its new ledger entry.
     assert validate_tree(root, repo=INTERNAL_REPO).ok
+
+
+def test_promotion_preserves_target_root_metadata(tmp_path):
+    root, directory = _promotable(tmp_path)
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    metadata = {
+        "README.md": b"# Public dataset\n",
+        ".gitattributes": b"*.parquet filter=lfs diff=lfs merge=lfs -text\n",
+    }
+    for name, content in metadata.items():
+        (target / name).write_bytes(content)
+    apply_promotion(plan, root, target)
+    assert validate_tree(target, repo=PUBLIC, profile="public").ok
+    assert {name: (target / name).read_bytes() for name in metadata} == metadata
+    assert all((target / path).read_bytes() == (root / path).read_bytes() for path in plan.files)
 
 
 def test_unlabeled_and_restricted_paths_are_not_promoted(tmp_path):
