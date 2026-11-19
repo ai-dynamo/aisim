@@ -2332,16 +2332,22 @@ def test_validate_gemm_quant_transfer_reachable_in_hybrid():
         with pytest.raises(ValueError, match="Unsupported gemm quant mode 'int4_wo'"):
             make("HYBRID", disabled).validate()
 
-    # nvfp4 (fp4 MMA) can never run on Hopper: strict per-dtype resolution
-    # (#1398) rejects it at validate() in EVERY mode and policy — BEFORE the
-    # transfer ladder is consulted — mirroring the query-entry behavior, so
-    # impossible sweep configurations fail early instead of on the first
-    # HYBRID query.
+    # A live NVFP4 override takes the same Hopper weight-only lane as a
+    # constructor override. Its data/transfer admission remains strict.
+    # Native FP4 compute still has no usable FLOPS entry on Hopper.
     from aisim.sdk.errors import MissingSystemFlopsError
 
     for mode, policy in (("SILICON", None), ("HYBRID", None), ("HYBRID", "xprofile")):
+        task = make(mode, policy, quant=common.GEMMQuantMode.nvfp4)
+        assert task.gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        assert task._gemm_quant_mode_explicit_by_role["agg"] is True
+        if mode == "SILICON":
+            with pytest.raises(ValueError, match="Unsupported gemm quant mode 'nvfp4_wo'"):
+                task.validate()
+        else:
+            task.validate()
         with pytest.raises(MissingSystemFlopsError, match="fp4_tc_flops"):
-            make(mode, policy, quant=common.GEMMQuantMode.nvfp4).validate()
+            common.get_quant_tc_flops(task._try_load_role_database("agg").system_spec, common.GEMMQuantMode.nvfp4)
 
 
 def test_validate_nvfp4_wo_ladder_admitted_in_hybrid():
