@@ -1533,7 +1533,9 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
         _validate_recommendation_host(self, modes=modes, backends=backends)
         for role in ("aggregated", "prefill", "decode"):
             worker = getattr(self.workers, role)
-            if worker is not None and worker.scheduler.chunked_prefill_size is not None and backends != {"sglang"}:
+            if worker is None or is_afd_worker(worker):
+                continue
+            if worker.scheduler.chunked_prefill_size is not None and backends != {"sglang"}:
                 raise ValueError(f"workers.{role}.scheduler.chunked_prefill_size requires backend=sglang")
         _validate_speculation(self, modes=modes, backends=backends)
         _validate_backend_block_sizes(backends=backends, modes=modes, workers=self.workers)

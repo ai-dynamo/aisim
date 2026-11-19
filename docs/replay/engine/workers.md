@@ -199,6 +199,8 @@ you raise it.
 > `max_batched_tokens` rounded down to a whole KV block (at least one block).
 > A decode worker keeps SGLang's 8192-token default.
 
+AFD workers configure their chunk window through `afd.chunked_prefill_size`.
+
 Predict takes a positive integer. Recommend also accepts `choices` or an
 integer `range` (linear or logarithmic), independently for each worker role.
 For example, this recommendation fragment searches the prefill worker's chunk

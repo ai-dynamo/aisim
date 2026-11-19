@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from aisim.generator.api import generate_from_request
+from aisim.generator.rendering.engine import prepare_template_context
 from aisim.generator.request import ModelFacts, from_sweeper_candidate
 
 from .test_sweeper_request import _agg_candidate, _cli_flag_value, _disagg_candidate
@@ -56,6 +57,19 @@ def test_null_chunk_matches_omitted_chunk(version, legacy):
         assert "--chunked-prefill-size" in explicit_null
 
 
+@pytest.mark.parametrize("legacy_value", [True, False])
+def test_explicit_chunk_overrides_later_legacy_mapping(legacy_value):
+    context = prepare_template_context(
+        {
+            "params": {
+                "agg": {"max_num_tokens": 8192, "chunked_prefill_size": 128, "enable_chunked_prefill": legacy_value}
+            }
+        },
+        "sglang",
+    )
+    assert context["agg_chunked-prefill-size"] == 128
+
+
 def test_disagg_sglang_candidate_renders_each_role_prefill_token_limit():
     adapters = {
         "dynamo.router": {
@@ -104,8 +118,11 @@ def test_sglang_candidate_omits_unspecified_kv_cache_dtype(backend_version):
 
 
 @pytest.mark.parametrize("mode", ["agg", "disagg"])
-def test_explicit_chunk_is_preserved_separately_from_prefill_ceiling(mode):
-    candidate = (_agg_candidate if mode == "agg" else _disagg_candidate)(backend="sglang", backend_version="0.5.18")
+@pytest.mark.parametrize(
+    "version", ["0.5.1.post1", "0.5.3.post2", "0.5.4.post3", "0.5.6.post2", "0.5.8", "0.5.9", "0.5.10.post1", "0.5.18"]
+)
+def test_explicit_chunk_is_preserved_separately_from_prefill_ceiling(mode, version):
+    candidate = (_agg_candidate if mode == "agg" else _disagg_candidate)(backend="sglang", backend_version=version)
     candidate["config"].pop("adapters", None)
     roles = ("agg",) if mode == "agg" else ("prefill", "decode")
     chunks = {role: 4096 * (index + 1) for index, role in enumerate(roles)}
@@ -115,7 +132,7 @@ def test_explicit_chunk_is_preserved_separately_from_prefill_ceiling(mode):
         candidate,
         workload={"isl": 4000, "osl": 1000},
         model_facts=ModelFacts(is_moe=False, architecture="Qwen3ForCausalLM"),
-        generator_overrides={"K8sConfig": {"k8s_image": "example/sglang:0.5.18"}},
+        generator_overrides={"K8sConfig": {"k8s_image": f"example/sglang:{version}"}},
     )
     artifacts = generate_from_request(request)
     for role, chunk in chunks.items():

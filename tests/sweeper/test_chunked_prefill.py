@@ -252,3 +252,16 @@ def test_chunk_controls_native_prefill_passes(dp):
         observed.append(report.metrics["mean_ttft_ms"])
     # One 256-token prompt, fixed 10 ms per prefill pass: four, two, one passes.
     assert observed == pytest.approx([40, 20, 10])
+
+
+def test_native_prefill_floors_first_chunk_to_whole_blocks_per_rank():
+    raw = _config(chunk=192)
+    raw["traffic"]["source"]["input_tokens"] = 192
+    worker = raw["engine"]["workers"]["aggregated"]
+    worker["parallelism"] = {"attention_data": 2}
+    worker["kv_cache"]["block_size"] = 64
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    report = EngineReplayRunnerFactory().create(0).run(spec)
+    assert report.metrics["completed_requests"] == 1
+    # The 96-token rank budget yields a 64-token first chunk and 96/32-token continuations.
+    assert report.metrics["mean_ttft_ms"] == pytest.approx(30)
