@@ -437,6 +437,9 @@ the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, th
 is used whole, never merged field by field. Sidecar resources apply only when the selector matches the profile's
 model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
 requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
+The selector and verified library identity must identify one distinct deployment. An absent or partial selector
+matching several deployments (for example, `tp: 1` matching both DEP4 and DEP8) leaves their resources pending.
+Supplying resources explicitly for one deployment does not disambiguate the sidecar evidence for the others.
 Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. For plain
 autoregressive profiles, the draft constructs through `best_available` and answers timing queries; cache sizing,
 replay, and a load that requires resources fail with the fields to supply. A block with valid geometry but no
@@ -445,6 +448,15 @@ need the memory. Speculative-round profiles require resources with observed `run
 `best_available` construction, even for timing queries; geometry alone or declared non-KV bytes do not suffice.
 Entries published without `resources` stay valid. Loading uses only the library and its sidecar and never reads
 `measurements/`.
+
+Libraries can aggregate several models and deployment cells on the declared system, backend and backend version.
+The collector's sidecar `model_paths` inventory, when present, must match the table's `model_path` values; the
+manifest's `identity.model` must occur in that verified column. Historical sidecars without an inventory use the
+table column as the model record. Validation and loading check this binding before staging; native selection
+then requires the exact model path and deployment-cell identity and never substitutes another model's curves.
+An explicit `coordinate_system` must be `iteration_totals_balanced_v1`; null is rejected. Historical reconstructed
+sidecars may omit it for verified row-contract recovery. Runtime-memory `runtime_framework_version` evidence may
+be omitted or null, but a supplied string must contain a non-whitespace character.
 
 The sidecar's `row_count`, selector topology degrees and repeat counts, and measurement-file `bytes` require
 JSON integer literals; `1.0`, strings and booleans are rejected. JSON Schema treats `1.0` as an integer,

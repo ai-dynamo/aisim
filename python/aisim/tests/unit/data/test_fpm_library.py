@@ -757,6 +757,60 @@ def test_staging_reuse_tracks_the_copied_system_definition(root, profile, tmp_pa
     assert (staged.systems_root / definition.name).read_bytes() == definition.read_bytes()
 
 
+def test_staging_digest_describes_the_yaml_copied_during_a_source_edit(root, profile, tmp_path, monkeypatch):
+    make_entry(root, profile)
+    systems = tmp_path / "systems"
+    systems.mkdir()
+    definition = systems / "h200_sxm.yaml"
+    original = "data_dir: data/custom\n# A\n"
+    changed = "data_dir: data/custom\n# B\n"
+    definition.write_text(original)
+    copy2 = shutil.copy2
+
+    def edit_then_copy(source, target):
+        if Path(source) == definition:
+            definition.write_text(changed)
+        return copy2(source, target)
+
+    kwargs = {**KWARGS, "systems_paths": [systems], "output_dir": tmp_path / "out"}
+    with monkeypatch.context() as patch:
+        patch.setattr(shutil, "copy2", edit_then_copy)
+        staged = stage_fpm_library(*_stage_args(root), **kwargs)
+    assert (staged.systems_root / definition.name).read_text() == changed
+    marker = json.loads((staged.systems_root / ".staged.json").read_text())
+    assert marker["system_definition"]["sha256"] == _sha(changed.encode())
+    definition.write_text(original)
+    again = stage_fpm_library(*_stage_args(root), **kwargs)
+    assert (again.systems_root / definition.name).read_text() == original
+
+
+def test_overlay_rejects_targets_removed_by_replacement_and_preserves_old_staging(root, profile, tmp_path):
+    make_entry(root, profile)
+    systems = tmp_path / "systems"
+    version = systems / "data/custom/vllm/0.25.1"
+    version.mkdir(parents=True)
+    (systems / "h200_sxm.yaml").write_text("data_dir: data/custom\n")
+    kwargs = {**KWARGS, "systems_paths": [systems], "output_dir": tmp_path / "out"}
+    staged = stage_fpm_library(*_stage_args(root), **kwargs)
+    marker = (staged.systems_root / ".staged.json").read_bytes()
+    owned = staged.parquet_path.with_name("gemm.parquet")
+    owned.write_bytes(b"previous staging op data")
+    link = version / "gemm.parquet"
+    link.symlink_to(owned)
+    with pytest.raises(FpmContractError, match="overlay source .* resolves inside output_dir"):
+        stage_fpm_library(*_stage_args(root), **kwargs)
+    assert (staged.systems_root / ".staged.json").read_bytes() == marker
+    assert owned.read_bytes() == b"previous staging op data"
+    assert staged.parquet_path.is_file() and staged.metadata_path.is_file()
+    assert not list(tmp_path.glob(".out.staging-*"))
+    external = tmp_path / "external.parquet"
+    external.write_bytes(b"external op data")
+    link.unlink()
+    link.symlink_to(external)
+    again = stage_fpm_library(*_stage_args(root), **kwargs)
+    assert again.parquet_path.with_name("gemm.parquet").read_bytes() == b"external op data"
+
+
 def test_failed_replacement_restores_the_previous_staged_root(root, profile, tmp_path, monkeypatch):
     import os
 
@@ -1135,6 +1189,43 @@ def test_reconstructed_schema6_metadata_is_recovered_only_from_verified_rows(tmp
         complete,
         {},
     )
+
+
+def test_recovered_staged_pair_answers_through_native_best_available(root, profile, tmp_path):
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    rows = pq.read_table(parquet).to_pylist()
+    for row in rows:
+        row.update(measurement_policy="dynamo_native_single_sample_v1", measurement_repeats=1, warmup_repeats=0)
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    metadata = json.loads(sidecar.read_text())
+    metadata.update(
+        metadata_provenance="reconstructed_from_parquet",
+        parquet_sha256=_sha(parquet.read_bytes()),
+        configuration_selector={name: rows[0][name] for name in ("model_path", "system", "backend", "backend_version")},
+    )
+    for name in ("coordinate_system", "measurement_policy", "system", "backend", "backend_version"):
+        metadata.pop(name)
+    sidecar.write_text(json.dumps(metadata))
+    original = sidecar.read_bytes()
+    staged = stage_fpm_library(parquet, sidecar, **KWARGS, output_dir=tmp_path / "out")
+    assert not staged.metadata_path.is_symlink()
+    assert staged.diagnostics["fpm_metadata_recovery"]["recovered_fields"]["coordinate_system"] == (
+        "iteration_totals_balanced_v1"
+    )
+    config = user_config(profile)
+    config["systems_paths"] = [str(staged.systems_root)]
+    with_estimator_path(config, staged.parquet_path)
+    model = RustForwardPassPerfModel.best_available(config)
+    try:
+        for query, expected in (
+            ({"num_prefill_requests": 1, "sum_prefill_tokens": 1}, 2.0),
+            ({"num_decode_requests": 1, "sum_decode_kv_tokens": 1}, 3.0),
+        ):
+            assert model.estimate_forward_pass_time_ms([{"scheduled_requests": query}]) == pytest.approx(expected)
+    finally:
+        model.close()
+    assert sidecar.read_bytes() == original
 
 
 def test_staging_writes_recovered_sidecar_copy_and_leaves_the_original(tmp_path):
@@ -1882,6 +1973,34 @@ def test_sidecar_resources_wait_for_an_identified_deployment(profile):
     assert complete_fpm_profile(one, metadata, required=False)[1] == ["metadata"]
 
 
+def test_partial_selector_must_distinguish_dep4_from_dep8(profile):
+    draft = copy.deepcopy(profile)
+    draft["deployments"] = [
+        {**draft["deployments"][0], "tp": 1, "moe_tp": 1, "dp": degree, "moe_ep": degree} for degree in (4, 8)
+    ]
+    # These are supported DEP configurations, rather than identities rejected by profile validation.
+    valid = copy.deepcopy(draft)
+    for deployment in valid["deployments"]:
+        deployment["resources"] = RESOURCES
+    load_fpm_profile(valid)
+    for deployment in draft["deployments"]:
+        deployment.pop("resources", None)
+    identity = {"system": "h200_sxm", "backend": "vllm", "backend_version": "0.25.1"}
+    metadata = {"resources": RESOURCES, "configuration_selector": {"tp": 1}}
+    assert complete_fpm_profile(draft, metadata, identity=identity, required=False)[1] == ["pending", "pending"]
+    with pytest.raises(FpmResourcesPendingError):
+        complete_fpm_profile(draft, metadata, identity=identity)
+    # An explicit block does not establish which deployment the sidecar evidence describes.
+    user = {**RESOURCES, "max_num_tokens": 4096, "provenance": "Explicit DEP8 fixture resources."}
+    draft["deployments"][1]["resources"] = user
+    assert complete_fpm_profile(draft, metadata, identity=identity, required=False)[1] == ["pending", "user"]
+    metadata["configuration_selector"]["moe_ep"] = 4
+    completed, sources = complete_fpm_profile(draft, metadata, identity=identity)
+    assert sources == ["metadata", "user"]
+    assert completed["deployments"][0]["resources"]["max_num_tokens"] == RESOURCES["max_num_tokens"]
+    assert completed["deployments"][1]["resources"]["max_num_tokens"] == user["max_num_tokens"]
+
+
 def test_selector_precision_needs_a_deployment_that_establishes_it(profile):
     draft = copy.deepcopy(profile)
     draft["deployments"][0].pop("resources", None)
@@ -2137,6 +2256,109 @@ def test_library_row_integers_reject_booleans():
     assert FpmLibraryRow.model_validate(row).tp == 1
     with pytest.raises(ModelValidationError):
         FpmLibraryRow.model_validate({**row, "tp": True})
+
+
+@pytest.mark.parametrize("inventory", [None, ["other/model"], ["MiniMaxAI/MiniMax-M2.7"]])
+@pytest.mark.parametrize("temporary", [False, True])
+def test_manifest_model_must_be_covered_by_library_rows(root, profile, tmp_path, inventory, temporary):
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    table = pq.read_table(parquet)
+    table = table.set_column(
+        table.schema.get_field_index("model_path"), "model_path", pa.array(["other/model"] * table.num_rows)
+    )
+    pq.write_table(table, parquet)
+    metadata = json.loads(sidecar.read_text())
+    metadata["parquet_sha256"] = _sha(parquet.read_bytes())
+    if inventory is not None:
+        metadata["model_paths"] = inventory
+    sidecar.write_text(json.dumps(metadata))
+    document = json.loads((root / MANIFEST).read_text())
+    for artifact in document["artifacts"][:2]:
+        data = (root / artifact["path"]).read_bytes()
+        artifact.update(sha256=_sha(data), bytes=len(data))
+    (root / MANIFEST).write_text(json.dumps(document))
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ["invalid-sidecar"]
+    expected = "model_paths differs" if inventory == [profile["model"]] else "does not cover manifest model"
+    assert expected in findings[0].message
+    with pytest.raises(LoaderError, match=expected):
+        FpmLoader().load(
+            root, MANIFEST, output_dir=None if temporary else tmp_path / "out", config=user_config(profile)
+        )
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("inventory", [False, True])
+def test_shared_library_covers_multiple_manifest_models(root, profile, tmp_path, inventory):
+    make_entry(root, profile)
+    parquet, sidecar = _stage_args(root)
+    rows = pq.read_table(parquet).to_pylist()
+    rows += [{**row, "cell_id": "other-" + row["cell_id"], "model_path": "other/model"} for row in rows]
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    metadata = json.loads(sidecar.read_text())
+    metadata.update(row_count=len(rows), parquet_sha256=_sha(parquet.read_bytes()))
+    if inventory:
+        metadata["model_paths"] = [profile["model"], "other/model"]
+    sidecar.write_text(json.dumps(metadata))
+    document = json.loads((root / MANIFEST).read_text())
+    for artifact in document["artifacts"][:2]:
+        data = (root / artifact["path"]).read_bytes()
+        artifact.update(sha256=_sha(data), bytes=len(data))
+        if artifact["role"] == "fpm-library":
+            artifact["rows"] = len(rows)
+    (root / MANIFEST).write_text(json.dumps(document))
+    assert check_fpm_entry(root, MANIFEST) == []
+    data = load(root, user_config(profile), tmp_path)
+    model = RustForwardPassPerfModel.best_available(data.config)
+    try:
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_prefill_requests": 1, "sum_prefill_tokens": 1}}]
+        ) == pytest.approx(2.0)
+    finally:
+        model.close()
+
+
+@pytest.mark.parametrize("value", [None, "unsupported", "iteration_totals_balanced_v1"])
+@pytest.mark.parametrize("provenance", [None, "reconstructed_from_parquet"])
+def test_coordinate_system_agrees_in_schema_publication_and_staging(root, profile, tmp_path, value, provenance):
+    make_entry(root, profile, sidecar_extra={"coordinate_system": value, "metadata_provenance": provenance})
+    _, sidecar = _stage_args(root)
+    metadata = json.loads(sidecar.read_text())
+    schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
+    if value == "iteration_totals_balanced_v1":
+        Draft202012Validator(schema).validate(metadata)
+        assert check_fpm_entry(root, MANIFEST) == []
+        stage_fpm_library(*_stage_args(root), **KWARGS, output_dir=tmp_path / "out")
+    else:
+        with pytest.raises(ValidationError):
+            Draft202012Validator(schema).validate(metadata)
+        findings = check_fpm_entry(root, MANIFEST)
+        assert [f.code for f in findings] == ["invalid-sidecar"]
+        assert "coordinate_system" in findings[0].message
+        with pytest.raises(FpmContractError, match="coordinate_system"):
+            stage_fpm_library(*_stage_args(root), **KWARGS, output_dir=tmp_path / "out")
+
+
+@pytest.mark.parametrize("version", [" ", "\t\n", "", None, "0.25.1"])
+def test_runtime_version_nonblank_constraint_matches_sidecar_schema_and_reader(tmp_path, version):
+    metadata = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "resources": {**RESOURCES, "runtime_memory": {**RUNTIME_MEMORY, "runtime_framework_version": version}},
+    }
+    schema = json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6"))
+    sidecar = tmp_path / "sidecar.json"
+    sidecar.write_text(json.dumps(metadata))
+    if version is None or version.strip():
+        Draft202012Validator(schema).validate(metadata)
+        assert read_library_metadata(sidecar) == metadata
+    else:
+        with pytest.raises(ValidationError):
+            Draft202012Validator(schema).validate(metadata)
+        with pytest.raises(FpmContractError, match="runtime_framework_version"):
+            read_library_metadata(sidecar)
 
 
 def test_sidecar_reader_rejects_duplicate_keys_and_float_overflow(tmp_path):

@@ -343,12 +343,16 @@ class FpmLoader(Loader):
         foreign = explicit is not None and Path(explicit).expanduser().resolve() != library_file.resolve()
         base = dict(config or {})
         with_estimator_path(base, library_file)
+        # Validate model coverage even for temporary staging and before replacing a previous output_dir.
+        from aisim_core.data.fpm_library import check_library_model
+
+        try:
+            declared = read_library_metadata(sidecar_file)
+            check_library_model(declared, library_file, identity.model)
+        except FpmContractError as exc:
+            raise LoaderError(str(exc)) from exc
         if output_dir is not None:
             # Staging replaces a previous root at output_dir, so reject an unusable resource contract first.
-            try:
-                declared = read_library_metadata(sidecar_file)
-            except FpmContractError as exc:
-                raise LoaderError(str(exc)) from exc
             _resolve_library_resources(
                 dict(base),
                 user_profile,

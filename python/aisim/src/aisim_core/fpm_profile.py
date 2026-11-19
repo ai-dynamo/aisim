@@ -207,7 +207,8 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     hash_block_size_tokens: Annotated[int, Field(le=2**32 - 1)] | None = None
     # The version of the runtime that observed the cache group evidence. It can differ from the deployment's
     # backend_version, which is a dataset label.
-    runtime_framework_version: str | None = None
+    # _prefix_caching owns the validation order and error text shared with Rust; export its nonblank rule too.
+    runtime_framework_version: Annotated[str, Field(json_schema_extra={"minLength": 1, "pattern": r"\S"})] | None = None
 
     @model_validator(mode="after")
     def _prefix_caching(self) -> FpmRuntimeMemoryProfile:

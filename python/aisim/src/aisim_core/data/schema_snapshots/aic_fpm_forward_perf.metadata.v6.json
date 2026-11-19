@@ -624,6 +624,8 @@
         "runtime_framework_version": {
           "anyOf": [
             {
+              "minLength": 1,
+              "pattern": "\\S",
               "type": "string"
             },
             {
@@ -715,16 +717,9 @@
       "title": "Configuration Selector"
     },
     "coordinate_system": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Coordinate System"
+      "const": "iteration_totals_balanced_v1",
+      "title": "Coordinate System",
+      "type": "string"
     },
     "measurement_policy": {
       "anyOf": [
@@ -761,6 +756,22 @@
       ],
       "default": null,
       "title": "Metadata Provenance"
+    },
+    "model_paths": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model Paths"
     },
     "parquet_sha256": {
       "anyOf": [
