@@ -11592,6 +11592,153 @@ mod tests {
     }
 
     #[test]
+    fn sglang_phase_priced_dp_wait_includes_vision_in_step_power() {
+        use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
+        use crate::engine::{Command, EncoderShape, EngineFactory, ImageSpec, Request};
+
+        #[derive(Default)]
+        struct VisionTiming(Mutex<(TimingEvidenceSummary, f64)>);
+
+        impl VisionTiming {
+            // Synthetic operation evidence at 400 W for both vision and language work.
+            fn record(&self, name: &str, ms: f64, prefill: bool) -> Result<f64> {
+                let phase =
+                    TimingPhaseEvidence::from_operations(vec![TimingOperationEvidence::new(
+                        name,
+                        ms,
+                        Some(ms * 400.0),
+                        TimingEvidenceSource::Other("synthetic".into()),
+                    )?]);
+                let mut evidence = self.0.lock().unwrap();
+                if prefill {
+                    evidence.0.prefill.try_accumulate(phase)?;
+                } else {
+                    evidence.0.decode.try_accumulate(phase)?;
+                }
+                Ok(ms)
+            }
+        }
+
+        impl TimingModel for VisionTiming {
+            fn predict_vision_ms(&self, shapes: &[VisionShape]) -> Result<Option<f64>> {
+                let ms = shapes.iter().map(|shape| 20.0 * shape.count as f64).sum();
+                self.record("encoder", ms, true).map(Some)
+            }
+
+            fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> Result<f64> {
+                self.record("prefill", 10.0, true)
+            }
+
+            fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> Result<f64> {
+                self.record("decode", 4.0, false)
+            }
+
+            fn power_evidence_summary(&self) -> Option<(TimingEvidenceSummary, f64, f64)> {
+                let evidence = self.0.lock().unwrap();
+                Some((evidence.0.clone(), 0.0, evidence.1))
+            }
+
+            fn tracks_attention_dp_wait(&self) -> bool {
+                true
+            }
+
+            fn record_phase_priced_wait(&self, wait_ms: f64) -> Result<()> {
+                self.0.lock().unwrap().1 += wait_ms;
+                Ok(())
+            }
+        }
+
+        for speedup_ratio in [1.0, 2.0] {
+            let timing = Arc::new(VisionTiming::default()) as Arc<dyn TimingModel>;
+            let config = EngineConfig {
+                num_gpu_blocks: 1024,
+                block_size: 16,
+                max_num_seqs: 16,
+                max_num_batched_tokens: 128,
+                enable_prefix_caching: false,
+                speedup_ratio,
+                decode_speedup_ratio: 2.0,
+                wait_power_w: Some(60.0),
+                ..EngineConfig::for_backend(Backend::Sglang)
+            };
+            let power = TimingPowerSource::new(Arc::clone(&timing), &config).unwrap();
+            let mut engine = EngineFactory::with_timing_model(config, timing)
+                .unwrap()
+                .build(
+                    EngineIdentity::new(0),
+                    std::num::NonZeroU32::new(2).unwrap(),
+                )
+                .unwrap();
+            for dp_rank in 0..2 {
+                let images = if dp_rank == 0 {
+                    vec![ImageSpec {
+                        identity: 1,
+                        token_start: 0,
+                        token_end: 4,
+                        encoder: EncoderShape {
+                            sequences: 1,
+                            patch_tokens: 16,
+                            transformer_tokens: 16,
+                            output_tokens: 4,
+                        },
+                        embedding_bytes: 4_000,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                engine
+                    .apply_command_effects(
+                        SchedulerCommand::new(
+                            dp_rank,
+                            Command::Submit(Request {
+                                cache_salt: None,
+                                request_id: uuid::Uuid::from_u128(dp_rank as u128 + 1),
+                                tokens: vec![dp_rank + 1; 32],
+                                max_output_tokens: 2,
+                                output_token_ids: None,
+                                session_id: None,
+                                images,
+                                kv_hint: None,
+                            }),
+                        ),
+                        0.0,
+                    )
+                    .unwrap();
+            }
+
+            let prefill = engine.execute_pass(0.0).unwrap().unwrap();
+            // Rank 0 encodes for 20 ms then prefills for 10 ms; rank 1 only
+            // prefills for 10 ms. Total active time is 40, wait is 20, and
+            // total rank time is 2 * 30 = 60 ms, all scaled once.
+            assert_eq!(prefill.end_ms, 30.0 / speedup_ratio);
+            assert_eq!(prefill.by_rank[0].rank_end_ms, 30.0 / speedup_ratio);
+            assert_eq!(prefill.by_rank[1].rank_end_ms, 10.0 / speedup_ratio);
+            let sources = [power];
+            let evidence = replay_timing_evidence(&sources).unwrap().unwrap();
+            let diagnostics = replay_power_diagnostics(Some(&evidence), None).unwrap();
+            assert_eq!(diagnostics.latency_ms, Some(40.0 / speedup_ratio));
+            assert_eq!(diagnostics.attention_dp_wait_ms, Some(20.0 / speedup_ratio));
+            assert_eq!(diagnostics.power_w, Some(400.0));
+            assert_eq!(diagnostics.power_coverage, Some(1.0));
+            assert_eq!(diagnostics.step_power_w, Some(17_200.0 / 60.0));
+            engine
+                .complete_pass(prefill.pass_id, prefill.end_ms)
+                .unwrap();
+
+            // A subsequent balanced decode must not retain the vision time.
+            let decode = engine.execute_pass(prefill.end_ms).unwrap().unwrap();
+            assert_eq!(decode.end_ms - prefill.end_ms, 2.0 / speedup_ratio);
+            engine.complete_pass(decode.pass_id, decode.end_ms).unwrap();
+            assert!(engine.execute_pass(decode.end_ms).unwrap().is_none());
+            let evidence = replay_timing_evidence(&sources).unwrap().unwrap();
+            let diagnostics = replay_power_diagnostics(Some(&evidence), None).unwrap();
+            assert_eq!(diagnostics.latency_ms, Some(44.0 / speedup_ratio));
+            assert_eq!(diagnostics.attention_dp_wait_ms, Some(20.0 / speedup_ratio));
+            assert_eq!(diagnostics.step_power_w, Some(18_800.0 / 64.0));
+        }
+    }
+
+    #[test]
     fn aic_measurement_reset_clears_phase_provenance_without_clearing_shape_cache() {
         pyo3::prepare_freethreaded_python();
         let engine = Python::with_gil(|py| Py::new(py, PerOpEvidenceProbe::default()).unwrap());

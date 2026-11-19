@@ -1314,6 +1314,13 @@ impl SglangCore {
         let scheduled_end_ms = forward_end_ms + scheduler_ms;
         let mut result = pass.result;
         result.forward_time = forward_time;
+        // Vision runs before the language forward and belongs to the same
+        // active prefill evidence. Include its already-scaled time in rank
+        // wait accounting without adding it to the simulated timeline again.
+        if pass.forward_start_ms > pass.selected_ms {
+            result.forward_time.prefill +=
+                modeled_duration(pass.forward_start_ms - pass.selected_ms, 1.0)?;
+        }
         // When this pass's forward leaves stage 0, and its time per stage.
         let mut stage0 = Some((scheduled_end_ms, forward_ms));
         let host_launch = pass.launch.is_some();
