@@ -58,6 +58,19 @@ const SHARED_LOAD_GENERATION_ATTEMPTS: usize = 3;
 /// keeping the systems root each entry was loaded from.
 type SharedTablesMemo = Mutex<HashMap<String, (PathBuf, Weak<PerfTables>)>>;
 
+/// Digest of the staged-library marker, empty for a root without one. A managed
+/// staging can atomically replace a library at the same paths. Its verified
+/// marker identifies the generation (pair digests, system YAML and overlay
+/// targets). Hash only this small preparation record, never the potentially
+/// large parquet on every engine construction. Ordinary roots without a marker
+/// retain their existing immutable-root cache behavior.
+fn staged_generation(systems_root: &Path) -> String {
+    std::fs::read(systems_root.join(".staged.json"))
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default()
+}
+
 fn shared_tables_key(
     systems_root: &Path,
     system: &str,
@@ -65,16 +78,8 @@ fn shared_tables_key(
     version: &str,
     resolver: &SourceResolver,
     fpm_parquet_path: Option<&Path>,
+    generation: &str,
 ) -> String {
-    // A managed staging can atomically replace a library at the same paths.
-    // Its verified marker identifies the generation (pair digests, system YAML
-    // and overlay targets). Hash only this small preparation record, never the
-    // potentially large parquet on every engine construction. Ordinary roots
-    // without a marker retain their existing immutable-root cache behavior.
-    let generation = std::fs::read(systems_root.join(".staged.json"))
-        .ok()
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .unwrap_or_default();
     format!(
         "{}\x1f{system}\x1f{backend}\x1f{version}\x1f{}\x1f{}\x1f{generation}",
         systems_root.display(),
@@ -760,19 +765,23 @@ impl PerfDatabase {
                 fpm_parquet_path,
             );
         }
-        let ctx = Self::resolve_ctx(
-            systems_root,
-            system,
-            backend,
-            version,
-            enable_shared_layer,
-            strict_provenance,
-        )?;
-        let resolver = Arc::new(SourceResolver::live(ctx));
         // A staging replacement can land between the marker read and the data
-        // reads. Accept a load only if the marker is unchanged after it;
-        // otherwise reload, so one load never memoizes mixed generations.
+        // reads, and can change the data directory the system yaml names. Each
+        // attempt therefore reads the marker first, builds its resolution
+        // context from the yaml current at that point, and is accepted only if
+        // the marker is unchanged after the load; otherwise reload, so one load
+        // never memoizes mixed generations.
         for _ in 0..SHARED_LOAD_GENERATION_ATTEMPTS {
+            let generation = staged_generation(systems_root);
+            let ctx = Self::resolve_ctx(
+                systems_root,
+                system,
+                backend,
+                version,
+                enable_shared_layer,
+                strict_provenance,
+            )?;
+            let resolver = Arc::new(SourceResolver::live(ctx));
             let key = shared_tables_key(
                 systems_root,
                 system,
@@ -780,6 +789,7 @@ impl PerfDatabase {
                 version,
                 &resolver,
                 fpm_parquet_path,
+                &generation,
             );
             if let Some(tables) = memo
                 .lock()
@@ -798,15 +808,9 @@ impl PerfDatabase {
                 false,
                 fpm_parquet_path,
             )?;
-            let settled = shared_tables_key(
-                systems_root,
-                system,
-                backend,
-                version,
-                &resolver,
-                fpm_parquet_path,
-            );
-            if settled != key {
+            #[cfg(test)]
+            tests::after_shared_load_hook();
+            if staged_generation(systems_root) != generation {
                 continue;
             }
             let mut map = memo.lock().unwrap();
@@ -1262,6 +1266,65 @@ mod tests {
         assert!(!Arc::ptr_eq(&db1.util_grids, &db2.util_grids));
         assert!(!Arc::ptr_eq(&db1.delta_lookups, &db2.delta_lookups));
         assert!(!Arc::ptr_eq(&db1.moe_references, &db2.moe_references));
+    }
+
+    thread_local! {
+        static AFTER_SHARED_LOAD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs the test's staging replacement right after a shared load's table
+    /// reads, the window the generation check exists for.
+    pub(super) fn after_shared_load_hook() {
+        // Take the hook out while it runs so it can never re-enter itself.
+        let hook = AFTER_SHARED_LOAD.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+            AFTER_SHARED_LOAD.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+    }
+
+    #[test]
+    fn shared_load_retry_rebuilds_sources_from_the_current_generation() {
+        // A staging replacement changes the data dir named by the system yaml
+        // while the first attempt reads tables. The retry must resolve its
+        // sources from the new generation, not the first attempt's context.
+        let tmp = tempfile::tempdir().unwrap();
+        energy_test_fixtures::write_energy_systems_root(tmp.path());
+        let second = tmp.path().join("data_two/vllm/1.0");
+        std::fs::create_dir_all(&second).unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join(".staged.json"), b"first").unwrap();
+        let replaced = std::cell::Cell::new(false);
+        AFTER_SHARED_LOAD.with(|cell| {
+            let root = root.clone();
+            *cell.borrow_mut() = Some(Box::new(move || {
+                if replaced.replace(true) {
+                    return;
+                }
+                let yaml = std::fs::read_to_string(root.join("testsys.yaml")).unwrap();
+                std::fs::write(
+                    root.join("testsys.yaml"),
+                    yaml.replace("data_dir: data\n", "data_dir: data_two\n"),
+                )
+                .unwrap();
+                std::fs::write(root.join(".staged.json"), b"second").unwrap();
+            }));
+        });
+        let memo = SharedTablesMemo::default();
+        let db = PerfDatabase::load_resolved_shared_in(
+            &memo, &root, "testsys", "vllm", "1.0", false, false, false, None,
+        );
+        AFTER_SHARED_LOAD.with(|cell| *cell.borrow_mut() = None);
+        let db = db.expect("the retry must settle on the replaced generation");
+        assert_eq!(db.tables.data_root, root.join("data_two/vllm/1.0"));
+        assert!(
+            db.tables
+                .source_resolver
+                .identity_key()
+                .contains(&root.join("data_two").display().to_string()),
+            "sources must come from the generation the tables were read from"
+        );
     }
 
     #[test]
