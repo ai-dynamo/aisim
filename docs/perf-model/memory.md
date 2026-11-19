@@ -413,8 +413,23 @@ With prefix caching on, replay keeps the blocks of all groups in one block pool:
   `prefill_schedule_interval` is 1. Every `state` group needs a `blocks_per_request` of 1.
 - The pool must hold the blocks of one request of `max_model_len` tokens, as
   vLLM's startup check counts them. That is
-  `ceil(max_model_len / block_size_tokens)` blocks for full attention and
-  vLLM's admission cap for a sliding window. It is 2 blocks for a
+  `ceil(max_model_len / block_size_tokens)` blocks for full attention. For a
+  sliding window it is vLLM's admission cap,
+  `ceil(min(sliding_window - 1 + in-flight tokens, max_model_len) / block_size_tokens) + 1`.
+  With `async_scheduling` on, the default, the in-flight tokens are
+  `max_num_batched_tokens` (`scheduler.max_batched_tokens` in the engine
+  YAML) times 2. With it off they are `max_num_batched_tokens`. This is the
+  same on every modeled version. vLLM v0.31.0
+  [`kv_cache_interface.py:840-866`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py#L840-L866),
+  v0.32.0
+  [`:859-885`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py#L859-L885)
+  and v0.33.0
+  [`:918-944`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py#L918-L944)
+  use the same formula. They also add `extra_retained_tokens`. vLLM sets it on
+  every sliding-window spec to `max(0, num_prefill_lookahead_tokens - 1)`,
+  which is above 0 only with multi-module speculative decoding. A rank with
+  `kv_cache_groups` refuses speculative decoding, so replay leaves the term
+  out. The count is 2 blocks for a
   prefix-cacheable `state` group, 3 with a checkpoint block, and 1 block for a
   ring.
 - Replay admits a waiting request only with room for the blocks of its whole
