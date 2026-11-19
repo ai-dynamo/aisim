@@ -28,6 +28,7 @@ re-checks anything that was promoted.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ from aisim_core.data.e2e import (
     read_snapshot,
 )
 from aisim_core.data.eval import load_record
-from aisim_core.data.hygiene import Finding
+from aisim_core.data.hygiene import Finding, checked_path
 from aisim_core.data.parquet import read_parquet
 
 Label = Literal["public", "internal", "restricted"]
@@ -167,7 +168,9 @@ def _walk(value: Any, key: str = "") -> Iterable[tuple[str, str]]:
     """Yield (key, string) for every string in a JSON-like value, with the nearest key name."""
     if isinstance(value, Mapping):
         for k, v in value.items():
-            yield from _walk(v, str(k))
+            yield "", str(k)  # content rules apply to keys; field-name rules apply only to their values
+            context = key if _IMAGE_KEY.search(key) or _PATCH_KEY.search(key) or _RUN_KEY.search(key) else str(k)
+            yield from _walk(v, context)
     elif isinstance(value, (list, tuple)):
         for v in value:
             yield from _walk(v, key)
@@ -178,23 +181,23 @@ def _walk(value: Any, key: str = "") -> Iterable[tuple[str, str]]:
 def _json_text(text: str) -> Any:
     try:
         return json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return text
 
 
-def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str) -> list[Finding]:
+def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _key: str = "") -> list[Finding]:
     """Findings for run URLs, images, digests, patch references, secrets and internal hosts."""
     out: list[Finding] = []
 
     def flag(code: str, detail: str) -> None:
         out.append(Finding(code, f"{where}: {detail}", path))
 
-    for key, text in _walk(value):
+    for key, text in _walk(value, _key):
         if text == REDACTED or not text:
             continue
         nested = _json_text(text) if text[:1] in "{[" else None
         if isinstance(nested, (dict, list)):
-            out.extend(scan_value(nested, policy, path, where))
+            out.extend(scan_value(nested, policy, path, where, _key=key))
             continue
         if (_RUN_KEY.search(key) or _RUN_URL.search(text)) and not any(
             text.startswith(p) for p in policy.allowed_run_url_prefixes
@@ -268,6 +271,12 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
                     read_parquet(root / artifact.path, artifact.artifact_schema), artifact.path, policy, "column"
                 )
             )
+        elif artifact.format == "json":
+            out.extend(
+                scan_value(
+                    json.loads(checked_path(root, artifact.path).read_bytes()), policy, artifact.path, "JSON sidecar"
+                )
+            )
     out.extend(scan_value(manifest.provenance, policy, rel, "manifest provenance"))
     out.extend(scan_value([manifest.requested_settings, manifest.evidence_gaps], policy, rel, "manifest"))
     return out
@@ -297,11 +306,7 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
     """Scan textual columns, including JSON-valued strings and future extension columns."""
     out: list[Finding] = []
     for name in table.column_names:
-        if not (
-            pa.types.is_string(table.schema.field(name).type) or pa.types.is_large_string(table.schema.field(name).type)
-        ):
-            continue
-        values = [v for v in table.column(name).to_pylist() if isinstance(v, str) and v not in ("", REDACTED)]
+        values = table.column(name).to_pylist()
         if values:
             out.extend(scan_value({name: values}, policy, rel, f"{where} {name}")[:1])
     return out
@@ -325,6 +330,8 @@ def _check_eval_record(root: Path, rel: str, policy: RedactionPolicy, infx_ids: 
     record = load_record(root / rel)
     out = scan_value(record.model_dump(mode="json", by_alias=True), policy, rel, "eval record")
     for artifact in record.truth.artifacts:
+        if artifact.format == "gzip" and not policy.allow_provenance_artifacts:
+            out.append(Finding("provenance-withheld", "logs and raw output are withheld", artifact.path))
         if artifact.format == "parquet":
             path = _verify((root / rel).parent, artifact)
             artifact_rel = path.relative_to(root).as_posix()
@@ -356,20 +363,38 @@ def check_publishable(
     chosen = sorted(set(paths))
     loaded = dict(manifests or {})
     findings: list[Finding] = []
+    from aisim_core.data.mirror import list_tree
+
+    for f in list_tree(root):
+        if f.is_symlink:
+            findings.append(Finding("symlink", "symbolic links are not published", f.path))
+    try:
+        for rel in chosen:
+            checked_path(root, rel)
+    except ValueError as exc:
+        findings.append(Finding("path-unsafe", str(exc)))
+    if findings:
+        return findings
     for rel in chosen:
         if rel.endswith("/manifest.json") and rel not in loaded:
             try:
                 loaded[rel] = Manifest.model_validate_json((root / rel).read_bytes())
             except (OSError, ValidationError, ValueError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
-    infx_ids = {
-        m.configuration_id
-        for m in loaded.values()
-        if m.category == "e2e" and _is_infx(body_from_manifest(m).source_kind)
-    }
+    infx_ids = set()
+    invalid = set()
+    for rel, manifest in loaded.items():
+        try:
+            for artifact in manifest.artifacts:
+                checked_path(root, artifact.path)
+            if manifest.category == "e2e" and _is_infx(body_from_manifest(manifest).source_kind):
+                infx_ids.add(manifest.configuration_id)
+        except (ValueError, OSError) as exc:
+            findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
+            invalid.add(rel)
     chosen_set = set(chosen)
     for rel, manifest in sorted(loaded.items()):
-        if rel in chosen_set:
+        if rel in chosen_set and rel not in invalid:
             try:
                 findings.extend(_check_manifest(root, rel, manifest, policy))
             except (OSError, ValidationError, ValueError) as exc:
@@ -401,7 +426,26 @@ def check_disclosure(rows: Iterable[Mapping[str, Any]], policy: RedactionPolicy 
         for key in sorted(set(row) - AGGREGATE_FIELDS):
             out.append(Finding("not-aggregate", f"field {key!r} is not an allowed aggregate field", where))
         scored = row.get("n_scored")
-        if not isinstance(scored, int) or scored < policy.min_scored:
+        if type(scored) is not int or scored < policy.min_scored:
             out.append(Finding("small-cell", f"n_scored must be an integer >= {policy.min_scored}", where))
+        for key, value in row.items():
+            if key not in AGGREGATE_FIELDS:
+                continue
+            if key in {"n_total", "n_scored", "n_configs"}:
+                valid = type(value) is int and value >= 0
+            elif key in {"coverage", "mape_pct"}:
+                valid = value is None or (type(value) in (int, float) and math.isfinite(value) and value >= 0)
+                if key == "coverage" and valid:
+                    valid = value is None or value <= 1
+            elif key == "residual_quantiles_pct":
+                valid = value is None or (
+                    isinstance(value, Mapping)
+                    and set(value) <= {"p0", "p25", "p50", "p75", "p90", "p95", "p99", "p100"}
+                    and all(type(v) in (int, float) and math.isfinite(v) for v in value.values())
+                )
+            else:
+                valid = isinstance(value, str)
+            if not valid:
+                out.append(Finding("not-aggregate", f"invalid aggregate shape for {key!r}", where))
         out.extend(scan_value({k: v for k, v in row.items() if k in AGGREGATE_FIELDS}, policy, where, where))
     return out

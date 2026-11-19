@@ -15,7 +15,9 @@ SPDX-License-Identifier: Apache-2.0
 # Collect and record GPU time
 
 Stage 2 of [`aisim-benchmark`](../aisim-benchmark/SKILL.md). Only for cells the plan
-marked `collect` or `recollect_or_reevaluate`, within the user's authorization.
+marked `collect` or `recollect_or_reevaluate`, or explicitly approved `not_in_catalog`
+cells (for example FPM/E2E for `Brand/New-Model`), within the user's GPU authorization
+and approved budget. An unknown cell is not authorization to collect it.
 
 ## Collect
 

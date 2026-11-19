@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from aisim_core.data.catalog import build_catalog
-from aisim_core.data.eval import current_records, write_record
+from aisim_core.data.eval import PredictionIdentity, current_records, load_record, write_record
 from tests.unit.data.test_catalog import dataset  # noqa: F401  (fixture)
 from tests.unit.data.test_eval import _predict
 from tests.unit.data.test_eval import built as built_record  # noqa: F401  (fixture)
@@ -141,12 +141,12 @@ def test_requeued_attempt_with_same_job_id_is_a_retry_not_the_result():
 def test_record_gpu_time_kubernetes(tmp_path, capsys):
     tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
     job = {
-        "metadata": {"name": "j", "namespace": "ns"},
+        "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
         "status": {"succeeded": 1},
         "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
     }
     pod = {
-        "metadata": {"name": "j-abc"},
+        "metadata": {"name": "j-abc", "ownerReferences": [{"kind": "Job", "uid": "job-a"}]},
         "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]},
         "status": {
             "phase": "Succeeded",
@@ -160,6 +160,10 @@ def test_record_gpu_time_kubernetes(tmp_path, capsys):
     assert tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")]) == 0
     gt = json.loads(capsys.readouterr().out)["gpu_time"]
     assert gt["gpu_count"] == 4 and gt["gpu_seconds"] == 1800 * 4 and gt["gpu_type"] is None
+    pod["metadata"]["ownerReferences"][0]["uid"] = "job-b"
+    (tmp_path / "pods.json").write_text(json.dumps({"items": [pod]}))
+    assert tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")]) == 2
+    assert "owner" in capsys.readouterr().err
 
 
 def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noqa: F811
@@ -185,3 +189,55 @@ def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noq
     bad.write_text(good.read_text().replace("1.1", "1.5"))
     assert tool.main([str(path), "--truth-root", str(root), "--predictor", str(bad)]) == 1
     assert _predict({"tokens": 10}) == pytest.approx(11.0)
+
+
+def test_attestation_requires_a_predictor_and_copies_the_predecessor(built_record, tmp_path, capsys):  # noqa: F811
+    root, record = built_record
+    previous = record.model_copy(update={"status": "failed", "status_reason": "temporary fixture failure"})
+    write_record(root, previous)
+    record = record.model_copy(update={"supersedes": previous.record_id})
+    path = write_record(root, record)
+    tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
+    dest = tmp_path / "separate-dataset"
+    with pytest.raises(SystemExit) as exc:
+        tool.main([str(path), "--attest-root", str(dest)])
+    assert exc.value.code == 2 and not dest.exists()
+    predictor = tmp_path / "predictor.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    assert tool.main([str(path), "--truth-root", str(root), "--predictor", str(predictor)]) == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info["verification"]["ok"] and "verified_record_path" not in info
+    assert (
+        tool.main([str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(dest)])
+        == 0
+    )
+    verified = load_record(json.loads(capsys.readouterr().out)["verified_record_path"])
+    assert verified.supersedes == record.record_id
+    predecessor = next(dest.rglob(f"{record.record_id}.json"))
+    assert load_record(predecessor) == record and path.is_file()
+    assert load_record(predecessor.parent / f"{previous.record_id}.json") == previous
+
+
+def test_evaluation_reuse_requires_complete_status_and_matching_behavior(built_record):  # noqa: F811
+    root, record = built_record
+    for status in ("failed", "partial"):
+        previous = record.model_copy(update={"status": status, "status_reason": "temporary unavailable input"})
+        path = write_record(root / status, previous)
+        current = current_records(path.parent)
+        assert previous in current and not [r for r in current if r.status == "complete"]
+        retry = record.model_copy(update={"supersedes": previous.record_id})
+        write_record(root / status, retry)
+        assert retry in current_records(path.parent) and previous not in current_records(path.parent)
+    identity = PredictionIdentity.build("fpm_interpolation", {"p": "b" * 64}, "a" * 64, code_version="behavior-v1")
+    assert identity == PredictionIdentity.build(
+        "fpm_interpolation", {"p": "b" * 64}, "a" * 64, code_version="behavior-v1"
+    )
+    assert (
+        identity.fingerprint
+        != PredictionIdentity.build(
+            "fpm_interpolation", {"p": "b" * 64}, "a" * 64, code_version="behavior-v2"
+        ).fingerprint
+    )

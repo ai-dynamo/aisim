@@ -9,6 +9,7 @@ All HTTP is faked; the response shapes mirror the live documented endpoints
 
 import ast
 import json
+import shutil
 import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -253,7 +254,8 @@ def test_correction_keeps_observation_id_changes_hash_and_preserves_old_snapshot
         expected_ttft = 0.2 if member.observation_id == "inferencex:2" else 0.1
         assert json.loads(read_raw_record(root, data, member.observation_id))["metrics"]["mean_ttft"] == expected_ttft
         assert evaluation_points(data)[0].metrics[("ttft", "mean")] == expected_ttft * 1000
-        assert (member.manifest_path == old_paths[member.observation_id]) == (member.observation_id == "inferencex:1")
+        # The original full HTTP page changed too, so even the unchanged row gets a new evidence revision.
+        assert member.manifest_path != old_paths[member.observation_id]
     assert infx_job.load_state(root)["qualified"]["snapshot_id"] == first.snapshot_id
 
 
@@ -413,6 +415,68 @@ def test_model_filter_selecting_nothing_is_valid_empty(root, tmp_path):
     assert result.status == "empty"
 
 
+@pytest.mark.parametrize("selector", ["Other", "other"])
+def test_empty_model_scope_does_not_compare_another_models_prior_data(root, tmp_path, selector):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    before = tree(root)
+    assert make_run(tmp_path, FakeInfx(), models=[selector])[0].status == "empty"
+    assert tree(root) == before
+
+
+@pytest.mark.parametrize("artifact", ["manifest.json", "metrics.parquet"])
+def test_promotion_verifies_member_configuration_artifacts(root, tmp_path, artifact):
+    first, _ = make_run(tmp_path, FakeInfx())
+    state = infx_job.load_state(root)
+    _, members = read_snapshot(root, state["candidate"]["snapshot_path"])
+    directory = (root / members[0].manifest_path).parent
+    path = directory / artifact
+    if not path.exists():
+        path = next(directory.glob("*metrics*.parquet"))
+    path.unlink()
+    before = (root / infx_job.STATE_FILE).read_bytes()
+    with pytest.raises((OSError, ValueError)):
+        promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    assert (root / infx_job.STATE_FILE).read_bytes() == before
+
+
+def test_snapshot_document_publication_is_atomic_and_retryable(root, tmp_path, monkeypatch):
+    original = infx_ingest.os.replace
+
+    def interrupt(source, destination):
+        if str(destination).endswith("/snapshot.json"):
+            raise OSError("interrupted snapshot publication")
+        return original(source, destination)
+
+    monkeypatch.setattr(infx_ingest.os, "replace", interrupt)
+    with pytest.raises(OSError, match="interrupted"):
+        make_run(tmp_path, FakeInfx())
+    assert not list(root.rglob("snapshot.json")) and not (root / infx_job.STATE_FILE).exists()
+    monkeypatch.setattr(infx_ingest.os, "replace", original)
+    result, _ = make_run(tmp_path, FakeInfx())
+    assert read_snapshot(root, infx_job.snapshot_path(result.snapshot_id))[0].snapshot_id == result.snapshot_id
+
+
+def test_existing_corrupt_snapshot_is_not_registered(root, tmp_path):
+    acq = infx_ingest.Acquirer(InfxClient(FakeInfx()), infx_ingest.AcquisitionCache(tmp_path / "cache")).acquire()
+    plan = infx_ingest.plan_snapshot(acq)
+    path = root / infx_job.snapshot_path(plan.snapshot_id)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"truncated":')
+    with pytest.raises(ValueError):
+        infx_ingest.write_candidate(root, acq, plan)
+    assert not (root / infx_job.STATE_FILE).exists()
+
+
+def test_malformed_workflow_info_fails_without_changing_qualified_state(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    before = tree(root)
+    result, _ = make_run(tmp_path, FakeInfx(workflow={"error": "unavailable"}))
+    assert result.status == "failed" and "workflow-info" in result.error
+    assert tree(root) == before
+
+
 # --------------------------------------------------------------------------- contradictions
 
 
@@ -431,6 +495,15 @@ def test_same_benchmark_across_as_of_dates_is_deduplicated_ignoring_curve_contex
     assert result.status == "candidate" and result.changes["added"] == ["inferencex:1"]
     _, members = read_snapshot(root, infx_job.load_state(root)["candidate"]["snapshot_path"])
     assert len(members) == 1
+    import gzip
+
+    shutil.rmtree(tmp_path / "cache")
+    data = load_e2e(root, members[0].manifest_path)
+    originals = [a for a in data.manifest.artifacts if "inferencex-response-" in a.path]
+    assert len(originals) == 2
+    assert {gzip.decompress((root / a.path).read_bytes()) for a in originals} == {
+        json.dumps(page).encode() for page in rows.values()
+    }
 
 
 def test_row_for_a_different_model_is_a_contradiction(root, tmp_path):

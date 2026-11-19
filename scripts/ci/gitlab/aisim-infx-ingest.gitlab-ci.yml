@@ -25,7 +25,9 @@ variables:
   #   AISIM_REVIEWED_COMMIT   40-hex commit of ai-dynamo/aisim that was code-reviewed
   #   AISIM_REPO_URL          fetch URL for that repository (read-only)
   #   INFX_CACHE_REPO_URL     git URL of the private aisim-infx-cache repository
-  #   INFX_CACHE_WRITE_TOKEN  fine-grained token: write on aisim-infx-cache ONLY (masked, protected)
+  #   INFX_CACHE_READ_TOKEN   read-only token on aisim-infx-cache (masked, protected)
+  #   INFX_CACHE_WRITE_TOKEN  write on aisim-infx-cache ONLY; environment scope infx-cache-writer
+  #                           (masked, protected; never use the default '*' environment scope)
   #   SLACK_WEBHOOK_URL       incoming webhook for #swdl-dynamo-aisim-daily (masked, protected)
   #   SMTP_HOST, SMTP_FROM, AISIM_JOB_OWNER_EMAIL   owner email alerts (owner: Simone Chen)
   GIT_STRATEGY: empty  # a clean build directory for every job, even on a runner that reuses workspaces
@@ -53,9 +55,15 @@ variables:
 .cache_clone: &cache_clone |
   git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 "$INFX_CACHE_REPO_URL" cache-repo
 
+.cache_read_clone: &cache_read_clone |
+  git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_READ_TOKEN}" clone -q --depth 1 "$INFX_CACHE_REPO_URL" cache-repo
+
 publish_candidate:
   stage: ingest
   extends: .pinned
+  environment:
+    name: infx-cache-writer
+    action: access
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "ingest"'
     - if: '$CI_PIPELINE_SOURCE == "web" && ($AISIM_JOB == null || $AISIM_JOB == "ingest")'
@@ -89,6 +97,9 @@ publish_candidate:
 promote:
   stage: promote
   extends: .pinned
+  environment:
+    name: infx-cache-writer
+    action: access
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web" && $AISIM_JOB == "promote"'
       when: manual
@@ -111,7 +122,7 @@ staleness:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "staleness"'
   script:
     - set -eu
-    - *cache_clone
+    - *cache_read_clone
     # Alert only: exit 10 = warn (>= 8 days), 11 = stale (>= 14 days) since the last qualified snapshot.
     - $JOB_PY staleness --root cache-repo
   allow_failure:
@@ -119,13 +130,47 @@ staleness:
 
 alert_failure:
   stage: notify
-  extends: .pinned
   when: on_failure
-  needs: []
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "ingest"'
+      when: on_failure
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "staleness"'
       when: on_failure
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: on_failure
   script:
-    - $JOB_PY notify --subject "job failed" --text "pipeline ${CI_PIPELINE_URL}; last qualified snapshot retained"
+    # Standard library only: alerts still run if fetching or installing AISim failed.
+    - |
+      python3 - <<'PY'
+      import json
+      import os
+      import smtplib
+      import sys
+      import urllib.request
+      from email.message import EmailMessage
+
+      text = "pipeline " + os.environ["CI_PIPELINE_URL"] + "; last qualified snapshot retained"
+      failures = []
+      try:
+          request = urllib.request.Request(
+              os.environ["SLACK_WEBHOOK_URL"],
+              json.dumps({"channel": "#swdl-dynamo-aisim-daily", "text": text}).encode(),
+              {"Content-Type": "application/json"},
+          )
+          urllib.request.urlopen(request, timeout=30).close()
+      except Exception:
+          failures.append("Slack notification failed")
+      try:
+          message = EmailMessage()
+          message["From"] = os.environ["SMTP_FROM"]
+          message["To"] = os.environ["AISIM_JOB_OWNER_EMAIL"]
+          message["Subject"] = "AISim InferenceX job failed"
+          message.set_content(text)
+          with smtplib.SMTP(os.environ["SMTP_HOST"], timeout=30) as smtp:
+              smtp.send_message(message)
+      except Exception:
+          failures.append("Email notification failed")
+      for failure in failures:
+          print(failure, file=sys.stderr)
+      sys.exit(1 if failures else 0)
+      PY

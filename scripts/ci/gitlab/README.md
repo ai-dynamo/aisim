@@ -11,7 +11,9 @@ internal project by hand.
 2. Set the protected variables listed at the top of the file. `AISIM_REVIEWED_COMMIT` is a full
    40-hex SHA of this repository; bump it only through a reviewed merge request.
 3. Create a token that can write **only** `aisim-infx-cache` and store it as masked, protected
-   `INFX_CACHE_WRITE_TOKEN`. Acquisition (public GET) uses no credential.
+   `INFX_CACHE_WRITE_TOKEN`, with environment scope **`infx-cache-writer`**, never `*`.
+   Only `publish_candidate` and `promote` select that environment. Add a separate masked,
+   protected, read-only `INFX_CACHE_READ_TOKEN` for staleness. Acquisition (public GET) uses no credential.
 4. Schedules: weekly with `AISIM_JOB=ingest`; daily with `AISIM_JOB=staleness`. Manual refresh:
    run a web pipeline (default `ingest`). Promotion: web pipeline with `AISIM_JOB=promote` and
    `CANDIDATE_SNAPSHOT_ID`, started by the reviewing maintainer.
@@ -34,6 +36,8 @@ then. The jobs never push to the default branch.
 
 Configuration shards are stored under `revisions/<content-sha256>/e2e/...`.
 The revision covers the converted rows, manifest body and provenance, including producer metadata.
+Original benchmark HTTP response bodies are retained unchanged as hash-linked provenance alongside
+the normalized record bundles; removing `curve_*` context for deduplication does not erase source evidence.
 Snapshots reference these immutable revisions, so a candidate that corrects a measurement or changes
 configuration membership cannot alter earlier qualified truth. Unchanged revisions are verified and
 reused. Existing snapshots at legacy `e2e/...` paths remain readable and their shards are retained;
@@ -44,6 +48,9 @@ the first refresh after upgrading may create a candidate solely to adopt version
 - `aisim-infx-cache` is reachable by git over HTTPS with a bearer token (the DEP names the repository but
   not the host); adjust the clone/push lines if it is only reachable through the Hugging Face API.
 - Slack alerts use an incoming webhook; email uses the internal SMTP relay named in `SMTP_HOST`.
+  Failure notification uses Python's standard library without cloning or installing AISim. The notify
+  stage waits for earlier stages, including unexpected scheduled staleness failures; statuses 10/11
+  remain allowed warnings and do not trigger the failure job.
 - InferenceX data terms are unresolved (DEP #435 Risks): keep the cache private and never export it publicly.
 
 The logic lives in `python/aisim/src/aisim_core/data/infx_ingest.py` (client, caches, snapshot)

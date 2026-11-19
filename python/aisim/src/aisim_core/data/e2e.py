@@ -1449,6 +1449,21 @@ def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[Snapsho
     return snapshot, members
 
 
+def verify_snapshot_members(root: Path, members: Sequence[SnapshotMember]) -> None:
+    """Verify that every member still reaches the exact observation it pins."""
+    by_path: dict[str, tuple[str, dict[str, str]]] = {}
+    for member in members:
+        if member.manifest_path not in by_path:
+            data = load_e2e(root, member.manifest_path)
+            by_path[member.manifest_path] = (
+                data.manifest.configuration_id,
+                {o.observation_id: o.record_sha256 for o in data.observations},
+            )
+        cid, observations = by_path[member.manifest_path]
+        if cid != member.configuration_id or observations.get(member.observation_id) != member.record_sha256:
+            raise ValueError(f"snapshot member does not match configuration contents: {member.observation_id}")
+
+
 # --------------------------------------------------------------------------- InferenceX converter
 
 _IFX_LATENCY = re.compile(r"^(?P<stat>mean|median|std|min|max|p\d+(?:[._]\d+)?)_(?P<metric>ttft|tpot|itl|e2el)$")
