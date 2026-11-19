@@ -48,11 +48,21 @@ def _vision_encoder_parallel(lowered: Mapping[str, Any]) -> str:
     return layout
 
 
-def reject_pipeline_parallelism(role: str, *sizes: object) -> None:
-    """Engine replay has no pipeline-stage scheduler; fail before any capacity work."""
+def reject_pipeline_parallelism(role: str, *sizes: object, backend: str | None = None) -> None:
+    """Fail before any capacity work unless the role's pipeline stages are priced.
 
+    Engine replay models pipeline stages only on an SGLang disaggregated prefill
+    worker: passes retire at the per-stage rate and the last forward crosses the
+    remaining stages before its KV handoff.
+    """
+
+    if role == "prefill" and backend == "sglang":
+        return
     if any(size is not None and size != 1 for size in sizes):
-        raise ValueError(f"engine replay does not support pipeline parallelism for {role}; use pipeline=1")
+        raise ValueError(
+            f"engine replay does not support pipeline parallelism for {role}; use pipeline=1 "
+            "(only an SGLang disaggregated prefill worker accepts pipeline > 1)"
+        )
 
 
 def materialize_aic_num_gpu_blocks(
@@ -73,6 +83,10 @@ def materialize_aic_num_gpu_blocks(
             "dp_size",
             "kv_cache_groups",
             "kv_cache_capacity_bytes",
+            "state_cache",
+            "prefix_match_unit",
+            "kv_cache_bytes_per_token",
+            "block_size",
         ):
             if name in value:
                 result[name] = value[name]
@@ -147,8 +161,9 @@ def materialize_aic_num_gpu_blocks(
                 finally:
                     model.close()
             if diagnostics.get("readiness") != "ready":
-                from .estimator_readiness import unready_estimator_message
+                from .estimator_readiness import reject_unlisted_estimator_version, unready_estimator_message
 
+                reject_unlisted_estimator_version(diagnostics)
                 raise ValueError(unready_estimator_message(diagnostics))
             canonical_result = dict(raw)
             resolved = diagnostics["provenance"]["config"]
@@ -354,10 +369,23 @@ def _materialize_profile_cache_groups(raw: dict[str, Any], diagnostics: dict[str
     deployment.resources.require_memory()
     if deployment.resources.runtime_memory is not None and raw.get("num_gpu_blocks") is not None:
         raise ValueError("runtime FPM memory cannot use fixed num_gpu_blocks; use the recorded cache allocation")
-    if deployment.resources.cache_layout != "grouped":
+    if deployment.resources.cache_layout not in ("grouped", "mamba_align"):
         return False
+    if deployment.resources.cache_layout == "mamba_align" and (
+        raw.get("native_host_offload") is not None or raw.get("g3_offload") is not None
+    ):
+        raise ValueError("Mamba FPM cache supports HBM replay only")
     if raw.get("num_gpu_blocks") is not None:
-        raise ValueError("grouped FPM cache requires a byte budget; fixed num_gpu_blocks is unsupported")
+        raise ValueError(
+            f"{deployment.resources.cache_layout} FPM cache requires a byte budget; fixed num_gpu_blocks is unsupported"
+        )
+    depth = raw.get("aic_nextn", 0)
+    canonical = raw.get("timing_model", {}).get("config", {})
+    if "nextn" in canonical:
+        depth = canonical["nextn"]
+        for name in ("aic_nextn", "nextn"):
+            if name in raw and raw[name] != depth:
+                raise ValueError(f"{name} conflicts with canonical timing configuration")
     estimate = estimate_kv_cache(
         identity.pop("model"),
         identity.pop("system"),
@@ -371,6 +399,7 @@ def _materialize_profile_cache_groups(raw: dict[str, Any], diagnostics: dict[str
         cuda_graph_reserved_bytes=raw.get("cuda_graph_reserved_bytes", 0),
         systems_path=raw.get("systems_path"),
         fpm_profile=profile,
+        nextn=depth,
         **{
             target: raw[source]
             for target, source in (
@@ -387,10 +416,11 @@ def _materialize_profile_cache_groups(raw: dict[str, Any], diagnostics: dict[str
             if raw.get(source) is not None
         },
     )
-    for name, value in (
-        ("kv_cache_groups", estimate["cache_groups"]),
-        ("kv_cache_capacity_bytes", estimate["total_kv_size_bytes"]),
-    ):
+    geometry = estimate.get("replay_cache") or {
+        "kv_cache_groups": estimate["cache_groups"],
+        "kv_cache_capacity_bytes": estimate["total_kv_size_bytes"],
+    }
+    for name, value in geometry.items():
         if name in raw and raw[name] != value:
             raise ValueError(f"{name} conflicts with the canonical FPM resource budget")
         raw[name] = value
@@ -578,11 +608,26 @@ def estimate_kv_bytes_per_token(
         allow_hf_config_download=True,
     )
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)
+    if getattr(estimator, "architecture", None) == "DeepseekV4ForCausalLM":
+        # The dense formula prices every layer's full BF16 KV (88 KiB/token for V4 Flash). V4 stores
+        # FP8 compressed KV (ratio 4 and 128 layers) plus the indexer K; its sliding-window rows are a
+        # fixed per-request state, not token bytes. Replicated on every TP rank.
+        from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
+        from aisim_core.sdk.models import _get_model_info
+
+        if kvcache_quant_mode not in (None, "fp8"):
+            raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8")
+        geometry = _get_model_info(model_name)["extra_params"]
+        return int(deepseek_v4_state_cache(geometry, indexer_cache_dtype="auto")["kv_bytes_per_token"])
     if kvcache_quant_mode is not None:
         from aisim_core.sdk.common import KVCacheQuantMode
 
+        # V4 is refused above; V4.1's compressed cache has no kv_lora_rank.
+        latent = estimator.geometry.get("kv_lora_rank") or estimator.architecture == "DeepseekV41ForCausalLM"
+        if kvcache_quant_mode == "nvfp4" and latent:
+            raise ValueError(f"{model_name}: an nvfp4 KV cache is modeled only for standard K/V attention")
         try:
-            estimator.dtype_bytes = int(KVCacheQuantMode[kvcache_quant_mode].value.memory)
+            estimator.dtype_bytes = KVCacheQuantMode[kvcache_quant_mode].value.memory
         except KeyError as exc:
             raise ValueError(f"unsupported kvcache_quant_mode {kvcache_quant_mode!r}") from exc
     value = estimator.kv_bytes_per_token()
@@ -595,16 +640,18 @@ def estimate_kv_bytes_per_token(
 def resolve_model_context_length(model_name: str) -> int:
     """Resolve ``context_length: max`` from a local, cached, or HF config."""
 
+    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
     from aisim_core.sdk.memory import NaiveKVCacheEstimator
 
     # Both modules ship in the same distribution; reuse the canonical loader.
     config = NaiveKVCacheEstimator._load_config(model_name, allow_hf_config_download=True)
     if not isinstance(config, dict):
         raise ValueError(f"could not load Hugging Face config for {model_name!r}")
-    text_config = config.get("text_config")
-    mappings = [config]
-    if isinstance(text_config, dict):
-        mappings.insert(0, text_config)
+    key = decoder_config_key(config)
+    decoder = config.get(key)
+    if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:
+        raise ValueError(f"Hugging Face config for {model_name!r}: {problem}")
+    mappings = [decoder, config] if decoder is not None else [config]
     for mapping in mappings:
         for name in (
             "max_position_embeddings",

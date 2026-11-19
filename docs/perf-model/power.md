@@ -5,12 +5,33 @@ SPDX-License-Identifier: Apache-2.0
 
 # Modeled power and energy
 
-Op-level FPE returns operation energy. Native Replay accumulates that evidence
-and computes the coverage-gated power summary. Unified prediction and
-recommendation preserve and display `power_w` and `power_coverage`; `predict
---detail energy` exposes available breakdown evidence. Whole-forward FPM,
-fixed, and polynomial timing remain latency-only. EPD's combined report keeps
-unified power unavailable even when its encoder has separate analytical power.
+Native Replay accumulates op-level FPE energy and non-speculative
+schema-v8 FPM component energy. Unified prediction and recommendation display
+`power_w` and `power_coverage`. Use `predict --detail energy` for the
+breakdown. Combined EPD power remains unavailable.
+
+SDK static, aggregate, and disaggregated results and legacy `cli_estimate()`
+use the same 90% coverage threshold. For mixed FPM, measured prefill energy
+is retained and decode marginal energy subtracts the measured KV-floor
+baseline. A marginal with zero latency or missing target or floor power
+contributes zero energy. A positive-latency marginal with zero energy is
+uncovered.
+
+FPM Replay with attention DP sums energy and covered component time across
+working ranks and divides each by summed modeled active rank time, as op-level
+Replay does. The scheduler still uses the slowest rank to price the step.
+[Attention-DP wait accounting](https://linear.app/nvidia/issue/AISIM-2452)
+tracks a later change to both paths.
+
+FPM v6/v7 have no row-power evidence. FPM watts are withheld for speculative
+schemes, models with encoder operations, and language-only EPD workers. The
+legacy disaggregated result withholds watts when either worker withholds them.
+`Task.run_single_agg()` and `Task.run_single_disagg()` include `power_coverage`.
+Raw SDK summaries expose it through `get_power_data_coverage()`. Below
+the gate, available operation energy remains accessible for diagnostics.
+Mixed-step watts are **unqualified** until the measured mixed-step campaign
+passes. The result uses the standard power fields.
+See [schema-8 behavior](methods/whole-forward.md) for the interpolation contract.
 
 The current producers and consumers are
 [Replay reports](../../crates/core/src/replay/report.rs),
@@ -95,10 +116,9 @@ and sets `power_w` to `null`, allowing a consumer to distinguish insufficient
 data from an unsupported energy path. A provider with an energy channel but
 no covered operations therefore reports `power_coverage: 0` and `power_w: null`.
 
-Fixed, polynomial, and forward-pass-metrics (FPM) timing providers do not
-synthesize energy. A replay using any of those providers, or mixing an
-energy-aware role with an energy-unaware role, returns `power_w: null` and
-`power_coverage: null`. The null values never mean zero watts or zero coverage.
+Fixed, polynomial, fitted, and v6/v7 FPM timing do not supply an energy
+channel. A Replay with an energy-unaware role returns `power_w: null` and
+`power_coverage: null`. Unified prediction preserves these nulls.
 
 ## Aggregate and disaggregated deployments
 
@@ -219,6 +239,23 @@ the `0.9` gate is a breaking semantic change. It requires a versioned schema
 and an explicit converter or coordinated result-schema version bump. Adding
 new optional provenance details is backward-compatible when existing meanings
 do not change.
+
+**AISIM-2001 release note.** Supported schema-v8 FPM now reports power in
+Replay and prices mixed-step energy in legacy aggregate. This includes
+`method: direct`, which prices power from the anchors selected for latency.
+DP>1 Replay divides energy and covered time by summed active rank time.
+Mixed-step watts remain unqualified pending measured validation. The approved mixed-step
+exception retains `power-metrics-v1`. Use the producer revision when
+comparing results across the change.
+
+The public Rust `aisim_core::FpmRankEstimate`
+(`crates/core/src/perfmodel/fpm/evidence.rs`) gains `prefill_energy_wms` and
+`decode_energy_wms`, both `Option<f64>`. These fields are optional in serde:
+missing fields deserialize as `None`, and `None` fields are omitted when
+serializing. Existing Rust struct literals that enumerate the old fields
+without a `..` update no longer compile. Callers should use
+`..Default::default()` for unspecified fields. This source compatibility
+change is separate from the additive JSON fields.
 
 Support and accuracy remain separate gates. Execution with sufficient data
 coverage establishes that a power result can be produced; parity with AIC and

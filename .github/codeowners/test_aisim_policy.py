@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -331,6 +332,8 @@ def test_fast_and_full_ci_keep_their_cost_boundary() -> None:
         "readme-commands",
         "application-wheel",
         "python-compliance",
+        "license-crate-inventory",
+        "license-evidence",
     }
     assert set(full_readiness["needs"]) == set(full_config["jobs"]) - {"readiness", "stage-application-wheel"}
     full_readiness_script = full_readiness["steps"][0]["run"]
@@ -424,6 +427,7 @@ def test_full_ci_exact_target_verification(tmp_path: Path) -> None:
 
     matching = {
         "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": "refs/heads/main",
         "EXPECTED_SHA": target_sha,
         "RUN_SHA": target_sha,
     }
@@ -474,7 +478,7 @@ def test_full_ci_trusted_copy_verification(tmp_path: Path) -> None:
     }
 
     assert _run_readiness_script(copy_script, tmp_path, matching).returncode == 0
-    assert (tmp_path / "output.txt").read_text() == f"base={base_sha}\n"
+    assert (tmp_path / "output.txt").read_text() == f"base={base_sha}\nnumber=135\n"
 
     mismatched = {**matching, "FAKE_PR_HEAD": "fedcba9876543210"}
     assert _run_readiness_script(copy_script, tmp_path, mismatched).returncode != 0
@@ -493,7 +497,8 @@ def test_coderabbit_reviews_non_draft_prs_without_opt_in() -> None:
     assert auto_review["enabled"] is True
     assert auto_review["labels"] == ["!wip", "!do-not-review"]
     assert auto_review["drafts"] is False
-    assert auto_review["base_branches"] == ["release/.*"]
+    for target in ["main", "release/1.0", "simonec/unified-data-pr", "topic/arbitrary-stack-parent"]:
+        assert any(re.fullmatch(pattern, target) for pattern in auto_review["base_branches"])
     assert auto_review["ignore_title_keywords"] == [
         "WIP",
         "[skip review]",

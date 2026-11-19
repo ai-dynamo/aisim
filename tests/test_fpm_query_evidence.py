@@ -504,6 +504,53 @@ def test_replay_prices_a_mixed_rank_as_one_canonical_iteration(profile, batching
     assert mixed[0]["estimate"]["latency_ms"] == 4.0
 
 
+def test_powered_direct_replay_exports_energy_and_source(profile, evidence_systems):
+    import jsonschema
+
+    table = Path(evidence_systems) / "data/h200_sxm/vllm/0.25.1/fpm_forward_perf.parquet"
+    policy = "dynamo_native_single_sample_power_window_v1"
+    rows = pq.read_table(table).to_pylist()
+    for row in rows:
+        row.update(
+            model_config_sha256="",
+            execution_profile="full",
+            engram_residency="none",
+            input_modality="text",
+            measurement_policy=policy,
+            measurement_repeats=1,
+            power_w=500.0,
+        )
+    pq.write_table(pa.Table.from_pylist(rows), table)
+    metadata_path = table.with_suffix(".metadata.json")
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        schema_version=8, measurement_policy=policy, parquet_sha256=hashlib.sha256(table.read_bytes()).hexdigest()
+    )
+    metadata_path.write_text(json.dumps(metadata))
+
+    config = CorePredictionConfig.model_validate(prediction(profile, evidence_systems))
+    runner = EngineReplayRunnerFactory().create(0)
+    try:
+        report = runner.run(
+            prediction_to_replay_spec(config),
+            output_requirements=ReplayOutputRequirements(capture_performance_diagnostics=True),
+        )
+    finally:
+        runner.close()
+    assert report.metrics["completed_requests"] == 3
+    assert report.metrics["power_w"] == pytest.approx(500.0)
+    assert report.metrics["power_coverage"] == 1.0
+    details = build_prediction_details(report.metadata["native_report"], ["energy", "source", "time"])
+    schema = json.loads(
+        (Path(__file__).resolve().parents[1] / "docs/reference/schemas/prediction-details.schema.json").read_text()
+    )
+    jsonschema.validate(details, schema)
+    energy = details["sections"]["energy"]["diagnostics"]
+    # Each request contributes 2 ms of prefill and two decode passes of 4/5 ms.
+    assert energy["energy_wms"] == pytest.approx(3 * (2 + 4 + 5) * 500)
+    assert details["sections"]["source"]["status"] == "available"
+
+
 def test_prediction_cli_saves_direct_query_evidence(profile, evidence_systems, tmp_path, capsys):
     import aisim.main as cli
 
@@ -592,6 +639,37 @@ def test_prediction_details_reject_malformed_fpm_evidence(native_prediction_repo
     expected_path = "performance_diagnostics.phases[0].operations[0].fpm_estimates[0]" + "".join(
         f"[{key}]" if isinstance(key, int) else f".{key}" for key in path
     )
+    for section in ("source", "time"):
+        with pytest.raises(ValueError) as error:
+            build_prediction_details(native_prediction_report, (section,))
+        assert str(error.value).startswith(expected_path)
+
+
+@pytest.mark.parametrize("field", ["prefill_energy_wms", "decode_energy_wms"])
+@pytest.mark.parametrize("energy", [0.0, 1250.5])
+def test_prediction_details_preserve_rank_energy(native_prediction_report, field, energy):
+    import jsonschema
+
+    operation = native_prediction_report["performance_diagnostics"]["phases"][0]["operations"][0]
+    operation["fpm_estimates"][0]["estimate"]["ranks"][0][field] = energy
+    original = deepcopy(native_prediction_report)
+    details = build_prediction_details(native_prediction_report, ("source", "time"))
+    schema = json.loads(
+        (Path(__file__).resolve().parents[1] / "docs/reference/schemas/prediction-details.schema.json").read_text()
+    )
+    jsonschema.validate(details, schema)
+    for section in (details["sections"]["source"], details["sections"]["time"]["diagnostics"]):
+        published = section["phases"][0]["operations"][0]["fpm_estimates"]
+        assert published[0]["estimate"]["ranks"][0][field] == energy
+    assert native_prediction_report == original
+
+
+@pytest.mark.parametrize("field", ["prefill_energy_wms", "decode_energy_wms"])
+@pytest.mark.parametrize("energy", [-1.0, float("inf"), float("-inf"), float("nan"), None, True, "1"])
+def test_prediction_details_reject_invalid_rank_energy(native_prediction_report, field, energy):
+    operation = native_prediction_report["performance_diagnostics"]["phases"][0]["operations"][0]
+    operation["fpm_estimates"][0]["estimate"]["ranks"][0][field] = energy
+    expected_path = f"performance_diagnostics.phases[0].operations[0].fpm_estimates[0].estimate.ranks[0].{field}"
     for section in ("source", "time"):
         with pytest.raises(ValueError) as error:
             build_prediction_details(native_prediction_report, (section,))

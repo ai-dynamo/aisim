@@ -67,9 +67,10 @@ vLLM and SGLang replay with either aggregated workers or separate prefill/decode
 pools and HBM-only KV cache, including
 [speculative decoding](../engine/speculation.md) with explicit acceptance
 assumptions; ngram requires vLLM. vLLM also supports local or shared
-[G2 host offload](../engine/kv-cache.md#agentic-g2) on a static single aggregated worker or 1P1D,
-or local G2 on several static aggregated workers, with attention DP1 on every role and
-speculative decoding disabled. For example:
+[G2 host offload](../engine/kv-cache.md#agentic-g2) on static workers of any count and
+attention DP; speculative decoding with G2 is limited to canonical MTP, or to MTP on a
+[hybrid G2](../engine/kv-cache.md#hybrid-g2) with
+`engine.speculation.disable_eagle_block_drop`. For example:
 
 ```yaml
 traffic:
@@ -92,7 +93,8 @@ it remains resident on every worker.
 
 Weka, Agentic Mooncake, and agentic Dynamo trace inputs use this same offline
 path. Reading a Dynamo trace does not require the Dynamo integration. Agentic
-TensorRT-LLM, G3 offload, speculative decoding with G2 offload, and online P/D
+TensorRT-LLM, G3 offload, G2 offload with speculation other than those MTP
+cases, and online P/D
 are rejected;
 the built-in runner does not silently change the requested configuration.
 Dynamo-owned routing and online integration require separate downstream
@@ -157,8 +159,13 @@ recommendation use the same field.
 This is a request-boundary snapshot. Requests whose recorded start is strictly
 before the cut are history, including requests whose recorded service interval
 crosses the cut. Requests at or after the cut remain in the continuation.
-Recorded service intervals provide dependency-timer provenance. Dynamo request
-traces retain their existing first-request clock origin and preserve all source
+With `traffic.source.client: agentx` and `agentic_snapshot`, a continuing
+request whose previous or spawning turn lies before the cut also waits for its
+recorded offset from the cut. Live joins and replay barriers still gate
+dispatch; requests whose previous or spawning turn remains live follow
+dependency events. Recorded service intervals provide dependency-timer
+provenance. Dynamo request traces retain their existing first-request clock
+origin and preserve all source
 intervals separately from completion-relative execution gates; legacy graph
 serialization and digests are unchanged. The snapshot
 does not estimate partial decode progress or restore a physical engine checkpoint.

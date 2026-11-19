@@ -774,8 +774,12 @@ def test_nightly_accuracy_is_independent_from_release_staging_and_keeps_preview_
         == "e2e-accuracy-preview-evidence-${{ inputs.artifact_key }}-shard-${{ matrix.shard }}"
     )
     assert shard_uploads[2]["with"]["path"] == "${{ runner.temp }}/accuracy-evidence-encrypted/"
-    wheel_upload = next(s for s in workflow["jobs"]["wheel"]["steps"] if "upload-artifact@" in s.get("uses", ""))
-    assert wheel_upload["with"]["overwrite"] == "true"
+    wheel_upload = next(
+        s
+        for s in workflow["jobs"]["wheel"]["steps"]
+        if s.get("uses", "").endswith("/wheel-storage") and s["with"]["mode"] == "upload"
+    )
+    assert wheel_upload["with"]["mode"] == "upload"
     assert wheel_upload["with"]["name"] == "e2e-accuracy-wheel-${{ inputs.artifact_key }}"
     # The container hook remaps one directory, not multiline absolute paths.
     assert uploads[0]["with"]["path"] == "${{ runner.temp }}/accuracy-public/"
@@ -1334,13 +1338,14 @@ def test_predictor_layout_rejects_multiple_baseline_apis(adapters):
     "api,adapter_name",
     [
         ("aisim.legacy_cli.api", "aisim.sdk.config_adapter"),
+        ("aisimulate.legacy_cli.api", "aisimulate.sdk.config_adapter"),
         ("aiconfigurator.cli.api", "aiconfigurator.sdk.config_adapter"),
     ],
 )
 def test_predict_point_calls_selected_api_and_adapter(monkeypatch, api, adapter_name):
     files = [api.replace(".", "/") + ".py", adapter_name.replace(".", "/") + "/__init__.py"]
     monkeypatch.setattr(campaign, "installed_distribution", lambda: SimpleNamespace(files=files))
-    monkeypatch.setitem(sys.modules, "aisim.runner", SimpleNamespace(EngineReplayRunnerFactory=object))
+    application = "aisim" if api.startswith("aisim.") else "aisimulate"
     calls = []
     request = SimpleNamespace(
         topology=SimpleNamespace(kind="agg", worker=SimpleNamespace(replicas=1, gpus_per_replica=0))
@@ -1359,12 +1364,20 @@ def test_predict_point_calls_selected_api_and_adapter(monkeypatch, api, adapter_
         raise ValueError("test baseline failure")
 
     modules = {
+        application + ".runner": SimpleNamespace(EngineReplayRunnerFactory=object),
         api: SimpleNamespace(cli_estimate=estimate),
         adapter_name: SimpleNamespace(
             InferenceXSource=lambda **values: values, adapt_config=adapt, to_cli_estimate_kwargs=kwargs
         ),
     }
-    monkeypatch.setattr(campaign.importlib, "import_module", modules.__getitem__)
+    original_import = campaign.importlib.import_module
+
+    def import_evaluated_wheel(name, *args, **kwargs):
+        if application == "aisimulate" and name == "aisim.runner":
+            raise ModuleNotFoundError("canonical namespace absent from historical wheel", name="aisim")
+        return modules[name] if name in modules else original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(campaign.importlib, "import_module", import_evaluated_wheel)
     result = campaign.predict_point({"id": "point", "config": {}, "benchmark": {}})
     assert result["outcome"] == "baseline_failed"
     assert calls == [("adapt", {"config": {}, "benchmark": {}}), ("estimate", {"test_input": 42})]
@@ -1419,7 +1432,12 @@ def test_campaign_does_not_infer_measured_output_from_total(monkeypatch, output)
             to_cli_estimate_kwargs=lambda _: {},
         ),
     }
-    monkeypatch.setattr(campaign.importlib, "import_module", modules.__getitem__)
+    original_import = campaign.importlib.import_module
+    monkeypatch.setattr(
+        campaign.importlib,
+        "import_module",
+        lambda name, *a, **kw: modules[name] if name in modules else original_import(name, *a, **kw),
+    )
     monkeypatch.setattr(campaign, "replay_spec", lambda *_: None)
     config = dict(
         id=1,
@@ -1526,7 +1544,7 @@ def source_config_adapter(monkeypatch):
     # Pages installs only its pinned Python dependencies, not an AISim wheel.
     # The adapter/replay contracts are pure Python; the runner is stubbed below.
     existing_modules = set(sys.modules)
-    monkeypatch.syspath_prepend(str(ROOT / "python" / "aisimulate" / "src"))
+    monkeypatch.syspath_prepend(str(ROOT / "python" / "aisim" / "src"))
     try:
         from aisim.sdk import config_adapter
 
@@ -1535,7 +1553,7 @@ def source_config_adapter(monkeypatch):
         # Do not make later Pages tests mistake source imports for an installed
         # wheel with a native runtime, after monkeypatch restores sys.path.
         for name in set(sys.modules) - existing_modules:
-            if name.split(".")[0] in {"aisimulate", "aisim_core"}:
+            if name.split(".")[0] in {"aisim", "aisimulate", "aisim_core", "aisimulate_core"}:
                 sys.modules.pop(name, None)
 
 
@@ -1596,7 +1614,12 @@ def test_ep_prediction_preserves_physical_gpus_through_publication(
     }
     files = ["aisim/legacy_cli/api.py", "aisim/sdk/config_adapter/__init__.py"]
     monkeypatch.setattr(campaign, "installed_distribution", lambda: SimpleNamespace(files=files))
-    monkeypatch.setattr(campaign.importlib, "import_module", modules.__getitem__)
+    original_import = campaign.importlib.import_module
+    monkeypatch.setattr(
+        campaign.importlib,
+        "import_module",
+        lambda name, *a, **kw: modules[name] if name in modules else original_import(name, *a, **kw),
+    )
     result = campaign.predict_point(point)
     row = result["row"]
     assert row["silicon_github_run_id"] == "28196140241"
@@ -1682,7 +1705,12 @@ def test_old_wheel_incorrect_topology_cannot_publish(monkeypatch, dp_attention):
     }
     files = ["aisim/legacy_cli/api.py", "aisim/sdk/config_adapter/__init__.py"]
     monkeypatch.setattr(campaign, "installed_distribution", lambda: SimpleNamespace(files=files))
-    monkeypatch.setattr(campaign.importlib, "import_module", modules.__getitem__)
+    original_import = campaign.importlib.import_module
+    monkeypatch.setattr(
+        campaign.importlib,
+        "import_module",
+        lambda name, *a, **kw: modules[name] if name in modules else original_import(name, *a, **kw),
+    )
     monkeypatch.setitem(sys.modules, "aisim.runner", SimpleNamespace(EngineReplayRunnerFactory=object))
     assert campaign.predict_point(point) == {
         "id": "ep-point",

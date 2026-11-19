@@ -273,6 +273,8 @@ pub(crate) struct AdmissionEvent {
 pub(crate) struct EnginePassResult {
     pub(crate) committed_requests: Vec<Uuid>,
     pub(crate) end_ms: f64,
+    /// Modeled pass boundary with serial batch selection excluded, when charged.
+    pub(crate) end_without_selection_ms: Option<f64>,
     /// Scheduler-owned same-timestamp convergence status. This is not an
     /// externally observable effect or ordinary progress.
     pub(crate) same_timestamp_retry: SameTimestampRetry,
@@ -293,6 +295,10 @@ pub(crate) struct EnginePassResult {
     /// Forward pass metrics snapshot for this iteration.
     pub(crate) fpm: Option<ForwardPassSnapshot>,
     pub(crate) decode_acceptance: DecodeAcceptance,
+    /// vLLM `launch`: when the engine loop returns the previous pass's
+    /// outputs, after launching this pass. `None` when the previous pass's
+    /// outputs left at its end.
+    pub(crate) previous_returned_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

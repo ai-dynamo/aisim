@@ -200,7 +200,7 @@ struct AgenticDependentEdge {
 /// predecessor already ran, even while a join or replay barrier still gates it.
 /// Without causal edges, as for the first request of a detected chain, any
 /// pending barrier or join stands in for the spawn.
-fn waits_on_live_work(
+pub(super) fn waits_on_live_work(
     dependencies: &[AgenticDependency],
     pending: impl Fn(&AgenticDependency) -> bool,
 ) -> bool {

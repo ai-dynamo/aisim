@@ -103,6 +103,23 @@ class AicEngine:
         list[_PerOpValueWithMetadata],
         list[_PerOpValueWithMetadata],
     ]: ...
+    def _run_static_per_op_with_coverage(
+        self,
+        batch_size: int,
+        beam_width: int,
+        isl: int,
+        osl: int,
+        prefix: int,
+        seq_imbalance_correction_scale: float,
+        gen_seq_imbalance_correction_scale: float,
+        mode: str = "static",
+        stride: int = 32,
+    ) -> tuple[
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        float,
+        float,
+    ]: ...
     def mixed_step_breakdown_per_op(
         self,
         ctx_tokens: int,
@@ -127,9 +144,8 @@ class AicEngine:
         seq_imbalance_correction_scale: float = 1.0,
         gen_seq_imbalance_correction_scale: float = 1.0,
     ) -> tuple[
-        list[_PerOpValueWithMetadata],
-        list[_PerOpValueWithMetadata],
-        list[_PerOpValueWithMetadata],
+        tuple[list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata]],
+        float | None,
     ]: ...
     def decode_step_per_op(
         self,

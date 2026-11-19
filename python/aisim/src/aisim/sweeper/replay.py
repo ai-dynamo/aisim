@@ -356,44 +356,31 @@ class HookCapability:
 def _require_agentic_g2_scope(spec: ReplaySpec, roles: list[tuple[str, Mapping[str, Any]]]) -> None:
     """Constrain agentic offload without narrowing ordinary HBM-only replay.
 
-    Inspect every role, including roles without G2: the supported P/D fleet is
-    one DP1 worker per role. Canonical timing and flat topology aliases must
-    receive the same early gate before a runner materializes either form.
+    Inspect every role, including roles without G2: every role must be a static
+    vLLM pool. Canonical timing must receive the same early gate before a runner
+    materializes it.
     """
 
     ranks = [(role, args, args.get("rank", args)) for role, args in roles]
     if not any(isinstance(rank, Mapping) and rank.get("native_host_offload") is not None for _, _, rank in ranks):
         return
-    # Imported here: the SDK loads the Rust runtime, and this module is read
-    # where it is not built, through result.py.
-    from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
-
     deployment = spec.backend_deployment
     if spec.execution_mode != "offline":
         raise ValueError("agentic host offload requires offline execution")
     if deployment.backend != "vllm":
         raise ValueError("agentic host offload requires backend=vllm on every role")
     if deployment.deployment_mode == "agg":
-        counts = (deployment.num_workers,)
+        counts = {"num_workers": deployment.num_workers}
     elif deployment.deployment_mode == "disagg":
-        counts = (deployment.num_prefill_workers, deployment.num_decode_workers)
+        counts = {
+            "num_prefill_workers": deployment.num_prefill_workers,
+            "num_decode_workers": deployment.num_decode_workers,
+        }
     else:
         raise ValueError("agentic host offload supports only aggregated or disaggregated workers")
-    # Each aggregated worker owns a private G2; a shared pool and P/D keep one
-    # worker per role.
-    shared = any(
-        isinstance(rank, Mapping)
-        and isinstance(rank.get("native_host_offload"), Mapping)
-        and rank["native_host_offload"].get("scope", "dp_rank_local") != "dp_rank_local"
-        for _, _, rank in ranks
-    )
-    if any(type(count) is not int or count < 1 for count in counts) or (
-        any(count != 1 for count in counts) and (deployment.deployment_mode != "agg" or shared)
-    ):
-        raise ValueError(
-            "agentic host offload requires one aggregated worker or one prefill and one decode worker, "
-            "or static aggregated workers with scope=dp_rank_local"
-        )
+    for name, count in counts.items():
+        if type(count) is not int or count < 1:
+            raise ValueError(f"agentic host offload requires {name} to be a positive integer, got {count!r}")
     if any(hook.kind == "scaling_policy" for hook in spec.runtime_hooks):
         raise ValueError("agentic host offload requires static worker pools without a scaling policy")
     for role, args, rank in ranks:
@@ -419,51 +406,37 @@ def _require_agentic_g2_scope(spec: ReplaySpec, roles: list[tuple[str, Mapping[s
             for name in names
         ):
             raise ValueError("agentic host offload requires backend=vllm on every role")
+        speculation = rank.get("speculation")
+        # With a state cache, MTP takes G2 only with the EAGLE block drop off.
+        hybrid_mtp = (
+            rank.get("state_cache") is not None
+            and (
+                rank.get("disable_eagle_block_drop") is True
+                or (isinstance(speculation, Mapping) and speculation.get("disable_eagle_block_drop") is True)
+            )
+            and all(
+                isinstance(selection, Mapping) and selection.get("kind") == "mtp"
+                for selection in (speculation, identity.get("speculation"))
+                if selection is not None
+            )
+        )
         if (
             any(rank.get(name) is not None for name in ("aic_nextn", "nextn", "speculation"))
             or any(identity.get(name) is not None for name in ("aic_nextn", "speculation"))
             or identity.get("nextn") not in (None, 0)
-        ):
+        ) and not hybrid_mtp:
             selections = [
                 selection
                 for selection in (rank.get("speculation"), identity.get("speculation"))
                 if selection is not None
             ]
-            if not (
-                deployment.deployment_mode == "agg"
-                and role == "aggregated"
-                and deployment.num_workers == 1
-                and selections
-                and all(isinstance(selection, Mapping) and selection.get("kind") == "mtp" for selection in selections)
-                and isinstance(offload, Mapping)
-                and offload.get("scope", "dp_rank_local") == "dp_rank_local"
-                and rank.get("enable_prefix_caching", True) is True
-                and rank.get("g3_offload") is None
-                and rank.get("state_cache") is None
-                and rank.get("prefix_match_unit") is None
-                and not rank.get("kv_cache_groups")
+            if not selections or not all(
+                isinstance(selection, Mapping) and selection.get("kind") == "mtp" for selection in selections
             ):
                 raise ValueError(
-                    "agentic G2 replay requires speculative decoding disabled except canonical MTP "
-                    "on an aggregated worker with prefix caching and scope=dp_rank_local"
+                    "agentic host offload requires canonical mtp speculation or speculative decoding "
+                    f"disabled on the {role} role, or MTP with state_cache and disable_eagle_block_drop"
                 )
-        prefix = "" if role == "aggregated" else f"{role}_"
-        # A fitted snapshot's identity may spell its width unknown; as in the
-        # runner, that leaves the role's own DP, which the other sources give.
-        known_identity = {name: value for name, value in identity.items() if value != UNKNOWN_IDENTITY}
-        dp_values = [
-            source[name]
-            for source, names in (
-                (args, ("dp_size", "aic_attention_dp_size")),
-                (rank, ("dp_size", "aic_attention_dp_size")),
-                (known_identity, ("attention_dp", "attention_dp_size")),
-                (deployment.parallel_config, (f"{prefix}attention_dp",)),
-            )
-            for name in names
-            if name in source
-        ]
-        if any(type(value) is not int or value != 1 for value in dp_values):
-            raise ValueError("agentic host offload requires attention DP=1 on every role")
 
 
 @dataclass(frozen=True)
@@ -499,6 +472,7 @@ class RunnerCapabilities:
     supports_generic_speculation: bool = False
     supports_tokenization: bool = False
     supports_detokenization: bool = False
+    supports_scheduler_launch: bool = False
     supports_deferred_encoder_overlay: bool = False
     supports_mtp_host_offload: bool = False
 
@@ -715,6 +689,13 @@ class RunnerCapabilities:
                 raise ValueError("runner does not support engine.detokenization; use --stack engine")
             if spec.execution_mode != "offline":
                 raise ValueError("engine.detokenization requires offline replay")
+        agg_rank = (deployment.agg_engine_args or {}).get("rank", deployment.agg_engine_args)
+        if isinstance(agg_rank, Mapping) and agg_rank.get("launch") is not None:
+            # Only offline replay releases the outputs a vLLM rank holds until it returns them.
+            if not self.supports_scheduler_launch:
+                raise ValueError("runner does not support scheduler.launch; use --stack engine")
+            if spec.execution_mode != "offline":
+                raise ValueError("scheduler.launch requires offline replay")
         if deployment.encoder is not None and deployment.deployment_mode not in {"agg", "disagg"}:
             raise ValueError("encoder pools support only agg/disagg language deployments; AFD is unsupported")
         if deployment.encoder is not None:

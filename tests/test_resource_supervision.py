@@ -112,12 +112,16 @@ def test_child_exit_code_is_preserved(tmp_path):
 
 @pytest.mark.parametrize("failure", ["missing", "malformed", "override", "resources"])
 @pytest.mark.parametrize("stack", ["engine", "missing-stack"])
-def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack):
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack, suffix):
     import subprocess
 
-    config = tmp_path / "config.yaml"
+    config = tmp_path / f"config{suffix}"
     if failure != "missing":
-        config.write_text("[" if failure == "malformed" else "execution:\n  resources:\n    memory_limit_gb: -1\n")
+        serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+        config.write_text(
+            "[" if failure == "malformed" else serialize({"execution": {"resources": {"memory_limit_gb": -1}}})
+        )
     output = tmp_path / "output"
     output.mkdir()
     original = {"prediction.json": '{"old":true}', "resource-runtime.json": '{"old_runtime":true}'}
@@ -145,6 +149,7 @@ def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, fai
         assert "missing-stack" in result.stderr
         assert "could not read configuration" not in result.stderr
         assert "malformed YAML" not in result.stderr
+        assert "malformed JSON" not in result.stderr
         assert "invalid --set" not in result.stderr
 
 
@@ -912,8 +917,10 @@ aisim.cli_args._extract_output_configs({'artifact': {}}, ['artifact'], stack='en
 
 runtime = ('aisim._runtime', 'aisim.sweeper', 'numpy', 'pandas')
 assert not any(name == root or name.startswith(root + '.') for name in sys.modules for root in runtime)
-# Profile validation needs only lightweight metadata before resource admission.
-allowed_core = {'aisim_core', 'aisim_core.fpm_profile', 'aisim_core.quantization'}
+# Profile validation needs only lightweight metadata before resource admission. The perf model
+# loader is the standard library only; the config rules take the estimator key names from it.
+allowed_core = {'aisim_core', 'aisim_core.ais_perf_model', 'aisim_core.fpm_profile',
+                'aisim_core.quantization'}
 loaded_core = {name for name in sys.modules if name == 'aisim_core' or name.startswith('aisim_core.')}
 assert loaded_core <= allowed_core, loaded_core - allowed_core
 """,

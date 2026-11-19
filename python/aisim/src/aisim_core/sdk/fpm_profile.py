@@ -12,6 +12,7 @@ from pathlib import Path
 from aisim_core.fpm_profile import _MUTABLE_REFERENCES
 from aisim_core.fpm_profile import FpmCacheGroup as FpmCacheGroup
 from aisim_core.fpm_profile import FpmDeploymentProfile as FpmDeploymentProfile
+from aisim_core.fpm_profile import FpmMambaCache as FpmMambaCache
 from aisim_core.fpm_profile import FpmModelProfile as FpmModelProfile
 from aisim_core.fpm_profile import FpmResourceProfile as FpmResourceProfile
 from aisim_core.fpm_profile import FpmRuntimeMemoryProfile as FpmRuntimeMemoryProfile
@@ -96,7 +97,7 @@ def _load_pinned_checkpoint_config(model: str, revision: str) -> dict | None:
 
 def _validate_checkpoint_architecture(profile: FpmModelProfile) -> None:
     """Verify raw checkpoint metadata without loading weights or remote code."""
-    from aisim_core.sdk.fpm_model_metadata import decoder_config_key
+    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
     from aisim_core.sdk.utils import HuggingFaceDownloadError, _load_local_config
 
     checkpoint = Path(profile.model).expanduser()
@@ -116,8 +117,12 @@ def _validate_checkpoint_architecture(profile: FpmModelProfile) -> None:
     if not isinstance(metadata, dict):
         raise ValueError(f"FPM profile checkpoint config.json must be a mapping for {identity}")
     # Match the collector's text-model view of checkpoint metadata. A decoder that declares no architectures,
-    # absent or null, keeps the wrapper's, as the collector and config intake read it.
-    decoder = metadata.get(decoder_config_key(metadata))
+    # absent or null, keeps the wrapper's, as the collector and config intake read it. A decoder key that does not
+    # hold one text decoder is refused, as the collector and config intake refuse it.
+    key = decoder_config_key(metadata)
+    decoder = metadata.get(key)
+    if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:
+        raise ValueError(f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}")
     if isinstance(decoder, dict):
         merged = {**metadata, **decoder}
         if decoder.get("architectures") is None:

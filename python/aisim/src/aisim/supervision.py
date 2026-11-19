@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import multiprocessing.spawn
@@ -30,6 +31,7 @@ from .config.common import (
     RECOMMENDATION_CORE_SECTIONS,
     ResourceConfig,
 )
+from .package_identity import PROGRAM_ENVIRONMENT, program_name
 from .resources import ResourceLimitError, descendants_of, discover_host, resolve_budget
 
 _CONTEXT = "_AISIM_SUPERVISED_BUDGET"
@@ -234,10 +236,16 @@ def run_process(
     policy: ResourceConfig,
     timeout: float | None = None,
     events_output: str | None = None,
+    output_lock: int | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="aisim-monitor-") as directory:
         return _run_process(
-            command, policy=policy, timeout=timeout, events_output=events_output, directory=Path(directory)
+            command,
+            policy=policy,
+            timeout=timeout,
+            events_output=events_output,
+            directory=Path(directory),
+            output_lock=output_lock,
         )
 
 
@@ -248,6 +256,7 @@ def _run_process(
     timeout: float | None,
     events_output: str | None,
     directory: Path,
+    output_lock: int | None = None,
 ) -> dict[str, Any]:
     """Run an owned process tree under one fixed budget and live host headroom.
 
@@ -266,13 +275,22 @@ def _run_process(
     env = dict(os.environ)
     env.update(dict.fromkeys(_THREAD_VARIABLES, "1"))
     env["TOKENIZERS_PARALLELISM"] = "false"
+    # Preserve the invoked CLI in parser errors from the supervised worker.
+    env[PROGRAM_ENVIRONMENT] = program_name()
     events_path = directory / "events.jsonl"
     ready_path = directory / "ready"
     env[_CONTEXT] = json.dumps(
         {**budget, "supervisor_pid": os.getpid(), "events_path": str(events_path), "ready_path": str(ready_path)}
     )
+    pass_fds: tuple[int, ...] = ()
+    env.pop(OUTPUT_LOCK_FD_ENVIRONMENT, None)
+    if output_lock is not None:
+        # The worker holds the same locked open file description, so the output
+        # directory stays locked through its writes even if this process exits.
+        env[OUTPUT_LOCK_FD_ENVIRONMENT] = str(output_lock)
+        pass_fds = (output_lock,)
     started = time.monotonic()
-    process = subprocess.Popen(list(command), env=env, start_new_session=os.name == "posix")
+    process = subprocess.Popen(list(command), env=env, start_new_session=os.name == "posix", pass_fds=pass_fds)
     tree = OwnedTree(process)
     peak = 0
     reason = ""
@@ -351,6 +369,9 @@ def _save_report(output: str, filename: str, report: dict[str, Any], *, overwrit
         target.write("\n")
 
 
+# Mirrors aisim.output.OUTPUT_LOCK_FD_ENVIRONMENT without importing output here.
+OUTPUT_LOCK_FD_ENVIRONMENT = "AISIM_OUTPUT_DIR_LOCK_FD"
+
 # Mirrors stack.py and output_adapter.py without importing runner or result modules here.
 _BUILTIN_STACKS = frozenset({"engine"})
 _STACK_GROUP = "aisim.runner_factories"
@@ -396,7 +417,9 @@ def _require_known_sections(raw: dict[str, Any], *, command: str, stack: str) ->
 
 def main(argv: Sequence[str] | None = None) -> int:
     from .cli_args import _apply_overrides, _extract_output_configs, _load_mapping, build_parser
-    from .output import prepare_output_directory
+    from .config.ais_perf_model import anchor_paths, warn_old_keys
+    from .config.cli import config_folder
+    from .output import OutputDirectoryOwnership, prepare_output_directory
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -410,9 +433,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(str(exc))
         except KeyboardInterrupt:
             return 130
-    raw = None
+    if args.command == "perf-model":
+        from .perf_model_cli import run_perf_model_command
+
+        try:
+            return run_perf_model_command(args)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        except KeyboardInterrupt:
+            return 130
+    raw = file_raw = None
     try:
         raw = _load_mapping(args.config)
+        # A path written in the file starts at the file's folder. A path given
+        # with --set starts at the working directory, so anchor before overrides.
+        raw = anchor_paths(raw, config_folder(args.config), args.command)
+        # --set edits the mapping in place; the deprecation hint needs what the file itself said.
+        file_raw = copy.deepcopy(raw) if args.overrides else raw
         _apply_overrides(raw, args.overrides, command=args.command)
         policy = ResourceConfig.model_validate(raw.get("execution", {}).get("resources", {}))
     except (OSError, ValueError, AttributeError):
@@ -465,60 +502,70 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise ValueError("encoder pools require --stack engine without adapters")
         except (ValueError, TypeError, AttributeError) as exc:
             parser.error(f"{args.config}: {exc}")
-    event_output = None
     if raw is not None:
+        # Old estimator fields keep working and warn once, here in the process the
+        # user started. The call stays outside every try: when warnings are turned
+        # into errors, the warning must not be reported as a configuration error.
+        warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw)
+    # The output directory stays locked until the last report below is written.
+    with OutputDirectoryOwnership() as ownership:
+        event_output = None
+        output_lock = None
+        if raw is not None:
+            try:
+                output = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
+            event_output = str(output / "execution-events.jsonl")
+            output_lock = ownership.descriptor_for(output)
+        resource_plan = None
         try:
-            output = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
-        except (OSError, ValueError) as exc:
-            parser.error(str(exc))
-        event_output = str(output / "execution-events.jsonl")
-    resource_plan = None
-    try:
-        report = run_process(
-            [sys.executable, "-m", "aisim.resource_worker", "cli", *arguments],
-            policy=policy,
-            events_output=event_output,
-        )
-    except ResourceLimitError as exc:
-        resource_plan = {
-            "schema_version": 1,
-            "stack": args.stack,
-            "host": None,
-            "budget": None,
-            "estimate": None,
-            "requested_resources": policy.model_dump(mode="json"),
-            **exc.plan,
-        }
-        report = {
-            "schema_version": 1,
-            "status": "resource_limited",
-            "reason": str(exc),
-            "exit_code": None,
-            "budget": None,
-            "requested_resources": policy.model_dump(mode="json"),
-            "peak_observed_rss_bytes": None,
-            "wall_seconds": None,
-            "thread_limit_per_runtime": None,
-            "termination_complete": None,
-            **exc.plan,
-        }
-    if report["status"] != "completed":
-        sys.stderr.write(f"aisim: {report.get('reason', report['status'])}\n")
-    if raw is not None:
-        for filename, payload in (("resource-plan.json", resource_plan), ("resource-runtime.json", report)):
-            if payload is not None:
-                try:
-                    _save_report(args.output_dir, filename, payload, overwrite=args.overwrite)
-                except (OSError, ValueError) as exc:
-                    sys.stderr.write(f"could not save {filename}: {exc}\n")
-    if report["status"] == "resource_limited":
-        return 3
-    if report["status"] == "cancelled":
-        return 130
-    if report["status"] == "timed_out":
-        return 124
-    code = int(report.get("exit_code") or 0)
-    return 1 if code < 0 else code
+            report = run_process(
+                [sys.executable, "-m", "aisim.resource_worker", "cli", *arguments],
+                policy=policy,
+                events_output=event_output,
+                output_lock=output_lock,
+            )
+        except ResourceLimitError as exc:
+            resource_plan = {
+                "schema_version": 1,
+                "stack": args.stack,
+                "host": None,
+                "budget": None,
+                "estimate": None,
+                "requested_resources": policy.model_dump(mode="json"),
+                **exc.plan,
+            }
+            report = {
+                "schema_version": 1,
+                "status": "resource_limited",
+                "reason": str(exc),
+                "exit_code": None,
+                "budget": None,
+                "requested_resources": policy.model_dump(mode="json"),
+                "peak_observed_rss_bytes": None,
+                "wall_seconds": None,
+                "thread_limit_per_runtime": None,
+                "termination_complete": None,
+                **exc.plan,
+            }
+        if report["status"] != "completed":
+            sys.stderr.write(f"aisim: {report.get('reason', report['status'])}\n")
+        if raw is not None:
+            for filename, payload in (("resource-plan.json", resource_plan), ("resource-runtime.json", report)):
+                if payload is not None:
+                    try:
+                        _save_report(args.output_dir, filename, payload, overwrite=args.overwrite)
+                    except (OSError, ValueError) as exc:
+                        sys.stderr.write(f"could not save {filename}: {exc}\n")
+        if report["status"] == "resource_limited":
+            return 3
+        if report["status"] == "cancelled":
+            return 130
+        if report["status"] == "timed_out":
+            return 124
+        code = int(report.get("exit_code") or 0)
+        return 1 if code < 0 else code
 
 
 def supervised_recommendation(config, kwargs):

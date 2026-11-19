@@ -190,6 +190,7 @@ class TestParseHFConfig:
             "n_groups": 8,
             "chunk_size": 128,
             "moe_shared_expert_intermediate_size": 3712,
+            "mamba_ssm_cache_dtype": "bfloat16",
         }
 
         result = _parse_hf_config_json(config)
@@ -206,6 +207,7 @@ class TestParseHFConfig:
         assert extra_params.hybrid_override_pattern == "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
         assert extra_params.mamba_num_heads == 64
         assert extra_params.moe_shared_expert_intermediate_size == 3712
+        assert extra_params.mamba_ssm_cache_dtype == "bfloat16"
 
     def test_parse_nemotronh_without_moe(self):
         """Test parsing a NemotronH config without MoE layers (no 'E' in pattern)."""
@@ -240,6 +242,33 @@ class TestParseHFConfig:
         assert extra_params is not None
         assert "E" not in extra_params.hybrid_override_pattern  # No MoE layers
         assert extra_params.moe_shared_expert_intermediate_size == 0
+        assert extra_params.mamba_ssm_cache_dtype == "float32"  # absent field
+
+    @pytest.mark.parametrize(("declared", "parsed"), [(None, "float32"), ("", ""), (0, 0)])
+    def test_parse_nemotronh_ssm_cache_dtype_defaults_only_when_null(self, declared, parsed):
+        # Only an absent or null field selects float32; an explicit value, valid or
+        # not, reaches NemotronHConfig unchanged so that set_hybrid_config can reject it.
+        config = {
+            "architectures": ["NemotronHForCausalLM"],
+            "num_hidden_layers": 118,
+            "num_key_value_heads": 8,
+            "hidden_size": 8192,
+            "num_attention_heads": 64,
+            "intermediate_size": 32768,
+            "vocab_size": 131072,
+            "max_position_embeddings": 8192,
+            "attention_head_dim": 128,
+            "hybrid_override_pattern": "M-M*-",
+            "mamba_num_heads": 256,
+            "mamba_head_dim": 64,
+            "ssm_state_size": 256,
+            "conv_kernel": 4,
+            "n_groups": 8,
+            "chunk_size": 128,
+            "mamba_ssm_cache_dtype": declared,
+        }
+
+        assert _parse_hf_config_json(config)["extra_params"].mamba_ssm_cache_dtype == parsed
 
     @pytest.mark.parametrize("architecture", ["NemotronHForCausalLM", "NemotronH_Omni_Reasoning_V3"])
     @pytest.mark.parametrize("attention_names", [("mamba", "attention"), ("linear_attention", "full_attention")])
@@ -1512,6 +1541,32 @@ class TestKVCacheQuantInference:
                 common.KVCacheQuantMode[normalized_kv] if normalized_kv else None
             )
             assert "fmha_quant_mode" not in modes
+
+    # NVFP4 weights must not reset an NVFP4 KV declaration to FP8.
+    @pytest.mark.parametrize(
+        "kv_declaration",
+        [
+            {"kv_cache_quant_algo": "NVFP4"},
+            {"kv_cache_scheme": "NVFP4"},
+            {"kv_cache_scheme": {"num_bits": 4, "type": "float"}},
+        ],
+    )
+    def test_modelopt_nvfp4_kv_declarations(self, kv_declaration):
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+        from aisim.sdk.utils import _attach_inferred_quant_fields
+
+        quant = {"quant_method": "modelopt", "quant_algo": "NVFP4", **kv_declaration}
+        raw = _attach_inferred_quant_fields({"quantization_config": quant})
+        assert _infer_quant_modes_from_raw_config(raw)["kvcache_quant_mode"] is common.KVCacheQuantMode.nvfp4
+
+    def test_modelopt_unknown_kv_scheme_string_fails(self):
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+        from aisim.sdk.utils import _attach_inferred_quant_fields
+
+        quant = {"quant_method": "modelopt", "quant_algo": "NVFP4", "kv_cache_scheme": "NVFP4_AFFINE"}
+        raw = _attach_inferred_quant_fields({"quantization_config": quant})
+        with pytest.raises(ValueError, match="Unsupported kv cache algorithm"):
+            _infer_quant_modes_from_raw_config(raw)
 
     @pytest.mark.parametrize("kv_algo", ["not-an-algorithm", "null", ["none"], {"algorithm": "none"}, True])
     @pytest.mark.parametrize("source", ["quantization_config", "hf_quant_config"])

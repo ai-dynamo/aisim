@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ import yaml
 from pydantic import ValidationError
 
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
-from aisim.config.common import split_config_sections
+from aisim.config.common import load_config_with_text, split_config_sections
 from aisim.config.engine import (
     EngineRecommendationConfig,
     EstimatorPolicyConfig,
@@ -33,6 +34,137 @@ def _engine() -> dict:
         "hardware": "h200_sxm",
         "workers": {"aggregated": {}},
     }
+
+
+@pytest.mark.parametrize(
+    "filename", ["input.json", "input.JSON", ".json", ".JSON", "input.yaml", "input.yml", "input", "input.conf"]
+)
+@pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
+@pytest.mark.parametrize("sla", [{"ttft_ms": 1e-7, "itl_ms": 1e-6}, {"e2e_ms": 1e21}])
+def test_config_file_formats_preserve_numeric_slas(tmp_path, filename, config_type, sla):
+    from aisim.cli_args import _load_mapping
+
+    raw = {"engine": {**_engine(), "mode": "aggregated"}, "evaluation": {"sla": sla}}
+    if config_type is CoreRecommendationConfig:
+        raw["optimization"] = {"target": "throughput"}
+    path = tmp_path / filename
+    serialize = json.dumps if filename.lower().endswith(".json") else yaml.safe_dump
+    path.write_text(serialize(raw), encoding="utf-8")
+
+    expected = config_type.model_validate(raw)
+    assert config_type.from_yaml(path) == expected
+    assert config_type.model_validate(_load_mapping(str(path))) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ('{"engine":', "malformed JSON"),
+        ('{"engine": {},}', "malformed JSON"),
+        ("engine: {}", "malformed JSON"),
+        ("[]", "must contain one JSON object"),
+        ("null", "must contain one JSON object"),
+        ('"config"', "must contain one JSON object"),
+        ('{"value": NaN}', "NaN is not a valid JSON number"),
+        ('{"value": Infinity}', "Infinity is not a valid JSON number"),
+        ('{"value": -Infinity}', "-Infinity is not a valid JSON number"),
+    ],
+)
+def test_json_config_rejects_invalid_documents_with_filename(tmp_path, text, message):
+    from aisim.cli_args import _load_mapping
+
+    path = tmp_path / "bad.json"
+    path.write_text(text, encoding="utf-8")
+    for load in (load_config_with_text, _load_mapping):
+        with pytest.raises(ValueError, match=message) as error:
+            load(str(path))
+        assert str(path) in str(error.value)
+
+
+def test_yaml_parser_keeps_legacy_scalar_and_alias_semantics(tmp_path):
+    path = tmp_path / "input.yaml"
+    path.write_text("a: &value {tiny: 1e-7, numeric: 1.0e-7, enabled: yes}\nb: *value\n")
+    raw, text = load_config_with_text(path)
+    assert raw["a"] == {"tiny": "1e-7", "numeric": 1e-7, "enabled": True}
+    assert raw["b"] is raw["a"]
+    assert text == path.read_text()
+
+
+@pytest.mark.parametrize("filename", ["input.json", "input.JSON", "input.yaml"])
+def test_yaml_only_helpers_ignore_filename_extension(tmp_path, filename):
+    from aisim.config.common import load_yaml, load_yaml_with_text
+
+    path = tmp_path / filename
+    text = "tiny: 1e-7\nnumeric: 1.0e-7\nenabled: yes\n"
+    path.write_text(text, encoding="utf-8")
+    expected = {"tiny": "1e-7", "numeric": 1e-7, "enabled": True}
+    assert load_yaml(path) == expected
+    assert load_yaml_with_text(path) == (expected, text)
+
+
+@pytest.mark.parametrize("value", ['"1e-7"', "true", "1e999"])
+@pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
+def test_json_config_keeps_numeric_field_validation(tmp_path, value, config_type):
+    from aisim.cli_args import _load_mapping
+
+    raw = {"engine": {**_engine(), "mode": "aggregated"}}
+    if config_type is CoreRecommendationConfig:
+        raw["optimization"] = {"target": "throughput"}
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(raw)[:-1] + ', "evaluation": {"sla": {"ttft_ms": ' + value + "}}}")
+    with pytest.raises(ValidationError, match="ttft_ms"):
+        config_type.from_yaml(path)
+    with pytest.raises(ValidationError, match="ttft_ms"):
+        config_type.model_validate(_load_mapping(str(path)))
+
+
+@pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
+def test_json_config_preserves_perf_model_paths_and_repeated_key_checks(tmp_path, config_type):
+    from aisim.cli_args import _load_mapping
+
+    raw = {"engine": {**_engine(), "mode": "aggregated", "ais_perf_model": {"systems_paths": ["profiles"]}}}
+    if config_type is CoreRecommendationConfig:
+        raw["optimization"] = {"target": "throughput"}
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(raw))
+    assert config_type.from_yaml(path).engine.systems_paths == [str(tmp_path / "profiles")]
+
+    path.write_text('{"engine": {"ais_perf_model": {"systems_paths": [], "systems_paths": []}}}')
+    for load in (config_type.from_yaml, _load_mapping):
+        with pytest.raises(ValueError, match="systems_paths"):
+            load(str(path))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"engine": {"ais_perf_model": null}, "engine": {}}',
+        '{"engine": {"ais_perf_model": {}, "ais_perf_model": {}}}',
+        '{"engine": {"model": "\u007f\u0080\u009f\ufffe", '
+        '"ais_perf_model": {"systems_paths": [], "systems_paths": []}}}',
+        '{"engine": {"ais_perf_model": [{"estimator_config": {"\U0001f600": 1, "\\ud83d\\ude00": 2}}]}}',
+    ],
+)
+def test_json_repeated_perf_model_keys_use_json_string_semantics(tmp_path, text):
+    from aisim.cli_args import _load_mapping
+
+    path = tmp_path / "input.json"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="written twice"):
+        _load_mapping(str(path))
+
+
+def test_json_distinct_unicode_keys_and_unrelated_repeats_remain_valid(tmp_path):
+    from aisim.cli_args import _load_mapping
+
+    path = tmp_path / "input.json"
+    path.write_text(
+        '{"extra": 1, "extra": 2, "engine": {"ais_perf_model": {"estimator_config": {"a\u0085b": 1, "a b": 2}}}}',
+        encoding="utf-8",
+    )
+    raw = _load_mapping(str(path))
+    assert raw["extra"] == 2
+    assert raw["engine"]["ais_perf_model"]["estimator_config"] == {"a\u0085b": 1, "a b": 2}
 
 
 @pytest.mark.parametrize("config_type", [CorePredictionConfig, EngineRecommendationConfig])
@@ -398,6 +530,38 @@ def test_prediction_rejects_invalid_prefill_decode_interval(value) -> None:
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.parametrize("value", [-1, float("inf"), True, "1.5"])
+def test_prediction_rejects_invalid_sglang_scheduler_selection_cost(value) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {"scheduler": {"scheduler_select_time_ms": value}}
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+def test_prediction_rejects_serial_selection_cost_with_sglang_host_loop() -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {"host_loop": True, "scheduler": {"scheduler_select_time_ms": 1.5}}
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms requires host_loop=false"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("provider", ["afd", "aic-afd"])
+def test_prediction_schema_rejects_native_external_afd_timing(provider: str) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {
+        "scheduler": {"scheduler_select_time_ms": 1.5},
+        "timing": {"type": "external", "provider": provider},
+    }
+    with pytest.raises(ValidationError, match=r"timing\.type") as error:
+        CorePredictionConfig.model_validate({"engine": engine})
+    assert any(
+        item["loc"][-2:] == ("timing", "type") and item["type"] == "literal_error" for item in error.value.errors()
+    )
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> None:
     engine = _engine()
@@ -412,10 +576,23 @@ def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> 
     [
         ("vllm", "prefill_decode_interval", 1, "sglang"),
         ("trtllm", "prefill_decode_interval", 1, "sglang"),
+        ("vllm", "scheduler_select_time_ms", 1.5, "sglang"),
         ("sglang", "prefill_schedule_interval", 2, "vllm"),
         ("trtllm", "prefill_schedule_interval", 2, "vllm"),
         ("sglang", "async_scheduling", True, "vllm"),
         ("trtllm", "async_scheduling", False, "vllm"),
+        (
+            "sglang",
+            "launch",
+            {
+                "decode_ms": 5,
+                "piecewise_ms": 50,
+                "eager_ms": 150,
+                "max_cudagraph_capture_size": 512,
+                "eager_queue_fraction": 0.4,
+            },
+            "vllm",
+        ),
     ],
 )
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
@@ -431,6 +608,35 @@ def test_prediction_rejects_wrong_backend_scheduler_interval(backend, field, val
         ValidationError,
         match=rf"workers.{role}.scheduler.{field}.*backend={required_backend}",
     ):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize(
+    ("role", "worker"),
+    [
+        ("aggregated", {"parallelism": {"tensor": 2}}),
+        ("aggregated", {"parallelism": {"attention_data": 2}}),
+        ("aggregated", {"scheduler": {"async_scheduling": False}}),
+        ("decode", {}),
+    ],
+)
+def test_prediction_rejects_launch_outside_a_one_gpu_async_aggregated_worker(role, worker) -> None:
+    engine = _engine()
+    engine["backend"] = "vllm"
+    if role != "aggregated":
+        engine["mode"] = "disaggregated"
+        engine["workers"] = {"prefill": {}, "decode": {}}
+    launch = {
+        "decode_ms": 5,
+        "piecewise_ms": 50,
+        "eager_ms": 150,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    worker.setdefault("scheduler", {})["launch"] = launch
+    engine["workers"][role] = worker
+
+    with pytest.raises(ValidationError, match=rf"workers.{role}.scheduler.launch"):
         CorePredictionConfig.model_validate({"engine": engine})
 
 
@@ -1779,6 +1985,26 @@ def test_aggregated_deployment_accepts_one_context_parallel_knob() -> None:
     assert "cp_size" not in spec.performance_model_metadata["aggregated"]["config"]
 
 
+def test_afd_prediction_rejects_scheduler_selection_cost():
+    raw = {
+        "engine": {
+            **_engine(),
+            "backend": "sglang",
+            "workers": {
+                "aggregated": {
+                    "type": "afd",
+                    "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8},
+                    "scheduler": {"scheduler_select_time_ms": 0.0},
+                },
+            },
+        },
+    }
+    CorePredictionConfig.model_validate(raw)
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["scheduler_select_time_ms"] = 1.5
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms is unsupported for AFD"):
+        CorePredictionConfig.model_validate(raw)
+
+
 @pytest.mark.parametrize("knob", ["prefill_context", "decode_context"])
 def test_afd_companion_rejects_context_parallelism(knob: str) -> None:
     # The companion's ParallelShape / GPU accounting carry tp/pp/dp/moe only, so
@@ -1860,6 +2086,59 @@ def test_sglang_decode_radix_cache_is_off_by_default_and_lowers_when_enabled() -
     enabled = decode_engine_args({"kv_cache": {"decode_radix_cache": True}})
     assert enabled["enable_prefix_caching"] is True
     assert enabled["sglang"] == {"disaggregation_decode_enable_radix_cache": True}
+
+
+def test_sglang_swa_prefix_tails_follow_the_deepseek_v4_architecture(tmp_path) -> None:
+    from aisim.compiler import _deployment, _swa_prefix_tails
+
+    def engine(model="deepseek-ai/DeepSeek-V4-Flash", backend="sglang", **kv_cache):
+        prefill = {"kv_cache": kv_cache, "scheduler": {"max_sequences": 8}}
+        return CorePredictionConfig.model_validate(
+            {"engine": _disaggregated_engine(backend, {}, prefill, model=model)}
+        ).engine
+
+    def tails(role="prefill", **kwargs):
+        config = engine(**kwargs)
+        return _swa_prefix_tails(config, getattr(config.workers, role), role)
+
+    assert tails() == 32
+    assert tails(role="decode") is None
+    assert tails(model="example/model") is None
+    assert tails(model="example/model", swa_prefix_tails=100) == 100
+    assert tails(swa_prefix_tails=None) is None
+    assert tails(prefix_caching=False) is None
+    assert tails(backend="vllm") is None
+    with pytest.raises(ValueError, match="only for backend=sglang"):
+        tails(backend="vllm", swa_prefix_tails=100)
+
+    # A local config is read only for its architecture, so a model without a performance model works.
+    def local(name, architectures):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps({"architectures": architectures}))
+        return str(path)
+
+    assert tails(model=local("custom", ["CustomForCausalLM"])) is None
+    assert tails(model=local("v4", ["DeepseekV4ForCausalLM"])) == 32
+    with pytest.raises(ValueError, match="architectures must be a list of strings"):
+        tails(model=local("malformed", "DeepseekV4ForCausalLM"))
+    # A local directory without a readable config leaves `auto` off.
+    (tmp_path / "empty").mkdir()
+    assert tails(model=str(tmp_path / "empty")) is None
+    # A corrupt config is reported instead of silently replaying unrestricted prefix reuse.
+    corrupt = tmp_path / "corrupt"
+    corrupt.mkdir()
+    (corrupt / "config.json").write_text('{"architectures":["DeepseekV4ForCausalLM"')
+    with pytest.raises(ValueError, match="config is not valid JSON") as raised:
+        tails(model=str(corrupt))
+    assert isinstance(raised.value.__cause__, json.JSONDecodeError)
+    (corrupt / "config.json").write_text('["DeepseekV4ForCausalLM"]')
+    with pytest.raises(ValueError, match="config must be a JSON object"):
+        tails(model=str(corrupt))
+
+    spec = _deployment(engine(model="example/model", swa_prefix_tails=100), workload={})
+    assert spec.prefill_engine_args["sglang"]["swa_prefix_tails"] == 100
+    assert "sglang" not in spec.decode_engine_args
 
 
 @pytest.mark.parametrize(

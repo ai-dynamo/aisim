@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Modified Rust simulation of the vLLM v0.29.0
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 // Modified source-read ordering semantics derived from vLLM v0.32.0:
 // https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -434,6 +438,8 @@ pub(crate) struct VllmBlockPool {
     // Fine token keys share a physical page; removed together at page eviction.
     token_aliases: Option<Box<FxHashMap<BlockCopyId, Vec<SequenceHash>>>>,
     state_index: Option<Box<StateIndex>>,
+    /// See [`Self::state_visibility_epoch`].
+    state_visibility_epoch: u64,
     /// Intrusive ordinary LRU: head is evicted first, tail was released last.
     inactive_head: Option<BlockCopyId>,
     inactive_tail: Option<BlockCopyId>,
@@ -463,6 +469,7 @@ impl VllmBlockPool {
             by_hash: FxHashMap::default(),
             token_aliases: None,
             state_index: None,
+            state_visibility_epoch: 0,
             inactive_head: None,
             inactive_tail: None,
             inactive_len: 0,
@@ -520,6 +527,12 @@ impl VllmBlockPool {
             // A held source is referenced by its transfer, not evictable.
             is_active: *refs > 0 || *pins > 0 || self.holds_source(id),
         })
+    }
+
+    /// Counts the state keys that became visible. While it stands still, no
+    /// state key's [`Self::key_hit`] has turned from a miss into a hit.
+    pub(crate) fn state_visibility_epoch(&self) -> u64 {
+        self.state_visibility_epoch
     }
 
     /// Blocks of capacity behind `key`'s visible copy: a grouped state copy's
@@ -905,10 +918,14 @@ impl VllmBlockPool {
         }
         let (became_visible, became_redundant) = match hash {
             CacheKey::Token(hash) => Self::index_copy(&mut self.by_hash, hash, id),
-            CacheKey::State { prefix, slot } => self
-                .state_index
-                .get_or_insert_with(Default::default)
-                .insert(prefix, slot, id),
+            CacheKey::State { prefix, slot } => {
+                let inserted = self
+                    .state_index
+                    .get_or_insert_with(Default::default)
+                    .insert(prefix, slot, id);
+                self.state_visibility_epoch += u64::from(inserted.0);
+                inserted
+            }
         };
         if became_redundant {
             self.refresh_belady_hash(hash.prefix_hash());
@@ -932,6 +949,12 @@ impl VllmBlockPool {
                 (true, false)
             }
         }
+    }
+
+    /// Whether `id` is still a cached copy of state key `key`. A copy whose
+    /// request was preempted in the pass that published it is gone.
+    pub(crate) fn holds_state_key(&self, id: BlockCopyId, key: CacheKey) -> bool {
+        self.copies.contains_key(id) && self.state_key(id) == Some(key)
     }
 
     pub(crate) fn is_private(&self, id: BlockCopyId) -> bool {

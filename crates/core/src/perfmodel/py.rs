@@ -39,8 +39,8 @@ use pyo3::types::PyType;
 use crate::common::error::AicError;
 use crate::perfmodel::EngineConfig;
 use crate::perfmodel::engine::runtime::{
-    DEFAULT_STATIC_STRIDE, Engine, PerOpSolValue, PerOpValue, PerOpValueWithMetadata,
-    RuntimeConfig, StaticMode, StaticResult,
+    DEFAULT_STATIC_STRIDE, Engine, MixedStepPerOpValuesWithMetadata, PerOpSolValue, PerOpValue,
+    PerOpValueWithMetadata, RuntimeConfig, StaticMode, StaticPerOpValuesWithCoverage, StaticResult,
 };
 use crate::{BackendKind, DataType, DatabaseMode, ENGINE_CONFIG_SCHEMA_VERSION};
 
@@ -681,6 +681,53 @@ impl AicEngine {
         .map_err(aic_to_py)
     }
 
+    /// Internal `_run_static_per_op_with_metadata` from the same walk, plus
+    /// each phase's power-covered latency: returns ``(context, generation,
+    /// context_covered_ms, generation_covered_ms)``. A query result counts as
+    /// covered when its own energy is positive, decided before the name fold.
+    #[pyo3(signature = (
+        batch_size,
+        beam_width,
+        isl,
+        osl,
+        prefix,
+        seq_imbalance_correction_scale,
+        gen_seq_imbalance_correction_scale,
+        mode="static",
+        stride=DEFAULT_STATIC_STRIDE,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn _run_static_per_op_with_coverage(
+        &self,
+        py: Python<'_>,
+        batch_size: u32,
+        beam_width: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        seq_imbalance_correction_scale: f64,
+        gen_seq_imbalance_correction_scale: f64,
+        mode: &str,
+        stride: u32,
+    ) -> PyResult<StaticPerOpValuesWithCoverage> {
+        let rt = RuntimeConfig {
+            batch_size,
+            beam_width,
+            isl,
+            osl,
+            prefix,
+            seq_imbalance_correction_scale,
+            gen_seq_imbalance_correction_scale,
+        };
+        let mode = parse_mode(mode)?;
+        self.inner.reset_provenance();
+        py.allow_threads(|| {
+            self.inner
+                .run_static_per_op_with_coverage(&rt, mode, stride)
+        })
+        .map_err(aic_to_py)
+    }
+
     /// `mixed_step_breakdown` with the per-op values kept: returns
     /// ``(shared_non_attention, context_attention, decode_attention)`` lists
     /// of ``(name, latency_ms, energy_wms, source)`` tuples. The
@@ -718,7 +765,7 @@ impl AicEngine {
 
     /// Internal metadata-bearing counterpart of `mixed_step_breakdown_per_op`;
     /// each fifth field is `None` or `(first_record, additional_records)` in
-    /// deterministic encounter order.
+    /// deterministic encounter order. Includes pre-fold coverage for FPM chunks.
     #[pyo3(signature = (ctx_tokens, gen_tokens, isl, osl, prefix=0,
                         seq_imbalance_correction_scale=1.0,
                         gen_seq_imbalance_correction_scale=1.0))]
@@ -733,11 +780,7 @@ impl AicEngine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> PyResult<(
-        Vec<PerOpValueWithMetadata>,
-        Vec<PerOpValueWithMetadata>,
-        Vec<PerOpValueWithMetadata>,
-    )> {
+    ) -> PyResult<(MixedStepPerOpValuesWithMetadata, Option<f64>)> {
         self.inner.reset_provenance();
         py.allow_threads(|| {
             self.inner.mixed_step_breakdown_per_op_with_metadata(
@@ -1789,6 +1832,17 @@ pub(crate) fn resolve_speculation_identity(
 pub(crate) fn speculation_replay_depth(
     config: &crate::ForwardPassSpeculationConfig,
 ) -> Result<u32, AicError> {
+    // The `python` feature also serves extension hosts, which initialize their
+    // own interpreter. Calling with_gil before that would panic. Embedders opt
+    // into PyO3's automatic initialization with the separate embed-python feature.
+    #[cfg(not(feature = "embed-python"))]
+    if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+        return Err(AicError::InvalidEngineConfig(
+            "generic speculative replay requires an initialized Python interpreter; \
+             initialize Python or enable the embed-python feature"
+                .into(),
+        ));
+    }
     Python::with_gil(|py| -> PyResult<_> {
         let encoded = serde_json::to_string(config)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -2107,12 +2161,13 @@ fn fmha_quant_name(dtype: Option<&DataType>) -> Option<&'static str> {
     }
 }
 
-/// `DataType` → `KVCacheQuantMode` enum name. Only bf16/int8/fp8 exist.
+/// `DataType` → `KVCacheQuantMode` enum name. Only bf16/int8/fp8/nvfp4 exist.
 fn kvcache_quant_name(dtype: Option<&DataType>) -> Option<&'static str> {
     match dtype? {
         DataType::Bfloat16 => Some("bfloat16"),
         DataType::Int8 => Some("int8"),
         DataType::Fp8 => Some("fp8"),
+        DataType::Nvfp4 => Some("nvfp4"),
         _ => None,
     }
 }
@@ -3247,6 +3302,10 @@ mod tests {
             };
             check(
                 AicError::PerfDatabase("missing table".to_string()),
+                "PerfDataNotAvailableError",
+            );
+            check(
+                AicError::LinearAttentionDataMissing("no Mamba2 rows".to_string()),
                 "PerfDataNotAvailableError",
             );
             check(

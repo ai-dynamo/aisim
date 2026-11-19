@@ -2,6 +2,41 @@
 
 This file adds explicit repository-wide development guards.
 
+## Code Review Rules
+
+For code and PR reviews, first read [the review contract](REVIEW.md), including
+its [Codex review method](REVIEW.md#codex-review-method). Apply the area-specific
+rules below when reviewing the corresponding code.
+
+- Ground findings in a reachable failure or a violated evidence requirement
+  introduced or worsened by the full PR. Follow changed inputs through real
+  callers, consumers, and outputs; verify the code independently of author claims
+  and other bots' verdicts. A missing required numerical derivation can be an
+  evidence-gap finding without proof of a wrong answer; it is not automatically
+  P0/P1. Keep mechanical formatting and lint checks in CI.
+- Treat formulas, data selection, interpolation, defaults, and rank reduction
+  as numerical behavior. Preserve the Rust single oracle and synchronized
+  Rust/Python/CLI/serialized contracts. Use explained before/after results or
+  an independent oracle; parity alone does not establish prediction accuracy.
+- For engine changes, inspect cancellation, draining, retry, and terminal-state
+  accounting. For CI changes, inspect fork inputs, execution trust, exact-head
+  evidence, and required gates. Distinguish expected absence and optional
+  monitoring failures from corruption or missing required validation.
+
+Keep Risk (review routing) separate from Merge Risk (remaining risk). Apply
+the contract's Codex severity floors, human-first escalation, and fresh-review
+requirement after Full CI failure. Instructions describe the policy; they do
+not themselves grant approval, repair, CI-admission, or merge authority.
+
+## Wheel artifact handoffs
+
+GitHub Actions artifacts must not contain Python wheels or wheel-containing
+bundles. Use `.github/actions/wheel-storage` for intermediate wheel transfers;
+Actions retains only the completion manifest. Consumers must bind the exact
+source SHA, producer run and architecture, and verify object sizes/checksums.
+Reruns read the producer attempt from that manifest, never from the consumer's
+`github.run_attempt`. Keep qualification reports as normal Actions artifacts.
+
 ## FPM model onboarding
 
 When asked to onboard a model for FPM simulation on designated hardware, follow
