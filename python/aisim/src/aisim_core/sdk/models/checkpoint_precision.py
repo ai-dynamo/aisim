@@ -238,9 +238,9 @@ def projection_modes(
     """
     gemm = common.GEMMQuantMode
     modes = {
-        # shortcut: FP8 is dynamic only when the global mode already is; per-layer activation
-        # scaling is not read from the checkpoint. Upgrade if an export mixes static and dynamic FP8.
-        "fp8": gemm.fp8 if default == gemm.fp8 else gemm.fp8_static,
+        # shortcut: the checkpoint-wide quant_dynamic picks the FP8 lane, as for the global mode
+        # (helpers._mixed_precision_algo_gemm_mode). Upgrade if an export mixes static and dynamic FP8.
+        "fp8": gemm.fp8 if checkpoint.raw.get("quant_dynamic") is True else gemm.fp8_static,
         # MXFP8 takes the fp8_block lane, as the global mode does (helpers._mixed_precision_algo_gemm_mode).
         "mxfp8": gemm.fp8_block,
         "fp8_block": gemm.fp8_block,
@@ -284,11 +284,11 @@ def moe_modes(
     native mode, as on the canonical API path. Unlisted experts are BF16 only in a targets-only
     export; an excluded layer is always BF16.
 
-    A layer's precision is read from its declared expert modules (expert 0). When any of them is
-    unlisted, it is read from the expert block as vLLM resolves the FusedMoE prefix: the block's
-    own listing or any listed expert (ModelOptMixedPrecisionConfig._resolve_quant_algo, vLLM
-    v0.31.0). A layer whose listed experts disagree is rejected, since per-expert precision is
-    not modeled.
+    A layer's precision is read from its declared expert modules (expert 0). When the expert block
+    is listed itself or any declared module is unlisted, it is read from the expert block as vLLM
+    resolves the FusedMoE prefix: the block's own listing first, else any listed expert
+    (ModelOptMixedPrecisionConfig._resolve_quant_algo, vLLM v0.31.0). A layer whose listed
+    experts disagree is rejected, since per-expert precision is not modeled.
     """
     moe = common.MoEQuantMode
     nvfp4 = _nvfp4_lane(system, systems_path, moe.nvfp4, moe.nvfp4_wo)
@@ -336,8 +336,12 @@ def moe_modes(
             algos = {algo for path in layer_paths(layer, block) for algo in checkpoint.descendants.get(path, ())}
             if len(algos) > 1:
                 raise ValueError(f"Routed experts of layer {layer} disagree on precision: {algos}")
-        if declared and not all(checkpoint.module(layer_paths(layer, module))[1] for module in declared):
-            _, algos = checkpoint.module([path for block in blocks for path in layer_paths(layer, block)])
+        block_paths = [path for block in blocks for path in layer_paths(layer, block)]
+        block_listed = any(path in checkpoint.exact or path in checkpoint.conflicts for path in block_paths)
+        if declared and (
+            block_listed or not all(checkpoint.module(layer_paths(layer, module))[1] for module in declared)
+        ):
+            _, algos = checkpoint.module(block_paths)
             if len(algos) > 1:
                 raise ValueError(f"Conflicting checkpoint precisions for the experts of layer {layer}: {algos}")
             if algos:

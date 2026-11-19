@@ -13,6 +13,7 @@ from aisim_core.sdk.config import ModelConfig
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.checkpoint_precision import checkpoint_precision
 from aisim_core.sdk.models.nemotron_h import _moe_modes, _projection_modes
+from aisim_core.sdk.utils import _load_json_with_infinity
 
 pytestmark = pytest.mark.unit
 
@@ -258,6 +259,27 @@ def test_projection_modes(raw, pattern, expected):
     assert got == {key: want if isinstance(want, dict) else {want} for key, want in expected.items()}
 
 
+@pytest.mark.parametrize("dynamic,fp8", [(True, common.GEMMQuantMode.fp8), (None, FP8)])
+def test_fp8_projection_lane_follows_quant_dynamic_not_the_global_default(dynamic, fp8):
+    raw = _listing(
+        {
+            "backbone.layers.0.mixer.in_proj": {"quant_algo": "MXFP8"},
+            "backbone.layers.1.mixer.in_proj": {"quant_algo": "FP8"},
+        }
+    )
+    if dynamic is not None:
+        raw["quant_dynamic"] = dynamic
+    # The MXFP8 layer makes the global default fp8_block; the FP8 layer keeps its own lane.
+    block = common.GEMMQuantMode.fp8_block
+    assert _projection_modes(raw, "MM", block)["mamba_in_proj_gemm"] == {block: 1, fp8: 1}
+
+
+def test_config_loader_keeps_quoted_infinity_markers(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text('{"bare": [0.0, Infinity, -Infinity, NaN], "marker": {"__float__": "Infinity"}}')
+    assert _load_json_with_infinity(path) == {"bare": [0.0, None, None, None], "marker": {"__float__": "Infinity"}}
+
+
 def test_untargeted_projection_takes_the_system_nvfp4_lane():
     raw = {"quantization_config": {"config_groups": _groups(a=(4, ["backbone.layers.0.mixer.in_proj"]))}}
     assert _projection_modes(raw, "MM", NVFP4, "h200_sxm")["mamba_in_proj_gemm"] == {NVFP4_WO: 2}
@@ -458,6 +480,17 @@ def test_a_sparse_expert_listing_resolves_the_fused_block(proj):
     # Only one of expert 0's projections listed: vLLM resolves the fused experts prefix from it.
     raw = _listing({f"backbone.layers.1.mixer.experts.0.{proj}_proj": {"quant_algo": "FP8"}})
     assert _moe_modes(raw, "MEME", MOE.nvfp4, "gb200") == {MOE.fp8: 1, MOE.bfloat16: 1}
+
+
+def test_an_explicit_expert_block_listing_precedes_its_experts():
+    def raw(block, expert):
+        listing = {"backbone.layers.1.mixer.experts": {"quant_algo": block}}
+        listing.update(_expert_listing({1: expert})["quantization_config"]["quantized_layers"])
+        return _listing(listing)
+
+    # vLLM looks the fused experts prefix up before its children.
+    assert _moe_modes(raw("NVFP4", "FP8"), "ME", MOE.fp8, "gb200") == {MOE.nvfp4: 1}
+    assert _moe_modes(raw("FP8", "FP8"), "ME", MOE.nvfp4, "gb200") == {MOE.fp8: 1}
 
 
 def test_routed_experts_of_one_layer_must_share_a_precision():
