@@ -368,9 +368,45 @@ def test_wheel_handoffs_require_internal_containerized_runners():
             )
             if not runners or not runners <= internal_runners:
                 violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
-            if not job.get("container", {}).get("image"):
+            container = job.get("container")
+            if isinstance(container, dict):
+                container = container.get("image")
+            if not isinstance(container, str) or not container.strip():
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
     assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "container,runner,error",
+    [
+        ("${{ vars.CI_JOB_CONTAINER_IMAGE }}", "prod-aisim-default-amd64-v1", None),
+        ({"image": "${{ vars.CI_JOB_CONTAINER_IMAGE }}"}, "prod-aisim-default-amd64-v1", None),
+        (None, "prod-aisim-default-amd64-v1", "lacks the required ARC job container"),
+        ("", "prod-aisim-default-amd64-v1", "lacks the required ARC job container"),
+        ("   ", "prod-aisim-default-amd64-v1", "lacks the required ARC job container"),
+        ({}, "prod-aisim-default-amd64-v1", "lacks the required ARC job container"),
+        ({"image": ""}, "prod-aisim-default-amd64-v1", "lacks the required ARC job container"),
+        ({"image": True}, "prod-aisim-default-amd64-v1", "lacks the required ARC job container"),
+        ("ubuntu:24.04", "ubuntu-24.04", "lacks an internal Artifactory runner"),
+        ({"image": "ubuntu:24.04"}, "ubuntu-24.04", "lacks an internal Artifactory runner"),
+    ],
+)
+def test_wheel_runner_policy_accepts_container_forms_without_bypassing_guards(
+    tmp_path, monkeypatch, container, runner, error
+):
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    job = {"runs-on": runner, "steps": [{"uses": "./.github/actions/wheel-storage"}]}
+    if container is not None:
+        job["container"] = container
+    (workflows / "handoff.yml").write_text(yaml.safe_dump({"jobs": {"handoff": job}}))
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path)
+
+    if error is None:
+        test_wheel_handoffs_require_internal_containerized_runners()
+    else:
+        with pytest.raises(AssertionError, match=error):
+            test_wheel_handoffs_require_internal_containerized_runners()
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():
