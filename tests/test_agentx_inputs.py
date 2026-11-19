@@ -21,6 +21,7 @@ from scripts.e2e_accuracy.agentx_inputs import (
     load_runs,
     manual_geometry,
     reconstruct,
+    recorded_profile,
     replay_config,
     safe_path,
 )
@@ -298,7 +299,7 @@ def test_non_speculative_replay_validates_without_acceptance(tmp_path):
     )
 
 
-def hub_replay_inputs(tmp_path, monkeypatch, acceptance):
+def hub_replay_inputs(tmp_path, monkeypatch, acceptance, *, phase_overrides=None):
     hub = tmp_path / "hub"
     catalog = silicon_inputs(hub, result())
     manifest_path = hub / catalog["runs"][0]["manifest"]["path"]
@@ -319,7 +320,10 @@ def hub_replay_inputs(tmp_path, monkeypatch, acceptance):
 
     for role, entry in extra["artifacts"].items():
         if role != "workload":
-            put(role, json.loads((replay / entry["path"]).read_bytes()))
+            value = json.loads((replay / entry["path"]).read_bytes())
+            if role == "feature_harness_receipt" and phase_overrides is not None:
+                value["input_config"]["phases"][0].update(phase_overrides)
+            put(role, value)
     workload = json.loads((manifest_path.parent / manifest["artifacts"]["workload"]["path"]).read_bytes())
     workload.update(
         corpus_id="test-corpus",
@@ -369,6 +373,83 @@ def test_fetch_preflights_acceptance_before_downloading_corpus(tmp_path, monkeyp
         agentx_run.fetch("a" * 40, output)
     assert all(repo == agentx_run.REPO for repo, _ in downloads)
     assert not (output / "corpora").exists()
+
+
+def test_fetch_rejects_invalid_profile_duration_before_corpus(tmp_path, monkeypatch):
+    downloads, _ = hub_replay_inputs(
+        tmp_path,
+        monkeypatch,
+        {"verification_depth": 3, "accepted_draft_tokens": 1.25},
+        phase_overrides={"duration": "not-a-duration"},
+    )
+    with pytest.raises(ValueError, match="agentx-446063.*duration"):
+        agentx_run.fetch("a" * 40, tmp_path / "inputs")
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+def test_recorded_profile_matches_canonical_timing_validation():
+    phases = [
+        {"duration": 60, "system_idle_gap_cap_seconds": 2, "grace_period": 5, **changes}
+        for changes in (
+            {},
+            {"duration": "60"},
+            {"duration": True},
+            {"duration": "not-a-duration"},
+            {"duration": 0},
+            {"duration": -1},
+            {"duration": None},
+            {"duration": float("inf")},
+            {"duration": float("nan")},
+            {"duration": 1e306},
+            {"duration": 1e305, "grace_period": 1e305},
+            {"system_idle_gap_cap_seconds": 0},
+            {"system_idle_gap_cap_seconds": -1},
+            {"system_idle_gap_cap_seconds": "bad"},
+            {"grace_period": 0},
+            {"grace_period": -1},
+            {"grace_period": float("nan")},
+            {"grace_period": "bad"},
+        )
+    ]
+    profiles = [
+        {
+            "duration_seconds": phase["duration"],
+            "global_idle_cap_seconds": phase["system_idle_gap_cap_seconds"],
+            "response_grace_seconds": phase["grace_period"],
+            "tree_idle_cap_seconds": 300,
+            "cancel_drain_seconds": 10,
+        }
+        for phase in phases
+    ]
+    source = Path(__file__).resolve().parents[1] / "python/aisim/src"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json,sys\n"
+            "from aisim.config.traffic import AgenticProfileOptions\n"
+            "results=[]\n"
+            "for profile in json.load(sys.stdin):\n"
+            " try:\n"
+            "  AgenticProfileOptions.model_validate(profile)\n"
+            "  results.append(True)\n"
+            " except ValueError:\n"
+            "  results.append(False)\n"
+            "print(json.dumps(results))\n",
+        ],
+        input=json.dumps(profiles),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(source)},
+        check=True,
+    )
+    expected = json.loads(result.stdout)
+    for phase, profile, valid in zip(phases, profiles, expected, strict=True):
+        if valid:
+            assert recorded_profile(phase) == profile
+        else:
+            with pytest.raises(ValueError):
+                recorded_profile(phase)
 
 
 @pytest.mark.parametrize("input_error", ["missing", "null_base", "null_override", "empty_phases"])
