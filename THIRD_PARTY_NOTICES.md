@@ -681,6 +681,7 @@ release of the skipped blocks of a completed source.
 `vllm_backend.rs` also adapts the two admission tests of an async KV load and
 the reservation of the blocks that the loads in flight still need. `core.rs`
 also adapts the queue order that serves the requests that hold KV blocks first.
+`crates/core/tests/runtime_contract.rs` holds replay tests of these rules.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
