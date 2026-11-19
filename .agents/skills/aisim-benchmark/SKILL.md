@@ -44,7 +44,9 @@ resolved plan instead of improvising cluster access.
 
 ## Flow
 
-1. Plan. If the catalog shows the cell as `have` with a recent verified record, report it and stop.
+1. Plan. Stop for reuse only with a complete, verified record for the exact requested identity
+   and a prediction fingerprint matching the current predictor (including `code_version`,
+   spec and profile hashes). `have` or an unchanged spec alone is insufficient; otherwise re-evaluate.
 2. Collect only what is `missing` or `stale`; use the smallest layer that answers the question.
 3. Capture `gpu_time` from the Slurm or Kubernetes record of every collection and evaluation job.
 4. Evaluate against truth that was not used for calibration; store and verify the record.

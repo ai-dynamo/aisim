@@ -90,6 +90,7 @@ class CatalogRow(_Row):
     acc_record_id: str | None = None
     acc_created_at: str | None = None
     acc_spec_sha256: str | None = None
+    acc_prediction_fingerprint: str | None = None  # includes code_version, spec and profile hashes
     collection_quality_json: str | None = None  # latest record's collection_quality, canonical JSON
     gpu_seconds: float | None = Field(default=None, ge=0)  # sum over recorded gpu_time; null if none recorded
     gpu_n_recorded: int = Field(default=0, ge=0)  # records contributing to gpu_seconds
@@ -121,6 +122,7 @@ _ROW_FIELDS = {
     "acc_record_id": pa.string(),
     "acc_created_at": pa.string(),
     "acc_spec_sha256": pa.string(),
+    "acc_prediction_fingerprint": pa.string(),
     "collection_quality_json": pa.string(),
     "gpu_seconds": pa.float64(),
     "gpu_n_recorded": pa.int32(),
@@ -208,7 +210,7 @@ def _read_eval_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
 
 
 def _latest_accuracy(records: list[EvalRecord]) -> EvalRecord | None:
-    scored = [r for r in records if r.results.mape_pct is not None and r.status != "failed"]
+    scored = [r for r in records if r.results.mape_pct is not None and r.status == "complete"]
     return max(scored, key=lambda r: (_instant(r.created_at), r.record_id), default=None)
 
 
@@ -247,6 +249,7 @@ def _summarize(key: tuple, cell: _Cell | None, current_specs: Mapping[str, str])
         acc_record_id=latest.record_id if latest else None,
         acc_created_at=latest.created_at if latest else None,
         acc_spec_sha256=latest.prediction.spec_sha256 if latest else None,
+        acc_prediction_fingerprint=latest.prediction.fingerprint if latest else None,
         collection_quality_json=(
             None if quality is None else json.dumps(quality, sort_keys=True, separators=(",", ":"), allow_nan=False)
         ),

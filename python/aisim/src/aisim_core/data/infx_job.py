@@ -14,6 +14,8 @@ Rules enforced here (AISIM-2334 / DEP #435):
   snapshot stays in ``ingestion-state.json`` untouched.
 * A successful run with new content writes a **candidate** only. The job has no code path
   that sets ``qualified``; :func:`promote` needs a named reviewer and is a separate manual step.
+* A model-filtered candidate replaces the qualified scope. Its change report
+  includes removals from unselected models, so review sees every effect of promotion.
 * Staleness is measured from the last qualified snapshot: warn at 8 days, stale at 14
   (alert only; nothing is deleted or demoted).
 """
@@ -134,15 +136,14 @@ def run_ingestion(
             prior_models = {m.observation_id: by_path[m.manifest_path] for m in members}
         acquirer = Acquirer(client, AcquisitionCache(cache_dir), clock)
         acq = acquirer.acquire(models, list(prior), prior_models)
-        if acquirer.selected_models is not None:
-            prior = {oid: sha for oid, sha in prior.items() if prior_models.get(oid) in acquirer.selected_models}
+        plan = None if acq.empty_scope else plan_snapshot(acq)
     except InfxError as exc:
         return RunResult("failed", error=f"{type(exc).__name__}: {exc}", requests_made=client.requests_made)
     if acq.empty_scope:
         return RunResult(
             "empty", warnings=["no InferenceX data declared for the scope"], requests_made=acq.requests_made
         )
-    plan = plan_snapshot(acq)
+    assert plan is not None
     known = {e["snapshot_id"] for e in (qualified, candidate) if e}
     changes = diff_members(prior, plan.members)
     if plan.snapshot_id in known:

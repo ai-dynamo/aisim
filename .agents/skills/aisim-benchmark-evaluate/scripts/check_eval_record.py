@@ -18,11 +18,14 @@ a failed check.
 import argparse
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
-from aisim_core.data.eval import attest, check_record_gpu_time, load_record, verify_record, write_record
+from aisim_core.data import _verify
+from aisim_core.data.eval import attest, check_record_gpu_time, load_record, record_dir, verify_record, write_record
 from aisim_core.data.gpu_time import check_gpu_time
+from aisim_core.data.hygiene import checked_path
 
 
 def _load_predictor(path: Path):
@@ -82,6 +85,26 @@ def main(argv=None) -> int:
             history = [record]
             while history[-1].supersedes:
                 history.append(load_record(args.record.parent / f"{history[-1].supersedes}.json"))
+            # Preflight every input and collision before staging any record.
+            copies = {}
+            for item in [*history, verified]:
+                destination = record_dir(args.attest_root, item.truth.identity)
+                for artifact in [*item.truth.artifacts, *item.findings]:
+                    source = _verify(args.truth_root or args.record.parent, artifact)
+                    target = checked_path(destination, artifact.path)
+                    if target in copies and copies[target][1] != artifact.sha256:
+                        raise ValueError(f"conflicting artifact content: {target}")
+                    if target.exists():
+                        _verify(destination, artifact)
+                    copies[target] = (source, artifact.sha256)
+            for target, (source, _) in copies.items():
+                if not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+            for item in [*history, verified]:
+                destination = record_dir(args.attest_root, item.truth.identity)
+                for artifact in [*item.truth.artifacts, *item.findings]:
+                    _verify(destination, artifact)
             for predecessor in reversed(history):
                 write_record(args.attest_root, predecessor)
             out["verified_record_path"] = str(write_record(args.attest_root, verified))

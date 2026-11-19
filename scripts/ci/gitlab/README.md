@@ -34,6 +34,11 @@ then. The jobs never push to the default branch.
 | Candidates | pushed to `candidate/<snapshot-id>` branches; never auto-promoted, never pushed to the default branch |
 | Failure | writes nothing; the last qualified snapshot in `ingestion-state.json` is retained |
 
+A `run --model ...` candidate contains only the selected models and replaces the qualified
+snapshot when promoted. Its `changes.removed` and `change_counts.removed` include qualified
+observations from unselected models. Review that removal count before promotion; use an
+unfiltered run to retain the full model scope.
+
 Configuration shards are stored under `revisions/<content-sha256>/e2e/...`.
 The revision covers the converted rows, manifest body and provenance, including producer metadata.
 Original benchmark HTTP response bodies are retained unchanged as hash-linked provenance alongside

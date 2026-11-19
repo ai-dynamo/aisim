@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Definition of the validator CI for the private mirror ai-dynamo/aisim-data-internal
-# (DEP #435, Phase 7, AISIM-2343). It is a TEMPLATE: copy it unchanged to
-# .github/workflows/validate.yml in the mirror repository when that repository exists.
+# (DEP #435, Phase 7, AISIM-2343). It is a TEMPLATE: first replace the exact
+# all-zero AISIM_VALIDATOR_REF placeholder with a reviewed, full validator commit
+# SHA, then install at .github/workflows/validate.yml in the mirror repository.
 # It does not run in this repository (it is outside .github/workflows).
 #
 # The mirror has the public layout and runs the same validator, from a pinned checkout of
@@ -42,6 +43,11 @@ jobs:
           path: mirror
           persist-credentials: false
 
+      - name: Validate the validator pin
+        run: |
+          [[ "${AISIM_VALIDATOR_REF}" =~ ^[0-9a-f]{40}$ && "${AISIM_VALIDATOR_REF}" != 0000000000000000000000000000000000000000 ]] \
+            || { echo "::error::Set AISIM_VALIDATOR_REF to a reviewed full validator commit SHA before installation"; exit 1; }
+
       - name: Check out the pinned validator
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,8 +68,6 @@ jobs:
         env:
           PYTHONPATH: validator/python/aisim/src
         run: |
-          [[ "${AISIM_VALIDATOR_REF}" =~ ^[0-9a-f]{40}$ && "${AISIM_VALIDATOR_REF}" != 0000* ]] \
-            || { echo "::error::AISIM_VALIDATOR_REF must be a real full commit SHA"; exit 1; }
           python -m aisim_core.data.mirror validate \
             --root mirror --repo "${MIRROR_REPO}" --profile mirror \
             --output "${RUNNER_TEMP}/mirror-report.json"

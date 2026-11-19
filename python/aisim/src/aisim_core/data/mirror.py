@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import pyarrow.parquet as pq
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, check_manifest, configuration_id
@@ -65,13 +66,13 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "5"
+VALIDATOR_VERSION = "6"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
 NEVER_PROMOTED = frozenset({INFX_CACHE_REPO})
 MIRROR_CONTROL_DIR = "mirror"  # private-only control files; absent from the public layout
-DATA_ROOTS = ("catalog/", "eval/", "data/")
+DATA_ROOTS = ("catalog/", "eval/", "data/", "systems/")
 ROOT_METADATA_FILES = frozenset({"README.md", ".gitattributes"})
 REPOSITORY_FILES = ROOT_METADATA_FILES | {".github/workflows/validate.yml"}
 MAX_METADATA_BYTES = 4 * 1024 * 1024
@@ -143,7 +144,11 @@ def _check_root_metadata(root: Path, tree: list[CandidateFile], profile: Profile
         if file.size > MAX_METADATA_BYTES:
             report.add("metadata-too-large", f"repository metadata exceeds {MAX_METADATA_BYTES} bytes", file.path)
             continue
-        data = (root / file.path).read_bytes()
+        try:
+            data = (root / file.path).read_bytes()
+        except OSError as exc:
+            report.add("metadata-unreadable", str(exc).splitlines()[0], file.path)
+            continue
         report.findings.extend(check_content(_tree_policy(()), file, data))
         try:
             text = data.decode("utf-8")
@@ -264,7 +269,7 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
 
 
 def _check_snapshots(root: Path, report: TreeReport, declared: set[str], manifests: dict[str, Manifest]) -> None:
-    for path in sorted((root / "data").rglob("*snapshot*.json")) if (root / "data").is_dir() else []:
+    for path in sorted((root / "data").rglob("snapshot.json")) if (root / "data").is_dir() else []:
         rel = path.relative_to(root).as_posix()
         try:
             snapshot, members = read_snapshot(root, rel)
@@ -303,17 +308,26 @@ def _check_catalog_drift(root: Path, report: TreeReport, declared: set[str]) -> 
         with tempfile.TemporaryDirectory() as tmp:
             fresh = Path(tmp)
             _write(fresh, rows, known_system_specs())
-            want = {p.relative_to(fresh).as_posix(): p.read_bytes() for p in catalog_files(fresh)}
+            want = {p.relative_to(fresh).as_posix(): pq.read_table(p) for p in catalog_files(fresh)}
     except (ValueError, ValidationError, OSError) as exc:
         report.add("catalog-unbuildable", str(exc).splitlines()[0], f"{CATALOG_DIR}/")
         return
-    have = {p.relative_to(root).as_posix(): p.read_bytes() for p in existing}
-    for name in sorted(set(want) | set(have)):
-        if name not in have:
+    have = {}
+    for path in existing:
+        name = path.relative_to(root).as_posix()
+        try:
+            have[name] = pq.read_table(path)
+        except ValueError as exc:
+            report.add("catalog-drift", f"invalid catalog shard: {str(exc).splitlines()[0]}", name)
+        except OSError as exc:
+            report.add("catalog-unreadable", str(exc).splitlines()[0], name)
+    existing_names = {p.relative_to(root).as_posix() for p in existing}
+    for name in sorted(set(want) | existing_names):
+        if name not in existing_names:
             report.add("catalog-drift", "catalog shard is missing; regenerate the catalog", name)
         elif name not in want:
             report.add("catalog-drift", "stale catalog shard; regenerate the catalog", name)
-        elif want[name] != have[name]:
+        elif name in have and not want[name].equals(have[name], check_metadata=True):
             report.add("catalog-drift", "catalog shard differs from the data; regenerate the catalog", name)
 
 
@@ -328,6 +342,8 @@ def validate_tree(
 
     ``allow_empty`` accepts a tree with no dataset payload files, for a freshly created mirror.
     """
+    if profile not in ("mirror", "public"):
+        raise ValueError(f"unsupported validation profile: {profile!r}")
     root = Path(root)
     report = TreeReport(repo=repo, profile=profile)
     if not root.is_dir():
@@ -369,6 +385,8 @@ def validate_tree(
 
     declared: set[str] = set()
     manifests = _check_indexes(root, report, declared)
+    system_files = _check_system_bundles(root, report)
+    declared.update(system_files)
     yaml_sidecars = {
         artifact.path
         for manifest in manifests.values()
@@ -381,7 +399,7 @@ def validate_tree(
         and artifact.artifact_schema.startswith(schema_prefix)
     }
     for f in listing:
-        if Path(f.path).suffix.lower() == ".yaml" and f.path not in yaml_sidecars:
+        if Path(f.path).suffix.lower() == ".yaml" and f.path not in yaml_sidecars | system_files:
             report.add("yaml-sidecar", "YAML must be a declared operation collection/reuse sidecar", f.path)
     _check_eval(root, report, declared)
     _check_snapshots(root, report, declared, manifests)
@@ -426,6 +444,26 @@ def validate_tree(
                 report.add("control-file", "mirror/ control files must not exist in the public dataset", f.path)
         report.findings.extend(check_publishable(root, [f.path for f in listing], manifests=manifests))
     return report
+
+
+def _check_system_bundles(root: Path, report: TreeReport) -> set[str]:
+    from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, check_published_system, copy_filename, read_manifest
+
+    declared = set()
+    for path in sorted((root / "systems").glob("*/manifest.yaml")):
+        rel = path.relative_to(root).as_posix()
+        system = path.parent.name
+        try:
+            manifest = read_manifest(path)
+            problems = check_published_system(system, root, PACKAGED_SYSTEMS_DIR / f"{system}.yaml")
+            if problems:
+                raise ValueError("; ".join(problems))
+        except (ValueError, OSError) as exc:
+            report.add("system-spec-invalid", str(exc).splitlines()[0], rel)
+            continue
+        declared.add(rel)
+        declared.update(f"systems/{system}/{copy_filename(system, h.spec_sha256)}" for h in manifest.history)
+    return declared
 
 
 def report_paths_with_errors(report: TreeReport, *prefixes: str) -> set[str]:

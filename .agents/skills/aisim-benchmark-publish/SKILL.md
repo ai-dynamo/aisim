@@ -33,7 +33,8 @@ ai-dynamo/aisim#435; this skill does not widen them.
 ## Candidate, not promotion
 
 - Stage a candidate as a path-identical directory under the dataset layout
-  (`data/{op-latency,fpm,e2e,eval}/...`) with the regenerated catalog. Collector or packaged operation
+  (`data/{op-latency,fpm,e2e}/...` for configurations and `eval/...` for evaluation records,
+  as returned by `write_record`) with the regenerated catalog. Collector or packaged operation
   tables are converted to the op-latency layout with
   `python/aisim/tools/perf_database/publish_op_latency_tree.py build` and re-verified with `... audit`
   (a supported publish step until AISIM-2373 makes the collector emit the layout directly). Writes to a public repository go

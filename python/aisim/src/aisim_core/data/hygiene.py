@@ -200,16 +200,34 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
                 if suffix == ".yaml":
                     yaml_sidecar_value(head)
                 else:
-                    json.loads(head.decode("utf-8"), parse_constant=_reject_constant)
+                    json.loads(head.decode("utf-8"), parse_constant=_reject_constant, parse_float=_finite_float)
             except (UnicodeDecodeError, ValueError, RecursionError) as exc:
                 out.append(Finding(f"{kind}-invalid", f"not strict UTF-8 {kind.upper()}: {exc}", path))
     return out
 
 
+class _SidecarLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        # Check explicit keys before flattening merges: an explicit override of a
+        # merged default is valid YAML, while repeated explicit settings are ambiguous.
+        seen = set()
+        for key, _ in node.value:
+            if key.tag == "tag:yaml.org,2002:merge":
+                continue
+            value = self.construct_object(key, deep=deep)
+            try:
+                if value in seen:
+                    raise ValueError(f"duplicate YAML key: {value!r}")
+                seen.add(value)
+            except TypeError as exc:
+                raise ValueError("YAML mapping keys must be scalar") from exc
+        return super().construct_mapping(node, deep=deep)
+
+
 def yaml_sidecar_value(data: bytes):
     """Safely read operation metadata; retain shared YAML aliases without expanding them."""
     try:
-        value = yaml.safe_load(data.decode("utf-8"))
+        value = yaml.load(data.decode("utf-8"), Loader=_SidecarLoader)
     except (yaml.YAMLError, RecursionError) as exc:
         raise ValueError(f"invalid YAML sidecar: {exc}") from exc
     if not isinstance(value, dict):
@@ -247,6 +265,13 @@ def yaml_sidecar_value(data: bytes):
 
 def _reject_constant(name: str):
     raise ValueError(f"non-finite constant {name}")
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite number {text}")
+    return value
 
 
 def check_candidate(

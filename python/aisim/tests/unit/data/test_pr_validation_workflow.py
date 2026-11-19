@@ -44,10 +44,26 @@ def test_actions_pinned_to_commit(text):
 def test_pr_code_is_never_checked_out_or_interpolated(text):
     assert "pull_request_target" not in text and "head.ref" not in text
     assert "ref:" not in text.replace("?ref=", "")  # checkout stays on the default branch
-    for line in text.splitlines():
-        if line.strip().startswith(("run:", "python", "gh ")):
-            assert "${{ inputs" not in line
+    _check_run_inputs(yaml.safe_load(text))
     assert "persist-credentials: false" in text
+
+
+def _check_run_inputs(doc):
+    for job in doc["jobs"].values():
+        for step in job.get("steps", []):
+            assert not re.search(r"\$\{\{\s*inputs(?:\.|\[)", step.get("run", ""))
+
+
+def test_echo_input_is_rejected_while_env_is_allowed(text):
+    doc = yaml.safe_load(text)
+    doc["jobs"]["validate"]["steps"].append({"run": 'echo "${{ inputs.request_path }}"'})
+    with pytest.raises(AssertionError):
+        _check_run_inputs(doc)
+    doc["jobs"]["validate"]["steps"][-1] = {
+        "run": 'echo "$REQUEST_PATH"',
+        "env": {"REQUEST_PATH": "${{ inputs.request_path }}"},
+    }
+    _check_run_inputs(doc)
 
 
 @pytest.mark.parametrize(
