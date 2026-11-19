@@ -1000,6 +1000,13 @@ qualified split. The raw runs are in
   estimates, so it still derives each folded operation's coverage from its
   energy.
 - One model family, one modeled platform, synthetic shapes.
+- The whole-model FPM mixed step prices every draft context operation at
+  `ceil(ctx_tokens / (isl - prefix))` requests of `isl - prefix` new tokens,
+  as main does. A qualified draft scan is no exception. With `isl = 512`,
+  `prefix = 256` and `ctx_tokens = 384`, the target query prices 384 new
+  tokens, but a draft scan prices 2 requests of 256 tokens, 512 tokens. The
+  scheduled chunks are 256 and 128 tokens. This change keeps one rule for all
+  draft operations. It does not split only the qualified draft scan.
 - With one request whose uncached tokens exceed the budget, `run_agg`
   counts one mix step in throughput and energy, as main does, although the
   request takes several prefill chunks. This is part of the unresolved
