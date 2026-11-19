@@ -803,3 +803,73 @@ def test_model_filtered_refresh_reports_all_qualified_removals(root, tmp_path):
     promote(root, result.snapshot_id, "Reviewer", now=NOW)
     _, members = read_snapshot(root, infx_ingest.snapshot_path(result.snapshot_id))
     assert {m.observation_id for m in members} == {"inferencex:1"}
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_model_keys_require_consistent_display_names(root, tmp_path, conflicting):
+    fake = FakeInfx()
+    fake.respond(
+        "views/options",
+        ok(
+            {
+                "models": [
+                    OPTIONS["models"][0],
+                    {"name": "Different" if conflicting else "Test-Model", "dbKeys": ["testmodel"]},
+                ]
+            }
+        ),
+    )
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == ("failed" if conflicting else "candidate")
+    if conflicting:
+        assert "ContradictionError" in result.error and tree(root) == {}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("decode_tp", "eight"),
+        ("prefill_ep", True),
+        ("decode_num_workers", -1),
+        ("num_decode_gpu", "8"),
+        ("is_multinode", "false"),
+        ("decode_dp_attention", 1),
+    ],
+)
+def test_malformed_deployment_preserves_qualified_state(root, tmp_path, field, value):
+    fake = FakeInfx()
+    first, _ = make_run(tmp_path, fake)
+    promote(root, first.snapshot_id, "reviewer", NOW)
+    before = tree(root)
+    fake.rows[0][field] = value
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "failed" and field in result.error
+    assert tree(root) == before
+
+
+@pytest.mark.parametrize("degree", [None, 0, 8])
+def test_deployment_unknown_and_zero_sentinels_remain_supported(root, tmp_path, degree):
+    result, _ = make_run(tmp_path, FakeInfx(rows=[row(decode_tp=degree)], availability=[avail()]))
+    assert result.status == "candidate", result.error
+
+
+def test_promotion_during_acquisition_is_not_reverted(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promoted = []
+    fake = FakeInfx(rows=[row(1, metrics={"mean_ttft": 0.2}), row(2, "h200")])
+
+    def interleave(url, headers, timeout):
+        if not promoted:
+            promoted.append(promote(root, first.snapshot_id, "reviewer", NOW))
+            promoted.append(tree(root))
+        return fake(url, headers, timeout)
+
+    result, _ = make_run(tmp_path, interleave)
+    state = infx_job.load_state(root)
+    assert promoted and state["qualified"] == promoted[0]
+    assert tree(root) == promoted[1]
+    assert state["candidate"] is None
+    assert result.status == "failed" and "state changed" in result.error
+    retry, _ = make_run(tmp_path, fake)
+    assert retry.status == "candidate"
+    assert infx_job.load_state(root)["qualified"] == promoted[0]

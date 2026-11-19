@@ -39,13 +39,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aisim_core.data import Manifest, _verify
+from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify
 from aisim_core.data.catalog import catalog_files
 from aisim_core.data.e2e import (
     OBSERVATIONS_SCHEMA,
     REQUESTS_SCHEMA,
     E2eManifestBody,
     body_from_manifest,
+    load_e2e,
     read_snapshot,
 )
 from aisim_core.data.eval import load_record, record_paths
@@ -247,12 +248,14 @@ def _request_rows_allowed(body: E2eManifestBody | None, policy: RedactionPolicy)
     )
 
 
-def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionPolicy) -> list[Finding]:
+def _check_manifest(
+    root: Path, rel: str, manifest: Manifest, policy: RedactionPolicy, infx_ids: set[str]
+) -> list[Finding]:
     out: list[Finding] = []
     body: E2eManifestBody | None = None
     if manifest.category == "e2e":
         body = body_from_manifest(manifest)
-        if _is_infx(body.source_kind) and policy.inferencex_disclosure == "aggregates-only":
+        if manifest.configuration_id in infx_ids and policy.inferencex_disclosure == "aggregates-only":
             out.append(
                 Finding(
                     "infx-aggregates-only",
@@ -290,7 +293,11 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
             # extension schemas, rather than exempting unmatched schema IDs.
             out.extend(
                 _check_table_text(
-                    read_parquet(root / artifact.path, artifact.artifact_schema), artifact.path, policy, "column"
+                    read_parquet(root / artifact.path, artifact.artifact_schema),
+                    artifact.path,
+                    policy,
+                    "column",
+                    path=root / artifact.path,
                 )
             )
         elif artifact.format == "json":
@@ -318,18 +325,18 @@ def _check_observations(path: Path, rel: str, policy: RedactionPolicy) -> list[F
             out.append(Finding("provenance-withheld", f"{name} links withheld evidence", rel))
         elif name == "evidence_refs" and any(values) and not policy.allow_provenance_artifacts:
             out.append(Finding("provenance-withheld", "evidence_refs link withheld evidence", rel))
-    out.extend(_check_table_text(table, rel, policy, "column"))
+    out.extend(_check_table_text(table, rel, policy, "column", path=path))
     return out
 
 
 def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
     """Scan every string column of an accepted request table; one finding per column stops the copy."""
-    return _check_table_text(read_parquet(path, REQUESTS_SCHEMA), rel, policy, "request column")
+    return _check_table_text(read_parquet(path, REQUESTS_SCHEMA), rel, policy, "request column", path=path)
 
 
-def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str) -> list[Finding]:
+def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str, *, path: Path) -> list[Finding]:
     """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid."""
-    out: list[Finding] = []
+    out = scan_value(pq.ParquetFile(path).metadata.created_by, policy, rel, "Parquet producer")
     metadata = [table.schema.metadata or {}]
 
     def field_metadata(field: pa.Field) -> None:
@@ -367,7 +374,7 @@ def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy) -> list[Findi
             path = _verify(root, artifact)
             out.extend(
                 _check_table_text(
-                    read_parquet(path, artifact.artifact_schema), artifact.path, policy, "snapshot column"
+                    read_parquet(path, artifact.artifact_schema), artifact.path, policy, "snapshot column", path=path
                 )
             )
     return out
@@ -392,7 +399,7 @@ def _check_eval_record(
         if artifact.format == "parquet":
             out.extend(
                 _check_table_text(
-                    read_parquet(path, artifact.artifact_schema), artifact_rel, policy, "eval truth column"
+                    read_parquet(path, artifact.artifact_schema), artifact_rel, policy, "eval truth column", path=path
                 )
             )
         elif artifact.format == "json":
@@ -447,26 +454,44 @@ def check_publishable(
         try:
             for artifact in manifest.artifacts:
                 checked_path(root, artifact.path)
-            if manifest.category == "e2e" and _is_infx(body_from_manifest(manifest).source_kind):
-                infx_ids.add(manifest.configuration_id)
+            if manifest.category == "e2e":
+                configuration = load_e2e(root, rel)
+                if _is_infx(configuration.body.source_kind) or any(
+                    _is_infx(observation.source_kind) for observation in configuration.observations
+                ):
+                    infx_ids.add(manifest.configuration_id)
         except (ValueError, OSError) as exc:
             findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
             invalid.add(rel)
     chosen_set = set(chosen)
+    index_rel = "catalog/dataset.json"
+    if (root / index_rel).is_file():
+        try:
+            dataset = DatasetIndex.model_validate_json(checked_path(root, index_rel).read_bytes())
+            indexes = {index_rel: dataset}
+            for ref in dataset.categories.values():
+                checked_path(root, ref.index.path)
+                indexes[ref.index.path] = CategoryIndex.model_validate_json(_verify(root, ref.index).read_bytes())
+            for rel, index in indexes.items():
+                if rel in chosen_set:
+                    findings.extend(scan_value(index.model_dump(mode="json", by_alias=True), policy, rel, "index"))
+        except (OSError, ValueError, RecursionError) as exc:
+            findings.append(Finding("document-invalid", str(exc).splitlines()[0], index_rel))
     catalog_shards = {p.relative_to(root).as_posix() for p in catalog_files(root)}
     snapshots = snapshot_documents(root, chosen)
     for rel, manifest in sorted(loaded.items()):
         if rel in chosen_set and rel not in invalid:
             try:
-                findings.extend(_check_manifest(root, rel, manifest, policy))
+                findings.extend(_check_manifest(root, rel, manifest, policy, infx_ids))
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
         if rel in catalog_shards:
             try:
                 parquet = pq.ParquetFile(checked_path(root, rel))
-                findings.extend(_check_table_text(parquet.read(), rel, policy, "catalog column"))
-                findings.extend(scan_value(parquet.metadata.created_by, policy, rel, "Parquet producer"))
+                findings.extend(
+                    _check_table_text(parquet.read(), rel, policy, "catalog column", path=checked_path(root, rel))
+                )
             except (OSError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel.startswith("systems/") and rel.endswith(".yaml"):

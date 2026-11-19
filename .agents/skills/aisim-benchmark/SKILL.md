@@ -46,7 +46,10 @@ resolved plan instead of improvising cluster access.
 
 1. Plan. Stop for reuse only with a complete, verified record for the exact requested identity
    and a prediction fingerprint matching the current predictor (including `code_version`,
-   spec and profile hashes). `have` or an unchanged spec alone is insufficient; otherwise re-evaluate.
+   spec and profile hashes). The requested truth snapshot, truth artifact hashes and comparison
+   workload must also match the record; confirm these against its truth inputs even when the catalog
+   groups the cell as `reuse`. Unchanged truth and workload remain reusable; changed or unverified
+   truth or workload requires re-evaluation. `have` or an unchanged spec alone is insufficient.
 2. Collect only what is `missing` or `stale`; use the smallest layer that answers the question.
 3. Capture `gpu_time` from the Slurm or Kubernetes record of every collection and evaluation job.
 4. Evaluate against truth that was not used for calibration; store and verify the record.
