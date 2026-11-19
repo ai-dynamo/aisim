@@ -174,6 +174,14 @@ def test_truncated_body_is_retried_and_request_budget_is_enforced():
         InfxClient(fake, RetryPolicy(max_attempts=9, max_requests=2), lambda _: None).get("availability")
 
 
+def test_incomplete_read_from_the_transport_is_retried():
+    import http.client
+
+    fake = FakeInfx()
+    fake.respond("availability", http.client.IncompleteRead(b"[1", 99), ok([]))
+    assert InfxClient(fake, RetryPolicy(max_attempts=2), lambda _: None).get("availability").attempts == 2
+
+
 # --------------------------------------------------------------------------- end to end
 
 
@@ -289,6 +297,18 @@ def test_valid_empty_after_data_existed_is_a_contradiction(root, tmp_path):
     promote(root, first.snapshot_id, "Reviewer", now=NOW)
     result, _ = make_run(tmp_path, FakeInfx(availability=[]))
     assert result.status == "failed" and "ContradictionError" in result.error
+
+
+def test_availability_differing_only_by_workload_shape_is_declared_separately(root, tmp_path):
+    long_context = {**avail("h100"), "isl": 2048}
+    result, _ = make_run(tmp_path, FakeInfx(rows=[row(1)], availability=[avail("h100"), long_context]))
+    assert result.status == "failed" and "IncompleteAcquisitionError" in result.error and "absent" in result.error
+
+
+def test_unknown_model_selector_fails_but_known_model_without_data_is_empty(root, tmp_path):
+    result, _ = make_run(tmp_path, FakeInfx(), models=["Test-Modle"])
+    assert result.status == "failed" and "unknown model selector" in result.error
+    assert make_run(tmp_path, FakeInfx(), models=["other"])[0].status == "empty"  # a db key is accepted too
 
 
 def test_model_filter_selecting_nothing_is_valid_empty(root, tmp_path):

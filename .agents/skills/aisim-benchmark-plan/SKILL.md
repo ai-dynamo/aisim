@@ -34,8 +34,11 @@ Stage 1 of [`aisim-benchmark`](../aisim-benchmark/SKILL.md). Do not re-collect w
 
    Output groups cells into `reuse` (data and an accuracy record), `evaluate_only` (data, no
    record), `recollect_or_reevaluate` (`stale`: the system spec changed since the last record)
-   and `collect` (`missing`). Check each reused cell's version and tier match the request;
-   `submitted` records are not evidence for defaults or gates.
+   and `collect` (`missing`). A row can combine several framework versions and configurations
+   (`multi_version`), and its tier belongs to one latest record. Before reusing a cell, confirm the
+   requested version has its own manifest and an evaluation record naming that exact identity.
+   `submitted` records are not evidence for defaults or gates. A model listed under
+   `not_in_catalog` has never appeared in the catalog: treat its cells as unknown and collect.
 4. Estimate budget from the same script. The number is `estimated` (GPUs x wall hours x retry
    margin, queue wait excluded); show `prior_recorded_gpu_seconds` of comparable cells as a
    reference only. A null prior is "never recorded", not zero.

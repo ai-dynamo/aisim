@@ -11,6 +11,7 @@ is recorded.
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def _row(r):
         "framework": r.framework,
         "status": r.status,
         "versions": r.versions,
+        "multi_version": "," in r.versions,  # the tier below belongs to one record, not every listed version
         "n_configs": r.n_configs,
         "acc_mape_pct": r.acc_mape_pct,
         "acc_tier": r.acc_tier,
@@ -47,12 +49,20 @@ def build_plan(args) -> dict:
         "recollect_or_reevaluate": [r for r in rows if r.status == "stale"],
         "collect": [r for r in rows if r.status == "missing"],
     }
+    recorded = [r.gpu_seconds for r in rows if r.gpu_seconds is not None]
     plan = {
         "hardware": args.hardware,
         "known_hardware": catalog.hardware(),
         "cells": {name: [_row(r) for r in group] for name, group in groups.items()},
-        "prior_recorded_gpu_seconds": sum(r.gpu_seconds for r in rows if r.gpu_seconds is not None) or None,
+        "prior_recorded_gpu_seconds": sum(recorded) if recorded else None,  # a recorded zero stays zero
     }
+    if args.model is not None:
+        wanted = [args.layer] if args.layer in ("fpm", "e2e") else ["fpm", "e2e"] if args.layer is None else []
+        present = {r.layer for r in rows if r.model == args.model}
+        # The catalog lists only models that have appeared; absence is "unknown", not "covered".
+        plan["not_in_catalog"] = [
+            {"layer": layer, "model": args.model, "hardware": args.hardware} for layer in wanted if layer not in present
+        ]
     if args.gpus is not None and args.wall_hours is not None:
         base = args.gpus * args.wall_hours * 3600.0
         plan["budget"] = {
@@ -76,6 +86,14 @@ def main(argv=None) -> int:
     p.add_argument("--wall-hours", type=float, help="planned wall hours of the whole allocation")
     p.add_argument("--retry-margin", type=float, default=0.25, help="fraction added for failed/retried attempts")
     args = p.parse_args(argv)
+    if (args.gpus is None) != (args.wall_hours is None):
+        p.error("--gpus and --wall-hours must be given together")
+    if args.gpus is not None and args.gpus <= 0:
+        p.error("--gpus must be positive")
+    if args.wall_hours is not None and not (math.isfinite(args.wall_hours) and args.wall_hours > 0):
+        p.error("--wall-hours must be a positive finite number")
+    if not (math.isfinite(args.retry_margin) and args.retry_margin >= 0):
+        p.error("--retry-margin must be a non-negative finite number")
     try:
         plan = build_plan(args)
     except FileNotFoundError as exc:
