@@ -179,15 +179,19 @@ def run_init(args: argparse.Namespace) -> int:
             )
         mode = _prompt_mode()
     path = config_path(cache_dir=args.cache_dir)
-    config = InitConfig(
-        mode=mode,
-        hardware=args.hardware,
-        repo=args.repo,
-        revision=args.revision,
-    )
+    saved = load_config(path)
+    repo, revision = args.repo, args.revision
+    if saved:  # an omitted flag keeps the saved source; a revision belongs to its repository
+        if repo is None and revision is None:
+            repo, revision = saved.repo, saved.revision
+        elif repo is not None and revision is None and repo == saved.repo:
+            revision = saved.revision
+        elif repo is None and revision is not None:
+            repo = saved.repo
+    config = InitConfig(mode=mode, hardware=args.hardware, repo=repo, revision=revision)
     payload: dict[str, Any] = {"mode": mode, "config": str(path)}
     if mode != "on-demand":
-        repo, revision = resolve_source(args.repo, args.revision, config=load_config(path))
+        repo, revision = resolve_source(args.repo, args.revision, config=saved)
         selection = Selection(
             category="op-latency", hardware=args.hardware, purpose="operation-tables", select_all=mode == "all"
         )
@@ -268,16 +272,31 @@ def run_clear(args: argparse.Namespace) -> int:
         if sys.stdin.readline().strip().lower() not in ("y", "yes"):
             sys.stderr.write("aborted\n")
             return EXIT_FAILURE
+    failures: list[str] = []
+    removed = freed = 0
     for target in (*targets, *extras):
-        shutil.rmtree(target, ignore_errors=True)
+        size = _dir_size(target)
+        try:
+            shutil.rmtree(target)
+        except OSError as exc:
+            failures.append(f"{target}: {exc}")
+            continue
+        if target in targets:
+            removed += 1
+        freed += size
     for repo_dir in sorted(p for p in cache.root.glob("*__*") if p.is_dir()) if cache.root.is_dir() else []:
         try:
             repo_dir.rmdir()  # only when empty
         except OSError:
             pass
+    if failures:
+        for failure in failures:
+            sys.stderr.write(f"{_NAME}: could not remove {failure}\n")
+        _emit({"removed_revisions": removed, "freed_bytes": freed, "config_removed": False, "failed": failures})
+        return EXIT_FAILURE  # keep the init config: the cache is only partly cleared
     config_removed = path.exists()
     path.unlink(missing_ok=True)
-    _emit({"removed_revisions": len(targets), "freed_bytes": sizes, "config_removed": config_removed})
+    _emit({"removed_revisions": removed, "freed_bytes": freed, "config_removed": config_removed})
     return 0
 
 

@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from aisim_core.data import Category, CategoryIndex, Manifest, _verify, check_dataset, check_manifest
 from aisim_core.data.fetch import Cache, Selection, SelectionError, Transport, fetch, resolve_revision
 from aisim_core.data.loaders import LoaderError
-from aisim_core.data.names_check import check_names, iter_manifests
+from aisim_core.data.names_check import check_names, discover_manifests
 
 #: Categories with no offline manifest checker; their manifests get name checks and digest checks only.
 UNCHECKED_CATEGORIES = ("e2e", "eval", "systems")
@@ -46,7 +46,10 @@ def validate_local(path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"{path}: no such file or directory")
     findings: list[dict[str, Any]] = []
     skipped: set[str] = set()
-    manifests = iter_manifests(path)
+    manifests, discovery_errors = discover_manifests(path)
+    for message in discovery_errors:
+        manifest_path, _, detail = message.partition(": ")
+        findings.append(_finding("manifest", manifest_path, detail))
     root = _dataset_root(path, manifests)
     dataset_checked = False
     cataloged: set[str] = set()  # manifests check_dataset already checked
@@ -103,8 +106,10 @@ def _dataset_root(path: Path, manifests: list[Path]) -> Path:
             return candidate
     for manifest_file in manifests[:1]:
         try:
-            artifacts = json.loads(manifest_file.read_text(encoding="utf-8")).get("artifacts") or []
-            first = artifacts[0]["path"]
+            document = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                break  # the manifest check reports it
+            first = (document.get("artifacts") or [])[0]["path"]
         except (OSError, ValueError, LookupError, TypeError):
             break
         for candidate in candidates:

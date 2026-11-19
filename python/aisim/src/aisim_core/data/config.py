@@ -37,12 +37,21 @@ class ConfigError(ValueError):
 
 
 def shipped_pin() -> tuple[str, str]:
-    """``(repo, revision)`` shipped with the package; ``main`` when the pin file is absent."""
+    """``(repo, revision)`` shipped with the package; ``main`` only when the pin file is absent.
+
+    An existing pin that is unreadable or lacks ``revision`` raises :class:`ConfigError`.
+    """
     try:
-        data = json.loads(PIN_FILE.read_text(encoding="utf-8"))
-        return str(data.get("repo") or DEFAULT_REPO), str(data["revision"])
-    except (OSError, ValueError, KeyError, TypeError):
+        text = PIN_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return DEFAULT_REPO, FALLBACK_REVISION
+    except OSError as exc:
+        raise ConfigError(f"{PIN_FILE}: unreadable shipped pin: {exc}") from exc
+    try:
+        data = json.loads(text)
+        return str(data.get("repo") or DEFAULT_REPO), str(data["revision"])
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ConfigError(f"{PIN_FILE}: malformed shipped pin: {type(exc).__name__}: {exc}") from exc
 
 
 def config_path(env: Mapping[str, str] | None = None, cache_dir: str | Path | None = None) -> Path:

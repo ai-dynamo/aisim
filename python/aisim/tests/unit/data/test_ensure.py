@@ -715,3 +715,20 @@ def test_pin_from_environment_uses_saved_init_source(tmp_path):
     assert (p.repo, p.revision) == (REPO, SHA)
     other = pin_from_environment({**env, "AISIM_DATASET": f"{REPO}@{'b' * 40}"})
     assert other.revision == "b" * 40
+
+
+@pytest.mark.unit
+def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path):
+    from aisim_core.data.config import ConfigError, InitConfig, resolve_source, save_config, shipped_pin
+
+    env = {"AISIM_DATA_CACHE": str(tmp_path)}
+    cfg = tmp_path / "config.json"
+    save_config(InitConfig(mode="on-demand", revision=SHA), cfg)  # revision only
+    p = pin_from_environment(env)
+    assert (p.repo, p.revision) == (shipped_pin()[0], SHA)
+    save_config(InitConfig(mode="on-demand", repo=shipped_pin()[0]), cfg)  # shipped repository, no revision
+    p = pin_from_environment(env)
+    assert (p.repo, p.revision) == resolve_source(config=InitConfig(mode="on-demand", repo=shipped_pin()[0]))
+    cfg.write_text("{truncated")  # corrupt saved config is reported, not ignored
+    with pytest.raises(ConfigError):
+        pin_from_environment(env)
