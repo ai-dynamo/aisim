@@ -53,7 +53,7 @@ for r in range(rounds):
         )
         for c in json.loads(proc.stdout)["results"]:
             if c.get("status") != "OK":
-                sys.exit(f"{b} {c['case_id']}: {c.get('status')} {c.get('error', '')[:200]}")
+                sys.exit(f"{b} {c['case_id']}: {c.get('status')} {json.dumps(c.get('error', {}))[:200]}")
             row = res[b].setdefault(c["case_id"], {"cold": [], "warm": []})
             row["cold"].append(c["cold_us"])
             row["warm"].append(c["warm"]["call_median_us"])
