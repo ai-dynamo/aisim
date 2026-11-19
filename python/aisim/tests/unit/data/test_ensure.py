@@ -468,3 +468,16 @@ def test_the_ownership_lookup_reads_each_category_index(tmp_path, files):
     )  # this dataset has no such category
     remote = pin(tmp_path, categories=("fpm", "op-latency"))
     assert ensure_mod._category_configuration_ids(remote, FakeTransport(files), "fpm") == set(ids)
+
+
+@pytest.mark.unit
+def test_pin_from_environment_uses_saved_init_source(tmp_path):
+    from aisim_core.data.config import InitConfig, save_config
+
+    env = {"AISIM_DATA_CACHE": str(tmp_path)}
+    assert pin_from_environment(env) is None
+    save_config(InitConfig(mode="on-demand", repo=REPO, revision=SHA), tmp_path / "config.json")
+    p = pin_from_environment(env)
+    assert (p.repo, p.revision) == (REPO, SHA)
+    other = pin_from_environment({**env, "AISIM_DATASET": f"{REPO}@{'b' * 40}"})
+    assert other.revision == "b" * 40
