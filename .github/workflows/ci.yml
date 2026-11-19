@@ -765,10 +765,7 @@ jobs:
 
   python-compliance:
     name: Python Dependency Licenses
-    # SPDX headers are covered by the spdx-headers checks in fast-ci; this
-    # job is only the dependency-license gate, which is architecture-
-    # independent. Gated on the application-wheel scope (and listed in that
-    # job's needs) so a disallowed license blocks wheel builds and staging.
+    # License policy applies even when wheel/test components are N/A.
     needs: [fast-ci, select-full-ci]
     if: >-
       ${{
@@ -776,8 +773,7 @@ jobs:
         !failure() &&
         !cancelled() &&
         needs.fast-ci.result == 'success' &&
-        needs.select-full-ci.result == 'success' &&
-        needs.select-full-ci.outputs.application_wheel == 'true'
+        needs.select-full-ci.result == 'success'
       }}
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 15
@@ -794,6 +790,22 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
+      - name: Require known and approved configuration licenses
+        env:
+          CONFIG_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python scripts/ci/check_config_license_approvals.py \
+            --source-sha "${CONFIG_SOURCE_SHA}" \
+            --output-dir "${RUNNER_TEMP}/config-license-approval"
+      - name: Preserve configuration license findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: config-license-approval
+          path: ${{ runner.temp }}/config-license-approval/config-license-approval.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
       - name: Check Python dependency licenses
         run: python scripts/ci/check_python_licenses.py
 
@@ -970,7 +982,6 @@ jobs:
               "rust-feature-modes": "rust_feature_modes",
               "public-api-rust": "public_api_rust",
               "application-wheel": "application_wheel",
-              "python-compliance": "application_wheel",
               "application-test-wheel": "application_tests",
               "application-tests": "application_tests",
               "python-compatibility": "python_compatibility",
@@ -981,6 +992,7 @@ jobs:
               "verify-target": "success",
               "select-full-ci": "success",
               "fast-ci": "success",
+              "python-compliance": "success",
           }
           invalid_outputs = []
           for job, output in component_outputs.items():

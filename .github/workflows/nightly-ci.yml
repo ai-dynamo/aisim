@@ -301,7 +301,7 @@ jobs:
         USER: runner
     steps:
       # Keep the license policy/tooling at the workflow revision. Older
-      # release sources need only their package manifest, not this helper.
+      # release sources must also carry an exact config inventory/review ledger.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
@@ -314,6 +314,22 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Require known and approved configuration licenses
+        env:
+          CONFIG_SOURCE_SHA: ${{ needs.changes-guard.outputs.target-sha }}
+        run: |
+          python scripts/ci/check_config_license_approvals.py --root source \
+            --source-sha "${CONFIG_SOURCE_SHA}" \
+            --output-dir "${RUNNER_TEMP}/config-license-approval"
+      - name: Preserve configuration license findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-config-license-approval-${{ matrix.arch }}-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/config-license-approval/config-license-approval.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
       - name: Check Python dependency licenses
         env:
           MATRIX_ARCH: ${{ matrix.arch }}
