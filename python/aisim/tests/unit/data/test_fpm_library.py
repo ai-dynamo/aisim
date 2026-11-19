@@ -2110,3 +2110,100 @@ def test_entry_checks_coordinates_with_a_complete_sidecar(root, profile, field, 
     findings = check_fpm_entry(root, MANIFEST)
     assert [f.code for f in findings] == ["library-coordinates"]
     assert field in findings[0].message
+
+
+# ------------------------------------------------------------------ review hardening
+
+
+def test_library_declaration_is_validated_before_the_format_branch(root, profile):
+    from aisim_core.data import _verify
+
+    make_entry(root, profile, resources=RESOURCES)
+    manifest = Manifest.model_validate_json((root / MANIFEST).read_bytes())
+    library = next(a for a in manifest.artifacts if a.role == "fpm-library")
+    assert _verify(root, library).is_file()
+    for update in ({"format": "json"}, {"rows": None}, {"artifact_schema": "aic_fpm_forward_perf/v7"}):
+        with pytest.raises(ValueError, match="fpm-library|FPM library schema"):
+            _verify(root, library.model_copy(update=update))
+
+
+def test_library_row_integers_reject_booleans():
+    from pydantic import ValidationError as ModelValidationError
+
+    from aisim_core.data.fpm_library import FpmLibraryRow
+
+    samples = {str: "x", int: 1, float: 1.0, bool: False}
+    row = {name: samples[info.annotation] for name, info in FpmLibraryRow.model_fields.items() if info.is_required()}
+    assert FpmLibraryRow.model_validate(row).tp == 1
+    with pytest.raises(ModelValidationError):
+        FpmLibraryRow.model_validate({**row, "tp": True})
+
+
+def test_sidecar_reader_rejects_duplicate_keys_and_float_overflow(tmp_path):
+    sidecar = tmp_path / "sidecar.json"
+    base = '{"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, %s}'
+    sidecar.write_text(base % '"b": 1, "a": 1, "b": 2, "a": 3')
+    with pytest.raises(FpmContractError, match="duplicate JSON key 'a'"):
+        read_library_metadata(sidecar)
+    sidecar.write_text(base % '"scale": 1e400')
+    with pytest.raises(FpmContractError, match="non-finite"):
+        read_library_metadata(sidecar)
+    sidecar.write_text(base % '"scale": 1.5e3')
+    assert read_library_metadata(sidecar)["scale"] == 1500.0
+
+
+def _stage_args(root):
+    source = root / ENTRY / "fpm"
+    return (source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json")
+
+
+KWARGS = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1")
+
+
+def test_invalid_system_yaml_is_a_contract_error(root, profile, tmp_path):
+    make_entry(root, profile, resources=RESOURCES)
+    systems = tmp_path / "systems"
+    systems.mkdir()
+    (systems / "h200_sxm.yaml").write_text("data_dir: [")
+    with pytest.raises(FpmContractError, match="not valid YAML"):
+        stage_fpm_library(*_stage_args(root), **KWARGS, systems_paths=[systems], output_dir=tmp_path / "out")
+
+
+def test_staging_inside_a_system_data_tree_is_rejected(root, profile, tmp_path):
+    make_entry(root, profile, resources=RESOURCES)
+    systems = tmp_path / "systems"
+    (systems / "data/h200_sxm/vllm").mkdir(parents=True)
+    (systems / "h200_sxm.yaml").write_text("data_dir: data/h200_sxm\n")
+    with pytest.raises(FpmContractError, match="must not be inside the system data tree"):
+        stage_fpm_library(
+            *_stage_args(root), **KWARGS, systems_paths=[systems], output_dir=systems / "data/h200_sxm/vllm/out"
+        )
+    assert not any(p.is_symlink() and not p.exists() for p in systems.rglob("*"))
+
+
+def test_failed_resource_contract_leaves_the_previous_staging_in_place(root, profile, tmp_path):
+    make_entry(root, profile, resources=RESOURCES)
+    first = load(root, user_config(profile), tmp_path)
+    before = first.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"]
+    other = tmp_path / "other"
+    make_entry(other, profile)  # no sidecar resources
+    with pytest.raises(FpmResourcesPendingError):
+        load(other, user_config(profile), tmp_path, require_resources=True)
+    staged = Path(before)
+    assert staged.resolve() == (root / ENTRY / "fpm/fpm_forward_perf.parquet").resolve()
+
+
+def test_sidecar_resources_do_not_attach_to_a_different_explicit_library(root, profile, tmp_path):
+    make_entry(root, profile, resources=RESOURCES)
+    config = {**user_config(profile)}
+    config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] = "/user/other.parquet"
+    data = load(root, config, tmp_path)
+    assert data.resource_sources == ("pending",)
+    with pytest.raises(FpmResourcesPendingError):
+        load(root, config, tmp_path / "again", require_resources=True)
+    own = user_config(profile)
+    own["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] = str(_stage_args(root)[0])
+    assert load(root, own, tmp_path / "own").resource_sources == ("metadata",)
+    explicit = user_config(profile, **RESOURCES)
+    explicit["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] = "/user/other.parquet"
+    assert load(root, explicit, tmp_path / "user").resource_sources == ("user",)

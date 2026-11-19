@@ -146,7 +146,11 @@ def test_ensure_guard_blocks_recursion(tmp_path, files):
     real = FpmLoader.load
 
     def spy(self, *a, **k):
+        from aisim_core.sdk.rust_engine_step import _ensure_dataset
+
         seen.append(ensure_mod.ensuring())
+        # A consumer built while the dataset pin is active must not ensure the dataset again.
+        assert _ensure_dataset(CONFIG, pin(tmp_path)) is None
         return real(self, *a, **k)
 
     FpmLoader.load = spy
@@ -461,3 +465,73 @@ def test_the_ownership_lookup_reads_each_category_index(tmp_path, files):
     )  # this dataset has no such category
     remote = pin(tmp_path, categories=("fpm", "op-latency"))
     assert ensure_mod._category_configuration_ids(remote, FakeTransport(files), "fpm") == set(ids)
+
+
+def _materialized_dir(tmp_path):
+    (config,) = (tmp_path / "cache").rglob("config.json")
+    return config.parent
+
+
+def test_interrupted_legacy_materialization_is_rebuilt(tmp_path, files):
+    ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    directory = _materialized_dir(tmp_path)
+    (directory / "config.json").unlink()  # a killed load left the directory without its last file
+    out = ensure_data(CONFIG, pin(tmp_path, offline=True), transport=FakeTransport(files))
+    assert out.config["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+    assert (directory / "config.json").is_file()
+
+
+def test_cached_materialization_is_verified_before_reuse(tmp_path, files, monkeypatch):
+    ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    directory = _materialized_dir(tmp_path)
+    marker = directory / "stale.txt"
+    marker.write_text("x")
+    monkeypatch.setattr(ensure_mod, "_materialization_is_intact", lambda systems, manifest: False)
+    ensure_data(CONFIG, pin(tmp_path, offline=True), transport=FakeTransport(files))
+    assert not marker.exists()  # the failed verification discarded the cache and rebuilt it
+
+
+def test_cached_pin_must_match_the_manifest_and_materialized_profile(tmp_path):
+    import hashlib
+    from types import SimpleNamespace
+
+    profile_bytes = b'{"retained_files": []}'
+    (tmp_path / "profile.json").write_bytes(profile_bytes)
+    sha = hashlib.sha256(profile_bytes).hexdigest()
+    profile = SimpleNamespace(
+        role="execution-profile",
+        sha256=sha,
+        bytes=len(profile_bytes),
+        format="json",
+        path="x",
+        artifact_schema="s",
+        rows=None,
+        model_copy=lambda update: SimpleNamespace(**{**profile.__dict__, **update}),
+    )
+    manifest = SimpleNamespace(artifacts=[profile])
+
+    def cached(**pin):
+        return {
+            "estimator_config": {
+                "op_level": {"execution_profile": {**{"path": str(tmp_path / "profile.json"), "sha256": sha}, **pin}}
+            }
+        }
+
+    assert ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached())
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached(sha256="0" * 64))
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached(path="/elsewhere/profile.json"))
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, {})
+    (tmp_path / "profile.json").write_bytes(b"edited")
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached())
+
+
+def test_generated_library_path_is_dropped_but_a_user_override_stays(tmp_path):
+    materialized = tmp_path / "cache" / "materialized"
+    generated = materialized / "repo-aaa" / "cfg-1-hash" / "systems" / "fpm_forward_perf.parquet"
+    config = {"estimator_config": {"fpm_interpolation": {"fpm_parquet_path": str(generated), "other": 1}}}
+    cleaned = ensure_mod._drop_generated_library_path(config, materialized)
+    assert cleaned["estimator_config"]["fpm_interpolation"] == {"other": 1}
+    assert config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(generated)  # input untouched
+    mine = {"estimator_config": {"fpm_interpolation": {"fpm_parquet_path": "/user/lib.parquet"}}}
+    assert ensure_mod._drop_generated_library_path(mine, materialized) == mine
+    assert ensure_mod._drop_generated_library_path({}, materialized) == {}

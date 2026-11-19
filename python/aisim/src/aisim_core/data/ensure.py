@@ -625,6 +625,34 @@ def _materialization_is_intact(systems: Path, manifest) -> bool:
     return True
 
 
+def _cached_pin_is_valid(output_dir: Path, manifest, cached: Mapping[str, Any]) -> bool:
+    """True when the cached config pins the manifest's profile at the path this materialization wrote."""
+    try:
+        profile = next(a for a in manifest.artifacts if a.role == "execution-profile")
+        pin = cached["estimator_config"]["op_level"]["execution_profile"]
+        if pin.get("sha256") != profile.sha256 or Path(pin.get("path", "")) != output_dir / "profile.json":
+            return False
+        _verify(output_dir, profile.model_copy(update={"path": "profile.json"}))
+    except (StopIteration, KeyError, TypeError, AttributeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) -> dict[str, Any]:
+    """Copy of ``config`` without an ``fpm_parquet_path`` that an earlier ensure call generated.
+
+    Such a path names a staged library of another materialization; keeping it would pair a new dataset revision
+    with the old library. A path the user set elsewhere is a genuine override and stays.
+    """
+    out = dict(config)
+    interpolation = (out.get("estimator_config") or {}).get("fpm_interpolation")
+    path = interpolation.get("fpm_parquet_path") if isinstance(interpolation, Mapping) else None
+    if path is not None and Path(path).expanduser().resolve().is_relative_to(materialized.resolve()):
+        interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
+        out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
+    return out
+
+
 def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
     manifest_path = entry.manifest.path
     if category == "fpm":
@@ -636,6 +664,7 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
             # set in its own materialization so later calls cannot replace an earlier configuration's inputs.
             # A configuration returned by an earlier call lists that call's own staging root; it is derived from
             # the same inputs, not a different user root, so it must not change this materialization's key.
+            config = _drop_generated_library_path(config, output_dir.parent.parent)
             owned = f"{output_dir.name}-"
             roots = tuple(
                 str(p)
@@ -658,8 +687,11 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
         cached = output_dir / "config.json"
         if cached.is_file():  # materialized by an earlier load; config.json is written last
             try:
-                if _materialization_is_intact(output_dir / "systems", manifest):
-                    return FpmData(manifest, config=json.loads(cached.read_text()))
+                cached_config = json.loads(cached.read_text())
+                if _materialization_is_intact(output_dir / "systems", manifest) and _cached_pin_is_valid(
+                    output_dir, manifest, cached_config
+                ):
+                    return FpmData(manifest, config=cached_config)
             except ValueError:
                 pass
         if output_dir.exists():  # partial, stale or edited: rebuild, never serve or trip over it

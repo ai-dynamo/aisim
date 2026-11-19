@@ -223,6 +223,15 @@ def _verify(root: Path, artifact: Artifact) -> Path:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if path.stat().st_size != artifact.bytes or digest != artifact.sha256:
         raise ValueError(f"artifact integrity mismatch: {artifact.path}")
+    if artifact.role == "fpm-library":
+        # Native libraries are identified by the manifest declaration alone, so validate it before any branch on
+        # the declared format.
+        from aisim_core.data.fpm_library import LIBRARY_SCHEMA_ID
+
+        if artifact.format != "parquet" or artifact.rows is None:
+            raise ValueError(f"an fpm-library artifact must declare format parquet and rows: {artifact.path}")
+        if artifact.artifact_schema != LIBRARY_SCHEMA_ID:
+            raise ValueError(f"unsupported FPM library schema ID {artifact.artifact_schema!r}: {artifact.path}")
     if artifact.format == "parquet" and (
         artifact.rows is None or pq.ParquetFile(path).metadata.num_rows != artifact.rows
     ):
