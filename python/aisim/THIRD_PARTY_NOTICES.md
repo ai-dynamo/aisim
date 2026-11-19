@@ -663,6 +663,8 @@ not fit, whose hit is searched again at the next step.
 `crates/core/src/engine/scheduler/vllm/core.rs` adapts, from
 `sched/scheduler.py`, the point where the copied hit blocks of a scheduling
 pass are released: after the waiting loop, at the end of the pass.
+`crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
+tests of these rules.
 `crates/core/src/engine/config.rs` and `grouped_prefix.rs` adapt the startup
 check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
 tokens, with the size of each group from `kv_cache_interface.py`, summed per
