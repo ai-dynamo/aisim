@@ -2359,6 +2359,10 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                     if not isinstance(inline_video, dict):
                         raise ValueError(f"{key} must be an object")
                     processor[key] = {**inline_video, **data}
+                if kimi:
+                    # Native video fields override legacy media aliases through
+                    # either sidecar, after preserving unspecified inline fields.
+                    sidecar_video = data.get("video_processor", {}) if key is None else data
                     media = processor.get("media_proc_cfg", processor)
                     if not isinstance(media, dict):
                         raise ValueError("Kimi media_proc_cfg must be an object")
@@ -2367,7 +2371,7 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                         ("max_patches", "in_patch_limit_each_frame"),
                         ("temporal_patch_size", "temporal_merge_kernel_size"),
                     ):
-                        if native in data:
+                        if native in sidecar_video:
                             media.pop(legacy, None)
                     if "media_proc_cfg" in processor:
                         processor["media_proc_cfg"] = media

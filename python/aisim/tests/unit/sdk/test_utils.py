@@ -244,6 +244,51 @@ def test_kimi_partial_video_sidecar_retains_inline_patch_limit(tmp_path, filenam
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("model", ["moonshotai/Kimi-K2.5", "moonshotai/Kimi-K3"])
+@pytest.mark.parametrize("nested_inline", [False, True])
+@pytest.mark.parametrize("filename", ["preprocessor_config.json", "video_preprocessor_config.json"])
+def test_kimi_native_video_sidecar_overrides_inline_legacy_patch_limit(tmp_path, model, nested_inline, filename):
+    config = utils._load_pre_downloaded_hf_config(model)
+    media = {"in_patch_limit": 8192, "in_patch_limit_each_frame": 1024, "temporal_merge_kernel_size": 4}
+    config["preprocessor_config"] = {"media_proc_cfg": media} if nested_inline else media
+    video = {"max_patches": 2048}
+    sidecar = {"video_processor": video} if filename == "preprocessor_config.json" else video
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / filename).write_text(json.dumps(sidecar))
+    try:
+        loaded = get_model_config_from_model_path(str(tmp_path))
+        encoder = loaded["encoder_config"]
+        assert encoder.video_max_patches == 2048
+        assert encoder.image_max_patches == 8192
+        assert encoder.max_video_frames == 4
+        assert (
+            utils._load_model_config_from_model_path(str(tmp_path))["preprocessor_config"]
+            == config["preprocessor_config"]
+        )
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("model", ["moonshotai/Kimi-K2.5", "moonshotai/Kimi-K3"])
+@pytest.mark.parametrize("nested_inline", [False, True])
+@pytest.mark.parametrize("filename", ["preprocessor_config.json", "video_preprocessor_config.json"])
+def test_kimi_native_video_sidecar_cannot_hide_unsupported_temporal_size(tmp_path, model, nested_inline, filename):
+    config = utils._load_pre_downloaded_hf_config(model)
+    media = {"in_patch_limit_each_frame": 1024, "temporal_merge_kernel_size": 4}
+    config["preprocessor_config"] = {"media_proc_cfg": media} if nested_inline else media
+    video = {"temporal_patch_size": 8}
+    sidecar = {"video_processor": video} if filename == "preprocessor_config.json" else video
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / filename).write_text(json.dumps(sidecar))
+    try:
+        with pytest.raises(ValueError, match="temporal chunk size must be 4"):
+            get_model_config_from_model_path(str(tmp_path))
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 @pytest.mark.parametrize("payload", [None, [], 7, {"quantization": {"quant_algo": "FP8"}}])
 def test_network_quant_json_must_be_an_object_through_public_loader(monkeypatch, hf_cache, payload):
     model = "org/network-quant-object"
