@@ -1539,7 +1539,6 @@ def test_nemotron_super_fp8_auto_degrades_to_hybrid_on_the_missing_mamba2_table(
     """AISIM-2194: the SILICON op_level candidate misses the Mamba2 table; auto rebuilds it in HYBRID."""
     pytest.importorskip("aisim_core")
     from dataclasses import replace
-    from importlib import resources
 
     from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
     from aisim_core.sdk.errors import PerfDataNotAvailableError
@@ -1570,9 +1569,11 @@ def test_nemotron_super_fp8_auto_degrades_to_hybrid_on_the_missing_mamba2_table(
         assert provenance["selected_estimation_mode"] == "op_level"
         assert provenance["requested_database_mode"] == "SILICON"
         assert provenance["selected_database_mode"] == "HYBRID"
-        packaged = str(resources.files("aisim_core") / "systems")
-        assert provenance["selected_systems_root"] == packaged
-        assert provenance["config"]["systems_paths"] == [packaged]
+        from aisim_core.data.default_systems import default_systems_path
+
+        default_root = default_systems_path()
+        assert provenance["selected_systems_root"] == default_root
+        assert provenance["config"]["systems_paths"] == [default_root]
         assert provenance["config"]["database_mode"] == "HYBRID"
         assert provenance["config"]["estimation_mode"] == "op_level"
         assert provenance["config"]["fallback_policy"] == "deny"
