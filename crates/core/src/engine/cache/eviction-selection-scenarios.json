@@ -1,0 +1,375 @@
+{
+  "schema_version": 1,
+  "seed": 363,
+  "token_rule": "token = seed * 65536 + page_label * page_size + offset; offset in 0..page_size",
+  "scenarios": [
+    {
+      "id": "lru_compressed_overshoot",
+      "policy": "lru",
+      "page_size": 4,
+      "capacity_pages": 6,
+      "forecast": [],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            9,
+            10
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 4
+        },
+        {
+          "op": "evict",
+          "tokens": 4
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        },
+        {
+          "op": "evict",
+          "tokens": 0
+        }
+      ]
+    },
+    {
+      "id": "lru_single_page_recency_control",
+      "policy": "lru",
+      "page_size": 1,
+      "capacity_pages": 3,
+      "forecast": [],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            2
+          ]
+        },
+        {
+          "op": "touch",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 1
+        },
+        {
+          "op": "evict",
+          "tokens": 1
+        }
+      ]
+    },
+    {
+      "id": "lru_locked_branch",
+      "policy": "lru",
+      "page_size": 4,
+      "capacity_pages": 6,
+      "forecast": [],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "op": "lock",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            4
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            9
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 4
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        },
+        {
+          "op": "unlock",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    },
+    {
+      "id": "lru_recycled_page",
+      "policy": "lru",
+      "page_size": 1,
+      "capacity_pages": 3,
+      "forecast": [],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            2
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 1
+        },
+        {
+          "op": "insert",
+          "pages": [
+            9
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 1
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    },
+    {
+      "id": "belady_tail_reranking",
+      "policy": "belady",
+      "page_size": 1,
+      "capacity_pages": 3,
+      "forecast": [
+        [
+          1
+        ],
+        [
+          3
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            2
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            3
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 2
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    },
+    {
+      "id": "belady_equal_priority_recency",
+      "policy": "belady",
+      "page_size": 1,
+      "capacity_pages": 3,
+      "forecast": [],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            2
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            3
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 2
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    },
+    {
+      "id": "belady_global_retirement",
+      "policy": "belady",
+      "page_size": 1,
+      "capacity_pages": 2,
+      "forecast": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            2
+          ]
+        },
+        {
+          "op": "retire",
+          "request": 0
+        },
+        {
+          "op": "evict",
+          "tokens": 1
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    },
+    {
+      "id": "belady_locked_prefix",
+      "policy": "belady",
+      "page_size": 4,
+      "capacity_pages": 4,
+      "forecast": [
+        [
+          1
+        ],
+        [
+          9
+        ],
+        [
+          1,
+          2,
+          3
+        ]
+      ],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "op": "lock",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            9
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        },
+        {
+          "op": "unlock",
+          "pages": [
+            1
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    },
+    {
+      "id": "belady_prefix_identity",
+      "policy": "belady",
+      "page_size": 1,
+      "capacity_pages": 4,
+      "forecast": [
+        [
+          1,
+          7
+        ],
+        [
+          2
+        ]
+      ],
+      "operations": [
+        {
+          "op": "insert",
+          "pages": [
+            1,
+            7
+          ]
+        },
+        {
+          "op": "insert",
+          "pages": [
+            2,
+            7
+          ]
+        },
+        {
+          "op": "evict",
+          "tokens": 2
+        },
+        {
+          "op": "evict",
+          "tokens": 100
+        }
+      ]
+    }
+  ]
+}

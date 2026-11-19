@@ -72,3 +72,7 @@ The SGLang simulator delegates radix matching, insertion, locking, and LRU evict
 Chunked growth inserts only suffix values and acquires the extended path before releasing its previous lock. Completed requests replay the retained prefix's access updates. LRU follows SGLang's whole-leaf eviction, so it can reclaim more pages than requested. Belady retains page-at-a-time tail eviction and reconsiders the exposed parent against the remaining leaves. Fallible admission snapshots clone tree metadata while sharing immutable key and page buffers; rollback restores the allocator, tree, leases, and buffered event state together.
 
 The dependency is pinned to the SGLang radix-core integration branch by immutable revision. Publishing `aisimulate-core` to crates.io requires a published `sglang-radix-tree` version in place of this Git dependency.
+
+The [eviction selection evidence](src/engine/cache/EVICTION_EVIDENCE.md) records
+reproducible before/after victim IDs, page counts, LRU overshoot, and Belady
+ordering, including the observed equal-priority recency difference.

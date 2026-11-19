@@ -26,6 +26,10 @@ use crate::engine::common::hashing::compute_block_hash_for_seq;
 
 pub use sglang_radix_tree::NodeId;
 
+#[cfg(test)]
+#[path = "eviction_evidence.rs"]
+mod eviction_evidence;
+
 /// Physical page identifier in the simulated SGLang KV pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KvPageId(usize);

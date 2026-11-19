@@ -1,0 +1,1537 @@
+{
+  "schema_version": 1,
+  "seed": 363,
+  "scenario_kind": "synthetic deterministic cache operations; no serving-accuracy or host-performance claim",
+  "scenarios_sha256": "6df0142e5022313eca3e9f1a2dde17796b7f1fe8bb87f779b6c41e3c6bddb972",
+  "probe_sha256": "b1a5cae4aa31da89d230775d6658ecd51608f3eb01e19d81cf41b4b52b2a0060",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "host": "Linux x86_64, CPython 3.12.12",
+  "profile": "test (unoptimized, debug assertions enabled)",
+  "features": [],
+  "native_radix_revision": "f0fda25fc95c357368b714f90a13a69c1b67f50a",
+  "reproduce_command": "python3 scripts/compare_radix_eviction.py --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d --candidate 335a02280b23cbc2f806bf32a2b4523869cdcbe9 --work-dir \"$TMPDIR/radix-eviction-evidence\"",
+  "baseline": {
+    "commit": "8288046ac88fccaee124714cd60e62b2ad4e184d",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "eviction_selection_matches_recorded_evidence"
+    ],
+    "scenarios": [
+      {
+        "evictions": [
+          {
+            "available_tokens": 8,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 4,
+            "victim_page_ids": [
+              2
+            ]
+          },
+          {
+            "available_tokens": 12,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 4,
+            "victim_page_ids": [
+              1
+            ]
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 3,
+            "freed_tokens": 12,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0,
+              3,
+              4
+            ]
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 0,
+            "freed_tokens": 0,
+            "operation_index": 5,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 0,
+            "requested_tokens": 0,
+            "victim_page_ids": []
+          }
+        ],
+        "id": "lru_compressed_overshoot"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              1
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "lru_single_page_recency_control"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 8,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  1,
+                  4
+                ]
+              },
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 4,
+            "victim_page_ids": [
+              2
+            ]
+          },
+          {
+            "available_tokens": 20,
+            "freed_pages": 3,
+            "freed_tokens": 12,
+            "operation_index": 5,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  4
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              1,
+              3,
+              4
+            ]
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 7,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  4
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "lru_locked_branch"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 1,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  1,
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              1
+            ]
+          },
+          {
+            "available_tokens": 2,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              0
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              1
+            ]
+          }
+        ],
+        "id": "lru_recycled_page"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 2,
+            "requested_tokens": 2,
+            "victim_page_ids": [
+              1,
+              2
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "belady_tail_reranking"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 2,
+            "requested_tokens": 2,
+            "victim_page_ids": [
+              1,
+              0
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              2
+            ]
+          }
+        ],
+        "id": "belady_equal_priority_recency"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 1,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              0
+            ]
+          },
+          {
+            "available_tokens": 2,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              1
+            ]
+          }
+        ],
+        "id": "belady_global_retirement"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 12,
+            "freed_pages": 3,
+            "freed_tokens": 12,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              2,
+              1,
+              3
+            ]
+          },
+          {
+            "available_tokens": 16,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 5,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "belady_locked_prefix"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 2,
+                "pages": [
+                  1,
+                  7
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2,
+                  7
+                ]
+              }
+            ],
+            "requested_pages": 2,
+            "requested_tokens": 2,
+            "victim_page_ids": [
+              3,
+              2
+            ]
+          },
+          {
+            "available_tokens": 4,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  7
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2,
+                  7
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              1,
+              0
+            ]
+          }
+        ],
+        "id": "belady_prefix_identity"
+      }
+    ]
+  },
+  "candidate": {
+    "commit": "335a02280b23cbc2f806bf32a2b4523869cdcbe9",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "eviction_selection_matches_recorded_evidence"
+    ],
+    "scenarios": [
+      {
+        "evictions": [
+          {
+            "available_tokens": 16,
+            "freed_pages": 3,
+            "freed_tokens": 12,
+            "operation_index": 2,
+            "overshoot_pages": 2,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 4,
+            "victim_page_ids": [
+              0,
+              1,
+              2
+            ]
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 2,
+            "freed_tokens": 8,
+            "operation_index": 3,
+            "overshoot_pages": 1,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 4,
+            "victim_page_ids": [
+              3,
+              4
+            ]
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 0,
+            "freed_tokens": 0,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": []
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 0,
+            "freed_tokens": 0,
+            "operation_index": 5,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9,
+                  10
+                ]
+              }
+            ],
+            "requested_pages": 0,
+            "requested_tokens": 0,
+            "victim_page_ids": []
+          }
+        ],
+        "id": "lru_compressed_overshoot"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              1
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "lru_single_page_recency_control"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 12,
+            "freed_pages": 2,
+            "freed_tokens": 8,
+            "operation_index": 4,
+            "overshoot_pages": 1,
+            "prefix_matches": [
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 8,
+                "pages": [
+                  1,
+                  4
+                ]
+              },
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 4,
+            "victim_page_ids": [
+              1,
+              2
+            ]
+          },
+          {
+            "available_tokens": 20,
+            "freed_pages": 2,
+            "freed_tokens": 8,
+            "operation_index": 5,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  4
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              3,
+              4
+            ]
+          },
+          {
+            "available_tokens": 24,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 7,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  4
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "lru_locked_branch"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 3,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 1,
+            "overshoot_pages": 1,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              0,
+              1
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              1
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 0,
+            "freed_tokens": 0,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": []
+          }
+        ],
+        "id": "lru_recycled_page"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 2,
+            "requested_tokens": 2,
+            "victim_page_ids": [
+              1,
+              2
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "belady_tail_reranking"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 2,
+            "requested_tokens": 2,
+            "victim_page_ids": [
+              1,
+              2
+            ]
+          },
+          {
+            "available_tokens": 3,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  3
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "belady_equal_priority_recency"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 1,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 1,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 1,
+            "requested_tokens": 1,
+            "victim_page_ids": [
+              0
+            ]
+          },
+          {
+            "available_tokens": 2,
+            "freed_pages": 1,
+            "freed_tokens": 1,
+            "operation_index": 4,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              1
+            ]
+          }
+        ],
+        "id": "belady_global_retirement"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 12,
+            "freed_pages": 3,
+            "freed_tokens": 12,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 4,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              2,
+              1,
+              3
+            ]
+          },
+          {
+            "available_tokens": 16,
+            "freed_pages": 1,
+            "freed_tokens": 4,
+            "operation_index": 5,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  2,
+                  3
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  9
+                ]
+              }
+            ],
+            "requested_pages": 25,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              0
+            ]
+          }
+        ],
+        "id": "belady_locked_prefix"
+      },
+      {
+        "evictions": [
+          {
+            "available_tokens": 2,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 2,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 2,
+                "pages": [
+                  1,
+                  7
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2,
+                  7
+                ]
+              }
+            ],
+            "requested_pages": 2,
+            "requested_tokens": 2,
+            "victim_page_ids": [
+              3,
+              2
+            ]
+          },
+          {
+            "available_tokens": 4,
+            "freed_pages": 2,
+            "freed_tokens": 2,
+            "operation_index": 3,
+            "overshoot_pages": 0,
+            "prefix_matches": [
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  1,
+                  7
+                ]
+              },
+              {
+                "matched_tokens": 0,
+                "pages": [
+                  2,
+                  7
+                ]
+              }
+            ],
+            "requested_pages": 100,
+            "requested_tokens": 100,
+            "victim_page_ids": [
+              1,
+              0
+            ]
+          }
+        ],
+        "id": "belady_prefix_identity"
+      }
+    ]
+  },
+  "scenario_comparisons": [
+    {
+      "id": "lru_compressed_overshoot",
+      "equal": false,
+      "differences": [
+        {
+          "operation_index": 2,
+          "differing_fields": [
+            "available_tokens",
+            "freed_pages",
+            "freed_tokens",
+            "overshoot_pages",
+            "prefix_matches",
+            "victim_page_ids"
+          ]
+        },
+        {
+          "operation_index": 3,
+          "differing_fields": [
+            "available_tokens",
+            "freed_pages",
+            "freed_tokens",
+            "overshoot_pages",
+            "prefix_matches",
+            "victim_page_ids"
+          ]
+        },
+        {
+          "operation_index": 4,
+          "differing_fields": [
+            "freed_pages",
+            "freed_tokens",
+            "victim_page_ids"
+          ]
+        }
+      ],
+      "explanation": "Main truncates the oldest leaf tail one requested page at a time: [2], then [1], then remaining [0,3,4]. Native LRU removes the entire oldest compressed leaf [0,1,2] (two-page overshoot), then [3,4] (one-page overshoot), leaving no pages for the drain. Lower retained-prefix matches and higher free capacity follow directly."
+    },
+    {
+      "id": "lru_single_page_recency_control",
+      "equal": true,
+      "differences": [],
+      "explanation": "Identical: touching page 0 makes page 1 oldest; neither victim is compressed, so both calls free exactly one page."
+    },
+    {
+      "id": "lru_locked_branch",
+      "equal": false,
+      "differences": [
+        {
+          "operation_index": 4,
+          "differing_fields": [
+            "available_tokens",
+            "freed_pages",
+            "freed_tokens",
+            "overshoot_pages",
+            "prefix_matches",
+            "victim_page_ids"
+          ]
+        },
+        {
+          "operation_index": 5,
+          "differing_fields": [
+            "freed_pages",
+            "freed_tokens",
+            "victim_page_ids"
+          ]
+        }
+      ],
+      "explanation": "The lock splits off and protects page 0. Main first truncates tail [2]; native LRU removes the full unlocked suffix [1,2], overshooting by one page. The next drain therefore has one fewer page. Both preserve the locked shared prefix and reclaim it only after unlock."
+    },
+    {
+      "id": "lru_recycled_page",
+      "equal": false,
+      "differences": [
+        {
+          "operation_index": 1,
+          "differing_fields": [
+            "available_tokens",
+            "freed_pages",
+            "freed_tokens",
+            "overshoot_pages",
+            "prefix_matches",
+            "victim_page_ids"
+          ]
+        },
+        {
+          "operation_index": 3,
+          "differing_fields": [
+            "available_tokens",
+            "prefix_matches",
+            "victim_page_ids"
+          ]
+        },
+        {
+          "operation_index": 4,
+          "differing_fields": [
+            "freed_pages",
+            "freed_tokens",
+            "victim_page_ids"
+          ]
+        }
+      ],
+      "explanation": "The first call frees [1] on main and the complete [0,1] leaf natively. Both recycle physical page 1 for the new prompt. Main still owns older prefix page 0 and evicts it next; native LRU has only recycled page 1 left. Remaining-prefix matches and the final drain reflect that difference."
+    },
+    {
+      "id": "belady_tail_reranking",
+      "equal": true,
+      "differences": [],
+      "explanation": "Identical: page 1 is farthest away, then the newly exposed page 0 is needed before competing page 2. Order [1,2], then [0] proves tail priorities are recomputed."
+    },
+    {
+      "id": "belady_equal_priority_recency",
+      "equal": false,
+      "differences": [
+        {
+          "operation_index": 2,
+          "differing_fields": [
+            "prefix_matches",
+            "victim_page_ids"
+          ]
+        },
+        {
+          "operation_index": 3,
+          "differing_fields": [
+            "victim_page_ids"
+          ]
+        }
+      ],
+      "explanation": "Observed difference, not a parity claim or approval of the behavior: all next uses are infinite. Main preserves the retained prefix recency and chooses [1,0], then [2]. The native suffix split assigns the retained page 0 a fresh access counter, so it chooses [1,2], then [0]. This is the separately open PRRT_kwDOT0t9uc65JEIW finding, outside this selected evidence repair; its behavior has not been changed here."
+    },
+    {
+      "id": "belady_global_retirement",
+      "equal": true,
+      "differences": [],
+      "explanation": "Identical: retiring forecast request 0 changes the global next-use ranking; both evict page 0 before page 1 without creating remote KV."
+    },
+    {
+      "id": "belady_locked_prefix",
+      "equal": true,
+      "differences": [],
+      "explanation": "Identical: unlocked tails [2,1] precede independent page 3, locked prefix page 0 survives, and page 0 is reclaimed after unlock. Page size four also checks page-to-token conversion."
+    },
+    {
+      "id": "belady_prefix_identity",
+      "equal": true,
+      "differences": [],
+      "explanation": "Identical: the equal local page label 7 below prefix 2 has no future demand, while prefix [1,7] is needed. Both remove [3,2] before [1,0]."
+    }
+  ],
+  "native_dependency_test_features": [
+    "inspection"
+  ]
+}
