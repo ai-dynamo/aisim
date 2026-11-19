@@ -631,6 +631,11 @@ def _download_hf_json_at(
         cached = _load_cached_hf_json_at(hf_id, filename, revision)
         if cached is not None:
             return cached
+        if not raise_on_404:
+            snapshot = _hf_cache_snapshot(hf_id, revision)
+            if snapshot is not None and (snapshot[0] / ".no_exist" / snapshot[1] / filename).is_file():
+                logger.debug("Confirmed absent optional %s for %s at %s", filename, hf_id, snapshot[1])
+                return None, None
     if offline is not None:
         if not raise_on_404:
             snapshot = _hf_cache_snapshot(hf_id, revision)
@@ -2195,6 +2200,12 @@ def _attach_inferred_quant_fields(raw_config: dict) -> dict:
 
 def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> dict:
     """Merge normalized hf_quant_config fields into raw_config if present."""
+    if (
+        hf_quant_config is not None
+        and "quantization" in hf_quant_config
+        and not isinstance(hf_quant_config["quantization"], dict)
+    ):
+        raise _HuggingFaceMetadataError("hf_quant_config.json quantization must be an object")
     if not hf_quant_config:
         return raw_config
     raw_config["hf_quant_config"] = hf_quant_config
@@ -2279,9 +2290,18 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                     family = "Kimi" if kimi else "Qwen3-VL"
                     raise ValueError(f"{family} {filename} must be an object")
                 if key is None:
+                    if qwen_vl and isinstance(data.get("size"), dict):
+                        # Sidecar aliases override equivalent inline pixel keys.
+                        data = dict(data)
+                        for bound, alias in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
+                            if bound not in data and alias in data["size"]:
+                                data[bound] = data["size"][alias]
                     processor.update(data)
                 else:
-                    processor[key] = data
+                    inline_video = processor.get(key, {})
+                    if not isinstance(inline_video, dict):
+                        raise ValueError(f"{key} must be an object")
+                    processor[key] = {**inline_video, **data}
         raw_config = {**raw_config, "preprocessor_config": processor}
     return raw_config
 

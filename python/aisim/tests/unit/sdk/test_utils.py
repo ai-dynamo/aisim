@@ -140,6 +140,84 @@ def test_offline_optional_absence_is_observable_through_public_loader(monkeypatc
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("confirmed_absent", [False, True])
+@pytest.mark.parametrize("consumer", ["sdk", "collector"])
+def test_pinned_optional_absence_survives_network_outage(monkeypatch, hf_cache, confirmed_absent, consumer):
+    from collector.fpm_forward.model_capability import _download_model_config
+
+    model = f"org/confirmed-absence-{consumer}-{confirmed_absent}"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    _cache_file(hf_cache, model, "config.json", config)
+    if confirmed_absent:
+        marker = hf_cache / f"models--{model.replace('/', '--')}" / ".no_exist" / ("c" * 40) / "hf_quant_config.json"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    requested = []
+
+    def unavailable(request, *, timeout):
+        requested.append(request.full_url)
+        raise _http_error(503, "unavailable")
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", unavailable)
+    load = get_model_config_from_model_path if consumer == "sdk" else _download_model_config
+    try:
+        if confirmed_absent:
+            loaded = load(model)
+            payload = loaded["raw_config"] if consumer == "sdk" else loaded.payload
+            assert "hf_quant_config" not in payload
+            assert len(requested) == 1
+        else:
+            expected_error = utils.HuggingFaceDownloadError if consumer == "sdk" else ValueError
+            with pytest.raises(expected_error, match="unavailable"):
+                load(model)
+            assert len(requested) == 2
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize("section", [[], None, "FP8"])
+def test_invalid_quantization_section_fails_public_loader(monkeypatch, hf_cache, offline, section):
+    model = "org/invalid-quant-section"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    quant = {"quantization": section}
+    if offline:
+        _cache_file(hf_cache, model, "config.json", config)
+        _cache_file(hf_cache, model, "hf_quant_config.json", quant)
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    else:
+
+        def remote(request, *, timeout):
+            payload = config if request.full_url.endswith("/config.json") else quant
+            return io.BytesIO(json.dumps(payload).encode())
+
+        monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        with pytest.raises(utils._HuggingFaceMetadataError, match="quantization must be an object"):
+            get_model_config_from_model_path(model)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_kimi_partial_video_sidecar_retains_inline_patch_limit(tmp_path):
+    config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
+    config["preprocessor_config"] = {"video_processor": {"max_patches": 1024}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "video_preprocessor_config.json").write_text('{"temporal_patch_size": 4}')
+    try:
+        loaded = get_model_config_from_model_path(str(tmp_path))
+        assert loaded["encoder_config"].video_max_patches == 1024
+        assert loaded["raw_config"]["preprocessor_config"]["video_processor"] == {
+            "max_patches": 1024,
+            "temporal_patch_size": 4,
+        }
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 @pytest.mark.parametrize("payload", [None, [], 7, {"quantization": {"quant_algo": "FP8"}}])
 def test_network_quant_json_must_be_an_object_through_public_loader(monkeypatch, hf_cache, payload):
     model = "org/network-quant-object"
@@ -182,7 +260,10 @@ def test_llama4_missing_offline_processor_reports_revision_and_can_retry(monkeyp
         utils.get_model_config_from_model_path.cache_clear()
 
 
-@pytest.mark.parametrize("sidecar", [None, {"min_pixels": 262144, "max_pixels": 2097152}])
+@pytest.mark.parametrize(
+    "sidecar",
+    [None, {"min_pixels": 262144, "max_pixels": 2097152}, {"size": {"shortest_edge": 262144, "longest_edge": 2097152}}],
+)
 def test_local_qwen_inline_processor_bounds_and_sidecar_precedence(tmp_path, sidecar):
     config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
     config["preprocessor_config"] = {"min_pixels": 131072, "max_pixels": 1048576}
@@ -191,10 +272,11 @@ def test_local_qwen_inline_processor_bounds_and_sidecar_precedence(tmp_path, sid
         (tmp_path / "preprocessor_config.json").write_text(json.dumps(sidecar))
     try:
         loaded = get_model_config_from_model_path(str(tmp_path))
-        expected = sidecar or config["preprocessor_config"]
+        expected = {"min_pixels": 262144, "max_pixels": 2097152} if sidecar else config["preprocessor_config"]
         encoder = loaded["extra_params"]
         assert (encoder.min_pixels, encoder.max_pixels) == (expected["min_pixels"], expected["max_pixels"])
-        assert loaded["raw_config"]["preprocessor_config"] == expected
+        assert loaded["raw_config"]["preprocessor_config"]["min_pixels"] == expected["min_pixels"]
+        assert loaded["raw_config"]["preprocessor_config"]["max_pixels"] == expected["max_pixels"]
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()

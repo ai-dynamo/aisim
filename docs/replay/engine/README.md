@@ -121,7 +121,7 @@ unverified sidecar provenance also fail DSPARK `nextn` resolution in the CLI
 recommendation/sizing path, instead of returning `None` as an access failure.
 To retry offline, first cache `config.json` and any needed quantization or
 processor files in one invocation under `main` (for a checkpoint publishing all
-these files, `hf download org/model config.json hf_quant_config.json preprocessor_config.json video_preprocessor_config.json --revision main`),
+these files, `env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json hf_quant_config.json preprocessor_config.json video_preprocessor_config.json --revision main`),
 then set `HF_HUB_OFFLINE=1`. An unpinned `engine.model: org/model` needs the
 cache's `refs/main`; downloading only with `--revision <commit>` does not create
 that ref. For an exact commit, cache all required files at that commit and set
