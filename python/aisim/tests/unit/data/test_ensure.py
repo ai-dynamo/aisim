@@ -4,7 +4,6 @@
 """ensure_data with fake transports: cold cache, warm offline, threshold, precise errors."""
 
 import json
-
 from pathlib import Path
 
 import pytest
@@ -64,7 +63,9 @@ def test_local_override_selection_needs_no_network_or_cache(tmp_path, files):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
     with pytest.raises(MissingDataError, match="no fpm data"):
-        ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
+        ensure_data(
+            {**CONFIG, "model": "nope"}, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+        )
 
 
 def test_pin_from_environment():

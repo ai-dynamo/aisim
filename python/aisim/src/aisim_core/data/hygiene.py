@@ -162,6 +162,8 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
     if head.startswith(LFS_POINTER_PREFIX):
         out.append(Finding("lfs-pointer", "file is a Git LFS pointer", path))
     for label, magic in _FORBIDDEN_MAGIC.items():
+        if label == "gzip archive" and suffix == ".gz" and suffix in policy.allowed_suffixes:
+            continue  # a gzip file under an allowed .gz suffix is the expected content
         if head.startswith(magic):
             out.append(Finding("forbidden-content", f"content looks like a {label}", path))
     if suffix == ".parquet":
