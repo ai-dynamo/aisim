@@ -198,6 +198,51 @@ def test_clean_mirror_passes_with_repo_id_and_fingerprint(tmp_path):
     assert mirror_main(["validate", "--root", str(root)]) == 0
 
 
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+def test_installed_validation_workflow_is_repository_infrastructure(tmp_path, profile):
+    repo = INTERNAL_REPO if profile == "mirror" else PUBLIC
+    root, _ = _mirror(tmp_path, repo=repo)
+    payload_files = validate_tree(root, repo=repo, profile=profile).files
+    workflow = root / ".github/workflows/validate.yml"
+    workflow.parent.mkdir(parents=True)
+    template = Path(__file__).resolve().parents[5] / ".github/mirror/aisim-data-internal-validate.yml"
+    shutil.copyfile(template, workflow)
+
+    report_path = tmp_path / "report.json"
+    assert (
+        mirror_main(
+            ["validate", "--root", str(root), "--repo", repo, "--profile", profile, "--output", str(report_path)]
+        )
+        == 0
+    )
+    report = json.loads(report_path.read_text())
+    assert report["ok"] and report["configurations"] == 1 and report["files"] == payload_files
+    assert not report["findings"]
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+def test_repository_workflow_symlinks_are_rejected(tmp_path, profile):
+    root, _ = _mirror(tmp_path)
+    workflow = root / ".github/workflows/validate.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.symlink_to(tmp_path / "missing.yml")
+    report = validate_tree(root, profile=profile)
+    assert not report.ok
+    assert any(f.code == "symlink" and f.path == ".github/workflows/validate.yml" for f in report.errors)
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+@pytest.mark.parametrize("path", [".github/workflows/other.yml", ".github/raw.json", "data/validate.yml"])
+def test_repository_infrastructure_exemption_is_narrow(tmp_path, profile, path):
+    root, _ = _mirror(tmp_path)
+    unexpected = root / path
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_text("{}\n")
+    report = validate_tree(root, profile=profile)
+    assert not report.ok
+    assert any(f.path == path and f.code in {"path-root", "suffix"} for f in report.errors)
+
+
 def test_infx_cache_is_validated_with_its_own_repo_id(tmp_path):
     root, _ = _mirror(tmp_path, repo=INFX_CACHE_REPO)
     assert validate_tree(root, repo=INFX_CACHE_REPO).ok
@@ -207,6 +252,14 @@ def test_empty_mirror_needs_explicit_bootstrap(tmp_path):
     (tmp_path / "e").mkdir()
     assert not validate_tree(tmp_path / "e").ok
     assert validate_tree(tmp_path / "e", allow_empty=True).ok
+    workflow = tmp_path / "e/.github/workflows/validate.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: Validate mirror\n")
+    assert not validate_tree(tmp_path / "e").ok
+    assert validate_tree(tmp_path / "e", allow_empty=True).ok
+    workflow.unlink()
+    workflow.symlink_to(tmp_path / "missing.yml")
+    assert "symlink" in {f.code for f in validate_tree(tmp_path / "e", allow_empty=True).errors}
 
 
 @pytest.mark.parametrize("profile", ["mirror", "public"])

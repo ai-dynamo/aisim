@@ -16,6 +16,11 @@ forbids:
 * ``public``  everything in ``mirror`` plus the publication rules in
   :mod:`aisim_core.data.redaction`, and no ``mirror/`` control directory.
 
+Both profiles separate the installed ``.github/workflows/validate.yml`` from
+dataset payloads. This exact repository infrastructure path is reviewed as code,
+never loaded as data, and still must not be a symlink. Candidate hygiene does not
+permit contributors to change it.
+
 ``aisim-infx-cache`` is a separate private cache that is never promoted
 (:data:`NEVER_PROMOTED`). It uses the same E2E layout, so it can be validated with
 ``repo=INFX_CACHE_REPO``.
@@ -56,13 +61,14 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "1"
+VALIDATOR_VERSION = "2"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
 NEVER_PROMOTED = frozenset({INFX_CACHE_REPO})
 MIRROR_CONTROL_DIR = "mirror"  # private-only control files; absent from the public layout
 DATA_ROOTS = ("catalog/", "eval/", "data/")
+REPOSITORY_FILES = frozenset({".github/workflows/validate.yml"})
 Profile = Literal["mirror", "public"]
 
 
@@ -281,14 +287,22 @@ def validate_tree(
 ) -> TreeReport:
     """Validate a dataset checkout. ``repo`` (when given) must equal ``dataset.json``'s ``dataset_id``.
 
-    ``allow_empty`` accepts a tree with no files at all, for a freshly created mirror.
+    ``allow_empty`` accepts a tree with no dataset payload files, for a freshly created mirror.
     """
     root = Path(root)
     report = TreeReport(repo=repo, profile=profile)
     if not root.is_dir():
         report.add("root-missing", f"{root} is not a directory")
         return report
-    listing = [f for f in list_tree(root) if not (profile == "mirror" and f.path.startswith(f"{MIRROR_CONTROL_DIR}/"))]
+    tree = list_tree(root)
+    for f in tree:
+        if f.path in REPOSITORY_FILES and f.is_symlink:
+            report.add("symlink", "symbolic links are not allowed", f.path)
+    listing = [
+        f
+        for f in tree
+        if f.path not in REPOSITORY_FILES and not (profile == "mirror" and f.path.startswith(f"{MIRROR_CONTROL_DIR}/"))
+    ]
     evidence: list[CandidateFile] = []
     if profile == "mirror":  # internal-only root: hash-checked blobs, never loaded; the public profile rejects it
         evidence = [f for f in listing if f.path.startswith(EVIDENCE_ROOT)]
@@ -297,7 +311,7 @@ def validate_tree(
             if f.is_symlink:
                 report.add("symlink", "symbolic links are not allowed", f.path)
     if profile == "mirror":
-        control = [f for f in list_tree(root) if f.path.startswith(f"{MIRROR_CONTROL_DIR}/")]
+        control = [f for f in tree if f.path.startswith(f"{MIRROR_CONTROL_DIR}/")]
         for f in control:
             if f.is_symlink or not f.path.endswith(".json"):
                 report.add("control-file", "mirror/ may hold plain .json files only", f.path)
@@ -361,7 +375,9 @@ def main(argv: list[str] | None = None) -> int:
     val.add_argument("--root", type=Path, required=True)
     val.add_argument("--repo", default=INTERNAL_REPO, help="expected dataset_id (default: the internal mirror)")
     val.add_argument("--profile", choices=("mirror", "public"), default="mirror")
-    val.add_argument("--allow-empty", action="store_true", help="accept a tree with no files (new mirror)")
+    val.add_argument(
+        "--allow-empty", action="store_true", help="accept a tree with no dataset payload files (new mirror)"
+    )
     val.add_argument("--output", type=Path, help="write the JSON report here")
     sub.add_parser("fingerprint", help="print the validator fingerprint")
     args = parser.parse_args(argv)

@@ -46,6 +46,7 @@ def test_listing_accepts_valid():
         (CandidateFile("data\\x.json", 1), "path-unsafe"),
         (CandidateFile("data//x.json", 1), "path-traversal"),
         (CandidateFile("other/x.json", 1), "path-root"),
+        (CandidateFile(".github/workflows/validate.yml", 1), "path-root"),
         (CandidateFile("data/x.pkl", 1), "suffix"),
         (CandidateFile("data/x.py", 1), "suffix"),
         (CandidateFile("data/x.txt", 1), "suffix"),
