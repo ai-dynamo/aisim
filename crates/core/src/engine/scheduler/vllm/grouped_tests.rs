@@ -346,7 +346,10 @@ fn grouped_resumed_request_takes_a_checkpoint_block_only_at_its_prefill_end() {
     let id = submit(&mut core, 1700, 33, 200);
     let mut trace = TraceCollector::default();
     let mut step = 0.0;
-    while core.state.requests[&id].sequence.len() < 113 {
+    for _ in 0..200 {
+        if core.state.requests[&id].sequence.len() >= 113 {
+            break;
+        }
         core.execute_pass(&mut trace, step);
         step += 1.0;
     }
