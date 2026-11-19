@@ -1782,6 +1782,33 @@ def test_sglang_prefill_pipeline_width_must_be_a_positive_integer(monkeypatch, w
         _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": width}, "prefill")
 
 
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_sglang_prediction_lowers_measured_scheduler_selection_cost(mode):
+    costs = {"aggregated": 1.5} if mode == "aggregated" else {"prefill": 1.5, "decode": 2.5}
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "backend": "sglang",
+                "model": "synthetic",
+                "hardware": "h200_sxm",
+                "mode": mode,
+                "workers": {
+                    role: {
+                        "scheduler": {"scheduler_select_time_ms": cost},
+                        "kv_cache": {"capacity": {"type": "fixed", "blocks": 64}},
+                        "timing": {"type": "fixed", "prefill_ms": 7, "decode_ms": 2},
+                    }
+                    for role, cost in costs.items()
+                },
+            }
+        }
+    )
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    for role, cost in costs.items():
+        role_args = getattr(deployment, f"{'agg' if role == 'aggregated' else role}_engine_args")
+        assert role_args["sglang"]["scheduler_select_time_ms"] == cost
+
+
 def test_sglang_pd_prefill_compiles_pipeline_stages():
     config = CorePredictionConfig.model_validate(
         {

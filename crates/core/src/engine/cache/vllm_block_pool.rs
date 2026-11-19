@@ -456,6 +456,8 @@ pub(crate) struct VllmBlockPool {
     /// last one, the only changes of `key_hit(..).is_some()` for a grouped
     /// key. Equal values mean the same set of resident grouped keys.
     grouped_key_generation: u64,
+    /// See [`Self::state_visibility_epoch`].
+    state_visibility_epoch: u64,
     /// Intrusive ordinary LRU: head is evicted first, tail was released last.
     inactive_head: Option<BlockCopyId>,
     inactive_tail: Option<BlockCopyId>,
@@ -487,6 +489,7 @@ impl VllmBlockPool {
             state_index: None,
             grouped_index: None,
             grouped_key_generation: 0,
+            state_visibility_epoch: 0,
             inactive_head: None,
             inactive_tail: None,
             inactive_len: 0,
@@ -549,6 +552,12 @@ impl VllmBlockPool {
     /// See the field `grouped_key_generation`.
     pub(crate) fn grouped_key_generation(&self) -> u64 {
         self.grouped_key_generation
+    }
+
+    /// Counts the state keys that became visible. While it stands still, no
+    /// state key's [`Self::key_hit`] has turned from a miss into a hit.
+    pub(crate) fn state_visibility_epoch(&self) -> u64 {
+        self.state_visibility_epoch
     }
 
     /// Blocks of capacity behind `key`'s visible copy: a grouped state copy's
@@ -934,10 +943,14 @@ impl VllmBlockPool {
         }
         let (became_visible, became_redundant) = match hash {
             CacheKey::Token(hash) => Self::index_copy(&mut self.by_hash, hash, id),
-            CacheKey::State { prefix, slot } => self
-                .state_index
-                .get_or_insert_with(Default::default)
-                .insert(prefix, slot, id),
+            CacheKey::State { prefix, slot } => {
+                let inserted = self
+                    .state_index
+                    .get_or_insert_with(Default::default)
+                    .insert(prefix, slot, id);
+                self.state_visibility_epoch += u64::from(inserted.0);
+                inserted
+            }
             CacheKey::Grouped { group, hash } => {
                 // Belady rekeying walks token and state copies only.
                 assert!(self.belady.is_none(), "grouped keys use LRU eviction");

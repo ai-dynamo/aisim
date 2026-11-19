@@ -375,6 +375,12 @@ eviction rules G2 follows:
 | A hit before its load | Not pinned | Not pinned | Pinned until the request loads it or looks it up again |
 | G1 blocks being copied | Freed with their request; a new owner waits for the copy | The same | Held until the copy completes, then freed first block first |
 | A preemption | Waits for the preempted request's stores | The same | Waits for every transfer in flight |
+| A waiting request that holds G1 for its load | Keeps its place among the requests that have waited on G2, unless the rank has G3 or has pulled over KVCR | Once its load lands, is admitted before every waiting request that holds none | The same |
+
+On a decode rank with G2, or while a destination reservation is pending, an
+activated handoff is admitted before a fresh G2 restore, including one whose
+load has landed. A pending reservation blocks fresh admission but not a
+handoff whose KV has already been activated.
 
 A rank-local pool that keeps the checkpoints of a sliding-window
 [state cache](#state-cache) follows `offloading_v0_32` under either offloading
