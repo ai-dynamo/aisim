@@ -721,10 +721,6 @@ mod tests {
         ] {
             req.engine.extra.insert(name.into(), value.into());
         }
-        req.engine.extra.insert(
-            "fpm_profile".into(),
-            serde_json::json!({"model": "test-model"}).to_string(),
-        );
         Python::with_gil(|py| -> PyResult<()> {
             let kwargs = estimate_kwargs(py, &req)?;
             assert_eq!(kwargs.get_item("dcp_size")?.unwrap().extract::<u32>()?, 4);
@@ -741,6 +737,15 @@ mod tests {
                     .unwrap()
                     .extract::<String>()?,
                 "deepep_moe"
+            );
+            req.engine.extra.insert(
+                "fpm_profile".into(),
+                serde_json::json!({"model": "test-model"}).to_string(),
+            );
+            let kwargs = estimate_kwargs(py, &req)?;
+            assert!(
+                kwargs.get_item("moe_backend")?.is_none(),
+                "profile backend identity must not become a user override"
             );
             assert_eq!(
                 kwargs
