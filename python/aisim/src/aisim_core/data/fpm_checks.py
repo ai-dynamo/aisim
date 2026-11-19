@@ -154,7 +154,7 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
     coordinate_minima = {"batch_size": 1, "total_prefill_tokens": 0, "total_kv_read_tokens": 0}
     if columns is not None and coordinate_minima.keys() <= columns:
         try:
-            # Publication validation only: stream three columns with bounded memory, never latency data.
+            # Publication validation only: stream the coordinate columns with bounded memory.
             parquet = pq.ParquetFile(_file(root, library.path))
             for batch in parquet.iter_batches(batch_size=4096, columns=list(coordinate_minima)):
                 for name, minimum in coordinate_minima.items():
@@ -167,6 +167,19 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
                         raise ValueError(f"{name} must contain integers >= {minimum}")
         except (OSError, ValueError) as exc:
             add("library-coordinates", str(exc))
+    if columns is not None and "latency_ms" in columns:
+        try:
+            parquet = pq.ParquetFile(_file(root, library.path))
+            for batch in parquet.iter_batches(batch_size=4096, columns=["latency_ms"]):
+                values = batch.column("latency_ms")
+                if (
+                    not (pa.types.is_integer(values.type) or pa.types.is_floating(values.type))
+                    or values.null_count
+                    or pc.any(pc.invert(pc.and_(pc.is_finite(values), pc.greater(values, 0)))).as_py()
+                ):
+                    raise ValueError("latency_ms must contain finite values greater than 0")
+        except (OSError, ValueError) as exc:
+            add("library-latency", str(exc))
     try:
         metadata = read_library_metadata(_file(root, sidecar.path))
     except (FpmContractError, ValueError) as exc:

@@ -32,6 +32,7 @@ from aisim_core.data.fpm_library import (
     read_library_metadata,
     recover_reconstructed_metadata,
     resolve_resources,
+    resource_metadata_for_deployment,
     stage_fpm_library,
     with_estimator_path,
 )
@@ -581,6 +582,38 @@ def test_resources_only_fill_profiles_matching_selector(root, profile, tmp_path,
         load(root, user_config(profile), tmp_path, require_resources=True)
     user = {**RESOURCES, "provenance": "Explicit user resource override."}
     assert load(root, user_config(profile, **user), tmp_path, require_resources=True).resource_sources == ("user",)
+
+
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_dcp_sidecar_resources_do_not_fill_an_unrecorded_profile(root, profile, tmp_path, dcp):
+    make_entry(
+        root,
+        profile,
+        resources=RESOURCES,
+        sidecar_extra={"configuration_selector": {"tp": 4, "moe_tp": 4, "dcp": dcp}},
+    )
+    config = user_config(profile)
+    assert "dcp" not in config["fpm_profile"]["deployments"][0]
+    data = load(root, config, tmp_path)
+    assert data.resource_sources == ("pending",)
+    assert data.resources.resources is None
+    assert "resources" not in data.config["fpm_profile"]["deployments"][0]
+    with pytest.raises(FpmResourcesPendingError):
+        load(root, config, tmp_path, require_resources=True)
+    override = {**RESOURCES, "provenance": "Explicit user resource override."}
+    assert load(root, user_config(profile, **override), tmp_path, require_resources=True).resource_sources == ("user",)
+
+
+@pytest.mark.parametrize("requested_dcp", [None, 1, 2])
+def test_dcp_sidecar_resources_require_the_recorded_dcp(requested_dcp):
+    # Exercise the resource boundary with canonical config normalization, without pairing a DCP request
+    # with the unrecorded-DCP catalog/table used by the TP-only integration fixture above.
+    config = RustForwardPassPerfModel.normalize_config(
+        {**CONFIG, **({"dcp": requested_dcp} if requested_dcp is not None else {})}
+    )
+    metadata = {"resources": RESOURCES, "configuration_selector": {"dcp": 2}}
+    selected = resource_metadata_for_deployment(config, config, metadata)
+    assert selected == (metadata if requested_dcp == 2 else None)
 
 
 @pytest.mark.parametrize("selector_role", ["prefill", "decode", "aggregated"])
@@ -2229,6 +2262,42 @@ def test_entry_checks_coordinates_with_a_complete_sidecar(root, profile, field, 
     findings = check_fpm_entry(root, MANIFEST)
     assert [f.code for f in findings] == ["library-coordinates"]
     assert field in findings[0].message
+
+
+@pytest.mark.parametrize("latency", [-1.0, 0.0, float("nan"), float("inf"), -float("inf"), None, 1.0])
+@pytest.mark.parametrize("row_count", [1, 4097])
+def test_entry_checks_latency_with_valid_declarations(root, profile, latency, row_count):
+    make_entry(root, profile)
+    directory = root / ENTRY / "fpm"
+    parquet = directory / "fpm_forward_perf.parquet"
+    table = pq.read_table(parquet)
+    row = table.slice(0, 1).to_pylist()[0]
+    rows = [{**row, "latency_ms": 1.0} for _ in range(row_count)]
+    rows[-1]["latency_ms"] = latency
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), parquet)
+    sidecar = directory / "fpm_forward_perf.metadata.json"
+    metadata = json.loads(sidecar.read_text())
+    metadata.update(parquet_sha256=_sha(parquet.read_bytes()), row_count=row_count)
+    sidecar.write_text(json.dumps(metadata))
+    manifest = json.loads((root / MANIFEST).read_text())
+    manifest["artifacts"][:2] = [
+        _artifact(
+            root,
+            f"{ENTRY}/fpm/fpm_forward_perf.parquet",
+            "fpm-library",
+            "parquet",
+            "aic_fpm_forward_perf/v6",
+            rows=row_count,
+        ),
+        _artifact(root, f"{ENTRY}/fpm/fpm_forward_perf.metadata.json", "fpm-library-metadata", "json", "unversioned"),
+    ]
+    (root / MANIFEST).write_text(json.dumps(manifest))
+    findings = check_fpm_entry(root, MANIFEST)
+    if latency == 1.0:
+        assert findings == []
+    else:
+        assert [finding.code for finding in findings] == ["library-latency"]
+        assert "latency_ms" in findings[0].message
 
 
 # ------------------------------------------------------------------ review hardening

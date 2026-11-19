@@ -855,13 +855,14 @@ def _resource_metadata_matches(profile, deployment, metadata, identity) -> bool:
         applies = applies and deployment.get("worker_type") == wanted["worker_type"]
     # Selectors also pin precision, implementation and model identity. Use the profile's own defaults for
     # omitted deployment fields; never attach resources from a differently selected configuration.
+    # DCP has no implicit default here: unrecorded DCP and explicit DCP1 are distinct identities.
     selected_identity = _resource_deployment_identity(profile, deployment)
     applies = applies and all(
         selected_identity.get(name) == value
         for name, value in selector.items()
         if name not in _TOPOLOGY
         and name not in _IDENTITY_KEYS
-        and (name in selected_identity or name in _PRECISION_KEYS)
+        and (name in selected_identity or name in _PRECISION_KEYS or name == "dcp")
     )
     return applies
 
