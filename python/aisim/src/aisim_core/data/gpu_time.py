@@ -389,9 +389,9 @@ def gpu_time_from_kubernetes(
 
     Exactly one Succeeded pod is the result; Failed pods are ``failed`` attempts.
     Time runs from container start to finish (``startedAt``/``finishedAt``), so
-    queue and scheduling wait are excluded; when a pod lacks container
-    timestamps the Job's ``startTime``/``completionTime`` are used for the
-    succeeded pod. GPU count comes from the pod spec's ``gpu_resource``
+    queue and scheduling wait are excluded. A succeeded pod without container
+    timestamps is rejected: Job-level times may include scheduling wait.
+    GPU count comes from the pod spec's ``gpu_resource``
     request, else the Job's pod template. Unfinished work is rejected.
     """
     jmeta = job.get("metadata") or {}
@@ -413,10 +413,7 @@ def gpu_time_from_kubernetes(
             if phase != "Succeeded":
                 # A failed pod that never started consumed no allocated GPU time.
                 continue
-            start, end = (
-                _ts(jstatus.get("startTime"), "job startTime"),
-                _ts(jstatus.get("completionTime"), "job completionTime"),
-            )
+            raise
         seconds = (end - start).total_seconds()
         if seconds < 0:
             raise KubeParseError("pod finished before it started")

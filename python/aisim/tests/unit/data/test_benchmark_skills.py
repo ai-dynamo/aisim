@@ -139,11 +139,12 @@ def test_requeued_attempt_with_same_job_id_is_a_retry_not_the_result():
     assert gt.retried is not None and gt.retried.count == 1 and gt.gpu_seconds == 3600 * 8
 
 
-def test_record_gpu_time_kubernetes(tmp_path, capsys):
+@pytest.mark.parametrize("container_times", [True, False])
+def test_record_gpu_time_kubernetes(tmp_path, capsys, container_times):
     tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
     job = {
         "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
-        "status": {"succeeded": 1},
+        "status": {"succeeded": 1, "startTime": "2025-12-31T23:00:00Z", "completionTime": "2026-01-01T00:30:00Z"},
         "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
     }
     pod = {
@@ -156,8 +157,15 @@ def test_record_gpu_time_kubernetes(tmp_path, capsys):
             ],
         },
     }
+    if not container_times:
+        del pod["status"]["containerStatuses"]
     (tmp_path / "job.json").write_text(json.dumps(job))
     (tmp_path / "pods.json").write_text(json.dumps({"items": [pod]}))
+    if not container_times:
+        assert tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")]) == 2
+        captured = capsys.readouterr()
+        assert not captured.out and "no terminated container times" in captured.err
+        return
     assert tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")]) == 0
     gt = json.loads(capsys.readouterr().out)["gpu_time"]
     assert gt["gpu_count"] == 4 and gt["gpu_seconds"] == 1800 * 4 and gt["gpu_type"] is None
@@ -215,6 +223,30 @@ def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noq
     bad.write_text(good.read_text().replace("1.1", "1.5"))
     assert tool.main([str(path), "--truth-root", str(root), "--predictor", str(bad)]) == 1
     assert _predict({"tokens": 10}) == pytest.approx(11.0)
+
+
+@pytest.mark.parametrize("status", ["partial", "failed"])
+def test_incomplete_attempt_is_verified_but_not_attested(built_record, tmp_path, capsys, status):  # noqa: F811
+    root, record = built_record
+    record = record.model_copy(update={"status": status, "status_reason": "synthetic interrupted attempt"})
+    path = write_record(root, record)
+    predictor = tmp_path / "predictor.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    destination = tmp_path / "attested"
+    tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
+    assert (
+        tool.main(
+            [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
+        )
+        == 0
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["verification"]["ok"] and out["status"] == status
+    assert "verified_record_id" not in out and "verified_record_path" not in out
+    assert not destination.exists() and load_record(path) == record
 
 
 @pytest.mark.parametrize("has_previous", [False, True, None])

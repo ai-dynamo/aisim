@@ -37,7 +37,7 @@ the result a verifiable record.
    unknown if never recorded), `simulation_cost`, and `producer` (`kind="agent"`, this skill's
    name, evaluator revision). Partial or failed attempts are kept with `status_reason`.
 5. Store: `write_record(dataset_root, record)`. It is content-addressed and refuses overwrites.
-6. Verify and promote one tier:
+6. Verify and promote one tier only for records with `status == "complete"`:
 
    ```bash
    python/aisim/.venv/bin/python .agents/skills/aisim-benchmark-evaluate/scripts/check_eval_record.py \
@@ -45,6 +45,8 @@ the result a verifiable record.
    ```
 
    `predictor.py` exposes `predict(inputs)` and `fingerprint()` from the same predictor as step 2.
+   Keep partial and failed attempts stored for retry; do not call `attest` on them. The helper
+   can verify their metrics but skips promotion, even with `--attest-root`.
    Exit code 1 means recomputation disagrees with the claim: fix the record, do not edit the check.
    Without `--predictor` the script only loads the record and prints `gpu_time` findings.
 7. `qualified` needs a recorded `gpu_time` (the model rejects it otherwise), a threshold the

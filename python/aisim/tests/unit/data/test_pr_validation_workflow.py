@@ -3,7 +3,9 @@
 
 """Static trust-model checks for the public PR-validation workflow."""
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -46,3 +48,32 @@ def test_pr_code_is_never_checked_out_or_interpolated(text):
         if line.strip().startswith(("run:", "python", "gh ")):
             assert "${{ inputs" not in line
     assert "persist-credentials: false" in text
+
+
+@pytest.mark.parametrize(
+    "role,permission,admitted", [("admin", "admin", True), ("maintain", "write", True), ("write", "write", False)]
+)
+def test_maintainer_roles(text, tmp_path, role, permission, admitted):
+    doc = yaml.safe_load(text)
+    script = doc["jobs"]["validate"]["steps"][0]["run"]
+    gh = tmp_path / "gh"
+    gh.write_text(
+        '#!/bin/sh\nfor arg; do field="$arg"; done\n'
+        'case "$field" in\n.role_name) echo "$FIXTURE_ROLE";;\n'
+        '.permission) echo "$FIXTURE_PERMISSION";;\n*) exit 2;;\nesac\n'
+    )
+    gh.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "GH_REPO": "ai-dynamo/aisim",
+            "GITHUB_ACTOR": "fixture",
+            "FIXTURE_ROLE": role,
+            "FIXTURE_PERMISSION": permission,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) == admitted, result.stdout + result.stderr
