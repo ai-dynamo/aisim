@@ -32,6 +32,13 @@ then. The jobs never push to the default branch.
 | Candidates | pushed to `candidate/<snapshot-id>` branches; never auto-promoted, never pushed to the default branch |
 | Failure | writes nothing; the last qualified snapshot in `ingestion-state.json` is retained |
 
+Configuration shards are stored under `revisions/<content-sha256>/e2e/...`.
+The revision covers the converted rows, manifest body and provenance, including producer metadata.
+Snapshots reference these immutable revisions, so a candidate that corrects a measurement or changes
+configuration membership cannot alter earlier qualified truth. Unchanged revisions are verified and
+reused. Existing snapshots at legacy `e2e/...` paths remain readable and their shards are retained;
+the first refresh after upgrading may create a candidate solely to adopt versioned paths.
+
 ## Assumptions to confirm before install
 
 - `aisim-infx-cache` is reachable by git over HTTPS with a bearer token (the DEP names the repository but

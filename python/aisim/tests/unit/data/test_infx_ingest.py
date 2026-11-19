@@ -17,7 +17,7 @@ import pytest
 
 from aisim_core.data import e2e as e2e_module
 from aisim_core.data import infx_ingest, infx_job
-from aisim_core.data.e2e import evaluation_points, load_e2e, read_snapshot
+from aisim_core.data.e2e import evaluation_points, load_e2e, read_raw_record, read_snapshot
 from aisim_core.data.infx_ingest import (
     HttpResponse,
     HttpStatusError,
@@ -192,7 +192,7 @@ def test_first_run_writes_candidate_with_stable_shards_and_never_qualifies(root,
     assert state["qualified"] is None and state["candidate"]["snapshot_id"] == result.snapshot_id
     snapshot, members = read_snapshot(root, state["candidate"]["snapshot_path"])
     assert snapshot.completeness == "complete" and snapshot.counts == {"observations": 2, "configurations": 2}
-    assert all(m.manifest_path.startswith("e2e/Test-Model") or "test" in m.manifest_path.lower() for m in members)
+    assert all(m.manifest_path.startswith("revisions/") and "/e2e/testmodel/" in m.manifest_path for m in members)
     # One shared loader, producer metadata from workflow-info reached the observation row.
     dataset = load_e2e(root, members[0].manifest_path, config=None)
     assert dataset.observations[0].producer_revision == "a" * 40 and dataset.observations[0].producer_attempt == 2
@@ -227,13 +227,110 @@ def test_candidate_is_not_promoted_by_a_later_run_and_promotion_needs_a_reviewer
 def test_correction_keeps_observation_id_changes_hash_and_preserves_old_snapshot(root, tmp_path):
     first, _ = make_run(tmp_path, FakeInfx())
     old_doc = (root / infx_job.snapshot_path(first.snapshot_id)).read_bytes()
+    _, old_members = read_snapshot(root, infx_job.snapshot_path(first.snapshot_id))
+    old_data = {m.observation_id: load_e2e(root, m.manifest_path) for m in old_members}
+    old_shards = {m.manifest_path: tree((root / m.manifest_path).parent) for m in old_members}
     promote(root, first.snapshot_id, "Reviewer", now=NOW)
     fixed = row(2, "h200", metrics={"mean_ttft": 0.2, "mean_tpot": 0.01, "mean_e2el": 1.5})
     second, _ = make_run(tmp_path, FakeInfx(rows=[row(1), fixed]))
     assert second.status == "candidate" and second.snapshot_id != first.snapshot_id
     assert second.changes == {"added": [], "corrected": ["inferencex:2"], "removed": []}
     assert (root / infx_job.snapshot_path(first.snapshot_id)).read_bytes() == old_doc  # old pin stays readable
-    read_snapshot(root, infx_job.snapshot_path(first.snapshot_id))
+    for member in old_members:
+        data = load_e2e(root, member.manifest_path)
+        assert data.observations == old_data[member.observation_id].observations
+        assert data.metrics == old_data[member.observation_id].metrics
+        assert (
+            next(o for o in data.observations if o.observation_id == member.observation_id).record_sha256
+            == member.record_sha256
+        )
+        assert tree((root / member.manifest_path).parent) == old_shards[member.manifest_path]
+        assert json.loads(read_raw_record(root, data, member.observation_id))["metrics"]["mean_ttft"] == 0.1
+    _, new_members = read_snapshot(root, infx_job.snapshot_path(second.snapshot_id))
+    old_paths = {m.observation_id: m.manifest_path for m in old_members}
+    for member in new_members:
+        data = load_e2e(root, member.manifest_path)
+        expected_ttft = 0.2 if member.observation_id == "inferencex:2" else 0.1
+        assert json.loads(read_raw_record(root, data, member.observation_id))["metrics"]["mean_ttft"] == expected_ttft
+        assert evaluation_points(data)[0].metrics[("ttft", "mean")] == expected_ttft * 1000
+        assert (member.manifest_path == old_paths[member.observation_id]) == (member.observation_id == "inferencex:1")
+    assert infx_job.load_state(root)["qualified"]["snapshot_id"] == first.snapshot_id
+
+
+@pytest.mark.parametrize("change", ["add", "remove"])
+def test_configuration_membership_changes_preserve_qualified_shards(root, tmp_path, change):
+    first, _ = make_run(tmp_path, FakeInfx(rows=[row(1), row(3)], availability=[avail()]))
+    _, old_members = read_snapshot(root, infx_job.snapshot_path(first.snapshot_id))
+    old_path = old_members[0].manifest_path
+    before = tree((root / old_path).parent)
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    rows = [row(1), row(3), row(4)] if change == "add" else [row(1)]
+    second, _ = make_run(tmp_path, FakeInfx(rows=rows, availability=[avail()]))
+    assert second.status == "candidate"
+    _, new_members = read_snapshot(root, infx_job.snapshot_path(second.snapshot_id))
+    assert new_members[0].manifest_path != old_path
+    assert tree((root / old_path).parent) == before
+    assert {o.observation_id for o in load_e2e(root, old_path).observations} == {"inferencex:1", "inferencex:3"}
+    assert {o.observation_id for o in load_e2e(root, new_members[0].manifest_path).observations} == {
+        f"inferencex:{r['id']}" for r in rows
+    }
+
+
+def test_producer_metadata_correction_retains_the_old_configuration_revision(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    _, old_members = read_snapshot(root, infx_job.snapshot_path(first.snapshot_id))
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    workflow = {**WORKFLOW, "runConfigs": [{"html_url": RUN, "head_sha": "b" * 40}]}
+    second, _ = make_run(tmp_path, FakeInfx(workflow=workflow))
+    assert second.status == "candidate" and second.snapshot_id != first.snapshot_id
+    _, new_members = read_snapshot(root, infx_job.snapshot_path(second.snapshot_id))
+    for old, new in zip(old_members, new_members, strict=True):
+        assert old.record_sha256 == new.record_sha256  # workflow-info, rather than the benchmark, changed
+        assert old.manifest_path != new.manifest_path
+        assert load_e2e(root, old.manifest_path).observations[0].producer_revision == "a" * 40
+        assert load_e2e(root, new.manifest_path).observations[0].producer_revision == "b" * 40
+
+
+def test_refresh_preserves_legacy_configuration_paths(root, tmp_path):
+    from aisim_core.data.e2e import SnapshotMember, snapshot_id, write_configuration, write_snapshot
+
+    records = [row(1), row(2, "h200")]
+    members = []
+    for cfg in e2e_module.inferencex_to_configurations(records):
+        manifest = write_configuration(root, cfg)
+        members.extend(
+            SnapshotMember(
+                configuration_id=o.configuration_id,
+                observation_id=o.observation_id,
+                record_sha256=o.record_sha256,
+                manifest_path=manifest,
+            )
+            for o in cfg.observations
+        )
+    scope = {"source": "inferencex", "models": "all"}
+    sid = snapshot_id(members, scope, infx_ingest.SELECTION_POLICY)
+    path = infx_job.snapshot_path(sid)
+    (root / path).parent.mkdir(parents=True)
+    write_snapshot(
+        root, path, members, source_scope=scope, selection_policy=infx_ingest.SELECTION_POLICY, completeness="complete"
+    )
+    infx_job.save_state(
+        root,
+        {
+            "schema_version": infx_job.STATE_SCHEMA,
+            "qualified": None,
+            "candidate": {"snapshot_id": sid, "snapshot_path": path},
+        },
+    )
+    promote(root, sid, "Reviewer", now=NOW)
+    legacy = tree(root / "e2e")
+    result, _ = make_run(tmp_path, FakeInfx(rows=[row(1), row(2, "h200", metrics={"mean_ttft": 0.2})]))
+    assert result.status == "candidate"
+    assert tree(root / "e2e") == legacy
+    for member in read_snapshot(root, path)[1]:
+        data = load_e2e(root, member.manifest_path)
+        assert data.observations[0].record_sha256 == member.record_sha256
+        assert evaluation_points(data)[0].metrics[("ttft", "mean")] == 100.0
 
 
 def test_removed_upstream_observation_is_reported(root, tmp_path):
