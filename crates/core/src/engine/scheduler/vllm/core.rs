@@ -4,8 +4,10 @@
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
 // scheduling contracts, of the v0.28.0 (2cf0a6915ce544dc493a0990f2ea38d81601128a)
 // async-scheduling batch queue, of the v0.29.0
-// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split and of the
-// v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees;
+// (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode prefill split, of the
+// v0.30.0 (ced6857afa0ea7b2e3f0846a62e1394e90f15607) async block frees and of
+// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP/G2 semantics additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py

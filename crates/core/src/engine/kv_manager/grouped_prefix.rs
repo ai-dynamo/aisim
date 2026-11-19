@@ -350,7 +350,9 @@ impl GroupedPrefixRules {
                 GroupRuleKind::State => 2 + checkpoint,
                 GroupRuleKind::Ring => 1,
             })
-            .sum()
+            // vLLM sums Python integers, which cannot overflow. A sum above
+            // usize is more than any pool holds, so it saturates.
+            .fold(0, usize::saturating_add)
     }
 
     /// Whether hits land on hash boundaries inside a block (`coord:703`,
@@ -608,7 +610,7 @@ fn window_admission_blocks(
         .saturating_add(max_in_flight_tokens)
         .min(max_model_len)
         .div_ceil(block)
-        + 1
+        .saturating_add(1)
 }
 
 /// The first end, a multiple of `step` at most `max`, with `needed`
