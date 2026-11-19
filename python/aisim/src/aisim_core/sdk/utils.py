@@ -747,7 +747,7 @@ class _SnapshotConfig(dict):
 
     __slots__ = ("__weakref__", "_snapshot_commit", "_source")
 
-    def __init__(self, payload: dict, commit: str | None, *, source: str | Path = "hub"):
+    def __init__(self, payload: dict, commit: str | None = None, *, source: str | Path = "hub"):
         super().__init__(payload)
         self._snapshot_commit = commit
         self._source = source
