@@ -74,6 +74,12 @@ Native op-level Replay packs every decode request at the configured width,
 `nextn + 1`. If its scheduler verifies fewer tokens for a request, the
 estimate counts more tokens than that request verifies.
 
+A qualified Mamba2 operation cannot use the name `context_attention` or
+`context_attention (scaled)`. The SDK reports those names as context
+attention that is amortized over prefill chunks, but a qualified Mamba2 row is
+not amortized. The engine build rejects such an operation with an
+invalid-configuration error.
+
 With `token_width` one, an operation can read a measured row when the state
 dtype allows it and the table covers its shape. The collected state-scan
 rows use a BF16 state. A qualified scan operation with any other state

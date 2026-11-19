@@ -1224,6 +1224,25 @@ impl Engine {
                 "operation name {name} belongs to two mixed-step passes beside qualified Mamba ops"
             )));
         }
+        // The SDK reports these names as amortized context attention, which
+        // XPU TTFT rescales; a qualified Mamba row is never amortized.
+        if let Some(op) = spec
+            .context_ops
+            .iter()
+            .chain(&spec.generation_ops)
+            .find(|op| {
+                op.is_qualified_mamba()
+                    && matches!(
+                        op.name(),
+                        "context_attention" | "context_attention (scaled)"
+                    )
+            })
+        {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "qualified Mamba op may not use the reserved attention name {}",
+                op.name()
+            )));
+        }
         // Per-op rows fold by name and only attention is amortized over
         // chunks, so a qualified Mamba name may repeat only on qualified Mamba.
         if let Some(op) = spec
@@ -5219,22 +5238,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn packed_mixed_step_prices_a_scan_named_context_attention_once() {
-        // A qualified scan named like context attention runs only in its own
-        // first-pass branch: the same value and diagnostics as any other name.
-        let engine = |scan_name: &str| {
-            let Op::Mamba2(mut scan) = qualified_mamba(true, 1) else {
+    fn qualified_mamba_rejects_reserved_attention_names() {
+        // The SDK reports these names as amortized context attention; an
+        // ordinary scan name builds and prices the same mixed step.
+        let engine = |scan_name: &str, prefill: bool| {
+            let Op::Mamba2(mut scan) = qualified_mamba(prefill, 1) else {
                 unreachable!()
             };
             scan.name = scan_name.into();
             let norm = Op::Elementwise(ElementwiseOp::new("norm", 2.0));
-            let spec = EngineSpec::new(
-                fixture_engine_config(None),
-                vec![norm, Op::Mamba2(scan)],
-                vec![qualified_mamba(false, 1)],
-            );
-            Engine::build(spec, build_engine(None).db).unwrap()
+            let (context, generation) = if prefill {
+                (
+                    vec![norm, Op::Mamba2(scan)],
+                    vec![qualified_mamba(false, 1)],
+                )
+            } else {
+                (vec![norm, qualified_mamba(true, 1)], vec![Op::Mamba2(scan)])
+            };
+            let spec = EngineSpec::new(fixture_engine_config(None), context, generation);
+            Engine::build(spec, build_engine(None).db)
         };
+        for name in ["context_attention", "context_attention (scaled)"] {
+            for prefill in [true, false] {
+                let err = engine(name, prefill).unwrap_err();
+                assert!(
+                    matches!(&err, AicError::InvalidEngineConfig(m) if m.contains("reserved attention name")),
+                    "{err}"
+                );
+            }
+        }
         let mixed = [ForwardPassMetrics {
             scheduled_requests: crate::ScheduledRequestMetrics {
                 num_prefill_requests: 1,
@@ -5245,17 +5277,8 @@ pub(crate) mod tests {
             },
             ..Default::default()
         }];
-        let (named, plain) = (engine("context_attention"), engine("context_ssm"));
-        let latency = plain.forward_pass_time_ms(&mixed).unwrap();
-        assert_eq!(named.forward_pass_time_ms(&mixed).unwrap(), latency);
-        let rows = |engine: &Engine| {
-            assert_rank_operations_sum(engine, &mixed)[0]
-                .operations
-                .iter()
-                .map(|op| op.latency_ms)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(rows(&named), rows(&plain));
+        let plain = engine("context_ssm", true).unwrap();
+        assert!(plain.forward_pass_time_ms(&mixed).unwrap() > 0.0);
     }
 
     #[test]
@@ -5667,17 +5690,15 @@ pub(crate) mod tests {
             let err = build(context, generation).unwrap_err().to_string();
             assert!(err.contains("belongs to two mixed-step passes"), "{err}");
         }
-        // Same pass, different chunk amortization: folding by name would
-        // leave the attention row unamortized in per-op pricing.
-        let mut mamba_as_attention = qualified_mamba(true, 1);
-        mamba_as_attention.set_name("context_attention".into());
-        let context_attention = context_ops()
-            .into_iter()
-            .find(|op| op.is_context_attention())
-            .unwrap();
+        // Same pass: folding a scan with another operation by name would mix
+        // a Mamba row into that operation's per-op value. In the context pass
+        // the only partner is context attention, a reserved name that fails
+        // first, so the decode pass shows the rule.
+        let mut mamba_as_attention = qualified_mamba(false, 1);
+        mamba_as_attention.set_name("generation_attention".into());
         let err = build(
-            vec![mamba_as_attention, context_attention],
-            vec![qualified_mamba(false, 1)],
+            vec![qualified_mamba(true, 1)],
+            vec![mamba_as_attention, attention()],
         )
         .unwrap_err()
         .to_string();

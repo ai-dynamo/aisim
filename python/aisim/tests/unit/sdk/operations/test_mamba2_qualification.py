@@ -547,21 +547,59 @@ def test_mixed_power_coverage_counts_each_mamba_query():
     assert two["covered_latency_ms"] == pytest.approx(one["covered_latency_ms"], rel=1e-12)
 
 
-def test_mixed_breakdown_rejects_a_scan_named_like_reported_attention():
-    # The SDK reports context attention as "context_attention (scaled)", so a
-    # scan with that native name would fold into the attention row.
-    import json
-
-    import aisim_core
-    from aisim_core.sdk import rust_engine_step
+@pytest.mark.parametrize("reserved", ["context_attention", "context_attention (scaled)"])
+def test_qualified_scan_rejects_reserved_attention_names(monkeypatch, reserved):
+    # The SDK reports these names as amortized attention, which XPU TTFT
+    # rescales. The compiled build rejects them on every SDK path, and the
+    # canonical model does not fall back to another estimator.
+    from aisim_core.sdk import common, config, rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import nemotron_h
+    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
+    from aisim_core.sdk.step_estimate import MixedStepInput
 
     database = _hybrid_trtllm_database()
-    model = _nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16")
-    index = next(i for i, op in enumerate(model.context_ops) if op._name == "context_mamba_ssm")
-    scan = json.loads(model.context_ops[index]._spec_json())
-    scan["Mamba2"]["name"] = "context_attention (scaled)"
-    model.context_ops[index] = aisim_core.op_from_spec_json(json.dumps(scan))
-    with pytest.raises(ValueError, match="collides with the reported name"):
-        rust_engine_step.estimate_mixed_step_breakdown_with_rust(
-            model, database, ctx_tokens=2048, gen_tokens=0, isl=2048, osl=64, prefix=0
+    runtime = config.RuntimeConfig(batch_size=1, beam_width=1, isl=2048, osl=64, prefix=0)
+    for name, rejected in (("context_ssm", False), (reserved, True)):
+        model = _renamed(_nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16"), context_mamba_ssm=name)
+        rust_engine_step._engine_handle_cache_clear()
+        calls = (
+            lambda m=model: rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+                m, database, ctx_tokens=2048, gen_tokens=0, isl=2048, osl=64, prefix=0
+            ),
+            # The mixed step the XPU TTFT path prices.
+            lambda m=model: get_backend("trtllm").run_mixed(m, database, runtime, MixedStepInput(2048, 0)),
+        )
+        for call in calls:
+            if rejected:
+                with pytest.raises(ValueError, match="reserved attention name"):
+                    call()
+            else:
+                call()
+
+    real_ops = nemotron_h.ops
+
+    def kernel(name, *args, **kwargs):
+        name = reserved if name == "context_mamba_ssm" else name
+        return real_ops.Mamba2Kernel(name, *args, state_dtype="bfloat16", token_width=1, **kwargs)
+
+    class Ops:
+        def __getattr__(self, attr):
+            return kernel if attr == "Mamba2Kernel" else getattr(real_ops, attr)
+
+    monkeypatch.setattr(nemotron_h, "ops", Ops())
+    with pytest.raises(ValueError, match="reserved attention name"):
+        RustForwardPassPerfModel.best_available(
+            {
+                "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                "system": "b200_sxm",
+                "backend": "trtllm",
+                "backend_version": "1.3.0rc20",
+                "estimation_mode": "auto",
+                "tp": 1,
+                "moe_tp_size": 1,
+                "moe_ep_size": 1,
+                "worker_type": "aggregated",
+                "database_mode": common.DatabaseMode.HYBRID.name,
+            }
         )
