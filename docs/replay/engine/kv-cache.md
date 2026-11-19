@@ -1167,6 +1167,33 @@ sub-block matching without an explicit full-state scratch count.
     [`:1600-1604`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py#L1600-L1604)
     and
     [`block_pool.py:281-284`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py#L281-L284).
+  - With prefix caching off, replay admits a waiting request when the bytes
+    of its first chunk fit the free bytes of the pool. By default vLLM admits
+    it only when the blocks of its whole sequence fit, because its option
+    `scheduler_reserve_full_isl` is on. So under memory pressure, with
+    chunked prefill and a prompt longer than the token budget of a step,
+    replay can admit a request, compute its first chunks, preempt it and
+    compute them again, where vLLM keeps the request waiting. Replay then
+    counts more preemptions and more computed prefill tokens. With prefix
+    caching on, replay tests the blocks of the whole prompt, as vLLM does.
+    See vLLM v0.31.0
+    [`config/scheduler.py:191`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/scheduler.py#L191),
+    [`kv_cache_manager.py:519-536`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py#L519-L536),
+    [`scheduler.py:1218`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L1218)
+    and
+    [`:1223-1230`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/sched/scheduler.py#L1223-L1230),
+    vLLM v0.32.0
+    [`config/scheduler.py:190`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/scheduler.py#L190),
+    [`kv_cache_manager.py:522-539`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py#L522-L539),
+    [`scheduler.py:1270`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L1270)
+    and
+    [`:1275-1282`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L1275-L1282),
+    and vLLM v0.33.0
+    [`config/scheduler.py:190`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/scheduler.py#L190),
+    [`kv_cache_manager.py:531-548`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py#L531-L548),
+    [`scheduler.py:1449`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L1449)
+    and
+    [`:1454-1461`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L1454-L1461).
 
   In `mode: disaggregated`, the prefill and decode deployments need equal
   tensor parallelism and identical cache groups. `engine.backend_version` must
