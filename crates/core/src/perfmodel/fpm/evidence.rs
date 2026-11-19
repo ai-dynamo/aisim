@@ -53,6 +53,11 @@ pub struct FpmRankEstimate {
     pub decode_baseline_ms: Option<f64>,
     /// For a mixed pass, max(decode_ms - decode_baseline_ms, 0).
     pub marginal_decode_ms: Option<f64>,
+    /// Native prefill and effective decode energy, before timing correction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_energy_wms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_energy_wms: Option<f64>,
     pub queries: Vec<DirectFpmQueryEvidence>,
     /// Name-folded operations of an operation-graph rank (op-level and stage
     /// graphs), in first-encounter order with the static phase diagnostics'

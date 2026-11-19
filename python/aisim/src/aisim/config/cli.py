@@ -20,7 +20,7 @@ from .common import (
     OptimizationConfig,
     OptimizerConfig,
     StrictModel,
-    load_yaml_with_text,
+    load_config_with_text,
 )
 from .engine import EnginePredictionConfig, EngineRecommendationConfig, has_afd, require_native_vl_parallelism
 from .traffic import (
@@ -53,7 +53,7 @@ def _read_config_file(path: str | os.PathLike[str], kind: str) -> dict[str, Any]
     ``reject_repeated_keys``).
     ``kind`` is ``predict`` or ``recommend``.
     """
-    raw, text = load_yaml_with_text(path)
+    raw, text = load_config_with_text(path)
     reject_repeated_keys(text, kind, path)
     return anchor_paths(raw, config_folder(path), kind)
 
@@ -81,7 +81,7 @@ class CorePredictionConfig(StrictModel):
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> CorePredictionConfig:
-        """Load a prediction config file.
+        """Load a YAML or JSON prediction config file.
 
         Relative paths inside ``engine.ais_perf_model`` start at the folder of
         the file. The key written twice, or a key written twice inside it, is
@@ -157,7 +157,7 @@ class CoreRecommendationConfig(StrictModel):
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> CoreRecommendationConfig:
-        """Load a recommendation config file.
+        """Load a YAML or JSON recommendation config file.
 
         Relative paths inside ``engine.ais_perf_model`` start at the folder of
         the file. The key written twice, or a key written twice inside it, is

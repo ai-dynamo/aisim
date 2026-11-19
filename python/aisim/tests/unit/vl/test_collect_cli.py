@@ -13,6 +13,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
 from aisim.config.engine import FrontendMeasurementConfig
 from aisim.vl.collect.__main__ import main
@@ -59,6 +60,33 @@ def test_a_recording_lowers_into_a_table_that_show_prints_with_its_provenance(tm
     with pytest.raises(SystemExit, match="absent.json") as error:
         main(["--table", str(absent), "--show"])
     assert "Traceback" not in str(error.value)
+
+
+def test_json_named_prediction_config_retains_yaml_parsing(tmp_path, capsys):
+    kept = tmp_path / "recording.json"
+    kept.write_text(json.dumps(_recording()), encoding="utf-8")
+    table = tmp_path / "table.json"
+    config = tmp_path / "prediction.json"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "engine": {
+                    "model": "m",
+                    "workers": {
+                        "aggregated": {
+                            "host_profile": {"path": str(table), "frontend": "python"},
+                        }
+                    },
+                },
+                "traffic": {"source": {"images": {"height": 480, "width": 480}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(["--config", str(config), "--recording", str(kept)]) == 0
+    assert table.exists()
+    assert main(["--table", str(table), "--show"]) == 0
+    assert MEASUREMENT.describe() in capsys.readouterr().out
 
 
 def test_a_tilde_table_path_lands_under_home(tmp_path, monkeypatch, capsys):

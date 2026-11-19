@@ -151,6 +151,8 @@ shared:
     owners: [forward-pass-engine, replay, infra, maintainers]
   - glob: benchmarks/reports/perf-data/
     owners: [forward-pass-engine, infra, maintainers]
+  - glob: skills/
+    owners: [maintainers]
   - glob: .agents/skills/aisim-fpe-performance/
     owners: [forward-pass-engine, maintainers]
   - glob: .claude/skills/aisim-fpe-performance
@@ -425,6 +427,8 @@ shared:
   - glob: .github/codeowners/
     owners: [infra, maintainers]
   - glob: .github/workflows/codeowners.yml
+    owners: [infra, maintainers]
+  - glob: .github/workflows/request-nvskills-ci.yml
     owners: [infra, maintainers]
   - glob: CODEOWNERS
     owners: [infra, maintainers]
