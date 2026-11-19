@@ -20,7 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-root, rounds, out, builds = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4:]
+root, rounds, out, builds = Path(sys.argv[1]).resolve(), int(sys.argv[2]), sys.argv[3], sys.argv[4:]
 sys.path.insert(0, str(root / builds[0] / "src/python/aisim"))
 from tools.forward_perf_gate.cases import expand_cases
 
