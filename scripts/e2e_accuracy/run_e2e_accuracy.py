@@ -42,7 +42,7 @@ from scripts.e2e_accuracy.hf_measurements import POLICY as HF_POLICY
 from scripts.e2e_accuracy.source.cohort import select_points as select_resolved_points
 from scripts.e2e_accuracy.source.recipes.runtime_evidence import prepare_runtime_evidence
 from scripts.pages.build_pages_site import _accuracy_summary
-from scripts.release.package_identity import installed_distribution
+from scripts.release.package_identity import installed_distribution, runtime_module
 
 REPOSITORY = "https://github.com/ai-dynamo/aisim"
 
@@ -252,7 +252,8 @@ def wheel_identity(wheel: Path) -> dict:
 
 
 def replay_spec(request, backend_version: str):
-    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+    replay = runtime_module("aisim.sweeper.replay")
+    deployment_type, replay_type = replay.BackendDeploymentSpec, replay.ReplaySpec
 
     def engine(worker, system, role):
         args = {
@@ -313,8 +314,8 @@ def replay_spec(request, backend_version: str):
             num_prefill_workers=topology.prefill.replicas,
             num_decode_workers=topology.decode.replicas,
         )
-    return ReplaySpec(
-        backend_deployment=BackendDeploymentSpec(
+    return replay_type(
+        backend_deployment=deployment_type(
             deployment_mode=topology.kind,
             backend=request.backend.name,
             backend_version=backend_version,
@@ -335,7 +336,7 @@ def replay_spec(request, backend_version: str):
 def predict_point(point: dict) -> dict:
     if "source_row" in point:
         return predict_resolved_point(point)
-    from aisim.runner import EngineReplayRunnerFactory
+    runner_factory_type = runtime_module("aisim.runner").EngineReplayRunnerFactory
 
     api_name, adapter_name = predictor_module_names(installed_distribution().files or ())
     cli_estimate = importlib.import_module(api_name).cli_estimate
@@ -438,7 +439,7 @@ def predict_point(point: dict) -> dict:
     }
     try:
         spec = replay_spec(request, baseline.backend_version)
-        runner = EngineReplayRunnerFactory().create(0)
+        runner = runner_factory_type().create(0)
         try:
             metrics = runner.run(spec).metrics
         finally:
@@ -515,8 +516,9 @@ def predict_resolved_point(point):
             "reason": "source_unresolved",
         }
 
-    from aisim.runner import EngineReplayRunnerFactory
-    from aisim.sweeper.replay import BackendDeploymentSpec, ReplaySpec
+    runner_factory_type = runtime_module("aisim.runner").EngineReplayRunnerFactory
+    replay = runtime_module("aisim.sweeper.replay")
+    deployment_type, replay_type = replay.BackendDeploymentSpec, replay.ReplaySpec
     from scripts.e2e_accuracy.source.estimate import estimate_kwargs
     from scripts.e2e_accuracy.source.model_config_snapshot import materialize_model_config
     from scripts.e2e_accuracy.source.replay import replay_spec as resolved_replay_spec
@@ -525,7 +527,7 @@ def predict_resolved_point(point):
     deployment = point["deployment"]
     config, bench = point["config"], point["benchmark"]
     api_name, adapter_name = predictor_module_names(installed_distribution().files or ())
-    namespace = "aiconfigurator" if api_name.startswith("aiconfigurator.") else "aisim"
+    namespace = "aiconfigurator" if api_name.startswith("aiconfigurator.") else api_name.split(".")[0]
     try:
         version = importlib.import_module(namespace + ".sdk.perf_database").get_latest_database_version(
             system=deployment["system"], backend=deployment["backend"]
@@ -626,8 +628,8 @@ def predict_resolved_point(point):
     except Exception as error:
         row["aic_error"] = str(error)
     try:
-        spec = resolved_replay_spec(deployment, version, BackendDeploymentSpec, ReplaySpec)
-        runner = EngineReplayRunnerFactory().create(0)
+        spec = resolved_replay_spec(deployment, version, deployment_type, replay_type)
+        runner = runner_factory_type().create(0)
         try:
             metrics = runner.run(spec).metrics
         finally:
@@ -852,9 +854,10 @@ def campaign(args) -> None:
 def driver_digest() -> str:
     return sha(
         {
-            str(path.relative_to(Path(__file__).parent)): digest(path)
+            os.path.relpath(path, Path(__file__).parent): digest(path)
             for path in [
                 Path(__file__),
+                Path(__file__).resolve().parents[1] / "release/package_identity.py",
                 Path(__file__).with_name("hf_measurements.py"),
                 *sorted(Path(__file__).with_name("source").rglob("*.py")),
                 *sorted(Path(__file__).with_name("source").rglob("*.json")),
