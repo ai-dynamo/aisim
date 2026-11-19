@@ -520,7 +520,10 @@ def test_speculative_round_prediction_preserves_progress_identity_and_observed_c
     assert rank["timing_model"]["config"]["fpm_profile"]["deployments"][0]["execution_profile"] == execution
     assert report.metrics["completed_requests"] == 2
     assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0)
-    records = report.metadata["native_report"]["per_request"]
+    native = report.metadata["native_report"]
+    assert native["power_w"] is None
+    assert native["power_coverage"] is None
+    records = native["per_request"]
     assert len(records) == 2
     for record in records:
         assert record["output_length"] == 7

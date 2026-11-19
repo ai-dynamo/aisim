@@ -296,8 +296,9 @@ def test_version_label_cannot_change_publication_path(tmp_path, label):
 
 
 @pytest.mark.parametrize("ambiguous", [False, True])
+@pytest.mark.parametrize("profile_format", ["json", "yaml"])
 def test_supplied_profile_version_is_preserved_or_requires_explicit_selection(
-    tmp_path, forbid_host_version_detection, ambiguous
+    tmp_path, forbid_host_version_detection, ambiguous, profile_format
 ):
     source, resources = _files(tmp_path)
     first_path = tmp_path / "first.yaml"
@@ -310,7 +311,8 @@ def test_supplied_profile_version_is_preserved_or_requires_explicit_selection(
         second["backend_version"] = "my-vllm-patch-4"
         profile["deployments"].append(second)
     profile_path = tmp_path / "profile.json"
-    profile_path.write_text(json.dumps(profile))
+    serialize = json.dumps if profile_format == "json" else yaml.safe_dump
+    profile_path.write_text(serialize(profile), encoding="utf-8")
     output = tmp_path / "from-profile.yaml"
     args = _args(output, source, framework_version=None)
     index = args.index("--model-config")
