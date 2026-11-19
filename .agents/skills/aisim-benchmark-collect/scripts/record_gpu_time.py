@@ -20,7 +20,6 @@ from pathlib import Path
 
 from aisim_core.data.gpu_time import (
     KubeParseError,
-    SlurmParseError,
     check_gpu_time,
     gpu_time_from_kubernetes,
     gpu_time_from_sacct,
@@ -56,7 +55,7 @@ def main(argv=None) -> int:
                 if not any(o.get("kind") == "Job" and o.get("uid") == uid for o in owners):
                     raise KubeParseError("Pod owner does not match the Job UID")
             gpu_time = gpu_time_from_kubernetes(job, pods, gpu_type=args.gpu_type)
-    except (SlurmParseError, KubeParseError) as exc:
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
         # Unfinished or inconsistent job records are not turned into numbers.
         print(f"error: {exc}", file=sys.stderr)
         return 2

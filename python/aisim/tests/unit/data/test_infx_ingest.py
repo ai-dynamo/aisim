@@ -8,6 +8,7 @@ All HTTP is faked; the response shapes mirror the live documented endpoints
 """
 
 import ast
+import gzip
 import json
 import shutil
 import socket
@@ -530,6 +531,91 @@ def test_row_missing_required_fields_is_incomplete(root, tmp_path):
     del bad["decode_tp"]
     result, _ = make_run(tmp_path, FakeInfx(rows=[bad, row(2, "h200")]))
     assert result.status == "failed" and "IncompleteAcquisitionError" in result.error
+
+
+@pytest.mark.parametrize("field,value", [("benchmark_type", None), ("id", "invalid"), ("id", "²")])
+def test_malformed_benchmark_writes_failure_report(root, tmp_path, monkeypatch, field, value):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    before = tree(root)
+    bad = row()
+    if value is None:
+        del bad[field]
+    else:
+        bad[field] = value
+    fake = FakeInfx(rows=[bad])
+    monkeypatch.setattr(
+        infx_job,
+        "run_ingestion",
+        lambda root, cache_dir, **kw: run_ingestion(root, cache_dir, transport=fake, sleep=lambda _: None),
+    )
+    monkeypatch.setattr(infx_job, "_env_alert", lambda *args: [])
+    report = tmp_path / "report.json"
+    assert (
+        infx_job.main(["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report)])
+        == 1
+    )
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and "IncompleteAcquisitionError" in result["error"]
+    assert tree(root) == before
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"models": None},
+        {"models": {}},
+        {"models": [1]},
+        {"models": [{"dbKeys": ["testmodel"]}]},
+        {"models": [{"name": 1, "dbKeys": ["testmodel"]}]},
+        {"models": [{"name": "Test-Model", "dbKeys": "testmodel"}]},
+        {"models": [{"name": "Test-Model", "dbKeys": [1]}]},
+    ],
+)
+def test_malformed_model_options_fail_without_writing_state(root, tmp_path, options):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    before = tree(root)
+    fake = FakeInfx()
+    fake.respond("views/options", ok(options))
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "failed" and "IncompleteAcquisitionError" in result.error
+    assert tree(root) == before
+
+
+@pytest.mark.parametrize("model", ["dsr1", "DEEPSEEK-AI/DEEPSEEK-R1-0528"])
+def test_original_responses_follow_canonical_model_names(root, tmp_path, model):
+    rows = [row(model=model)]
+    fake = FakeInfx(rows=rows, availability=[avail(model=model)])
+    fake.respond("views/options", ok({"models": [{"name": "DeepSeek R1", "dbKeys": [model]}]}))
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "candidate"
+    _, members = read_snapshot(root, infx_ingest.snapshot_path(result.snapshot_id))
+    loaded = load_e2e(root, members[0].manifest_path)
+    responses = [a for a in loaded.manifest.artifacts if "inferencex-response-" in a.path]
+    assert len(responses) == 1
+    assert gzip.decompress((root / responses[0].path).read_bytes()) == json.dumps(rows).encode()
+    assert loaded.body.model_id == "deepseek-ai/DeepSeek-R1-0528"
+
+
+@pytest.mark.parametrize("selector", ["dsr1", "DeepSeek R1"])
+def test_scoped_refresh_preserves_prior_canonical_observations(root, tmp_path, selector):
+    options = {"models": [{"name": "DeepSeek R1", "dbKeys": ["dsr1"]}]}
+    fake = FakeInfx(rows=[row(model="dsr1")], availability=[avail(model="dsr1")])
+    fake.respond("views/options", ok(options))
+    first, _ = make_run(tmp_path, fake)
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    # A different selector changes the scope, but the observations are inherited, not added again.
+    result, _ = make_run(tmp_path, fake, models=[selector])
+    assert result.status == "candidate"
+    assert result.changes == {"added": [], "corrected": [], "removed": []}
+    before = tree(root)
+    empty = FakeInfx(rows=[], availability=[])
+    empty.respond("views/options", ok(options))
+    failed, _ = make_run(tmp_path, empty, models=[selector])
+    assert failed.status == "failed" and "ContradictionError" in failed.error
+    assert tree(root) == before
 
 
 # --------------------------------------------------------------------------- staleness and alerts

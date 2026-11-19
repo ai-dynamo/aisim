@@ -61,11 +61,12 @@ from aisim_core.data.e2e import (
     write_configuration,
     write_snapshot,
 )
+from aisim_core.data.names import normalize
 
 BASE_URL = "https://inferencex.semianalysis.com/api/v1/"
 USER_AGENT = "aisim-infx-ingest/1"
 SELECTION_POLICY = "inferencex-all-observations-in-scope/v1"
-REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl")
+REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl", "benchmark_type")
 # ``exact=true&date=D`` returns the logical snapshot as of D, so one benchmark id can reappear on later
 # dates. Only these per-view context fields differ between appearances (verified against the live API);
 # they are not measured content and are excluded from normalized records and contradiction checks.
@@ -291,7 +292,7 @@ class Acquirer:
         self.client, self.cache = client, cache
         self.now = now or (lambda: datetime.now(UTC))
         self.responses: dict[str, bytes] = {}
-        self.selected_models: set[str] | None = None
+        self.selected_models: set[str] | None = None  # canonical stored model IDs after applying a selector
 
     def _page(self, route: str, params: Mapping[str, Any] | None, expect: type) -> tuple[Any, str, str]:
         """Fetch with a conditional request; returns (value, acquired_at, status 'acquired'|'inherited')."""
@@ -317,8 +318,17 @@ class Acquirer:
     ) -> Acquisition:
         options, _, _ = self._page("views/options", None, dict)
         by_key: dict[str, str] = {}
-        for entry in options.get("models", []):
-            for key in entry.get("dbKeys", []):
+        if not isinstance(options.get("models"), list):
+            raise IncompleteAcquisitionError("views/options: models must be a list")
+        for entry in options["models"]:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("name"), str)
+                or not isinstance(entry.get("dbKeys"), list)
+                or any(not isinstance(key, str) for key in entry["dbKeys"])
+            ):
+                raise IncompleteAcquisitionError("views/options: model entries need a string name and string dbKeys")
+            for key in entry["dbKeys"]:
                 by_key[key] = entry["name"]
         availability, _, _ = self._page("availability", None, list)
         wanted = set(models) if models else None
@@ -326,7 +336,10 @@ class Acquirer:
             known = set(by_key) | set(by_key.values())
             if unknown := sorted(wanted - known):
                 raise InfxError(f"unknown model selector(s) {unknown}; known: {sorted(set(by_key.values()))}")
-            self.selected_models = {k for k, name in by_key.items() if k in wanted or name in wanted}
+            # Stored observation model IDs are normalized DB keys, not display names.
+            self.selected_models = {
+                normalize("model", k) for k, name in by_key.items() if k in wanted or name in wanted
+            }
             if prior_observation_models is not None:
                 prior_observation_ids = [
                     oid for oid in prior_observation_ids if prior_observation_models.get(oid) in self.selected_models
@@ -365,6 +378,8 @@ class Acquirer:
                     raise ContradictionError(f"{url}: row {row['id']} is for model {row['model']!r}, not {name!r}")
                 row = {k: v for k, v in row.items() if not k.startswith(VIEW_CONTEXT_PREFIX)}
                 rid = str(row["id"])
+                if not rid.isascii() or not rid.isdigit():
+                    raise IncompleteAcquisitionError(f"{url}: benchmark id must be numeric: {rid!r:.200}")
                 if rid in records and _canonical(records[rid]) != _canonical(row):
                     raise ContradictionError(f"{url}: benchmark id {rid} has two different bodies in one acquisition")
                 records[rid] = row
@@ -446,11 +461,15 @@ def plan_snapshot(acq: Acquisition) -> SnapshotPlan:
     # Keep original response bytes as well as the normalized, deduplicated record bundle.
     # These hash-linked artifacts survive removal of the mutable acquisition cache.
     originals: dict[str, list[ProvenanceFile]] = {}
+    models = {data.body.model_id for data in configurations}
     for url, body in sorted(acq.responses.items()):
         artifact = ProvenanceFile(
             "raw-output", body, name=f"inferencex-response-{_sha(url.encode() + body)}", source_tool=url
         )
-        for model in {row["model"] for row in json.loads(body)}:
+        response_models = {normalize("model", row["model"]) for row in json.loads(body)}
+        if not response_models & models:
+            raise IncompleteAcquisitionError(f"{url}: retained response matches no configuration")
+        for model in response_models:
             originals.setdefault(model, []).append(artifact)
     configurations = [
         replace(data, provenance=[*data.provenance, *originals.get(data.body.model_id, [])]) for data in configurations
