@@ -1057,9 +1057,39 @@ sub-block matching without an explicit full-state scratch count.
     can then miss a prefill stop where vLLM saves an extra state, and with hits
     inside a block it can give a shorter hit. The profile does not record which
     groups share a spec.
-  - One corner needs hits inside a block. Replay does not give a
-    full-attention block that is already cached a second key at a hash
-    boundary inside it. A later hit there can then be lower than in vLLM.
+  - When the hash block is smaller than a full-attention block, vLLM 0.32.0
+    and 0.33.0 can give a cached block two keys: the key of its block
+    boundary and the key of the last hash boundary before the end of a
+    prompt, inside the block. Replay gives the block one key, the key that it
+    got first. vLLM 0.31.0 puts that key at the last hash boundary at or
+    before the end of the prompt, in a block that prompt tokens do not fill,
+    so it has no such case. The difference shows in two ways. With hits
+    inside a block and a prefill checkpoint block, one chunk can end at the
+    end of a prompt whose length is a multiple of the full-attention block.
+    The last block then gets its full key only, and the state group has a key
+    only at the checkpoint inside that block. A later request with the same
+    tokens and a length inside the last hash block of that prompt, such as a
+    repeat of the prompt, gets an older state or no hit. vLLM hits the prompt
+    length less one hash block. With blocks of 32 tokens, a hash block of 4
+    and a prompt of 64 tokens, a repeat hits 0 tokens in replay and 60 in
+    vLLM. A longer prompt, or a prompt whose length is not a multiple of the
+    block, is not affected. The other way needs no hits inside a block:
+    every prefix-cacheable group is full attention, their blocks differ, and
+    the hash block is their greatest common divisor. A block that gets the
+    key of the last hash boundary first gets no full key when a later chunk
+    fills it. A later, longer prompt can then hit one least common multiple
+    of the group block sizes less than in vLLM. With blocks of 64 and 16
+    tokens, a prompt of 128 tokens computed in chunks that end at 120 and 128
+    makes a later prompt of 200 tokens hit 64 tokens in replay and 128 in
+    vLLM. With hits inside a block this order gives the same hit as in vLLM,
+    because the state group has its key at the same hash boundary. The
+    shipped GLM-5.3-Flash profile reaches neither case, because its hash
+    block equals its block. See vLLM v0.32.0
+    [`single_type_kv_cache_manager.py:838-884`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py#L838-L884),
+    [`block_pool.py:286-299`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L286-L299),
+    [`:502-523`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L502-L523)
+    and
+    [`:626-646`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py#L626-L646).
   - With hits inside a block and a state group whose block is larger than the
     hash block, a request can write past a state that it published inside a
     block. Replay then takes a new block and keeps the published block
