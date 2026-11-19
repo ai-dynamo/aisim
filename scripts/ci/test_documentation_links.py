@@ -3,16 +3,23 @@
 
 """Behavioral coverage for local documentation destination checks."""
 
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.ci.check_documentation_links import check_file, documentation_files, local_links
 
 
 class DocumentationLinksTest(unittest.TestCase):
+    def setUp(self):
+        # Git hooks export overrides that can redirect commands out of the fixtures.
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        self.enterContext(patch.dict(os.environ, environment, clear=True))
+
     def test_default_scan_finds_broken_links_in_agent_guides_and_skill_references(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
