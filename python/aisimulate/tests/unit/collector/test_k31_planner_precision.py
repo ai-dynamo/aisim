@@ -29,10 +29,12 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_dat
 
 
 @pytest.fixture
-def inputs(tmp_path, monkeypatch):
+def inputs(tmp_path, monkeypatch, request):
     index_path, launches = _complete_fixture(tmp_path, monkeypatch)
     config_path, _ = _kimi_k31_config(tmp_path)
     launch = launches["tp2"]
+    attention_backend = getattr(request, "param", "trtllm_mla")
+    launch["precision"]["attention_backend"] = attention_backend
     launch["model_config"] = {"path": str(config_path), "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()}
     launch["topology"].update(dp=1, moe_tp=2, moe_ep=1)
     launch = runtime_probe.normalize_probe_launch(launch)
@@ -54,6 +56,13 @@ def inputs(tmp_path, monkeypatch):
             continue
         record["model_config_sha256"] = launch["model_config"]["sha256"]
         record["resolved_config"]["parallel_config"].update(data_parallel_size=1, enable_expert_parallel=False)
+        if attention_backend == "flashmla":
+            config = record["resolved_config"]
+            config["cache_config"]["cache_dtype"] = "fp8_ds_mla"
+            config["attention_config"]["backend"] = "FLASHMLA_SPARSE"
+            if record["kind"] == "worker":
+                record["attention_backend"][0] = "FLASHMLA_SPARSE"
+                record["attention_groups"][0]["backend"] = "FLASHMLA_SPARSE"
         record["instrumentation_binding"] = {
             **runtime_binding(),
             **{key: record[key] for key in ("attempt_id", "configuration", "phase", "bundle_sha256")},
@@ -228,7 +237,49 @@ def test_current_model_payload_is_bound_independently_of_public_name(inputs):
 def test_unobserved_checkpoint_native_identity_is_not_promoted(inputs):
     inputs["profile"]["deployments"][0]["moe_quant_mode"] = "w4a16_mxfp4"
     inputs["runtime_instrumentation"] = inputs["runtime_launch"] = None
-    assert bind(inputs) is inputs["capability"]
+    with pytest.raises(ValueError, match="formal runtime instrumentation and launch"):
+        bind(inputs)
+
+
+def test_formal_plan_rejects_unobserved_inferred_moe_precision(inputs):
+    inputs["profile"]["deployments"][0]["moe_quant_mode"] = "w4a16_mxfp4"
+    with pytest.raises(ValueError, match="formal runtime instrumentation and launch"):
+        planner.build_collection_plan(
+            backend=inputs["backend"],
+            model_path=inputs["model_path"],
+            system=inputs["system"],
+            selected_ops=set(),
+            options=inputs["options"],
+            has_model_cases=False,
+            model_config_path=inputs["runtime_launch"]["model_config"]["path"],
+            fpm_profile=inputs["profile"],
+        )
+
+
+def test_matching_inferred_moe_label_still_requires_observed_arithmetic(inputs):
+    inputs["profile"]["deployments"][0]["moe_quant_mode"] = "w4a16_mxfp4"
+    with pytest.raises(ValueError, match="from the selected profile"):
+        bind(inputs)
+
+
+@pytest.mark.parametrize("matching", [False, True])
+def test_inline_tp2_proof_requires_matching_effective_graph_settings(inputs, matching):
+    def captured(proof):
+        for artifact in proof["artifacts"]:
+            record = artifact["evidence"]
+            if record["kind"] != "worker":
+                continue
+            graph = record["resolved_config"]["compilation_config"]
+            record["initial_compilation_config"] = copy.deepcopy(graph)
+            if matching or record["tp_rank"] == 1:
+                graph["cudagraph_mode"] = "PIECEWISE"
+
+    edit_proof(inputs, captured)
+    if matching:
+        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
+    else:
+        with pytest.raises(ValueError, match="effective runtime/graph settings across phases/ranks"):
+            bind(inputs)
 
 
 @pytest.mark.parametrize(

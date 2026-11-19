@@ -38,12 +38,13 @@ which layout was executed.
 
 Every decode point must report native `real_kv` seeding. A balanced MoE router
 or synthetic KV allocation does not establish the request's recurrent state.
-Cached prefill likewise requires `real_prefix` seeding. These checks retain the
-native protocol evidence; they do not inspect recurrent tensors or establish
-numerical correctness. A compatible serving image, successful native-state
-smoke, measured graph behavior, matching timing/memory artifacts and independent
-accuracy validation are still required for each deployment. No K3 measurements
-are relabelled as K3.1-Pro data.
+Only zero-history prefill with prefix caching disabled is supported; cached
+prefill with historical KV remains unsupported even with `real_prefix` seeding.
+These checks retain the native protocol evidence; they do not inspect recurrent
+tensors or establish numerical correctness. A compatible serving image,
+successful native-state smoke, measured graph behavior, matching timing/memory
+artifacts and independent accuracy validation are still required for each
+deployment. No K3 measurements are relabelled as K3.1-Pro data.
 
 The collector policies and evidence checks are preliminary integration work.
 They do not provide a qualified K3.1 instrumentation manifest: the current

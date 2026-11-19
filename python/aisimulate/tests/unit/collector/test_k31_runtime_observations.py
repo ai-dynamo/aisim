@@ -330,6 +330,32 @@ def test_native_component_or_allocation_corruption_is_rejected(monkeypatch, muta
         _physical_views(cache, scheduled, "fp8")
 
 
+def test_uniform_attention_child_cannot_override_parent_kind_with_state_components(monkeypatch):
+    cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
+    child = cache["groups"][0]["layer_specs"]["mla.0"]
+    child.update(kind="state", state_shapes=[[4, 8], [4, 4]], state_dtypes=["torch.bfloat16", "torch.float32"])
+    scheduled["groups"][0]["layer_specs"]["mla.0"].update(copy.deepcopy(child))
+    component = cache["layer_components"]["mla.0"][0]
+    convolution = {
+        **component,
+        "shape": [10, 4, 8],
+        "stride_bytes": [512, 16, 2],
+        "dtype": "torch.bfloat16",
+        "element_size_bytes": 2,
+    }
+    recurrence = {
+        **component,
+        "shape": [10, 4, 4],
+        "stride_bytes": [512, 16, 4],
+        "dtype": "torch.float32",
+        "element_size_bytes": 4,
+        "storage_offset_bytes": 64,
+    }
+    cache["layer_components"]["mla.0"] = [convolution, recurrence]
+    with pytest.raises(ValueError, match="component count"):
+        _physical_views(cache, scheduled, "fp8")
+
+
 def test_nonuniform_group_cannot_override_its_geometry_with_child_specs(monkeypatch):
     cache, scheduled, _ = _native_fixture(monkeypatch)
     for record in (cache, scheduled):

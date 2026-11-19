@@ -130,6 +130,7 @@ def native_execution(snapshot, request):
     index_path.write_text(json.dumps(index))
     workers, _ = execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
     classes = {
+        "FLASHMLA_SPARSE": "vllm.v1.attention.backends.mla.flashmla_sparse.FlashMLASparseBackend",
         "FLASHINFER_MLA_SPARSE": (
             "vllm.v1.attention.backends.mla.flashinfer_mla_sparse.FlashInferMLASparseTRTLLMBackend"
         ),
@@ -158,6 +159,25 @@ def native_execution(snapshot, request):
         cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id=collection.collector_attempt_id
     )
     return plan, cell, raw, collection, index_path
+
+
+@pytest.mark.parametrize("inputs", ["flashmla"], indirect=True)
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "fp8"])
+@pytest.mark.usefixtures("inputs")
+def test_flashmla_native_execution_requires_matching_observed_cache_layout(native_execution, cache_dtype):
+    plan, cell, raw, collection, _ = native_execution
+    for path in raw.glob("**/fpm-execution-worker-*.json"):
+        payload = json.loads(path.read_text())
+        assert payload["resolved_config"]["cache_config"]["cache_dtype"] == "fp8_ds_mla"
+        payload["resolved_config"]["cache_config"]["cache_dtype"] = cache_dtype
+        path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == ("qualified" if cache_dtype == "fp8_ds_mla" else "failed"), (
+        result["missing_evidence"],
+        result["failures"],
+    )
+    if cache_dtype != "fp8_ds_mla":
+        assert any("KV precision/layout differs" in reason for reason in result["failures"])
 
 
 @pytest.mark.parametrize(

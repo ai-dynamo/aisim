@@ -276,7 +276,7 @@ def validate_views(cache, precision, count, page):
         if "layer_specs" in group and not uniform:
             raise ValueError("K3.1 per-layer specs require a native uniform group")
         for name in group["layer_names"]:
-            spec = {**group, **group["layer_specs"][name]} if uniform else group
+            spec = {**group, **group["layer_specs"][name], "kind": group["kind"]} if uniform else group
             by_name[name] = (index, spec)
             if spec["kind"] == "attention" and spec.get("dtype") not in {"torch.uint8", "torch.float8_e4m3fn"}:
                 raise ValueError("K3.1 attention storage contradicts FP8 precision")

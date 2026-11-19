@@ -830,8 +830,6 @@ def _observed_k31_capability(
         )
         for topology in topologies
     )
-    if all(deployment.moe_quant_mode == capability.dtype.moe_quant_mode for deployment in deployments):
-        return capability
     if runtime_instrumentation is None or runtime_launch is None:
         raise ValueError("K3.1 observed MoE precision requires formal runtime instrumentation and launch facts")
     bundle = (
@@ -897,6 +895,7 @@ def _observed_k31_capability(
         if not isinstance(artifacts, list) or not artifacts or not isinstance(capacities, list):
             raise ValueError("K3.1 observed MoE provenance requires worker artifacts and rank capacities")
         workers, schedulers, paths = {}, {}, set()
+        canonical_graph = None
         for artifact in artifacts:
             if not isinstance(artifact, dict) or not isinstance(artifact.get("evidence"), dict):
                 raise ValueError("K3.1 observed MoE artifact requires inline native evidence")
@@ -911,7 +910,7 @@ def _observed_k31_capability(
                 raise ValueError("K3.1 observed MoE evidence has an unexpected phase")
             binding = {key: proof[key] for key in ("attempt_id", "configuration", "bundle_sha256")}
             binding["phase"] = phase
-            observations._validate_record(
+            config = observations._validate_record(
                 record, launch=launch, bundle=bundle, binding=binding, cell=observations._launch_cell(launch, phase)
             )
             observations._validate_import_binding(record, runtime_binding(), bundle)
@@ -925,6 +924,14 @@ def _observed_k31_capability(
                 if key in workers:
                     raise ValueError("K3.1 observed MoE worker evidence is duplicated")
                 workers[key] = record
+                if canonical_graph is None:
+                    canonical_graph = config["compilation_config"]
+                else:
+                    observations._same(
+                        config["compilation_config"],
+                        canonical_graph,
+                        "effective runtime/graph settings across phases/ranks",
+                    )
                 modes.add(moe_precision(record.get("initialized_moe")))
             else:
                 if tp is not None or pp is not None or (phase, dp) in schedulers:

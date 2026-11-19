@@ -21,7 +21,7 @@ from .cpu_affinity import inspect_cpu_affinity
 from .native_artifact import NativeCollection, _rank_artifacts
 from .planner import FPMCell, FPMCollectionPlan, _canonical_hash
 from .runtime.fpm_memory_observer import EXECUTION_SUPPORTED_VERSIONS, audited_release
-from .runtime_memory import _dtype, _validate_graph, _validate_precision, _validate_revision
+from .runtime_memory import _dtype, _resolved_cache_dtype, _validate_graph, _validate_precision, _validate_revision
 
 _GRAPH_FIELDS = {"mode", "cudagraph_mode", "cudagraph_capture_sizes", "max_cudagraph_capture_size"}
 _CONFIG_TYPES = {
@@ -298,6 +298,12 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
             else:
                 valid[section][name] = values[name]
     model, cache, parallel = (valid.get(key, {}) for key in ("model_config", "cache_config", "parallel_config"))
+    resolved_cache_dtype = None
+    if "dtype" in model and "cache_dtype" in cache:
+        try:
+            resolved_cache_dtype = _resolved_cache_dtype(config, cell)
+        except ValueError as error:
+            failures.append(str(error))
     if cache.get("gpu_memory_utilization", 1) > 1:
         failures.append("runtime GPU memory utilization must not exceed one")
     if parallel.get("data_parallel_size_local", 1) > parallel.get("data_parallel_size", 1):
@@ -373,6 +379,8 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
                 failures.append(f"runtime {section}.{name} differs from generated flags")
         for flag, actual in (("--dtype", model.get("dtype")), ("--kv-cache-dtype", cache.get("cache_dtype"))):
             if flag in flags and flags[flag] != "auto" and actual is not None and _dtype(actual) != _dtype(flags[flag]):
+                if flag == "--kv-cache-dtype" and resolved_cache_dtype == _dtype(flags[flag]):
+                    continue
                 failures.append(f"runtime precision differs from generated {flag}")
         if "--quantization" in flags and "quantization" in model and model["quantization"] != flags["--quantization"]:
             failures.append("runtime quantization differs from generated --quantization")
@@ -396,10 +404,8 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
                 _validate_revision(config, revision)
             except ValueError as error:
                 failures.append(str(error))
-    if "dtype" in model and "cache_dtype" in cache:
-        actual = model["dtype"] if cache["cache_dtype"] == "auto" else cache["cache_dtype"]
-        if _dtype(actual) != cell.kv_cache_dtype:
-            failures.append("runtime KV precision differs from the planned identity")
+    if resolved_cache_dtype is not None and resolved_cache_dtype != cell.kv_cache_dtype:
+        failures.append("runtime KV precision differs from the planned identity")
     method = model.get("quantization")
     quant = config.get("quantization_config")
     if "quantization_config" not in config:
