@@ -31,7 +31,7 @@ use crate::engine::host_offload::{
     ExternalPlan, HostBlockKey, HostBlockMeta, HostEviction, HostLink, HostPolicy, HostTier,
     HostTierConfig, HostTierHandle, KvcrOrigin, Lookup, ReversedTouch, TransferId,
 };
-use crate::engine::kvcr::SharedKvcrRegistry;
+use crate::engine::kvcr::{KvcrRegistry, SharedKvcrRegistry};
 use crate::engine::offload_transfer::bytes_per_ms;
 use crate::engine::{KvEventData, KvHintSource, KvcrLocalG2Policy, StoredBlocks};
 
@@ -568,11 +568,15 @@ impl VllmKvcrAdapter {
     /// Land finished copies and pulls: make their reservations resident and
     /// release their sources.
     pub(super) fn advance(&mut self, tier: &mut HostTier, now: f64) -> bool {
-        let mut landed = self.land_copies(tier, now);
-        let mut registry = self.registry.lock().unwrap();
+        let shared = self.registry.clone();
+        let mut registry = shared.lock().unwrap();
+        let mut landed = false;
         let lru = self.local.as_ref().is_some_and(|local| local.lru);
         let mut taken = false;
         for (id, landed_ms) in registry.take_landed(self.rank, now) {
+            // Merge the already ordered streams without sorting or scanning
+            // resident blocks. Copies win ties, as in a poll at that instant.
+            landed |= self.land_copies(tier, landed_ms, &mut registry);
             let stage = self
                 .stages
                 .remove(&id)
@@ -626,7 +630,7 @@ impl VllmKvcrAdapter {
             }
             taken = true;
         }
-        drop(registry);
+        landed |= self.land_copies(tier, now, &mut registry);
         self.epoch += u64::from(taken);
         landed |= taken;
         landed
@@ -657,7 +661,7 @@ impl VllmKvcrAdapter {
     /// readable in G2. A landed copy into KVCR-owned memory changes no
     /// lookup's answer: its blocks were G2 hits while it was copied. It
     /// frees room in G2, which a promotion finds at its next lookup.
-    fn land_copies(&mut self, tier: &mut HostTier, now: f64) -> bool {
+    fn land_copies(&mut self, tier: &mut HostTier, now: f64, registry: &mut KvcrRegistry) -> bool {
         let Self {
             local: Some(local),
             joined,
@@ -677,7 +681,6 @@ impl VllmKvcrAdapter {
         }
         let mut source = local.tier.lock();
         let (mut blocks, mut stored, mut changed) = (0, 0, false);
-        let mut delivered = Vec::new();
         loop {
             match next(local) {
                 (Some(promotion), fill) if fill.is_none_or(|fill| promotion <= fill) => {
@@ -719,7 +722,7 @@ impl VllmKvcrAdapter {
                         // Always insert the promotion before the peer blocks,
                         // regardless of which leg was observed first.
                         Self::take_pull(pulling, tier, owner, reservation);
-                        delivered.push((id, at_ms));
+                        registry.complete_joined_delivery(id, at_ms);
                     }
                     changed = true;
                 }
@@ -734,13 +737,9 @@ impl VllmKvcrAdapter {
         }
         drop(source);
         if blocks > 0 || stored > 0 {
-            let mut registry = self.registry.lock().unwrap();
             let stats = registry.local_g2_stats();
             stats.promoted_blocks += blocks;
             stats.stored_blocks += stored;
-            for (id, at_ms) in delivered {
-                registry.complete_joined_delivery(id, at_ms);
-            }
         }
         self.epoch += u64::from(changed);
         changed
@@ -1568,6 +1567,63 @@ mod tests {
             );
             assert_eq!(local.lock().lookup(keys[1]), Lookup::Hit);
             assert_eq!(local.lock().lookup(HostBlockKey::new(9)), Lookup::Miss);
+        }
+    }
+
+    #[test]
+    fn kvcr_review_joined_local_eviction_is_independent_of_poll_schedule() {
+        // A two-slot local cache holds A, X at 8 ms. Promoting A ends at
+        // 12 ms; a store of C at 9 ms evicts X and finishes at 13 ms.
+        // The joined restore must align before C if its peer leg ends by
+        // 12 ms, and after C if that leg ends at or after 13 ms.
+        for (peer_end, expected_order) in [
+            (10.0, [0, 3]),
+            (12.0, [0, 3]),
+            (13.0, [3, 0]),
+            (14.0, [3, 0]),
+        ] {
+            for intermediate in [false, true] {
+                let f = Fixture::with_local_g2(2, KvcrLocalG2Policy::Lru, 0.25, 8, &[2], &[]);
+                let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+                let mut target = f.target.lock();
+                adapter.store_local(&target, f.owner, TransferId::new(0), &f.keys(&[0, 1]), 0.0);
+                assert!(!adapter.advance(&mut target, 8.0));
+                let local = adapter.local.as_ref().unwrap().tier.clone();
+                assert_eq!(local.lock().lru_order(), f.keys(&[0, 1]));
+                f.registry.lock().unwrap().note_pass(0, peer_end - 2.0);
+                let keys = f.keys(&[0, 2]);
+                assert!(adapter.stage_at(&mut target, f.owner, f.source, &mut restore, &keys, 8.0));
+                let store = TransferId::new(1);
+                adapter.expect_store(store, &mut None, &f.keys(&[3]));
+                adapter.store_local(&target, f.owner, store, &f.keys(&[3]), 9.0);
+                if intermediate {
+                    assert_eq!(
+                        adapter.advance(&mut target, peer_end.min(12.0)),
+                        peer_end == 12.0
+                    );
+                }
+                let both = peer_end.max(13.0);
+                assert_eq!(
+                    adapter.advance(&mut target, both),
+                    !(intermediate && peer_end == 12.0)
+                );
+                assert_eq!(local.lock().lru_order(), f.keys(&expected_order));
+                assert!(keys.iter().all(|key| target.lookup(*key) == Lookup::Hit));
+                assert_eq!(f.source_pins(&keys[1..]), vec![0]);
+                assert_eq!(local.lock().pins(keys[0]), 0);
+                assert!(!adapter.has_work());
+                adapter.store_local(&target, f.owner, TransferId::new(2), &f.keys(&[4]), both);
+                assert_eq!(
+                    local.lock().lookup(HostBlockKey::new(expected_order[0])),
+                    Lookup::Miss
+                );
+                assert_eq!(
+                    local.lock().lookup(HostBlockKey::new(expected_order[1])),
+                    Lookup::Hit
+                );
+                assert!(!adapter.advance(&mut target, both + 4.0));
+                assert!(!adapter.has_work());
+            }
         }
     }
 

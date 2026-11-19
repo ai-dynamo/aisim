@@ -609,9 +609,11 @@ The model simplifies KVCR:
 
 - The rank sees the source's G2 contents when it looks up the prefix. The
   source's blocks are then protected from eviction until the rank takes the
-  landed pull: as soon as it lands if the rank's worker is idle, otherwise when
-  that worker's current pass ends. The pulled blocks become usable in the
-  rank's G2 at the same point.
+  completed peer transfer: as soon as it lands if the rank's worker is idle,
+  otherwise when that worker's current pass ends. For a standalone pull, the
+  pulled blocks become usable in the rank's G2 at the same point. A pull joined
+  with a local promotion can still be waiting for the local copy after this
+  source protection ends.
 - The rank reserves G2 slots only for the blocks the source holds, all in one
   reservation per pull. A pull never evicts from the rank's G2 a block of the
   hinted prompt that the rank's G1 does not hold; it stops at the first block
@@ -702,7 +704,8 @@ counted when their first load into G1 starts).
 
 A joined promotion and peer pull become readable in G2 together. The pull's
 delivery counters update only then, and `remote_deliver_ms` includes any wait
-for the local copy. Its source blocks are released when the peer transfer ends.
+for the local copy. Its source blocks are released when the target takes the
+completed peer transfer, even if the local copy has not finished.
 
 KVCR's G3 spill, Guard ownership and custom policies are not modeled.
 
