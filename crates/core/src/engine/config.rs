@@ -3122,6 +3122,21 @@ mod tests {
     }
 
     #[test]
+    fn grouped_prefix_caching_refuses_a_window_admission_count_above_usize() {
+        // A sliding-window group of one-token blocks with max_model_len and
+        // max_num_batched_tokens of u64::MAX caps its admission at usize::MAX
+        // blocks, and the last block of the cap goes above usize.
+        let mut wire = glm_prefix_wire(Some("0.31.0"), None);
+        wire["prefix_match_unit"] = 1.into();
+        wire["max_model_len"] = u64::MAX.into();
+        wire["max_num_batched_tokens"] = u64::MAX.into();
+        wire["kv_cache_groups"] = serde_json::json!([
+            {"name": "w", "kind": "attention", "num_layers": 1, "block_size_tokens": 1, "page_size_bytes": GLM_PAGE, "sliding_window": 2, "prefix_cacheable": true},
+        ]);
+        assert!(validation_error(wire).contains("need capacity for the full prompt"));
+    }
+
+    #[test]
     fn grouped_prefix_caching_refuses_fifo_preemption() {
         // Only grouped prefix caching follows vLLM's preemption order. A
         // grouped rank without prefix caching and a linear rank keep `fifo`.
