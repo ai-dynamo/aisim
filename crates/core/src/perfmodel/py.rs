@@ -39,8 +39,8 @@ use pyo3::types::PyType;
 use crate::common::error::AicError;
 use crate::perfmodel::EngineConfig;
 use crate::perfmodel::engine::runtime::{
-    DEFAULT_STATIC_STRIDE, Engine, PerOpSolValue, PerOpValue, PerOpValueWithMetadata,
-    RuntimeConfig, StaticMode, StaticPerOpValuesWithCoverage, StaticResult,
+    DEFAULT_STATIC_STRIDE, Engine, MixedStepPerOpValuesWithMetadata, PerOpSolValue, PerOpValue,
+    PerOpValueWithMetadata, RuntimeConfig, StaticMode, StaticPerOpValuesWithCoverage, StaticResult,
 };
 use crate::{BackendKind, DataType, DatabaseMode, ENGINE_CONFIG_SCHEMA_VERSION};
 
@@ -765,7 +765,7 @@ impl AicEngine {
 
     /// Internal metadata-bearing counterpart of `mixed_step_breakdown_per_op`;
     /// each fifth field is `None` or `(first_record, additional_records)` in
-    /// deterministic encounter order.
+    /// deterministic encounter order. Includes pre-fold coverage for FPM chunks.
     #[pyo3(signature = (ctx_tokens, gen_tokens, isl, osl, prefix=0,
                         seq_imbalance_correction_scale=1.0,
                         gen_seq_imbalance_correction_scale=1.0))]
@@ -780,11 +780,7 @@ impl AicEngine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> PyResult<(
-        Vec<PerOpValueWithMetadata>,
-        Vec<PerOpValueWithMetadata>,
-        Vec<PerOpValueWithMetadata>,
-    )> {
+    ) -> PyResult<(MixedStepPerOpValuesWithMetadata, Option<f64>)> {
         self.inner.reset_provenance();
         py.allow_threads(|| {
             self.inner.mixed_step_breakdown_per_op_with_metadata(

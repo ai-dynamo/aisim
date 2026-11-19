@@ -660,6 +660,15 @@ fn agentic_v2_rejects_invalid_schema_and_graph_contracts() {
             "invalid not_before_ms",
         ),
         (
+            "invalid recorded start",
+            Fixture::Rows(vec![{
+                let mut value = node("r1", "p", serde_json::json!([]));
+                value["recorded_start_ms"] = serde_json::json!(-1.0);
+                value
+            }]),
+            "invalid recorded_start_ms",
+        ),
+        (
             "invalid typed edge",
             Fixture::Rows(vec![
                 node("r1", "p", serde_json::json!([])),

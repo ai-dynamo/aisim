@@ -547,6 +547,31 @@ def test_sglang_prefill_decode_interval_reaches_native_scheduler(tmp_path, inter
     assert (running["output_length"], waiting["output_length"]) == (6, 2)
 
 
+@pytest.mark.parametrize("selection_ms", [0.0, 1.5])
+def test_sglang_scheduler_selection_cost_reaches_native_scheduler(selection_ms: float) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    worker = engine["workers"]["aggregated"]
+    worker["scheduler"] = {"scheduler_select_time_ms": selection_ms}
+    worker["timing"] = {"type": "fixed", "prefill_ms": 7, "decode_ms": 2}
+    report = _run(
+        {
+            "engine": engine,
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 8, "output_tokens": 2},
+                "load": {"type": "concurrency", "concurrency": 1},
+                "stop": {"requests": 1},
+            },
+        }
+    )
+
+    # One prefill emits the first token, and one decode emits the second.
+    # Each of these two productive passes pays the selection cost once.
+    assert report.metrics["completed_requests"] == 1
+    assert report.metrics["mean_ttft_ms"] == pytest.approx(7.0 + selection_ms)
+    assert report.metrics["mean_tpot_ms"] == pytest.approx(2.0 + selection_ms)
+
+
 @pytest.mark.parametrize("seeded", [False, True], ids=["fresh", "completed_prior_wave"])
 def test_sglang_interval_idle_tail_does_not_relax_later_kv_admission(tmp_path, seeded) -> None:
     rows = [{"timestamp": 0, "input_length": 4, "output_length": 1, "hash_ids": [1] * 4}] if seeded else []

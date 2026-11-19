@@ -34,6 +34,11 @@ finally:
     runner.close()
 ```
 
+The existing `from_yaml()` file readers also accept `.json` files (case
+insensitive) using JSON parsing. This applies to `CorePredictionConfig`,
+`CoreRecommendationConfig`, and `SmartSearchConfig`; their typed schemas and
+validation are the same for both formats.
+
 The configuration above is the same core YAML used by `predict --stack engine`.
 `CorePredictionConfig` does not accept optional Router/Planner top-level sections;
 the CLI resolves and compiles those through their selected configuration adapters.
@@ -86,6 +91,14 @@ profiling summaries and per-request clock semantics are unchanged. See the
 [telemetry contract](../../getting-started/understand-results.md#replay-telemetry).
 Analytical EPD does not provide raw native
 or per-request EPD reports. Large capture can require substantial memory.
+
+Dynamo owns the downstream `ReplayTelemetrySnapshot` TypedDict in `_core.pyi`.
+It is intentionally unsynchronized with the Rust observer's new
+`completion_feedback` field until Dynamo bumps its simulator pin to a release
+that includes the field. The stub update is deferred to that pin bump and
+tracked in [Dynamo PR #18885](https://github.com/ai-dynamo/dynamo/pull/18885).
+See the [Rust observer contract](rust.md#reports-and-capture) for the
+completion feedback fields; telemetry capture does not export this block.
 
 ## HTML dashboard
 

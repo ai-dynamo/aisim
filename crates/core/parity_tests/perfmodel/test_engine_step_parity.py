@@ -2352,12 +2352,14 @@ _FPM_HYBRID_MIXED_FROZEN = 18.187255859375  # (ctx 1024, gen 1, isl 1024, osl 2)
 # engine at introduction (append-only; there is no Python reference). Each
 # latency equals its schema-6 pin above. Energy is the resolved row's power
 # times its latency: prefill (1, 1024, 0) is row 1 (310 W * 18 ms), decode
-# (4, 4100) is row 12 (420 W * 4.5 ms). The aggregate mixed step reports no
-# FPM energy (D10, AISIM-2001); a generation-only step keeps it.
+# (4, 4100) is row 12 (420 W * 4.5 ms). In the mixed step, prefill at 1028
+# tokens blends rows 1 and 2 with weight 4/1024. Decode at KV 4104 blends
+# rows 12 and 13 with weight 4/(262144 - 4100) and subtracts the batch-4 KV
+# floor (410 W * 4 ms). Their energies sum to the D5 pin below.
 _FPM_V8_POWER_FROZEN = {
     "static_ctx": (18.0, 5580.0),
     "static_gen": (4.5, 1890.0),
-    "mixed": (18.562552704189983, 0.0),
+    "mixed": (18.562552704189983, 5850.103399729668),
     "genonly": (4.5, 1890.0),
 }
 

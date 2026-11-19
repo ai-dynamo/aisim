@@ -406,22 +406,50 @@ def test_checkpoint_resolution_classifies_only_recognized_availability_errors(mo
     assert attempted_paths == [path]
 
 
-@pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
-def test_explicit_fpm_rejects_unimplemented_speculative_cost(mode):
+_MTP = {"kind": "mtp", "params": {"depth": 3}}
+_NGRAM = {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
+
+
+@pytest.mark.parametrize("entrypoint", ["normalize_config", "best_available"])
+def test_learned_rejects_mtp_before_reading_the_artifact(entrypoint, tmp_path):
+    config = _config(
+        estimation_mode="fpm_learned",
+        speculation=_MTP,
+        estimator_config={"fpm_learned": {"artifact_path": str(tmp_path / "missing.json"), "adaptation": "frozen"}},
+    )
+    with pytest.raises(ValueError, match="fpm_learned does not support speculative decoding"):
+        getattr(RustForwardPassPerfModel, entrypoint)(config)
+
+
+@pytest.mark.parametrize(("mode", "backend"), [("fpm_interpolation", "vllm"), ("fpm_regression", "sglang")])
+def test_explicit_fpm_rejects_unimplemented_speculative_cost(mode, backend):
     with pytest.raises(ValueError, match="speculat.*op_level|op_level.*speculat"):
-        RustForwardPassPerfModel.best_available(
-            _config(estimation_mode=mode, speculation={"kind": "mtp", "params": {"depth": 3}})
-        )
+        RustForwardPassPerfModel.best_available(_config(estimation_mode=mode, backend=backend, speculation=_MTP))
+
+
+@pytest.mark.parametrize("fallback", ["deny", "allow"])
+def test_a_vllm_regression_keeps_an_mtp_scheme(fallback):
+    model = RustForwardPassPerfModel.best_available(
+        _config(estimation_mode="fpm_regression", fallback_policy=fallback, speculation=_MTP)
+    )
+    try:
+        resolved = model.diagnostics()["provenance"]
+        assert resolved["selected_estimation_mode"] == "fpm_regression"
+        assert (resolved["config"]["nextn"], resolved["config"]["speculation"]["params"]) == (0, _MTP["params"])
+    finally:
+        model.close()
 
 
 @pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
-    ("mode", "fallback"), [("auto", "deny"), ("fpm_interpolation", "allow"), ("fpm_regression", "allow")]
-)
-@pytest.mark.parametrize(
-    "spec",
-    [{"kind": "mtp", "params": {"depth": 3}}, {"kind": "ngram", "params": {"num_speculative_tokens": 3}}],
-    ids=["mtp", "ngram"],
+    ("mode", "fallback", "spec"),
+    [
+        ("auto", "deny", _MTP),
+        ("fpm_interpolation", "allow", _MTP),
+        ("auto", "deny", _NGRAM),
+        ("fpm_interpolation", "allow", _NGRAM),
+        ("fpm_regression", "allow", _NGRAM),
+    ],
 )
 def test_selection_preserves_speculation(mode, fallback, spec):
     config = _config(database_mode="SOL", estimation_mode=mode, fallback_policy=fallback, speculation=spec)
