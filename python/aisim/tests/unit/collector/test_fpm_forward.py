@@ -3202,6 +3202,106 @@ def test_prefill_cells_keep_prefix_caching_for_seeded_kv_reads():
     assert "--no-async-scheduling" in args
 
 
+_HYBRID_ARCHITECTURE = "Qwen4ExpForConditionalGeneration"
+
+
+def _plan_with_config(payload: dict, architecture: str = _HYBRID_ARCHITECTURE):
+    plan = _args_plan()
+    plan.capability = SimpleNamespace(
+        architecture=architecture,
+        model_config=ResolvedModelConfig(payload, source_kind="explicit", source_reference="test"),
+    )
+    return plan
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Layers the config cannot describe, as Qwen3.8-Flash-Next declares them.
+        {"architectures": [_HYBRID_ARCHITECTURE], "layer_types": ["linear_attention"] * 3 + ["full_attention"]},
+        # Recurrent state fields declared without a layer-type list.
+        {"architectures": [_HYBRID_ARCHITECTURE], "ssm_cfg": {"d_state": 128}},
+    ],
+    ids=["layer_types", "recurrent-state-field"],
+)
+def test_recurrent_decode_renders_hybrid_live_state(payload):
+    """Hybrid checkpoints need the runtime's hybrid live-state mode to warm decode.
+
+    Without it the runtime refuses the real-KV warm-up for recurrent state
+    groups (``skip_reason="hybrid_state_layers_unsupported"``), then schedules
+    a decode point with a null block table and the worker takes a CUDA illegal
+    address. The flag is decode/agg only and mutually exclusive with the
+    random-state mode, which AISim never renders.
+    """
+    plan, cell = _plan_with_config(payload), _args_cell("decode", "tep")
+
+    from collector.fpm_forward.runner import _cell_generator_overrides
+
+    args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
+
+    assert args.count("--benchmark-hybrid-live-state") == 1
+    assert args.count("--benchmark-randomize-kda-state") == 0
+
+
+def test_prefill_never_renders_hybrid_live_state():
+    """The runtime validates the mode for decode/agg only, so prefill stays untouched."""
+    plan, cell = (
+        _plan_with_config({"architectures": [_HYBRID_ARCHITECTURE], "layer_types": ["linear_attention"]}),
+        _args_cell("prefill", "tep"),
+    )
+
+    from collector.fpm_forward.runner import _cell_generator_overrides
+
+    args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
+
+    assert "--benchmark-hybrid-live-state" not in args
+
+
+def test_full_attention_decode_keeps_the_default_state_mode():
+    """A config the collector can describe needs no state-mode flag."""
+    plan, cell = (
+        _plan_with_config({"architectures": [_HYBRID_ARCHITECTURE], "layer_types": ["full_attention"] * 4}),
+        _args_cell("decode", "tep"),
+    )
+
+    from collector.fpm_forward.runner import _cell_generator_overrides
+
+    args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
+
+    assert "--benchmark-hybrid-live-state" not in args
+
+
+def test_fake_kv_hybrid_decode_keeps_the_default_state_mode():
+    """Fake-KV decode (no warm-up) has no recurrent state to borrow."""
+    plan = _plan_with_config({"architectures": [_HYBRID_ARCHITECTURE], "layer_types": ["linear_attention"]})
+    cell = _args_cell("decode", "tp")
+
+    from collector.fpm_forward.runner import _cell_generator_overrides
+
+    args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
+
+    assert "--no-enable-prefix-caching" in args
+    assert "--benchmark-hybrid-live-state" not in args
+
+
+def test_backend_policy_cannot_select_the_recurrent_state_mode():
+    """The collector selects the mode from the model config; a policy that also did would be unverifiable."""
+    from dataclasses import replace
+
+    from collector.fpm_forward.runner import _cell_generator_overrides
+
+    plan = _plan_with_config({"architectures": [_HYBRID_ARCHITECTURE], "layer_types": ["linear_attention"]})
+    cell = _args_cell("decode", "tep")
+    conflicting = BackendPolicy(
+        "conflict",
+        {"params": {"agg": {"extra_cli_args": ["--benchmark-randomize-kda-state"]}}},
+        {},
+    )
+
+    with pytest.raises(ValueError, match="recurrent cache layouts"):
+        _cell_generator_overrides(plan, replace(cell, backend_policy=conflicting), {})
+
+
 def _decode_cell_with_coordinate_collision(tmp_path, *, clamp_first):
     """Two decode plan points that measure the same physical coordinate.
 

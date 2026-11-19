@@ -32,6 +32,7 @@ from typing import Any
 
 import yaml
 
+from aisim.fpm_cache_layout import cache_layout_markers
 from aisim.fpm_contract import (
     FPM_AUXILIARY_KINDS,
     FPM_BENCHMARK_RESULT_GLOB,
@@ -1660,6 +1661,21 @@ def _cell_generator_overrides(
             raise ValueError(
                 f"FPM decode strategy {cell.parallel_strategy!r} requires prefix caching disabled for fake-KV"
             )
+        if prefix_caching == "enabled" and _declares_recurrent_cache_layout(plan):
+            # Hybrid checkpoints keep recurrent (Mamba-spec) state groups. The
+            # real-KV warm-up refuses them unless the runtime's hybrid
+            # live-state mode is on: it skips the warm-up, then schedules a
+            # decode point with a null block table and the worker takes a CUDA
+            # illegal address. The mode is decode/agg only, so prefill cells
+            # never receive it, and it is mutually exclusive with the
+            # random-state mode that AISim does not render.
+            conflicting = policy_flags & {"--benchmark-hybrid-live-state", "--benchmark-randomize-kda-state"}
+            if conflicting:
+                raise ValueError(
+                    "recurrent cache layouts select the decode state mode from the model config; backend "
+                    f"policy cannot supply {sorted(conflicting)}"
+                )
+            scheduler_args.append("--benchmark-hybrid-live-state")
         workload_args = () if prefix_caching == "enabled" else _FPM_VLLM_DECODE_FAKE_KV_ARGS
     else:
         workload_args = _FPM_VLLM_PREFILL_ARGS
@@ -1682,6 +1698,25 @@ def _cell_generator_overrides(
         raise ValueError("backend policy cannot change --fpm-gpu-memory-utilization")
     merged_agg.update({"extra_cli_args": resolved_args})
     return merged
+
+
+def _declares_recurrent_cache_layout(plan: FPMCollectionPlan) -> bool:
+    """True when the plan's decode cells warm recurrent state groups through Dynamo's generic scheduler.
+
+    Hybrid checkpoints (for example a linear/recurrent layer next to full attention) keep recurrent state groups
+    that Dynamo's real-KV warm-up accepts only in hybrid live-state mode. The marker set is the same one config
+    intake uses, so the collector and intake agree on which checkpoints those are. GLM-5.3-Flash is excluded:
+    its producer seeds real KV through its own scheduler and its runtime probe is bound to that launch, so a
+    state-mode flag here would change an accepted probe/collection pair.
+    """
+
+    capability = getattr(plan, "capability", None)
+    if getattr(capability, "architecture", None) == GLM_ARCHITECTURE:
+        return False
+    model_config = getattr(capability, "model_config", None)
+    if model_config is None:
+        return False
+    return bool(cache_layout_markers(model_config.effective_payload, capability.architecture))
 
 
 def _decode_prefix_caching_mode(plan: FPMCollectionPlan, cell: FPMCell) -> str:
