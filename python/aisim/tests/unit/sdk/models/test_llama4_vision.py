@@ -53,12 +53,15 @@ def test_llama4_loads_separate_processor_metadata(
     else:
         model_path = f"test/{tmp_path.name}"
 
-        def download(hf_id, filename, *, raise_on_404=True):
+        def download(hf_id, filename, *, raise_on_404=True, revision="main"):
             assert hf_id == model_path
             requested_files.append(filename)
-            return {"config.json": raw, "preprocessor_config.json": processor}.get(filename)
+            if filename == "preprocessor_config.json":
+                assert revision == "a" * 40
+            payload = {"config.json": raw, "preprocessor_config.json": processor}.get(filename)
+            return payload, "a" * 40 if payload is not None else None
 
-        monkeypatch.setattr(utils_module, "_download_hf_json", download)
+        monkeypatch.setattr(utils_module, "_download_hf_json_at", download)
 
     model = get_model(model_path, _model_config(language_only=language_only), "trtllm")
     runtime = RuntimeConfig(isl=128, osl=1, image_height=336, image_width=672)

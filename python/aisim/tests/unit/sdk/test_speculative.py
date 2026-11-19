@@ -260,7 +260,7 @@ class TestResolveDsparkNextn:
 
         monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
         try:
-            with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached hf_quant_config.json"):
+            with pytest.raises(utils._HuggingFaceProvenanceError, match="config.json has no verified snapshot commit"):
                 resolve_dspark_nextn(model)
             assert len(requests) == 2
         finally:

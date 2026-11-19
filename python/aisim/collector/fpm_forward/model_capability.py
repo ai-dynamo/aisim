@@ -233,9 +233,10 @@ def _download_model_config(model_path: str) -> ResolvedModelConfig:
         commit = capture.get((model_path, "config.json"))
         pinned = {"revision": commit} if commit else {}
         quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
-        _check_hf_companion_snapshot(
-            model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
-        )
+        if quant_config is not None:
+            _check_hf_companion_snapshot(
+                model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
+            )
     except HuggingFaceDownloadError as error:
         raise ValueError(
             f"cannot resolve a real model config for {model_path!r} from local files, "

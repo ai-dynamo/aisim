@@ -84,7 +84,9 @@ def test_collector_offline_optional_absence_is_observable(monkeypatch, hub_cache
 def test_collector_network_quant_json_must_be_an_object(monkeypatch, hub_cache, payload):
     def fetch(request, *, timeout):
         data = _CONFIG if request.full_url.endswith("/config.json") else payload
-        return io.BytesIO(json.dumps(data).encode())
+        response = io.BytesIO(json.dumps(data).encode())
+        response.headers = {"X-Repo-Commit": _COMMIT}
+        return response
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
     if payload is None:
@@ -138,9 +140,9 @@ def test_collector_remote_config_rejects_cached_quant_fallback(monkeypatch, hub_
         raise utils.urllib.error.HTTPError(url, 503, "unavailable", {}, None)
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", fetch)
-    with pytest.raises(ValueError, match="Cannot mix cached hf_quant_config.json") as error:
+    with pytest.raises(ValueError, match="config.json has no verified snapshot commit") as error:
         load_model_config(_MODEL)
-    assert isinstance(error.value.__cause__, utils.HuggingFaceDownloadError)
+    assert isinstance(error.value.__cause__, utils._HuggingFaceProvenanceError)
     assert utils._SNAPSHOT_CAPTURE.get() is None
 
 

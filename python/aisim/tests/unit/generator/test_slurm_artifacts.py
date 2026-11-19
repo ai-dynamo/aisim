@@ -307,11 +307,12 @@ def test_typed_request_preserves_cluster_overrides(tmp_path):
 
 @pytest.mark.parametrize("source", ["sdk", "sweeper"])
 @pytest.mark.parametrize("mode", ["agg", "disagg"])
-def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_path):
+def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_path, monkeypatch):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     # The SDK resolves serving prescriptions while building generator inputs.
     # Use a real local checkpoint instead of a path absent from the test host.
+    monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
     model_path = tmp_path / "Qwen3"
     model_path.mkdir()
     (model_path / "config.json").write_text(json.dumps(_load_pre_downloaded_hf_config("Qwen/Qwen3-32B")))

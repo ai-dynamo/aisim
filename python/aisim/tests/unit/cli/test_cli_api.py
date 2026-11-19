@@ -75,7 +75,8 @@ def test_recommend_unverified_sidecar_is_a_console_input_error(tmp_path, boundar
         check=False,
     )
     assert result.returncode == (2 if boundary == "arguments" else 1)
-    assert "Error: Cannot mix cached hf_quant_config.json" in result.stderr
+    assert "Error: Cannot verify hf_quant_config.json" in result.stderr
+    assert "config.json has no verified snapshot commit" in result.stderr
     assert "Traceback" not in result.stdout + result.stderr
 
 

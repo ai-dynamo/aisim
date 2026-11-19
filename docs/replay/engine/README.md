@@ -103,7 +103,7 @@ Field tables on these pages use the following columns:
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
 | `engine.mode` | `aggregated` | `{choices: [aggregated, disaggregated]}` | `aggregated` or `disaggregated`. AFD is a per-role worker type described in [Analytical AFD and EPD](analytical.md). |
-| `engine.model` | Required | fixed | Hugging Face ID or local model directory. Bundled models load offline. Other IDs download `config.json`, falling back to the local Hugging Face cache on network failure, HTTP 429, or HTTP 5xx. FPM profiles with `profile.model_revision` pinned to a commit read the cache first. With `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1`, only the cache is read; missing required config raises an error. Missing optional metadata is allowed, with a warning when its absence is unconfirmed. The SDK and FPM Collector pin cached config companions to that snapshot; cached quantization or processor metadata with an unverified snapshot raises an error and never replaces a successfully downloaded config. Corrupt cached files or refs raise errors. |
+| `engine.model` | Required | fixed | Hugging Face ID or local model directory. Bundled models load offline. Other IDs download `config.json`, falling back to the local Hugging Face cache on network failure, HTTP 429, or HTTP 5xx. FPM profiles with `profile.model_revision` pinned to a commit read the cache first. With `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1`, only the cache is read; missing required config raises an error. Missing optional metadata is allowed, with a warning when its absence is unconfirmed. The SDK and FPM Collector pin cached config companions to that snapshot; quantization or processor metadata with an unverified snapshot raises an error and never replaces a successfully downloaded config. Corrupt cached files or refs raise errors. |
 | `engine.hardware` | Required | `auto` allowed | System identifier, such as `h200_sxm`. `auto` is recommendation-only and resolves from `optimization.hardware`. |
 | `engine.backend` | `vllm` | `{choices: [vllm, sglang]}` | `vllm`, `sglang`, or `trtllm`. Selects both the scheduler semantics and the performance data. |
 | `engine.backend_version` | `current` | fixed | Selects performance data only. It does not change scheduler behavior. Must be a queryable version for the hardware and backend: `current`, `previous` when configured, `next` when newer data is available, or a version one of those available aliases resolves to. See [backend versions](#backend-versions). |
@@ -119,6 +119,12 @@ with an older cached config when its quantization request fails: an unverified
 cached sidecar raises an error. Corrupt cached config or sidecar metadata and
 unverified sidecar provenance also fail DSPARK `nextn` resolution in the CLI
 recommendation/sizing path, instead of returning `None` as an access failure.
+Downloaded companions require a verified config snapshot too: if the config
+response omits `X-Repo-Commit`, present companion metadata raises a typed
+provenance error. Use one cached snapshot or a local model directory in that
+case. Absent optional companions remain supported. Passing a snapshot directory
+as a local model also rejects processor entries that are directories or dangling
+links, rather than treating them as absent.
 Generator DSA KV-dtype resolution also propagates metadata access errors, so a
 failed sidecar request cannot silently remove a checkpoint's FP8 prescription.
 To retry offline, first cache `config.json` and any needed quantization or

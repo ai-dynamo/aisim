@@ -2250,7 +2250,13 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
 
 
 def _check_hf_companion_snapshot(hf_id: str, filename: str, revision: str, cached_commit: str | None) -> None:
-    """Cached metadata must belong to the selected config's verified snapshot."""
+    """Present companion metadata requires the config's immutable snapshot."""
+    if not _COMMIT_HASH.fullmatch(revision):
+        raise _HuggingFaceProvenanceError(
+            f"Cannot verify {filename} for {hf_id}: config.json has no verified snapshot commit. "
+            "Cache config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1, "
+            "or supply a local model directory."
+        )
     if cached_commit is not None and cached_commit != revision:
         raise _HuggingFaceProvenanceError(
             f"Cannot mix cached {filename} from snapshot {cached_commit} with {hf_id} config at {revision}. "
@@ -2270,7 +2276,8 @@ def _download_hf_companion_json(
         data = _download_hf_json(hf_id, filename, raise_on_404=raise_on_404, **pinned)
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
-    _check_hf_companion_snapshot(hf_id, filename, revision, capture.get((hf_id, filename)))
+    if data is not None:
+        _check_hf_companion_snapshot(hf_id, filename, revision, capture.get((hf_id, filename)))
     return data
 
 
@@ -2315,8 +2322,24 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
         for filename, key in files:
             if os.path.isdir(model_path):
                 path = Path(model_path) / filename
-                if not path.is_file():
-                    continue
+                try:
+                    mode = path.stat().st_mode
+                except FileNotFoundError as error:
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as probe_error:
+                        raise _HuggingFaceMetadataError(
+                            f"Invalid local {filename} at {path}: {probe_error}"
+                        ) from probe_error
+                    raise _HuggingFaceMetadataError(
+                        f"Invalid local {filename} at {path}: dangling processor link"
+                    ) from error
+                except OSError as error:
+                    raise _HuggingFaceMetadataError(f"Invalid local {filename} at {path}: {error}") from error
+                if not stat.S_ISREG(mode):
+                    raise _HuggingFaceMetadataError(f"Invalid local {filename} at {path}: expected a regular file")
                 data = _load_json_with_infinity(path)
                 if data is None:
                     family = "Kimi" if kimi else "Qwen3-VL"
@@ -2548,9 +2571,10 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
             logger.debug("No optional hf_quant_config.json for %s", model_path)
     finally:
         _SNAPSHOT_CAPTURE.reset(token)
-    _check_hf_companion_snapshot(
-        model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
-    )
+    if hf_quant_config is not None:
+        _check_hf_companion_snapshot(
+            model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
+        )
     loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(raw_config, hf_quant_config))
     if commit:
         loaded = _SnapshotConfig(loaded, commit)

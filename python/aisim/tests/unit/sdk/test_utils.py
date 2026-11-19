@@ -32,6 +32,14 @@ from aisim.sdk.utils import (
 pytestmark = pytest.mark.unit
 
 
+def _hf_json_response(payload):
+    """A synthetic response from one known, immutable Hub snapshot."""
+    response = io.BytesIO(json.dumps(payload).encode())
+    response.headers = Message()
+    response.headers["X-Repo-Commit"] = "c" * 40
+    return response
+
+
 @pytest.mark.parametrize(
     "revision,path_revision",
     [(None, "main"), ("a" * 40, "a" * 40), ("release/v1", "release%2Fv1")],
@@ -205,7 +213,7 @@ def test_invalid_quantization_section_fails_public_loader(monkeypatch, hf_cache,
 
         def remote(request, *, timeout):
             payload = config if request.full_url.endswith("/config.json") else quant
-            return io.BytesIO(json.dumps(payload).encode())
+            return _hf_json_response(payload)
 
         monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
     try:
@@ -344,7 +352,7 @@ def test_network_quant_json_must_be_an_object_through_public_loader(monkeypatch,
 
     def remote(request, *, timeout):
         data = config if request.full_url.endswith("/config.json") else payload
-        return io.BytesIO(json.dumps(data).encode())
+        return _hf_json_response(data)
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
     try:
@@ -432,6 +440,44 @@ def test_local_null_processor_is_rejected_and_can_be_repaired(tmp_path, sidecar,
             get_model_config_from_model_path(str(tmp_path))
         processor_path.unlink()
         assert get_model_config_from_model_path(str(tmp_path))["architecture"] == config["architectures"][0]
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("entry", ["directory", "dangling"])
+@pytest.mark.parametrize(
+    "model_id,filename",
+    [
+        ("Qwen/Qwen3-VL-8B-Instruct", "preprocessor_config.json"),
+        ("moonshotai/Kimi-K2.5", "preprocessor_config.json"),
+        ("moonshotai/Kimi-K3", "video_preprocessor_config.json"),
+    ],
+)
+def test_invalid_processor_snapshot_entry_fails_as_hub_id_and_local_path(
+    monkeypatch, hf_cache, entry, model_id, filename
+):
+    model = "org/invalid-processor-entry"
+    config = utils._load_pre_downloaded_hf_config(model_id)
+    _cache_file(hf_cache, model, "config.json", config)
+    snapshot = hf_cache / "models--org--invalid-processor-entry" / "snapshots" / ("c" * 40)
+    path = snapshot / filename
+    if entry == "directory":
+        path.mkdir()
+    else:
+        path.symlink_to("missing-processor-blob")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    try:
+        for source in (model, str(snapshot)):
+            with pytest.raises(utils._HuggingFaceMetadataError, match=filename):
+                get_model_config_from_model_path(source)
+        # Removing the corrupt entry restores the supported optional-absence
+        # path for both ways of addressing exactly the same checkpoint.
+        path.rmdir() if entry == "directory" else path.unlink()
+        cached = get_model_config_from_model_path(model)
+        local = get_model_config_from_model_path(str(snapshot))
+        assert cached == local
+        assert local["architecture"] == config["architectures"][0]
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()
@@ -817,7 +863,7 @@ def test_processor_only_cache_fallback_cannot_mix_with_remote_config(monkeypatch
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
     monkeypatch.setattr(utils, "_parse_hf_config_json", unexpected_parse)
-    with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached"):
+    with pytest.raises(utils._HuggingFaceProvenanceError, match="config.json has no verified snapshot commit"):
         utils.get_model_config_from_model_path.__wrapped__(model)
 
 
@@ -854,7 +900,7 @@ def test_remote_config_with_cached_quant_fallback_rejects_unverified_snapshot(mo
     monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
     # The cached quant file cannot replace successful remote dimensions or be
     # attached to them. An explicit error leaves the model selection unchanged.
-    with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached hf_quant_config.json"):
+    with pytest.raises(utils._HuggingFaceProvenanceError, match="config.json has no verified snapshot commit"):
         utils._load_model_config_from_model_path.__wrapped__("org/mixed")
 
 
@@ -1096,7 +1142,9 @@ def test_failed_processor_load_can_retry_offline_in_same_process(monkeypatch, hf
     utils._load_model_config_from_model_path.cache_clear()
     utils.get_model_config_from_model_path.cache_clear()
     try:
-        with pytest.raises(utils.HuggingFaceDownloadError, match="Cannot mix cached") as error:
+        with pytest.raises(
+            utils._HuggingFaceProvenanceError, match="config.json has no verified snapshot commit"
+        ) as error:
             utils.get_model_config_from_model_path(model)
         assert "config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1" in str(
             error.value
@@ -1418,7 +1466,7 @@ def test_concurrent_llama4_readers_publish_one_validated_processor(monkeypatch, 
 
     def remote(request, *, timeout):
         if request.full_url.endswith("/config.json"):
-            return io.BytesIO(json.dumps(config).encode())
+            return _hf_json_response(config)
         if request.full_url.endswith("/hf_quant_config.json"):
             raise _http_error(404, "absent")
         with lock:
@@ -1479,6 +1527,72 @@ def test_deferred_llama4_processor_uses_downloaded_config_commit(monkeypatch, hf
         assert utils._config_snapshot_commit(loaded["raw_config"]) == config_commit
         assert requests[-1] == f"https://huggingface.co/{model}/raw/{config_commit}/preprocessor_config.json"
         assert utils._load_model_config_from_model_path(model) is raw
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("consumer", ["sdk", "collector"])
+@pytest.mark.parametrize("config_commit", [None, "a" * 40])
+@pytest.mark.parametrize("companion_commit", [None, "a" * 40, "b" * 40])
+def test_network_quant_requires_verified_config_snapshot(
+    monkeypatch, hf_cache, consumer, config_commit, companion_commit
+):
+    from collector.fpm_forward.model_capability import load_model_config
+
+    model = "org/network-quant-provenance"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    quant = {"quantization": {"quant_algo": "FP8"}}
+    requested = []
+
+    def remote(request, *, timeout):
+        requested.append(request.full_url)
+        is_config = request.full_url.endswith("/config.json")
+        response = io.BytesIO(json.dumps(config if is_config else quant).encode())
+        response.headers = Message()
+        commit = config_commit if is_config else companion_commit
+        if commit is not None:
+            response.headers["X-Repo-Commit"] = commit
+        return response
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    load = get_model_config_from_model_path if consumer == "sdk" else load_model_config
+    try:
+        if config_commit is None or companion_commit == "b" * 40:
+            expected = utils._HuggingFaceProvenanceError if consumer == "sdk" else ValueError
+            with pytest.raises(expected, match="snapshot|commit") as error:
+                load(model)
+            cause = error.value if consumer == "sdk" else error.value.__cause__
+            assert isinstance(cause, utils._HuggingFaceProvenanceError)
+        else:
+            # A request to an immutable commit also verifies a headerless
+            # companion; it can never follow a moving branch to another file.
+            loaded = load(model)
+            raw = loaded["raw_config"] if consumer == "sdk" else loaded.payload
+            assert raw["hf_quant_config"] == quant
+            if consumer == "collector":
+                assert loaded.source_reference == f"{model}@{config_commit}"
+        assert requested[-1] == (f"https://huggingface.co/{model}/raw/{config_commit or 'main'}/hf_quant_config.json")
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("companion", [{}, {"min_pixels": 65536, "max_pixels": 262144}])
+def test_network_processor_requires_verified_config_snapshot(monkeypatch, hf_cache, companion):
+    model = "org/network-processor-provenance"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/hf_quant_config.json"):
+            raise _http_error(404, "absent")
+        payload = config if request.full_url.endswith("/config.json") else companion
+        return io.BytesIO(json.dumps(payload).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        with pytest.raises(utils._HuggingFaceProvenanceError, match="snapshot"):
+            get_model_config_from_model_path(model)
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()
@@ -1559,7 +1673,7 @@ def test_failed_quant_sidecar_is_not_absence_and_can_retry(monkeypatch, hf_cache
     def remote(request, *, timeout):
         requests.append(request.full_url)
         if request.full_url.endswith("/config.json"):
-            return io.BytesIO(json.dumps(config).encode())
+            return _hf_json_response(config)
         if not recovered:
             if failure == "network":
                 raise utils.urllib.error.URLError("transient")
@@ -1595,7 +1709,7 @@ def test_raw_config_and_quant_consumer_do_not_fetch_processors(monkeypatch, hf_c
     def remote(request, *, timeout):
         requests.append(request.full_url)
         if request.full_url.endswith("/config.json"):
-            return io.BytesIO(json.dumps(config).encode())
+            return _hf_json_response(config)
         if request.full_url.endswith("/hf_quant_config.json"):
             return io.BytesIO(json.dumps(quant).encode())
         raise _http_error(503, "processor unavailable")
