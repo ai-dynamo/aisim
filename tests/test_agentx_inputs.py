@@ -439,6 +439,38 @@ def test_metadata_fetch_retains_invalid_inputs_for_diagnosis(tmp_path, monkeypat
     assert all(repo == agentx_run.REPO for repo, _ in downloads)
 
 
+def test_metadata_fetch_retains_catalog_when_workload_validation_fails(tmp_path, monkeypatch):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
+    hub = tmp_path / "hub"
+    catalog_path = hub / agentx_run.INDEX
+    catalog = json.loads(catalog_path.read_bytes())
+    manifest_entry = catalog["runs"][0]["manifest"]
+    manifest_path = hub / manifest_entry["path"]
+    manifest = json.loads(manifest_path.read_bytes())
+    workload_entry = manifest["artifacts"]["workload"]
+    workload_path = manifest_path.parent / workload_entry["path"]
+    workload = json.loads(workload_path.read_bytes())
+    workload["schema"] = "invalid-workload-schema"
+    workload_path.write_bytes(canonical(workload))
+    workload_entry.update(
+        sha256=hashlib.sha256(workload_path.read_bytes()).hexdigest(), bytes=workload_path.stat().st_size
+    )
+    manifest_path.write_bytes(canonical(manifest))
+    manifest_entry.update(
+        sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(), bytes=manifest_path.stat().st_size
+    )
+    del catalog["snapshot_id"]
+    catalog["snapshot_id"] = hashlib.sha256(canonical(catalog)).hexdigest()
+    catalog_path.write_bytes(canonical(catalog))
+
+    output = tmp_path / "inputs"
+    with pytest.raises(ValueError, match="Silicon workload identity mismatch"):
+        agentx_run.fetch("a" * 40, output, metadata_only=True)
+    assert (output / agentx_run.INDEX).read_bytes() == catalog_path.read_bytes()
+    assert (output / workload_path.relative_to(hub)).read_bytes() == workload_path.read_bytes()
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
 def test_rejected_replay_does_not_reconstruct_trace(tmp_path, monkeypatch):
     hub_replay_inputs(tmp_path, monkeypatch, None)
     root = tmp_path / "inputs"

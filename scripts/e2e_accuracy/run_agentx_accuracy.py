@@ -140,6 +140,8 @@ def fetch(revision, output, *, metadata_only=False, campaign_catalog=None, previ
                 name = safe_path(path.parent, value["path"]).relative_to(output).as_posix()
                 if not (output / name).exists():
                     download(name, value)
+    (output / INDEX).parent.mkdir(parents=True, exist_ok=True)
+    (output / INDEX).write_bytes(canonical(catalog))
     runs = load_runs(output, catalog)
     if not metadata_only:
         errors = []
@@ -160,8 +162,6 @@ def fetch(revision, output, *, metadata_only=False, campaign_catalog=None, previ
         target = safe_path(output / "corpora", identity + ".jsonl")
         target.parent.mkdir(parents=True, exist_ok=True)
         reconstruct(descriptor, source, target)
-    (output / INDEX).parent.mkdir(parents=True, exist_ok=True)
-    (output / INDEX).write_bytes(canonical(catalog))
 
 
 def artifact(root, run, name):
