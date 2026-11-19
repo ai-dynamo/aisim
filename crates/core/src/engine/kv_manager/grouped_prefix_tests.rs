@@ -423,9 +423,14 @@ fn rules_refuse_unsupported_checkpoint_fields() {
 #[test]
 fn rules_refuse_a_checkpoint_block_on_a_ring() {
     // The count is a field of `MambaSpec` alone (v0.31 iface:1049-1050,
-    // v0.32 iface:1042-1043). A ring that declares a block is refused on
-    // both rows. A ring with no count or a zero count stays a ring.
-    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+    // v0.32 iface:1042-1043, v0.33 iface:1101-1102). A ring that declares a
+    // block is refused on every row. A ring with no count or a zero count
+    // stays a ring.
+    for version in [
+        VllmRuleVersion::V0_31_0,
+        VllmRuleVersion::V0_32_0,
+        VllmRuleVersion::V0_33_0,
+    ] {
         let mut groups = vec![attention("full", 16, None), state("ring", 4, false, false)];
         for count in [None, Some(0)] {
             groups[1].prefill_checkpoint_blocks = count;

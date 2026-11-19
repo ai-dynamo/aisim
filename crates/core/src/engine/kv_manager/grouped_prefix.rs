@@ -170,10 +170,12 @@ impl GroupedPrefixRules {
                         GroupRuleKind::State
                     } else {
                         // The count is a field of `MambaSpec` alone (v0.31
-                        // `iface:1049-1050`, v0.32 `iface:1042-1043`), and no
-                        // ring spec is a `MambaSpec` (v0.31 `iface:890`,
-                        // `:1016`, v0.32 `iface:909`). A ring that declares a
-                        // checkpoint block is refused, not run without it.
+                        // `iface:1049-1050`, v0.32 `iface:1042-1043`, v0.33
+                        // `iface:1101-1102`), and no ring spec is a
+                        // `MambaSpec` (v0.31 `iface:890`, `:1016`, v0.32
+                        // `iface:909`, v0.33 `iface:968`). A ring that
+                        // declares a checkpoint block is refused, not run
+                        // without it.
                         ensure!(
                             !group
                                 .prefill_checkpoint_blocks
