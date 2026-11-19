@@ -132,8 +132,9 @@ fn radix_growth_measurement() {
                 }
                 assert_eq!(alloc.lease.cached_tokens(), tokens.len());
                 mgr.finish(&tokens, alloc.lease);
-                assert_eq!(mgr.cache().protected_size(), 0);
                 assert_eq!(mgr.cache().prefix_match_len(&tokens), tokens.len());
+                mgr.evict(131072);
+                assert_eq!(mgr.cache().available_tokens(), 131072);
                 std::hint::black_box(mgr);
             }
             observations.push(json!({

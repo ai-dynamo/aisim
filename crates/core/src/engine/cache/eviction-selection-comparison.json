@@ -9,7 +9,7 @@
   "profile": "test (unoptimized, debug assertions enabled)",
   "features": [],
   "native_radix_revision": "f0fda25fc95c357368b714f90a13a69c1b67f50a",
-  "reproduce_command": "python3 scripts/compare_radix_eviction.py --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d --candidate 335a02280b23cbc2f806bf32a2b4523869cdcbe9 --work-dir \"$TMPDIR/radix-eviction-evidence\"",
+  "reproduce_command": "python3 scripts/compare_radix_eviction.py --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d --candidate e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc --work-dir \"$TMPDIR/radix-eviction-evidence\"",
   "baseline": {
     "commit": "8288046ac88fccaee124714cd60e62b2ad4e184d",
     "command": [
@@ -698,7 +698,7 @@
     ]
   },
   "candidate": {
-    "commit": "335a02280b23cbc2f806bf32a2b4523869cdcbe9",
+    "commit": "e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc",
     "command": [
       "cargo",
       "test",
@@ -1147,14 +1147,14 @@
             "overshoot_pages": 0,
             "prefix_matches": [
               {
-                "matched_tokens": 1,
+                "matched_tokens": 0,
                 "pages": [
                   1,
                   2
                 ]
               },
               {
-                "matched_tokens": 0,
+                "matched_tokens": 1,
                 "pages": [
                   3
                 ]
@@ -1164,7 +1164,7 @@
             "requested_tokens": 2,
             "victim_page_ids": [
               1,
-              2
+              0
             ]
           },
           {
@@ -1191,7 +1191,7 @@
             "requested_pages": 100,
             "requested_tokens": 100,
             "victim_page_ids": [
-              0
+              2
             ]
           }
         ],
@@ -1494,23 +1494,9 @@
     },
     {
       "id": "belady_equal_priority_recency",
-      "equal": false,
-      "differences": [
-        {
-          "operation_index": 2,
-          "differing_fields": [
-            "prefix_matches",
-            "victim_page_ids"
-          ]
-        },
-        {
-          "operation_index": 3,
-          "differing_fields": [
-            "victim_page_ids"
-          ]
-        }
-      ],
-      "explanation": "Observed difference, not a parity claim or approval of the behavior: all next uses are infinite. Main preserves the retained prefix recency and chooses [1,0], then [2]. The native suffix split assigns the retained page 0 a fresh access counter, so it chooses [1,2], then [0]. This is the separately open PRRT_kwDOT0t9uc65JEIW finding, outside this selected evidence repair; its behavior has not been changed here."
+      "equal": true,
+      "differences": [],
+      "explanation": "Identical after PRRT_kwDOT0t9uc65JEIW correction: all next uses are infinite. Both preserve retained-prefix recency and choose [1,0], then [2]. Only an actual core access supersedes the saved recency; suffix splitting does not."
     },
     {
       "id": "belady_global_retirement",

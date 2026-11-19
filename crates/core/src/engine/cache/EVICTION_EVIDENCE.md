@@ -8,8 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 This is a synthetic cache-selection comparison for PR #363, not a measurement
 of serving accuracy or simulator speed. The production cache sources are pinned
 to main `8288046ac88fccaee124714cd60e62b2ad4e184d` and PR head
-`335a02280b23cbc2f806bf32a2b4523869cdcbe9`. The corrective commit adds tests and
-evidence only. The native dependency is SGLang
+`e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc`. That corrective commit preserves
+Belady recency across suffix splits and shares request hash buffers for growth. The native dependency is SGLang
 `f0fda25fc95c357368b714f90a13a69c1b67f50a`.
 
 ## Inputs and reproduction
@@ -28,7 +28,7 @@ From the repository root, with Rust and Python 3.12 available:
 ```bash
 python3 scripts/compare_radix_eviction.py \
   --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d \
-  --candidate 335a02280b23cbc2f806bf32a2b4523869cdcbe9 \
+  --candidate e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc \
   --work-dir "$TMPDIR/radix-eviction-evidence"
 cargo test -p aisimulate-core --locked --lib engine::cache::radix_cache
 ```
@@ -56,12 +56,16 @@ reproduction script checks both recorded sides.
 | `lru_compressed_overshoot`, first call requests one page | Frees `[2]` | Frees `[0,1,2]`, overshoot 2 | Whole compressed leaf eviction replaces suffix truncation. The next call frees `[3,4]` instead of `[1]`, so the final drain is empty. |
 | `lru_locked_branch`, first call requests one page | Frees `[2]` | Frees `[1,2]`, overshoot 1 | The shared page 0 remains locked; the entire unlocked suffix is reclaimed. Later drains differ by the already freed page. Both reclaim page 0 only after unlock. |
 | `lru_recycled_page` | Frees `[1]`, then `[0]`, then `[1]` | Frees `[0,1]`, then `[1]`, then `[]` | Whole-leaf eviction removes the old prefix earlier. Both reuse physical page 1 for the new prompt, but only main retains the older page 0. |
-| `belady_equal_priority_recency` | Frees `[1,0]`, then `[2]` | Frees `[1,2]`, then `[0]` | With all next uses infinite, the native suffix split refreshes the retained prefix's access counter. Main preserves its old recency. |
+| `belady_equal_priority_recency` | Frees `[1,0]`, then `[2]` | Frees `[1,0]`, then `[2]` | The adapter preserves pre-split recency while recomputing priority from the new tail. |
 
-The Belady equal-priority difference is an observation, not an assertion of
-semantic parity or acceptance of that change. It reproduces the separately open
-[recency finding](https://github.com/ai-dynamo/aisim/pull/363#discussion_r4619189045)
-(`PRRT_kwDOT0t9uc65JEIW`); that behavior is outside this selected evidence repair.
+The original native adapter chose `[1,2]`, then `[0]` for equal Belady priorities.
+The correction to [the recency finding](https://github.com/ai-dynamo/aisim/pull/363#discussion_r4619189045)
+(`PRRT_kwDOT0t9uc65JEIW`) makes this scenario match main. Additional tests cover
+separate eviction calls, admission snapshots, and invalidation after real touches.
+The adapter saves the original tie-break only for retained suffix-split prefixes,
+keyed by their tail page and the core's split tick. A changed core access tick
+supersedes it; freeing a physical page removes it. The table is bounded by resident
+pages, and stale entries are reclaimed during each eviction step.
 
 All calls in the other five scenarios match: single-page LRU recency, Belady
 tail reranking, global forecast retirement, locked-prefix preservation with
@@ -79,7 +83,8 @@ Rust regression supply that missing coverage through the actual `RadixCache`,
 allocator, lock, and forecast implementations. They run with ordinary Cargo
 unit tests in Full CI.
 
-Local validation used Rust 1.91.1, Python 3.12.12, the frozen Python lockfile,
+The original evidence-only repair at `9664b5ba9bc33ac02e7e0f727679c00587b08733`
+used Rust 1.91.1, Python 3.12.12, the frozen Python lockfile,
 and an optimized wheel built from `python/aisimulate` with:
 
 ```bash
@@ -106,3 +111,6 @@ These are local results for the commands in `engine-golden-regression`. Hosted
 workflow/log access returned HTTP 403 in the repair container; no hosted job
 success is claimed. The controller must obtain current-commit Full CI, reviews,
 and technical reapproval before merge.
+
+Current corrective validation, lifecycle events, and growth measurements are in
+[the scoped repair evidence](RADIX_REPAIR_EVIDENCE.md).

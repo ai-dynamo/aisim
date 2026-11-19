@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "probe": "lifecycle",
+  "probe_sha256": "a83069941bdad532ec2c8e4532eded72670f380db907771e20da2b3b090dfb38",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "profile": "test",
+  "features": [],
+  "baseline": {
+    "commit": "8288046ac88fccaee124714cd60e62b2ad4e184d",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_lifecycle_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "removed_block_hashes": [
+          4945711292740353085
+        ],
+        "repeat_reused_tokens": 4,
+        "requested_tokens": 4,
+        "scenario": "two_page_leaf"
+      },
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "removed_block_hashes": [
+          14643705804678351452
+        ],
+        "repeat_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "complete_without_new_page"
+      }
+    ]
+  },
+  "candidate": {
+    "commit": "e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_lifecycle_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 8,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "removed_block_hashes": [
+          14643705804678351452,
+          4945711292740353085
+        ],
+        "repeat_reused_tokens": 0,
+        "requested_tokens": 4,
+        "scenario": "two_page_leaf"
+      },
+      {
+        "capacity_tokens": 24,
+        "freed_tokens": 4,
+        "page_size": 4,
+        "prompt": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "removed_block_hashes": [
+          483935686894639516
+        ],
+        "repeat_reused_tokens": 4,
+        "requested_tokens": 4,
+        "scenario": "complete_without_new_page"
+      }
+    ]
+  },
+  "scenario_kind": "synthetic deterministic KV lease lifecycle; no serving-accuracy claim",
+  "reproduce_command": "python3 scripts/compare_radix_eviction.py --probe lifecycle --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d --candidate e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc --work-dir \"$TMPDIR/lifecycle-evidence\""
+}
