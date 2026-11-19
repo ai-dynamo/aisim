@@ -75,6 +75,12 @@ the benchmark ran no reference.
 `afd` entries drive analytical AFD prediction through
 `engine.afd.fastafd_profile_path`; see
 [measured FastAFD MoE stage](../../replay/engine/analytical.md#measured-fastafd-moe-stage).
+The consumer resolves `routed_topk` from the model's normalized `topk` metadata;
+missing or invalid routing width is infeasible. Both this width and the attention
+provider's layer count must match the profile key before precision selection.
+Other routing widths or layer counts do not make an exact match ambiguous. The
+selected key, including `routed_topk` and `moe_layers`, is retained in measurement
+provenance.
 
 ## Building a profile
 

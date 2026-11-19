@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig
+from aisimulate.sweeper import afd_fastafd
 from aisimulate.sweeper.afd_fastafd import FastAFDMoEStagePerformanceModel
 from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDTopology
 from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes, AFDMeasurementRequest
@@ -165,6 +166,7 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     provenance = measurement.provenance
     assert provenance["provider"] == "fastafd"
     assert provenance["stage"]["key"]["topology"] == "64A8F"
+    assert provenance["stage"]["key"]["routed_topk"] == 8
     assert provenance["stage"]["latency_ms"] == STAGE_MS
     assert provenance["stage"]["raw_artifact"].endswith("_balanced.json")
     assert provenance["stage"]["profile_sha256"]
@@ -207,8 +209,41 @@ def test_precision_is_selected_explicitly_when_several_entries_match(tmp_path):
 
 
 def test_layer_count_must_match_the_attention_model(tmp_path):
-    with pytest.raises(AFDInfeasible, match="measured 94 MoE layers"):
+    with pytest.raises(AFDInfeasible, match="no FastAFD split MoE stage measurement"):
         _provider(tmp_path, _Attention(num_layers=95)).measure(_request(_topology()))
+
+
+def test_routed_topk_must_match_the_resolved_model(tmp_path):
+    profile = _profile(tmp_path, [_entry(routed_topk=4)])
+    with pytest.raises(AFDInfeasible, match="no FastAFD split MoE stage measurement") as error:
+        _provider(tmp_path, profile_path=profile).measure(_request(_topology()))
+    assert error.value.provenance["routed_topk"] == 8
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_other_layer_counts_and_topk_do_not_make_an_exact_match_ambiguous(tmp_path, reverse):
+    entries = [_entry(moe_layers=1), _entry(routed_topk=4), _entry()]
+    if reverse:
+        entries.reverse()
+    (measurement,) = _provider(tmp_path, profile_path=_profile(tmp_path, entries)).measure(_request(_topology()))
+    assert measurement.provenance["stage"]["key"]["moe_layers"] == LAYERS
+    assert measurement.provenance["stage"]["key"]["routed_topk"] == 8
+
+
+@pytest.mark.parametrize("topk", [None, 0, -1, True, "8", 8.5])
+def test_unknown_or_invalid_model_topk_fails_closed(tmp_path, monkeypatch, topk):
+    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", lambda _: {"topk": topk})
+    with pytest.raises(AFDInfeasible, match="routed top-k must be a known positive integer"):
+        _provider(tmp_path).measure(_request(_topology()))
+
+
+def test_unresolvable_model_topk_fails_closed(tmp_path, monkeypatch):
+    def missing_model(_):
+        raise ValueError("unknown model")
+
+    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", missing_model)
+    with pytest.raises(AFDInfeasible, match="cannot resolve the model's routed top-k"):
+        _provider(tmp_path).measure(_request(_topology()))
 
 
 @pytest.mark.parametrize(
@@ -222,6 +257,35 @@ def test_layer_count_must_match_the_attention_model(tmp_path):
 def test_attention_provider_must_expose_the_boundary_components(tmp_path, components, match):
     with pytest.raises(AFDInfeasible, match=match):
         _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
+
+
+@pytest.mark.parametrize("missing", ["attention_compute_ms", "a_combine_ms", "router_ms"])
+def test_each_consumed_attention_component_is_required(tmp_path, missing):
+    components = {name: value for name, value in COMPONENTS.items() if name != missing}
+    with pytest.raises(AFDInfeasible, match="does not expose"):
+        _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
+
+
+@pytest.mark.parametrize("name", ["attention_compute_ms", "a_combine_ms", "router_ms"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), -0.001, None, "0.002", True])
+def test_invalid_attention_components_fail_closed(tmp_path, name, value):
+    with pytest.raises(AFDInfeasible, match=f"{name} must be a finite non-negative number"):
+        _provider(tmp_path, _Attention(components={**COMPONENTS, name: value})).measure(_request(_topology()))
+
+
+@pytest.mark.parametrize("name", ["attention_compute_ms", "a_combine_ms"])
+def test_attention_components_must_reconcile_with_the_headline(tmp_path, name):
+    # The provider still reports 0.096 ms, but its components now sum to 0.106 ms.
+    components = {**COMPONENTS, name: COMPONENTS[name] + 0.01}
+    with pytest.raises(AFDInfeasible, match="do not reconcile with attention_ms"):
+        _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
+
+
+def test_attention_component_reconciliation_tolerates_floating_point_roundoff(tmp_path):
+    components = {**COMPONENTS, "attention_compute_ms": 0.09 + 1e-15}
+    (measurement,) = _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
+    # The valid fixture keeps 0.09 ms of compute and adds the 0.002 ms router.
+    assert measurement.attention_ms == pytest.approx(0.092)
 
 
 def _prediction(profile_path: str) -> dict:
@@ -272,15 +336,24 @@ def test_prediction_config_attaches_the_profile_stage(tmp_path):
     assert measurement["ffn_ms"] == pytest.approx(STAGE_MS / (LAYERS * 2))
     assert measurement["a_to_f_ms"] == 0.0
     assert measurement["provenance"]["stage"]["key"]["topology"] == "64A8F"
+    assert measurement["provenance"]["stage"]["key"]["routed_topk"] == 8
     assert spec.backend_deployment.parallel_config["afd"]["a_batch_size"] == 128
     assert "fastafd_profile_path" not in spec.backend_deployment.parallel_config["afd"]
     assert attention.requests[0].topology.ffn_gpus == 8
+
+
+def test_prediction_config_rejects_a_profile_for_another_topk(tmp_path):
+    config = CorePredictionConfig.model_validate(_prediction(_profile(tmp_path, [_entry(routed_topk=4)])))
+    with pytest.raises(AFDInfeasible, match="no FastAFD split MoE stage measurement"):
+        prediction_to_replay_spec(config, afd_performance_model=_Attention())
 
 
 @pytest.mark.parametrize(
     ("afd_overrides", "match"),
     [
         ({"fastafd_moe_backend": None}, "configured together"),
+        ({"fastafd_profile_path": None}, "configured together"),
+        ({"fastafd_moe_backend": "unsupported"}, "Input should be"),
         ({"fastafd_profile_path": " "}, "cannot be empty"),
         ({"phase": "both", "combined_with_pd": False}, "requires phase='decode'"),
     ],

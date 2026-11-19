@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aisimulate_core.sdk.fastafd_profile import FastAFDMoEStageMeasurement, FastAFDMoEStageProfile
+from aisimulate_core.sdk.utils import get_model_config_from_model_path
 
 from .afd_parallel import AFDInfeasible, AFDPhase, AFDReasonCategory, AFDTopology
 from .afd_perfmodel import AFD_MEASUREMENT_API_VERSION, AFDLayerTimes, AFDMeasurementRequest, AFDPerformanceModel
@@ -124,7 +126,33 @@ class FastAFDMoEStagePerformanceModel:
                 "a_combine_ms, and router_ms components needed to recompose the FastAFD boundary",
                 provider=attention.provenance.get("provider"),
             )
-        components = {name: float(raw[name]) for name in _ATTENTION_COMPONENTS}
+        components = {}
+        for name in _ATTENTION_COMPONENTS:
+            value = raw[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0.0
+            ):
+                raise _infeasible(
+                    f"the attention provider component {name} must be a finite non-negative number",
+                    field=name,
+                    value=value,
+                )
+            components[name] = float(value)
+        if not math.isclose(
+            components["attention_compute_ms"] + components["a_combine_ms"],
+            attention.attention_ms,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise _infeasible(
+                "the attention provider components attention_compute_ms + a_combine_ms "
+                "do not reconcile with attention_ms",
+                components=components,
+                attention_ms=attention.attention_ms,
+            )
         if components["router_ms"] <= 0.0:
             raise _infeasible(
                 "the attention provider attributed no router time to the F side; "
@@ -139,6 +167,16 @@ class FastAFDMoEStagePerformanceModel:
         model_layers: int,
     ) -> FastAFDMoEStageMeasurement:
         topology = request.topology
+        try:
+            routed_topk = get_model_config_from_model_path(request.model_name).get("topk")
+        except (OSError, ValueError, KeyError) as exc:
+            raise _infeasible(f"cannot resolve the model's routed top-k: {exc}", model=request.model_name) from exc
+        if isinstance(routed_topk, bool) or not isinstance(routed_topk, int) or routed_topk < 1:
+            raise _infeasible(
+                "the model's routed top-k must be a known positive integer",
+                model=request.model_name,
+                routed_topk=routed_topk,
+            )
         wanted = {
             "model_path": request.model_name,
             "system": request.hardware_sku,
@@ -147,6 +185,8 @@ class FastAFDMoEStagePerformanceModel:
             "logical_batch_per_source_rank": topology.a_batch_size,
             "mtp_nextn": request.nextn,
             "microbatches": topology.num_microbatches,
+            "moe_layers": model_layers,
+            "routed_topk": routed_topk,
             "moe_backend": self.moe_backend,
         }
         if self.moe_precision is not None:
@@ -165,15 +205,7 @@ class FastAFDMoEStagePerformanceModel:
                 f"profile precision: {variants}",
                 **wanted,
             )
-        entry = matches[0]
-        if entry.key.moe_layers != model_layers:
-            raise _infeasible(
-                f"the profile measured {entry.key.moe_layers} MoE layers but the attention provider models "
-                f"{model_layers} layers; FastAFD profiles cover models whose layers are all MoE layers",
-                moe_layers=entry.key.moe_layers,
-                model_layers=model_layers,
-            )
-        return entry
+        return matches[0]
 
 
 __all__ = ["FastAFDMoEStagePerformanceModel"]

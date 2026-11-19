@@ -78,14 +78,19 @@ contributes to TTFT and E2E latency. TPOT is
 `engine.afd.fastafd_profile_path` with `fastafd_moe_backend` takes the decode F
 time from an AISimulate [FastAFD MoE stage profile](../../perf-model/schemas/fastafd-moe-stage-profile.md)
 instead of the operation model. The profile's `afd` entry must match the model,
-hardware, `<A GPUs>A<F GPUs>F` topology, `a_batch_size`, MTP degree and
-`num_microbatches` exactly; nothing is interpolated or projected. Its stage latency
+hardware, `<A GPUs>A<F GPUs>F` topology, `a_batch_size`, MTP degree,
+`num_microbatches`, the attention provider's layer count, and the model's routed
+top-k exactly; nothing is interpolated or projected. Top-k comes from normalized
+model metadata (`topk`); an unknown or invalid width is infeasible. Its stage latency
 covers dispatch, experts, return and the A-side combine for every MoE layer of one
 decode step, so it is spread evenly over `moe_layers × num_microbatches` pipeline
 units as F, and A→F and F→A are zero. A keeps the attention provider's
 A-side compute without its own combine term and adds the router, which FastAFD
 runs on the A side outside the measured stage. The attention provider must report
-these per-layer components; the built-in estimator does. When several entries
+these per-layer components; the built-in estimator does. Consumed components must
+be finite and non-negative, and attention compute plus combine must reconcile
+with the provider's attention total (relative tolerance `1e-9`, absolute tolerance
+`1e-12` ms). A positive router component is required. When several entries
 differ only in `moe_precision`, `engine.moe_quant_mode` selects one. The profile
 entry, its producer and the attention composition are recorded in the
 measurement provenance. FastAFD is not a runtime dependency.
