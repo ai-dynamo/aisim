@@ -13,8 +13,8 @@ these pure checks decide whether the candidate may be fetched at all:
 * content checks on the leading and trailing bytes of each file
   (:func:`check_content`).
 
-Nothing here touches the network or the filesystem. Callers pass the listing and
-byte samples they obtained, so every rule is unit-testable with fixtures. A
+The candidate checks touch neither network nor filesystem. Callers pass the listing and
+byte samples they obtained; ``checked_path`` additionally preflights local document references. A
 finding is final: a candidate with any error finding must not reach a workflow.
 """
 
@@ -24,6 +24,7 @@ import json
 import posixpath
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 PARQUET_MAGIC = b"PAR1"
@@ -73,6 +74,21 @@ class Finding:
     severity: Literal["error", "warning"] = "error"
 
 
+def checked_path(root: Path, relative: str) -> Path:
+    """Preflight a document reference before any loader may read it."""
+    parts = relative.split("/")
+    if not relative or relative.startswith("/") or "\\" in relative or any(p in {"", ".", ".."} for p in parts):
+        raise ValueError(f"unsafe repository-relative path: {relative!r}")
+    current = root
+    for part in ("", *parts):
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"symlink in document path: {relative}")
+    if not current.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"document path escapes root: {relative}")
+    return current
+
+
 @dataclass
 class HygieneReport:
     findings: list[Finding] = field(default_factory=list)
@@ -115,7 +131,7 @@ def _path_findings(policy: CandidatePolicy, path: str) -> list[Finding]:
         err("path-traversal", "path is not normalized or escapes the repository")
     if any(p in _RESERVED_NAMES for p in parts):
         err("path-reserved", "repository control files may not be changed by a candidate")
-    if not any(path.startswith(root) for root in policy.allowed_roots):
+    if not any(path.startswith(root.rstrip("/") + "/") for root in policy.allowed_roots):
         err("path-root", f"path is outside {list(policy.allowed_roots)}")
     suffix = posixpath.splitext(parts[-1])[1].lower()
     if suffix in _FORBIDDEN_SUFFIXES or suffix not in policy.allowed_suffixes:
@@ -177,7 +193,7 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
         else:
             try:
                 json.loads(head.decode("utf-8"), parse_constant=_reject_constant)
-            except (UnicodeDecodeError, ValueError) as exc:
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
                 out.append(Finding("json-invalid", f"not strict UTF-8 JSON: {exc}", path))
     return out
 

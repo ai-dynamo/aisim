@@ -48,7 +48,7 @@ from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, check_manifest, configuration_id
 from aisim_core.data.catalog import CATALOG_DIR, _write, build_catalog, catalog_files, known_system_specs
-from aisim_core.data.e2e import load_e2e, read_snapshot
+from aisim_core.data.e2e import load_e2e, read_snapshot, verify_snapshot_members
 from aisim_core.data.eval import load_record, record_dir
 from aisim_core.data.evidence import EVIDENCE_ROOT, check_evidence
 from aisim_core.data.hygiene import (
@@ -57,11 +57,12 @@ from aisim_core.data.hygiene import (
     Finding,
     check_content,
     check_listing,
+    checked_path,
 )
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "2"
+VALIDATOR_VERSION = "3"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
@@ -174,7 +175,7 @@ def _check_indexes(root: Path, report: TreeReport, declared: set[str]) -> dict[s
     for category, ref in dataset.categories.items():
         try:
             _verify(root, ref.index)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             report.add("index-integrity", str(exc), ref.index.path)
             continue
         declared.add(ref.index.path)
@@ -233,11 +234,17 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
         report.eval_records += 1
 
 
-def _check_snapshots(root: Path, report: TreeReport, declared: set[str]) -> None:
+def _check_snapshots(root: Path, report: TreeReport, declared: set[str], manifests: dict[str, Manifest]) -> None:
     for path in sorted((root / "data").rglob("*snapshot*.json")) if (root / "data").is_dir() else []:
         rel = path.relative_to(root).as_posix()
         try:
-            snapshot, _ = read_snapshot(root, rel)
+            snapshot, members = read_snapshot(root, rel)
+            for member in members:
+                checked_path(root, member.manifest_path)
+                manifest = manifests.get(member.manifest_path)
+                if manifest is None or manifest.configuration_id != member.configuration_id:
+                    raise ValueError(f"snapshot member is not a verified configuration: {member.manifest_path}")
+            verify_snapshot_members(root, members)
         except (ValueError, ValidationError, OSError) as exc:
             report.add("snapshot-invalid", str(exc).splitlines()[0], rel)
             continue
@@ -295,6 +302,14 @@ def validate_tree(
         report.add("root-missing", f"{root} is not a directory")
         return report
     tree = list_tree(root)
+    # Reject the complete unsafe tree before indexes, references or redaction can read it.
+    for f in tree:
+        if f.is_symlink:
+            report.add("symlink", "symbolic links are not allowed", f.path)
+    if root.is_symlink():
+        report.add("symlink", "dataset root must not be a symbolic link")
+    if report.errors:
+        return report
     for f in tree:
         if f.path in REPOSITORY_FILES and f.is_symlink:
             report.add("symlink", "symbolic links are not allowed", f.path)
@@ -322,7 +337,7 @@ def validate_tree(
     declared: set[str] = set()
     manifests = _check_indexes(root, report, declared)
     _check_eval(root, report, declared)
-    _check_snapshots(root, report, declared)
+    _check_snapshots(root, report, declared, manifests)
     _check_schema_snapshots(root, report, declared)
     _check_catalog_drift(root, report, declared)
 
@@ -339,12 +354,10 @@ def validate_tree(
         data = (root / f.path).read_bytes() if f.size <= 4 * 1024 * 1024 else None
         head = data if data is not None else (root / f.path).open("rb").read(16)
         tail = data[-4:] if data is not None else b""
-        if data is None and f.path.endswith(".parquet"):
+        if data is None and f.path.lower().endswith(".parquet"):
             with (root / f.path).open("rb") as handle:
                 handle.seek(-4, 2)
                 tail = handle.read(4)
-        if f.path.endswith(".gz"):
-            continue  # declared provenance artifact; archive magic is expected
         report.findings.extend(check_content(_tree_policy(()), f, head, tail))
     for f in listing:
         if f.path.endswith(".gz") and f.path not in gz_declared:

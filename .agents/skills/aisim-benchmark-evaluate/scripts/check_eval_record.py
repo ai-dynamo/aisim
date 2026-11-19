@@ -39,6 +39,8 @@ def main(argv=None) -> int:
     p.add_argument("--predictor", type=Path)
     p.add_argument("--attest-root", type=Path, help="dataset root to write the verified record into")
     args = p.parse_args(argv)
+    if args.attest_root and not args.predictor:
+        p.error("--attest-root requires --predictor")
 
     record = load_record(args.record)
     out = {
@@ -63,6 +65,11 @@ def main(argv=None) -> int:
             code = 1
         elif args.attest_root:
             verified = attest(record, report)
+            history = [record]
+            while history[-1].supersedes:
+                history.append(load_record(args.record.parent / f"{history[-1].supersedes}.json"))
+            for predecessor in reversed(history):
+                write_record(args.attest_root, predecessor)
             out["verified_record_path"] = str(write_record(args.attest_root, verified))
             out["verified_record_id"] = verified.record_id
     json.dump(out, sys.stdout, indent=2, sort_keys=True)

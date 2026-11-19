@@ -35,6 +35,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -138,6 +139,24 @@ def _sha(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def _check_source_checkout(source: Path, commit: str) -> None:
+    """Bind provenance to a clean checkout at the exact reviewed revision."""
+
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", "-C", str(source), *args], capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    try:
+        if Path(git("rev-parse", "--show-toplevel")).resolve() != source.resolve():
+            raise PromotionError("source root must be the Git checkout root")
+        if git("rev-parse", "HEAD") != commit:
+            raise PromotionError("source HEAD differs from request.source_commit")
+        if git("status", "--porcelain", "--untracked-files=all", "--ignored"):
+            raise PromotionError("source changed: checkout has uncommitted or ignored files")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise PromotionError("source must be a readable Git checkout") from exc
+
+
 def _select(source: Path, directories: list[str], plan: PromotionPlan) -> None:
     for raw in directories:
         d = raw.rstrip("/")
@@ -226,17 +245,25 @@ def plan_promotion(
     policy = policy or PromotionPolicy()
     source = Path(source_root)
     plan = PromotionPlan(request)
+    try:
+        _check_source_checkout(source, request.source_commit)
+    except PromotionError as exc:
+        plan.findings.append(Finding("source-checkout", str(exc)))
+    if policy.redaction != DEFAULT_POLICY:
+        plan.findings.append(
+            Finding("redaction-policy", "public promotion requires the authoritative default disclosure policy")
+        )
     if request.source_repo in NEVER_PROMOTED:
         plan.findings.append(Finding("never-promoted", f"{request.source_repo} is never a promotion source"))
         return plan
     if request.source_repo == request.target_repo:
         plan.findings.append(Finding("same-repo", "source and target must differ"))
         return plan
-    _select(source, request.directories, plan)
-    if not plan.content_ok:
-        return plan
     shared = validate_tree(source, repo=request.source_repo, profile="mirror")
     plan.findings.extend(Finding(f"source-{f.code}", f.message, f.path, f.severity) for f in shared.errors)
+    if any(f.code == "source-symlink" for f in plan.findings):
+        return plan
+    _select(source, request.directories, plan)
 
     ledger = load_ledger(source)
     for rel in sorted(plan.files):
@@ -361,6 +388,11 @@ def apply_promotion(
         raise PromotionError(
             "plan is not approved: " + "; ".join(f"{f.code} {f.path or ''}" for f in plan.findings[:5])
         )
+    ledger_now = load_ledger(source)
+    for rel in plan.files:
+        if ledger_now.label_for(rel) != "public":
+            raise PromotionError(f"source visibility is no longer public: {rel}")
+    _check_source_checkout(source, plan.request.source_commit)
     for rel, digest in plan.files.items():  # the reviewed bytes must still be the bytes on disk
         if not (source / rel).is_file() or _sha(source / rel) != digest:
             raise PromotionError(f"source changed since planning: {rel}")
@@ -409,7 +441,9 @@ def apply_promotion(
         if (target / CATALOG_DIR).is_dir() and not any((target / CATALOG_DIR).iterdir()):
             (target / CATALOG_DIR).rmdir()
         for rel, data in before.items():
-            (target / rel).write_bytes(data)
+            restored = target / rel
+            restored.parent.mkdir(parents=True, exist_ok=True)
+            restored.write_bytes(data)
         raise
     return ledger
 

@@ -82,13 +82,15 @@ def check_evidence(root: str | Path, paths: Iterable[str]) -> tuple[list[Finding
             findings.append(Finding("evidence-config-path", "config_path must be under data/<category>/", rel))
         if posixpath.join(EVIDENCE_ROOT, manifest.config_path) != directory:
             findings.append(Finding("evidence-config-path", "manifest must sit at evidence/<config_path>/", rel))
+        if posixpath.basename(manifest.config_path) != manifest.configuration_id:
+            findings.append(Finding("evidence-configuration", "configuration_id differs from config_path", rel))
         seen: set[str] = set()
         for artifact in manifest.artifacts:
             target = posixpath.normpath(posixpath.join(directory, artifact.path))
-            if artifact.path in seen or not target.startswith(directory + "/") or target == rel:
+            if target in seen or not target.startswith(directory + "/") or target == rel:
                 findings.append(Finding("evidence-artifact", f"duplicate or escaping path {artifact.path!r}", rel))
                 continue
-            seen.add(artifact.path)
+            seen.add(target)
             declared.add(target)
             actual = root / target
             if not actual.is_file() or actual.is_symlink():

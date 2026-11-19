@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aisim_core.data.e2e import read_snapshot
+from aisim_core.data.e2e import load_e2e, read_snapshot, verify_snapshot_members
 from aisim_core.data.infx_ingest import (
     Acquirer,
     AcquisitionCache,
@@ -127,7 +127,15 @@ def run_ingestion(
     qualified, candidate = state.get("qualified"), state.get("candidate")
     try:
         prior = _members_of(root, qualified)
-        acq = Acquirer(client, AcquisitionCache(cache_dir), clock).acquire(models, list(prior))
+        prior_models = {}
+        if models and qualified:
+            _, members = read_snapshot(root, qualified["snapshot_path"])
+            by_path = {path: load_e2e(root, path).body.model_id for path in {m.manifest_path for m in members}}
+            prior_models = {m.observation_id: by_path[m.manifest_path] for m in members}
+        acquirer = Acquirer(client, AcquisitionCache(cache_dir), clock)
+        acq = acquirer.acquire(models, list(prior), prior_models)
+        if acquirer.selected_models is not None:
+            prior = {oid: sha for oid, sha in prior.items() if prior_models.get(oid) in acquirer.selected_models}
     except InfxError as exc:
         return RunResult("failed", error=f"{type(exc).__name__}: {exc}", requests_made=client.requests_made)
     if acq.empty_scope:
@@ -138,6 +146,7 @@ def run_ingestion(
     known = {e["snapshot_id"] for e in (qualified, candidate) if e}
     changes = diff_members(prior, plan.members)
     if plan.snapshot_id in known:
+        read_snapshot(root, snapshot_path(plan.snapshot_id))
         return RunResult("unchanged", plan.snapshot_id, requests_made=acq.requests_made)
     path = write_candidate(root, acq, plan)
     state["candidate"] = {
@@ -160,7 +169,8 @@ def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = 
     candidate = state.get("candidate")
     if not candidate or candidate["snapshot_id"] != snapshot_id:
         raise PromotionError(f"{snapshot_id} is not the pending candidate")
-    read_snapshot(root, snapshot_path(snapshot_id))  # re-verify membership, tables and ID before promoting
+    _, members = read_snapshot(root, snapshot_path(snapshot_id))
+    verify_snapshot_members(root, members)
     state["qualified"] = {**candidate, "qualified_at": _stamp(now or datetime.now(UTC)), "reviewer": reviewer}
     state["candidate"] = None
     save_state(root, state)

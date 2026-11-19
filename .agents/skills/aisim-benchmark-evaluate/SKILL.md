@@ -24,10 +24,12 @@ the result a verifiable record.
    inputs and list them as `Assumption` entries (`kind` `calibration` or `truth`, `status`
    `verified` or `estimated`).
 2. Build the predictor through the canonical `best_available` interface. Compute its identity with
-   `PredictionIdentity.build(code_path, data_pins, spec_sha256)`; pins are SHA-256 of the exact
-   profiles and tables used. The fingerprint does not include the commit SHA, so unrelated commits do
-   not orphan the record. If a record with the same fingerprint and truth already exists
-   (`current_records`), report it instead of re-scoring.
+   `PredictionIdentity.build(code_path, data_pins, spec_sha256, code_version=behavior_version)`;
+   pins are SHA-256 of the exact profiles and tables used. Require a release or behavior version
+   that changes whenever estimation logic changes. The fingerprint does not include unrelated
+   commit SHAs. Reuse a record from `current_records` only when its fingerprint and truth match
+   and `status == "complete"`. Retry failed or partial records after fixing their cause; keep the
+   earlier attempt and set the new record's `supersedes` to its record ID.
 3. Write truth with `write_truth_table` (columns `case_id`, `inputs_json`, `truth_value`), score
    with `compute_results`. Rows without truth or prediction become exclusions with reasons, never
    zero. Put collection quality, resolved memory and replay coverage in their own `Results` fields.

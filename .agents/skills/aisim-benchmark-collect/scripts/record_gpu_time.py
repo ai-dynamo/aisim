@@ -48,6 +48,13 @@ def main(argv=None) -> int:
         else:
             job = json.loads(args.job.read_text(encoding="utf-8"))
             pods = _items(json.loads(args.pods.read_text(encoding="utf-8")))
+            uid = job.get("metadata", {}).get("uid")
+            if not uid or not isinstance(pods, list) or not pods:
+                raise KubeParseError("Job UID and owned Pods are required")
+            for pod in pods:
+                owners = pod.get("metadata", {}).get("ownerReferences", [])
+                if not any(o.get("kind") == "Job" and o.get("uid") == uid for o in owners):
+                    raise KubeParseError("Pod owner does not match the Job UID")
             gpu_time = gpu_time_from_kubernetes(job, pods, gpu_type=args.gpu_type)
     except (SlurmParseError, KubeParseError) as exc:
         # Unfinished or inconsistent job records are not turned into numbers.
