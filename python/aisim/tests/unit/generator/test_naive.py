@@ -537,3 +537,53 @@ def test_preserve_engine_limits_strips_disagg_roles():
         assert "max_batch_size" not in role_params
         assert "gpu_memory_utilization" not in role_params
     assert params["preserve_engine_limits"] is True
+
+
+@pytest.mark.unit
+class TestGetSystemConfig:
+    """Pin how the naive builder reads GPUs per node and VRAM from system specs."""
+
+    @staticmethod
+    def _use_systems_roots(monkeypatch, *roots):
+        from aisim.sdk import perf_database
+
+        monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [str(root) for root in roots])
+
+    @staticmethod
+    def _defaults():
+        import aisim.generator.naive as naive_module
+
+        return {"gpus_per_node": naive_module._DEFAULT_GPUS_PER_NODE, "vram_per_gpu": naive_module._DEFAULT_VRAM_BYTES}
+
+    def test_first_systems_root_with_the_spec_wins(self, tmp_path, monkeypatch):
+        from aisim.generator.naive import _get_system_config
+
+        empty, first, second = tmp_path / "empty", tmp_path / "first", tmp_path / "second"
+        for root in (empty, first, second):
+            root.mkdir()
+        (first / "probe.yaml").write_text("node: {num_gpus_per_node: 4}\ngpu: {mem_capacity: 2000}\n")
+        (second / "probe.yaml").write_text("node: {num_gpus_per_node: 2}\ngpu: {mem_capacity: 1000}\n")
+        self._use_systems_roots(monkeypatch, empty, first, second)
+
+        assert _get_system_config("probe") == {"gpus_per_node": 4, "vram_per_gpu": 2000}
+
+    def test_missing_spec_or_fields_use_defaults(self, tmp_path, monkeypatch):
+        from aisim.generator.naive import _get_system_config
+
+        (tmp_path / "bare.yaml").write_text("gpu: {}\n")
+        (tmp_path / "empty.yaml").write_text("")
+        self._use_systems_roots(monkeypatch, tmp_path)
+
+        for system_name in ("absent", "bare", "empty"):
+            assert _get_system_config(system_name) == self._defaults()
+
+    def test_unreadable_spec_warns_and_uses_defaults(self, tmp_path, monkeypatch):
+        import aisim.generator.naive as naive_module
+
+        (tmp_path / "broken.yaml").write_text("node: [unclosed\n")
+        self._use_systems_roots(monkeypatch, tmp_path)
+
+        with patch.object(naive_module.logger, "warning") as warning:
+            assert naive_module._get_system_config("broken") == self._defaults()
+        warning.assert_called_once()
+        assert "Could not read system config for broken" in warning.call_args.args[0]

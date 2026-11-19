@@ -64,6 +64,16 @@ def _load_yaml_payload(path: str) -> Any:
         return yaml.safe_load(fh) or {}
 
 
+def _deep_merge_dicts(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 @cache
 def load_backend_version_matrix(matrix_path: str) -> dict[str, dict[str, Any]]:
     payload = _load_yaml_payload(matrix_path)
