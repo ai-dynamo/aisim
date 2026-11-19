@@ -247,13 +247,16 @@ def plan_promotion(
         if entry:
             plan.lineage.update({p: h for p, h in entry.original_sha256.items() if p in plan.files})
     _check_closure(source, plan)
+    for f in shared.findings:  # unreferenced files would be copied without any content check
+        if f.code == "orphan-file" and f.path in plan.files:
+            plan.findings.append(Finding("orphan-file", f.message, f.path))
     plan.findings.extend(check_publishable(source, plan.files, policy=policy.redaction))
     _check_approvals(plan, policy)
     return plan
 
 
 def _check_approvals(plan: PromotionPlan, policy: PromotionPolicy) -> None:
-    allowed = {r.casefold() for r in policy.reviewers}
+    allowed = {r.casefold() for r in policy.reviewers}  # approvals count by normalized identity
     requester = plan.request.requested_by.casefold()
     names: set[str] = set()
     for approval in plan.request.approvals:
@@ -265,7 +268,7 @@ def _check_approvals(plan: PromotionPlan, policy: PromotionPolicy) -> None:
         elif approval.content_digest != plan.digest:
             plan.findings.append(Finding("approval-stale", f"{approval.reviewer!r} approved different content"))
         else:
-            names.add(approval.reviewer)
+            names.add(who)
     plan.approved_by = sorted(names)
     if len(names) < max(1, policy.min_approvals):
         plan.findings.append(
@@ -363,15 +366,17 @@ def apply_promotion(
             raise PromotionError(f"source changed since planning: {rel}")
         if (target / rel).exists() and _sha(target / rel) != digest:
             raise PromotionError(f"target already has different content at {rel}; promotion never overwrites")
+    _check_contained(target, list(plan.files) + [f"{CATALOG_DIR}/dataset.json"])
     before = _snapshot(target)
     added: list[Path] = []
+    ledger: Path | None = None
     try:
         for rel in sorted(plan.files):
             dest = target / rel
             if not dest.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)
+                added.append(dest)  # registered first so a partial copy is rolled back too
                 shutil.copyfile(source / rel, dest)
-                added.append(dest)
         for rel, digest in plan.files.items():
             if _sha(target / rel) != digest:
                 raise PromotionError(f"copied bytes differ from the reviewed bytes: {rel}")
@@ -383,7 +388,13 @@ def apply_promotion(
             raise PromotionError(
                 f"public validator rejects the result: {first.code} {first.path or ''}: {first.message}"
             )
+        if write_ledger:  # lineage is part of the promotion: a target without its record is rolled back
+            ledger = source / MIRROR_CONTROL_DIR / "promotions" / f"{plan.digest}.json"
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            ledger.write_text(_ledger_text(plan, report.fingerprint), encoding="utf-8")
     except BaseException:
+        if ledger is not None:
+            ledger.unlink(missing_ok=True)
         for path in added:
             path.unlink(missing_ok=True)
             for parent in path.parents:  # drop directories this promotion created
@@ -400,11 +411,11 @@ def apply_promotion(
         for rel, data in before.items():
             (target / rel).write_bytes(data)
         raise
-    if not write_ledger:
-        return None
-    ledger = source / MIRROR_CONTROL_DIR / "promotions" / f"{plan.digest}.json"
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text(
+    return ledger
+
+
+def _ledger_text(plan: PromotionPlan, fingerprint: str) -> str:
+    return (
         json.dumps(
             {
                 "schema_version": "aisim-promotion-ledger/v1",
@@ -416,15 +427,24 @@ def apply_promotion(
                 "approved_by": plan.approved_by,
                 "files": plan.files,
                 "original_sha256": plan.lineage,
-                "validator_fingerprint": report.fingerprint,
+                "validator_fingerprint": fingerprint,
             },
             indent=2,
             sort_keys=True,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
-    return ledger
+
+
+def _check_contained(target: Path, rels: list[str]) -> None:
+    """Refuse a destination whose existing ancestors are symlinks or resolve outside ``target``."""
+    root = target.resolve()
+    for rel in rels:
+        current = target
+        for part in Path(rel).parts[:-1]:
+            current = current / part
+            if current.is_symlink() or (current.exists() and not current.resolve().is_relative_to(root)):
+                raise PromotionError(f"target path escapes the target root through a symlink: {rel}")
 
 
 def main(argv: list[str] | None = None) -> int:

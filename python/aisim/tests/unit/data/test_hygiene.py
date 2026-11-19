@@ -86,8 +86,10 @@ def test_content_parquet_and_json():
     assert "parquet-magic" in codes(check_content(POLICY, PQ, b"PAR1", b"xxxx"))
     ok = CandidateFile("data/a.json", 2)
     assert check_content(POLICY, ok, b"{}") == []
+    for doc in (b'{"a":NaN}', b'{"a":Infinity}', b"[-Infinity]"):  # complete documents, invalid only for the constant
+        found = check_content(POLICY, CandidateFile("data/a.json", len(doc)), doc)
+        assert codes(found) == {"json-invalid"} and "non-finite" in found[0].message
     assert "json-invalid" in codes(check_content(POLICY, CandidateFile("data/a.json", 4), b"{NaN"))
-    assert "json-invalid" in codes(check_content(POLICY, CandidateFile("data/a.json", 6), b'{"a":NaN}'[:6] + b""))
     assert "json-incomplete" in codes(check_content(POLICY, CandidateFile("data/a.json", 50), b"{}"))
     assert "json-too-large" in codes(check_content(CandidatePolicy(max_json_bytes=1), ok, b"{}"))
 
@@ -108,3 +110,14 @@ def test_candidate_aggregate_and_missing_sample():
     report = check_candidate(POLICY, "alice", [GOOD, PQ], {GOOD.path: samples[GOOD.path]})
     assert not report.ok and codes(report.errors) == {"no-sample"}
     assert not check_candidate(POLICY, "mallory", [GOOD], {GOOD.path: samples[GOOD.path]}).ok
+
+
+def test_allowed_gz_suffix_is_exempt_from_the_gzip_magic_rule_only():
+    gz = b"\x1f\x8b\x08\x00" + b"x" * 12
+    allowed = dataclasses.replace(POLICY, allowed_suffixes=POLICY.allowed_suffixes | {".gz"})
+    f = CandidateFile("data/eval/x/log.gz", len(gz))
+    assert check_candidate(allowed, "alice", [f], {f.path: (gz, b"")}).ok
+    assert "forbidden-content" in codes(check_content(POLICY, f, gz))  # not allowed by default
+    renamed = CandidateFile("data/a.json", len(gz))
+    assert "forbidden-content" in codes(check_content(allowed, renamed, gz))
+    assert "forbidden-content" in codes(check_content(allowed, f, b"\x7fELF" + b"x" * 12))
