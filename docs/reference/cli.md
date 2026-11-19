@@ -544,7 +544,10 @@ Without `--output`, `migrate` prints the plan and writes nothing: the new
   `1e-7` as a number. If a value cannot round-trip through JSON, such as a
   non-string mapping key or a non-finite number, `migrate` writes nothing and
   exits `2` with the filename and reason. Use a filename without `.json` to
-  retain YAML-only values.
+  retain YAML-only values. When writing through symlinks or replacing the input
+  through another name, all known names of the output must select the same
+  format. Mixed JSON/YAML aliases are refused before writing; use matching
+  extensions or write a separate output file.
 - **All or nothing.** When one field cannot be converted, nothing is
   converted. `migrate` prints a `cannot convert: <field>: <reason>` line for
   each such field and then `Nothing was converted.`, `--output` writes no

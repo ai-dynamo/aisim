@@ -531,7 +531,7 @@ def _keep_permissions(target: str, temporary: str) -> None:
     os.chmod(temporary, mode)
 
 
-def _folders_with_a_name(path: str) -> list[str]:
+def _folders_with_a_name(path: str, *, output_format: str | None = None) -> list[str]:
     """The folders in which a config file has a name, the folder of ``path`` first.
 
     ``path`` can be a symbolic link to the file, or to another link to it. Each of them is a name
@@ -548,6 +548,13 @@ def _folders_with_a_name(path: str) -> list[str]:
             # Links that name each other name no file; the write reports that.
             break
         seen.add(path)
+        if output_format is not None:
+            read_format = "JSON" if path.lower().endswith(".json") else "YAML"
+            if read_format != output_format:
+                raise ValueError(
+                    f"cannot write {output_format}: the same file is read as {read_format} through {path}; "
+                    "use matching filename formats for symlinks, or write to a separate file"
+                )
         if folder not in folders:
             folders.append(folder)
         if not os.path.islink(path):
@@ -612,10 +619,13 @@ def _run_migrate(args: argparse.Namespace) -> int:
     }
     # ais_perf_model starts a relative path at the folder of the file it is read from: FILE once it is written.
     read_from = args.config if args.output is None else args.output
-    folders = _folders_with_a_name(read_from)
+    output_format = None if args.output is None else ("JSON" if args.output.lower().endswith(".json") else "YAML")
+    folders = _folders_with_a_name(read_from, output_format=output_format)
     if args.output is not None and os.path.realpath(args.output) == os.path.realpath(args.config):
         # CONFIG is one more name of FILE, and it can be a link in another folder.
-        folders += [folder for folder in _folders_with_a_name(args.config) if folder not in folders]
+        folders += [
+            folder for folder in _folders_with_a_name(args.config, output_format=output_format) if folder not in folders
+        ]
     config_dir, *other_config_dirs = folders
     try:
         converted, removed, notes = migrate_mapping(

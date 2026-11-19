@@ -851,6 +851,42 @@ def test_migrate_of_a_config_given_through_a_symlink_changes_the_file_and_keeps_
     assert sorted(tmp_path.rglob("*")) == [link, real.parent, real]
 
 
+@pytest.mark.parametrize("source_name,output_name", [("real", "link"), ("link", "real"), ("link", "link")])
+@pytest.mark.parametrize("real_suffix,link_suffix", [(".json", ".yaml"), (".yaml", ".json")])
+def test_migrate_refuses_mixed_format_aliases_without_changing_the_file(
+    tmp_path, capsys, source_name, output_name, real_suffix, link_suffix
+):
+    real = tmp_path / f"real{real_suffix}"
+    # This document is readable through both aliases before conversion.
+    original = json.dumps(_predict(**OLD_FIELDS))
+    real.write_text(original)
+    link = tmp_path / f"link{link_suffix}"
+    link.symlink_to(real)
+    paths = {"real": real, "link": link}
+
+    assert _run("migrate", paths[source_name], "--output", paths[output_name]) == 2
+    assert "matching filename formats" in capsys.readouterr().err
+    assert real.read_text() == original
+    assert link.is_symlink()
+
+
+def test_migrate_checks_format_of_intermediate_symlink(tmp_path, capsys):
+    real = tmp_path / "real.json"
+    original = json.dumps(_predict(**OLD_FIELDS))
+    real.write_text(original)
+    middle = tmp_path / "middle.yaml"
+    middle.symlink_to(real)
+    link = tmp_path / "link.json"
+    link.symlink_to(middle)
+
+    assert _run("migrate", real, "--output", link) == 2
+    error = capsys.readouterr().err
+    assert "matching filename formats" in error
+    assert str(middle) in error
+    assert real.read_text() == original
+    assert link.is_symlink() and middle.is_symlink()
+
+
 @pytest.fixture
 def umask_027():
     """New files of the test are not readable by others, whatever the umask of the test run is."""
