@@ -170,6 +170,43 @@ def test_nvidia_derivative_of_standard_base_does_not_need_self_approval():
     assert gate.assess([entry("LicenseRef-NVIDIA-Open-Model")], {PATH: item})[0]["passed"]
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "nvidia--Llama-3.1-70B-Instruct-FP8_config.json",
+        "nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json",
+        "nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json",
+    ],
+)
+@pytest.mark.parametrize("transpose", [False, True], ids=["correct", "transposed"])
+def test_cli_nvidia_repository_cannot_exempt_recorded_base_license(tmp_path, name, transpose):
+    root = gate.provenance.ROOT
+    records = gate.load_review(root / gate.REVIEW)
+    path = f"aisim_core/model_configs/{name}"
+    item = records[path]
+    original_mapping = copy.deepcopy(item["ownership_evidence"]["config_mapping"])
+    base = gate.provenance.inventory_entries(root / gate.provenance.INVENTORY)[path]["base_license"]
+    assert item["approval"]["status"] == "pending"
+    if transpose:
+        item["underlying_licenses"], item["nvidia_contribution_licenses"] = (
+            item["nvidia_contribution_licenses"],
+            item["underlying_licenses"],
+        )
+    review = policy(tmp_path, list(records.values()))
+    output = tmp_path / "report"
+    assert gate.main(["--root", str(root), "--review", str(review), "--output-dir", str(output)]) == 1
+    report = json.loads((output / "config-license-approval.json").read_text())
+    result = next(result for result in report["files"] if result["path"] == path)
+    assert not result["passed"] and result["approval_basis"] == "none"
+    assert base in result["required_licenses"] and "unapproved_license" in result["problems"]
+    if transpose:
+        assert "inconsistent_license_obligations" in result["problems"]
+    else:
+        assert result["problems"] == ["unapproved_license"]
+    assert item["ownership_evidence"]["config_mapping"] == original_mapping
+    assert "error" not in report and report["legal_approval_asserted"] is False
+
+
 def test_unknown_base_and_unverified_ownership_fail():
     item = record("nvidia_derivative", ["UNKNOWN"])
     item["ownership_evidence"]["status"] = "source_unverified"

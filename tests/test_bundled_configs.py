@@ -269,6 +269,42 @@ def test_license_copy_does_not_substitute_for_required_attribution(fixture):
     checker.validate(root, inventory)
 
 
+@pytest.mark.parametrize(
+    "name,version",
+    [
+        ("meta-llama--Meta-Llama-3.1-405B_config.json", "3.1"),
+        ("meta-llama--Meta-Llama-3.1-70B_config.json", "3.1"),
+        ("meta-llama--Meta-Llama-3.1-8B_config.json", "3.1"),
+        ("nvidia--Llama-3.1-70B-Instruct-FP8_config.json", "3.1"),
+        ("nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json", "3.1"),
+        ("nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json", "3.3"),
+    ],
+)
+@pytest.mark.parametrize("packaged", [False, True], ids=["source", "packaged"])
+def test_llama_notice_requires_prose_attribution(tmp_path, name, version, packaged):
+    entry = checker.inventory_entries(checker.ROOT / checker.INVENTORY)[f"aisim_core/model_configs/{name}"]
+    canonical = (checker.ROOT / "THIRD_PARTY_NOTICES.md").read_bytes()
+    package_notice = checker.ROOT / "python/aisim/THIRD_PARTY_NOTICES.md"
+    assert package_notice.read_bytes() == canonical
+    notice = tmp_path / "THIRD_PARTY_NOTICES.md"
+    notice.write_bytes(canonical)
+    member = "aisim-1.dist-info/licenses/THIRD_PARTY_NOTICES.md"
+    checker.check_notice(tmp_path, entry, {member: canonical} if packaged else None)
+    attribution = (
+        f"Llama {version} is licensed under the Llama {version} Community License, "
+        "Copyright © Meta Platforms, Inc. All Rights Reserved."
+    )
+    line = f"- {attribution}\n".encode()
+    assert canonical.count(line) == 1
+    # Remove only the prose line from both copies; retain every legal block,
+    # file-table row and upstream revision so attribution is the failing check.
+    removed = canonical.replace(line, b"")
+    assert re.findall(rb"```text\n(.*?)\n```", removed, re.S) == re.findall(rb"```text\n(.*?)\n```", canonical, re.S)
+    notice.write_bytes(removed)
+    with pytest.raises(checker.InventoryError, match="required attribution outside"):
+        checker.check_notice(tmp_path, entry, {member: removed} if packaged else None)
+
+
 def test_legacy_unknown_is_reported_without_license_approval(fixture, monkeypatch, tmp_path):
     root, path, entry, inventory, save = fixture
     entry.update(origin="legacy_unresolved", license="UNKNOWN", unresolved_reason="Existing provenance debt")

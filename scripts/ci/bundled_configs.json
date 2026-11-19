@@ -1144,7 +1144,10 @@
       "notice": {
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "required_attribution": [
+          "Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
+        ]
       },
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "meta-llama/Meta-Llama-3.1-405B",
@@ -1170,7 +1173,10 @@
       "notice": {
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "required_attribution": [
+          "Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
+        ]
       },
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "meta-llama/Meta-Llama-3.1-70B",
@@ -1196,7 +1202,10 @@
       "notice": {
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "required_attribution": [
+          "Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
+        ]
       },
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "meta-llama/Meta-Llama-3.1-8B",
@@ -2067,7 +2076,10 @@
       "notice": {
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "required_attribution": [
+          "Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
+        ]
       },
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "meta-llama/Llama-3.1-70B-Instruct",
@@ -2093,7 +2105,10 @@
       "notice": {
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "required_attribution": [
+          "Llama 3.1 is licensed under the Llama 3.1 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
+        ]
       },
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "meta-llama/Llama-3.1-70B-Instruct",
@@ -2119,7 +2134,10 @@
       "notice": {
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Previously uncited bundled model configurations",
-        "license_text_sha256": "b5c7be2418fefa3283f75e19d8a85f6429f82035e15c4affe3a549469cc5669c"
+        "license_text_sha256": "b5c7be2418fefa3283f75e19d8a85f6429f82035e15c4affe3a549469cc5669c",
+        "required_attribution": [
+          "Llama 3.3 is licensed under the Llama 3.3 Community License, Copyright \u00a9 Meta Platforms, Inc. All Rights Reserved."
+        ]
       },
       "source_context": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.",
       "base_model": "meta-llama/Llama-3.3-70B-Instruct",

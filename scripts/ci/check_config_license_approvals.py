@@ -249,11 +249,19 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
             ownership = record["ownership"]
             underlying = set(record["underlying_licenses"])
             contribution = set(record.get("nvidia_contribution_licenses", []))
-            if any(has_unknown_license(license_id) for license_id in reported | underlying | contribution):
+            # Ownership evidence binds the file, not the allocation of rights.
+            # A derivative's independently inventoried base cannot be exempted
+            # by relabeling it as NVIDIA's contribution in the review ledger.
+            base = (
+                license_terms(entry["base_license"])
+                if ownership == "nvidia_derivative" and entry.get("base_license")
+                else set()
+            )
+            if any(has_unknown_license(license_id) for license_id in reported | underlying | contribution | base):
                 problems.append("unknown_underlying_license")
             # Preserve the original exact-identifier standard-license policy.
             # In particular, third-party SPDX expressions still need a decision.
-            required = sorted({entry["license"]} | underlying)
+            required = sorted({entry["license"]} | underlying | base)
             if ownership != "third_party":
                 if record["ownership_evidence"].get("status") == "source_unverified":
                     problems.append("ownership_source_unverified")
@@ -264,9 +272,10 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
                         not contribution <= reported
                         or contribution & underlying
                         or not (reported - contribution) <= underlying
+                        or not base <= underlying
                     ):
                         problems.append("inconsistent_license_obligations")
-                    required = sorted((reported - contribution) | underlying)
+                    required = sorted((reported - contribution) | underlying | base)
             elif underlying and underlying != reported:
                 problems.append("inconsistent_license_obligations")
             if record["approval"]["status"] == "rejected":
