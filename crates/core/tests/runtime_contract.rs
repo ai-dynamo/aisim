@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Some tests of a modified Rust simulation of the vLLM v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
