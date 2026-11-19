@@ -156,6 +156,11 @@ impl ExternalPlan {
     pub(crate) fn reserved(&self) -> &[HostBlockKey] {
         &self.reserved
     }
+
+    /// The blocks applying the plan evicts.
+    pub(crate) fn victims(&self) -> &[HostBlockKey] {
+        &self.victims
+    }
 }
 
 /// Result of scheduling an H2D selected by a framework adapter.
@@ -204,6 +209,13 @@ impl ReversedTouch {
         self.admitted += blocks as u64;
         self.absent_from = self.absent_from.max(end);
     }
+
+    /// The caller's key list grew, or blocks entered the tier outside its
+    /// stores: the next call looks up every key after the kept run.
+    pub(crate) fn rescan(&mut self) {
+        self.lru_touches = u64::MAX;
+        self.admitted = u64::MAX;
+    }
 }
 
 /// The adjacent blocks of a caller's first `len` keys: `oldest` holds key
@@ -229,12 +241,21 @@ struct Entry {
     /// This block's [`Lru`] node while it is resident and unpinned, or while
     /// it is present in a [`HostPolicy::Ranked`] tier.
     lru_slot: Option<NonZeroU32>,
-    /// Filled by a KVCR peer fetch rather than a local store.
-    kvcr_origin: bool,
+    /// Filled by KVCR rather than a local store; cleared at the first load.
+    kvcr_origin: Option<KvcrOrigin>,
     /// Pool blocks the entry occupies: one, or a state checkpoint's rows.
     /// External reservations and [`HostTier::free_blocks`] count entries;
     /// they never share a pool with a weighted entry.
     weight: u32,
+}
+
+/// Where KVCR filled a G2 block from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KvcrOrigin {
+    /// A peer rank.
+    Peer,
+    /// This rank's KVCR-owned memory.
+    LocalG2,
 }
 
 /// Declaration order is the same-timestamp completion order.
@@ -720,7 +741,7 @@ impl HostTier {
                 state: EntryState::PendingStore { transfer_id },
                 load_pins: 0,
                 lru_slot: None,
-                kvcr_origin: false,
+                kvcr_origin: None,
                 weight: if index < units { 1 } else { weight },
             };
             if self.config.policy == HostPolicy::Ranked {
@@ -871,6 +892,16 @@ impl HostTier {
     /// Add one key, absent after the plan's victims so far, to `plan`. False,
     /// leaving `plan` unchanged, when neither a free slot nor a victim is left.
     pub(crate) fn plan_reserve(&self, plan: &mut ExternalPlan, key: HostBlockKey) -> bool {
+        self.plan_reserve_unless(plan, key, |_| false)
+    }
+
+    /// [`Self::plan_reserve`] that also never evicts a block `in_use`.
+    pub(crate) fn plan_reserve_unless(
+        &self,
+        plan: &mut ExternalPlan,
+        key: HostBlockKey,
+        in_use: impl Fn(HostBlockKey) -> bool,
+    ) -> bool {
         debug_assert!(self.planned_lookup(Some(plan), key) == Lookup::Miss);
         if let Some(free) = plan.free.checked_sub(1) {
             plan.free = free;
@@ -886,7 +917,7 @@ impl HostTier {
             let Some((node, victim)) = self
                 .lru
                 .oldest_after(plan.cursor)
-                .find(|(_, key)| !plan.protected.contains(key))
+                .find(|(_, key)| !plan.protected.contains(key) && !in_use(*key))
             else {
                 return false;
             };
@@ -994,15 +1025,15 @@ impl HostTier {
     }
 
     pub(crate) fn complete_external(&mut self, id: TransferId) {
-        self.complete_external_with(id, false);
+        self.complete_external_with(id, None);
     }
 
-    /// Complete a KVCR peer fetch, marking each block as filled by it.
-    pub(crate) fn complete_external_from_kvcr(&mut self, id: TransferId) {
-        self.complete_external_with(id, true);
+    /// Complete a reservation KVCR filled, marking each block with its origin.
+    pub(crate) fn complete_external_from_kvcr(&mut self, id: TransferId, origin: KvcrOrigin) {
+        self.complete_external_with(id, Some(origin));
     }
 
-    fn complete_external_with(&mut self, id: TransferId, kvcr_origin: bool) {
+    fn complete_external_with(&mut self, id: TransferId, kvcr_origin: Option<KvcrOrigin>) {
         let transfer = self
             .remove_transfer(id)
             .filter(|transfer| transfer.kind == Kind::External)
@@ -1022,18 +1053,18 @@ impl HostTier {
         self.notify_peers(transfer.client);
     }
 
-    /// Count the `keys` a KVCR peer fetch filled and clear their mark, so each
-    /// pulled block counts once, at its first load.
-    pub(crate) fn take_kvcr_origin(&mut self, keys: &[HostBlockKey]) -> usize {
-        let mut count = 0;
+    /// Count the `keys` KVCR filled, as `[peer, local G2]`, and clear their
+    /// marks, so each such block counts once, at its first load.
+    pub(crate) fn take_kvcr_origin(&mut self, keys: &[HostBlockKey]) -> [usize; 2] {
+        let mut counts = [0; 2];
         for key in keys {
             if let Some(entry) = self.entries.get_mut(key)
-                && std::mem::take(&mut entry.kvcr_origin)
+                && let Some(origin) = entry.kvcr_origin.take()
             {
-                count += 1;
+                counts[origin as usize] += 1;
             }
         }
-        count
+        counts
     }
 
     /// Roll back an unsubmitted reservation.
@@ -1681,6 +1712,12 @@ impl HostTier {
         self.config.capacity_blocks
     }
 
+    /// Unit blocks ever admitted. While it stands, no absent key has entered
+    /// the tier.
+    pub(crate) fn admitted_blocks(&self) -> u64 {
+        self.admitted_blocks
+    }
+
     /// Empty physical slots, excluding all resident and pending blocks.
     pub(crate) fn empty_blocks(&self) -> usize {
         self.config.capacity_blocks - self.used_blocks
@@ -2069,7 +2106,7 @@ pub(crate) mod tests {
                 };
                 assert_occupancy(&tier, 1, 2);
                 if kvcr {
-                    tier.complete_external_from_kvcr(transfer_id);
+                    tier.complete_external_from_kvcr(transfer_id, KvcrOrigin::Peer);
                 } else {
                     tier.complete_external(transfer_id);
                 }
@@ -2176,10 +2213,10 @@ pub(crate) mod tests {
         else {
             panic!("reservation")
         };
-        tier.complete_external_from_kvcr(transfer_id);
-        assert_eq!(tier.take_kvcr_origin(&[a]), 1);
-        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), 1); // only `b` was left
-        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), 0);
+        tier.complete_external_from_kvcr(transfer_id, KvcrOrigin::Peer);
+        assert_eq!(tier.take_kvcr_origin(&[a]), [1, 0]);
+        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), [1, 0]); // only `b` was left
+        assert_eq!(tier.take_kvcr_origin(&[a, b, c]), [0, 0]);
         assert_eq!(tier.block_bytes(), 1_000_000);
 
         // A completion that is not a KVCR peer fetch never carries the mark.
@@ -2189,7 +2226,7 @@ pub(crate) mod tests {
             panic!("reservation")
         };
         tier.complete_external(transfer_id);
-        assert_eq!(tier.take_kvcr_origin(&[c]), 0);
+        assert_eq!(tier.take_kvcr_origin(&[c]), [0, 0]);
     }
 
     #[test]

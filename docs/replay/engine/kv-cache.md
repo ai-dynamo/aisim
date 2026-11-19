@@ -13,6 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 | G2 | Host (CPU) memory | `host_offload` |
 | G3 | Storage shared by workers | `g3_offload` |
 | G2 peer fetch (KVCR) | Another rank's G2 | `kvcr` |
+| KVCR-owned memory | Host memory KVCR owns, behind each rank's G2 | `kvcr.local_g2` |
 
 Recurrent-state models also use `state_cache`; see
 [state cache](#state-cache).
@@ -561,23 +562,31 @@ the request recomputes the missing part instead. Each time this happens
 
 KVCR (KV Cache Runner) lets a rank pull a prompt prefix it is missing from
 another rank's G2 over the network, instead of recomputing it. A router attaches
-a hint naming the source rank; without hints KVCR does nothing. It requires
+a hint naming the source rank; without hints KVCR pulls nothing. With
+`local_g2` it also keeps blocks in memory of its own on each rank and restores
+them without a hint. It requires
 private G2 (`host_offload` with the default `scope: dp_rank_local`). Add it next
 to `host_offload` in the [host offload example](#host-offload-g2):
 
 ```yaml
 kvcr:
   latency_to_first_byte_ms: 1.0
-  bandwidth_gbps: 50.0
+  bandwidth_gbps: 32.0
+  # local_g2: {num_blocks: 4096}   # optional KVCR-owned memory per rank
 ```
 
 | Knob (under `kvcr`) | Default | Rules |
 |---|---|---|
 | `latency_to_first_byte_ms` | `1.0` | Fixed delay before each pull moves bytes, for the control round trip and the source pin. |
-| `bandwidth_gbps` | `50.0` | Per source rank (one attention-DP rank of a worker), decimal GB/s (a 400 Gb/s NIC is `50`). All GPUs of the rank share it, and so do concurrent pulls from it, equally. `0` means unlimited. |
+| `bandwidth_gbps` | `32.0` | Per source rank (one attention-DP rank of a worker), decimal GB/s (a 400 Gb/s NIC is `50`). All GPUs of the rank share it, and so do concurrent pulls from it, equally. `0` means unlimited. |
+| `local_g2` | Unset (off) | Host memory KVCR owns on each rank; see [KVCR-owned memory](#kvcr-owned-memory). |
+| `local_g2.num_blocks` | Required | Capacity of each rank, in the rank's G2 blocks (vLLM `secondary_g2_slots`). Must be positive; omit `local_g2` to turn it off. |
+| `local_g2.policy` | `lru` | `lru` or `fifo`, the block to drop when the memory is full. |
+| `local_g2.copy_bandwidth_gbps` | `6.0` | Rate of the copies between a rank's G2 and its KVCR-owned memory, decimal GB/s. `0` means the copies take no time. |
 
-`kvcr: {}` uses the defaults. These defaults are modeling assumptions, not
-measured values.
+`kvcr: {}` uses the defaults. The default `bandwidth_gbps` approximates pulls
+over RDMA between B200 nodes; set the rate of your transport.
+`latency_to_first_byte_ms` is a modeling assumption.
 
 ### How KVCR behaves
 
@@ -608,7 +617,7 @@ The model simplifies KVCR:
   hinted prompt that the rank's G1 does not hold; it stops at the first block
   it has no other room for. G2 copies of prompt blocks already in G1 stay
   evictable, since the request does not load them.
-- While its pull is in flight, a request is not looked up again, as vLLM skips
+- While its pull is in flight a request is not looked up again, as vLLM skips
   a request that waits for remote KV.
 - Pulls do not fail or time out, and the first pull between two ranks has no
   connection setup cost.
@@ -639,6 +648,58 @@ bookkeeping still queries shared pool state from per-rank calls. Large worker
 or attention-DP pools can substantially increase replay wall time. Further
 overhead reductions are deferred; they must preserve CanonicalV1 replay output bytes.
 
+<a id="kvcr-owned-memory"></a>
+
+### KVCR-owned memory
+
+With `kvcr.local_g2`, each rank has a second host cache that KVCR owns, behind
+the rank's own G2 (vLLM `secondary_g2_slots`). Only G2 exchanges blocks with
+the GPU, so the two caches work as a chain:
+
+- **Store.** When a G2 store completes, its blocks are copied into KVCR-owned
+  memory and are readable there once the copy ends. A block already there is
+  skipped. If the memory is full and no block can be dropped, the new block is
+  not copied.
+- **Evict and order.** The two caches evict independently. `lru` drops the
+  block used least recently: a request's stores, promotion and finish and a
+  peer's read count as use, lookups do not. `fifo` drops the block stored
+  longest ago; a promotion queues its blocks again. A block being copied or
+  read by a peer is never dropped.
+- **Promote.** A lookup that misses a block in G2 checks KVCR-owned memory
+  next, before the hinted peer and without needing a hint. A block found there
+  is copied back into G2, which can evict another G2 block, and then loads to
+  G1 like any G2 hit, so copy and load time add to TTFT.
+- **Peer pulls.** A source serves a pull from both of its caches. If its
+  KVCR-owned memory holds every block the rank asks for, the pull starts when
+  it is requested; otherwise it waits for the source's pass as before. Pulled
+  blocks land in the target's G2 only.
+- **Router events.** A block is published as `HostPinned` when it enters
+  either cache and removed when it has left both.
+
+A copy between the two caches takes its bytes, a block's KV for every GPU of
+the rank, divided by `copy_bandwidth_gbps`. Each direction runs a rank's
+copies one after another. The default approximates copies on a B200 node
+without RDMA; set the rate of your transport. Promotions count toward the
+1,024-round limit above.
+
+The model simplifies KVCR-owned memory:
+
+- Copies do not fail or time out.
+- G2 cannot evict a store's blocks until their copy into KVCR-owned memory
+  ends, and then ranks them as most recently used.
+- A promotion never evicts a G2 block of the same prompt and stops at the
+  first block it has no other room for.
+
+Under `lru`, the order can differ from vLLM's in corner cases, such
+as a pull that lands without a promotion.
+
+With `local_g2` the `kvcr` summary gains a `local_g2` section of block counts:
+`stored_blocks`, `dropped_blocks` (not copied for lack of room),
+`evicted_blocks`, `promoted_blocks` and `loaded_blocks` (promoted blocks,
+counted when their first load into G1 starts).
+
+KVCR's G3 spill, Guard ownership and custom policies are not modeled.
+
 ### Supported
 
 KVCR supports vLLM aggregated workers with any `attention_data`, and pulls
@@ -654,8 +715,8 @@ Hints come from the placement policy (see
 from `kv_hints` on native ReplaySpec requests (see
 [Rust API](../api/rust.md#serializable-spec)). Replay ignores a hint that names
 the receiving rank. CLI traffic carries no hints, so
-`aisim predict --stack engine` runs KVCR idle: apart from the `kvcr`
-section, the results equal G2 alone.
+`aisim predict --stack engine` runs peer fetch idle: without `local_g2`, the
+results equal G2 alone apart from the `kvcr` section.
 
 For a complete CLI example with router-generated hints, follow
 [Simulate KVCR peer reuse](../dynamo.md#simulate-kvcr-peer-reuse). It uses

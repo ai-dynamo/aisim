@@ -631,7 +631,7 @@ def test_native_speculative_field_is_not_part_of_public_engine_schema() -> None:
 
 
 def _kvcr_defaults() -> dict:
-    return {"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 50.0}
+    return {"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 32.0}
 
 
 @pytest.mark.parametrize(
@@ -731,6 +731,16 @@ def test_kvcr_defaults_and_overrides() -> None:
         "latency_to_first_byte_ms": 0.0,
         "bandwidth_gbps": 0.0,
     }
+    # KVCR-owned memory is part of the descriptor only when configured.
+    cache["kvcr"] = {"local_g2": {"num_blocks": 4}}
+    assert KvCachePredictionConfig.model_validate(cache).kvcr.model_dump() == {
+        **_kvcr_defaults(),
+        "local_g2": {"num_blocks": 4, "policy": "lru", "copy_bandwidth_gbps": 6.0},
+    }
+    for local_g2 in ({"num_blocks": 0}, {"num_blocks": 4, "policy": "g3_lru"}, {"policy": "fifo"}):
+        cache["kvcr"] = {"local_g2": local_g2}
+        with pytest.raises(ValidationError, match="local_g2"):
+            KvCachePredictionConfig.model_validate(cache)
 
 
 def test_kvcr_defaults_match_the_rust_runtime() -> None:
@@ -888,9 +898,9 @@ def test_authored_kv_hints_pull_through_the_python_runtime() -> None:
     # Four blocks of 4 tokens at 250,000 bytes per token.
     assert (kvcr["blocks"], kvcr["bytes"]) == (4, 4_000_000)
     # Default timing: the pull starts at b's arrival (rank 0 is idle), waits 1 ms
-    # for its first byte, then moves 4 MB at 50 GB/s.
+    # for its first byte, then moves 4 MB at 32 GB/s.
     assert kvcr["source_wait_ms"] == 0.0
-    assert kvcr["remote_deliver_ms"] == 1.08
+    assert kvcr["remote_deliver_ms"] == 1.125
     assert kvcr["loaded_blocks"] == 4
     assert "bypassed" not in kvcr
     # b reuses all four blocks from its own G2, where the pull put them.
