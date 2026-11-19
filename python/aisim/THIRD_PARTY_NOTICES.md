@@ -694,6 +694,7 @@ the reservation of the blocks that the loads in flight still need, which
 `core.rs` also adapts the set of prefills in flight of `sched/scheduler.py`,
 so that a decode rank keeps free what its local prefills still need. `core.rs`
 also adapts the queue order that serves the requests that hold KV blocks first.
+`crates/core/tests/runtime_contract.rs` holds replay tests of these rules.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
@@ -750,6 +751,8 @@ truncation, the blocks that a decode rank pulls, the state pairing and the
 copy on each TP rank. The rules count the same blocks in both versions and
 take the bytes that the connector reads for one block of each group from the
 profile, so one set of rules covers both.
+`crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
+tests of these rules.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
