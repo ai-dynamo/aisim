@@ -420,7 +420,7 @@ def check_publishable(
     chosen = sorted(set(paths))
     loaded = dict(manifests or {})
     findings: list[Finding] = []
-    from aisim_core.data.mirror import list_tree
+    from aisim_core.data.mirror import list_tree, snapshot_documents
 
     for f in list_tree(root):
         if f.is_symlink:
@@ -451,6 +451,7 @@ def check_publishable(
             findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
             invalid.add(rel)
     chosen_set = set(chosen)
+    snapshots = snapshot_documents(root, chosen)
     for rel, manifest in sorted(loaded.items()):
         if rel in chosen_set and rel not in invalid:
             try:
@@ -466,7 +467,7 @@ def check_publishable(
             except (OSError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         # Match the snapshot documents declared by mirror._check_snapshots.
-        if rel.startswith("data/") and Path(rel).name == "snapshot.json":
+        if rel in snapshots:
             try:
                 findings.extend(_check_snapshot(root, rel, policy))
             except (OSError, ValidationError, ValueError, RecursionError) as exc:

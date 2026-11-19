@@ -693,7 +693,8 @@ def test_target_is_restored_when_public_validator_rejects(tmp_path):
     assert [p.name for p in (target / "data").iterdir()] == ["stray.py"] and not (target / "catalog").exists()
 
 
-def test_snapshot_never_spans_private_and_public(tmp_path):
+@pytest.mark.parametrize("document_name", ["snapshot.json", "input-snapshot.json", "frozen-input.json"])
+def test_snapshot_never_spans_private_and_public(tmp_path, document_name):
     from aisim_core.data.e2e import SnapshotMember, write_snapshot
 
     root, manifests = _mirror(tmp_path, dev=("synthetic/model-a", "synthetic/model-b"))
@@ -709,7 +710,7 @@ def test_snapshot_never_spans_private_and_public(tmp_path):
     snap_dir = root / "data" / "e2e-snapshots" / "s1"
     snap_dir.mkdir(parents=True)
     write_snapshot(
-        root, "data/e2e-snapshots/s1/snapshot.json", members,
+        root, f"data/e2e-snapshots/s1/{document_name}", members,
         source_scope={"kind": "synthetic"}, selection_policy="p", completeness="complete",
     )  # fmt: skip
     _public(root, public_dir, "data/e2e-snapshots/s1")
