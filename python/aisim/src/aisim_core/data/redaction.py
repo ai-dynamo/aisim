@@ -37,7 +37,7 @@ from typing import Any, Literal
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aisim_core.data import Manifest
+from aisim_core.data import Manifest, _verify
 from aisim_core.data.e2e import OBSERVATIONS_SCHEMA, REQUESTS_SCHEMA, E2eManifestBody, body_from_manifest
 from aisim_core.data.eval import load_record
 from aisim_core.data.hygiene import Finding
@@ -270,15 +270,17 @@ def _check_observations(path: Path, rel: str, policy: RedactionPolicy) -> list[F
             out.append(Finding("provenance-withheld", f"{name} links withheld evidence", rel))
         elif name == "evidence_refs" and any(values) and not policy.allow_provenance_artifacts:
             out.append(Finding("provenance-withheld", "evidence_refs link withheld evidence", rel))
-        elif name in ("producer_id", "image", "source_config_json", "unmapped_metrics_json", "source_observation_id"):
-            hits = scan_value({name: [v for v in values if isinstance(v, str)]}, policy, rel, f"column {name}")
-            out.extend(hits[:1])  # one finding per column is enough to stop the copy
+    out.extend(_check_table_text(table, rel, policy, "column"))
     return out
 
 
 def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
     """Scan every string column of an accepted request table; one finding per column stops the copy."""
-    table: pa.Table = read_parquet(path, REQUESTS_SCHEMA)
+    return _check_table_text(read_parquet(path, REQUESTS_SCHEMA), rel, policy, "request column")
+
+
+def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str) -> list[Finding]:
+    """Scan textual columns, including JSON-valued strings and future extension columns."""
     out: list[Finding] = []
     for name in table.column_names:
         if not (
@@ -287,13 +289,22 @@ def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Findi
             continue
         values = [v for v in table.column(name).to_pylist() if isinstance(v, str) and v not in ("", REDACTED)]
         if values:
-            out.extend(scan_value({name: values}, policy, rel, f"request column {name}")[:1])
+            out.extend(scan_value({name: values}, policy, rel, f"{where} {name}")[:1])
     return out
 
 
 def _check_eval_record(root: Path, rel: str, policy: RedactionPolicy, infx_ids: set[str]) -> list[Finding]:
     record = load_record(root / rel)
     out = scan_value(record.model_dump(mode="json", by_alias=True), policy, rel, "eval record")
+    for artifact in record.truth.artifacts:
+        if artifact.format == "parquet":
+            path = _verify((root / rel).parent, artifact)
+            artifact_rel = path.relative_to(root).as_posix()
+            out.extend(
+                _check_table_text(
+                    read_parquet(path, artifact.artifact_schema), artifact_rel, policy, "eval truth column"
+                )
+            )
     if record.findings and not policy.allow_provenance_artifacts:
         out.append(Finding("provenance-withheld", "linked finding artifacts may be logs", rel))
     if policy.inferencex_disclosure == "aggregates-only" and infx_ids & set(record.truth.configuration_ids):
