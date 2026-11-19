@@ -966,7 +966,7 @@ The ragged qualified prefill adds a second scan query and convolution query,
 which keep the remainder token. Its simulated latency changes as described
 above. The other entry points return identical values. The 13 SILICON cases
 of the forward-prediction gate changed by -1.2% to +1.6% warm. A 12-round
-rerun of the 11 Qwen3-32B cases gave -1.1% to +4.1% cold, at most 2.1 us.
+rerun of the 11 Qwen3-32B cases gave -1.8% to +4.1% cold, at most 2.1 us.
 The raw rounds are in
 [`affected-perf-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/affected-perf-d462dab8-d6b02759.json),
 [`host-perf-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/host-perf-d462dab8-d6b02759.json)
