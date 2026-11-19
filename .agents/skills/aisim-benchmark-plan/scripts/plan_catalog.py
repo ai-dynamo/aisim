@@ -30,6 +30,7 @@ def _row(r):
         "n_configs": r.n_configs,
         "acc_mape_pct": r.acc_mape_pct,
         "acc_tier": r.acc_tier,
+        "acc_prediction_fingerprint": r.acc_prediction_fingerprint,
         "gpu_seconds": r.gpu_seconds,
         "stale_reason": r.stale_reason,
     }
@@ -39,13 +40,13 @@ def build_plan(args) -> dict:
     catalog = Catalog(args.dataset_root)
     rows = catalog.rows(hardware=args.hardware, model=args.model, framework=args.framework, layer=args.layer)
     # The op layer is model-independent (model is null), so keep it when a model filter is set.
-    if args.model is not None:
+    if args.model is not None and args.layer in (None, "op"):
         rows += [r for r in catalog.rows(hardware=args.hardware, framework=args.framework, layer="op") if r not in rows]
-        if args.layer not in (None, "op"):
-            rows = [r for r in rows if r.layer != "op"]
+    fingerprints = set(args.prediction_fingerprint)
+    reusable = lambda r: r.acc_mape_pct is not None and r.acc_prediction_fingerprint in fingerprints
     groups = {
-        "reuse": [r for r in rows if r.status == "have" and r.acc_mape_pct is not None],
-        "evaluate_only": [r for r in rows if r.status == "have" and r.acc_mape_pct is None],
+        "reuse": [r for r in rows if r.status == "have" and reusable(r)],
+        "evaluate_only": [r for r in rows if r.status == "have" and not reusable(r)],
         "recollect_or_reevaluate": [r for r in rows if r.status == "stale"],
         "collect": [r for r in rows if r.status == "missing"],
     }
@@ -82,6 +83,12 @@ def main(argv=None) -> int:
     p.add_argument("--model")
     p.add_argument("--framework")
     p.add_argument("--layer", choices=["op", "fpm", "e2e"])
+    p.add_argument(
+        "--prediction-fingerprint",
+        action="append",
+        default=[],
+        help="current PredictionIdentity fingerprint(s); without a match accuracy must be re-evaluated",
+    )
     p.add_argument("--gpus", type=int, help="GPUs the planned run allocates")
     p.add_argument("--wall-hours", type=float, help="planned wall hours of the whole allocation")
     p.add_argument("--retry-margin", type=float, default=0.25, help="fraction added for failed/retried attempts")

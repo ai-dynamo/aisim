@@ -28,3 +28,7 @@ re-implementing it.
 
 Not on this branch: a Hugging Face publish function and the `aisim data fetch`
 CLI. Do not call or imitate them; see the publish skill for what to do instead.
+
+Catalog accuracy fields summarize only complete records. `acc_prediction_fingerprint`
+is nullable for older catalogs and includes the selected record's predictor `code_version`,
+spec and profile hashes. A null or mismatched fingerprint requires re-evaluation before reuse.

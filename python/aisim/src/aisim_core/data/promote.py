@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -203,12 +204,7 @@ def _check_closure(source: Path, plan: PromotionPlan) -> None:
                 if a.path not in chosen:
                     plan.findings.append(Finding("closure", f"artifact {a.path} is outside the selection", rel))
     for rel in sorted(chosen):
-        if (
-            "snapshot" in rel
-            and rel.startswith("data/")
-            and rel.endswith(".json")
-            and not rel.endswith("manifest.json")
-        ):
+        if rel.startswith("data/") and Path(rel).name == "snapshot.json":
             try:
                 _, members = read_snapshot(source, rel)
             except (ValueError, ValidationError, OSError) as exc:
@@ -341,7 +337,7 @@ def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str)
         by_category.setdefault(manifest.category, []).append((rel, manifest))
     categories = dict(dataset.categories)
     for category, items in sorted(by_category.items()):
-        index_rel = f"{CATALOG_DIR}/{category}.json"
+        index_rel = categories[category].index.path if category in categories else f"{CATALOG_DIR}/{category}.json"
         existing = (
             {
                 e.configuration_id: e
@@ -386,6 +382,29 @@ def _snapshot(target: Path) -> dict[str, bytes]:
 
 
 def apply_promotion(
+    plan: PromotionPlan, source_root: str | Path, target_root: str | Path, *, write_ledger: bool = True
+) -> Path | None:
+    """Apply with one writer per target, including validation and rollback.
+
+    A competing writer fails before reading the target snapshot. The adjacent
+    lock is removed on exit; after a process crash an operator must verify no
+    writer remains before removing its lock.
+    """
+    target = Path(target_root).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = target.parent / f".{target.name}.promotion.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise PromotionError(f"another promotion holds the target lock: {lock}") from exc
+    try:
+        return _apply_promotion(plan, source_root, target_root, write_ledger=write_ledger)
+    finally:
+        os.close(fd)
+        lock.unlink()
+
+
+def _apply_promotion(
     plan: PromotionPlan, source_root: str | Path, target_root: str | Path, *, write_ledger: bool = True
 ) -> Path | None:
     """Copy the approved files, regenerate indexes and catalog, and prove the target is valid.

@@ -45,7 +45,7 @@ class EvidenceArtifact(_Model):
 
 class EvidenceManifest(_Model):
     schema_version: Literal["aisim-evidence/v1"] = EVIDENCE_SCHEMA
-    configuration_id: str = Field(min_length=1)
+    configuration_id: str = Field(pattern=r"^cfg-[0-9a-f]{64}$")
     category: Category
     config_path: str = Field(min_length=1)  # directory of the public configuration, under ``data/``
     artifacts: list[EvidenceArtifact] = Field(min_length=1)
@@ -82,7 +82,7 @@ def check_evidence(root: str | Path, paths: Iterable[str]) -> tuple[list[Finding
             findings.append(Finding("evidence-config-path", "config_path must be under data/<category>/", rel))
         if posixpath.join(EVIDENCE_ROOT, manifest.config_path) != directory:
             findings.append(Finding("evidence-config-path", "manifest must sit at evidence/<config_path>/", rel))
-        if posixpath.basename(manifest.config_path) != manifest.configuration_id:
+        if manifest.category == "e2e" and posixpath.basename(manifest.config_path) != manifest.configuration_id:
             findings.append(Finding("evidence-configuration", "configuration_id differs from config_path", rel))
         seen: set[str] = set()
         for artifact in manifest.artifacts:
@@ -93,10 +93,13 @@ def check_evidence(root: str | Path, paths: Iterable[str]) -> tuple[list[Finding
             seen.add(target)
             declared.add(target)
             actual = root / target
-            if not actual.is_file() or actual.is_symlink():
-                findings.append(Finding("evidence-missing", "declared evidence file is missing", target))
-            elif actual.stat().st_size != artifact.size or _sha256(actual) != artifact.sha256:
-                findings.append(Finding("evidence-digest", "size or sha256 differs from the manifest", target))
+            try:
+                if not actual.is_file() or actual.is_symlink():
+                    findings.append(Finding("evidence-missing", "declared evidence file is missing", target))
+                elif actual.stat().st_size != artifact.size or _sha256(actual) != artifact.sha256:
+                    findings.append(Finding("evidence-digest", "size or sha256 differs from the manifest", target))
+            except OSError as exc:
+                findings.append(Finding("evidence-unreadable", str(exc).splitlines()[0], target))
     for rel in files:
         if rel not in declared:
             findings.append(Finding("evidence-undeclared", "file is not listed in an evidence manifest", rel))
