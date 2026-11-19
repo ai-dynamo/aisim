@@ -252,6 +252,8 @@ def _validate_record(
     if cache.get("allocation_layout") == LAYOUT and not is_audited_runtime(record.get("runtime")):
         raise ValueError("K3.1 native cache mapping requires the exact audited runtime source map")
     lifecycle = record.get("lifecycle", {})
+    if not isinstance(lifecycle, dict):
+        raise ValueError("runtime observation lifecycle must be an object")
     if lifecycle.get("cache_initialized") is not True:
         raise ValueError("cache initialization lifecycle evidence is missing")
     if kind == "worker":

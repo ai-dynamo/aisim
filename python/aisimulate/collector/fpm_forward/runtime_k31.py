@@ -114,6 +114,8 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
         raise ValueError("K3.1 cache group coverage is incomplete")
     names, result = set(), []
     for index, (group, scheduler) in enumerate(zip(raw, other, strict=True)):
+        if not isinstance(group, dict) or not isinstance(scheduler, dict):
+            raise ValueError("K3.1 cache group must be an object")
         if "layer_specs" in group and group.get("spec_type") != SPEC + "UniformTypeKVCacheSpecs":
             raise ValueError("K3.1 per-layer specs require a native uniform group")
         if group.get("spec_type") == SPEC + "UniformTypeKVCacheSpecs":
@@ -245,7 +247,7 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
             raise ValueError("K3.1 cache spec/kind has no audited mapping")
         elif any(
             group.get("cache_dtype_str")
-            not in ({"fp8"} if cls.endswith("KimiK3IndexerCache") else {"fp8", "fp8_ds_mla"})
+            not in ({"fp8"} if cls.endswith("KimiK3IndexerCache") else {"fp8", "fp8_e4m3", "fp8_ds_mla"})
             for cls in classes.values()
         ):
             raise ValueError("K3.1 attention cache dtype has no audited FP8 mapping")

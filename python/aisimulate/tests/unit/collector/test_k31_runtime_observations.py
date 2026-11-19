@@ -704,8 +704,23 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
 
 
 @pytest.mark.parametrize("workload_kind", ["prefill", "decode"])
-def test_complete_rank_import_preserves_native_grouping_state_and_precision(tmp_path, monkeypatch, workload_kind):
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+def test_complete_rank_import_preserves_native_grouping_state_and_precision(
+    tmp_path, monkeypatch, workload_kind, cache_dtype
+):
     path, launches = _complete_fixture(tmp_path, monkeypatch, workload_kind=workload_kind)
+
+    def resolve_dtype(record):
+        record["resolved_config"]["cache_config"]["cache_dtype"] = cache_dtype
+        group = record["cache"]["groups"][0]
+        if "layer_specs" in group:
+            for name, spec in group["layer_specs"].items():
+                if name.startswith("mla."):
+                    spec["cache_dtype_str"] = cache_dtype
+        else:
+            group["cache_dtype_str"] = cache_dtype
+
+    _mutate(path, resolve_dtype)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
     assert len(result["resources"]["cache_groups"]) == 2
@@ -717,6 +732,45 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(tmp_
         evidence = artifact["evidence"]
         if evidence["kind"] == "worker":
             assert runtime_k31.moe_precision(evidence["initialized_moe"]) == "w4a8_mxfp4_mxfp8_trtllm"
+
+
+def test_import_rejects_e4m3_spelling_for_indexer_even_with_matching_scheduler(tmp_path, monkeypatch):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def corrupt(record):
+        group = record["cache"]["groups"][0]
+        if "layer_specs" in group:
+            for name, spec in group["layer_specs"].items():
+                if name.startswith("indexer."):
+                    spec["cache_dtype_str"] = "fp8_e4m3"
+
+    _mutate(path, corrupt)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None, result
+    assert "cache spec dtype differs" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("quantization", ["absent", "wrong_method", "wrong_class"])
+def test_k31_import_requires_audited_quantization_even_for_reviewed_bf16_launch(tmp_path, monkeypatch, quantization):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    launches["tp2"]["precision"]["moe_quant_mode"] = "bfloat16"
+    _replace_launch(path, launches)
+
+    def corrupt(record):
+        config = record["resolved_config"]
+        if quantization == "absent":
+            config["model_config"]["quantization"] = None
+            config["quantization_config"] = None
+        elif quantization == "wrong_method":
+            config["model_config"]["quantization"] = "fp8"
+        else:
+            config["quantization_config"]["type"] = "vllm.model_executor.layers.quantization.fp8.Fp8Config"
+        record.pop("initialized_moe", None)
+
+    _mutate(path, corrupt)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None, result
+    assert "K3.1 runtime weight precision requires audited MXFP4" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("omit", ["indexer", "mla"])

@@ -160,6 +160,13 @@ def test_valid_imported_native_proof_changes_only_moe_precision(inputs):
     assert original.dtype.moe_quant_mode == "w4a16_mxfp4"
 
 
+@pytest.mark.parametrize("instrumentation", [None, [], "verified"])
+def test_inline_proof_rejects_non_object_instrumentation(inputs, instrumentation):
+    edit_proof(inputs, lambda proof: proof.update(instrumentation=instrumentation))
+    with pytest.raises(ValueError, match="provenance is not bound"):
+        bind(inputs)
+
+
 def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(inputs, monkeypatch):
     calls = []
     validate = runtime_probe.validate_collection_probe_launch
@@ -335,7 +342,8 @@ def test_inline_tp2_proof_requires_matching_effective_graph_settings(inputs, mat
 
 
 @pytest.mark.parametrize("matching", [False, True])
-def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, matching):
+@pytest.mark.parametrize("difference", ["settings", "geometry"])
+def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, matching, difference):
     # Preserve two physical workers while changing the topology to TP1/DP2.
     # Each DP scheduler agrees with its worker even in the mismatching case.
     launch = inputs["runtime_launch"]
@@ -363,9 +371,18 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
             observed["resolved_config"]["parallel_config"].update(
                 tensor_parallel_size=1,
                 data_parallel_size=2,
-                data_parallel_size_local=2 if matching or dp == 0 else 1,
+                data_parallel_size_local=1 if difference == "settings" and not matching and dp == 1 else 2,
                 enable_expert_parallel=True,
             )
+            if difference == "geometry" and not matching and dp == 1:
+                observed["cache"]["groups"][-1]["layer_names"].reverse()
+            if difference == "geometry":
+                cache = observed["cache"]
+                cache["pool_id"] = f"pool-dp{dp}"
+                for group in cache["groups"]:
+                    group["pool_id"] = cache["pool_id"]
+                if observed["kind"] == "scheduler":
+                    cache["group_pool_ids"] = [cache["pool_id"]] * len(cache["groups"])
             artifacts.append(item)
     proof["artifacts"] = artifacts
     for rank in proof["rank_capacities"]:
@@ -374,7 +391,8 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
     if matching:
         assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
     else:
-        with pytest.raises(ValueError, match="effective runtime/graph settings across phases/ranks"):
+        message = "effective runtime/graph settings" if difference == "settings" else "cache geometry"
+        with pytest.raises(ValueError, match=message + " across phases/ranks"):
             bind(inputs)
 
     # Rebuild the hashed artifact route from the same records to verify that
@@ -396,7 +414,7 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
     imported = validate_observations(index_path, {"tp2": launch})["tp2"]
     assert imported["status"] == ("complete" if matching else "incomplete"), imported
     if not matching:
-        assert "effective runtime/graph settings across phases/ranks" in str(imported["diagnostics"])
+        assert message + " across phases/ranks" in str(imported["diagnostics"])
 
 
 @pytest.mark.parametrize(

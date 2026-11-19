@@ -883,6 +883,7 @@ def _observed_k31_capability(
             or not is_audited_runtime(proof.get("runtime"))
             or proof.get("bundle_sha256") != bundle.sha256
             or proof.get("launch") != launch
+            or not isinstance(proof.get("instrumentation"), dict)
             or proof.get("instrumentation", {}).get("files") != bundle.files
             or proof.get("instrumentation", {}).get("import_binding") != "verified"
         ):
@@ -961,7 +962,7 @@ def _observed_k31_capability(
             capacity_by_rank[key] = capacity
         if set(capacity_by_rank) != expected:
             raise ValueError("K3.1 observed MoE rank capacity coverage is incomplete")
-        canonical_groups = None
+        canonical_groups, canonical_geometry = None, None
         for key, worker in workers.items():
             scheduler = schedulers[key[:2]]
             observations.runtime_memory._validate_scheduler_config(worker, scheduler)
@@ -971,10 +972,15 @@ def _observed_k31_capability(
                 deployment.kv_cache_dtype,
                 context=launch["collection"]["max_model_len"],
             )
-            if canonical_groups is None:
-                canonical_groups = groups
-            elif groups != canonical_groups:
-                raise ValueError("K3.1 observed MoE cache groups differ across native ranks")
+            geometry = [
+                {name: value for name, value in group.items() if name != "pool_id"}
+                for group in worker["cache"]["groups"]
+            ]
+            if canonical_geometry is None:
+                canonical_geometry, canonical_groups = geometry, groups
+            else:
+                observations._same(geometry, canonical_geometry, "cache geometry across phases/ranks")
+                observations._same(groups, canonical_groups, "physical page cost across phases/ranks")
             expected_capacity = {
                 "phase": key[0],
                 "dp_rank": key[1],

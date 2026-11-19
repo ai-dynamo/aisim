@@ -218,6 +218,7 @@ def test_profile_architecture_matches_collector_text_config_view(profile_dict, c
 @pytest.mark.parametrize(
     "wrapper, text_method",
     [
+        ("KimiK25ForConditionalGeneration", "direct"),
         ("KimiK3ForConditionalGeneration", "direct"),
         ("KimiK31ForConditionalGeneration", "sol"),
     ],
@@ -297,6 +298,41 @@ def test_text_only_qwen35_decoder_queries_unmeasured_point_with_direct_interpola
         ) == pytest.approx(3.0)
     finally:
         model.close()
+
+
+def test_text_only_kimi25_uses_direct_at_unmeasured_batch_and_rejects_sol(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path
+):
+    profile_dict["architecture"] = "DeepseekV3ForCausalLM"
+    profile_dict["deployments"][0]["system"] = "h200_sxm"
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": ["KimiK25ForConditionalGeneration"],
+        "text_config": {"architectures": [profile_dict["architecture"]]},
+    }
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(engine, "get_model", _fail_graph)
+    parquet = _write_external_profile_pair(
+        profile_dict,
+        tmp_path,
+        decode_points=[(1, 4, 3.0), (1, 64, 3.0), (4, 4, 6.0), (4, 256, 6.0)],
+    )
+    request = _request(profile_dict)
+    controls = request["estimator_config"]["fpm_interpolation"]
+    controls.update(text_only=True, fpm_parquet_path=str(parquet))
+    model = RustForwardPassPerfModel.best_available(request)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+        # Batch 2 is unmeasured; interpolate the synthetic 3/6 ms batch 1/4 curves.
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 2, "sum_decode_kv_tokens": 32}}]
+        ) == pytest.approx(4.0)
+    finally:
+        model.close()
+    controls["method"] = "sol"
+    for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            entry_point(request)
 
 
 @pytest.mark.parametrize("wrapper", ["NemotronH_Omni_Reasoning_V3", "InternVLChatModel"])
@@ -1632,7 +1668,7 @@ def test_saved_profile_compiler_controls_merge_with_caller_options(native_profil
     assert controls["features"]["attention_kv_weight"] == 7
 
 
-def _write_external_profile_pair(profile, directory, *, prefill_points=None):
+def _write_external_profile_pair(profile, directory, *, prefill_points=None, decode_points=None):
     """Generate routing/identity evidence; these synthetic rows are not silicon data."""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -1642,21 +1678,23 @@ def _write_external_profile_pair(profile, directory, *, prefill_points=None):
     rows = [
         {
             **identity,
-            "cell_id": f"synthetic-{phase}-{kv}",
+            "cell_id": f"synthetic-{phase}-{batch}-{kv}",
             "model_path": profile["model"],
             "weight_quantization": "synthetic",
             "workload_kind": phase,
             "partition_policy": "balanced_v1",
-            "batch_size": 1,
+            "batch_size": batch,
             "total_prefill_tokens": tokens,
             "total_kv_read_tokens": kv,
             "latency_ms": latency,
             "kv_seed_regime": "real_kv",
         }
-        for phase, tokens, kv, latency in [
-            *[("prefill", *point) for point in (prefill_points or [(1, 0, 2.0)])],
-            ("decode", 0, 1, 3.0),
-            ("decode", 0, 64, 3.0),
+        for phase, batch, tokens, kv, latency in [
+            *[("prefill", 1, *point) for point in (prefill_points or [(1, 0, 2.0)])],
+            *[
+                ("decode", batch, 0, kv, latency)
+                for batch, kv, latency in (decode_points or [(1, 1, 3.0), (1, 64, 3.0)])
+            ],
         ]
     ]
     path = directory / "synthetic-profile.parquet"

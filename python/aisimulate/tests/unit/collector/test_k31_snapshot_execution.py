@@ -487,7 +487,16 @@ def test_execution_reports_malformed_initialized_weight_shapes(native_execution,
 
 
 @pytest.mark.parametrize(
-    "mutation", ["null_phase", "list_classes", "null_placement", "null_cache", "null_group", "null_component"]
+    "mutation",
+    [
+        "null_phase",
+        "list_classes",
+        "null_placement",
+        "null_cache",
+        "null_group",
+        "null_component",
+        "null_scheduler_group",
+    ],
 )
 def test_execution_reports_malformed_native_objects_as_failed(native_execution, mutation):
     plan, cell, raw, collection, index_path = native_execution
@@ -498,7 +507,7 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
     else:
 
         def corrupt(record):
-            if record["kind"] == "worker":
+            if record["kind"] == "worker" and mutation != "null_scheduler_group":
                 if mutation == "list_classes":
                     group = record["cache"]["groups"][-1]
                     group["layer_classes"] = group["layer_names"]
@@ -510,6 +519,8 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
                     record["cache"]["layer_components"]["mla.0"] = [None]
                 else:
                     record["cache"]["tensor_allocations"][0] = None
+            elif record["kind"] == "scheduler" and mutation == "null_scheduler_group":
+                record["cache"]["groups"][0] = None
 
         _mutate(index_path, corrupt)
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
@@ -521,8 +532,24 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
         "null_cache": "cache must be an object",
         "null_group": "cache group must be an object",
         "null_component": "layer component must be an object",
+        "null_scheduler_group": "cache group must be an object",
     }
     assert any(message[mutation] in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("role", ["worker", "scheduler"])
+@pytest.mark.parametrize("lifecycle", [None, [], "initialized"])
+def test_execution_reports_malformed_lifecycle_as_failed(native_execution, role, lifecycle):
+    plan, cell, raw, collection, index_path = native_execution
+
+    def corrupt(record):
+        if record["kind"] == role:
+            record["lifecycle"] = lifecycle
+
+    _mutate(index_path, corrupt)
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed", result
+    assert any("lifecycle must be an object" in reason for reason in result["failures"])
 
 
 @pytest.mark.parametrize("group_index", [0, 1, 2])

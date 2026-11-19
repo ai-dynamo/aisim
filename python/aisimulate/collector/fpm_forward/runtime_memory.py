@@ -274,10 +274,25 @@ def _validate_precision(config: dict[str, Any], cell: FPMCell, *, evidence=None,
     if "quantization" not in model or "quantization_config" not in config or base not in {"bfloat16", "half"}:
         raise ValueError("runtime memory weight precision evidence is incomplete or unsupported")
     gemm, moe = None, None
-    if method is None and quant is None:
+    prefix = "vllm.model_executor.layers.quantization."
+    if model.get("architectures") == ["KimiK31ForConditionalGeneration"]:
+        if method != "mxfp4" or not isinstance(quant, dict) or quant.get("type") != prefix + "mxfp4.Mxfp4Config":
+            raise ValueError("K3.1 runtime weight precision requires audited MXFP4 method and quantization class")
+        # The pinned image's quantization/mxfp4.py::Mxfp4MoEMethod and
+        # fused_moe/oracle/mxfp4.py::make_mxfp4_moe_quant_config can select
+        # MXFP8/FP4 activations despite BF16 model inputs. The config class
+        # establishes weight format, not the initialized expert arithmetic.
+        from .runtime_k31 import moe_precision
+
+        gemm = base  # Mxfp4Config.get_quant_method leaves LinearBase unquantized.
+        # Schedulers have no model. Every worker must independently attest
+        # the initialized precision before rank-complete import succeeds.
+        moe = "w4a8_mxfp4_mxfp8_trtllm" if scheduler else moe_precision(evidence)
+        if cell.gemm_quant_mode != base or cell.moe_quant_mode != moe:
+            raise ValueError("K3.1 initialized MoE weight precision differs from the planned GEMM/MoE identity")
+    elif method is None and quant is None:
         gemm = moe = base
     elif isinstance(quant, dict):
-        prefix = "vllm.model_executor.layers.quantization."
         if method == "modelopt_fp4" and quant.get("type") == prefix + "modelopt.ModelOptNvFp4Config":
             if quant.get("quant_method") == "NVFP4":
                 gemm = moe = "nvfp4"
@@ -294,23 +309,6 @@ def _validate_precision(config: dict[str, Any], cell: FPMCell, *, evidence=None,
             and quant.get("quant_method") == "FP8"
         ):
             gemm, moe = "fp8_static", "fp8"
-        elif (
-            model.get("architectures") == ["KimiK31ForConditionalGeneration"]
-            and method == "mxfp4"
-            and quant.get("type") == prefix + "mxfp4.Mxfp4Config"
-        ):
-            # The pinned image's quantization/mxfp4.py::Mxfp4MoEMethod and
-            # fused_moe/oracle/mxfp4.py::make_mxfp4_moe_quant_config can select
-            # MXFP8/FP4 activations despite BF16 model inputs. The config class
-            # establishes weight format, not the initialized expert arithmetic.
-            from .runtime_k31 import moe_precision
-
-            gemm = base  # Mxfp4Config.get_quant_method leaves LinearBase unquantized.
-            # Schedulers have no model. Every worker must independently attest
-            # the initialized precision before rank-complete import succeeds.
-            moe = "w4a8_mxfp4_mxfp8_trtllm" if scheduler else moe_precision(evidence)
-            if cell.gemm_quant_mode != base or cell.moe_quant_mode != moe:
-                raise ValueError("K3.1 initialized MoE weight precision differs from the planned GEMM/MoE identity")
     if gemm is None:
         raise ValueError("runtime memory weight precision mapping is unsupported or contradicts quantization evidence")
     # A mixed checkpoint may leave attention/shared experts in the base dtype.
