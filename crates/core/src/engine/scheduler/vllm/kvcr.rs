@@ -32,6 +32,7 @@ use crate::engine::host_offload::{
     HostTierConfig, HostTierHandle, KvcrOrigin, Lookup, ReversedTouch, TransferId,
 };
 use crate::engine::kvcr::SharedKvcrRegistry;
+use crate::engine::offload_transfer::bytes_per_ms;
 use crate::engine::{KvEventData, KvHintSource, KvcrLocalG2Policy, StoredBlocks};
 
 struct Stage {
@@ -225,12 +226,15 @@ impl VllmKvcrAdapter {
         let mut registry = self.registry.lock().unwrap();
         if let Some(config) = registry.local_g2_config() {
             let lru = config.policy == KvcrLocalG2Policy::Lru;
-            let copy_ms_per_block = if config.copy_bandwidth_gbps == 0.0 {
-                0.0
-            } else {
+            let bytes = (block_bytes * gpus_per_rank) as f64;
+            let rate = bytes_per_ms(config.copy_bandwidth_gbps);
+            let copy_ms_per_block = if config.copy_bandwidth_gbps > 0.0 && rate.is_infinite() {
                 // Convert bytes to decimal MB before dividing, so even a
                 // very large finite GB/s rate cannot overflow an intermediate.
-                ((block_bytes * gpus_per_rank) as f64 / 1e6) / config.copy_bandwidth_gbps
+                (bytes / 1e6) / config.copy_bandwidth_gbps
+            } else {
+                // Preserve normal-rate rounding and explicit zero's unlimited rate.
+                bytes / rate
             };
             anyhow::ensure!(
                 (config.num_blocks as f64 * copy_ms_per_block).is_finite(),
@@ -1321,9 +1325,18 @@ mod tests {
 
     #[test]
     fn kvcr_review_positive_copy_rates_have_positive_durations() {
-        for (gbps, expected_ms) in [(0.0, 0.0), (1.0, 1.0), (1.0e303, 1.0e-303)] {
+        // 16 KiB at 0.1 GB/s takes 0.16384 ms. Keep the original
+        // representable-rate rounding as well as the explicit zero behavior.
+        for (gbps, bytes, expected_ms) in [
+            (0.0, 1_000_000, 0.0),
+            (1.0, 1_000_000, 1.0),
+            (0.1, 16_384, 0.16384),
+            (1.0e303, 1_000_000, 1.0e-303),
+        ] {
             let f = Fixture::with_local_g2(4, KvcrLocalG2Policy::Lru, gbps, 8, &[], &[]);
-            let adapter = f.adapter();
+            let adapter = VllmKvcrAdapter::new(f.registry.clone(), f.target_rank)
+                .with_local_g2(bytes, 1)
+                .unwrap();
             let ms = adapter.local.as_ref().unwrap().copy_ms_per_block;
             assert_eq!(ms, expected_ms);
         }
