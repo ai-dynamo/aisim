@@ -257,7 +257,7 @@ def test_kimi_native_video_sidecar_overrides_inline_legacy_patch_limit(tmp_path,
     (tmp_path / filename).write_text(json.dumps(sidecar))
     try:
         loaded = get_model_config_from_model_path(str(tmp_path))
-        encoder = loaded["encoder_config"]
+        encoder = loaded["extra_params"].vision_config if model == "moonshotai/Kimi-K3" else loaded["encoder_config"]
         assert encoder.video_max_patches == 2048
         assert encoder.image_max_patches == 8192
         assert encoder.max_video_frames == 4
