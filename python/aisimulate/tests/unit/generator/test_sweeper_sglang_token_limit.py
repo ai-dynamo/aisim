@@ -25,6 +25,37 @@ def test_agg_sglang_candidate_renders_evaluated_prefill_token_limit():
     assert _cli_flag_value(artifacts["cli_args_agg"], "--max-prefill-tokens") == "8192"
 
 
+@pytest.mark.parametrize("version", ["0.5.0", "0.5.18"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_null_chunk_matches_omitted_chunk(version, legacy):
+    candidate = _agg_candidate(backend="sglang", backend_version=version)
+    candidate["config"].pop("adapters", None)
+    request = from_sweeper_candidate(
+        candidate,
+        workload={"isl": 4000, "osl": 1000},
+        model_facts=ModelFacts(is_moe=False, architecture="Qwen3ForCausalLM"),
+        generator_overrides={"K8sConfig": {"k8s_image": f"example/sglang:{version}"}},
+    )
+    sizing = request.topology.roles["agg"]
+    extra = dict(sizing.extra)
+    if legacy:
+        extra["enable_chunked_prefill"] = True
+    else:
+        extra.pop("enable_chunked_prefill", None)
+
+    def render(extra):
+        roles = {"agg": replace(sizing, extra=extra)}
+        configured = replace(request, topology=replace(request.topology, roles=roles))
+        return generate_from_request(configured)["cli_args_agg"]
+
+    omitted = render(extra)
+    explicit_null = render({**extra, "chunked_prefill_size": None})
+    assert explicit_null == omitted
+    assert '--chunked-prefill-size "None"' not in explicit_null
+    if legacy:
+        assert "--chunked-prefill-size" in explicit_null
+
+
 def test_disagg_sglang_candidate_renders_each_role_prefill_token_limit():
     adapters = {
         "dynamo.router": {

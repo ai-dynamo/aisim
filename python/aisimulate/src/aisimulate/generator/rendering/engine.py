@@ -1321,6 +1321,9 @@ def prepare_template_context(param_values: dict[str, Any], backend: str) -> dict
             # Always expose param_key variables
             context[param_key] = value
             context[f"{worker_type}_{param_key}"] = value
+            if backend == "sglang" and param_key == "chunked_prefill_size" and value is None:
+                # An unset explicit chunk must not overwrite the legacy mapping.
+                continue
             if param_key in param_to_backend:
                 backend_mapping = param_to_backend[param_key]
 
