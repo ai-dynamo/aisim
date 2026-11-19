@@ -117,6 +117,23 @@ def test_content_parquet_and_json():
     assert "json-too-large" in codes(check_content(CandidatePolicy(max_json_bytes=1), ok, b"{}"))
 
 
+@pytest.mark.parametrize(
+    "doc,valid",
+    [
+        (b'{"setting":1,"setting":2}', False),
+        (b'{"nested":{"setting":1,"setting":2}}', False),
+        (b'{"nested":[{"setting":1,"setting":2}]}', False),
+        (b'{"setting":1}', True),
+        (b'{"first":{"setting":1},"second":{"setting":2}}', True),
+    ],
+)
+def test_json_keys_are_unique_within_each_object(doc, valid):
+    findings = check_content(POLICY, CandidateFile("data/settings.json", len(doc)), doc)
+    assert ("json-invalid" not in codes(findings)) is valid
+    if not valid:
+        assert "duplicate JSON key" in findings[0].message
+
+
 @pytest.mark.parametrize("head", [b"\x7fELF....", b"#!/bin/sh", b"PK\x03\x04zz", b"MZ\x90\x00"])
 def test_content_rejects_executables_even_when_renamed(head):
     assert "forbidden-content" in codes(check_content(POLICY, CandidateFile("data/a.json", len(head)), head))

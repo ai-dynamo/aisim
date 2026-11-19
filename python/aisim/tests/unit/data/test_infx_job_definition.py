@@ -4,6 +4,7 @@
 """The internal GitLab job definition keeps its safety properties (it is never executed here)."""
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -98,6 +99,12 @@ def test_dependency_setup_cannot_read_the_cache_write_token(definition, tmp_path
     uv.chmod(0o755)
     env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "INFX_CACHE_WRITE_TOKEN": "synthetic"}
     subprocess.run(["sh", "-eu", "-c", sync], env=env, cwd=tmp_path, check=True)
+
+
+def test_job_commands_do_not_resolve_new_dependencies(definition):
+    command = shlex.split(definition[".pinned"]["variables"]["JOB_PY"])
+    assert command[:3] == ["uv", "run", "--frozen"]
+    assert command[command.index("--project") + 1] == "aisim/python/aisim"
 
 
 @pytest.mark.parametrize("slack_fails", [False, True])

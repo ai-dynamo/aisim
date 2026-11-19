@@ -20,7 +20,14 @@ import pytest
 
 from aisim_core.data import Artifact, _verify
 from aisim_core.data.catalog import build_catalog
-from aisim_core.data.eval import PredictionIdentity, current_records, load_record, verify_record, write_record
+from aisim_core.data.eval import (
+    PredictionIdentity,
+    current_records,
+    load_record,
+    record_dir,
+    verify_record,
+    write_record,
+)
 from tests.unit.data.test_catalog import (
     NEW,
     dataset,  # noqa: F401  (fixture)
@@ -354,6 +361,82 @@ def test_attestation_rejects_conflicting_destination_artifact(built_record, tmp_
             [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
         )
     assert target.read_bytes() == b"conflicting bytes" and not list(destination.rglob("*.json"))
+
+
+@pytest.mark.parametrize("same_content", [False, True])
+def test_concurrent_attestations_never_replace_published_artifacts(built_record, tmp_path, monkeypatch, same_content):  # noqa: F811
+    root, record = built_record
+    tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
+    content = b"writer A evidence"
+    (root / "finding.json").write_bytes(content)
+    finding = Artifact(
+        artifact_id="finding", path="finding.json", role="finding", format="json", schema="finding/v1",
+        sha256=hashlib.sha256(content).hexdigest(), bytes=len(content),
+    )  # fmt: skip
+    record = record.model_copy(update={"findings": [finding]})
+    first_path = write_record(root, record)
+    second_root = tmp_path / "writer-b"
+    second_root.mkdir()
+    for artifact in record.truth.artifacts:
+        shutil.copyfile(root / artifact.path, second_root / artifact.path)
+    other_content = content if same_content else b"writer B evidence"
+    (second_root / finding.path).write_bytes(other_content)
+    other_finding = finding.model_copy(update={"sha256": hashlib.sha256(other_content).hexdigest()})
+    other_record = record.model_copy(update={"findings": [other_finding]})
+    second_path = write_record(second_root, other_record)
+    predictor = tmp_path / "predict.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    destination = tmp_path / "attested"
+    target = record_dir(destination, record.truth.identity) / finding.path
+    original = tool.os.link
+    winners = []
+
+    def interleave(staged, final):
+        if Path(final) == target and not winners:
+            winners.append(other_record.record_id)
+            assert (
+                tool.main(
+                    [
+                        str(second_path),
+                        "--truth-root",
+                        str(second_root),
+                        "--predictor",
+                        str(predictor),
+                        "--attest-root",
+                        str(destination),
+                    ]
+                )
+                == 0
+            )
+        return original(staged, final)
+
+    monkeypatch.setattr(tool.os, "link", interleave)
+    args = [
+        str(first_path),
+        "--truth-root",
+        str(root),
+        "--predictor",
+        str(predictor),
+        "--attest-root",
+        str(destination),
+    ]
+    if same_content:
+        assert tool.main(args) == 0
+    else:
+        with pytest.raises(ValueError, match="integrity mismatch"):
+            tool.main(args)
+    assert winners and target.read_bytes() == other_content
+    assert not list(destination.rglob("*.tmp"))
+    for path in destination.rglob("*.json"):
+        if path == target:
+            continue
+        published = load_record(path)
+        for artifact in [*published.truth.artifacts, *published.findings]:
+            _verify(path.parent, artifact)
+        assert verify_record(published, path.parent, _predict, published.prediction.fingerprint).ok
 
 
 def test_planner_requires_current_fingerprint_and_reads_only_selected_layer(built_catalog, capsys):

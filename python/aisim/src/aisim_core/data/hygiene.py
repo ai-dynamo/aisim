@@ -200,10 +200,24 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
                 if suffix == ".yaml":
                     yaml_sidecar_value(head)
                 else:
-                    json.loads(head.decode("utf-8"), parse_constant=_reject_constant, parse_float=_finite_float)
+                    json.loads(
+                        head.decode("utf-8"),
+                        parse_constant=_reject_constant,
+                        parse_float=_finite_float,
+                        object_pairs_hook=_unique_json_keys,
+                    )
             except (UnicodeDecodeError, ValueError, RecursionError) as exc:
                 out.append(Finding(f"{kind}-invalid", f"not strict UTF-8 {kind.upper()}: {exc}", path))
     return out
+
+
+def _unique_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 
 
 class _SidecarLoader(yaml.SafeLoader):

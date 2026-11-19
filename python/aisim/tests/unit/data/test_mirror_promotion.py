@@ -1977,6 +1977,13 @@ def test_operation_evidence_version_directory_and_strict_identity(tmp_path):
     }
     (destination / "evidence-manifest.json").write_text(json.dumps(doc))
     assert validate_tree(root).ok
+    wrong = {**doc, "configuration_id": "cfg-" + "d" * 64}
+    (destination / "evidence-manifest.json").write_text(json.dumps(wrong))
+    assert "evidence-configuration" in {f.code for f in validate_tree(root).errors}
+    # Evidence survives removal of the public configuration from the private mirror.
+    evidence_paths = [p.relative_to(root).as_posix() for p in destination.iterdir()]
+    assert check_evidence(root, evidence_paths, manifests={})[0] == []
+    (destination / "evidence-manifest.json").write_text(json.dumps(doc))
     for bad in ["anything", "cfg-" + "A" * 64]:
         with pytest.raises(ValidationError):
             EvidenceManifest.model_validate({**doc, "configuration_id": bad})
@@ -2108,6 +2115,73 @@ def test_catalog_drift_compares_ordered_data_and_schema(tmp_path, change):
     assert bool(report.errors) is (change != "writer"), report.errors
 
 
+@pytest.mark.parametrize("location", ["producer", "schema-metadata", "field-metadata"])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_catalog_footer_disclosure_is_independent_of_logical_drift(tmp_path, location, dirty):
+    import pyarrow.parquet as pq
+
+    root, _ = _mirror(tmp_path, repo=PUBLIC)
+    shard = root / "catalog/systems.parquet"
+    table = pq.read_table(shard)
+    value = b"node7.corp.nvidia.com" if dirty else b"public-writer"
+    if location == "producer":
+        created_by = pq.ParquetFile(shard).metadata.created_by.encode()
+        replacement = value.ljust(len(created_by), b" ")
+        assert len(replacement) == len(created_by)
+        shard.write_bytes(shard.read_bytes().replace(created_by, replacement))
+    elif location == "schema-metadata":
+        pq.write_table(table.replace_schema_metadata({**(table.schema.metadata or {}), b"origin": value}), shard)
+    else:
+        field = table.schema.field(0).with_metadata({b"origin": value})
+        pq.write_table(table.set_column(0, field, table.column(0)), shard)
+    mirror = validate_tree(root)
+    assert mirror.ok is (location == "producer")
+    assert any(f.code == "catalog-drift" for f in mirror.errors) is (location != "producer")
+    rel = shard.relative_to(root).as_posix()
+    findings = check_publishable(root, [rel])
+    assert any(f.code == "internal-host" and f.path == rel for f in findings) is dirty
+    report = validate_tree(root, profile="public")
+    assert report.ok is (location == "producer" and not dirty)
+    assert any(f.code == "internal-host" and f.path == rel for f in report.errors) is dirty
+
+
+def test_snapshot_discovery_bounds_sidecar_reads_and_keeps_custom_filenames(tmp_path, monkeypatch):
+    import io
+
+    from aisim_core.data.hygiene import CandidatePolicy
+    from aisim_core.data.mirror import snapshot_documents
+
+    root, directories = _snapshot_mirror(tmp_path)
+    snapshot = next((root / directories[1]).glob("snapshot.json"))
+    custom = snapshot.with_name("frozen-view.json")
+    snapshot.rename(custom)
+    limit = CandidatePolicy().max_json_bytes
+    oversized = root / "data/large-sidecar.json"
+    payload = b'{"padding":"' + b"x" * limit + b'"}'
+    oversized.write_bytes(payload)
+    original = Path.open
+    reads = []
+
+    class Bounded(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 <= size <= limit + 1
+            reads.append(size)
+            return super().read(size)
+
+    def opened(path, *args, **kwargs):
+        if path == oversized:
+            return Bounded(payload)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+    paths = [p.relative_to(root).as_posix() for p in (custom, oversized)]
+    assert snapshot_documents(root, paths) == {paths[0]}
+    report = validate_tree(root)
+    assert any(f.code == "json-too-large" and f.path == paths[1] for f in report.errors)
+    assert not any(f.code == "snapshot-invalid" for f in report.errors)
+    assert reads and max(reads) == limit + 1
+
+
 def test_promotion_lock_covers_snapshot_and_rollback(tmp_path, monkeypatch):
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -2120,8 +2194,8 @@ def test_promotion_lock_covers_snapshot_and_rollback(tmp_path, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     snapshots = []
 
-    def pause(path):
-        result = original(path)
+    def pause(path, index_paths):
+        result = original(path, index_paths)
         snapshots.append(result)
         entered.set()
         assert release.wait(10)
@@ -2150,7 +2224,8 @@ def test_promotion_lock_covers_snapshot_and_rollback(tmp_path, monkeypatch):
     assert validate_tree(target, profile="public").ok
 
 
-def test_promotion_preserves_noncanonical_category_index(tmp_path):
+@pytest.mark.parametrize("rollback", [False, True])
+def test_promotion_preserves_noncanonical_category_index(tmp_path, monkeypatch, rollback):
     from aisim_core.data import DatasetIndex
 
     root, _, plan = _approved(tmp_path)
@@ -2158,21 +2233,39 @@ def test_promotion_preserves_noncanonical_category_index(tmp_path):
     container.mkdir()
     target, manifests = _mirror(container, repo=PUBLIC, dev=("synthetic/prior-model",))
     old = target / "catalog/e2e.json"
-    custom = target / "catalog/indexes/existing.json"
+    custom = target / "data/indexes/existing.json"
     custom.parent.mkdir()
     old.rename(custom)
     path = target / "catalog/dataset.json"
     dataset = DatasetIndex.model_validate_json(path.read_bytes())
     ref = dataset.categories["e2e"]
-    artifact = ref.index.model_copy(update={"path": "catalog/indexes/existing.json"})
+    artifact = ref.index.model_copy(update={"path": "data/indexes/existing.json"})
     path.write_text(
         dataset.model_copy(update={"categories": {"e2e": ref.model_copy(update={"index": artifact})}}).model_dump_json(
             by_alias=True
         )
     )
     assert validate_tree(target).ok
+    if rollback:
+        from aisim_core.data import promote as module
+        from aisim_core.data.mirror import TreeReport
+
+        before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+
+        def reject(*args, **kwargs):
+            assert custom.read_bytes() != before[custom.relative_to(target)]  # rewrite already happened
+            report = TreeReport(None, "public")
+            report.add("fixture-rejected", "exercise rollback after category index registration")
+            return report
+
+        monkeypatch.setattr(module, "validate_tree", reject)
+        with pytest.raises(PromotionError, match="fixture-rejected"):
+            apply_promotion(plan, root, target, write_ledger=False)
+        assert {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()} == before
+        assert validate_tree(target, profile="public").ok
+        return
     apply_promotion(plan, root, target, write_ledger=False)
     updated = DatasetIndex.model_validate_json(path.read_bytes())
-    assert updated.categories["e2e"].index.path == "catalog/indexes/existing.json"
+    assert updated.categories["e2e"].index.path == "data/indexes/existing.json"
     assert validate_tree(target, profile="public").configurations == 2
     assert (target / manifests[0]).is_file()

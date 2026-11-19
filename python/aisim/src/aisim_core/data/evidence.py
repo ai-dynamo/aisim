@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import hashlib
 import posixpath
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aisim_core.data import Category, Digest
+from aisim_core.data import Category, Digest, Manifest
 from aisim_core.data.hygiene import Finding
 
 EVIDENCE_ROOT = "evidence/"
@@ -59,8 +59,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def check_evidence(root: str | Path, paths: Iterable[str]) -> tuple[list[Finding], set[str]]:
-    """Validate every ``evidence/`` file in ``paths``; return findings and the declared paths."""
+def check_evidence(
+    root: str | Path, paths: Iterable[str], *, manifests: Mapping[str, Manifest] | None = None
+) -> tuple[list[Finding], set[str]]:
+    """Validate evidence files and match IDs against any verified ``manifests`` still in the mirror."""
     root = Path(root)
     files = sorted(p for p in set(paths) if p.startswith(EVIDENCE_ROOT))
     findings: list[Finding] = []
@@ -69,8 +71,8 @@ def check_evidence(root: str | Path, paths: Iterable[str]) -> tuple[list[Finding
         parts = rel.split("/")
         if ".." in parts or "." in parts or "" in parts or posixpath.normpath(rel) != rel or "\\" in rel:
             findings.append(Finding("path-traversal", "path is not normalized", rel))
-    manifests = [p for p in files if p.endswith("/" + EVIDENCE_MANIFEST)]
-    for rel in manifests:
+    evidence_manifests = [p for p in files if p.endswith("/" + EVIDENCE_MANIFEST)]
+    for rel in evidence_manifests:
         declared.add(rel)
         directory = posixpath.dirname(rel)
         try:
@@ -84,6 +86,9 @@ def check_evidence(root: str | Path, paths: Iterable[str]) -> tuple[list[Finding
             findings.append(Finding("evidence-config-path", "manifest must sit at evidence/<config_path>/", rel))
         if manifest.category == "e2e" and posixpath.basename(manifest.config_path) != manifest.configuration_id:
             findings.append(Finding("evidence-configuration", "configuration_id differs from config_path", rel))
+        configuration = (manifests or {}).get(f"{manifest.config_path}/manifest.json")
+        if configuration is not None and configuration.configuration_id != manifest.configuration_id:
+            findings.append(Finding("evidence-configuration", "configuration_id differs from configuration", rel))
         seen: set[str] = set()
         for artifact in manifest.artifacts:
             target = posixpath.normpath(posixpath.join(directory, artifact.path))

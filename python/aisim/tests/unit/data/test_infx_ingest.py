@@ -9,6 +9,7 @@ All HTTP is faked; the response shapes mirror the live documented endpoints
 
 import ast
 import gzip
+import http.client
 import json
 import shutil
 import socket
@@ -176,12 +177,34 @@ def test_truncated_body_is_retried_and_request_budget_is_enforced():
         InfxClient(fake, RetryPolicy(max_attempts=9, max_requests=2), lambda _: None).get("availability")
 
 
-def test_incomplete_read_from_the_transport_is_retried():
-    import http.client
-
+@pytest.mark.parametrize(
+    "error", [http.client.IncompleteRead(b"[1", 99), http.client.BadStatusLine(""), http.client.LineTooLong("status")]
+)
+def test_http_protocol_errors_from_the_transport_are_retried(error):
     fake = FakeInfx()
-    fake.respond("availability", http.client.IncompleteRead(b"[1", 99), ok([]))
+    fake.respond("availability", error, ok([]))
     assert InfxClient(fake, RetryPolicy(max_attempts=2), lambda _: None).get("availability").attempts == 2
+
+
+def test_exhausted_http_protocol_errors_write_failure_report_and_alert(root, tmp_path, monkeypatch):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    before = tree(root)
+    fake = FakeInfx()
+    fake.respond("availability", http.client.BadStatusLine(""))
+    original = infx_job.run_ingestion
+    monkeypatch.setattr(
+        infx_job,
+        "run_ingestion",
+        lambda *a, **k: original(*a, **k, transport=fake, sleep=lambda _: None, policy=RetryPolicy(max_attempts=2)),
+    )
+    alerts = []
+    monkeypatch.setattr(infx_job, "_env_alert", lambda subject, text: alerts.append(subject) or [])
+    report = tmp_path / "failure.json"
+    assert infx_job.main(["run", "--root", str(root), "--cache-dir", str(tmp_path / "c"), "--report", str(report)]) == 1
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and "transport error" in result["error"]
+    assert alerts == ["ingestion failed"] and tree(root) == before
 
 
 # --------------------------------------------------------------------------- end to end

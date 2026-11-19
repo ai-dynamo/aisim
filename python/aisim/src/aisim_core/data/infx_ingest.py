@@ -186,7 +186,7 @@ class InfxClient:
             delay = min(self.policy.max_delay, self.policy.base_delay * 2 ** (attempt - 1))
             try:
                 response = self.transport(url, headers, self.policy.timeout)
-            except (OSError, TimeoutError, http.client.IncompleteRead) as exc:
+            except (OSError, http.client.HTTPException) as exc:
                 last = f"transport error: {exc!r}"
             else:
                 status = response.status

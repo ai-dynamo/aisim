@@ -23,11 +23,14 @@ ai-dynamo/aisim#435; this skill does not widen them.
    ([guidelines](../../../docs/perf-model/collector/README.md#benchmark-guidelines)). Missing rows are listed, not guessed.
 2. Parallelism: `registry.evaluate(Context(...))`; `blocks_import()` stops the import, any error
    blocks qualification but allows archival. Unknown inputs surface as evidence gaps.
-3. Structure: `check_manifest` / `check_dataset` for op-latency; FPM and E2E use their category
-   protocol (FPM self-service validators). `check_published_systems` when a system spec changed.
+3. Structure: `check_manifest` for op-latency and FPM; `check_dataset` for all indexed categories
+   (E2E through `load_e2e`). Also run the category-specific validators (including FPM self-service).
+   `check_published_systems` when a system spec changed.
 4. Records: `load_record` on every record; `verify_record` must pass before tier `verified`.
    `check_record_gpu_time`: warn for archival, error for `qualified`.
-5. Catalog: `build_catalog(root)` regenerates the shards; `check_catalog_size` must not be `refused`.
+5. Catalog: `build_catalog(root)` regenerates the shards; `check_catalog_size` returns a `SizeReport`.
+   Require no `("error", message)` entries in `SizeReport.findings`; report `"warn"` entries without
+   treating them as hard failures.
 6. Hygiene: no tokens, private inventory or private payloads; redact logs; keep raw output hash-linked.
 
 ## Candidate, not promotion
