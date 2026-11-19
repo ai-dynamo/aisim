@@ -37,7 +37,7 @@ from aisim_core.data.fpm_library import (
     stage_fpm_library,
     with_estimator_path,
 )
-from aisim_core.data.loaders import FpmLoader, LoaderError
+from aisim_core.data.loaders import FpmLoader, LoaderError, _resolve_library_resources
 from aisim_core.data.schemas import SCHEMA_MODELS, check_snapshots, render_snapshot
 from aisim_core.sdk import RustForwardPassPerfModel, engine, memory
 from aisim_core.sdk.fpm_profile import _require_forward_pass_profile_memory, load_fpm_profile
@@ -2060,6 +2060,18 @@ def test_sidecar_resources_wait_for_an_identified_deployment(profile):
     one = copy.deepcopy(two)
     one["deployments"] = one["deployments"][:1]
     assert complete_fpm_profile(one, metadata, required=False)[1] == ["metadata"]
+
+
+def test_selectorless_sidecar_resources_describe_the_one_requested_deployment(root, profile):
+    make_entry(root, profile)
+    identity = Manifest.model_validate_json((root / MANIFEST).read_bytes()).identity
+    metadata = {"resources": RESOURCES}  # published without a configuration_selector
+    for has_config in (True, False):
+        resolved = _resolve_library_resources(dict(CONFIG), None, identity, metadata, True, has_config, False)[0]
+        assert resolved.source == "metadata"
+    # A selector with no requested deployment to match against still leaves the resources pending.
+    selected = {**metadata, "configuration_selector": {"tp": 4}}
+    assert _resolve_library_resources({}, None, identity, selected, False, False, False)[0].source == "pending"
 
 
 def test_partial_selector_must_distinguish_dep4_from_dep8(profile):

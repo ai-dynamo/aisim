@@ -437,6 +437,7 @@ the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, th
 is used whole, never merged field by field. Sidecar resources apply only when the selector matches the profile's
 model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
 requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
+A sidecar with no selector applies to the single deployment the load requests; it never selects among several.
 The selector and verified library identity must identify one distinct deployment. An absent or partial selector
 matching several deployments (for example, `tp: 1` matching both DEP4 and DEP8) leaves their resources pending.
 Supplying resources explicitly for one deployment does not disambiguate the sidecar evidence for the others.
