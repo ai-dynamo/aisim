@@ -473,12 +473,90 @@ def test_snapshot_document_publication_is_atomic_and_retryable(root, tmp_path, m
         return original(source, destination)
 
     monkeypatch.setattr(infx_ingest.os, "replace", interrupt)
-    with pytest.raises(OSError, match="interrupted"):
-        make_run(tmp_path, FakeInfx())
+    failed, _ = make_run(tmp_path, FakeInfx())
+    assert failed.status == "failed" and "interrupted" in failed.error
     assert not list(root.rglob("snapshot.json")) and not (root / infx_job.STATE_FILE).exists()
     monkeypatch.setattr(infx_ingest.os, "replace", original)
     result, _ = make_run(tmp_path, FakeInfx())
     assert read_snapshot(root, infx_job.snapshot_path(result.snapshot_id))[0].snapshot_id == result.snapshot_id
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_unchanged_refresh_checks_member_artifacts(root, tmp_path, qualified):
+    first, _ = make_run(tmp_path, FakeInfx())
+    if qualified:
+        promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    _, members = read_snapshot(root, infx_job.snapshot_path(first.snapshot_id))
+    data = load_e2e(root, members[0].manifest_path)
+    metrics = next(a for a in data.manifest.artifacts if "metrics" in a.artifact_schema)
+    (root / metrics.path).unlink()
+    before = tree(root)
+    result, _ = make_run(tmp_path, FakeInfx())
+    assert result.status == "failed" and result.error
+    assert tree(root) == before
+
+
+def test_existing_candidate_is_verified_before_registration(root, tmp_path):
+    acquirer = infx_ingest.Acquirer(InfxClient(FakeInfx()), infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    acquisition = acquirer.acquire()
+    plan = infx_ingest.plan_snapshot(acquisition)
+    infx_ingest.write_candidate(root, acquisition, plan)
+    data = load_e2e(root, plan.members[0].manifest_path)
+    metrics = next(a for a in data.manifest.artifacts if "metrics" in a.artifact_schema)
+    (root / metrics.path).unlink()
+    with pytest.raises((ValueError, OSError)):
+        infx_ingest.write_candidate(root, acquisition, plan)
+    assert not (root / infx_job.STATE_FILE).exists()
+
+
+def test_promote_rejects_valid_but_different_snapshot_document(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    second, _ = make_run(tmp_path, FakeInfx(rows=[row(1, conc=64), row(2, "h200")]))
+    # Both documents and their referenced membership tables are internally valid.
+    shutil.copyfile(root / infx_job.snapshot_path(first.snapshot_id), root / infx_job.snapshot_path(second.snapshot_id))
+    assert read_snapshot(root, infx_job.snapshot_path(second.snapshot_id))[0].snapshot_id == first.snapshot_id
+    before = tree(root)
+    with pytest.raises(PromotionError, match="snapshot ID differs"):
+        promote(root, second.snapshot_id, "Reviewer", now=NOW)
+    assert tree(root) == before
+
+
+@pytest.mark.parametrize("failure", ["state", "snapshot-read", "publication"])
+def test_storage_failures_write_reports_and_notify(root, tmp_path, monkeypatch, failure):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    state = (root / infx_job.STATE_FILE).read_bytes()
+    fake = FakeInfx(rows=[row(1, conc=64), row(2, "h200")])
+    if failure == "state":
+        (root / infx_job.STATE_FILE).write_text("{")
+        state = b"{"
+    elif failure == "snapshot-read":
+        (root / infx_job.snapshot_path(first.snapshot_id)).write_text("{")
+    else:
+        original = infx_ingest.os.replace
+
+        def fail_publication(source, destination):
+            if str(destination).endswith("/snapshot.json"):
+                raise OSError("fixture storage failure")
+            return original(source, destination)
+
+        monkeypatch.setattr(infx_ingest.os, "replace", fail_publication)
+    monkeypatch.setattr(
+        infx_job,
+        "run_ingestion",
+        lambda root, cache_dir, **kw: run_ingestion(root, cache_dir, transport=fake, sleep=lambda _: None),
+    )
+    alerts = []
+    monkeypatch.setattr(infx_job, "_env_alert", lambda *args: alerts.append(args) or [])
+    report = tmp_path / "storage-report.json"
+    assert (
+        infx_job.main(["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report)])
+        == 1
+    )
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and result["error"]
+    assert alerts and (root / infx_job.STATE_FILE).read_bytes() == state
+    assert not root.with_name(".root.ingestion-state.lock").exists()
 
 
 def test_existing_corrupt_snapshot_is_not_registered(root, tmp_path):
@@ -524,9 +602,10 @@ def test_same_benchmark_across_as_of_dates_is_deduplicated_ignoring_curve_contex
     shutil.rmtree(tmp_path / "cache")
     data = load_e2e(root, members[0].manifest_path)
     originals = [a for a in data.manifest.artifacts if "inferencex-response-" in a.path]
-    assert len(originals) == 2
+    assert len(originals) == 4  # two benchmark pages and two dated workflow-info responses
     assert {gzip.decompress((root / a.path).read_bytes()) for a in originals} == {
-        json.dumps(page).encode() for page in rows.values()
+        *[json.dumps(page).encode() for page in rows.values()],
+        json.dumps(WORKFLOW).encode(),
     }
 
 
@@ -566,7 +645,7 @@ def test_malformed_benchmark_writes_failure_report(root, tmp_path, monkeypatch, 
         del bad[field]
     else:
         bad[field] = value
-    fake = FakeInfx(rows=[bad])
+    fake = FakeInfx(rows=[bad, row(2, "h200")])
     monkeypatch.setattr(
         infx_job,
         "run_ingestion",
@@ -580,6 +659,8 @@ def test_malformed_benchmark_writes_failure_report(root, tmp_path, monkeypatch, 
     )
     result = json.loads(report.read_text())
     assert result["status"] == "failed" and "IncompleteAcquisitionError" in result["error"]
+    if field == "id" and value is not None:
+        assert "benchmark id must be numeric" in result["error"]
     assert tree(root) == before
 
 
@@ -617,8 +698,8 @@ def test_original_responses_follow_canonical_model_names(root, tmp_path, model):
     _, members = read_snapshot(root, infx_ingest.snapshot_path(result.snapshot_id))
     loaded = load_e2e(root, members[0].manifest_path)
     responses = [a for a in loaded.manifest.artifacts if "inferencex-response-" in a.path]
-    assert len(responses) == 1
-    assert gzip.decompress((root / responses[0].path).read_bytes()) == json.dumps(rows).encode()
+    assert len(responses) == 2
+    assert json.dumps(rows).encode() in {gzip.decompress((root / a.path).read_bytes()) for a in responses}
     assert loaded.body.model_id == "deepseek-ai/DeepSeek-R1-0528"
 
 
@@ -740,8 +821,8 @@ def test_interrupted_configuration_write_can_retry_and_qualify(root, tmp_path, m
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "write_text", interrupt)
-        with pytest.raises(OSError, match="interrupted manifest"):
-            make_run(tmp_path, FakeInfx())
+        failed, _ = make_run(tmp_path, FakeInfx())
+        assert failed.status == "failed" and "interrupted manifest" in failed.error
     assert not list(root.rglob("manifest.json"))
     result, _ = make_run(tmp_path, FakeInfx())
     assert result.status == "candidate"
@@ -754,7 +835,7 @@ def test_malformed_acquisition_writes_report_and_notifies(root, tmp_path, monkey
     first, _ = make_run(tmp_path, FakeInfx())
     promote(root, first.snapshot_id, "Reviewer", now=NOW)
     before = tree(root)
-    fake = FakeInfx(rows=[row(metrics=1)]) if kind == "metrics" else FakeInfx()
+    fake = FakeInfx(rows=[row(metrics=1), row(2, "h200")]) if kind == "metrics" else FakeInfx()
     if kind == "availability":
         fake.availability[0]["isl"] = []
     if kind == "planning":
@@ -775,7 +856,10 @@ def test_malformed_acquisition_writes_report_and_notifies(root, tmp_path, monkey
         infx_job.main(["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report)])
         == 1
     )
-    assert json.loads(report.read_text())["status"] == "failed"
+    report_data = json.loads(report.read_text())
+    assert report_data["status"] == "failed"
+    if kind == "metrics":
+        assert "metrics must be a mapping" in report_data["error"]
     assert alerts and tree(root) == before
 
 
@@ -789,6 +873,124 @@ def test_conflicting_attempts_across_dates_fail(root, tmp_path):
     result, _ = make_run(tmp_path, fake)
     assert result.status == "failed" and "run_attempt" in result.error
     assert not list(root.iterdir())
+
+
+@pytest.mark.parametrize(
+    "corruption", ["truncated", "list", "missing-time", "bad-time", "etag", "url", "size", "unreadable"]
+)
+def test_corrupt_cache_metadata_is_refetched(root, tmp_path, monkeypatch, corruption):
+    first, _ = make_run(tmp_path, FakeInfx())
+    cache = infx_ingest.AcquisitionCache(tmp_path / "cache")
+    _, path = cache._paths(InfxClient().url("views/options"))
+    meta = json.loads(path.read_bytes())
+    if corruption == "truncated":
+        path.write_bytes(b"{")
+    elif corruption == "list":
+        path.write_text("[]")
+    elif corruption == "unreadable":
+        original = Path.read_bytes
+
+        def read_bytes(candidate):
+            if candidate == path:
+                raise OSError("fixture unreadable cache metadata")
+            return original(candidate)
+
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    else:
+        if corruption == "missing-time":
+            del meta["fetched_at"]
+        elif corruption == "bad-time":
+            meta["fetched_at"] = "not a timestamp"
+        elif corruption == "etag":
+            meta["etag"] = ["invalid"]
+        elif corruption == "url":
+            meta["url"] = "https://wrong.example.test/"
+        else:
+            meta["bytes"] += 1
+        path.write_text(json.dumps(meta))
+    fake = FakeInfx()
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "unchanged" and result.snapshot_id == first.snapshot_id
+    options = next(headers for url, headers in fake.calls if "views/options" in url)
+    assert "If-None-Match" not in options
+    assert any("If-None-Match" in headers for url, headers in fake.calls if "views/options" not in url)
+
+
+def test_duplicate_benchmark_metric_keys_fail_before_conversion(root, tmp_path):
+    fake = FakeInfx()
+    body = json.dumps(fake.rows).encode().replace(b'"mean_ttft": 0.1', b'"mean_ttft": 0.1, "mean_ttft": 0.2', 1)
+    fake.respond("benchmarks", HttpResponse(200, {}, body))
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "failed" and "duplicate JSON key: 'mean_ttft'" in result.error
+    assert not tree(root)
+
+
+@pytest.mark.parametrize("selector,count", [("testmodel", 2), ("Test-Model", 3)])
+def test_db_key_selector_drops_unselected_sibling_rows(root, tmp_path, selector, count):
+    fake = FakeInfx(rows=[row(1), row(2, "h200"), row(3, model="other")])
+    fake.respond("views/options", ok({"models": [{"name": "Test-Model", "dbKeys": ["testmodel", "other"]}]}))
+    result, _ = make_run(tmp_path, fake, models=[selector])
+    assert result.status == "candidate"
+    _, members = read_snapshot(root, infx_job.snapshot_path(result.snapshot_id))
+    assert len(members) == count
+    assert {m.observation_id for m in members} == {f"inferencex:{i}" for i in range(1, count + 1)}
+
+
+def test_workflow_response_evidence_survives_cache_removal(root, tmp_path):
+    fake = FakeInfx()
+    result, _ = make_run(tmp_path, fake)
+    shutil.rmtree(tmp_path / "cache")
+    _, members = read_snapshot(root, infx_job.snapshot_path(result.snapshot_id))
+    for member in members:
+        data = load_e2e(root, member.manifest_path)
+        responses = [a for a in data.manifest.artifacts if "inferencex-response-" in a.path]
+        raw = {gzip.decompress((root / a.path).read_bytes()) for a in responses}
+        assert json.dumps(WORKFLOW).encode() in raw
+        assert json.dumps(fake.rows).encode() in raw
+        observation = next(o for o in data.observations if o.observation_id == member.observation_id)
+        assert observation.producer_revision == "a" * 40 and observation.producer_attempt == 2
+
+
+def test_reused_acquirer_keeps_only_current_response_evidence(root, tmp_path):
+    fake = FakeInfx()
+    fake.respond(
+        "views/options",
+        ok({"models": [{"name": "Test-Model", "dbKeys": ["testmodel"]}, {"name": "Other", "dbKeys": ["other"]}]}),
+    )
+    fake.rows = [row(1)]
+    fake.availability = [avail(), avail(model="other")]
+    fake.respond("benchmarks", ok([row(3, model="other")]), ok([row(1)]))
+    acquirer = infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    first = acquirer.acquire()
+    assert any("model=Other" in url for url in first.responses)
+    second = acquirer.acquire(models=["testmodel"])
+    assert not any("model=Other" in url for url in second.responses)
+    plan = infx_ingest.plan_snapshot(second)
+    path = infx_ingest.write_candidate(root, second, plan)
+    assert {m.observation_id for m in read_snapshot(root, path)[1]} == {"inferencex:1"}
+
+
+def test_ci_can_delegate_failure_notification_to_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(infx_job, "run_ingestion", lambda *a, **k: infx_job.RunResult("failed", error="fixture"))
+    alerts = []
+    monkeypatch.setattr(infx_job, "_env_alert", lambda *a: alerts.append(a))
+    report = tmp_path / "report.json"
+    assert (
+        infx_job.main(
+            [
+                "run",
+                "--root",
+                str(tmp_path),
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--report",
+                str(report),
+                "--no-notify",
+            ]
+        )
+        == 1
+    )
+    assert not alerts and json.loads(report.read_text())["error"] == "fixture"
 
 
 def test_model_filtered_refresh_reports_all_qualified_removals(root, tmp_path):

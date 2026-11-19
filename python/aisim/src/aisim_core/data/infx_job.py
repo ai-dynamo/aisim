@@ -10,8 +10,9 @@ Rules enforced here (AISIM-2334 / DEP #435):
 
 * An **unchanged** refresh (snapshot ID equals the qualified or pending candidate) writes
   nothing, so the job has no commit to make.
-* A **failed** or **empty** run writes nothing under the data root: the last qualified
-  snapshot stays in ``ingestion-state.json`` untouched.
+* An **empty** run writes nothing under the data root. A **failed** publication may
+  leave completed immutable revisions for retry; the qualification pointer stays
+  unchanged, and the failed GitLab job does not push its checkout.
 * A successful run with new content writes a **candidate** only. The job has no code path
   that sets ``qualified``; :func:`promote` needs a named reviewer and is a separate manual step.
 * A model-filtered candidate replaces the qualified scope. Its change report
@@ -45,9 +46,11 @@ from aisim_core.data.infx_ingest import (
     Transport,
     diff_members,
     plan_snapshot,
-    snapshot_path,
     urllib_transport,
     write_candidate,
+)
+from aisim_core.data.infx_ingest import (
+    snapshot_path as snapshot_path,
 )
 
 STATE_FILE = "ingestion-state.json"
@@ -159,10 +162,10 @@ def run_ingestion(
     clock = now or (lambda: datetime.now(UTC))
     kwargs = {"sleep": sleep} if sleep else {}
     client = InfxClient(transport, policy, **kwargs)
-    state = load_state(root)
-    expected = dict(state)
-    qualified, candidate = state.get("qualified"), state.get("candidate")
     try:
+        state = load_state(root)
+        expected = dict(state)
+        qualified, candidate = state.get("qualified"), state.get("candidate")
         prior = _members_of(root, qualified)
         prior_models = {}
         if models and qualified:
@@ -172,19 +175,20 @@ def run_ingestion(
         acquirer = Acquirer(client, AcquisitionCache(cache_dir), clock)
         acq = acquirer.acquire(models, list(prior), prior_models)
         plan = None if acq.empty_scope else plan_snapshot(acq)
-    except InfxError as exc:
-        return RunResult("failed", error=f"{type(exc).__name__}: {exc}", requests_made=client.requests_made)
-    if acq.empty_scope:
-        return RunResult(
-            "empty", warnings=["no InferenceX data declared for the scope"], requests_made=acq.requests_made
-        )
-    assert plan is not None
-    known = {e["snapshot_id"] for e in (qualified, candidate) if e}
-    changes = diff_members(prior, plan.members)
-    if plan.snapshot_id in known:
-        read_snapshot(root, snapshot_path(plan.snapshot_id))
-        return RunResult("unchanged", plan.snapshot_id, requests_made=acq.requests_made)
-    try:
+        if acq.empty_scope:
+            return RunResult(
+                "empty", warnings=["no InferenceX data declared for the scope"], requests_made=acq.requests_made
+            )
+        assert plan is not None
+        known = {e["snapshot_id"] for e in (qualified, candidate) if e}
+        changes = diff_members(prior, plan.members)
+        if plan.snapshot_id in known:
+            entry = next(e for e in (qualified, candidate) if e and e["snapshot_id"] == plan.snapshot_id)
+            snapshot, members = read_snapshot(root, entry["snapshot_path"])
+            if snapshot.snapshot_id != plan.snapshot_id:
+                raise ValueError("existing snapshot ID differs from the planned snapshot")
+            verify_snapshot_members(root, members)
+            return RunResult("unchanged", plan.snapshot_id, requests_made=acq.requests_made)
         with _state_lock(root):
             _check_state(root, expected)  # stale acquisitions must not stage any candidate bytes
             path = write_candidate(root, acq, plan)
@@ -195,10 +199,10 @@ def run_ingestion(
                 "change_counts": {k: len(v) for k, v in changes.items()},
             }
             _save_state(root, state)
-    except InfxError as exc:
-        return RunResult("failed", error=str(exc), requests_made=acq.requests_made)
-    warnings = [f"availability lags benchmarks: {u}" for u in acq.undeclared]
-    return RunResult("candidate", plan.snapshot_id, changes, warnings, requests_made=acq.requests_made)
+        warnings = [f"availability lags benchmarks: {u}" for u in acq.undeclared]
+        return RunResult("candidate", plan.snapshot_id, changes, warnings, requests_made=acq.requests_made)
+    except (InfxError, OSError, ValueError) as exc:
+        return RunResult("failed", error=f"{type(exc).__name__}: {exc}", requests_made=client.requests_made)
 
 
 def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = None) -> dict[str, Any]:
@@ -211,7 +215,9 @@ def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = 
     candidate = state.get("candidate")
     if not candidate or candidate["snapshot_id"] != snapshot_id:
         raise PromotionError(f"{snapshot_id} is not the pending candidate")
-    _, members = read_snapshot(root, snapshot_path(snapshot_id))
+    snapshot, members = read_snapshot(root, candidate["snapshot_path"])
+    if snapshot.snapshot_id != snapshot_id:
+        raise PromotionError("candidate snapshot ID differs from the requested ID")
     verify_snapshot_members(root, members)
     state["qualified"] = {**candidate, "qualified_at": _stamp(now or datetime.now(UTC)), "reviewer": reviewer}
     state["candidate"] = None
@@ -297,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--root", type=Path, required=True, help="working tree of the private cache repository")
     run.add_argument("--cache-dir", type=Path, required=True, help="mutable acquisition cache (not committed)")
     run.add_argument("--model", action="append", help="display name or DB key; default all")
+    run.add_argument("--no-notify", action="store_true", help="let the CI fallback job deliver failure alerts")
     run.add_argument("--report", type=Path, help="write the run report JSON here")
     pro = sub.add_parser("promote")
     pro.add_argument("--root", type=Path, required=True)
@@ -316,7 +323,8 @@ def main(argv: list[str] | None = None) -> int:
             args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         print(json.dumps(report, sort_keys=True))
         if result.status == "failed":
-            _env_alert("ingestion failed", f"{result.error}\nThe last qualified snapshot is retained.")
+            if not args.no_notify:
+                _env_alert("ingestion failed", f"{result.error}\nThe last qualified snapshot is retained.")
             return 1
         return 0
     if args.command == "promote":

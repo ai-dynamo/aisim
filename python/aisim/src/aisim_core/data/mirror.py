@@ -60,6 +60,7 @@ from aisim_core.data.hygiene import (
     CandidateFile,
     CandidatePolicy,
     Finding,
+    bounded_json_bytes,
     check_content,
     check_listing,
     checked_path,
@@ -175,7 +176,7 @@ def list_tree(root: Path) -> list[CandidateFile]:
 
 def _read_json(root: Path, rel: str, model, report: TreeReport):
     try:
-        return model.model_validate_json((root / rel).read_bytes())
+        return model.model_validate_json(bounded_json_bytes(root / rel))
     except (OSError, ValidationError, ValueError) as exc:
         report.add("document-invalid", f"{model.__name__}: {str(exc).splitlines()[0]}", rel)
         return None
@@ -296,6 +297,7 @@ def _check_snapshots(root: Path, report: TreeReport, declared: set[str], manifes
     candidates = (p.relative_to(root).as_posix() for p in (root / "data").rglob("*") if p.suffix.lower() == ".json")
     for rel in sorted(snapshot_documents(root, candidates)):
         try:
+            bounded_json_bytes(checked_path(root, rel))
             snapshot, members = read_snapshot(root, rel)
             for member in members:
                 checked_path(root, member.manifest_path)
@@ -406,6 +408,17 @@ def validate_tree(
     report.files = len(listing) + len(evidence)
     if not listing and not evidence and allow_empty:
         return report
+    # Preflight before index loaders and catalog rebuilding can consume JSON.
+    # Evidence blobs are exempt, but their manifests use bounded_json_bytes.
+    oversized_json = [
+        file
+        for file in listing
+        if Path(file.path).suffix.lower() == ".json" and file.size > CandidatePolicy().max_json_bytes
+    ]
+    for file in oversized_json:
+        report.add("json-too-large", "JSON exceeds the structured-content size limit", file.path)
+    if oversized_json:
+        return report
 
     declared: set[str] = set()
     manifests = _check_indexes(root, report, declared)
@@ -433,7 +446,7 @@ def validate_tree(
     evidence_findings, _ = check_evidence(root, [f.path for f in evidence if not f.is_symlink], manifests=manifests)
     report.findings.extend(evidence_findings)
 
-    gz_declared = {p for p in declared if p.endswith(".gz")}
+    gz_declared = {p for p in declared if p.lower().endswith(".gz")}
     for finding in check_listing(_tree_policy(()), listing):
         report.findings.append(finding)
     skip = report_paths_with_errors(report, "path-", "symlink")
@@ -453,9 +466,9 @@ def validate_tree(
             continue
         report.findings.extend(check_content(_tree_policy(()), f, head, tail))
     for f in listing:
-        if f.path.endswith(".gz") and f.path not in gz_declared:
+        if f.path.lower().endswith(".gz") and f.path not in gz_declared:
             report.add("undeclared-archive", "gzip file is not a declared provenance artifact", f.path)
-        elif f.path not in declared and not f.path.endswith(".gz"):
+        elif f.path not in declared and not f.path.lower().endswith(".gz"):
             # Unreferenced files escape the content checks, so the public profile rejects them.
             severity = "error" if profile == "public" else "warning"
             report.add("orphan-file", "file is not referenced by any manifest, index or record", f.path, severity)

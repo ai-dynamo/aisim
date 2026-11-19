@@ -36,7 +36,12 @@ def test_definition_parser_rejects_duplicate_keys():
 
 @pytest.fixture(scope="module")
 def definition():
-    return yaml.load(JOB.read_text(), Loader=UniqueKeyLoader)
+    spec, definition = yaml.load_all(JOB.read_text(), Loader=UniqueKeyLoader)
+    inputs = spec["spec"]["inputs"]
+    assert inputs["job"]["default"] == "ingest"
+    assert inputs["job"]["options"] == ["ingest", "promote", "staleness"]
+    assert inputs["candidate-snapshot-id"]["regex"] == "^([0-9a-f]{64})?$"
+    return definition
 
 
 def _text(job):
@@ -72,13 +77,15 @@ def test_failure_alert_job_exists(definition):
     assert "needs" not in alert and "extends" not in alert and "before_script" not in alert
     assert "AISIM_REPO_URL" not in _text(alert) and "JOB_PY" not in _text(alert)
     rules = " ".join(r["if"] for r in alert["rules"])
-    assert '$AISIM_JOB == "staleness"' in rules and '$AISIM_JOB == "ingest"' in rules
+    assert '"$[[ inputs.job ]]" == "staleness"' in rules and '"$[[ inputs.job ]]" == "ingest"' in rules
 
 
 def test_ci_contract_clean_workspace_default_pipelines_and_staleness_status(definition):
     assert definition["variables"]["GIT_STRATEGY"] == "empty"
     rules = " ".join(r["if"] for r in definition["publish_candidate"]["rules"])
-    assert '$AISIM_JOB == "ingest"' in rules and "== null" in rules and "!=" not in rules  # promote never acquires
+    assert (
+        '"$[[ inputs.job ]]" == "ingest"' in rules and "== null" not in rules and "!=" not in rules
+    )  # promote never acquires
     assert "ls-remote --exit-code --heads origin" in _text(definition["publish_candidate"])
     assert "||" not in _text(definition["staleness"])  # unexpected statuses must fail the job
 
@@ -108,7 +115,11 @@ def test_job_commands_do_not_resolve_new_dependencies(definition):
 
 
 @pytest.mark.parametrize("slack_fails", [False, True])
-def test_failure_notification_works_without_repository_fetch(definition, monkeypatch, slack_fails):
+@pytest.mark.parametrize("has_report", [False, True])
+def test_failure_notification_works_without_repository_fetch(
+    definition, monkeypatch, tmp_path, slack_fails, has_report
+):
+    import json
     import smtplib
     import urllib.request
 
@@ -121,6 +132,9 @@ def test_failure_notification_works_without_repository_fetch(definition, monkeyp
         "AISIM_JOB_OWNER_EMAIL": "owner@example.test",
     }.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.chdir(tmp_path)
+    if has_report:
+        (tmp_path / "run-report.json").write_text(json.dumps({"status": "failed", "error": "structured fixture error"}))
     delivered = []
 
     class Response:
@@ -128,6 +142,7 @@ def test_failure_notification_works_without_repository_fetch(definition, monkeyp
             pass
 
     def slack(request, timeout):
+        assert ("structured fixture error" in json.loads(request.data)["text"]) is has_report
         delivered.append("slack")
         if slack_fails:
             raise OSError("fixture Slack failure")
@@ -145,6 +160,7 @@ def test_failure_notification_works_without_repository_fetch(definition, monkeyp
 
         def send_message(self, message):
             assert message["To"] == "owner@example.test" and "pipeline/1" in message.get_content()
+            assert ("structured fixture error" in message.get_content()) is has_report
             delivered.append("mail")
 
     monkeypatch.setattr(urllib.request, "urlopen", slack)
@@ -153,3 +169,9 @@ def test_failure_notification_works_without_repository_fetch(definition, monkeyp
     with pytest.raises(SystemExit) as exc:
         exec(compile(script, "gitlab-notification", "exec"), {})
     assert exc.value.code == int(slack_fails) and delivered == ["slack", "mail"]
+
+
+def test_ci_ingestion_defers_failure_alerts_to_the_fallback(definition):
+    assert "run --no-notify" in _text(definition["publish_candidate"])
+    assert "run-report.json" in _text(definition["alert_failure"])
+    assert definition["publish_candidate"]["artifacts"]["when"] == "always"

@@ -50,7 +50,7 @@ from aisim_core.data.e2e import (
     read_snapshot,
 )
 from aisim_core.data.eval import load_record, record_paths
-from aisim_core.data.hygiene import Finding, checked_path, yaml_sidecar_value
+from aisim_core.data.hygiene import Finding, bounded_json_bytes, checked_path, yaml_sidecar_value
 from aisim_core.data.parquet import read_parquet
 
 Label = Literal["public", "internal", "restricted"]
@@ -66,6 +66,11 @@ _INTERNAL_HOST = re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.(?:nvidia\.com|nvidia\.net)
 _PATCH_VALUE = re.compile(r"(?m)^(?:diff --git |--- a/|\+\+\+ b/)|\.(?:patch|diff)\b", re.I)
 _SECRET = re.compile(
     r"(hf_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,}|bearer\s+[A-Za-z0-9._\-]{16,})", re.I
+)
+_CREDENTIAL_KEY = re.compile(
+    r"^(password|passwd|secret|client_secret|api_key|access_token|auth_token|refresh_token|id_token|"
+    r"private_key|authorization|credential|credentials)$",
+    re.I,
 )
 _IMAGE_KEY = re.compile(r"(^|_)(image|images|container|docker_image)(_|$)", re.I)
 _PATCH_KEY = re.compile(r"(^|_)patch(es)?($|_)", re.I)
@@ -177,13 +182,22 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
     if isinstance(value, Mapping):
         for k, v in value.items():
             yield "", str(k)  # content rules apply to keys; field-name rules apply only to their values
-            context = key if _IMAGE_KEY.search(key) or _PATCH_KEY.search(key) or _RUN_KEY.search(key) else str(k)
+            context = (
+                key
+                if _IMAGE_KEY.search(key)
+                or _PATCH_KEY.search(key)
+                or _RUN_KEY.search(key)
+                or _CREDENTIAL_KEY.search(key)
+                else str(k)
+            )
             yield from _walk(v, context, seen)
     elif isinstance(value, (list, tuple)):
         for v in value:
             yield from _walk(v, key, seen)
     elif isinstance(value, str):
         yield key, value
+    elif value is not None and _CREDENTIAL_KEY.search(key) and not isinstance(value, bytes):
+        yield key, str(value)
     elif isinstance(value, bytes):
         # Binary extension columns and Arrow metadata must not bypass disclosure
         # checks. Invalid UTF-8 is refused rather than decoded lossily.
@@ -207,6 +221,8 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
     for key, text in _walk(value, _key):
         if text == REDACTED or not text:
             continue
+        if _CREDENTIAL_KEY.search(key):
+            flag("secret", "credential field must be removed or [REDACTED]")
         nested = _json_text(text) if text.lstrip(" \t\r\n")[:1] in ("{", "[") else None
         if isinstance(nested, (dict, list)):
             out.extend(scan_value(nested, policy, path, where, _key=key))
@@ -359,14 +375,30 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
     for entry in metadata:
         decoded = {key.decode("utf-8"): value.decode("utf-8") for key, value in entry.items()}
         out.extend(scan_value(decoded, policy, rel, "Parquet metadata"))
+
+    def disclosure_value(value, dtype):
+        if value is None:
+            return None
+        if pa.types.is_map(dtype):
+            # Keep duplicate map entries and their disclosure keys; converting
+            # straight to dict would discard all but the last repeated key.
+            return [{key: disclosure_value(item, dtype.item_type)} for key, item in value]
+        if pa.types.is_struct(dtype):
+            return {field.name: disclosure_value(value[field.name], field.type) for field in dtype}
+        if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+            return [disclosure_value(item, dtype.value_type) for item in value]
+        return value
+
     for name in table.column_names:
-        values = table.column(name).to_pylist()
+        column = table.column(name)
+        values = [disclosure_value(value, column.type) for value in column.to_pylist()]
         if values:
             out.extend(scan_value({name: values}, policy, rel, f"{where} {name}")[:1])
     return out
 
 
 def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
+    bounded_json_bytes(checked_path(root, rel))
     snapshot, _ = read_snapshot(root, rel)
     out = scan_value(snapshot.model_dump(mode="json", by_alias=True), policy, rel, "snapshot metadata")
     for artifact in (snapshot.members, snapshot.acquisition):
@@ -467,11 +499,13 @@ def check_publishable(
     index_rel = "catalog/dataset.json"
     if (root / index_rel).is_file():
         try:
-            dataset = DatasetIndex.model_validate_json(checked_path(root, index_rel).read_bytes())
+            dataset = DatasetIndex.model_validate_json(bounded_json_bytes(checked_path(root, index_rel)))
             indexes = {index_rel: dataset}
             for ref in dataset.categories.values():
                 checked_path(root, ref.index.path)
-                indexes[ref.index.path] = CategoryIndex.model_validate_json(_verify(root, ref.index).read_bytes())
+                indexes[ref.index.path] = CategoryIndex.model_validate_json(
+                    bounded_json_bytes(_verify(root, ref.index))
+                )
             for rel, index in indexes.items():
                 if rel in chosen_set:
                     findings.extend(scan_value(index.model_dump(mode="json", by_alias=True), policy, rel, "index"))
