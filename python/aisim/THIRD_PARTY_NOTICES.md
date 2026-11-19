@@ -734,6 +734,8 @@ truncation, the blocks that a decode rank pulls, the state pairing and the
 copy on each TP rank. The rules count the same blocks in both versions and
 take the bytes that the connector reads for one block of each group from the
 profile, so one set of rules covers both.
+`crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
+tests of these rules.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
