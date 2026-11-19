@@ -23,7 +23,7 @@ spec:
       default: ""
       regex: '^([0-9a-f]{64})?$'
     candidate-generation:
-      description: Pipeline ID suffix of the candidate branch (empty for legacy branches)
+      description: Job ID suffix of the candidate branch (empty for legacy branches)
       default: ""
       regex: '^[0-9]*$'
 ---
@@ -100,13 +100,15 @@ publish_candidate:
       while read -r REV REF; do
         git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin "$REF"
         git worktree add -q --detach ../remote-candidate FETCH_HEAD
-        if env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python - <<'PY'
+        RC=0
+        env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python - <<'PY' || RC=$?
       import sys
       from pathlib import Path
 
       from aisim_core.data.e2e import read_snapshot, verify_snapshot_members
       from aisim_core.data.infx_job import load_state
 
+      NOT_REUSABLE = 3  # the only exit code that allows publishing a replacement
       remote_root = Path("../remote-candidate")
       try:
           current = load_state(Path("."))
@@ -118,28 +120,31 @@ publish_candidate:
               and all(pending.get(k) == current["candidate"][k] for k in ("snapshot_id", "snapshot_path"))
           )
           if not same:
-              sys.exit(1)
+              sys.exit(NOT_REUSABLE)
           snapshot, members = read_snapshot(remote_root, pending["snapshot_path"])
           if snapshot.snapshot_id != pending["snapshot_id"] or snapshot.completeness != "complete":
-              sys.exit(1)
+              sys.exit(NOT_REUSABLE)
           verify_snapshot_members(remote_root, members)
       except (OSError, ValueError, RecursionError) as exc:
           print(f"pending branch is not reusable: {type(exc).__name__}: {exc}", file=sys.stderr)
-          sys.exit(1)
+          sys.exit(NOT_REUSABLE)
       PY
-        then
-          git worktree remove ../remote-candidate
+        git worktree remove ../remote-candidate
+        if [ "$RC" -eq 0 ]; then
           echo "${REF#refs/heads/} is pending for this baseline: nothing to push"; exit 0
         fi
-        git worktree remove ../remote-candidate
+        # Exit 3 is the verifier's verdict that this branch is not reusable. Any other
+        # failure (launcher, interpreter, crash) says nothing about the branch: stop.
+        if [ "$RC" -ne 3 ]; then echo "candidate verifier failed to run (exit ${RC}); not publishing" >&2; exit "$RC"; fi
       done < ../candidate-refs
-      case "$CI_PIPELINE_ID" in *[!0-9]*|"") echo "numeric CI_PIPELINE_ID required" >&2; exit 2 ;; esac
-      BRANCH="candidate/${SID}-${CI_PIPELINE_ID}"
+      # A retried job keeps its pipeline ID but gets a new job ID, so the job ID keeps each attempt's ref unique.
+      case "$CI_JOB_ID" in *[!0-9]*|"") echo "numeric CI_JOB_ID required" >&2; exit 2 ;; esac
+      BRANCH="candidate/${SID}-${CI_JOB_ID}"
       git checkout -q -b "$BRANCH"
       git add -A
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -q -m "candidate: InferenceX snapshot ${SID} (not qualified)"
       git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "$BRANCH"
-      echo "Review ${BRANCH}; promote with candidate-snapshot-id=${SID} and candidate-generation=${CI_PIPELINE_ID}"
+      echo "Review ${BRANCH}; promote with candidate-snapshot-id=${SID} and candidate-generation=${CI_JOB_ID}"
   cache:
     key: infx-acquisition
     paths: [infx-acquisition/]

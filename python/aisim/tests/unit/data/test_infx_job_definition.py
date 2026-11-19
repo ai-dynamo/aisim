@@ -65,7 +65,8 @@ def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_
     job = definition["publish_candidate"]
     text = _text(job)
     assert "env -u INFX_CACHE_WRITE_TOKEN" in text and 'push -q origin "$BRANCH"' in text
-    assert 'BRANCH="candidate/${SID}-${CI_PIPELINE_ID}"' in text
+    assert 'BRANCH="candidate/${SID}-${CI_JOB_ID}"' in text
+    assert '[ "$RC" -ne 3 ]' in text  # a verifier that cannot run never allows a replacement push
     assert "main" not in text and "unchanged refresh: no commit" in text and "git status --porcelain" in text
     assert "$JOB_PY promote" not in text
     assert job["resource_group"] == "infx-cache-candidate-publication"
@@ -368,7 +369,7 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
         env={
             **git_env,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
-            "CI_PIPELINE_ID": "42",
+            "CI_JOB_ID": "42",
             "INFX_CACHE_WRITE_TOKEN": "",
         },
         check=True,

@@ -22,7 +22,7 @@ internal project by hand.
 4. Supply CI/CD inputs, not pipeline variables: weekly with `job=ingest`; daily with
    `job=staleness`. Manual refresh: run a web pipeline (default `job=ingest`). Promotion:
    web pipeline with `job=promote`, `candidate-snapshot-id`, and `candidate-generation`
-   (the pipeline ID suffix printed by ingestion), started by the reviewing
+   (the job ID suffix printed by ingestion; pipeline-ID suffixes of earlier branches remain valid), started by the reviewing
    maintainer. Leave the generation empty for legacy `candidate/<snapshot-id>` branches.
    When including this definition, forward these inputs from the project's
    pipeline inputs through `include:inputs`; keep their enum/regex constraints.
@@ -34,7 +34,10 @@ internal project by hand.
    it does not authorize reviewers on its own.
 6. Select or provision a runner with a POSIX shell, Git, `uv`, and `python3`.
    On that runner, verify `sh -c 'git --version && uv --version && python3 --version'`
-   succeeds before enabling either schedule. A Docker runner can supply these tools
+   succeeds before enabling either schedule. `uv sync` also builds the local AISim Rust
+   extension with Maturin, so the runner needs Rust/Cargo, a C/C++ compiler and a platform linker;
+   run a cold `uv sync --frozen --project python/aisim` at `AISIM_REVIEWED_COMMIT` on the selected
+   runner before enabling schedules. A Docker runner can supply these tools
    through its configured default image; this definition does not select an image.
 
 After a successful promotion the qualification exists only on its candidate branch. Open a
@@ -50,7 +53,7 @@ then. The jobs never push to the default branch.
 | Failure alerts | Slack `#swdl-dynamo-aisim-daily` plus email to the owner |
 | Staleness | warn at 8 days, stale at 14 days since the last qualified snapshot (alert only) |
 | Unchanged refresh | no commit, no snapshot |
-| Candidates | pushed to `candidate/<snapshot-id>-<pipeline-id>` branches; never auto-promoted, never pushed to the default branch |
+| Candidates | pushed to `candidate/<snapshot-id>-<job-id>` branches; never auto-promoted, never pushed to the default branch |
 | Failure | publication may leave immutable revisions in the checkout; the qualification pointer stays unchanged and the failed GitLab job does not push the checkout |
 
 A `run --model ...` candidate limits observation membership to the selected models and replaces the qualified
@@ -79,8 +82,10 @@ raw-observation additions, corrections and removals. This includes producer-meta
 Producer SHA and attempt metadata from `workflow-info` are optional: absent values remain null,
 and `warnings` lists each affected benchmark run URL and missing field (including unchanged runs).
 Each HTTP page is limited to 64 MiB before parsing; larger pages fail with a structured run report.
-An aggregated row reporting `decode_num_workers=0` is rejected before conversion stores a
-configuration: zero cannot represent a serving replica count.
+An aggregated row reporting `decode_num_workers=0` is accepted: the source uses zero as an irrelevant
+placeholder there. The converter stores one effective replica, keeps the source value `0` in the
+observation's source config and records an `evidence_gaps` entry naming the normalization; it is not
+a reported replica count.
 
 ## Assumptions to confirm before install
 
