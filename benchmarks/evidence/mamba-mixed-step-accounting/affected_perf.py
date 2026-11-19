@@ -136,6 +136,8 @@ if __name__ == "__main__":
         worker(sys.argv[2])
         sys.exit()
     root, rounds, out, builds = Path(sys.argv[1]).resolve(), int(sys.argv[2]), sys.argv[3], sys.argv[4:]
+    if rounds <= 0:
+        sys.exit(f"ROUNDS must be positive, got {rounds}")
     res, orders = {b: {} for b in builds}, []
     for r in range(rounds):
         order = builds[r % len(builds) :] + builds[: r % len(builds)]
