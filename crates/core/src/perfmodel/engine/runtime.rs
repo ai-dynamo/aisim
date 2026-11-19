@@ -2698,9 +2698,11 @@ impl Engine {
         // `decode_query_tokens`). Acceptance does not reduce this
         // current-iteration work.
         let decode_query_tokens = self.packed_decode_tokens(gen_tokens)?;
-        let combined = ctx_tokens + decode_query_tokens;
+        // Raw packed tokens before removing cached work; u64 so a wide decode
+        // batch beside cached prefill cannot overflow before the subtraction.
+        let combined = u64::from(ctx_tokens) + u64::from(decode_query_tokens);
         let prefix1 = prefix * (ctx_tokens / isl); // prefix * floor(ctx/isl)
-        if prefix1 >= combined {
+        if u64::from(prefix1) >= combined {
             return Err(AicError::InvalidEngineConfig(format!(
                 "isl must be greater than 0 after removing prefix, but got {}",
                 combined as i64 - prefix1 as i64
@@ -2717,9 +2719,17 @@ impl Engine {
             }
             (full, partial, per_request)
         });
-        let shared_tokens = mamba_prefill.map_or(combined - prefix1, |(full, partial, length)| {
-            full * length + partial + decode_query_tokens
-        });
+        let shared_tokens = match mamba_prefill {
+            Some((full, partial, length)) => (full * length + partial)
+                .checked_add(decode_query_tokens)
+                .ok_or_else(|| {
+                    AicError::InvalidEngineConfig(format!(
+                        "{decode_query_tokens} decode tokens beside the new prefill tokens \
+                         overflow the u32 count of qualified Mamba shared ops"
+                    ))
+                })?,
+            None => u32::try_from(combined - u64::from(prefix1)).unwrap_or(u32::MAX),
+        };
         let mut shared_non_attention = 0.0;
         // Prefill-only, like context attention, but never amortized over chunks.
         let mut context_mamba = 0.0;
@@ -4901,6 +4911,19 @@ pub(crate) mod tests {
                 );
             }
         }
+        // Cached prefill leaves room for a wide decode: 4096 tokens with a
+        // 4000-token prefix add 96 new tokens, while the raw 4096 would overflow.
+        let near = qualified_mamba_engine(u32::MAX - 1001);
+        assert!(
+            near.mixed_step_breakdown(4096, 1, 4096, 2, 4000, 1.0, 1.0)
+                .is_ok()
+        );
+        let full = qualified_mamba_engine(u32::MAX - 11);
+        let result = full.mixed_step_breakdown(4096, 1, 4096, 2, 4000, 1.0, 1.0);
+        assert!(
+            matches!(&result, Err(AicError::InvalidEngineConfig(m)) if m.contains("overflow")),
+            "{result:?}"
+        );
         // Two width-four requests stay representable.
         for engine in [qualified_mamba_engine(3), generation_only(3)] {
             for result in decode_paths(&engine) {
