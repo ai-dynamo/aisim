@@ -542,6 +542,7 @@ def test_frozen_model_config_renders_without_model_resolution(monkeypatch):
         raise AssertionError("model resolution must not run when model_config is provided")
 
     monkeypatch.setattr("aisim.sdk.utils.get_model_config_from_model_path", _boom)
+    monkeypatch.setattr("aisim_core.sdk.utils._load_model_config_from_model_path", _boom)
     frozen = {
         "layers": 4,
         "hidden_size": 128,

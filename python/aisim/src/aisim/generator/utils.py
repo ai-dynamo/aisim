@@ -207,9 +207,12 @@ def _model_architecture(model_path: str, model_config: dict | None = None) -> st
     Indirection so tests can stub the SDK lookup."""
     if isinstance(model_config, dict):
         return model_config.get("architecture")
-    from aisim.sdk.utils import get_model_config_from_model_path
+    from aisim_core.sdk.utils import _load_model_config_from_model_path
 
-    return get_model_config_from_model_path(model_path).get("architecture")
+    # Architecture detection must also work for valid checkpoints outside the
+    # numerical model parser's support set; no processor metadata is needed.
+    raw = _load_model_config_from_model_path(model_path)
+    return (raw.get("architectures") or [None])[0]
 
 
 # DeepSeek sparse attention (DSA) architectures: the sparse-MLA selector is
@@ -283,8 +286,10 @@ def vllm_dsa_kv_cache_dtype(
         return None
     if str(gemm_quant_mode or "").lower() == "nvfp4":
         return "fp8"
-    raw = model_config.get("raw_config") if isinstance(model_config, dict) else None
-    if _artifact_pins_fp8_kv(_bundled_quantization(model_path, raw if isinstance(raw, dict) else None)):
+    # A frozen config supplies all available facts. An omitted raw payload must
+    # not cause a filesystem/network lookup for an otherwise self-contained render.
+    raw = (model_config.get("raw_config") or {}) if isinstance(model_config, dict) else None
+    if _artifact_pins_fp8_kv(_bundled_quantization(model_path, raw)):
         return "fp8"
     return None
 
