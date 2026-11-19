@@ -371,6 +371,56 @@ def test_fetch_preflights_acceptance_before_downloading_corpus(tmp_path, monkeyp
     assert not (output / "corpora").exists()
 
 
+@pytest.mark.parametrize("recipe_error", ["missing", "null_base", "null_override"])
+def test_fetch_reports_both_malformed_recipe_and_later_acceptance(tmp_path, monkeypatch, recipe_error):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
+    hub = tmp_path / "hub"
+    catalog = json.loads((hub / agentx_run.INDEX).read_bytes())
+    first_path = hub / catalog["runs"][0]["manifest"]["path"]
+    first = json.loads(first_path.read_bytes())
+    second_path = first_path.parent.parent / "agentx-446068" / first_path.name
+    second_path.parent.mkdir()
+    for source in first_path.parent.iterdir():
+        if source.is_file():
+            (second_path.parent / source.name).write_bytes(source.read_bytes())
+    second = copy.deepcopy(first)
+    second.update(id="agentx-446068", lanes=4)
+    for role in ("feature_metadata", "workload"):
+        entry = second["artifacts"][role]
+        path = second_path.parent / entry["path"]
+        value = json.loads(path.read_bytes())
+        value["benchmark_id"] = second["id"]
+        path.write_bytes(canonical(value))
+        entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    if recipe_error == "missing":
+        del first["artifacts"]["recipe"]
+    else:
+        entry = first["artifacts"]["recipe"]
+        path = first_path.parent / entry["path"]
+        recipe = json.loads(path.read_bytes())
+        recipe["base" if recipe_error == "null_base" else "override_c1"] = None
+        path.write_bytes(canonical(recipe))
+        entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    catalog["runs"] = []
+    for manifest, path in ((first, first_path), (second, second_path)):
+        path.write_bytes(canonical(manifest))
+        entry = {key: manifest[key] for key in ("id", "category", "configuration_id")}
+        entry["manifest"] = {
+            "path": path.relative_to(hub).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "bytes": path.stat().st_size,
+        }
+        catalog["runs"].append(entry)
+    del catalog["snapshot_id"]
+    catalog["snapshot_id"] = hashlib.sha256(canonical(catalog)).hexdigest()
+    (hub / agentx_run.INDEX).write_bytes(canonical(catalog))
+    with pytest.raises(ValueError) as caught:
+        agentx_run.fetch("a" * 40, tmp_path / "inputs")
+    assert "agentx-446063:" in str(caught.value)
+    assert "agentx-446068: Missing depth-matched measured speculative acceptance" in str(caught.value)
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
 def test_fetch_preflights_valid_inputs_and_preserves_corpus(tmp_path, monkeypatch):
     downloads, corpus = hub_replay_inputs(
         tmp_path, monkeypatch, {"verification_depth": 3, "accepted_draft_tokens": 1.25}

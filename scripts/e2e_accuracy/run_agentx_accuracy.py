@@ -146,7 +146,7 @@ def fetch(revision, output, *, metadata_only=False, campaign_catalog=None, previ
         for run in runs:
             try:
                 replay_config(output, run)
-            except ValueError as error:
+            except (AttributeError, KeyError, TypeError, ValueError) as error:
                 errors.append(f"{run['id']}: {error}")
         if errors:
             raise ValueError("AgentX replay input preflight failed:\n" + "\n".join(errors))
