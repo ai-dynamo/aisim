@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -197,6 +198,8 @@ def run_init(args: argparse.Namespace) -> int:
         )
         ns = argparse.Namespace(cache_dir=args.cache_dir, offline=args.offline, no_limit=args.no_limit, dry_run=False)
         payload["fetch"] = _download(selection, ns, repo, revision)
+        # Save the source the download used so later runs select that data, even with no flag or saved source.
+        config = replace(config, repo=repo, revision=revision)
     save_config(config, path)  # saved only after the download succeeded
     _emit(payload)
     return 0
