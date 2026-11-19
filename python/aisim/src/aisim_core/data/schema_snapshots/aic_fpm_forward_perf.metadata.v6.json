@@ -2,6 +2,31 @@
   "$defs": {
     "FpmCacheGroup": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "state"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "blocks_per_request": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "blocks_per_request"
+            ]
+          }
+        }
+      ],
       "description": "Rank-local physical cache pages for one attention, convolution or state group.\n\nIn an attention or convolution group, page bytes include all group layers\nand runtime padding. The retention window does not replace the logical\ncontext used for FPM timing queries.\n\nA state group has no window and holds ``blocks_per_request`` blocks of\n``page_size_bytes`` for every running request. Its ``page_size_bytes`` is\none pool block: every byte that one block ID reserves in the shared pool.\nThat can be more than the bytes of the group's own layers. Its\n``block_size_tokens`` is the block size of vLLM's state spec, as the\nruntime probe records it: the Mamba block (the scheduler block in\n``align`` mode, ``max_model_len`` in mode ``none``) or the ring block.\nSizing and replay do not read it yet.\n\n``blocks_per_request`` counts the pool blocks that a running request holds\nbetween block boundaries. For a Mamba spec, that is ``1 + k``, where ``k``\nis the spec's ``num_speculative_blocks``. Grouped execution forbids\nspeculative decoding, so ``k`` is 0 there. A ring spec, such as\n``KpoolTailSpec`` or ``CircularBufferSpec`` in vLLM 0.31.0, holds 1 block\nfor the whole life of the request in every mode. When a request crosses a\nblock boundary in ``align`` mode, a Mamba group also holds the previous\nblock for one or two steps. vLLM's startup sizing in that mode counts\n``2 + k + c`` blocks for a Mamba group, where ``c`` is the spec's\n``num_prefill_checkpoint_blocks``. It counts 1 block for a ring group.\n\nFour optional fields describe the group beyond its geometry.\n``prefix_cacheable`` says whether vLLM's manager for the group takes part in\nprefix caching. A ring spec does not. ``transfer_bytes_per_block`` is the\nbytes that vLLM's P/D connector reads for one block of the group in a\ntransfer on one TP rank, for the vLLM version of the deployment. It can be\nlarger than the page, because the connector reads a block in regions that\nlayers of other groups can share. The probe import of a vLLM 0.33.0 record\ndoes not write it.\n``prefill_checkpoint_blocks`` (0 or 1, state groups only) and\n``prefill_checkpoint_alignment`` (positive, with one checkpoint block) are\nthe prefill checkpoint settings of a Mamba spec.",
       "properties": {
         "block_size_tokens": {
@@ -300,6 +325,34 @@
               "runtime_memory",
               "mamba_cache"
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime_memory": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "runtime_memory"
+            ]
+          },
+          "then": {
+            "properties": {
+              "activations_bytes": {
+                "type": "null"
+              },
+              "comm_overhead_bytes": {
+                "type": "null"
+              },
+              "runtime_overhead_bytes": {
+                "type": "null"
+              },
+              "weights_bytes": {
+                "type": "null"
+              }
+            }
           }
         }
       ],

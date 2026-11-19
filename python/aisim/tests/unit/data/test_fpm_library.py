@@ -670,16 +670,16 @@ def test_failed_replacement_restores_the_previous_staged_root(root, profile, tmp
     replace = os.replace
 
     def fail_install(src, dst):
-        if str(src).endswith(".staging"):
+        if ".staging-" in str(src):
             raise PermissionError("injected final rename failure")
         return replace(src, dst)
 
     monkeypatch.setattr(os, "replace", fail_install)
-    with pytest.raises(PermissionError, match="final rename failure"):
+    with pytest.raises(FpmContractError, match="final rename failure"):
         stage_fpm_library(*args, **kwargs, systems_paths=[systems])
     assert (first.systems_root / ".staged.json").read_bytes() == marker
     assert all((first.systems_root / relative).read_bytes() == raw for relative, raw in before.items())
-    assert not list(tmp_path.glob(".out.*.staging"))
+    assert not list(tmp_path.glob(".out.staging-*"))
 
 
 def test_system_overlay_fills_missing_operation_files_from_fallback_roots(root, profile, tmp_path, monkeypatch):
@@ -803,6 +803,10 @@ def test_ensure_library_isolates_effective_systems_roots(root, profile, tmp_path
         inode = (staged / ".staged.json").stat().st_ino
         again = ensure_data(config, pin)
         assert again.config == result.config
+        assert (staged / ".staged.json").stat().st_ino == inode
+        # A saved configuration returned by an earlier call lists its own staging root; it must not key a new one.
+        reloaded = ensure_data(result.config, pin)
+        assert Path(reloaded.config["systems_paths"][0]) == staged
         assert (staged / ".staged.json").stat().st_ino == inode
         if explicit_roots:
             aliased = ensure_data({**config, "systems_paths": [str(systems) + "/.", str(systems)]}, pin)
@@ -1020,12 +1024,18 @@ def test_entry_checks_report_roles_hashes_and_sidecar_agreement(root, profile):
     }
     assert check(
         lambda d: d["artifacts"].append({**d["artifacts"][0], "artifact_id": "dup", "path": d["artifacts"][1]["path"]})
-    ) == {"duplicate-role"}
+    ) == {"duplicate-role", "duplicate-artifact"}
+    assert check(lambda d: d["artifacts"][1].update(artifact_id=d["artifacts"][0]["artifact_id"])) == {
+        "duplicate-artifact"
+    }
     assert check(lambda d: d.update(artifacts=[a for a in d["artifacts"] if a["role"] != "measurement-manifest"])) == {
         "missing-role"
     }
     assert check(lambda d: d["artifacts"][0].update(sha256="0" * 64)) == {"hash-mismatch"}
-    assert check(lambda d: d["artifacts"][0].update(schema="aic_fpm_forward_perf/v7")) == {"library-schema"}
+    assert check(lambda d: d["artifacts"][0].update(schema="aic_fpm_forward_perf/v7")) == {
+        "library-schema",
+        "hash-mismatch",  # an unstamped table is accepted only under the supported schema id
+    }
     path.write_text(json.dumps(document))
     sidecar = root / ENTRY / "fpm/fpm_forward_perf.metadata.json"
     changed = json.loads(sidecar.read_text())
@@ -1156,14 +1166,33 @@ def test_sidecar_version_is_constrained_in_model_and_packaged_snapshot():
             validator.validate(unsupported)
 
 
+_MEMORY_NAMES = ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes")
+_NO_KV = {k: v for k, v in RESOURCES.items() if k != "kv_bytes_per_token"}
+_STATE_GROUP_WITHOUT_BLOCKS = {
+    "name": "state",
+    "kind": "state",
+    "num_layers": 1,
+    "block_size_tokens": 16,
+    "page_size_bytes": 1024,
+}
+_STATE_GROUP = {**_STATE_GROUP_WITHOUT_BLOCKS, "blocks_per_request": 1}
+
+
 @pytest.mark.parametrize(
     "resources",
     [
         {k: v for k, v in RESOURCES.items() if k != "kv_bytes_per_token"},
         {**RESOURCES, "kv_bytes_per_token": None},
-        {**RESOURCES, "cache_layout": "grouped", "cache_groups": []},
-        {**RESOURCES, "cache_layout": "unmodeled"},
-        {**RESOURCES, "cache_layout": "mamba_align", "runtime_memory": RUNTIME_MEMORY},
+        {**_NO_KV, "cache_layout": "grouped", "cache_groups": []},
+        {**_NO_KV, "cache_layout": "unmodeled"},
+        {**_NO_KV, "cache_layout": "mamba_align", "runtime_memory": RUNTIME_MEMORY},
+        {**RESOURCES, "runtime_memory": RUNTIME_MEMORY, "weights_bytes": 0},
+        {
+            **_NO_KV,
+            "cache_layout": "grouped",
+            "cache_groups": [{**_STATE_GROUP, "blocks_per_request": 0}],
+        },
+        {**_NO_KV, "cache_layout": "grouped", "cache_groups": [_STATE_GROUP_WITHOUT_BLOCKS]},
     ],
 )
 def test_resource_layout_requirements_agree_in_runtime_and_exported_schema(resources):
@@ -1203,7 +1232,11 @@ def test_resource_layout_schema_keeps_valid_and_absent_resources():
             "num_speculative_states": 0,
         },
     }
-    for document in (base, *({**base, "resources": value} for value in (RESOURCES, grouped, unmodeled, mamba))):
+    state = {**grouped, "cache_groups": [_STATE_GROUP]}
+    runtime_only = {**RESOURCES, "runtime_memory": RUNTIME_MEMORY}
+    declared = {**RESOURCES, **dict.fromkeys(_MEMORY_NAMES, 0)}
+    values = (RESOURCES, grouped, unmodeled, mamba, state, runtime_only, declared)
+    for document in (base, *({**base, "resources": value} for value in values)):
         Draft202012Validator(schema).validate(document)
         FpmLibraryMetadata.model_validate(document)
 
@@ -1251,3 +1284,232 @@ def test_entries_differing_only_in_dp_attention_are_distinct(root, profile):
         update={"identity": manifest.identity.model_copy(update={"dp_attention": {"aggregated": False}})}
     )
     assert check_fpm_identities([("a", on), ("b", off)]) == []
+
+
+# ------------------------------------------------------------------ review follow-ups
+
+
+def test_stamp_exception_covers_only_the_supported_library_schema(tmp_path):
+    from aisim_core.data import Artifact, _verify
+
+    path = tmp_path / "lib.parquet"
+    pq.write_table(pa.table({"x": [1]}), path)
+    raw = path.read_bytes()
+
+    def artifact(schema):
+        return Artifact(
+            artifact_id="lib",
+            path="lib.parquet",
+            role="fpm-library",
+            format="parquet",
+            schema=schema,
+            sha256=_sha(raw),
+            bytes=len(raw),
+            rows=1,
+            runtime_path=None,
+        )
+
+    assert _verify(tmp_path, artifact("aic_fpm_forward_perf/v6")) == path
+    with pytest.raises(ValueError, match="schema ID"):
+        _verify(tmp_path, artifact("aic_fpm_forward_perf/v7"))
+
+
+def test_topology_aliases_select_like_their_canonical_names():
+    from aisim_core.data.loaders import _parallelism
+
+    canonical = {"tp": 4, "moe_tp_size": 4, "moe_ep_size": 1, "attention_dp": 2}
+    aliased = {"tp_size": 4, "moe_tp_size": 4, "moe_ep_size": 1, "attention_dp_size": 2}
+    assert _parallelism(aliased) == _parallelism(canonical) == (("dp", 2), ("moe_tp", 4), ("tp", 4))
+
+
+def test_sidecar_rejects_duplicate_keys_and_boolean_topology(tmp_path):
+    path = tmp_path / "meta.json"
+    base = '"schema_name": "aic_fpm_forward_perf", "row_count": 1'
+    path.write_text("{" + base + ', "schema_version": 7, "schema_version": 6}')
+    with pytest.raises(FpmContractError, match="duplicate JSON key"):
+        read_library_metadata(path)
+    path.write_text("{" + base + ', "schema_version": 6, "configuration_selector": {"tp": true}}')
+    with pytest.raises(FpmContractError, match="tp"):
+        read_library_metadata(path)
+    path.write_text("{" + base + ', "schema_version": 6, "configuration_selector": {"tp": 1}}')
+    assert read_library_metadata(path)["configuration_selector"] == {"tp": 1}
+
+
+def test_staging_rejects_a_sidecar_that_describes_another_table(root, profile, tmp_path):
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+    sidecar = source / "fpm_forward_perf.metadata.json"
+    document = json.loads(sidecar.read_text())
+    for change in ({"parquet_sha256": "0" * 64}, {"row_count": document["row_count"] + 1}):
+        sidecar.write_text(json.dumps({**document, **change}))
+        with pytest.raises(FpmContractError, match="differs"):
+            stage_fpm_library(
+                source / "fpm_forward_perf.parquet",
+                sidecar,
+                system="h200_sxm",
+                backend="vllm",
+                backend_version="0.25.1",
+                output_dir=tmp_path / "out",
+            )
+    document.pop("parquet_sha256")  # the digest is optional
+    sidecar.write_text(json.dumps(document))
+    stage_fpm_library(
+        source / "fpm_forward_perf.parquet",
+        sidecar,
+        system="h200_sxm",
+        backend="vllm",
+        backend_version="0.25.1",
+        output_dir=tmp_path / "out",
+    )
+
+
+def test_concurrent_staging_of_one_destination_does_not_collide(root, profile, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+
+    def stage(_):
+        return stage_fpm_library(
+            source / "fpm_forward_perf.parquet",
+            source / "fpm_forward_perf.metadata.json",
+            system="h200_sxm",
+            backend="vllm",
+            backend_version="0.25.1",
+            output_dir=tmp_path / "out",
+        ).systems_root
+
+    with ThreadPoolExecutor(8) as pool:
+        assert len(set(pool.map(stage, range(16)))) == 1
+    assert not list(tmp_path.glob(".out.*"))
+
+
+def test_staging_reuse_follows_overlay_precedence(root, profile, tmp_path):
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+    first, fallback = tmp_path / "first", tmp_path / "fallback"
+    for systems in (first, fallback):
+        data = systems / "data/custom/vllm/0.25.1"
+        data.mkdir(parents=True)
+        (systems / "h200_sxm.yaml").write_text("data_dir: data/custom\n")
+    (fallback / "data/custom/vllm/0.25.1/gemm.parquet").write_bytes(b"fallback")
+    kwargs = dict(
+        system="h200_sxm",
+        backend="vllm",
+        backend_version="0.25.1",
+        output_dir=tmp_path / "out",
+        systems_paths=[first, fallback],
+    )
+    args = (source / "fpm_forward_perf.parquet", source / "fpm_forward_perf.metadata.json")
+    warm = stage_fpm_library(*args, **kwargs)
+    gemm = warm.systems_root / "data/custom/vllm/0.25.1/gemm.parquet"
+    assert gemm.read_bytes() == b"fallback"
+    (first / "data/custom/vllm/0.25.1/gemm.parquet").write_bytes(b"first")
+    stage_fpm_library(*args, **kwargs)
+    assert gemm.read_bytes() == b"first"  # the same result as a cold staging
+
+
+def test_sidecar_resources_wait_for_an_identified_deployment(profile):
+    metadata = {"resources": RESOURCES}
+    two = copy.deepcopy(profile)
+    two["deployments"] = [{**two["deployments"][0], "tp": tp, "moe_tp": tp} for tp in (4, 8)]
+    for deployment in two["deployments"]:
+        deployment.pop("resources", None)
+    _, sources = complete_fpm_profile(two, metadata, required=False)
+    assert sources == ["pending", "pending"]  # no selector: the sidecar does not say which one it describes
+    one = copy.deepcopy(two)
+    one["deployments"] = one["deployments"][:1]
+    assert complete_fpm_profile(one, metadata, required=False)[1] == ["metadata"]
+
+
+def test_selector_precision_needs_a_deployment_that_establishes_it(profile):
+    draft = copy.deepcopy(profile)
+    draft["deployments"][0].pop("resources", None)
+    draft["deployments"][0].pop("weight_quantization", None)
+    draft.pop("weight_quantization", None)
+    metadata = {"resources": RESOURCES, "configuration_selector": {"tp": 4, "weight_quantization": "fp8_block"}}
+    assert complete_fpm_profile(draft, metadata, required=False)[1] == ["pending"]
+
+
+def _entry_catalog(root, manifest_path=MANIFEST, **entry_changes):
+    manifest = Manifest.model_validate_json((root / manifest_path).read_bytes())
+    (root / "catalog/fpm").mkdir(parents=True, exist_ok=True)
+    reference = _artifact(root, manifest_path, "manifest", "json", "aisim-artifact-manifest/v1")
+    entry = {
+        "configuration_id": manifest.configuration_id,
+        "purpose": "execution-profile",
+        "identity": manifest.identity.model_dump(),
+        "manifest": reference,
+        **entry_changes,
+    }
+    index = {"schema_version": "aisim-category-index/v1", "category": "fpm", "entries": [entry]}
+    (root / "catalog/fpm/index.json").write_text(json.dumps(index))
+    (root / "catalog/dataset.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aisim-dataset-index/v1",
+                "dataset_id": REPO,
+                "categories": {
+                    "fpm": {
+                        "root": "data/fpm",
+                        "index": _artifact(root, "catalog/fpm/index.json", "index", "json", "x"),
+                        "layout": "category",
+                    }
+                },
+            }
+        )
+    )
+    return reference
+
+
+def test_dataset_check_reports_index_digest_and_entry_mismatches(root, profile):
+    make_entry(root, profile)
+    reference = _entry_catalog(root)
+    assert check_fpm_dataset(root) == []
+    other = Manifest.model_validate_json((root / MANIFEST).read_bytes()).identity.model_dump()
+    other["model"] = "other/model"
+    _entry_catalog(root, identity=other)
+    assert [f.code for f in check_fpm_dataset(root)] == ["entry-mismatch"]
+    # A manifest edited without updating its indexed digest is reported, and the other entries continue.
+    _entry_catalog(root)
+    document = json.loads((root / MANIFEST).read_text())
+    document["provenance"] = {"edited": True}
+    (root / MANIFEST).write_text(json.dumps(document))
+    assert [f.code for f in check_fpm_dataset(root)] == ["hash-mismatch"]
+    assert reference["sha256"] != _sha((root / MANIFEST).read_bytes())
+
+
+def test_entry_check_accepts_a_legacy_profile_entry(root, profile):
+    make_entry(root, profile)
+    document = json.loads((root / MANIFEST).read_text())
+    keep = [a for a in document["artifacts"] if a["role"] == "legacy-configuration-manifest"]
+    keep[0] = {**keep[0], "role": "fpm-profile"}
+    document["artifacts"] = keep
+    (root / MANIFEST).write_text(json.dumps(document))
+    (root / keep[0]["path"]).write_bytes(b"{}")
+    assert check_fpm_entry(root, MANIFEST) == []
+
+
+def test_entry_check_applies_the_reconstruction_contract(root, profile):
+    make_entry(root, profile)
+    source = root / ENTRY / "fpm"
+    sidecar = source / "fpm_forward_perf.metadata.json"
+    document = json.loads(sidecar.read_text())
+    for name in ("coordinate_system", "measurement_policy", "system", "backend", "backend_version"):
+        document.pop(name, None)
+    document["metadata_provenance"] = "reconstructed_from_parquet"
+    document["configuration_selector"] = {
+        "model_path": profile["model"],
+        "system": "h200_sxm",
+        "backend": "vllm",
+        "backend_version": "0.25.1",
+    }
+    sidecar.write_text(json.dumps(document))
+    document_manifest = json.loads((root / MANIFEST).read_text())
+    for artifact in document_manifest["artifacts"]:
+        if artifact["role"] == "fpm-library-metadata":
+            data = sidecar.read_bytes()
+            artifact.update(sha256=_sha(data), bytes=len(data))
+    (root / MANIFEST).write_text(json.dumps(document_manifest))
+    codes = {f.code for f in check_fpm_entry(root, MANIFEST)}
+    assert codes == {"invalid-sidecar"}

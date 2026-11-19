@@ -32,7 +32,10 @@ from aisim_core.data.fpm_library import (
     ROLE_METADATA,
     FpmContractError,
     read_library_metadata,
+    recover_reconstructed_metadata,
 )
+
+ROLE_LEGACY_PROFILE = "fpm-profile"
 
 
 @dataclass(frozen=True)
@@ -65,9 +68,23 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         add("wrong-category", f"expected category fpm, got {manifest.category!r}")
     if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
         add("configuration-identity", "configuration_id does not match the manifest identity")
+    for name in ("artifact_id", "path", "runtime_path"):  # the structure the loader requires
+        values = [getattr(a, name) for a in manifest.artifacts if getattr(a, name) is not None]
+        if len(values) != len(set(values)):
+            add("duplicate-artifact", f"duplicate artifact {name}")
     by_role = defaultdict(list)
     for artifact in manifest.artifacts:
         by_role[artifact.role].append(artifact)
+    if not by_role.get(ROLE_LIBRARY) and not by_role.get(ROLE_METADATA) and by_role.get(ROLE_LEGACY_PROFILE):
+        # The older execution-profile bundle: one profile artifact, every declared file verified.
+        if len(by_role[ROLE_LEGACY_PROFILE]) != 1:
+            add("duplicate-role", f"role {ROLE_LEGACY_PROFILE!r} must appear exactly once")
+        for artifact in manifest.artifacts:
+            try:
+                _verify(root, artifact)
+            except (OSError, ValueError) as exc:
+                add("hash-mismatch", f"{artifact.role}: {exc}")
+        return found
     for role in (ROLE_LIBRARY, ROLE_METADATA):
         count = len(by_role.get(role, ()))
         if count != 1:
@@ -113,6 +130,16 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         add("sidecar-hash", "sidecar parquet_sha256 differs from the library in the manifest")
     if library.rows is not None and metadata.get("row_count") != library.rows:
         add("sidecar-rows", f"sidecar row_count {metadata.get('row_count')} differs from library rows {library.rows}")
+    if not found:
+        try:  # the check staging applies to a historical reconstructed sidecar
+            recover_reconstructed_metadata(
+                metadata,
+                _file(root, library.path),
+                parquet_sha256=library.sha256,
+                metadata_sha256=sidecar.sha256,
+            )
+        except (FpmContractError, OSError, ValueError) as exc:
+            add("invalid-sidecar", str(exc))
     return found
 
 
@@ -151,6 +178,18 @@ def check_fpm_identities(entries: Iterable[tuple[str, Manifest]]) -> list[FpmFin
     return found
 
 
+def _check_entry_matches_manifest(entry, manifest: Manifest) -> list[FpmFinding]:
+    """Catalog selection reads the entry; loading reads the manifest. They must describe one configuration."""
+    path = entry.manifest.path
+    found = []
+    for name in ("configuration_id", "purpose", "identity"):
+        if getattr(entry, name) != getattr(manifest, name):
+            found.append(FpmFinding("entry-mismatch", path, f"catalog {name} differs from the manifest"))
+    if manifest.category != "fpm":
+        found.append(FpmFinding("entry-mismatch", path, f"catalog category fpm, manifest {manifest.category!r}"))
+    return found
+
+
 def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list[FpmFinding]:
     """Check every FPM entry listed by ``catalog/fpm/index.json`` (or ``catalog/dataset.json``) of a local root."""
     from aisim_core.data import CategoryIndex, DatasetIndex
@@ -165,11 +204,16 @@ def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list
     found: list[FpmFinding] = []
     manifests = []
     for entry in index.entries:
+        try:  # the catalog records the manifest's digest; a manifest changed without its reference must not load
+            _verify(root, entry.manifest)
+        except (OSError, ValueError) as exc:
+            found.append(FpmFinding("hash-mismatch", entry.manifest.path, f"indexed manifest: {exc}"))
+            continue
         found += check_fpm_entry(root, entry.manifest.path, include_measurements=include_measurements)
         try:
-            manifests.append(
-                (entry.manifest.path, Manifest.model_validate_json(_file(root, entry.manifest.path).read_bytes()))
-            )
+            manifest = Manifest.model_validate_json(_file(root, entry.manifest.path).read_bytes())
         except (OSError, ValueError, ValidationError):
             continue  # already reported as invalid-manifest
+        found += _check_entry_matches_manifest(entry, manifest)
+        manifests.append((entry.manifest.path, manifest))
     return found + check_fpm_identities(manifests)

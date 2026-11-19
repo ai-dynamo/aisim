@@ -27,6 +27,34 @@ class _ProfileModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+def _state_group_schema(schema: dict[str, Any]) -> None:
+    # _window checks this for the Rust text; the exported schema must reject the same sidecar.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": {"properties": {"kind": {"const": "state"}}, "required": ["kind"]},
+            "then": {
+                "required": ["blocks_per_request"],
+                "properties": {"blocks_per_request": {"type": "integer", "exclusiveMinimum": 0}},
+            },
+        }
+    )
+
+
+def _runtime_or_declared_schema(schema: dict[str, Any]) -> None:
+    # _exact_total rejects runtime_memory beside any declared non-KV byte field, zero included.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": {"properties": {"runtime_memory": {"type": "object"}}, "required": ["runtime_memory"]},
+            "then": {
+                "properties": {
+                    name: {"type": "null"}
+                    for name in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes")
+                }
+            },
+        }
+    )
+
+
 class FpmCacheGroup(_ProfileModel):
     """Rank-local physical cache pages for one attention, convolution or state group.
 
@@ -69,6 +97,8 @@ class FpmCacheGroup(_ProfileModel):
     ``prefill_checkpoint_alignment`` (positive, with one checkpoint block) are
     the prefill checkpoint settings of a Mamba spec.
     """
+
+    model_config = ConfigDict(extra="forbid", strict=True, json_schema_extra=_state_group_schema)
 
     name: _Nonempty
     kind: Literal["attention", "convolution", "state"]
@@ -237,6 +267,7 @@ def _resource_layout_schema(schema: dict[str, Any]) -> None:
         }
         for layout, constraints in layouts.items()
     ]
+    _runtime_or_declared_schema(schema)
 
 
 class FpmResourceProfile(_ProfileModel):
