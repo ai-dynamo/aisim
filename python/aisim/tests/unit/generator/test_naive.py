@@ -256,18 +256,23 @@ class TestEstimateModelWeightBytes:
         # 3*hidden*intermediate*experts + hidden*experts + 4*hidden)].
         assert int(result.stdout.strip().splitlines()[-1]) == 205418659840
 
-    def test_llama4_malformed_processor_reports_sizing_error(self, tmp_path):
+    @pytest.mark.parametrize(
+        "invalid_processor", [[], {"max_patches": 0, "resize_to_max_canvas": True, "add_global_tile": True}]
+    )
+    def test_llama4_malformed_processor_reports_sizing_error(self, tmp_path, invalid_processor):
         from aisim.sdk import utils
 
         raw = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
         raw.pop("image_processor_config")
         (tmp_path / "config.json").write_text(json.dumps(raw))
-        (tmp_path / "preprocessor_config.json").write_text("[]")
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps(invalid_processor))
         try:
             with pytest.raises(RuntimeError, match="config unavailable") as error:
                 _estimate_model_weight_bytes(str(tmp_path))
-            assert isinstance(error.value.__cause__, TypeError)
-            assert "image_processor_config" in str(error.value.__cause__)
+            expected_error = TypeError if isinstance(invalid_processor, list) else ValueError
+            assert isinstance(error.value.__cause__, expected_error)
+            expected_message = "image_processor_config" if isinstance(invalid_processor, list) else "max_patches"
+            assert expected_message in str(error.value.__cause__)
         finally:
             utils._load_model_config_from_model_path.cache_clear()
             utils.get_model_config_from_model_path.cache_clear()
