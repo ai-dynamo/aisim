@@ -22,13 +22,14 @@ with replay-level timing tricks or new hard assertions.
 
 ## Eager forward-pass execution
 
-Starting an epoch commits one non-preemptive batch. Here, non-preemptive means
-later arrivals or commands cannot interrupt that batch or change its outcome;
-they may affect only queued or post-pass state, or be deferred.
+Starting an epoch commits one non-preemptive batch. Later arrivals or commands
+cannot interrupt that batch or change its committed request membership.
+Offline replay executes the batch eagerly at epoch start and buffers its
+completion effects.
 
-Offline replay executes the committed batch eagerly at epoch start, finalizing
-its participating `EngineCore` state changes and scheduled completion payload
-before virtual time reaches the completion timestamp. Visibility is split:
+Before the shared completion boundary, cancellation can still suppress
+pending outputs for a request. Replay assembles the final completion payload
+at the boundary. Visibility is split:
 
 - Admission observations and `PassStart` events are visible at epoch start.
 - Request outputs, lifecycle events, FPM publications, and `PassEnd` events
