@@ -485,6 +485,9 @@ def test_mixed_power_coverage_counts_each_mamba_query():
     one, two = step(apart), step(shared)
     latency, energy = one["per_op_latency_ms"], one["per_op_energy_wms"]
     assert energy["context_mamba_conv1d"] > 0 and energy["context_mamba_ssm"] == 0
+    # Coverage counts the whole powered convolution and none of the scan.
+    covered = one["covered_latency_ms"]
+    assert latency["context_mamba_conv1d"] <= covered <= sum(latency.values()) - latency["context_mamba_ssm"]
     folded = two["per_op_latency_ms"]["context_mamba_conv1d"]
     assert folded == pytest.approx(latency["context_mamba_conv1d"] + latency["context_mamba_ssm"], rel=1e-12)
     assert two["covered_latency_ms"] == pytest.approx(one["covered_latency_ms"], rel=1e-12)
