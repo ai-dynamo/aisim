@@ -54,6 +54,7 @@ from aisim_core.data.mirror import (
     MIRROR_CONTROL_DIR,
     NEVER_PROMOTED,
     list_tree,
+    snapshot_documents,
     validate_tree,
 )
 from aisim_core.data.redaction import (
@@ -189,6 +190,7 @@ def _select(source: Path, directories: list[str], plan: PromotionPlan) -> None:
 
 def _check_closure(source: Path, plan: PromotionPlan) -> None:
     chosen = set(plan.files)
+    snapshots = snapshot_documents(source, chosen)
     eval_records = {p.relative_to(source).as_posix() for p in record_paths(source / "eval", recursive=True)}
     configs: set[str] = set()
     for rel in sorted(chosen):
@@ -204,7 +206,7 @@ def _check_closure(source: Path, plan: PromotionPlan) -> None:
                 if a.path not in chosen:
                     plan.findings.append(Finding("closure", f"artifact {a.path} is outside the selection", rel))
     for rel in sorted(chosen):
-        if rel.startswith("data/") and Path(rel).name == "snapshot.json":
+        if rel in snapshots:
             try:
                 _, members = read_snapshot(source, rel)
             except (ValueError, ValidationError, OSError) as exc:

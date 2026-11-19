@@ -43,6 +43,7 @@ import hashlib
 import json
 import sys
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -52,7 +53,7 @@ from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, check_manifest, configuration_id
 from aisim_core.data.catalog import CATALOG_DIR, _write, build_catalog, catalog_files, known_system_specs
-from aisim_core.data.e2e import load_e2e, read_snapshot, verify_snapshot_members
+from aisim_core.data.e2e import SNAPSHOT_SCHEMA, load_e2e, read_snapshot, verify_snapshot_members
 from aisim_core.data.eval import load_record, record_dir, record_paths
 from aisim_core.data.evidence import EVIDENCE_ROOT, check_evidence
 from aisim_core.data.hygiene import (
@@ -268,9 +269,27 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
         report.eval_records += 1
 
 
+def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:
+    """Find snapshot schemas, preserving custom filenames without misclassifying JSON sidecars."""
+    found = set()
+    for rel in paths:
+        if not rel.startswith("data/") or not rel.endswith(".json"):
+            continue
+        if Path(rel).name == "snapshot.json":
+            found.add(rel)  # a malformed document at the conventional path must fail validation too
+            continue
+        try:
+            document = json.loads(checked_path(root, rel).read_bytes())
+        except (OSError, ValueError, RecursionError):
+            continue  # the content and integrity checks report unreadable or invalid JSON
+        if isinstance(document, dict) and document.get("schema_version") == SNAPSHOT_SCHEMA:
+            found.add(rel)
+    return found
+
+
 def _check_snapshots(root: Path, report: TreeReport, declared: set[str], manifests: dict[str, Manifest]) -> None:
-    for path in sorted((root / "data").rglob("snapshot.json")) if (root / "data").is_dir() else []:
-        rel = path.relative_to(root).as_posix()
+    candidates = (p.relative_to(root).as_posix() for p in (root / "data").rglob("*.json"))
+    for rel in sorted(snapshot_documents(root, candidates)):
         try:
             snapshot, members = read_snapshot(root, rel)
             for member in members:
