@@ -346,7 +346,7 @@ def test_curl_uses_private_config_without_redirects_or_token_arguments(tmp_path,
     transfer.transfer("https://artifactory.invalid/wheel", token, payload, upload=True, checksum="a" * 64)
 
 
-def assert_internal_wheel_handoff_runners(root):
+def _wheel_handoff_runner_violations(workflow_dir):
     # NVIDIA Artifactory requires internal DNS/network access. Dedicated ARC
     # runners also require a job container; a GitHub-hosted runner cannot
     # consume a handoff just because its manifest is available in Actions.
@@ -356,7 +356,7 @@ def assert_internal_wheel_handoff_runners(root):
         "prod-aisim-default-${{ matrix.arch }}-v1",
     }
     violations = []
-    for path in (root / ".github/workflows").glob("*.yml"):
+    for path in workflow_dir.glob("*.yml"):
         for job_name, job in yaml.safe_load(path.read_text()).get("jobs", {}).items():
             if not any(step.get("uses", "").endswith("/wheel-storage") for step in job.get("steps", [])):
                 continue
@@ -372,52 +372,43 @@ def assert_internal_wheel_handoff_runners(root):
             image = container.get("image") if isinstance(container, dict) else container
             if not isinstance(image, str) or not image.strip():
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
-    assert not violations, "\n".join(violations)
+    return violations
 
 
 def test_wheel_handoffs_require_internal_containerized_runners():
-    assert_internal_wheel_handoff_runners(ROOT)
+    violations = _wheel_handoff_runner_violations(ROOT / ".github/workflows")
+    assert not violations, "\n".join(violations)
 
 
-@pytest.mark.parametrize(
-    "container,valid",
-    [
-        ("ubuntu:24.04", True),
-        ("${{ vars.CI_JOB_CONTAINER_IMAGE }}", True),
-        ({"image": "ubuntu:24.04"}, True),
-        (None, False),
-        ({}, False),
-        ({"image": ""}, False),
-        ("", False),
-        ("   ", False),
-        (True, False),
-        (["ubuntu:24.04"], False),
-    ],
-)
+@pytest.mark.parametrize("container", ["${{ vars.CI_JOB_CONTAINER_IMAGE }}", {"image": "example/image:tag"}])
 @pytest.mark.parametrize("runner", ["prod-aisim-default-amd64-v1", "ubuntu-24.04"])
-def test_wheel_handoff_container_syntax_preserves_runner_and_image_guards(tmp_path, container, valid, runner):
-    workflow = tmp_path / ".github/workflows/handoff.yml"
-    workflow.parent.mkdir(parents=True)
-    workflow.write_text(
-        yaml.safe_dump(
-            {
-                "jobs": {
-                    "handoff": {
-                        "runs-on": runner,
-                        "container": container,
-                        "steps": [{"uses": "./.github/actions/wheel-storage"}],
-                    }
-                }
+def test_wheel_handoff_container_forms_preserve_runner_guard(tmp_path, container, runner):
+    workflow = {
+        "jobs": {
+            "consumer": {
+                "runs-on": runner,
+                "container": container,
+                "steps": [{"uses": "./.github/actions/wheel-storage"}],
             }
-        )
+        }
+    }
+    (tmp_path / "workflow.yml").write_text(yaml.safe_dump(workflow), encoding="utf-8")
+
+    violations = _wheel_handoff_runner_violations(tmp_path)
+    expected = (
+        [] if runner.startswith("prod-aisim-") else ["workflow.yml:consumer lacks an internal Artifactory runner"]
     )
-    if valid and runner.startswith("prod-aisim-"):
-        assert_internal_wheel_handoff_runners(tmp_path)
-    else:
-        with pytest.raises(
-            AssertionError, match="required ARC job container" if not valid else "internal Artifactory runner"
-        ):
-            assert_internal_wheel_handoff_runners(tmp_path)
+    assert violations == expected
+
+
+@pytest.mark.parametrize("container", [None, "", " ", {}, {"image": ""}, {"image": None}, {"image": 123}, []])
+def test_wheel_handoff_rejects_missing_container_images(tmp_path, container):
+    job = {"runs-on": "prod-aisim-default-amd64-v1", "steps": [{"uses": "./.github/actions/wheel-storage"}]}
+    if container is not None:
+        job["container"] = container
+    (tmp_path / "workflow.yml").write_text(yaml.safe_dump({"jobs": {"consumer": job}}), encoding="utf-8")
+
+    assert _wheel_handoff_runner_violations(tmp_path) == ["workflow.yml:consumer lacks the required ARC job container"]
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():

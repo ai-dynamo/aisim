@@ -10,6 +10,10 @@ For per-operation and forward-pass estimates, see the
 [performance-model Python API](perf-model/api/python.md). For direct runner
 control, see the [Replay Python API](replay/api/python.md).
 
+`CorePredictionConfig.from_yaml()` and `CoreRecommendationConfig.from_yaml()`
+accept YAML or JSON files. Filenames ending in `.json` (case insensitive) select
+JSON parsing; other filenames use YAML. Both formats use the same typed schema.
+
 ## Table of contents
 
 - [Python prediction API](#python-prediction-api)
@@ -24,7 +28,7 @@ runner, and returns a `PredictionResult` with the same summary the CLI renders.
 Use `prediction.yaml` from the [README prediction example](../README.md#predict-one-deployment).
 In the activated AISim environment, save the following as
 `predict_example.py` and run `python predict_example.py` from the directory
-containing the YAML file.
+containing the configuration file.
 
 ```python
 from aisim.config.cli import CorePredictionConfig
@@ -98,7 +102,7 @@ accept a `SmartSearchConfig` in place of `CoreRecommendationConfig`.
 Use `recommendation.yaml` from the [README recommendation example](../README.md#recommend-a-deployment).
 In the activated AISim environment, save the following as
 `recommend_example.py` and run `python recommend_example.py` from the directory
-containing the YAML file.
+containing the configuration file.
 
 Keep the main guard because recommendation runs in supervised subprocesses.
 

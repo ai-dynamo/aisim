@@ -1500,11 +1500,10 @@ class EngineHandle:
         seq_imbalance_correction_scale: float = 1.0,
         gen_seq_imbalance_correction_scale: float = 1.0,
     ) -> tuple[
-        list[_PerOpValueWithMetadata],
-        list[_PerOpValueWithMetadata],
-        list[_PerOpValueWithMetadata],
+        tuple[list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata]],
+        float | None,
     ]:
-        """Internal mixed-step per-op stream with inline-first fallback metadata."""
+        """Internal mixed-step per-op stream with fallback metadata and optional native coverage."""
         return self._engine._mixed_step_breakdown_per_op_with_metadata(
             int(ctx_tokens),
             int(gen_tokens),
