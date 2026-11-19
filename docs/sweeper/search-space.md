@@ -325,6 +325,20 @@ unset even though feasibility filtering used the model maximum. See
 [worker context limits](../replay/engine/workers.md#context-limits) for public
 configuration and synthetic workload validation.
 
+## SDK: SGLang decode reserve
+
+| Search-space field | Default | Meaning |
+| --- | --- | --- |
+| `decode_reserved_decode_tokens` | `None` (unset) | Fixed non-negative integer headroom per admitted native SGLang P/D decode request. Unset preserves the native default of 512 tokens; zero disables the fixed reserve. |
+
+`engine.workers.decode.scheduler.reserved_decode_tokens` maps to
+`SearchSpace.decode_reserved_decode_tokens`. When set, the SDK field requires
+`deployment_mode` to include `disagg`, exactly the backend set `{"sglang"}`,
+and no `afd_roles`. Aggregated-only searches, mixed-backend searches, and AFD
+are rejected. In a mixed aggregated/disaggregated search, only disaggregated
+samples carry the reserve. See [SGLang P/D decode reserve](../replay/engine/workers.md#sglang-pd-decode-reserve)
+for admission and completion-guard behavior.
+
 <a id="pinned-parallel-configurations"></a>
 
 ## SDK: Pinned Parallel Configurations

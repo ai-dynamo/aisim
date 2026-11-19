@@ -65,6 +65,24 @@ def test_decode_reserve_rejects_inapplicable_sweeps(backend, modes):
         SearchSpace(**_search_space(backend=backend, deployment_mode=modes, decode_reserved_decode_tokens=0))
 
 
+@pytest.mark.parametrize(
+    ("role", "message"),
+    [
+        ("prefill", "decode_reserved_decode_tokens requires native disaggregated decode"),
+        ("decode", "AFD decode_reserved_decode_tokens is unsupported"),
+    ],
+)
+def test_decode_reserve_rejects_afd_sweeps(role, message):
+    values = _search_space(
+        backend=["sglang"],
+        deployment_mode=["disagg"],
+        afd_roles={role: {"type": "afd", "afd": {"tp_a": 1, "a_batch_size": 8}}},
+    )
+    SearchSpace(**values)
+    with pytest.raises(ValidationError, match=message):
+        SearchSpace(**values, decode_reserved_decode_tokens=0)
+
+
 @pytest.mark.parametrize("modes", [["disagg"], ["agg", "disagg"]])
 @pytest.mark.parametrize(
     ("overrides", "message"),

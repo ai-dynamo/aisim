@@ -295,7 +295,7 @@ def test_disagg_candidate_accepts_matching_effective_role_hardware():
     assert to_legacy_params(request)["NodeConfig"]["system_name"] == "gb200"
 
 
-@pytest.mark.parametrize("reserve", [0, 384, 768])
+@pytest.mark.parametrize("reserve", [0, 384, 768, True, 512.0])
 def test_sglang_candidate_rejects_unrendered_decode_reserve(reserve):
     candidate = _disagg_candidate(backend="sglang", backend_version="0.5.11", decode_reserved_decode_tokens=reserve)
     with pytest.raises(

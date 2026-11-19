@@ -2132,6 +2132,34 @@ def test_sglang_decode_reserve_rejects_invalid_config(schema, backend, role, val
         schema.model_validate({"engine": engine})
 
 
+@pytest.mark.parametrize("schema", [CorePredictionConfig, CoreRecommendationConfig])
+@pytest.mark.parametrize(
+    ("mode", "afd_role"),
+    [("aggregated", None), ("aggregated", "aggregated"), ("disaggregated", "prefill"), ("disaggregated", "decode")],
+)
+def test_sglang_decode_reserve_rejects_aggregated_and_afd_workers(schema, mode, afd_role):
+    roles = ("aggregated",) if mode == "aggregated" else ("prefill", "decode")
+    engine = {**_engine(), "backend": "sglang", "mode": mode, "workers": {role: {} for role in roles}}
+    if afd_role is not None:
+        topology = {"tp_a": 1, "a_batch_size": 8}
+        if schema is CorePredictionConfig:
+            topology.update(n_a_nodes=1, n_f_nodes=1)
+        engine["workers"][afd_role] = {
+            "type": "afd",
+            "afd": topology,
+        }
+    config = {"engine": engine}
+    if schema is CoreRecommendationConfig:
+        config["optimization"] = {"constraints": {"max_candidate_gpus": 16}}
+    schema.model_validate(config)
+    reserve_role = "aggregated" if mode == "aggregated" else "decode"
+    engine["workers"][reserve_role]["scheduler"] = {"reserved_decode_tokens": 0}
+    with pytest.raises(
+        ValidationError, match="reserved_decode_tokens requires native disaggregated decode with backend=sglang"
+    ):
+        schema.model_validate(config)
+
+
 @pytest.mark.parametrize(
     ("backend", "prefill", "decode", "needle"),
     [
