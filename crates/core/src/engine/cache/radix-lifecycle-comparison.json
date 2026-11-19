@@ -60,7 +60,7 @@
     ]
   },
   "candidate": {
-    "commit": "e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc",
+    "commit": "f2254e0d6e47bea54c5fe0af7a6db5cbf736493e",
     "command": [
       "cargo",
       "test",
@@ -113,7 +113,5 @@
         "scenario": "complete_without_new_page"
       }
     ]
-  },
-  "scenario_kind": "synthetic deterministic KV lease lifecycle; no serving-accuracy claim",
-  "reproduce_command": "python3 scripts/compare_radix_eviction.py --probe lifecycle --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d --candidate e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc --work-dir \"$TMPDIR/lifecycle-evidence\""
+  }
 }

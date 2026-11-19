@@ -1,0 +1,618 @@
+{
+  "baseline": "9664b5ba9bc33ac02e7e0f727679c00587b08733",
+  "candidate": "f2254e0d6e47bea54c5fe0af7a6db5cbf736493e",
+  "profile": "release",
+  "features": [],
+  "test_only_dependency_features": [
+    "inspection"
+  ],
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "probe_sha256": "a83069941bdad532ec2c8e4532eded72670f380db907771e20da2b3b090dfb38",
+  "cpu": 0,
+  "binaries": {
+    "candidate": {
+      "sha256": "d0c71dc387d98b0c5c3b9aea4a865f8b1ae6ff06a8bfacae3a5299c3ef4fc308",
+      "bytes": 23034152,
+      "command": [
+        "cargo",
+        "test",
+        "--release",
+        "--locked",
+        "--lib",
+        "engine::kv_manager::sglang_backend::radix_lifecycle_evidence::radix_growth_measurement",
+        "--no-run",
+        "--message-format=json"
+      ]
+    },
+    "baseline": {
+      "sha256": "dd818959acde8d8754ddf2ca8b31f8e7f98ab91fdb31f9e162acbc20a1fa0ee0",
+      "bytes": 23020072,
+      "command": [
+        "cargo",
+        "test",
+        "--release",
+        "--locked",
+        "--lib",
+        "engine::kv_manager::sglang_backend::radix_lifecycle_evidence::radix_growth_measurement",
+        "--no-run",
+        "--message-format=json"
+      ]
+    }
+  },
+  "samples": [
+    {
+      "side": "candidate",
+      "pair": 1,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.039027456999974675,
+      "rows": [
+        {
+          "elapsed_ns": 308332,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 209162,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 7856377,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8475673,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8470835,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9283093,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "baseline",
+      "pair": 1,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.042592228000103205,
+      "rows": [
+        {
+          "elapsed_ns": 264888,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 205879,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8380235,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8665698,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10948897,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10106555,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "baseline",
+      "pair": 2,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.04398072499952832,
+      "rows": [
+        {
+          "elapsed_ns": 265124,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 194071,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8393570,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8657371,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 11168478,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10119657,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "candidate",
+      "pair": 2,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.03965916900051525,
+      "rows": [
+        {
+          "elapsed_ns": 320479,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 212035,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8074449,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8201937,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8561623,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10113774,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "candidate",
+      "pair": 3,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.040032857000369404,
+      "rows": [
+        {
+          "elapsed_ns": 265669,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 207373,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 7902258,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8369847,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8582643,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9299883,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "baseline",
+      "pair": 3,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.04508355699999811,
+      "rows": [
+        {
+          "elapsed_ns": 261827,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 195194,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8618751,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9049661,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 11362207,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10273803,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "baseline",
+      "pair": 4,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.0472811380004714,
+      "rows": [
+        {
+          "elapsed_ns": 249588,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 194542,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9152995,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9219814,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 11830501,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 12543472,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "candidate",
+      "pair": 4,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.0398476970003685,
+      "rows": [
+        {
+          "elapsed_ns": 276944,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 207898,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8018518,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8176431,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8830388,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9671951,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "candidate",
+      "pair": 5,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.04121520300031989,
+      "rows": [
+        {
+          "elapsed_ns": 277382,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 224414,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 7749033,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9122712,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 9393817,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10361345,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    },
+    {
+      "side": "baseline",
+      "pair": 5,
+      "peak_rss_kib": 36300,
+      "elapsed_s": 0.04306568900028651,
+      "rows": [
+        {
+          "elapsed_ns": 263791,
+          "growth_pages": 2,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 197738,
+          "growth_pages": 2,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 64,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8424185,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 8695590,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 4096,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10790249,
+          "growth_pages": 128,
+          "overlap": false,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        },
+        {
+          "elapsed_ns": 10550685,
+          "growth_pages": 128,
+          "overlap": true,
+          "page_size": 32,
+          "prompt_tokens": 32768,
+          "repetitions": 50
+        }
+      ]
+    }
+  ],
+  "host": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+    "python": "3.12.12",
+    "cgroup_memory_bytes": 5368709120,
+    "cgroup_cpu_quota": 2
+  },
+  "identity_checks": {
+    "distinct_binary_hashes": true,
+    "candidate_regression_test_inventory_verified": true,
+    "baseline_lacks_candidate_regression_tests": true
+  },
+  "timing_scope": "50 fresh cache lifecycles per row: allocation, initial cache, one-page growth, finish, full eviction and cleanup; test-only ownership counters present in candidate",
+  "warmups_per_side": 1,
+  "paired_samples_per_side": 5
+}

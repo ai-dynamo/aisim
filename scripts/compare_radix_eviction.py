@@ -6,7 +6,8 @@
 
 Only the test probe and its fixtures are overlaid. Production code and lockfiles
 come from each recorded revision. No refs are fetched and no goldens are updated.
-All snapshots, builds, logs, and observations stay in --work-dir.
+Snapshots, logs, and observations stay in --work-dir. Builds use isolated
+snapshot subdirectories under CARGO_TARGET_DIR, or --work-dir/target if unset.
 """
 
 from __future__ import annotations
@@ -97,12 +98,18 @@ def main() -> None:
         radix = snapshot / module_file
         if module.strip() not in radix.read_text():
             radix.write_text(radix.read_text() + module)
+        # Keep artifacts (including embedded manifest paths) unique to this
+        # snapshot. Archive mtimes and incremental caches are insufficient to
+        # distinguish workspaces sharing the same package/dependency identity.
+        target_root = Path(os.environ.get("CARGO_TARGET_DIR", str(work / "target")))
+        snapshot_id = hashlib.sha256(str(snapshot).encode()).hexdigest()[:16]
         observed = work / f"{side}.json"
         command = ["cargo", "test", "-p", "aisimulate-core", "--locked", "--lib", test]
         env = {
             **os.environ,
             "CARGO_BUILD_JOBS": "2",
-            "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(work / "target")),
+            "CARGO_TARGET_DIR": str(target_root / "radix-evidence" / snapshot_id),
+            "CARGO_INCREMENTAL": "0",
             "AISIM_EVICTION_EVIDENCE_OUTPUT": str(observed),
             "AISIM_EVICTION_EVIDENCE_SIDE": side,
         }

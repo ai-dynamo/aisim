@@ -42,6 +42,9 @@ It admits leases with the normal `input_len - 1` cap, uses four-token pages and
 reuse. It drains every cache back to its original capacity. The
 [machine-readable result](radix-lifecycle-comparison.json) records exact hashes,
 source revisions, the probe checksum, and commands.
+Its isolated-build rerun uses probe revision
+`f2254e0d6e47bea54c5fe0af7a6db5cbf736493e`, whose production code is unchanged
+from the correction.
 
 | Scenario | Main | Native adapter |
 | --- | --- | --- |
@@ -66,6 +69,150 @@ python3 scripts/compare_radix_eviction.py \
   --work-dir "$TMPDIR/selection-evidence"
 python3 scripts/compare_radix_eviction.py --probe lifecycle \
   --baseline 8288046ac88fccaee124714cd60e62b2ad4e184d \
-  --candidate e2f62f787b54bc6440d8e3b290e5327b3ee6e8dc \
+  --candidate f2254e0d6e47bea54c5fe0af7a6db5cbf736493e \
   --work-dir "$TMPDIR/lifecycle-evidence"
 ```
+
+The helper isolates each snapshot's Cargo artifacts beneath `CARGO_TARGET_DIR`
+and disables incremental compilation, including when a caller supplies a shared
+target root. This prevents reuse of binaries containing another snapshot's
+embedded manifest directory.
+
+## Growth cost and retained state
+
+The affected operation runs whenever SGLang materializes another complete page
+during prefill or decode. The former query construction copied every retained
+hash at each extension, accumulating quadratic hash copying over a growing
+request. Sharing the lease buffer removes that copy; native-owned key
+construction now copies only new suffix hashes. Native ancestor validation,
+lock walks, tree mutations, and event handling still run. This does not claim
+that total request growth is linear.
+
+The representation adds one `Vec` header per owned key allocation. The full
+request buffer remains owned only by its lease between calls, as asserted by
+the regression; nodes retain their suffix storage. Belady's optional correction
+map is bounded by resident physical pages and is absent for LRU. Cleanup and
+checkpoint tests cover both state lifetimes.
+
+The [cache microbenchmark results](radix-growth-comparison.json) compare pinned
+PR head with the correction using distinct optimized test binaries. Both were
+built before measurement, their hashes differ, and only the candidate inventory
+contains the new recency and ownership regressions. Rust 1.91.1, release profile,
+one codegen unit, thin LTO, the same lockfile, and test-only inspection were used.
+The candidate also includes the ownership counter. Measurements used CPU 0,
+one warmup, then five alternating paired samples in fresh processes on WSL2
+with a two-CPU quota and 5 GiB container memory limit.
+
+Each row times 50 complete cache lifecycles: allocation, initial caching,
+one-page extension, finish, full eviction, and cleanup. Pages contain 32 tokens.
+The 64-token control adds two pages; the larger contexts add 128. Overlap means
+another request inserts a suffix halfway through growth, requiring adoption of
+its canonical pages and freeing duplicates. All lifecycle assertions pass.
+Median milliseconds for 50 lifecycles follow; raw ranges are in the JSON.
+
+| Initial tokens | Overlap | Pinned head | Correction |
+| --- | --- | --- | --- |
+| 64 | No | 0.264 | 0.277 |
+| 64 | Yes | 0.195 | 0.209 |
+| 4096 | No | 8.424 | 7.902 |
+| 4096 | Yes | 8.696 | 8.370 |
+| 32768 | No | 11.168 | 8.583 |
+| 32768 | Yes | 10.274 | 9.672 |
+
+The small control has slight added ownership overhead. Larger-context medians
+improve, including overlap reconciliation. Process peak RSS was 36,300 KiB on
+both sides, but that coarse measure includes launcher overhead and does not
+establish exact retained-memory parity. Reproduce a single microbenchmark
+sample with `cargo test --release --locked --lib radix_growth_measurement --
+--ignored`; run the same probe at the pinned head for the paired comparison.
+
+## Production CLI comparison
+
+[The CLI report](radix-cli-comparison.json) records the exact configurations,
+model metadata and provenance, native hashes, all 20 timing/memory samples,
+and both canonical prediction reports. Release wheels were built first and
+installed into separate scratch environments. The baseline native SHA-256 is
+`7e4cb269adade83d3c0754f4103628f6c9ff697b41ec45fe4e718c92c8098660`;
+the candidate is
+`093c1556ef16ecb1c66ab8a1e4f7c0237b278cfa33c046b3b6de6bd5cf6162a0`.
+These production extensions have no test-only inspection or ownership counter.
+
+The real consumer was `python -m aisimulate predict --stack engine --config
+CONFIG --output-dir OUTPUT --format json`. Both sides use one SGLang worker,
+concurrency one, page size 32, 8192 cache blocks, fixed 1 ms prefill/decode
+timing, and 32 synthetic requests. The model is the repository's tiny config
+with its context limit extended to 131072; no weights were downloaded. The
+control has 64 input and 64 output tokens per request; growth has 32768 input
+and 4096 output tokens. Both use a 1.2 GB execution budget and one CPU with the
+default 1 GB host reserve. All builds and other test jobs finished before these
+CPU-0 measurements: one warmup per side/case, then five alternating paired runs.
+
+Every run completed all requests and input/output tokens, exited successfully,
+and reported complete supervised termination. Every prediction field matches
+exactly between sides and repetitions except the three host timer/rate fields
+`wall_time_ms`, `processed_tokens_per_s`, and `processed_output_tokens_per_s`.
+The growth case processes 1,048,576 input and 131,072 output tokens. This fixture
+qualifies engine execution and host cost, not serving prediction accuracy.
+
+| Case / metric | Pinned head median (min–max) | Correction median (min–max) |
+| --- | --- | --- |
+| Control / native wall ms | 1.503 (1.450–1.597) | 1.556 (1.498–1.618) |
+| Control / full CLI seconds | 2.193 (2.167–2.334) | 2.169 (2.165–2.274) |
+| Growth / native wall ms | 83.740 (82.961–85.334) | 82.054 (81.402–89.433) |
+| Growth / full CLI seconds | 2.271 (2.266–2.273) | 2.270 (2.242–2.311) |
+| Control / supervised peak RSS MB | 197.927 (196.555–198.058) | 197.493 (197.267–197.841) |
+| Growth / supervised peak RSS MB | 197.542 (197.284–197.808) | 197.513 (197.263–197.546) |
+
+Native wall time covers `Replayer::run_inner` through collector finalization;
+full CLI time additionally covers model/session preparation, Python startup,
+and serialization. RSS is the supervisor's sampled process-tree peak, not a
+precise allocation counter. The CLI ranges overlap: these measurements show
+equivalent completed work and no material integrated regression, not a
+statistically established CLI speedup. The microbenchmark and ownership bound
+provide the more direct evidence for removing repeated key copies.
+
+To reproduce, create the report's `generated_model` as a local `config.json`,
+set each recorded configuration's `engine.model` to that directory, and use
+separately built release wheels from the recorded revisions. Run the command
+above with fresh output directories, matched affinity/resources, a warmup, and
+alternating paired samples. Do not compare shared or unidentified native builds.
+
+## Current validation and environment corrections
+
+The corrected production code passed the full Rust workspace: 1792 unit tests,
+103 integration tests, and three doc tests; two existing/manual cases were
+ignored. The 386 native engine-step/compile-engine numerical parity cases
+passed with the original assertions and 120-second timeout after building the
+optimized wheel. All 16 numerical sentinels passed. Targeted engine/replay,
+recency/ownership, and isolated lifecycle comparisons passed. Rust formatting,
+Ruff, copyright/legal, CODEOWNERS, and documentation checks passed.
+The combined CODEOWNERS, workflow-contract, qualification, and release-policy
+suite passed all 434 tests; Python syntax compilation also passed with bytecode
+redirected into scratch storage.
+
+Earlier unsuccessful invocations are retained in the repair scratch logs:
+
+- Initial caller/probe compile errors and Ruff formatting were corrected before
+  the passing regressions; missing baseline build tooling was installed in its
+  scratch environment before rebuilding the release wheel.
+- Shared Cargo artifacts initially reused another snapshot's binary and embedded
+  data path. Those timings were discarded. The first full workspace attempt
+  consequently had 354 data-path failures (1438 passes). After clearing that
+  crate's invalid dev artifacts and disabling incremental reuse, the full
+  workspace rerun passed. Final comparison snapshots have isolated targets;
+  measured release binaries were rebuilt and checked by hash and test inventory.
+- A 2 GB CLI budget was rejected by the unchanged host-headroom guard, including
+  a retry after builds finished. A 1 GB budget completed the control but failed
+  the growth session's allocation estimate. Both final workloads use 1.2 GB,
+  satisfying the unchanged guards and completing every paired run. No workload,
+  test assertion, timeout, or memory reserve was reduced to obtain these results.
+- The first broader policy run had 429 passes and five failures because its
+  required `pip-licenses` and Node.js tools were absent. Installing
+  `pip-licenses==5.5.5` and Node.js 24.19.0 into the scratch environment and
+  adding its bin directory to `PATH` produced the passing 434-test rerun.
+
+This repair covers only the five selected findings. Existing dependency release
+contract/indexing decisions and merge conflicts remain outside this repair.
+Hosted workflow/log access returned HTTP 403; no hosted CI success, approval,
+or merge readiness is claimed. Fresh CI, reviews, and technical reapproval
+remain with the controller.
