@@ -346,7 +346,7 @@ def test_curl_uses_private_config_without_redirects_or_token_arguments(tmp_path,
     transfer.transfer("https://artifactory.invalid/wheel", token, payload, upload=True, checksum="a" * 64)
 
 
-def test_wheel_handoffs_require_internal_containerized_runners():
+def assert_internal_wheel_handoff_runners(root):
     # NVIDIA Artifactory requires internal DNS/network access. Dedicated ARC
     # runners also require a job container; a GitHub-hosted runner cannot
     # consume a handoff just because its manifest is available in Actions.
@@ -356,7 +356,7 @@ def test_wheel_handoffs_require_internal_containerized_runners():
         "prod-aisim-default-${{ matrix.arch }}-v1",
     }
     violations = []
-    for path in (ROOT / ".github/workflows").glob("*.yml"):
+    for path in (root / ".github/workflows").glob("*.yml"):
         for job_name, job in yaml.safe_load(path.read_text()).get("jobs", {}).items():
             if not any(step.get("uses", "").endswith("/wheel-storage") for step in job.get("steps", [])):
                 continue
@@ -368,9 +368,56 @@ def test_wheel_handoffs_require_internal_containerized_runners():
             )
             if not runners or not runners <= internal_runners:
                 violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
-            if not job.get("container", {}).get("image"):
+            container = job.get("container")
+            image = container.get("image") if isinstance(container, dict) else container
+            if not isinstance(image, str) or not image.strip():
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
     assert not violations, "\n".join(violations)
+
+
+def test_wheel_handoffs_require_internal_containerized_runners():
+    assert_internal_wheel_handoff_runners(ROOT)
+
+
+@pytest.mark.parametrize(
+    "container,valid",
+    [
+        ("ubuntu:24.04", True),
+        ("${{ vars.CI_JOB_CONTAINER_IMAGE }}", True),
+        ({"image": "ubuntu:24.04"}, True),
+        (None, False),
+        ({}, False),
+        ({"image": ""}, False),
+        ("", False),
+        ("   ", False),
+        (True, False),
+        (["ubuntu:24.04"], False),
+    ],
+)
+@pytest.mark.parametrize("runner", ["prod-aisim-default-amd64-v1", "ubuntu-24.04"])
+def test_wheel_handoff_container_syntax_preserves_runner_and_image_guards(tmp_path, container, valid, runner):
+    workflow = tmp_path / ".github/workflows/handoff.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        yaml.safe_dump(
+            {
+                "jobs": {
+                    "handoff": {
+                        "runs-on": runner,
+                        "container": container,
+                        "steps": [{"uses": "./.github/actions/wheel-storage"}],
+                    }
+                }
+            }
+        )
+    )
+    if valid and runner.startswith("prod-aisim-"):
+        assert_internal_wheel_handoff_runners(tmp_path)
+    else:
+        with pytest.raises(
+            AssertionError, match="required ARC job container" if not valid else "internal Artifactory runner"
+        ):
+            assert_internal_wheel_handoff_runners(tmp_path)
 
 
 def test_wheel_workflows_only_upload_manifests_and_preserve_credentials_boundary():
