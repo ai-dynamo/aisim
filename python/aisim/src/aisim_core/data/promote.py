@@ -124,6 +124,7 @@ class PromotionPlan:
     lineage: dict[str, str] = field(default_factory=dict)  # promoted path -> unredacted original sha256
     findings: list[Finding] = field(default_factory=list)
     approved_by: list[str] = field(default_factory=list)
+    approved_digest: str | None = None
 
     @property
     def digest(self) -> str:
@@ -208,10 +209,13 @@ def _check_closure(source: Path, plan: PromotionPlan) -> None:
     for rel in sorted(chosen):
         if rel in snapshots:
             try:
-                _, members = read_snapshot(source, rel)
+                snapshot, members = read_snapshot(source, rel)
             except (ValueError, ValidationError, OSError) as exc:
                 plan.findings.append(Finding("snapshot-invalid", str(exc).splitlines()[0], rel))
                 continue
+            for artifact in (snapshot.members, snapshot.acquisition):
+                if artifact is not None and artifact.path not in chosen:
+                    plan.findings.append(Finding("closure", f"artifact {artifact.path} is outside the selection", rel))
             outside = sorted({m.manifest_path for m in members} - chosen)
             if outside:
                 plan.findings.append(
@@ -278,8 +282,8 @@ def plan_promotion(
         label = entry.label if entry else "internal"
         if label != "public":
             plan.findings.append(Finding("not-public", f"labeled {label!r}; only 'public' is promoted", rel))
-        if entry:
-            plan.lineage.update({p: h for p, h in entry.original_sha256.items() if p in plan.files})
+        if entry and rel in entry.original_sha256:
+            plan.lineage[rel] = entry.original_sha256[rel]
     _check_closure(source, plan)
     for f in shared.findings:  # unreferenced files would be copied without any content check
         if f.code == "orphan-file" and f.path in plan.files:
@@ -308,6 +312,8 @@ def _check_approvals(plan: PromotionPlan, policy: PromotionPolicy) -> None:
         plan.findings.append(
             Finding("approval-missing", f"{len(names)} valid approval(s); {max(1, policy.min_approvals)} required")
         )
+    elif plan.ok:
+        plan.approved_digest = plan.digest
 
 
 # --------------------------------------------------------------------------- apply
@@ -416,6 +422,8 @@ def _apply_promotion(
         raise PromotionError(
             "plan is not approved: " + "; ".join(f"{f.code} {f.path or ''}" for f in plan.findings[:5])
         )
+    if plan.approved_digest is None or plan.digest != plan.approved_digest:
+        raise PromotionError("plan content differs from the approved digest")
     ledger_now = load_ledger(source)
     for rel in plan.files:
         if ledger_now.label_for(rel) != "public":

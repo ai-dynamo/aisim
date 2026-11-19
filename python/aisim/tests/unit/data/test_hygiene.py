@@ -187,3 +187,31 @@ def test_yaml_explicit_duplicates_and_merge_overrides(text, ok):
     else:
         with pytest.raises(ValueError, match="duplicate YAML key"):
             yaml_sidecar_value(text.encode())
+
+
+def test_yaml_merge_expansion_is_bounded_before_flattening(monkeypatch):
+    from aisim_core.data.hygiene import _SidecarLoader, yaml_sidecar_value
+
+    text = "base: &a0 {setting: 1}\n"
+    for depth in range(1, 20):
+        text += f"level{depth}: &a{depth} {{<<: [*a{depth - 1}, *a{depth - 1}]}}\n"
+    original = _SidecarLoader.flatten_mapping
+    flattened = []
+
+    def flatten(loader, node):
+        flattened.append(node)
+        return original(loader, node)
+
+    monkeypatch.setattr(_SidecarLoader, "flatten_mapping", flatten)
+    with pytest.raises(ValueError, match="merge expansion"):
+        yaml_sidecar_value(text.encode())
+    assert not flattened
+
+
+@pytest.mark.parametrize("scalar,valid", [("!!bool unknown", False), ("!!bool true", True)])
+def test_explicit_yaml_boolean_constructor_errors_are_findings(scalar, valid):
+    data = f"setting: {scalar}\n".encode()
+    findings = check_content(CandidatePolicy(), CandidateFile("data/settings.yaml", len(data)), data)
+    assert (not findings) is valid
+    if not valid:
+        assert codes(findings) == {"yaml-invalid"}

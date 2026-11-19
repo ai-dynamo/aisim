@@ -273,9 +273,9 @@ def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:
     """Find snapshot schemas, preserving custom filenames without misclassifying JSON sidecars."""
     found = set()
     for rel in paths:
-        if not rel.startswith("data/") or not rel.endswith(".json"):
+        if not rel.startswith("data/") or Path(rel).suffix.lower() != ".json":
             continue
-        if Path(rel).name == "snapshot.json":
+        if Path(rel).name.lower() == "snapshot.json":
             found.add(rel)  # a malformed document at the conventional path must fail validation too
             continue
         try:
@@ -293,7 +293,7 @@ def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:
 
 
 def _check_snapshots(root: Path, report: TreeReport, declared: set[str], manifests: dict[str, Manifest]) -> None:
-    candidates = (p.relative_to(root).as_posix() for p in (root / "data").rglob("*.json"))
+    candidates = (p.relative_to(root).as_posix() for p in (root / "data").rglob("*") if p.suffix.lower() == ".json")
     for rel in sorted(snapshot_documents(root, candidates)):
         try:
             snapshot, members = read_snapshot(root, rel)

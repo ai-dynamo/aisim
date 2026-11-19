@@ -103,9 +103,13 @@ def main(argv=None) -> int:
             while history[-1].supersedes:
                 history.append(load_record(args.record.parent / f"{history[-1].supersedes}.json"))
             # Preflight every input and collision before staging any record.
+            destinations = {
+                item.record_id: checked_path(args.attest_root, record_dir(Path(), item.truth.identity).as_posix())
+                for item in [*history, verified]
+            }
             copies = {}
             for item in [*history, verified]:
-                destination = record_dir(args.attest_root, item.truth.identity)
+                destination = destinations[item.record_id]
                 for artifact in [*item.truth.artifacts, *item.findings]:
                     source = _verify(args.truth_root or args.record.parent, artifact)
                     target = checked_path(destination, artifact.path)
@@ -118,7 +122,7 @@ def main(argv=None) -> int:
                 if not target.exists():
                     _publish_artifact(source, target)
             for item in [*history, verified]:
-                destination = record_dir(args.attest_root, item.truth.identity)
+                destination = destinations[item.record_id]
                 for artifact in [*item.truth.artifacts, *item.findings]:
                     _verify(destination, artifact)
             for predecessor in reversed(history):
