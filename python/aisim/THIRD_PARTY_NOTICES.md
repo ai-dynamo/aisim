@@ -30,7 +30,9 @@ https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/L
 The full Apache-2.0 license text is included here as `LICENSE`. The pinned
 upstream source has no separate NOTICE file on this workflow's ancestor paths.
 Modified for AISim by adding SPDX/provenance headers and pinning the reusable
-workflow reference to the same immutable commit instead of `main`.
+workflow reference to the same immutable commit instead of `main`, and by
+disabling default token permissions while retaining the request job's explicit
+read scopes.
 
 ## SGLang v0.5.22 HiCache residency and merged backups
 

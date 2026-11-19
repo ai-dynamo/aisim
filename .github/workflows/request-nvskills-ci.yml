@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Source: https://github.com/NVIDIA/skills/blob/bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f/.github/workflows/request-nvskills-ci.yml
-# Modified for AISim: added SPDX/provenance headers and pinned the reusable workflow.
+# Modified for AISim: added SPDX/provenance headers, pinned the reusable workflow,
+# and disabled default token permissions.
 
 name: Request NVSkills CI
 
@@ -11,6 +12,8 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   push:
+
+permissions: {}
 
 jobs:
   request:
