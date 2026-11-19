@@ -522,6 +522,78 @@ class RandomBranchSampler:
         del suggestion, reason
 
 
+class _QualifyingBound:
+    """Smallest qualifying GPU count seen by any sampler that shares this object."""
+
+    def __init__(self) -> None:
+        self.gpus: int | None = None
+
+    def offer(self, gpus: int) -> None:
+        if self.gpus is None or gpus < self.gpus:
+            self.gpus = gpus
+
+
+class SmallestFirstBranchSampler(RandomBranchSampler):
+    """Ascending-GPU search for the ``min_gpus`` target.
+
+    The Bayesian samplers ignore ``prefer_smallest``, so they can spend a
+    finite budget on larger shapes and never try the smallest ones. This
+    sampler visits legal backend/topology pairs in ascending GPU count, then
+    revisits their knob domains.
+
+    Once a configuration qualifies with ``n`` provisioned GPUs, a pair whose
+    topology alone needs more than ``n`` GPUs cannot improve the result and is
+    no longer suggested or retried. The topology count is a lower bound: other
+    choices, such as an encoder pool, can only add GPUs. The bound comes from the
+    observed objective (``-used_gpus``), and samplers built for the conditional
+    arms of one branch share it.
+    """
+
+    def __init__(self, branch: BranchSpace, *, seed: int, bound: _QualifyingBound | None = None) -> None:
+        super().__init__(replace(branch, prefer_smallest=True), seed=seed)
+        self._bound = bound if bound is not None else _QualifyingBound()
+
+    @property
+    def best_gpus(self) -> int | None:
+        """Smallest provisioned GPU count observed to qualify, or ``None``."""
+        return self._bound.gpus
+
+    def _within_bound(self, parallel_config: Any) -> bool:
+        return self._bound.gpus is None or parallel_config.total_gpus <= self._bound.gpus
+
+    def _prune(self) -> None:
+        if self._bound.gpus is None:
+            return
+        self._arms = deque(arm for arm in self._arms if self._within_bound(arm[1]))
+        self._retries = deque(retry for retry in self._retries if self._within_bound(retry.parallel_config))
+
+    @property
+    def exhausted(self) -> bool:
+        self._prune()
+        return super().exhausted
+
+    def suggest(self, count: int) -> list[Suggestion]:
+        self._prune()
+        return super().suggest(count)
+
+    def retry(self, suggestion: Suggestion) -> None:
+        if self._within_bound(suggestion.parallel_config):
+            super().retry(suggestion)
+
+    def observe(self, suggestion: Suggestion, metrics: dict[str, float]) -> None:
+        # The sweeper calls observe() only for candidates that passed every
+        # min_gpus gate (budget, aggregate SLA, goodput floor); gated trials go
+        # through observe_infeasible(). The objective is -used_gpus, which
+        # includes any GPUs beyond the topology, such as an encoder pool.
+        objective = metrics.get(_METRIC)
+        if isinstance(objective, Real) and math.isfinite(objective) and objective < 0:
+            gpus = round(-float(objective))
+        else:
+            gpus = suggestion.parallel_config.total_gpus
+        self._bound.offer(gpus)
+        self._prune()
+
+
 class SeededBayesianBranchSampler:
     """Local Vizier GP-UCB-PE designer with an explicit reproducible seed.
 
@@ -843,7 +915,13 @@ def make_branch_sampler(
     """Construct the default (Vizier) sampler for a branch. ``objectives`` (name, maximize)
     pairs default to a single maximized ``"objective"``; pass >=2 for a Pareto study."""
 
+    # Conditional arms of one min_gpus branch share the smallest qualifying count.
+    bound = _QualifyingBound()
+
     def construct(flat_branch: BranchSpace, flat_study_id: str, flat_seed: int) -> BranchSampler:
+        if flat_branch.prefer_smallest:
+            # min_gpus: ascending GPU-count search, whatever optimizer was requested.
+            return SmallestFirstBranchSampler(flat_branch, seed=flat_seed, bound=bound)
         if algorithm == "random":
             return RandomBranchSampler(flat_branch, seed=flat_seed)
         if algorithm == "bayesian":

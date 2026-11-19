@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::engine::{EngineConfig, G3Scope, TimingModelConfig};
@@ -27,6 +28,15 @@ impl ReplayTelemetryObserver for NoopTelemetryObserver {
     }
 }
 
+struct CaptureTelemetryObserver(Arc<Mutex<Vec<ReplayTelemetrySnapshot>>>);
+
+impl ReplayTelemetryObserver for CaptureTelemetryObserver {
+    fn on_sample(&mut self, sample: ReplayTelemetrySnapshot) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push(sample);
+        Ok(())
+    }
+}
+
 fn request(uuid: u128, arrival_ms: f64) -> DirectRequest {
     DirectRequest {
         tokens: vec![1; 4],
@@ -45,11 +55,19 @@ fn runtime_with_startup_time(
     pending: VecDeque<DirectRequest>,
     startup_time_ms: Option<f64>,
 ) -> RoundRobinAggRuntime {
+    runtime_with_timing(pending, startup_time_ms, 1.0)
+}
+
+fn runtime_with_timing(
+    pending: VecDeque<DirectRequest>,
+    startup_time_ms: Option<f64>,
+    pass_ms: f64,
+) -> RoundRobinAggRuntime {
     let config = ReplayEngineConfig {
         rank: EngineConfig {
             timing_model: TimingModelConfig::Fixed {
-                prefill_ms: 1.0,
-                decode_ms: 1.0,
+                prefill_ms: pass_ms,
+                decode_ms: pass_ms,
             },
             ..EngineConfig::default()
         },
@@ -82,6 +100,99 @@ fn telemetry_only_timestamps_do_not_enter_the_agg_semantic_drain() {
         observed_stats.semantic_drain_count, baseline_stats.semantic_drain_count,
         "telemetry-only heartbeats must not wake aggregate semantic replay work"
     );
+}
+
+#[test]
+fn aggregate_completion_feedback_matches_final_slo_and_gpu_accounting() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let sla = crate::replay::SlaThresholds {
+        ttft_ms: Some(10.0),
+        itl_ms: Some(5.0),
+        e2e_ms: None,
+    };
+    let report = runtime(VecDeque::from([request(1, 0.0), request(2, 10.0)]))
+        .with_sla_thresholds(sla)
+        .with_telemetry_observer(1.0, Box::new(CaptureTelemetryObserver(samples.clone())))
+        .run()
+        .unwrap()
+        .0
+        .finish();
+    let samples = samples.lock().unwrap();
+    let baseline = samples
+        .first()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    let final_sample = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(baseline.terminal_requests, 0);
+    assert_eq!(final_sample.sla, sla);
+    assert_eq!(final_sample.completed_requests, 2);
+    assert_eq!(
+        final_sample.good_requests,
+        report.goodput.unwrap().completed_requests as u64
+    );
+    assert_eq!(final_sample.good_requests_strict_itl, 0); // Both outputs have one token.
+    assert!((final_sample.gpu_seconds - report.throughput.gpu_hours * 3600.0).abs() < 1e-9);
+    let encoded = serde_json::to_value(samples.last().unwrap()).unwrap();
+    assert_eq!(encoded["completion_feedback"]["schema_version"], 1);
+}
+
+#[test]
+fn aggregate_baseline_leaves_earlier_latency_pairs_for_the_first_interval_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    // Zero-latency passes complete the first request before telemetry starts.
+    runtime_with_timing(
+        VecDeque::from([request(1, 0.0), request(2, 10.0)]),
+        None,
+        0.0,
+    )
+    .with_telemetry_observer(1.0, Box::new(CaptureTelemetryObserver(samples.clone())))
+    .run()
+    .unwrap();
+    let samples = samples.lock().unwrap();
+    assert_eq!(samples[0].kind, ReplayTelemetrySampleKind::Baseline);
+    let baseline = samples[0].completion_feedback.as_ref().unwrap();
+    assert_eq!(baseline.completed_requests, 1);
+    assert!(baseline.latency_samples.is_empty());
+    assert_eq!(baseline.latency_population, 0);
+    let first = samples[1].completion_feedback.as_ref().unwrap();
+    assert_eq!(first.latency_samples, vec![(0.0, None)]);
+    assert_eq!(first.latency_population, 1);
+    let last = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(last.completed_requests, 2);
+}
+
+#[test]
+fn aggregate_final_sample_reports_a_terminal_recorded_after_the_last_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = runtime(VecDeque::from([request(1, 10.0)]))
+        .with_telemetry_observer(1.0, Box::new(CaptureTelemetryObserver(samples.clone())));
+    runtime.start_profile_observers().unwrap();
+    // A rejection at the instant of the last sample delivers no token and
+    // admits nothing, so only completion feedback knows about it.
+    let rejected = Uuid::from_u128(2);
+    runtime.collector.on_arrival(rejected, 0.0, 4, 1);
+    runtime
+        .collector
+        .on_terminal(rejected, 0.0, ReplayTerminalStatus::Rejected);
+    runtime.publish_final_telemetry_sample().unwrap();
+    let samples = samples.lock().unwrap();
+    let last = samples.last().unwrap();
+    assert_eq!(last.kind, ReplayTelemetrySampleKind::Final);
+    let feedback = last.completion_feedback.as_ref().unwrap();
+    assert_eq!(feedback.terminal_requests, 1);
+    assert_eq!(feedback.completed_requests, 0);
 }
 
 struct MismatchedPlacement;

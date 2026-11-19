@@ -289,7 +289,7 @@ Pinned upstream collection and preserved-file SHA-256:
 `5fb7a61a53f71f476169fa8e2419d3073c8d7e96206d8986b7d4fbb0f11fbcdd`
 
 AISim-modified root overlay SHA-256:
-`a70a21425533b419feaafcec67b176b3048a0893c4833bb802f46dc6e9a8f57e`
+`c2c927f49fc270c4ceb754b7e1cbca7e42ea4ecbb7247fce3c560742ccc1e89d`
 
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
@@ -559,13 +559,16 @@ Apache-2.0 LICENSE supplies the license text; no upstream source file is vendore
 
 The repository-root files
 `crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs`,
-`crates/core/src/engine/kv_manager/state_cache_tests.rs` and
+`crates/core/src/engine/kv_manager/state_cache_tests.rs`,
+`crates/core/src/engine/scheduler/vllm/host_offload.rs` (state checkpoints in
+the host tier) and
 `python/aisim/src/aisim_core/sdk/memory/deepseek_v4.py` model the
 sliding-window prefix-cache retention (`VLLM_PREFIX_CACHE_RETENTION_INTERVAL`,
 replay boundaries, the EAGLE/MTP block after a boundary and the DeepSeek V4 MTP
-group) of vLLM [`v0.32.0`](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be)
-(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). The modeled functions are
-unchanged at main commit `0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0.32.0:
+group) and its offload to the host tier of vLLM [`v0.32.0`](https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be)
+(commit `5df63a7203cdb9328d824a27b682e77c7b9928be`). The modeled functions of the
+first four files below are unchanged at main commit
+`0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0.32.0:
 
 - [`vllm/v1/core/kv_cache_coordinator.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py)
   (`_validate_prefix_cache_retention_interval`, `replay_boundaries`,
@@ -578,6 +581,11 @@ unchanged at main commit `0d5306aaca3971b620443a3ea779550ffe4d5114`. Files at v0
   (`_annotate_eagle_groups`; lines 2029-2085)
 - [`vllm/models/deepseek_v4/attention.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/deepseek_v4/attention.py)
   (MTP layer without a compressor; line 235)
+- [`vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py)
+  (`RequestOffloadState.storable_chunks`, `_sliding_window_lookup`,
+  `_lookup_complete_chunks`, `_reachable_store_block_mask`, `_build_store_jobs`:
+  the sliding-window blocks the connector stores in one job with a step's other
+  blocks, and the window it loads at a hit; lines 450-481, 708-952 and 1517-1844)
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0
 (https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE).
@@ -682,6 +690,33 @@ No upstream method bodies or test fixtures are copied. The adaptation models,
 in virtual time, which committed batch an arriving request can join while the
 engine core keeps a queue of `max_concurrent_batches`; it does not reproduce
 asynchronous worker execution. That revision has no root NOTICE file.
+
+The async-scheduling block frees, preemption rules and engine-loop timing in
+repository-root files `crates/core/src/engine/scheduler/vllm/core.rs` and
+`crates/core/src/engine/scheduler/rank.rs` are an independently written,
+modified Rust simulation adaptation of behavioral contracts at vLLM tag
+`v0.30.0` (commit `ced6857afa0ea7b2e3f0846a62e1394e90f15607`):
+
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/config/parallel.py
+- https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/executor/uniproc_executor.py
+
+and of the CUDA-graph dispatch at vLLM tag `v0.32.0` (commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`):
+
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/cudagraph_utils.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/LICENSE
+https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+
+No upstream method bodies or test fixtures are copied. The adaptation models,
+in virtual time, when a finished request's blocks return to the pool, which
+running request may be preempted while a pass is in flight, when the engine
+loop decides a pass and returns the previous pass's outputs, and which passes
+run without a CUDA graph; it does not reproduce asynchronous worker execution.
+Neither revision has a root NOTICE file.
 
 The following files are derived from vLLM's attention test utilities at tag
 `v0.11.0` (commit `b8b302cde434df8c9289a2b465406b47ebab1c2d`):

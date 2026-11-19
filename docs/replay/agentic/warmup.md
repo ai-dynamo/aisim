@@ -159,8 +159,13 @@ recommendation use the same field.
 This is a request-boundary snapshot. Requests whose recorded start is strictly
 before the cut are history, including requests whose recorded service interval
 crosses the cut. Requests at or after the cut remain in the continuation.
-Recorded service intervals provide dependency-timer provenance. Dynamo request
-traces retain their existing first-request clock origin and preserve all source
+With `traffic.source.client: agentx` and `agentic_snapshot`, a continuing
+request whose previous or spawning turn lies before the cut also waits for its
+recorded offset from the cut. Live joins and replay barriers still gate
+dispatch; requests whose previous or spawning turn remains live follow
+dependency events. Recorded service intervals provide dependency-timer
+provenance. Dynamo request traces retain their existing first-request clock
+origin and preserve all source
 intervals separately from completion-relative execution gates; legacy graph
 serialization and digests are unchanged. The snapshot
 does not estimate partial decode progress or restore a physical engine checkpoint.

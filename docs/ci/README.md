@@ -106,6 +106,7 @@ Manual dispatches and site-change triggers are listed below.
 | --- | --- | --- |
 | [Fast CI](../../.github/workflows/fast-ci.yml) | PR open/update/reopen and ready-for-review; pushes to `main`, `release/*`, and trusted `pull-request/*`; manual dispatch with `expected_sha` | Quick checks and `Fast CI Success` |
 | [Full CI](../../.github/workflows/ci.yml) | Pushes to `main`, `release/*`, and trusted `pull-request/*`; manual dispatch with `expected_sha` | Selects and aggregates compiled validation |
+| [Full CI fail-fast](../../.github/workflows/full-ci-fail-fast.yml) | Full CI enters `in_progress`, including reruns | Cancels that attempt's remaining computation after a blocking job fails |
 | [Main branch nightly CI](../../.github/workflows/nightly-ci.yml) | Daily at 08:00 UTC; manual dispatch from `main` | Builds, stages, qualifies, and hands off artifacts for publication; skips unchanged scheduled `main` and requires approval for manual sources |
 | [Validate platform wheels](../../.github/workflows/validate-platform-wheels.yml) | Called by Full CI; manual dispatch | Linux x86-64/ARM64 and macOS ARM64 package validation |
 | [Collector Data Check](../../.github/workflows/collector-check.yml) | Called by Full CI; manual dispatch | Collector-data integrity and informational sanity reports |
@@ -194,6 +195,56 @@ separate Fast run; this preserves validation in both admission contexts.
 
 ## Full CI
 
+### Reusing pinned README dependencies
+
+The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
+three-wheel bundle is built on a miss and reused through Artifactory on matching
+subsequent runs. The key includes both source revisions, the build recipe and
+storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
+job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
+the bundle. Cross-run reuse accepts successful Full CI producers from this
+repository's `main`, or the exact same admitted PR head; another PR cannot
+populate the cache for this PR or for `main`.
+
+Pinned RCs are test dependencies, so the Dynamo profile uses `pr-wheel-staging`
+on both main and PR refs. Main seeds its RC bundle under `preview/` in that test
+repository; PR producers use their verified `pr/<number>/` namespace. This
+enables trusted-main reuse without giving PR jobs access to official release
+storage. Source, development, release, and macOS README profiles run in a
+separate job with no environment binding or storage secrets. The reusable
+workflow receives only the named `ARTIFACTORY_TOKEN`; only the Dynamo job
+references it, using the selected environment's value. The release-artifact
+contract now binds the same ref-selected storage environment as its application
+wheel producer; other wheel handoffs keep their existing environments.
+The `pr_number` input comes from Full CI's verified target validation; a nonempty
+value selects `pr` upload scope and enables discovery of that exact admitted PR
+head alongside trusted main preview producers.
+
+The Dynamo profile runs in the existing NVIDIA-connected AMD64 pool and CI job
+image because GitHub-hosted runners cannot resolve NVIDIA Artifactory. It checks
+storage DNS before compilation. Native prerequisites are prepared before key
+generation so cold and reused jobs have the same fingerprint. The other four
+README profiles keep their original runner placement; all README commands and
+the separate platform/Python compatibility matrices remain in place.
+
+The existing wheel-storage action checks the source SHA, producer run/attempt,
+architecture, scope, sizes, and checksums. The README job additionally verifies
+the build-input record and the complete three-package wheel set. Only the
+completion manifest and provenance reports are retained in GitHub Actions; wheels stay in Artifactory.
+On a cache hit, the consumer identity is preserved as diagnostic evidence and
+then removed from the restore directory; verification requires the producer's
+checksum-verified build-input record, including when a manifest omits it.
+Every README command and result assertion still executes in a fresh environment
+on both cold and reused builds. Full CI selection, test suites, platforms,
+Python versions, and required gates are unchanged.
+
+Release-artifact contracts consume the same exact-source, per-architecture
+manylinux wheel already built for application tests. They continue to build the
+Rust crate, verify the complete two-artifact package contract, install into a
+clean environment, check dependencies and versions, and exercise both CLIs.
+Standalone release builders still build a fresh wheel by default; only callers
+supplying a verified `--prebuilt-wheel` reuse one.
+
 Full CI first verifies the target commit, checks the standalone Fast CI
 prerequisite, and calculates validation scope. Expensive jobs wait for the
 prerequisite and scope selection.
@@ -232,18 +283,39 @@ marked it N/A.
 
 ### Validation components
 
+The separate **Full CI fail-fast** controller polls job results every minute and
+requests cancellation of the watched run after the first failed or timed-out
+blocking job. Validation groups retain their existing parallelism. The
+`Collector Data / Perf data sanity (informational)` job is advisory and cannot
+trigger cancellation. A canceled run is not successful Full CI evidence: the
+original failing job remains visible and the exact revision must pass
+`Full CI Success` before merging. Cancellation may leave the aggregate check
+canceled and takes time for runners to terminate work and perform cleanup.
+
+The controller uses a GitHub-hosted runner, outside the self-hosted validation
+pools. Only this separate workflow has cancellation permission. Its code is
+checked out at its immutable default-branch workflow commit; it never executes
+the watched revision's code or downloads its artifacts. It validates repository,
+workflow, branch, SHA and attempt, paginates the attempt's job list, and refreshes
+run identity immediately before requesting cancellation. It stops once
+`Full CI Success` completes, leaving protected wheel staging alone. API errors
+or its two-hour monitoring timeout leave Full CI running; they do not approve,
+skip, or cancel validation. It becomes active after its workflow is merged into
+the default branch. Changes to advisory-job names must update the controller's
+explicit exception and its workflow contract test.
+
 | Component | Coverage |
 | --- | --- |
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification reuses it |
+| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
 | Collector Data | Data-tree invariants (`check_collector_data.py` R1-R7) and the backend-facts registry; the cross-backend sanity scan is informational |
 | Prediction Regression | Collect old/new static, scheduling, and silicon-reference snapshots; fail when a previously working case stops working |
-| Release Artifact Contract | Build the wheel and crate; verify installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
+| Release Artifact Contract | Reuse the same-architecture application test wheel with `--prebuilt-wheel` and build the crate; verify package contents, installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
 
 ### Numerical and installed-package evidence
 
@@ -496,6 +568,12 @@ qualification are outside that target. Compare exact run SHAs and selected
 components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
+
+The application wheel-build job allows ten minutes on AMD64 and fifteen on
+ARM64. The ARM64 build budget includes cold release compilation, manylinux
+repair, provenance checks, and wheel handoff; compilation can consume most of
+ten minutes before those final steps run. Application test shards retain their
+separate fifteen-minute job budget and all per-test timeouts.
 
 The implementation reduces repeated work through wheel reuse, 24 application
 shards, pytest workers, and uv installation. Wheel verification overlaps test
