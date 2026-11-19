@@ -68,12 +68,14 @@ families keep one precision per op kind.
 
 Known limits:
 
-- The routed-expert precision of a layer comes from expert 0. If expert 0 is
-  unlisted, it comes from the expert block, as vLLM resolves it: the block's
-  own entry, or any listed expert of that block. For example, a block-level
+- The routed-expert precision of a layer comes from expert 0. If the expert
+  block has its own entry, or expert 0 is unlisted, it comes from the expert
+  block, as vLLM resolves it: the block's own entry first, else any listed
+  expert of that block. For example, a block-level
   FP8 entry prices that layer FP8 even when the global mode is NVFP4. An
   exclusion that matches the block itself makes the layer BF16.
-- An FP8 projection is dynamic FP8 only when the global mode is dynamic FP8.
+- An FP8 projection is dynamic FP8 only when the checkpoint's `quant_dynamic`
+  setting is true, as for the global mode.
 - A checkpoint that lists `W4A16_NVFP4` layers, such as Nemotron 3.5
   Lightning, keeps the global MoE mode for routed experts; GEMM projections
   still use their listed precisions. No packaged table has `w4a16_nvfp4` MoE

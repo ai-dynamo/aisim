@@ -159,12 +159,16 @@ class CheckpointPrecision:
                 packed = packed_modules.get(key) if packed_modules else None
                 if packed:
                     paths = layer_paths(layer, packed)
+                    split = [path for module in modules for path in layer_paths(layer, module)]
                     # Serving resolves an explicitly declared packed module before its split
-                    # checkpoint names. A generic pattern (``Linear``) is no packed declaration:
-                    # it would bypass the split exclusions, so compare every split mode then.
+                    # checkpoint names. A pattern that also matches a split name (``Linear``) is
+                    # no packed declaration: it would bypass the split exclusions.
                     if any(
                         self._excluded(path) or path in self.exact or path in self.conflicts or path in self.descendants
                         for path in paths
+                    ) or any(
+                        any(map(regex.fullmatch, paths)) and not any(map(regex.fullmatch, split))
+                        for regex, _ in self.patterns
                     ):
                         modules = (packed,)
                 entries = [(module, *self.module(layer_paths(layer, module))) for module in modules]
@@ -315,9 +319,17 @@ def moe_modes(
     for layer, kind in enumerate(layer_kinds):
         declared = expert_modules.get(kind, ())
         blocks = {module.partition("experts.")[0] + "experts" for module in declared}
-        if any(checkpoint._excluded(path) for block in blocks for path in layer_paths(layer, block)):
+        block_paths = [path for block in blocks for path in layer_paths(layer, block)]
+        if any(checkpoint._excluded(path) for path in block_paths):
             # vLLM checks exclusions against the fused expert prefix itself; its children are not read.
             block_excluded.add(layer)
+            continue
+        if any(path in checkpoint.exact or path in checkpoint.conflicts for path in block_paths):
+            # An explicit fused-block entry wins before any expert is read, as in vLLM.
+            _, algos = checkpoint.module(block_paths)
+            if len(algos) > 1:
+                raise ValueError(f"Conflicting checkpoint precisions for the experts of layer {layer}: {algos}")
+            block_modes[layer] = resolve(algos.pop(), False)
             continue
         if any(checkpoint.module(layer_paths(layer, module))[0] for module in declared):
             prefixes = tuple(f"{path}." for block in blocks for path in layer_paths(layer, block))
@@ -336,11 +348,7 @@ def moe_modes(
             algos = {algo for path in layer_paths(layer, block) for algo in checkpoint.descendants.get(path, ())}
             if len(algos) > 1:
                 raise ValueError(f"Routed experts of layer {layer} disagree on precision: {algos}")
-        block_paths = [path for block in blocks for path in layer_paths(layer, block)]
-        block_listed = any(path in checkpoint.exact or path in checkpoint.conflicts for path in block_paths)
-        if declared and (
-            block_listed or not all(checkpoint.module(layer_paths(layer, module))[1] for module in declared)
-        ):
+        if declared and not all(checkpoint.module(layer_paths(layer, module))[1] for module in declared):
             _, algos = checkpoint.module(block_paths)
             if len(algos) > 1:
                 raise ValueError(f"Conflicting checkpoint precisions for the experts of layer {layer}: {algos}")

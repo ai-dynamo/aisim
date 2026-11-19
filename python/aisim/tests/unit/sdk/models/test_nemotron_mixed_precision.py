@@ -324,6 +324,14 @@ def test_packed_qkv_declaration_precedes_split_entries():
     assert _projection_modes(raw, "*", NVFP4)["qkv_gemm"] == {FP8: 1}
 
 
+@pytest.mark.parametrize("target", ["*.qkv_proj", r"re:.*\.qkv_proj$"])
+def test_packed_qkv_pattern_target_precedes_split_names(target):
+    raw = {"quantization_config": {"config_groups": _groups(qkv=(4, [target]), mamba=(8, ["*.in_proj"]))}}
+    # The global mode inferred from in_proj is FP8; QKV keeps its packed NVFP4 target.
+    modes = _projection_modes(raw, "M*", FP8)
+    assert modes["qkv_gemm"] == {NVFP4: 1} and modes["mamba_in_proj_gemm"] == {FP8: 1}
+
+
 def test_generic_target_does_not_bypass_split_qkv_exclusions():
     def raw(*excluded):
         ignore = [f"backbone.layers.0.mixer.{name}" for name in excluded]
@@ -491,6 +499,12 @@ def test_an_explicit_expert_block_listing_precedes_its_experts():
     # vLLM looks the fused experts prefix up before its children.
     assert _moe_modes(raw("NVFP4", "FP8"), "ME", MOE.fp8, "gb200") == {MOE.nvfp4: 1}
     assert _moe_modes(raw("FP8", "FP8"), "ME", MOE.nvfp4, "gb200") == {MOE.fp8: 1}
+    # The block entry wins before its heterogeneous experts are compared.
+    mixed = raw("FP8", "NVFP4")
+    mixed["quantization_config"]["quantized_layers"].update(
+        {f"backbone.layers.1.mixer.experts.1.{proj}_proj": {"quant_algo": "FP8"} for proj in ("up", "down")}
+    )
+    assert _moe_modes(mixed, "ME", MOE.nvfp4, "gb200") == {MOE.fp8: 1}
 
 
 def test_routed_experts_of_one_layer_must_share_a_precision():
