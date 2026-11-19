@@ -190,6 +190,20 @@ contract (`aisim-dataset-index/v1`). Category entries reference hashed indexes;
 `aisim-category-index/v1` lists configuration identities and hashed manifests.
 Repository identity and authentication do not change the schema.
 
+The coverage catalog normally crosses the models and frameworks found in the dataset.
+`build_catalog(expected_models=..., expected_frameworks=...)` can widen that universe;
+the builder saves the declaration in `catalog/coverage.json` (`aisim-catalog-coverage/v1`)
+so subsequent builds and mirror/public validation reproduce the same missing cells.
+
+| Coverage field | Contract |
+| --- | --- |
+| `schema_version` | `aisim-catalog-coverage/v1`. |
+| `expected_models` | Additional model IDs to include even without measured data. |
+| `expected_frameworks` | Additional framework IDs to include even without measured data. |
+
+Omitted builder arguments reuse the saved declaration; an explicit empty iterable clears that
+dimension. A missing declaration preserves the default universe. Invalid declarations fail validation.
+
 Operation tables live under
 `data/op-latency/<hardware>/<operation-family>/<framework>/<version>/`.
 They retain their original Parquet bytes, columns, units and collection metadata.

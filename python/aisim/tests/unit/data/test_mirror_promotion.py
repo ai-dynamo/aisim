@@ -298,6 +298,126 @@ def test_clean_mirror_passes_with_repo_id_and_fingerprint(tmp_path):
     assert mirror_main(["validate", "--root", str(root)]) == 0
 
 
+@pytest.mark.parametrize("dirty", [False, True])
+def test_promotion_follows_indexed_noncanonical_manifest_names(tmp_path, dirty):
+    root, manifests = _mirror(tmp_path)
+    old = root / manifests[0]
+    renamed = old.with_name("configuration.json")
+    old.rename(renamed)
+    rel = renamed.relative_to(root).as_posix()
+    if dirty:
+        manifest = Manifest.model_validate_json(renamed.read_bytes())
+        renamed.write_text(
+            manifest.model_copy(update={"provenance": {**manifest.provenance, "password": "withheld"}}).model_dump_json(
+                by_alias=True
+            )
+        )
+    register_manifests(root, [rel], INTERNAL_REPO)
+    build_catalog(root)
+    directory = renamed.parent.relative_to(root).as_posix()
+    _public(root, directory)
+    assert validate_tree(root).ok
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert plan.manifests == [rel]
+    if dirty:
+        assert "secret" in {f.code for f in plan.findings}
+    else:
+        assert {f.code for f in plan.findings} == {"approval-missing"}
+        approved = plan_promotion(root, _request(root, [directory], plan), _reviewers())
+        assert approved.ok, approved.findings
+        target = tmp_path / "public"
+        apply_promotion(approved, root, target)
+        assert load_e2e(target, rel).observations == load_e2e(root, rel).observations
+        assert validate_tree(target, repo=PUBLIC, profile="public").ok
+
+
+@pytest.mark.parametrize("origin", ["inferencex", "InferenceX-derived", "self-collected"])
+def test_visibility_origin_enforces_inferencex_disclosure(tmp_path, origin):
+    root, manifests = _mirror(tmp_path)
+    directory = str(Path(manifests[0]).parent)
+    _public(root, directory, origin=origin)
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert ("infx-aggregates-only" in {f.code for f in plan.findings}) is (origin != "self-collected")
+    if origin == "self-collected":
+        approved = plan_promotion(root, _request(root, [directory], plan), _reviewers())
+        assert approved.ok, approved.findings
+
+
+@pytest.mark.parametrize(
+    "value,blocked",
+    [
+        ('{"note":"host.nvidia.com","note":"clean"}', True),
+        ('{"nested":[{"note":"hidden","note":"clean"}]}', True),
+        ('{"note":"clean"}', False),
+        ("ordinary text", False),
+    ],
+)
+def test_duplicate_json_in_operation_metadata_reaches_both_publication_gates(tmp_path, value, blocked):
+    root, directory, _ = _op_mirror(tmp_path, "attrs", value)
+    assert validate_tree(root).ok
+    public = validate_tree(root, profile="public")
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert ("duplicate-json-key" in {f.code for f in public.errors}) is blocked
+    assert ("duplicate-json-key" in {f.code for f in plan.findings}) is blocked
+
+
+@pytest.mark.parametrize("value", ["{", "[]", '{"schema_version":"unknown","entries":[]}', '{"entries":[null]}'])
+def test_malformed_visibility_is_a_validation_finding_not_a_planning_exception(tmp_path, monkeypatch, value):
+    from aisim_core.data import promote as module
+
+    root, manifests = _mirror(tmp_path)
+    path = root / "mirror/visibility.json"
+    path.parent.mkdir()
+    path.write_text(value)
+    report = validate_tree(root)
+    assert any(f.code == "document-invalid" and f.path == "mirror/visibility.json" for f in report.errors)
+
+    def no_second_parse(*args):
+        pytest.fail("planning parsed a ledger already rejected by mirror validation")
+
+    monkeypatch.setattr(module, "load_ledger", no_second_parse)
+    plan = plan_promotion(root, _request(root, [str(Path(manifests[0]).parent)]), _reviewers())
+    assert any(f.code == "source-document-invalid" and f.path == "mirror/visibility.json" for f in plan.findings)
+
+
+@pytest.mark.parametrize("location", ["manifest", "copy"])
+def test_oversized_system_yaml_is_rejected_before_system_loaders(tmp_path, monkeypatch, location):
+    from aisim_core.data import systems
+    from aisim_core.data.hygiene import CandidatePolicy
+
+    root, _ = _mirror(tmp_path)
+    systems.publish_system_spec(systems.PACKAGED_SYSTEMS_DIR / "h100_sxm.yaml", root)
+    path = root / "systems/h100_sxm/manifest.yaml"
+    if location == "copy":
+        path = next(p for p in path.parent.glob("*.yaml") if p.name != "manifest.yaml")
+    path.write_bytes(b" " * (CandidatePolicy().max_json_bytes + 1))
+
+    def must_not_read(*args, **kwargs):
+        pytest.fail("system loader read an oversized structured document")
+
+    monkeypatch.setattr(systems, "read_manifest", must_not_read)
+    monkeypatch.setattr(systems, "check_published_system", must_not_read)
+    report = validate_tree(root)
+    assert [(f.code, f.path) for f in report.errors] == [("yaml-too-large", path.relative_to(root).as_posix())]
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+def test_explicit_catalog_coverage_is_retained_for_rebuild_and_validation(tmp_path, profile):
+    from aisim_core.data.catalog import Catalog
+
+    root, _ = _mirror(tmp_path, repo=PUBLIC if profile == "public" else INTERNAL_REPO)
+    build_catalog(root, expected_models=["synthetic/missing-model"], expected_frameworks=["sglang"])
+    assert Catalog(root).rows(model="synthetic/missing-model", framework="sglang", status="missing")
+    before = {str(p.relative_to(root)): p.read_bytes() for p in (root / "catalog").rglob("*") if p.is_file()}
+    report = validate_tree(root, profile=profile)
+    assert report.ok, report.errors
+    build_catalog(root)
+    assert before == {str(p.relative_to(root)): p.read_bytes() for p in (root / "catalog").rglob("*") if p.is_file()}
+    build_catalog(root, expected_models=[], expected_frameworks=[])
+    assert not Catalog(root).rows(model="synthetic/missing-model")
+    assert validate_tree(root, profile=profile).ok
+
+
 @pytest.mark.parametrize("profile", ["mirror", "public"])
 def test_installed_validation_workflow_is_repository_infrastructure(tmp_path, profile):
     repo = INTERNAL_REPO if profile == "mirror" else PUBLIC
