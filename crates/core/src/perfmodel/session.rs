@@ -322,15 +322,16 @@ pub(crate) fn run_context_ops_with<'a>(
         filter,
         false,
         None,
-        |_, op, result| on_op(op, result.into_owned()),
+        |_, op, _, result| on_op(op, result.into_owned()),
     )
 }
 
 /// [`run_context_ops_with`] over an op list with its [`OpListPlan`], reusing
 /// `op_memo`'s results when given one. The sink also receives each op's index
-/// in `ops`. `any_cached` marks a walk whose integer mean `prefix` can round a
-/// cached prefill down to zero; qualified Mamba ops then see at least one
-/// cached token ([`mamba_cached_prefix`]), and every other op keeps `prefix`.
+/// in `ops` and the runtime context it was priced at. `any_cached` marks a
+/// walk whose integer mean `prefix` can round a cached prefill down to zero;
+/// qualified Mamba ops then see at least one cached token
+/// ([`mamba_cached_prefix`]), and every other op keeps `prefix`.
 /// `total_new_tokens` preserves an exact-total query's token sum for qualified
 /// Mamba, whose two balanced chunk lengths cannot be replaced by a mean.
 #[allow(clippy::too_many_arguments)]
@@ -346,7 +347,7 @@ pub(crate) fn run_context_ops_planned<'a>(
     filter: ContextOpFilter,
     any_cached: bool,
     total_new_tokens: Option<u32>,
-    mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
+    mut on_op: impl FnMut(usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
     let mut total = 0.0_f64;
@@ -364,33 +365,33 @@ pub(crate) fn run_context_ops_planned<'a>(
             let (q, r) = (tokens / batch_size, tokens % batch_size);
             let prefix = mamba_cached_prefix(op, prefix, any_cached);
             for (batch, length) in [(batch_size - r, q), (r, q + 1)] {
-                let result = query_context_op(
+                let ctx = context_op_runtime(
                     op,
-                    db,
                     batch,
                     length,
                     prefix,
                     seq_imbalance_correction_scale,
                     None,
-                )?;
+                );
+                let result = op.query(db, &ctx)?;
                 total += result.latency_ms;
-                on_op(index, op, Cow::Owned(result));
+                on_op(index, op, &ctx, Cow::Owned(result));
             }
             continue;
         }
+        let ctx = context_op_runtime(
+            op,
+            batch_size,
+            effective_isl,
+            mamba_cached_prefix(op, prefix, any_cached),
+            seq_imbalance_correction_scale,
+            None,
+        );
         let result = memo.query(index, || {
-            let ctx = context_op_runtime(
-                op,
-                batch_size,
-                effective_isl,
-                mamba_cached_prefix(op, prefix, any_cached),
-                seq_imbalance_correction_scale,
-                None,
-            );
             shared_query(op_memo, db, OpList::Context, index, op, &ctx)
         })?;
         total += result.latency_ms;
-        on_op(index, op, result);
+        on_op(index, op, &ctx, result);
     }
     Ok(total)
 }

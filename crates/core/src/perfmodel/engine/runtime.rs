@@ -36,9 +36,9 @@ use crate::perfmodel::afd::plan::AfdExecutionPlan;
 use crate::perfmodel::engine::spec::{EncoderImageShape, EngineSpec, VisionSpec};
 use crate::session::{
     ContextOpFilter, OpListPlan, OpMemo, QueryMemo, context_op_runtime, generation_op_runtime,
-    get_mix_step_ops, mamba_cached_prefix, query_context_op, query_generation_op,
-    run_context_ops_planned, run_context_ops_with, run_generation_ops_step,
-    run_generation_ops_step_beamed_with, run_generation_ops_step_planned,
+    get_mix_step_ops, query_context_op, query_generation_op, run_context_ops_planned,
+    run_context_ops_with, run_generation_ops_step, run_generation_ops_step_beamed_with,
+    run_generation_ops_step_planned,
 };
 use crate::{ForwardPassMetrics, ForwardPassWorkerType, validate_forward_pass_metrics};
 
@@ -2042,7 +2042,7 @@ impl Engine {
             ContextOpFilter::All,
             any_cached,
             total_new_tokens,
-            |_, op, result| on_op(op, result.into_owned()),
+            |_, op, _, result| on_op(op, result.into_owned()),
         )
     }
 
@@ -3396,7 +3396,7 @@ impl Engine {
                 ContextOpFilter::All,
                 false,
                 None,
-                |index, op, r| {
+                |index, op, _, r| {
                     let r = r.into_owned();
                     let covered = covered_latency(&r);
                     on_op(true, self.context_plan.name_slot(index), op, r, covered)
@@ -4369,8 +4369,8 @@ impl Engine {
                     1.0,
                     ContextOpFilter::All,
                     any_cached,
-                    None,
-                    |_, _, _| {},
+                    Some(sched.sum_prefill_tokens),
+                    |_, _, _, _| {},
                 )?,
                 operations => {
                     // The walk visits every op in order, so names fold by
@@ -4387,19 +4387,10 @@ impl Engine {
                         1.0,
                         ContextOpFilter::All,
                         any_cached,
-                        None,
-                        |index, op, result| {
+                        Some(sched.sum_prefill_tokens),
+                        |index, op, runtime, result| {
                             let slot = Some(self.context_plan.name_slot(index));
-                            operations.add_lent("context", slot, op, result, 1.0, || {
-                                context_op_runtime(
-                                    op,
-                                    n_prefill,
-                                    new_tokens_per_req,
-                                    mamba_cached_prefix(op, prefix_per_req, any_cached),
-                                    1.0,
-                                    None,
-                                )
-                            });
+                            operations.add_lent("context", slot, op, result, 1.0, || *runtime);
                         },
                     )?
                 }
@@ -5015,6 +5006,23 @@ pub(crate) mod tests {
             17.0 * 18_560.0 + 2.0 * 2_097_152.0 + 5_317_120.0
         ));
         assert!(close(packed(16, 1, 0), 16.0 * 18_560.0 + 2_097_152.0));
+        // A pure-prefill step keeps the remainder too: scans of 8 and 9
+        // tokens, never two of 8, in the scalar and the detailed estimate.
+        let pure = ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 2,
+                sum_prefill_tokens: 17,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pure_bytes = 17.0 * 18_560.0 + 2.0 * 2_097_152.0;
+        assert!(close(packed(17, 2, 0), pure_bytes));
+        let estimate = engine.forward_pass_estimate(&[pure], true, None).unwrap();
+        assert!(close(
+            estimate.ranks[0].operations[0].latency_ms,
+            pure_bytes
+        ));
         // Three prefill requests with two new tokens leave one request without
         // work: the mixed and pure-prefill packed paths both reject the payload.
         for decodes in [8, 0] {

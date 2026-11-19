@@ -917,12 +917,12 @@ The raw rounds are in
   counts one mix step in throughput and energy, as main does, although the
   request takes several prefill chunks. This is part of the unresolved
   multi-chunk TTFT limit above.
-- A pure-prefill packed step prices every operation at the integer mean of
-  its new tokens per request, as main does. Two prefills of 8 and 9 new
-  tokens price as two of 8. The mixed packed step and the exact-total query
+- A pure-prefill packed step prices every operation except qualified Mamba
+  at the integer mean of its new tokens per request, as main does. Two
+  prefills of 8 and 9 new tokens price those operations as two of 8. The
+  pure-prefill and mixed packed steps and the exact-total query
   `predict_prefill_latency_total` keep the remainder for qualified Mamba
-  operations. Other operations in the exact-total query still use integer
-  mean coordinates.
+  operations.
 - Replay prices a rank through `ForwardPassMetrics`, which carries prefill
   totals and request counts, not each chunk's length. A qualified Mamba scan
   therefore spreads the total evenly over the requests: chunks of 1000 and
