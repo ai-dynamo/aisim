@@ -19,8 +19,8 @@ import importlib.metadata as im
 import os
 
 import torch
-from collector.case_generator import get_gemm_case_specs, get_gemm_type_specs
 from collector.helper import benchmark_with_power, get_device_module, log_perf
+from collector.op_plans import plan_cases
 
 # The stock vLLM harness utilities reused here are device-neutral:
 # create_vllm_config builds a plain VllmConfig from a local fake HF model and
@@ -37,7 +37,7 @@ from vllm.model_executor.layers.linear import RowParallelLinear
 
 vllm_ascend_version = im.version("vllm-ascend")
 
-# Max device-memory fraction for the packed op copies.
+# Max fraction of live free device memory for the input and packed op copies.
 _LOOP_MEM_BUDGET_FRACTION = 0.45
 
 # Upper bound on GEMM ops packed into one measurement loop. Small GEMMs are
@@ -70,27 +70,15 @@ def _gemm_peak_footprint_bytes(m: int, n: int, k: int, copies: int = 1) -> int:
     return input_bytes + per_copy * max(copies, 0)
 
 
+# NPUs have no CUDA SM version; dtype exclusions live in collector/skips.py.
 def get_gemm_test_cases():
-    gemm_list = get_gemm_type_specs("vllm_npu")
-    if not gemm_list:
-        raise RuntimeError("collector/cases/base_ops/gemm.yaml must define vllm_npu gemm_types")
-
-    test_cases = []
-
-    for gemm_common_testcase in get_gemm_case_specs("vllm_npu"):
-        x = gemm_common_testcase.x
-        n = gemm_common_testcase.n
-        k = gemm_common_testcase.k
-        for gemm_type in gemm_list:
-            test_cases.append([gemm_type, x, n, k])
-
-    return test_cases
+    return plan_cases("gemm", "vllm_npu", None)
 
 
 @with_exit_stack
 def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="npu:0"):
     if gemm_type != "bfloat16":
-        # The YAML partition declares bf16 only; anything else would be
+        # The plan skips non-bf16 cases; anything else would be
         # benchmarked as bf16 and recorded under the wrong dtype label.
         raise RuntimeError(f"vllm_npu gemm collects bfloat16 only, got {gemm_type!r}")
 
@@ -102,8 +90,6 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="npu:0"):
     # TODO: on-device campaign — NPU visibility is governed by
     # ASCEND_RT_VISIBLE_DEVICES (CUDA_VISIBLE_DEVICES has no effect);
     # multi-card parallel collection must pin its workers with the former.
-
-    x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
 
     def create_gemm():
         gemm = RowParallelLinear(
@@ -142,12 +128,22 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="npu:0"):
     # Ops per measurement: pack as many as the memory budget allows, capped so
     # tiny shapes don't create an absurd number. Large shapes -> few
     # (memory-bound); tiny shapes -> the cap, diluting fixed launch overhead.
-    total_mem = get_device_module(device).get_device_properties(device).total_memory
+    free_mem, _ = get_device_module(device).mem_get_info(device)
     per_copy = (n * k + m * n) * 2
     fixed_bytes = _gemm_peak_footprint_bytes(m, n, k, copies=0)
-    budget = int(total_mem * _LOOP_MEM_BUDGET_FRACTION)
+    budget = int(free_mem * _LOOP_MEM_BUDGET_FRACTION)
     mem_cap = (budget - fixed_bytes) // max(per_copy, 1)
-    outside_loop_count = max(1, min(_MAX_OPS_PER_LOOP, mem_cap))
+    # Refuse capacity before allocating even the input. The plan stays shared
+    # across devices; oversized cases become classified worker failures.
+    if mem_cap < 1:
+        needed = _gemm_peak_footprint_bytes(m, n, k)
+        raise RuntimeError(
+            f"FIXME(kernel-limit): does not fit: GEMM ({m}, {n}, {k}) needs {needed} bytes "
+            f"for one copy, exceeding the {budget}-byte budget ({free_mem} bytes free)"
+        )
+    outside_loop_count = min(_MAX_OPS_PER_LOOP, mem_cap)
+
+    x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
 
     op_list = []
     try:

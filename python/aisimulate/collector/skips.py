@@ -56,6 +56,10 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
+    # vllm/collect_gemm_npu.py:run_gemm builds only an unquantized BF16 linear
+    # (quant_config=None); every quantized case would fail its dtype guard or
+    # mislabel a BF16 measurement. Quantized Ascend paths remain unverified.
+    {"backend": "vllm_npu", "op": "gemm", "gemm_type": ["fp8", "fp8_block", "nvfp4"]},
     # The sparse-attention (DSA) modules and the DeepSeek-V4 and GLM-5 sparse
     # kernels (DeepGEMM fp8_mqa_logits, FlashMLA sparse, JIT top-k) need Hopper
     # (SM90) or newer.

@@ -20,13 +20,14 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from collector.case_generator import get_gemm_case_specs, get_gemm_type_specs
+from collector.case_generator import get_gemm_case_specs
 from collector.framework_manifest import (
     get_collector_runtime,
     require_collector_runtime,
     resolve_op_runtime,
     validate_resolution,
 )
+from collector.op_plans import plan
 from collector.registry_types import PerfFile
 from collector.vllm.registry import REGISTRY, REGISTRY_NPU, REGISTRY_XPU
 
@@ -131,24 +132,19 @@ def test_npu_gemm_entry_uses_the_standard_vllm_gemm_entrypoints():
 
 
 # ---------------------------------------------------------------------------
-# Case partition
+# Shared case plan
 # ---------------------------------------------------------------------------
 
 
-def test_npu_gemm_cases_are_bf16_only():
-    # The vllm_npu YAML partition declares bf16 only for the MVP.
-    assert get_gemm_type_specs("vllm_npu") == ["bfloat16"]
+def test_npu_gemm_plan_preserves_shared_bf16_shapes_and_accounts_for_other_dtypes():
+    shared = plan("gemm", "vllm", None)
+    npu = plan("gemm", "vllm_npu", None)
 
-
-def test_npu_gemm_shape_sweep_expands():
-    specs = get_gemm_case_specs("vllm_npu")
-
-    assert specs, "cases/base_ops/gemm.yaml must define a vllm_npu shape sweep"
-    assert all(spec.x > 0 and spec.n > 0 and spec.k > 0 for spec in specs)
-    # Framework-specific transformer GEMM sweep (21 token counts x 21 k x 23 n = 10,143 base
-    # grid shapes plus model-specific shapes = 10,857), narrower than the all-frameworks base
-    # sweep (which adds +1 alignment-probe token counts).
-    assert 21 * 21 * 23 <= len(specs) < len(get_gemm_case_specs())
+    assert npu.cases == [case for case in shared.cases if case.gemm_type == "bfloat16"]
+    assert {region.region: region.cases for region in npu.removed} == {
+        f"gemm_type={dtype}": len(npu.cases) for dtype in ("fp8", "fp8_block", "nvfp4")
+    }
+    assert len(npu.cases) + sum(region.cases for region in npu.removed) == len(shared.cases)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +193,8 @@ def test_test_cases_are_all_bfloat16(collect_gemm_npu):
 
     assert cases
     assert {gemm_type for gemm_type, *_ in cases} == {"bfloat16"}
-    assert len(cases) == len(get_gemm_case_specs("vllm_npu"))
+    assert {(m, n, k) for _, m, n, k in cases} == {(spec.x, spec.n, spec.k) for spec in get_gemm_case_specs()}
+    assert ["bfloat16", 3, 32, 32] in [list(case) for case in cases]
 
 
 def test_version_logged_is_the_vllm_ascend_version(collect_gemm_npu):
@@ -215,7 +212,8 @@ def test_run_gemm_defaults_to_npu_0_and_refuses_other_dtypes(collect_gemm_npu):
         collect_gemm_npu.run_gemm("fp8", 16, 16, 16, perf_filename=PerfFile.GEMM)
 
 
-def test_run_gemm_logs_eager_row_without_power(collect_gemm_npu, monkeypatch):
+@pytest.mark.parametrize(("free_bytes", "expected_copies"), [(64 * 2**30, 64), (40000, 3), (15929, 1)])
+def test_run_gemm_logs_eager_row_without_power(collect_gemm_npu, monkeypatch, free_bytes, expected_copies):
     """Eager, no power sampling, untraced kernel label, standard gemm_perf columns."""
     from contextlib import contextmanager
 
@@ -223,6 +221,7 @@ def test_run_gemm_logs_eager_row_without_power(collect_gemm_npu, monkeypatch):
     benchmark_kwargs = {}
     device_module = MagicMock()
     device_module.get_device_properties.return_value.total_memory = 64 * 2**30
+    device_module.mem_get_info.return_value = (free_bytes, 64 * 2**30)
     device_module.get_device_name.return_value = "Ascend950DT"
 
     @contextmanager
@@ -253,9 +252,42 @@ def test_run_gemm_logs_eager_row_without_power(collect_gemm_npu, monkeypatch):
             "m": 16,
             "n": 32,
             "k": 64,
-            "latency": pytest.approx(1.0),
+            "latency": pytest.approx(64.0 / expected_copies),
             "used_cuda_graph": False,
         }
     ]
     assert not hasattr(collect_gemm_npu, "xpu_graph_measure_enabled")
     device_module.get_device_capability.assert_not_called()
+    device_module.mem_get_info.assert_called_once_with("npu:0")
+    assert collect_gemm_npu.RowParallelLinear.call_count == expected_copies
+    collect_gemm_npu.torch.randn.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "free_bytes"),
+    [
+        (16, 32, 64, 2047),  # Even the input cannot fit.
+        (16, 32, 64, 15928),  # One byte short of the budget needed for one copy.
+        (8192, 65536, 32768, 4 * 2**30),  # Large declared shape on a busy device.
+    ],
+)
+def test_run_gemm_refuses_insufficient_live_capacity_before_allocation(
+    collect_gemm_npu, monkeypatch, m, n, k, free_bytes
+):
+    device_module = MagicMock()
+    device_module.mem_get_info.return_value = (free_bytes, 64 * 2**30)
+    device_module.get_device_properties.return_value.total_memory = 64 * 2**30
+    monkeypatch.setattr(collect_gemm_npu, "setup_distributed", lambda device: None)
+    monkeypatch.setattr(collect_gemm_npu, "get_device_module", lambda device=None: device_module)
+    benchmark = MagicMock()
+    monkeypatch.setattr(collect_gemm_npu, "benchmark_with_power", benchmark)
+    log = MagicMock()
+    monkeypatch.setattr(collect_gemm_npu, "log_perf", log)
+
+    with pytest.raises(RuntimeError, match=r"^FIXME\(kernel-limit\): does not fit"):
+        collect_gemm_npu.run_gemm("bfloat16", m, n, k, perf_filename=PerfFile.GEMM)
+
+    collect_gemm_npu.torch.randn.assert_not_called()
+    collect_gemm_npu.RowParallelLinear.assert_not_called()
+    benchmark.assert_not_called()
+    log.assert_not_called()
