@@ -67,7 +67,7 @@ are separate from vLLM's cadence; see the
 
 ## SGLang radix core
 
-The SGLang simulator delegates radix matching, insertion, locking, and leaf removal to the Torch-free `sglang-radix-tree` dependency. AISimulate owns physical pages, request leases, token accounting, KV events, and its optional Belady forecast. Tree keys are existing page hashes; one tree atom represents one physical KV page, and the adapter converts page counts to tokens.
+The SGLang simulator delegates radix matching, insertion, locking, and leaf removal to the bundled Torch-free `sglang-radix-tree` core. AISimulate owns physical pages, request leases, token accounting, KV events, and its optional Belady forecast. Tree keys are existing page hashes; one tree atom represents one physical KV page, and the adapter converts page counts to tokens.
 
 Chunked growth inserts only suffix values and acquires the extended path before releasing its previous lock. Completed requests replay the retained prefix's access updates. LRU follows SGLang's whole-leaf eviction, so it can reclaim more pages than requested. Belady retains page-at-a-time tail eviction and reconsiders the exposed parent against the remaining leaves. Fallible admission snapshots clone tree metadata while sharing immutable key and page buffers; rollback restores the allocator, tree, leases, and buffered event state together.
 
@@ -78,7 +78,13 @@ eviction. Retained suffix-split buffers compact geometrically, bounding both
 copying and retained storage. See the [cache-pressure evidence](src/engine/cache/EVICTION_PRESSURE_EVIDENCE.md)
 for regression coverage, cost bounds, and matched native measurements.
 
-The dependency is pinned to the SGLang radix-core integration branch by immutable revision. Publishing `aisimulate-core` to crates.io requires a published `sglang-radix-tree` version in place of this Git dependency.
+The native core is bundled from immutable SGLang revision
+`f0fda25fc95c357368b714f90a13a69c1b67f50a` inside `aisimulate-core`, preserving
+the existing wheel and publishable-crate release contract without a Git-only
+dependency or an additional artifact. Its algorithms are unchanged; only
+module paths, dependency aliases, and native-only build wiring are adapted.
+See the [bundled source provenance](src/engine/cache/sglang_radix_tree/README.md)
+for original paths, licensing, and the update procedure.
 
 The [eviction selection evidence](src/engine/cache/EVICTION_EVIDENCE.md) records
 reproducible before/after victim IDs, page counts, LRU overshoot, and Belady

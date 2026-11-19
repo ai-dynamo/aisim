@@ -4,7 +4,7 @@
 //! SGLang radix-cache adapter for engine simulation.
 //!
 //! Tree structure, matching, locking, and eviction are delegated to the
-//! `sglang-radix-tree` crate. AISimulate continues to own physical page
+//! bundled `sglang-radix-tree` core. AISimulate continues to own physical page
 //! allocation, request leases, event publication, and token accounting.
 
 use std::borrow::{Borrow, Cow};
@@ -15,16 +15,16 @@ use std::sync::Arc;
 use crate::engine::belady::BeladyOracle;
 use crate::engine::common::hashing::{SequenceHash, compute_next_seq_hash};
 
-use sglang_radix_tree::{
-    CacheAction, CacheInitParams, ChildKeyType, ComponentSet, DecLockRefParams, FULL, InsertParams,
-    KeyNamespaceRef, MatchPrefixParams, PageValue, RadixValue, UnifiedTreeCore,
+use super::sglang_radix_tree::{
+    self, CacheAction, CacheInitParams, ChildKeyType, ComponentSet, DecLockRefParams, FULL,
+    InsertParams, KeyNamespaceRef, MatchPrefixParams, PageValue, RadixValue, UnifiedTreeCore,
 };
 
 use crate::engine::common::hashing::LocalBlockHash;
 #[cfg(test)]
 use crate::engine::common::hashing::compute_block_hash_for_seq;
 
-pub use sglang_radix_tree::NodeId;
+pub use super::sglang_radix_tree::NodeId;
 
 #[cfg(test)]
 #[path = "eviction_evidence.rs"]

@@ -4,4 +4,5 @@
 //! Cache data structures for KV block management.
 
 pub(crate) mod radix_cache;
+mod sglang_radix_tree;
 pub(crate) mod vllm_block_pool;

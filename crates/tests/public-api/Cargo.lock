@@ -32,6 +32,7 @@ dependencies = [
  "ddsketchy",
  "derive_builder",
  "flate2",
+ "hashbrown 0.16.1",
  "indicatif",
  "log",
  "parquet",
@@ -46,10 +47,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_yaml",
- "sglang-radix-tree",
  "sha2",
  "slotmap",
  "tempfile",
+ "thiserror 1.0.69",
  "thiserror 2.0.20",
  "tracing",
  "uuid",
@@ -1125,16 +1126,6 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
-]
-
-[[package]]
-name = "sglang-radix-tree"
-version = "0.1.0"
-source = "git+https://github.com/sgl-project/sglang.git?rev=f0fda25fc95c357368b714f90a13a69c1b67f50a#f0fda25fc95c357368b714f90a13a69c1b67f50a"
-dependencies = [
- "hashbrown 0.16.1",
- "sha2",
- "thiserror 1.0.69",
 ]
 
 [[package]]
