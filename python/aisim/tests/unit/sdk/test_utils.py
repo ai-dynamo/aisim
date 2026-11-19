@@ -1082,10 +1082,13 @@ def test_json_decoder_limits_are_metadata_errors(monkeypatch, hf_cache, source, 
         cause_type = ValueError
         cause_message = "integer string conversion"
     else:
-        depth = sys.getrecursionlimit() + 100
+        # Python 3.12's C decoder limit can exceed the Python recursion limit.
+        depth = max(10_000, sys.getrecursionlimit() + 100)
         contents = b'{"nested":' + b"[" * depth + b"0" + b"]" * depth + b"}"
         cause_type = RecursionError
         cause_message = "recursion depth"
+    with pytest.raises(cause_type):
+        json.loads(contents)
     model = f"org/oversized-{source}-{filename}-{consumer}-{failure}"
     config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
     if source == "cache":
