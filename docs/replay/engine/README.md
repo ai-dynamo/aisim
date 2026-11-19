@@ -119,6 +119,8 @@ with an older cached config when its quantization request fails: an unverified
 cached sidecar raises an error. Corrupt cached config or sidecar metadata and
 unverified sidecar provenance also fail DSPARK `nextn` resolution in the CLI
 recommendation/sizing path, instead of returning `None` as an access failure.
+Generator DSA KV-dtype resolution also propagates metadata access errors, so a
+failed sidecar request cannot silently remove a checkpoint's FP8 prescription.
 To retry offline, first cache `config.json` and any needed quantization or
 processor files in one invocation under `main` (for a checkpoint publishing all
 these files, `env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json hf_quant_config.json preprocessor_config.json video_preprocessor_config.json --revision main`),

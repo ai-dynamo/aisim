@@ -5,6 +5,11 @@
 Unit tests for CLI API functions.
 """
 
+import json
+import os
+import subprocess
+import sys
+import textwrap
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -15,6 +20,63 @@ from aisim.sdk import common
 from aisim.sdk.errors import NoFeasibleConfigError
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("boundary", ["arguments", "dispatch"])
+def test_recommend_unverified_sidecar_is_a_console_input_error(tmp_path, boundary):
+    from aisim_core.sdk import utils
+
+    model = "org/cli-unverified-sidecar"
+    repo = tmp_path / "models--org--cli-unverified-sidecar"
+    snapshot = repo / "snapshots" / ("c" * 40)
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(json.dumps(utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K3")))
+    (snapshot / "hf_quant_config.json").write_text('{"quantization": {"quant_algo": "FP8"}}')
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("c" * 40)
+    # Serve config successfully; the sidecar outage finds an unverified cached
+    # companion. Exercise the console and real resolver, not a raised stand-in.
+    script = textwrap.dedent("""
+        import io
+        import sys
+        import argparse
+        from pathlib import Path
+        from aisim_core.sdk import utils
+        from aisim.legacy_cli.entrypoint import main
+        from aisim.legacy_cli.main import configure_parser, main as dispatch
+
+        def remote(request, *, timeout):
+            if request.full_url.endswith('/config.json'):
+                return io.BytesIO(Path(sys.argv[1]).read_bytes())
+            raise utils.urllib.error.HTTPError(request.full_url, 503, 'unavailable', {}, None)
+
+        utils._get_hf_auth_headers = lambda: {}
+        utils.urllib.request.urlopen = remote
+        arguments = ['recommend', '--system', 'h200_sxm',
+                     '--target-concurrency', '16', '--nextn-accepted', '3.0']
+        if sys.argv[3] == 'arguments':
+            main(['cli', *arguments, '--model-path', sys.argv[2]])
+        else:
+            # Exercise a resolver rejection at dispatch independently of the
+            # earlier argparse validation boundary.
+            parser = argparse.ArgumentParser()
+            configure_parser(parser)
+            args = parser.parse_args(arguments)
+            args.model_path = sys.argv[2]
+            dispatch(args)
+    """)
+    env = {key: value for key, value in os.environ.items() if key not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+    env["HF_HUB_CACHE"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(snapshot / "config.json"), model, boundary],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == (2 if boundary == "arguments" else 1)
+    assert "Error: Cannot mix cached hf_quant_config.json" in result.stderr
+    assert "Traceback" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("nextn", [None, "auto"])

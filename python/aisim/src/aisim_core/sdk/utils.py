@@ -87,7 +87,7 @@ def _load_json_with_infinity(file_path) -> dict:
     Standard JSON doesn't support Infinity/NaN, but HuggingFace configs may contain them (e.g., Nemotron-H-56B)
     Decode non-finite constants as null without changing quoted strings.
     """
-    with open(file_path) as f:
+    with open(file_path, "rb") as f:
         return json.load(f, parse_constant=lambda _: None)
 
 
@@ -532,8 +532,14 @@ def _hf_optional_absence_known(hf_id: str, filename: str, revision: str) -> bool
     marker = snapshot[0] / ".no_exist" / snapshot[1] / filename
     try:
         mode = marker.stat().st_mode
-    except FileNotFoundError:
-        return False
+    except FileNotFoundError as error:
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as probe_error:
+            raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: {probe_error}") from probe_error
+        raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: dangling marker link") from error
     except OSError as error:
         raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: {error}") from error
     if not stat.S_ISREG(mode):
@@ -575,7 +581,7 @@ def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[d
         # Match the network JSON decoder, including quoted NaN/Infinity text.
         with path.open("rb") as handle:
             data = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: {error}") from error
     if not isinstance(data, dict):
         raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: expected a JSON object")
@@ -704,7 +710,7 @@ def _download_hf_json_at(
             raise missing from e
     except _HuggingFaceMetadataError:
         raise
-    except (UnicodeError, json.JSONDecodeError) as e:
+    except ValueError as e:
         raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: {e}") from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
@@ -2300,18 +2306,27 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                     family = "Kimi" if kimi else "Qwen3-VL"
                     raise ValueError(f"{family} {filename} must be an object")
                 if key is None:
-                    if qwen_vl and isinstance(data.get("size"), dict):
-                        # Sidecar aliases override equivalent inline pixel keys.
+                    if qwen_vl:
+                        # Normalize each source before merging so a one-bound
+                        # sidecar replaces only that bound, across both spellings.
                         data = dict(data)
-                        for bound, alias in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
-                            if bound not in data and alias in data["size"]:
-                                data[bound] = data["size"][alias]
+                        for source in (processor, data):
+                            if isinstance(source.get("size"), dict):
+                                for bound, alias in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
+                                    if bound not in source and alias in source["size"]:
+                                        source[bound] = source["size"][alias]
                     if kimi:
                         nested_media = "media_proc_cfg" in processor or "media_proc_cfg" in data
                         inline_media = processor.get("media_proc_cfg", processor)
                         sidecar_media = data.get("media_proc_cfg", data)
                         if not isinstance(inline_media, dict) or not isinstance(sidecar_media, dict):
                             raise ValueError("Kimi media_proc_cfg must be an object")
+                        has_video = "video_processor" in processor or "video_processor" in data
+                        inline_video = processor.get("video_processor", {})
+                        sidecar_video = data.get("video_processor", {})
+                        if not isinstance(inline_video, dict) or not isinstance(sidecar_video, dict):
+                            raise ValueError("Kimi video processor config must be an object")
+                        video = {**inline_video, **sidecar_video}
                         media = {
                             name: value
                             for name, value in {**inline_media, **sidecar_media}.items()
@@ -2323,15 +2338,20 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                             ("size", "patch_limit_on_one_side"),
                         ):
                             if native in sidecar_media and legacy not in sidecar_media:
+                                if legacy == "patch_limit_on_one_side" and legacy in media:
+                                    # Legacy image geometry also supplies the video
+                                    # default. Preserve it when replacing the image alias.
+                                    side = media[legacy]
+                                    video.setdefault("size", {"max_height": side, "max_width": side})
+                                    has_video = True
                                 media.pop(legacy, None)
                         processor.update(data)
                         if nested_media:
                             processor["media_proc_cfg"] = media
                         else:
-                            video = processor.get("video_processor")
                             processor = media
-                            if video is not None:
-                                processor["video_processor"] = video
+                        if has_video:
+                            processor["video_processor"] = video
                     else:
                         processor.update(data)
                 else:
@@ -2368,6 +2388,9 @@ class _ModelConfigCacheEntry:
 def _cache_raw_model_config(load):
     """Keep a base until its parsed readers finish; evict only if all fail."""
     entries = {}
+    # Tokens live only until a cold load publishes or fails. Removing a token
+    # invalidates unfinished reads without retaining per-model eviction history.
+    loading = {}
     hits = misses = 0
     lock = Lock()
     info = namedtuple("CacheInfo", "hits misses maxsize currsize")
@@ -2375,20 +2398,36 @@ def _cache_raw_model_config(load):
     @wraps(load)
     def cached(model_path):
         nonlocal hits, misses
-        with lock:
-            if model_path in entries:
-                hits += 1
-                return entries[model_path].raw
-            misses += 1
-        config = load(model_path)
-        with lock:
-            # Concurrent cold loads must all use the first published base.
-            return entries.setdefault(model_path, _ModelConfigCacheEntry(config)).raw
+        while True:
+            with lock:
+                if model_path in entries:
+                    hits += 1
+                    return entries[model_path].raw
+                misses += 1
+                token = loading.setdefault(model_path, object())
+            try:
+                config = load(model_path)
+            except BaseException:
+                with lock:
+                    if loading.get(model_path) is token:
+                        del loading[model_path]
+                raise
+            with lock:
+                # Concurrent cold loads use the first still-published base.
+                if model_path in entries:
+                    return entries[model_path].raw
+                if loading.get(model_path) is token:
+                    entries[model_path] = _ModelConfigCacheEntry(config)
+                    del loading[model_path]
+                    return config
+                # An eviction/clear invalidated this read. Resolve again rather
+                # than republishing a base read before the source was repaired.
 
     def clear():
         nonlocal hits, misses
         with lock:
             entries.clear()
+            loading.clear()
             hits = misses = 0
 
     @contextmanager

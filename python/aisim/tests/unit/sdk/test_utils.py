@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -223,11 +224,14 @@ def test_kimi_image_sidecar_overrides_equivalent_inline_layout(tmp_path, nested_
         utils.get_model_config_from_model_path.cache_clear()
 
 
-def test_kimi_partial_video_sidecar_retains_inline_patch_limit(tmp_path):
+@pytest.mark.parametrize("filename", ["preprocessor_config.json", "video_preprocessor_config.json"])
+def test_kimi_partial_video_sidecar_retains_inline_patch_limit(tmp_path, filename):
     config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
     config["preprocessor_config"] = {"video_processor": {"max_patches": 1024}}
     (tmp_path / "config.json").write_text(json.dumps(config))
-    (tmp_path / "video_preprocessor_config.json").write_text('{"temporal_patch_size": 4}')
+    video = {"temporal_patch_size": 4}
+    sidecar = {"video_processor": video} if filename == "preprocessor_config.json" else video
+    (tmp_path / filename).write_text(json.dumps(sidecar))
     try:
         loaded = get_model_config_from_model_path(str(tmp_path))
         assert loaded["encoder_config"].video_max_patches == 1024
@@ -282,23 +286,34 @@ def test_llama4_missing_offline_processor_reports_revision_and_can_retry(monkeyp
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("native_inline", [False, True])
 @pytest.mark.parametrize(
-    "sidecar",
-    [None, {"min_pixels": 262144, "max_pixels": 2097152}, {"size": {"shortest_edge": 262144, "longest_edge": 2097152}}],
+    "sidecar,expected",
+    [
+        (None, (131072, 1048576)),
+        ({"min_pixels": 262144, "max_pixels": 2097152}, (262144, 2097152)),
+        ({"size": {"shortest_edge": 262144, "longest_edge": 2097152}}, (262144, 2097152)),
+        ({"size": {"shortest_edge": 262144}}, (262144, 1048576)),
+        ({"size": {"longest_edge": 2097152}}, (131072, 2097152)),
+        ({"min_pixels": 262144}, (262144, 1048576)),
+        ({"max_pixels": 2097152}, (131072, 2097152)),
+    ],
 )
-def test_local_qwen_inline_processor_bounds_and_sidecar_precedence(tmp_path, sidecar):
+def test_local_qwen_inline_processor_bounds_and_sidecar_precedence(tmp_path, sidecar, expected, native_inline):
     config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
-    config["preprocessor_config"] = {"min_pixels": 131072, "max_pixels": 1048576}
+    config["preprocessor_config"] = (
+        {"size": {"shortest_edge": 131072, "longest_edge": 1048576}}
+        if native_inline
+        else {"min_pixels": 131072, "max_pixels": 1048576}
+    )
     (tmp_path / "config.json").write_text(json.dumps(config))
     if sidecar is not None:
         (tmp_path / "preprocessor_config.json").write_text(json.dumps(sidecar))
     try:
         loaded = get_model_config_from_model_path(str(tmp_path))
-        expected = {"min_pixels": 262144, "max_pixels": 2097152} if sidecar else config["preprocessor_config"]
         encoder = loaded["extra_params"]
-        assert (encoder.min_pixels, encoder.max_pixels) == (expected["min_pixels"], expected["max_pixels"])
-        assert loaded["raw_config"]["preprocessor_config"]["min_pixels"] == expected["min_pixels"]
-        assert loaded["raw_config"]["preprocessor_config"]["max_pixels"] == expected["max_pixels"]
+        assert (encoder.min_pixels, encoder.max_pixels) == expected
+        assert utils._qwen_pixel_bounds(loaded["raw_config"]["preprocessor_config"]) == expected
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()
@@ -372,7 +387,7 @@ def test_offline_mode_reads_a_ref_containing_a_slash(monkeypatch, hf_cache):
 @pytest.mark.parametrize("revision", ["../../escape", "main/../../escape"])
 def test_cache_lookup_rejects_path_traversal(monkeypatch, hf_cache, revision):
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    with pytest.raises(utils.HuggingFaceDownloadError):
+    with pytest.raises(utils.HuggingFaceDownloadError, match="unsupported Hugging Face revision"):
         utils._download_hf_json("org/model", "config.json", revision=revision)
 
 
@@ -795,6 +810,107 @@ def test_local_nonfinite_json_normalization_preserves_strings(tmp_path):
     assert utils._load_json_with_infinity(path) == {"values": [None, None, None], "name": "org/NaN-Infinity"}
 
 
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
+def test_cached_snapshot_can_be_used_as_a_local_model_directory(monkeypatch, hf_cache, encoding):
+    model = "org/encoded-snapshot"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    _cache_file(hf_cache, model, "config.json", config)
+    snapshot = hf_cache / "models--org--encoded-snapshot" / "snapshots" / ("c" * 40)
+    (snapshot / "config.json").write_bytes(json.dumps(config).encode(encoding))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    try:
+        cached = get_model_config_from_model_path(model)
+        local = get_model_config_from_model_path(str(snapshot))
+        assert cached == local
+        assert local["architecture"] == "Qwen3ForCausalLM"
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("source", ["cache", "network"])
+@pytest.mark.parametrize("filename", ["config.json", "hf_quant_config.json"])
+@pytest.mark.parametrize("consumer", ["sdk", "collector", "dspark"])
+def test_json_integer_conversion_failure_is_a_metadata_error(monkeypatch, hf_cache, source, filename, consumer):
+    from collector.fpm_forward.model_capability import _download_model_config
+
+    from aisim.sdk.config_builders import resolve_dspark_nextn
+
+    limit = sys.get_int_max_str_digits()
+    if not limit:
+        pytest.skip("Python integer string conversion limit is disabled")
+    contents = b'{"oversized":' + b"9" * (limit + 1) + b"}"
+    model = f"org/oversized-{source}-{filename}-{consumer}"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    if source == "cache":
+        _cache_file(hf_cache, model, "config.json", config)
+        snapshot = hf_cache / f"models--{model.replace('/', '--')}" / "snapshots" / ("c" * 40)
+        (snapshot / filename).write_bytes(contents)
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    else:
+
+        def remote(request, *, timeout):
+            return io.BytesIO(contents if request.full_url.endswith("/" + filename) else json.dumps(config).encode())
+
+        monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    load = {
+        "sdk": get_model_config_from_model_path,
+        "collector": _download_model_config,
+        "dspark": resolve_dspark_nextn,
+    }[consumer]
+    expected_error = ValueError if consumer == "collector" else utils._HuggingFaceMetadataError
+    try:
+        with pytest.raises(expected_error, match=filename) as error:
+            load(model)
+        metadata_error = error.value.__cause__ if consumer == "collector" else error.value
+        assert isinstance(metadata_error, utils._HuggingFaceMetadataError)
+        assert isinstance(metadata_error.__cause__, ValueError)
+        assert not isinstance(metadata_error.__cause__, json.JSONDecodeError)
+        assert "integer string conversion" in str(metadata_error.__cause__)
+        assert ("Invalid cached" if source == "cache" else "https://huggingface.co/") in str(metadata_error)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("video_side", [None, 256, 512])
+def test_kimi_image_sidecar_preserves_inherited_video_side_limit(tmp_path, nested, video_side):
+    config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
+    media = {"patch_limit_on_one_side": 256}
+    config["preprocessor_config"] = {"media_proc_cfg": media} if nested else media
+    if video_side is not None:
+        config["preprocessor_config"]["video_processor"] = {"size": {"max_height": video_side, "max_width": video_side}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "preprocessor_config.json").write_text('{"size": {"max_height": 256, "max_width": 256}}')
+    try:
+        if video_side == 512:
+            with pytest.raises(ValueError, match="side limits must match"):
+                get_model_config_from_model_path(str(tmp_path))
+        else:
+            loaded = get_model_config_from_model_path(str(tmp_path))
+            assert loaded["encoder_config"].max_patches_per_side == 256
+            processor = loaded["raw_config"]["preprocessor_config"]
+            assert "patch_limit_on_one_side" not in processor.get("media_proc_cfg", processor)
+            assert processor["video_processor"]["size"] == {"max_height": 256, "max_width": 256}
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("video", [None, [], 0])
+def test_kimi_image_sidecar_rejects_explicit_nonobject_video(tmp_path, video):
+    config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"video_processor": video}))
+    try:
+        with pytest.raises(ValueError, match="video processor config must be an object"):
+            get_model_config_from_model_path(str(tmp_path))
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 @pytest.mark.parametrize("architecture", ["Qwen3VLForConditionalGeneration", "KimiK25ForConditionalGeneration"])
 def test_failed_processor_load_can_retry_offline_in_same_process(monkeypatch, hf_cache, architecture):
     model = f"org/retry-{architecture}"
@@ -929,6 +1045,120 @@ def test_negative_cache_probe_error_keeps_metadata_error_chain(monkeypatch, hf_c
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("consumer", ["sdk", "collector"])
+def test_dangling_negative_cache_marker_is_corrupt(monkeypatch, hf_cache, consumer):
+    from collector.fpm_forward.model_capability import _download_model_config
+
+    model = f"org/dangling-marker-{consumer}"
+    _cache_file(hf_cache, model, "config.json", utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B"))
+    marker = hf_cache / f"models--{model.replace('/', '--')}" / ".no_exist" / ("c" * 40) / "hf_quant_config.json"
+    marker.parent.mkdir(parents=True)
+    marker.symlink_to("missing-marker-target")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    load = get_model_config_from_model_path if consumer == "sdk" else _download_model_config
+    expected_error = utils._HuggingFaceCacheError if consumer == "sdk" else ValueError
+    try:
+        with pytest.raises(expected_error, match="Invalid cached absence marker.*dangling marker link") as error:
+            load(model)
+        assert str(marker) in str(error.value)
+        marker.unlink()
+        marker.touch()
+        assert load(model)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("consumer", ["prescription", "optimized", "quantization"])
+def test_generator_rejects_unresolved_dsa_sidecar_instead_of_dropping_fp8(monkeypatch, hf_cache, consumer):
+    from aisim.generator.module_bridge import _vllm_dsa_kv_cache_dtype
+    from aisim.generator.utils import _bundled_quantization, vllm_dsa_kv_cache_dtype
+
+    model = "org/unbundled-dsa"
+    config = utils._load_pre_downloaded_hf_config("nvidia/DeepSeek-V3.2-NVFP4")
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4",
+        "kv_cache_scheme": {"num_bits": 8, "type": "float"},
+    }
+    sidecar_status = 503
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/config.json"):
+            return io.BytesIO(json.dumps(config).encode())
+        raise utils.urllib.error.HTTPError(request.full_url, sidecar_status, "sidecar unavailable", {}, None)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    task = SimpleNamespace(primary_backend_name="vllm", primary_model_path=model)
+    load = {
+        "prescription": lambda: vllm_dsa_kv_cache_dtype("vllm", model, "nvfp4"),
+        "optimized": lambda: _vllm_dsa_kv_cache_dtype(task, None),
+        "quantization": lambda: _bundled_quantization(model),
+    }[consumer]
+    try:
+        with pytest.raises(utils.HuggingFaceDownloadError, match="hf_quant_config.json.*503"):
+            load()
+        # Confirmed optional absence preserves the validated inline prescription.
+        sidecar_status = 404
+        result = load()
+        if consumer == "quantization":
+            assert result["kv_cache_scheme"] == {"num_bits": 8, "type": "float"}
+        else:
+            assert result == "fp8"
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("invalidation", ["eviction", "clear"])
+def test_cold_load_reloads_after_invalidation_before_publication(monkeypatch, tmp_path, invalidation):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    model = str(tmp_path)
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    config["generation"] = 1
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "preprocessor_config.json").write_text('{"size": {"shortest_edge": 131072}}')
+    paused = Event()
+    resume = Event()
+    real_load = utils._load_local_config
+
+    def load(path):
+        raw = real_load(path)
+        if current_thread().name.startswith("cold-load") and not paused.is_set():
+            paused.set()
+            assert resume.wait(10)
+        return raw
+
+    monkeypatch.setattr(utils, "_load_local_config", load)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cold-load") as pool:
+        pending = pool.submit(utils._load_model_config_from_model_path, model)
+        try:
+            assert paused.wait(10)
+            if invalidation == "eviction":
+                # A second cold reader publishes A, then rejects its incomplete processor.
+                with pytest.raises(ValueError, match="pixel budget must be positive integers"):
+                    get_model_config_from_model_path(model)
+            else:
+                utils._load_model_config_from_model_path.cache_clear()
+            assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+            repaired = dict(config)
+            repaired["generation"] = 2
+            (tmp_path / "config.json").write_text(json.dumps(repaired))
+            (tmp_path / "preprocessor_config.json").write_text(
+                '{"size": {"shortest_edge": 131072, "longest_edge": 1048576}}'
+            )
+            resume.set()
+            assert pending.result(timeout=10)["generation"] == 2
+            assert utils._load_model_config_from_model_path(model)["generation"] == 2
+            assert get_model_config_from_model_path(model)["raw_config"]["generation"] == 2
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            utils.get_model_config_from_model_path.cache_clear()
 
 
 def test_reader_reloads_instead_of_restoring_evicted_base(monkeypatch):
