@@ -88,6 +88,8 @@ def validate_afd_worker(worker):
         if timing.fpm_parquet_path is not None or timing.forward_model != "op_level":
             raise ValueError("AFD timing requires op_level")
     scheduler = worker.scheduler
+    if scheduler is not None and getattr(scheduler, "scheduler_select_time_ms", 0.0):
+        raise ValueError("scheduler.scheduler_select_time_ms is unsupported for AFD")
     if scheduler is not None and (
         getattr(scheduler, "prefill_schedule_interval", 1) != 1
         or getattr(scheduler, "async_scheduling", None) is not None

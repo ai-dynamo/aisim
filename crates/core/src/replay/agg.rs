@@ -267,13 +267,23 @@ where
         sink: ReplayTelemetryCaptureSink,
     ) -> Self {
         sink.set_preparing(self.admission.is_agentic_preparing());
-        let mut runtime = self.with_telemetry_observer(interval_ms, Box::new(sink.clone()));
+        let mut runtime = self.with_telemetry_runtime(interval_ms, Box::new(sink.clone()));
         runtime.telemetry_capture = Some(sink);
         runtime.collector.set_capture_per_request(true);
         runtime
     }
 
     pub(crate) fn with_telemetry_observer(
+        mut self,
+        sample_interval_ms: f64,
+        observer: Box<dyn ReplayTelemetryObserver>,
+    ) -> Self {
+        // Observers can drive closed-loop policies; capture exports stay unchanged.
+        self.collector.enable_completion_feedback();
+        self.with_telemetry_runtime(sample_interval_ms, observer)
+    }
+
+    fn with_telemetry_runtime(
         mut self,
         sample_interval_ms: f64,
         observer: Box<dyn ReplayTelemetryObserver>,
@@ -1318,6 +1328,10 @@ where
             })
             .collect();
         let snapshot = ReplayTelemetrySnapshot {
+            // A baseline is gauge-only: pending latency pairs wait for the next sample.
+            completion_feedback: self
+                .collector
+                .completion_feedback_snapshot(kind != ReplayTelemetrySampleKind::Baseline),
             host_caches,
             sample_ordinal,
             kind,
@@ -1548,6 +1562,7 @@ where
             || telemetry.has_observations()
             || self.traffic.telemetry_has_observations()
             || self.engine.telemetry_has_interval_observations()
+            || self.collector.completion_feedback_pending()
         {
             self.publish_telemetry_sample(ReplayTelemetrySampleKind::Final)?;
         }
@@ -3023,6 +3038,13 @@ mod agentic_warmup_tests {
                 );
                 let capture = sink.finish(&mut report, true);
                 assert_eq!(capture.requests.len(), 1);
+                // Completion feedback is an observer contract; capture exports omit it.
+                assert!(
+                    capture
+                        .samples
+                        .iter()
+                        .all(|sample| sample.sample.completion_feedback.is_none())
+                );
                 let request = &capture.requests[0].request;
                 let tokens: u64 = capture
                     .samples

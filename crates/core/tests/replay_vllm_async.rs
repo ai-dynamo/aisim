@@ -198,6 +198,44 @@ fn held_outputs_leave_before_those_of_the_pass_that_releases_them() {
 }
 
 #[test]
+fn each_worker_returns_its_held_outputs_at_its_own_launch() {
+    // Round-robin placement gives worker 0 the requests of EAGER_AFTER_DECODE,
+    // whose A leaves at 160, and worker 1 the same pair 3 ms later with an
+    // 8-token B. Worker 1 decides that pass at 113 and launches it piecewise
+    // for 20 ms, so its A leaves at 133: after worker 0 starts to hold its
+    // A, at 120, and before worker 0 returns it.
+    let requests = [
+        (1, 8, 3, 0.0),
+        (3, 8, 3, 3.0),
+        (2, 32, 1, 105.0),
+        (4, 8, 1, 108.0),
+    ];
+    let two_workers = ReplaySpec {
+        topology: ReplayTopology::Aggregated {
+            workers: WorkerPoolSpec {
+                initial_workers: 2,
+                ..WorkerPoolSpec::default()
+            },
+        },
+        ..spec(ReplayEngineConfig {
+            rank: launch(engine(64), [2.0, 20.0, 50.0], 0.0),
+            ..Default::default()
+        })
+    };
+    let report = Replayer::new(two_workers, ReplayEngineFactory::new())
+        .unwrap()
+        .with_runtime_input(ReplayRuntimeInput::Requests(
+            requests.iter().map(request).collect(),
+        ))
+        .run()
+        .unwrap();
+    assert_eq!(
+        [1, 3].map(|id| record(&report, id).last_token_ms),
+        [Some(160.0), Some(133.0)]
+    );
+}
+
+#[test]
 fn a_decode_pass_above_the_graph_limit_launches_eager() {
     // A, B and C prefill until 100, and A's last token comes from the decode
     // pass that ends at 110. With a one-token graph limit the two-token decode

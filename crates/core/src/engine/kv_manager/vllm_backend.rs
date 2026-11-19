@@ -195,6 +195,16 @@ struct BlockLeaseEntry {
     capacity_write_pending: bool,
 }
 
+/// A hybrid lookup that found no restorable state, kept on its lease so that
+/// a repeat of it skips the prefix walk and the state scan.
+#[derive(Debug, Clone, Copy)]
+struct StateMiss {
+    /// [`StateCacheManager::lookup_epoch`] at the lookup.
+    epoch: (u64, u64),
+    /// Leading blocks that hit the prefix cache.
+    overlap_blocks: usize,
+}
+
 /// Move-only native-G1 ownership token attached to one scheduler request.
 #[derive(Debug)]
 #[must_use = "a native block lease must be finished, aborted, retracted, or moved into a hold"]
@@ -228,6 +238,8 @@ pub(crate) struct BlockRequestLease {
     /// Block-aligned shared-prefix junction recorded at admission (vLLM
     /// `Request.shared_prefix_boundary`).
     junction: Option<usize>,
+    /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
+    state_miss: Option<StateMiss>,
     pub(crate) session_id: Option<String>,
 }
 
@@ -254,6 +266,7 @@ impl BlockRequestLease {
             state: None,
             prefill_checkpoint: None,
             junction: None,
+            state_miss: None,
             session_id: None,
         }
     }
@@ -2509,6 +2522,7 @@ impl VllmKvManager {
         lease.debug_assert_owner(owner);
         lease.prefill_checkpoint = None;
         lease.junction = None;
+        lease.state_miss = None;
         if let (Some(manager), Some(state)) = (&mut self.state_cache, &mut lease.state) {
             manager.preempt(&mut self.pool, state);
         }
@@ -2775,16 +2789,11 @@ impl VllmKvManager {
         }
     }
 
-    /// The prefill cost of a waiting request, and for a grouped prefix cache
-    /// the hit behind it, stored on the lease for the allocation.
-    ///
-    /// A request waits at the head of the queue for many steps, and most of
-    /// them change nothing that the search reads. So the lease keeps the
-    /// stamp of the search inputs with the hit, and the search runs again
-    /// only when the stamp changes (see `GroupedPrefixCoordinator::hit_stamp`).
-    /// The blocks and the active hit tokens read active and inactive block
-    /// state, which the stamp does not cover, so they are counted every time.
-    pub(crate) fn lookup_prefill_cost(
+    /// The prefill cost of a request that `schedule_request` prices itself,
+    /// and for a grouped prefix cache the hit behind it, stored on the lease
+    /// for the allocation (see [`Self::lookup_grouped_prefill_cost`]). Other
+    /// pools take [`Self::get_lease_prefill_cost`].
+    pub(crate) fn lookup_lease_prefill_cost(
         &self,
         sequence: &RequestSequence,
         lease: &mut BlockRequestLease,
@@ -2795,8 +2804,16 @@ impl VllmKvManager {
         self.get_lease_prefill_cost(sequence, lease)
     }
 
-    /// The grouped part of [`Self::lookup_prefill_cost`]. Kept out of line,
-    /// so that the lookup of the other pools keeps its small frame.
+    /// The prefill cost of a request for a grouped prefix cache, and the hit
+    /// behind it, stored on the lease for the allocation. Kept out of line, so
+    /// that the lookup of the other pools keeps its small frame.
+    ///
+    /// A request waits at the head of the queue for many steps, and most of
+    /// them change nothing that the search reads. So the lease keeps the
+    /// stamp of the search inputs with the hit, and the search runs again
+    /// only when the stamp changes (see `GroupedPrefixCoordinator::hit_stamp`).
+    /// The blocks and the active hit tokens read active and inactive block
+    /// state, which the stamp does not cover, so they are counted every time.
     #[inline(never)]
     fn lookup_grouped_prefill_cost(
         &self,
@@ -2895,6 +2912,65 @@ impl VllmKvManager {
         if self.grouped_prefix.is_some() {
             return self.grouped_prefill_cost(sequence, lease).0;
         }
+        self.lookup_prefill_cost(sequence, lease).0
+    }
+
+    /// [`Self::get_lease_prefill_cost`] of a waiting request, which repeats
+    /// its lookup every pass and keeps a [`StateMiss`] between them.
+    /// A grouped prefix cache keeps its hit on the lease instead (see
+    /// [`Self::lookup_grouped_prefill_cost`]).
+    pub(crate) fn get_waiting_lease_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        if let Some(coordinator) = &self.grouped_prefix {
+            return self.lookup_grouped_prefill_cost(coordinator, sequence, lease);
+        }
+        if let Some(cost) = self.repeated_state_miss(sequence, lease) {
+            debug_assert_eq!(self.lookup_prefill_cost(sequence, lease).0.cached_tokens, 0);
+            return cost;
+        }
+        let (cost, miss) = self.lookup_prefill_cost(sequence, lease);
+        lease.state_miss = miss;
+        cost
+    }
+
+    /// The cost of a hybrid lookup that repeats one which found no restorable
+    /// state. No state became visible since, the block after the old attention
+    /// hit still misses and no host load landed a state on the lease, so its
+    /// scan would find nothing again. Preemption clears the miss, so the
+    /// sequence, and with it the logits cap, is the one the miss was found for.
+    fn repeated_state_miss(
+        &self,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+    ) -> Option<PrefillCost> {
+        let miss = lease.state_miss?;
+        let manager = self.state_cache.as_ref()?;
+        let repeats = miss.epoch == manager.lookup_epoch(&self.pool)
+            && lease
+                .state
+                .as_deref()
+                .is_none_or(|state| state.working.is_empty())
+            && lease
+                .sequence_hash(miss.overlap_blocks)
+                .and_then(|hash| self.pool.prefix_hit(hash))
+                .is_none();
+        repeats.then(|| PrefillCost {
+            new_blocks: lease.entries.len(),
+            new_tokens: sequence.len(),
+            cached_tokens: 0,
+            active_cached_tokens: 0,
+        })
+    }
+
+    /// The lookup, and the [`StateMiss`] a waiting request may keep from it.
+    fn lookup_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+    ) -> (PrefillCost, Option<StateMiss>) {
         let (mut overlap_blocks, mut active_overlap_blocks): (usize, usize) =
             if self.enable_prefix_caching && sequence.enable_prefix_caching() {
                 let mut overlap = 0;
@@ -2962,21 +3038,40 @@ impl VllmKvManager {
                     })
                     .unwrap_or(0);
                 let full = cached_tokens / self.block_size;
-                let active = lease.entries[..full]
-                    .iter()
-                    .filter(|e| {
-                        e.identity
-                            .sequence_hash
-                            .and_then(|h| self.pool.prefix_hit(h))
-                            .is_some_and(|hit| hit.is_active)
-                    })
-                    .count();
-                return PrefillCost {
+                let active_in = |entries: &[BlockLeaseEntry]| {
+                    entries
+                        .iter()
+                        .filter(|e| {
+                            e.identity
+                                .sequence_hash
+                                .and_then(|h| self.pool.prefix_hit(h))
+                                .is_some_and(|hit| hit.is_active)
+                        })
+                        .count()
+                };
+                // The hit ends inside the overlap, whose active blocks the
+                // walk counted: a second look at the shorter side of the hit
+                // gives the hit's own.
+                let active = if full <= overlap_blocks - full {
+                    active_in(&lease.entries[..full])
+                } else {
+                    active_overlap_blocks - active_in(&lease.entries[full..overlap_blocks])
+                };
+                let cost = PrefillCost {
                     new_blocks: lease.entries.len() - full,
                     new_tokens: sequence.len() - cached_tokens,
                     cached_tokens,
                     active_cached_tokens: active * self.block_size,
                 };
+                // With block-aligned boundaries and no speculative drop, the
+                // scan depends only on what `repeated_state_miss` checks.
+                let miss =
+                    (cached_tokens == 0 && unit == self.block_size && !manager.speculative_drop())
+                        .then(|| StateMiss {
+                            epoch: manager.lookup_epoch(&self.pool),
+                            overlap_blocks,
+                        });
+                return (cost, miss);
             }
         }
         if let Some(manager) = &self.state_cache {
@@ -3026,12 +3121,13 @@ impl VllmKvManager {
         let new_blocks = lease.entries.len() - overlap_blocks;
         let cached_tokens = (overlap_blocks * self.block_size).min(sequence.len());
         let active_cached_tokens = (active_overlap_blocks * self.block_size).min(sequence.len());
-        PrefillCost {
+        let cost = PrefillCost {
             new_blocks,
             new_tokens: sequence.len() - cached_tokens,
             cached_tokens,
             active_cached_tokens,
-        }
+        };
+        (cost, None)
     }
 
     /// The shared-prefix junction of a fresh lookup: the attention hit when it
