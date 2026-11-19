@@ -101,7 +101,7 @@ def main() -> int:
     files = [p.resolve() for p in args.paths] if args.paths else documentation_files(ROOT)
     failures = []
     for path in files:
-        if not path.is_relative_to(ROOT) or not path.is_file():
+        if not path.is_file() or not path.resolve().is_relative_to(ROOT):
             failures.append(f"{path}: expected a Markdown file inside the repository")
             continue
         failures.extend(check_file(path, ROOT))

@@ -4,6 +4,7 @@
 """Behavioral coverage for local documentation destination checks."""
 
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,24 @@ class DocumentationLinksTest(unittest.TestCase):
                 path.write_text("[example](missing.md)")
             failures = [failure for page in documentation_files(root) for failure in check_file(page, root)]
             self.assertCountEqual(failures, [f"{name}:1: missing local destination: missing.md" for name in guides])
+
+    def test_default_scan_rejects_a_skill_file_outside_the_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            script = root / "scripts/ci/check_documentation_links.py"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
+            outside = root.parent / "outside.md"
+            outside.write_text("[fixture](outside-marker.md)")
+            link = root / ".agents/skills/example/SKILL.md"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside)
+
+            result = subprocess.run([sys.executable, str(script)], cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("SKILL.md: expected a Markdown file inside the repository", result.stdout)
+            self.assertNotIn("outside-marker.md", result.stdout)
 
     def test_extracts_inline_images_references_and_balanced_destinations(self):
         cases = {
