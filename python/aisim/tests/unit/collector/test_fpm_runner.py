@@ -843,6 +843,148 @@ def test_stage_rejects_masked_truncated_copy(tmp_path):
     assert hashlib.sha256(source.read_bytes()).hexdigest() in calls[-1]
 
 
+def test_staging_stall_detection():
+    """A stall is a channel failure; a checksum mismatch is a staging result."""
+    empty = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+
+    assert fpm_runner._staging_stalled(empty, subprocess.TimeoutExpired([], 90))
+    assert fpm_runner._staging_stalled(None, subprocess.TimeoutExpired([], 90))
+    assert fpm_runner._staging_stalled(
+        subprocess.CompletedProcess([], 1, stdout="", stderr="error: context deadline exceeded\n"),
+        RuntimeError("pod command failed"),
+    )
+    assert not fpm_runner._staging_stalled(empty, RuntimeError("pod command failed: remote_exit=1"))
+    assert not fpm_runner._staging_stalled(None, RuntimeError("pod command failed"))
+
+
+def _stage_one_file(
+    runner,
+    tmp_path,
+    verify,
+    *,
+    copy_stderr="error: context deadline exceeded\n",
+    copy_exit=1,
+    copy_timeout_on=(),
+):
+    source = tmp_path / "run.sh"
+    source.write_text("#!/bin/sh\necho hi\n")
+    copies, verifications = [], []
+
+    def kubectl(*args, **kwargs):
+        if args[0] == "cp":
+            copies.append(args)
+            if len(copies) in copy_timeout_on:
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+            return subprocess.CompletedProcess(args, copy_exit, stdout="", stderr=copy_stderr)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def exec_checked(pod, command, *, timeout):
+        if command[:2] == ["python3", "-c"]:
+            verifications.append(list(command))
+            verify(len(verifications))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner._kubectl = kubectl
+    runner._exec_checked = exec_checked
+    return source, copies, verifications
+
+
+def test_stage_retries_a_stalled_exec_channel(monkeypatch, tmp_path):
+    """A stalled channel retries the copy it belongs to, so staging survives a transport flake."""
+    monkeypatch.setattr(fpm_runner.time, "sleep", lambda _seconds: None)
+    runner = _runner(tmp_path)
+
+    def verify(attempt):
+        if attempt == 1:
+            raise RuntimeError("pod command failed: output='error: context deadline exceeded'")
+
+    source, copies, verifications = _stage_one_file(runner, tmp_path, verify)
+
+    runner.stage(["pod-0"], [source])
+
+    assert len(copies) == 2
+    assert len(verifications) == 2
+
+
+def test_stage_retries_a_timed_out_copy(monkeypatch, tmp_path):
+    """A copy that never returns is retried too; the verification runs on the copy that lands."""
+    monkeypatch.setattr(fpm_runner.time, "sleep", lambda _seconds: None)
+    runner = _runner(tmp_path)
+    source, copies, verifications = _stage_one_file(runner, tmp_path, lambda _attempt: None, copy_timeout_on={1})
+
+    runner.stage(["pod-0"], [source])
+
+    assert len(copies) == 2
+    assert len(verifications) == 1
+
+
+def test_stage_reports_an_exhausted_copy_timeout(monkeypatch, tmp_path):
+    monkeypatch.setattr(fpm_runner.time, "sleep", lambda _seconds: None)
+    runner = _runner(tmp_path)
+    source, copies, verifications = _stage_one_file(runner, tmp_path, lambda _attempt: None, copy_timeout_on={1, 2, 3})
+
+    with pytest.raises(RuntimeError, match=f"attempts={fpm_runner.STAGING_ATTEMPTS}"):
+        runner.stage(["pod-0"], [source])
+
+    assert len(copies) == fpm_runner.STAGING_ATTEMPTS
+    assert verifications == []
+
+
+def test_stage_propagates_cancellation(monkeypatch, tmp_path):
+    """A cancelled command is not a stall: it must stop the run, not be retried."""
+    monkeypatch.setattr(fpm_runner.time, "sleep", lambda _seconds: None)
+    runner = _runner(tmp_path)
+    source = tmp_path / "run.sh"
+    source.write_text("#!/bin/sh\necho hi\n")
+    copies = []
+
+    def kubectl(*args, **kwargs):
+        if args[0] == "cp":
+            copies.append(args)
+            raise fpm_runner._CommandCancelled("FPM execution was cancelled during command launch")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    runner._kubectl = kubectl
+    runner._exec_checked = lambda *a, **k: subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    with pytest.raises(fpm_runner._CommandCancelled):
+        runner.stage(["pod-0"], [source])
+
+    assert len(copies) == 1
+
+
+def test_stage_does_not_retry_a_checksum_mismatch(tmp_path):
+    """A copy that landed but does not match fails at once: retrying cannot change those bytes."""
+    runner = _runner(tmp_path)
+
+    def verify(_attempt):
+        raise RuntimeError("pod command failed: local_exit=0, remote_exit=1, output=''")
+
+    source, copies, verifications = _stage_one_file(runner, tmp_path, verify, copy_stderr="", copy_exit=0)
+
+    with pytest.raises(RuntimeError, match="failed to stage an exact copy"):
+        runner.stage(["pod-0"], [source])
+
+    assert len(copies) == 1
+    assert len(verifications) == 1
+
+
+def test_stage_reports_exhausted_stall_attempts(monkeypatch, tmp_path):
+    monkeypatch.setattr(fpm_runner.time, "sleep", lambda _seconds: None)
+    runner = _runner(tmp_path)
+    source, copies, verifications = _stage_one_file(
+        runner,
+        tmp_path,
+        lambda _attempt: (_ for _ in ()).throw(RuntimeError("error: context deadline exceeded")),
+    )
+
+    with pytest.raises(RuntimeError, match=f"attempts={fpm_runner.STAGING_ATTEMPTS}"):
+        runner.stage(["pod-0"], [source])
+
+    assert len(copies) == fpm_runner.STAGING_ATTEMPTS
+    assert len(verifications) == fpm_runner.STAGING_ATTEMPTS
+
+
 def test_collect_rejects_masked_partial_copy(tmp_path):
     # exercise the raw-copy path: these fixtures model uncompressed transfers
     runner = _runner(tmp_path)
