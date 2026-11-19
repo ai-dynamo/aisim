@@ -66,7 +66,6 @@ def row(c: dict, rank: int | None, config_file: str | None) -> dict:
         "shape": shape(cfg),
         "used_gpus": gpus,
         "score": _num(c.get("score")),
-        "num_requests": _num(m.get("num_requests")),
         "completed_requests": _num(m.get("completed_requests")),
         "sla_compliant_requests": _num(m.get("goodput_completed_requests")),
         "request_rps": _num(m.get("request_throughput_rps")),
@@ -75,10 +74,7 @@ def row(c: dict, rank: int | None, config_file: str | None) -> dict:
         "output_tok_s_per_gpu": per_gpu,
         "sla_compliant_output_tok_s": good_tok_s,
         "mean_ttft_ms": _num(m.get("mean_ttft_ms")),
-        "p90_ttft_ms": _num(m.get("p90_ttft_ms")),
         "mean_tpot_ms": _num(m.get("mean_tpot_ms")),
-        "p90_tpot_ms": _num(m.get("p90_tpot_ms")),
-        "mean_itl_ms": _num(m.get("mean_itl_ms")),
         "mean_e2e_ms": _num(m.get("mean_e2e_latency_ms")),
     }
 
@@ -98,9 +94,68 @@ def line(r: dict) -> str:
         f"{head} {where} | {r['backend']} | {r['shape']} | gpus={r['used_gpus']} | score={fmt(r['score'])}"
         f" | out_tok_s={fmt(r['output_tok_s'])} ({fmt(r['output_tok_s_per_gpu'])}/gpu)"
         f" | ttft={fmt(r['mean_ttft_ms'])}ms tpot={fmt(r['mean_tpot_ms'], 2)}ms e2e={fmt(r['mean_e2e_ms'])}ms"
-        f" | completed={fmt(r['completed_requests'], 0)}/{fmt(r['num_requests'], 0)}"
+        f" | completed={fmt(r['completed_requests'], 0)}"
         f" sla_ok={fmt(r['sla_compliant_requests'], 0)} goodput_rps={fmt(r['goodput_rps'], 2)}"
     )
+
+
+def validate_result(result) -> None:
+    """Validate the consumed ledger and view fields without requiring AISim imports."""
+    if not isinstance(result, dict):
+        raise ValueError("top level is not an object")
+    candidates, views = result.get("candidates"), result.get("views")
+    if not isinstance(candidates, list) or not isinstance(views, dict):
+        raise ValueError("'candidates' must be a list and 'views' must be an object")
+    counts = result.get("counts", {})
+    if not isinstance(counts, dict) or any(type(v) is not int or v < 0 for v in counts.values()):
+        raise ValueError("'counts' must contain nonnegative integer counts")
+    by_id = {}
+    statuses = {"feasible", "infeasible", "unsupported", "timed_out", "failed", "resource_limited"}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("a candidate is not an object")
+        cid = candidate.get("candidate_id")
+        if not isinstance(cid, str) or not cid or cid in by_id:
+            raise ValueError("candidate IDs must be nonempty unique strings")
+        status = candidate.get("status")
+        if not isinstance(status, str) or status not in statuses:
+            raise ValueError(f"{cid}: missing or invalid status")
+        config = candidate.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(f"{cid}: config must be an object")
+        for key in ("deployment_mode", "backend", "backend_version"):
+            if key in config and config[key] is not None and not isinstance(config[key], str):
+                raise ValueError(f"{cid}: config.{key} must be a string or null")
+        metrics = candidate.get("metrics", {})
+        if not isinstance(metrics, dict) or any(v is not None and _num(v) is None for v in metrics.values()):
+            raise ValueError(f"{cid}: metrics must contain finite numbers or null")
+        gpus, score = candidate.get("used_gpus"), candidate.get("score")
+        if gpus is not None and (type(gpus) is not int or gpus < 0):
+            raise ValueError(f"{cid}: used_gpus must be a nonnegative integer or null")
+        if score is not None and _num(score) is None:
+            raise ValueError(f"{cid}: score must be a finite number or null")
+        if status == "feasible" and (gpus is None or score is None):
+            raise ValueError(f"{cid}: feasible candidate needs used_gpus and score")
+        for key in ("reason", "reason_category"):
+            value = candidate.get(key)
+            if status != "feasible" and (not isinstance(value, str) or not value):
+                raise ValueError(f"{cid}: non-feasible candidate needs {key}")
+            if status == "feasible" and value is not None:
+                raise ValueError(f"{cid}: feasible candidate cannot have {key}")
+        prediction = candidate.get("prediction_config")
+        if prediction is not None and not isinstance(prediction, dict):
+            raise ValueError(f"{cid}: prediction_config must be an object or null")
+        by_id[cid] = candidate
+    for name in ("top_n", "pareto_front"):
+        view = views.get(name, [])
+        if not isinstance(view, list) or any(not isinstance(cid, str) for cid in view):
+            raise ValueError(f"{name} must be a list of candidate IDs")
+        if len(view) != len(set(view)):
+            raise ValueError(f"{name} contains duplicate candidate IDs")
+        if any(cid not in by_id or by_id[cid]["status"] != "feasible" for cid in view):
+            raise ValueError(f"{name} must reference retained feasible candidates")
+    if views.get("top_n") and views.get("pareto_front"):
+        raise ValueError("top_n and pareto_front cannot both be populated")
 
 
 def main() -> int:
@@ -126,19 +181,10 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(f"error: cannot read {path}: {exc}", file=sys.stderr)
         return 2
-    # Fail loudly on a malformed artifact instead of reporting an empty result.
-    problems = []
-    if not isinstance(d, dict):
-        problems.append("top level is not an object")
-    else:
-        if not isinstance(d.get("candidates"), list):
-            problems.append("'candidates' is missing or not a list")
-        elif not all(isinstance(c, dict) and "candidate_id" in c for c in d["candidates"]):
-            problems.append("a candidate has no candidate_id")
-        if not isinstance(d.get("views"), dict):
-            problems.append("'views' is missing or not an object")
-    if problems:
-        print(f"error: {path} is not a valid AISim recommendation result: {'; '.join(problems)}", file=sys.stderr)
+    try:
+        validate_result(d)
+    except ValueError as exc:
+        print(f"error: {path} is not a valid AISim recommendation result: {exc}", file=sys.stderr)
         return 2
     cands = d["candidates"]
     by_id = {c["candidate_id"]: c for c in cands}

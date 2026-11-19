@@ -6,8 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # GPU spot-check of AISim picks
 
 Source: `docs/sweeper/deployment-generation.md` in ai-dynamo/aisim (0.14.0).
-Step 1 runs on CPU and was tested with aisim 0.14.0. Steps 2 to 4 need GPUs
-and run only after the user approves the picks, GPU count and duration.
+Step 1 runs on CPU. Steps 2 to 4 need GPUs and run only after the user approves the picks, GPU count and duration.
 They were not run during testing.
 
 ## 1. Render serving artifacts for one pick (CPU)
@@ -64,8 +63,6 @@ For a fixed-length workload, it also writes `bench_run.sh` (an AIPerf run)
 and `k8s_bench.yaml`. Trace workloads have different benchmark requirements;
 see the limitation in step 3.
 
-It worked for both aggregated and disaggregated picks.
-
 Show the user any warning such as "No exact CLI args template for 0.30.0,
 using closest prior template". It means the launch flags come from an
 older backend template; check them against the runtime image before
@@ -76,6 +73,12 @@ and rejects what it cannot lower. Token budgets must be multiples of 64.
 Run `bash -n` on every generated script.
 
 ## 2. Launch (GPU, approval required)
+
+Before starting discovery services, record which etcd and NATS containers
+are already running in the Compose project. Reuse them. Record the exact
+container IDs of any services this spot-check starts, including containers
+that existed but were stopped. Keep this list for cleanup; if etcd was
+already running and only NATS was started, the list contains only NATS.
 
 - Single host: start etcd and NATS from the matching Dynamo release's
   `dev/docker-compose.yml`. Run the Dynamo runtime image with the model
@@ -169,7 +172,7 @@ comparing latency.
   planner; the measurement includes them. Report that as a limitation of
   the comparison.
 - Stop the serving processes or delete the deployment when done. Also stop
-  the etcd and NATS containers you started for this spot-check (for example
-  `docker compose -f dev/docker-compose.yml down`), but leave alone any
-  discovery services that were already running before you started. Tell the
-  user what was removed.
+  discovery containers recorded in step 2, using `docker stop <container-id>`
+  for each recorded ID. If the list is empty, skip discovery cleanup. Leave
+  pre-existing running services, networks and volumes in place. Tell the
+  user which processes, deployments and containers were stopped or removed.

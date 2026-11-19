@@ -2,7 +2,7 @@
 name: aisim-deployment-search
 description: Ranks serving configs for one model on a GPU type and budget already chosen, simulated on CPU with AISim. For how many GPUs a load needs, use aisim-gpu-selection-and-sizing.
 license: Apache-2.0
-compatibility: "Python 3.11-3.13; aisim 0.14.x (tested 0.14.0); CPU only for the search; optional GPU spot-check needs a Dynamo host or Kubernetes cluster"
+compatibility: "Python 3.11-3.13; aisim 0.14.x (targets 0.14.0; full evals pending); CPU only for the search; optional GPU spot-check needs a Dynamo host or Kubernetes cluster"
 allowed-tools: Bash Read Write
 permissions: [env, file_read, file_write, network, shell, kubectl_exec]
 metadata:
@@ -143,12 +143,15 @@ files behind. Exit codes:
 - `3`: local resource limit. If `recommendations/` was still written, the
   result covers only the candidates that ran; say so. Then read the reason
   in `resource-runtime.json` and the error message, and act on the cause:
+
   - the run's processes exceeded the memory cap: a lower cap fails again.
     Raise the cap (it must stay below free RAM) or shrink the search, for
     example fewer GPUs or backends, then rerun.
-  - free host memory fell below the reserved headroom, or the cap was above
-    free RAM at start: free host memory (or lower the cap below free RAM),
-    then rerun.
+  - free host memory fell below the reserved headroom: free host memory
+    until the reserve is available, then rerun. Lowering the cap does not
+    restore free-memory headroom.
+  - the cap was above free RAM at start: lower the cap below free RAM or
+    free enough host memory for that cap, then rerun.
 
   Rerun into a new directory.
 

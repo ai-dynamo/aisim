@@ -1,13 +1,13 @@
 {
   "skill": "aisim-gpu-selection-and-sizing",
-  "_draft_note": "Pinned to aisim==0.14.0. Grade on the invariants in expected_behavior: reported GPU counts and metrics must match the artifacts the agent produced (size_ladder.py JSON, recommendation.json, headroom_scan.py JSON) within 1%. Do not grade on a specific GPU count. The missing-coverage case requires HTTPS access to huggingface.co for the Granite config; the other cases use configs bundled with AISim.",
+  "_draft_note": "Pinned to aisim==0.14.0. Grade on the invariants in expected_behavior: reported GPU counts and metrics must match the artifacts the agent produced (size_ladder.py JSON, recommendation.json, headroom_scan.py JSON) within 1%. Do not grade on a specific GPU count. The missing-coverage case requires HTTPS access to huggingface.co for the Granite config; the other cases use configs bundled with AISim. These agent evals have not run against the public aisim==0.14.0 wheel; local synthetic consumer tests are separate evidence.",
   "cases": [
     {
       "id": "size-two-gpu-types",
       "question": "We expect 100 requests per second (Poisson) of Qwen/Qwen3.5-35B-A3B, 2048 input and 256 output tokens. TTFT must average under 500 ms and TPOT under 50 ms, and 99% of requests must meet that per-request SLA. We need at least 90 SLA-compliant requests per second. How many B200s (b200_sxm) or GB300s (gb300) do we need with vLLM?",
       "expected_skill": "aisim-gpu-selection-and-sizing",
       "expected_script": "scripts/size_ladder.py",
-      "ground_truth": "Writes sizing.yaml with a Poisson load of 100 rps, at least 300 s of arrivals (30000 requests) or a stated shorter window with the ladder's warning relayed, evaluation.sla ttft_ms 500 and itl_ms 50, target min_gpus and min_goodput_rps 90. Runs size_ladder.py once per GPU type, then headroom_scan.py on each answer with --min-compliant-share 0.99. Reports per type the smallest qualifying configuration found in the tested search space, whether 1.0x passed the 99% rule, and the highest tested passing multiplier. In the 0.14.0 test with a 60 s window, both types' ladders answered 2 GPUs.",
+      "ground_truth": "Writes sizing.yaml with a Poisson load of 100 rps, at least 300 s of arrivals (30000 requests) or a stated shorter window with the ladder's warning relayed, evaluation.sla ttft_ms 500 and itl_ms 50, target min_gpus and min_goodput_rps 90. Runs size_ladder.py once per GPU type, then headroom_scan.py on each answer with --min-compliant-share 0.99. Reports per type the smallest qualifying configuration found in the tested search space, whether 1.0x passed the 99% rule, and the highest tested passing multiplier.",
       "expected_behavior": [
         "Uses min_gpus with the user's 90 rps floor, not a silent default",
         "Uses at least 300 s of arrivals",
@@ -21,7 +21,7 @@
       "id": "hopper-comparison-window",
       "question": "For comparison with Blackwell: how many H200s (h200_sxm) does Qwen/Qwen3.5-35B-A3B need at 20 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms and TPOT under 50 ms, 18 SLA-compliant rps, 99% of requests within SLA, vLLM?",
       "expected_skill": "aisim-gpu-selection-and-sizing",
-      "ground_truth": "The ladder answers 1 GPU. With a 300 s window the headroom scan's 1.0x row fails the 99% rule (93.9% and 96.9% compliant in two 0.14.0 runs), so the agent must not present one H200 as sufficient under that rule.",
+      "ground_truth": "Runs the ladder and headroom scan over at least 300 s of arrivals. Reports the GPU count and compliance share from saved artifacts. If the 1.0x row fails the 99% rule, does not present that GPU count as sufficient. No fixed GPU count or compliance share is assumed.",
       "expected_behavior": [
         "Runs the headroom scan with --min-compliant-share 0.99",
         "Does not present a GPU count whose 1.0x row failed as sufficient"
@@ -32,7 +32,7 @@
       "question": "Qwen/Qwen3.5-35B-A3B on B200 (b200_sxm), vLLM: 100 requests per second (Poisson), 2048 in / 256 out, mean TTFT under 500 ms, mean TPOT under 50 ms, at least 90 SLA-compliant requests per second, 3000 requests. Smallest deployment?",
       "expected_skill": "aisim-gpu-selection-and-sizing",
       "expected_script": "scripts/size_ladder.py",
-      "ground_truth": "size_ladder.py fails at budgets 1 and 2 with genuine infeasibility, qualifies at budget 4, and its ascending refinement tries budget 3. The answer is the ladder JSON's answer.used_gpus (3 GPUs in one 0.14.0 test). Because each budget is a sampled search, another run with 6000 requests answered 2 GPUs at budget 4 after budget 2 failed; the ladder then emits a warning, which the agent must relay. The agent may also relay the arrival-window warning, since 3000 requests at 100 rps is 30 s.",
+      "ground_truth": "Reports answer.used_gpus from the ladder JSON. When a qualifying upper budget leaves untested smaller budgets, verifies ascending refinement in the saved steps. Relays all warnings, including any smaller qualifying configuration found after a lower-budget failure. Because each step is sampled, does not call the result a proven minimum. Relays the arrival-window warning: 3000 requests at 100 rps is 30 s.",
       "expected_behavior": [
         "Reported GPU count equals answer.used_gpus",
         "Relays every warning in the ladder JSON",

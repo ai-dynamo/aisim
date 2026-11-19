@@ -2,7 +2,7 @@
 name: aisim-gpu-selection-and-sizing
 description: Sizes how many GPUs of which type serve a model's request rate within a latency SLA (AISim on CPU). To tune GPUs already chosen, use aisim-deployment-search.
 license: Apache-2.0
-compatibility: "Python 3.11-3.13; aisim 0.14.x (tested 0.14.0); CPU only; PyYAML (installed with aisim)"
+compatibility: "Python 3.11-3.13; aisim 0.14.x (targets 0.14.0; full evals pending); CPU only; PyYAML (installed with aisim)"
 allowed-tools: Bash Read Write
 permissions: [env, file_read, file_write, network, shell]
 metadata:
@@ -46,7 +46,7 @@ these eight B200s handle 100 requests per second?" are sizing questions.
   recorded trace, say this version sizes request-rate workloads only. Ask
   for the expected request rate, or decline. The bundled scripts reject
   other load types.
-- One backend per run is the tested path. `vllm` and `sglang` both work.
+- Use one backend per run, such as `vllm` or `sglang`.
 - The GPU count is for a static deployment at one load, not autoscaling.
 
 ## When not to use
@@ -140,12 +140,10 @@ optimizer:
   max_trials: 16
 ```
 
-Use an observation window of at least 300 seconds. In testing at 100
-requests per second, 2 GB200s qualified on a 60-second window. Over 300
-seconds, the same configuration still met both SLA means (TTFT 238 ms, TPOT
-37.6 ms), but only 84% of requests individually met the TTFT bound. Its
-SLA-compliant throughput (83 requests per second) also fell below the
-90 floor.
+Use an observation window of at least 300 seconds. A shorter run can miss
+queue buildup. Check the per-request compliance share and SLA-compliant
+throughput as well as aggregate latency means before presenting a GPU count
+as sufficient.
 
 ### 3. Run the sizing ladder for each GPU type
 
@@ -309,12 +307,8 @@ requests within SLA. How many B200s or GB300s do we need?"
 4. Reports per type: the GPU count found, whether 1.0x passed the 99% rule,
    the highest tested passing multiple, and that all of it is simulated.
 
-Observed with 0.14.0 (60-second sizing window, 300-second check):
-
-- B200: 2 GPUs, 100% of requests within SLA.
-- GB300: 2 GPUs, 97.3% within SLA, so it fails the 99% rule at 1.0x.
-
-The agent says so rather than presenting 2 GB300s as sufficient.
+Read each result from the saved artifacts. If a type fails the 99% rule at
+1.0x, report that failure and do not present its ladder count as sufficient.
 
 **User:** "I own eight B200s. How many do I need to set aside for 100
 requests per second of the same workload?"
@@ -334,4 +328,5 @@ request-rate workloads only.
 - Each budget step is a sampled search (`optimizer.max_trials`), so a
   smaller configuration can exist.
 - SLA bounds are checked on aggregate means; tails (p90, p99) can exceed
-  them. The summarizer's `--json` output includes p90 TTFT and TPOT.
+  them. The 0.14.0 recommendation ledger provides mean TTFT, TPOT and E2E;
+  the summarizer does not report tail latency from this ledger.

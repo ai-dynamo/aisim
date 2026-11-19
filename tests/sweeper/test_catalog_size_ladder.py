@@ -428,3 +428,106 @@ def test_headroom_keeps_fallback_warnings_from_a_successful_prediction(
     for row in rows:
         assert row["fallback_warnings"] == [f"WARNING {FALLBACK_LINE}"]
         assert FALLBACK_LINE in Path(row["log_file"]).read_text()
+
+
+@pytest.fixture
+def consumer_fixture():
+    return json.loads((ROOT / "benchmarks/evidence/skills-catalog/consumer-fixture.json").read_text())
+
+
+def test_ladder_classifies_saved_consumer_fixture(ladder, consumer_fixture, tmp_path):
+    (tmp_path / "recommendation.json").write_text(json.dumps(consumer_fixture["recommendation"]))
+    status, _, report = ladder.classify(0, "", tmp_path)
+    assert status == consumer_fixture["expected"]["ladder_status"]
+    assert ladder.best_selected(report)["used_gpus"] == 2
+    assert ladder.classify(3, "memory budget", tmp_path)[0] == "qualified_partial"
+    report["candidates"] = [report["candidates"][1]]
+    report["views"]["top_n"] = []
+    (tmp_path / "recommendation.json").write_text(json.dumps(report))
+    assert ladder.classify(1, "no feasible candidates", tmp_path)[0] == "infeasible"
+
+
+def test_headroom_parses_saved_consumer_fixture(
+    headroom, consumer_fixture, monkeypatch, prediction_config, tmp_path, capsys
+):
+    def predict(cmd, **kwargs):
+        return headroom.subprocess.CompletedProcess(cmd, 0, json.dumps(consumer_fixture["prediction_report"]), "")
+
+    monkeypatch.setattr(headroom.subprocess, "run", predict)
+    assert invoke_headroom(headroom, monkeypatch, prediction_config, tmp_path, "--steps", "1.0") == 0
+    row = json.loads(capsys.readouterr().out)["rows"][0]
+    expected = consumer_fixture["expected"]
+    assert row["status"] == expected["headroom_status"]
+    assert row["compliant_share"] == expected["headroom_compliant_share"]
+    assert row["goodput_share"] == pytest.approx(expected["headroom_goodput_share"])
+
+
+@pytest.mark.parametrize(
+    ("changes", "passes"),
+    [
+        ({}, True),
+        ({"mean_ttft_ms": 500}, True),
+        ({"mean_ttft_ms": 500.01}, False),
+        ({"mean_tpot_ms": 50}, True),
+        ({"mean_tpot_ms": 50.01}, False),
+        ({"mean_e2e_latency_ms": 3000}, True),
+        ({"mean_e2e_latency_ms": 3000.01}, False),
+        ({"completed_requests": 0}, False),
+        ({"completed_requests": None}, False),
+        ({"num_ttft_samples": 0}, False),
+        ({"num_tpot_samples": None}, False),
+        ({"num_e2e_latency_samples": float("nan")}, False),
+        ({"mean_ttft_ms": None}, False),
+        ({"mean_tpot_ms": float("inf")}, False),
+        ({"mean_e2e_latency_ms": float("nan")}, False),
+    ],
+)
+def test_headroom_fallback_against_aisim_oracle(headroom, consumer_fixture, monkeypatch, changes, passes):
+    import builtins
+
+    from aisim.sweeper.config import SLATarget
+    from aisim.sweeper.score import aggregate_sla_violations
+
+    original_import = builtins.__import__
+
+    def without_score(name, *args, **kwargs):
+        if name == "aisim.sweeper.score":
+            raise ImportError("exercise standalone skill fallback")
+        return original_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "__import__", without_score)
+        fallback, checker = headroom.sla_checker()
+    assert checker == "built-in fallback (same rules)"
+    report = {**consumer_fixture["prediction_report"], **changes}
+    sla = {"e2e_ms": 3000} if any("e2e" in key for key in changes) else {"ttft_ms": 500, "itl_ms": 50}
+    # Independent expected verdicts include equality, just-over-bound, and unqualified samples.
+    assert (not fallback(report, sla)) is passes
+    assert (not aggregate_sla_violations(report, SLATarget(**sla))) is passes
+
+
+@pytest.mark.parametrize(("base_requests", "window"), [(1000, 300), (6000, 300), (12000, 600)])
+def test_headroom_preserves_arrival_window_at_double_rate(
+    headroom, consumer_fixture, monkeypatch, prediction_config, tmp_path, capsys, base_requests, window
+):
+    cfg = yaml.safe_load(prediction_config.read_text())
+    cfg["traffic"]["stop"]["requests"] = base_requests
+    prediction_config.write_text(yaml.safe_dump(cfg))
+
+    def predict(cmd, **kwargs):
+        rate = float(next(v.split("=", 1)[1] for v in cmd if v.startswith("traffic.load.requests_per_second=")))
+        total = next((int(v.split("=", 1)[1]) for v in cmd if v.startswith("traffic.stop.requests=")), base_requests)
+        report = {
+            **consumer_fixture["prediction_report"],
+            "num_requests": total,
+            "completed_requests": total,
+            "goodput_completed_requests": total,
+            "goodput_request_throughput_rps": rate * 0.98,
+        }
+        return headroom.subprocess.CompletedProcess(cmd, 0, json.dumps(report), "")
+
+    monkeypatch.setattr(headroom.subprocess, "run", predict)
+    assert invoke_headroom(headroom, monkeypatch, prediction_config, tmp_path, "--steps", "1.0,2.0") == 0
+    rows = json.loads(capsys.readouterr().out)["rows"]
+    assert [row["arrival_window_s"] for row in rows] == [window, window]
+    assert [row["num_requests"] for row in rows] == [20 * window, 40 * window]
