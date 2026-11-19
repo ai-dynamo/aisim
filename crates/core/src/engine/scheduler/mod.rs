@@ -185,6 +185,9 @@ pub struct MockerMetrics {
     pub total_blocks: u64,
     pub kv_cache_used_bytes: Option<u64>,
     pub kv_cache_capacity_bytes: Option<u64>,
+    /// Bytes of cached grouped-cache blocks that no request holds. Only a
+    /// grouped cache with prefix caching reports it.
+    pub kv_cache_cached_bytes: Option<u64>,
     pub gpu_cache_usage_perc: f64,
     pub physical_gpu_cache_usage_perc: f64,
     pub running_requests: u64,
@@ -251,6 +254,7 @@ impl MockerMetrics {
             total_blocks,
             kv_cache_used_bytes: None,
             kv_cache_capacity_bytes: None,
+            kv_cache_cached_bytes: None,
             gpu_cache_usage_perc,
             physical_gpu_cache_usage_perc,
             running_requests,
@@ -273,6 +277,8 @@ pub(crate) struct AdmissionEvent {
 pub(crate) struct EnginePassResult {
     pub(crate) committed_requests: Vec<Uuid>,
     pub(crate) end_ms: f64,
+    /// Modeled pass boundary with serial batch selection excluded, when charged.
+    pub(crate) end_without_selection_ms: Option<f64>,
     /// Scheduler-owned same-timestamp convergence status. This is not an
     /// externally observable effect or ordinary progress.
     pub(crate) same_timestamp_retry: SameTimestampRetry,

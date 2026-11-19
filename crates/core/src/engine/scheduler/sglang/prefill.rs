@@ -39,6 +39,7 @@ pub(super) struct AdmitResult {
 /// AISim allocates each selected request immediately. Add those new pages back
 /// when querying capacity so the offsets charge them exactly once; prefix locks
 /// remain excluded from the live evictable capacity.
+/// With no fresh-admission slot budget, only existing chunks may continue.
 pub(super) fn get_new_batch_prefill(
     waiting: &mut WaitingQueue,
     kv_manager: &mut SglangKvManager,
@@ -46,7 +47,7 @@ pub(super) fn get_new_batch_prefill(
     new_token_ratio: f64,
     running: &[SglangRequest],
     mut batch_is_full: bool,
-    occupied_request_slots: usize,
+    occupied_request_slots: Option<usize>,
 ) -> AdmitResult {
     let mut total_offset: f64 = running
         .iter()
@@ -66,9 +67,11 @@ pub(super) fn get_new_batch_prefill(
     let mut admissions = Vec::new();
     let mut prefill_fpm = Vec::new();
 
-    let available_running_slots = config
-        .max_running_requests
-        .saturating_sub(running.len() + occupied_request_slots);
+    let available_running_slots = occupied_request_slots.map(|occupied| {
+        config
+            .max_running_requests
+            .saturating_sub(running.len() + occupied)
+    });
     // An in-flight chunk owns KV and must run before newly matched requests,
     // including under LPM or a full running batch.
     if waiting.has_continuation()
@@ -79,10 +82,16 @@ pub(super) fn get_new_batch_prefill(
     }
     'requests: while let Some(mut req) = waiting.pop_front() {
         let first_admission = req.materialized_tokens == 0;
-        if first_admission && (batch_is_full || can_run.len() >= available_running_slots) {
-            batch_is_full = true;
-            waiting.push_front(req);
-            break;
+        if first_admission {
+            let Some(slots) = available_running_slots else {
+                waiting.push_front(req);
+                break;
+            };
+            if batch_is_full || can_run.len() >= slots {
+                batch_is_full = true;
+                waiting.push_front(req);
+                break;
+            }
         }
         // SGLang `Req.init_next_round_input(tree_cache)`: a waiting request matches its whole
         // prompt against the radix tree once, capped at `input_len - 1` so a request that must

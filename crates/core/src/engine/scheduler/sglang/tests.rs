@@ -588,8 +588,15 @@ mod hicache_tests {
         manager.complete_host_boundary(0.0);
         manager.evict(8);
         let mut waiting = WaitingQueue::from([SglangRequest::new(direct_request(tokens, 1), 4, 0)]);
-        let admitted =
-            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let admitted = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert_eq!(admitted.can_run[0].materialized_tokens, 8);
         assert_eq!(admitted.prefill_fpm[0].tokens_computed, 8);
         assert_eq!(admitted.prefill_fpm[0].prefix_tokens, 0);
@@ -725,6 +732,50 @@ mod pd_admission_v0522 {
             handoff_id: HandoffId::from(Uuid::from_u128(id)),
         })
         .unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::full_chunk_budget(24, 4)]
+    #[case::spare_chunk_budget(32, 8)]
+    fn pending_destination_allows_chunked_prefill_to_finish(
+        #[case] capacity: usize,
+        #[case] chunk: usize,
+    ) {
+        let mut args = test_args(capacity / 4, 4, chunk);
+        args.worker_type = WorkerType::Decode;
+        args.max_num_seqs = Some(2);
+        args.sglang.as_mut().unwrap().num_reserved_decode_tokens = Some(8);
+        let mut core = SglangCore::new(args);
+
+        let chunked = core.receive(direct_request(vec![1; chunk + 4], 1));
+        let first = core.execute_hidden_pass(0.0);
+        assert!(first.output_signals.is_empty());
+        assert_eq!(core.waiting[0].materialized_tokens, chunk);
+        assert!(core.waiting[0].kv_lease.is_active());
+        assert_eq!(core.kv_manager.cache().available_tokens(), capacity - chunk);
+
+        // The destination needs the entire pool including its decode reserve.
+        assert!(!reserve(&mut core, 2, capacity - 8, 1));
+        let fresh = core.receive(direct_request(vec![3; 4], 1));
+
+        let second = core.execute_hidden_pass(first.end_ms);
+        assert!(
+            second.admissions.is_empty(),
+            "fresh requests must not overtake the destination"
+        );
+        assert!(
+            second
+                .output_signals
+                .iter()
+                .any(|signal| { signal.uuid == chunked && signal.completed && !signal.rejected }),
+            "the already admitted chunk must finish and release its KV"
+        );
+        assert_eq!(core.waiting.len(), 1);
+        assert_eq!(core.waiting[0].uuid, fresh);
+
+        core.retry_pending_destinations();
+        let handoff_id = HandoffId::from(Uuid::from_u128(2));
+        assert!(core.destination_is_held(handoff_id));
     }
 
     #[test]
@@ -1088,7 +1139,15 @@ mod admission_v0522 {
             SglangRequest::new(direct_request((0..1000).collect(), 16), 16, 0),
             SglangRequest::new(direct_request(shared, 16), 16, 0),
         ]);
-        let result = get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert_eq!(result.can_run.len(), 1);
         assert_eq!(waiting.len(), 1);
         assert!(result.batch_is_full);
@@ -1115,7 +1174,15 @@ mod admission_v0522 {
             4,
             0,
         )]);
-        let result = get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert!(result.can_run.is_empty());
         assert_eq!(manager.cache().available_tokens(), 24);
         assert!(!waiting[0].kv_lease.is_active());
@@ -1138,8 +1205,15 @@ mod admission_v0522 {
             4,
             0,
         )]);
-        let mut first =
-            get_new_batch_prefill(&mut waiting, &mut manager, &config, 1.0, &[], false, 0);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            1.0,
+            &[],
+            false,
+            Some(0),
+        );
         let continuation = first.can_run.pop().unwrap();
         assert_eq!(continuation.materialized_tokens, 4);
         waiting.push_back(continuation);
@@ -1159,7 +1233,7 @@ mod admission_v0522 {
             ratio,
             &[running],
             true,
-            0,
+            Some(0),
         );
         assert_eq!(second.can_run.len(), 1);
         assert_eq!(second.can_run[0].materialized_tokens, expected_materialized);
@@ -1168,6 +1242,41 @@ mod admission_v0522 {
             expected_materialized - 4
         );
         assert!(second.admissions.is_empty());
+    }
+
+    #[test]
+    fn continuation_runs_without_a_fresh_admission_budget() {
+        let config = SglangConfig::from_args(&test_args(8, 4, 8));
+        let mut manager = SglangKvManager::new(32, 4, KvEventPublishers::default(), 0);
+        let mut waiting =
+            WaitingQueue::from([SglangRequest::new(direct_request(vec![1; 12], 1), 4, 0)]);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        let continuation = first.can_run.pop().unwrap();
+        assert_eq!(continuation.materialized_tokens, 8);
+        let continuation_id = continuation.uuid;
+        let fresh = SglangRequest::new(direct_request(vec![2; 4], 1), 4, 0);
+        let fresh_id = fresh.uuid;
+        let mut waiting = WaitingQueue::from([fresh, continuation]);
+
+        let result =
+            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, None);
+
+        assert_eq!(result.can_run.len(), 1);
+        assert_eq!(result.can_run[0].uuid, continuation_id);
+        assert_eq!(result.can_run[0].materialized_tokens, 12);
+        assert!(result.admissions.is_empty());
+        assert!(!result.batch_is_full);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].uuid, fresh_id);
+        assert!(!waiting[0].kv_lease.is_active());
     }
 
     /// LPM orders the continuation first itself; under FIFO it stays queued
@@ -1188,15 +1297,30 @@ mod admission_v0522 {
             4,
             0,
         )]);
-        let mut first =
-            get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let mut first = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         let continuation = first.can_run.pop().unwrap();
         let id = continuation.uuid;
         waiting.push_back(SglangRequest::new(direct_request(hot, 1), 4, 0));
         waiting.push_back(continuation);
         apply_schedule_policy(&mut waiting, &manager, &config);
         assert_eq!(waiting.front().unwrap().uuid == id, lpm);
-        let next = get_new_batch_prefill(&mut waiting, &mut manager, &config, 0.7, &[], false, 0);
+        let next = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert_eq!(next.can_run[0].uuid, id);
         assert!(next.admissions.is_empty());
         assert!(!waiting.has_continuation());
@@ -2289,10 +2413,18 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
         images: Vec::new(),
         pending_terminal: false,
     }]);
-    let mut req = get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[], false, 0)
-        .can_run
-        .pop()
-        .unwrap();
+    let mut req = get_new_batch_prefill(
+        &mut waiting,
+        &mut kv_manager,
+        &config,
+        0.7,
+        &[],
+        false,
+        Some(0),
+    )
+    .can_run
+    .pop()
+    .unwrap();
 
     assert_eq!(req.cached_tokens(), 4);
     assert_eq!(req.kv_pages()[..1], cached_pages[..1]);
@@ -4341,8 +4473,15 @@ mod core_behavior {
             pending_terminal: false,
         }]);
 
-        let admit =
-            get_new_batch_prefill(&mut waiting, &mut kv_manager, &config, 0.7, &[], false, 0);
+        let admit = get_new_batch_prefill(
+            &mut waiting,
+            &mut kv_manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
         assert!(admit.can_run.is_empty());
         assert_eq!(waiting.len(), 1);
         assert_eq!(kv_manager.cache().available_tokens(), 12);
@@ -5806,6 +5945,74 @@ mod forward_pass_metrics {
             let pass = core.execute_hidden_pass(10.0);
             assert!(pass.fpm.is_some(), "FPM should always be present");
         }
+    }
+    const BLOCK_SIZE: usize = 4;
+
+    #[test]
+    fn second_identical_multichunk_prompt_reuses_cache_beyond_first_chunk() {
+        let mut core = SglangCore::new(fpm_args_with_chunked_prefill(16, 32));
+        let prompt: Vec<u32> = (0..40).collect();
+
+        let prefill_per_pass_until_output =
+            |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (Vec<u64>, f64) {
+                let mut collector = crate::engine::trace::TraceCollector::default();
+                let mut prefill_per_pass = Vec::new();
+                let mut now_ms = start_ms;
+                for _ in 0..64 {
+                    let pass = core.execute_pass(&mut collector, now_ms);
+                    prefill_per_pass
+                        .push(pass.fpm.as_ref().map(|f| f.sum_prefill_tokens).unwrap_or(0));
+                    now_ms = pass.end_ms;
+                    if pass.output_signals.iter().any(|s| s.uuid == uuid) {
+                        return (prefill_per_pass, now_ms);
+                    }
+                }
+                panic!("request {uuid} emitted no output within 64 passes");
+            };
+
+        let first = Uuid::from_u128(1);
+        core.receive(DirectRequest {
+            uuid: Some(first),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (cold_passes, end_ms) = prefill_per_pass_until_output(&mut core, first, 0.0);
+        assert_eq!(
+            cold_passes,
+            [16, 16, 8],
+            "cold request must compute every prompt token in three chunks and emit output only after the last chunk"
+        );
+
+        let second = Uuid::from_u128(2);
+        core.receive(DirectRequest {
+            uuid: Some(second),
+            ..direct_request(prompt.clone(), 1)
+        });
+        let (warm_passes, _) = prefill_per_pass_until_output(&mut core, second, end_ms);
+        let warm_prefill: u64 = warm_passes.iter().sum();
+
+        assert!(
+            (1..=BLOCK_SIZE as u64).contains(&warm_prefill),
+            "warm identical prompt must compute 1 through {BLOCK_SIZE} tokens using the cache across chunks: computed {warm_prefill} tokens"
+        );
+    }
+
+    fn fpm_args_with_chunked_prefill(
+        chunked_prefill_size: usize,
+        num_gpu_blocks: usize,
+    ) -> MockEngineArgs {
+        MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(BLOCK_SIZE)
+            .num_gpu_blocks(num_gpu_blocks)
+            .max_num_seqs(Some(4))
+            .speedup_ratio(0.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(BLOCK_SIZE),
+                chunked_prefill_size: Some(chunked_prefill_size),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
     }
 }
 

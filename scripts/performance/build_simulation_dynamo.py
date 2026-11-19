@@ -274,6 +274,7 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
             "num_reserved_decode_tokens": ((True, "usize"), "SglangConfig::default().num_reserved_decode_tokens"),
             "disaggregation_decode_extra_slots": ((True, "Option<usize>"), "None"),
             "swa_prefix_tails": ((True, "Option<usize>"), "None"),
+            "scheduler_select_time_ms": ((True, "f64"), "SglangConfig::default().scheduler_select_time_ms"),
         },
     }.get(site.struct)
     if defaults is not None:

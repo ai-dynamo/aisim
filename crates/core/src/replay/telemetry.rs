@@ -52,8 +52,13 @@ pub struct ReplaySchedulerMetricsSnapshot {
     pub kv_cache_used_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_capacity_bytes: Option<u64>,
-    /// Legacy/backend-native block utilization, or physical byte utilization
-    /// for grouped caches (which have no scalar total block capacity).
+    /// Cached grouped-cache bytes that no request holds; present only with
+    /// grouped prefix caching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache_cached_bytes: Option<u64>,
+    /// Legacy/backend-native block utilization, or active byte utilization for
+    /// grouped caches. With grouped prefix caching, cached bytes that no request
+    /// holds count in `physical_cache_usage` only.
     pub active_cache_usage: f64,
     /// Physical resident utilization; equal to active utilization for SGLang.
     pub physical_cache_usage: f64,
@@ -161,6 +166,10 @@ pub struct ReplayTelemetryHostCache {
 /// Policy-neutral replay state sampled after a virtual timestamp has settled.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReplayTelemetrySnapshot {
+    /// Measured request outcomes and GPU time for closed-loop scaling policies.
+    /// Present for observers; absent from telemetry capture exports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_feedback: Option<crate::replay::CompletionFeedbackSnapshot>,
     pub host_caches: Vec<ReplayTelemetryHostCache>,
     pub sample_ordinal: u64,
     pub kind: ReplayTelemetrySampleKind,
@@ -802,6 +811,7 @@ mod tests {
         sampled_at_ms: f64,
     ) -> ReplayTelemetrySnapshot {
         ReplayTelemetrySnapshot {
+            completion_feedback: None,
             host_caches: Vec::new(),
             sample_ordinal,
             kind,
@@ -904,6 +914,7 @@ mod tests {
             assert!(value["traffic"][field].is_null(), "{field}");
         }
         assert_eq!(value["traffic"]["delivered_output_tokens"], 0);
+        assert!(value.get("completion_feedback").is_none());
     }
 
     #[test]
@@ -916,6 +927,7 @@ mod tests {
             total_blocks: 0,
             kv_cache_used_bytes: Some(1024),
             kv_cache_capacity_bytes: Some(2048),
+            kv_cache_cached_bytes: None,
             active_cache_usage: 0.5,
             physical_cache_usage: 0.5,
             running_requests: 1,

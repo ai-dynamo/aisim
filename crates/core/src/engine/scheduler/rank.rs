@@ -423,6 +423,7 @@ impl RankEngine for SchedulerRank {
             .ok_or_else(|| anyhow!("scheduler rank has no scheduled pass to resolve"))?;
         let pass = self.core.resolve_pass(iteration)?;
         let end_ms = pass.end_ms;
+        let end_without_selection_ms = pass.end_without_selection_ms;
         let previous_returned_ms = pass.previous_returned_ms;
         let (same_timestamp_retry, start_effects, completion_effects) = split_pass(pass)?;
         if let Some(held) = self.held_outputs.as_mut()
@@ -437,6 +438,7 @@ impl RankEngine for SchedulerRank {
             start_effects,
             pending: PendingPass {
                 started_at_ms,
+                end_without_selection_ms,
                 effects: completion_effects,
             },
         })
@@ -494,10 +496,23 @@ impl RankEngine for SchedulerRank {
         Ok(pending.effects)
     }
 
+    fn idle_telemetry_end_ms(&self, pending: &Self::PendingPass, end_ms: f64) -> f64 {
+        pending.end_without_selection_ms.unwrap_or(end_ms)
+    }
+
     fn complete_idle_group_pass(
         &mut self,
         started_at_ms: f64,
         end_ms: f64,
+    ) -> Result<Option<Self::PassCompletionEffects>> {
+        self.complete_idle_group_pass_with_telemetry(started_at_ms, end_ms, end_ms)
+    }
+
+    fn complete_idle_group_pass_with_telemetry(
+        &mut self,
+        started_at_ms: f64,
+        end_ms: f64,
+        telemetry_end_ms: f64,
     ) -> Result<Option<Self::PassCompletionEffects>> {
         self.core.complete_engine_boundary(end_ms);
         let lifecycle_events = self
@@ -512,7 +527,7 @@ impl RankEngine for SchedulerRank {
             kv_events,
             metrics: self.metrics(),
             forward_pass_metrics: ForwardPassMetrics {
-                duration_ms: (end_ms - started_at_ms).max(0.0),
+                duration_ms: (telemetry_end_ms - started_at_ms).max(0.0),
                 ..Default::default()
             },
             ..PassCompletionEffects::default()
@@ -654,6 +669,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
         kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
         kv_cache_groups: config.kv_cache_groups.clone(),
         kv_cache_capacity_bytes: config.kv_cache_capacity_bytes,
+        vllm_version: config.vllm_version.clone(),
         native_host_offload: config.resolved_host_offload(),
         state_cache: config.state_cache,
         prefix_match_unit: config.prefix_match_unit,
@@ -681,6 +697,7 @@ fn core_args(config: &EngineConfig, timing: Arc<dyn TimingModel>) -> MockEngineA
             chunked_prefill_size: Some(config.sglang.chunked_prefill_size),
             clip_max_new_tokens: Some(config.sglang.clip_max_new_tokens),
             schedule_conservativeness: Some(config.sglang.schedule_conservativeness),
+            scheduler_select_time_ms: config.sglang.scheduler_select_time_ms,
             vlm_cache_bytes: Some(config.sglang.vlm_cache_bytes),
             host_loop: config.sglang.host_loop,
             disaggregation_decode_enable_radix_cache: config
@@ -827,6 +844,7 @@ fn map_metrics(metrics: MockerMetrics) -> Metrics {
         total_blocks: metrics.total_blocks,
         kv_cache_used_bytes: metrics.kv_cache_used_bytes,
         kv_cache_capacity_bytes: metrics.kv_cache_capacity_bytes,
+        kv_cache_cached_bytes: metrics.kv_cache_cached_bytes,
         cache_usage: metrics.gpu_cache_usage_perc,
         physical_cache_usage: metrics.physical_gpu_cache_usage_perc,
         running_requests: metrics.running_requests,

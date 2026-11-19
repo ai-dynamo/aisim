@@ -178,6 +178,7 @@ pub(crate) struct SglangArgs {
     pub chunked_prefill_size: Option<usize>,
     pub clip_max_new_tokens: Option<usize>,
     pub schedule_conservativeness: Option<f64>,
+    pub scheduler_select_time_ms: f64,
     pub vlm_cache_bytes: Option<u64>,
     pub host_loop: bool,
     pub disaggregation_decode_enable_radix_cache: bool,
@@ -250,6 +251,10 @@ pub(crate) struct MockEngineArgs {
     pub kv_cache_groups: Vec<crate::perfmodel::FpmCacheGroup>,
     #[builder(default = "None")]
     pub kv_cache_capacity_bytes: Option<u64>,
+    /// The vLLM release whose grouped-cache rules apply; see
+    /// `EngineConfig::vllm_version`.
+    #[builder(default = "None")]
+    pub vllm_version: Option<String>,
     #[builder(default = "None")]
     pub native_host_offload: Option<NativeHostOffloadConfig>,
     #[builder(default = "None")]

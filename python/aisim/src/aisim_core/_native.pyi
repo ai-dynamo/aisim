@@ -144,9 +144,8 @@ class AicEngine:
         seq_imbalance_correction_scale: float = 1.0,
         gen_seq_imbalance_correction_scale: float = 1.0,
     ) -> tuple[
-        list[_PerOpValueWithMetadata],
-        list[_PerOpValueWithMetadata],
-        list[_PerOpValueWithMetadata],
+        tuple[list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata]],
+        float | None,
     ]: ...
     def decode_step_per_op(
         self,
