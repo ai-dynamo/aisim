@@ -1073,3 +1073,71 @@ group totals. `op_level_replay_preserves_observed_mamba_chunks_and_prefixes`
 checks those values through native iteration pricing, with and without
 captured diagnostics and with width-four decode. These are synthetic
 accounting oracles, not silicon accuracy measurements.
+
+
+At corrective source commit `70f971d4df4725b7a9224f13852e9b6529384af3`,
+39 native Mamba tests passed. Against its optimized wheel, 729 Python checks
+passed: the base/XPU backend suites, Mamba qualification, FPM forward,
+`test_engine_step_parity.py`, `test_compile_engine_parity.py` and the
+single-oracle contract. Goldens were unchanged. Earlier attempts hit disk or
+memory limits; the new measured fixture initially dropped its lazy table root
+too soon, and earlier Python setup/queue-factor expectations were corrected.
+The passing runs retain the normal assertions and timeouts. Build/test logs
+are retained by the repair run, outside the source tree.
+
+The current `telem.py` invocation still returns 9.033768855441256 ms for
+pure decode and 20.74584264890688 ms for mixed MTP3, identical to the corrected
+`c3ed1513` artifacts and the phase byte oracles above. The full current output,
+configuration, packed metrics and data fingerprint are in
+[`telem-70f971d4.json`](mamba-mixed-step-accounting/telem-70f971d4.json).
+The op-level convention remains context **including** the current token;
+`telem.py` is not a whole-model FPM past-only-KV input.
+
+For the host-cost check, the baseline is the pinned starting head
+`3fb31295a29497869bef1a2b0081bb36aab9e13a`, and the candidate is `70f971d4`.
+Both native extensions used Rust 1.91.1, release optimization level 3,
+`CARGO_PROFILE_RELEASE_LTO=false`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, `CARGO_BUILD_JOBS=2`, and features
+`extension-module,jemalloc`. This bounded build profile avoided the container's
+memory limit. Python was 3.12.12 on Linux x86_64, Intel i9-14900K, with a
+5 GiB container memory limit. The native embedded source inventories were
+verified against each exact commit, including dereferenced tracked symlinks.
+The report records their source and binary hashes.
+
+The driver is
+[`repair_replay_perf.py`](mamba-mixed-step-accounting/repair_replay_perf.py).
+With a candidate wheel installed in `PYTHON` and a baseline SDK installation
+in `BASE_SDK`, run:
+
+```bash
+python repair_replay_perf.py PYTHON BASE_SDK 6 OUT.json
+```
+
+It calls `PYTHON -m aisim predict --stack engine` in six balanced build-order
+rounds. Each case completes 1000 synthetic requests of 2048 input and 32 output
+tokens at concurrency 64, with 512 cached-prefix tokens, a 4096-token scheduler
+budget and 64 request slots. Full configurations and raw rounds are in
+[`repair-replay-70f971d4.json`](mamba-mixed-step-accounting/repair-replay-70f971d4.json).
+Nano uses a test-only BF16 width-one constructor shim, as `telem.py` does;
+the driver asserts that the child actually constructed qualified operations.
+This does not activate qualification in built-in production defaults. Qwen3-0.6B
+is the control. The fixed capacity, TP/DP/MoE parallelism, backend/version and
+all workload inputs are shared between builds.
+
+| Case | Full CLI median (baseline to candidate) | Native `wall_time_ms` median | Peak RSS median |
+| --- | --- | --- | --- |
+| Qualified Nano | 3.183 to 3.147 s | 96.334 to 89.327 ms | 308.9 to 318.9 MiB |
+| Qwen3-0.6B control | 2.956 to 2.903 s | 97.289 to 97.935 ms | 258.5 to 259.2 MiB |
+
+Full CLI timing includes startup, model construction, report aggregation and
+serialization. Native `wall_time_ms` has the narrower Replay boundary described
+in the performance skill: it excludes model construction and final evidence
+aggregation. RSS is the supervisor's peak observed process-tree memory. Nano's
+RSS ranges overlap (299.5–320.3 versus 299.9–320.5 MiB), as do the runtime
+ranges; these samples do not demonstrate a material host-runtime regression.
+They do not establish a speedup or a universal overhead bound. Every run
+completed all input and output tokens. Nano's modeled mean TTFT changes from
+56.580465 to 56.869976 ms, and TPOT from 24.988958 to 25.072246 ms as the
+actual chunk/prefix groups replace balanced coordinates. The control's
+modeled results are identical. These are functional and cost checks, not
+silicon accuracy qualification.
