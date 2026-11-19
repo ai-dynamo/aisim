@@ -17,11 +17,11 @@ Layers
 2. **Acquisition cache** (:class:`AcquisitionCache`): mutable, raw bytes + body
    hash + ETag per URL; conditional requests make an unchanged refresh cheap.
 3. **Snapshot** (:func:`write_candidate`): converts through
-   :func:`inferencex_to_configurations`, writes stable shard paths
-   (``e2e/<model>/.../<configuration-id>``) and an immutable
+   :func:`inferencex_to_configurations`, writes content-versioned shard paths
+   (``revisions/<content-sha256>/e2e/<model>/.../<configuration-id>``) and an immutable
    ``snapshots/<snapshot_id>/`` document. Corrections keep ``observation_id`` and
    change ``record_sha256``, which changes the snapshot ID; old snapshot
-   documents are never rewritten.
+   documents and their referenced configuration shards are never rewritten.
 
 Acquisition fails closed: a required page that is incomplete (exhausted retries,
 truncated or non-JSON body, configurations declared by ``availability`` but absent
@@ -49,10 +49,12 @@ from urllib.parse import urlencode
 
 from aisim_core.data.e2e import (
     INFERENCEX_CONFIG_FIELDS,
+    E2eConfigurationData,
     SnapshotAcquisition,
     SnapshotMember,
     configuration_dir,
     inferencex_to_configurations,
+    load_e2e,
     snapshot_id,
     write_configuration,
     write_snapshot,
@@ -397,22 +399,38 @@ class SnapshotPlan:
 
     snapshot_id: str
     members: list[SnapshotMember]
-    configurations: list[Any]
+    configurations: list[E2eConfigurationData]
+    configuration_prefixes: dict[str, str]
+
+
+def _configuration_prefix(data: E2eConfigurationData) -> str:
+    # Include the converted rows and producer metadata, not just raw record hashes:
+    # a normalization or workflow-info correction must retain the old truth too.
+    content = {
+        "body": data.body.model_dump(mode="json"),
+        "tables": [
+            [row.model_dump(mode="json") for row in rows]
+            for rows in (data.observations, data.metrics, data.requests, data.series)
+        ],
+        "provenance": [{**vars(item), "data": _sha(item.data)} for item in data.provenance],
+    }
+    return f"revisions/{_sha(_canonical(content))}"
 
 
 def plan_snapshot(acq: Acquisition) -> SnapshotPlan:
     configurations = inferencex_to_configurations(acq.records, acq.runs)
+    prefixes = {data.body.configuration_id(): _configuration_prefix(data) for data in configurations}
     members = [
         SnapshotMember(
             configuration_id=o.configuration_id,
             observation_id=o.observation_id,
             record_sha256=o.record_sha256,
-            manifest_path=f"{configuration_dir(data.body)}/manifest.json",
+            manifest_path=f"{prefixes[o.configuration_id]}/{configuration_dir(data.body)}/manifest.json",
         )
         for data in configurations
         for o in data.observations
     ]
-    return SnapshotPlan(snapshot_id(members, acq.scope, SELECTION_POLICY), members, configurations)
+    return SnapshotPlan(snapshot_id(members, acq.scope, SELECTION_POLICY), members, configurations, prefixes)
 
 
 def snapshot_path(sid: str) -> str:
@@ -426,7 +444,12 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
     if (root / path).exists():
         return path
     for data in plan.configurations:
-        write_configuration(root, data)
+        prefix = plan.configuration_prefixes[data.body.configuration_id()]
+        manifest_path = f"{prefix}/{configuration_dir(data.body)}/manifest.json"
+        if (root / manifest_path).exists():
+            load_e2e(root, manifest_path)  # verify reused shards without replacing any of their bytes
+        else:
+            write_configuration(root, data, prefix=prefix)
     (root / path).parent.mkdir(parents=True, exist_ok=True)
     snapshot = write_snapshot(
         root,
