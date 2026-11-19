@@ -69,6 +69,28 @@ def test_plan_groups_cells_and_budget(built_catalog, capsys):
     assert plan.main(["--dataset-root", str(root / "missing"), "--hardware", "b200_sxm"]) == 2
 
 
+def test_plan_rejects_bad_budget_and_reports_unknown_model_and_zero_gpu_time(built_catalog, capsys):
+    root, _ = built_catalog
+    plan = _script("aisim-benchmark-plan", "plan_catalog.py")
+    base = ["--dataset-root", str(root), "--hardware", "b200_sxm"]
+    for bad in (
+        ["--gpus", "8"],
+        ["--wall-hours", "2"],
+        ["--gpus", "0", "--wall-hours", "2"],
+        ["--gpus", "8", "--wall-hours", "-1"],
+        ["--gpus", "8", "--wall-hours", "nan"],
+        ["--gpus", "8", "--wall-hours", "2", "--retry-margin", "-1"],
+        ["--gpus", "8", "--wall-hours", "2", "--retry-margin", "inf"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            plan.main([*base, *bad])
+        assert exc.value.code == 2
+    capsys.readouterr()
+    assert plan.main([*base, "--model", "Brand/New-Model"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {c["layer"] for c in out["not_in_catalog"]} == {"fpm", "e2e"}
+
+
 @pytest.fixture
 def built_catalog(dataset):  # noqa: F811
     root, systems = dataset
@@ -100,6 +122,20 @@ def test_record_gpu_time_slurm_and_unfinished(tmp_path, capsys):
 
     sacct.write_text(SACCT_HEADER + "\n3|b|RUNNING|x|x|Unknown|10|00:00:10|1|gres/gpu=8\n")
     assert tool.main(["slurm", "--sacct", str(sacct)]) == 2  # not final: no number invented
+
+
+def test_requeued_attempt_with_same_job_id_is_a_retry_not_the_result():
+    from aisim_core.data.gpu_time import gpu_time_from_sacct
+
+    text = "\n".join(
+        [
+            SACCT_HEADER,
+            "7|b|REQUEUED|2026-01-01T00:00:00|2026-01-01T00:00:00|2026-01-01T00:10:00|600|00:10:00|1|gres/gpu=8",
+            "7|b|COMPLETED|2026-01-01T00:20:00|2026-01-01T01:00:00|2026-01-01T02:00:00|3600|01:00:00|1|gres/gpu=8",
+        ]
+    )
+    gt = gpu_time_from_sacct(text)
+    assert gt.retried is not None and gt.retried.count == 1 and gt.gpu_seconds == 3600 * 8
 
 
 def test_record_gpu_time_kubernetes(tmp_path, capsys):

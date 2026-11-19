@@ -40,7 +40,7 @@ archival and qualification level:
 
 ```bash
 S=.agents/skills/aisim-benchmark-collect/scripts/record_gpu_time.py
-sacct -j <ids> --parsable2 -o JobID,JobName,State,Submit,Start,End,ElapsedRaw,Elapsed,NNodes,AllocTRES > sacct.txt
+sacct -D -j <ids> --parsable2 -o JobID,JobName,State,Submit,Start,End,ElapsedRaw,Elapsed,NNodes,AllocTRES > sacct.txt
 python/aisim/.venv/bin/python $S slurm --sacct sacct.txt --gpu-type <observed type>
 kubectl get job <name> -o json > job.json; kubectl get pods -l job-name=<name> -o json > pods.json
 python/aisim/.venv/bin/python $S k8s --job job.json --pods pods.json --gpu-type <observed type>
