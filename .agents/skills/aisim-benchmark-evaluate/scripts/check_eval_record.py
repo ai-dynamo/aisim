@@ -25,8 +25,20 @@ from aisim_core.data.gpu_time import check_gpu_time
 
 def _load_predictor(path: Path):
     spec = importlib.util.spec_from_file_location("benchmark_predictor", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot load predictor module: {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    missing = object()
+    previous = sys.modules.get(spec.name, missing)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is missing:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+        raise
     return module.predict, module.fingerprint()
 
 

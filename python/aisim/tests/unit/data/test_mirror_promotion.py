@@ -63,6 +63,9 @@ from aisim_core.data.redaction import (
     check_publishable,
     write_ledger,
 )
+from aisim_core.data.schemas import write_snapshots
+from tests.unit.data.test_op_publish import _build as build_op_fixture
+from tests.unit.data.test_op_publish import tree as op_source  # noqa: F401
 
 pytestmark = pytest.mark.unit
 
@@ -1421,6 +1424,7 @@ def _extra_truth_artifact(root, manifests, name, payload, artifact_format):
     original = _eval(root, [cid])
     record = load_record(original)
     path = original.parent / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
     artifact = Artifact(
         artifact_id="extra-truth",
@@ -1474,3 +1478,256 @@ def test_uppercase_large_parquet_uses_its_footer(tmp_path):
     _extra_truth_artifact(root, manifests, "large.PARQUET", path.read_bytes(), "parquet")
     report = validate_tree(root)
     assert report.ok, report.errors
+
+
+def test_operation_publisher_yaml_sidecars_can_be_promoted(tmp_path, op_source):  # noqa: F811
+    out = tmp_path / "published"
+    build_op_fixture(op_source, out)
+    root = tmp_path / "mirror"
+    directory = "data/op-latency/h200_sxm/gemm/vllm"
+    shutil.copytree(out / directory, root / directory)
+    manifests = [p.relative_to(root).as_posix() for p in (root / directory).rglob("manifest.json")]
+    register_manifests(root, manifests, INTERNAL_REPO)
+    build_catalog(root)
+    _public(root, directory)
+    assert validate_tree(root).ok
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert draft.content_ok, draft.findings
+    approved = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    target = _target(tmp_path)
+    apply_promotion(approved, root, target)
+    assert validate_tree(target, repo=PUBLIC, profile="public").ok
+    for path in (root / directory).rglob("*.yaml"):
+        assert (target / path.relative_to(root)).read_bytes() == path.read_bytes()
+
+
+def _manifest_sidecar(root, manifest_rel, name, payload, fmt, role, schema):
+    manifest_path = root / manifest_rel
+    manifest = Manifest.model_validate_json(manifest_path.read_bytes())
+    rel = (manifest_path.parent / name).relative_to(root).as_posix()
+    (root / rel).write_bytes(payload)
+    artifact = Artifact(
+        artifact_id=name,
+        path=rel,
+        role=role,
+        format=fmt,
+        schema=schema,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        bytes=len(payload),
+    )
+    manifest_path.write_text(
+        manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+    )
+    register_manifests(root, [manifest_rel], INTERNAL_REPO)
+    build_catalog(root)
+    return rel
+
+
+@pytest.mark.parametrize(
+    "name,role,schema",
+    [
+        ("collection_meta.yaml", "collection-meta", "aisim-collection-meta/v1"),
+        ("reuse.yaml", "reuse-declaration", "aisim-reuse-declaration/v1"),
+    ],
+)
+@pytest.mark.parametrize(
+    "payload,code",
+    [
+        (b'authorization: "Bearer aaaaaaaaaaaaaaaaaaaaaaaa"\n', "secret"),
+        (b'endpoint: "https://node.corp.nvidia.com"\n', "internal-host"),
+        (b'authorization: "\\u0068f_aaaaaaaaaaaaaaaaaaaaaaaa"\n', "secret"),
+        (b"bad: [\n", "yaml-invalid"),
+        (b'!!python/object/apply:os.system ["true"]\n', "yaml-invalid"),
+    ],
+)
+def test_yaml_sidecars_are_content_checked_before_promotion(tmp_path, name, role, schema, payload, code):
+    root, directory, _ = _op_mirror(tmp_path, "kernel_source", "clean")
+    rel = _manifest_sidecar(root, f"{directory}/manifest.json", name, payload, "yaml", role, schema)
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert not plan.content_ok
+    assert any(f.code.removeprefix("source-") == code and f.path == rel for f in plan.findings)
+    assert code in {f.code for f in validate_tree(root, profile="public").errors}
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_yaml_aliases_remain_bounded_and_keep_field_context(tmp_path, dirty):
+    root, directory, _ = _op_mirror(tmp_path, "kernel_source", "clean")
+    payload = "abi: &a0 {name: clean}\n" + "".join(f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}]\n" for i in range(1, 25))
+    if dirty:
+        payload += "images: *a0\n"
+    _manifest_sidecar(
+        root,
+        f"{directory}/manifest.json",
+        "collection_meta.yaml",
+        payload.encode(),
+        "yaml",
+        "collection-meta",
+        "aisim-collection-meta/v1",
+    )
+    shutil.rmtree(root / "mirror")
+    report = validate_tree(root, profile="public")
+    assert ("image-name" in {f.code for f in report.errors}) == dirty
+    assert report.ok == (not dirty)
+
+
+@pytest.mark.parametrize("field", ["effective_settings", "unresolved_identity"])
+@pytest.mark.parametrize(
+    "payload,code",
+    [
+        ({"endpoint": "https://node.corp.nvidia.com"}, "internal-host"),
+        ({"authorization": "Bearer " + "a" * 24}, "secret"),
+    ],
+)
+def test_entire_manifest_identity_is_scanned(tmp_path, field, payload, code):
+    root, directory, _ = _op_mirror(tmp_path, "kernel_source", "clean")
+    rel = f"{directory}/manifest.json"
+    path = root / rel
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    identity = manifest.identity.model_copy(update={field: payload})
+    manifest = manifest.model_copy(
+        update={
+            "identity": identity,
+            "configuration_id": configuration_id(manifest.category, manifest.purpose, identity),
+        }
+    )
+    path.write_text(manifest.model_dump_json(by_alias=True))
+    # Rebuild the indexes without the old configuration ID.
+    shutil.rmtree(root / "catalog")
+    register_manifests(root, [rel], INTERNAL_REPO)
+    build_catalog(root)
+    assert validate_tree(root).ok
+    assert code in {f.code for f in validate_tree(root, profile="public").errors}
+    assert code in {f.code for f in plan_promotion(root, _request(root, [directory]), _reviewers()).findings}
+
+
+def test_manifest_artifact_ids_are_scanned(tmp_path):
+    root, manifests = _mirror(tmp_path)
+    path = root / manifests[0]
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    artifacts = [
+        a.model_copy(update={"artifact_id": "hf_" + "a" * 24}) if i == 0 else a
+        for i, a in enumerate(manifest.artifacts)
+    ]
+    path.write_text(manifest.model_copy(update={"artifacts": artifacts}).model_dump_json(by_alias=True))
+    register_manifests(root, manifests, INTERNAL_REPO)
+    build_catalog(root)
+    directory = path.parent.relative_to(root).as_posix()
+    _public(root, directory)
+    assert validate_tree(root).ok
+    assert "secret" in {f.code for f in validate_tree(root, profile="public").errors}
+    assert "secret" in {f.code for f in plan_promotion(root, _request(root, [directory]), _reviewers()).findings}
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_whitespace_json_table_cells_are_decoded(tmp_path, dirty):
+    value = "hf_" + "a" * 24 if dirty else "clean"
+    encoded = " \t\r\n" + json.dumps({"authorization": value}).replace("hf_", "\\u0068f_")
+    root, directory, _ = _op_mirror(tmp_path, "attrs", encoded)
+    report = validate_tree(root, profile="public")
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert ("secret" in {f.code for f in report.errors}) == dirty
+    assert plan.content_ok == (not dirty)
+
+
+@pytest.mark.parametrize("name", ["errors.json", "errors.JSON", "nested/errors.json"])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_json_truth_sidecars_validate_and_are_scanned(tmp_path, name, dirty):
+    root, manifests = _mirror(tmp_path)
+    payload = json.dumps({"authorization": "hf_" + "a" * 24 if dirty else "clean"}).encode()
+    rel = _extra_truth_artifact(root, manifests, name, payload, "json")
+    report = validate_tree(root)
+    assert report.ok, report.errors
+    public = validate_tree(root, profile="public")
+    assert ("secret" in {f.code for f in public.errors}) == dirty
+    assert public.ok == (not dirty)
+    directory = str(Path(manifests[0]).parent)
+    eval_dir = str(Path(rel).parent)
+    _public(root, directory, eval_dir)
+    draft = plan_promotion(root, _request(root, [directory, eval_dir]), _reviewers())
+    assert ("secret" in {f.code for f in draft.findings}) == dirty
+    assert draft.content_ok == (not dirty), draft.findings
+    if not dirty:
+        approved = plan_promotion(root, _request(root, [directory, eval_dir], draft), _reviewers())
+        target = _target(tmp_path)
+        apply_promotion(approved, root, target)
+        assert validate_tree(target, repo=PUBLIC, profile="public").ok
+
+
+def test_malformed_eval_record_is_still_rejected(tmp_path):
+    root, manifests = _mirror(tmp_path)
+    cid = load_e2e(root, manifests[0]).manifest.configuration_id
+    record_path = _eval(root, [cid])
+    build_catalog(root)
+    bad = record_path.parent / ("a" * 64 + ".json")
+    bad.write_text('{"schema_version":"aisim-eval/v1"}')
+    assert "eval-record-invalid" in {f.code for f in validate_tree(root).errors}
+
+
+def test_unsupported_truth_artifact_format_blocks_publication(tmp_path):
+    root, manifests = _mirror(tmp_path)
+    rel = _extra_truth_artifact(root, manifests, "opaque.JSON", b"{}", "opaque")
+    assert validate_tree(root).ok
+    assert "artifact-format" in {f.code for f in validate_tree(root, profile="public").errors}
+    directory = str(Path(manifests[0]).parent)
+    eval_dir = str(Path(rel).parent)
+    _public(root, directory, eval_dir)
+    plan = plan_promotion(root, _request(root, [directory, eval_dir]), _reviewers())
+    assert "artifact-format" in {f.code for f in plan.findings}
+
+
+@pytest.mark.parametrize("failure", ["encoding", "io"])
+def test_unreadable_schema_snapshot_writes_cli_report(tmp_path, monkeypatch, failure):
+    root, _ = _mirror(tmp_path)
+    path = write_snapshots(root / "catalog/schemas")[0]
+    if failure == "encoding":
+        path.write_bytes(b"\xff\xfe")
+    else:
+        read_text = Path.read_text
+        read_bytes = Path.read_bytes
+
+        def denied(self, *a, **kw):
+            if self == path:
+                raise OSError("synthetic read failure")
+            return read_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+
+        def denied_bytes(self):
+            if self == path:
+                raise OSError("synthetic read failure")
+            return read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", denied_bytes)
+    report_path = tmp_path / "report.json"
+    assert mirror_main(["validate", "--root", str(root), "--output", str(report_path)]) == 1
+    report = json.loads(report_path.read_text())
+    assert not report["ok"] and "schema-unreadable" in {f["code"] for f in report["findings"]}
+
+
+@pytest.mark.parametrize(
+    "reviewers,threshold",
+    [
+        (["alice"], 1.9),
+        ("alice", 1),
+        ([1], 1),
+        (["alice"], True),
+        (["alice"], "2"),
+        (["alice"], 0),
+        (["alice"], -1),
+        (None, 1),
+        ([""], 1),
+    ],
+)
+def test_policy_rejects_malformed_reviewers_and_thresholds(tmp_path, reviewers, threshold):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"reviewers": reviewers, "min_approvals": threshold}))
+    with pytest.raises(ValueError):
+        PromotionPolicy.from_file(path)
+
+
+def test_policy_preserves_valid_threshold_and_default(tmp_path):
+    path = tmp_path / "policy.json"
+    for options, expected in (({}, 1), ({"min_approvals": 2}, 2)):
+        path.write_text(json.dumps({"reviewers": ["alice", "bob"], **options}))
+        policy = PromotionPolicy.from_file(path)
+        assert policy.reviewers == frozenset({"alice", "bob"}) and policy.min_approvals == expected

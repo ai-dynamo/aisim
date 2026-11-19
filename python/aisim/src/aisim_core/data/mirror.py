@@ -52,7 +52,7 @@ from pydantic import ValidationError
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, check_manifest, configuration_id
 from aisim_core.data.catalog import CATALOG_DIR, _write, build_catalog, catalog_files, known_system_specs
 from aisim_core.data.e2e import load_e2e, read_snapshot, verify_snapshot_members
-from aisim_core.data.eval import load_record, record_dir
+from aisim_core.data.eval import load_record, record_dir, record_paths
 from aisim_core.data.evidence import EVIDENCE_ROOT, check_evidence
 from aisim_core.data.hygiene import (
     CandidateFile,
@@ -65,7 +65,7 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "4"
+VALIDATOR_VERSION = "5"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
@@ -75,6 +75,10 @@ DATA_ROOTS = ("catalog/", "eval/", "data/")
 ROOT_METADATA_FILES = frozenset({"README.md", ".gitattributes"})
 REPOSITORY_FILES = ROOT_METADATA_FILES | {".github/workflows/validate.yml"}
 MAX_METADATA_BYTES = 4 * 1024 * 1024
+OP_YAML_SIDECARS = {
+    "collection_meta.yaml": ("collection-meta", "aisim-collection-meta/v"),
+    "reuse.yaml": ("reuse-declaration", "aisim-reuse-declaration/v"),
+}
 Profile = Literal["mirror", "public"]
 
 
@@ -128,7 +132,7 @@ def _tree_policy(extra_roots: tuple[str, ...]) -> CandidatePolicy:
         max_total_bytes=1 << 62,
         max_file_bytes=1 << 40,
         allowed_roots=DATA_ROOTS + extra_roots,
-        allowed_suffixes=frozenset({".parquet", ".json", ".gz"}),
+        allowed_suffixes=frozenset({".parquet", ".json", ".gz", ".yaml"}),
     )
 
 
@@ -239,7 +243,7 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
     eval_root = root / "eval"
     if not eval_root.is_dir():
         return
-    for path in sorted(eval_root.rglob("*.json")):
+    for path in record_paths(eval_root, recursive=True):
         rel = path.relative_to(root).as_posix()
         try:
             record = load_record(path)
@@ -280,8 +284,11 @@ def _check_schema_snapshots(root: Path, report: TreeReport, declared: set[str]) 
     directory = root / CATALOG_DIR / "schemas"
     if not directory.is_dir():
         return
-    for problem in check_snapshots(directory):
-        report.add("schema-drift", problem, f"{CATALOG_DIR}/schemas")
+    try:
+        for problem in check_snapshots(directory):
+            report.add("schema-drift", problem, f"{CATALOG_DIR}/schemas")
+    except (OSError, UnicodeError) as exc:
+        report.add("schema-unreadable", str(exc).splitlines()[0], f"{CATALOG_DIR}/schemas")
     declared.update(p.relative_to(root).as_posix() for p in directory.glob("*.json"))
 
 
@@ -362,6 +369,20 @@ def validate_tree(
 
     declared: set[str] = set()
     manifests = _check_indexes(root, report, declared)
+    yaml_sidecars = {
+        artifact.path
+        for manifest in manifests.values()
+        if manifest.category == "op-latency"
+        for artifact in manifest.artifacts
+        for name, (role, schema_prefix) in OP_YAML_SIDECARS.items()
+        if Path(artifact.path).name == name
+        and artifact.format == "yaml"
+        and artifact.role == role
+        and artifact.artifact_schema.startswith(schema_prefix)
+    }
+    for f in listing:
+        if Path(f.path).suffix.lower() == ".yaml" and f.path not in yaml_sidecars:
+            report.add("yaml-sidecar", "YAML must be a declared operation collection/reuse sidecar", f.path)
     _check_eval(root, report, declared)
     _check_snapshots(root, report, declared, manifests)
     _check_schema_snapshots(root, report, declared)
@@ -377,13 +398,17 @@ def validate_tree(
     for f in listing:
         if f.is_symlink or f.path in skip:
             continue
-        data = (root / f.path).read_bytes() if f.size <= 4 * 1024 * 1024 else None
-        head = data if data is not None else (root / f.path).open("rb").read(16)
-        tail = data[-4:] if data is not None else b""
-        if data is None and f.path.lower().endswith(".parquet"):
-            with (root / f.path).open("rb") as handle:
-                handle.seek(-4, 2)
-                tail = handle.read(4)
+        try:
+            data = (root / f.path).read_bytes() if f.size <= 4 * 1024 * 1024 else None
+            head = data if data is not None else (root / f.path).open("rb").read(16)
+            tail = data[-4:] if data is not None else b""
+            if data is None and f.path.lower().endswith(".parquet"):
+                with (root / f.path).open("rb") as handle:
+                    handle.seek(-4, 2)
+                    tail = handle.read(4)
+        except OSError as exc:
+            report.add("content-unreadable", str(exc).splitlines()[0], f.path)
+            continue
         report.findings.extend(check_content(_tree_policy(()), f, head, tail))
     for f in listing:
         if f.path.endswith(".gz") and f.path not in gz_declared:

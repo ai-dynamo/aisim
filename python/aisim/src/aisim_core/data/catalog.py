@@ -46,7 +46,7 @@ import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest
-from aisim_core.data.eval import EvalRecord, Layer, current_records
+from aisim_core.data.eval import EvalRecord, Layer, current_records, record_paths
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
 
@@ -199,7 +199,7 @@ def _read_eval_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
     eval_root = root / "eval"
     if not eval_root.is_dir():
         return
-    directories = sorted({p.parent for p in eval_root.rglob("*.json")})
+    directories = sorted({p.parent for p in record_paths(eval_root, recursive=True)})
     for directory in directories:
         for record in current_records(directory):
             ident = record.truth.identity

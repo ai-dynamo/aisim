@@ -48,8 +48,8 @@ from aisim_core.data.e2e import (
     body_from_manifest,
     read_snapshot,
 )
-from aisim_core.data.eval import load_record
-from aisim_core.data.hygiene import Finding, checked_path
+from aisim_core.data.eval import load_record, record_paths
+from aisim_core.data.hygiene import Finding, checked_path, yaml_sidecar_value
 from aisim_core.data.op_schema import OP_TABLE_SCHEMA_ID
 from aisim_core.data.parquet import read_parquet
 
@@ -165,16 +165,23 @@ def write_ledger(root: str | Path, ledger: VisibilityLedger) -> Path:
 # --------------------------------------------------------------------------- text scanning
 
 
-def _walk(value: Any, key: str = "") -> Iterable[tuple[str, str]]:
+def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -> Iterable[tuple[str, str]]:
     """Yield (key, string) for every string in a JSON-like value, with the nearest key name."""
+    if seen is None:
+        seen = set()
+    if isinstance(value, (Mapping, list, tuple)):
+        marker = (id(value), key)
+        if marker in seen:
+            return  # YAML aliases are scanned once per field context, without exponential expansion
+        seen.add(marker)
     if isinstance(value, Mapping):
         for k, v in value.items():
             yield "", str(k)  # content rules apply to keys; field-name rules apply only to their values
             context = key if _IMAGE_KEY.search(key) or _PATCH_KEY.search(key) or _RUN_KEY.search(key) else str(k)
-            yield from _walk(v, context)
+            yield from _walk(v, context, seen)
     elif isinstance(value, (list, tuple)):
         for v in value:
-            yield from _walk(v, key)
+            yield from _walk(v, key, seen)
     elif isinstance(value, str):
         yield key, value
 
@@ -196,7 +203,7 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
     for key, text in _walk(value, _key):
         if text == REDACTED or not text:
             continue
-        nested = _json_text(text) if text[:1] in "{[" else None
+        nested = _json_text(text) if text.lstrip(" \t\r\n")[:1] in ("{", "[") else None
         if isinstance(nested, (dict, list)):
             out.extend(scan_value(nested, policy, path, where, _key=key))
             continue
@@ -278,8 +285,11 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
                     json.loads(checked_path(root, artifact.path).read_bytes()), policy, artifact.path, "JSON sidecar"
                 )
             )
-    out.extend(scan_value(manifest.provenance, policy, rel, "manifest provenance"))
-    out.extend(scan_value([manifest.requested_settings, manifest.evidence_gaps], policy, rel, "manifest"))
+        elif artifact.format == "yaml":
+            data = checked_path(root, artifact.path).read_bytes()
+            out.extend(scan_value(yaml_sidecar_value(data), policy, artifact.path, "YAML sidecar"))
+            out.extend(scan_value(data.decode("utf-8"), policy, artifact.path, "YAML source"))
+    out.extend(scan_value(manifest.model_dump(mode="json", by_alias=True), policy, rel, "manifest"))
     return out
 
 
@@ -331,16 +341,20 @@ def _check_eval_record(root: Path, rel: str, policy: RedactionPolicy, infx_ids: 
     record = load_record(root / rel)
     out = scan_value(record.model_dump(mode="json", by_alias=True), policy, rel, "eval record")
     for artifact in record.truth.artifacts:
+        path = _verify((root / rel).parent, artifact)
+        artifact_rel = path.relative_to(root).as_posix()
         if artifact.format == "gzip" and not policy.allow_provenance_artifacts:
             out.append(Finding("provenance-withheld", "logs and raw output are withheld", artifact.path))
         if artifact.format == "parquet":
-            path = _verify((root / rel).parent, artifact)
-            artifact_rel = path.relative_to(root).as_posix()
             out.extend(
                 _check_table_text(
                     read_parquet(path, artifact.artifact_schema), artifact_rel, policy, "eval truth column"
                 )
             )
+        elif artifact.format == "json":
+            out.extend(scan_value(json.loads(path.read_bytes()), policy, artifact_rel, "eval truth JSON"))
+        elif artifact.format != "gzip":
+            out.append(Finding("artifact-format", f"unsupported eval truth format: {artifact.format}", artifact_rel))
     if record.findings and not policy.allow_provenance_artifacts:
         out.append(Finding("provenance-withheld", "linked finding artifacts may be logs", rel))
     if policy.inferencex_disclosure == "aggregates-only" and infx_ids & set(record.truth.configuration_ids):
@@ -376,6 +390,7 @@ def check_publishable(
         findings.append(Finding("path-unsafe", str(exc)))
     if findings:
         return findings
+    eval_records = {p.relative_to(root).as_posix() for p in record_paths(root / "eval", recursive=True)}
     for rel in chosen:
         if rel.endswith("/manifest.json") and rel not in loaded:
             try:
@@ -407,7 +422,7 @@ def check_publishable(
                 findings.extend(_check_snapshot(root, rel, policy))
             except (OSError, ValidationError, ValueError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
-        if rel.startswith("eval/") and rel.endswith(".json"):
+        if rel in eval_records:
             try:
                 findings.extend(_check_eval_record(root, rel, policy, infx_ids))
             except (OSError, ValidationError, ValueError) as exc:

@@ -11,6 +11,7 @@ not replace a run on a real model and GPU.
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,28 @@ def test_record_gpu_time_kubernetes(tmp_path, capsys):
     assert "owner" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "job,pods",
+    [
+        ('{"metadata":', "[]"),
+        ("[]", "[]"),
+        ('{"metadata":{"uid":"j"}}', "[1]"),
+        ('{"metadata":{"uid":"j"}}', '{"items":null}'),
+        (None, "[]"),
+        ('{"metadata":{"uid":"j"}}', None),
+    ],
+)
+def test_gpu_time_bad_input_returns_status_two(tmp_path, capsys, job, pods):
+    tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
+    for name, text in (("job", job), ("pods", pods)):
+        if text is not None:
+            (tmp_path / f"{name}.json").write_text(text)
+    assert tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err.startswith("error:")
+    assert tool.main(["slurm", "--sacct", str(tmp_path / "missing.txt")]) == 2
+
+
 def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noqa: F811
     root, record = built_record
     path = write_record(root, record)
@@ -177,7 +200,10 @@ def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noq
 
     good = tmp_path / "good.py"
     good.write_text(
-        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        "from __future__ import annotations\nfrom dataclasses import dataclass\n"
+        "@dataclass\nclass Predictor:\n    scale: float = 1.1\n"
+        "def predict(inputs):\n"
+        "    return inputs['tokens'] * Predictor().scale + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
         f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
     )
     assert tool.main([str(path), "--truth-root", str(root), "--predictor", str(good), "--attest-root", str(root)]) == 0
@@ -189,6 +215,22 @@ def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noq
     bad.write_text(good.read_text().replace("1.1", "1.5"))
     assert tool.main([str(path), "--truth-root", str(root), "--predictor", str(bad)]) == 1
     assert _predict({"tokens": 10}) == pytest.approx(11.0)
+
+
+@pytest.mark.parametrize("has_previous", [False, True, None])
+def test_failed_predictor_import_restores_module(tmp_path, monkeypatch, has_previous):
+    tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
+    previous = None if has_previous is None else object()
+    if has_previous is not False:
+        monkeypatch.setitem(sys.modules, "benchmark_predictor", previous)
+    else:
+        monkeypatch.delitem(sys.modules, "benchmark_predictor", raising=False)
+    predictor = tmp_path / "broken.py"
+    predictor.write_text("raise RuntimeError('synthetic import failure')\n")
+    with pytest.raises(RuntimeError, match="synthetic import failure"):
+        tool._load_predictor(predictor)
+    assert sys.modules.get("benchmark_predictor") is (previous if has_previous else None)
+    assert ("benchmark_predictor" in sys.modules) == (has_previous is not False)
 
 
 def test_attestation_requires_a_predictor_and_copies_the_predecessor(built_record, tmp_path, capsys):  # noqa: F811
