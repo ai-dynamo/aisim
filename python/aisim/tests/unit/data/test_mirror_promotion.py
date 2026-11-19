@@ -418,6 +418,15 @@ def test_explicit_catalog_coverage_is_retained_for_rebuild_and_validation(tmp_pa
     assert validate_tree(root, profile=profile).ok
 
 
+@pytest.mark.parametrize(
+    "value", ["[]", '{"expected_models":42}', '{"expected_models":[],"expected_models":[]}', "[" * 2000 + "]" * 2000]
+)
+def test_invalid_catalog_coverage_returns_a_validation_report(tmp_path, value):
+    root, _ = _mirror(tmp_path)
+    (root / "catalog/coverage.json").write_text(value)
+    assert "catalog-unbuildable" in {f.code for f in validate_tree(root).errors}
+
+
 @pytest.mark.parametrize("profile", ["mirror", "public"])
 def test_installed_validation_workflow_is_repository_infrastructure(tmp_path, profile):
     repo = INTERNAL_REPO if profile == "mirror" else PUBLIC
