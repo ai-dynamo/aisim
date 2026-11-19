@@ -301,6 +301,16 @@ fn grouped_prefix_cache_replay_reports_reuse() {
             }
         }
         assert!(saw_cached_bytes, "{version}");
+        // Between the turns no request holds a block, and the eight cached
+        // blocks of the first turn stay.
+        assert!(
+            samples
+                .iter()
+                .flat_map(|sample| &sample.decode_scheduler_metrics)
+                .any(|row| row.kv_cache_used_bytes == Some(0)
+                    && row.kv_cache_cached_bytes == Some(8 * GLM_PAGE)),
+            "{version}"
+        );
     }
 }
 
