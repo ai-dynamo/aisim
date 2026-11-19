@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -496,7 +497,8 @@ def test_coderabbit_reviews_non_draft_prs_without_opt_in() -> None:
     assert auto_review["enabled"] is True
     assert auto_review["labels"] == ["!wip", "!do-not-review"]
     assert auto_review["drafts"] is False
-    assert auto_review["base_branches"] == ["release/.*"]
+    for target in ["main", "release/1.0", "simonec/unified-data-pr", "topic/arbitrary-stack-parent"]:
+        assert any(re.fullmatch(pattern, target) for pattern in auto_review["base_branches"])
     assert auto_review["ignore_title_keywords"] == [
         "WIP",
         "[skip review]",

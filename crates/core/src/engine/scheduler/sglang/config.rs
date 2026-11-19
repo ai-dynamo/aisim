@@ -37,6 +37,7 @@ pub(super) struct SglangConfig {
     pub(super) reserved_decode_tokens: usize,
     pub(super) chunked_prefill_size: usize,
     pub(super) prefill_decode_interval: usize,
+    pub(super) scheduler_select_time_ms: f64,
     pub(super) clip_max_new_tokens: usize,
     pub(super) init_new_token_ratio: f64,
     pub(super) min_new_token_ratio: f64,
@@ -136,6 +137,7 @@ impl SglangConfig {
         Self {
             schedule_policy,
             prefill_decode_interval: args.prefill_decode_interval,
+            scheduler_select_time_ms: sglang.map_or(0.0, |s| s.scheduler_select_time_ms),
             max_running_requests,
             decode_request_slots: max_running_requests.saturating_add(extra_decode_slots),
             decode_metadata_slots: max_running_requests.saturating_mul(2),

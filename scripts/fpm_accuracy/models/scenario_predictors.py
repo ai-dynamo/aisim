@@ -33,6 +33,7 @@ from scripts.fpm_accuracy.types.forward_pass import (
     ForwardPassMetric,
     RequestMetrics,
 )
+from scripts.release.package_identity import runtime_module
 
 # Field names are identical for every request record. Comparing their values in
 # this fixed name order equals comparing sorted (name, value) pairs, without
@@ -158,12 +159,12 @@ class _ScenarioInterpolation(aic_predictors.AicFpmPredictor):
         return operation()
 
     def predict(self, features: ForwardPassInput) -> Prediction:
-        from aisim_core.sdk.errors import PerfDataNotAvailableError
+        perf_data_error = runtime_module("aisim_core.sdk.errors").PerfDataNotAvailableError
         from scripts.fpm_accuracy.models.scenario_interpolation import is_interpolation_support_miss
 
         try:
             return super().predict(features)
-        except PerfDataNotAvailableError as exc:
+        except perf_data_error as exc:
             if not is_interpolation_support_miss(exc):
                 raise
             return Prediction(None, metadata={"reason": "unsupported_interpolation_query"})
@@ -255,7 +256,7 @@ class _WorkerScenarioRegression(ForwardPassTimePredictor):
 
 def _import_gbdt_trainer() -> Any:
     try:
-        from aisim_core.sdk import fpm_learned
+        fpm_learned = runtime_module("aisim_core.sdk.fpm_learned")
     except ImportError as exc:
         raise DependencyError("The evaluated AISim version does not provide the PR #280 GBDT trainer.") from exc
     if "fpm5" not in fpm_learned.FEATURE_PRESETS:

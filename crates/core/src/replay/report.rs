@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod bounded;
+mod feedback;
+pub use feedback::CompletionFeedbackSnapshot;
 
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -1114,6 +1116,7 @@ impl SlaThresholds {
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct TraceCollector {
+    completion_feedback: Option<feedback::CompletionFeedback>,
     pub(crate) g3_offload: Option<crate::engine::G3Stats>,
     pub(crate) kvcr: Option<crate::engine::KvcrStats>,
     pub(crate) g2_domains: Vec<G2DomainStats>,
@@ -1330,6 +1333,33 @@ impl TraceCollector {
     /// SLA set (the default), the report's `goodput` field stays `None`.
     pub fn set_sla_thresholds(&mut self, sla: SlaThresholds) {
         self.sla = sla;
+    }
+
+    /// Start counting completion feedback for telemetry samples.
+    pub(crate) fn enable_completion_feedback(&mut self) {
+        self.completion_feedback
+            .get_or_insert_with(Default::default);
+    }
+
+    /// Whether completion feedback holds updates no telemetry sample has reported.
+    pub(crate) fn completion_feedback_pending(&self) -> bool {
+        self.completion_feedback
+            .as_ref()
+            .is_some_and(feedback::CompletionFeedback::has_unreported)
+    }
+
+    /// Cumulative outcome counters, plus this interval's latency sample when
+    /// `take_interval` is set. `None` when feedback is not enabled.
+    pub(crate) fn completion_feedback_snapshot(
+        &mut self,
+        take_interval: bool,
+    ) -> Option<CompletionFeedbackSnapshot> {
+        let gpu_seconds = self.prefill_worker_seconds * self.prefill_gpus_per_worker as f64
+            + self.decode_worker_seconds * self.decode_gpus_per_worker as f64
+            + self.encoder_gpu_seconds;
+        self.completion_feedback
+            .as_mut()
+            .map(|feedback| feedback.snapshot(self.sla, gpu_seconds, take_interval))
     }
 
     /// Add provisioned worker-seconds for the interval just elapsed. The runtime
@@ -1822,6 +1852,8 @@ impl TraceCollector {
 
     pub fn on_terminal(&mut self, uuid: Uuid, terminal_time_ms: f64, status: ReplayTerminalStatus) {
         let Self {
+            completion_feedback,
+            sla,
             requests,
             defer_token_timeline_finalization,
             bounded_summary,
@@ -1833,6 +1865,9 @@ impl TraceCollector {
         {
             stats.terminal_time_ms = Some(terminal_time_ms);
             stats.terminal_status = Some(status);
+            if let Some(feedback) = completion_feedback {
+                feedback.observe(stats, *sla);
+            }
             if bounded_summary.is_some() {
                 completed_to_retire.push(uuid);
             }
@@ -1911,6 +1946,10 @@ impl TraceCollector {
     pub(crate) fn take_report(&mut self, report_end_ms: f64) -> ReplayReport {
         debug_assert!(report_end_ms.is_finite() && report_end_ms >= self.report_start_ms);
         let mut next = Self {
+            completion_feedback: self
+                .completion_feedback
+                .as_ref()
+                .map(|_| Default::default()),
             report_start_ms: report_end_ms,
             defer_token_timeline_finalization: self.defer_token_timeline_finalization,
             capture_per_request: self.capture_per_request,

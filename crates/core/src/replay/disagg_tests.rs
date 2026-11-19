@@ -64,6 +64,139 @@ impl ReplayTelemetryObserver for CaptureTelemetryObserver {
     }
 }
 
+#[test]
+fn disagg_completion_feedback_matches_final_slo_and_gpu_accounting() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let sla = crate::replay::SlaThresholds {
+        ttft_ms: Some(100.0),
+        itl_ms: Some(100.0),
+        e2e_ms: None,
+    };
+    let report = DisaggRuntime::from_requests(
+        &disagg_config(),
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 0.0), request(2, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_sla_thresholds(sla)
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    )
+    .run()
+    .unwrap()
+    .0
+    .finish();
+    let samples = samples.lock().unwrap();
+    let baseline = samples
+        .first()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    let final_sample = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(baseline.terminal_requests, 0);
+    assert_eq!(final_sample.sla, sla);
+    assert_eq!(final_sample.completed_requests, 2);
+    assert_eq!(
+        final_sample.good_requests,
+        report.goodput.unwrap().completed_requests as u64
+    );
+    assert_eq!(
+        final_sample.good_requests_strict_itl,
+        final_sample.good_requests
+    );
+    assert!((final_sample.gpu_seconds - report.throughput.gpu_hours * 3600.0).abs() < 1e-9);
+}
+
+#[test]
+fn disagg_baseline_leaves_earlier_latency_pairs_for_the_first_interval_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    // Zero-latency passes complete the first request before telemetry starts.
+    let mut config = disagg_config();
+    for args in [&mut config.prefill_args, &mut config.decode_args] {
+        args.timing_model = crate::engine::TimingModelConfig::Fixed {
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+        };
+    }
+    DisaggRuntime::from_requests(
+        &config,
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 0.0), request(2, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    )
+    .run()
+    .unwrap();
+    let samples = samples.lock().unwrap();
+    assert_eq!(samples[0].kind, ReplayTelemetrySampleKind::Baseline);
+    let baseline = samples[0].completion_feedback.as_ref().unwrap();
+    assert_eq!(baseline.completed_requests, 1);
+    assert!(baseline.latency_samples.is_empty());
+    assert_eq!(baseline.latency_population, 0);
+    let first = samples[1].completion_feedback.as_ref().unwrap();
+    assert_eq!(first.latency_samples, vec![(0.0, Some(0.0))]);
+    assert_eq!(first.latency_population, 1);
+    let last = samples
+        .last()
+        .unwrap()
+        .completion_feedback
+        .as_ref()
+        .unwrap();
+    assert_eq!(last.completed_requests, 2);
+}
+
+#[test]
+fn disagg_final_sample_reports_a_terminal_recorded_after_the_last_sample() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = DisaggRuntime::from_requests(
+        &disagg_config(),
+        None,
+        None,
+        VecDeque::from([request(1, 64, 2, 10.0)]),
+        ReplayMode::Trace,
+    )
+    .unwrap()
+    .with_telemetry_observer(
+        1.0,
+        Box::new(CaptureTelemetryObserver {
+            samples: samples.clone(),
+        }),
+    );
+    runtime.start_profile_observers().unwrap();
+    // A rejection at the instant of the last sample delivers no token and
+    // admits nothing, so only completion feedback knows about it.
+    let rejected = Uuid::from_u128(2);
+    runtime.collector.on_arrival(rejected, 0.0, 64, 2);
+    runtime
+        .collector
+        .on_terminal(rejected, 0.0, ReplayTerminalStatus::Rejected);
+    runtime.publish_final_telemetry_sample().unwrap();
+    let samples = samples.lock().unwrap();
+    let last = samples.last().unwrap();
+    assert_eq!(last.kind, ReplayTelemetrySampleKind::Final);
+    let feedback = last.completion_feedback.as_ref().unwrap();
+    assert_eq!(feedback.terminal_requests, 1);
+    assert_eq!(feedback.completed_requests, 0);
+}
+
 #[derive(Debug)]
 struct QueueUntilWorkerPlacement {
     scheduler_id: Option<usize>,

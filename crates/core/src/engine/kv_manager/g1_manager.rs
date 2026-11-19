@@ -382,14 +382,15 @@ impl G1Manager {
         self.inner.finish_lease(owner, lease);
     }
 
-    /// The prefill cost of a waiting candidate. A grouped prefix cache keeps
-    /// the hit on the lease for the allocation, so it is searched once.
+    /// The prefill cost of a request that `schedule_request` prices itself. A
+    /// grouped prefix cache keeps the hit on the lease for the allocation, so
+    /// it is searched once.
     pub(crate) fn lookup_native_prefill_cost(
         &self,
         sequence: &RequestSequence,
         lease: &mut BlockRequestLease,
     ) -> PrefillCost {
-        self.inner.lookup_prefill_cost(sequence, lease)
+        self.inner.lookup_lease_prefill_cost(sequence, lease)
     }
 
     pub(crate) fn get_native_prefill_cost(
@@ -398,6 +399,15 @@ impl G1Manager {
         lease: &BlockRequestLease,
     ) -> PrefillCost {
         self.inner.get_lease_prefill_cost(sequence, lease)
+    }
+
+    /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
+    pub(crate) fn get_native_waiting_prefill_cost(
+        &self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+    ) -> PrefillCost {
+        self.inner.get_waiting_lease_prefill_cost(sequence, lease)
     }
 
     /// What a request with `lease` still needs to hold its `tokens` tokens:
