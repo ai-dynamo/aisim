@@ -10,9 +10,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
-from aisim_core.data import Identity
+from aisim_core.data import Artifact, Identity, Manifest, configuration_id
 from aisim_core.data.catalog import build_catalog
 from aisim_core.data.e2e import (
     E2eManifestBody,
@@ -43,6 +44,8 @@ from aisim_core.data.mirror import (
 from aisim_core.data.mirror import (
     main as mirror_main,
 )
+from aisim_core.data.op_schema import OP_TABLE_SCHEMA_ID
+from aisim_core.data.parquet import write_parquet
 from aisim_core.data.promote import (
     Approval,
     PromotionError,
@@ -163,6 +166,49 @@ def _mirror(tmp_path, *, repo=INTERNAL_REPO, dev=("synthetic/model-a",)):
     register_manifests(root, manifests, repo)
     build_catalog(root)
     return root, manifests
+
+
+def _op_mirror(tmp_path, column, value):
+    root = tmp_path / "mirror"
+    directory = "data/op-latency/h100_sxm/gemm/vllm/0.11.0"
+    relative = f"{directory}/gemm_perf.parquet"
+    columns = {"kernel_source": ["synthetic-kernel"] * 2, "latency_ms": [1.0, 2.0]}
+    columns[column] = ["synthetic-kernel" if column == "kernel_source" else None, value]
+    table = pa.table(columns)
+    path = write_parquet(table, root / relative, OP_TABLE_SCHEMA_ID)
+    identity = Identity(
+        hardware="h100_sxm", framework="vllm", framework_version="0.11.0", operation_family="gemm",
+        model=None, effective_settings={}, unresolved_identity=None,
+    )  # fmt: skip
+    manifest = Manifest(
+        schema_version="aisim-artifact-manifest/v1",
+        category="op-latency",
+        purpose="operation-tables",
+        configuration_id=configuration_id("op-latency", "operation-tables", identity),
+        identity=identity,
+        requested_settings=None,
+        artifacts=[
+            Artifact(
+                artifact_id="gemm_perf.parquet",
+                path=relative,
+                role="operation-table",
+                format="parquet",
+                schema=OP_TABLE_SCHEMA_ID,
+                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                bytes=path.stat().st_size,
+                rows=table.num_rows,
+                runtime_path="data/h100_sxm/gemm/vllm/0.11.0/gemm_perf.parquet",
+            )
+        ],
+        provenance={},
+        evidence_gaps=[],
+    )
+    manifest_path = f"{directory}/manifest.json"
+    (root / manifest_path).write_text(manifest.model_dump_json(by_alias=True))
+    register_manifests(root, [manifest_path], INTERNAL_REPO)
+    build_catalog(root)
+    _public(root, directory)
+    return root, directory, relative
 
 
 def _public(root, *prefixes, **entry):
@@ -878,6 +924,46 @@ def test_clean_metric_and_series_text_can_be_promoted(tmp_path, value):
     for table in ("metrics", "series"):
         relative = f"{directory}/{table}.parquet"
         assert (target / relative).read_bytes() == (root / relative).read_bytes()
+    report = validate_tree(target, repo=PUBLIC, profile="public")
+    assert report.ok, report.errors
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "code"),
+    [
+        ("kernel_source", "https://node7.corp.nvidia.com/v1", "internal-host"),
+        ("kernel_source", "Bearer " + "a" * 24, "secret"),
+        ("future_text", "https://node7.corp.nvidia.com/v1", "internal-host"),
+        ("future_text", "Bearer " + "a" * 24, "secret"),
+        ("future_text", json.dumps({"endpoint": "https://node7.corp.nvidia.com/v1"}), "internal-host"),
+        ("future_text", {"authorization": "Bearer " + "a" * 24}, "secret"),
+        ("future_text", ["https://node7.corp.nvidia.com/v1"], "internal-host"),
+    ],
+)
+def test_operation_table_text_blocks_promotion_and_public_validation(tmp_path, column, value, code):
+    root, directory, relative = _op_mirror(tmp_path, column, value)
+    report = validate_tree(root, repo=INTERNAL_REPO)
+    assert report.ok, report.errors  # accepted private table with valid schema, hashes and catalog
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert not plan.content_ok and not plan.ok  # approval cannot override disclosure checks
+    assert any(f.code == code and f.path == relative and f"column {column}" in f.message for f in plan.findings)
+    assert any(f.code == code and f.path == relative for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert not (target / relative).exists()
+
+
+@pytest.mark.parametrize("value", [None, "", "[REDACTED]", '{"source": "public-benchmark"}'])
+def test_clean_operation_table_text_can_be_promoted(tmp_path, value):
+    root, directory, relative = _op_mirror(tmp_path, "future_text", value)
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    assert (target / relative).read_bytes() == (root / relative).read_bytes()
     report = validate_tree(target, repo=PUBLIC, profile="public")
     assert report.ok, report.errors
 

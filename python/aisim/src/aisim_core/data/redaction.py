@@ -50,6 +50,7 @@ from aisim_core.data.e2e import (
 )
 from aisim_core.data.eval import load_record
 from aisim_core.data.hygiene import Finding, checked_path
+from aisim_core.data.op_schema import OP_TABLE_SCHEMA_ID
 from aisim_core.data.parquet import read_parquet
 
 Label = Literal["public", "internal", "restricted"]
@@ -265,7 +266,7 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
             out.extend(_check_observations(root / artifact.path, artifact.path, policy))
         elif artifact.artifact_schema == REQUESTS_SCHEMA and _request_rows_allowed(body, policy):
             out.extend(_check_requests(root / artifact.path, artifact.path, policy))
-        elif artifact.artifact_schema in (METRICS_SCHEMA, SERIES_SCHEMA):
+        elif artifact.artifact_schema in (METRICS_SCHEMA, SERIES_SCHEMA, OP_TABLE_SCHEMA_ID):
             out.extend(
                 _check_table_text(
                     read_parquet(root / artifact.path, artifact.artifact_schema), artifact.path, policy, "column"
