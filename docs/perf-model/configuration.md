@@ -440,6 +440,14 @@ requires that same explicit deployment role; it cannot fill a shared deployment 
 The selector and verified library identity must identify one distinct deployment. An absent or partial selector
 matching several deployments (for example, `tp: 1` matching both DEP4 and DEP8) leaves their resources pending.
 Supplying resources explicitly for one deployment does not disambiguate the sidecar evidence for the others.
+
+| FPM deployment field | Default | Behavior |
+| --- | --- | --- |
+| `fpm_profile.deployments[].resources_source` | `user` (omitted when serialized) | The data loader marks sidecar-derived blocks as `metadata`. A later library load re-resolves those blocks from its sidecar, including after a dataset repin. Set `user` when replacing a derived block with an explicit override. |
+
+The source tag survives profile and native configuration round trips. It is provenance, not part of the
+deployment identity; explicit user blocks keep precedence on every load.
+
 Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. For plain
 autoregressive profiles, the draft constructs through `best_available` and answers timing queries; cache sizing,
 replay, and a load that requires resources fail with the fields to supply. A block with valid geometry but no

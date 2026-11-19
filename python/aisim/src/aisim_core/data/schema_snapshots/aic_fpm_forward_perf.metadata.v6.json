@@ -644,8 +644,7 @@
       ],
       "title": "FpmRuntimeMemoryProfile",
       "type": "object"
-    },
-    "JsonValue": {}
+    }
   },
   "$id": "aic_fpm_forward_perf.metadata/v6",
   "additionalProperties": true,
@@ -676,18 +675,6 @@
       "title": "Backend Version"
     },
     "configuration_selector": {
-      "anyOf": [
-        {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
-          },
-          "type": "object"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
       "properties": {
         "cp": {
           "minimum": 1,
@@ -714,7 +701,8 @@
           "type": "integer"
         }
       },
-      "title": "Configuration Selector"
+      "title": "Configuration Selector",
+      "type": "object"
     },
     "coordinate_system": {
       "const": "iteration_totals_balanced_v1",
@@ -722,16 +710,13 @@
       "type": "string"
     },
     "measurement_policy": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
+      "enum": [
+        "dynamo_native_single_sample_v1",
+        "per_row_single_sample_or_median_of_3",
+        "per_row_single_sample_or_full_grid_median_v1"
       ],
-      "default": null,
-      "title": "Measurement Policy"
+      "title": "Measurement Policy",
+      "type": "string"
     },
     "measurement_repeats": {
       "anyOf": [
@@ -774,17 +759,9 @@
       "title": "Model Paths"
     },
     "parquet_sha256": {
-      "anyOf": [
-        {
-          "pattern": "^[0-9a-f]{64}$",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Parquet Sha256"
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Parquet Sha256",
+      "type": "string"
     },
     "resources": {
       "anyOf": [
@@ -841,7 +818,8 @@
   "required": [
     "schema_name",
     "schema_version",
-    "row_count"
+    "row_count",
+    "parquet_sha256"
   ],
   "title": "FpmLibraryMetadata",
   "type": "object"

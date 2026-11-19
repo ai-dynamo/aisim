@@ -63,8 +63,17 @@ fn shared_tables_key(
     resolver: &SourceResolver,
     fpm_parquet_path: Option<&Path>,
 ) -> String {
+    // A managed staging can atomically replace a library at the same paths.
+    // Its verified marker identifies the generation (pair digests, system YAML
+    // and overlay targets). Hash only this small preparation record, never the
+    // potentially large parquet on every engine construction. Ordinary roots
+    // without a marker retain their existing immutable-root cache behavior.
+    let generation = std::fs::read(systems_root.join(".staged.json"))
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
     format!(
-        "{}\x1f{system}\x1f{backend}\x1f{version}\x1f{}\x1f{}",
+        "{}\x1f{system}\x1f{backend}\x1f{version}\x1f{}\x1f{}\x1f{generation}",
         systems_root.display(),
         resolver.identity_key(),
         fpm_parquet_path.map_or_else(String::new, |path| path.display().to_string())

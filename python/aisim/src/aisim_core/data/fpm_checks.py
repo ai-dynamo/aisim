@@ -29,11 +29,13 @@ from aisim_core.data import Manifest, _file, _verify, configuration_id
 from aisim_core.data.fpm_library import (
     EVALUATION_ROLES,
     LIBRARY_SCHEMA_ID,
+    MAX_WORKLOAD_COORDINATE,
     NATIVE_REQUIRED_COLUMNS,
     ROLE_LIBRARY,
     ROLE_METADATA,
     FpmContractError,
     FpmMeasurementManifest,
+    check_effective_measurement_policy,
     check_library_model,
     read_library_metadata,
     recover_reconstructed_metadata,
@@ -163,8 +165,9 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
                         not pa.types.is_integer(values.type)
                         or values.null_count
                         or pc.any(pc.less(values, minimum)).as_py()
+                        or pc.any(pc.greater(values, MAX_WORKLOAD_COORDINATE)).as_py()
                     ):
-                        raise ValueError(f"{name} must contain integers >= {minimum}")
+                        raise ValueError(f"{name} must contain integers in [{minimum}, {MAX_WORKLOAD_COORDINATE}]")
         except (OSError, ValueError) as exc:
             add("library-coordinates", str(exc))
     if columns is not None and "latency_ms" in columns:
@@ -185,19 +188,20 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
     except (FpmContractError, ValueError) as exc:
         add("invalid-sidecar", str(exc))
         return found
-    if metadata.get("parquet_sha256") not in (None, library.sha256):
+    if metadata.get("parquet_sha256") != library.sha256:
         add("sidecar-hash", "sidecar parquet_sha256 differs from the library in the manifest")
     if library.rows is not None and metadata.get("row_count") != library.rows:
         add("sidecar-rows", f"sidecar row_count {metadata.get('row_count')} differs from library rows {library.rows}")
     if not found:
         try:  # the check staging applies to a historical reconstructed sidecar
             check_library_model(metadata, _file(root, library.path), manifest.identity.model)
-            recover_reconstructed_metadata(
+            effective, _ = recover_reconstructed_metadata(
                 metadata,
                 _file(root, library.path),
                 parquet_sha256=library.sha256,
                 metadata_sha256=sidecar.sha256,
             )
+            check_effective_measurement_policy(effective)
         except (FpmContractError, OSError, ValueError) as exc:
             add("invalid-sidecar", str(exc))
     return found
