@@ -23,7 +23,8 @@ re-implementing it.
 | Store and read | `eval.write_record` (content-addressed, never overwrites), `load_record`, `current_records` |
 | Verify and promote tier | `eval.verify_record`, `eval.attest`, `eval.check_record_gpu_time` |
 | Parallelism validity | `registry.evaluate(Context(...))` returns a `Report` (`blocks_import`, `blocks_qualification`) |
-| Manifest checks | `aisim_core.data.check_manifest`, `check_dataset` (op-latency protocol only) |
+| Manifest checks | `aisim_core.data.check_manifest` (op-latency and FPM manifests) |
+| Dataset integrity | `aisim_core.data.check_dataset` (all indexed categories; E2E through `load_e2e`) |
 | System spec sync | `systems.check_published_systems`, `systems.publish_system_spec` |
 
 Not on this branch: a Hugging Face publish function and the `aisim data fetch`

@@ -374,13 +374,11 @@ def register_manifests(target: Path, manifest_paths: list[str], dataset_id: str)
     index_path.write_text(_dump(updated), encoding="utf-8")
 
 
-def _snapshot(target: Path) -> dict[str, bytes]:
+def _snapshot(target: Path, index_paths: set[str]) -> dict[str, bytes]:
     base = target / CATALOG_DIR
-    return (
-        {p.relative_to(target).as_posix(): p.read_bytes() for p in base.rglob("*") if p.is_file()}
-        if base.is_dir()
-        else {}
-    )
+    paths = {p for p in base.rglob("*") if p.is_file()} if base.is_dir() else set()
+    paths.update(target / rel for rel in index_paths if (target / rel).is_file())
+    return {p.relative_to(target).as_posix(): p.read_bytes() for p in paths}
 
 
 def apply_promotion(
@@ -428,8 +426,15 @@ def _apply_promotion(
             raise PromotionError(f"source changed since planning: {rel}")
         if (target / rel).exists() and _sha(target / rel) != digest:
             raise PromotionError(f"target already has different content at {rel}; promotion never overwrites")
+    index_path = target / CATALOG_DIR / "dataset.json"
     _check_contained(target, list(plan.files) + [f"{CATALOG_DIR}/dataset.json"])
-    before = _snapshot(target)
+    index_paths = (
+        {ref.index.path for ref in DatasetIndex.model_validate_json(index_path.read_bytes()).categories.values()}
+        if index_path.is_file()
+        else set()
+    )
+    _check_contained(target, list(index_paths))
+    before = _snapshot(target, index_paths)
     added: list[Path] = []
     ledger: Path | None = None
     try:
@@ -463,7 +468,7 @@ def _apply_promotion(
                 if parent == target or any(parent.iterdir()):
                     break
                 parent.rmdir()
-        for rel in set(_snapshot(target)) - set(before):
+        for rel in set(_snapshot(target, index_paths)) - set(before):
             (target / rel).unlink(missing_ok=True)
         for directory in sorted((target / CATALOG_DIR).rglob("*"), reverse=True):
             if directory.is_dir() and not any(directory.iterdir()):

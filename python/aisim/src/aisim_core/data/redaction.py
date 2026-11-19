@@ -36,9 +36,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aisim_core.data import Manifest, _verify
+from aisim_core.data.catalog import catalog_files
 from aisim_core.data.e2e import (
     OBSERVATIONS_SCHEMA,
     REQUESTS_SCHEMA,
@@ -451,6 +453,7 @@ def check_publishable(
             findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
             invalid.add(rel)
     chosen_set = set(chosen)
+    catalog_shards = {p.relative_to(root).as_posix() for p in catalog_files(root)}
     snapshots = snapshot_documents(root, chosen)
     for rel, manifest in sorted(loaded.items()):
         if rel in chosen_set and rel not in invalid:
@@ -459,6 +462,13 @@ def check_publishable(
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
+        if rel in catalog_shards:
+            try:
+                parquet = pq.ParquetFile(checked_path(root, rel))
+                findings.extend(_check_table_text(parquet.read(), rel, policy, "catalog column"))
+                findings.extend(scan_value(parquet.metadata.created_by, policy, rel, "Parquet producer"))
+            except (OSError, ValueError, RecursionError) as exc:
+                findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel.startswith("systems/") and rel.endswith(".yaml"):
             try:
                 data = checked_path(root, rel).read_bytes()
