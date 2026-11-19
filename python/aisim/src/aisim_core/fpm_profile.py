@@ -11,7 +11,8 @@ bytes or a runtime cache allocation. Provenance records how values were obtained
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Literal
+from collections.abc import Sequence
+from typing import Annotated, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
@@ -660,34 +661,71 @@ class FpmModelProfile(_ProfileModel):
         cp_size: int = 1,
         worker_type: str = "aggregated",
     ) -> FpmDeploymentProfile:
-        if worker_type not in ("prefill", "decode", "aggregated"):
-            raise ValueError("worker_type must be prefill, decode, or aggregated")
-        if model != self.model:
-            raise ValueError(f"FPM profile model identity mismatch: requested {model!r}, profile={self.model!r}")
-        shape = (
-            tp_size,
-            pp_size,
-            attention_dp_size,
-            1 if moe_tp_size is None else moe_tp_size,
-            1 if moe_ep_size is None else moe_ep_size,
-            cp_size,
+        return _select_deployment(
+            self,
+            self.deployments,
+            model=model,
+            system=system,
+            backend=backend,
+            backend_version=backend_version,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            attention_dp_size=attention_dp_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+            cp_size=cp_size,
+            worker_type=worker_type,
         )
-        if any(type(value) is not int or value <= 0 for value in shape):
-            raise ValueError("FPM deployment dimensions must be positive integers, not booleans")
-        for deployment in self.deployments:
-            if (
-                deployment.system == system
-                and deployment.backend == backend
-                and deployment.backend_version == backend_version
-                and deployment.parallel_tuple == shape
-                and deployment.worker_type in (None, worker_type)
-            ):
-                return deployment
-        raise ValueError(
-            f"no matching FPM deployment profile for {model!r}, {system}/{backend}/{backend_version}, "
-            f"(tp,pp,dp,moe_tp,moe_ep,cp)={shape}, worker_type={worker_type}; "
-            "provide explicit resources and precision for that deployment"
-        )
+
+
+_D = TypeVar("_D", bound=_FpmTimingDeploymentProfile)
+
+
+def _select_deployment(
+    profile: FpmModelProfile,
+    deployments: Sequence[_D],
+    *,
+    model: str,
+    system: str,
+    backend: str,
+    backend_version: str | None,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    attention_dp_size: int = 1,
+    moe_tp_size: int | None = None,
+    moe_ep_size: int | None = None,
+    cp_size: int = 1,
+    worker_type: str = "aggregated",
+) -> _D:
+    """Pick the deployment for one topology and role; the return type follows the deployment type."""
+    if worker_type not in ("prefill", "decode", "aggregated"):
+        raise ValueError("worker_type must be prefill, decode, or aggregated")
+    if model != profile.model:
+        raise ValueError(f"FPM profile model identity mismatch: requested {model!r}, profile={profile.model!r}")
+    shape = (
+        tp_size,
+        pp_size,
+        attention_dp_size,
+        1 if moe_tp_size is None else moe_tp_size,
+        1 if moe_ep_size is None else moe_ep_size,
+        cp_size,
+    )
+    if any(type(value) is not int or value <= 0 for value in shape):
+        raise ValueError("FPM deployment dimensions must be positive integers, not booleans")
+    for deployment in deployments:
+        if (
+            deployment.system == system
+            and deployment.backend == backend
+            and deployment.backend_version == backend_version
+            and deployment.parallel_tuple == shape
+            and deployment.worker_type in (None, worker_type)
+        ):
+            return deployment
+    raise ValueError(
+        f"no matching FPM deployment profile for {model!r}, {system}/{backend}/{backend_version}, "
+        f"(tp,pp,dp,moe_tp,moe_ep,cp)={shape}, worker_type={worker_type}; "
+        "provide explicit resources and precision for that deployment"
+    )
 
 
 def load_fpm_profile(value: dict[str, Any] | str | FpmModelProfile) -> FpmModelProfile:
@@ -702,6 +740,37 @@ class _FpmTimingModelProfile(FpmModelProfile):
     """Internal timing admission keeps full identity while allowing pending resources."""
 
     deployments: Annotated[list[_FpmTimingDeploymentProfile], Field(min_length=1)]
+
+    def select(  # type: ignore[override]  # pending resources: callers must check ``resources``
+        self,
+        *,
+        model: str,
+        system: str,
+        backend: str,
+        backend_version: str | None,
+        tp_size: int = 1,
+        pp_size: int = 1,
+        attention_dp_size: int = 1,
+        moe_tp_size: int | None = None,
+        moe_ep_size: int | None = None,
+        cp_size: int = 1,
+        worker_type: str = "aggregated",
+    ) -> _FpmTimingDeploymentProfile:
+        return _select_deployment(
+            self,
+            self.deployments,
+            model=model,
+            system=system,
+            backend=backend,
+            backend_version=backend_version,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            attention_dp_size=attention_dp_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+            cp_size=cp_size,
+            worker_type=worker_type,
+        )
 
 
 def _load_fpm_timing_profile(value: dict[str, Any] | str | FpmModelProfile) -> _FpmTimingModelProfile:

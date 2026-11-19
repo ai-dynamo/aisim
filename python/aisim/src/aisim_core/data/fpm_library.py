@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import threading
@@ -119,10 +120,10 @@ class FpmLibraryRow(BaseModel):
     backend: str
     backend_version: str
     weight_quantization: str
-    tp: int
-    pp: int
-    dp: int
-    moe_tp: int
+    tp: int = Field(strict=True)
+    pp: int = Field(strict=True)
+    dp: int = Field(strict=True)
+    moe_tp: int = Field(strict=True)
     moe_ep: int
     cp: int
     workload_kind: str
@@ -193,11 +194,23 @@ def _reject_constant(value: str):
     raise ValueError(f"non-finite JSON constant {value}")
 
 
+def _reject_nonfinite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):  # exponent-form overflow such as 1e400 never reaches parse_constant
+        raise ValueError(f"non-finite JSON number {text}")
+    return value
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    keys = [key for key, _ in pairs]
-    if duplicated := sorted({key for key in keys if keys.count(key) > 1}):
-        raise ValueError(f"duplicate JSON key {duplicated[0]!r}")
-    return dict(pairs)
+    out: dict[str, Any] = {}
+    duplicated: str | None = None
+    for key, value in pairs:
+        if key in out and (duplicated is None or key < duplicated):
+            duplicated = key
+        out[key] = value
+    if duplicated is not None:
+        raise ValueError(f"duplicate JSON key {duplicated!r}")
+    return out
 
 
 def read_library_metadata(path: Path) -> dict[str, Any]:
@@ -206,6 +219,7 @@ def read_library_metadata(path: Path) -> dict[str, Any]:
         raw = json.loads(
             Path(path).read_text(encoding="utf-8"),
             parse_constant=_reject_constant,
+            parse_float=_reject_nonfinite_float,
             object_pairs_hook=_reject_duplicate_keys,
         )
     except (OSError, ValueError) as exc:
@@ -427,7 +441,7 @@ def stage_fpm_library(
         # Unique per call: concurrent stagings of one destination never share or delete a build.
         build = Path(mkdtemp(prefix=f".{root.name}.staging-", dir=root.parent))
     try:
-        target = _prepare_system_overlay(build, source_yaml, backend, backend_version, systems_paths)
+        target = _prepare_system_overlay(build, source_yaml, backend, backend_version, systems_paths, root)
         (target / LIBRARY_FILE).symlink_to(parquet)
         if text is not None:
             (target / METADATA_FILE).write_text(text, encoding="utf-8")
@@ -589,13 +603,21 @@ def _system_definition(system: str, systems_paths: Sequence[str | Path]) -> Path
 
 
 def _prepare_system_overlay(
-    systems_root: Path, source_yaml: Path, backend: str, backend_version: str, systems_paths: Sequence[str | Path]
+    systems_root: Path,
+    source_yaml: Path,
+    backend: str,
+    backend_version: str,
+    systems_paths: Sequence[str | Path],
+    destination: Path | None = None,
 ) -> Path:
     import yaml
 
     target_yaml = systems_root / source_yaml.name
     shutil.copy2(source_yaml, target_yaml)
-    spec = yaml.safe_load(target_yaml.read_text(encoding="utf-8"))
+    try:
+        spec = yaml.safe_load(target_yaml.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise FpmContractError(f"AISim system definition {source_yaml} is not valid YAML: {exc}") from exc
     if not isinstance(spec, dict) or not isinstance(spec.get("data_dir"), str):
         raise FpmContractError(f"AISim system definition {source_yaml} has no data_dir")
     data_dir = _safe_relative_path(spec["data_dir"], "system data_dir")
@@ -607,6 +629,13 @@ def _prepare_system_overlay(
     for root in systems_paths:
         source_data_root = (Path(root) / data_dir).resolve()
         if source_data_root.is_dir():
+            # A build or destination inside a source tree would be scanned as a source entry and linked by a
+            # temporary path that installation renames away.
+            for staged in (systems_root, destination):
+                if staged is not None and staged.resolve().is_relative_to(source_data_root):
+                    raise FpmContractError(
+                        f"FPM output_dir {staged} must not be inside the system data tree {source_data_root}"
+                    )
             _link_overlay_entries(source_data_root, target_data_root, backend_name, version)
     return target_version
 

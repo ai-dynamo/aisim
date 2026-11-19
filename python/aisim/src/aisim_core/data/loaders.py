@@ -55,6 +55,7 @@ from aisim_core.data.fpm_library import (
     complete_fpm_profile,
     missing_memory_fields,
     missing_resource_fields,
+    read_library_metadata,
     resolve_resources,
     resource_metadata_for_deployment,
     stage_fpm_library,
@@ -333,10 +334,34 @@ class FpmLoader(Loader):
         library, sidecar = libraries[0], sidecars[0]
         identity = manifest.identity
         user_paths = tuple(systems_paths or (config or {}).get("systems_paths") or ()) or None
+        library_file, sidecar_file = _verify(root, library), _verify(root, sidecar)
+        estimator = (config or {}).get("estimator_config")
+        interpolation = estimator.get("fpm_interpolation") if isinstance(estimator, Mapping) else None
+        explicit = interpolation.get("fpm_parquet_path") if isinstance(interpolation, Mapping) else None
+        # The sidecar describes only the library it ships with. A user path to another library keeps its
+        # resources and selector out of reach of this sidecar, so they stay pending unless the user supplies them.
+        foreign = explicit is not None and Path(explicit).expanduser().resolve() != library_file.resolve()
+        base = dict(config or {})
+        with_estimator_path(base, library_file)
+        if output_dir is not None:
+            # Staging replaces a previous root at output_dir, so reject an unusable resource contract first.
+            try:
+                declared = read_library_metadata(sidecar_file)
+            except FpmContractError as exc:
+                raise LoaderError(str(exc)) from exc
+            _resolve_library_resources(
+                dict(base),
+                user_profile,
+                identity,
+                declared,
+                require_resources,
+                config is not None,
+                foreign,
+            )
         try:
             staged = stage_fpm_library(
-                _verify(root, library),
-                _verify(root, sidecar),
+                library_file,
+                sidecar_file,
                 system=identity.hardware,
                 backend=identity.framework,
                 backend_version=identity.framework_version,
@@ -352,57 +377,11 @@ class FpmLoader(Loader):
         out["systems_paths"] = list(
             dict.fromkeys(str(p) for p in (staged.systems_root, *(out.get("systems_paths") or ())))
         )
-        resources, sources, profile = None, (), None
-        resources_by_deployment = ()
         try:
             with_estimator_path(out, staged.parquet_path)
-            if user_profile is not None:
-                completed, sources = complete_fpm_profile(
-                    dict(user_profile),
-                    staged.metadata,
-                    identity={
-                        "system": identity.hardware,
-                        "backend": identity.framework,
-                        "backend_version": identity.framework_version,
-                    },
-                    required=require_resources,
-                )
-                out["fpm_profile"] = completed
-                from aisim_core.fpm_profile import load_fpm_profile
-
-                # A draft stays a dictionary until every deployment has resources. Do not invent a typed
-                # resource block merely to validate a timing-only load.
-                if "pending" not in sources:
-                    profile = load_fpm_profile(completed)
-                    blocks = [deployment.resources for deployment in profile.deployments]
-                else:
-                    blocks = [resolve_resources(d.get("resources"), None).resources for d in completed["deployments"]]
-                resources_by_deployment = tuple(
-                    ResolvedResources(block, source) for block, source in zip(blocks, sources, strict=True)
-                )
-                resources = resources_by_deployment[0]
-            else:
-                metadata = staged.metadata
-                if metadata.get("resources") is not None and metadata.get("configuration_selector"):
-                    if config is None:
-                        metadata = None  # No requested deployment to match against the selector.
-                    else:
-                        from aisim_core.sdk import RustForwardPassPerfModel
-
-                        # Canonical normalization owns defaults and aliases; do not assume omitted topology.
-                        normalized = RustForwardPassPerfModel.normalize_config(out)
-                        deployment = {
-                            **normalized,
-                            "dp": normalized["attention_dp"],
-                            "moe_tp": normalized.get("moe_tp_size"),
-                            "moe_ep": normalized.get("moe_ep_size"),
-                            "cp": normalized.get("cp_size"),
-                            "kv_cache_dtype": normalized.get("kvcache_quant_mode"),
-                        }
-                        deployment = {name: value for name, value in deployment.items() if value is not None}
-                        metadata = resource_metadata_for_deployment(normalized, deployment, metadata)
-                resources = resolve_resources(None, metadata, required=require_resources)
-                resources_by_deployment = (resources,)
+            resources, sources, profile, resources_by_deployment = _resolve_library_resources(
+                out, user_profile, identity, staged.metadata, require_resources, config is not None, foreign
+            )
         except FpmContractError:
             staged.close()
             raise
@@ -418,6 +397,65 @@ class FpmLoader(Loader):
             resources_by_deployment=resources_by_deployment,
             _staged=staged,
         )
+
+
+def _resolve_library_resources(
+    out: dict[str, Any],
+    user_profile: Mapping[str, Any] | None,
+    identity: Identity,
+    metadata: Mapping[str, Any],
+    require_resources: bool,
+    has_config: bool,
+    foreign: bool,
+):
+    """Resolve resources for a library load; sets ``out["fpm_profile"]`` when the user supplied one."""
+    if foreign:
+        metadata = {}
+    sources: tuple[str, ...] | list[str] = ()
+    profile = None
+    if user_profile is not None:
+        completed, sources = complete_fpm_profile(
+            dict(user_profile),
+            metadata,
+            identity={
+                "system": identity.hardware,
+                "backend": identity.framework,
+                "backend_version": identity.framework_version,
+            },
+            required=require_resources,
+        )
+        out["fpm_profile"] = completed
+        from aisim_core.fpm_profile import load_fpm_profile
+
+        # A draft stays a dictionary until every deployment has resources. Do not invent a typed
+        # resource block merely to validate a timing-only load.
+        if "pending" not in sources:
+            profile = load_fpm_profile(completed)
+            blocks = [deployment.resources for deployment in profile.deployments]
+        else:
+            blocks = [resolve_resources(d.get("resources"), None).resources for d in completed["deployments"]]
+        by_deployment = tuple(ResolvedResources(block, source) for block, source in zip(blocks, sources, strict=True))
+        return by_deployment[0], tuple(sources), profile, by_deployment
+    if metadata.get("resources") is not None and metadata.get("configuration_selector"):
+        if not has_config:
+            metadata = None  # No requested deployment to match against the selector.
+        else:
+            from aisim_core.sdk import RustForwardPassPerfModel
+
+            # Canonical normalization owns defaults and aliases; do not assume omitted topology.
+            normalized = RustForwardPassPerfModel.normalize_config(out)
+            deployment = {
+                **normalized,
+                "dp": normalized["attention_dp"],
+                "moe_tp": normalized.get("moe_tp_size"),
+                "moe_ep": normalized.get("moe_ep_size"),
+                "cp": normalized.get("cp_size"),
+                "kv_cache_dtype": normalized.get("kvcache_quant_mode"),
+            }
+            deployment = {name: value for name, value in deployment.items() if value is not None}
+            metadata = resource_metadata_for_deployment(normalized, deployment, metadata)
+    resources = resolve_resources(None, metadata, required=require_resources)
+    return resources, (), None, (resources,)
 
 
 def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | None:
