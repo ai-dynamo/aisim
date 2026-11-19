@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -189,6 +191,33 @@ def test_cli_failure_keeps_findings_and_missing_inputs_are_not_green(tmp_path, m
     review.unlink()
     assert gate.main(argv) == 1
     assert "error" in json.loads((output / "config-license-approval.json").read_text())
+
+
+def test_cli_corrupt_wheel_retains_failure_report(tmp_path):
+    wheel = tmp_path / "invalid.whl"
+    wheel.write_bytes(b"not a ZIP archive")
+    output = tmp_path / "report"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(gate.__file__)),
+            "--root",
+            str(gate.provenance.ROOT),
+            "--wheel",
+            str(wheel),
+            "--output-dir",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    report = json.loads((output / "config-license-approval.json").read_text())
+    assert report["passed"] is False
+    assert report["legal_approval_asserted"] is False
+    assert "zip" in report["error"].lower()
+    assert "Config license compliance failed" in result.stdout
 
 
 def test_malformed_reviewer_is_a_reported_failure(tmp_path, monkeypatch):

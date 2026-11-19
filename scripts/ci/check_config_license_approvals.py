@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import zipfile
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -186,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         results = assess(entries, records)
         report.update(passed=all(r["passed"] for r in results), files=results, wheel_sha256=wheel_sha)
         report["problem_counts"] = dict(Counter(problem for r in results for problem in r["problems"]))
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
         report["error"] = str(error)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "config-license-approval.json").write_text(json.dumps(report, indent=2) + "\n")
