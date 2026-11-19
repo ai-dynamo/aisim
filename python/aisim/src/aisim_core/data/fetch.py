@@ -535,6 +535,8 @@ class _Planner:
         plan.metadata_bytes += received
         if validate is not None:
             validate(b"".join(chunks))
+        # ``store`` verifies a temporary file and atomically replaces the destination, so an existing entry
+        # (possibly another reader's verified download) is never removed ahead of a transfer that may fail.
         self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
         self._add(ref)
         return self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()

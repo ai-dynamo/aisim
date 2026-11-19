@@ -9,6 +9,7 @@ spelling inside moved files (logical keys) is exercised exactly as in the publis
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -24,7 +25,7 @@ from tests.fpm_accuracy.test_hf_dataset import CONFIGURATION_PATH, REVISION, _bu
 REPO = "ai-dynamo/aisim-data"
 
 
-def _legacy_and_unified(tmp_path: Path) -> tuple[Path, Path]:
+def _legacy_and_unified(tmp_path: Path, edit=None) -> tuple[Path, Path]:
     legacy = tmp_path / "legacy"
     content = f"{json.dumps(_fpm_payload())}\n".encode()
     _build_dataset(
@@ -46,6 +47,8 @@ def _legacy_and_unified(tmp_path: Path) -> tuple[Path, Path]:
             }
         )
     )
+    if edit is not None:
+        edit(legacy)
     unified = tmp_path / "unified"
     fpm_migration.migrate(legacy, unified, revision=REVISION, repo=REPO)
     return legacy, unified
@@ -95,6 +98,58 @@ def test_leaf_manifest_tamper_is_caught_by_the_envelope_hash(tmp_path: Path) -> 
     leaf.write_text(leaf.read_text() + " ")
     with pytest.raises(DataError, match="hash mismatch"):
         HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO)
+
+
+def _refresh_index_hashes(unified: Path) -> None:
+    category_path = unified / fpm_migration.CATEGORY_INDEX
+    category = json.loads(category_path.read_text())
+    for entry in category["entries"]:
+        path = unified / entry["manifest"]["path"]
+        entry["manifest"].update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    category_path.write_text(json.dumps(category))
+    dataset_path = unified / fpm_migration.DATASET_INDEX
+    dataset = json.loads(dataset_path.read_text())
+    dataset["categories"]["fpm"]["index"].update(
+        sha256=hashlib.sha256(category_path.read_bytes()).hexdigest(), bytes=category_path.stat().st_size
+    )
+    dataset_path.write_text(json.dumps(dataset))
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+@pytest.mark.parametrize("role", ["measurement-manifest", "measurement-data"])
+def test_envelope_and_leaf_must_agree_on_the_measurement_digests(tmp_path: Path, role: str, conflict: bool) -> None:
+    _, unified = _legacy_and_unified(tmp_path)
+    if conflict:
+        # The local files and the hash-valid leaf agree with each other; only the envelope disagrees.
+        path = unified / fpm_migration.target_path(f"{CONFIGURATION_PATH}/aisim-manifest.json")
+        envelope = json.loads(path.read_text())
+        next(a for a in envelope["artifacts"] if a["role"] == role)["sha256"] = "0" * 64
+        path.write_text(json.dumps(envelope))
+        _refresh_index_hashes(unified)
+    dataset = HfDataset.from_local(unified, revision=REVISION, repo_id=REPO)
+    if conflict:
+        with pytest.raises(DataError, match="measurement file .* digest differs from its envelope"):
+            dataset.measurement_case(CONFIGURATION_PATH)
+    else:
+        assert dataset.measurement_case(CONFIGURATION_PATH).truth_files
+
+
+@pytest.mark.parametrize("spelling", ["data/", "./data/"])
+def test_unified_reader_resolves_dotted_leaf_measurement_paths(tmp_path: Path, spelling: str) -> None:
+    def edit(legacy: Path) -> None:
+        leaf_path = legacy / CONFIGURATION_PATH / "manifest.json"
+        leaf = json.loads(leaf_path.read_text())
+        manifest_path = leaf["measurements"]["manifest_path"]
+        assert manifest_path.startswith("data/")
+        leaf["measurements"]["manifest_path"] = spelling + manifest_path.removeprefix("data/")
+        leaf_path.write_text(json.dumps(leaf))
+
+    _, unified = _legacy_and_unified(tmp_path, edit)
+
+    case = HfDataset.from_local(unified, revision=REVISION, repo_id=REPO).measurement_case(CONFIGURATION_PATH)
+
+    assert case.truth_files
+    assert f"/blob/{REVISION}/data/fpm/" in case.configuration.measurements.provenance_url
 
 
 def test_selection_filters_before_any_artifact_is_needed(tmp_path: Path) -> None:

@@ -146,6 +146,7 @@ class HfDataset:
         # ``unified``: catalog/dataset.json + envelope manifests under data/fpm/ (logical paths inside the
         # moved files are mapped to physical ones). ``legacy``: catalog/index.json, paths used as written.
         self.layout = "unified" if (self.root / UNIFIED_CATALOG).is_file() else "legacy"
+        self._measurement_hashes: dict[str, dict[str, str]] = {}
         if self.layout == "unified":
             self._index = self._unified_index(configuration_ids)
         else:
@@ -289,6 +290,16 @@ class HfDataset:
             leaf = leaves[0]
             self._verify_file(self._safe_path(leaf.path), leaf.sha256, description=leaf.path)
             logical = logical_path(leaf.path)
+            try:
+                self._measurement_hashes[logical] = {
+                    logical_path(artifact.path): artifact.sha256
+                    for artifact in envelope.artifacts
+                    if artifact.role.startswith("measurement-")
+                }
+            except ValueError as exc:
+                raise DataError(
+                    f"envelope {entry.manifest.path} declares a measurement file outside the FPM layout"
+                ) from exc
             current.append(logical)
             for value in self._read_json(logical).get("history") or ():
                 if isinstance(value, Mapping) and isinstance(value.get("manifest_path"), str):
@@ -556,6 +567,7 @@ class HfDataset:
             file_count=_required_nonnegative_int(measurement_value, "file_count", manifest_path),
             provenance_url=self._provenance_url(_required_str(measurement_value, "manifest_path", manifest_path)),
         )
+        self._check_envelope_digest(manifest_path, measurement.manifest_path, measurement.manifest_sha256)
         self._verify_file(
             self._safe_path(measurement.manifest_path),
             measurement.manifest_sha256,
@@ -704,13 +716,15 @@ class HfDataset:
                     raise DataError("pre_grouped_rank_lists representation requires grouping metadata")
             elif any(item is not None for item in (iteration_count, rank_record_count, grouping)):
                 raise DataError("grouping metadata requires the pre_grouped_rank_lists representation")
+            sha256 = _required_sha256(value, "sha256", configuration.measurements.manifest_path)
+            self._check_envelope_digest(configuration.manifest_path, path, sha256)
             result.append(
                 MeasurementFile(
                     measurement_file_id=_required_str(
                         value, "measurement_file_id", configuration.measurements.manifest_path
                     ),
                     path=path,
-                    sha256=_required_sha256(value, "sha256", configuration.measurements.manifest_path),
+                    sha256=sha256,
                     role=role,
                     local_path=self._safe_path(path),
                     provenance_url=self._provenance_url(path),
@@ -1106,10 +1120,19 @@ class HfDataset:
         if actual != expected_sha256:
             raise DataError(f"HF dataset hash mismatch for {description}: expected {expected_sha256}, got {actual}")
 
+    def _check_envelope_digest(self, leaf_path: str, relative: str, sha256: str) -> None:
+        """A measurement file's leaf-pinned digest must equal the one its authenticated envelope declares."""
+        if self.layout != "unified":
+            return
+        declared = self._measurement_hashes.get(leaf_path, {}).get(PurePosixPath(relative).as_posix())
+        if declared is not None and declared != sha256:
+            raise DataError(f"leaf {leaf_path} measurement file {relative} digest differs from its envelope")
+
     def _physical(self, relative: str) -> str:
         """Repository path of a dataset path; the moved files still embed the legacy ``data/`` spelling."""
-        if self.layout == "unified" and relative.startswith("data/"):
-            return physical_path(relative)
+        normalized = PurePosixPath(relative).as_posix()  # "./data/x" names the same file as "data/x"
+        if self.layout == "unified" and normalized.startswith("data/"):
+            return physical_path(normalized)
         return relative
 
     def _provenance_url(self, relative: str) -> str:
