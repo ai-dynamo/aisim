@@ -32,6 +32,10 @@ internal project by hand.
    The manual `promote` job declares `environment.action: access`; GitLab permits
    listed users and administrators to play it. `GITLAB_USER_NAME` records the actor;
    it does not authorize reviewers on its own.
+6. Select or provision a runner with a POSIX shell, Git, `uv`, and `python3`.
+   On that runner, verify `sh -c 'git --version && uv --version && python3 --version'`
+   succeeds before enabling either schedule. A Docker runner can supply these tools
+   through its configured default image; this definition does not select an image.
 
 After a successful promotion the qualification exists only on its candidate branch. Open a
 reviewed merge request from that branch into the default branch and merge it: ingestion and
@@ -57,7 +61,9 @@ observations from unselected models. Review that removal count before promotion;
 unfiltered run to retain the full model scope.
 
 Ingestion skips an existing branch only when it still has the same snapshot pending against the
-current qualified baseline. If content recurs after another snapshot was qualified, a new
+current qualified baseline and its snapshot and all member artifacts pass verification. A damaged
+pending branch is preserved, and the healthy staged replacement is published as a new generation.
+If content recurs after another snapshot was qualified, a new
 pipeline-suffixed branch preserves the historical review and supports a fresh qualification.
 
 Configuration shards are stored under `revisions/<content-sha256>/e2e/...`.
@@ -73,6 +79,8 @@ raw-observation additions, corrections and removals. This includes producer-meta
 Producer SHA and attempt metadata from `workflow-info` are optional: absent values remain null,
 and `warnings` lists each affected benchmark run URL and missing field (including unchanged runs).
 Each HTTP page is limited to 64 MiB before parsing; larger pages fail with a structured run report.
+An aggregated row reporting `decode_num_workers=0` is rejected before conversion stores a
+configuration: zero cannot represent a serving replica count.
 
 ## Assumptions to confirm before install
 

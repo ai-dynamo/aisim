@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from aisim_core.data.e2e import SnapshotMember, load_e2e, read_snapshot, verify_snapshot_members
+from aisim_core.data.hygiene import bounded_json_bytes, json_sidecar_value
 from aisim_core.data.infx_ingest import (
     Acquirer,
     AcquisitionCache,
@@ -73,7 +74,7 @@ def load_state(root: Path) -> dict[str, Any]:
     path = Path(root) / STATE_FILE
     if not path.exists():
         return {"schema_version": STATE_SCHEMA, "qualified": None, "candidate": None}
-    state = json.loads(path.read_text())
+    state = json_sidecar_value(bounded_json_bytes(path))
     if not isinstance(state, dict):
         raise ValueError("ingestion state must be an object")
     if state.get("schema_version") != STATE_SCHEMA:

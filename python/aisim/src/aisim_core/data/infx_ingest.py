@@ -36,6 +36,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import tempfile
 import time
 import urllib.error
@@ -301,7 +302,7 @@ class Acquisition:
 def _json(fetched: Fetched, body: bytes, expect: type) -> Any:
     try:
         value = json_sidecar_value(body)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise IncompleteAcquisitionError(f"{fetched.url}: body is not valid JSON ({exc})") from exc
     if not isinstance(value, expect):
         raise IncompleteAcquisitionError(f"{fetched.url}: expected {expect.__name__}, got {type(value).__name__}")
@@ -403,6 +404,8 @@ class Acquirer:
                 _check_availability_values(row, url)
                 if not isinstance(row["metrics"], dict):
                     raise IncompleteAcquisitionError(f"{url}: metrics must be a mapping")
+                if row.get("run_url") is not None and not isinstance(row["run_url"], str):
+                    raise IncompleteAcquisitionError(f"{url}: run_url must be a string or null")
                 if row["model"] not in valid_keys:
                     raise ContradictionError(f"{url}: row {row['id']} is for model {row['model']!r}, not {name!r}")
                 if wanted is not None and row["model"] not in wanted and name not in wanted:
@@ -468,8 +471,10 @@ class Acquirer:
                     )
                 entry["run_attempt"] = attempt
             for config in info.get("runConfigs", []):
-                entry = runs.setdefault(config["html_url"], {})
                 sha = config.get("head_sha")
+                if sha is not None and (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha)):
+                    raise IncompleteAcquisitionError(f"workflow-info {date}: head_sha must be a full hex SHA or null")
+                entry = runs.setdefault(config["html_url"], {})
                 if sha and entry.get("head_sha") not in (None, sha):
                     raise ContradictionError(f"workflow-info {date}: run {config['html_url']} reports two head_sha")
                 if sha:

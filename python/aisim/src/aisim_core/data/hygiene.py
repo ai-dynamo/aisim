@@ -298,8 +298,12 @@ class _SidecarLoader(yaml.SafeLoader):
         # Check explicit keys before flattening merges: an explicit override of a
         # merged default is valid YAML, while repeated explicit settings are ambiguous.
         seen = set()
+        seen_merge = False
         for key, _ in node.value:
             if key.tag == "tag:yaml.org,2002:merge":
+                if seen_merge:
+                    raise ValueError("duplicate YAML key: '<<'")
+                seen_merge = True
                 continue
             if not isinstance(key, yaml.ScalarNode):
                 raise ValueError("YAML mapping keys must be scalar")

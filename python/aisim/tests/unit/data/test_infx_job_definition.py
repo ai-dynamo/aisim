@@ -7,7 +7,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -208,9 +210,18 @@ def test_selector_rules_use_gitlab_variable_comparisons_and_route_jobs(definitio
     assert selected == expected
 
 
-@pytest.mark.parametrize("kind", ["historical", "different-baseline", "pending", "generated-pending"])
+@pytest.mark.parametrize(
+    "kind", ["historical", "different-baseline", "pending", "generated-pending", "damaged-pending"]
+)
 def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pending(definition, tmp_path, kind):
-    sid = "a" * 64
+    from aisim_core.data.infx_job import run_ingestion
+    from tests.unit.data.test_infx_ingest import NOW, FakeInfx
+
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    result = run_ingestion(payload, tmp_path / "acquisition", transport=FakeInfx(), now=lambda: NOW)
+    assert result.status == "candidate"
+    sid = result.snapshot_id
     qualified_a = {
         "snapshot_id": sid,
         "snapshot_path": f"snapshots/{sid}/snapshot.json",
@@ -259,6 +270,12 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
     git(seed, "push", "-q", "origin", "main")
     branch = f"candidate/{sid}" + ("-17" if kind == "generated-pending" else "")
     git(seed, "checkout", "-qb", branch)
+    for name in ("revisions", "snapshots"):
+        shutil.copytree(payload / name, seed / name)
+    if kind == "damaged-pending":
+        damaged = next(seed.rglob("metrics.parquet"))
+        missing = damaged.relative_to(seed).as_posix()
+        damaged.unlink()
     commit_state(qualified_b if "pending" in kind else qualified_a, None if kind == "historical" else pending)
     git(seed, "push", "-q", "origin", branch)
     old = git(remote, "rev-parse", branch)
@@ -269,12 +286,31 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
     (workspace / "cache-repo/ingestion-state.json").write_text(
         json.dumps({"schema_version": schema, "qualified": qualified_b, "candidate": pending})
     )
+    for name in ("revisions", "snapshots"):
+        shutil.copytree(payload / name, workspace / "cache-repo" / name)
     (workspace / "run-report.json").write_text(json.dumps({"snapshot_id": sid}))
+    # Exercise the publication shell and real verification library offline.
+    # Only uv's already-installed interpreter selection is replaced here.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        'test "$1" = run && test "$2" = --frozen && test "$3" = --project && test "$5" = python || exit 2\n'
+        "shift 5\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    uv.chmod(0o755)
     script = definition["publish_candidate"]["script"][-1]
     subprocess.run(
         ["sh", "-eu", "-c", script],
         cwd=workspace,
-        env={**os.environ, "CI_PIPELINE_ID": "42", "INFX_CACHE_WRITE_TOKEN": ""},
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "CI_PIPELINE_ID": "42",
+            "INFX_CACHE_WRITE_TOKEN": "",
+        },
         check=True,
     )
     assert git(remote, "rev-parse", branch) == old
@@ -286,6 +322,9 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
         assert new_branch in branches
         state = json.loads(git(remote, "show", f"{new_branch}:ingestion-state.json"))
         assert state["qualified"] == qualified_b and state["candidate"]["snapshot_id"] == sid
+        if kind == "damaged-pending":
+            git(remote, "cat-file", "-e", f"{new_branch}:{missing}")
+            assert not (seed / missing).exists()
 
 
 @pytest.mark.parametrize("generation", ["", "42"])

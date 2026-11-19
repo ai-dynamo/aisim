@@ -56,6 +56,7 @@ from aisim_core.data.hygiene import (
     _unique_json_keys,
     bounded_json_bytes,
     checked_path,
+    json_sidecar_value,
     yaml_sidecar_value,
 )
 from aisim_core.data.parquet import read_parquet
@@ -148,9 +149,13 @@ class VisibilityLedger(_Model):
     schema_version: Literal["aisim-visibility/v1"] = LEDGER_SCHEMA
     entries: list[VisibilityEntry] = Field(default_factory=list)
 
+    def entries_for(self, path: str) -> list[VisibilityEntry]:
+        """All covering entries contribute origin, even when a child overrides visibility."""
+        return [e for e in self.entries if path == e.path.rstrip("/") or path.startswith(e.path.rstrip("/") + "/")]
+
     def entry_for(self, path: str) -> VisibilityEntry | None:
         """Longest matching prefix wins, so a file can be narrower than its directory."""
-        hits = [e for e in self.entries if path == e.path.rstrip("/") or path.startswith(e.path.rstrip("/") + "/")]
+        hits = self.entries_for(path)
         # Longest normalized prefix wins; equal prefixes resolve to the most restrictive label.
         return max(hits, key=lambda e: (len(e.path.rstrip("/")), _LABEL_RANK.index(e.label)), default=None)
 
@@ -160,10 +165,10 @@ class VisibilityLedger(_Model):
 
 
 def load_ledger(root: str | Path) -> VisibilityLedger:
-    path = Path(root) / LEDGER_PATH
-    if not path.is_file():
+    path = checked_path(Path(root), LEDGER_PATH)
+    if not path.exists():
         return VisibilityLedger()
-    return VisibilityLedger.model_validate_json(path.read_bytes())
+    return VisibilityLedger.model_validate(json_sidecar_value(bounded_json_bytes(path)))
 
 
 def write_ledger(root: str | Path, ledger: VisibilityLedger) -> Path:
@@ -611,7 +616,9 @@ def check_disclosure(rows: Iterable[Mapping[str, Any]], policy: RedactionPolicy 
                     and all(_finite_number(v) for v in value.values())
                 )
             else:
-                valid = isinstance(value, str)
+                # Identifiers and status labels are text, never a channel for
+                # serialized per-point measurements (including malformed containers).
+                valid = isinstance(value, str) and not value.lstrip().startswith(("[", "{"))
             if not valid:
                 out.append(Finding("not-aggregate", f"invalid aggregate shape for {key!r}", where))
         out.extend(scan_value({k: v for k, v in row.items() if k in AGGREGATE_FIELDS}, policy, where, where))

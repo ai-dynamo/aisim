@@ -43,7 +43,11 @@ def build_plan(args) -> dict:
     if args.model is not None and args.layer in (None, "op"):
         rows += [r for r in catalog.rows(hardware=args.hardware, framework=args.framework, layer="op") if r not in rows]
     fingerprints = set(args.prediction_fingerprint)
-    reusable = lambda r: r.acc_mape_pct is not None and r.acc_prediction_fingerprint in fingerprints
+    reusable = lambda r: (
+        r.acc_tier in {"verified", "qualified"}
+        and r.acc_mape_pct is not None
+        and r.acc_prediction_fingerprint in fingerprints
+    )
     groups = {
         "reuse": [r for r in rows if r.status == "have" and reusable(r)],
         "evaluate_only": [r for r in rows if r.status == "have" and not reusable(r)],

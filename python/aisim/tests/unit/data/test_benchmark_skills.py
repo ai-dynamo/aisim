@@ -21,6 +21,7 @@ import pytest
 from aisim_core.data import Artifact, _verify
 from aisim_core.data.catalog import build_catalog
 from aisim_core.data.eval import (
+    EvalRecord,
     PredictionIdentity,
     current_records,
     load_record,
@@ -121,8 +122,58 @@ def test_plan_rejects_bad_budget_and_reports_unknown_model_and_zero_gpu_time(bui
 @pytest.fixture
 def built_catalog(dataset):  # noqa: F811
     root, systems = dataset
+    # Synthetic tier labels for planner tests, not an attestation of real measurements.
+    for path in root.glob("eval/**/*.json"):
+        record = load_record(path)
+        path.unlink()
+        write_record(root, _with_catalog_tier(record, "verified"))
     build_catalog(root, systems_dir=systems)
     return root, systems
+
+
+def _with_catalog_tier(record, tier):
+    doc = record.model_dump(by_alias=True)
+    doc.update(tier=tier, verification=None)
+    if tier != "submitted":
+        doc["verification"] = {
+            "verifier_version": "synthetic-planner-fixture",
+            "recomputed_fingerprint": record.prediction.fingerprint,
+            "verified_record_id": record.record_id,
+        }
+    return EvalRecord.model_validate(doc)
+
+
+@pytest.mark.parametrize("tier,reuse", [("submitted", False), ("verified", True), ("qualified", True)])
+def test_planner_reuse_requires_verified_tier(built_catalog, capsys, tier, reuse):
+    root, systems = built_catalog
+    for path in root.glob("eval/**/*.json"):
+        record = load_record(path)
+        if record.truth.layer == "fpm" and record.truth.identity.model == QWEN:
+            path.unlink()
+            write_record(root, _with_catalog_tier(record, tier))
+    build_catalog(root, systems_dir=systems)
+    fingerprint = PredictionIdentity.build("fpm_interpolation", {"p": "b" * 64}, NEW).fingerprint
+    tool = _script("aisim-benchmark-plan", "plan_catalog.py")
+    assert (
+        tool.main(
+            [
+                "--dataset-root",
+                str(root),
+                "--hardware",
+                "b200_sxm",
+                "--model",
+                QWEN,
+                "--layer",
+                "fpm",
+                "--prediction-fingerprint",
+                fingerprint,
+            ]
+        )
+        == 0
+    )
+    cells = json.loads(capsys.readouterr().out)["cells"]
+    assert {r["layer"] for r in cells["reuse"]} == ({"fpm"} if reuse else set())
+    assert {r["layer"] for r in cells["evaluate_only"]} == (set() if reuse else {"fpm"})
 
 
 SACCT_HEADER = "JobID|JobName|State|Submit|Start|End|ElapsedRaw|Elapsed|NNodes|AllocTRES"

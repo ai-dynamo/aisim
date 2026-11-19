@@ -49,7 +49,7 @@ from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, Entry, Manife
 from aisim_core.data.catalog import CATALOG_DIR, build_catalog
 from aisim_core.data.e2e import read_snapshot
 from aisim_core.data.eval import load_record, record_paths
-from aisim_core.data.hygiene import Finding
+from aisim_core.data.hygiene import Finding, bounded_json_bytes, json_sidecar_value
 from aisim_core.data.mirror import (
     INTERNAL_REPO,
     MIRROR_CONTROL_DIR,
@@ -105,7 +105,7 @@ class PromotionPolicy:
 
     @classmethod
     def from_file(cls, path: str | Path) -> PromotionPolicy:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = json_sidecar_value(bounded_json_bytes(Path(path)))
         if not isinstance(raw, dict) or not isinstance(raw.get("reviewers"), list):
             raise ValueError("reviewers must be a list of non-empty strings")
         if unknown := set(raw) - {"reviewers", "min_approvals"}:
@@ -131,11 +131,12 @@ class PromotionPlan:
 
     @property
     def digest(self) -> str:
-        """What reviewers approve: target, source commit and every file path and hash."""
+        """What reviewers approve: target, source commit, files and catalog registrations."""
         payload = {
             "target_repo": self.request.target_repo,
             "source_commit": self.request.source_commit,
             "files": sorted(self.files.items()),
+            "manifests": sorted(self.manifests),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -294,7 +295,10 @@ def plan_promotion(
         return plan
     shared = validate_tree(source, repo=request.source_repo, profile="mirror")
     plan.findings.extend(Finding(f"source-{f.code}", f.message, f.path, f.severity) for f in shared.errors)
-    if any(f.code in ("source-symlink", "source-document-invalid") for f in plan.findings):
+    if any(
+        f.code in ("source-symlink", "source-document-invalid", "source-json-too-large", "source-yaml-too-large")
+        for f in plan.findings
+    ):
         return plan
     _select(source, request.directories, plan)
     if not plan.files:
@@ -306,7 +310,10 @@ def plan_promotion(
         label = entry.label if entry else "internal"
         if label != "public":
             plan.findings.append(Finding("not-public", f"labeled {label!r}; only 'public' is promoted", rel))
-        if entry and entry.origin and any(marker in entry.origin.casefold() for marker in ("inferencex", "infx")):
+        if any(
+            e.origin and any(marker in e.origin.casefold() for marker in ("inferencex", "infx"))
+            for e in ledger.entries_for(rel)
+        ):
             plan.findings.append(
                 Finding(
                     "infx-aggregates-only", "visibility ledger marks InferenceX-derived data; publish aggregates", rel
@@ -458,6 +465,8 @@ def _apply_promotion(
         )
     if plan.approved_digest is None or plan.digest != plan.approved_digest:
         raise PromotionError("plan content differs from the approved digest")
+    if any(rel not in plan.files for rel in plan.manifests):
+        raise PromotionError("manifest registration is outside the approved file selection")
     ledger_now = load_ledger(source)
     for rel in plan.files:
         if ledger_now.label_for(rel) != "public":
