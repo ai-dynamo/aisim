@@ -879,6 +879,116 @@ def test_failed_same_model_reader_preserves_active_readers_snapshot(monkeypatch,
             utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("consumer", ["sdk", "collector"])
+def test_negative_cache_probe_error_keeps_metadata_error_chain(monkeypatch, hf_cache, consumer):
+    from collector.fpm_forward.model_capability import _download_model_config
+
+    model = f"org/negative-probe-{consumer}"
+    _cache_file(hf_cache, model, "config.json", utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B"))
+    marker = hf_cache / f"models--{model.replace('/', '--')}" / ".no_exist" / ("c" * 40) / "hf_quant_config.json"
+    real_stat = Path.stat
+    denied = PermissionError("cannot traverse absence markers")
+
+    def probe(path, *args, **kwargs):
+        if path == marker:
+            raise denied
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", probe)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    load = get_model_config_from_model_path if consumer == "sdk" else _download_model_config
+    expected_error = utils.HuggingFaceDownloadError if consumer == "sdk" else ValueError
+    try:
+        with pytest.raises(expected_error, match="Invalid cached absence marker") as error:
+            load(model)
+        metadata_error = error.value if consumer == "sdk" else error.value.__cause__
+        assert isinstance(metadata_error, utils._HuggingFaceCacheError)
+        assert metadata_error.__cause__ is denied
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_reader_reloads_instead_of_restoring_evicted_base(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from functools import wraps
+    from threading import Event, current_thread
+
+    generation = 1
+    cached = utils._cache_raw_model_config(lambda path: {"generation": generation})
+    paused = Event()
+    resume = Event()
+
+    @wraps(cached)
+    def lookup(path):
+        raw = cached(path)
+        if current_thread().name.startswith("paused-lease") and not paused.is_set():
+            paused.set()
+            assert resume.wait(10)
+        return raw
+
+    monkeypatch.setattr(utils, "_load_model_config_from_model_path", lookup)
+
+    def reader():
+        with cached.cache_reader("model") as entry:
+            return entry.raw["generation"]
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="paused-lease") as pool:
+        pending = pool.submit(reader)
+        try:
+            assert paused.wait(10)
+            with pytest.raises(ValueError, match="failed parse"), cached.cache_reader("model"):
+                raise ValueError("failed parse")
+            assert cached.cache_info().currsize == 0
+            generation = 2
+            resume.set()
+            assert pending.result(timeout=10) == 2
+            assert cached("model")["generation"] == 2
+        finally:
+            resume.set()
+
+
+def test_concurrent_llama4_readers_publish_one_validated_processor(monkeypatch, hf_cache):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+    from time import sleep
+
+    model = "org/concurrent-llama4-publication"
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    processor = config.pop("image_processor_config")
+    requests = []
+    lock = Lock()
+    barrier = Barrier(4)
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/config.json"):
+            return io.BytesIO(json.dumps(config).encode())
+        if request.full_url.endswith("/hf_quant_config.json"):
+            raise _http_error(404, "absent")
+        with lock:
+            requests.append(request.full_url)
+            max_patches = 16 if len(requests) == 1 else 4
+        sleep(0.02)
+        return io.BytesIO(json.dumps({**processor, "max_patches": max_patches}).encode())
+
+    def load():
+        barrier.wait(timeout=10)
+        return get_model_config_from_model_path(model)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        utils._load_model_config_from_model_path(model)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(load) for _ in range(4)]
+            loaded = [future.result(timeout=10) for future in futures]
+        assert len(requests) == 1
+        assert all(item["extra_params"].vision_config.max_num_tiles == 16 for item in loaded)
+        assert utils._load_model_config_from_model_path(model)["image_processor_config"]["max_patches"] == 16
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 def test_failed_cached_processor_retries_release_base_configs(monkeypatch, hf_cache):
     import gc
     import weakref

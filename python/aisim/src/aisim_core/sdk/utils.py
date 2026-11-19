@@ -23,7 +23,7 @@ import tempfile
 import urllib.request
 from collections import namedtuple
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache, wraps
 from pathlib import Path
 from threading import Lock
@@ -525,6 +525,22 @@ def _hf_cache_snapshot(hf_id: str, revision: str) -> tuple[Path, str] | None:
     return repo, commit
 
 
+def _hf_optional_absence_known(hf_id: str, filename: str, revision: str) -> bool:
+    snapshot = _hf_cache_snapshot(hf_id, revision)
+    if snapshot is None:
+        return False
+    marker = snapshot[0] / ".no_exist" / snapshot[1] / filename
+    try:
+        mode = marker.stat().st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: {error}") from error
+    if not stat.S_ISREG(mode):
+        raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: expected a regular file")
+    return True
+
+
 def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str] | None:
     """Find a regular cached file and the snapshot commit it belongs to."""
     snapshot = _hf_cache_snapshot(hf_id, revision)
@@ -631,25 +647,19 @@ def _download_hf_json_at(
         cached = _load_cached_hf_json_at(hf_id, filename, revision)
         if cached is not None:
             return cached
-        if not raise_on_404:
-            snapshot = _hf_cache_snapshot(hf_id, revision)
-            if snapshot is not None and (snapshot[0] / ".no_exist" / snapshot[1] / filename).is_file():
-                logger.debug("Confirmed absent optional %s for %s at %s", filename, hf_id, snapshot[1])
-                return None, None
+        if not raise_on_404 and _hf_optional_absence_known(hf_id, filename, revision):
+            logger.debug("Confirmed absent optional %s for %s at %s", filename, hf_id, revision)
+            return None, None
     if offline is not None:
         if not raise_on_404:
-            snapshot = _hf_cache_snapshot(hf_id, revision)
-            if snapshot is not None and (snapshot[0] / ".no_exist" / snapshot[1] / filename).is_file():
-                logger.debug("Confirmed absent optional %s for %s at %s", filename, hf_id, snapshot[1])
-            else:
-                logger.warning(
-                    "%s is set; optional %s for %s is not cached and its absence is unconfirmed. "
-                    "Continuing without this metadata. %s",
-                    offline,
-                    filename,
-                    hf_id,
-                    _local_config_hint(hf_id, filename, revision),
-                )
+            logger.warning(
+                "%s is set; optional %s for %s is not cached and its absence is unconfirmed. "
+                "Continuing without this metadata. %s",
+                offline,
+                filename,
+                hf_id,
+                _local_config_hint(hf_id, filename, revision),
+            )
             return None, None
         raise HuggingFaceDownloadError(
             f"Cannot load {hf_id}'s {filename}: Hugging Face offline mode is on ({offline} is set) and the "
@@ -2311,6 +2321,7 @@ class _ModelConfigCacheEntry:
     raw: dict
     readers: int = 0
     parsed: bool = False
+    processor_lock: Lock = field(default_factory=Lock)
 
 
 def _cache_raw_model_config(load):
@@ -2341,15 +2352,18 @@ def _cache_raw_model_config(load):
 
     @contextmanager
     def reader(model_path):
-        config = _load_model_config_from_model_path(model_path)
-        with lock:
-            # A failed reader may have evicted the base between lookup and
-            # acquisition. Join the currently published base or restore this one.
-            entry = entries.setdefault(model_path, _ModelConfigCacheEntry(config))
-            entry.readers += 1
+        while True:
+            _load_model_config_from_model_path(model_path)
+            with lock:
+                # Lookup and lease acquisition are atomic. If another reader
+                # evicted the base, resolve again outside the lock, never restore it.
+                entry = entries.get(model_path)
+                if entry is not None:
+                    entry.readers += 1
+                    break
         succeeded = False
         try:
-            yield entry.raw
+            yield entry
             succeeded = True
         finally:
             with lock:
@@ -2457,7 +2471,13 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
-    with _model_config_reader(model_path) as raw_config:
+    with _model_config_reader(model_path) as entry:
+        raw_config = entry.raw
+        if (raw_config.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration":
+            # Publish the first validated processor once for this shared base.
+            # Competing readers reuse it; failed reads leave publication retryable.
+            with entry.processor_lock:
+                return _parse_model_config_from_raw(raw_config, model_path)
         return _parse_model_config_from_raw(raw_config, model_path)
 
 
