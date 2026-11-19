@@ -37,8 +37,14 @@ def test_coverage_replacement_preserves_previous_declaration(tmp_path, monkeypat
     before = path.read_bytes()
     original = catalog_module.tempfile.NamedTemporaryFile
 
-    def fail_replace(*args):
-        raise OSError("synthetic replacement failure")
+    original_replace = catalog_module.os.replace
+    replacement_reached = []
+
+    def fail_replace(src, dst):
+        if dst == path:
+            replacement_reached.append(True)
+            raise OSError("synthetic replacement failure")
+        return original_replace(src, dst)
 
     class BrokenWrite:
         def __enter__(self):
@@ -59,6 +65,8 @@ def test_coverage_replacement_preserves_previous_declaration(tmp_path, monkeypat
         monkeypatch.setattr(catalog_module.os, "replace", fail_replace)
     with pytest.raises(OSError, match="synthetic"):
         build_catalog(root, systems_dir=systems, expected_models=["replacement"])
+    if failure == "replace":
+        assert replacement_reached == [True]
     assert path.read_bytes() == before
     assert catalog_module.read_catalog_coverage(root).expected_models == ["original"]
     assert not [p for p in path.parent.iterdir() if p.is_file() and p.name.startswith("tmp")]
@@ -478,3 +486,47 @@ def test_a_manifest_beside_eval_records_is_not_loaded_as_a_record(dataset):
     victim.write_text(victim.read_text().replace("2026-11", "2027-01"))
     with pytest.raises(ValueError, match="content hash"):
         build_catalog(root, systems_dir=systems)
+
+
+def test_build_rejects_a_manifest_that_disagrees_with_its_index_entry(dataset):
+    root, systems = dataset
+    path = root / "data/fpm/m0.json"
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    other = manifest.identity.model_copy(update={"hardware": "h200_sxm"})
+    path.write_text(manifest.model_copy(update={"identity": other}).model_dump_json(by_alias=True))
+    with pytest.raises(ValueError, match="disagrees with its fpm index entry"):
+        build_catalog(root, systems_dir=systems)
+
+
+def test_catalog_versions_preserve_v1_and_write_v2(tmp_path):
+    import pyarrow as pa
+    from pydantic import ValidationError
+
+    from aisim_core.data.catalog import CATALOG_SCHEMA_ID, CatalogRowV1
+    from aisim_core.data.parquet import ParquetSchemaError, read_parquet, write_parquet
+    from aisim_core.data.schemas import SCHEMA_MODELS
+
+    legacy = CatalogRowV1(
+        layer="e2e",
+        model="synthetic/model",
+        hardware="h100_sxm",
+        framework="vllm",
+        status="have",
+        n_configs=1,
+        n_evidence_gaps=0,
+        n_eval_records=0,
+    )
+    path = shard_path(tmp_path, "e2e", "h100_sxm")
+    write_parquet(pa.Table.from_pylist([legacy.model_dump()]), path, "aisim-catalog/v1")
+    row = Catalog(tmp_path).rows(hardware="h100_sxm", layer="e2e")[0]
+    assert row.acc_prediction_fingerprint is None
+    row.acc_prediction_fingerprint = "a" * 64
+    catalog_module._write(tmp_path, [row], {})
+    assert CATALOG_SCHEMA_ID == "aisim-catalog/v2"
+    assert read_parquet_schema_id(path) == CATALOG_SCHEMA_ID
+    assert Catalog(tmp_path).rows(hardware="h100_sxm", layer="e2e")[0] == row
+    with pytest.raises(ParquetSchemaError):
+        read_parquet(path, "aisim-catalog/v1")  # an older reader rejects the new version explicitly
+    with pytest.raises(ValidationError):
+        SCHEMA_MODELS["aisim-catalog/v1"].model_validate(row.model_dump())
+    assert "acc_prediction_fingerprint" not in SCHEMA_MODELS["aisim-catalog/v1"].model_fields

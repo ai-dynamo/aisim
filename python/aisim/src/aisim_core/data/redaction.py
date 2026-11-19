@@ -264,6 +264,13 @@ def scan_value(value: Any, policy: RedactionPolicy, path: str, where: str, *, _k
     return out
 
 
+def scan_yaml(data: bytes, policy: RedactionPolicy, path: str, where: str) -> list[Finding]:
+    """Scan original mapping values, including overridden merge defaults, and source text."""
+    yaml_sidecar_value(data)  # also require valid effective YAML merge semantics
+    value = yaml_sidecar_value(data, preserve_merges=True)
+    return [*scan_value(value, policy, path, where), *scan_value(data.decode("utf-8"), policy, path, f"{where} source")]
+
+
 # --------------------------------------------------------------------------- content check
 
 
@@ -342,8 +349,7 @@ def _check_manifest(
             )
         elif artifact.format == "yaml":
             data = checked_path(root, artifact.path).read_bytes()
-            out.extend(scan_value(yaml_sidecar_value(data), policy, artifact.path, "YAML sidecar"))
-            out.extend(scan_value(data.decode("utf-8"), policy, artifact.path, "YAML source"))
+            out.extend(scan_yaml(data, policy, artifact.path, "YAML sidecar"))
     out.extend(scan_value(manifest.model_dump(mode="json", by_alias=True), policy, rel, "manifest"))
     return out
 
@@ -487,9 +493,10 @@ def check_publishable(
     chosen = sorted(set(paths))
     loaded = dict(manifests or {})
     findings: list[Finding] = []
-    from aisim_core.data.mirror import list_tree, snapshot_documents
+    from aisim_core.data.mirror import DATA_ROOTS, list_tree, snapshot_documents
 
-    for f in list_tree(root):
+    tree = list_tree(root)
+    for f in tree:
         if f.is_symlink:
             findings.append(Finding("symlink", "symbolic links are not published", f.path))
     try:
@@ -527,7 +534,10 @@ def check_publishable(
         try:
             dataset = DatasetIndex.model_validate_json(bounded_json_bytes(checked_path(root, index_rel)))
             indexes = {index_rel: dataset}
+            payload_paths = {f.path for f in tree if f.path.startswith(DATA_ROOTS)}
             for ref in dataset.categories.values():
+                if ref.index.path not in payload_paths:
+                    raise ValueError("category index must be a listed dataset payload file")
                 checked_path(root, ref.index.path)
                 indexes[ref.index.path] = CategoryIndex.model_validate_json(
                     bounded_json_bytes(_verify(root, ref.index))
@@ -562,8 +572,7 @@ def check_publishable(
         if rel.startswith("systems/") and rel.endswith(".yaml"):
             try:
                 data = checked_path(root, rel).read_bytes()
-                findings.extend(scan_value(yaml_sidecar_value(data), policy, rel, "system spec"))
-                findings.extend(scan_value(data.decode("utf-8"), policy, rel, "system spec source"))
+                findings.extend(scan_yaml(data, policy, rel, "system spec"))
             except (OSError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         # Match the snapshot documents declared by mirror._check_snapshots.

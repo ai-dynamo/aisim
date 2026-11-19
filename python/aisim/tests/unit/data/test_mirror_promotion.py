@@ -3104,3 +3104,161 @@ def test_aggregate_status_rejects_serialized_measurements(value):
 @pytest.mark.parametrize("value", ["complete", "partial", "failed", "have", "missing", "stale"])
 def test_aggregate_status_accepts_ordinary_values(value):
     assert check_disclosure([{"n_scored": 5, "status": value}]) == []
+
+
+@pytest.mark.parametrize("value", ["plain-synthetic-value", "[REDACTED]"])
+def test_dataset_card_front_matter_credential_fields(tmp_path, value):
+    root, _ = _mirror(tmp_path)
+    (root / "README.md").write_text(f'---\npassword: "{value}"\n---\n# Synthetic dataset\n')
+    shutil.rmtree(root / "mirror", ignore_errors=True)
+    report = validate_tree(root, profile="public")
+    secrets = [f for f in report.errors if f.code == "secret" and f.path == "README.md"]
+    assert bool(secrets) == (value != "[REDACTED]")
+    assert report.ok == (value == "[REDACTED]"), report.errors
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+@pytest.mark.parametrize("location", [".git/hidden-index.json", "data/indexes/e2e.json"])
+def test_category_indexes_must_be_dataset_payloads(tmp_path, monkeypatch, profile, location):
+    from aisim_core.data import DatasetIndex
+    from aisim_core.data.promote import _artifact
+
+    root, _ = _mirror(tmp_path)
+    index_path = root / "catalog/dataset.json"
+    dataset = DatasetIndex.model_validate_json(index_path.read_bytes())
+    original = root / dataset.categories["e2e"].index.path
+    destination = root / location
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    original.rename(destination)
+    categories = dict(dataset.categories)
+    categories["e2e"] = categories["e2e"].model_copy(
+        update={"index": _artifact(root, location, "aisim-category-index/v1")}
+    )
+    index_path.write_text(dataset.model_copy(update={"categories": categories}).model_dump_json(by_alias=True))
+    if profile == "public":
+        shutil.rmtree(root / "mirror", ignore_errors=True)
+    if location.startswith(".git/"):
+        real_open = Path.open
+
+        def refuse_hidden_index(self, *args, **kwargs):
+            if self == destination:
+                pytest.fail("validation opened an index outside the dataset payload")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", refuse_hidden_index)
+    report = validate_tree(root, profile=profile)
+    assert ("index-integrity" in {f.code for f in report.errors}) == location.startswith(".git/")
+    assert report.ok == (not location.startswith(".git/")), report.errors
+
+
+@pytest.mark.parametrize("predecessor", ["valid", "missing", "invalid"])
+def test_eval_successor_requires_verified_local_predecessor(tmp_path, predecessor):
+    from aisim_core.data.eval import load_record
+
+    root, manifests = _mirror(tmp_path)
+    first_path = _eval(root, [load_e2e(root, manifests[0]).manifest.configuration_id])
+    first = load_record(first_path)
+    successor = first.model_copy(update={"supersedes": first.record_id, "created_at": "2026-11-08T00:00:00Z"})
+    second_path = write_record(root, successor)
+    build_catalog(root)
+    if predecessor == "missing":
+        first_path.unlink()
+    elif predecessor == "invalid":
+        first_path.write_text("{}")
+    report = validate_tree(root)
+    missing = [f for f in report.errors if f.code == "eval-predecessor-missing"]
+    assert bool(missing) == (predecessor != "valid")
+    if missing:
+        assert missing[0].path == second_path.relative_to(root).as_posix()
+    else:
+        assert report.ok, report.errors
+
+
+@pytest.mark.parametrize("gate", ["plan", "apply"])
+def test_visibility_cannot_be_changed_through_assume_unchanged(tmp_path, gate):
+    root, directory = _promotable(tmp_path)
+    if gate == "plan":
+        write_ledger(root, VisibilityLedger(entries=[VisibilityEntry(path=directory, label="restricted")]))
+        _commit_source(root)
+    else:
+        draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+        plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+        assert plan.ok
+    _git(root, "update-index", "--assume-unchanged", "mirror/visibility.json")
+    _public(root, directory, origin="altered label provenance")
+    assert not _git(root, "status", "--porcelain", "--untracked-files=all", "--ignored")
+    if gate == "plan":
+        plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+        assert any(f.code == "source-checkout" and "visibility" in f.message for f in plan.findings)
+    else:
+        target = _target(tmp_path)
+        with pytest.raises(PromotionError, match="visibility ledger differs"):
+            apply_promotion(plan, root, target)
+        assert not list(target.iterdir())
+
+
+def test_two_approved_promotions_share_one_reviewed_source_revision(tmp_path):
+    root, manifests = _mirror(tmp_path, dev=("synthetic/model-a", "synthetic/model-b"))
+    directories = [str(Path(path).parent) for path in manifests]
+    _public(root, *directories)
+    plans = []
+    for directory in directories:
+        draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+        plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+        assert plan.ok, plan.findings
+        plans.append(plan)
+    before = {
+        f.relative_to(root).as_posix(): f.read_bytes() for f in root.rglob("*") if f.is_file() and ".git" not in f.parts
+    }
+    target = _target(tmp_path)
+    ledgers = [apply_promotion(plan, root, target) for plan in plans]
+    assert plans[0].request.source_commit == plans[1].request.source_commit == _git(root, "rev-parse", "HEAD")
+    assert all(not ledger.is_relative_to(root) and ledger.is_file() for ledger in ledgers)
+    assert not _git(root, "status", "--porcelain", "--untracked-files=all", "--ignored")
+    assert before == {
+        f.relative_to(root).as_posix(): f.read_bytes() for f in root.rglob("*") if f.is_file() and ".git" not in f.parts
+    }
+    report = validate_tree(target, profile="public")
+    assert report.ok and report.configurations == 2, report.errors
+
+
+@pytest.mark.parametrize("secret", [True, False])
+@pytest.mark.parametrize("merge", ["inline", "sequence", "literal-key"])
+def test_yaml_overridden_merge_defaults_are_scanned_in_publication_gates(tmp_path, secret, merge):
+    root, directory, _ = _op_mirror(tmp_path, "kernel_source", "clean")
+    value = "plain-synthetic-value" if secret else "[REDACTED]"
+    defaults = f'{{password: "{value}"}}'
+    if merge == "sequence":
+        defaults = f"[{defaults}, {{option: clean}}]"
+    payload = f'options:\n  <<: {defaults}\n  password: "[REDACTED]"\n'
+    if merge == "literal-key":
+        payload += '  "<<": "[REDACTED]"\n'
+    payload = payload.encode()
+    rel = _manifest_sidecar(
+        root,
+        f"{directory}/manifest.json",
+        "collection_meta.yaml",
+        payload,
+        "yaml",
+        "collection-meta",
+        "aisim-collection-meta/v1",
+    )
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert any(f.code == "secret" and f.path == rel for f in plan.findings) == secret
+    assert plan.content_ok == (not secret), plan.findings
+    shutil.rmtree(root / "mirror")
+    report = validate_tree(root, profile="public")
+    assert any(f.code == "secret" and f.path == rel for f in report.errors) == secret
+    assert report.ok == (not secret), report.errors
+
+
+@pytest.mark.parametrize("secret", [True, False])
+def test_system_yaml_scans_overridden_source_defaults(tmp_path, secret):
+    value = "plain-synthetic-value" if secret else "[REDACTED]"
+    rel = "systems/synthetic/spec.yaml"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    path.write_text(f'options:\n  <<: {{password: "{value}"}}\n  password: "[REDACTED]"\n')
+    findings = check_publishable(tmp_path, [rel])
+    assert any(f.code == "secret" and f.path == rel for f in findings) == secret
+    assert bool(findings) == secret

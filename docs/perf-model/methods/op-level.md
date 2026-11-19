@@ -190,6 +190,12 @@ contract (`aisim-dataset-index/v1`). Category entries reference hashed indexes;
 `aisim-category-index/v1` lists configuration identities and hashed manifests.
 Repository identity and authentication do not change the schema.
 
+Catalog shards use `aisim-catalog/v2`, which adds `acc_prediction_fingerprint`
+to bind the latest accuracy to its prediction code, spec and profiles. New readers
+also accept v1 shards, returning null for the absent fingerprint. Older v1 readers
+reject v2 by its schema ID; rebuild catalogs with the upgraded writer to migrate.
+The published v1 schema remains unchanged.
+
 The coverage catalog normally crosses the models and frameworks found in the dataset.
 `build_catalog(expected_models=..., expected_frameworks=...)` can widen that universe;
 with `write=True` (the default), the builder saves the declaration in
