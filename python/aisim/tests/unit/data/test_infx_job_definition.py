@@ -47,3 +47,11 @@ def test_promotion_is_manual_with_a_named_reviewer_and_staleness_is_alert_only(d
 
 def test_failure_alert_job_exists(definition):
     assert definition["alert_failure"]["when"] == "on_failure" and "notify" in _text(definition["alert_failure"])
+
+
+def test_ci_contract_clean_workspace_default_pipelines_and_staleness_status(definition):
+    assert definition["variables"]["GIT_STRATEGY"] == "empty"
+    rules = " ".join(r["if"] for r in definition["publish_candidate"]["rules"])
+    assert '$AISIM_JOB == "ingest"' in rules and "== null" in rules and "!=" not in rules  # promote never acquires
+    assert "ls-remote --exit-code --heads origin" in _text(definition["publish_candidate"])
+    assert "||" not in _text(definition["staleness"])  # unexpected statuses must fail the job

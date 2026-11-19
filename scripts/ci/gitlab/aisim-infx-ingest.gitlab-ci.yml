@@ -28,7 +28,7 @@ variables:
   #   INFX_CACHE_WRITE_TOKEN  fine-grained token: write on aisim-infx-cache ONLY (masked, protected)
   #   SLACK_WEBHOOK_URL       incoming webhook for #swdl-dynamo-aisim-daily (masked, protected)
   #   SMTP_HOST, SMTP_FROM, AISIM_JOB_OWNER_EMAIL   owner email alerts (owner: Simone Chen)
-  GIT_STRATEGY: none
+  GIT_STRATEGY: empty  # a clean build directory for every job, even on a runner that reuses workspaces
   GIT_TERMINAL_PROMPT: "0"
 
 .pinned:
@@ -58,7 +58,7 @@ publish_candidate:
   extends: .pinned
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $AISIM_JOB == "ingest"'
-    - if: '$CI_PIPELINE_SOURCE == "web" && $AISIM_JOB != "staleness"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && ($AISIM_JOB == null || $AISIM_JOB == "ingest")'
   script:
     - set -eu
     - *cache_clone
@@ -68,6 +68,10 @@ publish_candidate:
       cd cache-repo
       if [ -z "$(git status --porcelain)" ]; then echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
       SID=$(python3 -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
+      # An unmerged candidate for this snapshot may already be pending: keep it and its review, never re-push.
+      if git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote --exit-code --heads origin "candidate/${SID}" >/dev/null; then
+        echo "candidate/${SID} already exists: nothing to push"; exit 0
+      fi
       git checkout -q -b "candidate/${SID}"
       git add -A
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -q -m "candidate: InferenceX snapshot ${SID} (not qualified)"
@@ -109,7 +113,7 @@ staleness:
     - set -eu
     - *cache_clone
     # Alert only: exit 10 = warn (>= 8 days), 11 = stale (>= 14 days) since the last qualified snapshot.
-    - $JOB_PY staleness --root cache-repo || test $? -ge 10
+    - $JOB_PY staleness --root cache-repo
   allow_failure:
     exit_codes: [10, 11]
 

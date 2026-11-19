@@ -16,6 +16,11 @@ internal project by hand.
    run a web pipeline (default `ingest`). Promotion: web pipeline with `AISIM_JOB=promote` and
    `CANDIDATE_SNAPSHOT_ID`, started by the reviewing maintainer.
 
+After a successful promotion the qualification exists only on `candidate/<snapshot-id>`. Open a
+reviewed merge request from that branch into the default branch and merge it: ingestion and
+staleness jobs clone the default branch, so they keep seeing the previous qualified snapshot until
+then. The jobs never push to the default branch.
+
 ## Policy (AISIM-2314)
 
 | Item | Decision |
