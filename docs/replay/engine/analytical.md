@@ -87,10 +87,14 @@ decode step, so it is spread evenly over `moe_layers × num_microbatches` pipeli
 units as F, and A→F and F→A are zero. A keeps the attention provider's
 A-side compute without its own combine term and adds the router, which FastAFD
 runs on the A side outside the measured stage. The attention provider must report
-these per-layer components; the built-in estimator does. Consumed components must
-be finite and non-negative, and attention compute plus combine must reconcile
+these per-layer components; the built-in estimator does. Its `a_router_ms` is
+evaluated at the local A microbatch, widened by `nextn + 1` for MTP, using the A
+model. It is distinct from `router_ms`, the F-side router contribution measured
+at the combined F batch. Only `a_router_ms` is added to FastAFD attention time.
+Consumed components must be finite and non-negative, and attention compute plus
+combine must reconcile
 with the provider's attention total (relative tolerance `1e-9`, absolute tolerance
-`1e-12` ms). A positive router component is required. When several entries
+`1e-12` ms). A positive `a_router_ms` is required. When several entries
 differ only in `moe_precision`, `engine.moe_quant_mode` selects one. The profile
 entry, its producer and the attention composition are recorded in the
 measurement provenance. FastAFD is not a runtime dependency.

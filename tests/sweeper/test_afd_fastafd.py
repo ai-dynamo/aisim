@@ -6,16 +6,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 from pydantic import ValidationError
 
 from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig
+from aisimulate.legacy_cli.api import cli_estimate
+from aisimulate.sdk.inference_session import AFDInferenceSession
 from aisimulate.sweeper import afd_fastafd
 from aisimulate.sweeper.afd_fastafd import FastAFDMoEStagePerformanceModel
 from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDTopology
-from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes, AFDMeasurementRequest
+from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes, AFDMeasurementRequest, AICAFDPerformanceModel
 from aisimulate_core.sdk.fastafd_profile import FASTAFD_PROFILE_SCHEMA
 
 MODEL = "Qwen/Qwen3-235B-A22B-FP8"
@@ -25,7 +28,8 @@ STAGE_MS = 11.213456
 COMPONENTS = {
     "attention_compute_ms": 0.09,
     "a_combine_ms": 0.006,
-    "router_ms": 0.002,
+    "router_ms": 0.02,
+    "a_router_ms": 0.002,
     "ffn_compute_ms": 0.6,
     "f_collective_ms": 0.036,
 }
@@ -175,6 +179,38 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
 
 
+@pytest.mark.parametrize("nextn", [0, 1])
+def test_builtin_provider_recomputes_the_fastafd_router_on_a(tmp_path, monkeypatch, nextn):
+    """Native SOL evidence with the synthetic 64A8F stage fixture, not serving accuracy."""
+    local_router_batches = []
+    sum_latency = AFDInferenceSession._sum_latency
+
+    def trace_router_query(self, ops, **kwargs):
+        ops = list(ops)
+        if [op._name for op in ops] == ["generation_router_gemm"]:
+            local_router_batches.append(kwargs["batch_size"])
+        return sum_latency(self, ops, **kwargs)
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", trace_router_query)
+
+    def estimate(*args, **kwargs):
+        # Measure verification compute, without projecting service throughput
+        # by accepted tokens (the legacy projection drops layer metadata).
+        return cli_estimate(*args, **kwargs, database_mode="SOL", nextn_accepted=0.0 if nextn else None)
+
+    request = replace(_request(_topology(), nextn=nextn), max_seq_len=2048)
+    profile = _profile(tmp_path, [_entry(mtp_nextn=nextn)])
+    (measurement,) = _provider(tmp_path, AICAFDPerformanceModel(estimate), profile_path=profile).measure(request)
+
+    components = measurement.provenance["attention"]["components"]
+    # 128 requests / 2 microbatches on each A, widened for verification;
+    # the F query instead processes 64 times that many tokens.
+    assert local_router_batches == [64 * (nextn + 1)]
+    assert components["router_ms"] > components["a_router_ms"] > 0.0
+    assert measurement.attention_ms == pytest.approx(components["attention_compute_ms"] + components["a_router_ms"])
+    assert measurement.attention_ms < components["attention_compute_ms"] + components["router_ms"]
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -250,7 +286,7 @@ def test_unresolvable_model_topk_fails_closed(tmp_path, monkeypatch):
     ("components", "match"),
     [
         (None, "does not expose"),
-        ({**COMPONENTS, "router_ms": 0.0}, "no router time"),
+        ({**COMPONENTS, "a_router_ms": 0.0}, "no router time"),
         ({"attention_compute_ms": 0.09}, "does not expose"),
     ],
 )
@@ -259,14 +295,21 @@ def test_attention_provider_must_expose_the_boundary_components(tmp_path, compon
         _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
 
 
-@pytest.mark.parametrize("missing", ["attention_compute_ms", "a_combine_ms", "router_ms"])
+@pytest.mark.parametrize("missing", ["attention_compute_ms", "a_combine_ms", "a_router_ms"])
 def test_each_consumed_attention_component_is_required(tmp_path, missing):
     components = {name: value for name, value in COMPONENTS.items() if name != missing}
     with pytest.raises(AFDInfeasible, match="does not expose"):
         _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
 
 
-@pytest.mark.parametrize("name", ["attention_compute_ms", "a_combine_ms", "router_ms"])
+def test_f_side_router_is_not_a_substitute_for_the_local_a_router(tmp_path):
+    components = {name: value for name, value in COMPONENTS.items() if name != "a_router_ms"}
+    assert components["router_ms"] > 0.0
+    with pytest.raises(AFDInfeasible, match="a_router_ms"):
+        _provider(tmp_path, _Attention(components=components)).measure(_request(_topology()))
+
+
+@pytest.mark.parametrize("name", ["attention_compute_ms", "a_combine_ms", "a_router_ms"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), -0.001, None, "0.002", True])
 def test_invalid_attention_components_fail_closed(tmp_path, name, value):
     with pytest.raises(AFDInfeasible, match=f"{name} must be a finite non-negative number"):

@@ -20,7 +20,7 @@ from .afd_perfmodel import AFD_MEASUREMENT_API_VERSION, AFDLayerTimes, AFDMeasur
 # Per-layer attention components an attention provider must expose for the
 # recomposition to be exact: FastAFD runs the router on the A side outside its
 # measured stage and folds the top-k combine into that stage.
-_ATTENTION_COMPONENTS = ("attention_compute_ms", "a_combine_ms", "router_ms")
+_ATTENTION_COMPONENTS = ("attention_compute_ms", "a_combine_ms", "a_router_ms")
 
 
 def _infeasible(detail: str, **provenance: Any) -> AFDInfeasible:
@@ -37,7 +37,7 @@ class FastAFDMoEStagePerformanceModel:
     pipeline units and becomes ``ffn_ms``; both transfer stages are zero because
     dispatch and return are inside the measured stage. ``attention_ms`` is the
     attention provider's A-side compute without its own combine term, plus the
-    router the provider attributes to the F side. Lookup is exact-only.
+    router measured at the A-side microbatch. Lookup is exact-only.
     """
 
     profile_path: str | Path
@@ -56,7 +56,7 @@ class FastAFDMoEStagePerformanceModel:
         return (
             AFDLayerTimes(
                 phase=AFDPhase.DECODE,
-                attention_ms=components["attention_compute_ms"] + components["router_ms"],
+                attention_ms=components["attention_compute_ms"] + components["a_router_ms"],
                 ffn_ms=entry.latency_ms / units,
                 a_to_f_ms=0.0,
                 f_to_a_ms=0.0,
@@ -66,7 +66,7 @@ class FastAFDMoEStagePerformanceModel:
                     "api_version": AFD_MEASUREMENT_API_VERSION,
                     "units": "milliseconds_per_layer_microbatch",
                     "composition": {
-                        "attention_ms": "attention_compute_ms + router_ms",
+                        "attention_ms": "attention_compute_ms + a_router_ms",
                         "ffn_ms": "stage_latency_ms / (moe_layers * microbatches)",
                         "a_to_f_ms": "inside the measured stage",
                         "f_to_a_ms": "inside the measured stage",
@@ -123,7 +123,7 @@ class FastAFDMoEStagePerformanceModel:
         if not isinstance(raw, Mapping) or any(name not in raw for name in _ATTENTION_COMPONENTS):
             raise _infeasible(
                 "the attention provider does not expose the per-layer attention_compute_ms, "
-                "a_combine_ms, and router_ms components needed to recompose the FastAFD boundary",
+                "a_combine_ms, and a_router_ms components needed to recompose the FastAFD boundary",
                 provider=attention.provenance.get("provider"),
             )
         components = {}
@@ -153,9 +153,9 @@ class FastAFDMoEStagePerformanceModel:
                 components=components,
                 attention_ms=attention.attention_ms,
             )
-        if components["router_ms"] <= 0.0:
+        if components["a_router_ms"] <= 0.0:
             raise _infeasible(
-                "the attention provider attributed no router time to the F side; "
+                "the attention provider measured no router time on the A side; "
                 "FastAFD excludes the router from its measured stage, so it cannot be recomposed"
             )
         return components

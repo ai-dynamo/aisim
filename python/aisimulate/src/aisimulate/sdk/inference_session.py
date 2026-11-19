@@ -1226,6 +1226,16 @@ class AFDInferenceSession:
             num_microbatches,
         )
 
+    @staticmethod
+    def _router_ops(ops):
+        """Find router leaves, including those inside an F-side overlap group."""
+        for op in ops:
+            children = list(getattr(op, "_group_a", [])) + list(getattr(op, "_group_b", []))
+            if children:
+                yield from AFDInferenceSession._router_ops(children)
+            elif "router" in op._name.lower():
+                yield op
+
     def _build_afd_comm_ops(self, a_model, f_model, *, rank_mapping: str = "one_to_one") -> _AFDCommOps:
         """Construct the five comm-side ops modeling AFD per-layer traffic.
 
@@ -1785,6 +1795,24 @@ class AFDInferenceSession:
             t_cycle, comm_hidden = self._pipeline_tcycle(t_a_layer, t_f_layer, t_a2f_layer, t_f2a_layer)
             t_step = num_layers * t_cycle
 
+        # FastAFD runs the router locally on A, whereas the standard AFD
+        # graph evaluates it on F at the combined batch. Query the A model's
+        # router at the local microbatch instead of reusing that F timing.
+        # Router GEMMs do not depend on KV length, so one engine query per
+        # phase suffices, outside the decode stride loop. This diagnostic
+        # does not move any work in the standard AFD pipeline.
+        router_ops = list(self._router_ops(a_partition.ffn_ops))
+        t_a_router = 0.0
+        if router_ops:
+            t_a_router, _ = self._sum_latency(
+                router_ops,
+                batch_size=a_micro_batch_size * (self._nextn + 1) if phase == "decode" else a_micro_batch_size,
+                seq_len=isl + 1 if phase == "decode" else effective_prefill_len,
+                model=a_model,
+                runtime_config=runtime_config,
+                is_context=phase == "prefill",
+            )
+
         # Per-op dicts are tracked in *per-step* units (matching
         # ``_sum_latency`` output), so amortize per-layer values up by
         # ``num_layers`` before recording.
@@ -1841,6 +1869,7 @@ class AFDInferenceSession:
             "f_is_kv_cache_oom": f_memory_summary.check_kv_cache_oom(),
             "num_layers": num_layers,
             "t_a_combine_layer": brk_t_a_per_layer,
+            "t_a_router_layer": t_a_router / num_layers,
             "t_f_collective_layer": brk_t_f_per_layer,
             "a_partition": a_partition,
             "f_partition": f_partition,
@@ -2092,12 +2121,13 @@ class AFDInferenceSession:
                     "a_to_f_ms": float(metrics["t_a2f_layer"]),
                     "f_to_a_ms": float(metrics["t_f2a_layer"]),
                     "num_layers": num_layers,
-                    # Boundary components let an external MoE-stage provider move
-                    # the router to the A side and drop the combine it measured itself.
+                    # The local A router is measured separately from the F
+                    # router already included in the standard AFD headline.
                     "components": {
                         "attention_compute_ms": float(metrics["t_a_layer"]) - a_combine_ms,
                         "a_combine_ms": a_combine_ms,
                         "router_ms": router_ms,
+                        "a_router_ms": float(metrics["t_a_router_layer"]),
                         "ffn_compute_ms": float(metrics["t_f_layer"]) - f_collective_ms,
                         "f_collective_ms": f_collective_ms,
                     },

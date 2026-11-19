@@ -41,6 +41,7 @@ def _fake_phase_metrics(
     t_step: float = 50.0,
     comm_hidden: bool = True,
     t_a_combine_layer: float = 0.0,
+    t_a_router_layer: float = 0.0,
     t_f_collective_layer: float = 0.0,
     f_per_op: dict | None = None,
 ) -> dict:
@@ -61,6 +62,7 @@ def _fake_phase_metrics(
         "a_per_op": {},
         "f_per_op": dict(f_per_op or {}),
         "t_a_combine_layer": t_a_combine_layer,
+        "t_a_router_layer": t_a_router_layer,
         "t_f_collective_layer": t_f_collective_layer,
         "a_memory": {"total": 1.0, "weights": 1.0, "activations": 0.0, "kvcache": 0.0, "nccl": 0.0, "others": 0.0},
         "f_memory": {"total": 1.0, "weights": 1.0, "activations": 0.0, "kvcache": 0.0, "nccl": 0.0, "others": 0.0},
@@ -521,6 +523,86 @@ def test_afd_decode_mtp_widens_compute_and_communication_queries(monkeypatch, ca
     assert ("verify positions share sequence KV history" in caplog.text) is (nextn > 0)
 
 
+@pytest.mark.parametrize("nextn", [0, 1])
+@pytest.mark.parametrize("a_batch_size", [128, 129])
+@pytest.mark.parametrize("nested", [False, True])
+def test_afd_measures_local_router_once_outside_decode_integration(monkeypatch, nextn, a_batch_size, nested):
+    """64 A ranks must not reuse the F router's combined 4096-token query."""
+    from aisimulate.sdk import common, operations
+    from aisimulate.sdk.inference_session import _AFDCommOps
+
+    a_router = operations.GEMM("generation_router_gemm", 4, 128, 4096, common.GEMMQuantMode.bfloat16)
+    f_router = operations.GEMM("generation_router_gemm", 4, 128, 4096, common.GEMMQuantMode.bfloat16)
+    a_ops = [a_router]
+    if nested:
+        a_ops = [operations.OverlapOp("generation_moe_overlap", group_a=a_ops, group_b=[])]
+    a_model = SimpleNamespace(_num_layers=4, generation_ops=a_ops)
+    f_model = SimpleNamespace(_num_layers=4, generation_ops=[f_router])
+    queries = []
+
+    def fake_sum_latency(self, ops, *, model, batch_size, **_kwargs):
+        queries.append((list(ops), model, batch_size))
+        # Synthetic shape-sensitive engine result, in full-model units:
+        # each queried router contributes batch_size / 1000 ms per layer.
+        return 4 * batch_size / 1000, {"generation_router_gemm": 4 * batch_size / 1000}
+
+    def fake_memory_summary(self, _memory, runtime_config, _fraction):
+        summary = InferenceSummary(runtime_config)
+        summary.set_oom(False)
+        summary.set_kv_cache_oom(False)
+        return summary
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", fake_sum_latency)
+    monkeypatch.setattr(
+        AFDInferenceSession,
+        "_build_afd_comm_ops",
+        lambda *_a, **_k: _AFDCommOps(
+            *(
+                SimpleNamespace(_name=name, query=lambda *_a, **_k: 0.0)
+                for name in ("a2f", "f2a", "ag", "rs", "combine")
+            )
+        ),
+    )
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_a_memory_dict", lambda *_a, **_k: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_f_memory_dict", lambda *_a, **_k: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_check_memory_dict", fake_memory_summary)
+    session = AFDInferenceSession(
+        model_path="test-model",
+        a_model_config=SimpleNamespace(nextn=nextn),
+        f_model_config=SimpleNamespace(nextn=nextn),
+        database=object(),
+        backend=object(),
+        afd_config=AFDConfig(
+            n_a_nodes=16,
+            n_f_nodes=2,
+            gpus_per_node=4,
+            tp_a=1,
+            a_batch_size=a_batch_size,
+            f_moe_ep_size=8,
+            num_microbatches=2,
+        ),
+    )
+
+    metrics = session._simulate_phase(
+        phase="decode",
+        runtime_config=RuntimeConfig(isl=1024, osl=128),
+        a_model=a_model,
+        f_model=f_model,
+        free_gpu_memory_fraction=None,
+        max_seq_len=None,
+    )
+
+    local_batch = ((a_batch_size + 1) // 2) * (nextn + 1)
+    # Native overlap groups expose cloned leaf wrappers, so compare names
+    # while retaining the A model identity and the independently expected batch.
+    local_router_queries = [(q[2], [op._name for op in q[0]]) for q in queries if q[1] is a_model and q[0]]
+    assert local_router_queries == [(local_batch, ["generation_router_gemm"])]
+    f_queries = [q for q in queries if q[1] is f_model]
+    assert len(f_queries) > 1  # multiple decode strides, but one local router query
+    assert {q[2] for q in f_queries} == {64 * local_batch}
+    assert metrics["t_a_router_layer"] == pytest.approx(local_batch / 1000)
+
+
 def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):
     """``concurrency`` in the AFD summary equals the configured total batch.
 
@@ -718,6 +800,7 @@ def test_afd_summary_phase_both_paired_scalars_and_nan_unprefixed(monkeypatch):
                 "attention_compute_ms": 0.5,
                 "a_combine_ms": 0.0,
                 "router_ms": 0.0,
+                "a_router_ms": 0.0,
                 "ffn_compute_ms": 0.7,
                 "f_collective_ms": 0.0,
             },
@@ -732,6 +815,7 @@ def test_afd_summary_phase_both_paired_scalars_and_nan_unprefixed(monkeypatch):
                 "attention_compute_ms": 1.2,
                 "a_combine_ms": 0.0,
                 "router_ms": 0.0,
+                "a_router_ms": 0.0,
                 "ffn_compute_ms": 0.9,
                 "f_collective_ms": 0.0,
             },
@@ -760,6 +844,7 @@ def test_result_dict_splits_afd_layer_boundary_components(monkeypatch):
         t_f_layer=0.9,
         balance_ratio=1.33,
         t_a_combine_layer=0.05,
+        t_a_router_layer=0.003,
         t_f_collective_layer=0.1,
         f_per_op={"generation_router_gemm": 0.8, "generation_moe": 2.4},
     )
@@ -778,6 +863,7 @@ def test_result_dict_splits_afd_layer_boundary_components(monkeypatch):
             "attention_compute_ms": 1.15,
             "a_combine_ms": 0.05,
             "router_ms": 0.2,
+            "a_router_ms": 0.003,
             "ffn_compute_ms": 0.8,
             "f_collective_ms": 0.1,
         }
