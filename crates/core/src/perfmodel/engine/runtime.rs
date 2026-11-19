@@ -133,10 +133,11 @@ pub(crate) type MoeCommFallbackValues = (MoeCommFallbackValue, Vec<MoeCommFallba
 /// the provenance tag (`silicon|empirical|sol|estimated|mixed`).
 pub type PerOpValue = (String, f64, f64, &'static str);
 
-/// One op name's folded `(latency_ms, energy_wms, source)`, addressed by its
-/// [`OpListPlan`] name slot instead of carrying the name. Folded exactly like
-/// [`PerOpValue`].
-pub(crate) type PerOpSlotValue = (f64, f64, &'static str);
+/// One op name's folded `(latency_ms, energy_wms, covered_latency_ms,
+/// source)`, addressed by its [`OpListPlan`] name slot instead of carrying the
+/// name. Folded like [`PerOpValue`]; the covered latency is decided per query
+/// ([`covered_latency`]) before the fold.
+pub(crate) type PerOpSlotValue = (f64, f64, f64, &'static str);
 
 /// Internal per-op value used by the provenance-aware engine walk. The fifth
 /// field is `None` or `(first_record, additional_records)` in deterministic
@@ -199,6 +200,8 @@ struct PerOpFold {
     entries: Vec<PerOpValueWithMetadata>,
     /// Entry index per name slot, for [`Self::add_slot`].
     slots: Vec<Option<usize>>,
+    /// Each entry's power-covered latency, summed per query before the fold.
+    covered: Vec<f64>,
 }
 
 /// A query result's power-covered latency: all of it when its own energy is
@@ -241,6 +244,7 @@ impl PerOpFold {
             inference_phase,
             entries: Vec::new(),
             slots: Vec::new(),
+            covered: Vec::new(),
         }
     }
 
@@ -269,6 +273,7 @@ impl PerOpFold {
     fn add_at(&mut self, position: Option<usize>, op: &Op, r: PerformanceResult) {
         let name = op.name();
         let source = r.source.as_str();
+        let covered = covered_latency(&r);
         let mut fallbacks = None;
         for fallback in r.moe_comm_fallbacks.iter() {
             insert_per_op_fallback(
@@ -283,15 +288,18 @@ impl PerOpFold {
                 ),
             );
         }
-        if let Some(entry) = position.map(|position| &mut self.entries[position]) {
+        if let Some(position) = position {
+            let entry = &mut self.entries[position];
             entry.1 += r.latency_ms;
             entry.2 += r.energy_wms;
             if entry.3 != source {
                 entry.3 = "mixed";
             }
             extend_per_op_fallbacks(&mut entry.4, fallbacks);
+            self.covered[position] += covered;
             return;
         }
+        self.covered.push(covered);
         self.entries.push((
             name.to_string(),
             r.latency_ms,
@@ -303,6 +311,11 @@ impl PerOpFold {
 
     fn into_values(self) -> Vec<PerOpValueWithMetadata> {
         self.entries
+    }
+
+    /// [`Self::into_values`] with each entry's power-covered latency.
+    fn into_values_with_covered(self) -> (Vec<PerOpValueWithMetadata>, Vec<f64>) {
+        (self.entries, self.covered)
     }
 }
 
@@ -325,19 +338,20 @@ impl PerOpSlotFold {
     }
 
     fn add(&mut self, slot: usize, r: PerformanceResult) {
-        self.add_value(slot, (r.latency_ms, r.energy_wms, r.source.as_str()));
+        self.add_value(slot, slot_value(&r));
     }
 
     /// Fold one value into `slot`.
-    fn add_value(&mut self, slot: usize, (latency_ms, energy_wms, source): PerOpSlotValue) {
+    fn add_value(&mut self, slot: usize, value: PerOpSlotValue) {
         if let Some(entry) = self.entries.get_mut(slot) {
-            entry.0 += latency_ms;
-            entry.1 += energy_wms;
-            if entry.2 != source {
-                entry.2 = "mixed";
+            entry.0 += value.0;
+            entry.1 += value.1;
+            entry.2 += value.2;
+            if entry.3 != value.3 {
+                entry.3 = "mixed";
             }
         } else if slot == self.entries.len() {
-            self.entries.push((latency_ms, energy_wms, source));
+            self.entries.push(value);
         } else {
             self.misordered = true;
         }
@@ -357,6 +371,16 @@ impl PerOpSlotFold {
         }
         Ok(self.entries)
     }
+}
+
+/// One query result as a slot value, its coverage decided before any fold.
+fn slot_value(r: &PerformanceResult) -> PerOpSlotValue {
+    (
+        r.latency_ms,
+        r.energy_wms,
+        covered_latency(r),
+        r.source.as_str(),
+    )
 }
 
 fn strip_per_op_metadata(entries: Vec<PerOpValueWithMetadata>) -> Vec<PerOpValue> {
@@ -430,18 +454,25 @@ impl RankOperationFold {
         });
     }
 
-    fn into_operations(self) -> Vec<super::diagnostics::StaticOperationDiagnostics> {
-        self.fold
-            .into_values()
+    /// The folded diagnostics and each one's power-covered latency.
+    fn into_operations(
+        self,
+    ) -> (
+        Vec<super::diagnostics::StaticOperationDiagnostics>,
+        Vec<f64>,
+    ) {
+        let (entries, covered) = self.fold.into_values_with_covered();
+        let operations = entries
             .into_iter()
             .zip(self.sols)
             .map(|(entry, sol)| operation_diagnostics(entry, sol))
-            .collect()
+            .collect();
+        (operations, covered)
     }
 }
 
 /// Name-folded operation values of one operation-graph rank: each name's
-/// `(latency_ms, energy_wms, source)`, value `k` named `names[k]`. Ranks that
+/// [`PerOpSlotValue`], value `k` named `names[k]`. Ranks that
 /// run the same walk share `names`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RankOperationValues {
@@ -469,6 +500,9 @@ pub(crate) struct RankPricing {
     pub(crate) operations: Option<RankOperationValues>,
     /// [`RankDetail::Diagnostics`] of an operation graph.
     pub(crate) diagnostics: Option<Vec<super::diagnostics::StaticOperationDiagnostics>>,
+    /// Each diagnostic's power-covered latency, summed per query before the
+    /// name fold; present with `diagnostics`.
+    pub(crate) diagnostic_covered: Option<Vec<f64>>,
     /// What a caller derives from this pricing ([`Self::derived`]).
     derived: OnceLock<Box<dyn std::any::Any + Send + Sync>>,
 }
@@ -507,8 +541,9 @@ pub(crate) struct NativeIteration {
 enum RankObserver<'a> {
     Latency,
     /// Diagnostics: a whole-model rank's direct FPM lookups or an operation
-    /// graph's operations with their SOL comparison.
-    Diagnostics(&'a mut crate::FpmRankEstimate),
+    /// graph's operations with their SOL comparison, plus, when given, each
+    /// operation's power-covered latency.
+    Diagnostics(&'a mut crate::FpmRankEstimate, Option<&'a mut Vec<f64>>),
     /// An operation graph's operation values; whole-model FPM leaves `None`.
     Values(&'a mut Option<RankOperationValues>),
 }
@@ -797,10 +832,7 @@ impl OperationObserver {
                     slots: Some(slots), ..
                 }),
                 Some(slot),
-            ) if divisor == 1.0 => slots.add_value(
-                slot,
-                (result.latency_ms, result.energy_wms, result.source.as_str()),
-            ),
+            ) if divisor == 1.0 => slots.add_value(slot, slot_value(&result)),
             _ => self.add(
                 inference_phase,
                 slot,
@@ -3359,9 +3391,13 @@ impl Engine {
             &self.generation_plan
         };
         let mut fold = PerOpSlotFold::for_plan(plan);
-        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, _, r, _| {
+        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, _, r, covered| {
             if is_context == context {
-                fold.add(slot, r);
+                // A decode row is already folded per step: keep its per-query coverage.
+                fold.add_value(
+                    slot,
+                    (r.latency_ms, r.energy_wms, covered, r.source.as_str()),
+                );
             }
         })?;
         Ok((plan.slot_names(), fold.into_values(plan)?))
@@ -3931,7 +3967,7 @@ impl Engine {
                 } else {
                     self.rank_latency_ms(
                         metrics,
-                        RankObserver::Diagnostics(&mut evidence),
+                        RankObserver::Diagnostics(&mut evidence, None),
                         coverage.as_deref_mut(),
                     )?
                 };
@@ -4036,18 +4072,21 @@ impl Engine {
     ) -> Result<RankPricing, AicError> {
         let mut values = None;
         let mut evidence = crate::FpmRankEstimate::default();
+        let mut covered = Vec::new();
         let observer = match detail {
             None => RankObserver::Latency,
             Some(RankDetail::Values) => RankObserver::Values(&mut values),
-            Some(RankDetail::Diagnostics) => RankObserver::Diagnostics(&mut evidence),
+            Some(RankDetail::Diagnostics) => {
+                RankObserver::Diagnostics(&mut evidence, Some(&mut covered))
+            }
         };
         let latency_ms = self.rank_latency_ms(metrics, observer, coverage)?;
-        let diagnostics = (detail == Some(RankDetail::Diagnostics) && self.fpm_split().is_none())
-            .then_some(evidence.operations);
+        let operation_graph = detail == Some(RankDetail::Diagnostics) && self.fpm_split().is_none();
         Ok(RankPricing {
             latency_ms,
             operations: values,
-            diagnostics,
+            diagnostics: operation_graph.then_some(evidence.operations),
+            diagnostic_covered: operation_graph.then_some(covered),
             derived: OnceLock::new(),
         })
     }
@@ -4081,11 +4120,12 @@ impl Engine {
                 (names, values)
             }
             (_, _, Some(by_name)) => {
-                let (names, values): (Vec<_>, Vec<_>) = by_name
-                    .into_values()
+                let (entries, covered) = by_name.into_values_with_covered();
+                let (names, values): (Vec<_>, Vec<_>) = entries
                     .into_iter()
-                    .map(|(name, latency_ms, energy_wms, source, _)| {
-                        (name, (latency_ms, energy_wms, source))
+                    .zip(covered)
+                    .map(|((name, latency_ms, energy_wms, source, _), covered)| {
+                        (name, (latency_ms, energy_wms, covered, source))
                     })
                     .unzip();
                 (self.shared_names(names), values)
@@ -4116,10 +4156,10 @@ impl Engine {
         observer: RankObserver<'_>,
         mut coverage: Option<&mut FpmQueryCoverage>,
     ) -> Result<f64, AicError> {
-        let (mut evidence, values) = match observer {
-            RankObserver::Latency => (None, None),
-            RankObserver::Diagnostics(evidence) => (Some(evidence), None),
-            RankObserver::Values(values) => (None, Some(values)),
+        let (mut evidence, values, diagnostic_covered) = match observer {
+            RankObserver::Latency => (None, None, None),
+            RankObserver::Diagnostics(evidence, covered) => (Some(evidence), None, covered),
+            RankObserver::Values(values) => (None, Some(values), None),
         };
         let sched = &metrics.scheduled_requests;
         // Token-based dispatch, aligned with `IterationFeatures` (fpm/model.rs):
@@ -4240,7 +4280,11 @@ impl Engine {
             self.operation_rank_latency_ms(sched, has_prefill, has_decode, &mut operations)?;
         match (operations, evidence, values) {
             (OperationObserver::Diagnostics(operations), Some(evidence), _) => {
-                evidence.operations = operations.into_operations();
+                let (operations, covered) = operations.into_operations();
+                evidence.operations = operations;
+                if let Some(diagnostic_covered) = diagnostic_covered {
+                    *diagnostic_covered = covered;
+                }
             }
             (OperationObserver::Values(fold), _, Some(values)) => {
                 *values = Some(self.rank_operation_values(fold)?);
@@ -4744,7 +4788,7 @@ pub(crate) mod tests {
     }
 
     /// FP16 Mamba2 op with a 1 MiB state; decode verifies four tokens (MTP3).
-    fn qualified_mamba(prefill: bool, token_width: u32) -> Op {
+    pub(crate) fn qualified_mamba(prefill: bool, token_width: u32) -> Op {
         Op::Mamba2(crate::operators::Mamba2Op {
             name: if prefill {
                 "context_ssm"
@@ -4774,6 +4818,17 @@ pub(crate) mod tests {
 
     /// An engine whose only operations are a qualified context and
     /// generation Mamba pair at MTP `nextn`.
+    /// A qualified Mamba engine over `db`, as [`qualified_mamba_engine`].
+    pub(crate) fn qualified_mamba_engine_over(db: PerfDatabase, nextn: u32) -> Engine {
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(Some(nextn)),
+            vec![qualified_mamba(true, 1)],
+            vec![qualified_mamba(false, nextn + 1)],
+        );
+        spec.engine.database_mode = db.database_mode;
+        Engine::build(spec, Arc::new(db)).unwrap()
+    }
+
     pub(crate) fn qualified_mamba_engine(nextn: u32) -> Engine {
         let spec = EngineSpec::new(
             fixture_engine_config(Some(nextn)),
@@ -6046,7 +6101,7 @@ pub(crate) mod tests {
                 let actual = names
                     .iter()
                     .zip(&slots)
-                    .map(|(name, &(latency, energy, source))| {
+                    .map(|(name, &(latency, energy, _, source))| {
                         (name.clone(), latency.to_bits(), energy.to_bits(), source)
                     })
                     .collect::<Vec<_>>();
@@ -6081,12 +6136,14 @@ pub(crate) mod tests {
         fold.add(1, PerformanceResult::with_energy(0.5, 0.0, Source::Sol));
         fold.add(
             0,
-            PerformanceResult::with_energy(0.25, 4.0, Source::Empirical),
+            PerformanceResult::with_energy(0.25, 0.0, Source::Empirical),
         );
-        // "a": 1.0 + 0.25 ms and 2.0 + 4.0 W-ms; its sources differ.
+        // "a": 1.0 + 0.25 ms and 2.0 + 0.0 W-ms; its sources differ. Only
+        // its powered first query is covered, though its folded energy is
+        // positive.
         assert_eq!(
             fold.into_values(&plan).unwrap(),
-            [(1.25, 6.0, "mixed"), (0.5, 0.0, "sol")]
+            [(1.25, 2.0, 1.0, "mixed"), (0.5, 0.0, 0.0, "sol")]
         );
         let mut fold = PerOpSlotFold::for_plan(&plan);
         fold.add(1, PerformanceResult::new(1.0, Source::Sol));
@@ -6754,7 +6811,7 @@ pub(crate) mod tests {
                 .names
                 .iter()
                 .zip(&operations.values)
-                .map(|(name, (latency_ms, energy_wms, source))| {
+                .map(|(name, (latency_ms, energy_wms, _, source))| {
                     (
                         name.clone(),
                         latency_ms.to_bits(),
@@ -7038,6 +7095,7 @@ pub(crate) mod tests {
             latency_ms: 2.0,
             operations: None,
             diagnostics: None,
+            diagnostic_covered: None,
             derived: OnceLock::new(),
         };
         let builds = std::cell::Cell::new(0);

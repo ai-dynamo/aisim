@@ -1659,7 +1659,11 @@ impl AicTimingModel {
                 let fractions = prefill_fractions
                     .iter()
                     .map(|&fraction| if prefill { fraction } else { 1.0 - fraction });
-                if let Some(phase) = self.operation_part_evidence(&rank.operations, fractions)? {
+                // Public estimates carry no per-query coverage; each folded
+                // operation's energy decides it.
+                if let Some(phase) =
+                    self.operation_part_evidence(&rank.operations, None, fractions)?
+                {
                     evidence.push((Self::corrected_phase(Arc::new(phase), correction)?, prefill));
                 }
             }
@@ -1725,6 +1729,11 @@ impl AicTimingModel {
             !operations.is_empty(),
             "canonical model reported no operations for rank {index}'s work"
         );
+        let covered = rank.diagnostic_covered.as_deref();
+        ensure!(
+            covered.is_some_and(|covered| covered.len() == operations.len()),
+            "canonical model reported no covered latency for rank {index}'s operations"
+        );
         let prefill_fractions =
             Self::prefill_fractions(kind, query, operations, pricing.mix_step_passes.as_ref());
         let mut parts = Vec::with_capacity(2);
@@ -1732,7 +1741,7 @@ impl AicTimingModel {
             let fractions = prefill_fractions
                 .iter()
                 .map(|&fraction| if prefill { fraction } else { 1.0 - fraction });
-            if let Some(phase) = self.operation_part_evidence(operations, fractions)? {
+            if let Some(phase) = self.operation_part_evidence(operations, covered, fractions)? {
                 parts.push((Arc::new(phase), prefill));
             }
         }
@@ -1756,10 +1765,12 @@ impl AicTimingModel {
         let Some(operations) = operations else {
             bail!("canonical model reported no operations for rank {index}'s work");
         };
-        let value = |&(latency_ms, energy_wms, source): &PerOpSlotValue, fraction: f64| {
+        let value = |&(latency_ms, energy_wms, covered_ms, source): &PerOpSlotValue,
+                     fraction: f64| {
             Ok((
                 latency_ms * fraction,
                 Some(energy_wms * fraction),
+                covered_ms * fraction,
                 TimingEvidenceSource::from_native(source),
             ))
         };
@@ -1768,10 +1779,11 @@ impl AicTimingModel {
             let phase = ValidatedTimingPhase::from_slot_values(
                 &operations.names,
                 operations.values.iter().map(|value| {
-                    let (latency_ms, energy_wms, source) = *value;
+                    let (latency_ms, energy_wms, covered_ms, source) = *value;
                     Ok((
                         latency_ms,
                         Some(energy_wms),
+                        covered_ms,
                         TimingEvidenceSource::from_native(source),
                     ))
                 }),
@@ -1866,20 +1878,26 @@ impl AicTimingModel {
     /// latency, energy and SOL times its fraction, and an operation with none
     /// left out. `None` when no operation has a part. Details are kept only
     /// while diagnostics are captured, as for phase evidence.
+    /// `covered` holds each operation's power-covered latency, summed per
+    /// query before the name fold; without it, each operation's energy decides.
     fn operation_part_evidence(
         &self,
         operations: &[crate::perfmodel::engine::diagnostics::StaticOperationDiagnostics],
+        covered: Option<&[f64]>,
         fractions: impl Iterator<Item = f64>,
     ) -> Result<Option<ValidatedTimingPhase>> {
         let operations = operations
             .iter()
+            .enumerate()
             .zip(fractions)
             .filter(|(_, fraction)| *fraction > 0.0)
-            .map(|(entry, fraction)| {
-                let mut operation = TimingOperationEvidence::new(
+            .map(|((index, entry), fraction)| {
+                let covered_ms = covered.map_or(entry.latency_ms, |covered| covered[index]);
+                let mut operation = TimingOperationEvidence::with_covered(
                     entry.name.clone(),
                     entry.latency_ms * fraction,
                     Some(entry.energy_wms * fraction),
+                    covered_ms * fraction,
                     TimingEvidenceSource::from_provider(entry.source.clone()),
                 )?;
                 if self.diagnostic_model.is_some() {
@@ -2007,7 +2025,7 @@ fn phase_evidence_from_native_slots(
         names
             .iter()
             .zip(values)
-            .map(|(name, (latency_ms, energy_wms, source))| {
+            .map(|(name, (latency_ms, energy_wms, covered_ms, source))| {
                 ensure!(
                     energy_wms.is_finite() && energy_wms >= 0.0,
                     "AIC operation {name:?} returned invalid energy {energy_wms}W-ms"
@@ -2015,6 +2033,7 @@ fn phase_evidence_from_native_slots(
                 Ok((
                     latency_ms,
                     Some(energy_wms),
+                    covered_ms,
                     TimingEvidenceSource::from_native(source),
                 ))
             }),
@@ -2024,9 +2043,12 @@ fn phase_evidence_from_native_slots(
 fn phase_evidence_from_native_entries(
     entries: Vec<crate::perfmodel::engine::PerOpValue>,
 ) -> Result<ValidatedTimingPhase> {
+    // Each named entry is one result, so its energy decides its coverage.
     let (names, values): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .map(|(name, latency_ms, energy_wms, source)| (name, (latency_ms, energy_wms, source)))
+        .map(|(name, latency_ms, energy_wms, source)| {
+            (name, (latency_ms, energy_wms, latency_ms, source))
+        })
         .unzip();
     phase_evidence_from_native_slots(&names.into(), values)
 }
@@ -10260,6 +10282,117 @@ mod tests {
                 find(&evidence.prefill, "context_ssm").unwrap(),
                 ms(prefill_bytes)
             ));
+        }
+    }
+
+    #[test]
+    fn op_level_replay_counts_split_mamba_power_coverage_per_query() {
+        use crate::common::enums::{DatabaseMode, TransferPolicy};
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        pyo3::prepare_freethreaded_python();
+        // Batch-2 scan rows carry power; batch-1 rows do not.
+        let root = tempfile::tempdir().unwrap();
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).unwrap();
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"; 4]),
+                Col::Str("phase", vec!["context"; 4]),
+                Col::I64("batch_size", vec![1, 1, 2, 2]),
+                Col::I64("seq_len", vec![8, 16, 8, 16]),
+                Col::I64("d_model", vec![4096; 4]),
+                Col::I64("d_state", vec![128; 4]),
+                Col::I64("d_conv", vec![4; 4]),
+                Col::I64("nheads", vec![64; 4]),
+                Col::I64("head_dim", vec![64; 4]),
+                Col::I64("n_groups", vec![4; 4]),
+                Col::I64("chunk_size", vec![128; 4]),
+                Col::F64("latency", vec![0.1, 0.2, 0.2, 0.4]),
+                Col::F64("power", vec![0.0, 0.0, 500.0, 500.0]),
+            ],
+        );
+        let db = crate::perf_database::PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+            .unwrap()
+            .with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        let native =
+            Arc::new(crate::perfmodel::engine::runtime::tests::qualified_mamba_engine_over(db, 0));
+        // Independent queries: the split of 25 tokens over 3 requests prices
+        // (2, 8) on a powered row and (1, 9) on unpowered rows.
+        let crate::operators::Op::Mamba2(scan) =
+            crate::perfmodel::engine::runtime::tests::qualified_mamba(true, 1)
+        else {
+            unreachable!()
+        };
+        let query = |batch, tokens| {
+            scan.query_with_prefix(native.database(), batch, tokens, 0)
+                .unwrap()
+        };
+        let (powered, unpowered) = (query(2, 8), query(1, 9));
+        assert!(powered.energy_wms > 0.0 && unpowered.energy_wms == 0.0);
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::with_gil(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let scan_evidence = |timing: &AicTimingModel, rank: RankWork| {
+            let (_, evidence) =
+                priced_with_evidence(timing, |timing| iteration_ms(timing, &[rank]));
+            let phase = evidence.prefill;
+            let op = phase
+                .operations
+                .iter()
+                .find(|operation| operation.name == "context_ssm")
+                .unwrap()
+                .clone();
+            (op, phase)
+        };
+        let decode = decode_work(0, 2, 32, 1 << 20);
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            timing.phase_memo.clear();
+            let memo = timing.iteration.as_ref().unwrap().memo.as_ref().unwrap();
+            memo.clear();
+            for rank in [
+                prefill_work(0, 3, 25, 0),
+                mixed_work(prefill_work(0, 3, 25, 0), decode.clone()),
+            ] {
+                let (op, phase) = scan_evidence(&timing, rank);
+                // One folded row with positive energy, but only the powered
+                // query's latency is covered.
+                assert!(close(
+                    op.latency_ms,
+                    powered.latency_ms + unpowered.latency_ms
+                ));
+                assert!(close(op.energy_wms.unwrap(), powered.energy_wms));
+                assert!(
+                    close(op.covered_latency_ms, powered.latency_ms),
+                    "{capture}"
+                );
+                assert!(close(phase.covered_latency_ms, powered.latency_ms));
+                assert!(
+                    phase.covered_latency_ms / phase.latency_ms < POWER_DATA_COVERAGE_THRESHOLD,
+                    "{capture}: the folded row must not pass the publication gate"
+                );
+            }
+            // Controls: one powered (2, 8) query is fully covered; one
+            // unpowered (1, 9) query covers nothing.
+            let (op, _) = scan_evidence(&timing, prefill_work(0, 2, 16, 0));
+            assert!(op.covered_latency_ms > 0.0 && close(op.covered_latency_ms, op.latency_ms));
+            let (op, _) = scan_evidence(&timing, prefill_work(0, 1, 9, 0));
+            assert_eq!(op.covered_latency_ms, 0.0);
         }
     }
 

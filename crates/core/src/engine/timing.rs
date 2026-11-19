@@ -216,6 +216,28 @@ impl TimingOperationEvidence {
         Ok(OperationValues::new(&name, latency_ms, energy_wms, source)?.into_named(name))
     }
 
+    /// [`Self::new`] for a name-folded operation whose power-covered latency
+    /// was summed per query before the fold, instead of read from its total
+    /// energy. Without positive energy nothing is covered.
+    #[cfg(feature = "python")]
+    pub(crate) fn with_covered(
+        name: impl Into<String>,
+        latency_ms: f64,
+        energy_wms: Option<f64>,
+        covered_latency_ms: f64,
+        source: TimingEvidenceSource,
+    ) -> Result<Self> {
+        let name = name.into();
+        Ok(OperationValues::with_covered(
+            &name,
+            latency_ms,
+            energy_wms,
+            covered_latency_ms,
+            source,
+        )?
+        .into_named(name))
+    }
+
     fn canonicalized(mut self) -> Result<Self> {
         ensure!(
             !self.name.trim().is_empty(),
@@ -323,8 +345,21 @@ impl OperationValues {
         energy_wms: Option<f64>,
         source: TimingEvidenceSource,
     ) -> Result<Self> {
+        Self::with_covered(name, latency_ms, energy_wms, latency_ms, source)
+    }
+
+    /// [`Self::new`] with the power-covered part of `latency_ms` given, as a
+    /// fold sums it per query. It counts only with positive energy.
+    #[inline]
+    fn with_covered(
+        name: &str,
+        latency_ms: f64,
+        energy_wms: Option<f64>,
+        covered_latency_ms: f64,
+        source: TimingEvidenceSource,
+    ) -> Result<Self> {
         let covered_latency_ms = if energy_wms.is_some_and(|energy| energy > 0.0) {
-            latency_ms
+            covered_latency_ms
         } else {
             0.0
         };
@@ -478,15 +513,15 @@ impl ValidatedTimingPhase {
         Ok(Self(ValidatedEvidence::Named(phase)))
     }
 
-    /// [`Self::from_name_folded_operations`] over `TimingOperationEvidence::new`
-    /// of each `(latency_ms, energy_wms, source)` value and its slot name, in
-    /// slot order. Values are pulled one at a time, so a caller's own check of
+    /// [`Self::from_name_folded_operations`] over each `(latency_ms,
+    /// energy_wms, covered_latency_ms, source)` value and its slot name, in
+    /// slot order. The covered latency is the fold's per-query sum. Values are pulled one at a time, so a caller's own check of
     /// value `k` reports before any check of value `k + 1`. A compiled engine
     /// phase shares `names` across passes, so passes allocate no names; they
     /// are copied only when evidence is read.
     pub(crate) fn from_slot_values(
         names: &Arc<[String]>,
-        values: impl ExactSizeIterator<Item = Result<(f64, Option<f64>, TimingEvidenceSource)>>,
+        values: impl ExactSizeIterator<Item = Result<(f64, Option<f64>, f64, TimingEvidenceSource)>>,
     ) -> Result<Self> {
         ensure!(
             values.len() == names.len(),
@@ -496,8 +531,14 @@ impl ValidatedTimingPhase {
         );
         let mut operations = Vec::with_capacity(names.len());
         for (name, value) in names.iter().zip(values) {
-            let (latency_ms, energy_wms, source) = value?;
-            operations.push(OperationValues::new(name, latency_ms, energy_wms, source)?);
+            let (latency_ms, energy_wms, covered_latency_ms, source) = value?;
+            operations.push(OperationValues::with_covered(
+                name,
+                latency_ms,
+                energy_wms,
+                covered_latency_ms,
+                source,
+            )?);
         }
         let mut phase = SlottedPhase {
             names: Arc::clone(names),
@@ -2329,7 +2370,8 @@ pub(crate) mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    /// A slotted pass over `names` with `(latency_ms, energy_wms, source)`.
+    /// A slotted pass over `names` with `(latency_ms, energy_wms, source)`,
+    /// each value one query, so a powered value is wholly covered.
     fn slotted_pass(
         names: &Arc<[String]>,
         values: impl IntoIterator<
@@ -2337,7 +2379,33 @@ pub(crate) mod tests {
             IntoIter: ExactSizeIterator,
         >,
     ) -> Result<ValidatedTimingPhase> {
-        ValidatedTimingPhase::from_slot_values(names, values.into_iter().map(Ok))
+        ValidatedTimingPhase::from_slot_values(
+            names,
+            values
+                .into_iter()
+                .map(|(latency, energy, source)| Ok((latency, energy, latency, source))),
+        )
+    }
+
+    #[test]
+    fn slotted_passes_keep_each_folded_value_coverage() {
+        use TimingEvidenceSource::{Mixed, Sol};
+        // A slot folded from a powered 1.5 ms query and an unpowered 0.5 ms
+        // query has positive energy but only 1.5 ms covered; a slot without
+        // energy covers nothing whatever it is given.
+        let names = slot_names(&["scan", "norm"]);
+        let phase = ValidatedTimingPhase::from_slot_values(
+            &names,
+            [
+                Ok((2.0, Some(300.0), 1.5, Mixed)),
+                Ok((1.0, Some(0.0), 0.7, Sol)),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(phase.totals(), (3.0, Some(300.0), 1.5));
+        let over = [Ok((1.0, Some(1.0), 1.5, Sol)), Ok((1.0, None, 0.0, Sol))];
+        assert!(ValidatedTimingPhase::from_slot_values(&names, over.into_iter()).is_err());
     }
 
     #[test]
@@ -2558,7 +2626,7 @@ pub(crate) mod tests {
             (1.0, "caller rejected value 1"),
         ] {
             let values = [
-                Ok((latency, None, Silicon)),
+                Ok((latency, None, latency, Silicon)),
                 Err(anyhow::anyhow!("caller rejected value 1")),
             ];
             assert_eq!(
