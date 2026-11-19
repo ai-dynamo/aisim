@@ -93,8 +93,9 @@ reviews:
     auto_incremental_review: true
     # Keep automatic reviews active through repeated fix/review iterations.
     auto_pause_after_reviewed_commits: 0
+    # Review ready PRs against every target, including stacked feature branches.
     base_branches:
-      - "release/.*"
+      - ".*"
     ignore_title_keywords:
       - "WIP"
       - "[skip review]"

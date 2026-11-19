@@ -74,6 +74,7 @@
 /tests/test_agentx_g2.py                               @ai-dynamo/aisim-replay-codeowners
 /tests/test_ngram_cli.py                               @ai-dynamo/aisim-replay-codeowners
 /tests/test_cli_config.py                              @ai-dynamo/aisim-replay-codeowners
+/tests/test_output_lock.py                             @ai-dynamo/aisim-replay-codeowners
 /tests/test_unified_cli.py                             @ai-dynamo/aisim-replay-codeowners
 /tests/test_shared_g2_cli.py                           @ai-dynamo/aisim-replay-codeowners
 /tests/test_aiperf_metrics.py                          @ai-dynamo/aisim-replay-codeowners
@@ -208,6 +209,7 @@
 /tests/test_cli_config.py                              @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_pages_site.py                              @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /crates/core/src/python.rs                             @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
+/tests/test_output_lock.py                             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_unified_cli.py                             @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /crates/core/src/perfmodel/                            @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/.dockerignore                            @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain

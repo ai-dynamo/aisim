@@ -1024,3 +1024,33 @@ fn an_engine_joining_a_warm_shared_pool_publishes_its_residency() {
     assert!(consumer.next_internal_deadline_ms().is_none());
     assert!(consumer.is_drained());
 }
+
+#[test]
+fn v0_32_admits_a_waiter_that_holds_g1_before_one_that_holds_none() {
+    // Six 4-token G1 blocks and enough G2 to keep every prompt; H2D moves a
+    // 1 MB block in 10 ms.
+    let mut rank = rank(json!({
+        "connector": "offloading_v0_32", "num_host_blocks": 16, "h2d_bandwidth_gbps": 0.1,
+    }));
+    rank["num_gpu_blocks"] = json!(6);
+    let requests = trace(&[
+        // G2 keeps a 13-token and a 9-token prompt; the third evicts both
+        // from G1.
+        ("seed", 0.0, 1, 13, 1),
+        ("c_seed", 10.0, 21, 9, 1),
+        ("evict", 20.0, 41, 23, 1),
+        // A loads the 13-token prompt's first two blocks over [100, 120).
+        ("a", 100.0, 1, 9, 1),
+        // B hits the blocks A is loading, so it waits and holds no G1.
+        ("b", 101.0, 1, 13, 1),
+        // C queues behind B and reserves two G1 blocks for its load over
+        // [120, 140). B's four blocks never fit beside them, so in FCFS
+        // order B would hold the queue head forever.
+        ("c", 102.0, 21, 9, 1),
+    ]);
+    let report = run(aggregated(1), json!({"rank": rank}), requests).unwrap();
+    // C runs once its load lands; B then finds A's two blocks in G1 and
+    // loads its third over [141, 151).
+    assert_eq!(terminal_ms(&report, "c"), 141.0);
+    assert_eq!(terminal_ms(&report, "b"), 152.0);
+}

@@ -2815,11 +2815,12 @@ fn waiting_probe(core: &VllmCore, id: u128, tokens: Vec<u32>) -> RequestKvState 
 }
 
 /// The cached tokens that the waiting-loop lookup gives `probe`, checked
-/// against a fresh search of the same pool.
+/// against a fresh search of the same pool. The lookup that `schedule_request`
+/// uses must give the same cost from the hit that the waiting lookup stored.
 fn waiting_hit(core: &VllmCore, probe: &mut RequestKvState) -> usize {
     let lookup = core
         .kv_manager
-        .lookup_native_prefill_cost(&probe.sequence, &mut probe.lease);
+        .get_native_waiting_prefill_cost(&probe.sequence, &mut probe.lease);
     let fresh = core
         .kv_manager
         .get_native_prefill_cost(&probe.sequence, &probe.lease);
@@ -2833,6 +2834,21 @@ fn waiting_hit(core: &VllmCore, probe: &mut RequestKvState) -> usize {
             fresh.new_blocks,
             fresh.cached_tokens,
             fresh.active_cached_tokens
+        )
+    );
+    let scheduled = core
+        .kv_manager
+        .lookup_native_prefill_cost(&probe.sequence, &mut probe.lease);
+    assert_eq!(
+        (
+            scheduled.new_blocks,
+            scheduled.cached_tokens,
+            scheduled.active_cached_tokens
+        ),
+        (
+            lookup.new_blocks,
+            lookup.cached_tokens,
+            lookup.active_cached_tokens
         )
     );
     lookup.cached_tokens
