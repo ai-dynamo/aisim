@@ -1880,6 +1880,255 @@ fn grouped_decode_rank_readmits_a_held_request_when_a_load_activates_at_that_tim
     assert_eq!(usage(&core), (213, 6));
 }
 
+/// Price every pass of `core` at 0 ms.
+fn price_passes_at_0_ms(core: &mut VllmCore) {
+    core.args.perf_model = Arc::new(PerfModel::External {
+        timing: Arc::new(CapturedDecodeQueries::default()),
+    });
+}
+
+/// A prefill rank of 500 bytes in byte mode with a budget of 4 tokens and
+/// passes at 0 ms: a full-attention group of 4-token blocks of 100 bytes and
+/// a state group of 1 block of 10 bytes, with which a prefill stops one token
+/// short. A source of 9 tokens holds its 8 computed tokens in 2 full blocks
+/// and the state block: 210 bytes in 3 blocks, so 290 bytes are free. Returns
+/// the rank and the handoff of that source.
+fn byte_mode_prefill_rank_with_a_held_source() -> (VllmCore, HandoffId) {
+    let mut groups = vec![group("full", 4, 100, None), state("state", 10, 1)];
+    for group in &mut groups {
+        group.prefix_cacheable = Some(true);
+        group.transfer_bytes_per_block = Some(group.page_size_bytes);
+    }
+    let mut core = pd_core(groups, 500, 4, WorkerType::Prefill, None);
+    price_passes_at_0_ms(&mut core);
+    let blocker = HandoffId::new(Uuid::from_u128(1646));
+    hold_grouped_source(&mut core, blocker, 1645, 9);
+    let pool = grouped_pool(&core);
+    assert_eq!((pool.used_bytes(), pool.active_blocks()), (210, 3));
+    (core, blocker)
+}
+
+/// Run `passes` passes at 0 ms and return the passes that admit a request.
+fn admitting_passes_at_0_ms(core: &mut VllmCore, passes: usize) -> Vec<usize> {
+    let mut trace = TraceCollector::default();
+    let mut admissions = Vec::new();
+    for pass in 1..=passes {
+        let result = core.execute_pass(&mut trace, 0.0);
+        assert_eq!(result.end_ms, 0.0, "pass {pass}");
+        admissions.extend(result.admissions.iter().map(|_| pass));
+    }
+    admissions
+}
+
+#[test]
+fn grouped_prefill_rank_readmits_a_held_request_when_a_held_source_leaves_at_that_time() {
+    for cancel in [false, true] {
+        let (mut core, blocker) = byte_mode_prefill_rank_with_a_held_source();
+        let usage = |core: &VllmCore| {
+            let pool = grouped_pool(core);
+            (pool.used_bytes(), pool.active_blocks())
+        };
+        // A second source of 13 tokens computes 4 of its 12 tokens in each
+        // pass: 110 and 210 bytes. Its last 4 tokens need 3 full blocks and
+        // the state block, 310 bytes, and 290 are free. So it preempts
+        // itself in pass 3, is admitted again in pass 4 and preempts itself
+        // in pass 6 with the same pool. From pass 7 on it waits.
+        let waiting = HandoffId::new(Uuid::from_u128(1648));
+        let second = Uuid::from_u128(1647);
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id: waiting,
+            request: source_request(1647, 13),
+        })
+        .unwrap();
+        assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4], "{cancel}");
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+        assert_eq!(usage(&core), (210, 3));
+        // The held source is released or cancelled at the same time, so the
+        // 500 bytes are free. The next pass at that time admits the second
+        // source, and its third pass computes its last tokens and holds it.
+        let command = if cancel {
+            SchedulerCommand::CancelSource {
+                handoff_id: blocker,
+            }
+        } else {
+            SchedulerCommand::ReleaseSource {
+                handoff_id: blocker,
+            }
+        };
+        core.apply_command(command).unwrap();
+        assert_eq!(usage(&core), (0, 0));
+        let mut trace = TraceCollector::default();
+        let result = core.execute_pass(&mut trace, 0.0);
+        assert_eq!(
+            result
+                .admissions
+                .iter()
+                .map(|admission| admission.uuid)
+                .collect::<Vec<_>>(),
+            [second],
+            "{cancel}"
+        );
+        assert_eq!(usage(&core), (110, 2));
+        core.execute_pass(&mut trace, 0.0);
+        assert!(!core.source_is_held(waiting));
+        core.execute_pass(&mut trace, 0.0);
+        assert!(core.source_is_held(waiting), "{cancel}");
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+        assert_eq!(usage(&core), (310, 4));
+    }
+}
+
+#[test]
+fn grouped_prefill_rank_keeps_the_request_behind_a_held_request_waiting() {
+    // The rank and the second source of the test above, and behind it a
+    // third source of 5 tokens, whose 4 computed tokens need 110 bytes.
+    let (mut core, blocker) = byte_mode_prefill_rank_with_a_held_source();
+    let usage = |core: &VllmCore| {
+        let pool = grouped_pool(core);
+        (pool.used_bytes(), pool.active_blocks())
+    };
+    let (waiting, behind) = (
+        HandoffId::new(Uuid::from_u128(1648)),
+        HandoffId::new(Uuid::from_u128(1650)),
+    );
+    let (second, third) = (Uuid::from_u128(1647), Uuid::from_u128(1649));
+    for (handoff_id, request) in [
+        (waiting, source_request(1647, 13)),
+        (behind, source_request(1649, 5)),
+    ] {
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id,
+            request,
+        })
+        .unwrap();
+    }
+    // Each pass in which the second source runs gives it the whole budget,
+    // and a pass that preempts admits no request. From pass 7 on the second
+    // source waits at the head of the queue. The hold stops the waiting
+    // loop, as on a decode rank, so the third source waits too, while its
+    // 110 bytes fit the 290 free bytes and the budget is free.
+    assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4]);
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    assert_eq!(usage(&core), (210, 3));
+    assert_eq!(
+        [second, third].map(|uuid| core.state.requests[&uuid].status),
+        [RequestStatus::Preempted, RequestStatus::Waiting]
+    );
+    // The held source is released at the same time. The second source runs
+    // in the next three passes and is held with 310 bytes. The fourth pass
+    // admits the third source, which computes its 4 tokens and is held too.
+    core.apply_command(SchedulerCommand::ReleaseSource {
+        handoff_id: blocker,
+    })
+    .unwrap();
+    let mut trace = TraceCollector::default();
+    let mut admissions = Vec::new();
+    for _ in 0..4 {
+        let result = core.execute_pass(&mut trace, 0.0);
+        admissions.push(
+            result
+                .admissions
+                .iter()
+                .map(|admission| admission.uuid)
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(admissions, [vec![second], vec![], vec![], vec![third]]);
+    assert!(core.source_is_held(waiting) && core.source_is_held(behind));
+    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    assert_eq!(usage(&core), (420, 6));
+}
+
+#[test]
+fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source_leaves() {
+    // A prefill rank of 5 pages in block mode on vLLM 0.31.0 with a budget of
+    // 16 tokens and passes at 0 ms: a full-attention group and a state group
+    // of 16-token blocks, at a hash block of 16. A source of 17 tokens holds
+    // its 16 computed tokens in a full block and a state block, so 3 blocks
+    // are free.
+    for cancel in [false, true] {
+        let mut full = group("full", 16, 100, None);
+        full.prefix_cacheable = Some(true);
+        full.transfer_bytes_per_block = Some(100);
+        let mut recurrent = state("state", 100, 1);
+        recurrent.block_size_tokens = 16;
+        recurrent.prefix_cacheable = Some(true);
+        recurrent.transfer_bytes_per_block = Some(100);
+        let mut args = prefix_core(vec![full, recurrent], 5 * 100, 16, 16, "0.31.0").args;
+        args.worker_type = WorkerType::Prefill;
+        let mut core = VllmCore::new(args);
+        price_passes_at_0_ms(&mut core);
+        let blocker = HandoffId::new(Uuid::from_u128(1652));
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id: blocker,
+            request: DirectRequest {
+                tokens: (1000..1017).collect(),
+                ..source_request(1651, 0)
+            },
+        })
+        .unwrap();
+        held_timing(&mut core);
+        assert_eq!(block_pool(&core).active_blocks(), 2);
+        // A second source of 16 tokens with 3 output tokens, which the
+        // engine API accepts and Replay does not send. Pass 1 computes its
+        // 15 tokens in a full block and a state block and emits the first
+        // output token, and pass 2 computes that token and emits the
+        // second. The 17th token then needs a second full block and, past
+        // the block boundary, a new state block beside the previous one: 2
+        // blocks, and 1 is free. So the source preempts itself in pass 3.
+        // Its readmission in pass 4 counts 2 full blocks and a state block
+        // for its 17 tokens and finds 3. It computes 16 tokens again, and
+        // pass 5 preempts it with the same pool. From pass 6 on it waits.
+        let waiting = HandoffId::new(Uuid::from_u128(1654));
+        let second = Uuid::from_u128(1653);
+        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+            handoff_id: waiting,
+            request: DirectRequest {
+                tokens: (2000..2016).collect(),
+                max_output_tokens: 3,
+                ..source_request(1653, 0)
+            },
+        })
+        .unwrap();
+        assert_eq!(admitting_passes_at_0_ms(&mut core, 10), [1, 4], "{cancel}");
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+        assert_eq!(block_pool(&core).active_blocks(), 2);
+        // The held source is released or cancelled at the same time. The
+        // next pass at that time admits the second source, and the pass
+        // after it computes the 17th token in 4 blocks, emits the third
+        // output token and holds the source.
+        let command = if cancel {
+            SchedulerCommand::CancelSource {
+                handoff_id: blocker,
+            }
+        } else {
+            SchedulerCommand::ReleaseSource {
+                handoff_id: blocker,
+            }
+        };
+        core.apply_command(command).unwrap();
+        assert_eq!(block_pool(&core).active_blocks(), 0);
+        let mut trace = TraceCollector::default();
+        let result = core.execute_pass(&mut trace, 0.0);
+        assert_eq!(
+            result
+                .admissions
+                .iter()
+                .map(|admission| admission.uuid)
+                .collect::<Vec<_>>(),
+            [second],
+            "{cancel}"
+        );
+        assert_eq!(block_pool(&core).active_blocks(), 2);
+        assert!(!core.source_is_held(waiting));
+        block_pool(&core).reset_peak_active_blocks();
+        core.execute_pass(&mut trace, 0.0);
+        assert!(core.source_is_held(waiting), "{cancel}");
+        assert_eq!(block_pool(&core).peak_active_blocks(), 4);
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 2);
+    }
+}
+
 #[test]
 fn grouped_destination_without_state_layers_activates_prebuilt() {
     // Without a Mamba state the backoff is 0: the decode rank loads all 130

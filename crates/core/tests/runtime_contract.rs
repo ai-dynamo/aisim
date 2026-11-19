@@ -1102,6 +1102,61 @@ fn grouped_decode_rank_readmits_a_request_that_made_progress_at_one_time() {
 }
 
 #[test]
+fn grouped_prefill_rank_waits_for_a_transfer_end_after_a_repeated_self_preemption() {
+    // Two distinct prompts of 33 and 49 tokens with 2 output tokens each, in
+    // byte mode, with prefill passes priced at 0 ms, a 16-token budget, a
+    // prefill pool of 6 pages, a decode pool of 32 pages and handoffs at
+    // 1e-5 GB/s, 10 bytes per ms. The prefill rank computes 32 and 48
+    // tokens. It holds q0 at 0 ms with 2 attention pages and the state page,
+    // and the transfer of these 300 bytes ends at 30 ms. q1 computes 16 and
+    // 32 tokens in 3 pages. Its last chunk needs a fourth page, so q1
+    // preempts itself, and its readmission tests only the first chunk, which
+    // fits. With a prefill pass of 0 ms that turn repeats at 0 ms. After the
+    // second self-preemption with the same pool, replay lets q1 wait for
+    // the next event, the release of q0 at 30 ms. Then q1 computes its 48
+    // tokens and is held. The decode rank runs q0 from 30 ms and reserves q1
+    // when that pass ends, at 32 ms, so the 400 bytes of q1 arrive at 72 ms.
+    // Each request emits its 2 outputs in the two decode passes after its
+    // activation.
+    for async_scheduling in [true, false] {
+        let requests = distinct_requests(&[(33, 2, 0.0), (49, 2, 0.0)]);
+        let mut spec = small_grouped_pd_spec(requests, 32, None);
+        let rank = &mut spec.engine["rank"];
+        rank["kv_transfer_bandwidth"] = 1e-5.into();
+        rank["timing_model"] =
+            serde_json::json!({"type": "fixed", "prefill_ms": 0.0, "decode_ms": 2.0});
+        rank["max_num_batched_tokens"] = 16.into();
+        rank["async_scheduling"] = async_scheduling.into();
+        let mut prefill = spec.engine["rank"].clone();
+        prefill["kv_cache_capacity_bytes"] = (6 * 100).into();
+        spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+        let report = run_within_60_s(spec);
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{async_scheduling}"
+        );
+        let (q0, q1) = (record(&report, "q0"), record(&report, "q1"));
+        let prefill_admissions: Vec<f64> = q1
+            .admission_history
+            .iter()
+            .filter(|admission| admission.pool == ReplayRequestPool::Prefill)
+            .map(|admission| admission.at_ms)
+            .collect();
+        assert_eq!(prefill_admissions, [0.0, 0.0, 30.0], "{async_scheduling}");
+        assert_eq!(
+            (q0.source_held_ms, q0.source_released_ms, q1.source_held_ms),
+            (Some(0.0), Some(30.0), Some(30.0)),
+            "{async_scheduling}"
+        );
+        assert_eq!(
+            [q0, q1].map(|record| (record.destination_activated_ms, record.terminal_time_ms)),
+            [(Some(30.0), 34.0), (Some(72.0), 76.0)],
+            "{async_scheduling}"
+        );
+    }
+}
+
+#[test]
 fn grouped_roles_with_two_vllm_versions_cannot_pair() {
     // A grouped handoff follows the transfer rules of one vLLM version, so a
     // prefill rank of vLLM 0.31.0 cannot hand off to a decode rank of 0.32.0.

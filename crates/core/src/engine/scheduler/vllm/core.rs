@@ -109,7 +109,7 @@ pub(crate) struct VllmRequestState {
     self_preemption: Option<Box<SelfPreemption>>,
 }
 
-/// A request's last self-preemption on a grouped decode rank.
+/// A request's last self-preemption on a grouped prefill or decode rank.
 struct SelfPreemption {
     /// The bits of the virtual time, the pool state and the number of
     /// running requests after the preemption.
@@ -2733,7 +2733,7 @@ impl VllmCore {
                     self.state.compact_running();
                 }
                 ScheduleOutcome::CurrentPreempted { computed_tokens } => {
-                    if let Some(point) = self.grouped_decode_point(now_ms)
+                    if let Some(point) = self.self_preemption_point(now_ms)
                         && let Some(request) = self.state.requests.get_mut(&uuid)
                     {
                         let progress = (request.sequence.len(), computed_tokens);
@@ -3132,17 +3132,17 @@ impl VllmCore {
                 }
                 decision => decision,
             };
-            // Only a grouped decode rank records a self-preemption.
-            let grouped_decode =
-                self.args.worker_type == WorkerType::Decode && self.kv_manager.grouped().is_some();
+            // Only a grouped prefill or decode rank records a self-preemption.
+            // It alone has transfer rules.
+            let records_self_preemption = self.kv_manager.grouped_transfer().is_some();
             let prefill_cost = match decision {
                 AdmissionDecision::Admit { .. }
-                    if grouped_decode && self.defers_readmission(uuid, now_ms) =>
+                    if records_self_preemption && self.defers_readmission(uuid, now_ms) =>
                 {
                     break;
                 }
                 AdmissionDecision::Admit { prefill_cost } => {
-                    if grouped_decode
+                    if records_self_preemption
                         && let Some(last) = self
                             .state
                             .requests
@@ -3610,14 +3610,13 @@ impl VllmCore {
     }
 
     /// The bits of the virtual time, the pool state and the number of running
-    /// requests of a grouped decode rank. A pass schedules its running
-    /// requests before a waiting one, and each takes token budget from the
-    /// chunks of that request. The bytes that a sliding-window group holds
-    /// for a chunk depend on where the chunk starts.
-    fn grouped_decode_point(&self, now_ms: f64) -> Option<(u64, GroupedPoolState, usize)> {
-        if self.args.worker_type != WorkerType::Decode {
-            return None;
-        }
+    /// requests of a grouped prefill or decode rank. A pass schedules its
+    /// running requests before a waiting one, and each takes token budget
+    /// from the chunks of that request. The bytes that a sliding-window group
+    /// holds for a chunk depend on where the chunk starts.
+    fn self_preemption_point(&self, now_ms: f64) -> Option<(u64, GroupedPoolState, usize)> {
+        // Only a prefill or decode rank has transfer rules.
+        self.kv_manager.grouped_transfer()?;
         let pool = self.kv_manager.grouped()?;
         Some((
             now_ms.to_bits(),
@@ -3626,20 +3625,28 @@ impl VllmCore {
         ))
     }
 
-    /// A grouped decode rank prices the recompute after a preemption at 0 ms,
-    /// so a turn that ends in the same self-preemption can repeat at one time
-    /// without end. A request that preempted itself twice at this time, with
-    /// the same sequence length and computed tokens, the same pool state and
-    /// the same number of running requests, waits until the time, the pool
-    /// state or that number changes. vLLM repeats the turn until a transfer
-    /// finishes.
+    /// A grouped decode rank prices the recompute after a preemption at 0 ms.
+    /// A grouped prefill rank prices only the prompt tokens of a pass, so a
+    /// pass there takes 0 ms when the timing prices them at 0 ms or when it
+    /// computes none. So on both ranks a turn that ends in the same
+    /// self-preemption can repeat at one time without end. A request that
+    /// preempted itself twice at this time, with the same sequence length and
+    /// computed tokens, the same pool state and the same number of running
+    /// requests, waits until the time, the pool state or that number changes.
+    /// vLLM repeats the turn until a transfer finishes. On a prefill worker
+    /// the end of a transfer frees the blocks of its source (V31
+    /// `sched:3155-3158`, V32 `sched:3232-3235`). By default vLLM schedules
+    /// a preempted request again only when its whole sequence fits (V31
+    /// `mgr:519-536`, `sched:1223-1230`, V32 `mgr:522-539`,
+    /// `sched:1275-1282`). Byte mode admits on the first chunk, so there
+    /// vLLM keeps the request waiting where replay repeats the turn.
     fn defers_readmission(&self, uuid: Uuid, now_ms: f64) -> bool {
         self.state
             .requests
             .get(&uuid)
             .and_then(|request| request.self_preemption.as_deref())
             .is_some_and(|last| {
-                last.repeated && Some(last.point) == self.grouped_decode_point(now_ms)
+                last.repeated && Some(last.point) == self.self_preemption_point(now_ms)
             })
     }
 
