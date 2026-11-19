@@ -326,6 +326,26 @@ def record_files(directory: str | Path) -> list[Path]:
     return sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
 
 
+def record_paths(directory: str | Path, *, recursive: bool = False) -> list[Path]:
+    """Discover records separately from their declared JSON sidecars.
+
+    Undeclared JSON is still a record candidate, so malformed records fail in the
+    caller. A successfully loaded record is never hidden by an artifact reference.
+    """
+    root = Path(directory)
+    paths = sorted(root.rglob("*.json") if recursive else root.glob("*.json"))
+    records: set[Path] = set()
+    artifacts: set[Path] = set()
+    for path in paths:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        artifacts.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in paths if p in records or p not in artifacts]
+
+
 def _load_all(directory: str | Path) -> list[EvalRecord]:
     # Corrupt content at a valid record filename is still rejected by load_record.
     return [load_record(p) for p in record_files(directory)]

@@ -21,11 +21,15 @@ finding is final: a candidate with any error finding must not reach a workflow.
 from __future__ import annotations
 
 import json
+import math
 import posixpath
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
+
+import yaml
 
 PARQUET_MAGIC = b"PAR1"
 LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/"
@@ -167,10 +171,10 @@ def check_listing(policy: CandidatePolicy, files: Iterable[CandidateFile]) -> li
 
 
 def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tail: bytes = b"") -> list[Finding]:
-    """Check magic bytes and JSON shape from the first and last bytes of a file.
+    """Check magic bytes and structured text from the first and last bytes of a file.
 
     ``head`` is the first bytes (at least 16 when available), ``tail`` the last
-    four bytes. JSON files must be complete in ``head`` (small enough to read).
+    four bytes. JSON/YAML must fit ``max_json_bytes`` and be complete in ``head``.
     """
     path = file.path
     suffix = posixpath.splitext(path)[1].lower()
@@ -185,17 +189,60 @@ def check_content(policy: CandidatePolicy, file: CandidateFile, head: bytes, tai
     if suffix == ".parquet":
         if head[:4] != PARQUET_MAGIC or tail[-4:] != PARQUET_MAGIC:
             out.append(Finding("parquet-magic", "not a Parquet file (missing PAR1 magic)", path))
-    elif suffix == ".json":
+    elif suffix in {".json", ".yaml"}:
+        kind = suffix[1:]
         if file.size > policy.max_json_bytes:
-            out.append(Finding("json-too-large", f"JSON over {policy.max_json_bytes} bytes", path))
+            out.append(Finding(f"{kind}-too-large", f"{kind.upper()} over {policy.max_json_bytes} bytes", path))
         elif len(head) < file.size:
-            out.append(Finding("json-incomplete", "full JSON content is needed for the check", path))
+            out.append(Finding(f"{kind}-incomplete", f"full {kind.upper()} content is needed for the check", path))
         else:
             try:
-                json.loads(head.decode("utf-8"), parse_constant=_reject_constant)
+                if suffix == ".yaml":
+                    yaml_sidecar_value(head)
+                else:
+                    json.loads(head.decode("utf-8"), parse_constant=_reject_constant)
             except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-                out.append(Finding("json-invalid", f"not strict UTF-8 JSON: {exc}", path))
+                out.append(Finding(f"{kind}-invalid", f"not strict UTF-8 {kind.upper()}: {exc}", path))
     return out
+
+
+def yaml_sidecar_value(data: bytes):
+    """Safely read operation metadata; retain shared YAML aliases without expanding them."""
+    try:
+        value = yaml.safe_load(data.decode("utf-8"))
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise ValueError(f"invalid YAML sidecar: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("YAML sidecar must contain a mapping")
+
+    active: set[int] = set()
+    checked: set[int] = set()
+
+    def check(item):
+        if isinstance(item, (dict, list)):
+            marker = id(item)
+            if marker in active:
+                raise ValueError("cyclic YAML aliases are not supported")
+            if marker in checked:
+                return
+            active.add(marker)
+            for child in item:
+                check(child)
+                if isinstance(item, dict):
+                    check(item[child])
+            active.remove(marker)
+            checked.add(marker)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("non-finite YAML scalar")
+        elif item is not None and not isinstance(item, (str, bool, int, float, date, datetime)):
+            raise ValueError(f"unsupported YAML scalar type: {type(item).__name__}")
+
+    # Binary, sets and cycles must fail rather than escape the text scanner.
+    try:
+        check(value)
+    except RecursionError as exc:
+        raise ValueError("YAML sidecar is too deeply nested") from exc
+    return value
 
 
 def _reject_constant(name: str):

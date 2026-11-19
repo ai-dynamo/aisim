@@ -46,7 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from aisim_core.data import Artifact, CategoryIndex, DatasetIndex, Entry, Manifest
 from aisim_core.data.catalog import CATALOG_DIR, build_catalog
 from aisim_core.data.e2e import read_snapshot
-from aisim_core.data.eval import load_record
+from aisim_core.data.eval import load_record, record_paths
 from aisim_core.data.hygiene import Finding
 from aisim_core.data.mirror import (
     INTERNAL_REPO,
@@ -103,7 +103,15 @@ class PromotionPolicy:
     @classmethod
     def from_file(cls, path: str | Path) -> PromotionPolicy:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(reviewers=frozenset(raw["reviewers"]), min_approvals=int(raw.get("min_approvals", 1)))
+        if not isinstance(raw, dict) or not isinstance(raw.get("reviewers"), list):
+            raise ValueError("reviewers must be a list of non-empty strings")
+        reviewers = raw["reviewers"]
+        if any(not isinstance(name, str) or not name.strip() for name in reviewers):
+            raise ValueError("reviewers must be a list of non-empty strings")
+        threshold = raw.get("min_approvals", 1)
+        if type(threshold) is not int or threshold < 1:
+            raise ValueError("min_approvals must be a positive integer")
+        return cls(reviewers=frozenset(reviewers), min_approvals=threshold)
 
 
 @dataclass
@@ -180,6 +188,7 @@ def _select(source: Path, directories: list[str], plan: PromotionPlan) -> None:
 
 def _check_closure(source: Path, plan: PromotionPlan) -> None:
     chosen = set(plan.files)
+    eval_records = {p.relative_to(source).as_posix() for p in record_paths(source / "eval", recursive=True)}
     configs: set[str] = set()
     for rel in sorted(chosen):
         if rel.endswith("/manifest.json"):
@@ -210,7 +219,7 @@ def _check_closure(source: Path, plan: PromotionPlan) -> None:
                 plan.findings.append(
                     Finding("snapshot-spans", f"snapshot has members outside the selection: {outside[:3]}", rel)
                 )
-        if rel.startswith("eval/") and rel.endswith(".json"):
+        if rel in eval_records:
             try:
                 record = load_record(source / rel)
             except (ValueError, ValidationError, OSError) as exc:
@@ -222,7 +231,7 @@ def _check_closure(source: Path, plan: PromotionPlan) -> None:
                     plan.findings.append(Finding("closure", f"artifact {a.path} is outside the selection", rel))
     eval_needs = set()
     for rel in chosen:
-        if rel.startswith("eval/") and rel.endswith(".json"):
+        if rel in eval_records:
             try:
                 eval_needs |= set(load_record(source / rel).truth.configuration_ids)
             except (ValueError, ValidationError, OSError):
