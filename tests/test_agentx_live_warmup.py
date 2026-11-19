@@ -719,7 +719,7 @@ def test_cli_runs_warmup_only_on_a_stack_that_advertises_it(tmp_path, monkeypatc
     assert f"before selecting {policy}" in capsys.readouterr().err
 
 
-def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True, leftovers=None):
+def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True, leftovers=None, output_adapter=False):
     (tmp_path / "warmup_stacks.py").write_text(
         "from dataclasses import replace\n\n"
         "from aisim.runner import EngineReplayRunnerFactory\n\n\n"
@@ -754,6 +754,23 @@ def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True, lef
         "        with Path(__file__).with_name('capabilities.log').open('a') as log:\n"
         "            log.write('called\\n')\n"
         "        raise RuntimeError('broken plugin')\n"
+        "\nclass LoggingOutputAdapter:\n"
+        "    name = 'warmup_log'\n"
+        "    api_version = 1\n"
+        "    def record(self, event):\n"
+        "        from pathlib import Path\n"
+        "        with Path(__file__).with_name('adapter.log').open('a') as log:\n"
+        "            log.write(event + '\\n')\n"
+        "    def subscribe(self, config):\n"
+        "        from aisim.output_adapter import RecommendationOutputCallbacks\n"
+        "        self.record('subscribe')\n"
+        "        return RecommendationOutputCallbacks(\n"
+        "            on_complete=lambda: self.record('complete'),\n"
+        "            on_failure=lambda error: self.record('failure: ' + str(error)),\n"
+        "        )\n"
+        "    def write(self, config, *, result, output_dir):\n"
+        "        self.record('write')\n"
+        "        return []\n"
     )
     metadata = tmp_path / "warmup_stacks-1.0.dist-info"
     metadata.mkdir()
@@ -766,6 +783,8 @@ def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True, lef
         "constructor_resource_refusal = warmup_stacks:ConstructorResourceRefusal\n"
         "interrupted = warmup_stacks:Interrupted\n"
         "broken = warmup_stacks:Broken\n"
+        "\n[aisim.output_adapters]\n"
+        "warmup_log = warmup_stacks:LoggingOutputAdapter\n"
     )
     output = tmp_path / "output"
     output.mkdir()
@@ -785,11 +804,16 @@ def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True, lef
     for name, contents in original.items():
         (output / name).write_text(contents)
     config = warmup_cli_config(tmp_path, command, policy)
+    if output_adapter:
+        raw = yaml.safe_load(config.read_text())
+        raw["warmup_log"] = {}
+        config.write_text(yaml.safe_dump(raw))
     path = os.pathsep.join(filter(None, (str(tmp_path), os.environ.get("PYTHONPATH"))))
     result = subprocess.run(
         [sys.executable, "-m", "aisim", command, "--config", str(config), "--stack", stack]
         + ["--output-dir", str(output), "--format", "json"]
-        + (["--overwrite"] if overwrite else []),
+        + (["--overwrite"] if overwrite else [])
+        + (["--output", "warmup_log"] if output_adapter else []),
         env={**os.environ, "PYTHONPATH": path},
         capture_output=True,
         text=True,
@@ -816,6 +840,24 @@ def test_cli_without_overwrite_refuses_an_unsupported_policy_with_exit_2(tmp_pat
     assert f"before selecting {policy}" in result.stderr
     # Refused before resource admission and output adapters: the run writes nothing.
     assert outputs == {}
+
+
+@pytest.mark.parametrize("policy", ["live_trajectory_v1", "primers_only"])
+@pytest.mark.parametrize("stack", ["silent", "advertising"])
+def test_recommendation_cli_checks_policy_before_output_adapter_callbacks(tmp_path, policy, stack):
+    result, _, outputs = run_installed_stack(
+        tmp_path, "recommend", stack, policy, overwrite=False, output_adapter=True
+    )
+    log = tmp_path / "adapter.log"
+    if stack == "silent":
+        assert result.returncode == 2, result.stderr
+        assert f"before selecting {policy}" in result.stderr
+        assert not log.exists(), "a refused policy must neither subscribe nor call on_failure"
+        assert outputs == {}
+    else:
+        assert result.returncode == 0, result.stderr
+        assert log.read_text().splitlines() == ["subscribe", "complete", "write"]
+        assert json.loads(outputs["recommendation.json"])["candidates"]
 
 
 FAILED_RUN = {

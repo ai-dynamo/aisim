@@ -514,7 +514,7 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
         # Old estimator fields keep working and warn once, here in the process the
         # user started. The call stays outside every try: when warnings are turned
         # into errors, the warning must not be reported as a configuration error.
-        warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw)
+        warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw, stacklevel=3)
     # The output directory stays locked until the last report below is written.
     with OutputDirectoryOwnership() as ownership:
         event_output = None
