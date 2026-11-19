@@ -71,6 +71,15 @@ def test_gz_suffix_follows_the_policy_allow_list():
     assert "suffix" in codes(check_listing(pkl, [CandidateFile("data/x.pkl", 1)]))  # code stays forbidden
 
 
+@pytest.mark.parametrize("suffix", [".json", ".gz"])
+def test_empty_head_cannot_attest_nonempty_content(suffix):
+    policy = dataclasses.replace(POLICY, allowed_suffixes=POLICY.allowed_suffixes | {".gz"})
+    file = CandidateFile("data/payload" + suffix, 20)
+    assert "no-sample" in codes(check_candidate(policy, "alice", [file], {file.path: (b"", b"tail")}).findings)
+    empty = dataclasses.replace(file, size=0)
+    assert "no-sample" not in codes(check_candidate(policy, "alice", [empty], {empty.path: (b"", b"")}).findings)
+
+
 def test_root_matching_uses_directory_boundaries():
     policy = dataclasses.replace(POLICY, allowed_roots=("data",))
     assert check_listing(policy, [CandidateFile("data/x.json", 2)]) == []
