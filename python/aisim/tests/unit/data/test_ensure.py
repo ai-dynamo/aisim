@@ -66,7 +66,7 @@ def stub_prepare(monkeypatch):
 @pytest.fixture
 def files(tmp_path):
     files = build_repo(tmp_path)
-    index = json.loads(files["catalog/fpm/index.json"])
+    index = json.loads(files["catalog/fpm.json"])
     for entry in index["entries"]:
         path = entry["manifest"]["path"]
         manifest = json.loads(files[path])
@@ -78,10 +78,10 @@ def files(tmp_path):
         manifest["artifacts"].append(profile)
         files[path] = json.dumps(manifest).encode()
         entry["manifest"] = _artifact_json("m", path, files[path], format="json", schema="aisim-artifact-manifest/v1")
-    files["catalog/fpm/index.json"] = json.dumps(index).encode()
+    files["catalog/fpm.json"] = json.dumps(index).encode()
     dataset = json.loads(files["catalog/dataset.json"])
     dataset["categories"]["fpm"]["index"] = _artifact_json(
-        "i", "catalog/fpm/index.json", files["catalog/fpm/index.json"], format="json", schema="aisim-category-index/v1"
+        "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
     )
     files["catalog/dataset.json"] = json.dumps(dataset).encode()
     return files
@@ -148,7 +148,7 @@ def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
 
 
 def test_omitted_topology_keeps_ambiguous_catalog_entries_explicit(tmp_path, files):
-    index = json.loads(files["catalog/fpm/index.json"])
+    index = json.loads(files["catalog/fpm.json"])
     ids = []
     for entry, tp in zip(index["entries"], (1, 4), strict=True):
         path = entry["manifest"]["path"]
@@ -165,10 +165,10 @@ def test_omitted_topology_keeps_ambiguous_catalog_entries_explicit(tmp_path, fil
             identity=identity.model_dump(),
             manifest=_artifact_json("m", path, files[path], format="json", schema="aisim-artifact-manifest/v1"),
         )
-    files["catalog/fpm/index.json"] = json.dumps(index).encode()
+    files["catalog/fpm.json"] = json.dumps(index).encode()
     dataset = json.loads(files["catalog/dataset.json"])
     dataset["categories"]["fpm"]["index"] = _artifact_json(
-        "i", "catalog/fpm/index.json", files["catalog/fpm/index.json"], format="json", schema="aisim-category-index/v1"
+        "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
     )
     files["catalog/dataset.json"] = json.dumps(dataset).encode()
 

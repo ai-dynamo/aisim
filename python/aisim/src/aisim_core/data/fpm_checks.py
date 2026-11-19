@@ -267,7 +267,7 @@ def _check_entry_matches_manifest(entry, manifest: Manifest) -> list[FpmFinding]
 
 
 def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list[FpmFinding]:
-    """Check every FPM entry listed by ``catalog/fpm/index.json`` (or ``catalog/dataset.json``) of a local root."""
+    """Check every FPM entry listed by ``catalog/fpm.json`` (or ``catalog/dataset.json``) of a local root."""
     from aisim_core.data import CategoryIndex, DatasetIndex
 
     root = Path(root)
