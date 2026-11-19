@@ -46,6 +46,9 @@ pub(crate) fn resolve_op_sources(
         .expect("fixed-map resolution is infallible")
 }
 
+/// Reloads allowed when a staged-library marker changes during a shared load.
+const SHARED_LOAD_GENERATION_ATTEMPTS: usize = 3;
+
 /// Stable identity string for one load input set, used as the shared-tables
 /// memo key. The resolver renders its own identity: live resolution is a pure
 /// function of the load identity + policy; a fixed map renders its full
@@ -766,38 +769,58 @@ impl PerfDatabase {
             strict_provenance,
         )?;
         let resolver = Arc::new(SourceResolver::live(ctx));
-        let key = shared_tables_key(
-            systems_root,
-            system,
-            backend,
-            version,
-            &resolver,
-            fpm_parquet_path,
-        );
-        if let Some(tables) = memo
-            .lock()
-            .unwrap()
-            .get(&key)
-            .and_then(|(_, tables)| tables.upgrade())
-        {
-            return Ok(Self::from_tables(tables));
+        // A staging replacement can land between the marker read and the data
+        // reads. Accept a load only if the marker is unchanged after it;
+        // otherwise reload, so one load never memoizes mixed generations.
+        for _ in 0..SHARED_LOAD_GENERATION_ATTEMPTS {
+            let key = shared_tables_key(
+                systems_root,
+                system,
+                backend,
+                version,
+                &resolver,
+                fpm_parquet_path,
+            );
+            if let Some(tables) = memo
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|(_, tables)| tables.upgrade())
+            {
+                return Ok(Self::from_tables(tables));
+            }
+            let db = Self::load_with_resolver(
+                systems_root,
+                system,
+                backend,
+                version,
+                resolver.clone(),
+                false,
+                fpm_parquet_path,
+            )?;
+            let settled = shared_tables_key(
+                systems_root,
+                system,
+                backend,
+                version,
+                &resolver,
+                fpm_parquet_path,
+            );
+            if settled != key {
+                continue;
+            }
+            let mut map = memo.lock().unwrap();
+            map.retain(|_, (_, tables)| tables.strong_count() > 0);
+            map.insert(
+                key,
+                (systems_root.to_path_buf(), Arc::downgrade(&db.tables)),
+            );
+            return Ok(db);
         }
-        let db = Self::load_with_resolver(
-            systems_root,
-            system,
-            backend,
-            version,
-            resolver,
-            false,
-            fpm_parquet_path,
-        )?;
-        let mut map = memo.lock().unwrap();
-        map.retain(|_, (_, tables)| tables.strong_count() > 0);
-        map.insert(
-            key,
-            (systems_root.to_path_buf(), Arc::downgrade(&db.tables)),
-        );
-        Ok(db)
+        Err(AicError::PerfDatabase(format!(
+            "staged FPM library under {} changed during every load attempt; retry after staging completes",
+            systems_root.display()
+        )))
     }
 
     /// Fresh default-mode view over `tables`. Per-view state (query mode,

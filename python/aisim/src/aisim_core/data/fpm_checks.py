@@ -201,7 +201,12 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
                 parquet_sha256=library.sha256,
                 metadata_sha256=sidecar.sha256,
             )
-            check_effective_measurement_policy(effective)
+            check_effective_measurement_policy(
+                effective,
+                system=manifest.identity.hardware,
+                backend=manifest.identity.framework,
+                backend_version=manifest.identity.framework_version,
+            )
         except (FpmContractError, OSError, ValueError) as exc:
             add("invalid-sidecar", str(exc))
     return found

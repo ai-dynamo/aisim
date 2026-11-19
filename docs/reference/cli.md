@@ -128,8 +128,9 @@ dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_
 
 For FPM dataset selection, omitted topology leaves parallelism unfiltered. If both TP1 and TP4 entries
 match, `ensure_data` raises an ambiguity error; supply an explicit topology or set
-`AISIM_DATA_CONFIGURATION` to choose an entry. Explicit all-ones topology selects TP1. Prediction-time
-topology defaults do not silently choose among dataset entries.
+`AISIM_DATA_CONFIGURATION` to choose an entry. Explicit all-ones topology selects TP1. A typed `ForwardPassPerfModelConfig` applies its topology defaults (all ones) before `ensure_data`,
+so a typed instance built without topology selects TP1 rather than raising ambiguity; pass the
+topology explicitly to choose another entry.
 
 <a id="non-python-consumers"></a>
 
