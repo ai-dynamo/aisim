@@ -1570,11 +1570,15 @@ def _kimi_k31_dsa_expand(phase: str) -> Callable[[], list[ModuleCase]]:
         cases = []
         for model in _model_case_values("kimi_k31_dsa_module"):
             heads = model["native_num_heads"]
+            for field in ("tensor_parallel_sizes", "kv_cache_dtypes"):
+                if not model[field]:
+                    raise ValueError(f"native Kimi K3.1 requires non-empty {field}")
+            points = _long_context_points(phase, sweep, model["max_position_embeddings"])
             for tp in model["tensor_parallel_sizes"]:
-                if type(tp) is not int or tp <= 0 or heads % tp:
+                if type(tp) is not int or tp <= 0 or heads % tp or heads // tp not in (96, 48, 24, 12):
                     raise ValueError(f"invalid native Kimi K3.1 TP geometry: {heads=}, {tp=}")
                 for kv in model["kv_cache_dtypes"]:
-                    for batch, length, prefix in _long_context_points(phase, sweep, model["max_position_embeddings"]):
+                    for batch, length, prefix in points:
                         cases.append(
                             ModuleCase(
                                 length,

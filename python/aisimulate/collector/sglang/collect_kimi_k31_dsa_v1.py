@@ -63,7 +63,7 @@ def get_kimi_k31_dsa_generation_test_cases():
     return plan_cases("kimi_k31_dsa_generation_module", "sglang", get_sm_version())
 
 
-def validate_case(case: ModuleCase) -> int:
+def validate_case(case: ModuleCase, phase: str | None = None) -> int:
     if case.model_path != MODEL or case.num_heads not in (96, 48, 24, 12):
         raise ValueError(f"unsupported native Kimi K3.1 case: {case}")
     if case.compute_dtype != "bfloat16" or case.gemm_type != "bfloat16":
@@ -73,6 +73,8 @@ def validate_case(case: ModuleCase) -> int:
         raise ValueError(f"native Kimi K3.1 requires FP8 KV; got {case.kv_cache_dtype}")
     if min(case.seq_len, case.batch_size) <= 0 or case.prefix_len < 0:
         raise ValueError(f"invalid workload: {case}")
+    if phase == "generation" and (case.seq_len <= 1 or case.prefix_len != 0):
+        raise ValueError("native Kimi K3.1 generation requires seq_len > 1 and prefix_len = 0")
     if case.seq_len + case.prefix_len > 1048576:
         raise ValueError("Kimi K3.1 workload exceeds the native context limit")
     return NATIVE_HEADS // case.num_heads
@@ -137,7 +139,7 @@ def perf_item(case: ModuleCase, phase: str, latency: float) -> dict:
         "num_heads": case.num_heads,
         "batch_size": case.batch_size,
         "isl": case.seq_len if phase == "context" else 1,
-        "tp_size": validate_case(case),
+        "tp_size": validate_case(case, phase),
         "step": case.prefix_len if phase == "context" else case.seq_len - 1,
         "latency": f"{latency:.4f}",
     }
@@ -204,59 +206,67 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
 
 
 def _run_native_case(case, device, perf_filename):
-    validate_case(case)
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
     output = Path(perf_filename)
     previous_size = output.stat().st_size if output.exists() else 0
     phase = "context" if "context" in Path(perf_filename).name else "generation"
+    validate_case(case, phase)
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
-    with subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "collector.sglang.collect_kimi_k31_dsa_v1",
-            "--case",
-            json.dumps(list(case)),
-            "--phase",
-            phase,
-            "--output",
-            str(Path(perf_filename).resolve()),
-            "--device",
-            str(device),
-        ],
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    ) as process:
-        stderr = ""
-        try:
-            _, stderr = process.communicate(timeout=NATIVE_CASE_TIMEOUT_S)
-        except BaseException as error:
-            # Kill the spawned TP ranks too: they can retain the stderr pipe
-            # and GPU allocation after the launcher dies.
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "collector.sglang.collect_kimi_k31_dsa_v1",
+                "--case",
+                json.dumps(list(case)),
+                "--phase",
+                phase,
+                "--output",
+                str(Path(perf_filename).resolve()),
+                "--device",
+                str(device),
+            ],
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        ) as process:
+            stderr = ""
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _, stderr = process.communicate()
-            if isinstance(error, subprocess.TimeoutExpired):
-                error.stderr = stderr
-            raise
-        finally:
-            if stderr:
-                sys.stderr.write(stderr)
-        if process.returncode:
-            for line in reversed(stderr.splitlines()):
-                reason = line.strip().removeprefix("RuntimeError: ")
-                if reason.startswith("FIXME(kernel-limit):"):
-                    raise RuntimeError(reason)
-            raise RuntimeError(f"native K31 worker exited {process.returncode}: {stderr[-2000:]}")
-    # The full-node route owns this output exclusively. A successful process
-    # must have appended its row before the orchestrator checkpoints success.
-    if not output.is_file() or output.stat().st_size <= previous_size:
-        raise RuntimeError("native K31 worker exited successfully without writing its result row")
+                _, stderr = process.communicate(timeout=NATIVE_CASE_TIMEOUT_S)
+            except BaseException as error:
+                # Kill the spawned TP ranks too: they can retain the stderr pipe
+                # and GPU allocation after the launcher dies.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _, stderr = process.communicate()
+                if isinstance(error, subprocess.TimeoutExpired):
+                    error.stderr = stderr
+                raise
+            finally:
+                if stderr:
+                    sys.stderr.write(stderr)
+            if process.returncode:
+                for line in reversed(stderr.splitlines()):
+                    reason = line.strip().removeprefix("RuntimeError: ")
+                    if reason.startswith("FIXME(kernel-limit):"):
+                        raise RuntimeError(reason)
+                raise RuntimeError(f"native K31 worker exited {process.returncode}: {stderr[-2000:]}")
+        # The full-node route owns this output exclusively. A successful process
+        # must have appended its row before the orchestrator checkpoints success.
+        if not output.is_file() or output.stat().st_size <= previous_size:
+            raise RuntimeError("native K31 worker exited successfully without writing its result row")
+    except BaseException:
+        # This route exclusively owns its staged output. Failed attempts must
+        # contribute no rows, even if the child appended before it failed.
+        if output.exists():
+            with output.open("r+b") as stream:
+                stream.truncate(previous_size)
+        raise
 
 
 def _assert_runtime() -> None:
@@ -535,7 +545,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     case = ModuleCase(*json.loads(args.case))
-    tp = validate_case(case)
+    tp = validate_case(case, args.phase)
     _assert_runtime()
     import torch
     from huggingface_hub import hf_hub_download, snapshot_download

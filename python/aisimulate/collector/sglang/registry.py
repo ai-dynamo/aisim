@@ -9,6 +9,16 @@ The Kimi K3.1 preview route requires its dedicated model-scoped runtime.
 
 from collector.registry_types import OpEntry, PerfFile, VersionRoute
 
+
+def require_kimi_k31_runtime(installed_version: str, requested_ops: set[str]) -> None:
+    """The native preview requires its complete build identity before queueing."""
+    for entry in REGISTRY:
+        if entry.op.startswith("kimi_k31_dsa_") and entry.op in requested_ops:
+            expected = entry.versions[0].min_version
+            if installed_version != expected:
+                raise RuntimeError(f"native Kimi K3.1 requires exactly {expected}; found {installed_version}")
+
+
 REGISTRY: list[OpEntry] = [
     OpEntry(
         op="kimi_k31_dsa_context_module",

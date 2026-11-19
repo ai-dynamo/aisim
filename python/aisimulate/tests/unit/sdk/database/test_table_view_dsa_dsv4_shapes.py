@@ -596,3 +596,36 @@ def test_context_fmha_capability_filters_native_dsa_architecture_axis(systems_ro
     assert context_fmha_supported_modes(
         db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=DEFAULT_DSA_ARCHITECTURE
     ) == ["fp8"]
+
+
+@pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
+def test_native_dsa_capabilities_match_physical_bucket_and_gemm(systems_root, attention_backend):
+    from aisimulate_core.sdk.perf_database import context_fmha_supported_modes, dsa_generation_supported_modes
+
+    architecture = "KimiK31ForConditionalGeneration"
+    # These synthetic rows exercise the actual Rust table view and its typed
+    # keys. The packed lane has BF16 projections; the raw lane has FP8 ones.
+    rows = [
+        _dsa_row(
+            architecture=architecture,
+            kv_cache_dtype="fp8",
+            mla_dtype="fp8",
+            gemm_type=gemm,
+            num_heads=12,
+            kernel_source=source,
+        )
+        for gemm, source in [
+            ("bfloat16", "sglang_dsa_indexer_flashmla_kv_kv_flashmla_packed_eager"),
+            ("fp8", "sglang_dsa_indexer_trtllm_kv_raw_fp8_eager"),
+        ]
+    ]
+    _write_parquet(systems_root, DSA_CTX_REL, rows)
+    _write_parquet(systems_root, DSA_GEN_REL, rows)
+    db = _build_db(systems_root)
+    for gemm in (common.GEMMQuantMode.bfloat16, common.GEMMQuantMode.fp8):
+        identity = dict(architecture=architecture, attention_backend=attention_backend, gemm_quant_mode=gemm)
+        expected = ["fp8"] if (attention_backend == "flashmla") == (gemm == common.GEMMQuantMode.bfloat16) else []
+        assert (
+            context_fmha_supported_modes(db, "dsa_context_module", common.KVCacheQuantMode.fp8, **identity) == expected
+        )
+        assert dsa_generation_supported_modes(db, **identity) == expected

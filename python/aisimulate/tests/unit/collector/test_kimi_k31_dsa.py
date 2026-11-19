@@ -106,6 +106,70 @@ def test_case_plan_uses_native_tp_shards_and_supported_cache_precision(monkeypat
         assert not plan(op, "vllm", 103).cases
 
 
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("tensor_parallel_sizes", [], "non-empty tensor_parallel_sizes"),
+        ("kv_cache_dtypes", [], "non-empty kv_cache_dtypes"),
+        ("tensor_parallel_sizes", [3], "invalid native Kimi K3.1 TP geometry"),
+        ("tensor_parallel_sizes", [16], "invalid native Kimi K3.1 TP geometry"),
+    ],
+)
+def test_native_plan_rejects_unresolvable_declarations(monkeypatch, phase, field, value, message):
+    import collector.op_plans as module
+
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
+    rows = [dict(row) for row in module._model_case_values("kimi_k31_dsa_module")]
+    assert rows
+    rows[0][field] = value
+    monkeypatch.setattr(module, "_model_case_values", lambda _op: rows)
+    with pytest.raises(ValueError, match=message):
+        OP_PLANS[f"kimi_k31_dsa_{phase}_module"].expand()
+
+
+@pytest.mark.parametrize(("length", "prefix"), [(1, 0), (8192, 64)])
+def test_generation_coordinates_fail_before_native_runtime(monkeypatch, tmp_path, length, prefix):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    case = ModuleCase(length, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, prefix)
+    assert validate_case(case, "context") == 1
+    monkeypatch.setattr(module, "_assert_runtime", lambda: pytest.fail("loaded native runtime"))
+    monkeypatch.setattr(
+        sys, "argv", ["collector", "--case", json.dumps(list(case)), "--phase", "generation", "--output", str(tmp_path)]
+    )
+    with pytest.raises(ValueError, match="generation requires"):
+        module.main()
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_a, **_k: pytest.fail("launched invalid native case"))
+    with pytest.raises(ValueError, match="generation requires"):
+        module._run_native_case(case, "cuda:0", tmp_path / "dsa_generation_module_perf.txt")
+    assert validate_case(case._replace(seq_len=8192, prefix_len=0), "generation") == 1
+
+
+@pytest.mark.parametrize("op", ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"])
+@pytest.mark.parametrize("version", [RUNTIME_VERSION, "0.0.0.dev1+other", "0.0.0.dev1"])
+def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, version):
+    import importlib.metadata
+
+    from collector import collect as module
+    from collector.sglang.registry import require_kimi_k31_runtime
+
+    if version == RUNTIME_VERSION:
+        require_kimi_k31_runtime(version, {op})
+    else:
+        monkeypatch.setattr(importlib.metadata, "version", lambda _: version)
+        monkeypatch.setattr(module, "collect_ops", lambda *_a, **_k: pytest.fail("queued pool cases"))
+        import collector.fullnode
+
+        monkeypatch.setattr(
+            collector.fullnode, "collect_sglang_fullnode_op", lambda *_a, **_k: pytest.fail("queued native cases")
+        )
+        with pytest.raises(RuntimeError, match="native Kimi K3.1 requires exactly"):
+            module.collect_sglang(1, ops=[op], model_path=MODEL, sm_version=103)
+    # Other ops keep the shared public-version policy.
+    require_kimi_k31_runtime("0.5.21+vendor", {"gemm"})
+
+
 def test_existing_dsa_key_represents_complete_decode_history():
     case = ModuleCase(8192, 4, 24, "fp8", "bfloat16", "bfloat16", MODEL, 0)
     item = perf_item(case, "generation", 1.5)
@@ -196,6 +260,8 @@ def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(mon
         assert command[command.index("--phase") + 1] == phase
         observed.append(case)
         output = command[command.index("--output") + 1]
+        if case.num_heads == 24:
+            assert Path(output).read_text() == "synthetic result row\n"
         script = (
             "from pathlib import Path; "
             f"p=Path({output!r}); p.parent.mkdir(parents=True, exist_ok=True); "
@@ -215,6 +281,7 @@ def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(mon
     assert result["succeeded"] == 2
     assert result["failed"] == [cases[1]]
     assert result["failure_details"][str(cases[1])]["error_type"] == "RuntimeError"
+    assert output.read_text() == "synthetic result row\n" * 2
 
 
 @pytest.mark.parametrize(
@@ -327,12 +394,15 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
     children = []
     rank_pid = tmp_path / "rank.pid"
     error = exception_type("interrupted native communication")
+    output = tmp_path / "dsa_generation_module_perf.txt"
+    output.write_text("previous successful row\n")
 
     def launch(_command, **kwargs):
         code = (
             "import subprocess, sys, time; from pathlib import Path; "
             "rank = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
             "print('native cancellation diagnostic', file=sys.stderr, flush=True); "
+            f"Path({str(output)!r}).open('a').write('failed partial row\\n'); "
             f"Path({str(rank_pid)!r}).write_text(str(rank.pid)); time.sleep(60)"
         )
         child = popen([sys.executable, "-c", code], **kwargs)
@@ -357,7 +427,7 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     case = ModuleCase(4096, 1, 48, "fp8", "bfloat16", "bfloat16", MODEL, 0)
     try:
-        kwargs = {"cases": [case], "perf_filename": tmp_path / "dsa_generation_module_perf.txt"}
+        kwargs = {"cases": [case], "perf_filename": output}
         if issubclass(exception_type, Exception):
             result = run_kimi_k31_dsa_fullnode(**kwargs)
             assert result["failed"] == [case]
@@ -368,6 +438,7 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
                 run_kimi_k31_dsa_fullnode(**kwargs)
             assert raised.value is error
         assert children[0].poll() is not None
+        assert output.read_text() == "previous successful row\n"
         try:
             status = psutil.Process(int(rank_pid.read_text())).status()
         except psutil.NoSuchProcess:
@@ -592,6 +663,71 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
     assert collect() == []
     assert ran == [cases[0], cases[1], cases[1]]
     assert output.read_text().splitlines() == list(map(str, cases))
+
+
+@pytest.mark.parametrize("failure", ["runner", "result", "flush"])
+def test_native_batch_failure_leaves_unsubmitted_cases_runnable(monkeypatch, tmp_path, failure):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    from collector import fullnode
+    from collector.collect import ResumeCheckpoint
+
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (96, 48, 24)]
+    ran = []
+
+    def run(*, cases, **_kwargs):
+        ran.extend(cases)
+        if len(ran) == 2 and failure == "runner":
+            raise RuntimeError("runner failed")
+        if len(ran) == 2 and failure == "result":
+            return None
+        return {"failed": []}
+
+    class Checkpoint(ResumeCheckpoint):
+        fail_once = failure == "flush"
+
+        def flush(self, force=False):
+            if self.fail_once and len(self._done) == 1:
+                self.__class__.fail_once = False
+                raise OSError("checkpoint flush failed")
+            return super().flush(force=force)
+
+    monkeypatch.setattr(module, "run_kimi_k31_dsa_fullnode", run)
+
+    def collect():
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": "kimi_k31_dsa_context_module",
+                "module": module.__name__,
+                "get_func": "get_kimi_k31_dsa_context_test_cases",
+                "run_func": "run_kimi_k31_dsa_fullnode",
+                "perf_filename": str(tmp_path / "dsa_context_module_perf.txt"),
+            },
+            runtime_version=RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options={"checkpoint_dir": str(tmp_path / "checkpoint"), "resume": True},
+            model_path=MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_args: cases,
+            resume_checkpoint_cls=Checkpoint,
+            logger=logging.getLogger(__name__),
+        )
+
+    assert any(error["error_type"] == "FullNodeCollectionFailure" for error in collect())
+    assert ran == (cases[:1] if failure == "flush" else cases[:2])
+    checkpoint = json.loads(next((tmp_path / "checkpoint").rglob("*.json")).read_text())
+    assert len(checkpoint["failed"]) == (0 if failure == "flush" else 1)
+    assert len(checkpoint["attempted"]) == len(ran)
+    collect()  # ordinary resume skips the submitted failure and runs later cases
+    assert ran == cases
+    checkpoint = json.loads(next((tmp_path / "checkpoint").rglob("*.json")).read_text())
+    assert len(checkpoint["done"]) == (3 if failure == "flush" else 2)
+    assert len(checkpoint["failed"]) == (0 if failure == "flush" else 1)
 
 
 def test_native_success_without_result_row_is_not_checkpointable(monkeypatch, tmp_path):

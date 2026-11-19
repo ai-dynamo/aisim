@@ -451,6 +451,7 @@ def test_k31_context_capability_does_not_borrow_other_architecture_fp8(fake_mode
     fake_model_info(architecture, _V3_FP8_RAW)
     mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
     mc.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    mc.gemm_quant_mode = common.GEMMQuantMode.bfloat16
     db = _db(dsa_context_module=["fp8", "bfloat16"])
     db._context_dsa_module_data = {
         common.FMHAQuantMode.fp8: {
@@ -475,6 +476,7 @@ def test_k31_context_capability_requires_requested_backend(fake_model_info, expl
     fake_model_info(architecture, _V3_FP8_RAW)
     mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
     mc.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    mc.gemm_quant_mode = common.GEMMQuantMode.bfloat16
     mc.attention_backend = attention_backend
     requested = "flashmla_kv" if attention_backend == "flashmla" else "trtllm"
     other = "trtllm" if attention_backend == "flashmla" else "flashmla_kv"
@@ -495,6 +497,7 @@ def test_k31_context_capability_requires_requested_backend(fake_model_info, expl
     task._architecture = architecture
     task.attention_backend = attention_backend
     task.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    task.gemm_quant_mode = common.GEMMQuantMode.bfloat16
     monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
     assert task._context_fmha_supported_modes("agg", "dsa_context_module") == ["bfloat16"]
     if explicit:
@@ -513,3 +516,45 @@ def test_k31_context_capability_requires_requested_backend(fake_model_info, expl
     resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
     assert mc.fmha_quant_mode == (common.FMHAQuantMode.fp8 if explicit else None)
     assert task._context_fmha_supported_modes("agg", "dsa_context_module") == ["bfloat16", "fp8"]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("matching_gemm", [False, True])
+@pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
+def test_k31_context_capability_requires_matching_gemm(
+    fake_model_info, monkeypatch, explicit, matching_gemm, attention_backend
+):
+    from aisimulate.sdk.task_v2 import Task
+
+    architecture = "KimiK31ForConditionalGeneration"
+    fake_model_info(architecture, _V3_FP8_RAW)
+    mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
+    mc.gemm_quant_mode = common.GEMMQuantMode.fp8
+    mc.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    mc.attention_backend = attention_backend
+    bucket = "flashmla_kv" if attention_backend == "flashmla" else "trtllm"
+    db = _db(dsa_context_module=["fp8", "bfloat16"])
+    fp8_gemm = common.GEMMQuantMode.fp8 if matching_gemm else common.GEMMQuantMode.bfloat16
+    db._context_dsa_module_data = {
+        common.FMHAQuantMode.fp8: {common.KVCacheQuantMode.fp8: {fp8_gemm: {architecture: {bucket: {1: object()}}}}},
+        common.FMHAQuantMode.bfloat16: {
+            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.fp8: {architecture: {bucket: {1: object()}}}}
+        },
+    }
+    task = object.__new__(Task)
+    task._architecture = architecture
+    task.attention_backend = attention_backend
+    task.kvcache_quant_mode = mc.kvcache_quant_mode
+    task.gemm_quant_mode = mc.gemm_quant_mode
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    assert task._context_fmha_supported_modes("agg", "dsa_context_module") == (
+        ["bfloat16", "fp8"] if matching_gemm else ["bfloat16"]
+    )
+    if explicit and not matching_gemm:
+        with pytest.raises(ValueError, match="fmha_quant_mode=fp8 has no"):
+            resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+    else:
+        resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+        assert mc.fmha_quant_mode == (
+            (common.FMHAQuantMode.fp8 if explicit else None) if matching_gemm else common.FMHAQuantMode.bfloat16
+        )

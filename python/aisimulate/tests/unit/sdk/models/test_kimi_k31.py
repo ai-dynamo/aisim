@@ -136,6 +136,66 @@ def test_k31_bf16_analytic_task_validation_does_not_claim_measured_coverage(
         )
 
 
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla"])
+@pytest.mark.parametrize("has_requested_lane", [False, True])
+def test_k31_silicon_task_requires_selected_physical_lane(
+    tmp_path, k31_config, monkeypatch, phase, backend, has_requested_lane
+):
+    from aisimulate.sdk.task_v2 import Task
+
+    task = Task(
+        model_path=_write_checkpoint(tmp_path, k31_config),
+        system_name="b300_sxm",
+        backend_name="sglang",
+        database_mode="SILICON",
+        attention_backend=backend,
+        gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    requested = "flashmla_kv" if backend == "flashmla" else "trtllm"
+    other = "trtllm" if backend == "flashmla" else "flashmla_kv"
+    bucket = requested if has_requested_lane else other
+    gemm_slice = {common.GEMMQuantMode.bfloat16: {ARCHITECTURE: {bucket: {12: object()}}}}
+    db = SimpleNamespace(
+        supported_quant_mode={"dsa_context_module": ["bfloat16"], "dsa_generation_module": ["fp8"]},
+        _context_dsa_module_data={common.FMHAQuantMode.bfloat16: {common.KVCacheQuantMode.fp8: gemm_slice}},
+        _generation_dsa_module_data={common.KVCacheQuantMode.fp8: gemm_slice},
+    )
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    kwargs = dict(validate_context=phase == "context", validate_generation=phase == "generation")
+    if has_requested_lane:
+        task._check_role_against_db("agg", **kwargs)
+    else:
+        with pytest.raises(ValueError, match=f"Unsupported dsa_{phase}_module quant mode"):
+            task._check_role_against_db("agg", **kwargs)
+
+
+@pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla", None])
+def test_k31_fp8_sol_task_does_not_require_measured_generation_dtype(tmp_path, k31_config, monkeypatch, backend):
+    from aisimulate.sdk.task_v2 import Task
+
+    task = Task(
+        model_path=_write_checkpoint(tmp_path, k31_config),
+        system_name="b300_sxm",
+        backend_name="sglang",
+        database_mode="SOL",
+        attention_backend=backend,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    db = SimpleNamespace(
+        supported_quant_mode={"dsa_context_module": ["bfloat16"], "dsa_generation_module": ["bfloat16"]}
+    )
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    if backend is None:
+        with pytest.raises(ValueError, match="FP8 KV requires attention_backend"):
+            task._check_role_against_db("agg", validate_context=True, validate_generation=True)
+    else:
+        task._check_role_against_db("agg", validate_context=True, validate_generation=True)
+
+
 def test_k31_parser_preserves_backbone_and_marks_sparse_layers(k31_config):
     parsed = _parse_hf_config_json(k31_config)
     baseline = get_model_config_from_model_path("moonshotai/Kimi-K3")

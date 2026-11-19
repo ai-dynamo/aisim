@@ -1647,6 +1647,7 @@ class Task:
             self._role_attr(role, "kvcache_quant_mode"),
             architecture=self._architecture,
             attention_backend=self.attention_backend,
+            gemm_quant_mode=self._role_attr(role, "gemm_quant_mode"),
         )
 
     def _attention_quant_identity_mixed(self, role: str) -> bool:
@@ -2409,7 +2410,9 @@ class Task:
             qp = _mode_profile(mode)
             return any(p != qp for p in _supported_profiles(mode, supported_names))
 
-        def _check(op: str, mode: Any, *, profile_transfer: bool = False) -> None:
+        def _check(
+            op: str, mode: Any, *, profile_transfer: bool = False, supported_modes: list[str] | None = None
+        ) -> None:
             if mode is None:
                 return
             # Strict per-dtype FLOPS resolution happens at every query entry
@@ -2425,8 +2428,8 @@ class Task:
             _spec = getattr(database, "system_spec", None)
             if _spec is not None and getattr(getattr(mode, "value", None), "compute_dtype", None) is not None:
                 common.get_quant_tc_flops(_spec, mode)
-            modes = supported.get(op, []) or []
-            if not modes:
+            modes = (supported.get(op, []) or []) if supported_modes is None else supported_modes
+            if not modes and supported_modes is None:
                 return  # DB doesn't record support for this op; skip
             name = mode.name if hasattr(mode, "name") else str(mode)
             if name in modes:
@@ -2479,22 +2482,53 @@ class Task:
               losing them is not silent.
             - No informative op at all -> abstain (legacy behavior for ops the
               DB records nothing about)."""
-            # K3.1's hypothetical BF16 KV is an analytic SOL capability, not
-            # measured coverage. Keep SILICON and explicit FP8 lane checks.
+            # SOL computes K3.1 KV layouts analytically. FP8 still requires
+            # an explicit physical backend, independently of measured coverage.
+            if (
+                self._architecture == "KimiK31ForConditionalGeneration"
+                and mode == common.KVCacheQuantMode.fp8
+                and self.attention_backend not in ("flashmla", "trtllm_mla")
+            ):
+                raise ValueError("Kimi K3.1 FP8 KV requires attention_backend=flashmla or trtllm_mla")
             if (
                 self._architecture == "KimiK31ForConditionalGeneration"
                 and self.database_mode == "SOL"
-                and mode in (common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16)
+                and (
+                    mode in (common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16)
+                    or (mode == common.KVCacheQuantMode.fp8 and self.attention_backend in ("flashmla", "trtllm_mla"))
+                )
             ):
                 ops = [op for op in ops if op not in ("dsa_context_module", "dsa_generation_module")]
             informative = [op for op in ops if supported.get(op)]
             if not informative:
                 return
-            _check(informative[0], mode)
+
+            def _attention_modes(op):
+                if self._architecture != "KimiK31ForConditionalGeneration" or self.database_mode not in (
+                    None,
+                    "SILICON",
+                ):
+                    return None
+                from aisimulate.sdk.perf_database import context_fmha_supported_modes, dsa_generation_supported_modes
+
+                identity = dict(
+                    architecture=self._architecture,
+                    attention_backend=self.attention_backend,
+                    gemm_quant_mode=self._role_attr(role, "gemm_quant_mode"),
+                )
+                if op == "dsa_context_module":
+                    return context_fmha_supported_modes(
+                        database, op, self._role_attr(role, "kvcache_quant_mode"), **identity
+                    )
+                if op == "dsa_generation_module":
+                    return dsa_generation_supported_modes(database, **identity)
+                return None
+
+            _check(informative[0], mode, supported_modes=_attention_modes(informative[0]))
             unusable = []
             for op in informative[1:]:
                 try:
-                    _check(op, mode)
+                    _check(op, mode, supported_modes=_attention_modes(op))
                 except (ValueError, UnsupportedWideepConfigError):
                     unusable.append(op)
             if unusable:

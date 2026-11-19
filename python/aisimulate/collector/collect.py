@@ -2650,13 +2650,14 @@ def collect_sglang(
     )
 
     from collector.fullnode import SGLANG_FULLNODE_OPS, collect_sglang_fullnode_op
-    from collector.sglang.registry import REGISTRY
+    from collector.sglang.registry import REGISTRY, require_kimi_k31_runtime
     from collector.version_resolver import build_collections
 
     all_errors = []
     registry = _registry_with_requested_wideep(REGISTRY, "sglang", ops, case_plan)
     ops_filter = ops if ops is not None else (case_plan.ops if case_plan is not None else None)
     collections = build_collections(registry, "sglang", version, ops_filter, logger=logger)
+    require_kimi_k31_runtime(version, {collection["type"] for collection in collections})
     requested_fullnode_ops = requested_ops & set(SGLANG_FULLNODE_OPS)
     fullnode_collections = [collection for collection in collections if collection["type"] in requested_fullnode_ops]
     pool_collections = [collection for collection in collections if collection["type"] not in SGLANG_FULLNODE_OPS]

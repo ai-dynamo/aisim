@@ -187,14 +187,16 @@ def collect_sglang_fullnode_op(
     errors: list[dict] = []
     task_by_id = {task_info["id"]: task_info["params"] for task_info in task_infos}
     completed = set()
+    submitted = set()
     try:
         # DeepEP amortizes group setup across its batch. K3.1 already launches
         # a fresh native process per case: checkpoint each returned case before
         # launching the next so a job time limit cannot erase earlier progress.
-        resume_tracker.mark_attempted_many(task_by_id)
         batches = ([task_info] for task_info in task_infos) if op.startswith("kimi_k31_dsa_") else (task_infos,)
         for batch in batches:
             batch_ids = {str(task_info["params"]): task_info["id"] for task_info in batch}
+            resume_tracker.mark_attempted_many(batch_ids.values())
+            submitted.update(batch_ids.values())
             result = run_func(
                 perf_filename=collection["perf_filename"],
                 limit=None,
@@ -213,11 +215,11 @@ def collect_sglang_fullnode_op(
                 )
             failed_ids = {batch_ids[str(case)] for case in failed_cases}
             for task_id in batch_ids.values():
+                completed.add(task_id)
                 if task_id in failed_ids:
                     resume_tracker.mark_failed(task_id)
                 else:
                     resume_tracker.mark_passed(task_id)
-                completed.add(task_id)
             for task_id in sorted(failed_ids):
                 detail = failure_details.get(str(task_by_id[task_id]), {})
                 message = detail.get("error_message", "full-node runner reported failed case")
@@ -237,7 +239,7 @@ def collect_sglang_fullnode_op(
             resume_tracker.flush(force=True)
     except Exception as e:
         logger.exception(f"{full_name} full-node collection failed")
-        for task_id in task_by_id.keys() - completed:
+        for task_id in submitted - completed:
             resume_tracker.mark_failed(task_id)
         errors.append(
             {
