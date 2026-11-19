@@ -423,6 +423,7 @@ def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
     return worker
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("window", [False, True])
 def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
     """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
@@ -443,6 +444,7 @@ def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
     _runtime.run_replay_json(json.dumps(payload))
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None:
     """A request preempted for MTP draft slots makes the forward wait for its slow stores.
 
