@@ -269,7 +269,8 @@ class FpmLoader(Loader):
     category: ClassVar[Category] = "fpm"
     manifest_categories: ClassVar[tuple[str, ...]] = ("fpm", "op-latency")
     purposes: ClassVar[tuple[str, ...]] = ("execution-profile",)
-    # Evaluation-tier files are never part of a prediction selection; the legacy manifest adds nothing to it.
+    # Library prediction needs neither evaluation-tier files nor the legacy configuration manifest.
+    # Legacy execution-profile bundles still require every declared artifact for verification.
     excluded_roles: ClassVar[tuple[str, ...]] = (*EVALUATION_ROLES, ROLE_LEGACY_MANIFEST)
 
     def select(self, config: Mapping[str, Any]) -> Selection:
@@ -277,7 +278,7 @@ class FpmLoader(Loader):
             config,
             model=config.get("model"),
             parallelism=_parallelism(config),
-            exclude_roles=self.excluded_roles,
+            library_exclude_roles=self.excluded_roles,
         )
 
     def load(
@@ -351,10 +352,10 @@ class FpmLoader(Loader):
         out["systems_paths"] = list(
             dict.fromkeys(str(p) for p in (staged.systems_root, *(out.get("systems_paths") or ())))
         )
-        with_estimator_path(out, staged.parquet_path)
         resources, sources, profile = None, (), None
         resources_by_deployment = ()
         try:
+            with_estimator_path(out, staged.parquet_path)
             if user_profile is not None:
                 completed, sources = complete_fpm_profile(
                     dict(user_profile),

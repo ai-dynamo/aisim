@@ -34,7 +34,10 @@ def _cache_group_schema(schema: dict[str, Any]) -> None:
             "if": {"properties": {"kind": {"const": "state"}}, "required": ["kind"]},
             "then": {
                 "required": ["blocks_per_request"],
-                "properties": {"blocks_per_request": {"type": "integer", "exclusiveMinimum": 0}},
+                "properties": {
+                    "blocks_per_request": {"type": "integer", "exclusiveMinimum": 0},
+                    "sliding_window": {"type": "null"},
+                },
             },
             "else": {"properties": {"blocks_per_request": {"type": "null"}}},
         }
@@ -43,6 +46,18 @@ def _cache_group_schema(schema: dict[str, Any]) -> None:
         {
             "if": {"properties": {"kind": {"const": "convolution"}}, "required": ["kind"]},
             "then": {"required": ["sliding_window"], "properties": {"sliding_window": {"type": "integer"}}},
+        }
+    )
+    schema["allOf"].append(
+        {
+            "if": {
+                "properties": {"prefill_checkpoint_alignment": {"type": "integer"}},
+                "required": ["prefill_checkpoint_alignment"],
+            },
+            "then": {
+                "required": ["prefill_checkpoint_blocks"],
+                "properties": {"prefill_checkpoint_blocks": {"const": 1}},
+            },
         }
     )
 

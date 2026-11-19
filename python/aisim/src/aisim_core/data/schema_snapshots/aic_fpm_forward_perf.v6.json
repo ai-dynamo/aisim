@@ -16,6 +16,7 @@
       "type": "string"
     },
     "batch_size": {
+      "minimum": 1,
       "title": "Batch Size",
       "type": "integer"
     },
@@ -116,10 +117,12 @@
       "type": "string"
     },
     "total_kv_read_tokens": {
+      "minimum": 0,
       "title": "Total Kv Read Tokens",
       "type": "integer"
     },
     "total_prefill_tokens": {
+      "minimum": 0,
       "title": "Total Prefill Tokens",
       "type": "integer"
     },

@@ -26,6 +26,9 @@
               "blocks_per_request": {
                 "exclusiveMinimum": 0,
                 "type": "integer"
+              },
+              "sliding_window": {
+                "type": "null"
               }
             },
             "required": [
@@ -52,6 +55,28 @@
             },
             "required": [
               "sliding_window"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "prefill_checkpoint_alignment": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "prefill_checkpoint_alignment"
+            ]
+          },
+          "then": {
+            "properties": {
+              "prefill_checkpoint_blocks": {
+                "const": 1
+              }
+            },
+            "required": [
+              "prefill_checkpoint_blocks"
             ]
           }
         }

@@ -20,6 +20,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pydantic import ValidationError
 
@@ -62,11 +64,12 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
 
     try:
         manifest = Manifest.model_validate_json(_file(root, manifest_path).read_bytes())
+        expected_id = configuration_id(manifest.category, manifest.purpose, manifest.identity)
     except (OSError, ValueError, ValidationError) as exc:
         return [FpmFinding("invalid-manifest", manifest_path, str(exc).splitlines()[0])]
     if manifest.category != "fpm":
         add("wrong-category", f"expected category fpm, got {manifest.category!r}")
-    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+    if manifest.configuration_id != expected_id:
         add("configuration-identity", "configuration_id does not match the manifest identity")
     for name in ("artifact_id", "path", "runtime_path"):  # the structure the loader requires
         values = [getattr(a, name) for a in manifest.artifacts if getattr(a, name) is not None]
@@ -76,10 +79,12 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
     for artifact in manifest.artifacts:
         by_role[artifact.role].append(artifact)
     if not by_role.get(ROLE_LIBRARY) and not by_role.get(ROLE_METADATA) and by_role.get(ROLE_LEGACY_PROFILE):
-        # The older execution-profile bundle: one profile artifact, every declared file verified.
+        # The older execution-profile bundle, with the same opt-in measurement checks as libraries.
         if len(by_role[ROLE_LEGACY_PROFILE]) != 1:
             add("duplicate-role", f"role {ROLE_LEGACY_PROFILE!r} must appear exactly once")
         for artifact in manifest.artifacts:
+            if not include_measurements and artifact.role in EVALUATION_ROLES:
+                continue
             try:
                 verified = _verify(root, artifact)
             except (OSError, ValueError) as exc:
@@ -131,6 +136,22 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         columns = None
     if columns is not None and (absent := [c for c in NATIVE_REQUIRED_COLUMNS if c not in columns]):
         add("library-columns", f"library lacks columns the native loader requires: {', '.join(absent)}")
+    coordinate_minima = {"batch_size": 1, "total_prefill_tokens": 0, "total_kv_read_tokens": 0}
+    if columns is not None and coordinate_minima.keys() <= columns:
+        try:
+            # Publication validation only: stream three columns with bounded memory, never latency data.
+            parquet = pq.ParquetFile(_file(root, library.path))
+            for batch in parquet.iter_batches(batch_size=4096, columns=list(coordinate_minima)):
+                for name, minimum in coordinate_minima.items():
+                    values = batch.column(name)
+                    if (
+                        not pa.types.is_integer(values.type)
+                        or values.null_count
+                        or pc.any(pc.less(values, minimum)).as_py()
+                    ):
+                        raise ValueError(f"{name} must contain integers >= {minimum}")
+        except (OSError, ValueError) as exc:
+            add("library-coordinates", str(exc))
     try:
         metadata = read_library_metadata(_file(root, sidecar.path))
     except (FpmContractError, ValueError) as exc:
@@ -219,7 +240,10 @@ def check_fpm_dataset(root: Path, *, include_measurements: bool = False) -> list
         except (OSError, ValueError) as exc:
             found.append(FpmFinding("hash-mismatch", entry.manifest.path, f"indexed manifest: {exc}"))
             continue
-        found += check_fpm_entry(root, entry.manifest.path, include_measurements=include_measurements)
+        entry_findings = check_fpm_entry(root, entry.manifest.path, include_measurements=include_measurements)
+        found += entry_findings
+        if any(f.code == "invalid-manifest" for f in entry_findings):
+            continue  # An unhashable identity is invalid even if the manifest's JSON can be parsed.
         try:
             manifest = Manifest.model_validate_json(_file(root, entry.manifest.path).read_bytes())
         except (OSError, ValueError, ValidationError):
