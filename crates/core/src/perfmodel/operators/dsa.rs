@@ -281,10 +281,13 @@ impl DsaModuleOp {
 
     pub(crate) fn validate_kimi_geometry(&self) -> Result<(), AicError> {
         if self.architecture == "KimiK31ForConditionalGeneration"
-            && (self.cp_size != 1 || self.dcp_size != 1 || self.full_frac != 1.0)
+            && (self.cp_size != 1
+                || self.dcp_size != 1
+                || self.full_frac != 1.0
+                || self.index_topk != 2048)
         {
             return Err(AicError::InvalidEngineConfig(
-                "Kimi K3.1 DSA requires CP=1, DCP=1 and an indexer on every sparse layer".into(),
+                "Kimi K3.1 DSA requires CP=1, DCP=1, index_topk=2048 and an indexer on every sparse layer".into(),
             ));
         }
         Ok(())
@@ -2059,5 +2062,31 @@ mod tests {
                 Err(AicError::InvalidEngineConfig(_))
             ));
         }
+    }
+
+    #[test]
+    fn kimi_k31_requires_native_topk_in_both_phases() {
+        let db = b200_db("vllm", "0.24.0", DatabaseMode::Sol);
+        let mut op = dsa_op(
+            "KimiK31ForConditionalGeneration",
+            12,
+            KvCacheQuantMode::Bfloat16,
+        );
+        assert!(op.query_context(&db, 1, 2048, 0).is_ok());
+        assert!(op.query_generation(&db, 1, 4096).is_ok());
+        for topk in [0, 1024, 4096] {
+            op.index_topk = topk;
+            assert!(matches!(
+                op.query_context(&db, 1, 2048, 0),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+            assert!(matches!(
+                op.query_generation(&db, 1, 4096),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+        }
+        op.architecture = "DeepseekV32ForCausalLM".into();
+        op.index_topk = 1024;
+        assert!(op.validate_kimi_geometry().is_ok());
     }
 }

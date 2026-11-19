@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,9 +102,104 @@ def test_case_plan_uses_native_tp_shards_and_supported_cache_precision(monkeypat
         assert {case.num_heads for case in cases} == {96, 48, 24, 12}
         assert {case.kv_cache_dtype for case in cases} == {"fp8"}
         assert {case.gemm_type for case in cases} == {"bfloat16"}
-        assert {validate_case(case) for case in cases} == {1, 2, 4, 8}
+        assert {validate_case(case, phase) for case in cases} == {1, 2, 4, 8}
         assert all(case.seq_len + case.prefix_len <= 1048576 for case in cases)
         assert not plan(op, "vllm", 103).cases
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_native_plan_deduplicates_persisted_keys_in_first_seen_order(monkeypatch, phase):
+    import collector.op_plans as module
+
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
+    rows = [dict(row) for row in module._model_case_values("kimi_k31_dsa_module")]
+    rows[0]["tensor_parallel_sizes"] = [1, 2]
+    monkeypatch.setattr(module, "_model_case_values", lambda _op: rows)
+    expected = OP_PLANS[f"kimi_k31_dsa_{phase}_module"].expand()
+    rows[0]["tensor_parallel_sizes"] = [1, 1, 2]
+    actual = OP_PLANS[f"kimi_k31_dsa_{phase}_module"].expand()
+    assert actual == expected
+    assert len(set(actual)) == len(actual)
+    assert {case.num_heads for case in actual} == {96, 48}
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_explicit_native_request_rejected_before_stock_route_filtering(phase):
+    from collector.version_resolver import build_collections
+
+    op = f"kimi_k31_dsa_{phase}_module"
+    with pytest.raises(RuntimeError, match="native Kimi K3.1 requires exactly"):
+        build_collections(REGISTRY, "sglang", "0.5.21", [op])
+    ordinary = build_collections(REGISTRY, "sglang", "0.5.21")
+    assert ordinary
+    assert not any(entry["type"].startswith("kimi_k31_dsa_") for entry in ordinary)
+
+
+@pytest.mark.parametrize("ambient", [None, "0", "1"])
+def test_native_fusion_setting_is_fixed_for_child_and_standalone(monkeypatch, tmp_path, ambient):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    if ambient is None:
+        monkeypatch.delenv("SGLANG_DSA_FUSE_TOPK", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_DSA_FUSE_TOPK", ambient)
+    popen = subprocess.Popen
+    output = tmp_path / "dsa_generation_module_perf.txt"
+
+    def launch(_command, **kwargs):
+        code = (
+            f"import os; from pathlib import Path; Path({str(output)!r}).write_text(os.environ['SGLANG_DSA_FUSE_TOPK'])"
+        )
+        return popen([sys.executable, "-c", code], **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    case = ModuleCase(8192, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    module._run_native_case(case, "cuda:0", output)
+    assert output.read_text() == "1"
+    assert os.environ.get("SGLANG_DSA_FUSE_TOPK") == ambient
+    monkeypatch.setenv("SGLANG_DSA_FUSE_TOPK", ambient or "0")
+
+    class RuntimeReached(Exception):
+        pass
+
+    def runtime():
+        assert os.environ["SGLANG_DSA_FUSE_TOPK"] == "1"
+        raise RuntimeReached
+
+    monkeypatch.setattr(module, "_assert_runtime", runtime)
+    monkeypatch.setattr(
+        sys, "argv", ["collector", "--case", json.dumps(list(case)), "--phase", "generation", "--output", str(output)]
+    )
+    with pytest.raises(RuntimeReached):
+        module.main()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_native_failure_restores_staging_existence_and_length(monkeypatch, tmp_path, existing):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    output = tmp_path / "dsa_context_module_perf.txt"
+    if existing:
+        output.write_text("previous row\n")
+    popen = subprocess.Popen
+
+    def launch(_command, **kwargs):
+        return popen(
+            [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(output)!r}).open('a').write('partial row'); exit(1)",
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    with pytest.raises(RuntimeError, match="native K31 worker exited"):
+        module._run_native_case(case, "cuda:0", output)
+    assert output.exists() == existing
+    if existing:
+        assert output.read_text() == "previous row\n"
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
@@ -147,7 +243,7 @@ def test_generation_coordinates_fail_before_native_runtime(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize("op", ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"])
-@pytest.mark.parametrize("version", [RUNTIME_VERSION, "0.0.0.dev1+other", "0.0.0.dev1"])
+@pytest.mark.parametrize("version", [RUNTIME_VERSION, "0.0.0.dev1+other", "0.0.0.dev1", "0.5.21"])
 def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, version):
     import importlib.metadata
 
@@ -165,7 +261,7 @@ def test_native_registry_checks_full_runtime_before_queueing(monkeypatch, op, ve
             collector.fullnode, "collect_sglang_fullnode_op", lambda *_a, **_k: pytest.fail("queued native cases")
         )
         with pytest.raises(RuntimeError, match="native Kimi K3.1 requires exactly"):
-            module.collect_sglang(1, ops=[op], model_path=MODEL, sm_version=103)
+            module.collect_sglang(1, ops=[op], model_path=None if version == "0.5.21" else MODEL, sm_version=103)
     # Other ops keep the shared public-version policy.
     require_kimi_k31_runtime("0.5.21+vendor", {"gemm"})
 
@@ -194,7 +290,7 @@ def test_stock_runtime_cannot_select_native_preview_collector():
         assert "@sha256:" in runtime.image()
         assert entry.run_func == "run_kimi_k31_dsa_fullnode"
         assert not entry.unverified
-        assert set(entry.unverified_sms) == {80, 86, 89, 90, 100, 120}
+        assert set(entry.unverified_sms) == {80, 86, 89, 90, 100, 120, 121}
         assert resolve_module(entry, runtime.version) == "collector.sglang.collect_kimi_k31_dsa_v1"
         assert resolve_module(entry, get_collector_runtime("sglang").version) is None
         assert _check_compat(f"sglang=={RUNTIME_VERSION}", RUNTIME_VERSION)
@@ -358,17 +454,33 @@ def test_native_timeout_kills_tp_children_and_fullnode_continues(monkeypatch, ca
         output = command[command.index("--output") + 1]
         code = f"from pathlib import Path; Path({output!r}).write_text('synthetic row')"
         if case.num_heads == 48:
+            rank_code = (
+                "import os, time; from pathlib import Path; "
+                f"Path({str(rank_pid)!r}).write_text(str(os.getpid())); time.sleep(60)"
+            )
             code = (
                 "import subprocess, sys, time; from pathlib import Path; "
-                "rank = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-                f"Path({str(rank_pid)!r}).write_text(str(rank.pid)); "
+                f"rank = subprocess.Popen([sys.executable, '-c', {rank_code!r}]); "
                 "print('waiting on TP rank', file=sys.stderr, flush=True); time.sleep(60)"
             )
         child = popen([sys.executable, "-c", code], **kwargs)
         children.append(child)
+        # Interpreter startup is outside each execution deadline. The rank
+        # itself publishes readiness before the hang timeout begins.
+        if case.num_heads == 48:
+            deadline = time.monotonic() + 30
+            while not rank_pid.exists() or not rank_pid.read_text().strip():
+                assert time.monotonic() < deadline, "TP rank did not start"
+                time.sleep(0.01)
+            monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 1)
+        else:
+            deadline = time.monotonic() + 30
+            while not Path(output).exists():
+                assert time.monotonic() < deadline, "success control did not start"
+                time.sleep(0.01)
+            monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 30)
         return child
 
-    monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 1)
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
     assert result["succeeded"] == 1
@@ -453,6 +565,106 @@ def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeyp
             except ProcessLookupError:
                 pass
             child.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
+def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path):
+    import psutil
+
+    output = tmp_path / "dsa_generation_module_perf.txt"
+    output.write_text("previous row\n")
+    rank_pid = tmp_path / "rank.pid"
+    launcher_pid = tmp_path / "launcher.pid"
+    rank_code = (
+        "import os, time; from pathlib import Path; "
+        f"Path({str(rank_pid)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    launcher_code = (
+        "import os, subprocess, sys, time; from pathlib import Path; "
+        f"Path({str(output)!r}).open('a').write('partial row'); "
+        f"Path({str(launcher_pid)!r}).write_text(str(os.getpid())); "
+        f"subprocess.Popen([sys.executable, '-c', {rank_code!r}]); time.sleep(60)"
+    )
+    driver = tmp_path / "collector_driver.py"
+    driver.write_text(
+        "import subprocess, sys\n"
+        "import collector.sglang.collect_kimi_k31_dsa_v1 as module\n"
+        "real_popen = subprocess.Popen\n"
+        "def launch(_command, **kwargs):\n"
+        f"    return real_popen([sys.executable, '-c', {launcher_code!r}], **kwargs)\n"
+        "module.subprocess.Popen = launch\n"
+        f"case = module.ModuleCase(4096, 1, 48, 'fp8', 'bfloat16', 'bfloat16', {MODEL!r}, 0)\n"
+        f"module.run_kimi_k31_dsa_fullnode(perf_filename={str(output)!r}, cases=[case])\n"
+    )
+    with subprocess.Popen([sys.executable, str(driver)], stderr=subprocess.PIPE, text=True) as parent:
+        try:
+            deadline = time.monotonic() + 30
+            while not rank_pid.exists() or not rank_pid.read_text().strip():
+                assert time.monotonic() < deadline, "native rank did not become ready"
+                assert parent.poll() is None, "collector exited before native rank was ready"
+                time.sleep(0.01)
+            # Send only to the collector PID, never its process group.
+            os.kill(parent.pid, signal.SIGTERM)
+            _, stderr = parent.communicate(timeout=30)
+            assert parent.returncode == 128 + signal.SIGTERM, stderr
+            assert output.read_text() == "previous row\n"
+            for pid_file in (launcher_pid, rank_pid):
+                try:
+                    status = psutil.Process(int(pid_file.read_text())).status()
+                except psutil.NoSuchProcess:
+                    status = None
+                assert status in (None, psutil.STATUS_ZOMBIE)
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            if launcher_pid.exists():
+                try:
+                    os.killpg(int(launcher_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_context_prefix_preparation_covers_million_tokens_in_bounded_chunks(monkeypatch):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    case = ModuleCase(1, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 1048575)
+    reqs = [SimpleNamespace(prefix_len=0, extend_end=1048576, kv=SimpleNamespace(req_pool_idx=1))]
+    runner = SimpleNamespace(device="cpu", forward=lambda batch: None)
+    intervals = []
+
+    def extend(actual):
+        assert actual is reqs
+        req = actual[0]
+        intervals.append((req.prefix_len, req.extend_end))
+        assert req.extend_end - req.prefix_len <= module.HISTORY_CHUNK_TOKENS
+        batch = SimpleNamespace(
+            seq_lens_cpu=SimpleNamespace(tolist=lambda: [req.extend_end]),
+            prefix_lens=[req.prefix_len],
+            extend_lens=[req.extend_end - req.prefix_len],
+            input_ids=SimpleNamespace(numel=lambda: req.extend_end - req.prefix_len),
+            seq_lens=SimpleNamespace(tolist=lambda: [req.extend_end]),
+            extend_prefix_lens_cpu=[req.prefix_len],
+            extend_seq_lens_cpu=[req.extend_end - req.prefix_len],
+        )
+        runner.forward(batch)
+        return [0], None, batch
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.benchmark.one_batch",
+        SimpleNamespace(prepare_synthetic_inputs_for_latency_test=lambda batch, length: reqs),
+    )
+    monkeypatch.setattr(module, "_validate_tp_inputs", lambda *_args: None)
+    bench = SimpleNamespace(torch_runner=runner, clear=lambda: None, extend=extend)
+    batch, history = module._prepare_forward(bench, case, "context")
+    assert intervals[0][0] == 0
+    assert all(left[1] == right[0] for left, right in pairwise(intervals))
+    assert intervals[-2][1] == 1048575
+    assert intervals[-1] == (1048575, 1048576)
+    assert sum(end - start for start, end in intervals[:-1]) == 1048575
+    assert history["history_per_request"] == 1048575
+    assert history["chunks"] == 128
+    assert validate_forward_batch(batch, case, "context")["extend_prefix_lens"] == [1048575]
 
 
 def test_native_forward_batch_must_match_persisted_prefix_and_history():

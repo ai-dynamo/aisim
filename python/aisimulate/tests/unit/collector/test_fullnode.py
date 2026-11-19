@@ -101,6 +101,36 @@ def test_fullnode_preserves_registry_maturity_gate_before_import(maturity):
     assert not _Checkpoint.instances
 
 
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_native_sm121_maturity_gate_prevents_import_and_queueing(phase):
+    from collector.sglang.registry import REGISTRY
+    from collector.version_resolver import build_collections
+
+    _Checkpoint.instances.clear()
+    (collection,) = build_collections(
+        REGISTRY, "sglang", "0.0.0.dev1+g41208373c.d20261104", [f"kimi_k31_dsa_{phase}_module"]
+    )
+    assert 103 not in collection["unverified_sms"]
+    errors = fullnode.collect_sglang_fullnode_op(
+        {**collection, "module": "must_not_import"},
+        runtime_version="0.0.0.dev1+g41208373c.d20261104",
+        limit=None,
+        shuffle=False,
+        shuffle_seed=42,
+        backend="sglang",
+        resume_options=None,
+        model_path=None,
+        case_plan=None,
+        sm_version=121,
+        case_filters=None,
+        get_test_cases_for_model=lambda *_args: pytest.fail("planned unverified SM121"),
+        resume_checkpoint_cls=_Checkpoint,
+        logger=_logger(),
+    )
+    assert errors[0]["classification"] == "unverified_skipped"
+    assert not _Checkpoint.instances
+
+
 def test_runner_maps_reported_failure_to_exact_checkpoint_task(monkeypatch):
     cases = [
         {"hidden_size": 2048, "num_experts": 128, "topk": 8},
@@ -201,6 +231,64 @@ def test_runner_fails_closed_when_failure_list_is_missing(monkeypatch):
     assert len(_Checkpoint.instances[-1].failed) == 1
     assert errors[0]["error_type"] == "FullNodeCollectionFailure"
     assert "must return" in errors[0]["error_message"]
+
+
+def test_native_failure_summary_aggregates_by_consumer_group(monkeypatch, tmp_path):
+    from collector.op_plans import ModuleCase
+
+    model = "moonshotai/Kimi-K3.1-Pro"
+    cases = [ModuleCase(length, 1, 48, "fp8", "bfloat16", "bfloat16", model, 0) for length in (4096, 8192)]
+    module_name = "fake_native_failure_groups"
+    monkeypatch.setitem(
+        sys.modules,
+        module_name,
+        SimpleNamespace(
+            __compat__="sglang==0.0.0.dev1+g41208373c.d20261104",
+            get_cases=lambda: cases,
+            run_cases=lambda **kwargs: {"succeeded": 0, "failed": kwargs["cases"]},
+        ),
+    )
+    monkeypatch.setattr(fullnode, "filter_cases", lambda values, **_kwargs: (values, []))
+    errors = fullnode.collect_sglang_fullnode_op(
+        {
+            "name": "sglang",
+            "type": "kimi_k31_dsa_generation_module",
+            "module": module_name,
+            "get_func": "get_cases",
+            "run_func": "run_cases",
+            "perf_filename": str(tmp_path / "dsa_generation_module_perf.txt"),
+        },
+        runtime_version="0.0.0.dev1+g41208373c.d20261104",
+        limit=None,
+        shuffle=False,
+        shuffle_seed=42,
+        backend="sglang",
+        resume_options=None,
+        model_path=None,
+        case_plan=None,
+        sm_version=103,
+        case_filters=None,
+        get_test_cases_for_model=lambda get_func, _model_path: get_func(),
+        resume_checkpoint_cls=_Checkpoint,
+        logger=_logger(),
+    )
+    expected_group = json.dumps(
+        dict(
+            model_path=model,
+            num_heads=48,
+            kv_cache_dtype="fp8",
+            compute_dtype="bfloat16",
+            gemm_type="bfloat16",
+            batch_size=1,
+        ),
+        sort_keys=True,
+    )
+    assert len(errors) == 2
+    assert {error["group"] for error in errors} == {expected_group}
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(tmp_path))
+    collect_mod.generate_collection_summary(errors, "sglang", "test")
+    summary = json.loads((tmp_path / "collection_summary_sglang.json").read_text())["summary"]
+    assert summary["errors_by_group"] == {f"sglang.kimi_k31_dsa_generation_module:{expected_group}": 2}
 
 
 def test_replay_selects_full_node_cases_like_the_pool_ops(monkeypatch):

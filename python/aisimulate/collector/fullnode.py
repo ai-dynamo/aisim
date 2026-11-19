@@ -8,6 +8,7 @@ per-GPU worker pool. This module keeps their case selection, checkpointing, and
 failure mapping out of the top-level backend entrypoint.
 """
 
+import json
 import os
 import random
 import traceback
@@ -15,6 +16,7 @@ from datetime import datetime
 
 from collector.case_generator import without_models
 from collector.helper import create_test_case_id
+from collector.op_plans import OP_PLANS
 from collector.skips import filter_cases, models
 from collector.version_resolver import _check_compat
 
@@ -221,13 +223,23 @@ def collect_sglang_fullnode_op(
                 else:
                     resume_tracker.mark_passed(task_id)
             for task_id in sorted(failed_ids):
-                detail = failure_details.get(str(task_by_id[task_id]), {})
+                case = task_by_id[task_id]
+                detail = failure_details.get(str(case), {})
+                # Use the plan's consumer dimensions, excluding swept history
+                # coordinates, so repeated failures expose unavailable keys.
+                spec = OP_PLANS.get(op)
+                group = (
+                    json.dumps({field: getattr(case, field) for field in spec.group_fields}, sort_keys=True)
+                    if spec is not None and all(hasattr(case, field) for field in spec.group_fields)
+                    else None
+                )
                 message = detail.get("error_message", "full-node runner reported failed case")
                 errors.append(
                     {
                         "module": full_name,
                         "task_id": task_id,
                         "task_params": str(task_by_id[task_id]),
+                        "group": group,
                         "error_type": detail.get("error_type", "FullNodeCaseFailure"),
                         "error_message": message,
                         "classification": "kernel_limit"

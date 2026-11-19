@@ -469,6 +469,47 @@ def test_k31_context_capability_does_not_borrow_other_architecture_fp8(fake_mode
         assert mc.fmha_quant_mode == common.FMHAQuantMode.bfloat16
 
 
+@pytest.mark.parametrize("gemm", [None, common.GEMMQuantMode.fp8])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_k31_context_capability_resolves_default_gemm_before_selecting_slice(fake_model_info, gemm, explicit):
+    architecture = "KimiK31ForConditionalGeneration"
+    # Attention is excluded from this compressed checkpoint's GEMM quantization,
+    # while checkpoint inference still chooses FP8 FMHA and FP8 KV.
+    raw = {
+        "quant_algo": "compressed-tensors",
+        "kv_cache_quant_algo": "fp8",
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "config_groups": {"group_0": {"weights": {"num_bits": 8, "type": "float"}}},
+            "ignore": ["self_attn"],
+        },
+    }
+    inferred = helpers._infer_quant_modes_from_raw_config(raw, architecture)
+    assert inferred.get("gemm_quant_mode") is None
+    assert inferred["fmha_quant_mode"] == common.FMHAQuantMode.fp8
+    fake_model_info(architecture, raw)
+    mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
+    mc.gemm_quant_mode = gemm
+    mc.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    mc.attention_backend = "flashmla"
+    db = _db(dsa_context_module=["fp8", "bfloat16"])
+    db._context_dsa_module_data = {
+        fmha: {common.KVCacheQuantMode.fp8: {quant: {architecture: {"flashmla_kv": {12: object()}}}}}
+        for fmha, quant in (
+            (common.FMHAQuantMode.bfloat16, common.GEMMQuantMode.bfloat16),
+            (common.FMHAQuantMode.fp8, common.GEMMQuantMode.fp8),
+        )
+    }
+    if explicit and gemm is None:
+        with pytest.raises(ValueError, match="fmha_quant_mode=fp8 has no"):
+            resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+    else:
+        resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+        assert mc.fmha_quant_mode == (
+            common.FMHAQuantMode.bfloat16 if gemm is None else (common.FMHAQuantMode.fp8 if explicit else None)
+        )
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
 def test_k31_context_capability_requires_requested_backend(fake_model_info, explicit, attention_backend, monkeypatch):

@@ -36,6 +36,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from collector.helper import get_sm_version, log_perf
@@ -53,6 +54,11 @@ HISTORY_CHUNK_TOKENS = 8192
 # One point includes cold native initialization and up to 1M tokens of history
 # preparation. Allow an hour for that setup, but never wait forever on a TP rank.
 NATIVE_CASE_TIMEOUT_S = 3600
+# afcd srt/environ.py::Envs.SGLANG_DSA_FUSE_TOPK defaults to True;
+# srt/layers/attention/dsa/utils.py::should_use_dsa_fused_topk selects the fused
+# index transformation for this eager, non-disaggregated native plan.
+# Keep the pinned serving default independent of the invoking shell.
+NATIVE_ENV = {"SGLANG_DSA_FUSE_TOPK": "1"}
 
 
 def get_kimi_k31_dsa_context_test_cases():
@@ -205,34 +211,53 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
     return {"succeeded": len(selected) - len(failed), "failed": failed, "failure_details": failure_details}
 
 
+@contextmanager
+def _native_termination_handler():
+    def terminate(signum, _frame):
+        # SystemExit escapes the per-case Exception handler after the child
+        # group and staged output have been cleaned up.
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _run_native_case(case, device, perf_filename):
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
     output = Path(perf_filename)
-    previous_size = output.stat().st_size if output.exists() else 0
+    existed = output.exists()
+    previous_size = output.stat().st_size if existed else 0
     phase = "context" if "context" in Path(perf_filename).name else "generation"
     validate_case(case, phase)
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
     try:
-        with subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "collector.sglang.collect_kimi_k31_dsa_v1",
-                "--case",
-                json.dumps(list(case)),
-                "--phase",
-                phase,
-                "--output",
-                str(Path(perf_filename).resolve()),
-                "--device",
-                str(device),
-            ],
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        ) as process:
+        with (
+            _native_termination_handler(),
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "collector.sglang.collect_kimi_k31_dsa_v1",
+                    "--case",
+                    json.dumps(list(case)),
+                    "--phase",
+                    phase,
+                    "--output",
+                    str(Path(perf_filename).resolve()),
+                    "--device",
+                    str(device),
+                ],
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                env={**os.environ, **NATIVE_ENV},
+            ) as process,
+        ):
             stderr = ""
             try:
                 _, stderr = process.communicate(timeout=NATIVE_CASE_TIMEOUT_S)
@@ -264,8 +289,11 @@ def _run_native_case(case, device, perf_filename):
         # This route exclusively owns its staged output. Failed attempts must
         # contribute no rows, even if the child appended before it failed.
         if output.exists():
-            with output.open("r+b") as stream:
-                stream.truncate(previous_size)
+            if existed:
+                with output.open("r+b") as stream:
+                    stream.truncate(previous_size)
+            else:
+                output.unlink()
         raise
 
 
@@ -282,7 +310,7 @@ def _assert_runtime() -> None:
 
 
 def _extend_history(bench, reqs, history_length: int, chunk_tokens: int = HISTORY_CHUNK_TOKENS):
-    """Build complete decode history through native request continuation.
+    """Build complete KV history through native request continuation.
 
     afcd one_batch.prepare_extend_inputs_for_correctness_test and
     mem_cache/common.py::checkpoint_kv_cache advance Req.prefix_len to the
@@ -366,9 +394,9 @@ def _prepare_forward(bench, case: ModuleCase, phase: str):
             bench.decode(tokens, batch)
         else:
             if case.prefix_len:
-                for req in reqs:
-                    req.extend_end = case.prefix_len
-                bench.extend(reqs)
+                _, _, history = _extend_history(
+                    bench, reqs, case.prefix_len, max(HISTORY_CHUNK_TOKENS, case.batch_size)
+                )
                 for req in reqs:
                     req.prefix_len = case.prefix_len
                     req.extend_end = case.prefix_len + case.seq_len
@@ -546,6 +574,7 @@ def main() -> None:
     args = parser.parse_args()
     case = ModuleCase(*json.loads(args.case))
     tp = validate_case(case, args.phase)
+    os.environ.update(NATIVE_ENV)
     _assert_runtime()
     import torch
     from huggingface_hub import hf_hub_download, snapshot_download

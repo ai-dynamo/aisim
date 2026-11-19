@@ -1446,7 +1446,9 @@ def resolve_context_fmha_by_data(
         kv_mode,
         architecture=info["architecture"],
         attention_backend=model_config.attention_backend,
-        gemm_quant_mode=model_config.gemm_quant_mode or inferred.get("gemm_quant_mode"),
+        gemm_quant_mode=model_config.gemm_quant_mode
+        or inferred.get("gemm_quant_mode")
+        or common.GEMMQuantMode.bfloat16,
     )
     if not supported or common.FMHAQuantMode.fp8.name in supported:
         return

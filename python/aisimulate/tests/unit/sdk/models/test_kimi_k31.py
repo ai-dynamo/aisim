@@ -173,7 +173,8 @@ def test_k31_silicon_task_requires_selected_physical_lane(
 
 
 @pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla", None])
-def test_k31_fp8_sol_task_does_not_require_measured_generation_dtype(tmp_path, k31_config, monkeypatch, backend):
+@pytest.mark.parametrize("fmha", [common.FMHAQuantMode.bfloat16, common.FMHAQuantMode.fp8])
+def test_k31_fp8_sol_task_does_not_require_measured_generation_dtype(tmp_path, k31_config, monkeypatch, backend, fmha):
     from aisimulate.sdk.task_v2 import Task
 
     task = Task(
@@ -183,7 +184,7 @@ def test_k31_fp8_sol_task_does_not_require_measured_generation_dtype(tmp_path, k
         database_mode="SOL",
         attention_backend=backend,
         kvcache_quant_mode=common.KVCacheQuantMode.fp8,
-        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        fmha_quant_mode=fmha,
     )
     db = SimpleNamespace(
         supported_quant_mode={"dsa_context_module": ["bfloat16"], "dsa_generation_module": ["bfloat16"]}
@@ -194,6 +195,34 @@ def test_k31_fp8_sol_task_does_not_require_measured_generation_dtype(tmp_path, k
             task._check_role_against_db("agg", validate_context=True, validate_generation=True)
     else:
         task._check_role_against_db("agg", validate_context=True, validate_generation=True)
+
+
+@pytest.mark.parametrize("has_fp8_compute", [False, True])
+def test_k31_analytic_fp8_fmha_still_requires_hardware_compute(tmp_path, k31_config, monkeypatch, has_fp8_compute):
+    from aisimulate.sdk.task_v2 import Task
+    from aisimulate_core.sdk.errors import MissingSystemFlopsError
+
+    task = Task(
+        model_path=_write_checkpoint(tmp_path, k31_config),
+        system_name="b300_sxm",
+        backend_name="sglang",
+        database_mode="SOL",
+        attention_backend="flashmla",
+        gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+        moe_quant_mode=common.MoEQuantMode.bfloat16,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.fp8,
+    )
+    gpu = {"bfloat16_tc_flops": 1.0}
+    if has_fp8_compute:
+        gpu["fp8_tc_flops"] = 1.0
+    db = SimpleNamespace(supported_quant_mode={"dsa_context_module": ["bfloat16"]}, system_spec={"gpu": gpu})
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    if has_fp8_compute:
+        task._check_role_against_db("agg", validate_context=True, validate_generation=False)
+    else:
+        with pytest.raises(MissingSystemFlopsError, match="fp8_tc_flops"):
+            task._check_role_against_db("agg", validate_context=True, validate_generation=False)
 
 
 def test_k31_parser_preserves_backbone_and_marks_sparse_layers(k31_config):

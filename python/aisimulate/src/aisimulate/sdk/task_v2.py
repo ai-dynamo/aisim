@@ -2494,10 +2494,19 @@ class Task:
                 self._architecture == "KimiK31ForConditionalGeneration"
                 and self.database_mode == "SOL"
                 and (
-                    mode in (common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16)
+                    mode
+                    in (
+                        common.KVCacheQuantMode.bfloat16,
+                        common.FMHAQuantMode.bfloat16,
+                        common.FMHAQuantMode.fp8,
+                    )
                     or (mode == common.KVCacheQuantMode.fp8 and self.attention_backend in ("flashmla", "trtllm_mla"))
                 )
             ):
+                # Analytic FMHA still needs hardware compute support even when
+                # it has no measured table to validate against.
+                if isinstance(mode, common.FMHAQuantMode) and getattr(database, "system_spec", None) is not None:
+                    common.get_quant_tc_flops(database.system_spec, mode)
                 ops = [op for op in ops if op not in ("dsa_context_module", "dsa_generation_module")]
             informative = [op for op in ops if supported.get(op)]
             if not informative:
