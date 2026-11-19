@@ -480,6 +480,76 @@ def test_resources_only_fill_profiles_matching_selector(root, profile, tmp_path,
     assert load(root, user_config(profile, **user), tmp_path, require_resources=True).resource_sources == ("user",)
 
 
+@pytest.mark.parametrize("selector_role", ["prefill", "decode", "aggregated"])
+@pytest.mark.parametrize("deployment_role", ["omitted", None, "prefill", "decode", "aggregated"])
+def test_role_specific_sidecar_resources_require_an_explicit_deployment_role(
+    root, profile, tmp_path, selector_role, deployment_role
+):
+    make_entry(
+        root,
+        profile,
+        resources={**RESOURCES, "runtime_memory": RUNTIME_MEMORY},
+        sidecar_extra={"configuration_selector": {"tp": 4, "moe_tp": 4, "worker_type": selector_role}},
+    )
+    config = user_config(profile)
+    if deployment_role != "omitted":
+        config["fpm_profile"]["deployments"][0]["worker_type"] = deployment_role
+    # Shared deployments can be selected for another role; that must not promote role-specific evidence.
+    shared_role = "decode" if selector_role == "prefill" else "prefill"
+    config["worker_type"] = deployment_role if deployment_role in ("prefill", "decode", "aggregated") else shared_role
+    original = copy.deepcopy(config)
+    data = load(root, config, tmp_path)
+    matches = deployment_role == selector_role
+    assert data.resource_sources == (("metadata",) if matches else ("pending",))
+    assert config == original
+    saved = RustForwardPassPerfModel.normalize_config(json.loads(json.dumps(data.config)))
+    memory_args = dict(
+        tp_size=4,
+        moe_tp_size=4,
+        worker_type=config["worker_type"],
+        fpm_profile=saved["fpm_profile"],
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        max_num_tokens=8192,
+        max_batch_size=256,
+        gpu_memory_capacity_bytes_override=10**10,
+    )
+    if matches:
+        assert data.memory_pending == ()
+        assert load(root, config, tmp_path, require_resources=True).resource_sources == ("metadata",)
+        _require_forward_pass_profile_memory(saved)
+        estimate = memory.estimate_kv_cache(
+            CONFIG["model"], CONFIG["system"], CONFIG["backend"], CONFIG["backend_version"], **memory_args
+        )
+        assert estimate["total_kv_size_bytes"] == RUNTIME_MEMORY["kv_cache_bytes"]
+    else:
+        assert "resources" not in saved["fpm_profile"]["deployments"][0]
+        with pytest.raises(FpmResourcesPendingError, match="cache_layout"):
+            load(root, config, tmp_path, require_resources=True)
+        with pytest.raises(ValueError, match="FPM resources are pending.*cache_layout"):
+            _require_forward_pass_profile_memory(saved)
+        with pytest.raises(ValueError, match="FPM resources are pending.*cache_layout"):
+            memory.estimate_kv_cache(
+                CONFIG["model"], CONFIG["system"], CONFIG["backend"], CONFIG["backend_version"], **memory_args
+            )
+
+
+@pytest.mark.parametrize("selector_role", ["prefill", "decode", "aggregated"])
+def test_explicit_shared_resources_override_role_specific_sidecar(root, profile, tmp_path, selector_role):
+    make_entry(
+        root,
+        profile,
+        resources=RESOURCES,
+        sidecar_extra={"configuration_selector": {"worker_type": selector_role}},
+    )
+    user = {**RESOURCES, "max_num_tokens": 4096, "provenance": "Explicit shared-resource fixture."}
+    data = load(root, user_config(profile, **user), tmp_path, require_resources=True)
+    assert data.resource_sources == ("user",)
+    assert data.profile.deployments[0].worker_type is None
+    assert data.profile.deployments[0].resources.max_num_tokens == user["max_num_tokens"]
+    assert data.profile.deployments[0].resources.provenance == user["provenance"]
+
+
 def test_pending_memory_serves_timing_and_blocks_replay(root, profile, tmp_path):
     make_entry(root, profile, resources=RESOURCES)  # geometry known, memory not yet profiled
     data = load(root, user_config(profile), tmp_path)
