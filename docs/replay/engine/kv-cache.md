@@ -949,14 +949,20 @@ sub-block matching without an explicit full-state scratch count.
   Native replay checks more at startup and refuses the rank otherwise. Every
   state group holds one block per request. At least one group is
   prefix-cacheable. The hash block divides the block of every
-  prefix-cacheable group, and the scheduler block is a multiple of it. On
+  prefix-cacheable group, and the scheduler block is a multiple of it. The
+  scheduler block, the least common multiple of the group blocks, fits in
+  the machine's unsigned integer size. On
   vLLM 0.31.0 no prefix-cacheable state group has a positive
   `prefill_checkpoint_blocks`. On vLLM 0.32.0 and 0.33.0 every
   prefix-cacheable state group records `prefill_checkpoint_blocks`, with one
   count and one alignment across state groups, and a state group with a
   checkpoint block has the smallest block of the prefix-cacheable groups. On
-  vLLM 0.33.0 `prefill_schedule_interval` is 1. `max_model_len` is set, and the pool holds one prompt of
-  `max_model_len` plus the state blocks of one request. Planning runs only the
+  vLLM 0.33.0 `prefill_schedule_interval` is 1. On every modeled version no
+  `state` group with `prefix_cacheable: false` has a positive
+  `prefill_checkpoint_blocks`. `max_model_len` is set, and the pool holds one prompt of
+  `max_model_len` plus the state blocks of one request. `preemption_mode` is
+  `lifo`, the default, which is vLLM's order: it preempts the last running
+  request. Planning runs only the
   conditions above, so a profile that fails a native check plans prefix
   caching on and is refused at replay. The native rank does not hold the
   Mamba cache mode, so native replay does not check align mode. It does not
