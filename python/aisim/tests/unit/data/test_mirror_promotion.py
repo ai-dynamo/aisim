@@ -348,6 +348,7 @@ def test_visibility_origin_enforces_inferencex_disclosure(tmp_path, origin):
     [
         ('{"note":"host.nvidia.com","note":"clean"}', True),
         ('{"nested":[{"note":"hidden","note":"clean"}]}', True),
+        ('{"note":"hidden","note":"clean","number":1e309}', True),
         ('{"note":"clean"}', False),
         ("ordinary text", False),
     ],
@@ -359,6 +360,14 @@ def test_duplicate_json_in_operation_metadata_reaches_both_publication_gates(tmp
     plan = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert ("duplicate-json-key" in {f.code for f in public.errors}) is blocked
     assert ("duplicate-json-key" in {f.code for f in plan.findings}) is blocked
+
+
+def test_encoded_metadata_with_large_numbers_keeps_credential_context(tmp_path):
+    root, directory, _ = _op_mirror(tmp_path, "attrs", r'{"\u0070assword":"sensitive-value","number":1e309}')
+    assert validate_tree(root).ok
+    assert "secret" in {f.code for f in validate_tree(root, profile="public").errors}
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert "secret" in {f.code for f in plan.findings}
 
 
 @pytest.mark.parametrize("value", ["{", "[]", '{"schema_version":"unknown","entries":[]}', '{"entries":[null]}'])
