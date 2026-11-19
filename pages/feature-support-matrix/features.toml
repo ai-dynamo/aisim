@@ -124,6 +124,12 @@ doc = "replay/engine/workers.md#vllm-pass-launch"
 cells = ["limited", "not_supported", "not_supported"]
 note = "User-measured launch costs set when vLLM returns a pass's outputs; one-GPU aggregated workers with async scheduling, offline replay only."
 
+[[sections.rows]]
+name = "Serial batch-selection cost"
+doc = "replay/engine/workers.md#sglang-batch-selection-cost"
+cells = ["not_supported", "limited", "not_supported"]
+note = "User-measured CPU time per productive pass in built-in SGLang replay without host-loop overlap or AFD."
+
 [[sections]]
 id = "speculation"
 title = "Speculative decoding"

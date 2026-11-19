@@ -4,7 +4,9 @@
 //! G2 pool ownership: private per DP rank, or one cluster-shared pool per
 //! Replay deployment or per [`SharedG2Pool`] handle.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 
 use anyhow::{Result, ensure};
 
@@ -23,9 +25,39 @@ struct Contract {
     shared_h2d_bandwidth_gbps: f64,
 }
 
+/// A G2 tier and an epoch that moves each time the tier is locked for change,
+/// which tells a rank whether the deadline it last read can have moved.
+struct Pool {
+    tier: Mutex<HostTier>,
+    epoch: AtomicU64,
+}
+
+impl Pool {
+    fn new(tier: HostTier) -> Arc<Self> {
+        Arc::new(Self {
+            tier: Mutex::new(tier),
+            epoch: AtomicU64::new(0),
+        })
+    }
+
+    /// The tier, for change. Its holders take turns, so the epoch needs no
+    /// atomic add.
+    fn lock(&self) -> LockResult<MutexGuard<'_, HostTier>> {
+        let tier = self.tier.lock();
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        self.epoch.store(epoch + 1, Ordering::Relaxed);
+        tier
+    }
+
+    /// The tier, for queries only, which leave the epoch alone.
+    fn read(&self) -> impl Deref<Target = HostTier> {
+        self.tier.lock().unwrap()
+    }
+}
+
 #[derive(Default)]
 struct RegistryState {
-    pool: Option<(Contract, Arc<Mutex<HostTier>>)>,
+    pool: Option<(Contract, Arc<Pool>)>,
     next_client: u64,
 }
 
@@ -46,7 +78,7 @@ impl G2Registry {
                 Arc::clone(tier)
             }
             None => {
-                let tier = Arc::new(Mutex::new(HostTier::new(HostTierConfig {
+                let tier = Pool::new(HostTier::new(HostTierConfig {
                     capacity_blocks: contract.capacity_blocks,
                     block_bytes: contract.block_bytes,
                     shared_gbps: Some((
@@ -55,7 +87,7 @@ impl G2Registry {
                     )),
                     policy: HostPolicy::CohortLru,
                     eviction: HostEviction::TierLru,
-                })?));
+                })?);
                 state.pool = Some((contract, Arc::clone(&tier)));
                 tier
             }
@@ -63,20 +95,20 @@ impl G2Registry {
         let id = state.next_client;
         state.next_client += 1;
         tier.lock().unwrap().register(id, link)?;
-        Ok(HostClient { tier, id })
+        Ok(HostClient::of(tier, id))
     }
 
     /// `(capacity, resident, used)` blocks of the shared pool, if one exists.
     pub(crate) fn occupancy(&self) -> Option<(usize, usize, usize)> {
         let state = self.0.lock().unwrap();
-        let tier = state.pool.as_ref()?.1.lock().unwrap();
+        let tier = state.pool.as_ref()?.1.read();
         let (resident, used) = tier.occupancy();
         Some((tier.capacity_blocks(), resident, used))
     }
 
     pub(crate) fn metrics(&self) -> Option<crate::engine::HostCacheMetrics> {
         let state = self.0.lock().unwrap();
-        let tier = state.pool.as_ref()?.1.lock().unwrap();
+        let tier = state.pool.as_ref()?.1.read();
         Some(tier.metrics(G2Scope::ClusterShared))
     }
 }
@@ -114,10 +146,18 @@ pub(crate) struct G2Binding {
     pub(crate) tensor_parallel_size: u32,
 }
 
+/// Stands for no deadline in [`HostClient::deadline`]: a NaN, which no tier
+/// time is.
+const NO_DEADLINE: u64 = u64::MAX;
+
 /// One DP rank's handle on its G2 pool. Dropping it retires the rank.
 pub(crate) struct HostClient {
-    tier: Arc<Mutex<HostTier>>,
+    tier: Arc<Pool>,
     id: u64,
+    /// Bits of the deadline this rank last read, or [`NO_DEADLINE`].
+    deadline: AtomicU64,
+    /// The pool's epoch when `deadline` was read.
+    deadline_epoch: AtomicU64,
 }
 
 impl HostClient {
@@ -145,10 +185,7 @@ impl HostClient {
                     eviction: HostEviction::TierLru,
                 })?;
                 tier.register(0, link)?;
-                Ok(Self {
-                    tier: Arc::new(Mutex::new(tier)),
-                    id: 0,
-                })
+                Ok(Self::of(Pool::new(tier), 0))
             }
             G2Scope::ClusterShared => {
                 let binding = binding.ok_or_else(|| {
@@ -178,12 +215,52 @@ impl HostClient {
         }
     }
 
+    fn of(tier: Arc<Pool>, id: u64) -> Self {
+        Self {
+            tier,
+            id,
+            deadline: AtomicU64::new(NO_DEADLINE),
+            // No pool reaches this epoch, so the first read misses.
+            deadline_epoch: AtomicU64::new(u64::MAX),
+        }
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, HostTier> {
         self.tier.lock().unwrap()
+    }
+
+    pub(crate) fn read(&self) -> impl Deref<Target = HostTier> {
+        self.tier.read()
+    }
+
+    /// [`HostTier::next_deadline`] of this rank. Replay asks every idle rank
+    /// several times per timestamp, so the answer is kept until the pool is
+    /// next locked for change.
+    pub(crate) fn next_deadline(&self) -> Option<f64> {
+        let epoch = || self.tier.epoch.load(Ordering::Relaxed);
+        let seen = self.deadline_epoch.load(Ordering::Acquire);
+        if seen == epoch() {
+            let bits = self.deadline.load(Ordering::Relaxed);
+            let deadline = (bits != NO_DEADLINE).then(|| f64::from_bits(bits));
+            debug_assert!({
+                let tier = self.read();
+                epoch() != seen || tier.next_deadline(self.id) == deadline
+            });
+            return deadline;
+        }
+        // The epoch cannot move while this holds the tier.
+        let tier = self.read();
+        let deadline = tier.next_deadline(self.id);
+        self.deadline.store(
+            deadline.map_or(NO_DEADLINE, f64::to_bits),
+            Ordering::Relaxed,
+        );
+        self.deadline_epoch.store(epoch(), Ordering::Release);
+        deadline
     }
 
     pub(crate) fn tier_handle(&self) -> HostTierHandle {
@@ -205,7 +282,7 @@ impl Drop for HostClient {
 /// before the new worker's ranks run. This is deadlock-free only because Replay
 /// drives all ranks on one thread.
 #[derive(Clone)]
-pub(crate) struct HostTierHandle(Arc<Mutex<HostTier>>);
+pub(crate) struct HostTierHandle(Arc<Pool>);
 
 impl HostTierHandle {
     pub(crate) fn lock(&self) -> MutexGuard<'_, HostTier> {
@@ -214,7 +291,7 @@ impl HostTierHandle {
 
     #[cfg(test)]
     pub(crate) fn new(tier: HostTier) -> Self {
-        Self(Arc::new(Mutex::new(tier)))
+        Self(Pool::new(tier))
     }
 }
 

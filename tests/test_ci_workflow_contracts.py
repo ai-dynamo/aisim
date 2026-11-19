@@ -29,6 +29,7 @@ import yaml
 
 from scripts.ci import check_python_licenses as python_licenses
 from scripts.ci import generate_license_evidence as license_evidence
+from scripts.ci import readme_rc_wheels as rc_wheels
 from scripts.ci.check_application_test_inventory import Inventory, assignment
 from scripts.ci.require_fast_ci import REQUIRED_JOBS, GateError, latest_run, require_fast_ci, verify_jobs
 from scripts.ci.select_full_ci import COMPONENTS, select_components
@@ -942,6 +943,351 @@ def test_readme_checks_remain_in_full_ci_without_standalone_daily_jobs() -> None
     for name in ("readme-daily.yml", "readme-report.yml"):
         assert not (WORKFLOW_ROOT / name).exists()
         assert all(name not in path.read_text() for path in WORKFLOW_ROOT.glob("*.yml"))
+
+
+def _rc_producer():
+    artifact = {
+        "name": "bundle-manifest",
+        "expired": False,
+        "workflow_run": {
+            "id": 10,
+            "repository_id": 123,
+            "head_repository_id": 123,
+            "head_sha": "a" * 40,
+        },
+    }
+    run = {
+        "id": 10,
+        "status": "completed",
+        "conclusion": "success",
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": "a" * 40,
+        "repository": {"id": 123},
+        "head_repository": {"id": 123},
+    }
+    env = {
+        "GITHUB_REPOSITORY": "ai-dynamo/aisim",
+        "GITHUB_REPOSITORY_ID": "123",
+        "GITHUB_RUN_ID": "20",
+        "GITHUB_REF_NAME": "pull-request/42",
+        "GITHUB_SHA": "b" * 40,
+        "RC_PR_NUMBER": "42",
+    }
+    return artifact, run, env
+
+
+def test_rc_wheels_reuse_only_successful_main_or_exact_current_pr():
+    artifact, run, env = _rc_producer()
+
+    def request(endpoint):
+        return {"artifacts": [artifact]} if "/artifacts?" in endpoint else run
+
+    assert rc_wheels.find_producer("bundle", env, request) == {
+        "run-id": "10",
+        "scope": "preview",
+        "pr-number": "",
+    }
+    run["head_branch"] = env["GITHUB_REF_NAME"]
+    run["head_sha"] = artifact["workflow_run"]["head_sha"] = env["GITHUB_SHA"]
+    assert rc_wheels.find_producer("bundle", env, request) == {
+        "run-id": "10",
+        "scope": "pr",
+        "pr-number": "42",
+    }
+    run["head_sha"] = artifact["workflow_run"]["head_sha"] = "c" * 40
+    assert rc_wheels.find_producer("bundle", env, request)["run-id"] == ""
+
+
+@pytest.mark.parametrize(
+    ("target", "key", "value"),
+    [
+        ("artifact", "expired", True),
+        ("artifact", "name", "other-manifest"),
+        ("producer", "head_repository_id", 999),
+        ("producer", "repository_id", 999),
+        ("producer", "id", 20),
+        ("run", "status", "in_progress"),
+        ("run", "conclusion", "failure"),
+        ("run", "path", ".github/workflows/untrusted.yml"),
+        ("run", "event", "pull_request"),
+        ("run", "head_branch", "pull-request/99"),
+        ("run", "head_sha", "d" * 40),
+        ("run", "repository", {"id": 999}),
+        ("run", "head_repository", {"id": 999}),
+    ],
+)
+def test_rc_wheels_reject_untrusted_incomplete_or_superseded_producers(target, key, value):
+    artifact, run, env = _rc_producer()
+    {"artifact": artifact, "producer": artifact["workflow_run"], "run": run}[target][key] = value
+
+    def request(endpoint):
+        return {"artifacts": [artifact]} if "/artifacts?" in endpoint else run
+
+    assert rc_wheels.find_producer("bundle", env, request)["run-id"] == ""
+
+
+def test_rc_wheels_discovery_paginates_past_expired_manifests():
+    artifact, run, env = _rc_producer()
+    calls = []
+
+    def request(endpoint):
+        calls.append(endpoint)
+        if parse_qs(urlsplit(endpoint).query).get("page") == ["1"]:
+            return {"artifacts": [{**artifact, "expired": True}] * 100}
+        return {"artifacts": [artifact]} if "/artifacts?" in endpoint else run
+
+    assert rc_wheels.find_producer("bundle", env, request)["run-id"] == "10"
+    assert any("page=2" in call for call in calls)
+
+
+@pytest.mark.parametrize("changed_input", rc_wheels.INPUTS)
+def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, changed_input):
+    for key in ("AISIM_RC_REVISION", "DYNAMO_RC_REVISION"):
+        monkeypatch.setenv(key, "a" * 40)
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
+    monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pr-pypi-local")
+    monkeypatch.setenv("RC_STORAGE_URL", "https://artifactory.invalid/artifactory")
+    os_release = tmp_path / "os-release"
+    os_release.write_text("Linux image version")
+    monkeypatch.setattr(rc_wheels, "OS_RELEASE", os_release)
+    monkeypatch.setattr(rc_wheels.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(rc_wheels.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        rc_wheels.subprocess,
+        "check_output",
+        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"pinned package versions",
+    )
+    for relative in rc_wheels.INPUTS:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original")
+    original = rc_wheels.handoff_name(rc_wheels.identity(tmp_path))
+    (tmp_path / changed_input).write_text("changed")
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    (tmp_path / changed_input).write_text("original")
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:new-version")
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    monkeypatch.setenv("RC_JOB_IMAGE", "runner:2.336.0")
+    os_release.write_text("rebuilt Linux image")
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    os_release.write_text("Linux image version")
+    monkeypatch.setattr(
+        rc_wheels.subprocess,
+        "check_output",
+        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"updated package versions",
+    )
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+    monkeypatch.setattr(
+        rc_wheels.subprocess,
+        "check_output",
+        lambda *a, **kw: "pinned tool version" if kw.get("text") else b"pinned package versions",
+    )
+    monkeypatch.setenv("RC_STORAGE_REPO", "sw-dynamo-aisimulate-pypi-local")
+    assert rc_wheels.handoff_name(rc_wheels.identity(tmp_path)) != original
+
+
+def test_main_rc_producers_share_test_storage_with_pr_consumers():
+    workflow = _workflow("readme-checks.yml")
+    job = workflow["jobs"]["dynamo"]
+    assert job["environment"] == "pr-wheel-staging"
+    prepare = next(step for step in job["steps"] if step.get("id") == "rc-wheels")
+    assert prepare["env"]["RC_STORAGE_REPO"] == "${{ vars.WHEEL_STORAGE_REPO }}"
+    upload = next(
+        step
+        for step in job["steps"]
+        if step.get("uses", "").endswith("/wheel-storage") and step["with"]["mode"] == "upload"
+    )
+    assert upload["with"]["scope"] == "${{ inputs.pr_number != '' && 'pr' || 'preview' }}"
+    assert job["runs-on"] == "prod-aisim-default-amd64-v1"
+    assert job["container"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
+    commands = _run_commands(job)
+    assert commands.index("socket.getaddrinfo") < commands.index("readme_rc_wheels.py prepare")
+    assert commands.index("apt-get install") < commands.index("readme_rc_wheels.py prepare")
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [
+        {"run-id": "", "scope": "", "pr-number": ""},
+        {"run-id": "10", "scope": "preview", "pr-number": ""},
+        {"run-id": "11", "scope": "pr", "pr-number": "42"},
+    ],
+    ids=["cold", "trusted-main", "exact-pr"],
+)
+def test_rc_prepare_cli_outputs_reach_workflow_restore_inputs(tmp_path, monkeypatch, producer):
+    expected = {"verified": "build identity"}
+    monkeypatch.setattr(rc_wheels, "identity", lambda: expected)
+    monkeypatch.setattr(rc_wheels, "find_producer", lambda name, env: producer)
+    output = tmp_path / "github-output"
+    directory = tmp_path / "wheels"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setattr(sys, "argv", ["readme_rc_wheels.py", "prepare", "--directory", str(directory)])
+    rc_wheels.main()
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert values == {"name": rc_wheels.handoff_name(expected), **producer}
+    assert json.loads((directory / "rc-build-inputs.json").read_text()) == expected
+
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    assert job["env"]["RC_PR_NUMBER"] == "${{ inputs.pr_number }}"
+    restore = next(step for step in job["steps"] if step.get("name") == "Restore verified pinned Dynamo RC wheels")
+    inputs = {}
+    for name in ("name", "run-id", "scope", "pr-number"):
+        binding = re.fullmatch(r"\$\{\{ steps\.rc-wheels\.outputs\.([^ ]+) \}\}", restore["with"][name])
+        assert binding is not None, f"restore input {name} must consume the RC prepare outputs"
+        inputs[name] = values[binding[1]]
+    assert inputs == {"name": rc_wheels.handoff_name(expected), **producer}
+
+
+def test_rc_wheels_require_all_three_packages_and_matching_build_inputs(tmp_path):
+    expected = {"pinned": "build inputs"}
+    (tmp_path / "rc-build-inputs.json").write_text(json.dumps(expected))
+    for name in ("aisim", "ai_dynamo", "ai_dynamo_runtime"):
+        with zipfile.ZipFile(tmp_path / f"{name}.whl", "w") as archive:
+            archive.writestr(f"{name}.dist-info/METADATA", f"Name: {name}\nVersion: 1.0\n")
+    rc_wheels.verify(tmp_path, expected)
+    with pytest.raises(ValueError, match="build inputs"):
+        rc_wheels.verify(tmp_path, {"pinned": "different"})
+    (tmp_path / "ai_dynamo.whl").unlink()
+    with pytest.raises(ValueError, match="exactly the matching"):
+        rc_wheels.verify(tmp_path, expected)
+
+
+def test_pinned_rc_build_executes_all_three_locked_feature_builds(tmp_path):
+    job = _workflow("readme-checks.yml")["jobs"]["dynamo"]
+    log = tmp_path / "commands.jsonl"
+    executables = tmp_path / "bin"
+    executables.mkdir()
+    for name in ("git", "uv"):
+        executable = executables / name
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "with open(os.environ['COMMAND_LOG'], 'a') as output:\n"
+            "    output.write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]) + '\\n')\n"
+        )
+        executable.chmod(0o755)
+    wheelhouse = tmp_path / "wheelhouse"
+    subprocess.run(
+        ["bash", str(REPOSITORY_ROOT / "scripts/ci/build_readme_rc_wheels.sh")],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": str(executables) + os.pathsep + os.environ["PATH"],
+            "RUNNER_TEMP": str(tmp_path),
+            "COMMAND_LOG": str(log),
+            "AISIM_RC_WHEELHOUSE": str(wheelhouse),
+            "AISIM_RC_REVISION": job["env"]["AISIM_RC_REVISION"],
+            "DYNAMO_RC_REVISION": job["env"]["DYNAMO_RC_REVISION"],
+        },
+    )
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    expected = []
+    for name, revision in (
+        ("aisim", "77d82652b2f83fd67afefc3141d69a5f06e630be"),
+        ("dynamo", "9653d05441b37b6a004837651fd991e44158d755"),
+    ):
+        checkout = str(tmp_path / f"{name}-rc")
+        expected.extend(
+            [
+                ["git", "init", checkout],
+                ["git", "-C", checkout, "fetch", "--depth", "1", f"https://github.com/ai-dynamo/{name}.git", revision],
+                ["git", "-C", checkout, "checkout", "--detach", "FETCH_HEAD"],
+            ]
+        )
+    build = ["uv", "build", "--wheel", "--out-dir", str(wheelhouse)]
+    expected.extend(
+        [
+            [*build, "--config-setting=build-args=--locked", str(tmp_path / "aisim-rc/python/aisim")],
+            [*build, str(tmp_path / "dynamo-rc")],
+            [
+                *build,
+                "--config-setting=build-args=--locked --features ais-forward-pass",
+                str(tmp_path / "dynamo-rc/lib/bindings/python"),
+            ],
+        ]
+    )
+    assert commands == expected
+
+
+@pytest.mark.parametrize("filename,exists", [("missing.whl", False), ("not-a-wheel.txt", True)])
+def test_release_build_rejects_invalid_prebuilt_wheel_before_building(tmp_path, monkeypatch, filename, exists):
+    wheel = tmp_path / filename
+    if exists:
+        wheel.write_bytes(b"not a wheel")
+    calls = []
+    monkeypatch.setattr(release_artifacts, "_run", lambda *args, **kwargs: calls.append(args))
+    output = tmp_path / "dist"
+    with pytest.raises(ValueError, match="existing .whl file"):
+        release_artifacts.build(output, release_artifacts.VERSION, release_artifacts.VERSION, wheel)
+    assert calls == []
+    assert list(output.iterdir()) == []
+
+
+def test_release_main_forwards_prebuilt_wheel_argument(tmp_path, monkeypatch):
+    wheel = tmp_path / "application.whl"
+    output = tmp_path / "dist"
+    monkeypatch.setattr(
+        sys, "argv", ["build_release_artifacts.py", "--output-dir", str(output), "--prebuilt-wheel", str(wheel)]
+    )
+    monkeypatch.setattr(release_artifacts, "check_manifests", lambda: ("1.2.3", "1.2.3"))
+    # main supports historical source roots; restore its derived globals after this invocation.
+    for name in ("EXPECTED_PYTHON_PROJECTS", "EXPECTED_CRATE"):
+        monkeypatch.setattr(release_artifacts, name, getattr(release_artifacts, name))
+    calls = []
+    monkeypatch.setattr(release_artifacts, "build", lambda *args: calls.append(args))
+    release_artifacts.main()
+    assert calls == [(output.resolve(), "1.2.3", "1.2.3", wheel)]
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_release_build_reuses_exact_wheel_but_still_builds_and_verifies_crate(tmp_path, monkeypatch, reuse):
+    version = release_artifacts.VERSION
+    dist_info = f"aisim-{version}.dist-info"
+    wheel = tmp_path / f"aisim-{version}-cp311-abi3-manylinux_2_28_x86_64.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(f"{dist_info}/METADATA", f"Name: aisim\nVersion: {version}\n")
+        scripts = "\n".join(f"{key} = {value}" for key, value in release_artifacts._expected_scripts().items())
+        archive.writestr(f"{dist_info}/entry_points.txt", "[console_scripts]\n" + scripts)
+        for name in release_artifacts.LEGAL_FILES:
+            archive.writestr(f"{dist_info}/licenses/{name}", (REPOSITORY_ROOT / name).read_bytes())
+    calls = []
+
+    def run(*command, **kwargs):
+        calls.append(command)
+        if command[:2] == ("cargo", "package"):
+            target = Path(command[command.index("--target-dir") + 1]) / "package"
+            target.mkdir(parents=True)
+            (target / f"aisim-core-{version}.crate").write_bytes(b"crate output")
+        else:
+            assert "build_manylinux_wheel.py" in command[1]
+            shutil.copy2(wheel, Path(command[-1]) / wheel.name)
+
+    monkeypatch.setattr(release_artifacts, "_run", run)
+    monkeypatch.setattr(release_artifacts.sys, "platform", "linux")
+    output = tmp_path / "dist"
+    release_artifacts.build(output, version, version, wheel if reuse else None)
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert (output / f"aisim-core-{version}.crate").is_file()
+    assert len(calls) == (1 if reuse else 2)
+    assert calls[-1][:2] == ("cargo", "package")
+
+
+def test_release_contract_reuses_the_same_source_architecture_wheel():
+    jobs = _workflow("ci.yml")["jobs"]
+    job = jobs["release-artifact-contract"]
+    assert "application-test-wheel" in job["needs"]
+    download = next(step for step in job["steps"] if step.get("uses", "").endswith("/wheel-storage"))
+    assert download["with"]["source-sha"] == "${{ github.sha }}"
+    assert download["with"]["architecture"] == "${{ matrix.arch }}"
+    assert download["with"]["name"] == "application-test-wheel-${{ matrix.arch }}"
+    assert "--prebuilt-wheel application-test-dist/*.whl" in _run_commands(job)
+    cases = yaml.safe_load((REPOSITORY_ROOT / ".github/full-ci-selection-cases.yml").read_text())
+    for case in cases["cases"]:
+        components = select_components(case["paths"])["components"]
+        if components["release_artifact_contract"]:
+            assert components["application_tests"], case
 
 
 def test_full_ci_aggregate_checks_every_declared_dependency() -> None:
@@ -2289,8 +2635,13 @@ def test_release_qualification_pins_source_and_tooling_across_all_jobs():
     assert "maturin build --release --locked" in prepare
     assert "run_release_fpe.py record-wheel" in prepare
     assert "run_release_fpe.py discover" in prepare
-    assert "uv sync --project release-source/python/aisim --locked --no-install-project --no-dev" in prepare
+    assert 'project_directory(Path("release-source"))' in prepare
+    assert 'uv sync --project "${project}" --locked --no-install-project --no-dev' in prepare
     generate = _run_commands(jobs["generate"])
+    assert 'project_directory(Path("release-source"))' in generate
+    assert 'uv sync --project "${project}" --locked --no-install-project --no-dev' in generate
+    assert 'echo "RELEASE_PROJECT=${project}" >> "${GITHUB_ENV}"' in generate
+    assert '"${RELEASE_PROJECT}/.venv/bin/python" scripts/fpe/run_release_fpe.py probe' in generate
     assert "run_release_fpe.py probe" in generate
     assert "--max-workers 8" in generate
     assert "--max-topologies-per-role" not in generate
@@ -4568,6 +4919,7 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
     assert "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
     assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
     assert "swa_prefix_tails: None," in adapter.read_text()
+    assert "scheduler_select_time_ms: SglangConfig::default().scheduler_select_time_ms," in adapter.read_text()
     assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
 
