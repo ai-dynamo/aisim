@@ -222,8 +222,11 @@ def load_config_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
     Return the mapping and original text, which retains evidence of repeated keys.
     Keep YAML as the default for existing files without a recognized suffix.
     """
+    return _load_mapping_with_text(path, is_json=Path(path).name.lower().endswith(".json"))
+
+
+def _load_mapping_with_text(path: str | Path, *, is_json: bool) -> tuple[dict[str, Any], str]:
     source = Path(path)
-    is_json = source.name.lower().endswith(".json")
     format_name = "JSON" if is_json else "YAML"
     try:
         text = source.read_text(encoding="utf-8")
@@ -245,12 +248,12 @@ def _reject_json_constant(value: str) -> None:
 
 
 def load_yaml_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
-    """Compatibility entry point for YAML or JSON configuration files."""
-    return load_config_with_text(path)
+    """Read YAML regardless of filename, preserving the existing YAML-only contract."""
+    return _load_mapping_with_text(path, is_json=False)
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
-    return load_config_with_text(path)[0]
+    return load_yaml_with_text(path)[0]
 
 
 CONFIG_ADAPTER_ENTRY_POINT_GROUP = "aisim.config_adapters"

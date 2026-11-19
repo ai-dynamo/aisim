@@ -90,6 +90,18 @@ def test_yaml_parser_keeps_legacy_scalar_and_alias_semantics(tmp_path):
     assert text == path.read_text()
 
 
+@pytest.mark.parametrize("filename", ["input.json", "input.JSON", "input.yaml"])
+def test_yaml_only_helpers_ignore_filename_extension(tmp_path, filename):
+    from aisim.config.common import load_yaml, load_yaml_with_text
+
+    path = tmp_path / filename
+    text = "tiny: 1e-7\nnumeric: 1.0e-7\nenabled: yes\n"
+    path.write_text(text, encoding="utf-8")
+    expected = {"tiny": "1e-7", "numeric": 1e-7, "enabled": True}
+    assert load_yaml(path) == expected
+    assert load_yaml_with_text(path) == (expected, text)
+
+
 @pytest.mark.parametrize("value", ['"1e-7"', "true", "1e999"])
 @pytest.mark.parametrize("config_type", [CorePredictionConfig, CoreRecommendationConfig])
 def test_json_config_keeps_numeric_field_validation(tmp_path, value, config_type):
@@ -147,7 +159,8 @@ def test_json_distinct_unicode_keys_and_unrelated_repeats_remain_valid(tmp_path)
 
     path = tmp_path / "input.json"
     path.write_text(
-        '{"extra": 1, "extra": 2, "engine": {"ais_perf_model": {"estimator_config": {"a\u0085b": 1, "a b": 2}}}}'
+        '{"extra": 1, "extra": 2, "engine": {"ais_perf_model": {"estimator_config": {"a\u0085b": 1, "a b": 2}}}}',
+        encoding="utf-8",
     )
     raw = _load_mapping(str(path))
     assert raw["extra"] == 2

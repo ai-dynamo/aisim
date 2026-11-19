@@ -16,6 +16,12 @@ selects Python's JSON parser; other filenames retain YAML parsing, including
 `"1e-7"` remains a string and fails validation in numeric fields. Invalid JSON
 is reported as an error without falling back to YAML.
 
+This format selection applies to `predict`, `recommend`, `perf-model migrate`,
+and the `CorePredictionConfig`, `CoreRecommendationConfig`, and `SmartSearchConfig`
+file readers. The existing `load_yaml()` and `load_yaml_with_text()` helpers
+always parse YAML, including files named `.json`. Their onboarding, checkpoint,
+validation, and `vl collect --config` consumers retain that behavior.
+
 <a id="configuration-model"></a>
 
 ## Configuration Model

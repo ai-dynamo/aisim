@@ -887,7 +887,9 @@ def _section(kind: str) -> str:
     return sections[kind]
 
 
-def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -> None:
+def reject_repeated_keys(
+    text: str, kind: str, source: str | os.PathLike[str], *, json_input: bool | None = None
+) -> None:
     """Fail when the text of a config file writes ``ais_perf_model``, or a key inside it, twice.
 
     ``text`` is the YAML or JSON text of a config file, ``kind`` is ``predict``,
@@ -917,11 +919,15 @@ def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -
     reader cannot parse is left to the code that reads the file.
 
     JSON uses decoded key identities and reports the repeated key's path.
+    Unless ``json_input`` is supplied, the filename selects the format. A
+    YAML-only caller must pass ``False`` to match its own reader.
     A YAML repeat is an ``AisPerfModelError`` that names the key and its lines:
     the first and the last writing of the section or of ``ais_perf_model``,
     the first two writings of a key inside the value.
     """
-    if os.fspath(source).lower().endswith(".json"):
+    if json_input is None:
+        json_input = os.fspath(source).lower().endswith(".json")
+    if json_input:
         _reject_repeated_json_keys(text, kind, source)
         return
 
