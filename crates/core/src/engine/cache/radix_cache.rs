@@ -174,22 +174,57 @@ pub(crate) struct InsertPageResult {
 }
 
 /// Shared immutable keys keep admission checkpoints proportional to node metadata.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-struct PageKey(Arc<[LocalBlockHash]>);
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PageKey {
+    hashes: Arc<Vec<LocalBlockHash>>,
+    end: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OWNED_KEY_ATOMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl PageKey {
+    #[cfg(test)]
+    pub(crate) fn take_owned_key_atoms() -> usize {
+        OWNED_KEY_ATOMS.with(|atoms| atoms.replace(0))
+    }
+
+    pub(crate) fn shared(hashes: Arc<Vec<LocalBlockHash>>, end: usize) -> Self {
+        assert!(end <= hashes.len());
+        Self { hashes, end }
+    }
+}
+
+impl PartialEq for PageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+impl Eq for PageKey {}
+impl std::hash::Hash for PageKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
 
 impl From<Vec<LocalBlockHash>> for PageKey {
     fn from(value: Vec<LocalBlockHash>) -> Self {
-        Self(value.into())
+        #[cfg(test)]
+        OWNED_KEY_ATOMS.with(|atoms| atoms.set(atoms.get() + value.len()));
+        let end = value.len();
+        Self::shared(Arc::new(value), end)
     }
 }
 impl AsRef<[LocalBlockHash]> for PageKey {
     fn as_ref(&self) -> &[LocalBlockHash] {
-        &self.0
+        &self.hashes[..self.end]
     }
 }
 impl Borrow<[LocalBlockHash]> for PageKey {
     fn borrow(&self) -> &[LocalBlockHash] {
-        &self.0
+        self.as_ref()
     }
 }
 impl ChildKeyType for PageKey {
@@ -223,6 +258,29 @@ type SglangTree = UnifiedTreeCore<PageKey, PageValue<KvPageId>>;
 struct BeladyPages {
     oracle: BeladyOracle,
     page_hashes: Vec<Option<SequenceHash>>,
+    /// Tail page -> (core split tick, pre-split recency). A real core access
+    /// changes the tick and supersedes the correction. Physical frees remove it.
+    retained_recency: HashMap<KvPageId, (i64, i64)>,
+}
+
+impl BeladyPages {
+    fn priority(
+        &self,
+        candidate: sglang_radix_tree::FullDeviceEvictionCandidate<'_, PageValue<KvPageId>>,
+    ) -> Reverse<(Reverse<usize>, i64, NodeId)> {
+        let page = candidate.value.as_slice().last().expect("nonempty leaf");
+        let hash = self.page_hashes[page.index()].expect("cached page has prefix identity");
+        let access = self
+            .retained_recency
+            .get(page)
+            .filter(|(tick, _)| *tick == candidate.last_access_counter)
+            .map_or(candidate.last_access_counter, |(_, access)| *access);
+        Reverse((
+            Reverse(self.oracle.next_use(hash)),
+            access,
+            candidate.node_id,
+        ))
+    }
 }
 
 /// Thin adapter from AISimulate's page-native cache contract to SGLang's tree.
@@ -252,6 +310,7 @@ impl RadixCache {
         self.belady = Some(BeladyPages {
             oracle,
             page_hashes: vec![None; self.page_pool.total_pages],
+            retained_recency: HashMap::new(),
         });
     }
 
@@ -281,44 +340,51 @@ impl RadixCache {
 
     fn evict_belady(&mut self, target_pages: usize) -> Vec<KvPageId> {
         let belady = self.belady.as_ref().expect("Belady configured");
-        let priority =
-            |candidate: sglang_radix_tree::FullDeviceEvictionCandidate<'_, PageValue<KvPageId>>| {
-                let page = candidate.value.as_slice().last().expect("nonempty leaf");
-                let hash =
-                    belady.page_hashes[page.index()].expect("cached page has prefix identity");
-                Reverse((
-                    Reverse(belady.oracle.next_use(hash)),
-                    candidate.last_access_counter,
-                    candidate.node_id,
-                ))
-            };
         // Start from the core's current unlocked leaves. Global forecast changes
         // are observed at each eviction; they never create or unlock local KV.
         let mut candidates: BinaryHeap<_> = self
             .tree
             .full_device_eviction_candidates()
-            .map(priority)
+            .map(|candidate| belady.priority(candidate))
             .collect();
         let mut pages = Vec::with_capacity(target_pages.min(self.tree.evictable_size()));
         while pages.len() < target_pages {
-            let Some(Reverse((_, _, node_id))) = candidates.pop() else {
+            let Some(Reverse((_, access, node_id))) = candidates.pop() else {
                 break;
             };
+            let split = self
+                .tree
+                .full_device_eviction_candidate(node_id)
+                .expect("live eviction candidate")
+                .value
+                .as_slice()
+                .len()
+                > 1;
             let (parent, step) = self
                 .tree
                 .evict_full_device_suffix(node_id, 1)
                 .expect("live eviction candidate");
             for chunk in step.device_frees.get(&FULL).into_iter().flatten() {
+                let belady = self.belady.as_mut().expect("Belady configured");
+                for page in chunk.as_slice() {
+                    belady.page_hashes[page.index()] = None;
+                    belady.retained_recency.remove(page);
+                }
                 pages.extend_from_slice(chunk.as_slice());
             }
             if let Some(parent) = parent.and_then(|id| self.tree.full_device_eviction_candidate(id))
             {
-                candidates.push(priority(parent));
+                let belady = self.belady.as_mut().expect("Belady configured");
+                if split {
+                    let page = *parent.value.as_slice().last().expect("retained prefix");
+                    belady
+                        .retained_recency
+                        .insert(page, (parent.last_access_counter, access));
+                }
+                // Recompute next use from the retained tail, keeping its recency
+                // only when this operation split the selected compressed leaf.
+                candidates.push(belady.priority(parent));
             }
-        }
-        let belady = self.belady.as_mut().expect("Belady configured");
-        for page in &pages {
-            belady.page_hashes[page.index()] = None;
         }
         pages
     }
@@ -461,7 +527,7 @@ impl RadixCache {
         );
         let page_keys = self.page_hashes(&key[..aligned_len]);
         let pages = self.page_ids(&value[..aligned_len], page_keys.len());
-        self.insert_page_hashes_from_node(self.root(), 0, &page_keys, &pages, false)
+        self.insert_page_hashes_from_node(self.root(), 0, page_keys.into(), &pages, false)
             .last_node
     }
 
@@ -470,10 +536,11 @@ impl RadixCache {
         &mut self,
         prefix_node: NodeId,
         prefix_len: usize,
-        page_keys: &[LocalBlockHash],
+        key: PageKey,
         pages: &[KvPageId],
         chunked: bool,
     ) -> InsertPageResult {
+        let page_keys = key.as_ref();
         assert_eq!(
             prefix_len % self.page_size,
             0,
@@ -497,7 +564,6 @@ impl RadixCache {
             &page_keys[prefix_pages..],
             &pages[prefix_pages..page_keys.len()],
         );
-        let key: PageKey = page_keys.to_vec().into();
         let suffix_value = PageValue::from_vec(pages[prefix_pages..page_keys.len()].to_vec());
         let result = self.tree.insert_suffix_from_node(
             prefix_node,
@@ -747,6 +813,53 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn belady_retains_recency_across_suffix_evictions(
+        #[values(false, true)] touch_retained: bool,
+        #[values(false, true)] checkpoint: bool,
+    ) {
+        let mut cache = RadixCache::new(4, 1);
+        cache.set_belady_oracle(oracle_for_prompts(&[]));
+        let older = cache.page_pool.allocate(3).unwrap();
+        cache.insert(&[1, 2, 3], &older);
+        let newer = cache.page_pool.allocate(1).unwrap();
+        cache.insert(&[9], &newer);
+
+        assert_eq!(cache.evict(1).1, vec![KvPageId(2)]);
+        if checkpoint {
+            cache = cache.admission_checkpoint();
+        }
+        if touch_retained {
+            assert_eq!(cache.match_prefix(&[1, 2]).0, 2);
+            assert_eq!(cache.evict(1).1, vec![KvPageId(3)]);
+        }
+        // Each split must carry the original recency through both this call
+        // and earlier calls, rather than treating the split as a cache access.
+        assert_eq!(cache.evict(2).1, vec![KvPageId(1), KvPageId(0)]);
+        if !touch_retained {
+            assert_eq!(cache.prefix_match_len(&[9]), 1);
+            assert_eq!(cache.evict(1).1, vec![KvPageId(3)]);
+        }
+        assert!(cache.belady.as_ref().unwrap().retained_recency.is_empty());
+        assert_eq!(cache.available_tokens(), 4);
+    }
+
+    #[test]
+    fn shared_query_key_limits_visible_hashes_and_keeps_content_identity() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let hashes = Arc::new(vec![LocalBlockHash(1), LocalBlockHash(2)]);
+        let query = PageKey::shared(Arc::clone(&hashes), 1);
+        assert_eq!(query.as_ref().as_ptr(), hashes.as_ptr());
+        let owned: PageKey = vec![LocalBlockHash(1)].into();
+        assert_eq!(query, owned);
+        let hash = |key: &PageKey| {
+            let mut state = DefaultHasher::new();
+            key.hash(&mut state);
+            state.finish()
+        };
+        assert_eq!(hash(&query), hash(&owned));
+    }
+
+    #[rstest::rstest]
     fn belady_reranks_compressed_tail_before_evicting_its_prefix(
         #[values(false, true)] shared: bool,
     ) {
@@ -798,7 +911,7 @@ mod tests {
         cache.insert_page_hashes_from_node(
             parent,
             2,
-            &cache.page_hashes(&[1, 2, 3]),
+            cache.page_hashes(&[1, 2, 3]).into(),
             &pages.iter().copied().map(KvPageId).collect::<Vec<_>>(),
             true,
         );
@@ -900,14 +1013,25 @@ mod tests {
         let mut cache = RadixCache::new(64, 4);
         let existing = cache.page_pool.allocate_pages(2).unwrap();
         let key = cache.page_hashes(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let _ = cache.insert_page_hashes_from_node(cache.root(), 0, &key, &existing, false);
+        let _ = cache.insert_page_hashes_from_node(
+            cache.root(),
+            0,
+            key.clone().into(),
+            &existing,
+            false,
+        );
 
         let (prefix_len, prefix_node) = cache.match_prefix_hashes_and_lock(&key[..1]);
         assert_eq!(prefix_len, 4);
         let incoming_suffix = cache.page_pool.allocate_pages(1).unwrap();
         let incoming = [existing[0], incoming_suffix[0]];
-        let result =
-            cache.insert_page_hashes_from_node(prefix_node, prefix_len, &key, &incoming, true);
+        let result = cache.insert_page_hashes_from_node(
+            prefix_node,
+            prefix_len,
+            key.into(),
+            &incoming,
+            true,
+        );
 
         assert_eq!(result.canonical_suffix, vec![existing[1]]);
         assert_eq!(result.unretained_pages, incoming_suffix);

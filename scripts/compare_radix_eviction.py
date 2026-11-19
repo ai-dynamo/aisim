@@ -41,7 +41,17 @@ def main() -> None:
     parser.add_argument("--baseline", default=BASELINE)
     parser.add_argument("--candidate", default="HEAD")
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--probe", choices=("selection", "lifecycle"), default="selection")
     args = parser.parse_args()
+    lifecycle = args.probe == "lifecycle"
+    probe = Path("crates/core/src/engine/kv_manager/radix_lifecycle_evidence.rs") if lifecycle else PROBE
+    module_file = probe.with_name("sglang_backend.rs") if lifecycle else PROBE.with_name("radix_cache.rs")
+    module = (
+        '\n#[cfg(test)]\n#[path = "radix_lifecycle_evidence.rs"]\nmod radix_lifecycle_evidence;\n'
+        if lifecycle
+        else MODULE
+    )
+    test = "radix_lifecycle_matches_recorded_behavior" if lifecycle else TEST
     work = args.work_dir.resolve()
     if work.is_relative_to(ROOT):
         parser.error("--work-dir must be outside the source checkout")
@@ -49,12 +59,14 @@ def main() -> None:
     work.mkdir(parents=True, exist_ok=False)
     report = {
         "schema_version": 1,
-        "probe_sha256": sha256(ROOT / PROBE),
-        "scenarios_sha256": sha256(ROOT / SCENARIOS),
+        "probe": args.probe,
+        "probe_sha256": sha256(ROOT / probe),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
         "profile": "test",
         "features": [],
     }
+    if not lifecycle:
+        report["scenarios_sha256"] = sha256(ROOT / SCENARIOS)
     for side in ("baseline", "candidate"):
         revision = git("rev-parse", "--verify", f"{getattr(args, side)}^{{commit}}")
         snapshot = work / side
@@ -78,15 +90,15 @@ def main() -> None:
         with tarfile.open(archive) as source:
             source.extractall(snapshot, filter="data")
         archive.unlink()
-        for relative in (PROBE, SCENARIOS, COMPARISON):
+        for relative in (probe,) if lifecycle else (probe, SCENARIOS, COMPARISON):
             target = snapshot / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / relative).read_bytes())
-        radix = snapshot / "crates/core/src/engine/cache/radix_cache.rs"
-        if "mod eviction_evidence;" not in radix.read_text():
-            radix.write_text(radix.read_text() + MODULE)
+        radix = snapshot / module_file
+        if module.strip() not in radix.read_text():
+            radix.write_text(radix.read_text() + module)
         observed = work / f"{side}.json"
-        command = ["cargo", "test", "-p", "aisimulate-core", "--locked", "--lib", TEST]
+        command = ["cargo", "test", "-p", "aisimulate-core", "--locked", "--lib", test]
         env = {
             **os.environ,
             "CARGO_BUILD_JOBS": "2",

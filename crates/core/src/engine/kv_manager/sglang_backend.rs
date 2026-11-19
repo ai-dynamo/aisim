@@ -5,7 +5,7 @@
 //! operations and KV event publishing.
 
 use crate::engine::belady::BeladyOracle;
-use crate::engine::cache::radix_cache::{KvPageId, NodeId, RadixCache};
+use crate::engine::cache::radix_cache::{KvPageId, NodeId, PageKey, RadixCache};
 use crate::engine::common::hashing::{
     LocalBlockHash, SequenceHash, compute_block_hash_for_seq, compute_next_seq_hash,
 };
@@ -13,6 +13,11 @@ use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::KvEventPublishers;
 use crate::engine::{KvBlock, KvEvent, KvEventData, StoredBlocks};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
+
+#[cfg(test)]
+#[path = "radix_lifecycle_evidence.rs"]
+mod radix_lifecycle_evidence;
 
 /// Move-only ownership of a request's SGLang KV state.
 ///
@@ -28,7 +33,9 @@ pub(crate) struct RadixRequestLease {
     /// Radix-cache prefix matched when the request was admitted from the waiting queue. Unlike
     /// `cached_tokens`, this never grows with the request's own chunks or outputs.
     admission_reused_tokens: usize,
-    page_hashes: Vec<LocalBlockHash>,
+    // Native inserts retain only their copied suffix, so the lease normally
+    // remains the sole owner between calls. Growth can append without copying.
+    page_hashes: Arc<Vec<LocalBlockHash>>,
     last_node: Option<NodeId>,
 }
 
@@ -63,7 +70,7 @@ impl RadixRequestLease {
         self.materialized_tokens = checkpoint.materialized_tokens;
         self.cached_tokens = checkpoint.cached_tokens;
         self.admission_reused_tokens = checkpoint.admission_reused_tokens;
-        self.page_hashes.truncate(checkpoint.page_hashes_len);
+        Arc::make_mut(&mut self.page_hashes).truncate(checkpoint.page_hashes_len);
         self.last_node = checkpoint.last_node;
     }
 
@@ -95,8 +102,8 @@ impl RadixRequestLease {
     }
 
     pub(crate) fn reserve_page_hashes(&mut self, complete_pages: usize) {
-        self.page_hashes
-            .reserve_exact(complete_pages.saturating_sub(self.page_hashes.len()));
+        let additional = complete_pages.saturating_sub(self.page_hashes.len());
+        Arc::make_mut(&mut self.page_hashes).reserve_exact(additional);
     }
 
     #[cfg(test)]
@@ -110,7 +117,7 @@ impl RadixRequestLease {
             return;
         }
         let first_new_token = self.page_hashes.len() * page_size;
-        self.page_hashes.extend(compute_block_hash_for_seq(
+        Arc::make_mut(&mut self.page_hashes).extend(compute_block_hash_for_seq(
             &token_ids[first_new_token..complete_pages * page_size],
             page_size,
         ));
@@ -141,7 +148,7 @@ impl RadixRequestLease {
             materialized_tokens,
             cached_tokens,
             admission_reused_tokens: cached_tokens,
-            page_hashes: Vec::new(),
+            page_hashes: Arc::default(),
             last_node: Some(last_node),
         }
     }
@@ -522,7 +529,7 @@ impl SglangKvManager {
         );
         let last_node = lease.last_node();
         let complete_pages = complete_len / self.cache.page_size();
-        let page_hashes = &lease.page_hashes[..complete_pages];
+        let page_hashes = PageKey::shared(Arc::clone(&lease.page_hashes), complete_pages);
         let pages = &mut lease.pages[..complete_pages];
         let new_last_node = self.cache_unfinished_hashes(
             page_hashes,
@@ -580,7 +587,7 @@ impl SglangKvManager {
             return;
         }
         self.cache_finished_hashes(
-            lease.page_hashes_through(complete_len, self.cache.page_size()),
+            PageKey::shared(lease.page_hashes, complete_pages),
             &lease.pages,
             last_node,
             lease.cached_tokens,
@@ -608,19 +615,21 @@ impl SglangKvManager {
     /// endpoint in LRU order; adding a complete page refreshes the full path.
     fn cache_finished_hashes(
         &mut self,
-        page_hashes: &[LocalBlockHash],
+        key: PageKey,
         pages: &[KvPageId],
         last_node: NodeId,
         first_new_token: usize,
         token_ids: &[u32],
     ) {
+        let page_hashes = key.as_ref();
         self.publish_stored_hashes(page_hashes, pages, first_new_token, token_ids);
+        let chunked = first_new_token == page_hashes.len() * self.cache.page_size();
         let insert = self.cache.insert_page_hashes_from_node(
             last_node,
             first_new_token,
-            page_hashes,
+            key,
             pages,
-            first_new_token == page_hashes.len() * self.cache.page_size(),
+            chunked,
         );
         self.free_pages(&insert.unretained_pages);
         self.cache.dec_lock_ref(last_node);
@@ -636,12 +645,13 @@ impl SglangKvManager {
     /// subsequent calls.
     fn cache_unfinished_hashes(
         &mut self,
-        page_hashes: &[LocalBlockHash],
+        key: PageKey,
         pages: &mut [KvPageId],
         last_node: NodeId,
         first_new_token: usize,
         token_ids: &[u32],
     ) -> NodeId {
+        let page_hashes = key.as_ref();
         let block_size = self.cache.page_size();
         let complete_len = page_hashes.len() * block_size;
         assert!(
@@ -653,13 +663,9 @@ impl SglangKvManager {
         );
 
         self.publish_stored_hashes(page_hashes, pages, first_new_token, token_ids);
-        let insert = self.cache.insert_page_hashes_from_node(
-            last_node,
-            first_new_token,
-            page_hashes,
-            pages,
-            true,
-        );
+        let insert =
+            self.cache
+                .insert_page_hashes_from_node(last_node, first_new_token, key, pages, true);
         let new_last_node = insert.last_node;
 
         // An interleaved insert can retain different physical pages for the same prefix.
@@ -753,7 +759,10 @@ impl SglangKvManager {
         let (new_last_node, cached_tokens) = if self.enable_prefix_caching {
             (
                 self.cache_unfinished_hashes(
-                    lease.page_hashes_through(token_count, self.cache.page_size()),
+                    PageKey::shared(
+                        Arc::clone(&lease.page_hashes),
+                        token_count / self.cache.page_size(),
+                    ),
                     &mut prefix_pages,
                     last_node,
                     prefix_len,
@@ -1446,6 +1455,51 @@ mod tests {
     }
 
     #[test]
+    fn incremental_growth_does_not_recopy_or_retain_request_hash_buffer() {
+        for prompt_len in [512, 8192] {
+            let mut mgr = SglangKvManager::new(65536, 4, KvEventPublishers::default(), 0);
+            let mut tokens: Vec<u32> = (0..prompt_len).collect();
+            let mut alloc = mgr.allocate_for_request(&tokens).unwrap();
+            alloc
+                .lease
+                .reserve_page_hashes(prompt_len as usize / 4 + 16);
+            let buffer = alloc.lease.page_hashes().as_ptr();
+            mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+            for page in 0..16 {
+                let start = tokens.len() as u32;
+                tokens.extend(start..start + 4);
+                mgr.extend_allocation(&tokens, &mut alloc.lease).unwrap();
+                if page == 0 {
+                    // Another request caches the same suffix before this lease.
+                    // Growth must adopt its canonical pages and free duplicates.
+                    let overlapping = mgr.allocate_for_request(&tokens).unwrap();
+                    let canonical = overlapping.lease.pages().to_vec();
+                    mgr.finish(&tokens, overlapping.lease);
+                    mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                    assert_eq!(alloc.lease.pages(), canonical);
+                } else {
+                    PageKey::take_owned_key_atoms();
+                    mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+                    // Include the native child-map keys. Only the new page
+                    // may be materialized, independent of the retained prompt.
+                    assert!(PageKey::take_owned_key_atoms() < 16);
+                }
+                assert_eq!(alloc.lease.page_hashes().as_ptr(), buffer);
+                // A native node or resumable walk retaining the full query
+                // would make the next Arc::make_mut copy the growing prefix.
+                assert_eq!(Arc::strong_count(&alloc.lease.page_hashes), 1);
+                assert_eq!(alloc.lease.cached_tokens(), tokens.len());
+            }
+            mgr.finish(&tokens, alloc.lease);
+            let repeat = mgr.allocate_for_request(&tokens).unwrap();
+            assert_eq!(repeat.prefix_len, tokens.len());
+            mgr.abort(repeat.lease);
+            mgr.evict(65536);
+            assert_eq!(mgr.cache.available_tokens(), 65536);
+        }
+    }
+
+    #[test]
     fn test_free_request_without_caching() {
         let mut mgr = SglangKvManager::new(100, 1, KvEventPublishers::default(), 0);
 
@@ -1705,7 +1759,7 @@ mod tests {
         let root = mgr.cache().root();
         let page_hashes = compute_block_hash_for_seq(&[1, 2, 3, 4], 4);
 
-        mgr.cache_unfinished_hashes(&page_hashes, &mut pages, root, 4, &[1, 2, 3, 4]);
+        mgr.cache_unfinished_hashes(page_hashes.into(), &mut pages, root, 4, &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -1719,7 +1773,13 @@ mod tests {
         let page_hashes = alloc.lease.page_hashes().to_vec();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            mgr.cache_unfinished_hashes(&page_hashes, &mut alloc.lease.pages, last_node, 2, &tokens)
+            mgr.cache_unfinished_hashes(
+                page_hashes.into(),
+                &mut alloc.lease.pages,
+                last_node,
+                2,
+                &tokens,
+            )
         }));
 
         assert!(result.is_err());
@@ -1738,7 +1798,13 @@ mod tests {
         let page_hashes = alloc.lease.page_hashes().to_vec();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            mgr.cache_unfinished_hashes(&page_hashes, &mut alloc.lease.pages, last_node, 0, &tokens)
+            mgr.cache_unfinished_hashes(
+                page_hashes.into(),
+                &mut alloc.lease.pages,
+                last_node,
+                0,
+                &tokens,
+            )
         }));
 
         assert!(result.is_err());
