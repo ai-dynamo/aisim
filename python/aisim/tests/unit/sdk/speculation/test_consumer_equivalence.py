@@ -771,9 +771,10 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
         [
             ("generation_attention", 7.0, 70.0, "silicon"),
             ("draft_eagle_fc", 11.0, 110.0, "sol", (generation_fallback, [])),
-            ("draft_eagle_fc", 13.0, 130.0, "silicon", (generation_fallback, [])),
+            # Unpowered: native coverage drops it, though its folded row stays powered.
+            ("draft_eagle_fc", 13.0, 0.0, "silicon", (generation_fallback, [])),
         ],
-        41.0,
+        28.0,
     )
     handle = SimpleNamespace(
         _mixed_step_breakdown_per_op_with_metadata=lambda *args, **kwargs: native, last_provenance=lambda: None
@@ -786,6 +787,8 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
     _assert_public_mixed_rows(estimate, native)
     assert estimate.per_op_latency_ms["draft_eagle_fc"] == 27.0
     assert estimate.per_op_source["draft_eagle_fc"] == "mixed"
+    # The native per-query coverage, not one recomputed from the folded rows (41 ms).
+    assert estimate.covered_latency_ms == 28.0
     assert estimate.moe_comm_fallbacks == (MoECommFallback(*context_fallback), MoECommFallback(*generation_fallback))
 
 
