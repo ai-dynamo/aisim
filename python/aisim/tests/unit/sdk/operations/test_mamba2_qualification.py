@@ -479,6 +479,41 @@ def test_engine_identity_keeps_fpm_wrapped_mamba_ops_distinct():
     assert rust_engine_step.engine_identity(first, database) != rust_engine_step.engine_identity(second, database)
 
 
+def _renamed(model, **names):
+    """``model`` with each context op named by a key of ``names`` renamed to its value."""
+    import json
+
+    import aisim_core
+
+    for index, op in enumerate(model.context_ops):
+        if op._name in names:
+            spec = json.loads(op._spec_json())
+            (body,) = spec.values()
+            body["name"] = names[op._name]
+            model.context_ops[index] = aisim_core.op_from_spec_json(json.dumps(spec))
+    return model
+
+
+def test_run_agg_reuse_keeps_a_renamed_neighbor_rejection():
+    # Build validation reads every op name: a neighbor named like the qualified
+    # scan must fail cold and after the valid graph warmed both caches.
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.backends.factory import get_backend
+
+    database = _hybrid_trtllm_database()
+    valid = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    clash = _renamed(_nano_with_state_dtypes(conv1d="float16", ssm="float16"), context_mamba_norm="context_mamba_ssm")
+    rust_engine_step._engine_handle_cache_clear()
+    with pytest.raises(Exception, match="invalid engine config"):
+        _agg_ttft(get_backend("trtllm", "b200_sxm"), clash, database)
+    rust_engine_step._engine_handle_cache_clear()
+    backend = get_backend("trtllm", "b200_sxm")
+    _agg_ttft(backend, valid, database)
+    for warm in (backend, get_backend("trtllm", "b200_sxm")):
+        with pytest.raises(Exception, match="invalid engine config"):
+            _agg_ttft(warm, clash, database)
+
+
 def test_mixed_power_coverage_counts_each_mamba_query():
     # The qualified convolution prices a powered measured row and the scan
     # prices unpowered SOL. Under one name their rows fold, so coverage must

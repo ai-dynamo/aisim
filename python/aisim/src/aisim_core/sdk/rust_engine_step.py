@@ -1823,7 +1823,7 @@ def engine_identity(model: Any, database: Any) -> str:
 
 
 def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
-    """The compiled spec of each op that holds a Mamba2 op, by op list and position.
+    """The compiled spec of every op, by op list and position, for a graph that holds a Mamba2 op.
 
     The model config does not carry the qualification fields: one config can
     compile qualified or legacy ops, or assign different state dtypes to each
@@ -1841,10 +1841,10 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
         for index, op in enumerate(getattr(model, ops_name, ())):
             # A whole-model FPM op serializes its op-level graph, Mamba2 ops included.
             if isinstance(op, (Operation, FPMForwardOp)):
-                spec = _as_engine_op(op)._spec_json()
-                if '"Mamba2"' in spec:
-                    entries.append([ops_name, index, spec])
-    return entries
+                entries.append([ops_name, index, _as_engine_op(op)._spec_json()])
+    # Build validation of a Mamba graph also reads its other ops (names, stages), so a
+    # Mamba graph keys on every compiled op; other graphs keep the config-only key.
+    return entries if any('"Mamba2"' in entry[2] for entry in entries) else []
 
 
 def _cached_engine_handle(model: Any, database: Any) -> Any:
