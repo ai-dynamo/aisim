@@ -591,11 +591,12 @@ def test_silicon_requires_exact_runtime_glm_tables():
         ("zai-org/GLM-5.3-Flash", "gb200", 4, None),
         ("nvidia/GLM-5.3-Flash-NVFP4", "gb300", 4, None),
         ("zai-org/GLM-5.3-Flash", "h100_sxm", 8, "bfloat16"),
+        ("zai-org/GLM-5.3-Flash", "h200_sxm", 4, "bfloat16"),
     ],
 )
 def test_packaged_silicon_prices_each_sparse_attention_layer_from_its_table(path, system, tp, kv):
     # The current vLLM slot: the GLM-5.3-Flash attention and all-reduce tables are
-    # packaged for it on these systems. The Hopper table holds BF16-KV rows.
+    # packaged for it on these systems. The Hopper tables hold BF16-KV rows.
     config = replace(
         _config("SILICON", enable_shared_layer=False),
         model=path,
