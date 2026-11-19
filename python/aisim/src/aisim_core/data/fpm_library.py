@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
-from aisim_core.fpm_profile import FpmResourceProfile
+from aisim_core.fpm_profile import FpmDeploymentProfile, FpmResourceProfile
 
 LIBRARY_SCHEMA_NAME = "aic_fpm_forward_perf"
 LIBRARY_SCHEMA_ID = "aic_fpm_forward_perf/v6"
@@ -75,7 +75,7 @@ class FpmLibraryMetadata(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     schema_name: Literal["aic_fpm_forward_perf"]
-    schema_version: int = Field(description="Library schema version; 6 is supported, 7 and 8 are follow-ups.")
+    schema_version: Literal[6] = Field(description="Library schema version; only 6 is supported.")
     row_count: int = Field(gt=0)
     parquet_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     system: str | None = None
@@ -386,9 +386,10 @@ def stage_fpm_library(
         root = Path(temporary.name)
         build = root
     else:
-        root = Path(output_dir).absolute()
+        root = Path(output_dir).expanduser().absolute()
         build = root.with_name(f".{root.name}.{os.getpid()}.staging")
-        if _staged_marker(root) == marker:  # an earlier verified staging of the same files: reuse it
+        previous = _check_staging_destination(root)
+        if previous == marker:  # an earlier verified staging of the same files: reuse it
             return _staged(root, metadata, recovery, parquet_sha256, artifact_id, None)
         shutil.rmtree(build, ignore_errors=True)
         build.mkdir(parents=True)
@@ -402,6 +403,7 @@ def stage_fpm_library(
         if output_dir is not None:
             (build / STAGED_MARKER).write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
             if root.exists():
+                _check_staging_destination(root)
                 shutil.rmtree(root)
             os.replace(build, root)
     except BaseException:
@@ -416,22 +418,46 @@ def stage_fpm_library(
 STAGED_MARKER = ".staged.json"
 
 
-def _stageable_roots(systems_paths: Sequence[str | Path] | None, output_dir: str | Path | None) -> list[Path] | None:
-    """Systems roots as the canonical resolver reads them (``default``, ``~``), minus the root being replaced."""
-    if systems_paths is None:
-        return None
-    from aisim_core.sdk.perf_database import _normalize_systems_paths
+def _stageable_roots(systems_paths: Sequence[str | Path] | None, output_dir: str | Path | None) -> list[Path]:
+    """Ordered effective roots, including active defaults, canonicalized and excluding the destination."""
+    from aisim_core.sdk.perf_database import _normalize_systems_paths, get_systems_paths
 
     destination = Path(output_dir).expanduser().absolute().resolve() if output_dir is not None else None
-    roots = [Path(r).expanduser() for p in systems_paths for r in _normalize_systems_paths([os.fspath(p)])]
-    return [r for r in roots if destination is None or r.absolute().resolve() != destination]
+    roots = [
+        Path(r).expanduser().resolve()
+        for p in [*(systems_paths or ()), *get_systems_paths()]
+        for r in _normalize_systems_paths([os.fspath(p)])
+    ]
+    return list(dict.fromkeys(r for r in roots if r != destination))
 
 
-def _staged_marker(root: Path) -> Any:
+class _StagingMarker(BaseModel):
+    """Recognize directories owned by this staging implementation before allowing replacement."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    system: str = Field(min_length=1)
+    backend: str = Field(min_length=1)
+    backend_version: str = Field(min_length=1)
+    parquet_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    metadata_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    systems_paths: list[str] | None
+    parquet_path: str = Field(min_length=1)
+    metadata_path: str = Field(min_length=1)
+
+
+def _staged_marker(root: Path) -> dict[str, Any] | None:
     try:
-        return json.loads((root / STAGED_MARKER).read_text(encoding="utf-8"))
+        return _StagingMarker.model_validate_json((root / STAGED_MARKER).read_bytes()).model_dump()
     except (OSError, ValueError):
         return None
+
+
+def _check_staging_destination(root: Path) -> dict[str, Any] | None:
+    marker = _staged_marker(root)
+    if root.is_symlink() or (root.exists() and (not root.is_dir() or (any(root.iterdir()) and marker is None))):
+        raise FpmContractError(f"refusing to replace {root}: nonempty output_dir requires a valid staging marker")
+    return marker
 
 
 def _staged(root, metadata, recovery, parquet_sha256, artifact_id, temporary) -> StagedFpmLibrary:
@@ -454,14 +480,11 @@ def _staged(root, metadata, recovery, parquet_sha256, artifact_id, temporary) ->
 
 
 def _prepare_system_overlay(
-    systems_root: Path, system: str, backend: str, backend_version: str, systems_paths: Sequence[str | Path] | None
+    systems_root: Path, system: str, backend: str, backend_version: str, systems_paths: Sequence[str | Path]
 ) -> Path:
     import yaml
 
-    from aisim_core.sdk import perf_database
-
-    # The caller's roots first; the active defaults still supply a system definition they do not carry.
-    systems_paths = [*(systems_paths or ()), *perf_database.get_systems_paths()]
+    # The effective roots were resolved once for both the marker and the overlay.
     source_yaml = next(
         (Path(root) / f"{system}.yaml" for root in systems_paths if (Path(root) / f"{system}.yaml").is_file()),
         None,
@@ -610,6 +633,7 @@ def complete_fpm_profile(
     metadata: Mapping[str, Any] | None,
     *,
     identity: Mapping[str, str] | None = None,
+    required: bool = True,
 ) -> tuple[dict[str, Any], list[str]]:
     """Fill deployments that lack ``resources`` from the sidecar; the user's block always wins.
 
@@ -618,7 +642,8 @@ def complete_fpm_profile(
     has no selector) and only to deployments of the library's own ``identity`` (system, backend, backend_version);
     a deployment that names another hardware, version or role is left to its own resources.
     Returns the completed dictionary and the source of each deployment's resources.
-    A deployment with neither raises :class:`FpmResourcesPendingError`.
+    A deployment with neither raises :class:`FpmResourcesPendingError` when ``required``; otherwise its
+    resources stay absent and its source is ``pending``.
     """
     selector = (metadata or {}).get("configuration_selector") or {}
     out = json.loads(json.dumps(profile, allow_nan=False))
@@ -637,13 +662,31 @@ def complete_fpm_profile(
         applies = applies and all(
             deployment.get(name) in (None, value) for name, value in wanted.items() if name in _IDENTITY_KEYS
         )
+        # Selectors also pin precision, implementation and model identity. Use the profile's own defaults for
+        # omitted deployment fields; never attach resources from a differently selected configuration.
+        selected_identity = {
+            **{name: value for name, value in out.items() if name != "deployments"},
+            "model_path": out.get("model"),
+            **{
+                name: info.get_default()
+                for name, info in FpmDeploymentProfile.model_fields.items()
+                if not info.is_required() and name not in {"resources", "execution_profile"}
+            },
+            **deployment,
+        }
+        applies = applies and all(
+            selected_identity.get(name) == value
+            for name, value in selector.items()
+            if name not in _TOPOLOGY and name not in _IDENTITY_KEYS and name in selected_identity
+        )
         resolved = resolve_resources(
             deployment.get("resources"),
             metadata if applies else None,
             where=where,
-            required=True,
+            required=required,
         )
-        deployment["resources"] = resolved.resources.model_dump(mode="json")
+        if resolved.resources is not None:
+            deployment["resources"] = resolved.resources.model_dump(mode="json")
         sources.append(resolved.source)
     return out, sources
 

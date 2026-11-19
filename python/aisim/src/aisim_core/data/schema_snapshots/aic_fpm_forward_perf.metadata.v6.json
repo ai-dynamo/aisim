@@ -538,7 +538,8 @@
       "type": "string"
     },
     "schema_version": {
-      "description": "Library schema version; 6 is supported, 7 and 8 are follow-ups.",
+      "const": 6,
+      "description": "Library schema version; only 6 is supported.",
       "title": "Schema Version",
       "type": "integer"
     },
