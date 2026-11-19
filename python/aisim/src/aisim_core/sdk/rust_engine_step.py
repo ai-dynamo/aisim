@@ -1478,6 +1478,11 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": "context_attention (scaled)",
         "fpm_forward_decode": "generation_attention",
     }
+    native_names = {entry[0] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group}
+    for native, public in public_names.items():
+        # Folding two distinct operations under one reported name would hide one's values.
+        if native in native_names and public in native_names:
+            raise ValueError(f"operation {public!r} collides with the reported name of {native!r}")
     per_op_latency_ms, per_op_energy_wms, per_op_source, fallbacks = _fold_per_op(
         (public_names.get(entry[0], entry[0]), *entry[1:])
         for group in (shared_ops, ctx_attn_ops, decode_attn_ops)

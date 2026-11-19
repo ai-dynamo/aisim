@@ -491,3 +491,23 @@ def test_mixed_power_coverage_counts_each_mamba_query():
     folded = two["per_op_latency_ms"]["context_mamba_conv1d"]
     assert folded == pytest.approx(latency["context_mamba_conv1d"] + latency["context_mamba_ssm"], rel=1e-12)
     assert two["covered_latency_ms"] == pytest.approx(one["covered_latency_ms"], rel=1e-12)
+
+
+def test_mixed_breakdown_rejects_a_scan_named_like_reported_attention():
+    # The SDK reports context attention as "context_attention (scaled)", so a
+    # scan with that native name would fold into the attention row.
+    import json
+
+    import aisim_core
+    from aisim_core.sdk import rust_engine_step
+
+    database = _hybrid_trtllm_database()
+    model = _nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16")
+    index = next(i for i, op in enumerate(model.context_ops) if op._name == "context_mamba_ssm")
+    scan = json.loads(model.context_ops[index]._spec_json())
+    scan["Mamba2"]["name"] = "context_attention (scaled)"
+    model.context_ops[index] = aisim_core.op_from_spec_json(json.dumps(scan))
+    with pytest.raises(ValueError, match="collides with the reported name"):
+        rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+            model, database, ctx_tokens=2048, gen_tokens=0, isl=2048, osl=64, prefix=0
+        )
