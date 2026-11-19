@@ -2144,12 +2144,13 @@ impl Engine {
             ));
         }
         self.reject_full_round_surface("static generation trajectories")?;
-        let bs = self.packed_decode_tokens(runtime.batch_size)?;
         let stride = stride.max(1);
         let mut total = 0.0_f64;
         if runtime.osl <= 1 {
             return Ok(0.0);
         }
+        // Pack only when a decode step runs, so an empty trajectory stays zero.
+        let bs = self.packed_decode_tokens(runtime.batch_size)?;
         let plan = &self.generation_plan;
         // Per-step name fold, indexed by name slot; `order` keeps first encounter.
         let mut step_fold: Vec<Option<(&Op, PerformanceResult, f64)>> = vec![None; plan.names()];
@@ -4930,6 +4931,14 @@ pub(crate) mod tests {
                 );
             }
         }
+        // An empty decode trajectory packs nothing and stays zero.
+        let empty = RuntimeConfig {
+            batch_size: 2,
+            isl: 64,
+            osl: 1,
+            ..Default::default()
+        };
+        assert_eq!(both.run_generation_phase(&empty, 1).unwrap(), 0.0);
         // Cached prefill leaves room for a wide decode: 4096 tokens with a
         // 4000-token prefix add 96 new tokens, while the raw 4096 would overflow.
         let near = qualified_mamba_engine(u32::MAX - 1001);
