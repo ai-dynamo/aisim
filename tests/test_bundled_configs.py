@@ -410,12 +410,12 @@ def test_current_inventory_is_complete_and_does_not_relabel_unknowns():
     assert {e["license"] for e in llama} == {"LicenseRef-Llama-4-Community"}
 
 
-def test_packaged_deepseek_v3_notice_preserves_unresolved_scope(tmp_path):
+def test_packaged_deepseek_v3_notice_preserves_source_material_grants(tmp_path):
     entries = checker.inventory_entries(checker.ROOT / checker.INVENTORY)
     name = "aisim_core/model_configs/deepseek-ai--DeepSeek-V3_config.json"
     entry = entries[name]
-    assert entry["origin"] == "legacy_unresolved"
-    assert entry["license"] == "UNKNOWN"
+    assert entry["origin"] == "upstream"
+    assert entry["license"] == "Apache-2.0 AND MIT"
     canonical = (checker.ROOT / "THIRD_PARTY_NOTICES.md").read_bytes()
     packaged = checker.ROOT / "python/aisim/THIRD_PARTY_NOTICES.md"
     assert packaged.read_bytes() == canonical
@@ -429,7 +429,8 @@ def test_packaged_deepseek_v3_notice_preserves_unresolved_scope(tmp_path):
     sections = dict(re.findall(r"^## (.*?)\n(.*?)(?=^## |\Z)", text, re.M | re.S))
     notice = sections[entry["notice"]["section"]]
     assert "deepseek-ai--DeepSeek-V3_config.json" in notice
-    assert "UNKNOWN / unresolved" in notice
+    assert "UNKNOWN / unresolved" not in notice
+    assert "Complementary Material" in sections["DeepSeek V3 configuration source-material scope"]
     assert entry["source"]["revision"] in notice
     assert "LICENSE-CODE" in notice and "LICENSE-MODEL" in notice
     assert "deepseek-ai--DeepSeek-V3_config.json" not in sections["DeepSeek model configuration files"]

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import zipfile
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -26,7 +27,17 @@ else:
 
 REVIEW = Path("scripts/ci/config_license_review.json")
 STANDARD_LICENSES = {"Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib"}
+# This explicit pair combines two policy-approved grants; other expressions,
+# including OR choices, still require a recorded decision.
+STANDARD_COMBINATIONS = {"Apache-2.0 AND MIT"}
 OWNERSHIP = {"third_party", "nvidia_developed", "nvidia_derivative"}
+
+
+def license_terms(expression: str) -> set[str]:
+    """Split plain conjunctions only; other SPDX expressions remain obligations."""
+    if re.fullmatch(r"[A-Za-z0-9.+:-]+(?: AND [A-Za-z0-9.+:-]+)*", expression):
+        return set(expression.split(" AND "))
+    return {expression}
 
 
 def https_reference(value: object) -> bool:
@@ -36,12 +47,60 @@ def https_reference(value: object) -> bool:
     return bool(url.scheme == "https" and url.hostname and not url.username and not url.password)
 
 
+def pinned_nvidia_card(evidence: dict) -> bool:
+    source = evidence.get("url", "")
+    revision = evidence.get("revision", "")
+    if not https_reference(source) or not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{40}", revision):
+        return False
+    url = urlsplit(source)
+    if evidence.get("kind") == "nvidia_repository":
+        # Repository identity alone does not prove exclusive file ownership.
+        # ownership_matches still requires the exact per-file source mapping.
+        return bool(
+            url.hostname == "github.com"
+            and not url.query
+            and not url.fragment
+            and url.path == f"/ai-dynamo/aiconfigurator/blob/{revision}/LICENSE"
+        )
+    return bool(
+        url.hostname == "huggingface.co"
+        and not url.query
+        and not url.fragment
+        and re.fullmatch(r"/nvidia/[^/]+/blob/" + revision + r"/README\.md", url.path)
+    )
+
+
+def ownership_matches(entry: dict, record: dict) -> bool:
+    evidence = record["ownership_evidence"]
+    if evidence.get("status") != "recorded_source" or not pinned_nvidia_card(evidence):
+        return False
+    source = entry.get("source", {})
+    if not isinstance(source, dict):
+        return False
+    card = evidence["url"].removesuffix("README.md")
+    if source.get("revision") == evidence["revision"] and source.get("url") == card + source.get("path", ""):
+        return True
+    # Cross-source ownership needs a deliberate file/bytes/source-bound mapping.
+    mapping = evidence.get("config_mapping", {})
+    return bool(
+        isinstance(mapping, dict)
+        and mapping.get("path") == entry["path"]
+        and mapping.get("sha256") == entry["sha256"]
+        and mapping.get("source") == source
+        and https_reference(mapping.get("reference"))
+        and isinstance(mapping.get("explanation"), str)
+        and mapping["explanation"].strip()
+    )
+
+
 def load_review(path: Path) -> dict:
     review = provenance.load_json(path.read_bytes())
     if review.get("schema_version") != 1 or review.get("releasing_entity") != "NVIDIA":
         raise ValueError("unsupported config-license review schema or releasing entity")
     if review.get("approved_standard_licenses") != sorted(STANDARD_LICENSES):
         raise ValueError("standard-license policy must match the reviewed six-license set")
+    if review.get("approved_standard_combinations") != sorted(STANDARD_COMBINATIONS):
+        raise ValueError("standard combinations must match the explicit Apache-2.0 AND MIT policy")
     if not isinstance(review.get("files"), list):
         raise ValueError("missing per-file config-license review")
     files = {}
@@ -62,23 +121,24 @@ def load_review(path: Path) -> dict:
             raise ValueError(f"NVIDIA-developed record has third-party base licenses: {name}")
         if record["ownership"] == "nvidia_derivative" and not licenses:
             raise ValueError(f"NVIDIA derivative must retain base licenses: {name}")
+        contribution = record.get("nvidia_contribution_licenses", [])
+        if not isinstance(contribution, list) or any(not isinstance(x, str) or not x.strip() for x in contribution):
+            raise ValueError(f"invalid NVIDIA contribution license list: {name}")
+        if record["ownership"] == "third_party" and contribution:
+            raise ValueError(f"third-party record cannot exempt NVIDIA contribution licenses: {name}")
+        notices = record.get("license_notices", {})
+        if not isinstance(notices, dict) or any(
+            not isinstance(k, str) or not k.strip() or not isinstance(v, dict) for k, v in notices.items()
+        ):
+            raise ValueError(f"invalid per-license notice references: {name}")
         if record["ownership"] != "third_party":
             evidence = record.get("ownership_evidence", {})
             if not isinstance(evidence, dict):
                 raise ValueError(f"invalid ownership evidence: {name}")
             if evidence.get("status") not in {"recorded_source", "source_unverified"}:
                 raise ValueError(f"invalid ownership evidence status: {name}")
-            source = evidence.get("url", "")
-            revision = evidence.get("revision", "")
-            pinned = (
-                https_reference(source)
-                and urlsplit(source).hostname == "huggingface.co"
-                and urlsplit(source).path.startswith("/nvidia/")
-                and re.fullmatch(r"[a-f0-9]{40}", revision)
-                and f"/blob/{revision}/README.md" in urlsplit(source).path
-            )
             # A declaration of an unavailable source cannot pass the gate.
-            if not pinned and evidence.get("status") != "source_unverified":
+            if not pinned_nvidia_card(evidence) and evidence.get("status") != "source_unverified":
                 raise ValueError(f"NVIDIA ownership needs pinned evidence: {name}")
         approval = record.get("approval", {})
         if not isinstance(approval, dict):
@@ -100,19 +160,55 @@ def load_review(path: Path) -> dict:
                 or not isinstance(approval.get("required_licenses"), list)
                 or any(not isinstance(x, str) or not x for x in approval["required_licenses"])
                 or not re.fullmatch(r"[a-f0-9]{64}", str(approval.get("license_text_sha256")))
+                or approval.get("path") != name
+                or not re.fullmatch(r"[a-f0-9]{64}", str(approval.get("sha256")))
+                or not isinstance(approval.get("license_text_sha256_by_license"), dict)
+                or any(
+                    not isinstance(k, str) or not k or not re.fullmatch(r"[a-f0-9]{64}", str(v))
+                    for k, v in approval.get("license_text_sha256_by_license", {}).items()
+                )
             ):
-                raise ValueError(f"approval must bind the reported license, required licenses and text hash: {name}")
+                raise ValueError(
+                    f"approval must bind path, hash, reported/required licenses and each text hash: {name}"
+                )
         files[name] = record
     return files
 
 
-def assess(entries: list[dict], records: dict) -> list[dict]:
+def required_text_hashes(entry: dict, record: dict, licenses: list[str], root: Path | None, registry: dict) -> dict:
+    hashes = {}
+    for license_id in licenses:
+        if license_id == entry["license"]:
+            # The provenance check already validated this identifier and text.
+            notice = entry["notice"]
+        else:
+            notice = record.get("license_notices", {}).get(license_id)
+            if not isinstance(notice, dict) or root is None:
+                raise ValueError(f"missing legal text for {license_id}")
+            if not registry:
+                registry.update(provenance.load_json((root / provenance.INVENTORY).read_bytes())["licenses"])
+            registered_license = registry.get(license_id)
+            if not isinstance(registered_license, dict):
+                raise ValueError(f"unregistered legal text for {license_id}")
+            registered = registered_license.get("license_text_sha256", [])
+            if not isinstance(registered, list):
+                raise ValueError(f"invalid legal text registry for {license_id}")
+            if notice.get("license_text_sha256") not in registered:
+                raise ValueError(f"unregistered legal text for {license_id}")
+            provenance.check_notice(root, entry | {"notice": notice}, None)
+        hashes[license_id] = notice["license_text_sha256"]
+    return hashes
+
+
+def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> list[dict]:
     """Evaluate declarations after the source/wheel provenance check succeeds."""
     results = []
+    registry = {}
     for entry in entries:
         name = entry["path"]
         record = records.get(name)
         problems = []
+        reported = license_terms(entry["license"])
         required = [entry["license"]]
         approval_basis = "none"
         if not record:
@@ -121,25 +217,50 @@ def assess(entries: list[dict], records: dict) -> list[dict]:
             problems.append("stale_review_hash")
         else:
             ownership = record["ownership"]
+            underlying = set(record["underlying_licenses"])
+            # Preserve the original exact-identifier standard-license policy.
+            # In particular, third-party SPDX expressions still need a decision.
+            required = sorted({entry["license"]} | underlying)
             if ownership != "third_party":
-                required = record["underlying_licenses"]
                 if record["ownership_evidence"].get("status") == "source_unverified":
                     problems.append("ownership_source_unverified")
+                if not ownership_matches(entry, record):
+                    problems.append("ownership_source_mismatch")
+                else:
+                    contribution = set(record.get("nvidia_contribution_licenses", []))
+                    if (
+                        not contribution <= reported
+                        or contribution & underlying
+                        or not (reported - contribution) <= underlying
+                    ):
+                        problems.append("inconsistent_license_obligations")
+                    required = sorted((reported - contribution) | underlying)
+            elif underlying and underlying != reported:
+                problems.append("inconsistent_license_obligations")
             if record["approval"]["status"] == "rejected":
                 problems.append("rejected")
             if entry["origin"] == "legacy_unresolved" or entry["license"] in {"UNKNOWN", "NOASSERTION", ""}:
                 problems.append("unknown_license_or_provenance")
             if any(license_id in {"UNKNOWN", "NOASSERTION"} for license_id in required):
                 problems.append("unknown_underlying_license")
-            outside_policy = sorted(set(required) - STANDARD_LICENSES)
+            outside_policy = sorted(set(required) - STANDARD_LICENSES - STANDARD_COMBINATIONS)
+            try:
+                text_hashes = required_text_hashes(entry, record, outside_policy, root, registry)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                problems.append("missing_or_invalid_required_license_text")
+                text_hashes = {}
+                text_error = str(error)
             if outside_policy and record["approval"]["status"] != "approved":
                 problems.append("unapproved_license")
             elif record["approval"]["status"] == "approved":
                 approval = record["approval"]
                 if (
-                    approval.get("reported_license") != entry["license"]
+                    approval.get("path") != name
+                    or approval.get("sha256") != entry["sha256"]
+                    or approval.get("reported_license") != entry["license"]
                     or approval.get("required_licenses") != sorted(required)
                     or approval.get("license_text_sha256") != entry.get("notice", {}).get("license_text_sha256")
+                    or approval.get("license_text_sha256_by_license") != text_hashes
                 ):
                     problems.append("stale_approval_scope_or_license_text")
                 else:
@@ -161,6 +282,8 @@ def assess(entries: list[dict], records: dict) -> list[dict]:
                 "approval_basis": approval_basis if not problems else "none",
             }
         )
+        if "missing_or_invalid_required_license_text" in problems:
+            results[-1]["license_text_error"] = text_error
     return results
 
 
@@ -179,14 +302,21 @@ def main(argv: list[str] | None = None) -> int:
         report["source_sha"] = args.source_sha
         root = args.root.resolve()
         entries, wheel_sha = provenance.validate(root, root / provenance.INVENTORY, wheel_path=args.wheel)
+        report["wheel_sha256"] = wheel_sha
         records = load_review(args.review or root / REVIEW)
         # Extra records are not silently reused for another branch/source.
-        if set(records) != {entry["path"] for entry in entries}:
-            raise ValueError("review paths differ from the exact source inventory")
-        results = assess(entries, records)
+        paths = {entry["path"] for entry in entries}
+        if set(records) != paths:
+            report["missing_review_paths"] = sorted(paths - records.keys())
+            report["extra_review_paths"] = sorted(records.keys() - paths)
+            raise ValueError(
+                "review paths differ from the exact source inventory: "
+                f"missing={report['missing_review_paths']}, extra={report['extra_review_paths']}"
+            )
+        results = assess(entries, records, root=root)
         report.update(passed=all(r["passed"] for r in results), files=results, wheel_sha256=wheel_sha)
         report["problem_counts"] = dict(Counter(problem for r in results for problem in r["problems"]))
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
         report["error"] = str(error)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "config-license-approval.json").write_text(json.dumps(report, indent=2) + "\n")
