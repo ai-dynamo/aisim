@@ -17,9 +17,13 @@ from aisim_core.data.e2e import (
     E2eManifestBody,
     SeriesRow,
     Setting,
+    SnapshotAcquisition,
+    SnapshotMember,
     aiperf_to_configuration,
     inferencex_to_configurations,
+    load_e2e,
     write_configuration,
+    write_snapshot,
 )
 from aisim_core.data.eval import (
     EvalRecord,
@@ -484,6 +488,94 @@ def test_snapshot_never_spans_private_and_public(tmp_path):
     plan = plan_promotion(root, _request([public_dir, "data/e2e-snapshots/s1"]), _reviewers())
     assert "snapshot-spans" in {f.code for f in plan.findings}
     _ = private_dir
+
+
+def _snapshot_mirror(tmp_path, *, source_scope=None, selection_policy="synthetic", member=None, acquisition=None):
+    root, manifests = _mirror(tmp_path)
+    manifest = manifests[0]
+    observation = load_e2e(root, manifest).observations[0]
+    snapshot_dir = "data/e2e-snapshots/s1"
+    (root / snapshot_dir).mkdir(parents=True)
+    write_snapshot(
+        root,
+        f"{snapshot_dir}/snapshot.json",
+        [
+            SnapshotMember(
+                configuration_id=observation.configuration_id,
+                observation_id=observation.observation_id,
+                record_sha256=observation.record_sha256,
+                manifest_path=manifest,
+                **(member or {}),
+            )
+        ],
+        source_scope=source_scope or {"kind": "synthetic"},
+        selection_policy=selection_policy,
+        completeness="complete",
+        acquisition=[SnapshotAcquisition(observation_id=observation.observation_id, **acquisition)]
+        if acquisition is not None
+        else [],
+    )
+    directories = [str(Path(manifest).parent), snapshot_dir]
+    _public(root, *directories)
+    return root, directories
+
+
+@pytest.mark.parametrize(
+    ("location", "column"),
+    [
+        ("metadata", "source_scope"),
+        ("metadata", "selection_policy"),
+        ("members", "future_text"),
+        ("acquisition", "source_uri"),
+        ("acquisition", "future_text"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("https://node7.corp.nvidia.com/v1", "internal-host"),
+        (json.dumps({"authorization": "Bearer " + "a" * 24}), "secret"),
+    ],
+)
+def test_snapshot_text_blocks_promotion_and_public_validation(tmp_path, location, column, value, code):
+    if location == "metadata":
+        updates = {column: {"endpoint": value} if column == "source_scope" else value}
+    else:
+        updates = {"member" if location == "members" else "acquisition": {column: value}}
+    root, directories = _snapshot_mirror(tmp_path, **updates)
+    private = validate_tree(root, repo=INTERNAL_REPO)
+    assert private.ok, private.errors  # valid, hash-linked private data; all referenced configurations are selected
+    draft = plan_promotion(root, _request(directories), _reviewers())
+    plan = plan_promotion(root, _request(directories, draft), _reviewers())
+    assert not plan.content_ok and not plan.ok  # valid approvals cannot override content checks
+    filename = "snapshot.json" if location == "metadata" else f"snapshot-{location}.parquet"
+    path = f"{directories[-1]}/{filename}"
+    assert any(f.code == code and f.path == path for f in plan.findings)
+    assert any(f.code == code and f.path == path for f in validate_tree(root, profile="public").errors)
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError):
+        apply_promotion(plan, root, target)
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", [None, "", "[REDACTED]", '{"endpoint": "https://benchmark.example/data"}'])
+@pytest.mark.parametrize("with_acquisition", [False, True])
+def test_clean_snapshot_is_promoted_by_copy_and_passes_public_validation(tmp_path, value, with_acquisition):
+    root, directories = _snapshot_mirror(
+        tmp_path,
+        source_scope={"kind": "synthetic", "endpoint": value},
+        member={"future_text": value},
+        acquisition={"source_uri": value, "future_text": value} if with_acquisition else None,
+    )
+    draft = plan_promotion(root, _request(directories), _reviewers())
+    plan = plan_promotion(root, _request(directories, draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    apply_promotion(plan, root, target)
+    for path in (root / directories[-1]).iterdir():
+        assert (target / path.relative_to(root)).read_bytes() == path.read_bytes()
+    report = validate_tree(target, repo=PUBLIC, profile="public")
+    assert report.ok, report.errors
 
 
 def test_eval_record_is_promoted_with_its_configuration(tmp_path):

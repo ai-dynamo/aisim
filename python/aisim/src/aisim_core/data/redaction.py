@@ -45,6 +45,7 @@ from aisim_core.data.e2e import (
     SERIES_SCHEMA,
     E2eManifestBody,
     body_from_manifest,
+    read_snapshot,
 )
 from aisim_core.data.eval import load_record
 from aisim_core.data.hygiene import Finding
@@ -306,6 +307,20 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
     return out
 
 
+def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
+    snapshot, _ = read_snapshot(root, rel)
+    out = scan_value(snapshot.model_dump(mode="json", by_alias=True), policy, rel, "snapshot metadata")
+    for artifact in (snapshot.members, snapshot.acquisition):
+        if artifact is not None:
+            path = _verify(root, artifact)
+            out.extend(
+                _check_table_text(
+                    read_parquet(path, artifact.artifact_schema), artifact.path, policy, "snapshot column"
+                )
+            )
+    return out
+
+
 def _check_eval_record(root: Path, rel: str, policy: RedactionPolicy, infx_ids: set[str]) -> list[Finding]:
     record = load_record(root / rel)
     out = scan_value(record.model_dump(mode="json", by_alias=True), policy, rel, "eval record")
@@ -360,6 +375,12 @@ def check_publishable(
             except (OSError, ValidationError, ValueError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
+        # Match the snapshot documents declared by mirror._check_snapshots.
+        if rel.startswith("data/") and Path(rel).match("*snapshot*.json"):
+            try:
+                findings.extend(_check_snapshot(root, rel, policy))
+            except (OSError, ValidationError, ValueError) as exc:
+                findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel.startswith("eval/") and rel.endswith(".json"):
             try:
                 findings.extend(_check_eval_record(root, rel, policy, infx_ids))
