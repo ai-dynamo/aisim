@@ -67,7 +67,7 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "6"
+VALIDATOR_VERSION = "7"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
@@ -279,7 +279,12 @@ def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:
             found.add(rel)  # a malformed document at the conventional path must fail validation too
             continue
         try:
-            document = json.loads(checked_path(root, rel).read_bytes())
+            limit = CandidatePolicy().max_json_bytes
+            with checked_path(root, rel).open("rb") as handle:
+                data = handle.read(limit + 1)
+            if len(data) > limit:
+                continue  # leave oversized sidecars to the bounded content check
+            document = json.loads(data)
         except (OSError, ValueError, RecursionError):
             continue  # the content and integrity checks report unreadable or invalid JSON
         if isinstance(document, dict) and document.get("schema_version") == SNAPSHOT_SCHEMA:
@@ -425,7 +430,7 @@ def validate_tree(
     _check_schema_snapshots(root, report, declared)
     _check_catalog_drift(root, report, declared)
 
-    evidence_findings, _ = check_evidence(root, [f.path for f in evidence if not f.is_symlink])
+    evidence_findings, _ = check_evidence(root, [f.path for f in evidence if not f.is_symlink], manifests=manifests)
     report.findings.extend(evidence_findings)
 
     gz_declared = {p for p in declared if p.endswith(".gz")}

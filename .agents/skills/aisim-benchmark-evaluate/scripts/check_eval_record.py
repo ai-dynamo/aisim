@@ -18,8 +18,10 @@ a failed check.
 import argparse
 import importlib.util
 import json
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from aisim_core.data import _verify
@@ -45,6 +47,21 @@ def _load_predictor(path: Path):
             sys.modules[spec.name] = previous
         raise
     return module.predict, module.fingerprint()
+
+
+def _publish_artifact(source: Path, target: Path) -> None:
+    """Publish complete bytes without replacing a competing writer's artifact."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, pending = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, output)
+        try:
+            os.link(pending, target)
+        except FileExistsError:
+            pass  # the caller verifies the winner against the expected artifact hash
+    finally:
+        Path(pending).unlink(missing_ok=True)
 
 
 def main(argv=None) -> int:
@@ -99,8 +116,7 @@ def main(argv=None) -> int:
                     copies[target] = (source, artifact.sha256)
             for target, (source, _) in copies.items():
                 if not target.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source, target)
+                    _publish_artifact(source, target)
             for item in [*history, verified]:
                 destination = record_dir(args.attest_root, item.truth.identity)
                 for artifact in [*item.truth.artifacts, *item.findings]:
