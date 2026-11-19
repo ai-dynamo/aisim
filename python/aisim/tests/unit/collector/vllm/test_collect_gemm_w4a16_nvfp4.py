@@ -119,7 +119,8 @@ def test_pack_e2m1_round_trips_through_an_independent_decoder(torch, collect_gem
 
 
 @pytest.mark.parametrize("sm", [80, 89, 90])
-def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, monkeypatch, sm):
+@pytest.mark.parametrize("chunk_rows", [2, 3, 8])
+def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, monkeypatch, sm, chunk_rows):
     n, k = 8, 64
     weight = torch.randn(n, k, generator=torch.Generator().manual_seed(1)).to(torch.bfloat16)
     calls = []
@@ -128,13 +129,15 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
 
     def reference(x, global_scale, block_size):
         calls.append((x, global_scale, block_size))
-        values = torch.tensor(E2M1).repeat(n, k // len(E2M1))
-        return values, scales
+        start = x.storage_offset() // k
+        values = torch.tensor(E2M1).repeat(len(x), k // len(E2M1))
+        return values, scales[start : start + len(x)]
 
     def blackwell_only(*args, **kwargs):
         raise AssertionError("scaled_fp4_quant needs an SM100+ kernel")
 
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(collect_gemm, "_W4A16_NVFP4_CHUNK_ELEMENTS", chunk_rows * k)
     monkeypatch.setattr(collect_gemm, "_ref_nvfp4_quant", reference)
     monkeypatch.setattr(collect_gemm, "_scaled_fp4_quant", blackwell_only)
 
@@ -142,9 +145,11 @@ def test_pre_blackwell_weights_use_the_reference_quantizer(torch, collect_gemm, 
 
     amax = float(weight.abs().max())
     assert weight_scale_2 == pytest.approx(amax / 2688.0)
-    ((x, global_scale, block_size),) = calls
-    assert x is weight and block_size == 16
-    assert float(global_scale) == pytest.approx(2688.0 / amax)
+    assert len(calls) == (n + chunk_rows - 1) // chunk_rows
+    assert torch.equal(torch.cat([x for x, _, _ in calls]), weight)
+    for x, global_scale, block_size in calls:
+        assert len(x) <= chunk_rows and block_size == 16
+        assert float(global_scale) == pytest.approx(2688.0 / amax)
     assert weight_fp4.dtype == torch.uint8 and weight_fp4.shape == (n, k // 2)
     assert torch.equal(_decode(torch, weight_fp4), torch.tensor(E2M1).repeat(n, k // len(E2M1)))
     assert weight_scale.dtype == torch.float8_e4m3fn and weight_scale.shape == (n, k // 16)
@@ -165,18 +170,18 @@ def test_weight_preparation_fit_check_releases_cached_memory_first(torch, collec
     monkeypatch.setattr(cuda, "empty_cache", empty_cache)
     monkeypatch.setattr(cuda, "mem_get_info", lambda _device: (state["free"], 80 * gib))
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 90)
-    # Below SM100 a 1 Gi-element weight needs at least 6.5625 GiB: unused cached segments are
-    # released before the driver-free memory is read, so 1 free + 6 cached fits and 1 + 4 does not.
-    n, k = gib, 1
-    device(1 * gib, cached=6 * gib)
+    # The full SM80-plan weight needs 9.77 GiB for the layer, BF16 input and prepared
+    # packed outputs, plus bounded scratch. Unused cached segments count after release.
+    # The old full-matrix reference quantizer needed over 40 GiB for this shape.
+    n, k = 65536, 51200
+    device(4 * gib, cached=6 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0") is None
-    device(1 * gib, cached=4 * gib)
+    device(4 * gib, cached=5 * gib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(1, n, k, "cuda:0").startswith("FIXME(kernel-limit): does not fit")
-    # The activation is budgeted too: preparation alone (3.28 MiB) fits in 4 MiB, but not with
-    # the 2 MiB activation.
-    device(4 * mib)
+    # Include the activation alongside preparation and chunk scratch.
+    device(18 * mib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(1, 128, 4096, "cuda:0") is None
-    device(4 * mib)
+    device(18 * mib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(256, 128, 4096, "cuda:0").startswith("FIXME(kernel-limit)")
     # The forward's BF16 output counts as well: a small weight with a 4 GiB output does not fit in 3 GiB.
     device(3 * gib)
@@ -186,6 +191,23 @@ def test_weight_preparation_fit_check_releases_cached_memory_first(torch, collec
     monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 100)
     device(4192 * mib)
     assert collect_gemm._w4a16_nvfp4_does_not_fit(32768, 65536, 1024, "cuda:0").startswith("FIXME(kernel-limit)")
+
+
+def test_capacity_refusal_precedes_tensor_allocation(torch, collect_gemm, monkeypatch):
+    monkeypatch.setattr(collect_gemm.envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda *_a: None)
+    monkeypatch.setattr(torch, "set_default_dtype", lambda *_a: None)
+    monkeypatch.setattr(torch, "set_default_device", lambda *_a: None)
+    monkeypatch.setattr(collect_gemm, "get_sm_version", lambda: 80)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _d: (8 * 2**30, 40 * 2**30))
+
+    def unexpected_allocation(*_a, **_kw):
+        raise AssertionError("must refuse before allocating the activation or layer weights")
+
+    monkeypatch.setattr(torch, "randn", unexpected_allocation)
+    with pytest.raises(RuntimeError, match="^FIXME\\(kernel-limit\\): does not fit"):
+        collect_gemm.run_gemm(None, "w4a16_nvfp4", 1, 65536, 51200, perf_filename="unused")
 
 
 def test_blackwell_keeps_the_scaled_fp4_quant_kernel(torch, collect_gemm, monkeypatch):

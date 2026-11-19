@@ -112,8 +112,8 @@ def _ep_rows(phases=(("context", _HT_PAIRS), ("generation", _LL_PAIRS))) -> list
     return rows
 
 
-def _write_version_dir(root: str, family: str, filename: str, rows: list[dict]) -> None:
-    version_dir = os.path.join(root, "data", family, SYNTH_BACKEND, SYNTH_VERSION)
+def _write_version_dir(root: str, family: str, filename: str, rows: list[dict], backend=SYNTH_BACKEND) -> None:
+    version_dir = os.path.join(root, "data", family, backend, SYNTH_VERSION)
     os.makedirs(version_dir, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows), os.path.join(version_dir, filename))
     # Legacy compatibility sidecar: these synthetic rows do not model the
@@ -149,7 +149,7 @@ def _one_shot_log_state():
         task_v2._LARGE_EP_ASYMMETRIC_COVERAGE_WARNED.update(asym_before)
 
 
-def _build_synth_root(tmp_path, a2a_rows, ep_rows) -> str:
+def _build_synth_root(tmp_path, a2a_rows, ep_rows, backend=SYNTH_BACKEND) -> str:
     """A synthetic systems root (8 GPUs/node, SM 90) holding ONLY the two
     large-EP tables, mounted alongside the shipped default systems path."""
     root = str(tmp_path / "systems")
@@ -174,8 +174,8 @@ def _build_synth_root(tmp_path, a2a_rows, ep_rows) -> str:
             },
             f,
         )
-    _write_version_dir(root, "comm", "moe_a2a_perf.parquet", a2a_rows)
-    _write_version_dir(root, "moe", "moe_expert_compute_perf.parquet", ep_rows)
+    _write_version_dir(root, "comm", "moe_a2a_perf.parquet", a2a_rows, backend)
+    _write_version_dir(root, "moe", "moe_expert_compute_perf.parquet", ep_rows, backend)
     return root
 
 
@@ -535,6 +535,80 @@ def test_coverage_probes_the_weight_only_nvfp4_lane_off_blackwell(synth_systems,
     t.moe_quant_mode = common.MoEQuantMode.nvfp4
     t._large_ep_coverage("agg")
     assert probed and set(probed) == {common.MoEQuantMode.nvfp4_wo}
+
+
+@pytest.fixture
+def synth_vllm_systems(tmp_path):
+    root = _build_synth_root(
+        tmp_path,
+        _a2a_rows((("deepep_ht", _HT_PAIRS), ("deepep_ll", _HT_PAIRS))),
+        _ep_rows((("context", _HT_PAIRS), ("generation", _HT_PAIRS))),
+        backend="vllm",
+    )
+    databases_cache.clear()
+    set_systems_paths(["default", root])
+    try:
+        yield root
+    finally:
+        set_systems_paths(None)
+        databases_cache.clear()
+
+
+def _vllm_mode_task(role, mode, **overrides):
+    identity = {
+        "model_path": SYNTH_MODEL,
+        "system_name": SYNTH_SYSTEM,
+        "backend_name": "vllm",
+        "backend_version": SYNTH_VERSION,
+    }
+    kwargs = {"serving_mode": "agg" if role == "agg" else "disagg"}
+    for active in ["agg"] if role == "agg" else ["prefill", "decode"]:
+        prefix = "" if active == "agg" else f"{active}_"
+        kwargs.update({f"{prefix}{name}": value for name, value in identity.items()})
+    kwargs["moe_quant_mode" if role == "agg" else f"{role}_moe_quant_mode"] = mode
+    return Task(**(kwargs | overrides))
+
+
+@pytest.mark.parametrize("role", ["agg", "prefill", "decode"])
+def test_live_moe_mode_refreshes_automatic_candidates(synth_vllm_systems, role):
+    mode_field = "moe_quant_mode" if role == "agg" else f"{role}_moe_quant_mode"
+    task = _vllm_mode_task(role, common.MoEQuantMode.fp8_block)
+    assert 32 not in getattr(task, f"{role}_moe_ep_candidates")
+    partner = "decode" if role == "prefill" else "prefill"
+    partner_before = list(task.iter_parallel(partner)) if role != "agg" else None
+
+    setattr(task, mode_field, common.MoEQuantMode.bfloat16)
+    fresh = _vllm_mode_task(role, common.MoEQuantMode.bfloat16)
+    for dim in ("num_gpu", "dp", "moe_ep"):
+        assert getattr(task, f"{role}_{dim}_candidates") == getattr(fresh, f"{role}_{dim}_candidates")
+        assert 32 in getattr(task, f"{role}_{dim}_candidates")
+    assert list(task.iter_parallel(role)) == list(fresh.iter_parallel(role))
+    assert _tuple(dp=32, moe_ep=32) in [tuple(point) for point in task.iter_parallel(role)]
+    assert task.build_model_config(role=role, parallel=_tuple(dp=32, moe_ep=32)).moe_comm_backend
+    if role != "agg":
+        assert task.max_gpu_per_replica == fresh.max_gpu_per_replica
+        assert list(task.iter_parallel(partner)) == partner_before
+
+    setattr(task, mode_field, common.MoEQuantMode.fp8_block)
+    assert 32 not in getattr(task, f"{role}_moe_ep_candidates")
+    assert _tuple(dp=32, moe_ep=32) not in [tuple(point) for point in task.iter_parallel(role)]
+
+
+def test_live_moe_mode_preserves_caller_candidates_and_gpu_limits(synth_vllm_systems):
+    task = _vllm_mode_task("agg", common.MoEQuantMode.fp8_block, agg_moe_ep_candidates=[8], total_gpus=16)
+    task.agg_dp_candidates = list(task.agg_dp_candidates)  # Explicitly pin even the current defaults.
+    task.agg_tp_candidates.remove(16)  # In-place restrictions count too.
+    task.moe_quant_mode = common.MoEQuantMode.bfloat16
+    assert task.agg_moe_ep_candidates == [8]
+    assert task.agg_dp_candidates == [1, 2, 4, 8, 16]
+    assert task.agg_tp_candidates == [1, 2, 4, 8]
+    assert max(task.agg_num_gpu_candidates) == 16
+    assert all(point[4] == 8 for point in task.iter_parallel("agg"))
+
+    disagg = _vllm_mode_task("decode", common.MoEQuantMode.fp8_block, max_gpu_per_replica=24, total_gpus=48)
+    disagg.decode_moe_quant_mode = common.MoEQuantMode.bfloat16
+    assert disagg.max_gpu_per_replica == 24
+    assert max(disagg.decode_num_gpu_candidates) <= 48
 
 
 def test_eplb_prunes_deepep_ll_before_model_build(synth_systems):

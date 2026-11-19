@@ -651,6 +651,8 @@ class Task:
     # system / backend / MoE quant mode only, never on the candidate lists, so
     # it survives post-construction edits to those.
     _large_ep_coverage_cache: dict = field(default_factory=dict, repr=False, init=False)
+    # Snapshots distinguish generated candidates from caller assignments or in-place edits.
+    _auto_search_candidates: dict = field(default_factory=dict, repr=False, init=False)
 
     # =====================================================================
     # Construction
@@ -1567,12 +1569,43 @@ class Task:
             for dim in ("num_gpu", "tp", "pp", "dp", "moe_tp", "moe_ep")
             if getattr(self, f"{role}_{dim}_candidates") is None
         }
+        if self.serving_mode == "disagg" or self.enable_epd:
+            defaulted.update(
+                name for name in ("max_gpu_per_replica", "num_gpu_per_replica") if getattr(self, name) is None
+            )
         if self.serving_mode == "agg":
             self._resolve_agg_search()
         else:
             self._resolve_disagg_search()
         self._apply_large_pipeline_parallel(defaulted)
         self._apply_total_gpus_budget()
+        object.__setattr__(
+            self, "_auto_search_candidates", {name: copy.copy(getattr(self, name)) for name in defaulted}
+        )
+
+    def _refresh_auto_search_space(self, role: str) -> None:
+        automatic = self._auto_search_candidates
+        prefix = f"{role}_"
+        affected = {
+            name
+            for name in automatic
+            if name.startswith(prefix) or name in ("max_gpu_per_replica", "num_gpu_per_replica")
+        }
+        reset = {name for name in affected if getattr(self, name) == automatic[name]}
+        if not reset:
+            return
+        # Keep the partner role and caller-edited lists. Clear tracking during internal
+        # resolution so its assignments cannot be mistaken for new caller restrictions.
+        remaining = {name: values for name, values in automatic.items() if name not in affected}
+        refreshed = copy.copy(self)
+        object.__setattr__(refreshed, "_auto_search_candidates", {})
+        for name in reset:
+            object.__setattr__(refreshed, name, None)
+        refreshed._resolve_search_space()
+        for name in reset:
+            object.__setattr__(self, name, getattr(refreshed, name))
+        object.__setattr__(self, "_large_ep_coverage_cache", refreshed._large_ep_coverage_cache)
+        object.__setattr__(self, "_auto_search_candidates", {**remaining, **refreshed._auto_search_candidates})
 
     def _large_pipeline_parallel_applies(self) -> bool:
         """v1 _large_pipeline_parallel_worker_defaults_apply: DeepSeek-V3.2/V4 MoE on
@@ -1836,6 +1869,9 @@ class Task:
     def __setattr__(self, name: str, value: Any) -> None:
         # A caller assigning a GEMM, MoE or FMHA mode after resolution makes it explicit, so
         # build_model_config, to_yaml and recommend rebuilds keep it.
+        automatic = self.__dict__.get("_auto_search_candidates", {})
+        if name in automatic:
+            object.__setattr__(self, "_auto_search_candidates", {k: v for k, v in automatic.items() if k != name})
         role, _, key = name.partition("_") if name.startswith(("prefill_", "decode_")) else ("agg", "", name)
         # Replace the maps instead of mutating them: a shallow copy of the Task shares them.
         explicit_attr = _QUANT_EXPLICIT_BY_ROLE.get(key, "")
@@ -1858,6 +1894,8 @@ class Task:
         if key == "moe_quant_mode" and coverage_cache is not None:
             # Large-EP coverage depends on the MoE mode.
             object.__setattr__(self, "_large_ep_coverage_cache", {r: c for r, c in coverage_cache.items() if r != role})
+            if resolved_role and isinstance(value, common.MoEQuantMode):
+                self._refresh_auto_search_space(role)
 
     # =====================================================================
     # Builders consumed by sweep.py

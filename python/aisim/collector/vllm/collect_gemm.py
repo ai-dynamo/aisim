@@ -185,6 +185,13 @@ _W4A16_NVFP4_QUANT_CONFIG = {
 # break_fp4_bytes :328-345 @0.24.0, :529-546 @0.31.0).
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
+# Bound the reference quantizer's FP32 intermediates independently of the weight size.
+_W4A16_NVFP4_CHUNK_ELEMENTS = 1024 * 1024
+
+
+def _w4a16_nvfp4_chunk_rows(n, k):
+    return min(n, max(1, _W4A16_NVFP4_CHUNK_ELEMENTS // k))
+
 
 def _pack_e2m1(values):
     """Pack E2M1-valued floats of shape (n, k) into checkpoint bytes (n, k // 2)."""
@@ -204,9 +211,20 @@ def _w4a16_nvfp4_checkpoint_weights(weight_bf16):
     (modelopt.py:1305-1339, 1369-1376 @0.24.0; KNvfp4Static :1909-1986
     @0.31.0).
     """
-    weight_scale_2 = float(weight_bf16.abs().max()) / 2688.0
+    n, k = weight_bf16.shape
+    chunk_rows = _w4a16_nvfp4_chunk_rows(n, k)
+    blackwell = get_sm_version() >= 100
+    if blackwell:
+        weight_scale_2 = float(weight_bf16.abs().max()) / 2688.0
+    else:
+        # Reduce before quantizing so every row chunk uses the same matrix-wide scale.
+        # The reduction itself must not allocate a full-size abs() weight temporary.
+        amax = weight_bf16.new_zeros(())
+        for start in range(0, n, chunk_rows):
+            amax = torch.maximum(amax, weight_bf16[start : start + chunk_rows].abs().max())
+        weight_scale_2 = float(amax) / 2688.0
     global_scale = torch.tensor(1.0 / weight_scale_2, dtype=torch.float32, device=weight_bf16.device)
-    if get_sm_version() >= 100:
+    if blackwell:
         weight_fp4, weight_scale = _scaled_fp4_quant(weight_bf16, global_scale, is_sf_swizzled_layout=False)
     else:
         # scaled_fp4_quant needs an SM100+ quantization kernel
@@ -215,25 +233,36 @@ def _w4a16_nvfp4_checkpoint_weights(weight_bf16):
         # same layout with vLLM's PyTorch reference quantizer, identical in
         # every admitted release (nvfp4_emulation_utils.py ref_nvfp4_quant
         # :439-453 @0.24.0, :640-654 @0.31.0).
-        values, scales = _ref_nvfp4_quant(weight_bf16, global_scale, 16)
-        weight_fp4, weight_scale = _pack_e2m1(values), scales.to(torch.float8_e4m3fn)
+        weight_fp4 = torch.empty((n, k // 2), dtype=torch.uint8, device=weight_bf16.device)
+        weight_scale = torch.empty((n, k // 16), dtype=torch.float8_e4m3fn, device=weight_bf16.device)
+        for start in range(0, n, chunk_rows):
+            stop = start + chunk_rows
+            values, scales = _ref_nvfp4_quant(weight_bf16[start:stop], global_scale, 16)
+            weight_fp4[start:stop].copy_(_pack_e2m1(values))
+            weight_scale[start:stop].copy_(scales)
+            del values, scales
     return weight_fp4, weight_scale, weight_scale_2
 
 
 def _w4a16_nvfp4_does_not_fit(m, n, k, device):
     """Why W4A16_NVFP4 weight preparation cannot fit the device, or None; checked before allocating.
 
-    Lower bound on what is live at once, per weight element: the layer's packed FP4 weight and
-    FP8 block scales (0.5 + 1/16 B), the BF16 weight (2 B), plus its full-size abs() temporary
-    for the global scale (2 B) or, below SM100, the FP32 copy that ref_nvfp4_quant makes (4 B;
-    nvfp4_emulation_utils.py :640-654 @0.31.0). The preparation tensors are freed after loading,
+    Budget the layer's packed FP4 weight and FP8 block scales (0.5 + 1/16 B), the BF16 weight
+    (2 B), and the prepared packed weight/scales (0.5 + 1/16 B). Below SM100, allow 32 B per
+    chunk element for the reference quantizer's live FP32 intermediates and packing scratch
+    (nvfp4_emulation_utils.py ref_nvfp4_quant/cast_to_fp4 @0.31.0). The chunked abs reduction
+    fits that scratch too. The preparation tensors are freed after loading,
     so the dry-run forward holds the layer's packed weight and scales and the BF16 output
     (m x n). The BF16 activation (2 B per element) is allocated first and counts in both phases.
     Unused cached segments are released before reading driver-free memory, so split remainders
     of used segments do not count as available.
     """
     layer = 0.5625 * n * k
-    preparation = layer + n * k * (4 if get_sm_version() >= 100 else 6)
+    if get_sm_version() >= 100:
+        preparation = layer + 4 * n * k  # BF16 input and the full abs() reduction temporary.
+    else:
+        scratch = 32 * _w4a16_nvfp4_chunk_rows(n, k) * k
+        preparation = 2 * layer + 2 * n * k + scratch
     forward = layer + 2 * m * n
     needed = int(max(preparation, forward)) + 2 * m * k
     torch.cuda.empty_cache()

@@ -923,10 +923,10 @@ def test_task_mode_overrides_survive_model_building_yaml_and_recommend(monkeypat
     config = task.build_model_config(role="agg", parallel=(1, 1, 1, 1, 1, 1))
     assert experts(dataclasses.replace(config, moe_quant_mode=MOE.fp8)) == {MOE.fp8}
     # A mode assigned to the Task after construction is explicit for building, YAML and recommend,
-    # and drops that role's cached large-EP coverage, which depends on the MoE mode.
+    # and refreshes that role's cached large-EP coverage, which depends on the MoE mode.
     task._large_ep_coverage_cache.update(agg={"stale": {}}, prefill={"kept": {}})
     task.moe_quant_mode = MOE.fp8
-    assert task._large_ep_coverage_cache == {"prefill": {"kept": {}}}
+    assert task._large_ep_coverage_cache == {"prefill": {"kept": {}}, "agg": {}}
     reloaded = Task.from_yaml(yaml.safe_load(task.to_yaml()))
     rebuilt = _build_recommend_tasks({"agg": task}, 8)["agg"]
     for other in (task, reloaded, rebuilt):
@@ -1045,7 +1045,8 @@ def test_native_kv_sizing_uses_the_database_root_after_skipping_an_overlay(monke
 
 @pytest.mark.parametrize("system,mode", [("h100_sxm", NVFP4_WO), ("gb200", NVFP4)])
 @pytest.mark.parametrize("serving_mode", ["agg", "disagg"])
-def test_live_task_nvfp4_override_uses_the_same_hardware_lane_as_reload(monkeypatch, system, mode, serving_mode):
+@pytest.mark.parametrize("kind", ["gemm", "moe"])
+def test_live_task_nvfp4_override_uses_the_same_hardware_lane_as_reload(monkeypatch, system, mode, serving_mode, kind):
     import yaml
 
     from aisim.legacy_cli.api import _build_recommend_tasks
@@ -1053,7 +1054,7 @@ def test_live_task_nvfp4_override_uses_the_same_hardware_lane_as_reload(monkeypa
 
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     if serving_mode == "agg":
-        task = _task(SUPER, system=system)
+        task = _task(SUPER, system=system, **({"gemm_quant_mode": BF16} if kind == "moe" else {}))
         role = "agg"
     else:
         role = "prefill"
@@ -1061,14 +1062,17 @@ def test_live_task_nvfp4_override_uses_the_same_hardware_lane_as_reload(monkeypa
             serving_mode="disagg",
             backend_version="0.31.0",
             database_mode="SOL",
+            **({f"{r}_gemm_quant_mode": BF16 for r in ("prefill", "decode")} if kind == "moe" else {}),
             **{
                 f"{r}_{key}": value
                 for r in ("prefill", "decode")
                 for key, value in {"model_path": SUPER, "system_name": system, "backend_name": "vllm"}.items()
             },
         )
-    field = "gemm_quant_mode" if role == "agg" else f"{role}_gemm_quant_mode"
-    setattr(task, field, NVFP4)
+    enum = common.GEMMQuantMode if kind == "gemm" else common.MoEQuantMode
+    mode = enum[mode.name]
+    field = f"{kind}_quant_mode" if role == "agg" else f"{role}_{kind}_quant_mode"
+    setattr(task, field, enum.nvfp4)
     assert getattr(task, field) == mode
     for other in (
         task,
@@ -1076,9 +1080,13 @@ def test_live_task_nvfp4_override_uses_the_same_hardware_lane_as_reload(monkeypa
         _build_recommend_tasks({serving_mode: task}, 8)[serving_mode],
     ):
         other.validate()
-        assert other._gemm_quant_mode_explicit_by_role[role] is True
+        assert getattr(other, f"_{kind}_quant_mode_explicit_by_role")[role] is True
         model = _task_model(other, SUPER, role)
-        assert all(set(modes) == {mode} for modes in _buckets(model.context_ops).values())
+        assert getattr(model.config, f"{kind}_quant_mode") == mode
+        if kind == "gemm":
+            assert all(set(modes) == {mode} for modes in _buckets(model.context_ops).values())
+        else:
+            assert set(_experts(model)) == {mode}
     if serving_mode == "agg":
         # Execute the real Task engine path; Hopper native FP4 would fail here.
         task.run_single_agg(tp=2, moe_tp=2, batch_size=1, ctx_tokens=128)
