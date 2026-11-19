@@ -27,6 +27,9 @@ else:
 
 REVIEW = Path("scripts/ci/config_license_review.json")
 STANDARD_LICENSES = {"Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib"}
+# This explicit pair combines two policy-approved grants; other expressions,
+# including OR choices, still require a recorded decision.
+STANDARD_COMBINATIONS = {"Apache-2.0 AND MIT"}
 OWNERSHIP = {"third_party", "nvidia_developed", "nvidia_derivative"}
 
 
@@ -55,6 +58,15 @@ def pinned_nvidia_card(evidence: dict) -> bool:
     if not https_reference(source) or not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{40}", revision):
         return False
     url = urlsplit(source)
+    if evidence.get("kind") == "nvidia_repository":
+        # Repository identity alone does not prove exclusive file ownership.
+        # ownership_matches still requires the exact per-file source mapping.
+        return bool(
+            url.hostname == "github.com"
+            and not url.query
+            and not url.fragment
+            and url.path == f"/ai-dynamo/aiconfigurator/blob/{revision}/LICENSE"
+        )
     return bool(
         url.hostname == "huggingface.co"
         and not url.query
@@ -110,6 +122,8 @@ def load_review(path: Path) -> dict:
         raise ValueError("unsupported config-license review schema or releasing entity")
     if review.get("approved_standard_licenses") != sorted(STANDARD_LICENSES):
         raise ValueError("standard-license policy must match the reviewed six-license set")
+    if review.get("approved_standard_combinations") != sorted(STANDARD_COMBINATIONS):
+        raise ValueError("standard combinations must match the explicit Apache-2.0 AND MIT policy")
     if not isinstance(review.get("files"), list):
         raise ValueError("missing per-file config-license review")
     files = {}
@@ -257,7 +271,7 @@ def assess(entries: list[dict], records: dict, *, root: Path | None = None) -> l
                 problems.append("inconsistent_license_obligations")
             if record["approval"]["status"] == "rejected":
                 problems.append("rejected")
-            outside_policy = sorted(set(required) - STANDARD_LICENSES)
+            outside_policy = sorted(set(required) - STANDARD_LICENSES - STANDARD_COMBINATIONS)
             try:
                 text_hashes = required_text_hashes(entry, record, outside_policy, root, registry)
             except (OSError, ValueError, KeyError, TypeError) as error:

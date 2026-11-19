@@ -82,6 +82,7 @@ def policy(tmp_path, records):
                 "schema_version": 1,
                 "releasing_entity": "NVIDIA",
                 "approved_standard_licenses": sorted(gate.STANDARD_LICENSES),
+                "approved_standard_combinations": sorted(gate.STANDARD_COMBINATIONS),
                 "files": records,
             }
         )
@@ -121,6 +122,40 @@ def test_nvidia_licensor_has_no_outbound_licensee_permission_gate():
     item = record("nvidia_developed", contribution=["LicenseRef-NVIDIA-Internal-RD"])
     result = gate.assess([entry("LicenseRef-NVIDIA-Internal-RD")], {PATH: item})[0]
     assert result["passed"] and result["approval_basis"] == "nvidia_own_contribution"
+
+
+def test_explicit_apache_mit_pair_is_policy_approved():
+    result = gate.assess([entry("Apache-2.0 AND MIT")], {PATH: record()})[0]
+    assert result["passed"] and result["approval_basis"] == "standard_license_policy"
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_aiconfigurator_source_evidence_needs_exact_mapping(mapping):
+    current = entry("Apache-2.0")
+    current["source"] = {
+        "url": f"https://github.com/ai-dynamo/aiconfigurator/blob/{REVISION}/src/config.json",
+        "revision": REVISION,
+        "path": "src/config.json",
+    }
+    item = record("nvidia_developed", contribution=["Apache-2.0"])
+    item["ownership_evidence"] = {
+        "kind": "nvidia_repository",
+        "url": f"https://github.com/ai-dynamo/aiconfigurator/blob/{REVISION}/LICENSE",
+        "revision": REVISION,
+        "status": "recorded_source",
+    }
+    if mapping:
+        item["ownership_evidence"]["config_mapping"] = {
+            "path": PATH,
+            "sha256": SHA,
+            "source": current["source"],
+            "reference": current["source"]["url"],
+            "explanation": "NVIDIA-owned exact predecessor config copy; no third-party base identified.",
+        }
+    result = gate.assess([current], {PATH: item})[0]
+    assert result["passed"] is mapping
+    if not mapping:
+        assert "ownership_source_mismatch" in result["problems"]
 
 
 def test_nvidia_derivative_retains_unapproved_base_rights():
@@ -601,24 +636,27 @@ def test_cli_names_missing_and_extra_review_paths(licensed_source, tmp_path, mis
         assert name in report["error"]
 
 
-def test_minimax_unknown_base_cannot_be_approved_after_export_provenance_is_fixed(tmp_path):
-    records = gate.load_review(gate.provenance.ROOT / gate.REVIEW)
-    selected = [
-        item
-        for item in records.values()
-        if item["underlying_licenses"] == ["UNKNOWN"] and "MiniMax-M2.5" in item["path"]
-    ]
+def test_unknown_base_cannot_be_approved_after_export_provenance_is_fixed(tmp_path):
+    item = approved(record("nvidia_derivative", ["UNKNOWN"], ["LicenseRef-Example"]), required=["UNKNOWN"])
+    current = entry()
+    current["source"]["url"] = item["ownership_evidence"]["url"].replace("README.md", "config.json")
+    current["source"]["revision"] = item["ownership_evidence"]["revision"]
+    records = gate.load_review(policy(tmp_path, [item]))
+    result = gate.assess([current], records)[0]
+    assert not result["passed"] and "unknown_underlying_license" in result["problems"]
+
+
+def test_minimax_identified_base_still_requires_scoped_approval():
+    root = gate.provenance.ROOT
+    records = gate.load_review(root / gate.REVIEW)
+    entries = gate.provenance.inventory_entries(root / gate.provenance.INVENTORY)
+    selected = [r for r in records.values() if "nvidia--MiniMax-M2.5" in r["path"]]
     assert len(selected) == 2
-    for original in selected:
-        item = approved(copy.deepcopy(original), required=["UNKNOWN"])
-        item["nvidia_contribution_licenses"] = ["LicenseRef-Example"]
-        current = entry()
-        current.update(path=item["path"], sha256=item["sha256"])
-        current["source"]["url"] = original["ownership_evidence"]["url"].replace("README.md", "config.json")
-        current["source"]["revision"] = original["ownership_evidence"]["revision"]
-        records = gate.load_review(policy(tmp_path, [item]))
-        result = gate.assess([current], records)[0]
-        assert not result["passed"] and "unknown_underlying_license" in result["problems"]
+    for item in selected:
+        assert item["underlying_licenses"] == ["LicenseRef-MiniMax-M2.5-Model"]
+        assert item["approval"]["status"] == "pending"
+        result = gate.assess([entries[item["path"]]], records, root=root)[0]
+        assert result["problems"] == ["unapproved_license"]
 
 
 def test_cli_wheel_digest_survives_missing_review(licensed_source, licensed_wheel, tmp_path):

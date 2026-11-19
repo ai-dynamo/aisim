@@ -480,7 +480,7 @@ def main() -> int:
         print(f"::error::Bundled configuration {args.command} failed: {error}", file=sys.stderr)
         return 1
     unresolved = sum(entry["origin"] == "legacy_unresolved" for entry in entries)
-    custom = sum(entry["license"].startswith("LicenseRef-") for entry in entries)
+    custom = sum("LicenseRef-" in entry["license"] for entry in entries)
     print(
         f"Verified {len(entries)} bundled configs; {custom} custom-licensed; {unresolved} legacy provenance unresolved"
     )

@@ -151,7 +151,7 @@ The findings JSON is uploaded with `always()` as `config-license-approval` in Fu
 
 The original provenance checker still preserves a byte-pinned legacy inventory for investigation. The approval gate first validates the exact source, and optionally `--wheel`, through that checker, then independently rejects unknown licenses/provenance, missing or stale review records, rejected decisions and unapproved required third-party licenses. NVIDIA ownership cannot turn an `UNKNOWN` source/license into known provenance. Missing/malformed policy inputs fail closed and write an error report.
 
-The review ledger is `scripts/ci/config_license_review.json`. Each file record binds its packaged path and SHA256, ownership, underlying third-party licenses, ownership evidence and approval status. This ledger supplements `bundled_configs.json`; it does not rewrite that inventory's license identifiers, canonical notices or frozen baseline. The standard repository allowance is exactly Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC and Zlib. SPDX/custom expressions outside that set need a recorded decision, not an inferred permissive classification. Dependency-specific Python/Cargo policies remain separate.
+The review ledger is `scripts/ci/config_license_review.json`. Each file record binds its packaged path and SHA256, ownership, underlying third-party licenses, ownership evidence and approval status. This ledger supplements `bundled_configs.json`; it does not rewrite that inventory's license identifiers, canonical notices or frozen baseline. The standard repository allowance is Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC and Zlib, plus the explicitly recorded Apache-2.0 AND MIT conjunction; other expressions still require a decision. SPDX/custom expressions outside that set need a recorded decision, not an inferred permissive classification. Dependency-specific Python/Cargo policies remain separate.
 
 | Per-file ledger field | Required evidence |
 | --- | --- |
@@ -178,7 +178,7 @@ python scripts/ci/check_config_license_approvals.py --wheel dist/aisim-example.w
 
 For a selected historical/nightly source, `--root SOURCE` reads that source's exact inventory and review ledger. A historical source without the required records fails; it cannot silently borrow another version's approvals. `--review` explicitly selects a trusted ledger, but its path set and file hashes must match the source exactly; mismatch reports list missing and extra paths. Reports bind the optional workflow-verified `--source-sha` and the exact wheel digest once provenance validation succeeds, including when the review ledger subsequently fails to load. Inputs that fail provenance validation may have no wheel digest in their failure report.
 
-The current seed deliberately leaves unresolved/custom records pending. Enabling this gate therefore exposes existing compliance debt as a failing job until accurate provenance/notices and real scoped approvals are supplied. A report with a complete inventory is not itself a passing approval result.
+The 108 formerly UNKNOWN entries now have exact source citations and complete recorded terms; provenance does not create approval. Known custom third-party decisions remain pending, so the gate still fails those records until an actual scoped decision is recorded.
 
 Nightly builds stamp a dev suffix with `scripts/release/apply_dev_version.py` before
 building: the wheel becomes `0.15.0.devYYYYMMDD` (PEP 440) and the crate
