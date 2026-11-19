@@ -951,34 +951,44 @@ Each config is an entry.
   - a perf-model file, a template file named by `from`, and inline JSON;
   - the value written under `engine.ais_perf_model` or
     `search_space.ais_perf_model` in a `predict`, `recommend` or search YAML
-    file, when `aisim predict`, `aisim recommend`,
+    or JSON file, when `aisim predict`, `aisim recommend`,
     `CorePredictionConfig.from_yaml`, `CoreRecommendationConfig.from_yaml` or
     `SmartSearchConfig.from_yaml` reads the file.
 
-  A configuration file reports it like this:
+  These configuration readers select JSON for `.json` filenames (case
+  insensitive) and YAML otherwise.
+  A YAML configuration file reports it like this:
   `engine.ais_perf_model in predict.yaml: the key 'estimation_mode' is written twice (lines 9 and 11); write it once`.
+  A JSON configuration file reports it like this:
+  `predict.json: engine.ais_perf_model.estimation_mode is written twice`.
+  JSON errors use decoded key paths without line numbers, so escaped and
+  literal spellings of the same key count as a repeat.
   `aisim predict` and `aisim recommend` then exit with code `2`
-  before they touch the output directory. A key that a YAML merge (`<<`)
+  before they touch the output directory. In YAML, a key that a merge (`<<`)
   brings in does not repeat a key written next to it.
 - The same commands and loaders reject a configuration file that writes
   `ais_perf_model` itself twice in its section. They also reject a file that
   writes the section (`engine`, or `search_space` in a search file) twice
-  when one of these sections writes `ais_perf_model`. The YAML reader would
-  keep the last one and drop the others without a word. The error has the
-  same form and names the first and the last line:
+  when one of these sections writes `ais_perf_model`. Without this check,
+  the reader for the file's format would keep the last one and drop the
+  others without a word. YAML errors name the first and the last line:
   `engine.ais_perf_model in predict.yaml: the key 'ais_perf_model' is written twice (lines 8 and 10); write it once`
   or
   `engine.ais_perf_model in predict.yaml: the key 'engine' is written twice (lines 1 and 14); write it once`.
+  JSON errors name the decoded path instead:
+  `predict.json: engine.ais_perf_model is written twice` or
+  `predict.json: engine is written twice`.
   A file with several of these repeats reports the section first, then
   `ais_perf_model`, then a key inside the value.
 - `ais_perf_model`, or its section, that a YAML merge (`<<`) brings in next
   to a written one is not a repeat: the written one is used. When only a
   merge brings the value in, the value that the YAML reader keeps is the one
   that is checked for a key written twice.
-- A key written twice is not checked in a value given with `--set`. The YAML
-  reader keeps the last value there. It does the same for a key repeated
-  anywhere else in a configuration file, such as an old estimator field, and
-  for a section written twice when none of them writes `ais_perf_model`.
+- A key written twice is not checked in a value given with `--set`, which
+  always uses YAML parsing and keeps the last value. Elsewhere in a
+  configuration file, the reader for the file's format keeps the last
+  value of a repeated key, such as an old estimator field, or a section
+  written twice when none of them writes `ais_perf_model`.
   `aisim perf-model migrate` makes the same checks when it reads a file.
   Python data passed to `model_validate` cannot hold a key twice.
 - When a consumer needs a worker type the value does not have, the error lists
