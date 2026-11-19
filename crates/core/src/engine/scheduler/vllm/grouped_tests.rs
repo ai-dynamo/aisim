@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
 // Tests of a modified Rust simulation of the vLLM v0.31.0
-// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 use std::sync::{Arc, Mutex};
