@@ -38,7 +38,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -215,18 +215,14 @@ def _select(source: Path, directories: list[str], plan: PromotionPlan) -> None:
                     plan.files[rel] = _sha(source / rel)
 
 
-def _check_closure(source: Path, plan: PromotionPlan) -> None:
+def _check_closure(source: Path, plan: PromotionPlan, manifests: Mapping[str, Manifest]) -> None:
     chosen = set(plan.files)
     snapshots = snapshot_documents(source, chosen)
     eval_records = {p.relative_to(source).as_posix() for p in record_paths(source / "eval", recursive=True)}
     configs: set[str] = set()
     for rel in sorted(chosen):
-        if rel.endswith("/manifest.json"):
-            try:
-                manifest = Manifest.model_validate_json((source / rel).read_bytes())
-            except (ValidationError, ValueError, OSError) as exc:
-                plan.findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
-                continue
+        if rel in manifests:
+            manifest = manifests[rel]
             plan.manifests.append(rel)
             configs.add(manifest.configuration_id)
             for a in manifest.artifacts:
@@ -298,7 +294,7 @@ def plan_promotion(
         return plan
     shared = validate_tree(source, repo=request.source_repo, profile="mirror")
     plan.findings.extend(Finding(f"source-{f.code}", f.message, f.path, f.severity) for f in shared.errors)
-    if any(f.code == "source-symlink" for f in plan.findings):
+    if any(f.code in ("source-symlink", "source-document-invalid") for f in plan.findings):
         return plan
     _select(source, request.directories, plan)
     if not plan.files:
@@ -310,13 +306,19 @@ def plan_promotion(
         label = entry.label if entry else "internal"
         if label != "public":
             plan.findings.append(Finding("not-public", f"labeled {label!r}; only 'public' is promoted", rel))
+        if entry and entry.origin and any(marker in entry.origin.casefold() for marker in ("inferencex", "infx")):
+            plan.findings.append(
+                Finding(
+                    "infx-aggregates-only", "visibility ledger marks InferenceX-derived data; publish aggregates", rel
+                )
+            )
         if entry and rel in entry.original_sha256:
             plan.lineage[rel] = entry.original_sha256[rel]
-    _check_closure(source, plan)
+    _check_closure(source, plan, shared.manifests)
     for f in shared.findings:  # unreferenced files would be copied without any content check
         if f.code == "orphan-file" and f.path in plan.files:
             plan.findings.append(Finding("orphan-file", f.message, f.path))
-    plan.findings.extend(check_publishable(source, plan.files, policy=policy.redaction))
+    plan.findings.extend(check_publishable(source, plan.files, manifests=shared.manifests, policy=policy.redaction))
     _check_approvals(plan, policy)
     return plan
 

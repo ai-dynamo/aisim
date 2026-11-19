@@ -1,0 +1,29 @@
+{
+  "$id": "aisim-catalog-coverage/v1",
+  "additionalProperties": false,
+  "description": "Explicit coverage universe, retained so validation rebuilds the same missing cells.",
+  "properties": {
+    "expected_frameworks": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Expected Frameworks",
+      "type": "array"
+    },
+    "expected_models": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Expected Models",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "aisim-catalog-coverage/v1",
+      "default": "aisim-catalog-coverage/v1",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "title": "CatalogCoverage",
+  "type": "object"
+}

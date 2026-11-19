@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aisim_core.data.e2e import load_e2e, read_snapshot, verify_snapshot_members
+from aisim_core.data.e2e import SnapshotMember, load_e2e, read_snapshot, verify_snapshot_members
 from aisim_core.data.infx_ingest import (
     Acquirer,
     AcquisitionCache,
@@ -74,8 +74,31 @@ def load_state(root: Path) -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": STATE_SCHEMA, "qualified": None, "candidate": None}
     state = json.loads(path.read_text())
+    if not isinstance(state, dict):
+        raise ValueError("ingestion state must be an object")
     if state.get("schema_version") != STATE_SCHEMA:
         raise ValueError(f"unsupported ingestion state schema {state.get('schema_version')!r}")
+    for key in ("qualified", "candidate"):
+        entry = state.get(key)
+        if entry is None:
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"ingestion state {key} must be an object or null")
+        for name in ("snapshot_id", "snapshot_path", *(("qualified_at", "reviewer") if key == "qualified" else ())):
+            if not isinstance(entry.get(name), str) or not entry[name].strip():
+                raise ValueError(f"ingestion state {key}.{name} must be a nonempty string")
+        sid = entry["snapshot_id"]
+        if len(sid) != 64 or any(c not in "0123456789abcdef" for c in sid):
+            raise ValueError(f"ingestion state {key}.snapshot_id must be a SHA-256")
+        for name in ("created_at", "qualified_at"):
+            if name not in entry:
+                continue
+            value = entry[name]
+            if not isinstance(value, str) or datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None:
+                raise ValueError(f"ingestion state {key}.{name} must include a timezone")
+        counts = entry.get("change_counts", {})
+        if not isinstance(counts, dict) or any(type(n) is not int or n < 0 for n in counts.values()):
+            raise ValueError(f"ingestion state {key}.change_counts must contain nonnegative integer counts")
     return state
 
 
@@ -119,11 +142,13 @@ def save_state(root: Path, state: Mapping[str, Any], *, expected: Mapping[str, A
         _save_state(root, state)
 
 
-def _members_of(root: Path, entry: Mapping[str, Any] | None) -> dict[str, str]:
+def _members_of(root: Path, entry: Mapping[str, Any] | None) -> dict[str, SnapshotMember]:
     if not entry:
         return {}
-    _, members = read_snapshot(root, entry["snapshot_path"])
-    return {m.observation_id: m.record_sha256 for m in members}
+    snapshot, members = read_snapshot(root, entry["snapshot_path"])
+    if snapshot.snapshot_id != entry["snapshot_id"]:
+        raise ValueError("qualified snapshot ID differs from ingestion state")
+    return {m.observation_id: m for m in members}
 
 
 @dataclass
@@ -181,14 +206,25 @@ def run_ingestion(
             )
         assert plan is not None
         known = {e["snapshot_id"] for e in (qualified, candidate) if e}
-        changes = diff_members(prior, plan.members)
+        changes = diff_members({oid: m.record_sha256 for oid, m in prior.items()}, plan.members)
+        changes["revised_shards"] = sorted(
+            {
+                m.manifest_path
+                for m in plan.members
+                if m.observation_id in prior and m.manifest_path != prior[m.observation_id].manifest_path
+            }
+        )
+        warnings = [f"availability lags benchmarks: {u}" for u in acq.undeclared]
+        warnings.extend(f"missing producer metadata: {u}" for u in acq.missing_producer_metadata)
         if plan.snapshot_id in known:
             entry = next(e for e in (qualified, candidate) if e and e["snapshot_id"] == plan.snapshot_id)
             snapshot, members = read_snapshot(root, entry["snapshot_path"])
             if snapshot.snapshot_id != plan.snapshot_id:
                 raise ValueError("existing snapshot ID differs from the planned snapshot")
             verify_snapshot_members(root, members)
-            return RunResult("unchanged", plan.snapshot_id, requests_made=acq.requests_made)
+            with _state_lock(root):
+                _check_state(root, expected)
+            return RunResult("unchanged", plan.snapshot_id, warnings=warnings, requests_made=acq.requests_made)
         with _state_lock(root):
             _check_state(root, expected)  # stale acquisitions must not stage any candidate bytes
             path = write_candidate(root, acq, plan)
@@ -199,7 +235,6 @@ def run_ingestion(
                 "change_counts": {k: len(v) for k, v in changes.items()},
             }
             _save_state(root, state)
-        warnings = [f"availability lags benchmarks: {u}" for u in acq.undeclared]
         return RunResult("candidate", plan.snapshot_id, changes, warnings, requests_made=acq.requests_made)
     except (InfxError, OSError, ValueError) as exc:
         return RunResult("failed", error=f"{type(exc).__name__}: {exc}", requests_made=client.requests_made)

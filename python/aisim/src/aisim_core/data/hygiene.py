@@ -216,11 +216,15 @@ def bounded_json_bytes(path: Path) -> bytes:
     return data
 
 
+class DuplicateJsonKeyError(ValueError):
+    """JSON is ambiguous because an object repeats a key."""
+
+
 def _unique_json_keys(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate JSON key: {key!r}")
+            raise DuplicateJsonKeyError(f"duplicate JSON key: {key!r}")
         result[key] = value
     return result
 

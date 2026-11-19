@@ -22,6 +22,10 @@ spec:
       description: Snapshot to qualify (required for promote)
       default: ""
       regex: '^([0-9a-f]{64})?$'
+    candidate-generation:
+      description: Pipeline ID suffix of the candidate branch (empty for legacy branches)
+      default: ""
+      regex: '^[0-9]*$'
 ---
 workflow:
   rules:
@@ -43,6 +47,7 @@ variables:
   #   SMTP_HOST, SMTP_FROM, AISIM_JOB_OWNER_EMAIL   owner email alerts (owner: Simone Chen)
   GIT_STRATEGY: empty  # a clean build directory for every job, even on a runner that reuses workspaces
   GIT_TERMINAL_PROMPT: "0"
+  INFX_JOB: $[[ inputs.job ]]
 
 .pinned:
   before_script:
@@ -76,8 +81,8 @@ publish_candidate:
     name: infx-cache-writer
     action: access
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "ingest"'
-    - if: '$CI_PIPELINE_SOURCE == "web" && "$[[ inputs.job ]]" == "ingest"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "ingest"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $INFX_JOB == "ingest"'
   script:
     - set -eu
     - *cache_clone
@@ -87,14 +92,40 @@ publish_candidate:
       cd cache-repo
       if [ -z "$(git status --porcelain)" ]; then echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
       SID=$(python3 -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
-      # An unmerged candidate for this snapshot may already be pending: keep it and its review, never re-push.
-      if git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote --exit-code --heads origin "candidate/${SID}" >/dev/null; then
-        echo "candidate/${SID} already exists: nothing to push"; exit 0
-      fi
-      git checkout -q -b "candidate/${SID}"
+      # A branch is reusable only while this exact snapshot is pending against
+      # the current qualification. Historical reviews stay untouched.
+      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote --heads origin "candidate/${SID}" "candidate/${SID}-*" > ../candidate-refs
+      while read -r REV REF; do
+        git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin "$REF"
+        git show FETCH_HEAD:ingestion-state.json > ../remote-candidate-state.json
+        if python3 - <<'PY'
+      import json
+      import sys
+
+      with open("ingestion-state.json") as handle:
+          current = json.load(handle)
+      with open("../remote-candidate-state.json") as handle:
+          remote = json.load(handle)
+      pending = remote.get("candidate")
+      same = (
+          remote.get("schema_version") == current["schema_version"]
+          and remote.get("qualified") == current["qualified"]
+          and isinstance(pending, dict)
+          and all(pending.get(k) == current["candidate"][k] for k in ("snapshot_id", "snapshot_path"))
+      )
+      sys.exit(0 if same else 1)
+      PY
+        then
+          echo "${REF#refs/heads/} is pending for this baseline: nothing to push"; exit 0
+        fi
+      done < ../candidate-refs
+      case "$CI_PIPELINE_ID" in *[!0-9]*|"") echo "numeric CI_PIPELINE_ID required" >&2; exit 2 ;; esac
+      BRANCH="candidate/${SID}-${CI_PIPELINE_ID}"
+      git checkout -q -b "$BRANCH"
       git add -A
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -q -m "candidate: InferenceX snapshot ${SID} (not qualified)"
-      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "candidate/${SID}"
+      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "$BRANCH"
+      echo "Review ${BRANCH}; promote with candidate-snapshot-id=${SID} and candidate-generation=${CI_PIPELINE_ID}"
   cache:
     key: infx-acquisition
     paths: [infx-acquisition/]
@@ -112,25 +143,29 @@ promote:
     name: infx-cache-writer
     action: access
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "web" && "$[[ inputs.job ]]" == "promote"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $INFX_JOB == "promote"'
       when: manual
   allow_failure: false
   script:
     - set -eu
     - 'test -n "$[[ inputs.candidate-snapshot-id ]]" || { echo "set the candidate-snapshot-id input" >&2; exit 2; }'
-    - git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "candidate/$[[ inputs.candidate-snapshot-id ]]" "$INFX_CACHE_REPO_URL" cache-repo
+    - |
+      BRANCH="candidate/$[[ inputs.candidate-snapshot-id ]]"
+      GENERATION="$[[ inputs.candidate-generation ]]"
+      if [ -n "$GENERATION" ]; then BRANCH="${BRANCH}-${GENERATION}"; fi
+      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "$BRANCH" "$INFX_CACHE_REPO_URL" cache-repo
     - $JOB_PY promote --root cache-repo --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
     - |
       cd cache-repo
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -qam "qualify: $[[ inputs.candidate-snapshot-id ]] (reviewer ${GITLAB_USER_NAME})"
-      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "HEAD:refs/heads/candidate/$[[ inputs.candidate-snapshot-id ]]"
+      git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "HEAD:refs/heads/${BRANCH}"
     # Merging the candidate branch into the default branch stays a reviewed merge request, not this job.
 
 staleness:
   stage: staleness
   extends: .pinned
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "staleness"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "staleness"'
   script:
     - set -eu
     - *cache_read_clone
@@ -143,9 +178,9 @@ alert_failure:
   stage: notify
   when: on_failure
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "ingest"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "ingest"'
       when: on_failure
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && "$[[ inputs.job ]]" == "staleness"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "staleness"'
       when: on_failure
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: on_failure

@@ -67,6 +67,8 @@ from aisim_core.data.names import normalize
 
 BASE_URL = "https://inferencex.semianalysis.com/api/v1/"
 USER_AGENT = "aisim-infx-ingest/1"
+# Bound each upstream page before allocation; this is independent of the request budget.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 SELECTION_POLICY = "inferencex-all-observations-in-scope/v1"
 REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl", "benchmark_type")
 # ``exact=true&date=D`` returns the logical snapshot as of D, so one benchmark id can reappear on later
@@ -118,9 +120,13 @@ def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> Ht
     request = urllib.request.Request(url, headers=dict(headers))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return HttpResponse(response.status, {k.lower(): v for k, v in response.headers.items()}, response.read())
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise IncompleteAcquisitionError(f"{url}: response exceeds the {MAX_RESPONSE_BYTES}-byte limit")
+            return HttpResponse(response.status, {k.lower(): v for k, v in response.headers.items()}, body)
     except urllib.error.HTTPError as exc:
-        return HttpResponse(exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read())
+        with exc:
+            return HttpResponse(exc.code, {k.lower(): v for k, v in exc.headers.items()}, b"")
     except urllib.error.URLError as exc:
         raise ConnectionError(str(exc.reason)) from exc
 
@@ -289,6 +295,7 @@ class Acquisition:
     undeclared: list[str] = field(default_factory=list)  # benchmark rows availability did not list (warning)
     requests_made: int = 0
     responses: dict[str, bytes] = field(default_factory=dict)  # immutable original benchmark response evidence
+    missing_producer_metadata: list[str] = field(default_factory=list)
 
 
 def _json(fetched: Fetched, body: bytes, expect: type) -> Any:
@@ -421,6 +428,14 @@ class Acquirer:
                 undeclared.append(f"{name}/{date}/{sorted(map(str, seen - expected))[0]}")
 
         runs = self._runs(sorted({date for _, date in declared}))
+        # Workflow metadata is optional upstream. Keep absent values null, but
+        # make every affected run visible rather than silently losing provenance.
+        missing_producer_metadata = []
+        for url in sorted({r.get("run_url") or "" for r in records.values()}):
+            run = runs.get(url, {})
+            absent = [key for key in ("head_sha", "run_attempt") if run.get(key) is None]
+            if absent:
+                missing_producer_metadata.append(f"{url or '(no run URL)'}: {', '.join(absent)}")
         return Acquisition(
             records=[records[k] for k in sorted(records, key=int)],
             runs=runs,
@@ -431,6 +446,7 @@ class Acquirer:
             responses={
                 url: body for url, body in self.responses.items() if "/benchmarks?" in url or "/workflow-info?" in url
             },
+            missing_producer_metadata=missing_producer_metadata,
         )
 
     def _runs(self, dates: Sequence[str]) -> dict[str, dict[str, Any]]:

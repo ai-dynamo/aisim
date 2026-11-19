@@ -3,7 +3,9 @@
 
 """The internal GitLab job definition keeps its safety properties (it is never executed here)."""
 
+import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -60,9 +62,10 @@ def test_runs_only_on_schedule_or_manual_and_is_pinned(definition):
 def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_branch(definition):
     job = definition["publish_candidate"]
     text = _text(job)
-    assert "env -u INFX_CACHE_WRITE_TOKEN" in text and 'push -q origin "candidate/' in text
+    assert "env -u INFX_CACHE_WRITE_TOKEN" in text and 'push -q origin "$BRANCH"' in text
+    assert 'BRANCH="candidate/${SID}-${CI_PIPELINE_ID}"' in text
     assert "main" not in text and "unchanged refresh: no commit" in text and "git status --porcelain" in text
-    assert "qualified" not in text.replace("not qualified", "")
+    assert "$JOB_PY promote" not in text
 
 
 def test_promotion_is_manual_with_a_named_reviewer_and_staleness_is_alert_only(definition):
@@ -77,16 +80,14 @@ def test_failure_alert_job_exists(definition):
     assert "needs" not in alert and "extends" not in alert and "before_script" not in alert
     assert "AISIM_REPO_URL" not in _text(alert) and "JOB_PY" not in _text(alert)
     rules = " ".join(r["if"] for r in alert["rules"])
-    assert '"$[[ inputs.job ]]" == "staleness"' in rules and '"$[[ inputs.job ]]" == "ingest"' in rules
+    assert '$INFX_JOB == "staleness"' in rules and '$INFX_JOB == "ingest"' in rules
 
 
 def test_ci_contract_clean_workspace_default_pipelines_and_staleness_status(definition):
     assert definition["variables"]["GIT_STRATEGY"] == "empty"
     rules = " ".join(r["if"] for r in definition["publish_candidate"]["rules"])
-    assert (
-        '"$[[ inputs.job ]]" == "ingest"' in rules and "== null" not in rules and "!=" not in rules
-    )  # promote never acquires
-    assert "ls-remote --exit-code --heads origin" in _text(definition["publish_candidate"])
+    assert '$INFX_JOB == "ingest"' in rules and "== null" not in rules and "!=" not in rules  # promote never acquires
+    assert "ls-remote --heads origin" in _text(definition["publish_candidate"])
     assert "||" not in _text(definition["staleness"])  # unexpected statuses must fail the job
 
 
@@ -175,3 +176,140 @@ def test_ci_ingestion_defers_failure_alerts_to_the_fallback(definition):
     assert "run --no-notify" in _text(definition["publish_candidate"])
     assert "run-report.json" in _text(definition["alert_failure"])
     assert definition["publish_candidate"]["artifacts"]["when"] == "always"
+
+
+@pytest.mark.parametrize(
+    "source,selector,expected",
+    [
+        ("schedule", "ingest", {"publish_candidate", "alert_failure"}),
+        ("schedule", "staleness", {"staleness", "alert_failure"}),
+        ("schedule", "promote", set()),
+        ("web", "ingest", {"publish_candidate", "alert_failure"}),
+        ("web", "promote", {"promote", "alert_failure"}),
+        ("web", "staleness", {"alert_failure"}),
+        ("push", "ingest", set()),
+    ],
+)
+def test_selector_rules_use_gitlab_variable_comparisons_and_route_jobs(definition, source, selector, expected):
+    assert definition["variables"]["INFX_JOB"] == "$[[ inputs.job ]]"
+    variables = {"CI_PIPELINE_SOURCE": source, "INFX_JOB": selector}
+    selected = set()
+    # This definition uses GitLab's documented variable-left string equality
+    # subset. Validate the complete expression, then exercise its routing table.
+    comparison = r'\$([A-Z_]+)\s*==\s*"([^"]*)"'
+    for name in ("publish_candidate", "promote", "staleness", "alert_failure"):
+        for rule in definition[name]["rules"]:
+            parts = rule["if"].split(" && ")
+            matches = [re.fullmatch(comparison, part) for part in parts]
+            assert all(matches), rule["if"]
+            if all(variables[m[1]] == m[2] for m in matches):
+                selected.add(name)
+                break
+    assert selected == expected
+
+
+@pytest.mark.parametrize("kind", ["historical", "different-baseline", "pending", "generated-pending"])
+def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pending(definition, tmp_path, kind):
+    sid = "a" * 64
+    qualified_a = {
+        "snapshot_id": sid,
+        "snapshot_path": f"snapshots/{sid}/snapshot.json",
+        "created_at": "2026-11-01T00:00:00Z",
+        "qualified_at": "2026-11-01T00:00:00Z",
+        "reviewer": "reviewer",
+    }
+    qualified_b = {**qualified_a, "snapshot_id": "b" * 64, "snapshot_path": f"snapshots/{'b' * 64}/snapshot.json"}
+    pending = {
+        "snapshot_id": sid,
+        "snapshot_path": f"snapshots/{sid}/snapshot.json",
+        "created_at": "2026-11-19T00:00:00Z",
+    }
+    schema = "aisim-infx-ingestion-state/v1"
+
+    def git(path, *args):
+        return subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(path),
+                "-c",
+                "user.name=Synthetic Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                *args,
+            ],
+            text=True,
+        ).strip()
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    git(seed, "init", "-qb", "main")
+
+    def commit_state(qualified, candidate):
+        (seed / "ingestion-state.json").write_text(
+            json.dumps({"schema_version": schema, "qualified": qualified, "candidate": candidate})
+        )
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "synthetic state")
+
+    commit_state(qualified_b, None)
+    git(seed, "remote", "add", "origin", str(remote))
+    git(seed, "push", "-q", "origin", "main")
+    branch = f"candidate/{sid}" + ("-17" if kind == "generated-pending" else "")
+    git(seed, "checkout", "-qb", branch)
+    commit_state(qualified_b if "pending" in kind else qualified_a, None if kind == "historical" else pending)
+    git(seed, "push", "-q", "origin", branch)
+    old = git(remote, "rev-parse", branch)
+
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    subprocess.run(["git", "clone", "-q", "--branch", "main", str(remote), str(workspace / "cache-repo")], check=True)
+    (workspace / "cache-repo/ingestion-state.json").write_text(
+        json.dumps({"schema_version": schema, "qualified": qualified_b, "candidate": pending})
+    )
+    (workspace / "run-report.json").write_text(json.dumps({"snapshot_id": sid}))
+    script = definition["publish_candidate"]["script"][-1]
+    subprocess.run(
+        ["sh", "-eu", "-c", script],
+        cwd=workspace,
+        env={**os.environ, "CI_PIPELINE_ID": "42", "INFX_CACHE_WRITE_TOKEN": ""},
+        check=True,
+    )
+    assert git(remote, "rev-parse", branch) == old
+    branches = git(remote, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+    new_branch = f"candidate/{sid}-42"
+    if kind in ("pending", "generated-pending"):
+        assert new_branch not in branches
+    else:
+        assert new_branch in branches
+        state = json.loads(git(remote, "show", f"{new_branch}:ingestion-state.json"))
+        assert state["qualified"] == qualified_b and state["candidate"]["snapshot_id"] == sid
+
+
+@pytest.mark.parametrize("generation", ["", "42"])
+def test_promotion_selects_the_reviewed_candidate_generation(definition, tmp_path, generation):
+    # Execute the clone command with a fake git to observe the exact branch;
+    # promotion must push back to that same branch, preserving historical refs.
+    script = next(line for line in definition["promote"]["script"] if "GENERATION=" in line)
+    script = script.replace("$[[ inputs.candidate-snapshot-id ]]", "a" * 64).replace(
+        "$[[ inputs.candidate-generation ]]", generation
+    )
+    git = tmp_path / "git"
+    git.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > clone-args\n')
+    git.chmod(0o755)
+    subprocess.run(
+        ["sh", "-eu", "-c", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "INFX_CACHE_WRITE_TOKEN": "",
+            "INFX_CACHE_REPO_URL": "synthetic",
+        },
+        check=True,
+    )
+    args = (tmp_path / "clone-args").read_text().splitlines()
+    assert args[args.index("--branch") + 1] == "candidate/" + "a" * 64 + (f"-{generation}" if generation else "")
+    assert "HEAD:refs/heads/${BRANCH}" in _text(definition["promote"])

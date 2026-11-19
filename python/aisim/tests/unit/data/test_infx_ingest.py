@@ -10,9 +10,11 @@ All HTTP is faked; the response shapes mirror the live documented endpoints
 import ast
 import gzip
 import http.client
+import io
 import json
 import shutil
 import socket
+import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -259,7 +261,13 @@ def test_correction_keeps_observation_id_changes_hash_and_preserves_old_snapshot
     fixed = row(2, "h200", metrics={"mean_ttft": 0.2, "mean_tpot": 0.01, "mean_e2el": 1.5})
     second, _ = make_run(tmp_path, FakeInfx(rows=[row(1), fixed]))
     assert second.status == "candidate" and second.snapshot_id != first.snapshot_id
-    assert second.changes == {"added": [], "corrected": ["inferencex:2"], "removed": []}
+    _, corrected_members = read_snapshot(root, infx_job.snapshot_path(second.snapshot_id))
+    assert second.changes == {
+        "added": [],
+        "corrected": ["inferencex:2"],
+        "removed": [],
+        "revised_shards": sorted({m.manifest_path for m in corrected_members}),
+    }
     assert (root / infx_job.snapshot_path(first.snapshot_id)).read_bytes() == old_doc  # old pin stays readable
     for member in old_members:
         data = load_e2e(root, member.manifest_path)
@@ -309,6 +317,7 @@ def test_producer_metadata_correction_retains_the_old_configuration_revision(roo
     workflow = {**WORKFLOW, "runConfigs": [{"html_url": RUN, "head_sha": "b" * 40}]}
     second, _ = make_run(tmp_path, FakeInfx(workflow=workflow))
     assert second.status == "candidate" and second.snapshot_id != first.snapshot_id
+    assert second.to_json()["change_counts"] == {"added": 0, "corrected": 0, "removed": 0, "revised_shards": 2}
     _, new_members = read_snapshot(root, infx_job.snapshot_path(second.snapshot_id))
     for old, new in zip(old_members, new_members, strict=True):
         assert old.record_sha256 == new.record_sha256  # workflow-info, rather than the benchmark, changed
@@ -713,7 +722,7 @@ def test_scoped_refresh_preserves_prior_canonical_observations(root, tmp_path, s
     # A different selector changes the scope, but the observations are inherited, not added again.
     result, _ = make_run(tmp_path, fake, models=[selector])
     assert result.status == "candidate"
-    assert result.changes == {"added": [], "corrected": [], "removed": []}
+    assert result.changes == {"added": [], "corrected": [], "removed": [], "revised_shards": []}
     before = tree(root)
     empty = FakeInfx(rows=[], availability=[])
     empty.respond("views/options", ok(options))
@@ -1075,3 +1084,143 @@ def test_promotion_during_acquisition_is_not_reverted(root, tmp_path):
     retry, _ = make_run(tmp_path, fake)
     assert retry.status == "candidate"
     assert infx_job.load_state(root)["qualified"] == promoted[0]
+
+
+@pytest.mark.parametrize("size", [16, 17])
+def test_transport_bounds_response_before_ingestion_reports_failure(root, tmp_path, monkeypatch, size):
+    class Response(io.BytesIO):
+        status = 200
+
+        def __init__(self, data):
+            super().__init__(data)
+            self.headers = {}
+
+        def read(self, amount=-1):
+            assert amount == 17  # one sentinel byte beyond the limit, never an unbounded read
+            return super().read(amount)
+
+    response = Response(b" " * (size - 2) + b"{}")
+    monkeypatch.setattr(infx_ingest, "MAX_RESPONSE_BYTES", 16)
+    monkeypatch.setattr(infx_ingest.urllib.request, "urlopen", lambda *a, **k: response)
+    if size == 16:
+        assert len(infx_ingest.urllib_transport("https://example.test", {}, 1).body) == 16
+    else:
+        report = tmp_path / "oversized-report.json"
+        assert (
+            infx_job.main(
+                [
+                    "run",
+                    "--root",
+                    str(root),
+                    "--cache-dir",
+                    str(tmp_path / "cache"),
+                    "--report",
+                    str(report),
+                    "--no-notify",
+                ]
+            )
+            == 1
+        )
+        result = json.loads(report.read_text())
+        assert result["status"] == "failed" and "response exceeds" in result["error"]
+        assert result["requests_made"] == 1 and not tree(root)
+    assert response.closed
+
+
+def test_transport_closes_http_errors_without_reading_the_body(monkeypatch):
+    class Unreadable(io.BytesIO):
+        def read(self, *args):
+            pytest.fail("unused HTTP error body was read")
+
+    body = Unreadable(b"unused")
+    error = urllib.error.HTTPError("https://example.test", 429, "limited", {"Retry-After": "3"}, body)
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(infx_ingest.urllib.request, "urlopen", fail)
+    response = infx_ingest.urllib_transport("https://example.test", {}, 1)
+    assert response.status == 429 and response.headers == {"retry-after": "3"} and response.body == b""
+    assert body.closed
+
+
+@pytest.mark.parametrize("missing", ["both", "head_sha", "run_attempt", "run_url"])
+def test_missing_optional_producer_metadata_is_reported_for_candidates_and_noops(root, tmp_path, missing):
+    workflow = json.loads(json.dumps(WORKFLOW))
+    rows = None
+    if missing == "both":
+        workflow = {"runs": [], "runConfigs": []}
+    elif missing == "run_url":
+        rows = [row(1, run_url=None), row(2, "h200", run_url=None)]
+    else:
+        workflow["runs" if missing == "run_attempt" else "runConfigs"][0].pop(missing)
+    fake = FakeInfx(rows=rows, workflow=workflow)
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "candidate" and any("missing producer metadata:" in w for w in result.warnings)
+    _, members = read_snapshot(root, infx_job.snapshot_path(result.snapshot_id))
+    observation = load_e2e(root, members[0].manifest_path).observations[0]
+    assert (observation.producer_revision is None) is (missing in ("both", "head_sha", "run_url"))
+    assert (observation.producer_attempt is None) is (missing in ("both", "run_attempt", "run_url"))
+    repeated, _ = make_run(tmp_path, fake)
+    assert repeated.status == "unchanged" and repeated.warnings == result.warnings
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        None,
+        1,
+        {"schema_version": infx_job.STATE_SCHEMA, "candidate": []},
+        {"schema_version": infx_job.STATE_SCHEMA, "qualified": "bad"},
+        {"schema_version": infx_job.STATE_SCHEMA, "candidate": {}},
+        {"schema_version": infx_job.STATE_SCHEMA, "candidate": {"snapshot_id": [], "snapshot_path": 1}},
+    ],
+)
+def test_malformed_state_shapes_write_a_failure_report(root, tmp_path, value):
+    path = root / infx_job.STATE_FILE
+    path.write_text(json.dumps(value))
+    before = tree(root)
+    report = tmp_path / "state-report.json"
+    assert (
+        infx_job.main(
+            ["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report), "--no-notify"]
+        )
+        == 1
+    )
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and "ValueError" in result["error"]
+    assert result["requests_made"] == 0 and tree(root) == before
+
+
+def test_ingestion_refuses_a_qualified_snapshot_id_path_mismatch(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", NOW)
+    fake = FakeInfx(rows=[row(1, metrics={"mean_ttft": 0.2}), row(2, "h200")])
+    second, _ = make_run(tmp_path, fake)
+    state = infx_job.load_state(root)
+    state["qualified"]["snapshot_path"] = infx_job.snapshot_path(second.snapshot_id)
+    infx_job.save_state(root, state)
+    before = tree(root)
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "failed" and "qualified snapshot ID differs" in result.error
+    assert result.requests_made == 0 and tree(root) == before
+
+
+def test_noop_refuses_a_candidate_replaced_during_acquisition(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    replacement = []
+    original = FakeInfx()
+
+    def interleave(url, headers, timeout):
+        if not replacement:
+            result, _ = make_run(tmp_path, FakeInfx(rows=[row(1, metrics={"mean_ttft": 0.2}), row(2, "h200")]))
+            assert result.status == "candidate" and result.snapshot_id != first.snapshot_id
+            replacement.append(tree(root))
+        return original(url, headers, timeout)
+
+    result, _ = make_run(tmp_path, interleave)
+    assert result.status == "failed" and "state changed" in result.error and "retry" in result.error
+    assert tree(root) == replacement[0]
+    retry, _ = make_run(tmp_path, original)
+    assert retry.status == "candidate" and retry.snapshot_id == first.snapshot_id

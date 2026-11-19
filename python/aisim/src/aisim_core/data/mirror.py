@@ -52,7 +52,7 @@ import pyarrow.parquet as pq
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, check_manifest, configuration_id
-from aisim_core.data.catalog import CATALOG_DIR, _write, build_catalog, catalog_files, known_system_specs
+from aisim_core.data.catalog import CATALOG_DIR, COVERAGE_FILE, _write, build_catalog, catalog_files, known_system_specs
 from aisim_core.data.e2e import SNAPSHOT_SCHEMA, load_e2e, read_snapshot, verify_snapshot_members
 from aisim_core.data.eval import load_record, record_dir, record_paths
 from aisim_core.data.evidence import EVIDENCE_ROOT, check_evidence
@@ -68,7 +68,7 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "7"
+VALIDATOR_VERSION = "8"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
@@ -103,6 +103,7 @@ class TreeReport:
     configurations: int = 0
     eval_records: int = 0
     findings: list[Finding] = field(default_factory=list)
+    manifests: dict[str, Manifest] = field(default_factory=dict, repr=False)
 
     @property
     def errors(self) -> list[Finding]:
@@ -324,6 +325,9 @@ def _check_schema_snapshots(root: Path, report: TreeReport, declared: set[str]) 
 
 
 def _check_catalog_drift(root: Path, report: TreeReport, declared: set[str]) -> None:
+    coverage_rel = f"{CATALOG_DIR}/{COVERAGE_FILE}"
+    if (root / coverage_rel).is_file():
+        declared.add(coverage_rel)
     existing = catalog_files(root)
     declared.update(p.relative_to(root).as_posix() for p in existing)
     if not existing:
@@ -405,23 +409,29 @@ def validate_tree(
         for f in control:
             if f.is_symlink or not f.path.endswith(".json"):
                 report.add("control-file", "mirror/ may hold plain .json files only", f.path)
+        from aisim_core.data.redaction import LEDGER_PATH, VisibilityLedger
+
+        if (root / LEDGER_PATH).is_file():
+            _read_json(root, LEDGER_PATH, VisibilityLedger, report)
     report.files = len(listing) + len(evidence)
     if not listing and not evidence and allow_empty:
         return report
-    # Preflight before index loaders and catalog rebuilding can consume JSON.
+    # Preflight before index/system loaders and catalog rebuilding consume structured data.
     # Evidence blobs are exempt, but their manifests use bounded_json_bytes.
-    oversized_json = [
+    oversized = [
         file
         for file in listing
-        if Path(file.path).suffix.lower() == ".json" and file.size > CandidatePolicy().max_json_bytes
+        if Path(file.path).suffix.lower() in (".json", ".yaml") and file.size > CandidatePolicy().max_json_bytes
     ]
-    for file in oversized_json:
-        report.add("json-too-large", "JSON exceeds the structured-content size limit", file.path)
-    if oversized_json:
+    for file in oversized:
+        kind = Path(file.path).suffix.lower()[1:]
+        report.add(f"{kind}-too-large", f"{kind.upper()} exceeds the structured-content size limit", file.path)
+    if oversized:
         return report
 
     declared: set[str] = set()
     manifests = _check_indexes(root, report, declared)
+    report.manifests = manifests
     system_files = _check_system_bundles(root, report)
     declared.update(system_files)
     yaml_sidecars = {

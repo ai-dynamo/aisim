@@ -21,12 +21,19 @@ internal project by hand.
    protected, read-only `INFX_CACHE_READ_TOKEN` for staleness. Acquisition (public GET) uses no credential.
 4. Supply CI/CD inputs, not pipeline variables: weekly with `job=ingest`; daily with
    `job=staleness`. Manual refresh: run a web pipeline (default `job=ingest`). Promotion:
-   web pipeline with `job=promote` and `candidate-snapshot-id`, started by the reviewing
-   maintainer. When including this definition, forward these inputs from the project's
+   web pipeline with `job=promote`, `candidate-snapshot-id`, and `candidate-generation`
+   (the pipeline ID suffix printed by ingestion), started by the reviewing
+   maintainer. Leave the generation empty for legacy `candidate/<snapshot-id>` branches.
+   When including this definition, forward these inputs from the project's
    pipeline inputs through `include:inputs`; keep their enum/regex constraints.
    Use a GitLab version supporting pipeline and schedule inputs before installing.
+5. Protect the `infx-cache-writer` environment and restrict **Allowed to deploy** to
+   reviewing maintainers (including the account that owns the ingestion schedule).
+   The manual `promote` job declares `environment.action: access`; GitLab permits
+   listed users and administrators to play it. `GITLAB_USER_NAME` records the actor;
+   it does not authorize reviewers on its own.
 
-After a successful promotion the qualification exists only on `candidate/<snapshot-id>`. Open a
+After a successful promotion the qualification exists only on its candidate branch. Open a
 reviewed merge request from that branch into the default branch and merge it: ingestion and
 staleness jobs clone the default branch, so they keep seeing the previous qualified snapshot until
 then. The jobs never push to the default branch.
@@ -39,13 +46,19 @@ then. The jobs never push to the default branch.
 | Failure alerts | Slack `#swdl-dynamo-aisim-daily` plus email to the owner |
 | Staleness | warn at 8 days, stale at 14 days since the last qualified snapshot (alert only) |
 | Unchanged refresh | no commit, no snapshot |
-| Candidates | pushed to `candidate/<snapshot-id>` branches; never auto-promoted, never pushed to the default branch |
+| Candidates | pushed to `candidate/<snapshot-id>-<pipeline-id>` branches; never auto-promoted, never pushed to the default branch |
 | Failure | publication may leave immutable revisions in the checkout; the qualification pointer stays unchanged and the failed GitLab job does not push the checkout |
 
-A `run --model ...` candidate contains only the selected models and replaces the qualified
-snapshot when promoted. Its `changes.removed` and `change_counts.removed` include qualified
+A `run --model ...` candidate limits observation membership to the selected models and replaces the qualified
+snapshot when promoted. The raw evidence can still include sibling DB-key observations from a shared
+benchmark page and full dated `workflow-info` responses. This filter is not a redaction boundary.
+Its `changes.removed` and `change_counts.removed` include qualified
 observations from unselected models. Review that removal count before promotion; use an
 unfiltered run to retain the full model scope.
+
+Ingestion skips an existing branch only when it still has the same snapshot pending against the
+current qualified baseline. If content recurs after another snapshot was qualified, a new
+pipeline-suffixed branch preserves the historical review and supports a fresh qualification.
 
 Configuration shards are stored under `revisions/<content-sha256>/e2e/...`.
 The revision covers the converted rows, manifest body and provenance, including producer metadata.
@@ -55,6 +68,11 @@ Snapshots reference these immutable revisions, so a candidate that corrects a me
 configuration membership cannot alter earlier qualified truth. Unchanged revisions are verified and
 reused. Existing snapshots at legacy `e2e/...` paths remain readable and their shards are retained;
 the first refresh after upgrading may create a candidate solely to adopt versioned paths.
+The run report counts changed revision paths as `change_counts.revised_shards`, separately from
+raw-observation additions, corrections and removals. This includes producer-metadata-only revisions.
+Producer SHA and attempt metadata from `workflow-info` are optional: absent values remain null,
+and `warnings` lists each affected benchmark run URL and missing field (including unchanged runs).
+Each HTTP page is limited to 64 MiB before parsing; larger pages fail with a structured run report.
 
 ## Assumptions to confirm before install
 
