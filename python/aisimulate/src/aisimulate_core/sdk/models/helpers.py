@@ -1180,7 +1180,11 @@ def resolve_kimi_k3_moe_arch_mode(
     """
     if backend_name != "sglang":
         return None
-    if model_path not in {"moonshotai/Kimi-K3", "moonshotai/Kimi-K3.1-Pro"}:
+    info = _get_model_info(model_path)
+    if info["architecture"] not in {"KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"}:
+        return None
+    inferred = _infer_quant_modes_from_raw_config(info.get("raw_config", {}), info["architecture"])
+    if inferred.get("moe_quant_mode") != common.MoEQuantMode.w4a16_mxfp4:
         return None
     from aisimulate_core.sdk.perf_database import is_blackwell_system
 
@@ -1430,7 +1434,7 @@ def resolve_context_fmha_by_data(
     # run with (explicit wins, else the checkpoint inference).
     kv_mode = model_config.kvcache_quant_mode or inferred.get("kvcache_quant_mode")
     ctx_op, _ = attention_op_keys(family, backend_name, architecture=info.get("architecture"))
-    supported = context_fmha_supported_modes(database, ctx_op, kv_mode)
+    supported = context_fmha_supported_modes(database, ctx_op, kv_mode, architecture=info["architecture"])
     if not supported or common.FMHAQuantMode.fp8.name in supported:
         return
 

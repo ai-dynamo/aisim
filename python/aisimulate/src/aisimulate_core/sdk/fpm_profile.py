@@ -82,6 +82,12 @@ def _quantization_from_engine_config(config_json: str) -> dict[str, str]:
                 f"FPM profile identity conflict: {field}={supplied!r}, "
                 f"profile {mode}={modes[mode]!r} requires wire dtype {expected!r}"
             )
+    supplied_comm = config["extra"].get("comm_quant_mode")
+    if supplied_comm is not None and supplied_comm != modes["comm_quant_mode"]:
+        raise ValueError(
+            f"FPM profile identity conflict: comm_quant_mode={supplied_comm!r}, "
+            f"profile comm_quant_mode={modes['comm_quant_mode']!r}"
+        )
     modes.pop("attention_backend")
     return modes
 

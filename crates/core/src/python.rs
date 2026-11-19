@@ -3141,7 +3141,9 @@ fn resolve_ngram_async_scheduling(rank: &mut EngineConfig, speculation_kind: &st
 fn architecture_requires_state_cache(architecture: &str) -> bool {
     matches!(
         architecture,
-        "KimiK31ForConditionalGeneration" | "KimiLinearForCausalLM"
+        "KimiK31ForConditionalGeneration"
+            | "KimiK3ForConditionalGeneration"
+            | "KimiLinearForCausalLM"
     )
 }
 
@@ -7761,7 +7763,11 @@ mod tests {
             }))
             .unwrap(),
         );
-        for architecture in ["KimiK31ForConditionalGeneration", "KimiLinearForCausalLM"] {
+        for architecture in [
+            "KimiK31ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+        ] {
             let requires_state = architecture_requires_state_cache(architecture);
             assert!(requires_state);
             validate_aic_state_cache(requires_state, &role, Some(&resources)).unwrap();
@@ -7815,7 +7821,11 @@ mod tests {
     #[test]
     fn k31_fitted_replay_checks_local_checkpoint_after_snapshot_restore() {
         pyo3::prepare_freethreaded_python();
-        for architecture in ["KimiK31ForConditionalGeneration", "KimiLinearForCausalLM"] {
+        for architecture in [
+            "KimiK31ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let checkpoint = dir.path().join("renamed-checkpoint");
             std::fs::create_dir(&checkpoint).unwrap();
@@ -7823,7 +7833,11 @@ mod tests {
                 checkpoint.join("config.json"),
                 serde_json::to_vec(&serde_json::json!({
                     "architectures": [architecture],
-                    "text_config": {"architectures": ["KimiLinearForCausalLM"]}
+                    "text_config": if architecture == "KimiK3ForConditionalGeneration" {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"architectures": ["KimiLinearForCausalLM"]})
+                    }
                 }))
                 .unwrap(),
             )

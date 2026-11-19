@@ -2300,3 +2300,18 @@ def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog
         enc_cfg = get_model_config_from_model_path(str(bare))["extra_params"]
     assert (enc_cfg.min_pixels, enc_cfg.max_pixels) == utils.QWEN3_VL_PIXEL_BOUNDS
     assert "no pixel budget" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"re:.*block_sparse_moe\.(routed_expert_up_proj|experts\..*)",
+        r"re:.*(experts|routed_expert_up_proj).*",
+        r"re:.*(shared_experts|experts|routed_expert_down_proj).*",
+    ],
+)
+def test_combined_ignore_patterns_preserve_expert_bank_exclusion(pattern):
+    from aisimulate_core.sdk.utils import _categorize_ignore_pattern
+
+    assert "routing_experts" in _categorize_ignore_pattern(pattern)

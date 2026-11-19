@@ -608,3 +608,38 @@ def test_optional_runner_rejects_new_mtp_representation(nested, field, accepted)
             ),
         )
     )
+
+
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_naive_auto_token_geometry_rejects_unrepresented_dcp(dcp):
+    from aisimulate.capacity import estimate_kv_bytes_per_token
+
+    if dcp != 1:
+        with pytest.raises(ValueError, match="naive KV geometry.*decode context parallelism"):
+            estimate_kv_bytes_per_token("Qwen/Qwen3-32B", tp_size=1, pp_size=1, dcp_size=dcp)
+    else:
+        assert estimate_kv_bytes_per_token("Qwen/Qwen3-32B", tp_size=1, pp_size=1, dcp_size=dcp) > 0
+
+
+def test_restored_unknown_estimator_widths_use_concrete_sample():
+    from aisimulate.sweeper.deploy import _kv_geometry_args
+
+    widths = {"tp": 8, "pp": 1, "moe_tp": 2, "moe_ep": 4, "attention_dp": 2}
+    sample = {"backend": "sglang", "hardware_sku": "b200_sxm", **widths}
+    estimator = ForwardPassEstimatorSpec(
+        config={
+            "tp": "unknown",
+            "pp": "unknown",
+            "moe_tp_size": "unknown",
+            "moe_ep_size": "unknown",
+            "attention_dp": "unknown",
+        }
+    )
+    actual = _kv_geometry_args(sample, "agg", backend_version="0.5.21", estimator=estimator)
+    assert {key: actual[key] for key in ("tp_size", "pp_size", "moe_tp_size", "moe_ep_size", "attention_dp_size")} == {
+        "tp_size": 8,
+        "pp_size": 1,
+        "moe_tp_size": 2,
+        "moe_ep_size": 4,
+        "attention_dp_size": 2,
+    }

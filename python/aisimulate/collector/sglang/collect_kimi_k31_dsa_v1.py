@@ -152,7 +152,7 @@ def executed_kernel_source(backend, pool, phase: str) -> str:
     if packed and pool.kv_cache_dim == 656 and not cast_on_write:
         layout = "kv_flashmla_packed"
     elif not packed and pool.kv_cache_dim == 576 and cast_on_write:
-        layout = "kv_raw_fp8"
+        raise RuntimeError("FIXME(kernel-limit): native K31 raw FP8 KV pool has no qualified kernel-source mapping")
     else:
         raise RuntimeError("native K31 KV pool does not match a supported physical layout")
     # Dense-prefill kernel choice does not identify the KV write format. Keep
@@ -192,13 +192,15 @@ def run_kimi_k31_dsa_fullnode(*, perf_filename, limit=None, cases=None):
         cases = getter()
     selected = list(cases)[:limit] if limit is not None else list(cases)
     failed = []
+    failure_details = {}
     for case in selected:
         try:
             _run_native_case(case, "cuda:0", perf_filename)
-        except Exception:
+        except Exception as error:
+            failure_details[str(case)] = {"error_type": type(error).__name__, "error_message": str(error)}
             logging.getLogger(__name__).exception("Native Kimi K3.1 full-node case failed: %s", case)
             failed.append(case)
-    return {"succeeded": len(selected) - len(failed), "failed": failed}
+    return {"succeeded": len(selected) - len(failed), "failed": failed, "failure_details": failure_details}
 
 
 def _run_native_case(case, device, perf_filename):
@@ -472,6 +474,33 @@ def _rank_main(rank, server_args, port_args, case_values, phase, output, first_g
         torch.distributed.destroy_process_group()
 
 
+def _check_capacity(case: ModuleCase, phase: str, cuda, first_gpu: int) -> None:
+    """Refuse a proven non-fit before native model/pool allocation.
+
+    MLAKVPool's packed latent (656 B) and DSA index-K (128 B + FP32
+    scale) are replicated across TP. KimiK3MLAAttention also consumes a
+    BF16 hidden-state tensor. These unavoidable buffers form a lower bound;
+    weights/workspaces add memory and may still cause an observed OOM.
+    Decode history uses bounded native continuations, not a monolithic
+    full-history activation (see _prepare_forward/_extend_history).
+    """
+    history = case.seq_len + case.prefix_len
+    cache_bytes = case.batch_size * (history + 64) * (656 + 128 + 4)
+    forward_tokens = (
+        case.batch_size * max(case.seq_len, case.prefix_len)
+        if phase == "context"
+        else min(case.batch_size * max(case.seq_len - 1, 1), max(HISTORY_CHUNK_TOKENS, case.batch_size))
+    )
+    required = cache_bytes + forward_tokens * 7168 * 2
+    for gpu in range(first_gpu, first_gpu + validate_case(case)):
+        free, _total = cuda.mem_get_info(gpu)
+        if required > free:
+            raise RuntimeError(
+                f"FIXME(kernel-limit): does not fit: native KV and hidden-state buffers require at least "
+                f"{required} bytes on cuda:{gpu}, only {free} bytes free"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", required=True)
@@ -490,6 +519,7 @@ def main() -> None:
     first_gpu = int(args.device.rsplit(":", 1)[-1])
     if first_gpu + tp > torch.cuda.device_count():
         raise RuntimeError(f"FIXME(kernel-limit): does not fit: native TP{tp} requires {tp} available GPUs")
+    _check_capacity(case, args.phase, torch.cuda, first_gpu)
     config_path = hf_hub_download(MODEL, "config.json", revision=MODEL_REVISION)
     config = single_layer_config(json.loads(Path(config_path).read_text()))
     tokenizer_path = snapshot_download(

@@ -132,3 +132,63 @@ def test_shard_state_reads_the_namespace(tmp_path):
     assert c.shard_state(tmp_path, s) == "done-no-parquet"  # the --keep-csv failure mode, picked up by `finalize`
     (d / "gemm_perf.parquet").write_bytes(b"")
     assert c.shard_state(tmp_path, s) == "finalized"
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_k31_campaign_uses_model_scoped_image_and_leaves_model_free_resolution_alone(phase):
+    from collector.framework_manifest import require_collector_runtime, resolve_op_runtime
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, RUNTIME_VERSION
+
+    c = _load()
+    op = f"kimi_k31_dsa_{phase}_module"
+    pinned = require_collector_runtime("sglang", RUNTIME_VERSION, requested_ops={op}, model_path=MODEL)
+    assert c.pinned_image("sglang", op, MODEL) == pinned.image()
+    assert "@sha256:" in c.pinned_image("sglang", op, MODEL)
+    assert c.pinned_image("sglang", op) == resolve_op_runtime("sglang", op).image()
+    assert c.pinned_image("sglang", op) != pinned.image()
+
+
+def test_campaign_images_are_keyed_by_shard_model(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    c = _load()
+    shards = (c.Shard("gemm", "one", model_path="one"), c.Shard("gemm", "two", model_path="two"))
+    plan = c.Plan("sglang", 103, shards)
+    monkeypatch.setattr(c, "collector_ref", lambda _checkout: "0" * 40)
+    monkeypatch.setattr(c, "pinned_image", lambda _backend, _op, model: model)
+    monkeypatch.setattr(c, "collect_image_tag", lambda base: "image-" + base)
+    monkeypatch.setattr(c, "image_digest", lambda _image: "sha256:test")
+    commands = []
+
+    def launch(argv):
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda: 0)
+
+    monkeypatch.setattr(c.subprocess, "Popen", launch)
+    assert (
+        c.run_campaign(
+            plan,
+            plan_path=tmp_path / "plan.yaml",
+            root=tmp_path / "out",
+            gpus=[0],
+            checkout=tmp_path,
+            image_override=None,
+            mode="run",
+        )
+        == 0
+    )
+    assert [cmd[cmd.index("--image") + 1] for cmd in commands] == ["image-one", "image-two"]
+
+
+def test_build_image_uses_model_scoped_runtime(monkeypatch):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL
+
+    c = _load()
+    op = "kimi_k31_dsa_context_module"
+    seen = []
+    monkeypatch.setattr(c, "build_image", lambda base, **_kwargs: seen.append(base) or "built")
+    monkeypatch.setattr(
+        sys, "argv", ["collect_campaign", "build-image", "--backend", "sglang", "--op", op, "--model-path", MODEL]
+    )
+    assert c.main() == 0
+    assert seen == [c.pinned_image("sglang", op, MODEL)]

@@ -570,3 +570,29 @@ def test_calib_view_absent_file_and_empty_rows_return_none(systems_root: Path) -
     assert _fetch(_build_db(systems_root), "_dsv4_csa_topk_calib_data") is None
     _write_parquet(systems_root, CALIB_REL, [_calib_row(score_mode="")])
     assert _fetch(_build_db(systems_root), "_dsv4_csa_topk_calib_data") is None
+
+
+def test_context_fmha_capability_filters_native_dsa_architecture_axis(systems_root):
+    from aisimulate_core.sdk.perf_database import context_fmha_supported_modes
+
+    architecture = "KimiK31ForConditionalGeneration"
+    _write_parquet(
+        systems_root,
+        DSA_CTX_REL,
+        [
+            _dsa_row(
+                architecture=architecture,
+                kv_cache_dtype="fp8",
+                num_heads=12,
+                kernel_source="sglang_dsa_indexer_flashmla_kv_kv_flashmla_packed_eager",
+            ),
+            _dsa_row(architecture=DEFAULT_DSA_ARCHITECTURE, kv_cache_dtype="fp8", mla_dtype="fp8"),
+        ],
+    )
+    db = _build_db(systems_root)
+    assert context_fmha_supported_modes(
+        db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=architecture
+    ) == ["bfloat16"]
+    assert context_fmha_supported_modes(
+        db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=DEFAULT_DSA_ARCHITECTURE
+    ) == ["fp8"]

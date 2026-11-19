@@ -478,9 +478,9 @@ _CONTEXT_FMHA_OP_TABLES: dict[str, tuple[str, ...]] = {
 }
 
 
-def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode) -> list[str]:
+def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode, *, architecture: str | None = None) -> list[str]:
     """FMHA mode names with perf data for ``ctx_op``, restricted to slices that
-    exist JOINTLY with ``kv_cache_mode``.
+    exist JOINTLY with ``kv_cache_mode`` and, for DSA, ``architecture``.
 
     The flat ``supported_quant_mode[ctx_op]`` list unions fmha keys across kv
     slices (and across granular+module tables for ``context_mla``), so an fmha
@@ -511,7 +511,12 @@ def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode) -> list[s
         lanes = list(data.values()) if isinstance(first_key, str) else [data]
         for lane_data in lanes:
             for fmha_key in lane_data:
-                if kv_cache_mode in lane_data[fmha_key]:
+                kv_slice = lane_data[fmha_key].get(kv_cache_mode)
+                if kv_slice is not None and (
+                    ctx_op != "dsa_context_module"
+                    or architecture is None
+                    or any(architecture in architectures for architectures in kv_slice.values())
+                ):
                     modes.add(fmha_key.name if hasattr(fmha_key, "name") else str(fmha_key))
     if not saw_table:
         return list(flat)

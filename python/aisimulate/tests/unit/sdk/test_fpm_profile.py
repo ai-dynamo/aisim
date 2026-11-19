@@ -2343,3 +2343,12 @@ def test_profile_rejects_unsupported_fpm_options_at_canonical_and_compile_bounda
             fpm_interpolation="direct",
             fpm_options=options,
         )
+
+
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_linear_profile_memory_requires_recorded_dcp1(profile_memory, dcp):
+    if dcp == 1:
+        assert profile_memory(dcp_size=dcp)["total_kv_size_tokens"] == 60
+    else:
+        with pytest.raises(ValueError, match="FPM linear profile capacity is recorded at DCP1"):
+            profile_memory(dcp_size=dcp)

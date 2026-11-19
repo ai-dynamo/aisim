@@ -606,6 +606,8 @@ def estimate_kv_bytes_per_token(
         model = get_model(model_name, model_config, backend)
         return int(model.get_kvcache_rank_bytes_per_token())
 
+    if dcp_size != 1:
+        raise ValueError("naive KV geometry does not support decode context parallelism; dcp_size must be 1")
     estimator = NaiveKVCacheEstimator.from_hf_config(
         raw_config,
         tp_size=tp_size,

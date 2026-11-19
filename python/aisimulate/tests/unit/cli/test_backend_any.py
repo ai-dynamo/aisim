@@ -125,3 +125,18 @@ class TestBackendAny:
         for task_config in tasks.values():
             assert task_config.nextn == 0
             assert task_config.nextn_accepted is None
+
+
+@pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla"])
+def test_k31_attention_backend_cli_parsing_preserves_dense_validation(backend):
+    import argparse
+
+    from aisimulate.legacy_cli.main import _add_attention_backend_argument
+    from aisimulate_core.sdk.attention_lanes import resolve_attention_override_lanes
+    from aisimulate_core.sdk.errors import UnsupportedAttentionBackendError
+
+    parser = argparse.ArgumentParser()
+    _add_attention_backend_argument(parser)
+    assert parser.parse_args(["--attention-backend", backend]).attention_backend == backend
+    with pytest.raises(UnsupportedAttentionBackendError):
+        resolve_attention_override_lanes("sglang", backend)

@@ -1321,6 +1321,8 @@ def estimate_kv_cache(
             )
             estimate["kvcache_quant_mode"] = deployment.kv_cache_dtype
             return estimate
+        if dcp_size != 1:
+            raise ValueError("FPM linear profile capacity is recorded at DCP1; dcp_size must be 1 on this path")
         estimate = KVCacheEstimator._estimate_from_breakdown(
             {
                 "weights_bytes": resources.weights_bytes,

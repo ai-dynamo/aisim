@@ -1789,16 +1789,20 @@ def _categorize_ignore_pattern(pattern: str) -> set[str]:
     if any(kw in p for kw in ("self_attn", "q_proj", "k_proj", "v_proj", "o_proj")):
         categories.add("attention")
 
-    # shared_expert must be checked before the generic expert check
     if "shared_expert" in p:
         categories.add("shared_experts")
-    elif "expert" in p and not any(
-        projection in p
-        for projection in ("routed_expert_up_proj", "routed_expert_down_proj", "routed_expert_(up|down)_proj")
+    # Remove only the shared projection names. Any remaining expert reference
+    # (including another regex alternative) still excludes routed weights.
+    expert_pattern = p
+    for projection in (
+        "routed_expert_up_proj",
+        "routed_expert_down_proj",
+        "routed_expert_(up|down)_proj",
+        "shared_experts",
+        "shared_expert",
     ):
-        # LatentMoE's routed_expert_up/down_proj wrap the expert bank. An
-        # exclusion for those shared projections does not exclude the routed
-        # experts' own weights (whose module paths contain "experts").
+        expert_pattern = expert_pattern.replace(projection, "")
+    if "expert" in expert_pattern:
         categories.add("routing_experts")
 
     if "lm_head" in p:

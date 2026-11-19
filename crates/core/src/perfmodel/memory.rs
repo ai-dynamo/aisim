@@ -334,6 +334,9 @@ fn estimate_kwargs<'py>(
     // typed fields on the legacy Mocker request. Preserve explicit choices:
     // attention backend, in particular, determines the physical MLA KV layout.
     for name in ["attention_backend", "moe_backend", "comm_quant_mode"] {
+        if name == "moe_backend" && engine.extra.contains_key("fpm_profile") {
+            continue;
+        }
         if let Some(value) = engine.extra.get(name) {
             kwargs.set_item(name, value)?;
         }
@@ -643,11 +646,37 @@ mod tests {
                     }
                 }]
             }).to_string());
-            let estimate =
-                estimate_kv_cache(req.clone()).expect("profile precision must survive the wire");
-            assert_eq!(estimate.source, EstimateSource::Profile);
-            assert_eq!(estimate.total_kv_size_bytes, 600);
-            assert_eq!(estimate.total_kv_size_tokens, 60);
+            for backend in ["auto", "future_pinned_moe"] {
+                let mut profile: serde_json::Value =
+                    serde_json::from_str(&req.engine.extra["fpm_profile"]).unwrap();
+                profile["deployments"][0]["moe_backend"] = backend.into();
+                req.engine
+                    .extra
+                    .insert("fpm_profile".into(), profile.to_string());
+                req.engine
+                    .extra
+                    .insert("moe_backend".into(), backend.into());
+                req.engine
+                    .extra
+                    .insert("comm_quant_mode".into(), "half".into());
+                let estimate =
+                    estimate_kv_cache(req.clone()).expect("profile identity must survive the wire");
+                assert_eq!(estimate.source, EstimateSource::Profile);
+                assert_eq!(estimate.total_kv_size_bytes, 600);
+                assert_eq!(estimate.total_kv_size_tokens, 60);
+            }
+            req.engine
+                .extra
+                .insert("comm_quant_mode".into(), "fp8".into());
+            let error =
+                estimate_kv_cache(req.clone()).expect_err("conflicting comm mode must fail");
+            assert!(
+                error.to_string().contains("FPM profile identity conflict"),
+                "{error}"
+            );
+            req.engine
+                .extra
+                .insert("comm_quant_mode".into(), "half".into());
 
             req.engine.quantization.weight_dtype = Some(DataType::Bfloat16);
             let error = estimate_kv_cache(req).expect_err("a different wire dtype must fail");

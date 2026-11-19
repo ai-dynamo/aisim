@@ -200,7 +200,10 @@ def collect_sglang_fullnode_op(
         )
         if not isinstance(result, dict) or "failed" not in result:
             raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")
+        # Native runners can retain per-case causes without changing the case
+        # list/checkpoint protocol used by older full-node collectors.
         failed_cases = result["failed"]
+        failure_details = result.get("failure_details", {})
         unknown_failed = [case for case in failed_cases if str(case) not in id_by_case]
         if unknown_failed:
             raise RuntimeError(
@@ -213,14 +216,18 @@ def collect_sglang_fullnode_op(
             else:
                 resume_tracker.mark_passed(task_id)
         for task_id in sorted(failed_ids):
+            detail = failure_details.get(str(task_by_id[task_id]), {})
+            message = detail.get("error_message", "full-node runner reported failed case")
             errors.append(
                 {
                     "module": full_name,
                     "task_id": task_id,
                     "task_params": str(task_by_id[task_id]),
-                    "error_type": "FullNodeCaseFailure",
-                    "error_message": "full-node runner reported failed case",
-                    "classification": "unexpected",
+                    "error_type": detail.get("error_type", "FullNodeCaseFailure"),
+                    "error_message": message,
+                    "classification": "kernel_limit"
+                    if message.lstrip().startswith("FIXME(kernel-limit)")
+                    else "unexpected",
                     "timestamp": datetime.now().isoformat(),
                 }
             )

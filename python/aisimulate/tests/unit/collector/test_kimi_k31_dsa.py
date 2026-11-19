@@ -4,6 +4,7 @@
 
 import copy
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -149,7 +150,8 @@ def test_kernel_source_reports_executed_native_backend_and_eager_mode():
     pool.dsa_kv_cache_store_fp8 = False
     pool.fp8_cast_on_write = True
     pool.kv_cache_dim = 576
-    assert executed_kernel_source(hybrid, pool, "context") == "sglang_dsa_dense_mha_trtllm_ragged_kv_raw_fp8_eager"
+    with pytest.raises(RuntimeError, match=r"FIXME\(kernel-limit\).*raw FP8"):
+        executed_kernel_source(hybrid, pool, "context")
     pool.kv_cache_dim = 656
     with pytest.raises(RuntimeError, match="physical layout"):
         executed_kernel_source(hybrid, pool, "context")
@@ -195,7 +197,9 @@ def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(mon
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
     assert observed == cases
-    assert result == {"succeeded": 2, "failed": [cases[1]]}
+    assert result["succeeded"] == 2
+    assert result["failed"] == [cases[1]]
+    assert result["failure_details"][str(cases[1])]["error_type"] == "RuntimeError"
 
 
 @pytest.mark.parametrize(
@@ -277,7 +281,9 @@ def test_native_timeout_kills_tp_children_and_fullnode_continues(monkeypatch, ca
     monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 1)
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
-    assert result == {"succeeded": 1, "failed": [cases[0]]}
+    assert result["succeeded"] == 1
+    assert result["failed"] == [cases[0]]
+    assert "timed out" in result["failure_details"][str(cases[0])]["error_message"]
     assert all(child.poll() is not None for child in children)
     pid = int(rank_pid.read_text())
     try:
@@ -374,3 +380,70 @@ def test_native_history_continuation_fails_closed(failure):
     with pytest.raises(RuntimeError, match="native"):
         _extend_history(SimpleNamespace(extend=extend), [req], 7, chunk_tokens=3)
     assert calls == 2
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_capacity_refuses_before_native_allocation_and_checks_every_rank(phase):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import _check_capacity
+
+    case = ModuleCase(1048576, 16, 48, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    visited = []
+
+    def memory(gpu):
+        visited.append(gpu)
+        return (2**40 if gpu == 2 else 1, 2**40)
+
+    with pytest.raises(RuntimeError, match=r"^FIXME\(kernel-limit\): does not fit.*cuda:3"):
+        _check_capacity(case, phase, SimpleNamespace(mem_get_info=memory), 2)
+    assert visited == [2, 3]
+    _check_capacity(case, phase, SimpleNamespace(mem_get_info=lambda _gpu: (2**40, 2**40)), 0)
+
+
+@pytest.mark.parametrize("sm", [80, 86, 89])
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_native_k31_plan_applies_pre_hopper_floor(sm, phase, monkeypatch):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
+    planned = plan(f"kimi_k31_dsa_{phase}_module", "sglang", sm)
+    assert not planned.cases
+    assert planned.removed
+
+
+def test_native_fullnode_failure_reaches_persisted_artifact(monkeypatch, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    from collector import fullnode
+    from collector.collect import ResumeCheckpoint
+
+    case = ModuleCase(4096, 1, 12, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    reason = "FIXME(kernel-limit): does not fit: native TP8 requires 8 available GPUs"
+
+    def fail(*_args):
+        raise RuntimeError(reason)
+
+    monkeypatch.setattr(module, "_run_native_case", fail)
+    errors = fullnode.collect_sglang_fullnode_op(
+        {
+            "name": "sglang",
+            "type": "kimi_k31_dsa_context_module",
+            "module": module.__name__,
+            "get_func": "get_kimi_k31_dsa_context_test_cases",
+            "run_func": "run_kimi_k31_dsa_fullnode",
+            "perf_filename": str(tmp_path / "context.txt"),
+        },
+        runtime_version=RUNTIME_VERSION,
+        limit=None,
+        shuffle=False,
+        shuffle_seed=42,
+        backend="sglang",
+        resume_options={"checkpoint_dir": str(tmp_path / "checkpoint")},
+        model_path=MODEL,
+        case_plan=None,
+        sm_version=103,
+        case_filters=None,
+        get_test_cases_for_model=lambda *_args: [case],
+        resume_checkpoint_cls=ResumeCheckpoint,
+        logger=logging.getLogger(__name__),
+    )
+    assert len(errors) == 1
+    assert errors[0]["error_message"] == reason
+    assert errors[0]["error_type"] == "RuntimeError"
+    assert errors[0]["classification"] == "kernel_limit"

@@ -214,11 +214,11 @@ def _kv_geometry_args(
     prefix = _role_prefix(role)
     resolved = estimator.config if estimator is not None else {}
     result = {
-        "tp_size": resolved.get("tp", int(sample[f"{prefix}tp"])),
-        "pp_size": resolved.get("pp", int(sample[f"{prefix}pp"])),
-        "moe_tp_size": resolved.get("moe_tp_size") or int(sample[f"{prefix}moe_tp"]),
-        "moe_ep_size": resolved.get("moe_ep_size") or int(sample[f"{prefix}moe_ep"]),
-        "attention_dp_size": resolved.get("attention_dp", int(sample[f"{prefix}attention_dp"])),
+        "tp_size": int(sample[f"{prefix}tp"]),
+        "pp_size": int(sample[f"{prefix}pp"]),
+        "moe_tp_size": int(sample[f"{prefix}moe_tp"]),
+        "moe_ep_size": int(sample[f"{prefix}moe_ep"]),
+        "attention_dp_size": int(sample[f"{prefix}attention_dp"]),
         "cp_size": resolved.get("cp_size", sample.get(f"{prefix}cp")) or 1,
         "dcp_size": resolved.get("dcp", sample.get(f"{prefix}dcp")) or 1,
         "worker_type": "aggregated" if role == "agg" else role,

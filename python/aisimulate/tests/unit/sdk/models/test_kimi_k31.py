@@ -352,7 +352,12 @@ def test_k31_attention_support_uses_dsa_keys(backend):
     )
 
 
-def test_k31_blackwell_moe_quantization_matches_k3():
+def test_k31_blackwell_moe_quantization_matches_k3(k31_config, monkeypatch):
+    from aisimulate_core.sdk.models import helpers
+
+    monkeypatch.setattr(
+        helpers, "_get_model_info", lambda _path: {"architecture": ARCHITECTURE, "raw_config": k31_config}
+    )
     assert resolve_kimi_k3_moe_arch_mode("moonshotai/Kimi-K3.1-Pro", "b200_sxm", "sglang") == (
         common.MoEQuantMode.w4a8_mxfp4_mxfp8
     )
@@ -386,3 +391,13 @@ def test_k31_canonical_sol_constructor_and_saved_identity(tmp_path, k31_config):
             )
     finally:
         predictor.close()
+
+
+@pytest.mark.parametrize("architecture", ["KimiK3ForConditionalGeneration", ARCHITECTURE])
+def test_local_kimi_moe_mode_matches_checkpoint_identity(tmp_path, k31_config, architecture):
+    k31_config["architectures"] = [architecture]
+    if architecture == "KimiK3ForConditionalGeneration":
+        k31_config["text_config"].pop("dsa_config")
+    local = _write_checkpoint(tmp_path, k31_config)
+    assert resolve_kimi_k3_moe_arch_mode(local, "b200_sxm", "sglang") == common.MoEQuantMode.w4a8_mxfp4_mxfp8
+    assert resolve_kimi_k3_moe_arch_mode(local, "h200_sxm", "sglang") is None

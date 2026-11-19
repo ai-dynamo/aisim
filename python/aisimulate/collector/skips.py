@@ -56,6 +56,10 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
+    # Native K31 uses DSAAttnBackend._forward_flashmla_kv ->
+    # sgl_kernel.flash_mla.flash_mla_with_kvcache (SM90/SM100), or SM90 FA3
+    # short prefill; sglang srt/layers/attention/dsa_backend.py.
+    {"backend": "sglang", "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"], "sm": [80, 86, 89]},
     # Native K31 Gated DSA has one source-pinned SGLang implementation.
     # Other framework implementations require their own serving audit.
     {"backend": ["vllm", "trtllm"], "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"]},

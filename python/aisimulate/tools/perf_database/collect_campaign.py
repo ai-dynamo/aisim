@@ -108,10 +108,14 @@ def load_plan(path: Path) -> Plan:
     return Plan(backend=str(doc["backend"]), sm=int(doc["sm"]), shards=tuple(shards))
 
 
-def pinned_image(backend: str, op: str) -> str:
+def pinned_image(backend: str, op: str, model_path: str | None = None) -> str:
     """The manifest-pinned image for (backend, op) — family pins included."""
-    from collector.framework_manifest import resolve_op_runtime
+    from collector.framework_manifest import _model_pinned_runtime, load_manifest, resolve_op_runtime
 
+    if model_path is not None:
+        runtime = _model_pinned_runtime(load_manifest(), backend.lower(), model_path)
+        if runtime is not None:
+            return runtime.image()
     return resolve_op_runtime(backend, op).image()
 
 
@@ -344,7 +348,9 @@ def run_campaign(
         todo.append(s)
     print(f"{mode}: {len(todo)}/{len(plan.shards)} shards on gpus {gpus}")
     ref = collector_ref(checkout)  # once, before any shard starts: every shard records the same commit
-    images = {s.op: (image_override or collect_image_tag(pinned_image(plan.backend, s.op))) for s in todo}
+    images = {
+        s.key: (image_override or collect_image_tag(pinned_image(plan.backend, s.op, s.model_path))) for s in todo
+    }
     for img in sorted(set(images.values())):
         if image_digest(img) is None:
             raise SystemExit(f"image {img} not present — run `build-image` for its base first")
@@ -376,7 +382,7 @@ def run_campaign(
                 "--checkout",
                 str(checkout),
                 "--image",
-                images[s.op],
+                images[s.key],
                 "--collector-ref",
                 ref,
                 "--mode",
@@ -409,6 +415,7 @@ def main() -> int:
     b = sub.add_parser("build-image", help="build <manifest image for (backend, op)> + finalize deps")
     b.add_argument("--backend", required=True)
     b.add_argument("--op", required=True, help="any op of the backend; family pins may select a different image")
+    b.add_argument("--model-path", default=None, help="model identity for model-scoped runtime pins")
     b.add_argument("--build-arg", action="append", default=[], help="extra docker build args, e.g. http_proxy=...")
     for name in ("run", "finalize", "status"):
         p = sub.add_parser(name)
@@ -441,7 +448,7 @@ def main() -> int:
             mode=args.mode,
         )
     if args.cmd == "build-image":
-        base = pinned_image(args.backend, args.op)
+        base = pinned_image(args.backend, args.op, args.model_path)
         tag = build_image(base, extra_build_args=[f"--build-arg={a}" for a in args.build_arg])
         print(f"built {tag} from {base}")
         return 0

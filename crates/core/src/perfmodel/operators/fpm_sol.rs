@@ -394,6 +394,8 @@ fn dsa_context_module_sol(
     s: f64,
     p: f64,
 ) -> Result<f64, AicError> {
+    op.validate_kimi_geometry()?;
+    op.validate_kimi_backend()?;
     if op.cp_size > 1 {
         return Err(AicError::SolNotImplemented(format!(
             "forward_model='fpm' SOL roofline has no Rust implementation for DSA context \
@@ -476,6 +478,8 @@ fn dsa_generation_module_sol(
     b: f64,
     s: f64,
 ) -> Result<f64, AicError> {
+    op.validate_kimi_geometry()?;
+    op.validate_kimi_backend()?;
     let spec = &db.system_spec;
     let dims = dsa_dims_for_backend(&op.architecture, op.context_table_backend());
     let flops = dsa_generation_sol_flops(spec, op.gemm_quant_mode)?;
@@ -1275,6 +1279,41 @@ mod tests {
             "GlmMoeDsaForCausalLM",
             2048,
         )
+    }
+
+    #[test]
+    fn kimi_fpm_sol_rejects_unsupported_geometry_and_ambiguous_backend() {
+        let d = db();
+        let mut valid = glm_dsa_op("attention");
+        valid.architecture = "KimiK31ForConditionalGeneration".into();
+        valid.attention_backend = Some("flashmla".into());
+        for generation in [false, true] {
+            let evaluate = |op: DsaModuleOp| {
+                let op = if generation {
+                    Op::DsaGeneration(op)
+                } else {
+                    Op::DsaContext(op)
+                };
+                op_sol_latency_ms(&op, &d, 1.0, 1.0, 4096.0, 0.0)
+            };
+            assert!(evaluate(valid.clone()).unwrap() > 0.0);
+            for (cp, dcp, frac) in [(2, 1, 1.0), (1, 2, 1.0), (1, 1, 0.5)] {
+                let mut invalid = valid.clone();
+                invalid.cp_size = cp;
+                invalid.dcp_size = dcp;
+                invalid.full_frac = frac;
+                assert!(matches!(
+                    evaluate(invalid),
+                    Err(AicError::InvalidEngineConfig(_))
+                ));
+            }
+            let mut ambiguous = valid.clone();
+            ambiguous.attention_backend = None;
+            assert!(matches!(
+                evaluate(ambiguous),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+        }
     }
 
     /// Hand ledger at TP8 (12 heads), BF16 weights, FP8 KV and one new token.

@@ -443,3 +443,26 @@ def test_fpm_does_not_apply_op_level_context_fmha_guard(fake_model_info, fmha, e
     )
 
     assert mc.fmha_quant_mode == expected
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_k31_context_capability_does_not_borrow_other_architecture_fp8(fake_model_info, explicit):
+    architecture = "KimiK31ForConditionalGeneration"
+    fake_model_info(architecture, _V3_FP8_RAW)
+    mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
+    mc.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    db = _db(dsa_context_module=["fp8", "bfloat16"])
+    db._context_dsa_module_data = {
+        common.FMHAQuantMode.fp8: {
+            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {"DeepseekV32ForCausalLM": {1: object()}}}
+        },
+        common.FMHAQuantMode.bfloat16: {
+            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {architecture: {1: object()}}}
+        },
+    }
+    if explicit:
+        with pytest.raises(ValueError, match="fmha_quant_mode=fp8 has no"):
+            resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+    else:
+        resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+        assert mc.fmha_quant_mode == common.FMHAQuantMode.bfloat16
