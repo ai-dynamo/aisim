@@ -144,6 +144,10 @@ class FpmLibraryMetadata(BaseModel):
             value = (self.configuration_selector or {}).get(name)
             if name in (self.configuration_selector or {}) and (type(value) is not int or value < 1):
                 raise ValueError(f"configuration_selector.{name} must be a positive integer")
+        if "dcp" in (self.configuration_selector or {}):
+            dcp = self.configuration_selector["dcp"]
+            if type(dcp) is not int or not 1 <= dcp <= 2**32 - 1:
+                raise ValueError("configuration_selector.dcp must be an integer in 1..4294967295")
         return self
 
 
@@ -292,10 +296,28 @@ def _first_error(exc: ValidationError) -> str:
     return f"{where}: {error['msg']}"
 
 
-def check_effective_measurement_policy(metadata: Mapping[str, Any]) -> None:
-    """An omitted policy is only an input to reconstruction, never a native-ready declaration."""
+def check_effective_measurement_policy(
+    metadata: Mapping[str, Any],
+    *,
+    system: str | None = None,
+    backend: str | None = None,
+    backend_version: str | None = None,
+) -> None:
+    """Check the sidecar native admission will see, after reconstruction.
+
+    Omitted declarations are only inputs to reconstruction, never native-ready. The coordinate system, policy and
+    runtime identity must be present, and the identity must equal the requested one when that is given.
+    """
     if metadata.get("measurement_policy") is None:
         raise FpmContractError("FPM sidecar measurement_policy is required after reconstruction")
+    if metadata.get("coordinate_system") != "iteration_totals_balanced_v1":
+        raise FpmContractError("FPM sidecar coordinate_system is required after reconstruction")
+    for name, expected in (("system", system), ("backend", backend), ("backend_version", backend_version)):
+        declared = metadata.get(name)
+        if declared is None:
+            raise FpmContractError(f"FPM sidecar {name} is required after reconstruction")
+        if expected is not None and declared != expected:
+            raise FpmContractError(f"FPM sidecar {name} {declared!r} differs from the requested {expected!r}")
 
 
 # --------------------------------------------------------------------------- schema-6 recovery
@@ -456,7 +478,6 @@ def stage_fpm_library(
     metadata, recovered = recover_reconstructed_metadata(
         metadata, parquet, parquet_sha256=parquet_sha256, metadata_sha256=metadata_sha256
     )
-    check_effective_measurement_policy(metadata)
     text = None
     recovery = None
     if recovered:
@@ -491,6 +512,7 @@ def stage_fpm_library(
         build = Path(mkdtemp(prefix=f".{root.name}.staging-", dir=root.parent))
     try:
         target = _prepare_system_overlay(build, source_yaml, backend, backend_version, systems_paths, root)
+        check_effective_measurement_policy(metadata, system=system, backend=backend, backend_version=backend_version)
         (target / LIBRARY_FILE).symlink_to(parquet)
         if text is not None:
             (target / METADATA_FILE).write_text(text, encoding="utf-8")

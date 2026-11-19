@@ -27,6 +27,7 @@ from aisim_core.data.fpm_library import (
     FpmLibraryMetadata,
     FpmMeasurementManifest,
     FpmResourcesPendingError,
+    check_effective_measurement_policy,
     complete_fpm_profile,
     missing_resource_fields,
     read_library_metadata,
@@ -1869,7 +1870,7 @@ def test_publication_checks_strict_integer_spellings_beyond_json_schema(root, pr
 @pytest.mark.parametrize("key", ["pp", "pp_size"])
 def test_loader_selects_and_loads_pipeline_parallel_entry(root, profile, tmp_path, pp, key):
     make_entry(root, profile)
-    # The optional typed resource profile supports PP1 only. Library rows and requests also support PP2.
+    # The typed resource profile supports PP1 only. Rows and loader selection accept PP2; no PP2 request is priced.
     parquet = root / ENTRY / "fpm/fpm_forward_perf.parquet"
     table = pq.read_table(parquet)
     table = table.set_column(table.schema.get_field_index("pp"), "pp", pa.array([pp] * table.num_rows))
@@ -2327,7 +2328,8 @@ def test_entry_checks_latency_with_valid_declarations(root, profile, latency, ro
     parquet = directory / "fpm_forward_perf.parquet"
     table = pq.read_table(parquet)
     row = table.slice(0, 1).to_pylist()[0]
-    rows = [{**row, "latency_ms": 1.0} for _ in range(row_count)]
+    # Distinct physical coordinates: Rust rejects duplicate rows, so this fixture must be natively loadable.
+    rows = [{**row, "latency_ms": 1.0, "batch_size": index + 1} for index in range(row_count)]
     rows[-1]["latency_ms"] = latency
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), parquet)
     sidecar = directory / "fpm_forward_perf.metadata.json"
@@ -2780,3 +2782,40 @@ def test_workload_coordinate_u32_bounds_match_model_schema_and_publication(root,
     _refresh_prediction_manifest(root)
     findings = check_fpm_entry(root, MANIFEST)
     assert [f.code for f in findings] == ([] if value == 2**32 - 1 else ["library-coordinates"])
+
+
+@pytest.mark.parametrize("dcp", [True, 0, 2**32, 1.0, "1"])
+def test_sidecar_rejects_invalid_declared_dcp_selector(dcp):
+    metadata = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "parquet_sha256": "0" * 64,
+        "coordinate_system": "iteration_totals_balanced_v1",
+        "configuration_selector": {"dcp": dcp},
+    }
+    with pytest.raises(ValueError, match="dcp"):
+        FpmLibraryMetadata.model_validate(metadata)
+
+
+@pytest.mark.parametrize(
+    "mutation, message",
+    [
+        ({"coordinate_system": None}, "coordinate_system"),
+        ({"system": None}, "system is required"),
+        ({"backend": "other"}, "backend 'other' differs"),
+        ({"backend_version": "9"}, "backend_version '9' differs"),
+    ],
+)
+def test_effective_sidecar_must_match_native_admission(mutation, message):
+    metadata = {
+        "measurement_policy": "dynamo_native_single_sample_v1",
+        "coordinate_system": "iteration_totals_balanced_v1",
+        "system": "s",
+        "backend": "vllm",
+        "backend_version": "1",
+        **mutation,
+    }
+    metadata = {k: v for k, v in metadata.items() if v is not None}
+    with pytest.raises(FpmContractError, match=message):
+        check_effective_measurement_policy(metadata, system="s", backend="vllm", backend_version="1")
