@@ -955,10 +955,12 @@ sub-block matching without an explicit full-state scratch count.
   scheduler block, the least common multiple of the group blocks, fits in
   the machine's unsigned integer size. On
   vLLM 0.31.0 no prefix-cacheable state group has a positive
-  `prefill_checkpoint_blocks`. On vLLM 0.32.0 and 0.33.0 every
-  prefix-cacheable state group records `prefill_checkpoint_blocks`, with one
-  count and one alignment across state groups, and a state group with a
-  checkpoint block has the smallest block of the prefix-cacheable groups. On
+  `prefill_checkpoint_blocks`. On vLLM 0.32.0 and 0.33.0, which replay checks
+  the same way, every prefix-cacheable state group records
+  `prefill_checkpoint_blocks`, and all of them record one count, 0 or 1. With
+  a count of 1 they record one `prefill_checkpoint_alignment`, and each of
+  them has the smallest block of the prefix-cacheable groups. With a count of
+  0 no group has an alignment. On
   vLLM 0.33.0 `prefill_schedule_interval` is 1. On every modeled version no
   `state` group with `prefix_cacheable: false` has a positive
   `prefill_checkpoint_blocks`. `max_model_len` is set, and the pool holds one prompt of
