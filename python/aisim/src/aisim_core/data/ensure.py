@@ -57,7 +57,7 @@ import yaml
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
-from aisim_core.data.config import FALLBACK_REVISION, ConfigError, config_path, load_config
+from aisim_core.data.config import config_path, load_config, resolve_source
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
@@ -198,13 +198,10 @@ def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None
     env = os.environ if env is None else env
     spec, local = env.get("AISIM_DATASET"), env.get("AISIM_DATA_LOCAL")
     if not spec and not local:
-        try:
-            saved = load_config(config_path(env))
-        except ConfigError:
-            saved = None
-        if not saved or not saved.repo:
+        saved = load_config(config_path(env))  # a corrupt saved config raises ConfigError
+        if not saved or not (saved.repo or saved.revision):
             return None
-        spec = f"{saved.repo}@{saved.revision or FALLBACK_REVISION}"
+        spec = "{}@{}".format(*resolve_source(env=env, config=saved))  # same rules as ``data fetch``
     repo = revision = None
     if spec:
         repo, sep, revision = spec.partition("@")

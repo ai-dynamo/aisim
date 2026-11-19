@@ -186,6 +186,18 @@ def test_shipped_pin_file_is_used(env, tmp_path, monkeypatch):
     assert resolve_source() == ("ai-dynamo/aisim-data", SHA)
 
 
+def test_malformed_shipped_pin_fails_but_absent_pin_falls_back(env, tmp_path, monkeypatch):
+    from aisim_core.data.config import ConfigError
+
+    pin = tmp_path / "pin.json"
+    monkeypatch.setattr("aisim_core.data.config.PIN_FILE", pin)
+    assert shipped_pin() == ("ai-dynamo/aisim-data", "main")  # absent
+    for text in ("{truncated", json.dumps({"repo": "x/y"}), "[]"):
+        pin.write_text(text)
+        with pytest.raises(ConfigError, match="shipped pin"):
+            shipped_pin()
+
+
 def test_ensure_hints_are_valid_commands(run):
     pin = DataPin(repo=REPO, revision=SHA)
     for selection in (
@@ -229,6 +241,16 @@ def test_init_hardware_downloads_one_platform(run):
     paths = json.loads(out)["fetch"]["paths"]
     assert status == 0 and "data/op-latency/b200_sxm/ops.parquet" not in paths
     assert load_config() == InitConfig(mode="hardware", hardware="h200_sxm", revision=SHA)
+
+
+def test_init_mode_change_keeps_saved_source(run):
+    run("init", "--on-demand", "--repo", "x/y", "--revision", SHA)
+    run("init", "--on-demand")
+    assert load_config() == InitConfig(mode="on-demand", repo="x/y", revision=SHA)
+    run("init", "--on-demand", "--repo", "z/w")  # a revision does not follow a different repository
+    assert load_config() == InitConfig(mode="on-demand", repo="z/w")
+    run("init", "--on-demand", "--revision", "main")  # revision only: kept with the saved repository
+    assert load_config() == InitConfig(mode="on-demand", repo="z/w", revision="main")
 
 
 def test_init_failure_saves_nothing(run, monkeypatch):
@@ -338,6 +360,22 @@ def test_clear_removes_revisions_and_config(run, monkeypatch):
     assert json.loads(run("data", "status")[1])["revisions"] == []
 
 
+def test_clear_reports_removal_failure(run, monkeypatch):
+    run("init", "--all", "--revision", SHA)
+    real = data_cli.shutil.rmtree
+
+    def deny(path, *a, **kw):
+        raise PermissionError(13, "denied", str(path))
+
+    monkeypatch.setattr(data_cli.shutil, "rmtree", deny)
+    status, out, err = run("data", "clear", "--yes")
+    payload = json.loads(out)
+    assert status == 1 and payload["removed_revisions"] == 0 and payload["freed_bytes"] == 0
+    assert payload["failed"] and "could not remove" in err and load_config() is not None
+    monkeypatch.setattr(data_cli.shutil, "rmtree", real)
+    assert run("data", "clear", "--yes")[0] == 0
+
+
 def test_clear_asks_unless_yes(run, monkeypatch):
     run("init", "--all", "--revision", SHA)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
@@ -394,6 +432,27 @@ def test_validate_checks_uncataloged_manifest_when_catalog_present(run, tmp_path
     status, out, _ = run("data", "validate", str(root))
     findings = json.loads(out)["findings"]
     assert status == 1 and any(f["check"] == "manifest" and f["path"].endswith("extra/manifest.json") for f in findings)
+
+
+def test_validate_directory_reports_malformed_manifest(run, tmp_path):
+    root = tmp_path / "ds"
+    _write_dataset(root, run.files)
+    bad = root / "data/op-latency/broken/manifest.json"
+    bad.parent.mkdir(parents=True)
+    bad.write_text('{"schema_version": "aisim-artifact')
+    status, out, _ = run("data", "validate", str(root))
+    report = json.loads(out)
+    assert status == 1 and report["ok"] is False
+    assert any(f["check"] == "manifest" and f["path"].endswith("broken/manifest.json") for f in report["findings"])
+
+
+@pytest.mark.parametrize("body", ["[]", "null"])
+def test_validate_non_object_manifest_is_a_finding(run, tmp_path, body):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(body)
+    status, out, _ = run("data", "validate", str(manifest))
+    report = json.loads(out)
+    assert status == 1 and any(f["check"] == "manifest" for f in report["findings"])
 
 
 def test_validate_single_manifest(run, tmp_path):
