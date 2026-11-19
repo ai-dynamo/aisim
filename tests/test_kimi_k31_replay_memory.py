@@ -164,3 +164,52 @@ def test_k31_manual_pd_transfer_charges_one_state_per_request(k31_checkpoint):
     # The only changed input is one additional state block. At 1000 B/s,
     # each additional byte contributes one millisecond, once per request.
     assert ttft(2 * BLOCK_BYTES) - ttft(BLOCK_BYTES) == pytest.approx(BLOCK_BYTES)
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_k31_snapshot_controls_compile_and_restore_exact_identity(k31_checkpoint, tmp_path, conflict):
+    from aisimulate.compiler import _resolve_kv_bytes_per_token
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload(k31_checkpoint, state_bytes=2 * BLOCK_BYTES)
+    original_config = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"]["config"]
+    original = RustForwardPassPerfModel.best_available(original_config)
+    pinned = original.save_state_snapshot(tmp_path / "snapshot")
+    engine = payload["engine"]
+    engine.pop("kvcache_quant_mode")
+    engine.pop("attention_backend")
+    engine.update(
+        estimator_config=pinned["estimator_config"],
+        estimation_mode=pinned["estimation_mode"],
+        fallback_policy=pinned["fallback_policy"],
+        backend_version=pinned["backend_version"],
+        transfer_policy=pinned["transfer_policy"],
+    )
+    if conflict:
+        engine["attention_backend"] = "trtllm_mla"
+    args = _saved_spec(payload).backend_deployment.agg_engine_args
+    timing = args["timing_model"]["config"]
+    assert timing["kvcache_quant_mode"] == "fp8"
+    assert timing["attention_backend"] == ("trtllm_mla" if conflict else "flashmla")
+    config = CorePredictionConfig.model_validate(payload)
+    assert _resolve_kv_bytes_per_token(config.engine, config.engine.workers.aggregated, "auto", role="aggregated") == (
+        16_992 if conflict else TOKEN_BYTES
+    )
+    if conflict:
+        with pytest.raises(ValueError, match="attention_backend"):
+            RustForwardPassPerfModel.best_available(timing)
+    else:
+        restored = RustForwardPassPerfModel.best_available(timing)
+        rank = [
+            {
+                "version": 1,
+                "wall_time": 0.0,
+                "scheduled_requests": {
+                    "num_prefill_requests": 0,
+                    "sum_prefill_tokens": 0,
+                    "num_decode_requests": 1,
+                    "sum_decode_kv_tokens": 64,
+                },
+            }
+        ]
+        assert restored.estimate_forward_pass_time_ms(rank) == original.estimate_forward_pass_time_ms(rank)

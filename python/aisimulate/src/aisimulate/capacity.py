@@ -580,10 +580,12 @@ def estimate_kv_bytes_per_token(
 
     from aisimulate_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY
     from aisimulate_core.sdk.memory import NaiveKVCacheEstimator
+    from aisimulate_core.sdk.utils import _load_model_config_from_model_path
 
-    raw_config = NaiveKVCacheEstimator._load_config(model_name, allow_hf_config_download=True)
-    if raw_config is None:
-        raise ValueError(f"insufficient model metadata: no HF config for {model_name!r}")
+    # Share the native loader's cached raw metadata. Dispatch must not force a
+    # second remote fetch, including when get_model's parsed metadata is warm.
+    # Raw configs remain usable by the naive estimator for unparsed families.
+    raw_config = _load_model_config_from_model_path(model_name)
     architectures = raw_config.get("architectures") or []
     architecture = architectures[0] if architectures else None
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)

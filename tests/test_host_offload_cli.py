@@ -508,6 +508,40 @@ def test_kv_geometry_reads_saved_snapshot_controls_when_unspecified(tmp_path, mo
     assert seen["kvcache_quant_mode"] == "fp8"
 
 
+def test_unknown_snapshot_kv_identity_uses_dense_checkpoint_geometry(tmp_path) -> None:
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    model_name = "Qwen/Qwen3-0.6B"
+    model = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=model_name,
+            system="h200_sxm",
+            backend="vllm",
+            worker_type="aggregated",
+            tp=1,
+            pp=1,
+            attention_dp=1,
+            kv_block_size=16,
+            estimation_mode="fpm_regression",
+            kvcache_quant_mode="unknown",
+        )
+    )
+    pinned = model.save_state_snapshot(tmp_path / "snapshot")
+    assert pinned["kvcache_quant_mode"] == "unknown"
+    engine = _prediction_engine()
+    engine.update(model=model_name, estimation_mode="fpm_regression", estimator_config=pinned["estimator_config"])
+    worker = engine["workers"]["aggregated"]
+    worker["timing"] = {"type": "default"}
+    worker["kv_cache"].update(bytes_per_token="auto", host_offload=_host_offload())
+    args = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate({"engine": engine})
+    ).backend_deployment.agg_engine_args
+    # Bundled Qwen3-0.6B: 28 layers * K/V * 8 KV heads * 128 dims * 2 BF16 bytes.
+    assert args["kv_cache_bytes_per_token"] == 28 * 2 * 8 * 128 * 2
+    assert args["timing_model"]["config"]["kvcache_quant_mode"] == "unknown"
+    RustForwardPassPerfModel.best_available(args["timing_model"]["config"])
+
+
 def test_prediction_transfer_and_cache_geometry_are_independent(monkeypatch) -> None:
     engine = _prediction_engine(mode="disaggregated")
     engine["kv_transfer"] = {

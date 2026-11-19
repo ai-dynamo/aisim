@@ -907,10 +907,7 @@ def _worker_engine_args(
             **_prefill_cp_knob(parallel, "cp_size"),
             kv_block_size=block_size,
             nextn=engine.nextn,
-            **{
-                name: getattr(timing, name, None) if getattr(timing, name, None) is not None else getattr(engine, name)
-                for name in ENGINE_MODEL_CONTROL_FIELDS
-            },
+            **{name: _worker_model_control(engine, worker, name, saved) for name in ENGINE_MODEL_CONTROL_FIELDS},
             speculation=engine.speculation.cost_config() if engine.speculation is not None else None,
             estimation_mode=timing.estimation_mode or engine.estimation_mode,
             fallback_policy=timing.fallback_policy or engine.fallback_policy,
@@ -987,6 +984,14 @@ def _worker_engine_args(
     return payload
 
 
+def _worker_model_control(engine, worker, name: str, saved: dict):
+    """Resolve explicit role/engine controls before the named snapshot's identity."""
+    value = getattr(worker.timing, name, None)
+    if value is None:
+        value = getattr(engine, name)
+    return saved.get(name) if value is None else value
+
+
 def _resolve_kv_bytes_per_token(
     engine: EnginePredictionConfig,
     worker: WorkerPredictionConfig,
@@ -1003,10 +1008,10 @@ def _resolve_kv_bytes_per_token(
     saved = saved_snapshot_config(controls if controls is not None else engine.estimator_config)
 
     def control(name: str) -> str | None:
-        value = getattr(worker.timing, name)
-        if value is None:
-            value = getattr(engine, name)
-        return saved.get(name) if value is None else value
+        value = _worker_model_control(engine, worker, name, saved)
+        # Unknown is an exact restoration identity, not a physical KV dtype
+        # or layout. Geometry may still derive those from checkpoint metadata.
+        return None if value == "unknown" else value
 
     return estimate_kv_bytes_per_token(
         engine.model,

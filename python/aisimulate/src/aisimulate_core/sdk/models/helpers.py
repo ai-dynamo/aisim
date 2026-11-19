@@ -985,6 +985,12 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         if kv_cache_algo is None or kv_cache_algo != "fp8":
             overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
+    # The released K3.1 runtime uses FP8 even without checkpoint KV metadata.
+    # An explicit caller mode still wins over these inferred defaults; BF16
+    # remains available for analytic modeling. FP8 needs a layout selector.
+    if architecture == "KimiK31ForConditionalGeneration":
+        overrides.setdefault("kvcache_quant_mode", common.KVCacheQuantMode.fp8)
+
     return overrides
 
 

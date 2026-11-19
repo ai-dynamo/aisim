@@ -186,54 +186,58 @@ def collect_sglang_fullnode_op(
     logger.info(f"Running {full_name} full-node collection (bypassing per-GPU worker pool)")
     errors: list[dict] = []
     task_by_id = {task_info["id"]: task_info["params"] for task_info in task_infos}
-    id_by_case = {str(task_info["params"]): task_info["id"] for task_info in task_infos}
+    completed = set()
     try:
-        # The runner consumes the selected cases as one batch, so persist its
-        # entire pending provenance set atomically before handing it control.
-        # An interrupted resume then extends this set; only the successful
-        # common parquet/sidecar finalizer closes it.
+        # DeepEP amortizes group setup across its batch. K3.1 already launches
+        # a fresh native process per case: checkpoint each returned case before
+        # launching the next so a job time limit cannot erase earlier progress.
         resume_tracker.mark_attempted_many(task_by_id)
-        result = run_func(
-            perf_filename=collection["perf_filename"],
-            limit=None,
-            cases=[task_info["params"] for task_info in task_infos],
-        )
-        if not isinstance(result, dict) or "failed" not in result:
-            raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")
-        # Native runners can retain per-case causes without changing the case
-        # list/checkpoint protocol used by older full-node collectors.
-        failed_cases = result["failed"]
-        failure_details = result.get("failure_details", {})
-        unknown_failed = [case for case in failed_cases if str(case) not in id_by_case]
-        if unknown_failed:
-            raise RuntimeError(
-                f"{full_name} runner reported failures outside the requested case plan: {unknown_failed}"
+        batches = ([task_info] for task_info in task_infos) if op.startswith("kimi_k31_dsa_") else (task_infos,)
+        for batch in batches:
+            batch_ids = {str(task_info["params"]): task_info["id"] for task_info in batch}
+            result = run_func(
+                perf_filename=collection["perf_filename"],
+                limit=None,
+                cases=[task_info["params"] for task_info in batch],
             )
-        failed_ids = {id_by_case[str(case)] for case in failed_cases if str(case) in id_by_case}
-        for task_id in task_by_id:
-            if task_id in failed_ids:
-                resume_tracker.mark_failed(task_id)
-            else:
-                resume_tracker.mark_passed(task_id)
-        for task_id in sorted(failed_ids):
-            detail = failure_details.get(str(task_by_id[task_id]), {})
-            message = detail.get("error_message", "full-node runner reported failed case")
-            errors.append(
-                {
-                    "module": full_name,
-                    "task_id": task_id,
-                    "task_params": str(task_by_id[task_id]),
-                    "error_type": detail.get("error_type", "FullNodeCaseFailure"),
-                    "error_message": message,
-                    "classification": "kernel_limit"
-                    if message.lstrip().startswith("FIXME(kernel-limit)")
-                    else "unexpected",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
+            if not isinstance(result, dict) or "failed" not in result:
+                raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")
+            # Native runners can retain per-case causes without changing the case
+            # list/checkpoint protocol used by older full-node collectors.
+            failed_cases = result["failed"]
+            failure_details = result.get("failure_details", {})
+            unknown_failed = [case for case in failed_cases if str(case) not in batch_ids]
+            if unknown_failed:
+                raise RuntimeError(
+                    f"{full_name} runner reported failures outside the requested case plan: {unknown_failed}"
+                )
+            failed_ids = {batch_ids[str(case)] for case in failed_cases}
+            for task_id in batch_ids.values():
+                if task_id in failed_ids:
+                    resume_tracker.mark_failed(task_id)
+                else:
+                    resume_tracker.mark_passed(task_id)
+                completed.add(task_id)
+            for task_id in sorted(failed_ids):
+                detail = failure_details.get(str(task_by_id[task_id]), {})
+                message = detail.get("error_message", "full-node runner reported failed case")
+                errors.append(
+                    {
+                        "module": full_name,
+                        "task_id": task_id,
+                        "task_params": str(task_by_id[task_id]),
+                        "error_type": detail.get("error_type", "FullNodeCaseFailure"),
+                        "error_message": message,
+                        "classification": "kernel_limit"
+                        if message.lstrip().startswith("FIXME(kernel-limit)")
+                        else "unexpected",
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+            resume_tracker.flush(force=True)
     except Exception as e:
         logger.exception(f"{full_name} full-node collection failed")
-        for task_id in task_by_id:
+        for task_id in task_by_id.keys() - completed:
             resume_tracker.mark_failed(task_id)
         errors.append(
             {

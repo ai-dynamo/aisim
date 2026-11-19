@@ -2479,6 +2479,14 @@ class Task:
               losing them is not silent.
             - No informative op at all -> abstain (legacy behavior for ops the
               DB records nothing about)."""
+            # K3.1's hypothetical BF16 KV is an analytic SOL capability, not
+            # measured coverage. Keep SILICON and explicit FP8 lane checks.
+            if (
+                self._architecture == "KimiK31ForConditionalGeneration"
+                and self.database_mode == "SOL"
+                and mode in (common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16)
+            ):
+                ops = [op for op in ops if op not in ("dsa_context_module", "dsa_generation_module")]
             informative = [op for op in ops if supported.get(op)]
             if not informative:
                 return

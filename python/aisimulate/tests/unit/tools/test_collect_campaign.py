@@ -226,7 +226,9 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
     from types import SimpleNamespace
 
     c = _load()
-    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',")
+    shard = c.Shard(
+        f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',", model_path="moonshotai/Kimi-K3.1-Pro"
+    )
     plan = c.Plan("sglang", 103, (shard,))
     monkeypatch.setattr(c, "collector_ref", lambda _: "0" * 40)
     monkeypatch.setattr(c, "image_digest", lambda _: "sha256:test")
@@ -252,3 +254,26 @@ def test_k31_campaign_preserves_tp1_shards(monkeypatch, tmp_path, phase):
     assert len(commands) == 1
     assert commands[0][commands[0].index("--gpu") + 1] == "3"
     assert ", 96, 'fp8'," in c.collector_argv(plan, shard)
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("mode", ["run", "finalize"])
+def test_k31_model_free_tp1_shard_is_rejected_before_launch(monkeypatch, tmp_path, phase, mode):
+    c = _load()
+    shard = c.Shard(f"kimi_k31_dsa_{phase}_module", "tp1", case_filter=", 96, 'fp8',")
+    plan = c.Plan("sglang", 103, (shard,))
+    monkeypatch.setattr(c, "collector_ref", lambda _: pytest.fail("admission must precede launch preparation"))
+    if mode == "finalize":
+        directory = c.shard_dir(tmp_path / "out", shard)
+        directory.mkdir(parents=True)
+        (directory / "DONE").touch()
+    with pytest.raises(SystemExit, match=r"model_path: moonshotai/Kimi-K3.1-Pro.*pinned K3.1 runtime"):
+        c.run_campaign(
+            plan,
+            plan_path=tmp_path / "plan.yaml",
+            root=tmp_path / "out",
+            gpus=[0],
+            checkout=tmp_path,
+            image_override=None,
+            mode=mode,
+        )

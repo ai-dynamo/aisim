@@ -47,11 +47,93 @@ def _write_checkpoint(tmp_path, raw):
 
 
 def _model_config(**overrides):
+    overrides.setdefault("kvcache_quant_mode", common.KVCacheQuantMode.bfloat16)
     return config.ModelConfig(tp_size=8, moe_tp_size=1, moe_ep_size=8, **overrides)
 
 
 def _specs(model, phase):
     return json.loads(engine._ops_json(getattr(model, f"{phase}_ops")))
+
+
+@pytest.mark.parametrize("explicit", [None, common.KVCacheQuantMode.bfloat16])
+def test_k31_unspecified_kv_uses_fp8_in_model_and_task(tmp_path, k31_config, explicit):
+    from aisimulate.sdk.task_v2 import Task
+
+    path = _write_checkpoint(tmp_path, k31_config)
+    mc = _model_config(kvcache_quant_mode=explicit, attention_backend="flashmla")
+    model = get_model(path, mc, "sglang")
+    expected = explicit or common.KVCacheQuantMode.fp8
+    assert model.config.kvcache_quant_mode == expected
+    task = Task(
+        serving_mode="agg",
+        model_path=path,
+        system_name="b300_sxm",
+        backend_name="sglang",
+        attention_backend="flashmla",
+        kvcache_quant_mode=explicit,
+    )
+    assert task.kvcache_quant_mode == expected
+
+
+def test_k31_unspecified_kv_requires_fp8_layout(tmp_path, k31_config):
+    with pytest.raises(ValueError, match="FP8 KV requires attention_backend"):
+        get_model(_write_checkpoint(tmp_path, k31_config), _model_config(kvcache_quant_mode=None), "sglang")
+
+
+@pytest.mark.parametrize("database_mode", ["SOL", "SILICON"])
+def test_k31_bf16_analytic_task_validation_does_not_claim_measured_coverage(
+    tmp_path, k31_config, monkeypatch, database_mode
+):
+    from aisimulate.sdk.task_v2 import Task
+
+    task = Task(
+        serving_mode="agg",
+        model_path=_write_checkpoint(tmp_path, k31_config),
+        system_name="b300_sxm",
+        backend_name="sglang",
+        database_mode=database_mode,
+        kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    # A packed-FP8-only data-presence list must not veto analytic BF16 SOL.
+    db = SimpleNamespace(supported_quant_mode={"dsa_context_module": ["bfloat16"], "dsa_generation_module": ["fp8"]})
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    if database_mode == "SILICON":
+        with pytest.raises(ValueError, match="Unsupported dsa_generation_module quant mode 'bfloat16'"):
+            task._check_role_against_db("agg", validate_context=True, validate_generation=True)
+    else:
+        task._check_role_against_db("agg", validate_context=True, validate_generation=True)
+        model = RustForwardPassPerfModel.best_available(
+            ForwardPassPerfModelConfig(
+                model=task.model_path,
+                system="b300_sxm",
+                backend="sglang",
+                worker_type="aggregated",
+                tp=8,
+                moe_tp_size=1,
+                moe_ep_size=8,
+                database_mode=database_mode,
+                estimation_mode="op_level",
+                kvcache_quant_mode="bfloat16",
+            )
+        )
+        assert (
+            model.estimate_forward_pass_time_ms(
+                [
+                    {
+                        "version": 1,
+                        "wall_time": 0.0,
+                        "scheduled_requests": {
+                            "num_prefill_requests": 0,
+                            "sum_prefill_tokens": 0,
+                            "num_decode_requests": 1,
+                            "sum_decode_kv_tokens": 4096,
+                        },
+                    }
+                ]
+            )
+            > 0
+        )
 
 
 def test_k31_parser_preserves_backbone_and_marks_sparse_layers(k31_config):
@@ -371,6 +453,7 @@ def test_k31_canonical_sol_constructor_and_saved_identity(tmp_path, k31_config):
         system="gb300",
         backend="sglang",
         worker_type="aggregated",
+        kvcache_quant_mode="bfloat16",
         tp=8,
         moe_tp_size=1,
         moe_ep_size=8,

@@ -207,6 +207,8 @@ def _run_native_case(case, device, perf_filename):
     validate_case(case)
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
+    output = Path(perf_filename)
+    previous_size = output.stat().st_size if output.exists() else 0
     phase = "context" if "context" in Path(perf_filename).name else "generation"
     # The generic executor's worker must not create children using fork after
     # CUDA initialization. A clean subprocess owns SGLang's spawned TP ranks.
@@ -251,6 +253,10 @@ def _run_native_case(case, device, perf_filename):
                 if reason.startswith("FIXME(kernel-limit):"):
                     raise RuntimeError(reason)
             raise RuntimeError(f"native K31 worker exited {process.returncode}: {stderr[-2000:]}")
+    # The full-node route owns this output exclusively. A successful process
+    # must have appended its row before the orchestrator checkpoints success.
+    if not output.is_file() or output.stat().st_size <= previous_size:
+        raise RuntimeError("native K31 worker exited successfully without writing its result row")
 
 
 def _assert_runtime() -> None:
@@ -322,6 +328,7 @@ def _prepare_forward(bench, case: ModuleCase, phase: str):
     native prefix forward creates both latent and index-K history. Decode
     begins at total length minus one, then native prepare_for_decode adds one.
     """
+    import numpy as np
     from sglang.benchmark.one_batch import prepare_synthetic_inputs_for_latency_test
 
     runner = bench.torch_runner
@@ -336,14 +343,18 @@ def _prepare_forward(bench, case: ModuleCase, phase: str):
     history = None
     try:
         bench.clear()
+        # one_batch's helper draws from NumPy's global RNG. Model loading may
+        # consume different rank-local draws; reseed immediately before inputs.
+        np.random.seed(0)
+        length = case.seq_len - 1 if phase == "generation" else case.prefix_len + case.seq_len
+        reqs = prepare_synthetic_inputs_for_latency_test(case.batch_size, length)
+        _validate_tp_inputs(reqs, runner.device)
         if phase == "generation":
-            reqs = prepare_synthetic_inputs_for_latency_test(case.batch_size, case.seq_len - 1)
             tokens, batch, history = _extend_history(
                 bench, reqs, case.seq_len - 1, max(HISTORY_CHUNK_TOKENS, case.batch_size)
             )
             bench.decode(tokens, batch)
         else:
-            reqs = prepare_synthetic_inputs_for_latency_test(case.batch_size, case.prefix_len + case.seq_len)
             if case.prefix_len:
                 for req in reqs:
                     req.extend_end = case.prefix_len
@@ -357,6 +368,20 @@ def _prepare_forward(bench, case: ModuleCase, phase: str):
     if len(captured) != 1:
         raise RuntimeError("native batch builder did not produce one forward")
     return captured[0], history
+
+
+def _validate_tp_inputs(reqs, device):
+    """Check native one_batch Req.origin_input_ids before any TP forward or timing."""
+    import torch
+
+    # A bounded prefix from every request catches rank-local RNG drift without
+    # copying million-token histories between devices. The deterministic draw
+    # above establishes the rest of the sequence too.
+    tokens = torch.tensor([list(req.origin_input_ids[:16]) for req in reqs], dtype=torch.int64, device=device)
+    copies = [torch.empty_like(tokens) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(copies, tokens)
+    if any(not torch.equal(tokens, other) for other in copies):
+        raise RuntimeError("FIXME(kernel-limit): native K31 token IDs differ across TP ranks")
 
 
 def validate_forward_batch(batch, case: ModuleCase, phase: str) -> dict:

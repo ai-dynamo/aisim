@@ -195,7 +195,13 @@ def test_fullnode_runs_each_requested_tp_group_and_retains_exact_failed_case(mon
         assert command[command.index("--device") + 1] == "cuda:0"
         assert command[command.index("--phase") + 1] == phase
         observed.append(case)
-        return popen([sys.executable, "-c", f"raise SystemExit({int(case.num_heads == 48)})"], **kwargs)
+        output = command[command.index("--output") + 1]
+        script = (
+            "from pathlib import Path; "
+            f"p=Path({output!r}); p.parent.mkdir(parents=True, exist_ok=True); "
+            f"p.open('a').write('synthetic result row\\n'); raise SystemExit({int(case.num_heads == 48)})"
+        )
+        return popen([sys.executable, "-c", script], **kwargs)
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     # Directory names must not turn a generation run into a context run.
@@ -251,15 +257,22 @@ def test_native_success_keeps_stderr_visible(monkeypatch, capfd, tmp_path):
     import collector.sglang.collect_kimi_k31_dsa_v1 as module
 
     popen = subprocess.Popen
+    output = tmp_path / "dsa_context_module_perf.txt"
     monkeypatch.setattr(
         module.subprocess,
         "Popen",
         lambda _command, **kwargs: popen(
-            [sys.executable, "-c", "import sys; print('native warning', file=sys.stderr)"], **kwargs
+            [
+                sys.executable,
+                "-c",
+                "import sys; from pathlib import Path; "
+                f"Path({str(output)!r}).write_text('synthetic row'); print('native warning', file=sys.stderr)",
+            ],
+            **kwargs,
         ),
     )
     case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
-    run_kimi_k31_dsa_worker(*case, perf_filename=tmp_path / "dsa_context_module_perf.txt")
+    run_kimi_k31_dsa_worker(*case, perf_filename=output)
     assert "native warning" in capfd.readouterr().err
 
 
@@ -275,7 +288,8 @@ def test_native_timeout_kills_tp_children_and_fullnode_continues(monkeypatch, ca
 
     def launch(command, **kwargs):
         case = ModuleCase(*json.loads(command[command.index("--case") + 1]))
-        code = ""
+        output = command[command.index("--output") + 1]
+        code = f"from pathlib import Path; Path({output!r}).write_text('synthetic row')"
         if case.num_heads == 48:
             code = (
                 "import subprocess, sys, time; from pathlib import Path; "
@@ -523,3 +537,133 @@ def test_native_fullnode_failure_reaches_persisted_artifact(monkeypatch, tmp_pat
     assert errors[0]["error_message"] == reason
     assert errors[0]["error_type"] == "RuntimeError"
     assert errors[0]["classification"] == "kernel_limit"
+
+
+def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    from collector import fullnode
+    from collector.collect import ResumeCheckpoint
+
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (96, 48)]
+    output = tmp_path / "dsa_context_module_perf.txt"
+    ran = []
+
+    def native(case, _device, filename):
+        ran.append(case)
+        if len(ran) == 2:
+            raise KeyboardInterrupt("allocation cancelled during B")
+        with Path(filename).open("a") as stream:
+            stream.write(str(case) + "\n")
+
+    monkeypatch.setattr(module, "_run_native_case", native)
+    options = {"checkpoint_dir": str(tmp_path / "checkpoint"), "resume": True}
+
+    def collect():
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": "kimi_k31_dsa_context_module",
+                "module": module.__name__,
+                "get_func": "get_kimi_k31_dsa_context_test_cases",
+                "run_func": "run_kimi_k31_dsa_fullnode",
+                "perf_filename": str(output),
+            },
+            runtime_version=RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options=options,
+            model_path=MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_args: cases,
+            resume_checkpoint_cls=ResumeCheckpoint,
+            logger=logging.getLogger(__name__),
+        )
+
+    with pytest.raises(KeyboardInterrupt, match="during B"):
+        collect()
+    checkpoint = json.loads(next((tmp_path / "checkpoint").rglob("*.json")).read_text())
+    assert len(checkpoint["done"]) == 1
+    assert not checkpoint["failed"]
+    assert output.read_text().splitlines() == [str(cases[0])]
+    assert collect() == []
+    assert ran == [cases[0], cases[1], cases[1]]
+    assert output.read_text().splitlines() == list(map(str, cases))
+
+
+def test_native_success_without_result_row_is_not_checkpointable(monkeypatch, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    popen = subprocess.Popen
+    monkeypatch.setattr(module.subprocess, "Popen", lambda _cmd, **kw: popen([sys.executable, "-c", "pass"], **kw))
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_context_module_perf.txt", cases=[case])
+    assert result["succeeded"] == 0
+    assert result["failed"] == [case]
+    assert "without writing its result row" in result["failure_details"][str(case)]["error_message"]
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_native_input_draw_is_identical_despite_rank_local_rng(monkeypatch, phase):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    import numpy as np
+
+    draws, checked = [], []
+
+    def prepare(batch_size, length):
+        ids = np.random.randint(0, 10000, size=(batch_size, length)).tolist()
+        draws.append(ids)
+        return [SimpleNamespace(origin_input_ids=seq) for seq in ids]
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.benchmark.one_batch", SimpleNamespace(prepare_synthetic_inputs_for_latency_test=prepare)
+    )
+    monkeypatch.setattr(
+        module, "_validate_tp_inputs", lambda reqs, _device: checked.append([r.origin_input_ids for r in reqs])
+    )
+    case = ModuleCase(8, 2, 48, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    for seed in (73, 891):
+        np.random.seed(seed)
+        runner = SimpleNamespace(device="cuda:0", forward=lambda batch: None)
+
+        def extend(reqs):
+            assert checked[-1] == [r.origin_input_ids for r in reqs]
+            runner.forward("captured batch")
+            return "tokens", "batch"
+
+        bench = SimpleNamespace(
+            torch_runner=runner, clear=lambda: None, extend=extend, decode=lambda *_a: runner.forward("captured batch")
+        )
+        monkeypatch.setattr(module, "_extend_history", lambda bench, reqs, *_a: (*bench.extend(reqs), None))
+        assert module._prepare_forward(bench, case, phase)[0] == "captured batch"
+    assert draws[0] == draws[1]
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_native_tp_input_check_observes_other_ranks(monkeypatch, mismatch):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    import numpy as np
+
+    def gather(copies, tokens):
+        for other in copies:
+            other[:] = tokens
+        if mismatch:
+            copies[1][0, 0] += 1
+
+    torch = SimpleNamespace(
+        tensor=lambda values, **_kw: np.asarray(values),
+        int64=None,
+        empty_like=np.empty_like,
+        equal=np.array_equal,
+        distributed=SimpleNamespace(get_world_size=lambda: 2, all_gather=gather),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    reqs = [SimpleNamespace(origin_input_ids=[1, 2, 3]), SimpleNamespace(origin_input_ids=[4, 5, 6])]
+    if mismatch:
+        with pytest.raises(RuntimeError, match=r"FIXME\(kernel-limit\).*token IDs differ"):
+            module._validate_tp_inputs(reqs, "cuda:0")
+    else:
+        module._validate_tp_inputs(reqs, "cuda:0")

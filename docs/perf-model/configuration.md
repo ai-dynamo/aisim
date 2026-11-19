@@ -1051,6 +1051,7 @@ recorded `kv_cache_dtype`. Otherwise, the first matching rule below applies:
 |---|---|
 | `kv_cache_quant_algo` is not missing/null, `fp8`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
 | DeepSeek V4/V4.1 architecture | FP8 |
+| Kimi K3.1 architecture with no inferred KV declaration | FP8 (requires an explicit layout selector) |
 | `kv_cache_quant_algo: fp8` | FP8 |
 | `kv_cache_quant_algo: "none"` | BF16 |
 | KV declaration missing/null or `bfloat16`; weight `quant_algo` is `fp8`, `fp8_block`, or `nvfp4` | FP8 |
@@ -1063,7 +1064,8 @@ The explicit engine field also accepts `int8`, subject to model/backend validati
 this does not make an `int8` checkpoint KV declaration valid.
 Kimi K3.1 modeling accepts BF16 or FP8 KV only. BF16 is a theoretical
 analytic option: the pinned native SGLang runtime requires FP8 KV and defaults
-to FlashMLA for both phases. Its FP8 cache requires
+to FlashMLA for both phases. AISimulate infers FP8 when K3.1 KV metadata is
+absent; request BF16 explicitly for analytic SOL modeling. Its FP8 cache requires
 `attention_backend: flashmla` (656 bytes per sparse-layer latent entry) or
 `attention_backend: trtllm_mla` (576 bytes). Both retain a separate 132-byte
 indexer entry per token per sparse layer; the sparse top-k does not truncate

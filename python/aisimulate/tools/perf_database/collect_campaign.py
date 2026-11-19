@@ -341,7 +341,7 @@ def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
     ):
         return
     from collector.op_plans import plan as plan_cases
-    from collector.sglang.collect_kimi_k31_dsa_v1 import validate_case
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, validate_case
 
     cases = plan_cases(shard.op, plan.backend, plan.sm, include_long_context=shard.include_long_context).cases
     for case in cases:
@@ -356,6 +356,11 @@ def _validate_shard_allocation(plan: Plan, shard: Shard) -> None:
                 "use collector/collect.py's full-node path (collector/fullnode.py) on a dedicated "
                 "allocation exposing the full TP group, or select only TP1 cases with case_filter"
             )
+    if shard.model_path is None:
+        raise SystemExit(
+            f"{shard.key}: native K3.1 shards require model_path: {MODEL} to select the pinned K3.1 runtime; "
+            "model-free shards select the default SGLang runtime"
+        )
 
 
 def run_campaign(

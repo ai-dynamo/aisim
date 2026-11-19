@@ -337,7 +337,10 @@ def test_kv_quantization_auto_aliases_preserve_model_dtype(monkeypatch, alias):
 
     estimator = SimpleNamespace(dtype_bytes=2)
     estimator.kv_bytes_per_token = lambda: 100 * estimator.dtype_bytes
-    monkeypatch.setattr(NaiveKVCacheEstimator, "_load_config", lambda *a, **k: {"architectures": ["LlamaForCausalLM"]})
+    monkeypatch.setattr(
+        "aisimulate_core.sdk.utils._load_model_config_from_model_path",
+        lambda *a, **k: {"architectures": ["LlamaForCausalLM"]},
+    )
     monkeypatch.setattr(NaiveKVCacheEstimator, "from_hf_config", lambda *a, **k: estimator)
     assert estimate_kv_bytes_per_token("model", tp_size=1, pp_size=1, kvcache_quant_mode=alias) == 200
 
@@ -395,6 +398,79 @@ def test_k31_token_geometry_rejects_ambiguous_layout(k31_token_geometry_config):
         estimate_kv_bytes_per_token(
             k31_token_geometry_config, tp_size=8, pp_size=1, moe_tp_size=8, kvcache_quant_mode="fp8"
         )
+
+
+def test_k31_geometry_reuses_native_metadata_when_remote_fetch_fails(monkeypatch, k31_token_geometry_config):
+    import json
+    from pathlib import Path
+
+    from aisimulate.capacity import estimate_kv_bytes_per_token
+    from aisimulate_core.sdk import utils
+    from aisimulate_core.sdk.config_builders import build_model_config
+    from aisimulate_core.sdk.models import get_model
+
+    raw = json.loads(Path(k31_token_geometry_config, "config.json").read_text())
+    calls = []
+
+    def download(path):
+        calls.append(path)
+        if len(calls) > 1:
+            raise ConnectionError("remote config unavailable after first load")
+        return raw
+
+    model_id = "test/k31-cached-capacity"
+    monkeypatch.setattr(utils, "_download_hf_config", download)
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *_a, **_k: None)
+    try:
+        # Cold geometry dispatch and native construction share this one fetch.
+        kwargs = dict(
+            tp_size=8,
+            pp_size=1,
+            moe_tp_size=8,
+            backend="sglang",
+            kvcache_quant_mode="fp8",
+            attention_backend="flashmla",
+        )
+        assert estimate_kv_bytes_per_token(model_id, **kwargs) == 18_912
+        get_model(
+            model_id,
+            build_model_config(
+                tp_size=8,
+                pp_size=1,
+                attention_dp_size=1,
+                moe_tp_size=8,
+                moe_ep_size=1,
+                kvcache_quant_mode="fp8",
+                attention_backend="flashmla",
+            ),
+            "sglang",
+        )
+        assert estimate_kv_bytes_per_token(model_id, **kwargs) == 18_912
+        assert calls == [model_id]
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_kv_geometry_retains_raw_config_fallback_for_unparsed_family(tmp_path):
+    import json
+
+    from aisimulate.capacity import estimate_kv_bytes_per_token
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["UnparsedTestArchitecture"],
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "hidden_size": 32,
+                "torch_dtype": "bfloat16",
+            }
+        )
+    )
+    # 2 layers * K/V * 2 KV heads * 8 dims * 2 BF16 bytes.
+    assert estimate_kv_bytes_per_token(str(tmp_path), tp_size=1, pp_size=1) == 128
 
 
 @pytest.mark.parametrize("precision,expected", [("bfloat16", 27_648), ("fp8", 13_824)])
