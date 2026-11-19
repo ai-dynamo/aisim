@@ -385,5 +385,8 @@ def check_candidate(
         if sample is None:
             report.findings.append(Finding("no-sample", "content was not inspected", f.path))
             continue
+        if not sample[0] and f.size > 0:
+            report.findings.append(Finding("no-sample", "head sample is empty; content was not inspected", f.path))
+            continue
         report.extend(check_content(policy, f, *sample))
     return report

@@ -192,8 +192,12 @@ Repository identity and authentication do not change the schema.
 
 The coverage catalog normally crosses the models and frameworks found in the dataset.
 `build_catalog(expected_models=..., expected_frameworks=...)` can widen that universe;
-the builder saves the declaration in `catalog/coverage.json` (`aisim-catalog-coverage/v1`)
+with `write=True` (the default), the builder saves the declaration in
+`catalog/coverage.json` (`aisim-catalog-coverage/v1`)
 so subsequent builds and mirror/public validation reproduce the same missing cells.
+With `write=False`, it returns rows without saving the declaration. The builder
+rejects projected coverage grids above 100,000 rows, including all hardware,
+before expanding model and framework combinations.
 
 | Coverage field | Contract |
 | --- | --- |

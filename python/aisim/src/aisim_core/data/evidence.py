@@ -67,6 +67,9 @@ def check_evidence(
     files = sorted(p for p in set(paths) if p.startswith(EVIDENCE_ROOT))
     findings: list[Finding] = []
     declared: set[str] = set()
+    configuration_ids_by_directory: dict[str, set[str]] = {}
+    for path, configuration in (manifests or {}).items():
+        configuration_ids_by_directory.setdefault(posixpath.dirname(path), set()).add(configuration.configuration_id)
     for rel in files:
         parts = rel.split("/")
         if ".." in parts or "." in parts or "" in parts or posixpath.normpath(rel) != rel or "\\" in rel:
@@ -86,8 +89,8 @@ def check_evidence(
             findings.append(Finding("evidence-config-path", "manifest must sit at evidence/<config_path>/", rel))
         if manifest.category == "e2e" and posixpath.basename(manifest.config_path) != manifest.configuration_id:
             findings.append(Finding("evidence-configuration", "configuration_id differs from config_path", rel))
-        configuration = (manifests or {}).get(f"{manifest.config_path}/manifest.json")
-        if configuration is not None and configuration.configuration_id != manifest.configuration_id:
+        configuration_ids = configuration_ids_by_directory.get(manifest.config_path, set())
+        if configuration_ids - {manifest.configuration_id}:
             findings.append(Finding("evidence-configuration", "configuration_id differs from configuration", rel))
         seen: set[str] = set()
         for artifact in manifest.artifacts:

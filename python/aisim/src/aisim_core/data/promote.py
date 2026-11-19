@@ -87,7 +87,7 @@ class Approval(_Model):
 
 class PromotionRequest(_Model):
     schema_version: Literal["aisim-promotion/v1"] = REQUEST_SCHEMA
-    source_repo: str = INTERNAL_REPO
+    source_repo: str = Field(default=INTERNAL_REPO, pattern=r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$")
     target_repo: str = Field(pattern=r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$")
     source_commit: str = Field(pattern=_SHA40)  # internal commit the reviewers looked at
     directories: list[str] = Field(min_length=1)
@@ -479,11 +479,16 @@ def _apply_promotion(
             raise PromotionError(f"target already has different content at {rel}; promotion never overwrites")
     index_path = target / CATALOG_DIR / "dataset.json"
     _check_contained(target, list(plan.files) + [f"{CATALOG_DIR}/dataset.json"])
-    index_paths = (
-        {ref.index.path for ref in DatasetIndex.model_validate_json(index_path.read_bytes()).categories.values()}
-        if index_path.is_file()
-        else set()
-    )
+    categories = DatasetIndex.model_validate_json(index_path.read_bytes()).categories if index_path.is_file() else {}
+    index_paths = {ref.index.path for ref in categories.values()}
+    generated_indexes = {f"{CATALOG_DIR}/dataset.json"}
+    for rel in plan.manifests:
+        category = Manifest.model_validate_json((source / rel).read_bytes()).category
+        generated_indexes.add(
+            categories[category].index.path if category in categories else f"{CATALOG_DIR}/{category}.json"
+        )
+    if overlap := generated_indexes & set(plan.files):
+        raise PromotionError(f"generated indexes overlap approved files: {sorted(overlap)}")
     _check_contained(target, list(index_paths))
     before = _snapshot(target, index_paths)
     added: list[Path] = []

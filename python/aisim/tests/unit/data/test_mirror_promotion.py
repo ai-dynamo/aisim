@@ -446,6 +446,22 @@ def test_invalid_catalog_coverage_returns_a_validation_report(tmp_path, value):
     assert "catalog-unbuildable" in {f.code for f in validate_tree(root).errors}
 
 
+def test_oversized_catalog_grid_returns_a_cli_validation_report(tmp_path):
+    root, _ = _mirror(tmp_path)
+    (root / "catalog/coverage.json").write_text(
+        json.dumps(
+            {
+                "expected_models": [f"model{i}" for i in range(1000)],
+                "expected_frameworks": [f"framework{i}" for i in range(1000)],
+            }
+        )
+    )
+    output = tmp_path / "report.json"
+    assert mirror_main(["validate", "--root", str(root), "--output", str(output)]) == 1
+    findings = json.loads(output.read_bytes())["findings"]
+    assert any(f["code"] == "catalog-unbuildable" and "projected catalog grid" in f["message"] for f in findings)
+
+
 @pytest.mark.parametrize("profile", ["mirror", "public"])
 def test_installed_validation_workflow_is_repository_infrastructure(tmp_path, profile):
     repo = INTERNAL_REPO if profile == "mirror" else PUBLIC
@@ -760,6 +776,111 @@ def test_sample_configuration_is_promoted_by_copy_only_and_passes_public_validat
     assert entry["approved_by"] == ["alice"] and entry["source_commit"] == plan.request.source_commit
     # The source tree still validates as a mirror with its new ledger entry.
     assert validate_tree(root, repo=INTERNAL_REPO).ok
+
+
+def test_empty_promotion_source_cannot_bypass_cache_repository_identity(tmp_path):
+    root, manifests = _mirror(tmp_path, repo=INFX_CACHE_REPO)
+    assert validate_tree(root, repo=INFX_CACHE_REPO).ok
+    with pytest.raises(ValueError, match="source_repo"):
+        _request(root, [str(Path(manifests[0]).parent)], source_repo="")
+    assert "dataset-id-mismatch" in {f.code for f in validate_tree(root, repo="").errors}
+    assert _request(root, [str(Path(manifests[0]).parent)]).source_repo == INTERNAL_REPO
+
+
+def test_promotion_rejects_selected_noncanonical_generated_index_before_writing(tmp_path):
+    from aisim_core.data import DatasetIndex
+
+    root, directory = _promotable(tmp_path)
+    relative = "data/indexes/e2e.json"
+    custom = root / relative
+    custom.parent.mkdir()
+    custom.write_text(json.dumps(json.loads((root / "catalog/e2e.json").read_bytes()), separators=(",", ":")))
+    (root / "catalog/e2e.json").unlink()
+    index_path = root / "catalog/dataset.json"
+    dataset = DatasetIndex.model_validate_json(index_path.read_bytes())
+    ref = dataset.categories["e2e"]
+    artifact = ref.index.model_copy(
+        update={
+            "path": relative,
+            "sha256": hashlib.sha256(custom.read_bytes()).hexdigest(),
+            "bytes": custom.stat().st_size,
+        }
+    )
+    index_path.write_text(
+        dataset.model_copy(update={"categories": {"e2e": ref.model_copy(update={"index": artifact})}}).model_dump_json(
+            by_alias=True
+        )
+    )
+    selection = [directory, str(custom.parent.relative_to(root))]
+    _public(root, *selection)
+    assert validate_tree(root).ok
+    target = _target(tmp_path)
+    shutil.copytree(root, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git", "mirror"))
+    target_index = target / "catalog/dataset.json"
+    target_index.write_text(
+        DatasetIndex.model_validate_json(target_index.read_bytes())
+        .model_copy(update={"dataset_id": PUBLIC})
+        .model_dump_json(by_alias=True)
+    )
+    assert validate_tree(target, profile="public").ok
+    draft = plan_promotion(root, _request(root, selection), _reviewers())
+    plan = plan_promotion(root, _request(root, selection, draft), _reviewers())
+    assert plan.ok, plan.findings
+    before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+    with pytest.raises(PromotionError, match="generated indexes overlap approved files"):
+        apply_promotion(plan, root, target)
+    assert {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_artifact_only_publication_scans_through_supplied_owner(tmp_path, dirty):
+    cfg = _config()
+    metrics = list(cfg.metrics)
+    metrics[0] = metrics[0].model_copy(
+        update={"attrs": json.dumps({"endpoint": "node7.corp.nvidia.com" if dirty else "public"})}
+    )
+    root = tmp_path / "mirror"
+    relative = write_configuration(root, dataclasses.replace(cfg, metrics=metrics), prefix="data")
+    configuration = load_e2e(root, relative)
+    artifact = next(a for a in configuration.manifest.artifacts if a.path.endswith("/metrics.parquet"))
+    findings = check_publishable(root, [artifact.path], manifests={relative: configuration.manifest})
+    assert any(f.code == "internal-host" and f.path == artifact.path for f in findings) is dirty
+    if not dirty:
+        assert findings == []
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_eval_findings_json_scanned_when_provenance_is_allowed(tmp_path, dirty):
+    from aisim_core.data.eval import load_record
+
+    root, manifests = _mirror(tmp_path)
+    path = _eval(root, [load_e2e(root, manifests[0]).manifest.configuration_id])
+    original = load_record(path)
+    payload = json.dumps({"endpoint": "node7.corp.nvidia.com" if dirty else "public"}).encode()
+    sidecar = path.parent / "findings.json"
+    sidecar.write_bytes(payload)
+    artifact = Artifact(
+        artifact_id="findings",
+        path=sidecar.name,
+        role="findings",
+        format="json",
+        schema="findings/v1",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        bytes=len(payload),
+    )
+    record = original.model_copy(update={"findings": [artifact], "supersedes": original.record_id})
+    record_path = write_record(root, record).relative_to(root).as_posix()
+    owners = {rel: load_e2e(root, rel).manifest for rel in manifests}
+    policy = RedactionPolicy(allow_provenance_artifacts=True)
+    findings = check_publishable(root, [record_path], manifests=owners, policy=policy)
+    assert any(f.code == "internal-host" and f.path.endswith("/findings.json") for f in findings) is dirty
+    if not dirty:
+        assert findings == []
+    assert "provenance-withheld" in {f.code for f in check_publishable(root, [record_path], manifests=owners)}
+    sidecar.write_bytes(b"{}")
+    assert "document-invalid" in {
+        f.code for f in check_publishable(root, [record_path], manifests=owners, policy=policy)
+    }
 
 
 def test_promotion_preserves_target_root_metadata(tmp_path):
@@ -2141,13 +2262,19 @@ def test_unknown_python_validation_profile_is_refused(tmp_path):
         validate_tree(root, profile="publc")
 
 
-def test_operation_evidence_version_directory_and_strict_identity(tmp_path):
+@pytest.mark.parametrize("manifest_name", ["manifest.json", "configuration.json"])
+def test_operation_evidence_version_directory_and_strict_identity(tmp_path, manifest_name):
     from pydantic import ValidationError
 
     from aisim_core.data.evidence import EvidenceManifest, check_evidence
 
     root, directory, _ = _op_mirror(tmp_path, "future_text", None)
-    manifest = Manifest.model_validate_json((root / directory / "manifest.json").read_bytes())
+    original = root / directory / "manifest.json"
+    if manifest_name != original.name:
+        original.rename(original.with_name(manifest_name))
+        register_manifests(root, [f"{directory}/{manifest_name}"], INTERNAL_REPO)
+        build_catalog(root)
+    manifest = Manifest.model_validate_json((root / directory / manifest_name).read_bytes())
     destination = root / "evidence" / directory
     destination.mkdir(parents=True)
     (destination / "capture.log").write_bytes(b"fixture")

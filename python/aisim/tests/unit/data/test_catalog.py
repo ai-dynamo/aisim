@@ -27,6 +27,64 @@ from tests.unit.data.test_fetch import _repin
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.mark.parametrize("failure", ["write", "replace"])
+def test_coverage_replacement_preserves_previous_declaration(tmp_path, monkeypatch, failure):
+    root, systems = tmp_path / "dataset", tmp_path / "systems"
+    systems.mkdir()
+    build_catalog(root, systems_dir=systems, expected_models=["original"], expected_frameworks=["vllm"])
+    path = root / "catalog/coverage.json"
+    before = path.read_bytes()
+    original = catalog_module.tempfile.NamedTemporaryFile
+
+    def fail_replace(*args):
+        raise OSError("synthetic replacement failure")
+
+    class BrokenWrite:
+        def __enter__(self):
+            self.handle = original("w", dir=path.parent, delete=False)
+            self.name = self.handle.name
+            return self
+
+        def write(self, value):
+            self.handle.write(value[:8])
+            raise OSError("synthetic partial write")
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+    if failure == "write":
+        monkeypatch.setattr(catalog_module.tempfile, "NamedTemporaryFile", lambda *a, **kw: BrokenWrite())
+    else:
+        monkeypatch.setattr(catalog_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="synthetic"):
+        build_catalog(root, systems_dir=systems, expected_models=["replacement"])
+    assert path.read_bytes() == before
+    assert catalog_module.read_catalog_coverage(root).expected_models == ["original"]
+    assert not [p for p in path.parent.iterdir() if p.is_file() and p.name.startswith("tmp")]
+
+
+@pytest.mark.parametrize("hardware_count", [1, 2])
+def test_catalog_rejects_projected_grid_before_materializing_rows(tmp_path, monkeypatch, hardware_count):
+    monkeypatch.setattr(catalog_module, "known_system_specs", lambda _: {f"gpu{i}": NEW for i in range(hardware_count)})
+
+    def unexpected(*args):
+        pytest.fail("oversized grid reached row materialization")
+
+    monkeypatch.setattr(catalog_module, "_summarize", unexpected)
+    # The same dimensions fit on one hardware only; hardware must count too.
+    count = 1000 if hardware_count == 1 else 200
+    frameworks = 1000 if hardware_count == 1 else 200
+    with pytest.raises(ValueError, match="projected catalog grid.*limit"):
+        build_catalog(
+            tmp_path,
+            expected_models=[f"model{i}" for i in range(count)],
+            expected_frameworks=[f"framework{i}" for i in range(frameworks)],
+            write=False,
+        )
+    assert not (tmp_path / "catalog").exists()
+
+
 SPEC = {"gpu": {"flops": 1}, "node": {"gpus": 8}}
 NEW = spec_sha256(SPEC)
 OLD = "0" * 64

@@ -296,6 +296,30 @@ def test_store_verify_attest_walkthrough(built_record, tmp_path, capsys):  # noq
     assert out["verification"]["ok"] and out["verified_record_id"]
     assert [r.tier for r in current_records(path.parent)] == ["verified"]
 
+    from aisim_core.data.eval import attest
+    from aisim_core.data.gpu_time import GpuTime
+
+    verified = load_record(out["verified_record_path"])
+    recorded = verified.model_copy(
+        update={
+            "gpu_time": GpuTime(authority="measured", gpu_count=4, wall_seconds=1.0),
+            "supersedes": verified.record_id,
+        }
+    )
+    write_record(root, recorded)
+    qualified = attest(
+        recorded, verify_record(recorded, root, _predict, recorded.prediction.fingerprint), tier="qualified"
+    )
+    qualified_path = write_record(root, qualified)
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    with pytest.raises(SystemExit) as exc:
+        tool.main([str(qualified_path), "--predictor", str(good), "--attest-root", str(root)])
+    assert exc.value.code == 2
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+    assert [r.tier for r in current_records(path.parent)] == ["qualified"]
+    assert tool.main([str(qualified_path), "--truth-root", str(root), "--predictor", str(good)]) == 0
+    assert json.loads(capsys.readouterr().out)["verification"]["ok"]
+
     bad = tmp_path / "bad.py"
     bad.write_text(good.read_text().replace("1.1", "1.5"))
     assert tool.main([str(path), "--truth-root", str(root), "--predictor", str(bad)]) == 1

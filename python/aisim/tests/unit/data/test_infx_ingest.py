@@ -122,6 +122,107 @@ def tree(path: Path):
     return {str(p.relative_to(path)): p.read_bytes() for p in sorted(path.rglob("*")) if p.is_file()}
 
 
+@pytest.mark.parametrize("attempts", [(None, 2), (2, None), (2, 3)])
+def test_run_attempt_merge_requires_two_known_conflicting_values(tmp_path, attempts):
+    fake = FakeInfx()
+    pages = []
+    for attempt in attempts:
+        run = {"html_url": RUN}
+        if attempt is not None:
+            run["run_attempt"] = attempt
+        pages.append(ok({**WORKFLOW, "runs": [run]}))
+    fake.respond("workflow-info", *pages)
+    acquirer = infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path))
+    if attempts == (2, 3):
+        with pytest.raises(infx_ingest.ContradictionError, match="run_attempt"):
+            acquirer._runs([DATE, "2026-11-06"])
+    else:
+        assert acquirer._runs([DATE, "2026-11-06"])[RUN]["run_attempt"] == 2
+
+
+def test_overflow_metric_writes_cli_failure_report_and_preserves_qualification(root, tmp_path, monkeypatch):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "reviewer", NOW)
+    before = tree(root)
+    fake = FakeInfx(rows=[row(1, metrics={"mean_ttft": 10**400}), row(2, "h200")])
+    run = infx_job.run_ingestion
+    monkeypatch.setattr(infx_job, "run_ingestion", lambda *a, **kw: run(*a, **kw, transport=fake))
+    report = tmp_path / "report.json"
+    assert (
+        infx_job.main(
+            ["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report), "--no-notify"]
+        )
+        == 1
+    )
+    failure = json.loads(report.read_text())
+    assert failure["status"] == "failed" and "IncompleteAcquisitionError" in failure["error"]
+    assert tree(root) == before
+
+
+def test_large_workflow_response_is_retained_in_published_candidate(root, tmp_path):
+    from aisim_core.data import Manifest, _verify
+
+    raw = json.dumps({**WORKFLOW, "padding": "x" * (17 * 1024 * 1024)}).encode()
+    fake = FakeInfx(rows=[row()], availability=[avail()])
+    fake.respond("workflow-info", HttpResponse(200, {}, raw))
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "candidate", result.error
+    _, members = read_snapshot(root, infx_job.load_state(root)["candidate"]["snapshot_path"])
+    manifest = Manifest.model_validate_json((root / members[0].manifest_path).read_bytes())
+    bodies = [gzip.decompress(_verify(root, a).read_bytes()) for a in manifest.artifacts if a.format == "gzip"]
+    assert raw in bodies
+
+
+def test_deep_state_writes_cli_failure_report(root, tmp_path):
+    (root / infx_job.STATE_FILE).write_bytes(b"[" * 10000 + b"0" + b"]" * 10000)
+    before = tree(root)
+    report = tmp_path / "report.json"
+    assert (
+        infx_job.main(
+            ["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report), "--no-notify"]
+        )
+        == 1
+    )
+    failure = json.loads(report.read_text())
+    assert "ValueError" in failure["error"] and "nesting" in failure["error"]
+    assert failure["requests_made"] == 0 and tree(root) == before
+
+
+def test_empty_acquisition_rechecks_concurrent_qualification(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promoted = []
+    fake = FakeInfx(rows=[], availability=[])
+
+    def interleave(url, headers, timeout):
+        if not promoted:
+            promoted.append(promote(root, first.snapshot_id, "reviewer", NOW))
+        return fake(url, headers, timeout)
+
+    result, _ = make_run(tmp_path, interleave)
+    assert result.status == "failed" and "state changed" in result.error
+    assert infx_job.load_state(root)["qualified"] == promoted[0]
+
+
+@pytest.mark.parametrize("operation", ["promote", "reuse", "reuse-orphan"])
+def test_partial_snapshot_cannot_be_qualified_or_reused(root, tmp_path, operation):
+    first, _ = make_run(tmp_path, FakeInfx())
+    path = root / infx_job.load_state(root)["candidate"]["snapshot_path"]
+    document = json.loads(path.read_bytes())
+    document["completeness"] = "partial"
+    path.write_text(json.dumps(document))
+    if operation == "reuse-orphan":
+        state = infx_job.load_state(root)
+        infx_job.save_state(root, {**state, "candidate": None}, expected=state)
+    before = tree(root)
+    if operation == "promote":
+        with pytest.raises(PromotionError, match="must be complete"):
+            promote(root, first.snapshot_id, "reviewer", NOW)
+    else:
+        result, _ = make_run(tmp_path, FakeInfx())
+        assert result.status == "failed" and "must be complete" in result.error
+    assert tree(root) == before
+
+
 # --------------------------------------------------------------------------- client
 
 

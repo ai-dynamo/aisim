@@ -74,7 +74,10 @@ def load_state(root: Path) -> dict[str, Any]:
     path = Path(root) / STATE_FILE
     if not path.exists():
         return {"schema_version": STATE_SCHEMA, "qualified": None, "candidate": None}
-    state = json_sidecar_value(bounded_json_bytes(path))
+    try:
+        state = json_sidecar_value(bounded_json_bytes(path))
+    except RecursionError as exc:
+        raise ValueError("ingestion state JSON exceeds the decoder nesting limit") from exc
     if not isinstance(state, dict):
         raise ValueError("ingestion state must be an object")
     if state.get("schema_version") != STATE_SCHEMA:
@@ -202,6 +205,8 @@ def run_ingestion(
         acq = acquirer.acquire(models, list(prior), prior_models)
         plan = None if acq.empty_scope else plan_snapshot(acq)
         if acq.empty_scope:
+            with _state_lock(root):
+                _check_state(root, expected)
             return RunResult(
                 "empty", warnings=["no InferenceX data declared for the scope"], requests_made=acq.requests_made
             )
@@ -222,6 +227,8 @@ def run_ingestion(
             snapshot, members = read_snapshot(root, entry["snapshot_path"])
             if snapshot.snapshot_id != plan.snapshot_id:
                 raise ValueError("existing snapshot ID differs from the planned snapshot")
+            if snapshot.completeness != "complete":
+                raise ValueError("existing snapshot must be complete")
             verify_snapshot_members(root, members)
             with _state_lock(root):
                 _check_state(root, expected)
@@ -254,6 +261,8 @@ def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = 
     snapshot, members = read_snapshot(root, candidate["snapshot_path"])
     if snapshot.snapshot_id != snapshot_id:
         raise PromotionError("candidate snapshot ID differs from the requested ID")
+    if snapshot.completeness != "complete":
+        raise PromotionError("candidate snapshot must be complete")
     verify_snapshot_members(root, members)
     state["qualified"] = {**candidate, "qualified_at": _stamp(now or datetime.now(UTC)), "reviewer": reviewer}
     state["candidate"] = None

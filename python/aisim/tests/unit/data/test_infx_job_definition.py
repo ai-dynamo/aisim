@@ -68,6 +68,38 @@ def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_
     assert 'BRANCH="candidate/${SID}-${CI_PIPELINE_ID}"' in text
     assert "main" not in text and "unchanged refresh: no commit" in text and "git status --porcelain" in text
     assert "$JOB_PY promote" not in text
+    assert job["resource_group"] == "infx-cache-candidate-publication"
+
+
+@pytest.mark.parametrize("status", [0, 73])
+def test_publication_status_failure_cannot_look_unchanged(definition, tmp_path, status):
+    git = tmp_path / "git"
+    git.write_text(f'#!/bin/sh\ntest "$1 $2" = "status --porcelain" || exit 99\nexit {status}\n')
+    git.chmod(0o755)
+    (tmp_path / "cache-repo").mkdir()
+    result = subprocess.run(
+        ["sh", "-eu", "-c", definition["publish_candidate"]["script"][-1]],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == status
+    assert ("unchanged refresh" in result.stdout) is (status == 0)
+
+
+def test_qualification_process_does_not_inherit_write_token(definition, tmp_path):
+    command = next(line for line in definition["promote"]["script"] if "$JOB_PY promote" in line)
+    command = command.replace("$[[ inputs.candidate-snapshot-id ]]", "a" * 64)
+    tool = tmp_path / "job-python"
+    tool.write_text('#!/bin/sh\ntest "$1" = promote\n[ "${INFX_CACHE_WRITE_TOKEN+x}" != x ]\n')
+    tool.chmod(0o755)
+    subprocess.run(
+        ["sh", "-eu", "-c", command],
+        cwd=tmp_path,
+        check=True,
+        env={**os.environ, "JOB_PY": str(tool), "INFX_CACHE_WRITE_TOKEN": "synthetic", "GITLAB_USER_NAME": "reviewer"},
+    )
 
 
 def test_promotion_is_manual_with_a_named_reviewer_and_staleness_is_alert_only(definition):

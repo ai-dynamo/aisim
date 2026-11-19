@@ -77,6 +77,8 @@ def main(argv=None) -> int:
         p.error("--attest-root requires --predictor")
 
     record = load_record(args.record)
+    if args.attest_root and record.tier == "qualified":
+        p.error("--attest-root cannot downgrade a qualified record; use verification only")
     out = {
         "record_id": record.record_id,
         "tier": record.tier,
