@@ -9,7 +9,7 @@
 
 use std::borrow::{Borrow, Cow};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::engine::belady::BeladyOracle;
@@ -17,7 +17,7 @@ use crate::engine::common::hashing::{SequenceHash, compute_next_seq_hash};
 
 use sglang_radix_tree::{
     CacheAction, CacheInitParams, ChildKeyType, ComponentSet, DecLockRefParams, FULL, InsertParams,
-    KeyNamespaceRef, MatchPrefixParams, PageValue, UnifiedTreeCore,
+    KeyNamespaceRef, MatchPrefixParams, PageValue, RadixValue, UnifiedTreeCore,
 };
 
 use crate::engine::common::hashing::LocalBlockHash;
@@ -29,6 +29,14 @@ pub use sglang_radix_tree::NodeId;
 #[cfg(test)]
 #[path = "eviction_evidence.rs"]
 mod eviction_evidence;
+
+#[cfg(test)]
+#[path = "eviction_performance.rs"]
+mod eviction_performance;
+
+#[cfg(test)]
+#[path = "eviction_pressure_probe.rs"]
+mod eviction_pressure_probe;
 
 /// Physical page identifier in the simulated SGLang KV pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -244,6 +252,19 @@ impl ChildKeyType for PageKey {
     fn raw_token_ids(atoms: &[LocalBlockHash]) -> Cow<'_, [i64]> {
         Cow::Owned(atoms.iter().map(|atom| atom.0 as i64).collect())
     }
+
+    fn split_at(&self, at: usize) -> (Self, Self) {
+        assert!(0 < at && at < self.end);
+        // Copy the removed suffix, sharing the retained prefix. Compact only
+        // after halving the backing allocation: repeated tail removals then
+        // copy O(N) hashes in total, including with a live checkpoint.
+        let head = if at < self.hashes.len().div_ceil(2) {
+            self.as_ref()[..at].to_vec().into()
+        } else {
+            Self::shared(Arc::clone(&self.hashes), at)
+        };
+        (head, self.as_ref()[at..].to_vec().into())
+    }
 }
 
 impl From<KvPageId> for i64 {
@@ -252,7 +273,130 @@ impl From<KvPageId> for i64 {
     }
 }
 
-type SglangTree = UnifiedTreeCore<PageKey, PageValue<KvPageId>>;
+/// Keep the core's value operations, but amortize retained-prefix compaction
+/// across suffix splits. Adoption still takes a compact, independent buffer.
+#[derive(Clone, Debug)]
+struct CacheValue {
+    pages: PageValue<KvPageId>,
+    backing_len: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SPLIT_VALUE_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl CacheValue {
+    fn from_vec(pages: Vec<KvPageId>) -> Self {
+        Self {
+            backing_len: pages.len(),
+            pages: PageValue::from_vec(pages),
+        }
+    }
+
+    fn as_slice(&self) -> &[KvPageId] {
+        self.pages.as_slice()
+    }
+}
+
+impl RadixValue for CacheValue {
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn shallow_clone(&self) -> Self {
+        self.clone()
+    }
+
+    fn copy_for_adoption(&self) -> Self {
+        Self::from_vec(self.as_slice().to_vec())
+    }
+
+    fn slice(&self, start: usize, len: usize) -> Self {
+        Self {
+            pages: self.pages.slice(start, len),
+            backing_len: self.backing_len,
+        }
+    }
+
+    fn split_owned(self, at: usize) -> (Self, Self) {
+        assert!(0 < at && at < self.len());
+        let tail = Self::from_vec(self.as_slice()[at..].to_vec());
+        let mut head = self.slice(0, at);
+        if at < self.backing_len.div_ceil(2) {
+            head = head.copy_for_adoption();
+            #[cfg(test)]
+            SPLIT_VALUE_COPIES.with(|copies| copies.set(copies.get() + at));
+        }
+        #[cfg(test)]
+        SPLIT_VALUE_COPIES.with(|copies| copies.set(copies.get() + tail.len()));
+        (head, tail)
+    }
+
+    fn concat(values: &[Self]) -> Self {
+        match values {
+            [] => Self::empty(),
+            [one] => one.clone(),
+            _ => {
+                let mut pages = Vec::with_capacity(values.iter().map(Self::len).sum());
+                for value in values {
+                    pages.extend_from_slice(value.as_slice());
+                }
+                Self::from_vec(pages)
+            }
+        }
+    }
+
+    fn empty() -> Self {
+        Self::from_vec(Vec::new())
+    }
+
+    fn to_i64_vec(&self) -> Vec<i64> {
+        self.pages.to_i64_vec()
+    }
+}
+
+type SglangTree = UnifiedTreeCore<PageKey, CacheValue>;
+type VictimPriority = (Reverse<usize>, i64, NodeId);
+
+/// Entries are introduced at insert/unlock or native parent promotion. Access
+/// ticks only increase, so stale recency/eligibility can be checked lazily at
+/// the minimum. Forecast changes can improve a buried Belady victim's rank;
+/// the reverse hash index refreshes those entries before selection.
+#[derive(Clone, Default)]
+struct EvictionIndex {
+    ordered: BTreeSet<VictimPriority>,
+    by_node: HashMap<NodeId, (VictimPriority, Option<SequenceHash>)>,
+    by_hash: HashMap<SequenceHash, HashSet<NodeId>>,
+    forecast_cursor: usize,
+    #[cfg(test)]
+    candidate_queries: usize,
+}
+
+impl EvictionIndex {
+    fn remove(&mut self, node: NodeId) {
+        if let Some((priority, hash)) = self.by_node.remove(&node) {
+            self.ordered.remove(&priority);
+            if let Some(hash) = hash {
+                let nodes = self.by_hash.get_mut(&hash).expect("indexed forecast hash");
+                nodes.remove(&node);
+                if nodes.is_empty() {
+                    self.by_hash.remove(&hash);
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, priority: VictimPriority, hash: Option<SequenceHash>) {
+        let node = priority.2;
+        self.remove(node);
+        self.ordered.insert(priority);
+        self.by_node.insert(node, (priority, hash));
+        if let Some(hash) = hash {
+            self.by_hash.entry(hash).or_default().insert(node);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct BeladyPages {
@@ -266,8 +410,8 @@ struct BeladyPages {
 impl BeladyPages {
     fn priority(
         &self,
-        candidate: sglang_radix_tree::FullDeviceEvictionCandidate<'_, PageValue<KvPageId>>,
-    ) -> Reverse<(Reverse<usize>, i64, NodeId)> {
+        candidate: sglang_radix_tree::FullDeviceEvictionCandidate<'_, CacheValue>,
+    ) -> (VictimPriority, SequenceHash) {
         let page = candidate.value.as_slice().last().expect("nonempty leaf");
         let hash = self.page_hashes[page.index()].expect("cached page has prefix identity");
         let access = self
@@ -275,11 +419,14 @@ impl BeladyPages {
             .get(page)
             .filter(|(tick, _)| *tick == candidate.last_access_counter)
             .map_or(candidate.last_access_counter, |(_, access)| *access);
-        Reverse((
-            Reverse(self.oracle.next_use(hash)),
-            access,
-            candidate.node_id,
-        ))
+        (
+            (
+                Reverse(self.oracle.next_use(hash)),
+                access,
+                candidate.node_id,
+            ),
+            hash,
+        )
     }
 }
 
@@ -287,6 +434,7 @@ impl BeladyPages {
 pub struct RadixCache {
     tree: SglangTree,
     belady: Option<BeladyPages>,
+    candidates: EvictionIndex,
     pub page_pool: PagePool,
     page_size: usize,
 }
@@ -296,6 +444,7 @@ impl RadixCache {
         Self {
             tree: self.tree.snapshot_full_device(),
             belady: self.belady.clone(),
+            candidates: self.candidates.clone(),
             page_pool: self.page_pool.clone(),
             page_size: self.page_size,
         }
@@ -338,18 +487,66 @@ impl RadixCache {
         }
     }
 
+    fn refresh_candidate(&mut self, node: NodeId) {
+        #[cfg(test)]
+        {
+            self.candidates.candidate_queries += 1;
+        }
+        if let Some(candidate) = self.tree.full_device_eviction_candidate(node) {
+            let (priority, hash) = match &self.belady {
+                Some(belady) => {
+                    let (priority, hash) = belady.priority(candidate);
+                    (priority, Some(hash))
+                }
+                None => ((Reverse(0), candidate.last_access_counter, node), None),
+            };
+            if self.candidates.by_node.get(&node) != Some(&(priority, hash)) {
+                self.candidates.insert(priority, hash);
+            }
+        } else {
+            self.candidates.remove(node);
+        }
+    }
+
+    fn refresh_forecast(&mut self) {
+        let Some(belady) = &self.belady else {
+            return;
+        };
+        for (hash, next_use) in belady
+            .oracle
+            .changes_since(&mut self.candidates.forecast_cursor)
+        {
+            if let Some(nodes) = self.candidates.by_hash.get(&hash) {
+                for node in nodes {
+                    let (priority, _) =
+                        self.candidates.by_node.get_mut(node).expect("indexed node");
+                    self.candidates.ordered.remove(priority);
+                    priority.0 = Reverse(next_use);
+                    self.candidates.ordered.insert(*priority);
+                }
+            }
+        }
+    }
+
+    fn next_victim(&mut self) -> Option<(NodeId, i64)> {
+        loop {
+            let priority = *self.candidates.ordered.first()?;
+            let node = priority.2;
+            // A native touch can only move this entry later in recency order.
+            // Locks, branching, or extension can make it ineligible instead.
+            self.refresh_candidate(node);
+            if self.candidates.ordered.first() == Some(&priority) {
+                self.candidates.remove(node);
+                return Some((node, priority.1));
+            }
+        }
+    }
+
     fn evict_belady(&mut self, target_pages: usize) -> Vec<KvPageId> {
-        let belady = self.belady.as_ref().expect("Belady configured");
-        // Start from the core's current unlocked leaves. Global forecast changes
-        // are observed at each eviction; they never create or unlock local KV.
-        let mut candidates: BinaryHeap<_> = self
-            .tree
-            .full_device_eviction_candidates()
-            .map(|candidate| belady.priority(candidate))
-            .collect();
+        self.refresh_forecast();
         let mut pages = Vec::with_capacity(target_pages.min(self.tree.evictable_size()));
         while pages.len() < target_pages {
-            let Some(Reverse((_, access, node_id))) = candidates.pop() else {
+            let Some((node_id, access)) = self.next_victim() else {
                 break;
             };
             let split = self
@@ -372,18 +569,22 @@ impl RadixCache {
                 }
                 pages.extend_from_slice(chunk.as_slice());
             }
-            if let Some(parent) = parent.and_then(|id| self.tree.full_device_eviction_candidate(id))
-            {
-                let belady = self.belady.as_mut().expect("Belady configured");
+            if let Some(parent) = parent {
                 if split {
-                    let page = *parent.value.as_slice().last().expect("retained prefix");
-                    belady
+                    let candidate = self
+                        .tree
+                        .full_device_eviction_candidate(parent)
+                        .expect("retained prefix");
+                    let page = *candidate.value.as_slice().last().expect("retained prefix");
+                    self.belady
+                        .as_mut()
+                        .expect("Belady configured")
                         .retained_recency
-                        .insert(page, (parent.last_access_counter, access));
+                        .insert(page, (candidate.last_access_counter, access));
                 }
                 // Recompute next use from the retained tail, keeping its recency
                 // only when this operation split the selected compressed leaf.
-                candidates.push(belady.priority(parent));
+                self.refresh_candidate(parent);
             }
         }
         pages
@@ -402,6 +603,7 @@ impl RadixCache {
         Self {
             tree,
             belady: None,
+            candidates: EvictionIndex::default(),
             page_pool: PagePool::new(total_tokens, page_size),
             page_size,
         }
@@ -498,9 +700,7 @@ impl RadixCache {
         );
         let last_node = result.last_device_node_id;
         let matched_tokens = result.device_indices.as_slice().len() * self.page_size;
-        self.tree
-            .inc_lock_ref(last_node, ComponentSet::EMPTY)
-            .expect("live prefix");
+        self.inc_lock_ref(last_node);
         (matched_tokens, last_node)
     }
 
@@ -564,7 +764,7 @@ impl RadixCache {
             &page_keys[prefix_pages..],
             &pages[prefix_pages..page_keys.len()],
         );
-        let suffix_value = PageValue::from_vec(pages[prefix_pages..page_keys.len()].to_vec());
+        let suffix_value = CacheValue::from_vec(pages[prefix_pages..page_keys.len()].to_vec());
         let result = self.tree.insert_suffix_from_node(
             prefix_node,
             prefix_pages,
@@ -597,6 +797,8 @@ impl RadixCache {
             page_keys.len() - prefix_pages,
             "SGLang core returned an incomplete canonical suffix"
         );
+        self.refresh_candidate(prefix_node);
+        self.refresh_candidate(last_node);
 
         InsertPageResult {
             last_node,
@@ -638,6 +840,7 @@ impl RadixCache {
         self.tree
             .inc_lock_ref(node_id, ComponentSet::EMPTY)
             .expect("live lock anchor");
+        self.candidates.remove(node_id);
     }
 
     pub fn dec_lock_ref(&mut self, node_id: NodeId) {
@@ -652,6 +855,7 @@ impl RadixCache {
                 false,
             )
             .expect("live lock anchor");
+        self.refresh_candidate(node_id);
     }
 
     /// Evict cache pages in SGLang LRU order.
@@ -669,30 +873,34 @@ impl RadixCache {
             return (pages.len() * self.page_size, pages);
         }
 
-        let mut tracker = HashMap::from([(FULL, 0)]);
         let mut evicted_pages = Vec::with_capacity(target_pages.min(self.tree.evictable_size()));
-        self.tree.evict_device_start(FULL, target_pages);
-        loop {
-            let (candidate, step) = self.tree.evict_device_next_node(FULL, &tracker);
-            absorb_eviction_step(&mut tracker, &mut evicted_pages, step);
-            let Some(candidate) = candidate else {
+        while evicted_pages.len() < target_pages {
+            let Some((candidate, _)) = self.next_victim() else {
                 break;
             };
-
-            let (backup, step) = self
+            let len = self
                 .tree
-                .evict_device_leaf(candidate, false)
+                .full_device_eviction_candidate(candidate)
+                .expect("live eviction candidate")
+                .value
+                .len();
+            // A full-length suffix removes the whole native leaf and returns
+            // its parent without starting the core's all-leaf eviction walk.
+            let (parent, step) = self
+                .tree
+                .evict_full_device_suffix(candidate, len)
                 .expect("live eviction candidate");
-            assert!(
-                backup.is_none(),
-                "write-through eviction requested a backup"
-            );
-            absorb_eviction_step(&mut tracker, &mut evicted_pages, step);
-            if tracker.get(&FULL).copied().unwrap_or(0) >= target_pages {
-                break;
+            assert!(step.host_frees.is_empty());
+            for (component, chunks) in step.device_frees {
+                assert_eq!(component, FULL);
+                for chunk in chunks {
+                    evicted_pages.extend_from_slice(chunk.as_slice());
+                }
+            }
+            if let Some(parent) = parent {
+                self.refresh_candidate(parent);
             }
         }
-        self.tree.evict_device_end(FULL);
 
         self.page_pool.free_pages(&evicted_pages);
         (evicted_pages.len() * self.page_size, evicted_pages)
@@ -736,7 +944,7 @@ impl RadixCache {
     }
 }
 
-fn collect_unretained_pages(actions: Vec<CacheAction<PageValue<KvPageId>>>) -> Vec<KvPageId> {
+fn collect_unretained_pages(actions: Vec<CacheAction<CacheValue>>) -> Vec<KvPageId> {
     let mut pages = Vec::new();
     for action in actions {
         match action {
@@ -758,26 +966,6 @@ fn collect_unretained_pages(actions: Vec<CacheAction<PageValue<KvPageId>>>) -> V
         }
     }
     pages
-}
-
-fn absorb_eviction_step(
-    tracker: &mut HashMap<sglang_radix_tree::ComponentType, usize>,
-    evicted_pages: &mut Vec<KvPageId>,
-    step: sglang_radix_tree::EvictionStepResult<PageValue<KvPageId>>,
-) {
-    for (component, count) in step.tracker {
-        *tracker.entry(component).or_default() += count;
-    }
-    for (component, chunks) in step.device_frees {
-        assert_eq!(component, FULL, "Full-only tree evicted an auxiliary pool");
-        for chunk in chunks {
-            evicted_pages.extend_from_slice(chunk.as_slice());
-        }
-    }
-    assert!(
-        step.host_frees.is_empty(),
-        "device-only simulation tree unexpectedly freed host pages"
-    );
 }
 
 #[cfg(test)]
