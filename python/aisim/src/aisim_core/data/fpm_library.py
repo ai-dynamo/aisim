@@ -85,8 +85,8 @@ class FpmLibraryMetadata(BaseModel):
     backend_version: str | None = None
     coordinate_system: str | None = None
     measurement_policy: str | None = None
-    measurement_repeats: int | None = None
-    warmup_repeats: int | None = None
+    measurement_repeats: int | None = Field(default=None, strict=True)
+    warmup_repeats: int | None = Field(default=None, strict=True)
     metadata_provenance: str | None = None
     configuration_selector: dict[str, JsonValue] | None = Field(
         default=None,
@@ -126,9 +126,9 @@ class FpmLibraryRow(BaseModel):
     moe_ep: int
     cp: int
     workload_kind: str
-    batch_size: int
-    total_prefill_tokens: int
-    total_kv_read_tokens: int
+    batch_size: int = Field(ge=1)
+    total_prefill_tokens: int = Field(ge=0)
+    total_kv_read_tokens: int = Field(ge=0)
     partition_policy: str
     latency_ms: float
     gemm_quant_mode: str
@@ -160,7 +160,7 @@ class FpmMeasurementFile(BaseModel):
     path: str
     format: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    bytes: int = Field(ge=0)
+    bytes: int = Field(ge=0, strict=True)
 
 
 class FpmMeasurementManifest(BaseModel):
@@ -632,7 +632,11 @@ def _link_overlay_entries(source_root: Path, target_root: Path, backend: str, ve
 
 def _link_if_missing(source: Path, target: Path) -> None:
     if not target.exists() and not target.is_symlink():
-        target.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+        try:
+            resolved = source.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise FpmContractError(f"cannot resolve FPM overlay source {source}: {exc}") from exc
+        target.symlink_to(resolved, target_is_directory=resolved.is_dir())
 
 
 def _safe_relative_path(value: Any, field_name: str) -> Path:
@@ -685,8 +689,8 @@ def pending_resources_error(
     return FpmResourcesPendingError(
         f"FPM resources are pending for {where}; supply these fields in the deployment `resources` of the "
         f"fpm_profile, or publish them in a `resources` block of {sidecar}: {', '.join(fields)}. "
-        "Timing queries need only these; cache sizing and replay also need runtime_memory (or all four declared "
-        "non-KV byte fields)",
+        "These fields are needed for cache sizing and replay, along with runtime_memory (or all four declared "
+        "non-KV byte fields). Plain autoregressive timing queries do not require resources",
         fields,
     )
 
@@ -842,7 +846,12 @@ def complete_fpm_profile(
 def with_estimator_path(config: dict[str, Any], parquet_path: Path) -> None:
     """Point the interpolation estimator at the staged library unless the user chose a path."""
     estimator = dict(config.get("estimator_config") or {})
-    interpolation = dict(estimator.get("fpm_interpolation") or {})
+    interpolation = estimator.get("fpm_interpolation")
+    if interpolation is None:
+        interpolation = {}
+    elif not isinstance(interpolation, Mapping):
+        raise FpmContractError("estimator_config.fpm_interpolation must be a mapping")
+    interpolation = dict(interpolation)
     interpolation.setdefault("fpm_parquet_path", str(parquet_path))
     estimator["fpm_interpolation"] = interpolation
     config["estimator_config"] = estimator
