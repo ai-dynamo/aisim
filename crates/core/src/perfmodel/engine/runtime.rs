@@ -1165,11 +1165,13 @@ impl Engine {
                 "qualified Mamba ops need nextn+1 to fit the u32 verify width".into(),
             ));
         }
-        // DSv4.1 staged mixed steps price every context op token-major.
+        // DSv4.1 staged mixed steps price every context op token-major, and
+        // the unstaged mixed walk skips a stage in either phase.
         if seen[0]
             && spec
                 .context_ops
                 .iter()
+                .chain(&spec.generation_ops)
                 .any(|op| matches!(op, Op::Dsv41Stage(_)))
         {
             return Err(AicError::InvalidEngineConfig(
@@ -5586,17 +5588,22 @@ pub(crate) mod tests {
                 })],
             })
         };
-        let err = Engine::build(
-            EngineSpec::new(
-                fixture_engine_config(None),
-                vec![stage(true), qualified_mamba(true, 1)],
-                vec![stage(false), qualified_mamba(false, 1)],
-            ),
-            db.clone(),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("DSv4.1 stages"), "{err}");
+        for (context, generation) in [
+            (vec![stage(true)], vec![stage(false)]),
+            (vec![], vec![stage(false)]),
+        ] {
+            let err = Engine::build(
+                EngineSpec::new(
+                    fixture_engine_config(None),
+                    [context, vec![qualified_mamba(true, 1)]].concat(),
+                    [generation, vec![qualified_mamba(false, 1)]].concat(),
+                ),
+                db.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("DSv4.1 stages"), "{err}");
+        }
         for (context, generation) in [("unrecorded", "float16"), ("float16", "unrecorded")] {
             let err = phases(context, generation).unwrap_err().to_string();
             assert!(err.contains("all record a state_dtype"), "{err}");
