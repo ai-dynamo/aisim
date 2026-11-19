@@ -28,24 +28,152 @@ pub struct Mamba2Op {
     pub head_dim: u32,
     pub n_groups: u32,
     pub chunk_size: u32,
+    /// Recurrent-state dtype. `"unrecorded"` marks a legacy op whose state
+    /// traffic and speculative width are unknown, so mixed steps keep the
+    /// legacy token-major pricing for it.
+    #[serde(default = "default_mamba_state_dtype")]
+    pub state_dtype: String,
+    /// Flattened decode tokens per request (`nextn + 1`). Generation queries
+    /// carry flattened tokens; the measured axis counts requests.
+    #[serde(default = "default_token_width")]
+    pub token_width: u32,
+}
+
+fn default_mamba_state_dtype() -> String {
+    "unrecorded".to_string()
+}
+
+fn default_token_width() -> u32 {
+    1
 }
 
 impl Mamba2Op {
+    /// A convolution kernel by logical label. The physical TRT-LLM
+    /// `causal_conv1d_fn_token_major` label counts only for qualified ops, so
+    /// legacy ops keep their SSM-formula SOL.
+    fn is_conv(&self) -> bool {
+        match self.kernel_source.as_str() {
+            "causal_conv1d_fn" | "causal_conv1d_update" => true,
+            "causal_conv1d_fn_token_major" => self.state_dtype != "unrecorded",
+            _ => false,
+        }
+    }
+
+    /// Why this op's qualification fields are invalid, if they are.
+    pub(crate) fn field_error(&self) -> Option<String> {
+        if !matches!(
+            self.state_dtype.as_str(),
+            "unrecorded" | "float16" | "bfloat16" | "float32"
+        ) {
+            return Some(format!("unsupported state_dtype {:?}", self.state_dtype));
+        }
+        if self.token_width == 0 || (self.state_dtype == "unrecorded" && self.token_width != 1) {
+            return Some(format!(
+                "token_width {} must be positive, and 1 for an unrecorded state_dtype",
+                self.token_width
+            ));
+        }
+        if self.state_dtype != "unrecorded"
+            && !matches!(self.phase.as_str(), "context" | "generation")
+        {
+            return Some(format!(
+                "a qualified op needs phase \"context\" or \"generation\", not {:?}",
+                self.phase
+            ));
+        }
+        // Each supported kernel label runs in one phase only. A qualified op
+        // must use one of them; a legacy op keeps any label.
+        let kernel_phase = match self.kernel_source.as_str() {
+            "causal_conv1d_fn"
+            | "causal_conv1d_fn_token_major"
+            | "mamba_chunk_scan_combined"
+            | "vllm_mamba_chunk_scan_combined_varlen" => Some("context"),
+            "causal_conv1d_update"
+            | "selective_state_update"
+            | "selective_state_update_flashinfer"
+            | "selective_state_update_triton" => Some("generation"),
+            _ => None,
+        };
+        if self.state_dtype == "unrecorded" {
+            return None;
+        }
+        match kernel_phase {
+            None => Some(format!(
+                "unsupported kernel {:?} for a qualified Mamba2 op",
+                self.kernel_source
+            )),
+            Some(phase) if phase != self.phase => Some(format!(
+                "kernel {} runs in the {phase} phase, not {:?}",
+                self.kernel_source, self.phase
+            )),
+            Some(_) => None,
+        }
+    }
+
     pub fn query(
         &self,
         db: &PerfDatabase,
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        self.query_with_prefix(db, batch_size, seq_len, 0)
+    }
+
+    /// [`Self::query`] for a prefill whose first `prefix` tokens are cached.
+    pub fn query_with_prefix(
+        &self,
+        db: &PerfDatabase,
+        batch_size: u32,
+        seq_len: u32,
+        prefix: u32,
+    ) -> Result<PerformanceResult, AicError> {
+        if let Some(why) = self.field_error() {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {}: {why}",
+                self.name
+            )));
+        }
+        // Each request verifies exactly `token_width` decode tokens.
+        if self.phase == "generation" && batch_size % self.token_width != 0 {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {}: decode batch {batch_size} is not a multiple of token_width {}",
+                self.name, self.token_width
+            )));
+        }
+        // A qualified prefill with no new token has no scan work to price.
+        if self.state_dtype != "unrecorded" && self.phase == "context" && seq_len == 0 {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {}: a qualified prefill needs at least one new token",
+                self.name
+            )));
+        }
+        let requests = if self.phase == "generation" {
+            batch_size.div_ceil(self.token_width.max(1))
+        } else {
+            batch_size
+        };
+        // A measured row prices one decode token per request, and the SSM rows
+        // hold a BF16 state (the collectors' dtype). A qualified op that
+        // verifies several tokens or keeps another state dtype has no row, so
+        // it takes the analytic SOL like a table miss. Convolution rows do not
+        // depend on the state dtype. Scan rows start from a cold state, so they
+        // do not measure a prefill that restores a cached prefix's state.
+        let no_measured_row = self.state_dtype != "unrecorded"
+            && ((self.phase == "generation" && self.token_width > 1)
+                || (!self.is_conv()
+                    && (self.state_dtype != "bfloat16"
+                        || (self.phase == "context" && prefix > 0))));
         // SOL (and the retired SOL_FULL alias) never reads the table, as in
         // the GEMM, attention, MoE and mHC operators. Mamba2 has no util-space
         // empirical layer, so EMPIRICAL answers with the same analytic SOL
         // instead of reading measured rows.
-        if matches!(
-            db.database_mode,
-            DatabaseMode::Sol | DatabaseMode::SolFull | DatabaseMode::Empirical
-        ) {
-            let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
+        if no_measured_row
+            || matches!(
+                db.database_mode,
+                DatabaseMode::Sol | DatabaseMode::SolFull | DatabaseMode::Empirical
+            )
+        {
+            let latency = self.sol_latency_ms(db, requests as f64, seq_len as f64);
             return Ok(PerformanceResult::new(latency, Source::Sol)
                 .clamp_non_negative()
                 .scaled(self.scale_factor));
@@ -57,7 +185,7 @@ impl Mamba2Op {
         match db.state_space.query_mamba2(
             &self.kernel_source,
             &self.phase,
-            batch_size,
+            requests,
             seq_len,
             self.d_model,
             self.d_state,
@@ -69,14 +197,22 @@ impl Mamba2Op {
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
             Ok(Some(value)) => {
+                // Convolution rows are cold too. A qualified cached prefill
+                // keeps the cold timing as a proxy, not as a measurement.
+                let source =
+                    if self.state_dtype != "unrecorded" && self.phase == "context" && prefix > 0 {
+                        Source::Estimated
+                    } else {
+                        Source::Silicon
+                    };
                 Ok(
-                    PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
+                    PerformanceResult::with_energy(value.latency, value.energy, source)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
             }
             Ok(None) | Err(AicError::PerfDatabase(_)) => {
-                let latency = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
+                let latency = self.sol_latency_ms(db, requests as f64, seq_len as f64);
                 Ok(PerformanceResult::new(latency, Source::Sol)
                     .clamp_non_negative()
                     .scaled(self.scale_factor))
@@ -85,9 +221,9 @@ impl Mamba2Op {
         }
     }
 
-    /// Mirrors Python `Mamba2Kernel.get_sol()`. `f64` coordinates because the
-    /// perf_interp engine evaluates SOL at blended/snapped anchor points.
-    fn sol_latency_ms(&self, db: &PerfDatabase, batch_size: f64, seq_len: f64) -> f64 {
+    /// Input/output traffic plus, for ops with a recorded state dtype,
+    /// recurrent-state reads and per-token checkpoint writes.
+    fn sol_total_bytes(&self, batch_size: f64, seq_len: f64) -> f64 {
         let nheads = self.nheads as f64;
         let head_dim = self.head_dim as f64;
         let n_groups = self.n_groups as f64;
@@ -97,20 +233,39 @@ impl Mamba2Op {
         let conv_dim = d_inner + 2.0 * n_groups * d_state;
         let x = if self.phase == "context" && seq_len > 0.0 {
             batch_size * seq_len
+        } else if self.phase == "generation" {
+            batch_size * self.token_width as f64
         } else {
             batch_size
         };
-        let total_bytes = match self.kernel_source.as_str() {
-            "causal_conv1d_fn" | "causal_conv1d_update" => {
-                x * conv_dim * (d_conv + 1.0) * 2.0 + x * conv_dim * 2.0
-            }
-            _ => {
-                // SSM kernels (`mamba_chunk_scan_combined` etc.).
-                x * (d_inner + n_groups * d_state * 2.0 + nheads) * 2.0 + x * d_inner * 2.0
-            }
-        };
-        let mem_bw = db.system_spec.gpu.mem_bw.max(1.0);
-        total_bytes / mem_bw * 1000.0
+        if self.is_conv() {
+            x * conv_dim * (d_conv + 1.0) * 2.0 + x * conv_dim * 2.0
+        } else {
+            // SSM kernels (`mamba_chunk_scan_combined` etc.).
+            let state_bytes = if matches!(self.state_dtype.as_str(), "float16" | "bfloat16") {
+                2.0
+            } else {
+                4.0
+            };
+            let writes = if self.phase == "generation" {
+                self.token_width as f64
+            } else {
+                1.0
+            };
+            // Legacy ops use unsharded shapes and unknown state precision.
+            let recurrent = if self.state_dtype == "unrecorded" {
+                0.0
+            } else {
+                batch_size * d_inner * d_state * state_bytes * (1.0 + writes)
+            };
+            x * (d_inner + n_groups * d_state * 2.0 + nheads) * 2.0 + x * d_inner * 2.0 + recurrent
+        }
+    }
+
+    /// Mirrors Python `Mamba2Kernel.get_sol()`. `f64` coordinates because the
+    /// perf_interp engine evaluates SOL at blended/snapped anchor points.
+    fn sol_latency_ms(&self, db: &PerfDatabase, batch_size: f64, seq_len: f64) -> f64 {
+        self.sol_total_bytes(batch_size, seq_len) / db.system_spec.gpu.mem_bw.max(1.0) * 1000.0
     }
 }
 
@@ -569,6 +724,75 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn mamba_recurrent_traffic_accounts_for_state_precision_and_verify_writes() {
+        let mut op = super::Mamba2Op {
+            name: "ssu".into(),
+            scale_factor: 1.0,
+            kernel_source: "selective_state_update_flashinfer".into(),
+            phase: "generation".into(),
+            d_model: 4096,
+            d_state: 128,
+            d_conv: 4,
+            nheads: 64,
+            head_dim: 64,
+            n_groups: 4,
+            chunk_size: 128,
+            state_dtype: "float16".into(),
+            token_width: 1,
+        };
+        // Per request: 18,560 activation bytes and a 1 MiB FP16 state.
+        // Width one reads/writes the state once. Width four writes four checkpoints.
+        assert_eq!(op.sol_total_bytes(2.0, 0.0), 4_231_424.0);
+        op.token_width = 4;
+        assert_eq!(op.sol_total_bytes(2.0, 0.0), 10_634_240.0);
+        op.state_dtype = "float32".into();
+        assert_eq!(op.sol_total_bytes(2.0, 0.0), 21_120_000.0);
+        op.state_dtype = "unrecorded".into();
+        assert_eq!(op.sol_total_bytes(2.0, 0.0), 8.0 * 18_560.0);
+        // The physical TRT-LLM convolution label prices as convolution.
+        op.phase = "context".into();
+        op.state_dtype = "float32".into();
+        op.token_width = 1;
+        op.kernel_source = "causal_conv1d_fn".into();
+        let logical = op.sol_total_bytes(2.0, 16.0);
+        op.kernel_source = "causal_conv1d_fn_token_major".into();
+        assert_eq!(op.sol_total_bytes(2.0, 16.0), logical);
+        // Decode width never scales context work, even without a sequence length.
+        let unit = op.sol_total_bytes(2.0, 0.0);
+        op.token_width = 4;
+        assert_eq!(op.sol_total_bytes(2.0, 0.0), unit);
+        // A legacy op keeps main's SSM formula for the physical label: 32 tokens * 18,560 bytes.
+        op.token_width = 1;
+        op.state_dtype = "unrecorded".into();
+        assert_eq!(op.sol_total_bytes(2.0, 16.0), 593_920.0);
+        // A qualified op needs an exact phase; a legacy op keeps its old checks.
+        op.phase = "generaton".into();
+        assert_eq!(op.field_error(), None);
+        op.state_dtype = "float16".into();
+        assert!(op.field_error().unwrap().contains("needs phase"));
+        // A known kernel label fixes its phase.
+        op.phase = "generation".into();
+        assert!(
+            op.field_error()
+                .unwrap()
+                .contains("runs in the context phase")
+        );
+        op.kernel_source = "causal_conv1d_update".into();
+        assert_eq!(op.field_error(), None);
+        op.phase = "context".into();
+        assert!(
+            op.field_error()
+                .unwrap()
+                .contains("runs in the generation phase")
+        );
+        // A qualified op must name a supported kernel; a legacy op may not.
+        op.kernel_source = "causal_conv1d_updte".into();
+        assert!(op.field_error().unwrap().contains("unsupported kernel"));
+        op.state_dtype = "unrecorded".into();
+        assert_eq!(op.field_error(), None);
+    }
+
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane
     /// (AIC-1745 Task 4, Rust twin of Task 3's
     /// `test_flashinfer_lane_sol_matches_census_at_bs128`,
@@ -841,6 +1065,8 @@ mod tests {
             head_dim: 64,
             n_groups: 4,
             chunk_size: 128,
+            state_dtype: "unrecorded".into(),
+            token_width: 1,
         };
         let measured = op("causal_conv1d_update").query(&db, 2, 1024).unwrap();
         assert_eq!(measured.source, Source::Silicon);
@@ -894,6 +1120,8 @@ mod tests {
             head_dim: 64,
             n_groups: 2,
             chunk_size: 128,
+            state_dtype: "unrecorded".into(),
+            token_width: 1,
         };
         let expected = 9_437_184.0 / 7.7e12 * 1000.0 * 2.0;
         for mode in [DatabaseMode::Silicon, DatabaseMode::Hybrid] {
@@ -907,6 +1135,94 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// A measured scan row starts from a cold state. A qualified BF16 prefill
+    /// with the same new-token count but a cached prefix restores a state, so
+    /// it takes SOL. The cold query and a legacy op keep the measured row. A
+    /// cached qualified convolution keeps its cold row as an `estimated` proxy.
+    #[test]
+    fn qualified_cached_prefill_scan_does_not_read_cold_rows() {
+        use crate::common::enums::{DatabaseMode, TransferPolicy};
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str(
+                    "kernel_source",
+                    vec!["mamba_chunk_scan_combined", "causal_conv1d_fn"],
+                ),
+                Col::Str("phase", vec!["context"; 2]),
+                Col::I64("batch_size", vec![2; 2]),
+                Col::I64("seq_len", vec![512; 2]),
+                Col::I64("d_model", vec![1024; 2]),
+                Col::I64("d_state", vec![64; 2]),
+                Col::I64("d_conv", vec![4; 2]),
+                Col::I64("nheads", vec![16; 2]),
+                Col::I64("head_dim", vec![64; 2]),
+                Col::I64("n_groups", vec![4; 2]),
+                Col::I64("chunk_size", vec![128; 2]),
+                Col::F64("latency", vec![0.5, 0.25]),
+            ],
+        );
+        let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+            .expect("load")
+            .with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        let op = |state_dtype: &str| Mamba2Op {
+            name: "context_ssm".into(),
+            scale_factor: 1.0,
+            kernel_source: "mamba_chunk_scan_combined".into(),
+            phase: "context".into(),
+            d_model: 1024,
+            d_state: 64,
+            d_conv: 4,
+            nheads: 16,
+            head_dim: 64,
+            n_groups: 4,
+            chunk_size: 128,
+            state_dtype: state_dtype.into(),
+            token_width: 1,
+        };
+        let qualified = op("bfloat16");
+        let cold = qualified.query_with_prefix(&db, 2, 512, 0).unwrap();
+        assert_eq!((cold.source, cold.latency_ms), (Source::Silicon, 0.5));
+        let cached = qualified.query_with_prefix(&db, 2, 512, 256).unwrap();
+        assert_eq!(cached.source, Source::Sol);
+        // 1024 tokens of (1024 + 2 * 4 * 64 + 16) * 2 + 1024 * 2 = 5,152 bytes,
+        // plus two 128 KiB BF16 states each read and written once.
+        assert_eq!(cached.latency_ms, 5_799_936.0 / 7.7e12 * 1000.0);
+        let legacy = op("unrecorded")
+            .query_with_prefix(&db, 2, 512, 256)
+            .unwrap();
+        assert_eq!((legacy.source, legacy.latency_ms), (Source::Silicon, 0.5));
+        // A fully cached qualified prefill has no new token to scan.
+        let err = qualified.query_with_prefix(&db, 2, 0, 512).unwrap_err();
+        assert!(err.to_string().contains("at least one new token"), "{err}");
+
+        let conv = |state_dtype: &str| Mamba2Op {
+            name: "context_conv1d".into(),
+            kernel_source: "causal_conv1d_fn".into(),
+            ..op(state_dtype)
+        };
+        let cold = conv("bfloat16").query_with_prefix(&db, 2, 512, 0).unwrap();
+        assert_eq!((cold.source, cold.latency_ms), (Source::Silicon, 0.25));
+        let cached = conv("bfloat16")
+            .query_with_prefix(&db, 2, 512, 256)
+            .unwrap();
+        assert_eq!(
+            (cached.source, cached.latency_ms),
+            (Source::Estimated, 0.25)
+        );
+        let legacy = conv("unrecorded")
+            .query_with_prefix(&db, 2, 512, 256)
+            .unwrap();
+        assert_eq!((legacy.source, legacy.latency_ms), (Source::Silicon, 0.25));
     }
 
     /// Mamba2 follows the database-mode semantics of the other table-backed
@@ -963,6 +1279,8 @@ mod tests {
             head_dim: 64,
             n_groups: 4,
             chunk_size: 128,
+            state_dtype: "unrecorded".into(),
+            token_width: 1,
         };
         let context = op("causal_conv1d_fn", "context");
         let decode = op("causal_conv1d_update", "generation");

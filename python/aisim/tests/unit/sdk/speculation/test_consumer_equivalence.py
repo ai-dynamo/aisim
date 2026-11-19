@@ -666,6 +666,7 @@ def test_mixed_draft_native_phases_match_independent_queries(real_database, ctx_
 
 def _assert_public_mixed_rows(estimate, native):
     """Compare the public report with executed native rows, without repricing."""
+    native = native[:3]
     rows = [row for group in native for row in group]
     names = {row[0] for row in rows} | {"context_attention", "generation_attention"}
     public_names = {"context_attention (scaled)" if name == "context_attention" else name for name in names}
@@ -772,6 +773,7 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
             ("draft_eagle_fc", 11.0, 110.0, "sol", (generation_fallback, [])),
             ("draft_eagle_fc", 13.0, 130.0, "silicon", (generation_fallback, [])),
         ],
+        41.0,
     )
     handle = SimpleNamespace(
         _mixed_step_breakdown_per_op_with_metadata=lambda *args, **kwargs: native, last_provenance=lambda: None

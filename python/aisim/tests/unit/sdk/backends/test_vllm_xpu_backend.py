@@ -453,3 +453,39 @@ def test_direct_run_mixed_is_independent_of_call_history(monkeypatch) -> None:
     second = backend.run_mixed(MagicMock(), MagicMock(), rc, step)
     assert first == second == step
     assert [c for c in captured_direct if c == step] == [step, step]
+
+
+@pytest.mark.parametrize(("forward_model", "context_tokens"), [("op_level", 4096), ("fpm", 1096)])
+def test_compute_ttft_single_request_feeds_the_step_its_model_tokens(monkeypatch, forward_model, context_tokens):
+    # One request, isl 4096 with 3000 cached tokens, under run_agg's one-step TTFT
+    # budget of isl: op-level pricing reads the prompt, a whole-model FPM reads
+    # the 1096 new tokens, and either step is one request's whole prefill.
+    backend = VLLMXPUBackend()
+    model = MagicMock(forward_model=forward_model, _num_layers=10)
+    seen = []
+
+    def run_mixed(self, _model, _database, _runtime, step):
+        seen.append(step.context_tokens)
+        return StepEstimate(latency_ms=40.0, energy_wms=0.0, context_tokens=step.context_tokens)
+
+    monkeypatch.setattr(VLLMXPUBackend, "run_mixed", run_mixed)
+    ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 4096, 10, 4096, 3000, **_ttft_kwargs())
+    assert seen == [context_tokens]
+    assert ttft == pytest.approx(40.0 + 10 * 0.3)
+
+
+@pytest.mark.parametrize(("forward_model", "prefill_ms"), [("op_level", 40.0 * 4096 / 2048), ("fpm", 40.0 * 2)])
+def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch, forward_model, prefill_ms):
+    # 3000 new tokens under a 2048-token budget: an FPM step prices the mean of the
+    # 2048- and 952-token chunks, so one request's prefill is two chunks, not 3000/2048.
+    backend = VLLMXPUBackend()
+    model = MagicMock(forward_model=forward_model, _num_layers=10)
+    monkeypatch.setattr(
+        VLLMXPUBackend,
+        "run_mixed",
+        lambda self, _m, _d, _r, step: StepEstimate(
+            latency_ms=40.0, energy_wms=0.0, context_tokens=step.context_tokens
+        ),
+    )
+    ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 4096, 10, 2048, 1096, **_ttft_kwargs())
+    assert ttft == pytest.approx(prefill_ms + 10 * 0.3)

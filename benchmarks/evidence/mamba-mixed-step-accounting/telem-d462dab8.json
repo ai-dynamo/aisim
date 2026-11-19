@@ -1,0 +1,229 @@
+{
+ "config": {
+  "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+  "system": "b200_sxm",
+  "backend": "trtllm",
+  "backend_version": "1.3.0rc20",
+  "estimation_mode": "op_level",
+  "nextn": 3,
+  "tp": 1,
+  "moe_tp_size": 1,
+  "moe_ep_size": 1,
+  "fallback_policy": "deny",
+  "worker_type": "aggregated",
+  "database_mode": "HYBRID"
+ },
+ "qualification": {
+  "state_dtype": "bfloat16",
+  "token_width_generation": 4
+ },
+ "cases": {
+  "pure_decode_8req": {
+   "forward_pass_metrics": {
+    "scheduled_requests": {
+     "num_decode_requests": 32,
+     "sum_decode_kv_tokens": 32800
+    }
+   },
+   "total_ms": 9.033768855441256,
+   "mamba_ops": [
+    {
+     "name": "generation_mamba_norm",
+     "latency_ms": 0.0756983076923077,
+     "source": "empirical"
+    },
+    {
+     "name": "generation_mamba_in_proj_gemm",
+     "latency_ms": 0.29595528284765604,
+     "source": "silicon"
+    },
+    {
+     "name": "generation_mamba_conv1d",
+     "latency_ms": 0.00745381978021978,
+     "source": "sol"
+    },
+    {
+     "name": "generation_mamba_ssm",
+     "latency_ms": 0.13459579780219777,
+     "source": "sol"
+    },
+    {
+     "name": "generation_mamba_out_proj_gemm",
+     "latency_ms": 0.20478656361769262,
+     "source": "silicon"
+    },
+    {
+     "name": "generation_mamba_ar",
+     "latency_ms": 0.0,
+     "source": "empirical"
+    }
+   ],
+   "non_mamba_ms": 8.315279083701181
+  },
+  "mixed_1x2048_plus_8req": {
+   "forward_pass_metrics": {
+    "scheduled_requests": {
+     "num_prefill_requests": 1,
+     "sum_prefill_tokens": 2048,
+     "num_decode_requests": 32,
+     "sum_decode_kv_tokens": 32800
+    }
+   },
+   "total_ms": 20.74584264890688,
+   "mamba_ops": [
+    {
+     "name": "context_mamba_norm",
+     "latency_ms": 0.23600509090909091,
+     "source": "empirical"
+    },
+    {
+     "name": "context_mamba_in_proj_gemm",
+     "latency_ms": 1.7345212855670078,
+     "source": "silicon"
+    },
+    {
+     "name": "context_mamba_conv1d",
+     "latency_ms": 0.5073983907699585,
+     "source": "silicon"
+    },
+    {
+     "name": "context_mamba_ssm",
+     "latency_ms": 0.132331652987013,
+     "source": "sol"
+    },
+    {
+     "name": "context_mamba_out_proj_gemm",
+     "latency_ms": 0.7503848629722198,
+     "source": "silicon"
+    },
+    {
+     "name": "context_mamba_ar",
+     "latency_ms": 0.0,
+     "source": "empirical"
+    },
+    {
+     "name": "generation_mamba_conv1d",
+     "latency_ms": 0.00745381978021978,
+     "source": "sol"
+    },
+    {
+     "name": "generation_mamba_ssm",
+     "latency_ms": 0.13459579780219777,
+     "source": "sol"
+    }
+   ],
+   "non_mamba_ms": 17.243151748119168
+  }
+ },
+ "diagnostics": {
+  "source": "aic",
+  "readiness": "ready",
+  "retained_observations": 0,
+  "correction_ready_buckets": 0,
+  "last_warning": null,
+  "provenance": {
+   "config": {
+    "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "system": "b200_sxm",
+    "backend": "trtllm",
+    "worker_type": "aggregated",
+    "backend_version": "1.3.0rc20",
+    "fpm_profile": null,
+    "tp": 1,
+    "pp": 1,
+    "attention_dp": 1,
+    "dcp": null,
+    "moe_tp_size": 1,
+    "moe_ep_size": 1,
+    "gemm_quant_mode": null,
+    "moe_quant_mode": null,
+    "fmha_quant_mode": null,
+    "fpm_fmha_quant_mode": null,
+    "kvcache_quant_mode": null,
+    "comm_quant_mode": null,
+    "nextn": 3,
+    "speculation": null,
+    "kv_block_size": null,
+    "decoder_replay": false,
+    "estimation_mode": "op_level",
+    "database_mode": "HYBRID",
+    "transfer_policy": [
+     "xshape",
+     "xquant",
+     "xprofile",
+     "xop"
+    ],
+    "systems_paths": [
+     "/tmp/ais6-d462/venv/lib/python3.13/site-packages/aisim_core/systems"
+    ],
+    "fallback_policy": "deny",
+    "estimator_config": {
+     "features": {
+      "attention_kv_weight": 1.0,
+      "prefill_attention_pair_weight": 1.0,
+      "ffn_token_weight": 1.0
+     },
+     "op_level": {},
+     "fpm_interpolation": {
+      "method": "sol"
+     },
+     "fpm_regression": {
+      "sampling": {
+       "bins_per_axis": [
+        4,
+        4
+       ],
+       "max_observations": 64
+      },
+      "min_observations": 5,
+      "fit": {
+       "kind": "standardized_nnls",
+       "singular_ridge_scale": 1e-09,
+       "rebuild_interval": null
+      }
+     },
+     "correction": {
+      "enabled": true,
+      "feature_space": "legacy_workload",
+      "sampling": {
+       "bins_per_axis": [
+        4,
+        4
+       ],
+       "max_observations": 64
+      },
+      "min_observations": 5,
+      "factor_bounds": {
+       "min": 0.5,
+       "max": 2.0
+      },
+      "max_num_tokens": 8192,
+      "max_batch_size": 512,
+      "max_kv_tokens": 2000000
+     }
+    },
+    "attention_backend": null,
+    "moe_kernel_source": null,
+    "moe_backend": null,
+    "enable_eplb": false,
+    "wideep_num_slots": null,
+    "enable_shared_layer": null,
+    "strict_provenance": false
+   },
+   "selected_systems_root": "/tmp/ais6-d462/venv/lib/python3.13/site-packages/aisim_core/systems",
+   "requested_estimation_mode": "op_level",
+   "selected_estimation_mode": "op_level",
+   "selection_failures": [],
+   "requested_database_mode": "HYBRID",
+   "selected_database_mode": "HYBRID"
+  }
+ },
+ "performance_data": {
+  "method": "systems_tree_sha256_v1",
+  "system": "b200_sxm",
+  "data_dir": "data/b200_sxm",
+  "sha256": "0babf8aeb4277e466d03c79c2f9c2fb8106132f238c3b04e44e72817f789bceb",
+  "file_count": 340,
+  "size_bytes": 39306278
+ }
+}

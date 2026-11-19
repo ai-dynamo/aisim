@@ -1,0 +1,159 @@
+{
+ "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+ "system": "b200_sxm",
+ "backend": "trtllm",
+ "version": "1.3.0rc20",
+ "mode": "HYBRID",
+ "cases": {
+  "one_request_budget_above_new_tokens": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 4096,
+    "osl": 64,
+    "prefix": 3000,
+    "ctx_tokens": 2048
+   },
+   "ttft_ms": 29.01,
+   "tpot_ms": 2.616,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 0.3481049886206165,
+    "context_mamba_in_proj_gemm": 1.0659807007336703,
+    "context_mamba_norm": 0.15699883636363637,
+    "context_mamba_out_proj_gemm": 0.4427862161036474,
+    "context_mamba_ssm": 0.0737299948051948
+   },
+   "mix_step_non_mamba_ms": 13.180793682949433
+  },
+  "one_request_budget_above_prompt": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 4096,
+    "osl": 64,
+    "prefix": 3000,
+    "ctx_tokens": 8192
+   },
+   "ttft_ms": 29.01,
+   "tpot_ms": 2.616,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 0.3481049886206165,
+    "context_mamba_in_proj_gemm": 1.0659807007336703,
+    "context_mamba_norm": 0.15699883636363637,
+    "context_mamba_out_proj_gemm": 0.4427862161036474,
+    "context_mamba_ssm": 0.0737299948051948
+   },
+   "mix_step_non_mamba_ms": 13.180793682949433
+  },
+  "one_request_exact_prompt_budget": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 4096,
+    "osl": 64,
+    "prefix": 3000,
+    "ctx_tokens": 4096
+   },
+   "ttft_ms": 29.01,
+   "tpot_ms": 2.616,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 0.3481049886206165,
+    "context_mamba_in_proj_gemm": 1.0659807007336703,
+    "context_mamba_norm": 0.15699883636363637,
+    "context_mamba_out_proj_gemm": 0.4427862161036474,
+    "context_mamba_ssm": 0.0737299948051948
+   },
+   "mix_step_non_mamba_ms": 13.180793682949433
+  },
+  "two_complete_cached_requests": {
+   "inputs": {
+    "batch_size": 16,
+    "isl": 4096,
+    "osl": 64,
+    "prefix": 3000,
+    "ctx_tokens": 8192
+   },
+   "ttft_ms": 49.379,
+   "tpot_ms": 7.577,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 0.5750017275568098,
+    "context_mamba_in_proj_gemm": 1.7983627437282501,
+    "context_mamba_norm": 0.24612174545454546,
+    "context_mamba_out_proj_gemm": 0.7972891632087158,
+    "context_mamba_ssm": 0.1474599896103896,
+    "generation_mamba_conv1d": 0.08710560137405991,
+    "generation_mamba_ssm": 0.08856087272727273
+   },
+   "mix_step_non_mamba_ms": 18.20612757934315
+  },
+  "split_budget_cached": {
+   "inputs": {
+    "batch_size": 16,
+    "isl": 4096,
+    "osl": 64,
+    "prefix": 1024,
+    "ctx_tokens": 8128
+   },
+   "ttft_ms": 91.943,
+   "tpot_ms": 9.607,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 1.1691359743475913,
+    "context_mamba_in_proj_gemm": 5.378181049029061,
+    "context_mamba_norm": 0.5634314181818181,
+    "context_mamba_out_proj_gemm": 2.3207003819186753,
+    "context_mamba_ssm": 0.3907307387012987,
+    "generation_mamba_conv1d": 0.08710560137405991,
+    "generation_mamba_ssm": 0.08856087272727273
+   },
+   "mix_step_non_mamba_ms": 29.97734086023396
+  },
+  "chunked_uncached": {
+   "inputs": {
+    "batch_size": 16,
+    "isl": 6000,
+    "osl": 64,
+    "prefix": 0,
+    "ctx_tokens": 2048
+   },
+   "ttft_ms": 251.36,
+   "tpot_ms": 16.874,
+   "mix_step_mamba_ms": {
+    "context_mamba_ar": 0.0,
+    "context_mamba_conv1d": 0.5073983907699585,
+    "context_mamba_in_proj_gemm": 1.7258969997521862,
+    "context_mamba_norm": 0.23464014545454548,
+    "context_mamba_out_proj_gemm": 0.7440175549232889,
+    "context_mamba_ssm": 0.132331652987013,
+    "generation_mamba_conv1d": 0.08646160182543099,
+    "generation_mamba_ssm": 0.09488664935064936
+   },
+   "mix_step_non_mamba_ms": 17.421055602181674
+  }
+ },
+ "same_session_prefixes": {
+  "inputs": {
+   "batch_size": 1,
+   "isl": 4096,
+   "osl": 64,
+   "ctx_tokens": 2048,
+   "prefixes": [
+    0,
+    3000,
+    3000
+   ]
+  },
+  "context_mamba_ssm_ms": [
+   0.132331652987013,
+   0.0737299948051948,
+   0.0737299948051948
+  ],
+  "ttft_ms": [
+   79.852,
+   29.01,
+   29.01
+  ],
+  "repeat_reuses_result": true
+ }
+}

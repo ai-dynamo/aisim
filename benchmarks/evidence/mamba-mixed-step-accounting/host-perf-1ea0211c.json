@@ -1,0 +1,634 @@
+{
+ "rbf1b539f": {
+  "qwen3-32b/silicon/context/bs1-isl1024": {
+   "cold": [
+    54.539,
+    52.461,
+    54.979
+   ],
+   "warm": [
+    14.186499999999999,
+    14.076,
+    14.030000000000001
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl8192": {
+   "cold": [
+    35.155,
+    39.027,
+    35.189
+   ],
+   "warm": [
+    13.9475,
+    13.8945,
+    13.903
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl32768": {
+   "cold": [
+    246.511,
+    254.816,
+    256.813
+   ],
+   "warm": [
+    15.717,
+    15.5405,
+    15.553
+   ]
+  },
+  "qwen3-32b/silicon/context/bs4-isl4096": {
+   "cold": [
+    37.786,
+    38.601,
+    43.953
+   ],
+   "warm": [
+    14.052499999999998,
+    14.194500000000001,
+    13.991
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs1-isl1024": {
+   "cold": [
+    49.519,
+    53.585,
+    47.883
+   ],
+   "warm": [
+    24.691499999999998,
+    25.2365,
+    24.454
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl1024": {
+   "cold": [
+    49.629,
+    50.437,
+    49.997
+   ],
+   "warm": [
+    24.948,
+    25.501,
+    24.9055
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs128-isl1024": {
+   "cold": [
+    49.101,
+    48.044,
+    65.53
+   ],
+   "warm": [
+    24.8315,
+    25.0685,
+    26.531
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl8192": {
+   "cold": [
+    30.133,
+    31.224,
+    30.496
+   ],
+   "warm": [
+    25.631500000000003,
+    25.58,
+    24.9655
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs8-isl32768": {
+   "cold": [
+    48.076,
+    48.844,
+    48.3
+   ],
+   "warm": [
+    25.478,
+    25.6305,
+    25.3795
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl1024-prefix0": {
+   "cold": [
+    59.829,
+    57.234,
+    57.318
+   ],
+   "warm": [
+    20.4675,
+    20.6145,
+    20.6925
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl32768-prefix0": {
+   "cold": [
+    369.088,
+    374.703,
+    400.043
+   ],
+   "warm": [
+    22.066499999999998,
+    22.3615,
+    22.6235
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs1-isl1024-prefix0": {
+   "cold": [
+    75.985,
+    79.491,
+    76.766
+   ],
+   "warm": [
+    41.808,
+    41.934,
+    41.596999999999994
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs128-isl1024-prefix0": {
+   "cold": [
+    87.198,
+    73.854,
+    72.721
+   ],
+   "warm": [
+    42.3495,
+    42.4465,
+    42.0465
+   ]
+  }
+ },
+ "r9eaa66e8": {
+  "qwen3-32b/silicon/context/bs1-isl1024": {
+   "cold": [
+    49.882,
+    53.466,
+    62.646
+   ],
+   "warm": [
+    14.0815,
+    14.529499999999999,
+    14.3385
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl8192": {
+   "cold": [
+    36.636,
+    35.451,
+    34.066
+   ],
+   "warm": [
+    14.278,
+    14.516,
+    14.2805
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl32768": {
+   "cold": [
+    248.838,
+    267.497,
+    266.345
+   ],
+   "warm": [
+    15.904499999999999,
+    17.3415,
+    16.016
+   ]
+  },
+  "qwen3-32b/silicon/context/bs4-isl4096": {
+   "cold": [
+    38.382,
+    39.923,
+    37.215
+   ],
+   "warm": [
+    14.0805,
+    14.4465,
+    14.2675
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs1-isl1024": {
+   "cold": [
+    49.184,
+    48.717,
+    47.475
+   ],
+   "warm": [
+    24.8075,
+    25.6115,
+    24.822
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl1024": {
+   "cold": [
+    48.082,
+    47.305,
+    46.685
+   ],
+   "warm": [
+    25.03,
+    25.039,
+    25.130000000000003
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs128-isl1024": {
+   "cold": [
+    47.712,
+    47.198,
+    47.243
+   ],
+   "warm": [
+    24.739,
+    24.691,
+    24.801000000000002
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl8192": {
+   "cold": [
+    31.231,
+    32.035,
+    31.171
+   ],
+   "warm": [
+    25.3705,
+    25.503999999999998,
+    25.348
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs8-isl32768": {
+   "cold": [
+    46.835,
+    46.736,
+    46.09
+   ],
+   "warm": [
+    25.180999999999997,
+    25.227,
+    25.221
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl1024-prefix0": {
+   "cold": [
+    58.202,
+    56.77,
+    57.468
+   ],
+   "warm": [
+    20.816000000000003,
+    20.86,
+    20.886000000000003
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl32768-prefix0": {
+   "cold": [
+    363.396,
+    358.727,
+    364.241
+   ],
+   "warm": [
+    22.416,
+    22.642,
+    22.4155
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs1-isl1024-prefix0": {
+   "cold": [
+    77.438,
+    77.357,
+    80.175
+   ],
+   "warm": [
+    42.8835,
+    43.158,
+    42.812
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs128-isl1024-prefix0": {
+   "cold": [
+    73.611,
+    75.047,
+    79.661
+   ],
+   "warm": [
+    42.323,
+    42.9445,
+    43.1465
+   ]
+  }
+ },
+ "r1ea0211c": {
+  "qwen3-32b/silicon/context/bs1-isl1024": {
+   "cold": [
+    56.659,
+    54.868,
+    62.883
+   ],
+   "warm": [
+    17.03,
+    17.076500000000003,
+    17.549
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl8192": {
+   "cold": [
+    38.966,
+    38.539,
+    57.745
+   ],
+   "warm": [
+    17.1005,
+    19.1095,
+    17.552
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl32768": {
+   "cold": [
+    257.352,
+    256.626,
+    259.368
+   ],
+   "warm": [
+    18.9955,
+    18.785,
+    18.906
+   ]
+  },
+  "qwen3-32b/silicon/context/bs4-isl4096": {
+   "cold": [
+    39.157,
+    40.073,
+    40.098
+   ],
+   "warm": [
+    17.2865,
+    17.1975,
+    17.3695
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs1-isl1024": {
+   "cold": [
+    53.478,
+    51.49,
+    52.515
+   ],
+   "warm": [
+    27.682,
+    28.110500000000002,
+    27.938499999999998
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl1024": {
+   "cold": [
+    52.394,
+    52.274,
+    55.548
+   ],
+   "warm": [
+    28.0455,
+    28.0805,
+    28.192
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs128-isl1024": {
+   "cold": [
+    51.407,
+    50.372,
+    52.254
+   ],
+   "warm": [
+    27.833,
+    27.8995,
+    27.877000000000002
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl8192": {
+   "cold": [
+    35.643,
+    34.7,
+    34.52
+   ],
+   "warm": [
+    28.355,
+    31.98,
+    29.173499999999997
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs8-isl32768": {
+   "cold": [
+    51.205,
+    60.989,
+    55.777
+   ],
+   "warm": [
+    28.4605,
+    31.7485,
+    28.5865
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl1024-prefix0": {
+   "cold": [
+    64.031,
+    65.441,
+    66.185
+   ],
+   "warm": [
+    24.468,
+    24.4955,
+    24.197499999999998
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl32768-prefix0": {
+   "cold": [
+    368.215,
+    359.724,
+    371.184
+   ],
+   "warm": [
+    25.6505,
+    26.005000000000003,
+    25.771
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs1-isl1024-prefix0": {
+   "cold": [
+    81.081,
+    86.195,
+    81.766
+   ],
+   "warm": [
+    46.464,
+    45.721000000000004,
+    45.57
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs128-isl1024-prefix0": {
+   "cold": [
+    77.691,
+    76.188,
+    83.133
+   ],
+   "warm": [
+    46.253,
+    46.185500000000005,
+    45.703500000000005
+   ]
+  }
+ },
+ "r59c4575a": {
+  "qwen3-32b/silicon/context/bs1-isl1024": {
+   "cold": [
+    54.709,
+    53.898,
+    53.246
+   ],
+   "warm": [
+    14.805499999999999,
+    14.721499999999999,
+    14.295
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl8192": {
+   "cold": [
+    35.659,
+    35.976,
+    37.463
+   ],
+   "warm": [
+    14.909500000000001,
+    15.1345,
+    14.413
+   ]
+  },
+  "qwen3-32b/silicon/context/bs1-isl32768": {
+   "cold": [
+    255.283,
+    272.643,
+    256.394
+   ],
+   "warm": [
+    16.848,
+    18.1315,
+    16.291
+   ]
+  },
+  "qwen3-32b/silicon/context/bs4-isl4096": {
+   "cold": [
+    38.157,
+    38.477,
+    39.035
+   ],
+   "warm": [
+    15.243,
+    15.1025,
+    14.5375
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs1-isl1024": {
+   "cold": [
+    61.887,
+    49.749,
+    48.936
+   ],
+   "warm": [
+    25.4925,
+    25.319000000000003,
+    25.250500000000002
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl1024": {
+   "cold": [
+    48.392,
+    48.993,
+    48.799
+   ],
+   "warm": [
+    25.7975,
+    25.656,
+    25.372
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs128-isl1024": {
+   "cold": [
+    47.439,
+    51.386,
+    49.239
+   ],
+   "warm": [
+    25.392,
+    25.378999999999998,
+    25.223
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs32-isl8192": {
+   "cold": [
+    31.656,
+    32.325,
+    31.827
+   ],
+   "warm": [
+    25.8385,
+    25.921,
+    25.7035
+   ]
+  },
+  "qwen3-32b/silicon/generation/bs8-isl32768": {
+   "cold": [
+    48.507,
+    49.742,
+    48.436
+   ],
+   "warm": [
+    26.389,
+    26.1005,
+    26.015
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl1024-prefix0": {
+   "cold": [
+    59.577,
+    69.659,
+    60.661
+   ],
+   "warm": [
+    21.5465,
+    23.8815,
+    21.5955
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/context/bs1-isl32768-prefix0": {
+   "cold": [
+    365.823,
+    423.359,
+    353.097
+   ],
+   "warm": [
+    23.2505,
+    25.913,
+    23.261000000000003
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs1-isl1024-prefix0": {
+   "cold": [
+    82.274,
+    88.847,
+    81.0
+   ],
+   "warm": [
+    42.7035,
+    48.075500000000005,
+    43.3185
+   ]
+  },
+  "nemotron-3-super-120b-fp8-h100_sxm-vllm-0.24.0-tp8-pp1-adp1-mtp1-ep8/silicon/generation/bs128-isl1024-prefix0": {
+   "cold": [
+    79.107,
+    81.611,
+    73.484
+   ],
+   "warm": [
+    43.0685,
+    44.467,
+    43.727999999999994
+   ]
+  }
+ }
+}

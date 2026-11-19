@@ -17,6 +17,22 @@ class MixedStepInput:
     ``num_decode_requests`` is the number of logical decode sequences. It is
     deliberately distinct from the target-model query-token count, which is
     derived from the model's speculative draft depth.
+
+    For op-level pricing, ``context_tokens`` is the packed prompt budget in
+    full prompt tokens:
+    ``context_tokens // isl`` complete requests of the effective ``isl``
+    tokens, prefix included. A nonzero remainder adds one partial request,
+    and an exact multiple of ``isl`` has none. A qualified Mamba op caps that
+    partial request at ``isl - prefix`` new tokens. The budget is not the
+    count of newly scheduled tokens after prefix-cache hits. A whole-model FPM
+    instead reads ``context_tokens`` as new tokens. If the budget holds at
+    least one request's ``isl - prefix`` new tokens, it derives
+    ``ceil(context_tokens / (isl - prefix))`` requests, each with ``prefix``
+    cached tokens, and one query holds ``context_tokens`` new tokens plus the
+    packed decode tokens. A smaller budget splits one request into chunks of
+    at most ``context_tokens`` new tokens. Each chunk query holds its own new
+    tokens plus the packed decode tokens, with the prefix and the earlier
+    chunks cached, and the step averages the chunk prices.
     """
 
     context_tokens: int

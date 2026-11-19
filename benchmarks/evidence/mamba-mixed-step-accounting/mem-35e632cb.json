@@ -1,0 +1,38 @@
+{
+ "build": {
+  "base_backend_sha256": "98452e0003777a0263f6c1d2e0b55ca8e5e8609c4c1c1384364b0d9e2b4813b6",
+  "native_extension_sha256": "fdaea0e29e759116dd012592ab5a859d9aead5d8a5537da00d387e95759c5780"
+ },
+ "prefix=3000,ctx_tokens=2048": {
+  "total": 62.542492,
+  "weights": 58.816727,
+  "activations": 0.15625,
+  "kvcache": 0.069515,
+  "nccl": 0.0,
+  "others": 3.5
+ },
+ "prefix=3000,ctx_tokens=4096": {
+  "total": 62.698742,
+  "weights": 58.816727,
+  "activations": 0.3125,
+  "kvcache": 0.069515,
+  "nccl": 0.0,
+  "others": 3.5
+ },
+ "prefix=3000,ctx_tokens=8192": {
+  "total": 62.698742,
+  "weights": 58.816727,
+  "activations": 0.3125,
+  "kvcache": 0.069515,
+  "nccl": 0.0,
+  "others": 3.5
+ },
+ "prefix=0,ctx_tokens=2048": {
+  "total": 62.542492,
+  "weights": 58.816727,
+  "activations": 0.15625,
+  "kvcache": 0.069515,
+  "nccl": 0.0,
+  "others": 3.5
+ }
+}

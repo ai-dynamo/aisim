@@ -147,6 +147,7 @@ class AicEngine:
         list[_PerOpValueWithMetadata],
         list[_PerOpValueWithMetadata],
         list[_PerOpValueWithMetadata],
+        float,
     ]: ...
     def decode_step_per_op(
         self,

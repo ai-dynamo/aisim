@@ -31,6 +31,7 @@ from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.performance_result import MoECommFallback, merge_moe_comm_fallbacks
 from aisim_core.sdk.rust_engine_step import (
     _estimate_decode_step_with_rust,
+    engine_identity,
     estimate_decode_step_breakdown_with_rust,
     estimate_mixed_step_breakdown_with_rust,
     estimate_static_breakdown_with_power_coverage_with_rust,
@@ -2012,6 +2013,8 @@ class BaseBackend:
         )
         cache_key = (
             self._make_agg_cache_key(isl, osl, b, ctx_tokens, agg_extra),
+            # The cached prefix changes the uncached prefill work.
+            prefix,
             visual_cache_key,
             getattr(model, "forward_model", "op_level"),
             # Explicit progress and an omitted kwarg schedule identically at
@@ -2024,6 +2027,9 @@ class BaseBackend:
         # unknown values must still raise, ``python`` must still warn, and a
         # synthetic database must not inherit a prior PerfDatabase result.
         self._require_rust_engine_step(runtime_config, database, surface="aggregate")
+        # The compiled-engine identity scopes reuse to this model graph and
+        # this database in its current mode; it is memoized on the model.
+        cache_key = (cache_key, engine_identity(model, database))
         cached = self._agg_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -2039,6 +2045,10 @@ class BaseBackend:
         # Compute the mean-field number of engine iterations needed to consume
         # all context and commit the requested output tokens.
         steps_to_finish_ctx = np.ceil(isl * b / ctx_tokens)
+        # Budget whose ``ceil(isl / budget)`` counts one request's prefill
+        # steps, and the step count the TTFT queuing factor reads.
+        ttft_ctx_tokens = ctx_tokens
+        ttft_steps_to_finish_ctx = steps_to_finish_ctx
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
@@ -2058,9 +2068,21 @@ class BaseBackend:
                 num_genonly_tokens = b
                 num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         elif b == 1:
-            # special case for b=1
+            # special case for b=1: the packed budget holds at most this one
+            # request, never unused budget. Op-level pricing reads prompt
+            # tokens (prefix included); a whole-model FPM reads new tokens.
             num_mix_steps = 1
-            num_mix_ctx_tokens = ctx_tokens
+            fits = 0 < isl - prefix <= ctx_tokens
+            if getattr(model, "forward_model", "op_level") == "fpm" and isl > prefix:
+                num_mix_ctx_tokens = min(ctx_tokens, isl - prefix)
+            else:
+                num_mix_ctx_tokens = isl if fits else min(ctx_tokens, isl)
+            if fits:
+                # The uncached prompt fits the budget: one step schedules the
+                # whole request, and TTFT counts that one prefill step, in its
+                # chunk count and in the queuing factor's input.
+                ttft_ctx_tokens = isl
+                ttft_steps_to_finish_ctx = 1
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
             num_genonly_tokens = 1
@@ -2120,12 +2142,12 @@ class BaseBackend:
             b,
             isl,
             osl,
-            ctx_tokens,
+            ttft_ctx_tokens,
             prefix,
             prefill_step_ms=_prefill_step_ms,
             genonly_step_latency_ms=genonly_step_latency_ms,
             encoder_latency_ms=encoder_latency_ms,
-            steps_to_finish_ctx=steps_to_finish_ctx,
+            steps_to_finish_ctx=ttft_steps_to_finish_ctx,
             decode_iterations=decode_iterations,
         )
 
@@ -2197,8 +2219,9 @@ class BaseBackend:
             mtp_scaled_tokens = int(num_gen_requests)
         else:
             # b == 1 starts with a context-only step; the later decode peak is
-            # compared below when the workload schedules output tokens.
-            num_tokens = ctx_tokens
+            # compared below when the workload schedules output tokens. Its
+            # activations follow the new tokens it schedules, at most the budget.
+            num_tokens = min(isl - prefix, ctx_tokens)
             mtp_scaled_tokens = 0
 
         memory = self._get_memory_usage(

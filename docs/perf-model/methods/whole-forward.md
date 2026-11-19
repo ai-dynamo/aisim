@@ -382,7 +382,7 @@ uncorrected native timings, in milliseconds:
 | Method | Coordinate contract |
 | --- | --- |
 | `predict_prefill_latency(batch_size, isl, prefix)` | Full input length and cached-prefix length per request; direct-FPM totals are `(batch_size, batch_size * (isl - prefix), batch_size * prefix)`. |
-| `predict_prefill_latency_total(batch_size, total_prefill_tokens, total_kv_read_tokens)` | Exact tokens computed and cached or earlier-chunk KV read across the prefill batch. Whole-forward FPM without operation-level draft tails queries these totals directly, so a ragged batch is never priced above its scheduled token count. Other graphs use the integer means of `predict_prefill_latency`; execution profiles reject totals that do not divide evenly across the batch. |
+| `predict_prefill_latency_total(batch_size, total_prefill_tokens, total_kv_read_tokens)` | Exact tokens computed and cached or earlier-chunk KV read across the prefill batch. Whole-forward FPM without operation-level draft tails queries these totals directly, so a ragged batch is never priced above its scheduled token count. Other graphs use the integer means of `predict_prefill_latency`, except that qualified Mamba ops split a ragged total into two balanced request lengths; schema-v1 execution profiles reject totals that do not divide evenly across the batch. |
 | `predict_decode_latency_total(batch_size, total_past_kv_tokens)` | Exact total past-KV across the decode batch, preserving the native FPM coordinate without a mean-context conversion. |
 | `fpm_decode_kv_ceiling()` | Largest collected decode KV total, or `None`; reading this bound does not record a timing lookup or prove shape-specific coverage. |
 

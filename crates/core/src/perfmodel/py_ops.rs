@@ -2814,7 +2814,7 @@ impl PyMamba2Kernel {
     const _ENGINE_QUERY_SHAPE: &'static str = "module";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, kernel_source, phase, hidden_size, nheads, head_dim, d_state, d_conv, n_groups, chunk_size, seq_split=1))]
+    #[pyo3(signature = (name, scale_factor, kernel_source, phase, hidden_size, nheads, head_dim, d_state, d_conv, n_groups, chunk_size, seq_split=1, state_dtype="unrecorded".to_string(), token_width=1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
@@ -2829,9 +2829,11 @@ impl PyMamba2Kernel {
         n_groups: u32,
         chunk_size: u32,
         seq_split: u32,
+        state_dtype: String,
+        token_width: u32,
     ) -> PyResult<(Self, PyOperation)> {
         cp_audit_gate("Mamba2Kernel", false, seq_split)?;
-        let inner = Op::Mamba2(crate::operators::Mamba2Op {
+        let op = crate::operators::Mamba2Op {
             name,
             scale_factor,
             kernel_source,
@@ -2843,7 +2845,16 @@ impl PyMamba2Kernel {
             head_dim,
             n_groups,
             chunk_size,
-        });
+            state_dtype,
+            token_width,
+        };
+        if let Some(why) = op.field_error() {
+            return Err(PyValueError::new_err(format!(
+                "Mamba op {}: {why}",
+                op.name
+            )));
+        }
+        let inner = Op::Mamba2(op);
         Ok((PyMamba2Kernel, PyOperation { inner }))
     }
 
@@ -2866,7 +2877,14 @@ impl PyMamba2Kernel {
             o.chunk_size,
         )
             .into_pyobject(py)?;
-        Ok((args, PyDict::new(py)))
+        // Legacy (unrecorded) ops keep the old positional-only rebuild, so a
+        // subclass with the pre-qualification `__new__` still unpickles.
+        let kwargs = PyDict::new(py);
+        if o.state_dtype != "unrecorded" || o.token_width != 1 {
+            kwargs.set_item("state_dtype", &o.state_dtype)?;
+            kwargs.set_item("token_width", o.token_width)?;
+        }
+        Ok((args, kwargs))
     }
 
     #[getter(_kernel_source)]

@@ -1453,14 +1453,16 @@ def estimate_mixed_step_breakdown_with_rust(
     """
     handle = _cached_engine_handle(model, database)
     try:
-        shared_ops, ctx_attn_ops, decode_attn_ops = handle._mixed_step_breakdown_per_op_with_metadata(
-            int(ctx_tokens),
-            int(gen_tokens),
-            int(isl),
-            int(osl),
-            int(prefix or 0),
-            seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
-            gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+        shared_ops, ctx_attn_ops, decode_attn_ops, covered_latency_ms = (
+            handle._mixed_step_breakdown_per_op_with_metadata(
+                int(ctx_tokens),
+                int(gen_tokens),
+                int(isl),
+                int(osl),
+                int(prefix or 0),
+                seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
+                gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+            )
         )
     except ValueError as exc:
         _reraise_engine_error(exc)
@@ -1476,6 +1478,11 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": "context_attention (scaled)",
         "fpm_forward_decode": "generation_attention",
     }
+    native_names = {entry[0] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group}
+    for native, public in public_names.items():
+        # Folding two distinct operations under one reported name would hide one's values.
+        if native in native_names and public in native_names:
+            raise ValueError(f"operation {public!r} collides with the reported name of {native!r}")
     per_op_latency_ms, per_op_energy_wms, per_op_source, fallbacks = _fold_per_op(
         (public_names.get(entry[0], entry[0]), *entry[1:])
         for group in (shared_ops, ctx_attn_ops, decode_attn_ops)
@@ -1507,9 +1514,8 @@ def estimate_mixed_step_breakdown_with_rust(
         "component_energy_wms": component_energy_wms,
         "per_op_latency_ms": per_op_latency_ms,
         "per_op_energy_wms": per_op_energy_wms,
-        "covered_latency_ms": sum(
-            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
-        ),
+        # Decided per query before the name fold, as the static path does.
+        "covered_latency_ms": covered_latency_ms,
         "per_op_source": per_op_source,
         "moe_comm_fallbacks": fallbacks,
     }
@@ -1790,6 +1796,57 @@ def _engine_handle_cache_put(key: str, value: Any) -> None:
             _ENGINE_HANDLE_CACHE.popitem(last=False)
 
 
+def engine_identity(model: Any, database: Any) -> str:
+    """The compiled-engine identity of ``(model, database)``, memoized on the model.
+
+    The memo is reused only for the same database object in the same query
+    mode and transfer policy: ``set_default_database_mode`` changes both in
+    place, and the compiled engine bakes them into its query dispatch. The
+    setters replace the mode member and the frozen policy instead of mutating
+    them, so identity checks detect a change without rebuilding either key on
+    this per-query path.
+    """
+    # The stored attributes behind ``get_default_database_mode`` and
+    # ``transfer_policy``; reading them directly keeps the check near main's
+    # single identity test.
+    mode = getattr(database, "_default_database_mode", None)
+    policy = getattr(database, "_transfer_policy", None)
+    memo = getattr(model, "_aic_engine_identity_memo", None)
+    if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy:
+        return memo[3]
+    key = _engine_config_json(model, database)
+    try:
+        model._aic_engine_identity_memo = (database, mode, policy, key)
+    except (AttributeError, TypeError):
+        pass  # slotted/frozen model objects: recompute per call
+    return key
+
+
+def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
+    """The compiled spec of every op, by op list and position, for a graph that holds a Mamba2 op.
+
+    The model config does not carry the qualification fields: one config can
+    compile qualified or legacy ops, or assign different state dtypes to each
+    op. The spec is the representation ``Engine::build`` validates, so it keeps
+    a legacy op explicit, a draft query width's ``TokenScale`` wrapper, and a
+    Mamba2 op nested in a composite. It runs only when the memo misses.
+    """
+    # Lazy import: ``sdk.engine`` imports from this module at top level.
+    from aisim_core.sdk.engine import _as_engine_op
+    from aisim_core.sdk.operations import FPMForwardOp
+    from aisim_core.sdk.operations.base import Operation
+
+    entries = []
+    for ops_name in ("context_ops", "generation_ops"):
+        for index, op in enumerate(getattr(model, ops_name, ())):
+            # A whole-model FPM op serializes its op-level graph, Mamba2 ops included.
+            if isinstance(op, (Operation, FPMForwardOp)):
+                entries.append([ops_name, index, _as_engine_op(op)._spec_json()])
+    # Build validation of a Mamba graph also reads its other ops (names, stages), so a
+    # Mamba graph keys on every compiled op; other graphs keep the config-only key.
+    return entries if any('"Mamba2"' in entry[2] for entry in entries) else []
+
+
 def _cached_engine_handle(model: Any, database: Any) -> Any:
     """Return a cached ``EngineHandle`` for ``(model, database)``.
 
@@ -1809,15 +1866,7 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     # identity is immutable for a given (model, database) pair, so memoize the
     # computed key on the model object and only recompute when the database
     # object changes.
-    memo = getattr(model, "_aic_engine_identity_memo", None)
-    if memo is not None and memo[0] is database:
-        key = memo[1]
-    else:
-        key = _engine_config_json(model, database)
-        try:
-            model._aic_engine_identity_memo = (database, key)
-        except (AttributeError, TypeError):
-            pass  # slotted/frozen model objects: recompute per call
+    key = engine_identity(model, database)
     entry = _engine_handle_cache_get(key)
     if isinstance(entry, _CachedUnsupported):
         # Compilation already failed for this engine identity; raise a fresh
@@ -1982,6 +2031,7 @@ def _engine_config_json(model: Any, database: Any) -> str:
                         "enable_shared_layer": bool(getattr(database, "enable_shared_layer", False)),
                         "strict_provenance": bool(getattr(database, "strict_provenance", False)),
                     },
+                    "mamba_qualification": _mamba_qualification_identity(model),
                 },
                 sort_keys=True,
                 separators=(",", ":"),

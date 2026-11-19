@@ -765,7 +765,8 @@ impl AicEngine {
 
     /// Internal metadata-bearing counterpart of `mixed_step_breakdown_per_op`;
     /// each fifth field is `None` or `(first_record, additional_records)` in
-    /// deterministic encounter order.
+    /// deterministic encounter order. The fourth value is the step's
+    /// power-covered latency, decided per query before the name fold.
     #[pyo3(signature = (ctx_tokens, gen_tokens, isl, osl, prefix=0,
                         seq_imbalance_correction_scale=1.0,
                         gen_seq_imbalance_correction_scale=1.0))]
@@ -784,6 +785,7 @@ impl AicEngine {
         Vec<PerOpValueWithMetadata>,
         Vec<PerOpValueWithMetadata>,
         Vec<PerOpValueWithMetadata>,
+        f64,
     )> {
         self.inner.reset_provenance();
         py.allow_threads(|| {
