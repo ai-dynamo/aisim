@@ -36,8 +36,9 @@ pub(super) struct AdmitResult {
 /// overlap iteration's result observation, were verified against v0.5.19 (`0bcd822`); the token
 /// chunking and batch selection otherwise keep the `5c8bd8b5` pin. Fixed-output
 /// running reservation and the chunked input-cap stop condition follow
-/// SGLang `baa9befa381511cd4d56f83980951e5a45fffc6d` (0.5.22),
-/// `python/sglang/srt/managers/schedule_policy.py`; see THIRD_PARTY_NOTICES.md.
+/// SGLang's [`schedule_policy.py` at `baa9befa381511cd4d56f83980951e5a45fffc6d` (0.5.22)](
+/// https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/managers/schedule_policy.py).
+/// See THIRD_PARTY_NOTICES.md for license and attribution.
 pub(super) fn get_new_batch_prefill(
     waiting: &mut WaitingQueue,
     kv_manager: &mut SglangKvManager,
