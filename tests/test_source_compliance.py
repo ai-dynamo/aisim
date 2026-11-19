@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -112,6 +114,15 @@ def test_wheel_local_legal_file_matches_root(name):
     assert canonical.is_file()
     assert packaged.is_file()
     assert packaged.read_bytes() == canonical.read_bytes()
+
+
+def test_wheel_metadata_declares_notices_and_readme_has_distribution_credit():
+    project = tomllib.loads((PACKAGE_ROOT / "pyproject.toml").read_text())["project"]
+    assert set(PACKAGED_LEGAL_FILES) <= set(project["license-files"])
+    readme = (PACKAGE_ROOT / project["readme"]).read_text()
+    prose = re.sub(r"```.*?```", "", readme, flags=re.S)
+    assert "Built with Llama" in prose
+    assert "THIRD_PARTY_NOTICES.md" in prose
 
 
 @pytest.mark.parametrize("name", PACKAGED_README_ROOT_LINKS)
