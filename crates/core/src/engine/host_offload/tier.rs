@@ -895,6 +895,17 @@ impl HostTier {
         self.plan_reserve_unless(plan, key, |_| false)
     }
 
+    /// Whether one more external key can fit without evicting a protected
+    /// block. Unlike reserving, this leaves the plan unchanged on success too.
+    pub(crate) fn plan_has_room(&self, plan: &ExternalPlan) -> bool {
+        plan.free > 0
+            || (self.config.eviction != HostEviction::Caller
+                && self
+                    .lru
+                    .oldest_after(plan.cursor)
+                    .any(|(_, key)| !plan.protected.contains(&key)))
+    }
+
     /// [`Self::plan_reserve`] that also never evicts a block `in_use`.
     pub(crate) fn plan_reserve_unless(
         &self,
@@ -996,6 +1007,52 @@ impl HostTier {
             now_ms,
             Kind::External,
         )
+    }
+
+    /// Apply one prompt-ordered plan as two reservations, classified by
+    /// `first`. Both parts share its capacity decision and protected prefix.
+    /// Evict the victims once, before either part is admitted; no consumer
+    /// can observe the intermediate state of this synchronous operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_planned_partitioned(
+        &mut self,
+        client: u64,
+        owner: Uuid,
+        plan: ExternalPlan,
+        meta: Option<Vec<HostBlockMeta>>,
+        mut first: impl FnMut(HostBlockKey) -> bool,
+        now: f64,
+    ) -> [Option<TransferId>; 2] {
+        let now_ms = self.prepare_mutation(now);
+        let meta = match meta {
+            Some(meta) => meta.into_iter().map(Some).collect::<Vec<_>>(),
+            None => vec![None; plan.reserved.len()],
+        };
+        assert_eq!(meta.len(), plan.reserved.len());
+        let mut keys = [Vec::new(), Vec::new()];
+        let mut metadata = [Vec::new(), Vec::new()];
+        for (key, meta) in plan.reserved.into_iter().zip(meta) {
+            let part = usize::from(!first(key));
+            keys[part].push(key);
+            metadata[part].push(meta);
+        }
+        let mut victims = plan.victims;
+        std::array::from_fn(|part| {
+            if keys[part].is_empty() {
+                return None;
+            }
+            let units = (keys[part].len(), 1);
+            Some(self.admit(
+                client,
+                owner,
+                &std::mem::take(&mut victims),
+                std::mem::take(&mut keys[part]),
+                std::mem::take(&mut metadata[part]),
+                units,
+                now_ms,
+                Kind::External,
+            ))
+        })
     }
 
     /// Record that an external reservation stopped at `key` for lack of space.
