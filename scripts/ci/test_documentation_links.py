@@ -24,6 +24,8 @@ class DocumentationLinksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
+            # Keep untracked fixtures visible despite personal Git ignore rules.
+            subprocess.run(["git", "-C", str(root), "config", "--local", "core.excludesFile", os.devnull], check=True)
             guides = [
                 "REVIEW.md",
                 "crates/example/AGENTS.md",
@@ -42,6 +44,7 @@ class DocumentationLinksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "--local", "core.excludesFile", os.devnull], check=True)
             script = root / "scripts/ci/check_documentation_links.py"
             script.parent.mkdir(parents=True)
             script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
