@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::driver::waits_on_live_work;
 use super::{
     AgenticDependencyRelation, AgenticDependencyTrigger, AgenticGraphIdentity, AgenticNode,
     SYNTHETIC_OUTPUT_SEED, ValidatedAgenticGraph, planned_output_token_ids,
@@ -503,7 +504,8 @@ impl AgenticReplayContext {
             } else {
                 live_conversations.insert(node.session_id.as_str());
             }
-            // Recorded starts classify history, but do not add execution gates.
+            // Recorded starts classify history, but do not add execution gates,
+            // except for the flagged requests below.
             // Retain authored gates; live dependencies still release relative
             // to actual dispatch/completion, while historical edges become timers.
             let mut delay = (node.not_before_ms - t_star_ms).max(0.0);
@@ -528,6 +530,17 @@ impl AgenticReplayContext {
                     } else {
                         pending.push(snapshot.instance_request_id(&edge.request_id));
                     }
+                }
+                // The AgentX client resumes a request whose causal predecessor
+                // is history at its recorded offset from the cut; historical
+                // edges alone would release it sooner.
+                if node.recorded_start_gates_frontier
+                    && !waits_on_live_work(&node.dependencies, |edge| {
+                        let source = index_by_id[edge.request_id.as_str()];
+                        self.recorded_intervals[source].0 >= t_star_ms
+                    })
+                {
+                    delay = delay.max(recorded_start - t_star_ms);
                 }
             }
             snapshot.evidence.requests.push(AgenticSnapshotRequest {

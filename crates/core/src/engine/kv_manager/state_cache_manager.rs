@@ -77,6 +77,8 @@ pub(crate) struct StateCacheManager {
     // request takes its own entries; holes disappear at the next begin_step.
     step_copy_holds: Vec<Option<BlockCopyId>>,
     published_this_step: FxHashSet<SequenceHash>,
+    /// Steps that began by un-hiding the previous step's publications.
+    reveals: u64,
     step: u64,
 }
 
@@ -93,6 +95,7 @@ impl StateCacheManager {
             junction_checkpoints: false,
             step_copy_holds: Vec::new(),
             published_this_step: FxHashSet::default(),
+            reveals: 0,
             step: 0,
         }
     }
@@ -101,8 +104,18 @@ impl StateCacheManager {
         for id in self.step_copy_holds.drain(..).flatten() {
             pool.release(id);
         }
-        self.published_this_step.clear();
+        if !self.published_this_step.is_empty() {
+            self.published_this_step.clear();
+            self.reveals += 1;
+        }
         self.step = self.step.checked_add(1).expect("state cache step overflow");
+    }
+
+    /// Changes whenever a [`Self::lookup_snapshot`] miss can have turned into
+    /// a hit: a state key became visible in `pool`, or a step un-hid the
+    /// states published by the one before it.
+    pub(crate) fn lookup_epoch(&self, pool: &VllmBlockPool) -> (u64, u64) {
+        (pool.state_visibility_epoch(), self.reveals)
     }
 
     pub(crate) fn keys(&self, prefix: SequenceHash) -> impl ExactSizeIterator<Item = CacheKey> {

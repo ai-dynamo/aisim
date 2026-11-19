@@ -173,6 +173,7 @@ pub fn load_agentic_mooncake(path: &Path, legacy_trace_block_size: usize) -> Res
                     0.0
                 },
                 recorded_api_time_ms: None,
+                recorded_start_ms: None,
                 priority: raw.priority,
                 strict_priority: raw.strict_priority,
                 policy_class: raw.policy_class,
@@ -1546,6 +1547,16 @@ impl AgenticTraceBuilder {
                 raw.recorded_api_time_ms
             );
         }
+        if raw
+            .recorded_start_ms
+            .is_some_and(|start| !start.is_finite() || start < 0.0)
+        {
+            bail!(
+                "trace line {} has invalid recorded_start_ms {:?}",
+                line_idx + 1,
+                raw.recorded_start_ms
+            );
+        }
         for dependency in &raw.dependencies {
             if dependency.request_id.trim().is_empty() {
                 bail!(
@@ -1604,7 +1615,10 @@ impl AgenticTraceBuilder {
             hash_ids,
             not_before_ms: raw.not_before_ms,
             recorded_api_time_ms: raw.recorded_api_time_ms,
-            recorded_interval_ms: None,
+            recorded_interval_ms: raw
+                .recorded_start_ms
+                .map(|start| (start, raw.recorded_api_time_ms.map(|api| start + api))),
+            recorded_start_gates_frontier: raw.recorded_start_ms.is_some(),
             priority: raw.priority.unwrap_or(0),
             strict_priority: raw.strict_priority.unwrap_or(0),
             policy_class: raw.policy_class,
@@ -2021,6 +2035,7 @@ fn canonical_agentic_graph_digest(
                 not_before_ms,
                 recorded_api_time_ms,
                 recorded_interval_ms: _,
+                recorded_start_gates_frontier: _,
                 priority,
                 strict_priority,
                 policy_class,

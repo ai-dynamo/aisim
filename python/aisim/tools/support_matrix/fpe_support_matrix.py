@@ -665,7 +665,12 @@ def _result(
 
 
 def _default_engine_factory(plan: EngineProbePlan) -> Any:
-    from aisim_core.sdk import EngineHandle
+    try:
+        from aisim_core.sdk import EngineHandle
+    except ModuleNotFoundError as error:
+        if error.name != "aisim_core":
+            raise
+        from aisimulate_core.sdk import EngineHandle
 
     return EngineHandle.compile(plan.model, plan.system, plan.backend, **plan.compile_kwargs())
 
