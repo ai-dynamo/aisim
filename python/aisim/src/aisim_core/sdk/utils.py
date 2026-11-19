@@ -642,9 +642,9 @@ def _download_hf_json_at(
 ) -> tuple[dict | None, str | None]:
     """Load a JSON file from a Hugging Face model repo, from the local cache or the network.
 
-    Returns the data and, when it came from the local cache, the snapshot commit
-    it belongs to (``None`` for a network download), so related files can be
-    read from the same commit.
+    Returns the data and its snapshot commit, from the local cache, a pinned
+    request, or the network response's X-Repo-Commit header when available, so
+    related files can be read from the same commit.
 
     Offline mode (``HF_HUB_OFFLINE`` or ``TRANSFORMERS_OFFLINE``) reads only the
     local Hugging Face cache and never opens a connection. Online, a pinned commit
@@ -688,10 +688,19 @@ def _download_hf_json_at(
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
+            commit = getattr(response, "headers", {}).get("X-Repo-Commit")
+            if commit is not None and not _COMMIT_HASH.fullmatch(commit):
+                raise _HuggingFaceProvenanceError(f"Invalid response commit for {hf_id}'s {filename}: {commit!r}")
+            if _COMMIT_HASH.fullmatch(revision):
+                if commit is not None and commit != revision:
+                    raise _HuggingFaceProvenanceError(
+                        f"Response commit {commit} for {hf_id}'s {filename} does not match requested commit {revision}"
+                    )
+                commit = revision
             data = json.load(response)
         if not isinstance(data, dict):
             raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: expected a JSON object")
-        return data, None
+        return data, commit
     except urllib.error.HTTPError as e:
         if e.code == 404 and not raise_on_404:
             return None, None
@@ -722,7 +731,7 @@ def _download_hf_json_at(
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 
 
-# Snapshot provenance for cache-served files. A capture is scoped to one loader
+# Snapshot provenance for downloaded and cache-served files. A capture is scoped to one loader
 # call through a context variable, so concurrent loads cannot see each other's
 # commits. Loaded configs own their provenance so active readers retain it
 # after cache eviction, without a registry keeping failed attempts alive.
@@ -732,7 +741,7 @@ _SNAPSHOT_CAPTURE: contextvars.ContextVar[dict[tuple[str, str], str] | None] = c
 
 
 class _SnapshotConfig(dict):
-    """A normal JSON mapping with non-serialized, object-owned cache provenance."""
+    """A normal JSON mapping with non-serialized, object-owned snapshot provenance."""
 
     __slots__ = ("__weakref__", "_snapshot_commit")
 
@@ -742,7 +751,7 @@ class _SnapshotConfig(dict):
 
 
 def _config_snapshot_commit(raw_config: dict) -> str | None:
-    """The cache snapshot commit a loaded raw config came from, or None."""
+    """The verified snapshot commit a loaded raw config came from, or None."""
     return raw_config._snapshot_commit if isinstance(raw_config, _SnapshotConfig) else None
 
 
@@ -2376,6 +2385,8 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                     # Native video fields override legacy media aliases through
                     # either sidecar, after preserving unspecified inline fields.
                     sidecar_video = data.get("video_processor", {}) if key is None else data
+                    if "merge_size" in sidecar_video and "merge_kernel_size" not in sidecar_video:
+                        processor["video_processor"].pop("merge_kernel_size", None)
                     media = processor.get("media_proc_cfg", processor)
                     if not isinstance(media, dict):
                         raise ValueError("Kimi media_proc_cfg must be an object")
@@ -2528,8 +2539,8 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     token = _SNAPSHOT_CAPTURE.set(capture)
     try:
         raw_config = _download_hf_config(model_path)
-        # A config served from the cache pins its companions to the same snapshot, so a
-        # transient failure cannot pair cached dimensions with newer remote metadata.
+        # Pin companions to the verified config snapshot, including successful
+        # downloads, so later reads cannot mix metadata after a branch moves.
         commit = capture.get((model_path, "config.json"))
         pinned = {"revision": commit} if commit else {}
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)

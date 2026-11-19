@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -68,6 +69,19 @@ def hf_cache(monkeypatch, tmp_path):
 
     monkeypatch.setattr(utils.urllib.request, "urlopen", no_network)
     return cache
+
+
+@pytest.mark.parametrize("revision,commit", [("main", "main"), ("a" * 40, "b" * 40)])
+def test_network_snapshot_identity_must_be_valid_and_match_pinned_revision(monkeypatch, hf_cache, revision, commit):
+    def remote(request, *, timeout):
+        response = io.BytesIO(b'{"architectures": ["LlamaForCausalLM"]}')
+        response.headers = Message()
+        response.headers["x-repo-commit"] = commit
+        return response
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    with pytest.raises(utils._HuggingFaceProvenanceError, match="commit"):
+        utils._download_hf_json("org/model", "config.json", revision=revision)
 
 
 def _cache_file(cache, hf_id, filename, payload, *, ref="main", commit="c" * 40, symlink=True):
@@ -284,6 +298,40 @@ def test_kimi_native_video_sidecar_cannot_hide_unsupported_temporal_size(tmp_pat
     try:
         with pytest.raises(ValueError, match="temporal chunk size must be 4"):
             get_model_config_from_model_path(str(tmp_path))
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("model", ["moonshotai/Kimi-K2.5", "moonshotai/Kimi-K3"])
+@pytest.mark.parametrize("filename", ["preprocessor_config.json", "video_preprocessor_config.json"])
+@pytest.mark.parametrize(
+    "inline_video,sidecar_video,valid",
+    [
+        ({"merge_kernel_size": 2}, {"merge_size": 3}, False),
+        ({"merge_size": 3}, {"merge_kernel_size": 2}, True),
+        ({"merge_kernel_size": 3}, {"max_patches": 1024}, False),
+        ({"merge_kernel_size": 2}, {"max_patches": 1024}, True),
+    ],
+)
+def test_kimi_video_merge_alias_uses_sidecar_precedence(tmp_path, model, filename, inline_video, sidecar_video, valid):
+    config = utils._load_pre_downloaded_hf_config(model)
+    config["preprocessor_config"] = {"video_processor": inline_video}
+    sidecar = {"video_processor": sidecar_video} if filename == "preprocessor_config.json" else sidecar_video
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / filename).write_text(json.dumps(sidecar))
+    try:
+        if valid:
+            loaded = get_model_config_from_model_path(str(tmp_path))
+            encoder = utils.get_vision_encoder_config_from_model_info(loaded)
+            assert encoder.spatial_merge_size == 2
+        else:
+            with pytest.raises(ValueError, match="merge_size must match vision_config"):
+                get_model_config_from_model_path(str(tmp_path))
+        assert (
+            utils._load_model_config_from_model_path(str(tmp_path))["preprocessor_config"]
+            == config["preprocessor_config"]
+        )
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()
@@ -1392,6 +1440,45 @@ def test_concurrent_llama4_readers_publish_one_validated_processor(monkeypatch, 
         assert len(requests) == 1
         assert all(item["extra_params"].vision_config.max_num_tiles == 16 for item in loaded)
         assert utils._load_model_config_from_model_path(model)["image_processor_config"]["max_patches"] == 16
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_deferred_llama4_processor_uses_downloaded_config_commit(monkeypatch, hf_cache):
+    model = "org/llama4-moving-main"
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    processor = config.pop("image_processor_config")
+    config_commit = "a" * 40
+    main_commit = config_commit
+    requests = []
+
+    def remote(request, *, timeout):
+        url = request.full_url
+        requests.append(url)
+        revision, filename = url.rsplit("/", 2)[-2:]
+        commit = main_commit if revision == "main" else revision
+        if filename == "hf_quant_config.json":
+            raise _http_error(404, "absent")
+        payload = (
+            config if filename == "config.json" else {**processor, "max_patches": 16 if commit == config_commit else 4}
+        )
+        response = io.BytesIO(json.dumps(payload).encode())
+        response.headers = Message()
+        response.headers["x-repo-commit"] = commit
+        return response
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    try:
+        raw = utils._load_model_config_from_model_path(model)
+        assert "image_processor_config" not in raw
+        assert not any("preprocessor_config.json" in url for url in requests)
+        main_commit = "b" * 40
+        loaded = get_model_config_from_model_path(model)
+        assert loaded["extra_params"].vision_config.max_num_tiles == 16
+        assert utils._config_snapshot_commit(loaded["raw_config"]) == config_commit
+        assert requests[-1] == f"https://huggingface.co/{model}/raw/{config_commit}/preprocessor_config.json"
+        assert utils._load_model_config_from_model_path(model) is raw
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         utils.get_model_config_from_model_path.cache_clear()
