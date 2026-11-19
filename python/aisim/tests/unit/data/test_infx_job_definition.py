@@ -45,6 +45,7 @@ def definition():
     assert inputs["job"]["default"] == "ingest"
     assert inputs["job"]["options"] == ["ingest", "promote", "staleness"]
     assert inputs["candidate-snapshot-id"]["regex"] == "^([0-9a-f]{64})?$"
+    assert inputs["candidate-commit"]["regex"] == "^([0-9a-f]{40}|[0-9a-f]{64})?$"
     return definition
 
 
@@ -75,13 +76,21 @@ def test_ingestion_runs_without_the_cache_token_and_never_pushes_to_the_default_
 @pytest.mark.parametrize("status", [0, 73])
 def test_publication_status_failure_cannot_look_unchanged(definition, tmp_path, status):
     git = tmp_path / "git"
-    git.write_text(f'#!/bin/sh\ntest "$1 $2" = "status --porcelain" || exit 99\nexit {status}\n')
+    git.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  'rev-parse HEAD') echo base ;;\n"
+        f"  'status --porcelain') exit {status} ;;\n"
+        "  *ls-remote*) printf 'base\\tHEAD\\n' ;;\n"
+        "  *) exit 99 ;;\n"
+        "esac\n"
+    )
     git.chmod(0o755)
     (tmp_path / "cache-repo").mkdir()
     result = subprocess.run(
         ["sh", "-eu", "-c", definition["publish_candidate"]["script"][-1]],
         cwd=tmp_path,
-        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "INFX_CACHE_WRITE_TOKEN": ""},
         capture_output=True,
         text=True,
     )
@@ -131,16 +140,37 @@ def test_staleness_only_uses_the_read_credential(definition):
     assert "INFX_CACHE_WRITE_TOKEN" not in _text(definition["staleness"])
     for name in ("publish_candidate", "promote"):
         assert definition[name]["environment"] == {"name": "infx-cache-writer", "action": "access"}
-    assert "environment" not in definition["staleness"] and "environment" not in definition["alert_failure"]
+        assert "INFX_CACHE_READ_TOKEN" not in _text(definition[name])
+    # The read token is scoped to its own environment, so no other job inherits it.
+    assert definition["staleness"]["environment"] == {"name": "infx-cache-reader", "action": "access"}
+    assert "environment" not in definition["alert_failure"]
 
 
-def test_dependency_setup_cannot_read_the_cache_write_token(definition, tmp_path):
+def test_staleness_cli_cannot_read_the_cache_read_token(definition, tmp_path):
+    command = next(line for line in definition["staleness"]["script"] if "$JOB_PY staleness" in line)
+    tool = tmp_path / "job-python"
+    tool.write_text('#!/bin/sh\ntest "$1" = staleness\n[ "${INFX_CACHE_READ_TOKEN+x}" != x ]\n')
+    tool.chmod(0o755)
+    subprocess.run(
+        ["sh", "-eu", "-c", command],
+        cwd=tmp_path,
+        check=True,
+        env={**os.environ, "JOB_PY": str(tool), "INFX_CACHE_READ_TOKEN": "synthetic"},
+    )
+
+
+def test_dependency_setup_cannot_read_either_cache_token(definition, tmp_path):
     setup = "\n".join(definition[".pinned"]["before_script"])
     sync = next(line.strip() for line in setup.splitlines() if "uv sync" in line)
     uv = tmp_path / "uv"
-    uv.write_text('#!/bin/sh\n[ "${INFX_CACHE_WRITE_TOKEN+x}" != x ]\n')
+    uv.write_text('#!/bin/sh\n[ "${INFX_CACHE_WRITE_TOKEN+x}" != x ] && [ "${INFX_CACHE_READ_TOKEN+x}" != x ]\n')
     uv.chmod(0o755)
-    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "INFX_CACHE_WRITE_TOKEN": "synthetic"}
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "INFX_CACHE_WRITE_TOKEN": "synthetic",
+        "INFX_CACHE_READ_TOKEN": "synthetic",
+    }
     subprocess.run(["sh", "-eu", "-c", sync], env=env, cwd=tmp_path, check=True)
 
 
@@ -244,7 +274,17 @@ def test_selector_rules_use_gitlab_variable_comparisons_and_route_jobs(definitio
 
 
 @pytest.mark.parametrize(
-    "kind", ["historical", "different-baseline", "pending", "generated-pending", "damaged-pending"]
+    "kind",
+    [
+        "historical",
+        "different-baseline",
+        "pending",
+        "generated-pending",
+        "damaged-pending",
+        "ignored-artifact",
+        "baseline-moved",
+        "baseline-moved-pending",
+    ],
 )
 def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pending(definition, tmp_path, kind):
     from aisim_core.data.infx_job import run_ingestion
@@ -312,7 +352,7 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
         ).strip()
 
     remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True, env=git_env)
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(remote)], check=True, env=git_env)
     seed = tmp_path / "seed"
     seed.mkdir()
     git(seed, "init", "-qb", "main")
@@ -324,6 +364,8 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
         git(seed, "add", "-A")
         git(seed, "commit", "-qm", "synthetic state")
 
+    if kind == "ignored-artifact":  # an ignore rule in the cache repository silently drops a required shard file
+        (seed / ".gitignore").write_text("metrics.parquet\n")
     commit_state(qualified_b, None)
     git(seed, "remote", "add", "origin", str(remote))
     git(seed, "push", "-q", "origin", "main")
@@ -350,6 +392,12 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
     for name in ("revisions", "snapshots"):
         shutil.copytree(payload / name, workspace / "cache-repo" / name)
     (workspace / "run-report.json").write_text(json.dumps({"snapshot_id": sid}))
+    if kind.startswith("baseline-moved"):  # another qualification lands on the default branch during acquisition
+        git(seed, "checkout", "-q", "main")
+        (seed / "moved").write_text("a later qualification\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "default branch moved")
+        git(seed, "push", "-q", "origin", "main")
     # Exercise the publication shell and real verification library offline.
     # Only uv's already-installed interpreter selection is replaced here.
     bin_dir = tmp_path / "bin"
@@ -363,7 +411,7 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
     )
     uv.chmod(0o755)
     script = definition["publish_candidate"]["script"][-1]
-    subprocess.run(
+    result = subprocess.run(
         ["sh", "-eu", "-c", script],
         cwd=workspace,
         env={
@@ -372,11 +420,23 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
             "CI_JOB_ID": "42",
             "INFX_CACHE_WRITE_TOKEN": "",
         },
-        check=True,
+        capture_output=True,
+        text=True,
     )
     assert git(remote, "rev-parse", branch) == old
     branches = git(remote, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
     new_branch = f"candidate/{sid}-42"
+    if kind.startswith("baseline-moved"):
+        # A moved baseline fails the job, even where the pending branch would otherwise be reused.
+        assert result.returncode == 4 and "default branch moved" in result.stderr
+        assert new_branch not in branches
+        return
+    if kind == "ignored-artifact":
+        # The ignored shard file is missing from the commit: nothing may be pushed.
+        assert result.returncode != 0 and "missing dataset artifact" in result.stderr
+        assert new_branch not in branches
+        return
+    assert result.returncode == 0, result.stderr
     if kind in ("pending", "generated-pending"):
         assert new_branch not in branches
     else:
@@ -413,3 +473,65 @@ def test_promotion_selects_the_reviewed_candidate_generation(definition, tmp_pat
     args = (tmp_path / "clone-args").read_text().splitlines()
     assert args[args.index("--branch") + 1] == "candidate/" + "a" * 64 + (f"-{generation}" if generation else "")
     assert "HEAD:refs/heads/${BRANCH}" in _text(definition["promote"])
+
+
+@pytest.mark.parametrize("reviewed", [True, False])
+def test_promotion_qualifies_only_the_reviewed_candidate_commit(definition, tmp_path, reviewed):
+    block = next(
+        line for line in definition["promote"]["script"] if "candidate branch tip is not the reviewed commit" in line
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false"})
+
+    def git(path, *args):
+        identity = ["-c", "user.name=Synthetic Fixture", "-c", "user.email=fixture@example.test"]
+        return subprocess.check_output(["git", "-C", str(path), *identity, *args], text=True, env=env).strip()
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(remote)], check=True, env=env)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    git(seed, "init", "-qb", "main")
+    (seed / "default.txt").write_text("default branch\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-qm", "default")
+    git(seed, "remote", "add", "origin", str(remote))
+    git(seed, "push", "-q", "origin", "main")
+    git(seed, "checkout", "-qb", "candidate/x")
+    (seed / "candidate.txt").write_text("reviewed\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-qm", "candidate")
+    git(seed, "push", "-q", "origin", "candidate/x")
+    reviewed_commit = git(seed, "rev-parse", "HEAD")
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--branch",
+            "candidate/x",
+            f"file://{remote}",
+            str(tmp_path / "cache-repo"),
+        ],
+        check=True,
+        env=env,
+    )
+    if not reviewed:  # the branch advanced after review but before the clone
+        (seed / "late.txt").write_text("unreviewed\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "late")
+    commit = reviewed_commit if reviewed else "0" * 40
+    result = subprocess.run(
+        ["sh", "-eu", "-c", block.replace("$[[ inputs.candidate-commit ]]", commit)],
+        cwd=tmp_path,
+        env={**env, "INFX_CACHE_WRITE_TOKEN": ""},
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is reviewed, result.stderr
+    # The comparison baseline is the default branch, not the candidate branch.
+    assert (tmp_path / "baseline/default.txt").exists() is reviewed
+    assert not (tmp_path / "baseline/candidate.txt").exists()
+    assert "--baseline-root baseline" in _text(definition["promote"])

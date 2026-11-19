@@ -18,12 +18,17 @@ internal project by hand.
 3. Create a token that can write **only** `aisim-infx-cache` and store it as masked, protected
    `INFX_CACHE_WRITE_TOKEN`, with environment scope **`infx-cache-writer`**, never `*`.
    Only `publish_candidate` and `promote` select that environment. Add a separate masked,
-   protected, read-only `INFX_CACHE_READ_TOKEN` for staleness. Acquisition (public GET) uses no credential.
+   protected, read-only `INFX_CACHE_READ_TOKEN` for staleness with environment scope
+   **`infx-cache-reader`**, never `*`; only `staleness` selects that environment, so no other job inherits it.
+   Dependency setup and the staleness CLI run with the read token removed; only the authenticated clone uses it.
+   Acquisition (public GET) uses no credential.
 4. Supply CI/CD inputs, not pipeline variables: weekly with `job=ingest`; daily with
    `job=staleness`. Manual refresh: run a web pipeline (default `job=ingest`). Promotion:
-   web pipeline with `job=promote`, `candidate-snapshot-id`, and `candidate-generation`
-   (the job ID suffix printed by ingestion; pipeline-ID suffixes of earlier branches remain valid), started by the reviewing
-   maintainer. Leave the generation empty for legacy `candidate/<snapshot-id>` branches.
+   web pipeline with `job=promote`, `candidate-snapshot-id`, `candidate-generation`
+   (the job ID suffix printed by ingestion; pipeline-ID suffixes of earlier branches remain valid) and
+   `candidate-commit` (the full commit SHA of the branch tip the reviewer inspected, also printed by
+   ingestion), started by the reviewing maintainer. Leave the generation empty for legacy
+   `candidate/<snapshot-id>` branches.
    When including this definition, forward these inputs from the project's
    pipeline inputs through `include:inputs`; keep their enum/regex constraints.
    Use a GitLab version supporting pipeline and schedule inputs before installing.
@@ -62,6 +67,16 @@ benchmark page and full dated `workflow-info` responses. This filter is not a re
 Its `changes.removed` and `change_counts.removed` include qualified
 observations from unselected models. Review that removal count before promotion; use an
 unfiltered run to retain the full model scope.
+
+Ingestion decisions are tied to the default-branch commit it cloned: before it accepts an unchanged
+refresh, skips a pending branch or publishes a candidate, it checks that the default branch still has that
+commit and otherwise fails (exit 4) so a rerun starts from the new baseline. It also verifies the pending
+snapshot and its member artifacts from the exact commit it pushes, so a Git ignore rule that omits a required
+artifact stops the job before any branch is created.
+
+Promotion refuses a candidate branch whose tip is not `candidate-commit`, and one whose recorded qualified
+baseline differs from the default branch's current qualification (its change counts would be stale); rerun
+ingestion from the new baseline in that case.
 
 Ingestion skips an existing branch only when it still has the same snapshot pending against the
 current qualified baseline and its snapshot and all member artifacts pass verification. A damaged

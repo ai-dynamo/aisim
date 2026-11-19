@@ -3,7 +3,7 @@
 
 """Weekly/manual InferenceX ingestion job: state, promotion, staleness and alerts.
 
-``python -m aisim_core.data.infx_job {run,promote,staleness}``. The internal GitLab
+``python -m aisim_core.data.infx_job {run,promote,verify,staleness}``. The internal GitLab
 job (``scripts/ci/gitlab/aisim-infx-ingest.gitlab-ci.yml``) only calls these entry points.
 
 Rules enforced here (AISIM-2334 / DEP #435):
@@ -250,23 +250,42 @@ def run_ingestion(
         return RunResult("failed", error=f"{type(exc).__name__}: {exc}", requests_made=client.requests_made)
 
 
-def promote(root: Path, snapshot_id: str, reviewer: str, now: datetime | None = None) -> dict[str, Any]:
-    """Manual review step: the pending candidate becomes the qualified snapshot."""
+def verify_pending(root: Path, snapshot_id: str) -> dict[str, Any]:
+    """The checkout's pending candidate is ``snapshot_id``, complete, and every member artifact is present."""
+    state = load_state(Path(root))
+    candidate = state.get("candidate")
+    if not candidate or candidate["snapshot_id"] != snapshot_id:
+        raise PromotionError(f"{snapshot_id} is not the pending candidate")
+    snapshot, members = read_snapshot(Path(root), candidate["snapshot_path"])
+    if snapshot.snapshot_id != snapshot_id:
+        raise PromotionError("candidate snapshot ID differs from the requested ID")
+    if snapshot.completeness != "complete":
+        raise PromotionError("candidate snapshot must be complete")
+    verify_snapshot_members(Path(root), members)
+    return state
+
+
+def promote(
+    root: Path, snapshot_id: str, reviewer: str, now: datetime | None = None, *, baseline: Path | None = None
+) -> dict[str, Any]:
+    """Manual review step: the pending candidate becomes the qualified snapshot.
+
+    ``baseline`` is a checkout of the current default branch. The candidate's change report is only valid
+    against the qualification it was built from, so a different current qualification is refused.
+    """
     root = Path(root)
     if not reviewer.strip():
         raise PromotionError("promotion requires a named reviewer")
     state = load_state(root)
     expected = dict(state)
-    candidate = state.get("candidate")
-    if not candidate or candidate["snapshot_id"] != snapshot_id:
-        raise PromotionError(f"{snapshot_id} is not the pending candidate")
-    snapshot, members = read_snapshot(root, candidate["snapshot_path"])
-    if snapshot.snapshot_id != snapshot_id:
-        raise PromotionError("candidate snapshot ID differs from the requested ID")
-    if snapshot.completeness != "complete":
-        raise PromotionError("candidate snapshot must be complete")
-    verify_snapshot_members(root, members)
-    state["qualified"] = {**candidate, "qualified_at": _stamp(now or datetime.now(UTC)), "reviewer": reviewer}
+    verify_pending(root, snapshot_id)
+    if baseline is not None and load_state(Path(baseline)).get("qualified") != state.get("qualified"):
+        raise PromotionError("the candidate was staged against a different qualified baseline; rerun ingestion")
+    state["qualified"] = {
+        **state["candidate"],
+        "qualified_at": _stamp(now or datetime.now(UTC)),
+        "reviewer": reviewer,
+    }
     state["candidate"] = None
     try:
         save_state(root, state, expected=expected)
@@ -356,6 +375,10 @@ def main(argv: list[str] | None = None) -> int:
     pro.add_argument("--root", type=Path, required=True)
     pro.add_argument("--snapshot-id", required=True)
     pro.add_argument("--reviewer", required=True)
+    pro.add_argument("--baseline-root", type=Path, help="checkout of the current default branch to compare against")
+    ver = sub.add_parser("verify", help="check a checkout's pending candidate and its member artifacts")
+    ver.add_argument("--root", type=Path, required=True)
+    ver.add_argument("--snapshot-id", required=True)
     notify = sub.add_parser("notify", help="alert the owner channels about a job failure outside ingestion")
     notify.add_argument("--subject", required=True)
     notify.add_argument("--text", required=True)
@@ -380,7 +403,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 1 if report_error else 0
     if args.command == "promote":
-        print(json.dumps(promote(args.root, args.snapshot_id, args.reviewer), sort_keys=True))
+        qualified = promote(args.root, args.snapshot_id, args.reviewer, baseline=args.baseline_root)
+        print(json.dumps(qualified, sort_keys=True))
+        return 0
+    if args.command == "verify":
+        verify_pending(args.root, args.snapshot_id)
         return 0
     if args.command == "notify":
         failures = _env_alert(args.subject, args.text)

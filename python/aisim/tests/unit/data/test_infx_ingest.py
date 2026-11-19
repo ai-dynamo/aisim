@@ -338,6 +338,40 @@ def test_unchanged_refresh_writes_nothing_and_uses_conditional_requests(root, tm
     assert any("If-None-Match" in headers for _, headers in fake.calls)
 
 
+@pytest.mark.parametrize("moved", [False, True])
+def test_promotion_requires_the_candidates_qualified_baseline_to_be_current(root, tmp_path, moved):
+    first, _ = make_run(tmp_path, FakeInfx())
+    baseline = tmp_path / "baseline"  # the default branch as it is now
+    baseline.mkdir()
+    state = infx_job.load_state(root)
+    if moved:  # another candidate was qualified and merged after this one was staged
+        qualified = {
+            **state["candidate"],
+            "snapshot_id": "b" * 64,
+            "qualified_at": "2026-11-06T00:00:00Z",
+            "reviewer": "r",
+        }
+        state = {**state, "qualified": qualified, "candidate": None}
+    infx_job.save_state(baseline, state | {"candidate": None})
+    if moved:
+        with pytest.raises(PromotionError, match="different qualified baseline"):
+            promote(root, first.snapshot_id, "Reviewer", now=NOW, baseline=baseline)
+        assert infx_job.load_state(root)["qualified"] is None
+    else:
+        promote(root, first.snapshot_id, "Reviewer", now=NOW, baseline=baseline)
+        assert infx_job.load_state(root)["qualified"]["snapshot_id"] == first.snapshot_id
+
+
+def test_verify_pending_checks_the_candidate_and_its_member_artifacts(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    assert infx_job.main(["verify", "--root", str(root), "--snapshot-id", first.snapshot_id]) == 0
+    with pytest.raises(PromotionError):
+        infx_job.verify_pending(root, "0" * 64)
+    next(root.rglob("metrics.parquet")).unlink()
+    with pytest.raises(ValueError, match="missing dataset artifact"):
+        infx_job.verify_pending(root, first.snapshot_id)
+
+
 def test_candidate_is_not_promoted_by_a_later_run_and_promotion_needs_a_reviewer(root, tmp_path):
     first, _ = make_run(tmp_path, FakeInfx())
     with pytest.raises(PromotionError):
