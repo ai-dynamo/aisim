@@ -66,6 +66,12 @@ def verified_build(repo):
             "path": str(imported),
             "source_sha256": hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest(),
         }
+    # The fixture copies the system YAML from the imported package, not the checkout.
+    system_yaml = Path(t._CORE_SYSTEMS, f"{t.SYSTEM}.yaml")
+    committed_yaml = repo / "python/aisim/src/aisim_core/systems" / system_yaml.name
+    require_committed(repo, revision, [committed_yaml])
+    if system_yaml.read_bytes() != committed_yaml.read_bytes():
+        raise ValueError(f"imported system file {system_yaml} does not match {revision}")
     native_inputs = [
         repo / name for name in ("Cargo.toml", "Cargo.lock", "crates/core/Cargo.toml", "crates/core/build.rs")
     ]
@@ -80,6 +86,10 @@ def verified_build(repo):
         "revision": revision,
         "packages": packages,
         "fixture_helper": {"path": HELPER, "sha256": hashlib.sha256(helper.read_bytes()).hexdigest()},
+        "system_yaml": {
+            "path": committed_yaml.relative_to(repo).as_posix(),
+            "sha256": hashlib.sha256(committed_yaml.read_bytes()).hexdigest(),
+        },
         "native_extension_path": _runtime.__file__,
         "native_extension_sha256": hashlib.sha256(Path(_runtime.__file__).read_bytes()).hexdigest(),
         "native_source_sha256": hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(),
