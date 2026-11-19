@@ -7,9 +7,13 @@
 #
 # Guarantees (asserted by tests/unit/data/test_infx_job_definition.py):
 #   * runs the library at AISIM_REVIEWED_COMMIT (a full SHA) and nothing else;
-#   * only `publish_candidate` and `promote` see the scoped cache token;
+#   * only `publish_candidate` and `promote` see the scoped write token, only `staleness` the read token,
+#     and neither reaches dependency setup or the library processes;
 #   * an unchanged refresh makes no commit; a candidate goes to a candidate/* branch, never the default branch;
-#   * promotion is manual and needs a named reviewer; failures never touch the last qualified snapshot;
+#   * no no-op or publication decision survives a move of the default branch during acquisition, and a candidate
+#     is verified from the exact commit that is pushed;
+#   * promotion is manual, needs a named reviewer, the reviewed candidate commit and an unchanged qualified baseline;
+#     failures never touch the last qualified snapshot;
 #   * failures and staleness alert Slack #swdl-dynamo-aisim-daily and the owner (Simone Chen) by email.
 
 spec:
@@ -26,6 +30,10 @@ spec:
       description: Job ID suffix of the candidate branch (empty for legacy branches)
       default: ""
       regex: '^[0-9]*$'
+    candidate-commit:
+      description: Full commit SHA of the reviewed candidate branch tip (required for promote)
+      default: ""
+      regex: '^([0-9a-f]{40}|[0-9a-f]{64})?$'
 ---
 workflow:
   rules:
@@ -40,7 +48,8 @@ variables:
   #   AISIM_REVIEWED_COMMIT   40-hex commit of ai-dynamo/aisim that was code-reviewed
   #   AISIM_REPO_URL          fetch URL for that repository (read-only)
   #   INFX_CACHE_REPO_URL     git URL of the private aisim-infx-cache repository
-  #   INFX_CACHE_READ_TOKEN   read-only token on aisim-infx-cache (masked, protected)
+  #   INFX_CACHE_READ_TOKEN   read-only token on aisim-infx-cache; environment scope infx-cache-reader
+  #                           (masked, protected; never use the default '*' environment scope)
   #   INFX_CACHE_WRITE_TOKEN  write on aisim-infx-cache ONLY; environment scope infx-cache-writer
   #                           (masked, protected; never use the default '*' environment scope)
   #   SLACK_WEBHOOK_URL       incoming webhook for #swdl-dynamo-aisim-daily (masked, protected)
@@ -62,7 +71,7 @@ variables:
       git fetch -q --depth 1 origin "$AISIM_REVIEWED_COMMIT"
       git checkout -q --detach FETCH_HEAD
       test "$(git rev-parse HEAD)" = "$AISIM_REVIEWED_COMMIT"
-      env -u INFX_CACHE_WRITE_TOKEN uv sync --project python/aisim --frozen
+      env -u INFX_CACHE_WRITE_TOKEN -u INFX_CACHE_READ_TOKEN uv sync --project python/aisim --frozen
       cd "$CI_PROJECT_DIR"
   variables:
     JOB_PY: "uv run --frozen --project aisim/python/aisim python -m aisim_core.data.infx_job"
@@ -91,8 +100,17 @@ publish_candidate:
     - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY run --no-notify --root cache-repo --cache-dir "$CI_PROJECT_DIR/infx-acquisition" --report run-report.json
     - |
       cd cache-repo
+      # Every no-op or publication decision below is only valid against the baseline this checkout was cloned from.
+      BASE=$(git rev-parse HEAD)
+      baseline_unchanged() {
+        TIP=$(git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote origin HEAD | cut -f1)
+        if [ "$TIP" != "$BASE" ]; then
+          echo "default branch moved from ${BASE} to ${TIP:-an unknown commit} during acquisition; rerun from the new baseline" >&2
+          exit 4
+        fi
+      }
       STATUS=$(git status --porcelain) || exit "$?"
-      if [ -z "$STATUS" ]; then echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
+      if [ -z "$STATUS" ]; then baseline_unchanged; echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
       SID=$(python3 -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
       # A branch is reusable only while this exact snapshot is pending against
       # the current qualification. Historical reviews stay untouched.
@@ -131,6 +149,7 @@ publish_candidate:
       PY
         git worktree remove ../remote-candidate
         if [ "$RC" -eq 0 ]; then
+          baseline_unchanged
           echo "${REF#refs/heads/} is pending for this baseline: nothing to push"; exit 0
         fi
         # Exit 3 is the verifier's verdict that this branch is not reusable. Any other
@@ -143,8 +162,14 @@ publish_candidate:
       git checkout -q -b "$BRANCH"
       git add -A
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -q -m "candidate: InferenceX snapshot ${SID} (not qualified)"
+      COMMIT=$(git rev-parse HEAD)
+      # `git add -A` honors ignore rules, so verify the exact commit rather than the checkout before publishing it.
+      git worktree add -q --detach ../pushed "$COMMIT"
+      env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python -m aisim_core.data.infx_job verify --root ../pushed --snapshot-id "$SID"
+      git worktree remove ../pushed
+      baseline_unchanged
       git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" push -q origin "$BRANCH"
-      echo "Review ${BRANCH}; promote with candidate-snapshot-id=${SID} and candidate-generation=${CI_JOB_ID}"
+      echo "Review ${BRANCH} at ${COMMIT}; promote with candidate-snapshot-id=${SID}, candidate-generation=${CI_JOB_ID} and candidate-commit=${COMMIT}"
   cache:
     key: infx-acquisition
     paths: [infx-acquisition/]
@@ -168,12 +193,19 @@ promote:
   script:
     - set -eu
     - 'test -n "$[[ inputs.candidate-snapshot-id ]]" || { echo "set the candidate-snapshot-id input" >&2; exit 2; }'
+    - 'test -n "$[[ inputs.candidate-commit ]]" || { echo "set the candidate-commit input to the reviewed tip" >&2; exit 2; }'
     - |
       BRANCH="candidate/$[[ inputs.candidate-snapshot-id ]]"
       GENERATION="$[[ inputs.candidate-generation ]]"
       if [ -n "$GENERATION" ]; then BRANCH="${BRANCH}-${GENERATION}"; fi
       git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "$BRANCH" "$INFX_CACHE_REPO_URL" cache-repo
-    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY promote --root cache-repo --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
+    - |
+      # Qualify exactly the tip the reviewer inspected, and only while the default branch still holds the
+      # qualification the candidate's change report was built against.
+      test "$(git -C cache-repo rev-parse HEAD)" = "$[[ inputs.candidate-commit ]]" || { echo "candidate branch tip is not the reviewed commit; review it again" >&2; exit 2; }
+      git -C cache-repo -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin HEAD
+      git -C cache-repo worktree add -q --detach ../baseline FETCH_HEAD
+    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY promote --root cache-repo --baseline-root baseline --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
     - |
       cd cache-repo
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -qam "qualify: $[[ inputs.candidate-snapshot-id ]] (reviewer ${GITLAB_USER_NAME})"
@@ -183,13 +215,16 @@ promote:
 staleness:
   stage: staleness
   extends: .pinned
+  environment:
+    name: infx-cache-reader
+    action: access
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $INFX_JOB == "staleness"'
   script:
     - set -eu
     - *cache_read_clone
     # Alert only: exit 10 = warn (>= 8 days), 11 = stale (>= 14 days) since the last qualified snapshot.
-    - $JOB_PY staleness --root cache-repo
+    - env -u INFX_CACHE_READ_TOKEN $JOB_PY staleness --root cache-repo
   allow_failure:
     exit_codes: [10, 11]
 
