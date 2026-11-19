@@ -461,7 +461,10 @@ def replay_config(root, run):
                 selection["source_play_id"] = f"{namespaces[identity]}:play:{identity}"
         if len(snapshot["initial_selections"]) != run["lanes"]:
             raise ValueError("Missing recorded lane selections")
-        phase = document(root, run, "feature_harness_receipt")["input_config"]["phases"][0]
+        phases = document(root, run, "feature_harness_receipt")["input_config"]["phases"]
+        if not isinstance(phases, list) or not phases:
+            raise ValueError("Feature harness receipt has no valid phases")
+        phase = phases[0]
         traffic["source"].update(format="weka", block_size=64, nested_timestamp_basis="absolute")
         traffic["load"].update(
             agentic_lanes=run["lanes"],
@@ -498,7 +501,10 @@ def replay_config(root, run):
         if set(selections) != set(range(run["lanes"])) or list(positions.values()) != sorted(set(positions.values())):
             raise ValueError("Missing or unordered initial lane selections")
         harness = document(root, run, "harness_receipt")
-        phase = harness["phases"][0]
+        phases = harness["phases"]
+        if not isinstance(phases, list) or not phases:
+            raise ValueError("Harness receipt has no valid phases")
+        phase = phases[0]
         traffic["source"].update(format="weka", block_size=64, nested_timestamp_basis="absolute")
         traffic["load"] = {
             "type": "trace_timestamps",

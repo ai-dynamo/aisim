@@ -371,8 +371,8 @@ def test_fetch_preflights_acceptance_before_downloading_corpus(tmp_path, monkeyp
     assert not (output / "corpora").exists()
 
 
-@pytest.mark.parametrize("recipe_error", ["missing", "null_base", "null_override"])
-def test_fetch_reports_both_malformed_recipe_and_later_acceptance(tmp_path, monkeypatch, recipe_error):
+@pytest.mark.parametrize("input_error", ["missing", "null_base", "null_override", "empty_phases"])
+def test_fetch_reports_malformed_input_and_later_acceptance(tmp_path, monkeypatch, input_error):
     downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
     hub = tmp_path / "hub"
     catalog = json.loads((hub / agentx_run.INDEX).read_bytes())
@@ -392,13 +392,24 @@ def test_fetch_reports_both_malformed_recipe_and_later_acceptance(tmp_path, monk
         value["benchmark_id"] = second["id"]
         path.write_bytes(canonical(value))
         entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
-    if recipe_error == "missing":
+    if input_error == "empty_phases":
+        for role in ("feature_point_receipt", "feature_harness_receipt"):
+            entry = first["artifacts"][role]
+            path = first_path.parent / entry["path"]
+            value = json.loads(path.read_bytes())
+            if role == "feature_point_receipt":
+                value["metrics"]["speculative_acceptance"] = {"verification_depth": 3, "accepted_draft_tokens": 1.25}
+            else:
+                value["input_config"]["phases"] = []
+            path.write_bytes(canonical(value))
+            entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    elif input_error == "missing":
         del first["artifacts"]["recipe"]
     else:
         entry = first["artifacts"]["recipe"]
         path = first_path.parent / entry["path"]
         recipe = json.loads(path.read_bytes())
-        recipe["base" if recipe_error == "null_base" else "override_c1"] = None
+        recipe["base" if input_error == "null_base" else "override_c1"] = None
         path.write_bytes(canonical(recipe))
         entry.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
     catalog["runs"] = []
@@ -419,6 +430,48 @@ def test_fetch_reports_both_malformed_recipe_and_later_acceptance(tmp_path, monk
     assert "agentx-446063:" in str(caught.value)
     assert "agentx-446068: Missing depth-matched measured speculative acceptance" in str(caught.value)
     assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+@pytest.mark.parametrize("backend", ["sglang", "vllm"])
+def test_replay_rejects_empty_recorded_phases(tmp_path, cache_workers, backend):
+    run = (
+        sglang_replay_inputs(tmp_path, acceptance={"verification_depth": 3, "accepted_draft_tokens": 1.25})
+        if backend == "sglang"
+        else result(
+            backend="vllm",
+            measured_backend_version="0.31.0",
+            model="Qwen/Qwen3.5-397B-A17B",
+            precision="BF16",
+            corpus_id="test-corpus",
+            artifacts={},
+        )
+    )
+
+    def put(role, value):
+        path = tmp_path / f"{role}.json"
+        content = canonical(value)
+        path.write_bytes(content)
+        run["artifacts"][role] = {
+            "path": path.name,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
+
+    if backend == "sglang":
+        put("feature_harness_receipt", {"input_config": {"phases": []}})
+    else:
+        for worker in cache_workers:
+            worker["model"]["max_model_len"] = 8192
+            worker["scheduler"].update(max_num_seqs=32, max_num_batched_tokens=512)
+        put("cache_receipt", {"workers": cache_workers})
+        put("workload", {"silicon_reference": {"namespace_map": {"trace": "weka:1111111111111111"}}})
+        put("snapshot_receipt", [{"lane_index": 0, "root_id": "trace", "snapshot": {"t_star_ms": 0}}])
+        put("harness_receipt", {"phases": [], "datasets": [{"random_seed": 42}]})
+        registry = tmp_path / agentx_run.CORPORA
+        registry.parent.mkdir(parents=True)
+        registry.write_bytes(canonical({"sources": {"test-corpus": {"transformations": []}}}))
+    with pytest.raises(ValueError, match="phases"):
+        replay_config(tmp_path, run)
 
 
 def test_fetch_preflights_valid_inputs_and_preserves_corpus(tmp_path, monkeypatch):
