@@ -683,7 +683,11 @@ def _check_availability_values(row: Mapping[str, Any], where: str, *, include_da
     if not include_date:
         for key in INFERENCEX_CONFIG_FIELDS:
             value = row.get(key)
-            if key in {"is_multinode", "prefill_dp_attention", "decode_dp_attention"}:
+            if key in {"prefill_dp_attention", "decode_dp_attention"}:
+                # The converter stores both roles as booleans (``E2eManifestBody.dp_attention``), also for
+                # aggregated rows, and the source always reports them: null cannot be converted.
+                valid = type(value) is bool
+            elif key == "is_multinode":
                 valid = value is None or type(value) is bool
             elif key.endswith(("_tp", "_ep", "_num_workers", "_gpu")):
                 valid = value is None or (type(value) is int and value >= 0)

@@ -59,7 +59,7 @@ import tempfile
 import types
 import typing
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -1218,10 +1218,18 @@ def write_snapshot(
     return snapshot
 
 
-def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[SnapshotMember]]:
-    """Verify a snapshot document, its tables, counts and ID."""
+def read_snapshot(
+    root: Path, path: str, *, payload: Collection[str] | None = None
+) -> tuple[E2eInputSnapshot, list[SnapshotMember]]:
+    """Verify a snapshot document, its tables, counts and ID.
+
+    ``payload`` optionally lists the dataset payload files; a table outside it is refused before it is opened.
+    """
     root = Path(root)
     snapshot = E2eInputSnapshot.model_validate_json(_file(root, path).read_bytes())
+    for table in (snapshot.members, snapshot.acquisition):
+        if payload is not None and table is not None and table.path not in payload:
+            raise ValueError(f"snapshot table {table.path} must be a listed dataset payload file")
     members = table_to_rows(
         SNAPSHOT_MEMBERS_SCHEMA, read_parquet(_verify(root, snapshot.members), SNAPSHOT_MEMBERS_SCHEMA)
     )
