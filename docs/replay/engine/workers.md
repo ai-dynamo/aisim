@@ -488,14 +488,17 @@ that can schedule the request.
 With `launch`, replay follows these rules for the
 [connector profiles](kv-cache.md#g2-connector-profiles) of vLLM v0.32.0:
 
-- `offloading_v0_32`: the copy starts once the issuing pass's GPU work ends.
-  Another request that needs the same blocks waits for the load until vLLM has
-  seen the copy finish.
-- `simple_cpu_v0_32`: a copy thread starts the copy when the issuing pass's
-  launch ends, without waiting for its GPU work.
+- `offloading_v0_32`: each load is its own copy, which starts once the issuing
+  pass's GPU work ends and the previous copy is done. Another request that
+  needs the same blocks waits for the load until vLLM has seen the copy
+  finish.
+- `simple_cpu_v0_32`: a copy thread copies the issuing pass's loads as one
+  batch, from the end of that pass's launch, without waiting for its GPU work
+  but after the previous batch; vLLM sees them finish together.
 - An engine that schedules nothing takes empty steps, each of which checks the
   connector. Replay prices them at zero, so such an engine sees a load when
-  its copy ends.
+  its copy ends. vLLM sleeps 1 ms after each empty step, so it schedules the
+  request a few milliseconds later.
 
 Each check comes at the end of a launch, and only `launch` times launches, so
 the rule needs no setting of its own and applies only with `launch`. Without
@@ -512,7 +515,10 @@ called at the end of `GPUModelRunner.sample_tokens`; the scheduler's
 `_update_from_kv_xfer_finished` and `_handle_blocked_waiting_request`; the
 offloading connector's
 [`transfer_async`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_offload/cpu/gpu_worker.py),
-whose stream waits for the compute stream; and SimpleCPU's
+whose stream waits for the compute stream and the previous transfer; and
+SimpleCPU's
+[`build_connector_meta`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/manager.py),
+which puts a step's loads in one event, and its
 [copy thread](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/simple_kv_offload/copy_backend.py).
 
 ### SGLang batch-selection cost
