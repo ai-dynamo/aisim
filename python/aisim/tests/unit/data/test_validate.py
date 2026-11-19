@@ -71,12 +71,15 @@ def _identity():
     )
 
 
-def build_dataset(tmp_path, claim_scale=1.0):
+def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions=False):
     rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, 5)] + [("bad", {"tokens": 1}, None)]
     art = write_truth_table(tmp_path / "t.parquet", rows)
     truth_bytes = (tmp_path / "t.parquet").read_bytes()
     art = art.model_copy(update={"path": "eval/truth.parquet"})
     cases = [(c, t, _predict(i) * claim_scale) for c, i, t in rows]
+    results = compute_results(cases)
+    if drop_exclusions:  # a producer that omits an exclusion but keeps every aggregate
+        results = results.model_copy(update={"exclusions": []})
     pred = PredictionIdentity.build("fpm_interpolation", {"p": PIN}, SPEC)
     ident = _identity()
     cfg = configuration_id("eval", "evaluation-record", ident)
@@ -91,7 +94,7 @@ def build_dataset(tmp_path, claim_scale=1.0):
                 "artifacts": [art.model_dump(by_alias=True)],
                 "truth_table_artifact_id": "truth-table",
             },
-            "results": compute_results(cases).model_dump(),
+            "results": results.model_dump(),
             "assumptions": [],
             "gpu_time": GpuTime(authority="unknown").model_dump(),
             "simulation_cost": {"wall_seconds": 1.0, "gpu_seconds": 0.0},
@@ -111,7 +114,20 @@ def build_dataset(tmp_path, claim_scale=1.0):
         "requested_settings": None,
         "artifacts": [
             _art("r", rec_name, rec_bytes, "json", "aisim-eval/v1"),
-            _art("truth-table", "eval/truth.parquet", truth_bytes, "parquet", "aisim-eval-truth/v1", rows=len(rows)),
+            *(
+                [
+                    _art(
+                        "truth-table",
+                        "eval/truth.parquet",
+                        truth_bytes,
+                        "parquet",
+                        "aisim-eval-truth/v1",
+                        rows=len(rows),
+                    )
+                ]
+                if list_truth
+                else []
+            ),
         ],
         "provenance": {},
         "evidence_gaps": [],
@@ -219,9 +235,34 @@ def test_required_case_unpredicted_or_missing_or_excluded(tmp_path):
     r = run(tmp_path, files, request(rec, cfg, required_cases=["bad", "nope"]))
     reasons = {o.case_id: o.reason for o in r.required_cases}
     assert r.verdict == "fail"
-    assert reasons["bad"] == "excluded by producer" and reasons["nope"] == "not in truth table"
+    assert reasons["bad"] == "not scored: missing truth" and reasons["nope"] == "not in truth table"
     r = run(tmp_path, files, request(rec, cfg), factory=lambda rec_: (lambda i: None, rec_.prediction.fingerprint))
     assert r.verdict == "fail"
+
+
+def test_required_case_gate_uses_the_verifiers_exclusions_not_the_producers(tmp_path):
+    files, rec, cfg, record = build_dataset(tmp_path, drop_exclusions=True)
+    assert record.results.exclusions == []  # the producer claims every case scored
+    r = run(tmp_path, files, request(rec, cfg, required_cases=["s1", "bad"]))
+    assert r.verdict == "fail"
+    assert {o.case_id: (o.status, o.reason) for o in r.required_cases} == {
+        "s1": ("pass", None),
+        "bad": ("fail", "not scored: missing truth"),
+    }
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_truth_table_outside_the_selected_evidence_fails_regardless_of_cache(tmp_path, warm_cache):
+    files, rec, cfg, _ = build_dataset(tmp_path, list_truth=False)
+    if warm_cache:  # the same file at the same commit left by an earlier run
+        cached = Cache(tmp_path / "cache").path_for(REPO, DSHA, "eval/truth.parquet")
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(files["eval/truth.parquet"])
+    transport = FakeTransport(files)
+    r = run(tmp_path, files, request(rec, cfg), transport=transport)
+    assert r.verdict == "fail" and r.accuracy is None
+    assert "truth-table" in r.problems[0] and "eval/truth.parquet" in r.problems[0]
+    assert "eval/truth.parquet" not in transport.opened
 
 
 def test_fingerprint_mismatch_fails(tmp_path):
@@ -349,6 +390,10 @@ def test_cli_run_and_recheck(tmp_path, monkeypatch, capsys):
 
     recheck = ["recheck", *common, "--report", str(out)]
     assert main(recheck) == 0
+    failed_out = tmp_path / "failed-report.json"
+    failed_out.write_text(report.model_copy(update={"verdict": "fail", "problems": ["x"]}).model_dump_json())
+    assert main(["recheck", *common, "--report", str(failed_out)]) == 1  # current binding, but not a pass
+    assert "NOT PASSING" in capsys.readouterr().err
     payload["head"]["sha"] = "9" * 40  # the PR head moved
     (tmp_path / "pr.json").write_text(json.dumps(payload))
     assert main(recheck) == 1
@@ -357,6 +402,44 @@ def test_cli_run_and_recheck(tmp_path, monkeypatch, capsys):
     assert main(run_args, transport=FakeTransport(files)) == 2
     monkeypatch.setenv("HF_TOKEN", "x")
     assert main(recheck) == 2
+
+
+def test_cli_fetches_anonymously_even_with_a_saved_login(tmp_path, monkeypatch):
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HOME_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    files, rec, cfg, _ = build_dataset(tmp_path)
+    (tmp_path / "req.json").write_text(request(rec, cfg).model_dump_json())
+    (tmp_path / "pr.json").write_text(
+        json.dumps({"number": 7, "state": "open", "head": {"sha": HEAD}, "base": {"sha": BASE}})
+    )
+    tokens = []
+
+    class RecordingTransport(FakeTransport):
+        def __init__(self, token=None):
+            super().__init__(files)
+            tokens.append(token)
+
+    monkeypatch.setattr("aisim_core.data.validate.HfTransport", RecordingTransport)
+    monkeypatch.setattr("aisim_core.data.validate._load_factory", lambda spec: factory)
+    args = [
+        "run",
+        "--pr-json",
+        str(tmp_path / "pr.json"),
+        "--repo",
+        REPO,
+        "--request-file",
+        str(tmp_path / "req.json"),
+        "--trusted-sha",
+        TRUSTED,
+        "--predictor-factory",
+        "aisim_core.data.validate:x",
+        "--cache-dir",
+        str(tmp_path / "c"),
+        "--output",
+        str(tmp_path / "report.json"),
+    ]
+    assert main(args) == 0
+    assert tokens == [False]  # False: no token at all; None would let huggingface_hub use a saved login
 
 
 def test_default_predictor_fails_closed(tmp_path):

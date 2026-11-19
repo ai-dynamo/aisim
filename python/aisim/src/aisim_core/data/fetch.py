@@ -137,9 +137,12 @@ class Transport(Protocol):
 
 
 class HfTransport:
-    """Hugging Face dataset transport (``huggingface_hub`` is imported lazily)."""
+    """Hugging Face dataset transport (``huggingface_hub`` is imported lazily).
 
-    def __init__(self, token: str | None = None):
+    ``token=None`` lets ``huggingface_hub`` pick up a saved login; ``token=False`` sends no credential.
+    """
+
+    def __init__(self, token: str | bool | None = None):
         self._token = token
 
     def resolve_revision(self, repo: str, revision: str) -> str:

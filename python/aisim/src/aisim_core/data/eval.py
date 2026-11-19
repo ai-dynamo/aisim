@@ -231,6 +231,14 @@ def _label(value: str) -> str:
     return value.replace("/", "--")
 
 
+def _component(value: str) -> str:
+    """One directory name derived from an identity field; never lets the path leave the root."""
+    label = _label(value)
+    if label in ("", ".", "..") or "\\" in label or "\0" in label:
+        raise ValueError(f"identity value cannot be a path component: {value!r}")
+    return label
+
+
 def parallelism_label(identity: Identity) -> str:
     """Readable path label, e.g. ``tp4-ep8``; ``unspecified`` when unknown."""
     if not identity.parallelism:
@@ -246,14 +254,14 @@ def record_dir(root: str | Path, identity: Identity) -> Path:
     """``eval/<model>/<hardware>/<framework>/<version>/<parallelism>/`` (op: ``<hardware>/<family>/``)."""
     base = Path(root) / "eval"
     if identity.model is None:
-        return base / identity.hardware / (identity.operation_family or "unspecified")
+        return base / _component(identity.hardware) / _component(identity.operation_family or "unspecified")
     return (
         base
-        / _label(identity.model)
-        / identity.hardware
-        / identity.framework
-        / identity.framework_version
-        / parallelism_label(identity)
+        / _component(identity.model)
+        / _component(identity.hardware)
+        / _component(identity.framework)
+        / _component(identity.framework_version)
+        / _component(parallelism_label(identity))
     )
 
 
@@ -428,7 +436,8 @@ def verify_record(
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != table_art.sha256 or len(data) != table_art.bytes:
         return VerificationReport(ok=False, problems=["truth table hash or size differs from record"])
-    table = read_parquet(path, TRUTH_SCHEMA_ID)
+    # Decode the bytes the digest covered, not a second read of the path (it could be replaced in between).
+    table = read_parquet(pa.BufferReader(data), TRUTH_SCHEMA_ID)
     if tuple(table.column_names) != TRUTH_COLUMNS:
         return VerificationReport(ok=False, problems=[f"truth table columns {table.column_names}"])
     ids = table.column("case_id").to_pylist()

@@ -112,6 +112,30 @@ def _observed_settings(effective: Sequence[Mapping[str, Any]]) -> dict[str, Sett
     return settings
 
 
+_GPU_FACTORS = (
+    "tensor_parallel_size",
+    "pipeline_parallel_size",
+    "data_parallel_size",
+    "prefill_context_parallel_size",
+)
+
+
+def _device_count(effective: Sequence[Mapping[str, Any]]) -> int | None:
+    """GPU count the bundle records: the product of the observed rank-0 parallelism degrees, else ``None``.
+
+    ``manifest["tensor_parallel"]`` is only the TP degree; with attention DP, EP or pipeline stages the
+    run uses more GPUs, so it cannot divide a total throughput into a per-device one.
+    """
+    parallel = (effective[0].get("parallelism") if effective else None) or {}
+    count = 1
+    for name in _GPU_FACTORS:
+        value = parallel.get(name)
+        if type(value) is not int or value < 1:
+            return None
+        count *= value
+    return count
+
+
 def _body(
     manifest: Mapping[str, Any], configuration: Mapping[str, Any], workload: Mapping[str, Any], features
 ) -> E2eManifestBody:
@@ -317,7 +341,15 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
         }.items()
         if v is not None
     }
-    device_count = manifest["tensor_parallel"]
+    device_count = _device_count(configuration.get("effective") or [])
+    if device_count is None:
+        body.evidence_gaps.append(
+            {
+                "field": "device_count",
+                "reason": "the bundle records no observed parallelism, so the GPU count is unknown; "
+                "per-device throughput cannot be derived",
+            }
+        )
     completed = sum(r["status"] == "completed" for r in profile)
     observation = ObservationRow(
         observation_id=observation_id,

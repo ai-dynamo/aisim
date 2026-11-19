@@ -339,7 +339,12 @@ def prepare_execution_profile(root: Path, manifest_path: str, output_dir: Path) 
         selection["path"] = str(destination)
         # Use the same Rust-owned admission/readiness checks as prediction;
         # manifest/profile agreement alone cannot establish runtime completeness.
-        RustForwardPassPerfModel.best_available(config)
+        # The saved configuration is what gets checked: an AISIM_DATASET/AISIM_DATA_LOCAL pin in the environment
+        # must neither add a dataset root to it nor fetch, so the check runs with the pin suppressed.
+        from aisim_core.data.ensure import _guard
+
+        with _guard():
+            RustForwardPassPerfModel.best_available(config)
         (output_dir / "config.json").write_text(json.dumps(config, indent=2, allow_nan=False) + "\n")
     except BaseException:
         shutil.rmtree(output_dir)

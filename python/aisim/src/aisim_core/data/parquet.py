@@ -68,7 +68,7 @@ def write_parquet(
     return path
 
 
-def read_parquet_schema_id(path: str | Path) -> str | None:
+def read_parquet_schema_id(path: str | Path | pa.NativeFile) -> str | None:
     """Return the schema ID stored in the file metadata, or None when absent."""
     metadata = pq.read_metadata(path).metadata or {}
     value = metadata.get(SCHEMA_METADATA_KEY)
@@ -76,7 +76,7 @@ def read_parquet_schema_id(path: str | Path) -> str | None:
 
 
 def read_parquet(
-    path: str | Path,
+    path: str | Path | pa.NativeFile,
     expected_schema_id: str | tuple[str, ...] | None = None,
     *,
     columns: list[str] | None = None,
@@ -85,6 +85,7 @@ def read_parquet(
 
     ``expected_schema_id`` may be one ID or several accepted versions. Pass
     ``None`` only for inspection; loaders must always name what they accept.
+    ``path`` may be a ``pa.BufferReader`` over bytes the caller already checked.
     """
     actual = read_parquet_schema_id(path)
     if expected_schema_id is not None:

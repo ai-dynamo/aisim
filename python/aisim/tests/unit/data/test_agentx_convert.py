@@ -156,3 +156,36 @@ def test_unsupported_bundle_schema_is_rejected(tmp_path):
     (path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(AgentxBundleError):
         agentx_bundle_to_configuration(path)
+
+
+def _set_effective_parallelism(path, **parallelism):
+    configuration = json.loads((path / "configuration.json").read_text())
+    configuration["effective"][0]["parallelism"] = parallelism
+    (path / "configuration.json").write_text(json.dumps(configuration))
+
+
+def test_device_count_is_the_observed_gpu_count_not_the_tensor_parallel_degree(tmp_path):
+    path = _bundle(tmp_path, "dp2")
+    _set_effective_parallelism(
+        path,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+        data_parallel_size=2,
+        prefill_context_parallel_size=1,
+    )
+    data = agentx_bundle_to_configuration(path)
+    assert data.observations[0].device_count == 16
+    throughput = next(m for m in data.metrics if m.metric == "output_throughput")
+    assert throughput.device_count == 16
+    assert not any(g["field"] == "device_count" for g in data.body.evidence_gaps)
+
+
+@pytest.mark.parametrize("parallelism", [None, {"tensor_parallel_size": 8}])
+def test_unrecorded_gpu_count_is_null_with_an_evidence_gap(tmp_path, parallelism):
+    path = _bundle(tmp_path, "unknown")
+    if parallelism is not None:
+        _set_effective_parallelism(path, **parallelism)
+    data = agentx_bundle_to_configuration(path)
+    assert data.observations[0].device_count is None
+    assert next(m for m in data.metrics if m.metric == "output_throughput").device_count is None
+    assert any(g["field"] == "device_count" for g in data.body.evidence_gaps)

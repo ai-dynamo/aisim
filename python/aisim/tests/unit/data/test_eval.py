@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from pathlib import Path
+
 import pytest
 
 from aisim_core.data import Identity
@@ -13,6 +15,7 @@ from aisim_core.data.eval import (
     current_records,
     load_record,
     prediction_fingerprint,
+    record_dir,
     record_path,
     verify_record,
     write_record,
@@ -173,3 +176,55 @@ def test_record_gpu_time_archival_warns_qualified_errors(built):
         EvalRecord.model_validate(doc)
     doc["gpu_time"] = GpuTime(authority="measured", gpu_count=4, wall_seconds=0.0).model_dump(by_alias=True)
     assert EvalRecord.model_validate(doc).tier == "qualified"  # zero is recorded, not missing
+
+
+def test_verification_scores_the_bytes_the_digest_covered(built, monkeypatch):
+    root, record = built
+    path = root / "truth.parquet"
+    rows = [(f"s{i}", {"tokens": 10 * i}, 99.0 * i) for i in range(1, 6)] + [("bad", {"tokens": 1}, None)]
+    write_truth_table(root / "replacement.parquet", rows)
+    replacement = (root / "replacement.parquet").read_bytes()
+    real_read_bytes = Path.read_bytes
+
+    def swap_after_the_digest_read(self):
+        data = real_read_bytes(self)
+        if self == path:
+            path.write_bytes(replacement)  # an atomic replace between the digest check and the decode
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", swap_after_the_digest_read)
+    report = verify_record(record, root, _predict, record.prediction.fingerprint)
+    assert report.ok, report.problems
+
+
+@pytest.mark.parametrize(
+    "model,field",
+    [
+        ("Qwen/Qwen3-32B", "hardware"),
+        ("Qwen/Qwen3-32B", "framework"),
+        ("Qwen/Qwen3-32B", "framework_version"),
+        ("Qwen/Qwen3-32B", "model"),
+        (None, "hardware"),
+        (None, "operation_family"),
+    ],
+)
+def test_record_dir_keeps_identity_values_inside_the_eval_root(tmp_path, field, model):
+    identity = _identity().model_copy(update={"model": model, "operation_family": "gemm"})
+    normal = record_dir(tmp_path, identity)
+    assert normal.relative_to(tmp_path / "eval").parts[0] == ("Qwen--Qwen3-32B" if model else "b200_sxm")
+    for value in ("../../escape", "a/b"):
+        path = record_dir(tmp_path, identity.model_copy(update={field: value}))
+        assert path.resolve().is_relative_to((tmp_path / "eval").resolve())
+        assert len(path.relative_to(tmp_path / "eval").parts) == len(normal.relative_to(tmp_path / "eval").parts)
+    for value in ("..", ".", "a\\b"):
+        with pytest.raises(ValueError, match="path component"):
+            record_dir(tmp_path, identity.model_copy(update={field: value}))
+
+
+def test_write_record_refuses_an_identity_that_would_leave_the_eval_root(built):
+    root, record = built
+    truth = record.truth.model_copy(update={"identity": record.truth.identity.model_copy(update={"hardware": ".."})})
+    escaped = record.model_copy(update={"truth": truth})
+    with pytest.raises(ValueError, match="path component"):
+        write_record(root, escaped)
+    assert not (root / "eval").exists()

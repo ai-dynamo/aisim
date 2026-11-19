@@ -287,8 +287,17 @@ def run_validation(
         return failed("fail", [f"record {request.record_path!r} is not in the selected evidence"], dataset_sha=sha)
     try:
         record = load_record(local)
-        predict, fingerprint = predictor_factory(record)
         table_art = next(a for a in record.truth.artifacts if a.artifact_id == record.truth.truth_table_artifact_id)
+        # Truth artifact paths are dataset-root relative. The table must be part of the selected evidence; a copy
+        # that is merely in the cache would make the verdict depend on cache state.
+        table_dataset_path = table_art.path
+        if table_dataset_path not in result.paths:
+            return failed(
+                "fail",
+                [f"truth table {table_art.artifact_id!r} ({table_dataset_path!r}) is not in the selected evidence"],
+                dataset_sha=sha,
+            )
+        predict, fingerprint = predictor_factory(record)
         seen: dict[str, float | None] = {}
 
         def recording(inputs):
@@ -301,7 +310,7 @@ def run_validation(
     except (PrValidationError, ValueError, KeyError, OSError, ValidationError, StopIteration) as exc:
         return failed("fail", [f"record could not be verified: {type(exc).__name__}: {exc}"], dataset_sha=sha)
 
-    outcomes = _required_outcomes(request.required_cases, record.results, table, seen, report.ok)
+    outcomes = _required_outcomes(request.required_cases, report.recomputed, table, seen, report.ok)
     accuracy = None
     if report.recomputed is not None:
         r: Results = report.recomputed
@@ -317,8 +326,10 @@ def run_validation(
     )
 
 
-def _required_outcomes(required, claimed: Results, table, seen, verified: bool) -> list[CaseOutcome]:
-    excluded = {e.case_id for e in claimed.exclusions}
+def _required_outcomes(required, recomputed: Results | None, table, seen, verified: bool) -> list[CaseOutcome]:
+    # The verifier's own exclusions, not the producer's list: a producer can omit an exclusion and still match
+    # every aggregate, but a case the verifier does not score is not covered.
+    excluded = {e.case_id: e.reason for e in recomputed.exclusions} if recomputed is not None else {}
     inputs_by_case: dict[str, str] = {}
     if table is not None:
         for case_id, inputs_json in zip(
@@ -331,10 +342,10 @@ def _required_outcomes(required, claimed: Results, table, seen, verified: bool) 
             out.append(CaseOutcome(case_id=case_id, status="fail", reason="record did not verify"))
         elif case_id not in inputs_by_case:
             out.append(CaseOutcome(case_id=case_id, status="fail", reason="not in truth table"))
-        elif case_id in excluded:
-            out.append(CaseOutcome(case_id=case_id, status="fail", reason="excluded by producer"))
         elif seen.get(inputs_by_case[case_id]) is None:
             out.append(CaseOutcome(case_id=case_id, status="fail", reason="no prediction"))
+        elif case_id in excluded:
+            out.append(CaseOutcome(case_id=case_id, status="fail", reason=f"not scored: {excluded[case_id]}"))
         else:
             out.append(CaseOutcome(case_id=case_id, status="pass"))
     return out
@@ -408,7 +419,8 @@ def main(argv: list[str] | None = None, *, transport: Transport | None = None) -
                 request,
                 pr,
                 trusted_sha=args.trusted_sha,
-                transport=transport or HfTransport(token=None),
+                # token=False sends no credential, not even a saved login (None would fall back to one).
+                transport=transport or HfTransport(token=False),
                 predictor_factory=_load_factory(args.predictor_factory),
                 cache=Cache(Path(args.cache_dir)),
             )
@@ -428,7 +440,9 @@ def main(argv: list[str] | None = None, *, transport: Transport | None = None) -
         )
         for reason in stale:
             print(f"STALE: {reason}", file=sys.stderr)
-        return 1 if stale else 0
+        if report.verdict != "pass":
+            print(f"NOT PASSING: the saved report's verdict is {report.verdict!r}", file=sys.stderr)
+        return 1 if stale or report.verdict != "pass" else 0
     except (PrValidationError, ValidationError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

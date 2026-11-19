@@ -157,6 +157,7 @@ _UNIT_ALIASES = {
     "tokens/second": "tokens/s",
     "tok/s": "tokens/s",
     "tokens/s/user": "tokens/s/user",
+    "tokens/sec/user": "tokens/s/user",
     "tokens/second/user": "tokens/s/user",
     "tok/s/user": "tokens/s/user",
     "requests/s": "requests/s",

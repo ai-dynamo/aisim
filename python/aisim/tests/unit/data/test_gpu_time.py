@@ -176,12 +176,29 @@ def test_kubernetes_capture_excludes_queue_wait_and_splits_failed():
     assert gt.source["source"] == "kubernetes"
 
 
-def test_kubernetes_falls_back_to_job_times_and_template_gpus():
+def test_kubernetes_takes_gpus_from_the_job_template_when_the_pod_spec_has_none():
     from aisim_core.data.gpu_time import gpu_time_from_kubernetes
 
-    pod = {"metadata": {"name": "p"}, "status": {"phase": "Succeeded"}}
+    pod = {
+        "metadata": {"name": "p"},
+        "status": {
+            "phase": "Succeeded",
+            "containerStatuses": [
+                {"state": {"terminated": {"startedAt": "2026-11-07T00:10:00Z", "finishedAt": "2026-11-07T00:20:00Z"}}}
+            ],
+        },
+    }
     gt = gpu_time_from_kubernetes(_JOB, [pod])
     assert gt.wall_seconds == 600 and gt.gpu_count == 4
+
+
+def test_kubernetes_does_not_report_job_wall_time_as_measured_gpu_time():
+    from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
+
+    # Job startTime..completionTime includes queue wait; without container timestamps nothing is measured.
+    pod = {"metadata": {"name": "p"}, "status": {"phase": "Succeeded"}}
+    with pytest.raises(KubeParseError, match="no terminated container times"):
+        gpu_time_from_kubernetes(_JOB, [pod])
 
 
 @pytest.mark.parametrize(

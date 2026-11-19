@@ -264,6 +264,13 @@ def test_requests_table_and_developer_observation(tmp_path):
     assert check_manifest is not None
 
 
+def test_aiperf_per_user_throughput_unit_spelling_converts():
+    summary = _aiperf_summary(output_token_throughput_per_user={"unit": "tokens/sec/user", "avg": 42.0})
+    cfg = aiperf_to_configuration(summary, _aiperf_records(), _dev_body(), observation_id="dev:1", device_count=8)
+    row = next(m for m in cfg.metrics if m.metric == "interactivity" and m.statistic == "mean")
+    assert (row.status, row.value, row.unit) == ("valid", 42.0, "tokens/s/user")
+
+
 def test_loader_rejects_tamper_and_wrong_schema(tmp_path):
     cfg = _dev_config()
     path = write_configuration(tmp_path, cfg)

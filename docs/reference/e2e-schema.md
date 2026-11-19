@@ -128,6 +128,7 @@ row with value 0. Replicas of a tensor-parallel group are never summed; `source`
 | AgentX server-side series | series table |
 | AgentX effective runtime settings | manifest `settings` with `observed` authority, `implementation` |
 | AgentX feature list | `ext["agentx/1"]` |
+| AgentX GPU count (product of the observed rank-0 parallelism degrees) | observation and total-throughput `device_count`; null with a `device_count` gap when the bundle records no parallelism |
 | AgentX official gaps (no effective settings, `cached_tokens` null) | `evidence_gaps`, null columns |
 
 `aisim_core.data.agentx_convert.agentx_bundles_to_configurations` converts AgentX bundles; the run-level
