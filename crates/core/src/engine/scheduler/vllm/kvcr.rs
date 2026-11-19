@@ -75,6 +75,8 @@ struct Promotion {
 struct Fill {
     ends: f64,
     reservation: TransferId,
+    /// Blocks counted as stored only when this copy lands.
+    blocks: usize,
     /// Under LRU: the request's blocks up to the store's last one.
     rerank: Option<Rerank>,
     /// The G2 store it copies and that store's blocks, which vLLM keeps
@@ -383,7 +385,15 @@ impl VllmKvcrAdapter {
             keys.len(),
         );
         if let Some(local) = &mut self.local {
-            if let Some(wait) = local.no_room.get(&owner).filter(|wait| wait.at == at) {
+            // The target epochs do not cover peer evictions. A cached room
+            // failure is still relevant only while a source holds its key.
+            if let Some(wait) = local.no_room.get(&owner).filter(|wait| {
+                wait.at == at
+                    && [own_local.as_ref(), src.as_ref(), src_local.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|tier| tier.lookup(wait.key) == Lookup::Hit)
+            }) {
                 tier.note_external_capacity_retry(owner, wait.key, now);
                 return (wait.deferred, false, None);
             }
@@ -640,7 +650,7 @@ impl VllmKvcrAdapter {
             return false;
         }
         let mut source = local.tier.lock();
-        let (mut blocks, mut changed) = (0, false);
+        let (mut blocks, mut stored, mut changed) = (0, 0, false);
         loop {
             match next(local) {
                 (Some(promotion), fill) if fill.is_none_or(|fill| promotion <= fill) => {
@@ -674,18 +684,18 @@ impl VllmKvcrAdapter {
                 (_, Some(_)) => {
                     let fill = local.fills.pop_front().unwrap();
                     LocalG2::land_fill(&mut source, fill.reservation, fill.rerank);
+                    stored += fill.blocks as u64;
                     tier.unpin_external(&fill.g2_keys);
                 }
                 _ => break,
             }
         }
         drop(source);
-        if blocks > 0 {
-            self.registry
-                .lock()
-                .unwrap()
-                .local_g2_stats()
-                .promoted_blocks += blocks;
+        if blocks > 0 || stored > 0 {
+            let mut registry = self.registry.lock().unwrap();
+            let stats = registry.local_g2_stats();
+            stats.promoted_blocks += blocks;
+            stats.stored_blocks += stored;
         }
         self.epoch += u64::from(changed);
         changed
@@ -727,9 +737,10 @@ impl VllmKvcrAdapter {
                 dropped += u64::from(full);
             }
         }
-        let (mut stored, mut evicted, mut left) = (0, 0, Vec::new());
+        let (mut completed, mut evicted, mut left) = (0, 0, Vec::new());
         if let Some(plan) = plan.filter(|plan| !plan.reserved().is_empty()) {
-            (stored, evicted) = (plan.reserved().len(), plan.victims().len());
+            let blocks = plan.reserved().len();
+            evicted = plan.victims().len();
             left.extend(
                 (plan.victims().iter())
                     .filter(|key| g2.lookup(**key) != Lookup::Hit)
@@ -737,13 +748,15 @@ impl VllmKvcrAdapter {
             );
             let reservation = tier.reserve_planned(LOCAL_G2_CLIENT, owner, plan, None, now);
             let last = local.fills.back().map(|copy| copy.ends);
-            let ends = local.copy_end(last, stored, now);
+            let ends = local.copy_end(last, blocks, now);
             if ends <= now {
                 LocalG2::land_fill(&mut tier, reservation, rerank);
+                completed = blocks;
             } else {
                 local.fills.push_back(Fill {
                     ends,
                     reservation,
+                    blocks,
                     rerank,
                     store,
                     g2_keys: Vec::new(),
@@ -756,7 +769,7 @@ impl VllmKvcrAdapter {
         }
         drop(tier);
         let stats = registry.local_g2_stats();
-        stats.stored_blocks += stored as u64;
+        stats.stored_blocks += completed as u64;
         stats.dropped_blocks += dropped;
         stats.evicted_blocks += evicted as u64;
         left
@@ -1151,6 +1164,75 @@ mod tests {
                     vec![keys[1], keys[1]]
                 };
                 assert_eq!(*observer.0.lock().unwrap(), expected, "{local:?}");
+                assert_eq!(target.lookup(keys[0]), Lookup::Hit);
+                assert_eq!(target.lookup(keys[1]), Lookup::Miss);
+                assert!(!adapter.has_work());
+            }
+        }
+    }
+
+    #[test]
+    fn cached_capacity_retry_rechecks_peer_residency() {
+        for policy in [KvcrLocalG2Policy::Lru, KvcrLocalG2Policy::Fifo] {
+            for peer_local in [false, true] {
+                // k0 protects the target's only slot. k1 starts in either
+                // peer cache, then leaves without changing the target epochs.
+                let source_keys = if peer_local { &[][..] } else { &[1][..] };
+                let f = Fixture::with_local_g2(3, policy, 0.0, 1, source_keys, &[0]);
+                let (mut adapter, mut source) = (f.adapter(), f.adapter_of(f.source));
+                if peer_local {
+                    source.store_local(
+                        &f.source_g2.lock(),
+                        f.owner,
+                        TransferId::new(0),
+                        &f.keys(&[1]),
+                        0.0,
+                    );
+                }
+                let observer = Arc::new(CapacityRetries::default());
+                let mut target = f.target.lock();
+                target.set_observer(observer.clone());
+                let mut restore = RestoreRounds::default();
+                let keys = f.keys(&[0, 1]);
+                for now in [0.0, 1.0] {
+                    assert!(!adapter.stage_at(
+                        &mut target,
+                        f.owner,
+                        f.source,
+                        &mut restore,
+                        &keys,
+                        now,
+                    ));
+                }
+                // A source hit preserves the cached retry.
+                assert_eq!(*observer.0.lock().unwrap(), vec![keys[1], keys[1]]);
+                assert_eq!(adapter.local.as_ref().unwrap().no_room.len(), 1);
+                if peer_local {
+                    source.store_local(
+                        &f.source_g2.lock(),
+                        f.owner,
+                        TransferId::new(1),
+                        &f.keys(&[2, 3, 4]),
+                        1.0,
+                    );
+                    assert_eq!(
+                        source.local.as_ref().unwrap().tier.lock().lookup(keys[1]),
+                        Lookup::Miss
+                    );
+                } else {
+                    make_resident(&f.source_g2, &[2, 3, 4, 5, 6, 7, 8, 9]);
+                    assert_eq!(f.source_g2.lock().lookup(keys[1]), Lookup::Miss);
+                }
+                assert!(!adapter.stage_at(
+                    &mut target,
+                    f.owner,
+                    f.source,
+                    &mut restore,
+                    &keys,
+                    2.0,
+                ));
+                assert_eq!(*observer.0.lock().unwrap(), vec![keys[1], keys[1]]);
+                assert!(adapter.local.as_ref().unwrap().no_room.is_empty());
                 assert_eq!(target.lookup(keys[0]), Lookup::Hit);
                 assert_eq!(target.lookup(keys[1]), Lookup::Miss);
                 assert!(!adapter.has_work());
@@ -1901,7 +1983,7 @@ mod tests {
             for (store, stored) in [(0, &keys[..2]), (2, &keys[2..]), (9, &keys[..1])] {
                 adapter.store_local(&target, f.owner, TransferId::new(store), stored, 0.0);
             }
-            assert_eq!(f.stats().local_g2.unwrap().stored_blocks, 3);
+            assert_eq!(f.stats().local_g2.unwrap().stored_blocks, 0);
             assert!(matches!(in_kvcr(keys[0]), Lookup::Pending { .. }));
             assert!(adapter.has_work());
             // G2 dropping k0 meanwhile does not remove it from host memory.
@@ -1915,7 +1997,9 @@ mod tests {
             assert_eq!(adapter.next_deadline(), Some(2.0 * ms));
             // A landed copy into KVCR memory changes no lookup's answer.
             assert!(!adapter.advance(&mut target, 2.0 * ms - 0.5));
+            assert_eq!(f.stats().local_g2.unwrap().stored_blocks, 0);
             assert!(!adapter.advance(&mut target, 2.0 * ms));
+            assert_eq!(f.stats().local_g2.unwrap().stored_blocks, 2);
             assert_eq!(in_kvcr(keys[1]), Lookup::Hit);
             assert!(matches!(in_kvcr(keys[2]), Lookup::Pending { .. }));
 
@@ -1923,6 +2007,7 @@ mod tests {
             assert!(stage(&mut adapter, &mut target, 2.0 * ms));
             assert_eq!(adapter.next_deadline(), Some(3.0 * ms));
             assert!(!adapter.advance(&mut target, 3.0 * ms));
+            assert_eq!(f.stats().local_g2.unwrap().stored_blocks, 3);
             assert_eq!(in_kvcr(keys[2]), Lookup::Hit);
             assert!(matches!(target.lookup(keys[0]), Lookup::Pending { .. }));
             assert_eq!(adapter.next_deadline(), Some(4.0 * ms));

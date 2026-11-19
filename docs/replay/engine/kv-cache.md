@@ -580,7 +580,7 @@ kvcr:
 | `latency_to_first_byte_ms` | `1.0` | Fixed delay before each pull moves bytes, for the control round trip and the source pin. |
 | `bandwidth_gbps` | `32.0` | Per source rank (one attention-DP rank of a worker), decimal GB/s (a 400 Gb/s NIC is `50`). All GPUs of the rank share it, and so do concurrent pulls from it, equally. `0` means unlimited. |
 | `local_g2` | Unset (off) | Host memory KVCR owns on each rank; see [KVCR-owned memory](#kvcr-owned-memory). |
-| `local_g2.num_blocks` | Required | Capacity of each rank, in the rank's G2 blocks (vLLM `secondary_g2_slots`). Must be positive; omit `local_g2` to turn it off. |
+| `local_g2.num_blocks` | Required | Capacity of each rank, in the rank's G2 blocks (vLLM `secondary_g2_slots`). Integer from 1 through 2^64 − 1; omit `local_g2` to turn it off. |
 | `local_g2.policy` | `lru` | `lru` or `fifo`, the block to drop when the memory is full. |
 | `local_g2.copy_bandwidth_gbps` | `6.0` | Rate of the copies between a rank's G2 and its KVCR-owned memory, decimal GB/s. `0` means the copies take no time. |
 
@@ -653,7 +653,8 @@ overhead reductions are deferred; they must preserve CanonicalV1 replay output b
 ### KVCR-owned memory
 
 With `kvcr.local_g2`, each rank has a second host cache that KVCR owns, behind
-the rank's own G2 (vLLM `secondary_g2_slots`). Only G2 exchanges blocks with
+the rank's own G2 (vLLM `secondary_g2_slots`). The capacity `num_blocks` must
+fit a positive unsigned 64-bit integer. Only G2 exchanges blocks with
 the GPU, so the two caches work as a chain:
 
 - **Store.** When a G2 store completes, its blocks are copied into KVCR-owned
@@ -694,7 +695,8 @@ Under `lru`, the order can differ from vLLM's in corner cases, such
 as a pull that lands without a promotion.
 
 With `local_g2` the `kvcr` summary gains a `local_g2` section of block counts:
-`stored_blocks`, `dropped_blocks` (not copied for lack of room),
+`stored_blocks` (counted when the copy into KVCR-owned memory completes),
+`dropped_blocks` (not copied for lack of room),
 `evicted_blocks`, `promoted_blocks` and `loaded_blocks` (promoted blocks,
 counted when their first load into G1 starts).
 

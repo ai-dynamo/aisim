@@ -743,6 +743,31 @@ def test_kvcr_defaults_and_overrides() -> None:
             KvCachePredictionConfig.model_validate(cache)
 
 
+@pytest.mark.parametrize("num_blocks", [1, (1 << 64) - 1])
+def test_kvcr_local_g2_block_count_accepts_u64_boundaries(num_blocks: int) -> None:
+    cache = {
+        "bytes_per_token": 131_072,
+        "host_offload": _host_offload(),
+        "kvcr": {"local_g2": {"num_blocks": num_blocks}},
+    }
+    config = KvCachePredictionConfig.model_validate(cache)
+    assert config.kvcr.local_g2.num_blocks == num_blocks
+    assert KvCachePredictionConfig.model_validate_json(config.model_dump_json()) == config
+
+
+@pytest.mark.parametrize("num_blocks", [0, -1, 1 << 64, True, 1.0])
+def test_kvcr_local_g2_block_count_rejects_values_outside_rust_contract(num_blocks: object) -> None:
+    engine = _prediction_engine()
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=131_072,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": num_blocks}},
+    )
+    with pytest.raises(ValidationError) as error:
+        CorePredictionConfig.model_validate({"engine": engine})
+    assert any(issue["loc"][-3:] == ("kvcr", "local_g2", "num_blocks") for issue in error.value.errors())
+
+
 def test_kvcr_defaults_match_the_rust_runtime() -> None:
     from aisim import _runtime
     from aisim.config.engine import KvcrConfig

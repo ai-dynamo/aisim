@@ -285,7 +285,7 @@ class G3OffloadConfig(StrictModel):
 class KvcrLocalG2Config(StrictModel):
     """Host memory KVCR owns on each rank, behind the rank's own G2."""
 
-    num_blocks: PositiveInt
+    num_blocks: PositiveU64
     policy: Literal["lru", "fifo"] = "lru"
     copy_bandwidth_gbps: NonNegativeFloat = 6.0
 

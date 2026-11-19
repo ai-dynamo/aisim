@@ -151,9 +151,9 @@ fn a_lone_request_is_restored_from_kvcr_memory() {
 fn stores_wait_for_g2_room_while_copies_into_kvcr_memory_pin_it() {
     // One rank with a G2 of 3 blocks. Six prompts of 3 complete blocks each
     // arrive 2 ms apart. A 1 MB block takes 1 s to copy at 0.001 GB/s, so
-    // the first store pins G2 for the rest of the run and later stores find
-    // no room; at 6 GB/s every store is copied.
-    let stored = |copy_gbps: f64| {
+    // the first store pins G2 until all requests finish and later stores
+    // find no room; at 6 GB/s every store is copied.
+    let stored = |copy_gbps: f64, max_sim_time_ms: Option<f64>| {
         let mut rank = rank(json!({"num_host_blocks": 3}));
         rank["kvcr"] = json!({"local_g2": {"num_blocks": 32, "copy_bandwidth_gbps": copy_gbps}});
         let requests = (0..6u32)
@@ -161,13 +161,29 @@ fn stores_wait_for_g2_room_while_copies_into_kvcr_memory_pin_it() {
                 let tokens = (0..13).map(|token| 100 * index + token).collect::<Vec<_>>();
                 request(&format!("r{index}"), 2.0 * f64::from(index), &tokens)
             })
-            .collect();
+            .collect::<Vec<_>>();
         let engine = json!({"dp_size": 1, "rank": rank});
-        let report = run(aggregated(1), engine, requests).unwrap();
+        let spec: ReplaySpec = serde_json::from_value(json!({
+            "version": 1, "topology": aggregated(1), "engine": engine,
+            "requests": requests, "record_per_request": true,
+            "max_sim_time_ms": max_sim_time_ms,
+        }))
+        .unwrap();
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
         assert_eq!(report.per_request.len(), 6);
+        assert_eq!(report.request_counts.completed_requests, 6);
         report.kvcr.unwrap().local_g2.unwrap().stored_blocks
     };
-    assert_eq!((stored(0.001), stored(6.0)), (3, 18));
+    // Uncapped replay drains the slow copy after all requests finish.
+    assert_eq!((stored(0.001, None), stored(6.0, None)), (3, 18));
+    // A report before that copy's deadline must not count its pending blocks.
+    assert_eq!(
+        (stored(0.001, Some(50.0)), stored(6.0, Some(50.0))),
+        (0, 18)
+    );
 }
 
 #[test]

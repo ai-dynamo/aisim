@@ -71,7 +71,7 @@ pub struct KvcrStats {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct KvcrLocalG2Stats {
     /// Written after a G2 store completed (`local_fill`), counted when the
-    /// store completes.
+    /// copy into KVCR-owned memory completes.
     pub stored_blocks: u64,
     /// Not written: every other block was in use.
     pub dropped_blocks: u64,
