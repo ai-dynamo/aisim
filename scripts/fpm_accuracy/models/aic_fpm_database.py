@@ -19,6 +19,7 @@ import yaml
 
 from scripts.fpm_accuracy.contract import strict_json
 from scripts.fpm_accuracy.exceptions import ConfigurationError, DependencyError
+from scripts.release.package_identity import runtime_module
 
 
 class FpmArtifactSource(Protocol):
@@ -222,7 +223,7 @@ def _read_metadata(path: Path) -> dict[str, Any]:
 
 def _prepare_system_overlay(systems_root: Path, engine_config: Mapping[str, Any]) -> Path:
     try:
-        from aisim_core.sdk import perf_database
+        perf_database = runtime_module("aisim_core.sdk.perf_database")
     except ImportError as exc:
         raise DependencyError(
             "AISim FPM prediction requires aisim; install the AISim checkout in this environment"

@@ -1156,6 +1156,8 @@ def _worker_engine_args(
         # Replay-only: the runner moves it to the decode pool's placement.
         payload["load_balance_method"] = worker.scheduler.load_balance_method
     if backend == "sglang":
+        if worker.scheduler.scheduler_select_time_ms:
+            payload.setdefault("sglang", {})["scheduler_select_time_ms"] = worker.scheduler.scheduler_select_time_ms
         # SGLang chunks a prefill at `--chunked-prefill-size`, the public `max_batched_tokens`. Without it
         # the scheduler keeps its 8192 default, and a PD prefill or aggregate worker launched with a smaller
         # chunk is priced on passes several times larger than any it runs. Replay chunks whole pages,

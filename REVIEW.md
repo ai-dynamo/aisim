@@ -29,9 +29,11 @@ governance status are separate; merge readiness is assessed on the exact head.
 ## Risk-tiered review and CI
 
 Fast CI runs automatically for every PR, including drafts. CodeRabbit reviews
-non-draft PRs automatically, subject to its configured title and label
-exclusions. Neither requires a `review-ready` label. Medium- and high-risk PRs
-also require a Codex review of the same commit. The risk level changes review
+non-draft PRs automatically against **any target branch**, including feature,
+stacked, and release branches, subject to its configured title and label
+exclusions. Marking a PR ready enables review without waiting for its target to
+become `main` or for a stack parent to merge. Neither requires a `review-ready` label. Medium- and high-risk
+PRs also require a Codex review of the same commit. The risk level changes review
 depth, not merge authority: every tier still requires the applicable CODEOWNER
 approval.
 
