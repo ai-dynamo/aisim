@@ -460,6 +460,25 @@ def test_run_agg_reuse_keeps_a_nested_mamba_op_distinct():
             _agg_ttft(warm, qualified, database)
 
 
+def test_engine_identity_keeps_fpm_wrapped_mamba_ops_distinct():
+    # A whole-model FPM op carries the op-level graph in its compiled spec, so
+    # two FPM graphs that differ only in a Mamba2 state dtype differ in identity.
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.operations import FPMForwardOp
+
+    def fpm(**dtypes):
+        model = _nano_with_state_dtypes(**dtypes)
+        model.context_ops = [FPMForwardOp("prefill", model.config, model.model_path, sol_ops=model.context_ops)]
+        model.generation_ops = []
+        return model
+
+    database = _hybrid_trtllm_database()
+    first = fpm(conv1d="float16", ssm="float16")
+    second = fpm(conv1d="float32", ssm="float16")
+    assert rust_engine_step._mamba_qualification_identity(first)
+    assert rust_engine_step.engine_identity(first, database) != rust_engine_step.engine_identity(second, database)
+
+
 def test_mixed_power_coverage_counts_each_mamba_query():
     # The qualified convolution prices a powered measured row and the scan
     # prices unpowered SOL. Under one name their rows fold, so coverage must

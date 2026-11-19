@@ -1833,12 +1833,14 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
     """
     # Lazy import: ``sdk.engine`` imports from this module at top level.
     from aisim_core.sdk.engine import _as_engine_op
+    from aisim_core.sdk.operations import FPMForwardOp
     from aisim_core.sdk.operations.base import Operation
 
     entries = []
     for ops_name in ("context_ops", "generation_ops"):
         for index, op in enumerate(getattr(model, ops_name, ())):
-            if isinstance(op, Operation):
+            # A whole-model FPM op serializes its op-level graph, Mamba2 ops included.
+            if isinstance(op, (Operation, FPMForwardOp)):
                 spec = _as_engine_op(op)._spec_json()
                 if '"Mamba2"' in spec:
                     entries.append([ops_name, index, spec])
