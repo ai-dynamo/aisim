@@ -560,9 +560,12 @@ def _apply_promotion(
                 and (preexisting_catalog_dirs is None or directory not in preexisting_catalog_dirs)
             ):
                 directory.rmdir()
-        if preexisting_catalog_dirs is None and (target / CATALOG_DIR).is_dir():
-            if not any((target / CATALOG_DIR).iterdir()):
-                (target / CATALOG_DIR).rmdir()
+        if (
+            preexisting_catalog_dirs is None
+            and (target / CATALOG_DIR).is_dir()
+            and not any((target / CATALOG_DIR).iterdir())
+        ):
+            (target / CATALOG_DIR).rmdir()
         for rel, data in before.items():
             restored = target / rel
             restored.parent.mkdir(parents=True, exist_ok=True)

@@ -1497,3 +1497,63 @@ def test_fake_etag_tracks_exact_response_bytes():
     assert second.status == 200 and second.body != first.body
     assert second.headers["etag"] != first.headers["etag"]
     assert fake(url, {"If-None-Match": second.headers["etag"]}, 1).status == 304
+
+
+def test_retry_after_accepts_only_ascii_delta_seconds():
+    assert parse_retry_after("²") is None
+    assert parse_retry_after("12") == 12.0
+
+
+def test_ambiguous_model_selector_is_refused(tmp_path):
+    fake = FakeInfx()
+    fake.respond(
+        "views/options", ok({"models": [{"name": "shared", "dbKeys": ["a"]}, {"name": "B", "dbKeys": ["shared"]}]})
+    )
+    fake.availability = [avail(model="a")]
+    acquirer = infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    with pytest.raises(infx_ingest.InfxError, match="ambiguous"):
+        acquirer.acquire(models=["shared"])
+
+
+@pytest.mark.parametrize("value", ["2", 1.5, True, -1])
+def test_malformed_parallelism_metric_is_refused(tmp_path, value):
+    fake = FakeInfx(rows=[row(1, metrics={"mean_ttft": 0.1, "pp": value, "decode_pp": 1})])
+    acquirer = infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    with pytest.raises(infx_ingest.IncompleteAcquisitionError, match="metrics.pp"):
+        acquirer.acquire()
+
+
+def test_request_budget_applies_to_each_acquisition(tmp_path):
+    fake = FakeInfx()
+    client = InfxClient(fake, RetryPolicy(max_requests=6))
+    acquirer = infx_ingest.Acquirer(client, infx_ingest.AcquisitionCache(tmp_path / "cache"))
+    acquirer.acquire()
+    acquirer.acquire()  # a shared counter would exhaust the budget here
+
+
+def test_failed_cache_replace_leaves_no_temporary_file(tmp_path, monkeypatch):
+    cache = infx_ingest.AcquisitionCache(tmp_path / "cache")
+
+    def fail(*_):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(infx_ingest.os, "replace", fail)
+    with pytest.raises(OSError):
+        cache.put("https://x/y", b"{}", None, "2026-11-07T12:00:00Z")
+    assert not [p for p in (tmp_path / "cache").rglob("*") if p.is_file()]
+
+
+def test_report_write_failure_still_alerts_and_exits_nonzero(root, tmp_path, monkeypatch):
+    fake = FakeInfx()
+    fake.respond("availability", http.client.BadStatusLine(""))
+    original = infx_job.run_ingestion
+    monkeypatch.setattr(
+        infx_job,
+        "run_ingestion",
+        lambda *a, **k: original(*a, **k, transport=fake, sleep=lambda _: None, policy=RetryPolicy(max_attempts=2)),
+    )
+    alerts = []
+    monkeypatch.setattr(infx_job, "_env_alert", lambda subject, text: alerts.append(subject) or [])
+    missing = tmp_path / "no-such-dir" / "report.json"
+    args = ["run", "--root", str(root), "--cache-dir", str(tmp_path / "c"), "--report", str(missing)]
+    assert infx_job.main(args) == 1 and alerts == ["ingestion failed"]
