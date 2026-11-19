@@ -664,6 +664,20 @@ mod tests {
                 assert_eq!(estimate.source, EstimateSource::Profile);
                 assert_eq!(estimate.total_kv_size_bytes, 600);
                 assert_eq!(estimate.total_kv_size_tokens, 60);
+                req.engine
+                    .extra
+                    .insert("moe_backend".into(), "megamoe".into());
+                let error = estimate_kv_cache(req.clone())
+                    .expect_err("conflicting profile MoE backend must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("FPM profile identity conflict: moe_backend"),
+                    "{error}"
+                );
+                req.engine
+                    .extra
+                    .insert("moe_backend".into(), backend.into());
             }
             req.engine
                 .extra

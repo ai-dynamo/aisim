@@ -1798,6 +1798,7 @@ def _categorize_ignore_pattern(pattern: str) -> set[str]:
         "routed_expert_up_proj",
         "routed_expert_down_proj",
         "routed_expert_(up|down)_proj",
+        "routed_expert_(?:up|down)_proj",
         "shared_experts",
         "shared_expert",
     ):

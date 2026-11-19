@@ -478,9 +478,12 @@ _CONTEXT_FMHA_OP_TABLES: dict[str, tuple[str, ...]] = {
 }
 
 
-def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode, *, architecture: str | None = None) -> list[str]:
+def context_fmha_supported_modes(
+    database, ctx_op: str, kv_cache_mode, *, architecture: str | None = None, attention_backend: str | None = None
+) -> list[str]:
     """FMHA mode names with perf data for ``ctx_op``, restricted to slices that
     exist JOINTLY with ``kv_cache_mode`` and, for DSA, ``architecture``.
+    Kimi K3.1 also requires the requested attention backend's physical KV lane.
 
     The flat ``supported_quant_mode[ctx_op]`` list unions fmha keys across kv
     slices (and across granular+module tables for ``context_mla``), so an fmha
@@ -497,6 +500,11 @@ def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode, *, archit
     table_attrs = _CONTEXT_FMHA_OP_TABLES.get(ctx_op)
     if table_attrs is None or kv_cache_mode is None:
         return list(flat)
+    # Match operators/dsa.rs::generation_table_backend (also used for K3.1
+    # context). Other DSA architectures retain their backend donor fallback.
+    dsa_backend = None
+    if ctx_op == "dsa_context_module" and architecture == "KimiK31ForConditionalGeneration":
+        dsa_backend = "flashmla_kv" if attention_backend == "flashmla" else "trtllm"
     modes: set[str] = set()
     saw_table = False
     for attr in table_attrs:
@@ -515,7 +523,11 @@ def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode, *, archit
                 if kv_slice is not None and (
                     ctx_op != "dsa_context_module"
                     or architecture is None
-                    or any(architecture in architectures for architectures in kv_slice.values())
+                    or any(
+                        architecture in architectures
+                        and (dsa_backend is None or dsa_backend in architectures[architecture])
+                        for architectures in kv_slice.values()
+                    )
                 ):
                     modes.add(fmha_key.name if hasattr(fmha_key, "name") else str(fmha_key))
     if not saw_table:

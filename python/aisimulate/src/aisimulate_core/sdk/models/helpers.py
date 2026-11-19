@@ -1434,7 +1434,13 @@ def resolve_context_fmha_by_data(
     # run with (explicit wins, else the checkpoint inference).
     kv_mode = model_config.kvcache_quant_mode or inferred.get("kvcache_quant_mode")
     ctx_op, _ = attention_op_keys(family, backend_name, architecture=info.get("architecture"))
-    supported = context_fmha_supported_modes(database, ctx_op, kv_mode, architecture=info["architecture"])
+    supported = context_fmha_supported_modes(
+        database,
+        ctx_op,
+        kv_mode,
+        architecture=info["architecture"],
+        attention_backend=model_config.attention_backend,
+    )
     if not supported or common.FMHAQuantMode.fp8.name in supported:
         return
 

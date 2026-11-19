@@ -231,7 +231,7 @@ def _run_native_case(case, device, perf_filename):
         stderr = ""
         try:
             _, stderr = process.communicate(timeout=NATIVE_CASE_TIMEOUT_S)
-        except subprocess.TimeoutExpired as error:
+        except BaseException as error:
             # Kill the spawned TP ranks too: they can retain the stderr pipe
             # and GPU allocation after the launcher dies.
             try:
@@ -239,7 +239,8 @@ def _run_native_case(case, device, perf_filename):
             except ProcessLookupError:
                 pass
             _, stderr = process.communicate()
-            error.stderr = stderr
+            if isinstance(error, subprocess.TimeoutExpired):
+                error.stderr = stderr
             raise
         finally:
             if stderr:

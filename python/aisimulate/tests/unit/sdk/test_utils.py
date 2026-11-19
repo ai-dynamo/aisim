@@ -1654,6 +1654,7 @@ class TestParseCompressedTensorsQuant:
             "block_sparse_moe.routed_expert_up_proj",
             "block_sparse_moe.routed_expert_down_proj",
             r"re:.*block_sparse_moe\.routed_expert_(up|down)_proj.*",
+            r"re:.*block_sparse_moe\.routed_expert_(?:up|down)_proj.*",
         ],
     )
     @pytest.mark.parametrize("architecture", ["KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"])
@@ -2308,6 +2309,7 @@ def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog
     [
         r"re:.*block_sparse_moe\.(routed_expert_up_proj|experts\..*)",
         r"re:.*(experts|routed_expert_up_proj).*",
+        r"re:.*(?:routed_expert_(?:up|down)_proj|experts\..*)",
         r"re:.*(shared_experts|experts|routed_expert_down_proj).*",
     ],
 )

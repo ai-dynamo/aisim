@@ -6,8 +6,10 @@ import copy
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -292,6 +294,73 @@ def test_native_timeout_kills_tp_children_and_fullnode_continues(monkeypatch, ca
         status = None
     assert status in (None, psutil.STATUS_ZOMBIE)
     assert "waiting on TP rank" in capfd.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, RuntimeError])
+def test_native_exception_kills_launcher_and_tp_children(exception_type, monkeypatch, capfd, caplog, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+    import psutil
+
+    popen = subprocess.Popen
+    children = []
+    rank_pid = tmp_path / "rank.pid"
+    error = exception_type("interrupted native communication")
+
+    def launch(_command, **kwargs):
+        code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "rank = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print('native cancellation diagnostic', file=sys.stderr, flush=True); "
+            f"Path({str(rank_pid)!r}).write_text(str(rank.pid)); time.sleep(60)"
+        )
+        child = popen([sys.executable, "-c", code], **kwargs)
+        children.append(child)
+        communicate = child.communicate
+        interrupted = False
+
+        def interrupt_once(*args, **kwargs):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                deadline = time.monotonic() + 5
+                while not rank_pid.exists() or not rank_pid.read_text().strip():
+                    assert time.monotonic() < deadline, "TP rank did not start"
+                    time.sleep(0.01)
+                raise error
+            return communicate(*args, **kwargs)
+
+        monkeypatch.setattr(child, "communicate", interrupt_once)
+        return child
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    case = ModuleCase(4096, 1, 48, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    try:
+        kwargs = {"cases": [case], "perf_filename": tmp_path / "dsa_generation_module_perf.txt"}
+        if issubclass(exception_type, Exception):
+            result = run_kimi_k31_dsa_fullnode(**kwargs)
+            assert result["failed"] == [case]
+            assert result["failure_details"][str(case)]["error_message"] == str(error)
+            assert any(record.exc_info and record.exc_info[1] is error for record in caplog.records)
+        else:
+            with pytest.raises(exception_type) as raised:
+                run_kimi_k31_dsa_fullnode(**kwargs)
+            assert raised.value is error
+        assert children[0].poll() is not None
+        try:
+            status = psutil.Process(int(rank_pid.read_text())).status()
+        except psutil.NoSuchProcess:
+            status = None
+        assert status in (None, psutil.STATUS_ZOMBIE)
+        assert "native cancellation diagnostic" in capfd.readouterr().err
+    finally:
+        # A regression must not leave the test's real process group running.
+        for child in children:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
 
 
 def test_native_forward_batch_must_match_persisted_prefix_and_history():

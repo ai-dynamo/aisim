@@ -457,7 +457,7 @@ def test_k31_context_capability_does_not_borrow_other_architecture_fp8(fake_mode
             common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {"DeepseekV32ForCausalLM": {1: object()}}}
         },
         common.FMHAQuantMode.bfloat16: {
-            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {architecture: {1: object()}}}
+            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {architecture: {"trtllm": {1: object()}}}}
         },
     }
     if explicit:
@@ -466,3 +466,39 @@ def test_k31_context_capability_does_not_borrow_other_architecture_fp8(fake_mode
     else:
         resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
         assert mc.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
+def test_k31_context_capability_requires_requested_backend(fake_model_info, explicit, attention_backend):
+    architecture = "KimiK31ForConditionalGeneration"
+    fake_model_info(architecture, _V3_FP8_RAW)
+    mc = _mc(common.FMHAQuantMode.fp8 if explicit else None)
+    mc.kvcache_quant_mode = common.KVCacheQuantMode.fp8
+    mc.attention_backend = attention_backend
+    requested = "flashmla_kv" if attention_backend == "flashmla" else "trtllm"
+    other = "trtllm" if attention_backend == "flashmla" else "flashmla_kv"
+    db = _db(dsa_context_module=["fp8", "bfloat16"])
+    db._context_dsa_module_data = {
+        common.FMHAQuantMode.fp8: {
+            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {architecture: {other: {1: object()}}}}
+        },
+        common.FMHAQuantMode.bfloat16: {
+            common.KVCacheQuantMode.fp8: {common.GEMMQuantMode.bfloat16: {architecture: {requested: {1: object()}}}}
+        },
+    }
+    if explicit:
+        with pytest.raises(ValueError, match="fmha_quant_mode=fp8 has no 'dsa_context_module' perf data"):
+            resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+    else:
+        resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+        assert mc.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+    # Once this exact backend has FP8 data, both explicit and inferred modes
+    # must remain unchanged instead of forcing every K3.1 context to BF16.
+    db._context_dsa_module_data[common.FMHAQuantMode.fp8][common.KVCacheQuantMode.fp8][common.GEMMQuantMode.bfloat16][
+        architecture
+    ][requested] = {1: object()}
+    mc.fmha_quant_mode = common.FMHAQuantMode.fp8 if explicit else None
+    resolve_context_fmha_by_data(mc, "local-k31", db, "sglang", is_context_role=True)
+    assert mc.fmha_quant_mode == (common.FMHAQuantMode.fp8 if explicit else None)
