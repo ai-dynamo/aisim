@@ -82,7 +82,8 @@ usage, and `1` for revision, transfer, integrity or offline failures.
 | `aisim init --on-demand` | Download nothing; data arrives when a run needs it. |
 
 `--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. The choice is saved
-only after the download succeeds, in `config.json` in the cache root: `~/.cache/aisim/config.json` (honoring
+only after the download succeeds (`--all` and `--hardware` also save the repository and revision they downloaded, so
+runs select that data), in `config.json` in the cache root: `~/.cache/aisim/config.json` (honoring
 `XDG_CACHE_HOME`), or `$AISIM_DATA_CACHE/config.json` when `AISIM_DATA_CACHE` is set. No file means on-demand.
 Precedence is flag, then environment variable, then config file, then shipped default; the config never
 overrides an environment variable.

@@ -15,7 +15,7 @@ from aisim.cli_args import build_parser
 from aisim.main import main
 from aisim_core.data import Identity, configuration_id
 from aisim_core.data.config import InitConfig, config_path, load_config, resolve_source, save_config, shipped_pin
-from aisim_core.data.ensure import DataPin, _command
+from aisim_core.data.ensure import DataPin, _command, pin_from_environment
 from aisim_core.data.fetch import Selection
 from aisim_core.data.parquet import write_parquet
 
@@ -236,11 +236,19 @@ def test_init_all_downloads_everything_then_saves(run):
     assert load_config().mode == "all"
 
 
+def test_init_download_saves_the_source_it_used(run):
+    status, _, _ = run("init", "--all")  # no flag, no saved source: the shipped default is downloaded
+    assert status == 0
+    assert load_config() == InitConfig(mode="all", repo=shipped_pin()[0], revision=shipped_pin()[1])
+    pin = pin_from_environment({"AISIM_DATA_CACHE": str(run.cache)})
+    assert (pin.repo, pin.revision) == shipped_pin()  # the downloaded data is what predictors select
+
+
 def test_init_hardware_downloads_one_platform(run):
     status, out, _ = run("init", "--hardware", "h200_sxm", "--revision", SHA)
     paths = json.loads(out)["fetch"]["paths"]
     assert status == 0 and "data/op-latency/b200_sxm/ops.parquet" not in paths
-    assert load_config() == InitConfig(mode="hardware", hardware="h200_sxm", revision=SHA)
+    assert load_config() == InitConfig(mode="hardware", hardware="h200_sxm", repo=shipped_pin()[0], revision=SHA)
 
 
 def test_init_mode_change_keeps_saved_source(run):
