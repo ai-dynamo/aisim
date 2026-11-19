@@ -37,3 +37,19 @@ def test_snapshot_bearing_config_skips_the_pin(monkeypatch, tmp_path):
 
 def test_every_instance_has_dataset_revisions():
     assert res.RustForwardPassPerfModel(object()).dataset_revisions == {}
+
+
+def test_typed_config_pin_does_not_resolve_default_systems_root(monkeypatch, tmp_path):
+    from aisim_core.sdk import perf_database
+
+    def cold_default_root():
+        raise AssertionError("default systems root resolved before the pinned dataset was wired")
+
+    monkeypatch.setattr(perf_database, "get_systems_paths", cold_default_root)
+    monkeypatch.setenv("AISIM_DATA_LOCAL", str(tmp_path))
+    config = res.ForwardPassPerfModelConfig(
+        model="m", system="h200", backend="vllm", backend_version="0.1", worker_type="aggregated"
+    )
+    assert config.to_dict(resolve_default_systems=False)["systems_paths"] == ()
+    with pytest.raises(ensure_mod.MissingDataError):  # reaches the pinned loader, not the default root
+        res._ensure_dataset(config, None)

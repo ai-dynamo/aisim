@@ -260,14 +260,21 @@ class ForwardPassPerfModelConfig:
         )
         return cls(**json.loads(payload))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, resolve_default_systems: bool = True) -> dict[str, Any]:
+        """Serialize; ``resolve_default_systems=False`` leaves an unset ``systems_paths`` empty.
+
+        Dataset pinning uses that form so the default systems root is not composed before the pinned
+        dataset has been wired in.
+        """
         payload = asdict(self)
         # Additive identity stays out of payloads that do not set it.
         for name in ("encoder_parallel", "deployment_limits", "afd_routing_location", "afd_pool_role"):
             if payload[name] is None:
                 payload.pop(name)
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
-        if self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths:
+        if self.systems_paths or (
+            resolve_default_systems and self.estimation_mode not in {"fpm_regression", "fpm_learned"}
+        ):
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(
                 self.systems_paths, require_directories=not _carries_state_snapshot(self.estimator_config)
             )
@@ -1032,7 +1039,13 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     pin = pin if pin is not None else pin_from_environment()
     if pin is None:
         return None
-    payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    # Leave an unset systems_paths unresolved: ensure_data wires the selected dataset first, so the default
+    # root is neither composed nor fetched when the pin selects other data.
+    payload = (
+        config.to_dict(resolve_default_systems=False)
+        if isinstance(config, ForwardPassPerfModelConfig)
+        else dict(config)
+    )
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own inputs; a pin selecting other data would only conflict with it
     return ensure_data(payload, pin)
