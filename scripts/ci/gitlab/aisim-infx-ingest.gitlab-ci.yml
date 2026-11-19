@@ -76,6 +76,7 @@ variables:
 
 publish_candidate:
   stage: ingest
+  resource_group: infx-cache-candidate-publication
   extends: .pinned
   environment:
     name: infx-cache-writer
@@ -90,7 +91,8 @@ publish_candidate:
     - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY run --no-notify --root cache-repo --cache-dir "$CI_PROJECT_DIR/infx-acquisition" --report run-report.json
     - |
       cd cache-repo
-      if [ -z "$(git status --porcelain)" ]; then echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
+      STATUS=$(git status --porcelain) || exit "$?"
+      if [ -z "$STATUS" ]; then echo "unchanged refresh: no commit, no snapshot"; exit 0; fi
       SID=$(python3 -c "import json;print(json.load(open('../run-report.json'))['snapshot_id'])")
       # A branch is reusable only while this exact snapshot is pending against
       # the current qualification. Historical reviews stay untouched.
@@ -166,7 +168,7 @@ promote:
       GENERATION="$[[ inputs.candidate-generation ]]"
       if [ -n "$GENERATION" ]; then BRANCH="${BRANCH}-${GENERATION}"; fi
       git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" clone -q --depth 1 --branch "$BRANCH" "$INFX_CACHE_REPO_URL" cache-repo
-    - $JOB_PY promote --root cache-repo --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
+    - env -u INFX_CACHE_WRITE_TOKEN $JOB_PY promote --root cache-repo --snapshot-id "$[[ inputs.candidate-snapshot-id ]]" --reviewer "$GITLAB_USER_NAME"
     - |
       cd cache-repo
       git -c user.name="aisim-infx-ingest" -c user.email="noreply@nvidia.com" commit -qam "qualify: $[[ inputs.candidate-snapshot-id ]] (reviewer ${GITLAB_USER_NAME})"

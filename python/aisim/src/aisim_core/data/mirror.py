@@ -205,7 +205,7 @@ def _check_indexes(root: Path, report: TreeReport, declared: set[str]) -> dict[s
     dataset = _read_json(root, index_rel, DatasetIndex, report)
     if dataset is None:
         return {}
-    if report.repo and dataset.dataset_id != report.repo:
+    if report.repo is not None and dataset.dataset_id != report.repo:
         report.add("dataset-id-mismatch", f"dataset_id {dataset.dataset_id!r} is not {report.repo!r}", index_rel)
     declared.add(index_rel)
     manifests: dict[str, Manifest] = {}

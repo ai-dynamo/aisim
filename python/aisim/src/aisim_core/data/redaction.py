@@ -458,6 +458,14 @@ def _check_eval_record(
             out.append(Finding("artifact-format", f"unsupported eval truth format: {artifact.format}", artifact_rel))
     if record.findings and not policy.allow_provenance_artifacts:
         out.append(Finding("provenance-withheld", "linked finding artifacts may be logs", rel))
+    for artifact in record.findings:
+        path = _verify((root / rel).parent, artifact)
+        if policy.allow_provenance_artifacts and artifact.format == "json":
+            out.extend(
+                scan_value(
+                    json.loads(path.read_bytes()), policy, path.relative_to(root).as_posix(), "eval findings JSON"
+                )
+            )
     if policy.inferencex_disclosure == "aggregates-only" and infx_ids & set(record.truth.configuration_ids):
         out.append(Finding("infx-aggregates-only", "record scores InferenceX-derived truth; publish aggregates", rel))
     return out
@@ -532,7 +540,7 @@ def check_publishable(
     catalog_shards = {p.relative_to(root).as_posix() for p in catalog_files(root)}
     snapshots = snapshot_documents(root, chosen)
     for rel, manifest in sorted(loaded.items()):
-        if rel in chosen_set and rel not in invalid:
+        if (rel in chosen_set or any(a.path in chosen_set for a in manifest.artifacts)) and rel not in invalid:
             try:
                 findings.extend(_check_manifest(root, rel, manifest, policy, infx_ids))
             except (OSError, ValidationError, ValueError, RecursionError) as exc:

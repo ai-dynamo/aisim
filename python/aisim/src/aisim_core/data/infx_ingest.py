@@ -465,11 +465,12 @@ class Acquirer:
             for run in info.get("runs", []):
                 entry = runs.setdefault(run["html_url"], {})
                 attempt = run.get("run_attempt")
-                if "run_attempt" in entry and entry["run_attempt"] != attempt:
+                if attempt is not None and entry.get("run_attempt") not in (None, attempt):
                     raise ContradictionError(
                         f"workflow-info {date}: run {run['html_url']} reports two run_attempt values"
                     )
-                entry["run_attempt"] = attempt
+                if attempt is not None:
+                    entry["run_attempt"] = attempt
             for config in info.get("runConfigs", []):
                 sha = config.get("head_sha")
                 if sha is not None and (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha)):
@@ -510,14 +511,21 @@ def _configuration_prefix(data: E2eConfigurationData) -> str:
 
 
 def plan_snapshot(acq: Acquisition) -> SnapshotPlan:
-    configurations = inferencex_to_configurations(acq.records, acq.runs)
+    try:
+        configurations = inferencex_to_configurations(acq.records, acq.runs)
+    except OverflowError as exc:
+        raise IncompleteAcquisitionError("benchmark metric exceeds the supported numeric range") from exc
     # Keep original response bytes as well as the normalized, deduplicated record bundle.
     # These hash-linked artifacts survive removal of the mutable acquisition cache.
     originals: dict[str, list[ProvenanceFile]] = {}
     models = {data.body.model_id for data in configurations}
     for url, body in sorted(acq.responses.items()):
         artifact = ProvenanceFile(
-            "raw-output", body, name=f"inferencex-response-{_sha(url.encode() + body)}", source_tool=url
+            "raw-output",
+            body,
+            name=f"inferencex-response-{_sha(url.encode() + body)}",
+            source_tool=url,
+            cap_bytes=MAX_RESPONSE_BYTES,
         )
         response_models = (
             models
@@ -557,6 +565,8 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
         snapshot, members = read_snapshot(root, path)
         if snapshot.snapshot_id != plan.snapshot_id:
             raise ValueError("existing snapshot ID differs from the planned snapshot")
+        if snapshot.completeness != "complete":
+            raise ValueError("existing snapshot must be complete")
         verify_snapshot_members(root, members)
         return path
     for data in plan.configurations:

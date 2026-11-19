@@ -36,6 +36,8 @@ a cell with no recorded GPU time has ``gpu_seconds`` null, never zero.
 """
 
 import json
+import os
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -57,6 +59,7 @@ SYSTEMS_SCHEMA_ID = "aisim-catalog-systems/v1"
 CATALOG_DIR = "catalog"
 SYSTEMS_FILE = "systems.parquet"
 COVERAGE_FILE = "coverage.json"
+MAX_CATALOG_ROWS = 100_000  # bound coverage expansion before allocating keys or row models
 
 LAYERS: tuple[Layer, ...] = ("op", "fpm", "e2e")
 LAYER_CATEGORY: dict[str, str] = {"op": "op-latency", "fpm": "fpm", "e2e": "e2e"}
@@ -319,6 +322,9 @@ def build_catalog(
     models = {k[1] for k in cells if k[1] is not None} | set(coverage.expected_models)
     frameworks = {k[3] for k in cells} | set(coverage.expected_frameworks)
     hardware = {k[2] for k in cells} | set(specs)
+    projected = len(hardware) * len(frameworks) * (1 + 2 * len(models))
+    if projected > MAX_CATALOG_ROWS:
+        raise ValueError(f"projected catalog grid has {projected} rows; limit is {MAX_CATALOG_ROWS}")
     keys = set(cells)
     for hw in hardware:
         for fw in frameworks:
@@ -332,7 +338,15 @@ def build_catalog(
         _write(root, rows, specs)
         path = root / CATALOG_DIR / COVERAGE_FILE
         if coverage.expected_models or coverage.expected_frameworks or path.exists():
-            path.write_text(coverage.model_dump_json(indent=2) + "\n", encoding="utf-8")
+            pending = None
+            try:
+                with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as handle:
+                    pending = Path(handle.name)
+                    handle.write(coverage.model_dump_json(indent=2) + "\n")
+                os.replace(pending, path)
+            finally:
+                if pending is not None:
+                    pending.unlink(missing_ok=True)
     return rows
 
 
