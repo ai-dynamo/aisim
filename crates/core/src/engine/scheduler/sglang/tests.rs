@@ -5764,30 +5764,35 @@ mod forward_pass_metrics {
         let mut core = SglangCore::new(fpm_args_with_chunked_prefill(16, 32));
         let prompt: Vec<u32> = (0..40).collect();
 
-        let run_until_complete = |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (u64, f64) {
-            let mut collector = crate::engine::trace::TraceCollector::default();
-            let mut total_prefill = 0u64;
-            let mut now_ms = start_ms;
-            for _ in 0..64 {
-                let pass = core.execute_pass(&mut collector, now_ms);
-                total_prefill += pass.fpm.as_ref().map(|f| f.sum_prefill_tokens).unwrap_or(0);
-                now_ms = pass.end_ms;
-                if pass.output_signals.iter().any(|s| s.uuid == uuid) {
-                    return (total_prefill, now_ms);
+        // Returns the prefill tokens of each pass up to and including the
+        // first pass that emits output for `uuid`.
+        let run_until_complete =
+            |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (Vec<u64>, f64) {
+                let mut collector = crate::engine::trace::TraceCollector::default();
+                let mut prefill_per_pass = Vec::new();
+                let mut now_ms = start_ms;
+                for _ in 0..64 {
+                    let pass = core.execute_pass(&mut collector, now_ms);
+                    prefill_per_pass
+                        .push(pass.fpm.as_ref().map(|f| f.sum_prefill_tokens).unwrap_or(0));
+                    now_ms = pass.end_ms;
+                    if pass.output_signals.iter().any(|s| s.uuid == uuid) {
+                        return (prefill_per_pass, now_ms);
+                    }
                 }
-            }
-            panic!("request {uuid} never completed within 64 passes");
-        };
+                panic!("request {uuid} never completed within 64 passes");
+            };
 
         let first = Uuid::from_u128(1);
         core.receive(DirectRequest {
             uuid: Some(first),
             ..direct_request(prompt.clone(), 1)
         });
-        let (cold_prefill, end_ms) = run_until_complete(&mut core, first, 0.0);
+        let (cold_passes, end_ms) = run_until_complete(&mut core, first, 0.0);
         assert_eq!(
-            cold_prefill, 40,
-            "cold request must compute every prompt token"
+            cold_passes,
+            [16, 16, 8],
+            "cold request must compute every prompt token in three chunks and emit output only after the last chunk"
         );
 
         let second = Uuid::from_u128(2);
@@ -5795,7 +5800,8 @@ mod forward_pass_metrics {
             uuid: Some(second),
             ..direct_request(prompt.clone(), 1)
         });
-        let (warm_prefill, _) = run_until_complete(&mut core, second, end_ms);
+        let (warm_passes, _) = run_until_complete(&mut core, second, end_ms);
+        let warm_prefill: u64 = warm_passes.iter().sum();
 
         // SGLang matches at most input_len - 1 tokens, so at most one block of
         // the warm prompt is recomputed. The bug recomputes everything past
