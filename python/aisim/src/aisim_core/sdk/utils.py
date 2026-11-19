@@ -24,7 +24,7 @@ import urllib.request
 from collections import namedtuple
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import cache, wraps
+from functools import wraps
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote
@@ -743,13 +743,14 @@ _SNAPSHOT_CAPTURE: contextvars.ContextVar[dict[tuple[str, str], str] | None] = c
 
 
 class _SnapshotConfig(dict):
-    """A normal JSON mapping with non-serialized, object-owned snapshot provenance."""
+    """A JSON mapping owning its non-serialized source and optional Hub commit."""
 
-    __slots__ = ("__weakref__", "_snapshot_commit")
+    __slots__ = ("__weakref__", "_snapshot_commit", "_source")
 
-    def __init__(self, payload: dict, commit: str):
+    def __init__(self, payload: dict, commit: str | None, *, source: str | Path = "hub"):
         super().__init__(payload)
         self._snapshot_commit = commit
+        self._source = source
 
 
 def _config_snapshot_commit(raw_config: dict) -> str | None:
@@ -2289,10 +2290,11 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revisi
         return raw_config
     if "image_processor_config" in raw_config:
         return raw_config
-    if os.path.isdir(model_path):
-        processor_path = Path(model_path) / "preprocessor_config.json"
+    source = raw_config._source
+    if isinstance(source, Path):
+        processor_path = source / "preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
-    elif model_path in DefaultHFModels:
+    elif source == "bundled":
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
@@ -2309,7 +2311,10 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
     architecture = (raw_config.get("architectures") or [None])[0]
     kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
     qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
-    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
+    if not (kimi or qwen_vl):
+        return raw_config
+    source = raw_config._source
+    if source != "bundled":
         # Bundled checkpoints use the pinned processor defaults. Other checkpoints
         # may override them with media_proc_cfg or native HF processor files.
         inline = raw_config.get("preprocessor_config", {})
@@ -2322,8 +2327,8 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
         if kimi:
             files.append(("video_preprocessor_config.json", "video_processor"))
         for filename, key in files:
-            if os.path.isdir(model_path):
-                path = Path(model_path) / filename
+            if isinstance(source, Path):
+                path = source / filename
                 try:
                     mode = path.stat().st_mode
                 except FileNotFoundError as error:
@@ -2435,6 +2440,8 @@ class _ModelConfigCacheEntry:
     raw: dict
     readers: int = 0
     parsed: bool = False
+    result: dict | None = None
+    generation: object = field(default_factory=object)
     processor_lock: Lock = field(default_factory=Lock)
 
 
@@ -2444,12 +2451,13 @@ class _ModelConfigLoad:
 
 
 def _cache_raw_model_config(load):
-    """Keep a base until its parsed readers finish; evict only if all fail."""
+    """Publish raw and parsed results in one generation; evict if all readers fail."""
     entries = {}
     # A token tracks concurrent cold loads until the last one finishes.
     # Eviction/clear invalidates it without retaining per-model history.
     loading = {}
     hits = misses = 0
+    parsed_hits = parsed_misses = 0
     lock = Lock()
     info = namedtuple("CacheInfo", "hits misses maxsize currsize")
 
@@ -2482,11 +2490,12 @@ def _cache_raw_model_config(load):
                         del loading[model_path]
 
     def clear():
-        nonlocal hits, misses
+        nonlocal hits, misses, parsed_hits, parsed_misses
         with lock:
             entries.clear()
             loading.clear()
             hits = misses = 0
+            parsed_hits = parsed_misses = 0
 
     @contextmanager
     def reader(model_path):
@@ -2498,6 +2507,7 @@ def _cache_raw_model_config(load):
                 entry = entries.get(model_path)
                 if entry is not None:
                     entry.readers += 1
+                    generation = entry.generation
                     break
         succeeded = False
         try:
@@ -2506,15 +2516,48 @@ def _cache_raw_model_config(load):
         finally:
             with lock:
                 entry.readers -= 1
-                entry.parsed |= succeeded
+                entry.parsed |= succeeded and entry.generation is generation
                 if not entry.readers and not entry.parsed and entries.get(model_path) is entry:
                     del entries[model_path]
                     loading.pop(model_path, None)
 
     def clear_parsed():
+        nonlocal parsed_hits, parsed_misses
         with lock:
             for entry in entries.values():
                 entry.parsed = False
+                entry.result = None
+                entry.generation = object()
+            parsed_hits = parsed_misses = 0
+
+    def parse_cached(model_path, parse):
+        nonlocal parsed_hits, parsed_misses
+        with lock:
+            entry = entries.get(model_path)
+            if entry is not None and entry.result is not None:
+                parsed_hits += 1
+                return entry.result
+            parsed_misses += 1
+        with reader(model_path) as entry:
+            with lock:
+                if entry.result is not None:
+                    return entry.result
+                generation = entry.generation
+            result = parse(entry, model_path)
+            with lock:
+                if entries.get(model_path) is entry and entry.generation is generation:
+                    # Publication and invalidation share the raw-entry lock. An
+                    # in-flight result may finish after clear, but cannot restore
+                    # an invalidated generation or protect it from failed readers.
+                    if entry.result is None:
+                        entry.result = result
+                    entry.parsed = True
+                    return entry.result
+            return result
+
+    def parsed_cache_info():
+        with lock:
+            return info(parsed_hits, parsed_misses, None, sum(entry.result is not None for entry in entries.values()))
 
     def cache_info():
         with lock:
@@ -2523,6 +2566,8 @@ def _cache_raw_model_config(load):
     cached.cache_clear = clear
     cached.cache_reader = reader
     cached.cache_clear_parsed = clear_parsed
+    cached.cache_parse = parse_cached
+    cached.cache_info_parsed = parsed_cache_info
     cached.cache_info = cache_info
     return cached
 
@@ -2550,15 +2595,18 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     """
     # Check if it's a local path
     if os.path.isdir(model_path):
-        config = _load_local_config(model_path)
-        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
+        source = Path(model_path).resolve()
+        config = _load_local_config(str(source))
+        loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(str(source))))
+        return _SnapshotConfig(loaded, None, source=source)
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
         config = _load_pre_downloaded_hf_config(model_path)
-        return _attach_inferred_quant_fields(
+        loaded = _attach_inferred_quant_fields(
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
+        return _SnapshotConfig(loaded, None, source="bundled")
 
     capture: dict[tuple[str, str], str] = {}
     token = _SNAPSHOT_CAPTURE.set(capture)
@@ -2578,28 +2626,13 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
             model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
         )
     loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(raw_config, hf_quant_config))
-    if commit:
-        loaded = _SnapshotConfig(loaded, commit)
-    return loaded
+    return _SnapshotConfig(loaded, commit)
 
 
 _model_config_reader = _load_model_config_from_model_path.cache_reader
+_model_config_parser = _load_model_config_from_model_path.cache_parse
 
 
-def _cache_parsed_model_config(parse):
-    """Clear parsed publication state together with the parsed memoization."""
-    cached = cache(parse)
-    clear = cached.cache_clear
-
-    def clear_parsed():
-        clear()
-        _load_model_config_from_model_path.cache_clear_parsed()
-
-    cached.cache_clear = clear_parsed
-    return cached
-
-
-@_cache_parsed_model_config
 def get_model_config_from_model_path(model_path: str) -> dict:
     """
     Get model configuration from model path and parse it into model configuration parameters.
@@ -2611,14 +2644,30 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
+    return _model_config_parser(model_path, _parse_model_config_entry)
+
+
+def _get_uncached_model_config_from_model_path(model_path: str) -> dict:
     with _model_config_reader(model_path) as entry:
-        raw_config = entry.raw
-        if (raw_config.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration":
-            # Publish the first validated processor once for this shared base.
-            # Competing readers reuse it; failed reads leave publication retryable.
-            with entry.processor_lock:
-                return _parse_model_config_from_raw(raw_config, model_path)
-        return _parse_model_config_from_raw(raw_config, model_path)
+        return _parse_model_config_entry(entry, model_path)
+
+
+# Preserve the functools-style inspection/invalidation API while keeping the
+# parsed result and its publication state on the raw entry, under one lock.
+get_model_config_from_model_path.__wrapped__ = _get_uncached_model_config_from_model_path
+get_model_config_from_model_path.cache_clear = _load_model_config_from_model_path.cache_clear_parsed
+get_model_config_from_model_path.cache_info = _load_model_config_from_model_path.cache_info_parsed
+get_model_config_from_model_path.cache_parameters = lambda: {"maxsize": None, "typed": False}
+
+
+def _parse_model_config_entry(entry: _ModelConfigCacheEntry, model_path: str) -> dict:
+    raw_config = entry.raw
+    if (raw_config.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration":
+        # Publish the first validated processor once for this shared base.
+        # Competing readers reuse it; failed reads leave publication retryable.
+        with entry.processor_lock:
+            return _parse_model_config_from_raw(raw_config, model_path)
+    return _parse_model_config_from_raw(raw_config, model_path)
 
 
 def _parse_model_config_from_raw(raw_config: dict, model_path: str) -> dict:
@@ -2633,8 +2682,8 @@ def _parse_model_config_from_raw(raw_config: dict, model_path: str) -> dict:
     # processor metadata has passed the parser. Raw loads never fetch it.
     if "image_processor_config" in raw_config:
         base_config["image_processor_config"] = raw_config["image_processor_config"]
-    if commit and raw_config is not base_config:
-        raw_config = _SnapshotConfig(raw_config, commit)
+    if raw_config is not base_config:
+        raw_config = _SnapshotConfig(raw_config, commit, source=base_config._source)
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))
         logger.warning(

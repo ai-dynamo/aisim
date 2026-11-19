@@ -1499,6 +1499,145 @@ def test_concurrent_llama4_readers_publish_one_validated_processor(monkeypatch, 
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("clear_cache", ["raw", "parsed"])
+def test_inflight_parse_cannot_republish_after_cache_clear(monkeypatch, tmp_path, clear_cache):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    model = str(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    config_path.write_text(json.dumps({**config, "generation": "A"}))
+    paused = Event()
+    resume = Event()
+    real_parse = utils._parse_hf_config_json
+
+    def parse(raw):
+        parsed = real_parse(raw)
+        if not paused.is_set():
+            paused.set()
+            assert resume.wait(10)
+        return parsed
+
+    monkeypatch.setattr(utils, "_parse_hf_config_json", parse)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(get_model_config_from_model_path, model)
+        try:
+            assert paused.wait(10)
+            cache = (
+                utils._load_model_config_from_model_path if clear_cache == "raw" else get_model_config_from_model_path
+            )
+            cache.cache_clear()
+            config_path.write_text(json.dumps({**config, "generation": "B"}))
+            resume.set()
+            # The existing caller may finish A, but it must not republish A.
+            assert pending.result(timeout=10)["raw_config"]["generation"] == "A"
+            raw = utils._load_model_config_from_model_path(model)
+            parsed = get_model_config_from_model_path(model)
+            assert raw["generation"] == parsed["raw_config"]["generation"] == "B"
+            assert get_model_config_from_model_path(model) is parsed
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            get_model_config_from_model_path.cache_clear()
+
+
+def test_failed_reader_before_clear_preserves_publication_after_clear(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    model = str(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    config_path.write_text(json.dumps({**config, "generation": "A"}))
+    paused = Event()
+    resume = Event()
+    real_parse = utils._parse_hf_config_json
+
+    def parse(raw):
+        if current_thread().name.startswith("failed-reader"):
+            paused.set()
+            assert resume.wait(10)
+            raise ValueError("failed parse before clear")
+        return real_parse(raw)
+
+    monkeypatch.setattr(utils, "_parse_hf_config_json", parse)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="failed-reader") as pool:
+        pending = pool.submit(get_model_config_from_model_path, model)
+        try:
+            assert paused.wait(10)
+            get_model_config_from_model_path.cache_clear()
+            published = get_model_config_from_model_path(model)
+            config_path.write_text(json.dumps({**config, "generation": "B"}))
+            resume.set()
+            with pytest.raises(ValueError, match="failed parse before clear"):
+                pending.result(timeout=10)
+            assert get_model_config_from_model_path(model) is published
+            assert utils._load_model_config_from_model_path(model)["generation"] == "A"
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "bundled_model",
+    ["meta-llama/Llama-4-Scout-17B-16E-Instruct", "Qwen/Qwen3-VL-8B-Instruct", "moonshotai/Kimi-K2.5"],
+)
+def test_deferred_processor_keeps_hub_source_when_local_directory_appears(
+    monkeypatch, hf_cache, tmp_path, bundled_model
+):
+    model = "org/deferred-processor-source"
+    config = utils._load_pre_downloaded_hf_config(bundled_model)
+    llama4 = bundled_model.startswith("meta-llama/")
+    processor = config.pop("image_processor_config") if llama4 else {"min_pixels": 65536, "max_pixels": 16777216}
+    if bundled_model.startswith("moonshotai/"):
+        processor = {"max_patches": 8192}
+    _cache_file(hf_cache, model, "config.json", config)
+    _cache_file(hf_cache, model, "preprocessor_config.json", processor)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.chdir(tmp_path)
+    try:
+        raw = utils._load_model_config_from_model_path(model)
+        local = tmp_path / model
+        local.mkdir(parents=True)
+        # A valid processor from another source must not replace the Hub metadata.
+        replacement = {**processor, "max_patches": 4} if llama4 else {**processor, "source": "local"}
+        (local / "preprocessor_config.json").write_text(json.dumps(replacement))
+        loaded = get_model_config_from_model_path(model)
+        key = "image_processor_config" if llama4 else "preprocessor_config"
+        assert loaded["raw_config"][key] == processor
+        assert utils._config_snapshot_commit(loaded["raw_config"]) == "c" * 40
+        if llama4:
+            assert loaded["extra_params"].vision_config.max_num_tiles == processor["max_patches"]
+            assert raw[key] == processor
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+
+
+def test_deferred_local_llama4_processor_uses_original_checkpoint(monkeypatch, tmp_path, hf_cache):
+    model = "org/local-checkpoint"
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    processor = config.pop("image_processor_config")
+    for directory, max_patches in (("first", 16), ("second", 4)):
+        checkpoint = tmp_path / directory / model
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "config.json").write_text(json.dumps(config))
+        (checkpoint / "preprocessor_config.json").write_text(json.dumps({**processor, "max_patches": max_patches}))
+    monkeypatch.chdir(tmp_path / "first")
+    try:
+        raw = utils._load_model_config_from_model_path(model)
+        monkeypatch.chdir(tmp_path / "second")
+        loaded = get_model_config_from_model_path(model)
+        assert loaded["extra_params"].vision_config.max_num_tiles == 16
+        assert raw["image_processor_config"]["max_patches"] == 16
+        assert utils._config_snapshot_commit(loaded["raw_config"]) is None
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+
+
 def test_deferred_llama4_processor_uses_downloaded_config_commit(monkeypatch, hf_cache):
     model = "org/llama4-moving-main"
     config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
