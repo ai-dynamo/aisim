@@ -12,6 +12,24 @@ the only GLM-specific measured table. Every other GLM operator uses the generic
 GEMM/MoE/KDA/mHC/collective tables. The flow follows the DeepSeek-V4.1
 precedent in `sglang/README.dsv41.md`.
 
+## Exception: one GPU per TP rank
+
+Every other op collector times its module alone on one GPU, with the TP shard
+as a logical slice. This one runs the complete deployment, so a TP*N* table
+needs *N* GPUs of one node and the full checkpoint. The measured layer runs on
+one rank, but its input is the residual stream, and under TP every layer's
+output is a sum over ranks. The collector is kept this way as a recorded
+exception. Do not copy the design: collect a new model's attention on one GPU.
+
+A one-GPU collector for a sparse attention must show that its synthetic weights
+and inputs reproduce a real checkpoint's timing before its table is used. In a
+B300 trial with vLLM's dummy weights (every tensor U(-1e-3, 1e-3)), decode
+matched this collector's table, while prefill steps that score the index
+(context above `index_topk` tokens) took 1.1-2.1x its time. With N(0, 0.02)
+matrices and unit norm weights the same steps took 0.97-1.14x. vLLM's prefill
+top-k (`csrc/sampler.cu` `top_k_per_row_prefill`) is a histogram select whose
+number of passes depends on the score values.
+
 ## Pinned runtimes
 
 | Backend | Version directory | Runtime |
