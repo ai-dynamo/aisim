@@ -367,7 +367,7 @@ def test_attestation_rejects_conflicting_destination_artifact(built_record, tmp_
 def test_concurrent_attestations_never_replace_published_artifacts(built_record, tmp_path, monkeypatch, same_content):  # noqa: F811
     root, record = built_record
     tool = _script("aisim-benchmark-evaluate", "check_eval_record.py")
-    content = b"writer A evidence"
+    content = b'{"writer":"A"}'
     (root / "finding.json").write_bytes(content)
     finding = Artifact(
         artifact_id="finding", path="finding.json", role="finding", format="json", schema="finding/v1",
@@ -379,7 +379,7 @@ def test_concurrent_attestations_never_replace_published_artifacts(built_record,
     second_root.mkdir()
     for artifact in record.truth.artifacts:
         shutil.copyfile(root / artifact.path, second_root / artifact.path)
-    other_content = content if same_content else b"writer B evidence"
+    other_content = content if same_content else b'{"writer":"B"}'
     (second_root / finding.path).write_bytes(other_content)
     other_finding = finding.model_copy(update={"sha256": hashlib.sha256(other_content).hexdigest()})
     other_record = record.model_copy(update={"findings": [other_finding]})
