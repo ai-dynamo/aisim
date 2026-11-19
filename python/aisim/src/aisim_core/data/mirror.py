@@ -18,8 +18,11 @@ forbids:
 
 Both profiles separate the installed ``.github/workflows/validate.yml`` from
 dataset payloads. This exact repository infrastructure path is reviewed as code,
-never loaded as data, and still must not be a symlink. Candidate hygiene does not
-permit contributors to change it.
+never loaded as data, and still must not be a symlink. Root ``README.md`` (the
+dataset card) and ``.gitattributes`` are also repository metadata, rather than
+manifest artifacts. They must be UTF-8 text of at most 4 MiB, pass content-signature
+checks and, in the public profile, pass disclosure scanning. Candidate hygiene
+does not permit contributors to change these repository files.
 
 ``aisim-infx-cache`` is a separate private cache that is never promoted
 (:data:`NEVER_PROMOTED`). It uses the same E2E layout, so it can be validated with
@@ -62,14 +65,16 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "3"
+VALIDATOR_VERSION = "4"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
 NEVER_PROMOTED = frozenset({INFX_CACHE_REPO})
 MIRROR_CONTROL_DIR = "mirror"  # private-only control files; absent from the public layout
 DATA_ROOTS = ("catalog/", "eval/", "data/")
-REPOSITORY_FILES = frozenset({".github/workflows/validate.yml"})
+ROOT_METADATA_FILES = frozenset({"README.md", ".gitattributes"})
+REPOSITORY_FILES = ROOT_METADATA_FILES | {".github/workflows/validate.yml"}
+MAX_METADATA_BYTES = 4 * 1024 * 1024
 Profile = Literal["mirror", "public"]
 
 
@@ -125,6 +130,26 @@ def _tree_policy(extra_roots: tuple[str, ...]) -> CandidatePolicy:
         allowed_roots=DATA_ROOTS + extra_roots,
         allowed_suffixes=frozenset({".parquet", ".json", ".gz"}),
     )
+
+
+def _check_root_metadata(root: Path, tree: list[CandidateFile], profile: Profile, report: TreeReport) -> None:
+    for file in tree:
+        if file.path not in ROOT_METADATA_FILES:
+            continue
+        if file.size > MAX_METADATA_BYTES:
+            report.add("metadata-too-large", f"repository metadata exceeds {MAX_METADATA_BYTES} bytes", file.path)
+            continue
+        data = (root / file.path).read_bytes()
+        report.findings.extend(check_content(_tree_policy(()), file, data))
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            report.add("metadata-invalid", "repository metadata must be UTF-8 text", file.path)
+            continue
+        if profile == "public":
+            from aisim_core.data.redaction import DEFAULT_POLICY, scan_value
+
+            report.findings.extend(scan_value(text, DEFAULT_POLICY, file.path, "repository metadata"))
 
 
 def list_tree(root: Path) -> list[CandidateFile]:
@@ -310,6 +335,7 @@ def validate_tree(
         report.add("symlink", "dataset root must not be a symbolic link")
     if report.errors:
         return report
+    _check_root_metadata(root, tree, profile, report)
     for f in tree:
         if f.path in REPOSITORY_FILES and f.is_symlink:
             report.add("symlink", "symbolic links are not allowed", f.path)
