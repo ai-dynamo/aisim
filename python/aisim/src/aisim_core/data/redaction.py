@@ -181,6 +181,10 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
             yield from _walk(v, key, seen)
     elif isinstance(value, str):
         yield key, value
+    elif isinstance(value, bytes):
+        # Binary extension columns and Arrow metadata must not bypass disclosure
+        # checks. Invalid UTF-8 is refused rather than decoded lossily.
+        yield key, value.decode("utf-8")
 
 
 def _json_text(text: str) -> Any:
@@ -262,6 +266,14 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
             elif not info.redacted:
                 out.append(Finding("unredacted-provenance", f"{info.artifact_id} is not redacted", rel))
     for artifact in manifest.artifacts:
+        suffixes = {"parquet": ".parquet", "json": ".json", "yaml": ".yaml", "gzip": ".gz"}
+        if artifact.format not in suffixes or Path(artifact.path).suffix.lower() != suffixes[artifact.format]:
+            out.append(
+                Finding(
+                    "artifact-format", f"unsupported or mismatched artifact format: {artifact.format}", artifact.path
+                )
+            )
+            continue
         if artifact.format == "gzip" and not policy.allow_provenance_artifacts:
             out.append(Finding("provenance-withheld", "logs and raw output are withheld", artifact.path))
         if artifact.artifact_schema == REQUESTS_SCHEMA and not _request_rows_allowed(body, policy):
@@ -314,8 +326,30 @@ def _check_requests(path: Path, rel: str, policy: RedactionPolicy) -> list[Findi
 
 
 def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where: str) -> list[Finding]:
-    """Scan textual columns, including JSON-valued strings and future extension columns."""
+    """Scan metadata and text, including UTF-8 binary cells; undecodable bytes are invalid."""
     out: list[Finding] = []
+    metadata = [table.schema.metadata or {}]
+
+    def field_metadata(field: pa.Field) -> None:
+        metadata.append(field.metadata or {})
+        if pa.types.is_struct(field.type):
+            for child in field.type:
+                field_metadata(child)
+        elif (
+            pa.types.is_list(field.type)
+            or pa.types.is_large_list(field.type)
+            or pa.types.is_fixed_size_list(field.type)
+        ):
+            field_metadata(field.type.value_field)
+        elif pa.types.is_map(field.type):
+            field_metadata(field.type.key_field)
+            field_metadata(field.type.item_field)
+
+    for field in table.schema:
+        field_metadata(field)
+    for entry in metadata:
+        decoded = {key.decode("utf-8"): value.decode("utf-8") for key, value in entry.items()}
+        out.extend(scan_value(decoded, policy, rel, "Parquet metadata"))
     for name in table.column_names:
         values = table.column(name).to_pylist()
         if values:
@@ -337,9 +371,17 @@ def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy) -> list[Findi
     return out
 
 
-def _check_eval_record(root: Path, rel: str, policy: RedactionPolicy, infx_ids: set[str]) -> list[Finding]:
+def _check_eval_record(
+    root: Path, rel: str, policy: RedactionPolicy, infx_ids: set[str], classified_ids: set[str]
+) -> list[Finding]:
     record = load_record(root / rel)
     out = scan_value(record.model_dump(mode="json", by_alias=True), policy, rel, "eval record")
+    if missing := set(record.truth.configuration_ids) - classified_ids:
+        out.append(
+            Finding(
+                "eval-configuration-unresolved", f"cannot classify evaluated configurations: {sorted(missing)}", rel
+            )
+        )
     for artifact in record.truth.artifacts:
         path = _verify((root / rel).parent, artifact)
         artifact_rel = path.relative_to(root).as_posix()
@@ -416,18 +458,36 @@ def check_publishable(
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
+        if rel.startswith("systems/") and rel.endswith(".yaml"):
+            try:
+                data = checked_path(root, rel).read_bytes()
+                findings.extend(scan_value(yaml_sidecar_value(data), policy, rel, "system spec"))
+                findings.extend(scan_value(data.decode("utf-8"), policy, rel, "system spec source"))
+            except (OSError, ValueError, RecursionError) as exc:
+                findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         # Match the snapshot documents declared by mirror._check_snapshots.
-        if rel.startswith("data/") and Path(rel).match("*snapshot*.json"):
+        if rel.startswith("data/") and Path(rel).name == "snapshot.json":
             try:
                 findings.extend(_check_snapshot(root, rel, policy))
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel in eval_records:
             try:
-                findings.extend(_check_eval_record(root, rel, policy, infx_ids))
+                findings.extend(
+                    _check_eval_record(root, rel, policy, infx_ids, {m.configuration_id for m in loaded.values()})
+                )
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     return findings
+
+
+def _finite_number(value: Any) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def check_disclosure(rows: Iterable[Mapping[str, Any]], policy: RedactionPolicy = DEFAULT_POLICY) -> list[Finding]:
@@ -444,20 +504,23 @@ def check_disclosure(rows: Iterable[Mapping[str, Any]], policy: RedactionPolicy 
         scored = row.get("n_scored")
         if type(scored) is not int or scored < policy.min_scored:
             out.append(Finding("small-cell", f"n_scored must be an integer >= {policy.min_scored}", where))
+        total = row.get("n_total")
+        if type(scored) is int and type(total) is int and scored >= 0 and total >= 0 and scored > total:
+            out.append(Finding("not-aggregate", "n_scored exceeds n_total", where))
         for key, value in row.items():
             if key not in AGGREGATE_FIELDS:
                 continue
             if key in {"n_total", "n_scored", "n_configs"}:
                 valid = type(value) is int and value >= 0
             elif key in {"coverage", "mape_pct"}:
-                valid = value is None or (type(value) in (int, float) and math.isfinite(value) and value >= 0)
+                valid = value is None or (_finite_number(value) and value >= 0)
                 if key == "coverage" and valid:
                     valid = value is None or value <= 1
             elif key == "residual_quantiles_pct":
                 valid = value is None or (
                     isinstance(value, Mapping)
                     and set(value) <= {"p0", "p25", "p50", "p75", "p90", "p95", "p99", "p100"}
-                    and all(type(v) in (int, float) and math.isfinite(v) for v in value.values())
+                    and all(_finite_number(v) for v in value.values())
                 )
             else:
                 valid = isinstance(value, str)

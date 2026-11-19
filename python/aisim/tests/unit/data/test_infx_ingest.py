@@ -704,3 +704,79 @@ def test_evaluator_paths_make_zero_inferencex_calls(root, tmp_path, monkeypatch)
     for member in members:
         assert evaluation_points(load_e2e(root, member.manifest_path, config=None))
     assert calls == []
+
+
+def test_interrupted_configuration_write_can_retry_and_qualify(root, tmp_path, monkeypatch):
+    original = Path.write_text
+
+    def interrupt(path, text, *args, **kwargs):
+        if path.name == "manifest.json":
+            path.write_bytes(b'{"partial":')
+            raise OSError("interrupted manifest write")
+        return original(path, text, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_text", interrupt)
+        with pytest.raises(OSError, match="interrupted manifest"):
+            make_run(tmp_path, FakeInfx())
+    assert not list(root.rglob("manifest.json"))
+    result, _ = make_run(tmp_path, FakeInfx())
+    assert result.status == "candidate"
+    promote(root, result.snapshot_id, "Reviewer", now=NOW)
+    assert infx_job.load_state(root)["qualified"]["snapshot_id"] == result.snapshot_id
+
+
+@pytest.mark.parametrize("kind", ["availability", "metrics", "planning"])
+def test_malformed_acquisition_writes_report_and_notifies(root, tmp_path, monkeypatch, kind):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    before = tree(root)
+    fake = FakeInfx(rows=[row(metrics=1)]) if kind == "metrics" else FakeInfx()
+    if kind == "availability":
+        fake.availability[0]["isl"] = []
+    if kind == "planning":
+
+        def bad_plan(_):
+            raise infx_ingest.IncompleteAcquisitionError("incomplete retained response")
+
+        monkeypatch.setattr(infx_job, "plan_snapshot", bad_plan)
+    monkeypatch.setattr(
+        infx_job,
+        "run_ingestion",
+        lambda root, cache_dir, **kw: run_ingestion(root, cache_dir, transport=fake, sleep=lambda _: None),
+    )
+    alerts = []
+    monkeypatch.setattr(infx_job, "_env_alert", lambda *args: alerts.append(args) or [])
+    report = tmp_path / "failed.json"
+    assert (
+        infx_job.main(["run", "--root", str(root), "--cache-dir", str(tmp_path / "cache"), "--report", str(report)])
+        == 1
+    )
+    assert json.loads(report.read_text())["status"] == "failed"
+    assert alerts and tree(root) == before
+
+
+def test_conflicting_attempts_across_dates_fail(root, tmp_path):
+    date2 = "2026-11-06"
+    fake = FakeInfx(
+        rows={DATE: [row(1)], date2: [row(2, date=date2)]}, availability=[avail(), {**avail(), "date": date2}]
+    )
+    workflow2 = {**WORKFLOW, "runs": [{**WORKFLOW["runs"][0], "run_attempt": 3}]}
+    fake.respond("workflow-info", ok(WORKFLOW), ok(workflow2))
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "failed" and "run_attempt" in result.error
+    assert not list(root.iterdir())
+
+
+def test_model_filtered_refresh_reports_all_qualified_removals(root, tmp_path):
+    rows = [row(1), row(2, model="other")]
+    fake = FakeInfx(rows=rows, availability=[avail(), avail(model="other")])
+    fake.respond("benchmarks", ok([rows[1]]), ok([rows[0]]))  # Other is queried before Test-Model
+    first, _ = make_run(tmp_path, fake)
+    assert first.status == "candidate", first.error
+    promote(root, first.snapshot_id, "Reviewer", now=NOW)
+    result, _ = make_run(tmp_path, FakeInfx(rows=[row(1)], availability=[avail()]), models=["Test-Model"])
+    assert result.status == "candidate" and result.changes["removed"] == ["inferencex:2"]
+    promote(root, result.snapshot_id, "Reviewer", now=NOW)
+    _, members = read_snapshot(root, infx_ingest.snapshot_path(result.snapshot_id))
+    assert {m.observation_id for m in members} == {"inferencex:1"}

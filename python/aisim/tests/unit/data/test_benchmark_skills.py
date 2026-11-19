@@ -8,17 +8,23 @@ attest an eval record. This exercises the deterministic checks the skills call; 
 not replace a run on a real model and GPU.
 """
 
+import hashlib
 import importlib.util
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
 import pytest
 
+from aisim_core.data import Artifact, _verify
 from aisim_core.data.catalog import build_catalog
-from aisim_core.data.eval import PredictionIdentity, current_records, load_record, write_record
-from tests.unit.data.test_catalog import dataset  # noqa: F401  (fixture)
+from aisim_core.data.eval import PredictionIdentity, current_records, load_record, verify_record, write_record
+from tests.unit.data.test_catalog import (
+    NEW,
+    dataset,  # noqa: F401  (fixture)
+)
 from tests.unit.data.test_eval import _predict
 from tests.unit.data.test_eval import built as built_record  # noqa: F401  (fixture)
 
@@ -58,7 +64,20 @@ def test_plan_groups_cells_and_budget(built_catalog, capsys):
     plan = _script("aisim-benchmark-plan", "plan_catalog.py")
     assert (
         plan.main(
-            ["--dataset-root", str(root), "--hardware", "b200_sxm", "--model", QWEN, "--gpus", "8", "--wall-hours", "2"]
+            [
+                "--dataset-root",
+                str(root),
+                "--hardware",
+                "b200_sxm",
+                "--model",
+                QWEN,
+                "--gpus",
+                "8",
+                "--wall-hours",
+                "2",
+                "--prediction-fingerprint",
+                PredictionIdentity.build("fpm_interpolation", {"p": "b" * 64}, NEW).fingerprint,
+            ]
         )
         == 0
     )
@@ -267,7 +286,20 @@ def test_failed_predictor_import_restores_module(tmp_path, monkeypatch, has_prev
 
 def test_attestation_requires_a_predictor_and_copies_the_predecessor(built_record, tmp_path, capsys):  # noqa: F811
     root, record = built_record
-    previous = record.model_copy(update={"status": "failed", "status_reason": "temporary fixture failure"})
+    finding_bytes = b'{"reason":"fixture interruption"}'
+    (root / "findings.json").write_bytes(finding_bytes)
+    finding = Artifact(
+        artifact_id="findings",
+        path="findings.json",
+        role="findings",
+        format="json",
+        schema="fixture-findings/v1",
+        sha256=hashlib.sha256(finding_bytes).hexdigest(),
+        bytes=len(finding_bytes),
+    )
+    previous = record.model_copy(
+        update={"status": "failed", "status_reason": "temporary fixture failure", "findings": [finding]}
+    )
     write_record(root, previous)
     record = record.model_copy(update={"supersedes": previous.record_id})
     path = write_record(root, record)
@@ -293,6 +325,55 @@ def test_attestation_requires_a_predictor_and_copies_the_predecessor(built_recor
     predecessor = next(dest.rglob(f"{record.record_id}.json"))
     assert load_record(predecessor) == record and path.is_file()
     assert load_record(predecessor.parent / f"{previous.record_id}.json") == previous
+    shutil.rmtree(root / "eval")
+    for artifact in record.truth.artifacts:
+        (root / artifact.path).unlink()
+    (root / finding.path).unlink()
+    assert _verify(predecessor.parent, finding).read_bytes() == finding_bytes
+    assert verify_record(verified, predecessor.parent, _predict, verified.prediction.fingerprint).ok
+    for historical in (previous, record):
+        assert verify_record(historical, predecessor.parent, _predict, historical.prediction.fingerprint).ok
+
+
+def test_attestation_rejects_conflicting_destination_artifact(built_record, tmp_path):  # noqa: F811
+    root, record = built_record
+    path = write_record(root, record)
+    from aisim_core.data.eval import record_dir
+
+    destination = tmp_path / "attested"
+    target = record_dir(destination, record.truth.identity) / record.truth.artifacts[0].path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"conflicting bytes")
+    predictor = tmp_path / "predict.py"
+    predictor.write_text(
+        "def predict(inputs):\n    return inputs['tokens'] * 1.1 + (5.0 if inputs['tokens'] == 40 else 0.0)\n"
+        f"def fingerprint():\n    return {record.prediction.fingerprint!r}\n"
+    )
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        _script("aisim-benchmark-evaluate", "check_eval_record.py").main(
+            [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
+        )
+    assert target.read_bytes() == b"conflicting bytes" and not list(destination.rglob("*.json"))
+
+
+def test_planner_requires_current_fingerprint_and_reads_only_selected_layer(built_catalog, capsys):
+    root, _ = built_catalog
+    plan = _script("aisim-benchmark-plan", "plan_catalog.py")
+    record = next(load_record(p) for p in root.glob("eval/**/*.json") if load_record(p).truth.layer == "fpm")
+    base = ["--dataset-root", str(root), "--hardware", "b200_sxm", "--model", QWEN, "--layer", "fpm"]
+    for fingerprints, reuse in [([], False), (["0" * 64], False), ([record.prediction.fingerprint], True)]:
+        argv = [*base, *[v for f in fingerprints for v in ("--prediction-fingerprint", f)]]
+        assert plan.main(argv) == 0
+        cells = json.loads(capsys.readouterr().out)["cells"]
+        assert bool(cells["reuse"]) is reuse
+        assert bool(cells["evaluate_only"]) is not reuse
+    op = root / "catalog/op-latency/b200_sxm.parquet"
+    op.parent.mkdir(exist_ok=True)
+    op.write_bytes(b"incompatible schema")
+    assert plan.main(base) == 0
+    capsys.readouterr()
+    with pytest.raises(ValueError, match="Parquet"):
+        plan.main(base[:-2])  # an unfiltered plan still consumes op coverage
 
 
 def test_evaluation_reuse_requires_complete_status_and_matching_behavior(built_record):  # noqa: F811
@@ -315,3 +396,54 @@ def test_evaluation_reuse_requires_complete_status_and_matching_behavior(built_r
             "fpm_interpolation", {"p": "b" * 64}, "a" * 64, code_version="behavior-v2"
         ).fingerprint
     )
+
+
+def test_partial_accuracy_is_evaluate_only_and_catalog_download_is_sufficient(built_catalog, tmp_path, capsys):
+    from aisim_core.data.catalog import Catalog
+
+    root, systems = built_catalog
+    for path in root.glob("eval/**/*.json"):
+        record = load_record(path)
+        if record.truth.layer == "fpm" and record.truth.identity.model == QWEN:
+            path.unlink()
+            write_record(root, record.model_copy(update={"status": "partial", "status_reason": "interrupted fixture"}))
+    build_catalog(root, systems_dir=systems)
+    downloaded = tmp_path / "downloaded"
+    shutil.copytree(root / "catalog", downloaded / "catalog")
+    fingerprint = PredictionIdentity.build("fpm_interpolation", {"p": "b" * 64}, NEW).fingerprint
+    assert (
+        _script("aisim-benchmark-plan", "plan_catalog.py").main(
+            [
+                "--dataset-root",
+                str(downloaded),
+                "--hardware",
+                "b200_sxm",
+                "--model",
+                QWEN,
+                "--prediction-fingerprint",
+                fingerprint,
+            ]
+        )
+        == 0
+    )
+    cells = json.loads(capsys.readouterr().out)["cells"]
+    assert [r["layer"] for r in cells["reuse"]] == ["e2e"]
+    assert [r["layer"] for r in cells["evaluate_only"]] == ["fpm"]
+    assert next(r for r in Catalog(downloaded).rows(model=QWEN) if r.layer == "fpm").acc_mape_pct is None
+    changed = PredictionIdentity.build("fpm_interpolation", {"p": "b" * 64}, NEW, code_version="new-behavior")
+    assert (
+        _script("aisim-benchmark-plan", "plan_catalog.py").main(
+            [
+                "--dataset-root",
+                str(downloaded),
+                "--hardware",
+                "b200_sxm",
+                "--model",
+                QWEN,
+                "--prediction-fingerprint",
+                changed.fingerprint,
+            ]
+        )
+        == 0
+    )
+    assert not json.loads(capsys.readouterr().out)["cells"]["reuse"]

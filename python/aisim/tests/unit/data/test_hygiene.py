@@ -144,3 +144,29 @@ def test_allowed_gz_suffix_is_exempt_from_the_gzip_magic_rule_only():
     renamed = CandidateFile("data/a.json", len(gz))
     assert "forbidden-content" in codes(check_content(allowed, renamed, gz))
     assert "forbidden-content" in codes(check_content(allowed, f, b"\x7fELF" + b"x" * 12))
+
+
+@pytest.mark.parametrize("number,ok", [("1e400", False), ("-1e400", False), ("1e30", True)])
+def test_json_overflow_is_not_finite(number, ok):
+    data = ('{"value":' + number + "}").encode()
+    assert (not check_content(CandidatePolicy(), CandidateFile("data/test.json", len(data)), data)) is ok
+
+
+@pytest.mark.parametrize(
+    "text,ok",
+    [
+        ("setting: 1\nsetting: 2\n", False),
+        ("nested:\n  setting: 1\n  setting: 2\n", False),
+        ("defaults: &d {setting: 1}\nconfig: {<<: *d, setting: 2}\nalias: *d\n", True),
+    ],
+)
+def test_yaml_explicit_duplicates_and_merge_overrides(text, ok):
+    from aisim_core.data.hygiene import yaml_sidecar_value
+
+    if ok:
+        value = yaml_sidecar_value(text.encode())
+        assert value["config"]["setting"] == 2
+        assert value["defaults"] is value["alias"]
+    else:
+        with pytest.raises(ValueError, match="duplicate YAML key"):
+            yaml_sidecar_value(text.encode())

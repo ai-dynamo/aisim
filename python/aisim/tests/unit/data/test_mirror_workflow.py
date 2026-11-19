@@ -3,7 +3,9 @@
 
 """Static checks of the mirror CI template: same validator, no secrets, never runs here."""
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -48,7 +50,16 @@ def test_runs_the_shared_validator_from_a_pinned_checkout(text):
     run = "\n".join(s.get("run", "") for s in doc["jobs"]["validate"]["steps"])
     assert "aisim_core.data.mirror validate" in run and "--profile mirror" in run
     assert re.fullmatch(r"[0-9a-f]{40}", doc["env"]["AISIM_VALIDATOR_REF"])
-    assert 'AISIM_VALIDATOR_REF}" != 0000*' in run  # the placeholder SHA fails closed
+    steps = doc["jobs"]["validate"]["steps"]
+    checkout = next(s for s in steps if s.get("with", {}).get("repository") == "ai-dynamo/aisim")
+    assert checkout["with"]["ref"] == "${{ env.AISIM_VALIDATOR_REF }}"
+    guard = next(s for s in steps if s.get("name") == "Validate the validator pin")
+    assert steps.index(guard) < steps.index(checkout)
+    for pin, ok in [("0" * 40, False), ("main", False), ("0000" + "a" * 36, True), ("a" * 40, True)]:
+        result = subprocess.run(
+            ["bash", "-c", guard["run"]], env={**os.environ, "AISIM_VALIDATOR_REF": pin}, capture_output=True
+        )
+        assert (result.returncode == 0) is ok
 
 
 def test_least_privilege_and_pinned_actions(text):

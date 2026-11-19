@@ -348,6 +348,7 @@ class Acquirer:
         for row in availability:
             if not isinstance(row, dict) or not {*_AVAILABILITY_KEY, "date"} <= row.keys():
                 raise IncompleteAcquisitionError(f"availability row lacks required fields: {row!r:.200}")
+            _check_availability_values(row, "availability", include_date=True)
             if wanted is not None and row["model"] not in wanted and by_key.get(row["model"]) not in wanted:
                 continue
             if row["model"] not in by_key:
@@ -374,6 +375,9 @@ class Acquirer:
             for row in rows:
                 if not isinstance(row, dict) or any(k not in row for k in REQUIRED_ROW_KEYS):
                     raise IncompleteAcquisitionError(f"{url}: row lacks required fields: {row!r:.200}")
+                _check_availability_values(row, url)
+                if not isinstance(row["metrics"], dict):
+                    raise IncompleteAcquisitionError(f"{url}: metrics must be a mapping")
                 if row["model"] not in valid_keys:
                     raise ContradictionError(f"{url}: row {row['id']} is for model {row['model']!r}, not {name!r}")
                 row = {k: v for k, v in row.items() if not k.startswith(VIEW_CONTEXT_PREFIX)}
@@ -418,7 +422,13 @@ class Acquirer:
                 if any(not isinstance(item, dict) or not isinstance(item.get("html_url"), str) for item in info[key]):
                     raise IncompleteAcquisitionError(f"workflow-info {date}: malformed {key} entry")
             for run in info.get("runs", []):
-                runs.setdefault(run["html_url"], {})["run_attempt"] = run.get("run_attempt")
+                entry = runs.setdefault(run["html_url"], {})
+                attempt = run.get("run_attempt")
+                if "run_attempt" in entry and entry["run_attempt"] != attempt:
+                    raise ContradictionError(
+                        f"workflow-info {date}: run {run['html_url']} reports two run_attempt values"
+                    )
+                entry["run_attempt"] = attempt
             for config in info.get("runConfigs", []):
                 entry = runs.setdefault(config["html_url"], {})
                 sha = config.get("head_sha")
@@ -507,7 +517,19 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
         if (root / manifest_path).exists():
             load_e2e(root, manifest_path)  # verify reused shards without replacing any of their bytes
         else:
-            write_configuration(root, data, prefix=prefix)
+            # The manifest is the last file in a multi-file shard. Publish the
+            # entire immutable revision only after all writes and verification
+            # succeed, so an interruption cannot poison the next identical run.
+            with tempfile.TemporaryDirectory(dir=root) as tmp:
+                staging = Path(tmp)
+                write_configuration(staging, data, prefix=prefix)
+                load_e2e(staging, manifest_path)
+                destination = root / prefix
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.rename(staging / prefix, destination)
+                except FileExistsError:
+                    load_e2e(root, manifest_path)
     (root / path).parent.mkdir(parents=True, exist_ok=True)
     pending = path + ".pending"
     try:
@@ -535,3 +557,18 @@ def diff_members(before: Mapping[str, str], after: Sequence[SnapshotMember]) -> 
         "corrected": sorted(o for o in now if o in before and now[o] != before[o]),
         "removed": sorted(set(before) - set(now)),
     }
+
+
+def _check_availability_values(row: Mapping[str, Any], where: str, *, include_date: bool = False) -> None:
+    for key in (*_AVAILABILITY_KEY, "date") if include_date else _AVAILABILITY_KEY:
+        value = row.get(key)
+        if key in ("isl", "osl"):
+            valid = type(value) is int and value >= 0
+        elif key == "disagg":
+            valid = type(value) is bool
+        elif key == "spec_method":
+            valid = value is None or isinstance(value, str)
+        else:
+            valid = isinstance(value, str) and bool(value)
+        if not valid:
+            raise IncompleteAcquisitionError(f"{where}: invalid scalar value for {key}")

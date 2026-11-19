@@ -1843,3 +1843,335 @@ def test_policy_preserves_valid_threshold_and_default(tmp_path):
         path.write_text(json.dumps({"reviewers": ["alice", "bob"], **options}))
         policy = PromotionPolicy.from_file(path)
         assert policy.reviewers == frozenset({"alice", "bob"}) and policy.min_approvals == expected
+
+
+# Regression cases for the scoped publication and transaction findings.
+def _refresh_artifact(root, directory, relative, **updates):
+    path = root / directory / "manifest.json"
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    artifacts = [
+        a.model_copy(
+            update={
+                "sha256": hashlib.sha256((root / relative).read_bytes()).hexdigest(),
+                "bytes": (root / relative).stat().st_size,
+                **updates,
+            }
+        )
+        if a.path == relative
+        else a
+        for a in manifest.artifacts
+    ]
+    path.write_text(manifest.model_copy(update={"artifacts": artifacts}).model_dump_json(by_alias=True))
+    register_manifests(root, [str(path.relative_to(root))], INTERNAL_REPO)
+    build_catalog(root)
+
+
+@pytest.mark.parametrize("location", ["file", "field", "binary"])
+@pytest.mark.parametrize("value,blocked", [("https://node7.corp.nvidia.com/v1", True), ("public-benchmark", False)])
+def test_parquet_metadata_and_binary_values_reach_both_publication_gates(tmp_path, location, value, blocked):
+    import pyarrow.parquet as pq
+
+    root, directory, relative = _op_mirror(tmp_path, "future_text", None)
+    table = pq.read_table(root / relative)
+    metadata = None
+    if location == "binary":
+        table = table.append_column("diagnostic", pa.array([None, value.encode()], type=pa.binary()))
+    elif location == "field":
+        table = table.set_column(0, table.schema.field(0).with_metadata({b"origin": value.encode()}), table.column(0))
+    else:
+        metadata = {"origin": value}
+    write_parquet(table, root / relative, OP_TABLE_SCHEMA_ID, extra_metadata=metadata)
+    _refresh_artifact(root, directory, relative)
+    assert validate_tree(root).ok
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert ("internal-host" in {f.code for f in plan.findings}) is blocked
+    public = tmp_path / "public"
+    shutil.copytree(root, public, ignore=shutil.ignore_patterns(".git", "mirror"))
+    report = validate_tree(public, profile="public")
+    assert ("internal-host" in {f.code for f in report.errors}) is blocked
+    assert report.ok is not blocked
+
+
+@pytest.mark.parametrize(
+    "declared_format,name", [("opaque", "errors.json"), ("json", "errors.json"), ("yaml", "errors.json")]
+)
+def test_manifest_sidecars_must_have_supported_consistent_formats(tmp_path, declared_format, name):
+    root, directory, _ = _op_mirror(tmp_path, "future_text", None)
+    relative = f"{directory}/{name}"
+    (root / relative).write_text('{"endpoint":"https://node7.corp.nvidia.com/v1"}')
+    path = root / directory / "manifest.json"
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    artifact = Artifact(
+        artifact_id="errors",
+        path=relative,
+        role="metadata",
+        format=declared_format,
+        schema="extension/v1",
+        sha256=hashlib.sha256((root / relative).read_bytes()).hexdigest(),
+        bytes=(root / relative).stat().st_size,
+    )
+    path.write_text(
+        manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+    )
+    register_manifests(root, [str(path.relative_to(root))], INTERNAL_REPO)
+    build_catalog(root)
+    for findings in (
+        plan_promotion(root, _request(root, [directory]), _reviewers()).findings,
+        validate_tree(root, profile="public").errors,
+    ):
+        expected = "internal-host" if declared_format == "json" else "artifact-format"
+        assert any(f.code == expected and f.path == relative for f in findings)
+
+
+def test_unresolved_eval_configuration_is_not_public(tmp_path):
+    root, _ = _mirror(tmp_path)
+    record = _eval(root, ["cfg-" + "f" * 64])
+    build_catalog(root)
+    directory = str(record.parent.relative_to(root))
+    _public(root, directory)
+    assert validate_tree(root).ok
+    assert "eval-configuration-unresolved" in {f.code for f in validate_tree(root, profile="public").errors}
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert {"eval-truth-not-selected", "eval-configuration-unresolved"} <= {f.code for f in plan.findings}
+
+
+@pytest.mark.parametrize(
+    "row,valid",
+    [
+        ({"n_scored": 5, "n_total": 1}, False),
+        ({"n_scored": 5}, True),
+        ({"n_scored": 5, "n_total": 5, "coverage": 1.0, "residual_quantiles_pct": {"p50": -2.5}}, True),
+        ({"n_scored": 5, "coverage": 10**400}, False),
+        ({"n_scored": 5, "residual_quantiles_pct": {"p50": 10**400}}, False),
+    ],
+)
+def test_aggregate_counts_and_large_numbers(row, valid):
+    assert (not check_disclosure([row])) is valid
+
+
+def test_unknown_python_validation_profile_is_refused(tmp_path):
+    root, _ = _mirror(tmp_path)
+    (root / "README.md").write_text("https://node7.corp.nvidia.com")
+    with pytest.raises(ValueError, match="unsupported validation profile"):
+        validate_tree(root, profile="publc")
+
+
+def test_operation_evidence_version_directory_and_strict_identity(tmp_path):
+    from pydantic import ValidationError
+
+    from aisim_core.data.evidence import EvidenceManifest, check_evidence
+
+    root, directory, _ = _op_mirror(tmp_path, "future_text", None)
+    manifest = Manifest.model_validate_json((root / directory / "manifest.json").read_bytes())
+    destination = root / "evidence" / directory
+    destination.mkdir(parents=True)
+    (destination / "capture.log").write_bytes(b"fixture")
+    doc = {
+        "configuration_id": manifest.configuration_id,
+        "category": "op-latency",
+        "config_path": directory,
+        "artifacts": [
+            {"path": "capture.log", "sha256": hashlib.sha256(b"fixture").hexdigest(), "size": 7, "kind": "log"}
+        ],
+    }
+    (destination / "evidence-manifest.json").write_text(json.dumps(doc))
+    assert validate_tree(root).ok
+    for bad in ["anything", "cfg-" + "A" * 64]:
+        with pytest.raises(ValidationError):
+            EvidenceManifest.model_validate({**doc, "configuration_id": bad})
+    e2e = _evidence(root)
+    wrong = json.loads((e2e / "evidence-manifest.json").read_text())
+    wrong["configuration_id"] = "cfg-" + "b" * 64
+    (e2e / "evidence-manifest.json").write_text(json.dumps(wrong))
+    assert "evidence-configuration" in {
+        f.code for f in check_evidence(root, [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()])[0]
+    }
+
+
+@pytest.mark.parametrize(
+    "kind,code",
+    [("metadata", "metadata-unreadable"), ("evidence", "evidence-unreadable"), ("catalog", "catalog-unreadable")],
+)
+def test_unreadable_files_produce_cli_reports(tmp_path, monkeypatch, kind, code):
+    from aisim_core.data import mirror
+
+    root, _ = _mirror(tmp_path)
+    if kind == "metadata":
+        bad = root / "README.md"
+        bad.write_text("dataset card")
+        original = Path.read_bytes
+
+        def read(path):
+            if path == bad:
+                raise PermissionError("synthetic unreadable file")
+            return original(path)
+
+        monkeypatch.setattr(Path, "read_bytes", read)
+    elif kind == "evidence":
+        bad = _evidence(root) / "capture.sh"
+        original = Path.open
+
+        def open_file(path, *args, **kw):
+            if path == bad:
+                raise PermissionError("synthetic unreadable file")
+            return original(path, *args, **kw)
+
+        monkeypatch.setattr(Path, "open", open_file)
+    else:
+        bad = root / "catalog/systems.parquet"
+        original = mirror.pq.read_table
+
+        def read_table(path, *args, **kw):
+            if Path(path) == bad:
+                raise PermissionError("synthetic unreadable file")
+            return original(path, *args, **kw)
+
+        monkeypatch.setattr(mirror.pq, "read_table", read_table)
+    output = tmp_path / "report.json"
+    assert mirror_main(["validate", "--root", str(root), "--output", str(output)]) == 1
+    assert any(
+        f["code"] == code and f["path"] == str(bad.relative_to(root))
+        for f in json.loads(output.read_text())["findings"]
+    )
+
+
+def test_declared_snapshot_named_sidecars_are_not_snapshot_documents(tmp_path):
+    root, directory, _ = _op_mirror(tmp_path, "future_text", None)
+    relative = f"{directory}/snapshot-run/snapshot-settings.json"
+    path = root / relative
+    path.parent.mkdir()
+    path.write_text('{"mode":"public"}')
+    manifest_path = root / directory / "manifest.json"
+    manifest = Manifest.model_validate_json(manifest_path.read_bytes())
+    artifact = Artifact(
+        artifact_id="settings",
+        path=relative,
+        role="metadata",
+        format="json",
+        schema="settings/v1",
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        bytes=path.stat().st_size,
+    )
+    manifest_path.write_text(
+        manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+    )
+    register_manifests(root, [str(manifest_path.relative_to(root))], INTERNAL_REPO)
+    build_catalog(root)
+    public = tmp_path / "public"
+    shutil.copytree(root, public, ignore=shutil.ignore_patterns(".git", "mirror"))
+    assert validate_tree(public, profile="public").ok
+    assert plan_promotion(root, _request(root, [directory]), _reviewers()).content_ok
+
+
+def test_system_publisher_bundle_is_admitted_narrowly(tmp_path):
+    from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, publish_system_spec
+
+    root, _ = _mirror(tmp_path)
+    publish_system_spec(PACKAGED_SYSTEMS_DIR / "h100_sxm.yaml", root)
+    for profile in ["mirror", "public"]:
+        report = validate_tree(root, profile=profile)
+        assert report.ok, report.errors
+    (root / "systems/h100_sxm/extra.yaml").write_text("unexpected: true")
+    assert "yaml-sidecar" in {f.code for f in validate_tree(root).errors}
+
+
+@pytest.mark.parametrize("change", ["writer", "row", "schema", "missing", "stale"])
+def test_catalog_drift_compares_ordered_data_and_schema(tmp_path, change):
+    import pyarrow.parquet as pq
+
+    from aisim_core.data.mirror import TreeReport, _check_catalog_drift
+
+    root, _ = _mirror(tmp_path)
+    shard = root / "catalog/systems.parquet"
+    table = pq.read_table(shard)
+    if change == "writer":
+        data = shard.read_bytes()
+        created_by = pq.ParquetFile(shard).metadata.created_by.encode()
+        assert created_by in data
+        shard.write_bytes(data.replace(created_by, b"x" * len(created_by)))
+        assert pq.ParquetFile(shard).metadata.created_by != created_by.decode()
+    elif change == "row":
+        rows = table.to_pylist()
+        rows[0]["spec_sha256"] = "f" * 64
+        pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
+    elif change == "schema":
+        pq.write_table(table.append_column("unexpected", pa.array([1] * table.num_rows)), shard)
+    elif change == "missing":
+        shard.unlink()
+    else:
+        stale = root / "catalog/e2e/stale.parquet"
+        stale.parent.mkdir(exist_ok=True)
+        stale.write_bytes(shard.read_bytes())
+    report = TreeReport(None, "mirror")
+    _check_catalog_drift(root, report, set())
+    assert bool(report.errors) is (change != "writer"), report.errors
+
+
+def test_promotion_lock_covers_snapshot_and_rollback(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aisim_core.data import promote as module
+
+    root, _, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    original = module._snapshot
+    entered, release = threading.Event(), threading.Event()
+    snapshots = []
+
+    def pause(path):
+        result = original(path)
+        snapshots.append(result)
+        entered.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(module, "_snapshot", pause)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(apply_promotion, plan, root, target, write_ledger=False)
+        try:
+            assert entered.wait(10)
+            with pytest.raises(PromotionError, match="target lock"):
+                apply_promotion(plan, root, target, write_ledger=False)
+            assert len(snapshots) == 1  # competing writer cannot capture a stale rollback snapshot
+        finally:
+            release.set()
+        first.result()
+    before = {str(p.relative_to(target)): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+
+    def fail(*args, **kw):
+        raise OSError("second transaction failed")
+
+    monkeypatch.setattr(module, "build_catalog", fail)
+    with pytest.raises(OSError, match="second transaction failed"):
+        apply_promotion(plan, root, target, write_ledger=False)
+    assert before == {str(p.relative_to(target)): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+    assert validate_tree(target, profile="public").ok
+
+
+def test_promotion_preserves_noncanonical_category_index(tmp_path):
+    from aisim_core.data import DatasetIndex
+
+    root, _, plan = _approved(tmp_path)
+    container = tmp_path / "prior"
+    container.mkdir()
+    target, manifests = _mirror(container, repo=PUBLIC, dev=("synthetic/prior-model",))
+    old = target / "catalog/e2e.json"
+    custom = target / "catalog/indexes/existing.json"
+    custom.parent.mkdir()
+    old.rename(custom)
+    path = target / "catalog/dataset.json"
+    dataset = DatasetIndex.model_validate_json(path.read_bytes())
+    ref = dataset.categories["e2e"]
+    artifact = ref.index.model_copy(update={"path": "catalog/indexes/existing.json"})
+    path.write_text(
+        dataset.model_copy(update={"categories": {"e2e": ref.model_copy(update={"index": artifact})}}).model_dump_json(
+            by_alias=True
+        )
+    )
+    assert validate_tree(target).ok
+    apply_promotion(plan, root, target, write_ledger=False)
+    updated = DatasetIndex.model_validate_json(path.read_bytes())
+    assert updated.categories["e2e"].index.path == "catalog/indexes/existing.json"
+    assert validate_tree(target, profile="public").configurations == 2
+    assert (target / manifests[0]).is_file()
