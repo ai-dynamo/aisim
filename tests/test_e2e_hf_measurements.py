@@ -419,6 +419,29 @@ def test_unsafe_artifact_paths(tmp_path, path):
         hf._get(Cache(tmp_path), FakeTransport({}), "a" * 40, path)
 
 
+def test_failed_download_keeps_another_readers_verified_file(tmp_path, monkeypatch):
+    path, body = "data/e2e/inferencex/file.json", b'{"verified": true}'
+    ref = dict(bytes=len(body), sha256=hashlib.sha256(body).hexdigest())
+    cache, stored, valid = Cache(tmp_path), [], Cache.valid
+
+    def valid_then_other_reader_stores(self, repo, sha, relative, expected):
+        found = valid(self, repo, sha, relative, expected)
+        if relative == path and not found and not stored:
+            stored.append(self.store(repo, sha, relative, [body], expected))  # reader one finishes after our miss
+        return found
+
+    class DroppedLink(FakeTransport):
+        def open_file(self, repo, sha, relative):
+            raise ConnectionError("link dropped")
+            yield
+
+    monkeypatch.setattr(Cache, "valid", valid_then_other_reader_stores)
+    with pytest.raises(hf._library()[0].TransferError):
+        hf._get(cache, DroppedLink({}), "a" * 40, path, ref)
+    assert stored
+    assert cache.path_for(hf.REPO_ID, "a" * 40, path).read_bytes() == body
+
+
 @pytest.fixture
 def sealed(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "synthetic-test-secret")

@@ -127,7 +127,6 @@ def _get(cache, transport, sha, path, ref=None):
             rows=ref.get("rows"),
         )
     if not cache.valid(REPO_ID, sha, path, expected):
-        cache.discard(REPO_ID, sha, path)
         cache.store(REPO_ID, sha, path, transport.open_file(REPO_ID, sha, path), expected)
     return cache.path_for(REPO_ID, sha, path)
 

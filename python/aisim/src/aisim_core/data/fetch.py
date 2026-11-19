@@ -492,7 +492,8 @@ class _Planner:
         plan.metadata_bytes += received
         if validate is not None:
             validate(b"".join(chunks))
-        self.cache.discard(plan.repo, plan.revision, ref.path)
+        # ``store`` verifies a temporary file and atomically replaces the destination, so an existing entry
+        # (possibly another reader's verified download) is never removed ahead of a transfer that may fail.
         self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
         self._add(ref)
         return self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
@@ -614,7 +615,6 @@ def fetch(
     for f in result_plan.files:
         if f.cached:
             continue
-        cache.discard(repo, sha, f.path)
         _, size = cache.store(repo, sha, f.path, transport.open_file(repo, sha, f.path), f)
         downloaded += size
         f.cached = True
@@ -690,7 +690,6 @@ def fetch_support(
         if not cache.valid(repo, sha, ref.path, ref):
             if offline or transport is None:
                 raise OfflineMissingError([ref.path])
-            cache.discard(repo, sha, ref.path)
             cache.store(repo, sha, ref.path, transport.open_file(repo, sha, ref.path), ref)
         paths[ref.path] = cache.path_for(repo, sha, ref.path)
     return sha, index, paths

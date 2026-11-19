@@ -301,6 +301,24 @@ def test_interrupted_transfer_leaves_no_partial_and_resumes(files, tmp_path):
     assert r.paths[art].read_bytes() == files[art]
 
 
+def test_failed_download_keeps_another_readers_verified_file(files, tmp_path, monkeypatch):
+    c = Cache(tmp_path / "c")
+    art = "fpm/m1/data.parquet"
+    valid, stored = Cache.valid, []
+
+    def valid_then_other_reader_stores(self, repo, sha, path, expected):
+        found = valid(self, repo, sha, path, expected)
+        if path == art and not found and not stored:
+            stored.append(self.store(repo, sha, path, [files[art]], expected))  # reader one finishes after our miss
+        return found
+
+    monkeypatch.setattr(Cache, "valid", valid_then_other_reader_stores)
+    with pytest.raises(TransferError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files, fail_after={art: 20}), cache=c)
+    assert stored
+    assert c.path_for(REPO, SHA, art).read_bytes() == files[art]
+
+
 def test_corrupt_download_rejected_and_not_cached(files, tmp_path):
     art = "fpm/m1/data.parquet"
     bad = dict(files)
