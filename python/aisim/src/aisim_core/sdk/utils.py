@@ -2306,12 +2306,53 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
                         for bound, alias in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
                             if bound not in data and alias in data["size"]:
                                 data[bound] = data["size"][alias]
-                    processor.update(data)
+                    if kimi:
+                        nested_media = "media_proc_cfg" in processor or "media_proc_cfg" in data
+                        inline_media = processor.get("media_proc_cfg", processor)
+                        sidecar_media = data.get("media_proc_cfg", data)
+                        if not isinstance(inline_media, dict) or not isinstance(sidecar_media, dict):
+                            raise ValueError("Kimi media_proc_cfg must be an object")
+                        media = {
+                            name: value
+                            for name, value in {**inline_media, **sidecar_media}.items()
+                            if name not in ("media_proc_cfg", "video_processor")
+                        }
+                        for native, legacy in (
+                            ("max_patches", "in_patch_limit"),
+                            ("merge_size", "merge_kernel_size"),
+                            ("size", "patch_limit_on_one_side"),
+                        ):
+                            if native in sidecar_media and legacy not in sidecar_media:
+                                media.pop(legacy, None)
+                        processor.update(data)
+                        if nested_media:
+                            processor["media_proc_cfg"] = media
+                        else:
+                            video = processor.get("video_processor")
+                            processor = media
+                            if video is not None:
+                                processor["video_processor"] = video
+                    else:
+                        processor.update(data)
                 else:
                     inline_video = processor.get(key, {})
                     if not isinstance(inline_video, dict):
                         raise ValueError(f"{key} must be an object")
                     processor[key] = {**inline_video, **data}
+                    media = processor.get("media_proc_cfg", processor)
+                    if not isinstance(media, dict):
+                        raise ValueError("Kimi media_proc_cfg must be an object")
+                    media = dict(media)
+                    for native, legacy in (
+                        ("max_patches", "in_patch_limit_each_frame"),
+                        ("temporal_patch_size", "temporal_merge_kernel_size"),
+                    ):
+                        if native in data:
+                            media.pop(legacy, None)
+                    if "media_proc_cfg" in processor:
+                        processor["media_proc_cfg"] = media
+                    else:
+                        processor = media
         raw_config = {**raw_config, "preprocessor_config": processor}
     return raw_config
 

@@ -201,6 +201,28 @@ def test_invalid_quantization_section_fails_public_loader(monkeypatch, hf_cache,
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("nested_inline", [False, True])
+@pytest.mark.parametrize("nested_sidecar", [False, True])
+def test_kimi_image_sidecar_overrides_equivalent_inline_layout(tmp_path, nested_inline, nested_sidecar):
+    config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
+    inline = {"in_patch_limit": 1024, "patch_limit_on_one_side": 512}
+    config["preprocessor_config"] = {"media_proc_cfg": inline} if nested_inline else inline
+    config["preprocessor_config"]["video_processor"] = {"max_patches": 2048}
+    sidecar = {"max_patches": 8192}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "preprocessor_config.json").write_text(
+        json.dumps({"media_proc_cfg": sidecar} if nested_sidecar else sidecar)
+    )
+    try:
+        loaded = get_model_config_from_model_path(str(tmp_path))
+        assert loaded["encoder_config"].image_max_patches == 8192
+        assert loaded["encoder_config"].video_max_patches == 2048
+        assert loaded["encoder_config"].max_patches_per_side == 512
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 def test_kimi_partial_video_sidecar_retains_inline_patch_limit(tmp_path):
     config = utils._load_pre_downloaded_hf_config("moonshotai/Kimi-K2.5")
     config["preprocessor_config"] = {"video_processor": {"max_patches": 1024}}
