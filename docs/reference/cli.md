@@ -36,9 +36,9 @@ illustrate the output format. Captured detail examples are simulation results, n
 
 | Option | Type | Default | Meaning |
 |---|---|---:|---|
-| `-c`, `--config PATH` | path | Required | Input YAML file. |
+| `-c`, `--config PATH` | path | Required | Input YAML or JSON file; a `.json` suffix (case insensitive) selects JSON parsing. |
 | `--stack NAME` | string | `engine` | Built-in or discovered execution stack. This selection is CLI-only and is never written into YAML. |
-| `--set PATH=YAML_VALUE` | repeatable assignment | None | Set a supported configuration path after loading YAML. |
+| `--set PATH=YAML_VALUE` | repeatable assignment | None | Set a supported configuration path after loading YAML or JSON; override values use YAML syntax. |
 | `--output-dir PATH` | path | `./aisim-output` | Directory for durable results. |
 | `--overwrite` | flag | `false` | Replace known AISim output files in an existing output directory. |
 | `--format table\|json` | enum | `table` | Standard-output presentation. It does not change durable output files. |
@@ -52,7 +52,7 @@ illustrate the output format. Captured detail examples are simulation results, n
 | `--online` | flag | `false` | Pace prediction against the real wall clock instead of virtual time. The selected stack must advertise online support. |
 
 The CLI deliberately does not expose field-specific flags such as `--request-per-second` or
-`--num-workers`. YAML is the authoritative semantic configuration surface.
+`--num-workers`. The [configuration schema](configuration.md) is the authoritative semantic surface for YAML and JSON.
 
 ### Eager execution and CUDA graphs
 
@@ -539,10 +539,12 @@ Without `--output`, `migrate` prints the plan and writes nothing: the new
   file system without hard links, a new `FILE` is empty for a moment before
   the converted text is moved into it.
 - **JSON.** A `FILE` that ends with `.json`, in any letter case, is written as
-  JSON. A `.json` configuration converted in place stays JSON. AISim
-  reads configuration files as YAML. When the JSON text would not be read
-  back as the same config, `migrate` writes nothing and exits `2`:
-  `cannot write small.json as JSON: engine.ais_perf_model.estimator_config.ridge is 1e-05 and would be read back from the file as '1e-05'; name a file that does not end with .json to write YAML`.
+  JSON. A `.json` configuration converted in place stays JSON. AISim reads
+  these files with the JSON parser, preserving scientific notation such as
+  `1e-7` as a number. If a value cannot round-trip through JSON, such as a
+  non-string mapping key or a non-finite number, `migrate` writes nothing and
+  exits `2` with the filename and reason. Use a filename without `.json` to
+  retain YAML-only values.
 - **All or nothing.** When one field cannot be converted, nothing is
   converted. `migrate` prints a `cannot convert: <field>: <reason>` line for
   each such field and then `Nothing was converted.`, `--output` writes no

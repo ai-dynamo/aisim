@@ -5,9 +5,16 @@ SPDX-License-Identifier: Apache-2.0
 
 # Public configuration
 
-The public CLI consumes strict, typed YAML. `predict` accepts concrete values;
+The public CLI consumes YAML or JSON with the same strict, typed schema. `predict` accepts concrete values;
 `recommend` adds supported search domains and an objective. This document is
 not the [`SmartSearchConfig` SDK schema](../sweeper/sdk.md).
+
+Pass either format with `--config PATH`. A `.json` suffix, in any letter case,
+selects Python's JSON parser; other filenames retain YAML parsing, including
+`.yaml`, `.yml`, and files without an extension. The document must be one object
+(mapping). JSON scientific notation such as `1e-7` is read as a number; quoted
+`"1e-7"` remains a string and fails validation in numeric fields. Invalid JSON
+is reported as an error without falling back to YAML.
 
 <a id="configuration-model"></a>
 
@@ -20,7 +27,7 @@ Jump to [traffic](../replay/workloads.md), [engine](../replay/engine/README.md),
 These fragments show the available top-level sections; they are not complete runnable inputs.
 Use the [quickstart](../getting-started/quickstart.md) for complete configurations.
 
-Both commands use one strict YAML model:
+Both commands use one strict configuration model, shown here in YAML:
 
 ```yaml
 traffic: {}
@@ -51,7 +58,7 @@ The command determines the document type. There is no top-level `kind` or stack 
 | `optimization` | Rejected | Required | Recommendation objective and candidate GPU constraints. |
 | `optimizer` | Rejected | Optional | Public search controls. |
 
-Unknown fields are rejected everywhere. Every semantic configuration knob is an explicit, typed YAML
+Unknown fields are rejected everywhere. Every semantic configuration knob is an explicit, typed
 field. The selected stack, backend, policy, timing model, or capacity model determines which
 conditional fields are legal; there is no generic configuration passthrough mapping.
 
@@ -63,7 +70,8 @@ component preset only where the field supports that form. Search domains are
 never accepted in a prediction. Presets expand to complete atomic mappings;
 see [presets and search domains](../sweeper/search-space.md).
 
-`--set PATH=YAML_VALUE` applies after YAML loading, in left-to-right order.
+`--set PATH=YAML_VALUE` applies after loading either format, in left-to-right order.
+Override values continue to use YAML syntax, including when the input file is JSON.
 The final value wins, then full validation runs. Replace a complete sequence
 rather than addressing its indices. When changing a tagged object such as
 `traffic.load.type`, replace the whole mapping if the old fields no longer

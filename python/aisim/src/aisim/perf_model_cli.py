@@ -362,13 +362,9 @@ def _load_config(path: str) -> tuple[dict[str, Any], str]:
 
     A file that is not UTF-8 text is reported with its name.
     """
-    from .config.common import load_yaml_with_text
+    from .config.common import load_config_with_text
 
-    try:
-        return load_yaml_with_text(path)
-    except UnicodeDecodeError as exc:
-        # load_yaml names the file for every other failure; this one would reach the user without it.
-        raise ValueError(f"could not read configuration {path}: the file is not valid UTF-8 text ({exc})") from exc
+    return load_config_with_text(path)
 
 
 class _NameTaken(Exception):
@@ -406,17 +402,14 @@ def _config_text(path: str, config: Mapping[str, Any]) -> str:
 def _json_text(path: str, config: Mapping[str, Any]) -> str:
     """The config as JSON text that reads back as the same config.
 
-    A config file is read as YAML whatever its name is. YAML holds values that JSON does not, such
-    as a date or a key that is not text, and it reads a number that JSON writes with an exponent
-    as text. A config with such a value is refused: the file would mean something else.
+    YAML holds values that JSON does not, such as a date or a key that is not text.
+    A config with such a value is refused: the file would mean something else.
     """
-    import yaml
-
     advice = "name a file that does not end with .json to write YAML"
     try:
         text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-        read_back = yaml.safe_load(text)
-    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        read_back = json.loads(text)
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"cannot write {path} as JSON: {exc}; {advice}") from exc
     if read_back != config:
         raise ValueError(f"cannot write {path} as JSON: {_first_difference(config, read_back)}; {advice}")

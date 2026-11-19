@@ -890,7 +890,7 @@ def _section(kind: str) -> str:
 def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -> None:
     """Fail when the text of a config file writes ``ais_perf_model``, or a key inside it, twice.
 
-    ``text`` is the YAML text of a config file, ``kind`` is ``predict``,
+    ``text`` is the YAML or JSON text of a config file, ``kind`` is ``predict``,
     ``recommend`` or ``search`` and ``source`` is the path of the file, named
     in the error. Call this where the file is read: the YAML reader keeps the
     last value of a repeated key, so the mapping it returns no longer shows
@@ -916,10 +916,15 @@ def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -
     value. Text without the key has nothing to check, and text the YAML
     reader cannot parse is left to the code that reads the file.
 
-    A repeat is an ``AisPerfModelError`` that names the key and its lines:
+    JSON uses decoded key identities and reports the repeated key's path.
+    A YAML repeat is an ``AisPerfModelError`` that names the key and its lines:
     the first and the last writing of the section or of ``ais_perf_model``,
     the first two writings of a key inside the value.
     """
+    if os.fspath(source).lower().endswith(".json"):
+        _reject_repeated_json_keys(text, kind, source)
+        return
+
     import yaml
 
     section = _section(kind)
@@ -934,6 +939,45 @@ def reject_repeated_keys(text: str, kind: str, source: str | os.PathLike[str]) -
     repeat = _repeat_below(value)
     if repeat:
         raise _written_twice(section, source, *repeat)
+
+
+def _reject_repeated_json_keys(text: str, kind: str, source: str | os.PathLike[str]) -> None:
+    """Apply the same scoped duplicate checks without interpreting JSON strings as YAML."""
+
+    class ObjectPairs(list):
+        """Keep every decoded key and distinguish JSON objects from arrays."""
+
+    root = json.loads(text, object_pairs_hook=ObjectPairs)
+    if not isinstance(root, ObjectPairs):
+        return  # The configuration reader reports non-object documents.
+    section = _section(kind)
+    sections = [value for key, value in root if key == section]
+    entries = [value for obj in sections if isinstance(obj, ObjectPairs) for key, value in obj if key == KEY]
+    if not entries:
+        return
+
+    def repeated(path: str) -> None:
+        raise AisPerfModelError(f"{source}: {path} is written twice")
+
+    if len(sections) > 1:
+        repeated(section)
+    if len(entries) > 1:
+        repeated(f"{section}.{KEY}")
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, ObjectPairs):
+            seen: set[str] = set()
+            for key, child in value:
+                child_path = f"{path}.{key}"
+                if key in seen:
+                    repeated(child_path)
+                seen.add(key)
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+
+    visit(entries[0], f"{section}.{KEY}")
 
 
 def repeated_key_in(text: str) -> tuple[str, int, int] | None:

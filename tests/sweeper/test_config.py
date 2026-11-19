@@ -3,6 +3,8 @@
 
 """Dynamo-independent Sweeper configuration contracts."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -30,6 +32,17 @@ def _workload(**overrides):
         "num_request_ratio": 10,
         **overrides,
     }
+
+
+def test_search_json_keeps_scientific_notation_numeric(tmp_path):
+    raw = {
+        "search_space": _search_space(),
+        "workload": _workload(),
+        "goal": {"target": "throughput", "sla": {"ttft_ms": 1e-7}},
+    }
+    path = tmp_path / "search.json"
+    path.write_text(json.dumps(raw))
+    assert SmartSearchConfig.from_yaml(path) == SmartSearchConfig.model_validate(raw)
 
 
 def _session(**load):

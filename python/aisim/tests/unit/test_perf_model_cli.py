@@ -559,9 +559,13 @@ def test_migrate_keeps_the_order_of_the_keys_and_text_that_is_not_ascii(tmp_path
     assert "模型/测试" in text
 
 
-def test_migrate_writes_json_to_a_file_whose_name_ends_with_json(tmp_path, capsys):
-    config = tmp_path / "config.json"
-    config.write_text(json.dumps(_unsorted_predict(), indent=2, ensure_ascii=False), encoding="utf-8")
+@pytest.mark.parametrize("ridge", [0.5, 1e-7, 1e21])
+@pytest.mark.parametrize("filename", ["config.json", ".json", ".JSON"])
+def test_migrate_writes_json_to_a_file_whose_name_ends_with_json(tmp_path, capsys, ridge, filename):
+    config = tmp_path / filename
+    raw = _unsorted_predict()
+    raw["engine"]["estimator_config"] = {"ridge": ridge}
+    config.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
     with pytest.warns(AisPerfModelDeprecationWarning):
         original = CorePredictionConfig.from_yaml(config)
     assert _run("migrate", config, "--format", "json") == 0
@@ -578,7 +582,7 @@ def test_migrate_writes_json_to_a_file_whose_name_ends_with_json(tmp_path, capsy
     assert "模型/测试" in text
     assert list(written) == ["traffic", "engine"]
     assert [key for key in written["engine"] if key != "ais_perf_model"] == ENGINE_KEYS
-    assert written["engine"]["ais_perf_model"] == OLD_FIELDS
+    assert written["engine"]["ais_perf_model"] == OLD_FIELDS | {"estimator_config": {"ridge": ridge}}
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         converted = CorePredictionConfig.from_yaml(config)
@@ -604,15 +608,14 @@ def test_migrate_writes_json_to_a_file_whose_name_ends_with_json_in_capital_lett
         (datetime.date(2024, 1, 1), "date"),
         ({1: "first"}, "extra.values[1] is {1: 'first'} and would be read back from the file as {'1': 'first'}"),
         (float("inf"), "inf"),
-        (1e-05, "extra.values[1] is 1e-05 and would be read back from the file as '1e-05'"),
     ],
-    ids=["a date", "a key that is not text", "a number that is not finite", "a number that YAML reads as text"],
+    ids=["a date", "a key that is not text", "a number that is not finite"],
 )
 def test_migrate_refuses_to_write_json_that_does_not_read_back_as_the_config(
     value, reason, tmp_path, monkeypatch, capsys
 ):
     converted = _predict(ais_perf_model=OLD_FIELDS) | {"extra": {"values": [0.5, value]}}
-    # YAML holds values that JSON does not, and a config file is read as YAML. The conversion is replaced
+    # YAML holds values that JSON does not. The conversion is replaced
     # so that the config to write has such a value whatever the conversion accepts.
     monkeypatch.setattr(migrate_module, "migrate_mapping", lambda *args, **kwargs: (converted, ["removed"], []))
     config = _write(tmp_path / "config.yaml", _predict(**OLD_FIELDS))

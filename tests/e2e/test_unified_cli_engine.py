@@ -336,6 +336,48 @@ def test_engine_predict_cli_cases(config_path: Path, tmp_path: Path) -> None:
         assert "requested='auto', resolved='absolute'" in result.stderr
 
 
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_config_formats_reach_native_recommend_and_predict(tmp_path: Path, suffix: str) -> None:
+    raw = yaml.safe_load((_REPO_ROOT / _CONFIG_ROOT / "recommend/engine/03-preset-off-ttft.yaml").read_text())
+    raw["evaluation"] = {"sla": {"ttft_ms": 1e-7, "itl_ms": 1e-6}}
+    raw["optimization"]["target"] = "throughput"
+    serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+    config = tmp_path / f"input{suffix}"
+    config.write_text(serialize(raw))
+    output = tmp_path / "recommend"
+    result = _run_cli(
+        "recommend",
+        "--config",
+        str(config),
+        "--set",
+        "optimizer.max_trials=1",
+        "--output-dir",
+        str(output),
+        "--format",
+        "json",
+    )
+    assert len(json.loads(result.stdout)) == 1
+    report = json.loads((output / "recommendation.json").read_text())
+    assert len(report["candidates"]) == 1
+    generated = yaml.safe_load((output / "recommendations/0001.yaml").read_text())
+    assert generated["evaluation"]["sla"] == raw["evaluation"]["sla"]
+
+    prediction = tmp_path / f"prediction{suffix}"
+    prediction.write_text(serialize(generated))
+    result = _run_cli(
+        "predict",
+        "--config",
+        str(prediction),
+        "--set",
+        "traffic.stop.requests=2",
+        "--output-dir",
+        str(tmp_path / "predict"),
+        "--format",
+        "json",
+    )
+    assert json.loads(result.stdout)["completed_requests"] == 2
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 @pytest.mark.parametrize("trace", ["weka-two-plays.jsonl", "weka-relative.json"])
 def test_agentx_replay_cli_matches_public_python(backend: str, trace: str, tmp_path: Path) -> None:

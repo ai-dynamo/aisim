@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 from pathlib import Path
@@ -215,26 +216,41 @@ class OptimizerConfig(StrictModel):
     seed: NonNegativeStrictInt = 42
 
 
-def load_yaml_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
-    """Read a configuration file. Return the one YAML mapping it holds and the text that was read.
+def load_config_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Read JSON for a .json suffix (case insensitive), otherwise YAML.
 
-    The text still shows what the mapping cannot, such as a key written twice.
+    Return the mapping and original text, which retains evidence of repeated keys.
+    Keep YAML as the default for existing files without a recognized suffix.
     """
     source = Path(path)
+    is_json = source.name.lower().endswith(".json")
+    format_name = "JSON" if is_json else "YAML"
     try:
         text = source.read_text(encoding="utf-8")
-        data = yaml.safe_load(text)
+        data = json.loads(text, parse_constant=_reject_json_constant) if is_json else yaml.safe_load(text)
     except OSError as exc:
         raise ValueError(f"could not read configuration {source}: {exc}") from exc
-    except yaml.YAMLError as exc:
-        raise ValueError(f"malformed YAML in {source}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"could not read configuration {source}: the file is not valid UTF-8 text ({exc})") from exc
+    except (ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"malformed {format_name} in {source}: {exc}") from exc
     if not isinstance(data, dict):
-        raise ValueError(f"configuration {source} must contain one YAML mapping")
+        expected = "JSON object" if is_json else "YAML mapping"
+        raise ValueError(f"configuration {source} must contain one {expected}")
     return data, text
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"{value} is not a valid JSON number")
+
+
+def load_yaml_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Compatibility entry point for YAML or JSON configuration files."""
+    return load_config_with_text(path)
+
+
 def load_yaml(path: str | Path) -> dict[str, Any]:
-    return load_yaml_with_text(path)[0]
+    return load_config_with_text(path)[0]
 
 
 CONFIG_ADAPTER_ENTRY_POINT_GROUP = "aisim.config_adapters"
