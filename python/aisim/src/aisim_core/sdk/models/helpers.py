@@ -1512,9 +1512,15 @@ def mtp_scale_factor(nextn: int, num_layers: int) -> float:
     return (nextn + num_layers) / num_layers
 
 
-def calc_vllm_swa_batch_cap(window_size: int, max_batched: int, max_model_len: int,
-                            global_per_token: float, swa_per_token: float, block_size: int,
-                            kv_budget_bytes: float) -> int:
+def calc_vllm_swa_batch_cap(
+    window_size: int,
+    max_batched: int,
+    max_model_len: int,
+    global_per_token: float,
+    swa_per_token: float,
+    block_size: int,
+    kv_budget_bytes: float,
+) -> int:
     """
     Calculate the max number of tokens in the KV Cache for a  model using SWA
     assuming that vLLM is being used as the backend.

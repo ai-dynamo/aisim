@@ -713,7 +713,9 @@ class BaseModel:
         # vLLM SlidingWindowSpec.max_memory_usage_bytes (v0.14+) asserts
         # decode_context_parallel_size == 1. Do not return the windowed
         # reservation estimate under DCP; full-attention+DCP hybrid layouts are
-        # a separate allocator path this helper does not model.
+        # a separate allocator path this helper does not model. Known
+        # approximation: hybrid group padding (e.g. Step-3.7 33 SWA / 12 global)
+        # is not recreated here; only the SlidingWindowSpec reservation + clamp.
         dcp = int(getattr(self.config, "dcp_size", None) or 1)
         if dcp > 1:
             raise NotImplementedError(

@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import re
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,9 @@ from aisim.fpm_contract import (
     FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION,
     FPM_NATIVE_BENCHMARK_RESULT_SCHEMA_VERSION,
     FPM_NATIVE_BENCHMARK_RESULT_SCHEMA_VERSIONS,
-    FPM_POWER_MAX_KV_DRIFT_FRAC,
+    FPM_POWER_LATENCY_GATE_EDGE_STEPS,
+    FPM_POWER_LATENCY_GATE_MIN_STEPS,
+    FPM_POWER_MAX_LATENCY_DRIFT_FRAC,
     FPM_POWER_MIN_WINDOW_S,
     FPM_POWER_WINDOW_REL_TOL,
 )
@@ -669,18 +672,30 @@ def _expected_scheduled(point: dict[str, Any]) -> dict[str, int]:
 
 
 _POWER_KEYS = frozenset(
-    {"status", "unavailable_reason", "gpu_energy", "window_s", "window_iterations", "kv_drift_tokens"}
+    {
+        "status",
+        "unavailable_reason",
+        "gpu_energy",
+        "window_s",
+        "window_iterations",
+        "kv_drift_tokens",
+        "step_wall_times_s",
+    }
 )
 
 
 def _validate_power(point: dict[str, Any], power: object) -> dict[str, Any] | None:
-    """Validate one rank's schema-3 power block; None is a well-formed failure report."""
+    """Validate one rank's schema-3 power block; None is a well-formed failure report.
+
+    The step timings are checked by the decode latency gate, which leaves the
+    point unpowered instead of failing the cell.
+    """
     if not isinstance(power, dict) or set(power) != _POWER_KEYS:
         raise ValueError(f"native FPM power block must have exactly the keys {sorted(_POWER_KEYS)}: {power!r}")
-    window = (power["window_s"], power["window_iterations"], power["kv_drift_tokens"])
+    window = (power["window_s"], power["window_iterations"], power["kv_drift_tokens"], power["step_wall_times_s"])
     if power["status"] == "unavailable":
         reason = power["unavailable_reason"]
-        if not isinstance(reason, str) or not reason.strip() or power["gpu_energy"] != [] or window != (None,) * 3:
+        if not isinstance(reason, str) or not reason.strip() or power["gpu_energy"] != [] or window != (None,) * 4:
             raise ValueError(f"native FPM power block is a malformed unavailable report: {power!r}")
         return None
     if power["status"] != "measured" or power["unavailable_reason"] is not None:
@@ -701,7 +716,7 @@ def _validate_power(point: dict[str, Any], power: object) -> dict[str, Any] | No
             or value <= 0
         ):
             raise ValueError(f"native FPM power has an invalid GPU energy entry: {entry!r}")
-    window_s, iterations, drift = window
+    window_s, iterations, drift, _step_wall_times = window
     if (
         isinstance(window_s, bool)
         or not isinstance(window_s, int | float)
@@ -714,6 +729,37 @@ def _validate_power(point: dict[str, Any], power: object) -> dict[str, Any] | No
     if type(drift) is not int or drift < 0 or (point["point_type"] == "prefill" and drift != 0):
         raise ValueError(f"native FPM power kv_drift_tokens is invalid for {point['point_type']}: {power!r}")
     return power
+
+
+def _decode_latency_gate(step_wall_times: object, window_iterations: int) -> str | None:
+    """Decode power gate on one rank's window step wall times.
+
+    Accepts (None) when the median of the last FPM_POWER_LATENCY_GATE_EDGE_STEPS
+    steps is within FPM_POWER_MAX_LATENCY_DRIFT_FRAC of the median of the first
+    ones, inclusive; otherwise returns why the point keeps latency without
+    power. A decode window completes one step per repeat, so a list whose
+    length differs from ``window_iterations`` is invalid evidence. Latency
+    stability is a proxy: a power change at constant latency, or an excursion
+    that recovers before the window ends, is not detected.
+    """
+    if (
+        not isinstance(step_wall_times, list)
+        or len(step_wall_times) != window_iterations
+        or any(
+            isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0
+            for value in step_wall_times
+        )
+    ):
+        return "latency_evidence_invalid"
+    if len(step_wall_times) < FPM_POWER_LATENCY_GATE_MIN_STEPS:
+        return "latency_evidence_insufficient"
+    first = statistics.median(step_wall_times[:FPM_POWER_LATENCY_GATE_EDGE_STEPS])
+    last = statistics.median(step_wall_times[-FPM_POWER_LATENCY_GATE_EDGE_STEPS:])
+    change, bound = abs(last - first), FPM_POWER_MAX_LATENCY_DRIFT_FRAC * first
+    # Exactly the bound passes; isclose keeps that true under float rounding.
+    if change > bound and not math.isclose(change, bound, rel_tol=1e-9):
+        return "latency_drift"
+    return None
 
 
 def _point_power_w(
@@ -751,11 +797,14 @@ def _point_power_w(
     window_s = max(power["window_s"] for power in measured)
     if any(not math.isclose(power["window_s"], window_s, rel_tol=FPM_POWER_WINDOW_REL_TOL) for power in measured):
         raise ValueError(f"native power window_s differs across ranks for benchmark_id={benchmark_id}")
-    # Decode repeats append KV (D2): a large drift keeps latency without power.
-    if any(
-        power["kv_drift_tokens"] > FPM_POWER_MAX_KV_DRIFT_FRAC * point["total_kv_read_tokens"] for power in measured
-    ):
-        return None, "kv_drift"
+    # Decode repeats append KV (D2); the window qualifies by its measured step
+    # latency on every rank, and the KV growth stays a diagnostic. Prefill
+    # repeats are identical requests.
+    if point["point_type"] == "decode":
+        for power in measured:
+            reason = _decode_latency_gate(power["step_wall_times_s"], power["window_iterations"])
+            if reason is not None:
+                return None, reason
     energy_wms = sum(entry["energy_wms"] for power in measured for entry in power["gpu_energy"])
     return energy_wms / cell.topology.total_gpus / (window_s * 1000.0), "measured"
 
@@ -1082,13 +1131,13 @@ def validate_native_collection(
         if not math.isclose(measured, measured_iteration_seconds, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError(f"native measured timing mismatch for rank={rank}")
     if power_statuses:
+        skipped = {status: count for status, count in sorted(power_statuses.items()) if status != "measured"}
         logger.info(
-            "FPM %s: power measured for %d of %d points (%d unavailable, %d above the KV drift bound)",
+            "FPM %s: power measured for %d of %d points (without power: %s)",
             cell.cell_id,
             power_statuses.get("measured", 0),
             len(measurements),
-            power_statuses.get("unavailable", 0),
-            power_statuses.get("kv_drift", 0),
+            ", ".join(f"{count} {status}" for status, count in skipped.items()) or "none",
         )
     return NativeCollection(
         points=tuple(measurements),

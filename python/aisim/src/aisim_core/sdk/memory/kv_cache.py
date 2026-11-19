@@ -397,7 +397,8 @@ class KVCacheEstimator:
         if max_num_batched_tokens > 0:
             model_config.max_num_batched_tokens = max_num_batched_tokens
         if kv_block_size is not None:
-            # Validated at estimate_kv_cache entry before naive fallback can run.
+            if isinstance(kv_block_size, bool) or not isinstance(kv_block_size, int) or kv_block_size <= 0:
+                raise ValueError(f"kv_block_size must be a positive integer, got {kv_block_size!r}")
             model_config.kv_block_size = kv_block_size
         # Capacity needs model/system metadata, including when external FPM
         # timing has no backend data directory.
@@ -1442,13 +1443,23 @@ def estimate_kv_cache(
         )
     else:
         # Native model built: budget-math failures (no KV budget, zero per-token)
-        # propagate; they do NOT trigger the naive fallback.
-        estimate = native.estimate(
-            is_of_free=is_of_free,
-            fraction=fraction,
-            gpu_memory_capacity_bytes_override=gpu_memory_capacity_bytes_override,
-            cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
-        )
+        # propagate; they do NOT trigger the naive fallback. A SlidingWindowSpec
+        # DCP rejection can also arise here (model construction may succeed) and
+        # must stay a hard error, not a silent idealized inverse.
+        try:
+            estimate = native.estimate(
+                is_of_free=is_of_free,
+                fraction=fraction,
+                gpu_memory_capacity_bytes_override=gpu_memory_capacity_bytes_override,
+                cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
+            )
+        except NotImplementedError as exc:
+            if int(cp_size) > 1 or int(dcp_size) > 1:
+                raise ValueError(
+                    f"context parallelism is not supported for KV-cache estimation of this model/backend "
+                    f"(model={model_path}, backend={backend}, cp_size={cp_size}, dcp_size={dcp_size}): {exc}"
+                ) from exc
+            raise
 
     # Apply the tolerance margin (no-op when `tolerance_fraction` is None),
     # identically for the native and naive estimates. _apply_tolerance reads the

@@ -241,6 +241,50 @@ def test_vllm_swa_batch_capacity_never_exceeds_byte_curve_inverse():
     assert model.get_kvcache_bytes_per_sequence(got) <= budget
 
 
+def test_vllm_swa_batch_capacity_uses_reservation_when_below_byte_curve_inverse():
+    """When SlidingWindowSpec capacity is below the byte-curve inverse, return it.
+
+    Pins Muse's vLLM dispatch through ``_vllm_swa_batch_capacity``: if the model
+    fell back to ``BaseModel.get_kvcache_batch_capacity`` / the idealized inverse
+    alone, this assertion would fail.
+    """
+    from aisim_core.sdk.models.helpers import calc_vllm_swa_batch_cap
+
+    model = _build(backend_name="vllm")
+    model.config.max_model_len = 8192
+    model.config.max_num_batched_tokens = 4096
+    model.config.kv_block_size = 16
+    budget = 20 * (1 << 30)
+
+    cfg = model._muse_glimmer_config
+    bytes_per_elem = model.config.kvcache_quant_mode.value.memory
+    n_kv_per_gpu = (model._num_kv_heads + model.config.tp_size - 1) // model.config.tp_size
+    per_layer = n_kv_per_gpu * model._head_size * 2 * bytes_per_elem
+    counts = model._count_layer_types()
+    reservation_based = calc_vllm_swa_batch_cap(
+        cfg.sliding_window_size,
+        4096,
+        8192,
+        counts["global"] * per_layer,
+        counts["swa"] * per_layer,
+        16,
+        budget,
+    )
+    ideal = model.get_kvcache_max_tokens(budget)
+    assert reservation_based < ideal  # reservation path is the tighter bound
+    assert model.get_kvcache_batch_capacity(budget, 256) == reservation_based
+
+
+def test_vllm_swa_batch_capacity_falls_back_without_max_model_len_or_non_vllm():
+    budget = 20 * (1 << 30)
+    unset = _build(backend_name="vllm")
+    assert unset.get_kvcache_batch_capacity(budget, 256) == unset.get_kvcache_max_tokens(budget)
+
+    non_vllm = _build(backend_name="sglang")
+    non_vllm.config.max_model_len = 8192
+    assert non_vllm.get_kvcache_batch_capacity(budget, 256) == non_vllm.get_kvcache_max_tokens(budget)
+
+
 def test_context_parallelism_emits_one_uniform_gather_and_splits_allreduces():
     model = _build(cp_size=2)
     attention = [op for op in model.context_ops if isinstance(op, ops.ContextAttention)]
