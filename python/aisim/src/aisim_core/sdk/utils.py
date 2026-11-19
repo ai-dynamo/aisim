@@ -2441,6 +2441,8 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
 @dataclass(slots=True)
 class _ModelConfigCacheEntry:
     raw: dict
+    # Sidecars exposed through raw belong only to this parsed generation.
+    deferred_processor: dict | None = None
     # Count only leases of the current parsed generation.
     readers: int = 0
     parsed: bool = False
@@ -2530,6 +2532,17 @@ def _cache_raw_model_config(load):
         nonlocal parsed_hits, parsed_misses
         with lock:
             for entry in entries.values():
+                if entry.deferred_processor is not None:
+                    # Retain genuine inline metadata, and leave snapshots owned
+                    # by in-flight readers intact when dropping a deferred file.
+                    raw = entry.raw
+                    entry.raw = _SnapshotConfig(
+                        {key: value for key, value in raw.items() if key != "image_processor_config"},
+                        raw._snapshot_commit,
+                        source=raw._source,
+                        bundled_root=raw._bundled_root,
+                    )
+                    entry.deferred_processor = None
                 entry.readers = 0
                 entry.parsed = False
                 entry.result = None
@@ -2558,8 +2571,13 @@ def _cache_raw_model_config(load):
                     if entries.get(model_path) is entry and entry.generation is generation:
                         # Processor and parsed-result publication share the same
                         # generation check, including uncached inspection calls.
-                        if llama4 and "image_processor_config" in result["raw_config"]:
-                            entry.raw["image_processor_config"] = result["raw_config"]["image_processor_config"]
+                        if (
+                            llama4
+                            and "image_processor_config" not in entry.raw
+                            and "image_processor_config" in result["raw_config"]
+                        ):
+                            entry.deferred_processor = result["raw_config"]["image_processor_config"]
+                            entry.raw["image_processor_config"] = entry.deferred_processor
                         if use_cache:
                             if entry.result is None:
                                 entry.result = result

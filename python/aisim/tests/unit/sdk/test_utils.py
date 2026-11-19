@@ -1692,7 +1692,8 @@ def test_deferred_bundled_llama4_processor_uses_original_root(monkeypatch, tmp_p
     processor = config.pop("image_processor_config")
     if inline_processor:
         config["image_processor_config"] = {**processor, "max_patches": 16}
-    for directory, max_patches in (("first", 16), ("second", 4)):
+    first_max_patches = 8 if inline_processor else 16
+    for directory, max_patches in (("first", first_max_patches), ("second", 4)):
         root = tmp_path / directory
         root.mkdir()
         (root / f"{model.replace('/', '--')}_config.json").write_text(json.dumps(config))
@@ -1707,6 +1708,50 @@ def test_deferred_bundled_llama4_processor_uses_original_root(monkeypatch, tmp_p
         assert loaded["extra_params"].vision_config.max_num_tiles == 16
         assert raw["image_processor_config"]["max_patches"] == 16
         assert utils._config_snapshot_commit(loaded["raw_config"]) is None
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("inline_processor", [False, True])
+@pytest.mark.parametrize("uncached", [False, True])
+def test_completed_llama4_processor_is_invalidated_by_parsed_clear(monkeypatch, tmp_path, inline_processor, uncached):
+    model = str(tmp_path)
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    processor = config.pop("image_processor_config")
+    if inline_processor:
+        config["image_processor_config"] = {**processor, "max_patches": 8}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    sidecar = tmp_path / "preprocessor_config.json"
+    sidecar.write_text(json.dumps({**processor, "max_patches": 16}))
+    processor_reads = []
+    real_load = utils._load_json_with_infinity
+
+    def load_json(path):
+        if path == sidecar:
+            processor_reads.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(utils, "_load_json_with_infinity", load_json)
+    load = get_model_config_from_model_path.__wrapped__ if uncached else get_model_config_from_model_path
+    try:
+        first = load(model)
+        expected = 8 if inline_processor else 16
+        assert first["extra_params"].vision_config.max_num_tiles == expected
+        sidecar.write_text(json.dumps({**processor, "max_patches": 4}))
+        # Both cached and uncached inspections reuse a validated processor until clear.
+        assert load(model)["extra_params"].vision_config.max_num_tiles == expected
+        assert len(processor_reads) == (0 if inline_processor else 1)
+
+        get_model_config_from_model_path.cache_clear()
+        loaded = get_model_config_from_model_path(model)
+        expected = 8 if inline_processor else 4
+        assert loaded["extra_params"].vision_config.max_num_tiles == expected
+        assert loaded["raw_config"]["image_processor_config"]["max_patches"] == expected
+        assert utils._load_model_config_from_model_path(model)["image_processor_config"]["max_patches"] == expected
+        assert first["extra_params"].vision_config.max_num_tiles == (8 if inline_processor else 16)
+        assert len(processor_reads) == (0 if inline_processor else 2)
+        assert get_model_config_from_model_path(model) is loaded
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         get_model_config_from_model_path.cache_clear()

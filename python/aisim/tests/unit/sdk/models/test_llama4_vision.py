@@ -74,11 +74,13 @@ def test_llama4_loads_separate_processor_metadata(
     assert bool(model.encoder_ops) is (not language_only)
     assert model.context_ops and model.generation_ops
     assert model.encoder_config.max_num_tiles == max_patches
-    # Both parsed and raw config caches must preserve the sidecar metadata.
+    if source == "remote":
+        assert requested_files.count("preprocessor_config.json") == 1
+    # A parsed clear revalidates the sidecar against the same pinned source.
     get_model_config_from_model_path.cache_clear()
     assert get_model_config_from_model_path(model_path)["extra_params"].vision_config == model.encoder_config
     if source == "remote":
-        assert requested_files.count("preprocessor_config.json") == 1
+        assert requested_files.count("preprocessor_config.json") == 2
 
 
 @pytest.mark.parametrize(
