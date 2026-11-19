@@ -400,9 +400,15 @@ class FpmLoader(Loader):
 def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | None:
     """Catalog parallelism dimensions of a configuration (degree 1 dropped), or None when it names none."""
     keys = {"tp": "tp", "attention_dp": "dp", "moe_tp_size": "moe_tp", "moe_ep_size": "ep", "dcp": "dcp"}
-    if not any(config.get(k) is not None for k in keys):
+    aliases = {"tp": "tp_size", "attention_dp": "attention_dp_size"}  # the same aliases the Rust configuration accepts
+
+    def value(key: str) -> Any:
+        found = config.get(key)
+        return found if found is not None else config.get(aliases[key]) if key in aliases else None
+
+    if not any(value(k) is not None for k in keys):
         return None
-    dims = {dim: config[key] for key, dim in keys.items() if config.get(key) not in (None, 1)}
+    dims = {dim: value(key) for key, dim in keys.items() if value(key) not in (None, 1)}
     return tuple(sorted(dims.items()))
 
 

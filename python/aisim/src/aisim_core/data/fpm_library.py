@@ -24,13 +24,14 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from aisim_core.fpm_profile import FpmDeploymentProfile, FpmResourceProfile
 
@@ -88,6 +89,14 @@ class FpmLibraryMetadata(BaseModel):
     metadata_provenance: str | None = None
     configuration_selector: dict[str, JsonValue] | None = None
     resources: FpmResourceProfile | None = None
+
+    @model_validator(mode="after")
+    def _selector_topology(self):
+        for name in _TOPOLOGY:
+            value = (self.configuration_selector or {}).get(name)
+            if name in (self.configuration_selector or {}) and (type(value) is not int or value < 1):
+                raise ValueError(f"configuration_selector.{name} must be a positive integer")
+        return self
 
 
 class FpmLibraryRow(BaseModel):
@@ -180,10 +189,21 @@ def _reject_constant(value: str):
     raise ValueError(f"non-finite JSON constant {value}")
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _ in pairs]
+    if duplicated := sorted({key for key in keys if keys.count(key) > 1}):
+        raise ValueError(f"duplicate JSON key {duplicated[0]!r}")
+    return dict(pairs)
+
+
 def read_library_metadata(path: Path) -> dict[str, Any]:
     """Read a sidecar strictly and check the library schema name, version and ``resources``."""
     try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=_reject_constant)
+        raw = json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            parse_constant=_reject_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
     except (OSError, ValueError) as exc:
         raise FpmContractError(f"cannot read FPM sidecar {path}: {exc}") from exc
     if not isinstance(raw, dict):
@@ -360,6 +380,7 @@ def stage_fpm_library(
     if parquet_sha256 not in (None, actual_parquet_sha256) or metadata_sha256 not in (None, actual_metadata_sha256):
         raise FpmContractError(f"FPM library {artifact_id or parquet} differs from its supplied hash")
     parquet_sha256, metadata_sha256 = actual_parquet_sha256, actual_metadata_sha256
+    _check_sidecar_describes_library(metadata, parquet, parquet_sha256)
     metadata, recovered = recover_reconstructed_metadata(
         metadata, parquet, parquet_sha256=parquet_sha256, metadata_sha256=metadata_sha256
     )
@@ -392,12 +413,10 @@ def stage_fpm_library(
         build = root
     else:
         root = Path(output_dir).expanduser().absolute()
-        build = root.with_name(f".{root.name}.{os.getpid()}.staging")
-        previous = _check_staging_destination(root)
-        if previous == marker:  # an earlier verified staging of the same files: reuse it
-            return _staged(root, metadata, recovery, parquet_sha256, artifact_id, None)
-        shutil.rmtree(build, ignore_errors=True)
-        build.mkdir(parents=True)
+        _check_staging_destination(root)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        # Unique per call: concurrent stagings of one destination never share or delete a build.
+        build = Path(mkdtemp(prefix=f".{root.name}.staging-", dir=root.parent))
     try:
         target = _prepare_system_overlay(build, source_yaml, backend, backend_version, systems_paths)
         (target / LIBRARY_FILE).symlink_to(parquet)
@@ -406,8 +425,16 @@ def stage_fpm_library(
         else:
             (target / METADATA_FILE).symlink_to(sidecar)
         if output_dir is not None:
+            # The selected overlay links, not only the inputs, identify a reusable staging: a root added to or
+            # reordered in front of the fallbacks can change which file a link names.
+            marker["overlay"] = _overlay_links(build)
             (build / STAGED_MARKER).write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
-            _replace_staged_root(build, root)
+            with _INSTALL_LOCK:  # one installer or reader of a destination at a time within the process
+                if _check_staging_destination(root) == marker:  # an earlier verified staging: reuse it
+                    shutil.rmtree(build, ignore_errors=True)
+                else:
+                    _replace_staged_root(build, root, marker)
+                return _staged(root, metadata, recovery, parquet_sha256, artifact_id, None)
     except BaseException:
         if temporary is not None:
             temporary.cleanup()
@@ -447,6 +474,32 @@ class _StagingMarker(BaseModel):
     parquet_path: str = Field(min_length=1)
     metadata_path: str = Field(min_length=1)
     system_definition: dict[str, str] | None = None
+    overlay: list[list[str]] | None = None
+
+
+def _overlay_links(build: Path) -> list[list[str]]:
+    """Every symlink of a staged root as sorted ``[relative path, target]`` pairs."""
+    links = []
+    for directory, names, files in os.walk(build):
+        for name in (*names, *files):
+            path = Path(directory) / name
+            if path.is_symlink():
+                links.append([path.relative_to(build).as_posix(), os.readlink(path)])
+    return sorted(links)
+
+
+def _check_sidecar_describes_library(metadata: Mapping[str, Any], parquet: Path, parquet_sha256: str) -> None:
+    """A declared digest and the row count must describe the staged table, not another one."""
+    import pyarrow.parquet as pq
+
+    if metadata.get("parquet_sha256") not in (None, parquet_sha256):
+        raise FpmContractError("FPM sidecar parquet_sha256 differs from the library")
+    try:
+        rows = pq.ParquetFile(parquet).metadata.num_rows
+    except Exception as exc:
+        raise FpmContractError(f"cannot read the FPM library {parquet}: {exc}") from exc
+    if metadata.get("row_count") != rows:
+        raise FpmContractError(f"FPM sidecar row_count {metadata.get('row_count')} differs from the library ({rows})")
 
 
 def _staged_marker(root: Path) -> dict[str, Any] | None:
@@ -463,8 +516,16 @@ def _check_staging_destination(root: Path) -> dict[str, Any] | None:
     return marker
 
 
-def _replace_staged_root(build: Path, root: Path) -> None:
-    """Retain the previous root until installation succeeds, restoring it on failure."""
+_INSTALL_LOCK = threading.Lock()
+
+
+def _replace_staged_root(build: Path, root: Path, marker: Mapping[str, Any]) -> None:
+    """Retain the previous root until installation succeeds, restoring it on failure.
+
+    The caller serializes installation within a process (``_INSTALL_LOCK``). Across processes, a concurrent
+    winner that installed the same staging is accepted; any other filesystem failure is a
+    :class:`FpmContractError`.
+    """
     _check_staging_destination(root)
     backup_dir = Path(mkdtemp(prefix=f".{root.name}.backup-", dir=root.parent))
     backup = backup_dir / "previous"
@@ -472,11 +533,16 @@ def _replace_staged_root(build: Path, root: Path) -> None:
         if root.exists():
             os.replace(root, backup)
         os.replace(build, root)
-    except BaseException:
-        if backup.exists():
+    except BaseException as exc:
+        if backup.exists() and not root.exists():
             # If restoration also fails, retain the backup for recovery.
             os.replace(backup, root)
         shutil.rmtree(backup_dir, ignore_errors=True)
+        if isinstance(exc, OSError):
+            if _staged_marker(root) == marker:
+                shutil.rmtree(build, ignore_errors=True)
+                return
+            raise FpmContractError(f"cannot install the staged FPM root {root}: {exc}") from exc
         raise
     shutil.rmtree(backup_dir, ignore_errors=True)
 
@@ -656,6 +722,15 @@ _TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 
 
 _IDENTITY_KEYS = ("system", "backend", "backend_version", "worker_type")
+# A selector that pins precision matches only a deployment that establishes the same precision.
+_PRECISION_KEYS = (
+    "weight_quantization",
+    "gemm_quant_mode",
+    "moe_quant_mode",
+    "fmha_quant_mode",
+    "comm_quant_mode",
+    "kv_cache_dtype",
+)
 
 
 def resource_metadata_for_deployment(
@@ -666,6 +741,10 @@ def resource_metadata_for_deployment(
 ) -> Mapping[str, Any] | None:
     """Return sidecar resources only for the selected model and deployment."""
     selector = (metadata or {}).get("configuration_selector") or {}
+    if not selector and _distinct_deployments(profile) > 1:
+        # Without a selector the sidecar does not say which deployment it describes; a profile with several
+        # distinct deployments keeps each of them pending rather than guessing.
+        return None
     applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
     wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
     applies = applies and all(
@@ -691,9 +770,23 @@ def resource_metadata_for_deployment(
     applies = applies and all(
         selected_identity.get(name) == value
         for name, value in selector.items()
-        if name not in _TOPOLOGY and name not in _IDENTITY_KEYS and name in selected_identity
+        if name not in _TOPOLOGY
+        and name not in _IDENTITY_KEYS
+        and (name in selected_identity or name in _PRECISION_KEYS)
     )
     return metadata if applies else None
+
+
+def _distinct_deployments(profile: Mapping[str, Any]) -> int:
+    deployments = profile.get("deployments")
+    if not isinstance(deployments, list):
+        return 1
+    keys = {
+        json.dumps([d.get(name, 1) for name in _TOPOLOGY] + [d.get("worker_type")], default=str)
+        for d in deployments
+        if isinstance(d, Mapping)
+    }
+    return len(keys)
 
 
 def complete_fpm_profile(

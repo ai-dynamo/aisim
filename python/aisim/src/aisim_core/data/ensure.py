@@ -634,7 +634,14 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
         if any(a.role == "fpm-library" for a in peek.artifacts):
             # Roots change the copied system definition and linked op data. Keep each ordered effective root
             # set in its own materialization so later calls cannot replace an earlier configuration's inputs.
-            roots = tuple(str(p) for p in _stageable_roots(config.get("systems_paths"), output_dir))
+            # A configuration returned by an earlier call lists that call's own staging root; it is derived from
+            # the same inputs, not a different user root, so it must not change this materialization's key.
+            owned = f"{output_dir.name}-"
+            roots = tuple(
+                str(p)
+                for p in _stageable_roots(config.get("systems_paths"), output_dir)
+                if not (p.parent == output_dir.parent.resolve() and p.name.startswith(owned))
+            )
             roots_key = hashlib.sha256(json.dumps(roots).encode()).hexdigest()
             output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
             output_dir.parent.mkdir(parents=True, exist_ok=True)
