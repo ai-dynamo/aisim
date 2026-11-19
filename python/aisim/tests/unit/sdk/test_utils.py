@@ -1530,11 +1530,14 @@ def test_inflight_parse_cannot_republish_after_cache_clear(monkeypatch, tmp_path
             cache.cache_clear()
             config_path.write_text(json.dumps({**config, "generation": "B"}))
             resume.set()
-            # The existing caller may finish A, but it must not republish A.
-            assert pending.result(timeout=10)["raw_config"]["generation"] == "A"
+            # Parsed-only clearing retains the raw base, but never the old result.
+            stale = pending.result(timeout=10)
+            assert stale["raw_config"]["generation"] == "A"
             raw = utils._load_model_config_from_model_path(model)
             parsed = get_model_config_from_model_path(model)
-            assert raw["generation"] == parsed["raw_config"]["generation"] == "B"
+            expected = "B" if clear_cache == "raw" else "A"
+            assert raw["generation"] == parsed["raw_config"]["generation"] == expected
+            assert parsed is not stale
             assert get_model_config_from_model_path(model) is parsed
         finally:
             resume.set()
@@ -1574,6 +1577,50 @@ def test_failed_reader_before_clear_preserves_publication_after_clear(monkeypatc
                 pending.result(timeout=10)
             assert get_model_config_from_model_path(model) is published
             assert utils._load_model_config_from_model_path(model)["generation"] == "A"
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            get_model_config_from_model_path.cache_clear()
+
+
+def test_failed_current_generation_evicts_base_with_preclear_reader(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    model = str(tmp_path)
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({**config, "generation": "A"}))
+    sidecar = tmp_path / "preprocessor_config.json"
+    valid_processor = {"min_pixels": 131072, "max_pixels": 1048576}
+    sidecar.write_text(json.dumps(valid_processor))
+    paused = Event()
+    resume = Event()
+    real_parse = utils._parse_hf_config_json
+
+    def parse(raw):
+        parsed = real_parse(raw)
+        if not paused.is_set():
+            paused.set()
+            assert resume.wait(10)
+        return parsed
+
+    monkeypatch.setattr(utils, "_parse_hf_config_json", parse)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(get_model_config_from_model_path, model)
+        try:
+            assert paused.wait(10)
+            get_model_config_from_model_path.cache_clear()
+            sidecar.write_text(json.dumps({**valid_processor, "max_pixels": 0}))
+            with pytest.raises(ValueError, match="pixel budget must be positive integers"):
+                get_model_config_from_model_path(model)
+            # Old leases own their snapshot but cannot keep a failed generation cached.
+            assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+            config_path.write_text(json.dumps({**config, "generation": "B"}))
+            sidecar.write_text(json.dumps(valid_processor))
+            resume.set()
+            assert pending.result(timeout=10)["raw_config"]["generation"] == "A"
+            assert get_model_config_from_model_path(model)["raw_config"]["generation"] == "B"
         finally:
             resume.set()
             utils._load_model_config_from_model_path.cache_clear()
@@ -1636,6 +1683,94 @@ def test_deferred_local_llama4_processor_uses_original_checkpoint(monkeypatch, t
     finally:
         utils._load_model_config_from_model_path.cache_clear()
         get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("inline_processor", [False, True])
+def test_deferred_bundled_llama4_processor_uses_original_root(monkeypatch, tmp_path, inline_processor):
+    model = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    config = utils._load_pre_downloaded_hf_config(model)
+    processor = config.pop("image_processor_config")
+    if inline_processor:
+        config["image_processor_config"] = {**processor, "max_patches": 16}
+    for directory, max_patches in (("first", 16), ("second", 4)):
+        root = tmp_path / directory
+        root.mkdir()
+        (root / f"{model.replace('/', '--')}_config.json").write_text(json.dumps(config))
+        (root / f"{model.replace('/', '--')}_preprocessor_config.json").write_text(
+            json.dumps({**processor, "max_patches": max_patches})
+        )
+    monkeypatch.setenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", str(tmp_path / "first"))
+    try:
+        raw = utils._load_model_config_from_model_path(model)
+        monkeypatch.setenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", str(tmp_path / "second"))
+        loaded = get_model_config_from_model_path(model)
+        assert loaded["extra_params"].vision_config.max_num_tiles == 16
+        assert raw["image_processor_config"]["max_patches"] == 16
+        assert utils._config_snapshot_commit(loaded["raw_config"]) is None
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("uncached", [False, True])
+def test_inflight_llama4_processor_cannot_publish_after_parsed_clear(monkeypatch, tmp_path, uncached):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock, current_thread
+
+    model = str(tmp_path)
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    processor = config.pop("image_processor_config")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    sidecar = tmp_path / "preprocessor_config.json"
+    sidecar.write_text(json.dumps({**processor, "max_patches": 16}))
+    paused = Event()
+    resume = Event()
+    waiting = Event()
+    processor_lock = Lock()
+    real_entry = utils._ModelConfigCacheEntry
+    real_parse = utils._parse_hf_config_json
+
+    class ObservedLock:
+        def __enter__(self):
+            if current_thread().name.startswith("second-reader"):
+                waiting.set()
+            processor_lock.acquire()
+
+        def __exit__(self, *args):
+            processor_lock.release()
+
+    def parse(raw):
+        parsed = real_parse(raw)
+        if not paused.is_set():
+            paused.set()
+            assert resume.wait(10)
+        return parsed
+
+    monkeypatch.setattr(utils, "_ModelConfigCacheEntry", lambda raw: real_entry(raw, processor_lock=ObservedLock()))
+    monkeypatch.setattr(utils, "_parse_hf_config_json", parse)
+    load = get_model_config_from_model_path.__wrapped__ if uncached else get_model_config_from_model_path
+    with (
+        ThreadPoolExecutor(max_workers=1) as first_pool,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="second-reader") as second_pool,
+    ):
+        first = first_pool.submit(load, model)
+        try:
+            assert paused.wait(10)
+            get_model_config_from_model_path.cache_clear()
+            sidecar.write_text(json.dumps({**processor, "max_patches": 4}))
+            second = second_pool.submit(get_model_config_from_model_path, model)
+            # The second reader has leased the shared base and is waiting to parse.
+            assert waiting.wait(10)
+            resume.set()
+            assert first.result(timeout=10)["extra_params"].vision_config.max_num_tiles == 16
+            loaded = second.result(timeout=10)
+            assert loaded["extra_params"].vision_config.max_num_tiles == 4
+            assert utils._load_model_config_from_model_path(model)["image_processor_config"]["max_patches"] == 4
+            assert get_model_config_from_model_path(model) is loaded
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            get_model_config_from_model_path.cache_clear()
 
 
 def test_deferred_llama4_processor_uses_downloaded_config_commit(monkeypatch, hf_cache):

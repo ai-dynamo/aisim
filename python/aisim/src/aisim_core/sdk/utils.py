@@ -22,7 +22,7 @@ import stat
 import tempfile
 import urllib.request
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -745,12 +745,13 @@ _SNAPSHOT_CAPTURE: contextvars.ContextVar[dict[tuple[str, str], str] | None] = c
 class _SnapshotConfig(dict):
     """A JSON mapping owning its non-serialized source and optional Hub commit."""
 
-    __slots__ = ("__weakref__", "_snapshot_commit", "_source")
+    __slots__ = ("__weakref__", "_bundled_root", "_snapshot_commit", "_source")
 
-    def __init__(self, payload: dict, commit: str | None = None, *, source: str | Path = "hub"):
+    def __init__(self, payload: dict, commit: str | None = None, *, source: str | Path = "hub", bundled_root=None):
         super().__init__(payload)
         self._snapshot_commit = commit
         self._source = source
+        self._bundled_root = bundled_root
 
 
 def _config_snapshot_commit(raw_config: dict) -> str | None:
@@ -1945,17 +1946,19 @@ def _get_model_config_path():
     return pkg_resources.files("aisim_core") / "model_configs"
 
 
-def _load_pre_downloaded_hf_config(hf_id: str) -> dict:
+def _load_pre_downloaded_hf_config(hf_id: str, *, root=None) -> dict:
     """Load a cached HuggingFace config.json from the model_configs package directory."""
-    config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_config.json"
+    config_path = (root if root is not None else _get_model_config_path()) / f"{hf_id.replace('/', '--')}_config.json"
     if not config_path.exists():
         raise ValueError(f"HuggingFace model {hf_id} is not cached in model_configs directory.")
     return _load_json_with_infinity(config_path)
 
 
-def _load_pre_downloaded_hf_quant_config(hf_id: str) -> dict | None:
+def _load_pre_downloaded_hf_quant_config(hf_id: str, *, root=None) -> dict | None:
     """Load a cached hf_quant_config.json, returning None if not present."""
-    config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_hf_quant_config.json"
+    config_path = (
+        root if root is not None else _get_model_config_path()
+    ) / f"{hf_id.replace('/', '--')}_hf_quant_config.json"
     if not config_path.exists():
         return None
     return _load_json_with_infinity(config_path)
@@ -2295,7 +2298,7 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revisi
         processor_path = source / "preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     elif source == "bundled":
-        processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
+        processor_path = raw_config._bundled_root / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
         processor_config = _download_hf_companion_json(
@@ -2438,6 +2441,7 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
 @dataclass(slots=True)
 class _ModelConfigCacheEntry:
     raw: dict
+    # Count only leases of the current parsed generation.
     readers: int = 0
     parsed: bool = False
     result: dict | None = None
@@ -2498,7 +2502,7 @@ def _cache_raw_model_config(load):
             parsed_hits = parsed_misses = 0
 
     @contextmanager
-    def reader(model_path):
+    def reader(model_path, *, with_generation=False):
         while True:
             _load_model_config_from_model_path(model_path)
             with lock:
@@ -2511,49 +2515,57 @@ def _cache_raw_model_config(load):
                     break
         succeeded = False
         try:
-            yield entry
+            yield (entry, generation) if with_generation else entry
             succeeded = True
         finally:
             with lock:
-                entry.readers -= 1
-                entry.parsed |= succeeded and entry.generation is generation
-                if not entry.readers and not entry.parsed and entries.get(model_path) is entry:
-                    del entries[model_path]
-                    loading.pop(model_path, None)
+                if entry.generation is generation:
+                    entry.readers -= 1
+                    entry.parsed |= succeeded
+                    if not entry.readers and not entry.parsed and entries.get(model_path) is entry:
+                        del entries[model_path]
+                        loading.pop(model_path, None)
 
     def clear_parsed():
         nonlocal parsed_hits, parsed_misses
         with lock:
             for entry in entries.values():
+                entry.readers = 0
                 entry.parsed = False
                 entry.result = None
                 entry.generation = object()
             parsed_hits = parsed_misses = 0
 
-    def parse_cached(model_path, parse):
+    def parse_cached(model_path, parse, *, use_cache=True):
         nonlocal parsed_hits, parsed_misses
-        with lock:
-            entry = entries.get(model_path)
-            if entry is not None and entry.result is not None:
-                parsed_hits += 1
-                return entry.result
-            parsed_misses += 1
-        with reader(model_path) as entry:
+        if use_cache:
             with lock:
-                if entry.result is not None:
+                entry = entries.get(model_path)
+                if entry is not None and entry.result is not None:
+                    parsed_hits += 1
                     return entry.result
-                generation = entry.generation
-            result = parse(entry, model_path)
-            with lock:
-                if entries.get(model_path) is entry and entry.generation is generation:
-                    # Publication and invalidation share the raw-entry lock. An
-                    # in-flight result may finish after clear, but cannot restore
-                    # an invalidated generation or protect it from failed readers.
-                    if entry.result is None:
-                        entry.result = result
-                    entry.parsed = True
-                    return entry.result
-            return result
+                parsed_misses += 1
+        with reader(model_path, with_generation=True) as (entry, generation):
+            llama4 = (entry.raw.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration"
+            # Keep Llama 4 validation and publication serialized. Other model
+            # readers remain independent while accessing processor metadata.
+            with entry.processor_lock if llama4 else nullcontext():
+                with lock:
+                    if use_cache and entry.generation is generation and entry.result is not None:
+                        return entry.result
+                result = parse(entry, model_path)
+                with lock:
+                    if entries.get(model_path) is entry and entry.generation is generation:
+                        # Processor and parsed-result publication share the same
+                        # generation check, including uncached inspection calls.
+                        if llama4 and "image_processor_config" in result["raw_config"]:
+                            entry.raw["image_processor_config"] = result["raw_config"]["image_processor_config"]
+                        if use_cache:
+                            if entry.result is None:
+                                entry.result = result
+                            entry.parsed = True
+                            return entry.result
+                return result
 
     def parsed_cache_info():
         with lock:
@@ -2602,11 +2614,14 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
-        config = _load_pre_downloaded_hf_config(model_path)
+        root = _get_model_config_path()
+        if isinstance(root, Path):
+            root = root.resolve()
+        config = _load_pre_downloaded_hf_config(model_path, root=root)
         loaded = _attach_inferred_quant_fields(
-            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
+            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path, root=root))
         )
-        return _SnapshotConfig(loaded, None, source="bundled")
+        return _SnapshotConfig(loaded, None, source="bundled", bundled_root=root)
 
     capture: dict[tuple[str, str], str] = {}
     token = _SNAPSHOT_CAPTURE.set(capture)
@@ -2648,8 +2663,7 @@ def get_model_config_from_model_path(model_path: str) -> dict:
 
 
 def _get_uncached_model_config_from_model_path(model_path: str) -> dict:
-    with _model_config_reader(model_path) as entry:
-        return _parse_model_config_entry(entry, model_path)
+    return _model_config_parser(model_path, _parse_model_config_entry, use_cache=False)
 
 
 # Preserve the functools-style inspection/invalidation API while keeping the
@@ -2661,13 +2675,7 @@ get_model_config_from_model_path.cache_parameters = lambda: {"maxsize": None, "t
 
 
 def _parse_model_config_entry(entry: _ModelConfigCacheEntry, model_path: str) -> dict:
-    raw_config = entry.raw
-    if (raw_config.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration":
-        # Publish the first validated processor once for this shared base.
-        # Competing readers reuse it; failed reads leave publication retryable.
-        with entry.processor_lock:
-            return _parse_model_config_from_raw(raw_config, model_path)
-    return _parse_model_config_from_raw(raw_config, model_path)
+    return _parse_model_config_from_raw(entry.raw, model_path)
 
 
 def _parse_model_config_from_raw(raw_config: dict, model_path: str) -> dict:
@@ -2678,12 +2686,10 @@ def _parse_model_config_from_raw(raw_config: dict, model_path: str) -> dict:
     raw_config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
     raw_config = _attach_multimodal_processor_config(raw_config, model_path, **pinned)
     parsed = _parse_hf_config_json(raw_config)
-    # Preserve Llama 4's established raw-cache reuse, but only after its
-    # processor metadata has passed the parser. Raw loads never fetch it.
-    if "image_processor_config" in raw_config:
-        base_config["image_processor_config"] = raw_config["image_processor_config"]
     if raw_config is not base_config:
-        raw_config = _SnapshotConfig(raw_config, commit, source=base_config._source)
+        raw_config = _SnapshotConfig(
+            raw_config, commit, source=base_config._source, bundled_root=base_config._bundled_root
+        )
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))
         logger.warning(
