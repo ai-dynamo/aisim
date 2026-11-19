@@ -174,6 +174,8 @@ def test_json_overflow_is_not_finite(number, ok):
     [
         ("setting: 1\nsetting: 2\n", False),
         ("nested:\n  setting: 1\n  setting: 2\n", False),
+        ("config: {<<: {setting: 1, setting: 2}}", False),
+        ("config: {<<: [{setting: 1, setting: 2}, {other: 3}]}", False),
         ("defaults: &d {setting: 1}\nconfig: {<<: *d, setting: 2}\nalias: *d\n", True),
     ],
 )

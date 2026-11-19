@@ -25,7 +25,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aisim_core.data import Category, Digest, Manifest
-from aisim_core.data.hygiene import Finding, json_sidecar_value
+from aisim_core.data.hygiene import Finding, bounded_json_bytes, json_sidecar_value
 
 EVIDENCE_ROOT = "evidence/"
 EVIDENCE_MANIFEST = "evidence-manifest.json"
@@ -76,7 +76,7 @@ def check_evidence(
         declared.add(rel)
         directory = posixpath.dirname(rel)
         try:
-            manifest = EvidenceManifest.model_validate(json_sidecar_value((root / rel).read_bytes()))
+            manifest = EvidenceManifest.model_validate(json_sidecar_value(bounded_json_bytes(root / rel)))
         except (OSError, ValidationError, ValueError, RecursionError) as exc:
             findings.append(Finding("document-invalid", f"EvidenceManifest: {str(exc).splitlines()[0]}", rel))
             continue

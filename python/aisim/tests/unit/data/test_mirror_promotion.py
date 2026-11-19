@@ -6,6 +6,7 @@
 import dataclasses
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -223,9 +224,35 @@ def _reviewers():
     return PromotionPolicy(reviewers=frozenset({"alice", "bob"}))
 
 
+def _git(root, *args):
+    local_keys = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    }
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in local_keys and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    }
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True, env=env).strip()
+
+
 def _commit_source(root):
     def git(*args):
-        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+        return _git(root, *args)
 
     if not (root / ".git").exists():
         git("init", "-q")
@@ -246,7 +273,7 @@ def _commit_source(root):
 def _request(root, directories, plan=None, **kw):
     if not (root / ".git").exists():
         _commit_source(root)
-    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    commit = _git(root, "rev-parse", "HEAD")
     approvals = [Approval(reviewer="alice", approved_at="2026-11-09", content_digest=plan.digest)] if plan else []
     return PromotionRequest(
         target_repo=PUBLIC,
@@ -1640,7 +1667,7 @@ def test_manifest_artifact_ids_are_scanned(tmp_path):
 
 @pytest.mark.parametrize("dirty", [False, True])
 def test_whitespace_json_table_cells_are_decoded(tmp_path, dirty):
-    value = "hf_" + "a" * 24 if dirty else "clean"
+    value = "hf_" + "a" * 24 if dirty else "[REDACTED]"
     encoded = " \t\r\n" + json.dumps({"authorization": value}).replace("hf_", "\\u0068f_")
     root, directory, _ = _op_mirror(tmp_path, "attrs", encoded)
     report = validate_tree(root, profile="public")
@@ -1653,7 +1680,7 @@ def test_whitespace_json_table_cells_are_decoded(tmp_path, dirty):
 @pytest.mark.parametrize("dirty", [False, True])
 def test_json_truth_sidecars_validate_and_are_scanned(tmp_path, name, dirty):
     root, manifests = _mirror(tmp_path)
-    payload = json.dumps({"authorization": "hf_" + "a" * 24 if dirty else "clean"}).encode()
+    payload = json.dumps({"authorization": "hf_" + "a" * 24 if dirty else "[REDACTED]"}).encode()
     rel = _extra_truth_artifact(root, manifests, name, payload, "json")
     report = validate_tree(root)
     assert report.ok, report.errors
@@ -1710,7 +1737,15 @@ def test_every_manifest_parquet_artifact_is_scanned(tmp_path, schema, column, di
     rel = f"{directory}/extension.parquet"
     value = "Bearer " + "a" * 24 if dirty else "synthetic"
     # Snapshot IDs/URIs and eval/extension JSON columns can all carry free text.
-    table = pa.table({column: [json.dumps({"authorization": value}) if column in ("inputs_json", "attrs") else value]})
+    table = pa.table(
+        {
+            column: [
+                json.dumps({"authorization": value if dirty else "[REDACTED]"})
+                if column in ("inputs_json", "attrs")
+                else value
+            ]
+        }
+    )
     artifact_path = write_parquet(table, root / rel, schema)
     manifest_rel = f"{directory}/manifest.json"
     manifest_path = root / manifest_rel
@@ -2281,6 +2316,203 @@ def test_evidence_duplicate_keys_are_rejected(tmp_path):
     path.write_text(text.replace('"kind": "raw-bundle"', '"kind": "log", "kind": "raw-bundle"', 1))
     report = validate_tree(root)
     assert any(f.code == "document-invalid" and "duplicate JSON key" in f.message for f in report.errors)
+
+
+@pytest.mark.parametrize("location", ["evidence", "dataset-index", "category-index", "snapshot"])
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+def test_structured_documents_are_bounded_before_loading(tmp_path, monkeypatch, location, profile):
+    import io
+
+    from aisim_core.data.hygiene import CandidatePolicy
+
+    root, directories = _snapshot_mirror(tmp_path)
+    if location == "evidence":
+        path = _evidence(root) / "evidence-manifest.json"
+    elif location == "snapshot":
+        path = root / directories[1] / "snapshot.json"
+    elif location == "dataset-index":
+        path = root / "catalog/dataset.json"
+    else:
+        dataset = json.loads((root / "catalog/dataset.json").read_bytes())
+        path = root / dataset["categories"]["e2e"]["index"]["path"]
+    limit = CandidatePolicy().max_json_bytes
+    payload = b" " * (limit + 1)
+    path.write_bytes(payload)
+    original = Path.open
+
+    class Bounded(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 <= size <= limit + 1
+            return super().read(size)
+
+    def opened(candidate, *args, **kwargs):
+        if candidate == path:
+            return Bounded(payload)
+        return original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+    report = validate_tree(root, profile=profile)
+    relative = path.relative_to(root).as_posix()
+    assert any(
+        f.path == relative and f.code in {"json-too-large", "document-invalid", "path-root"} for f in report.errors
+    )
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_uppercase_gzip_requires_a_declaration(tmp_path, declared):
+    root, directory, _ = _op_mirror(tmp_path, "future_text", None)
+    path = root / directory / "capture.GZ"
+    import gzip
+
+    path.write_bytes(gzip.compress(b"synthetic evidence"))
+    if declared:
+        manifest_path = root / directory / "manifest.json"
+        manifest = Manifest.model_validate_json(manifest_path.read_bytes())
+        artifact = Artifact(
+            artifact_id="uppercase-capture",
+            path=path.relative_to(root).as_posix(),
+            role="raw-output",
+            format="gzip",
+            schema="aisim-provenance/v1",
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            bytes=path.stat().st_size,
+        )
+        manifest_path.write_text(
+            manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+        )
+        register_manifests(root, [manifest_path.relative_to(root).as_posix()], INTERNAL_REPO)
+        build_catalog(root)
+    report = validate_tree(root)
+    assert ("undeclared-archive" in {f.code for f in report.errors}) is not declared
+    assert report.ok is declared, report.errors
+
+
+def test_policy_rejects_misspelled_approval_threshold(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"reviewers": ["alice", "bob"], "min_approval": 2}))
+    with pytest.raises(ValueError, match="unknown approval-policy keys"):
+        PromotionPolicy.from_file(path)
+
+
+def test_empty_directory_cannot_be_approved_for_promotion(tmp_path):
+    root, _ = _promotable(tmp_path)
+    (root / "data/empty").mkdir()
+    plan = plan_promotion(root, _request(root, ["data/empty"]), _reviewers())
+    assert not plan.content_ok and "selection-empty" in {f.code for f in plan.findings}
+
+
+def test_fixture_and_promotion_git_ignore_foreign_repository_environment(tmp_path, monkeypatch):
+    from aisim_core.data.promote import _check_source_checkout
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "untouched").write_text("foreign checkout")
+    _commit_source(foreign)
+    before = {p.relative_to(foreign): p.read_bytes() for p in foreign.rglob("*") if p.is_file()}
+    for name, value in {
+        "GIT_DIR": str(foreign / ".git"),
+        "GIT_WORK_TREE": str(foreign),
+        "GIT_INDEX_FILE": str(foreign / ".git/index"),
+        "GIT_COMMON_DIR": str(foreign / ".git"),
+        "GIT_OBJECT_DIRECTORY": str(foreign / ".git/objects"),
+        "GIT_PREFIX": "foreign/",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("AISIM_FIXTURE_UNRELATED", "preserved")
+    original_run = subprocess.run
+
+    def run(*args, **kwargs):
+        assert kwargs["env"]["AISIM_FIXTURE_UNRELATED"] == "preserved"
+        assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} & kwargs["env"].keys()
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    root, directory = _promotable(tmp_path)
+    commit = _commit_source(root)
+    request = _request(root, [directory])
+    assert request.source_commit == commit
+    _check_source_checkout(root, commit)
+    assert os.environ["AISIM_FIXTURE_UNRELATED"] == "preserved"
+    assert before == {p.relative_to(foreign): p.read_bytes() for p in foreign.rglob("*") if p.is_file()}
+
+
+def test_rollback_does_not_read_unreadable_generated_catalog(tmp_path, monkeypatch):
+    from aisim_core.data import promote as promotion
+    from aisim_core.data.hygiene import Finding
+    from aisim_core.data.mirror import TreeReport
+
+    root, _, plan = _approved(tmp_path)
+    (tmp_path / "existing").mkdir()
+    target, _ = _mirror(tmp_path / "existing", repo=PUBLIC, dev=("synthetic/model-b",))
+    before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+    unreadable = target / "catalog/e2e/unreadable.parquet"
+    original = Path.read_bytes
+
+    def read_bytes(path):
+        if path == unreadable:
+            raise OSError("generated shard stays unreadable")
+        return original(path)
+
+    def reject(*args, **kwargs):
+        unreadable.write_bytes(b"unreadable shard")
+        return TreeReport(PUBLIC, "public", findings=[Finding("catalog-unreadable", "fixture")])
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(promotion, "validate_tree", reject)
+    with pytest.raises(PromotionError, match="catalog-unreadable"):
+        apply_promotion(plan, root, target)
+    assert not unreadable.exists()
+    assert before == {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("redacted", [False, True])
+def test_public_validation_rejects_populated_password_fields(tmp_path, redacted):
+    root, manifests = _mirror(tmp_path, repo=PUBLIC)
+    manifest_path = root / manifests[0]
+    manifest = Manifest.model_validate_json(manifest_path.read_bytes())
+    value = "[REDACTED]" if redacted else "***REDACTED_SECRET_ASSIGNMENT***"
+    manifest = manifest.model_copy(update={"provenance": {**manifest.provenance, "password": value}})
+    manifest_path.write_text(manifest.model_dump_json(by_alias=True))
+    register_manifests(root, [manifest_path.relative_to(root).as_posix()], PUBLIC)
+    build_catalog(root)
+    report = validate_tree(root, profile="public")
+    assert ("secret" in {f.code for f in report.errors}) is not redacted
+    assert report.ok is redacted, report.errors
+
+
+@pytest.mark.parametrize("redacted", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_public_validation_preserves_arrow_map_disclosure_context(tmp_path, redacted, nested):
+    import pyarrow.parquet as pq
+
+    root, directory, _ = _op_mirror(tmp_path, "future_text", None)
+    shard = root / directory / "gemm_perf.parquet"
+    table = pq.read_table(shard)
+    value = "[REDACTED]" if redacted else "private-worker:v1"
+    dtype = pa.map_(pa.string(), pa.string())
+    cell = [("image", value), ("image", "[REDACTED]")]
+    if nested:
+        dtype = pa.struct([pa.field("nested", pa.list_(dtype))])
+        cell = {"nested": [cell]}
+    table = table.append_column("attrs", pa.array([cell] * table.num_rows, type=dtype))
+    write_parquet(table, shard, OP_TABLE_SCHEMA_ID)
+    manifest_path = root / directory / "manifest.json"
+    manifest = Manifest.model_validate_json(manifest_path.read_bytes())
+    artifacts = [
+        artifact.model_copy(
+            update={"sha256": hashlib.sha256(shard.read_bytes()).hexdigest(), "bytes": shard.stat().st_size}
+        )
+        if artifact.path == shard.relative_to(root).as_posix()
+        else artifact
+        for artifact in manifest.artifacts
+    ]
+    manifest_path.write_text(manifest.model_copy(update={"artifacts": artifacts}).model_dump_json(by_alias=True))
+    register_manifests(root, [manifest_path.relative_to(root).as_posix()], INTERNAL_REPO)
+    build_catalog(root)
+    shutil.rmtree(root / "mirror")  # public checkouts omit the internal visibility ledger
+    report = validate_tree(root, profile="public")
+    assert ("image-name" in {f.code for f in report.errors}) is not redacted
+    assert report.ok is redacted, report.errors
 
 
 @pytest.mark.parametrize("name", ["snapshot.JSON", "frozen-view.JSON"])

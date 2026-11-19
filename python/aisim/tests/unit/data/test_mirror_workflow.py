@@ -64,7 +64,7 @@ def test_runs_the_shared_validator_from_a_pinned_checkout(text):
 
 def test_least_privilege_and_pinned_actions(text):
     doc = _load(text)
-    assert doc["permissions"] == {"contents": "read"}
+    assert doc["jobs"]["validate"].get("permissions", doc.get("permissions")) == {"contents": "read"}
     assert "secrets." not in text and "pull_request_target" not in text
     checkouts = [st for st in doc["jobs"]["validate"]["steps"] if st.get("uses", "").startswith("actions/checkout@")]
     assert checkouts and all(st["with"]["persist-credentials"] is False for st in checkouts)
