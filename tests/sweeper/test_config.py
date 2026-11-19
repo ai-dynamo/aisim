@@ -3,6 +3,8 @@
 
 """Dynamo-independent Sweeper configuration contracts."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -30,6 +32,45 @@ def _workload(**overrides):
         "num_request_ratio": 10,
         **overrides,
     }
+
+
+def test_search_json_keeps_scientific_notation_numeric(tmp_path):
+    raw = {
+        "search_space": _search_space(),
+        "workload": _workload(),
+        "goal": {"target": "throughput", "sla": {"ttft_ms": 1e-7}},
+    }
+    path = tmp_path / "search.json"
+    path.write_text(json.dumps(raw))
+    assert SmartSearchConfig.from_yaml(path) == SmartSearchConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("text", "duplicate_path"),
+    [
+        (
+            '{"search_space": {"ais_perf_model": null, "ais_perf_model": null}}',
+            "search_space.ais_perf_model",
+        ),
+        (
+            '{"search_space": {"ais_perf_model": null}, "search_space": {}}',
+            "search_space",
+        ),
+        (
+            r'{"search_space": {"ais_perf_model": {"estimation_mode": "auto", "estimation_\u006dode": "op_level"}}}',
+            "search_space.ais_perf_model.estimation_mode",
+        ),
+    ],
+    ids=["perf-model-key", "search-space-section", "decoded-nested-key"],
+)
+def test_search_json_rejects_repeated_perf_model_keys(tmp_path, text, duplicate_path):
+    path = tmp_path / "search.json"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="written twice") as failure:
+        SmartSearchConfig.from_yaml(path)
+
+    assert str(failure.value) == f"{path}: {duplicate_path} is written twice"
 
 
 def _session(**load):

@@ -77,14 +77,15 @@ def _terminal(monkeypatch, answers=()) -> list[str]:
     return prompts
 
 
-def test_supervised_entrypoint_runs_onboarding_before_prediction_config_handling(tmp_path, monkeypatch):
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_supervised_entrypoint_runs_onboarding_before_prediction_config_handling(tmp_path, monkeypatch, suffix):
     from aisim import supervision
 
     def unexpected_supervision(*args, **kwargs):
         pytest.fail("interactive onboarding must retain the calling terminal")
 
     monkeypatch.setattr(supervision, "run_process", unexpected_supervision)
-    output = tmp_path / "request.yaml"
+    output = tmp_path / f"request{suffix}"
     assert supervision.main(_init_args(output)) == 0
     assert SupportRequest.from_yaml(output).identity.model == _REQUIRED["model"]
 

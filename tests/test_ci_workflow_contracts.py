@@ -732,6 +732,138 @@ def _workflow(name: str) -> dict:
         return yaml.load(handle, Loader=yaml.BaseLoader)
 
 
+def test_nvskills_request_events():
+    assert _workflow("request-nvskills-ci.yml")["on"] == {
+        "issue_comment": {"types": ["created"]},
+        "pull_request": {"types": ["opened", "reopened", "synchronize", "ready_for_review"]},
+        "push": "",
+    }
+
+
+def test_nvskills_request_token_permissions():
+    workflow = _workflow("request-nvskills-ci.yml")
+    assert workflow["permissions"] == {}
+    assert workflow["jobs"]["request"]["permissions"] == {
+        "contents": "read",
+        "pull-requests": "read",
+        "statuses": "read",
+    }
+
+
+def test_nvskills_request_pins_the_external_callee():
+    request = _workflow("request-nvskills-ci.yml")["jobs"]["request"]
+    assert request["uses"] == (
+        "NVIDIA/skills/.github/workflows/team-request.yml@bdc6bf92f4f76c741f0d499415f75c2ee7ceab6f"
+    )
+
+
+def test_nvskills_request_passes_only_the_dispatch_secret():
+    jobs = _workflow("request-nvskills-ci.yml")["jobs"]
+    assert set(jobs) == {"request"}
+    assert jobs["request"]["secrets"] == {"NVSKILLS_CI_DISPATCH_TOKEN": "${{ secrets.NVSKILLS_CI_DISPATCH_TOKEN }}"}
+    assert "steps" not in jobs["request"]
+
+
+def _nvskills_comment(body, *, is_pr=True):
+    issue = {"pull_request": {"url": "https://api.github.com/repos/ai-dynamo/aisim/pulls/936"}} if is_pr else {}
+    return {"event_name": "issue_comment", "event": {"issue": issue, "comment": {"body": body}}}
+
+
+def _nvskills_push(actor="nv-skills-ci[bot]", message="Attach NVSkills validation signatures"):
+    return {"event_name": "push", "actor": actor, "event": {"head_commit": {"message": message}}}
+
+
+@pytest.mark.parametrize(
+    ("github", "variables", "expected"),
+    [
+        *[
+            pytest.param({"event_name": "pull_request", "event": {"action": action}}, {}, True, id=f"pr-{action}")
+            for action in ("opened", "reopened", "synchronize", "ready_for_review")
+        ],
+        pytest.param(_nvskills_comment("/nvskills-ci"), {}, True, id="pr-command"),
+        pytest.param(_nvskills_comment("/nvskills-ci --force"), {}, True, id="command-arguments"),
+        pytest.param(_nvskills_comment("/nvskills-ci\nmore context"), {}, True, id="multiline-comment"),
+        pytest.param(_nvskills_comment("/NVSKILLS-CI"), {}, True, id="case-insensitive-command"),
+        # startsWith deliberately accepts suffixes; this is not an exact command parser.
+        pytest.param(_nvskills_comment("/nvskills-ci-extra"), {}, True, id="command-prefix"),
+        pytest.param(_nvskills_comment("ordinary review comment"), {}, False, id="ordinary-comment"),
+        pytest.param(_nvskills_comment(""), {}, False, id="empty-comment"),
+        pytest.param(_nvskills_comment(" /nvskills-ci"), {}, False, id="leading-space-comment"),
+        pytest.param(_nvskills_comment("/nvskills-ci", is_pr=False), {}, False, id="non-pr-issue"),
+        pytest.param({"event_name": "issue_comment", "event": {}}, {}, False, id="missing-comment-fields"),
+        pytest.param(_nvskills_comment(None), {}, False, id="null-comment"),
+        pytest.param(_nvskills_push(), {}, True, id="signature-push"),
+        pytest.param(
+            _nvskills_push(message="Attach NVSkills validation signatures\n\nSigned-off-by: Bot"),
+            {},
+            True,
+            id="multiline-commit",
+        ),
+        pytest.param(
+            _nvskills_push("NV-SKILLS-CI[BOT]", "attach nvskills validation signatures"),
+            {},
+            True,
+            id="case-insensitive-push",
+        ),
+        pytest.param(
+            _nvskills_push(message="Attach NVSkills validation signatures for PR 936"), {}, True, id="title-prefix"
+        ),
+        pytest.param(_nvskills_push(actor="contributor"), {}, False, id="wrong-push-actor"),
+        pytest.param(_nvskills_push(message="Update skills"), {}, False, id="wrong-commit-title"),
+        pytest.param(_nvskills_push(actor=""), {}, False, id="empty-push-actor"),
+        pytest.param({"event_name": "push", "actor": "nv-skills-ci[bot]"}, {}, False, id="missing-head-commit"),
+        pytest.param(_nvskills_push(message=None), {}, False, id="null-commit-message"),
+        pytest.param(
+            _nvskills_push("custom[bot]", "Sign skills for PR 936"),
+            {"NVSKILLS_SIGNATURE_PUSH_ACTOR": "custom[bot]", "NVSKILLS_SIGNATURE_COMMIT_TITLE": "Sign skills"},
+            True,
+            id="configured-actor-and-title",
+        ),
+        pytest.param(
+            _nvskills_push(),
+            {"NVSKILLS_SIGNATURE_PUSH_ACTOR": "custom[bot]"},
+            False,
+            id="override-rejects-default-actor",
+        ),
+        pytest.param(
+            _nvskills_push(),
+            {"NVSKILLS_SIGNATURE_COMMIT_TITLE": "Sign skills"},
+            False,
+            id="override-rejects-default-title",
+        ),
+        pytest.param(
+            _nvskills_push(),
+            {"NVSKILLS_SIGNATURE_PUSH_ACTOR": "", "NVSKILLS_SIGNATURE_COMMIT_TITLE": ""},
+            True,
+            id="empty-overrides-use-defaults",
+        ),
+        pytest.param({"event_name": "workflow_dispatch"}, {}, False, id="manual-event"),
+        pytest.param({"event_name": "schedule"}, {}, False, id="scheduled-event"),
+    ],
+)
+def test_nvskills_request_gate(github, variables, expected):
+    expression = _workflow("request-nvskills-ci.yml")["jobs"]["request"]["if"]
+    contexts = {"github": github, "vars": variables}
+
+    def substitute(match):
+        token = match[0]
+        if token.startswith("'"):
+            value = token[1:-1].replace("''", "'")
+        else:
+            value = contexts
+            for part in token.split("."):
+                value = value.get(part, "") if isinstance(value, dict) else ""
+        # GitHub treats absent properties as empty strings, compares strings
+        # without case, and casts null to an empty string in startsWith.
+        return repr(value.casefold() if isinstance(value, str) else "" if value is None else value)
+
+    # Evaluate the actual caller expression, using only the operators/functions
+    # it needs. actionlint independently validates the GitHub expression syntax.
+    expression = " ".join(expression.splitlines()).replace("&&", " and ").replace("||", " or ")
+    expression = re.sub(r"'(?:[^']|'')*'|(?:github|vars)(?:\.[\w_]+)+", substitute, expression)
+    assert bool(eval(expression, {"__builtins__": {}}, {"startsWith": str.startswith})) is expected
+
+
 def _run_commands(job: dict) -> str:
     return "\n".join(step.get("run", "") for step in job["steps"])
 

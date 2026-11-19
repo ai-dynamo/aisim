@@ -24,7 +24,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_serializer, model_validator
 
 from aisim.config.traffic import AgenticProfileOptions, AgenticSnapshotOptions, WekaChatTemplate
@@ -38,9 +37,15 @@ from ..config.common import (
     SystemsPath,
     SystemsRoot,
     is_active_engine_model_control,
+    load_config_with_text,
     requested_backend_version,
 )
-from ..config.engine import NgramSpeculationConfig, NonNegativeU64, ReplayEstimationMode
+from ..config.engine import (
+    NgramSpeculationConfig,
+    NonNegativeU64,
+    ReplayEstimationMode,
+    grouped_prefix_caching_requirements,
+)
 from .ais_perf_model import lower_search_space
 
 
@@ -1244,7 +1249,7 @@ class SearchSpace(BaseModel):
         profile = load_fpm_profile(self.fpm_profile)
         if not any(deployment.resources.cache_layout == "grouped" for deployment in profile.deployments):
             return self
-        from .search_space import _fpm_parallel_configs, _parallel_role
+        from .search_space import _fpm_parallel_configs, _parallel_role, _role_runtime
 
         for mode in self.deployment_mode:
             configs = _fpm_parallel_configs(self, mode)
@@ -1267,7 +1272,15 @@ class SearchSpace(BaseModel):
                     if role != "agg" or self.aic_nextn or self.speculation is not None:
                         raise ValueError("grouped FPM cache requires aggregated vLLM without speculative decoding")
                     if self.agg_enable_prefix_caching:
-                        raise ValueError("grouped FPM cache requires agg_enable_prefix_caching=false for cold replay")
+                        # The search has no prefix_match_unit. Each candidate is checked again with its own budget.
+                        grouped_prefix_caching_requirements(
+                            deployment,
+                            backend_version=self.requested_backend_version("vllm"),
+                            architecture=profile.architecture,
+                            prefix_match_unit=None,
+                            max_batched_tokens=_role_runtime(self, "vllm", "agg")[0],
+                            field="agg_enable_prefix_caching",
+                        )
                     if self.agg_native_host_offload is not None:
                         raise ValueError("grouped FPM cache supports only HBM without host offload")
                     if self.agg_num_gpu_blocks is not None or self.agg_kv_bytes_per_token != "auto":
@@ -1485,7 +1498,7 @@ class SmartSearchConfig(BaseModel):
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> SmartSearchConfig:
-        """Load + validate one YAML file into the nested config.
+        """Load + validate one YAML or JSON file into the nested config.
 
         Relative paths inside ``search_space.ais_perf_model`` start at the
         folder of the file. The key written twice, or a key written twice
@@ -1493,8 +1506,7 @@ class SmartSearchConfig(BaseModel):
         fields in the file give one deprecation warning, raised only after
         the file validated.
         """
-        text = Path(path).read_text()
-        data = yaml.safe_load(text)
+        data, text = load_config_with_text(path)
         reject_repeated_keys(text, "search", path)
         data = anchor_paths(data, config_folder(path), "search")
         config = cls.model_validate(data)
