@@ -230,13 +230,15 @@ impl GroupedTransferRules {
     /// The transfer bytes of one full-attention block, summed over the
     /// full-attention groups. vLLM does not clip the block list of a
     /// full-attention group (V31 `nixl/base_scheduler.py:282-297`, V32
-    /// `:280-291`).
+    /// `:280-291`). The profile bounds the bytes of one group, not the number
+    /// of groups, so a sum above `u64` saturates: a larger payload only
+    /// lengthens the handoff.
     pub(crate) fn bytes_per_full_block(&self) -> u64 {
         self.groups
             .iter()
             .filter(|group| group.kind == TransferKind::Full)
             .map(|group| group.bytes_per_block)
-            .sum()
+            .fold(0, u64::saturating_add)
     }
 
     /// The bytes that do not grow with the full-attention blocks. Of `T`
@@ -252,7 +254,8 @@ impl GroupedTransferRules {
     /// The worker trims the prefill list to the decode count (V31
     /// `nixl/base_worker.py:3485-3490`, `:3529-3534`, V32 `:3450-3455`,
     /// `:3493-3498`). A state group moves one block (V31
-    /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`).
+    /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`). The bytes saturate
+    /// at `u64::MAX`, as in `bytes_per_full_block`.
     pub(crate) fn fixed_bytes(&self, transfer_tokens: usize) -> u64 {
         self.groups
             .iter()
@@ -271,9 +274,9 @@ impl GroupedTransferRules {
                     }
                     TransferKind::State => 1,
                 };
-                blocks as u64 * group.bytes_per_block
+                (blocks as u64).saturating_mul(group.bytes_per_block)
             })
-            .sum()
+            .fold(0, u64::saturating_add)
     }
 
     /// The payload of one request when the decode rank already holds
@@ -637,5 +640,34 @@ mod tests {
         let timing =
             rules.handoff_transfer_timing(5_000, Some(1.0), KvTransferTimingMode::FullPrompt);
         assert!(close(timing.delay_ms(0), 9.861248));
+    }
+
+    #[test]
+    fn transfer_bytes_saturate_above_u64() {
+        const BYTES: u64 = 1 << 53;
+        // With 1-token blocks and 3,000 tokens, a window of `w` tokens holds
+        // `w - 1` blocks. 2,048 blocks of 2**53 bytes are 2**64 bytes.
+        let window = |window| group(FpmCacheKind::Attention, 1, BYTES, Some(window), true);
+        assert_eq!(rules(&[window(2_048)]).fixed_bytes(3_000), 2_047 * BYTES);
+        assert_eq!(rules(&[window(2_049)]).fixed_bytes(3_000), u64::MAX);
+        // The sum over the groups: 2,047 window blocks and one state block.
+        let state = group(FpmCacheKind::State, 1, BYTES, None, false);
+        assert_eq!(
+            rules(&[window(2_047), state.clone()]).fixed_bytes(3_000),
+            2_047 * BYTES
+        );
+        assert_eq!(rules(&[window(2_048), state]).fixed_bytes(3_000), u64::MAX);
+        // The bytes of one full-attention block over 2,048 groups.
+        let full = group(FpmCacheKind::Attention, 16, BYTES, None, true);
+        assert_eq!(
+            rules(&vec![full.clone(); 2_047]).bytes_per_full_block(),
+            2_047 * BYTES
+        );
+        let saturated = rules(&vec![full; 2_048]);
+        assert_eq!(saturated.bytes_per_full_block(), u64::MAX);
+        // The timing holds the saturated value.
+        let timing =
+            saturated.handoff_transfer_timing(16, Some(1.0), KvTransferTimingMode::FullPrompt);
+        assert_eq!(timing.kv_bytes_per_token, Some(usize::MAX));
     }
 }
