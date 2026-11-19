@@ -295,6 +295,23 @@ def test_disagg_candidate_accepts_matching_effective_role_hardware():
     assert to_legacy_params(request)["NodeConfig"]["system_name"] == "gb200"
 
 
+@pytest.mark.parametrize("reserve", [0, 384, 768])
+def test_sglang_candidate_rejects_unrendered_decode_reserve(reserve):
+    candidate = _disagg_candidate(backend="sglang", backend_version="0.5.11", decode_reserved_decode_tokens=reserve)
+    with pytest.raises(
+        SweeperCandidateError, match=r"candidate\.config\.decode_reserved_decode_tokens.*cannot be rendered"
+    ):
+        from_sweeper_candidate(candidate, workload={"isl": 4096, "osl": 128}, model_facts=ModelFacts(is_moe=False))
+
+
+def test_sglang_candidate_accepts_default_decode_reserve():
+    kwargs = {"workload": {"isl": 4096, "osl": 128}, "model_facts": ModelFacts(is_moe=True)}
+    backend = {"backend": "sglang", "backend_version": "0.5.11"}
+    implicit = from_sweeper_candidate(_disagg_candidate(**backend), **kwargs)
+    explicit = from_sweeper_candidate(_disagg_candidate(**backend, decode_reserved_decode_tokens=512), **kwargs)
+    assert explicit == implicit
+
+
 def test_disagg_candidate_rejects_heterogeneous_deployment_artifact_generation():
     with pytest.raises(
         SweeperCandidateError,

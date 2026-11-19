@@ -40,7 +40,7 @@ from ..config.common import (
     is_active_engine_model_control,
     requested_backend_version,
 )
-from ..config.engine import NgramSpeculationConfig, ReplayEstimationMode
+from ..config.engine import NgramSpeculationConfig, NonNegativeU64, ReplayEstimationMode
 from .ais_perf_model import lower_search_space
 
 
@@ -680,6 +680,7 @@ class SearchSpace(BaseModel):
     decode_gpu_memory_utilization: float | list[float] | None = 0.9
     decode_enable_prefix_caching: bool = False
     decode_radix_cache: bool = False  # SGLang --disaggregation-decode-enable-radix-cache
+    decode_reserved_decode_tokens: NonNegativeU64 | None = None
     decode_kv_bytes_per_token: int | str = "auto"
     decode_native_host_offload: dict[str, Any] | None = None
     decode_num_gpu_blocks: int | None = None
@@ -1057,6 +1058,10 @@ class SearchSpace(BaseModel):
 
     @model_validator(mode="after")
     def _validate_engine_controls(self):
+        if self.decode_reserved_decode_tokens is not None and (
+            "disagg" not in self.deployment_mode or set(self.backend) != {"sglang"} or self.afd_roles
+        ):
+            raise ValueError("decode_reserved_decode_tokens requires native disaggregated decode with backend=sglang")
         if self.decode_radix_cache and "sglang" not in self.backend:
             raise ValueError("decode_radix_cache requires a search with backend=sglang")
         if self.decode_radix_cache and "disagg" in self.deployment_mode:

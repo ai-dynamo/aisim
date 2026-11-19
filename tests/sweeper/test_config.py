@@ -49,6 +49,22 @@ def test_decode_radix_cache_rejects_searches_without_sglang(backend):
         SearchSpace(**_search_space(backend=backend, decode_radix_cache=True))
 
 
+@pytest.mark.parametrize("reserve", [True, 1.0, "384", -1])
+def test_sglang_decode_reserve_requires_a_nonnegative_integer(reserve):
+    with pytest.raises(ValidationError, match="decode_reserved_decode_tokens"):
+        SearchSpace(
+            **_search_space(backend=["sglang"], deployment_mode=["disagg"], decode_reserved_decode_tokens=reserve)
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "modes"), [(["vllm"], ["disagg"]), (["vllm", "sglang"], ["disagg"]), (["sglang"], ["agg"])]
+)
+def test_decode_reserve_rejects_inapplicable_sweeps(backend, modes):
+    with pytest.raises(ValidationError, match="decode_reserved_decode_tokens requires native disaggregated decode"):
+        SearchSpace(**_search_space(backend=backend, deployment_mode=modes, decode_reserved_decode_tokens=0))
+
+
 @pytest.mark.parametrize("modes", [["disagg"], ["agg", "disagg"]])
 @pytest.mark.parametrize(
     ("overrides", "message"),

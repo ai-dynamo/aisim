@@ -184,6 +184,8 @@ def unroll_sample(
     for key in pinned:
         sample[key] = selection.get(key, getattr(search_space, key))
     if mode == "disagg":
+        if search_space.decode_reserved_decode_tokens is not None:
+            sample["decode_reserved_decode_tokens"] = search_space.decode_reserved_decode_tokens
         for key in (
             "kv_transfer_bytes_per_token",
             "kv_transfer_bandwidth",

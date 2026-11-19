@@ -129,6 +129,11 @@ those choices. It rejects combinations it cannot lower, including analytical
 AFD/EPD and heterogeneous P/D hardware. AFD predictions instead produce their
 own analytical artifacts; see [AFD topology](../replay/engine/analytical.md#afd).
 
+The generator also rejects SGLang candidates with a non-default
+[`reserved_decode_tokens`](../replay/engine/workers.md#sglang-pd-decode-reserve)
+because it cannot render the evaluated reserve. An omitted reserve or the
+default of 512 does not block generation.
+
 Deployment token budgets must be multiples of 64. Ordinary generator requests
 round them upward, but an already evaluated candidate with an unaligned budget
 is rejected: changing the budget would invalidate its prediction and ranking.

@@ -110,6 +110,10 @@ def _engine_args_payload(
         if sample.get("aic_nextn") or sample.get("speculation") is not None:
             raise ValueError("decode_radix_cache is incompatible with speculative decoding for SGLang decode")
         payload["sglang"] = {"disaggregation_decode_enable_radix_cache": True}
+    if role == "decode" and (reserve := sample.get("decode_reserved_decode_tokens")) is not None:
+        if backend != "sglang" or sample["deployment_mode"] != "disagg" or sample.get("afd_roles"):
+            raise ValueError("decode_reserved_decode_tokens requires native disaggregated decode with backend=sglang")
+        payload.setdefault("sglang", {})["num_reserved_decode_tokens"] = reserve
     if sample.get("systems_paths") is not None and sample.get(f"{role}_timing_model") is not None:
         from .forward_pass_estimator import resolve_systems_paths
 
