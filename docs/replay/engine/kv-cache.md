@@ -751,9 +751,11 @@ block boundaries where the state is kept. This requires
 rejected for both default and explicit units with recurrent prefix caching.
 
 Fixed pools need room for the aligned prefill peak: token blocks plus both the
-previous and new working state when prefill stops at a boundary where the
-state is kept, as well as any speculative scratch states and internal prefill
-checkpoint. For
+previous and new working state when prefill stops at a retained boundary or
+the scheduler's token budget splits it across physical blocks, as well as
+any speculative scratch states and internal prefill checkpoint. A checkpoint
+replaces the second working state only when the cold prefill fits in one pass.
+For
 example, a 65-token prompt with 64-token blocks, 16 KV bytes per token and a
 1,500-byte state needs two token blocks and two two-block states: six blocks.
 A four-block pool is rejected at admission, before prefill, with required and
@@ -771,9 +773,10 @@ receive that default. Ordinary CLI `--capture-telemetry` and `--export-html`
 use telemetry capture without native KV-event export and support the aligned
 recurrent-state default.
 
-Dynamo's [Router event observation](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs#L188)
+Dynamo's [Router event observation](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs#L188-L198)
 also requests engine KV events when its
-`use_kv_events` option is true. The same native `prefix_match_unit` rejection
+`use_kv_events` option is true; `reads_engine_kv_events` defaults to true when
+there is no Router config. The same native `prefix_match_unit` rejection
 applies to aligned recurrent states, including the resolved default. For
 offline `predict --stack dynamo`, a Dynamo build that accepts the option turns
 the observation off:
@@ -784,9 +787,8 @@ router:
   use_kv_events: false
 ```
 
-`predict --online` does not support this workaround, because Dynamo's online
-Router requires `use_kv_events: true`. The option does not affect ordinary
-Engine-stack telemetry. See
+This source contract describes offline replay. The option does not affect
+ordinary Engine-stack telemetry. See
 [Dynamo integration](../dynamo.md#router-configuration).
 
 ### State pool from recorded runtime memory

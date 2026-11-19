@@ -118,11 +118,28 @@ engine-only configuration engine-only.
 | `router.overlap_score_credit` | `1.0` | `{choices: [0.0, 0.5, 1.0]}` | `-` | Finite, nonnegative, and KV-router-only. |
 | `router.prefill_load_scale` | `1.0` | `{choices: [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]}` | `-` | Finite, nonnegative, and KV-router-only. |
 | `router.temperature` | `0.0` | `{choices: [0.0, 0.2, 0.5, 1.0]}` | `-` | Finite, nonnegative, and KV-router-only. |
+| `router.use_kv_events` | `true` in the offline runtime; omitted by the adapter | prediction only | `-` | Boolean `true` or `false`, KV-router-only; explicit `null` is rejected. Owned by the Dynamo `dynamo.router` adapter. Requires a Dynamo build exposing this option. |
 
 `round_robin` requires `prefill_load_model.type: none` and has no KV-router-only knobs. The
 `kv_router` policy may use either load model. Production-only Router fields remain outside the version
 1 contract. Replacing the legacy `aic` load-model name with an implementation-neutral public name is
 deferred until the Router exposes that name.
+
+For `predict --stack dynamo`, `use_kv_events: false` asks the offline Router to
+index its routing decisions without observing engine KV events. This permits
+aligned recurrent state caches, whose `prefix_match_unit` cannot be combined
+with engine KV-event export. At pinned Dynamo commit
+[`099f12765b23b3d7d617eb9e340b1913a2ed406b`](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/components/src/dynamo/router/simulation/config.py#L114-L139),
+the prediction adapter accepts the boolean and
+[passes it through only when supplied](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/components/src/dynamo/router/simulation/provider.py#L204-L217).
+The native
+[`KvRouterConfig` default enables KV events](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/lib/router/kv-router/src/scheduling/config.rs#L678-L688).
+The offline composition's
+[`reads_engine_kv_events` and `without_engine_kv_events`](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs#L188-L198)
+select event observation, defaulting to enabled without a Router config.
+These are pinned source contracts; execution also requires matching Dynamo
+Python and native runtime artifacts. See
+[state-cache limits](engine/kv-cache.md#state-cache) for the native restriction.
 
 `optimization.target: min_gpus` accepts a `router` section. The Router adds no GPUs and keeps the
 worker pool static, so recommendations still rank qualifying candidates by provisioned GPU count.

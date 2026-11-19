@@ -698,6 +698,7 @@ impl VllmKvManager {
         known_tokens: usize,
         cost: &PrefillCost,
         reserved_blocks: usize,
+        prefill_token_budget: usize,
     ) -> AllocationRequirement {
         let token_blocks = known_tokens.div_ceil(self.block_size);
         if let Some(manager) = &self.state_cache
@@ -714,8 +715,10 @@ impl VllmKvManager {
         if let Some(state) = &self.state_cache {
             // Align mode rotates working allocations across physical blocks.
             // The previous state remains an input until the next pass, so a
-            // cold prompt needs both only when an align stop splits its
-            // prefill. Price that peak before starting prefill.
+            // cold prompt needs both when an align stop or the scheduler's
+            // token budget splits its prefill across physical slots. Use the
+            // whole-step budget here: pressure from other requests can clear,
+            // and must not make an otherwise feasible request impossible.
             let rotates = state.align_block_size.is_some_and(|block| {
                 let (last_full, resend_full, tail) = state_boundaries(
                     known_tokens,
@@ -727,9 +730,21 @@ impl VllmKvManager {
                     .into_iter()
                     .any(|stop| 0 < stop && stop < known_tokens)
             });
+            let budget_rotates = state.align_block_size.is_some_and(|block| {
+                let first_end = cost
+                    .cached_tokens
+                    .saturating_add(prefill_token_budget)
+                    .min(known_tokens);
+                first_end < known_tokens
+                    && first_end.saturating_sub(1) / block < known_tokens.saturating_sub(1) / block
+            });
             // An internal prefill checkpoint already supplies the second
-            // cold state; do not charge it twice on a one-pass prefill.
-            let copies = if cost.cached_tokens > 0 || (rotates && checkpoint_blocks == 0) {
+            // cold state only on a one-pass prefill. A budget split also
+            // needs the previous working state while exporting a checkpoint.
+            let copies = if cost.cached_tokens > 0
+                || budget_rotates
+                || (rotates && checkpoint_blocks == 0)
+            {
                 2
             } else {
                 1

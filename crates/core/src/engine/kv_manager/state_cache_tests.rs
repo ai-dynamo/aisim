@@ -1028,7 +1028,7 @@ fn kda_partial_restore_accounts_for_source_page_and_private_copy_atomically() {
     let cost = manager.get_lease_prefill_cost(&query, &reader);
     assert_eq!(cost.cached_tokens, 16);
     assert_eq!(
-        manager.admission_requirement(&reader, 17, &cost, 0),
+        manager.admission_requirement(&reader, 17, &cost, 0, usize::MAX),
         AllocationRequirement::Impossible
     );
     let before = (manager.num_active_blocks(), manager.num_inactive_blocks());

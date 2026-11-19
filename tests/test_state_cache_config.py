@@ -495,17 +495,26 @@ def test_unaligned_state_allows_unchunked_prefill(forbid_estimators, overrides):
 
 
 @pytest.mark.parametrize(
-    "input_tokens,blocks,completed,checkpoint",
-    [(64, 3, 1, False), (65, 4, 0, False), (65, 6, 1, False), (65, 6, 1, True)],
+    "input_tokens,blocks,budget,completed,checkpoint",
+    [
+        (64, 3, 1024, 1, False),
+        (65, 4, 1024, 0, False),
+        (65, 6, 1024, 1, False),
+        (65, 6, 1024, 1, True),
+        (193, 8, 128, 0, True),
+        (193, 8, 1024, 1, True),
+        (193, 10, 128, 1, True),
+    ],
 )
 def test_aligned_state_admission_accounts_for_rotating_state(
-    forbid_estimators, input_tokens, blocks, completed, checkpoint
+    forbid_estimators, input_tokens, blocks, budget, completed, checkpoint
 ):
     raw = _public(
         capacity={"type": "fixed", "blocks": blocks},
         state_cache={**STATE, "prefill_checkpoint": checkpoint},
         prefix_match_unit=64 if checkpoint else None,
     )
+    raw["engine"]["workers"]["aggregated"]["scheduler"] = {"max_batched_tokens": budget}
     raw["traffic"]["source"]["input_tokens"] = input_tokens
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     report = EngineReplayRunnerFactory().create(0).run(spec)
@@ -513,6 +522,34 @@ def test_aligned_state_admission_accounts_for_rotating_state(
     # Two token pages + two ceil(1500 / (64 * 16)) state copies = six blocks.
     # A pool that cannot fit the peak must reject before computing any prefill.
     assert report.metrics["committed_prefill_tokens"] == (input_tokens if completed else 0)
+
+
+@pytest.mark.parametrize("budget,blocks,completed", [(1024, 6, 1), (64, 6, 0), (64, 8, 1)])
+def test_eagle_state_admission_accounts_for_budget_split(forbid_estimators, budget, blocks, completed):
+    from aisim import _runtime
+
+    raw = _public(
+        timing="default",
+        capacity={"type": "fixed", "blocks": blocks},
+        state_cache={**STATE, "num_speculative_states": 1},
+    )
+    raw["engine"]["workers"]["aggregated"]["scheduler"] = {"max_batched_tokens": budget}
+    raw["engine"]["speculation"] = {"kind": "mtp", "params": {"depth": 1}, "expected_accepted_tokens": 1.0}
+    raw["traffic"]["source"]["input_tokens"] = 65
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    native = runtime.execution_spec
+    # Public MTP requires default timing. As in the reuse tests below, use
+    # fixed native timing to isolate scheduling from FPM data availability.
+    native["spec"]["engine"]["rank"]["timing_model"] = {
+        "type": "fixed",
+        "prefill_ms": 1.0,
+        "decode_ms": 1.0,
+    }
+    report = json.loads(_runtime.run_replay_json(json.dumps(native)))
+    assert report["completed_requests"] == completed
+    assert report["committed_prefill_tokens"] == (65 if completed else 0)
 
 
 def test_manual_dsv4_without_lookahead_uses_recurrent_aligned_chunks(forbid_estimators):
