@@ -403,10 +403,12 @@ def test_current_inventory_is_complete_and_does_not_relabel_unknowns():
     for entry in entries:
         if entry["origin"] == "legacy_unresolved":
             assert entry["license"] == "UNKNOWN"
-    qwen = [e for e in entries if "Qwen3.8" in e["path"]]
+    qwen_max = [e for e in entries if "Qwen3.8-2.4T" in e["path"]]
+    qwen_next = [e for e in entries if "Qwen3.8-Flash-Next" in e["path"]]
     llama = [e for e in entries if "Llama-4-" in e["path"]]
-    assert len(qwen) == len(llama) == 2
-    assert {e["license"] for e in qwen} == {"LicenseRef-Qwen3.8-Max"}
+    assert len(qwen_max) == len(qwen_next) == len(llama) == 2
+    assert {e["license"] for e in qwen_max} == {"LicenseRef-Qwen3.8-Max"}
+    assert {e["license"] for e in qwen_next} == {"LicenseRef-Qwen-Community-1.0"}
     assert {e["license"] for e in llama} == {"LicenseRef-Llama-4-Community"}
 
 
