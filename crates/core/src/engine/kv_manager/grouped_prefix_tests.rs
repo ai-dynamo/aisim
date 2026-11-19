@@ -421,6 +421,32 @@ fn rules_refuse_unsupported_checkpoint_fields() {
 }
 
 #[test]
+fn rules_refuse_a_checkpoint_block_on_a_ring() {
+    // The count is a field of `MambaSpec` alone (v0.31 iface:1049-1050,
+    // v0.32 iface:1042-1043). A ring that declares a block is refused on
+    // both rows. A ring with no count or a zero count stays a ring.
+    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        let mut groups = vec![attention("full", 16, None), state("ring", 4, false, false)];
+        for count in [None, Some(0)] {
+            groups[1].prefill_checkpoint_blocks = count;
+            let rules = GroupedPrefixRules::new(&groups, 16, version).unwrap();
+            assert_eq!(rules.groups[1].kind, GroupRuleKind::Ring, "{version:?}");
+        }
+        groups[1].prefill_checkpoint_blocks = Some(1);
+        groups[1].prefill_checkpoint_alignment = Some(16);
+        assert!(groups[1].validate().is_ok());
+        let err = GroupedPrefixRules::new(&groups, 16, version)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "kv_cache_groups with enable_prefix_caching=true do not model a prefill checkpoint block on a state group with prefix_cacheable=false; set prefix_cacheable: true on a Mamba state group, or remove prefill_checkpoint_blocks and prefill_checkpoint_alignment from a ring buffer",
+            "{version:?}"
+        );
+    }
+}
+
+#[test]
 fn rules_refuse_missing_prefix_cacheability() {
     for version in [
         VllmRuleVersion::V0_31_0,
