@@ -1206,6 +1206,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generation_attention_fpm_sol_qk_norm_uses_local_heads_under_dcp() {
+        let d = db();
+        let mut striped =
+            GenerationAttentionOp::new("generation_attention", 12, 1, 128, KvCacheQuantMode::Fp8);
+        striped.dcp_size = 4;
+        striped.use_qk_norm = true;
+        let gathered =
+            GenerationAttentionOp::new("generation_attention", 48, 1, 128, KvCacheQuantMode::Fp8);
+
+        for batch in [1.0, 256.0] {
+            // Attention sees 48 gathered Q heads and ceil(8192 / 4) = 2048
+            // KV positions. Norms run before gathering: 12 Q + 1 K local
+            // heads * 128 BF16 elements * four passes = 13,312 B/token,
+            // even though the KV cache itself uses FP8.
+            let attention = op_sol_latency_ms(
+                &Op::GenerationAttention(gathered.clone()),
+                &d,
+                batch,
+                batch,
+                2048.0,
+                0.0,
+            )
+            .unwrap();
+            let norm = 13_312.0 * batch * 1.1 / d.system_spec.gpu.mem_bw * 1000.0;
+            let normalized = op_sol_latency_ms(
+                &Op::GenerationAttention(striped.clone()),
+                &d,
+                batch,
+                batch,
+                8192.0,
+                0.0,
+            )
+            .unwrap();
+            approx(normalized, attention + norm);
+        }
+    }
+
     /// A sliding window of `w` occupies ~`w / dcp` positions of the stripe, so a
     /// striped windowed op prices like the gathered op over a `w / dcp` window.
     #[test]

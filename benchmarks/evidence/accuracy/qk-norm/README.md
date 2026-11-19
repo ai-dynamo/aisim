@@ -126,8 +126,14 @@ operations retain their 0.003 ms intercept at zero bytes.
 
 The Rust checks cover SILICON, HYBRID, EMPIRICAL, SOL and SOL_FULL; three batches
 and three KV lengths; layer/imbalance scaling; energy/provenance; SOL memory
-components; DCP local heads; FP8 KV with BF16 Q/K; speculative query widths;
-and fractional FPM inputs. Python checks exercise the real native bindings,
+components; DCP local heads in the op-level path; FP8 KV with BF16 Q/K;
+speculative query widths; and fractional FPM inputs. The FPM SOL leaf also
+checks DCP-local Q/K normalization with
+`generation_attention_fpm_sol_qk_norm_uses_local_heads_under_dcp`: at DCP 4,
+the attention term uses 48 gathered Q heads over 2,048 local KV positions,
+while norm traffic uses only 12 Q heads and one K head per rank. Batches 1
+and 256 check the independent 13,312-byte BF16 allowance per new token.
+Python checks exercise the real native bindings,
 canonical configuration round trips and speculative consumers.
 
 The golden refresh uses `pin_goldens.py --refresh`; record source commits are
