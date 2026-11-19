@@ -483,7 +483,7 @@ def test_readme_profiles_keep_storage_environment_and_secret_access_isolated(ref
         assert "secrets." not in json.dumps(commands)
     assert selected_environment(dynamo, ref=ref) == "pr-wheel-staging"
     assert dynamo["runs-on"] == "prod-aisim-default-amd64-v1"
-    assert dynamo["container"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
+    assert dynamo["container"]["image"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
     assert commands["permissions"] == {"contents": "read"}
     call = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["readme-commands"]
     assert call["secrets"] == {"ARTIFACTORY_TOKEN": "${{ secrets.ARTIFACTORY_TOKEN }}"}

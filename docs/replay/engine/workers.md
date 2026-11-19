@@ -275,7 +275,10 @@ The native Rust/JSON `engine.sglang` controls are:
 | `num_reserved_decode_tokens` | `512` | Decode headroom per preallocated request. A smaller value supports intentionally small synthetic KV pools; zero still retains the completion guard. |
 | `disaggregation_decode_extra_slots` | unset | Extra decode request rows for transfers. Unset uses twice the explicit per-rank sequence limit when it is at most 32, otherwise zero. |
 
-These controls apply to PD decode and are not YAML scheduler fields.
+These controls apply to PD decode. The YAML field
+[`workers.decode.scheduler.reserved_decode_tokens`](#sglang-pd-decode-reserve)
+maps to `num_reserved_decode_tokens`; `disaggregation_decode_extra_slots`
+remains native-only.
 The effective running-request limit is capped at half the KV token capacity.
 With native `max_num_seqs: null`, it is derived from KV capacity and context
 length, bounded to 2,048–4,096 before that cap. An omitted `max_num_seqs` keeps

@@ -80,7 +80,8 @@ jobs:
     environment: pr-wheel-staging
     # Artifactory DNS is available inside the existing NVIDIA runner network.
     runs-on: prod-aisim-default-amd64-v1
-    container: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
+    container:
+      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
     timeout-minutes: 330
     env:
       HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'

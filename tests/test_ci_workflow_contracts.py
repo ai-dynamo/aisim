@@ -1101,7 +1101,7 @@ def test_main_rc_producers_share_test_storage_with_pr_consumers():
     )
     assert upload["with"]["scope"] == "${{ inputs.pr_number != '' && 'pr' || 'preview' }}"
     assert job["runs-on"] == "prod-aisim-default-amd64-v1"
-    assert job["container"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
+    assert job["container"]["image"] == "${{ vars.CI_JOB_CONTAINER_IMAGE }}"
     commands = _run_commands(job)
     assert commands.index("socket.getaddrinfo") < commands.index("readme_rc_wheels.py prepare")
     assert commands.index("apt-get install") < commands.index("readme_rc_wheels.py prepare")
