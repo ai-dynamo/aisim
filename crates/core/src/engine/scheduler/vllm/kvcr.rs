@@ -54,9 +54,17 @@ struct Stage {
 /// The part of a promotion and pull staged together that ended first, which
 /// waits for the other part.
 enum Joined {
-    Promotion(TransferId, Option<Rerank>),
-    /// The owner, if still attached.
-    Pull(Option<Uuid>, TransferId),
+    Promotion {
+        reservation: TransferId,
+        rerank: Option<Rerank>,
+        ends: f64,
+    },
+    Pull {
+        /// The owner, if still attached.
+        owner: Option<Uuid>,
+        reservation: TransferId,
+        landed_ms: f64,
+    },
 }
 
 /// A copy into G2 in flight.
@@ -65,7 +73,8 @@ struct Promotion {
     reservation: TransferId,
     /// The copied blocks, pinned in KVCR-owned memory.
     keys: Vec<HostBlockKey>,
-    /// Under LRU: the request's blocks up to the last copied one.
+    /// Under LRU: the request's blocks through the job's last reservation,
+    /// including peer blocks when staged with a pull.
     rerank: Option<Rerank>,
     /// The pull staged with it.
     pull: Option<u64>,
@@ -334,6 +343,7 @@ impl VllmKvcrAdapter {
             let promotion = local.promotions.back_mut().expect("it was just staged");
             promotion.pull = Some(pull);
             self.stages.get_mut(&pull).expect("just staged").joined = true;
+            self.registry.lock().unwrap().join_delivery(pull);
         }
         if (promoted || pulled.is_some()) && restore.record_round(self.rank_progress) {
             self.registry.lock().unwrap().note_bypassed();
@@ -445,9 +455,9 @@ impl VllmKvcrAdapter {
                         (partial, no_room) = (true, Some(key));
                         break;
                     }
+                    end = g1_blocks + index + 1;
                     if in_own {
                         promoted.push(key);
-                        end = g1_blocks + index + 1;
                     } else if in_peer_local {
                         local_keys.push(key);
                     } else {
@@ -562,7 +572,7 @@ impl VllmKvcrAdapter {
         let mut registry = self.registry.lock().unwrap();
         let lru = self.local.as_ref().is_some_and(|local| local.lru);
         let mut taken = false;
-        for (id, _) in registry.take_landed(self.rank, now) {
+        for (id, landed_ms) in registry.take_landed(self.rank, now) {
             let stage = self
                 .stages
                 .remove(&id)
@@ -584,10 +594,22 @@ impl VllmKvcrAdapter {
                     source_local.touch_reversed(&stage.local_keys, &mut None);
                 }
             }
+            let mut delivered_ms = None;
             if stage.joined {
-                let Some(Joined::Promotion(promotion, rerank)) = self.joined.remove(&id) else {
-                    let pull = Joined::Pull(stage.owner, stage.reservation);
-                    self.joined.insert(id, pull);
+                let Some(Joined::Promotion {
+                    reservation,
+                    rerank,
+                    ends,
+                }) = self.joined.remove(&id)
+                else {
+                    self.joined.insert(
+                        id,
+                        Joined::Pull {
+                            owner: stage.owner,
+                            reservation: stage.reservation,
+                            landed_ms,
+                        },
+                    );
                     continue;
                 };
                 if let Some((prefix, len)) = rerank {
@@ -595,9 +617,13 @@ impl VllmKvcrAdapter {
                     let mut local = local.tier.lock();
                     prefix.lock().unwrap().rerank(&mut local, len);
                 }
-                tier.complete_external_from_kvcr(promotion, KvcrOrigin::LocalG2);
+                tier.complete_external_from_kvcr(reservation, KvcrOrigin::LocalG2);
+                delivered_ms = Some(ends.max(landed_ms));
             }
             Self::take_pull(&mut self.pulling, tier, stage.owner, stage.reservation);
+            if let Some(at_ms) = delivered_ms {
+                registry.complete_joined_delivery(id, at_ms);
+            }
             taken = true;
         }
         drop(registry);
@@ -651,6 +677,7 @@ impl VllmKvcrAdapter {
         }
         let mut source = local.tier.lock();
         let (mut blocks, mut stored, mut changed) = (0, 0, false);
+        let mut delivered = Vec::new();
         loop {
             match next(local) {
                 (Some(promotion), fill) if fill.is_none_or(|fill| promotion <= fill) => {
@@ -659,26 +686,41 @@ impl VllmKvcrAdapter {
                     // vLLM aligns the prefix only once the entire job ends.
                     source.unpin_external(&promotion.keys);
                     blocks += promotion.keys.len() as u64;
-                    match promotion.pull.map(|pull| (pull, joined.remove(&pull))) {
+                    let pull = match promotion.pull.map(|pull| (pull, joined.remove(&pull))) {
                         Some((pull, None)) => {
                             joined.insert(
                                 pull,
-                                Joined::Promotion(promotion.reservation, promotion.rerank),
+                                Joined::Promotion {
+                                    reservation: promotion.reservation,
+                                    rerank: promotion.rerank,
+                                    ends: promotion.ends,
+                                },
                             );
                             continue;
                         }
-                        Some((_, Some(Joined::Pull(owner, reservation)))) => {
-                            Self::take_pull(pulling, tier, owner, reservation);
-                        }
-                        Some((_, Some(Joined::Promotion(..)))) => {
+                        Some((
+                            id,
+                            Some(Joined::Pull {
+                                owner,
+                                reservation,
+                                landed_ms,
+                            }),
+                        )) => Some((id, owner, reservation, promotion.ends.max(landed_ms))),
+                        Some((_, Some(Joined::Promotion { .. }))) => {
                             unreachable!("a pull is staged with one promotion")
                         }
-                        None => {}
-                    }
+                        None => None,
+                    };
                     if let Some((prefix, len)) = promotion.rerank {
                         prefix.lock().unwrap().rerank(&mut source, len);
                     }
                     tier.complete_external_from_kvcr(promotion.reservation, KvcrOrigin::LocalG2);
+                    if let Some((id, owner, reservation, at_ms)) = pull {
+                        // Always insert the promotion before the peer blocks,
+                        // regardless of which leg was observed first.
+                        Self::take_pull(pulling, tier, owner, reservation);
+                        delivered.push((id, at_ms));
+                    }
                     changed = true;
                 }
                 (_, Some(_)) => {
@@ -696,6 +738,9 @@ impl VllmKvcrAdapter {
             let stats = registry.local_g2_stats();
             stats.promoted_blocks += blocks;
             stats.stored_blocks += stored;
+            for (id, at_ms) in delivered {
+                registry.complete_joined_delivery(id, at_ms);
+            }
         }
         self.epoch += u64::from(changed);
         changed
@@ -892,8 +937,8 @@ impl VllmKvcrAdapter {
         }
         let staged = self.stages.values_mut().map(|stage| &mut stage.owner);
         let landed = self.joined.values_mut().filter_map(|part| match part {
-            Joined::Pull(owner, _) => Some(owner),
-            Joined::Promotion(..) => None,
+            Joined::Pull { owner, .. } => Some(owner),
+            Joined::Promotion { .. } => None,
         });
         for attached in staged.chain(landed) {
             if *attached == Some(owner) {
@@ -1488,6 +1533,154 @@ mod tests {
         assert_eq!(local.lock().lru_order(), f.keys(&[1, 4, 2]));
         assert!(!adapter.has_work());
         assert!(adapter.joined.is_empty());
+    }
+
+    #[test]
+    fn kvcr_review_joined_alignment_reaches_the_last_reserved_block() {
+        for copy_gbps in [1.0, 0.25] {
+            // Local LRU is B, U, A. B hits G2, A needs a promotion and C
+            // needs a pull. Completing [A, B, C] must protect B as well as A.
+            let f = Fixture::with_local_g2(3, KvcrLocalG2Policy::Lru, copy_gbps, 4, &[3], &[1]);
+            let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+            let mut target = f.target.lock();
+            adapter.store_local(
+                &target,
+                f.owner,
+                TransferId::new(0),
+                &f.keys(&[1, 9, 0]),
+                0.0,
+            );
+            let start = 3.0 / copy_gbps;
+            adapter.advance(&mut target, start);
+            let keys = f.keys(&[0, 1, 3]);
+            assert!(adapter.stage_at(&mut target, f.owner, f.source, &mut restore, &keys, start));
+            let (copy_end, pull_end) = (start + 1.0 / copy_gbps, start + 2.0);
+            assert!(!adapter.advance(&mut target, copy_end.min(pull_end)));
+            let local = adapter.local.as_ref().unwrap().tier.clone();
+            assert_eq!(local.lock().lru_order()[0], keys[1]);
+            assert!(adapter.advance(&mut target, copy_end.max(pull_end)));
+            adapter.store_local(
+                &target,
+                f.owner,
+                TransferId::new(1),
+                &f.keys(&[4]),
+                copy_end.max(pull_end),
+            );
+            assert_eq!(local.lock().lookup(keys[1]), Lookup::Hit);
+            assert_eq!(local.lock().lookup(HostBlockKey::new(9)), Lookup::Miss);
+        }
+    }
+
+    #[test]
+    fn kvcr_review_joined_delivery_stats_wait_for_readable_g2() {
+        for (copy_gbps, source_end, source_wait) in [(0.25, 0.0, 0.0), (1.0, 6.0, 5.0)] {
+            for intermediate in [false, true] {
+                for detached in [false, true] {
+                    let f =
+                        Fixture::with_local_g2(2, KvcrLocalG2Policy::Lru, copy_gbps, 2, &[0], &[]);
+                    let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+                    let mut target = f.target.lock();
+                    adapter.store_local(&target, f.owner, TransferId::new(0), &f.keys(&[1]), 0.0);
+                    let start = 1.0 / copy_gbps;
+                    adapter.advance(&mut target, start);
+                    f.registry.lock().unwrap().note_pass(0, source_end);
+                    let keys = f.keys(&[0, 1]);
+                    assert!(adapter.stage_at(
+                        &mut target,
+                        f.owner,
+                        f.source,
+                        &mut restore,
+                        &keys,
+                        start
+                    ));
+                    if detached {
+                        assert!(adapter.release(f.owner));
+                    }
+                    let (copy_end, pull_end) = (start * 2.0, start + source_wait + 2.0);
+                    if intermediate {
+                        assert!(!adapter.advance(&mut target, copy_end.min(pull_end)));
+                        let stats = f.stats();
+                        assert_eq!(stats.pulls, KvcrPullCounts::default());
+                        assert_eq!((stats.blocks, stats.bytes), (0, 0));
+                        assert_eq!((stats.remote_deliver_ms, stats.source_wait_ms), (0.0, 0.0));
+                        assert!(
+                            keys.iter()
+                                .all(|key| matches!(target.lookup(*key), Lookup::Pending { .. }))
+                        );
+                        // Peer source protection ends with the peer leg, even
+                        // when its G2 delivery still waits for the local copy.
+                        assert_eq!(
+                            f.source_pins(&keys[..1]),
+                            vec![usize::from(pull_end > copy_end)]
+                        );
+                        if detached && pull_end < copy_end {
+                            // Draining the source must not wait for the
+                            // target's remaining local copy or its metrics.
+                            f.registry.lock().unwrap().unregister_worker(0).unwrap();
+                        }
+                    }
+                    // A late pass must use modeled completion times, not its
+                    // polling time, and repeated polling must not recount.
+                    let both = copy_end.max(pull_end);
+                    assert!(adapter.advance(&mut target, both + 3.0));
+                    assert!(!adapter.advance(&mut target, both + 4.0));
+                    let stats = f.stats();
+                    assert_eq!(
+                        stats.pulls,
+                        KvcrPullCounts {
+                            success: 1,
+                            partial: 0
+                        }
+                    );
+                    assert_eq!((stats.blocks, stats.bytes), (1, 1_000_000));
+                    assert_eq!(stats.remote_deliver_ms, both - start);
+                    assert_eq!(stats.source_wait_ms, source_wait);
+                    assert!(keys.iter().all(|key| target.lookup(*key) == Lookup::Hit));
+                    assert_eq!(f.source_pins(&keys[..1]), vec![0]);
+                    assert!(!adapter.has_work());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kvcr_review_joined_g2_eviction_is_independent_of_intermediate_advance() {
+        for copy_gbps in [1.0, 0.25] {
+            for intermediate in [false, true] {
+                let f = Fixture::with_local_g2(2, KvcrLocalG2Policy::Lru, copy_gbps, 2, &[0], &[]);
+                let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+                let mut target = f.target.lock();
+                adapter.store_local(&target, f.owner, TransferId::new(0), &f.keys(&[1]), 0.0);
+                let start = 1.0 / copy_gbps;
+                adapter.advance(&mut target, start);
+                let keys = f.keys(&[0, 1]);
+                assert!(adapter.stage_at(
+                    &mut target,
+                    f.owner,
+                    f.source,
+                    &mut restore,
+                    &keys,
+                    start
+                ));
+                assert!(adapter.release(f.owner));
+                let (copy_end, pull_end) = (start * 2.0, start + 2.0);
+                if intermediate {
+                    assert!(!adapter.advance(&mut target, copy_end.min(pull_end)));
+                }
+                let both = copy_end.max(pull_end);
+                assert!(adapter.advance(&mut target, both));
+                assert_eq!(target.lru_order(), f.keys(&[1, 0]));
+                let StoreOutcome::Prepared { transfer_id, .. } =
+                    target.reserve_external(C, Uuid::nil(), &f.keys(&[2]), None, both)
+                else {
+                    panic!("a detached joined restore leaves evictable blocks")
+                };
+                target.complete_external(transfer_id);
+                assert_eq!(target.lookup(keys[1]), Lookup::Miss);
+                assert_eq!(target.lookup(keys[0]), Lookup::Hit);
+                assert!(!adapter.has_work());
+            }
+        }
     }
 
     #[test]

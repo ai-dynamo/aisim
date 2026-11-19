@@ -700,6 +700,10 @@ With `local_g2` the `kvcr` summary gains a `local_g2` section of block counts:
 `evicted_blocks`, `promoted_blocks` and `loaded_blocks` (promoted blocks,
 counted when their first load into G1 starts).
 
+A joined promotion and peer pull become readable in G2 together. The pull's
+delivery counters update only then, and `remote_deliver_ms` includes any wait
+for the local copy. Its source blocks are released when the peer transfer ends.
+
 KVCR's G3 spill, Guard ownership and custom policies are not modeled.
 
 ### Supported
