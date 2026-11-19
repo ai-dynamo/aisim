@@ -545,16 +545,14 @@ def _check_capacity(case: ModuleCase, phase: str, cuda, first_gpu: int) -> None:
     scale) are replicated across TP. KimiK3MLAAttention also consumes a
     BF16 hidden-state tensor. These unavoidable buffers form a lower bound;
     weights/workspaces add memory and may still cause an observed OOM.
-    Decode history uses bounded native continuations, not a monolithic
+    Context prefixes and decode history use bounded native continuations, not a monolithic
     full-history activation (see _prepare_forward/_extend_history).
     """
     history = case.seq_len + case.prefix_len
     cache_bytes = case.batch_size * (history + 64) * (656 + 128 + 4)
-    forward_tokens = (
-        case.batch_size * max(case.seq_len, case.prefix_len)
-        if phase == "context"
-        else min(case.batch_size * max(case.seq_len - 1, 1), max(HISTORY_CHUNK_TOKENS, case.batch_size))
-    )
+    history_tokens = case.batch_size * (case.prefix_len if phase == "context" else case.seq_len - 1)
+    history_forward_tokens = min(history_tokens, max(HISTORY_CHUNK_TOKENS, case.batch_size))
+    forward_tokens = max(case.batch_size * (case.seq_len if phase == "context" else 1), history_forward_tokens)
     required = cache_bytes + forward_tokens * 7168 * 2
     for gpu in range(first_gpu, first_gpu + validate_case(case)):
         free, _total = cuda.mem_get_info(gpu)

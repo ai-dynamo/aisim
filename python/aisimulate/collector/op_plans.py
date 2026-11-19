@@ -1591,7 +1591,7 @@ def _kimi_k31_dsa_expand(phase: str) -> Callable[[], list[ModuleCase]]:
                                 prefix,
                             )
                         )
-        return list(dict.fromkeys(cases))
+        return cases
 
     return expand
 

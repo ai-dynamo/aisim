@@ -89,14 +89,23 @@ def test_changed_upstream_indexer_contract_fails_closed(config, field, wrong):
         single_layer_config(config)
 
 
-def test_case_plan_uses_native_tp_shards_and_supported_cache_precision(monkeypatch):
-    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
+@pytest.mark.parametrize("model_path", [None, MODEL])
+def test_case_plan_uses_native_tp_shards_and_supported_cache_precision(monkeypatch, model_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    if model_path is None:
+        monkeypatch.delenv("COLLECTOR_MODEL_PATH", raising=False)
+    else:
+        monkeypatch.setenv("COLLECTOR_MODEL_PATH", model_path)
+    monkeypatch.setattr(module, "get_sm_version", lambda: 103)
     for phase in ("context", "generation"):
         op = f"kimi_k31_dsa_{phase}_module"
         structural = OP_PLANS[op].expand()
+        assert len(set(structural)) == len(structural)
         assert {case.num_heads for case in structural} == {96, 48, 24, 12}
         planned = plan(op, "sglang", 103)
         cases = planned.cases
+        assert cases == getattr(module, f"get_kimi_k31_dsa_{phase}_test_cases")() == structural
         assert not planned.removed
         assert cases
         assert {case.num_heads for case in cases} == {96, 48, 24, 12}
@@ -105,22 +114,6 @@ def test_case_plan_uses_native_tp_shards_and_supported_cache_precision(monkeypat
         assert {validate_case(case, phase) for case in cases} == {1, 2, 4, 8}
         assert all(case.seq_len + case.prefix_len <= 1048576 for case in cases)
         assert not plan(op, "vllm", 103).cases
-
-
-@pytest.mark.parametrize("phase", ["context", "generation"])
-def test_native_plan_deduplicates_persisted_keys_in_first_seen_order(monkeypatch, phase):
-    import collector.op_plans as module
-
-    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
-    rows = [dict(row) for row in module._model_case_values("kimi_k31_dsa_module")]
-    rows[0]["tensor_parallel_sizes"] = [1, 2]
-    monkeypatch.setattr(module, "_model_case_values", lambda _op: rows)
-    expected = OP_PLANS[f"kimi_k31_dsa_{phase}_module"].expand()
-    rows[0]["tensor_parallel_sizes"] = [1, 1, 2]
-    actual = OP_PLANS[f"kimi_k31_dsa_{phase}_module"].expand()
-    assert actual == expected
-    assert len(set(actual)) == len(actual)
-    assert {case.num_heads for case in actual} == {96, 48}
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
@@ -753,6 +746,36 @@ def test_native_history_continuation_fails_closed(failure):
     with pytest.raises(RuntimeError, match="native"):
         _extend_history(SimpleNamespace(extend=extend), [req], 7, chunk_tokens=3)
     assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "batch_size", "prefix_len", "peak_hidden_tokens"),
+    [
+        (1, 1, 1048575, 8192),
+        (1, 2, 262144, 8192),
+        (1, 1, 512, 512),
+        (16384, 1, 16384, 16384),
+        (16384, 1, 0, 16384),
+        (8192, 2, 512, 16384),
+    ],
+)
+def test_context_capacity_accounts_for_history_chunks_and_final_forward(
+    monkeypatch, seq_len, batch_size, prefix_len, peak_hidden_tokens
+):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import _check_capacity
+
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
+    case = ModuleCase(seq_len, batch_size, 96, "fp8", "bfloat16", "bfloat16", MODEL, prefix_len)
+    assert case in OP_PLANS["kimi_k31_dsa_context_module"].expand()
+    cache_bytes = batch_size * (seq_len + prefix_len + 64) * (656 + 128 + 4)
+    required = cache_bytes + peak_hidden_tokens * 7168 * 2
+    # All these declared cases fit the accounted buffers within 8 GiB, even
+    # when their complete cached prefixes cannot be prepared in one forward.
+    assert required < 8 * 2**30
+    _check_capacity(case, "context", SimpleNamespace(mem_get_info=lambda _gpu: (8 * 2**30, 8 * 2**30)), 0)
+    _check_capacity(case, "context", SimpleNamespace(mem_get_info=lambda _gpu: (required, 8 * 2**30)), 0)
+    with pytest.raises(RuntimeError, match=r"^FIXME\(kernel-limit\): does not fit"):
+        _check_capacity(case, "context", SimpleNamespace(mem_get_info=lambda _gpu: (required - 1, 8 * 2**30)), 0)
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
