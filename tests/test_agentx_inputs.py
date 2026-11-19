@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from test_agentx_accuracy import result, silicon_inputs
 
+from scripts.e2e_accuracy import run_agentx_accuracy as agentx_run
 from scripts.e2e_accuracy.agentx_contract import canonical, validate_catalog
 from scripts.e2e_accuracy.agentx_inputs import (
     checked,
@@ -295,6 +296,111 @@ def test_non_speculative_replay_validates_without_acceptance(tmp_path):
         env={**os.environ, "PYTHONPATH": str(source)},
         check=True,
     )
+
+
+def hub_replay_inputs(tmp_path, monkeypatch, acceptance):
+    hub = tmp_path / "hub"
+    catalog = silicon_inputs(hub, result())
+    manifest_path = hub / catalog["runs"][0]["manifest"]["path"]
+    manifest = json.loads(manifest_path.read_bytes())
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    extra = sglang_replay_inputs(replay, acceptance=acceptance)
+
+    def put(role, value):
+        content = canonical(value)
+        path = manifest_path.parent / f"{role}.json"
+        path.write_bytes(content)
+        manifest["artifacts"][role] = {
+            "path": path.name,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
+
+    for role, entry in extra["artifacts"].items():
+        if role != "workload":
+            put(role, json.loads((replay / entry["path"]).read_bytes()))
+    workload = json.loads((manifest_path.parent / manifest["artifacts"]["workload"]["path"]).read_bytes())
+    workload.update(
+        corpus_id="test-corpus",
+        silicon_reference={"namespace_map": {"trace": "weka:1111111111111111"}},
+    )
+    put("workload", workload)
+    manifest["corpus_id"] = "test-corpus"
+    content = canonical(manifest)
+    manifest_path.write_bytes(content)
+    catalog["runs"][0]["manifest"].update(sha256=hashlib.sha256(content).hexdigest(), bytes=len(content))
+    del catalog["snapshot_id"]
+    catalog["snapshot_id"] = hashlib.sha256(canonical(catalog)).hexdigest()
+    (hub / agentx_run.INDEX).write_bytes(canonical(catalog))
+
+    corpus = tmp_path / "upstream.jsonl"
+    corpus.write_bytes(b'{"id":"trace","requests":[{"in":4,"out":2}]}\n')
+    checksum = hashlib.sha256(corpus.read_bytes()).hexdigest()
+    registry = {
+        "schema": "aisimulate.agentx.corpora.v1",
+        "sources": {
+            "test-corpus": {
+                "repository": "org/corpus",
+                "revision": "b" * 40,
+                "filename": "traces.jsonl",
+                "sha256": checksum,
+                "derived_sha256": checksum,
+                "transformations": [],
+            }
+        },
+    }
+    (hub / agentx_run.CORPORA).write_bytes(canonical(registry))
+    downloads = []
+
+    def download(repo, name, **kwargs):
+        downloads.append((repo, name))
+        return str(hub / name) if repo == agentx_run.REPO else str(corpus)
+
+    monkeypatch.setattr(agentx_run, "hf_hub_download", download)
+    return downloads, corpus
+
+
+@pytest.mark.parametrize("acceptance", [None, {"verification_depth": 2, "accepted_draft_tokens": 1.25}])
+def test_fetch_preflights_acceptance_before_downloading_corpus(tmp_path, monkeypatch, acceptance):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, acceptance)
+    output = tmp_path / "inputs"
+    with pytest.raises(ValueError, match="agentx-446063.*acceptance"):
+        agentx_run.fetch("a" * 40, output)
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+    assert not (output / "corpora").exists()
+
+
+def test_fetch_preflights_valid_inputs_and_preserves_corpus(tmp_path, monkeypatch):
+    downloads, corpus = hub_replay_inputs(
+        tmp_path, monkeypatch, {"verification_depth": 3, "accepted_draft_tokens": 1.25}
+    )
+    output = tmp_path / "inputs"
+    agentx_run.fetch("a" * 40, output)
+    assert ("org/corpus", "traces.jsonl") in downloads
+    assert (output / "corpora/test-corpus.jsonl").read_bytes() == corpus.read_bytes()
+
+
+def test_metadata_fetch_retains_invalid_inputs_for_diagnosis(tmp_path, monkeypatch):
+    downloads, _ = hub_replay_inputs(tmp_path, monkeypatch, None)
+    output = tmp_path / "inputs"
+    agentx_run.fetch("a" * 40, output, metadata_only=True)
+    assert len(load_runs(output, json.loads((output / agentx_run.INDEX).read_bytes()))) == 1
+    assert all(repo == agentx_run.REPO for repo, _ in downloads)
+
+
+def test_rejected_replay_does_not_reconstruct_trace(tmp_path, monkeypatch):
+    hub_replay_inputs(tmp_path, monkeypatch, None)
+    root = tmp_path / "inputs"
+    agentx_run.fetch("a" * 40, root, metadata_only=True)
+    run = load_runs(root, json.loads((root / agentx_run.INDEX).read_bytes()))[0]
+    monkeypatch.setattr(
+        agentx_run,
+        "prepare_trace",
+        lambda *args: pytest.fail("Reconstructed a rejected trace"),
+    )
+    with pytest.raises(ValueError, match="acceptance"):
+        agentx_run.run_one(root, run, tmp_path / "output", 1, {})
 
 
 @pytest.fixture
