@@ -5755,18 +5755,14 @@ mod forward_pass_metrics {
             assert!(pass.fpm.is_some(), "FPM should always be present");
         }
     }
-    /// Regression test for dynamo#13188: chunked-prefill continuations must
-    /// re-match the radix cache instead of recomputing every token past the
-    /// first chunk. Two identical 40-token prompts with chunked_prefill_size
-    /// 16: the second request must compute at most one block, not 24 tokens.
+    const BLOCK_SIZE: usize = 4;
+
     #[test]
     fn second_identical_multichunk_prompt_reuses_cache_beyond_first_chunk() {
         let mut core = SglangCore::new(fpm_args_with_chunked_prefill(16, 32));
         let prompt: Vec<u32> = (0..40).collect();
 
-        // Returns the prefill tokens of each pass up to and including the
-        // first pass that emits output for `uuid`.
-        let run_until_complete =
+        let prefill_per_pass_until_output =
             |core: &mut SglangCore, uuid: Uuid, start_ms: f64| -> (Vec<u64>, f64) {
                 let mut collector = crate::engine::trace::TraceCollector::default();
                 let mut prefill_per_pass = Vec::new();
@@ -5780,7 +5776,7 @@ mod forward_pass_metrics {
                         return (prefill_per_pass, now_ms);
                     }
                 }
-                panic!("request {uuid} never completed within 64 passes");
+                panic!("request {uuid} emitted no output within 64 passes");
             };
 
         let first = Uuid::from_u128(1);
@@ -5788,7 +5784,7 @@ mod forward_pass_metrics {
             uuid: Some(first),
             ..direct_request(prompt.clone(), 1)
         });
-        let (cold_passes, end_ms) = run_until_complete(&mut core, first, 0.0);
+        let (cold_passes, end_ms) = prefill_per_pass_until_output(&mut core, first, 0.0);
         assert_eq!(
             cold_passes,
             [16, 16, 8],
@@ -5800,15 +5796,12 @@ mod forward_pass_metrics {
             uuid: Some(second),
             ..direct_request(prompt.clone(), 1)
         });
-        let (warm_passes, _) = run_until_complete(&mut core, second, end_ms);
+        let (warm_passes, _) = prefill_per_pass_until_output(&mut core, second, end_ms);
         let warm_prefill: u64 = warm_passes.iter().sum();
 
-        // SGLang matches at most input_len - 1 tokens, so at most one block of
-        // the warm prompt is recomputed. The bug recomputes everything past
-        // chunk one: 40 - 16 = 24 tokens.
         assert!(
-            (1..=4).contains(&warm_prefill),
-            "warm identical prompt must compute 1 through 4 tokens using the cache across chunks: computed {warm_prefill} tokens"
+            (1..=BLOCK_SIZE as u64).contains(&warm_prefill),
+            "warm identical prompt must compute 1 through {BLOCK_SIZE} tokens using the cache across chunks: computed {warm_prefill} tokens"
         );
     }
 
@@ -5818,12 +5811,12 @@ mod forward_pass_metrics {
     ) -> MockEngineArgs {
         MockEngineArgs::builder()
             .engine_type(EngineType::Sglang)
-            .block_size(4)
+            .block_size(BLOCK_SIZE)
             .num_gpu_blocks(num_gpu_blocks)
             .max_num_seqs(Some(4))
             .speedup_ratio(0.0)
             .sglang(Some(SglangArgs {
-                page_size: Some(4),
+                page_size: Some(BLOCK_SIZE),
                 chunked_prefill_size: Some(chunked_prefill_size),
                 ..Default::default()
             }))
