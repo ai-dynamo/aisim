@@ -27,7 +27,7 @@ class _ProfileModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-def _state_group_schema(schema: dict[str, Any]) -> None:
+def _cache_group_schema(schema: dict[str, Any]) -> None:
     # _window checks this for the Rust text; the exported schema must reject the same sidecar.
     schema.setdefault("allOf", []).append(
         {
@@ -36,6 +36,13 @@ def _state_group_schema(schema: dict[str, Any]) -> None:
                 "required": ["blocks_per_request"],
                 "properties": {"blocks_per_request": {"type": "integer", "exclusiveMinimum": 0}},
             },
+            "else": {"properties": {"blocks_per_request": {"type": "null"}}},
+        }
+    )
+    schema["allOf"].append(
+        {
+            "if": {"properties": {"kind": {"const": "convolution"}}, "required": ["kind"]},
+            "then": {"required": ["sliding_window"], "properties": {"sliding_window": {"type": "integer"}}},
         }
     )
 
@@ -98,7 +105,7 @@ class FpmCacheGroup(_ProfileModel):
     the prefill checkpoint settings of a Mamba spec.
     """
 
-    model_config = ConfigDict(extra="forbid", strict=True, json_schema_extra=_state_group_schema)
+    model_config = ConfigDict(extra="forbid", strict=True, json_schema_extra=_cache_group_schema)
 
     name: _Nonempty
     kind: Literal["attention", "convolution", "state"]
@@ -290,8 +297,8 @@ class FpmResourceProfile(_ProfileModel):
     cache_layout: Literal["linear", "grouped", "unmodeled", "mamba_align"]
     cache_groups: list[FpmCacheGroup] = Field(default_factory=list)
     mamba_cache: FpmMambaCache | None = None
-    max_num_tokens: _PositiveInt
-    max_batch_size: _PositiveInt
+    max_num_tokens: Annotated[int, Field(gt=0, le=2**32 - 1)]
+    max_batch_size: Annotated[int, Field(gt=0, le=2**32 - 1)]
     provenance: _Nonempty
 
     @model_validator(mode="after")

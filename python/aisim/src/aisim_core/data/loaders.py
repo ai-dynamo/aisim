@@ -213,6 +213,10 @@ class FpmData:
     ``systems_paths`` and interpolation library path, and ``fpm_profile`` completed with resolved resources when
     the user supplied one. ``kind`` is ``"library"`` for the published library plus sidecar and
     ``"execution-profile"`` for the older profile bundles (``config`` from :func:`prepare_execution_profile`).
+
+    ``resources`` and ``memory_pending`` describe deployment zero, not the deployment selected by a worker's
+    configuration. Use ``resources_by_deployment`` and ``memory_pending_by_deployment`` in profile order to
+    inspect other deployments; this loader does not select a worker or role.
     """
 
     manifest: Manifest
@@ -223,6 +227,7 @@ class FpmData:
     resources: ResolvedResources | None = None  # first deployment, library kind
     resource_sources: tuple[str, ...] = ()  # per deployment of ``fpm_profile``
     diagnostics: Mapping[str, Any] | None = None
+    resources_by_deployment: tuple[ResolvedResources, ...] = ()
     # Owner of the staged root (a temporary directory when no ``output_dir`` was given); keep this object alive
     # while ``config`` is in use and call :meth:`close` to remove a temporary root.
     _staged: Any = field(default=None, repr=False, compare=False)
@@ -233,12 +238,21 @@ class FpmData:
 
     @property
     def memory_pending(self) -> tuple[str, ...]:
-        """Fields still missing before cache sizing or replay (timing queries do not need them)."""
+        """Missing cache sizing or replay fields for deployment zero; plain AR timing can omit them."""
         if self.resources is None:
             return ()
         if self.resources.resources is None:
             return tuple(missing_resource_fields(None))
         return tuple(missing_memory_fields(self.resources.resources))
+
+    @property
+    def memory_pending_by_deployment(self) -> tuple[tuple[str, ...], ...]:
+        """Missing fields in profile order (one entry for the requested configuration without a profile)."""
+        resolved = self.resources_by_deployment or ((self.resources,) if self.resources is not None else ())
+        return tuple(
+            tuple(missing_resource_fields(None) if r.resources is None else missing_memory_fields(r.resources))
+            for r in resolved
+        )
 
 
 class FpmLoader(Loader):
@@ -305,6 +319,9 @@ class FpmLoader(Loader):
         require_resources: bool,
         systems_paths: tuple[str, ...] | None,
     ) -> FpmData:
+        user_profile = (config or {}).get("fpm_profile")
+        if user_profile is not None and not isinstance(user_profile, Mapping):
+            raise LoaderError("fpm_profile must be a mapping for an FPM library load")
         manifest = self.read_manifest(root, manifest_path, config, roles=PREDICTION_ROLES)
         if config is not None:
             _check_parallelism(manifest.identity, config)
@@ -336,11 +353,11 @@ class FpmLoader(Loader):
         )
         with_estimator_path(out, staged.parquet_path)
         resources, sources, profile = None, (), None
+        resources_by_deployment = ()
         try:
-            user_profile = out.get("fpm_profile")
             if user_profile is not None:
                 completed, sources = complete_fpm_profile(
-                    user_profile,
+                    dict(user_profile),
                     staged.metadata,
                     identity={
                         "system": identity.hardware,
@@ -356,10 +373,13 @@ class FpmLoader(Loader):
                 # resource block merely to validate a timing-only load.
                 if "pending" not in sources:
                     profile = load_fpm_profile(completed)
-                    first_resources = profile.deployments[0].resources
+                    blocks = [deployment.resources for deployment in profile.deployments]
                 else:
-                    first_resources = resolve_resources(completed["deployments"][0].get("resources"), None).resources
-                resources = ResolvedResources(first_resources, sources[0])  # type: ignore[arg-type]
+                    blocks = [resolve_resources(d.get("resources"), None).resources for d in completed["deployments"]]
+                resources_by_deployment = tuple(
+                    ResolvedResources(block, source) for block, source in zip(blocks, sources, strict=True)
+                )
+                resources = resources_by_deployment[0]
             else:
                 metadata = staged.metadata
                 if metadata.get("resources") is not None and metadata.get("configuration_selector"):
@@ -381,6 +401,7 @@ class FpmLoader(Loader):
                         deployment = {name: value for name, value in deployment.items() if value is not None}
                         metadata = resource_metadata_for_deployment(normalized, deployment, metadata)
                 resources = resolve_resources(None, metadata, required=require_resources)
+                resources_by_deployment = (resources,)
         except FpmContractError:
             staged.close()
             raise
@@ -393,13 +414,21 @@ class FpmLoader(Loader):
             resources=resources,
             resource_sources=tuple(sources),
             diagnostics=staged.diagnostics,
+            resources_by_deployment=resources_by_deployment,
             _staged=staged,
         )
 
 
 def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | None:
     """Catalog parallelism dimensions of a configuration (degree 1 dropped), or None when it names none."""
-    keys = {"tp": "tp", "attention_dp": "dp", "moe_tp_size": "moe_tp", "moe_ep_size": "ep", "dcp": "dcp"}
+    keys = {
+        "tp": "tp",
+        "attention_dp": "dp",
+        "moe_tp_size": "moe_tp",
+        "moe_ep_size": "ep",
+        "cp_size": "cp",
+        "dcp": "dcp",
+    }
     aliases = {"tp": "tp_size", "attention_dp": "attention_dp_size"}  # the same aliases the Rust configuration accepts
 
     def value(key: str) -> Any:

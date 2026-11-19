@@ -48,6 +48,7 @@ PREDICTION_ROLES = (ROLE_LIBRARY, ROLE_METADATA)
 EVALUATION_ROLES = ("measurement-data", "measurement-manifest", "measurement-provenance")
 
 MEASUREMENT_MANIFEST_VERSION = 5
+_TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 
 
 class FpmContractError(ValueError):
@@ -77,7 +78,7 @@ class FpmLibraryMetadata(BaseModel):
 
     schema_name: Literal["aic_fpm_forward_perf"]
     schema_version: Literal[6] = Field(description="Library schema version; only 6 is supported.")
-    row_count: int = Field(gt=0)
+    row_count: int = Field(gt=0, strict=True)
     parquet_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     system: str | None = None
     backend: str | None = None
@@ -87,7 +88,10 @@ class FpmLibraryMetadata(BaseModel):
     measurement_repeats: int | None = None
     warmup_repeats: int | None = None
     metadata_provenance: str | None = None
-    configuration_selector: dict[str, JsonValue] | None = None
+    configuration_selector: dict[str, JsonValue] | None = Field(
+        default=None,
+        json_schema_extra={"properties": {name: {"type": "integer", "minimum": 1} for name in _TOPOLOGY}},
+    )
     resources: FpmResourceProfile | None = None
 
     @model_validator(mode="after")
@@ -365,13 +369,18 @@ def stage_fpm_library(
     The system definition and the other data of the selected backend version are linked from ``systems_paths``
     (the active systems roots follow as a fallback), so operation data stays reachable while the FPM
     directory is isolated.
-    Original files are linked, never modified; only a schema-6 sidecar that needs recovery is rewritten, in the
-    staged copy. ``output_dir`` is created (a previous staging there is replaced); without it a temporary root
+    Sources outside the destination are linked, never modified; a schema-6 sidecar that needs recovery is
+    rewritten in the staged copy. A recovered sidecar inside the destination is copied before replacement;
+    the Parquet input must resolve outside the destination. ``output_dir`` is created (a previous staging there
+    is replaced); without it a temporary root
     is used and removed by :meth:`StagedFpmLibrary.close`. Native validation still decides whether the staged
     table supports the requested estimator and workload.
     """
     system = _safe_component(system, "system")
     parquet, sidecar = Path(parquet_path).resolve(), Path(metadata_path).resolve()
+    destination = Path(output_dir).expanduser().resolve() if output_dir is not None else None
+    if destination is not None and parquet.is_relative_to(destination):
+        raise FpmContractError("FPM parquet input must resolve outside output_dir")
     systems_paths = _stageable_roots(systems_paths, output_dir)
     if not parquet.is_file() or not sidecar.is_file():
         raise FpmContractError(f"FPM library {artifact_id or parquet} is not materialized locally")
@@ -422,6 +431,9 @@ def stage_fpm_library(
         (target / LIBRARY_FILE).symlink_to(parquet)
         if text is not None:
             (target / METADATA_FILE).write_text(text, encoding="utf-8")
+        elif destination is not None and sidecar.is_relative_to(destination):
+            # A recovered sidecar is a regular file in the old staging, which replacement removes.
+            shutil.copyfile(sidecar, target / METADATA_FILE)
         else:
             (target / METADATA_FILE).symlink_to(sidecar)
         if output_dir is not None:
@@ -716,9 +728,6 @@ def _validated(value: Mapping[str, Any] | FpmResourceProfile, where: str, source
         missing = missing_resource_fields(value) if isinstance(value, Mapping) else []
         hint = f"; missing: {', '.join(missing)}" if missing else ""
         raise FpmContractError(f"invalid resources from {source} for {where}: {_first_error(exc)}{hint}") from exc
-
-
-_TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 
 
 _IDENTITY_KEYS = ("system", "backend", "backend_version", "worker_type")

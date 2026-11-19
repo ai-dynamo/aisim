@@ -437,11 +437,18 @@ the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, th
 is used whole, never merged field by field. Sidecar resources apply only when the selector matches the profile's
 model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
 requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
-Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. The draft
-constructs through `best_available` and answers timing queries; cache sizing, replay, and a load that requires
-resources fail with the fields to supply. A block with valid geometry but no `runtime_memory` or declared bytes still serves timing
-queries; cache sizing and replay need the memory. Entries published without `resources` stay valid. Loading uses
-only the library and its sidecar and never reads `measurements/`.
+Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. For plain
+autoregressive profiles, the draft constructs through `best_available` and answers timing queries; cache sizing,
+replay, and a load that requires resources fail with the fields to supply. A block with valid geometry but no
+`runtime_memory` or declared bytes still serves plain autoregressive timing queries; cache sizing and replay
+need the memory. Speculative-round profiles require resources with observed `runtime_memory` at
+`best_available` construction, even for timing queries; geometry alone or declared non-KV bytes do not suffice.
+Entries published without `resources` stay valid. Loading uses only the library and its sidecar and never reads
+`measurements/`.
+
+For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
+a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`
+order for other deployments. Without a profile, readiness describes the requested configuration.
 
 Each deployment may declare `worker_type: prefill`, `decode`, or `aggregated`.
 The canonical construction request selects only the matching role's precision,

@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
-from aisim_core.data import Identity, Manifest, configuration_id
+from aisim_core.data import Entry, Identity, Manifest, configuration_id
 from aisim_core.data.fetch import Cache, plan
 from aisim_core.data.fpm_checks import check_fpm_dataset, check_fpm_entry, check_fpm_identities
 from aisim_core.data.fpm_library import (
@@ -307,6 +307,72 @@ def test_parallelism_is_part_of_selection(root, profile):
     assert not Selection(**base, parallelism=(("dp", 4), ("ep", 4))).matches(entry)  # dep4 is another entry
     assert FpmLoader().select({**CONFIG, "tp": 1, "moe_tp_size": 1}).parallelism == ()  # explicit all-ones
     assert FpmLoader().select({"model": "m", "system": "h200_sxm"}).parallelism is None
+
+
+@pytest.mark.parametrize("cp", [1, 2])
+def test_context_parallelism_selects_and_loads_the_matching_entry(root, profile, tmp_path, cp):
+    make_entry(root, profile)
+    document = json.loads((root / MANIFEST).read_text())
+    dims = {"tp": 4, "moe_tp": 4, **({"cp": cp} if cp != 1 else {})}
+    document["identity"]["parallelism"] = {"aggregated": dims}
+    document["configuration_id"] = configuration_id("fpm", "execution-profile", Identity(**document["identity"]))
+    (root / MANIFEST).write_text(json.dumps(document))
+    entry = Entry(
+        configuration_id=document["configuration_id"],
+        purpose=document["purpose"],
+        identity=document["identity"],
+        manifest=_artifact(root, MANIFEST, "manifest", "json", "aisim-artifact-manifest/v1"),
+    )
+    config = {**CONFIG, "cp_size": cp}
+    loader = FpmLoader()
+    assert loader.select(config).parallelism == tuple(sorted(dims.items()))
+    assert loader.select(config).matches(entry)
+    different = {**config, "cp_size": 3}
+    assert not loader.select(different).matches(entry)
+    data = load(root, config, tmp_path)
+    assert data.config["cp_size"] == cp
+    with pytest.raises(LoaderError, match="parallelism"):
+        load(root, different, tmp_path)
+
+
+@pytest.mark.parametrize("as_model", [False, True])
+def test_library_loader_names_a_non_mapping_profile(root, profile, tmp_path, as_model):
+    make_entry(root, profile)
+    invalid = load_fpm_profile(profile) if as_model else json.dumps(profile)
+    config = {**CONFIG, "fpm_profile": invalid}
+    with pytest.raises(LoaderError, match="fpm_profile must be a mapping"):
+        load(root, config, tmp_path)
+    assert not (tmp_path / "staged").exists()
+
+
+@pytest.mark.parametrize("selected_ready", [False, True])
+def test_readiness_is_available_for_each_role_deployment(root, profile, tmp_path, selected_ready):
+    make_entry(root, profile)  # no metadata resources to fill the pending deployment
+    config = user_config(profile)
+    first = config["fpm_profile"]["deployments"][0]
+    first["worker_type"] = "prefill"
+    second = copy.deepcopy(first)
+    second["worker_type"] = "decode"
+    config["fpm_profile"]["deployments"].append(second)
+    for index, deployment in enumerate((first, second)):
+        deployment.pop("resources", None)
+        if (index == 1) == selected_ready:
+            deployment["resources"] = {**RESOURCES, "runtime_memory": RUNTIME_MEMORY}
+    config["worker_type"] = "decode"  # the consumer selects deployment one, not zero
+    data = load(root, config, tmp_path)
+    pending = tuple(missing_resource_fields(None))
+    assert data.memory_pending_by_deployment == ((pending, ()) if selected_ready else ((), pending))
+    assert data.memory_pending == data.memory_pending_by_deployment[0]
+    assert data.resources == data.resources_by_deployment[0]
+    assert data.resource_sources == (("pending", "user") if selected_ready else ("user", "pending"))
+    selected = data.resources_by_deployment[1]
+    assert (selected.resources is not None) == selected_ready
+    normalized = RustForwardPassPerfModel.normalize_config(data.config)
+    if selected_ready:
+        _require_forward_pass_profile_memory(normalized)
+    else:
+        with pytest.raises(ValueError, match="resources are pending"):
+            _require_forward_pass_profile_memory(normalized)
 
 
 # ------------------------------------------------------------------ resources: precedence and pending
@@ -998,6 +1064,52 @@ def test_staging_writes_recovered_sidecar_copy_and_leaves_the_original(tmp_path)
     assert recovery["policy"] == "schema6_reconstructed_row_contract_v1"
 
 
+def test_restaging_recovered_sidecar_keeps_it_readable(tmp_path):
+    metadata, parquet, _ = reconstructed(tmp_path)
+    sidecar = tmp_path / "lib.metadata.json"
+    sidecar.write_text(json.dumps(metadata))
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    staged = stage_fpm_library(parquet, sidecar, **kwargs)
+    expected = staged.metadata_path.read_bytes()
+    restaged = stage_fpm_library(staged.parquet_path, staged.metadata_path, **kwargs)
+    assert not restaged.metadata_path.is_symlink()
+    assert restaged.metadata_path.read_bytes() == expected
+    assert restaged.parquet_path.resolve() == parquet.resolve()
+    assert read_library_metadata(restaged.metadata_path) == staged.metadata
+    assert json.loads(sidecar.read_text()) == metadata
+
+
+def test_restaging_rejects_an_owned_parquet_before_replacement(tmp_path):
+    metadata, parquet, _ = reconstructed(tmp_path)
+    sidecar = tmp_path / "lib.metadata.json"
+    sidecar.write_text(json.dumps(metadata))
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    staged = stage_fpm_library(parquet, sidecar, **kwargs)
+    staged.parquet_path.unlink()
+    shutil.copyfile(parquet, staged.parquet_path)
+    expected = staged.metadata_path.read_bytes()
+    with pytest.raises(FpmContractError, match="parquet input must resolve outside output_dir"):
+        stage_fpm_library(staged.parquet_path, staged.metadata_path, **kwargs)
+    assert staged.parquet_path.read_bytes() == parquet.read_bytes()
+    assert staged.metadata_path.read_bytes() == expected
+
+
+@pytest.mark.parametrize("invalid", [True, "1", 1.0])
+def test_staging_requires_an_integer_row_count(tmp_path, invalid):
+    parquet = tmp_path / "one.parquet"
+    pq.write_table(pa.Table.from_pylist([RECONSTRUCTED_ROW]), parquet)
+    sidecar = tmp_path / "one.metadata.json"
+    metadata = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": invalid}
+    sidecar.write_text(json.dumps(metadata))
+    kwargs = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1", output_dir=tmp_path / "out")
+    with pytest.raises(FpmContractError, match="row_count"):
+        stage_fpm_library(parquet, sidecar, **kwargs)
+    sidecar.write_text(json.dumps({**metadata, "row_count": 1}))
+    staged = stage_fpm_library(parquet, sidecar, **kwargs)
+    assert type(staged.metadata["row_count"]) is int
+    assert staged.metadata["row_count"] == 1
+
+
 # ------------------------------------------------------------------ entry checks
 
 
@@ -1241,6 +1353,79 @@ def test_resource_layout_schema_keeps_valid_and_absent_resources():
         FpmLibraryMetadata.model_validate(document)
 
 
+@pytest.mark.parametrize("field", ["max_num_tokens", "max_batch_size"])
+@pytest.mark.parametrize("limit", [2**32 - 1, 2**32])
+def test_scheduler_limit_bounds_match_schema_python_and_native(profile, field, limit):
+    resources = {**RESOURCES, field: limit}
+    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "resources": resources}
+    validator = Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6")))
+    profile["deployments"][0]["resources"] = resources
+    config = _request(profile, "direct")
+    if limit == 2**32 - 1:
+        validator.validate(document)
+        assert FpmLibraryMetadata.model_validate(document).resources.model_dump()[field] == limit
+        normalized = RustForwardPassPerfModel.normalize_config(config)
+        assert normalized["fpm_profile"]["deployments"][0]["resources"][field] == limit
+    else:
+        with pytest.raises(ValidationError):
+            validator.validate(document)
+        with pytest.raises(ValueError, match=field):
+            FpmLibraryMetadata.model_validate(document)
+        with pytest.raises(ValueError, match=field):
+            RustForwardPassPerfModel.normalize_config(config)
+
+
+@pytest.mark.parametrize("degree", [0, 1])
+@pytest.mark.parametrize("dimension", ["tp", "pp", "dp", "moe_tp", "moe_ep", "cp"])
+def test_selector_topology_matches_exported_schema(tmp_path, dimension, degree):
+    document = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "configuration_selector": {dimension: degree, "future_selector": "kept open"},
+    }
+    sidecar = tmp_path / "metadata.json"
+    sidecar.write_text(json.dumps(document))
+    validator = Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6")))
+    if degree == 1:
+        validator.validate(document)
+        assert read_library_metadata(sidecar) == document
+    else:
+        with pytest.raises(ValidationError):
+            validator.validate(document)
+        with pytest.raises(FpmContractError, match=f"configuration_selector.{dimension}"):
+            read_library_metadata(sidecar)
+
+
+@pytest.mark.parametrize(
+    "group,valid",
+    [
+        ({"kind": "convolution"}, False),
+        ({"kind": "convolution", "sliding_window": None}, False),
+        ({"kind": "convolution", "sliding_window": 0}, False),
+        ({"kind": "convolution", "sliding_window": 16}, True),
+        ({"kind": "attention", "blocks_per_request": 1}, False),
+        ({"kind": "convolution", "sliding_window": 16, "blocks_per_request": 1}, False),
+        ({"kind": "attention", "blocks_per_request": None}, True),
+        ({"kind": "attention"}, True),
+        ({"kind": "state", "blocks_per_request": 1}, True),
+    ],
+)
+def test_cache_group_conditions_match_exported_schema(group, valid):
+    group = {**_STATE_GROUP_WITHOUT_BLOCKS, **group}
+    resources = {**_NO_KV, "cache_layout": "grouped", "cache_groups": [group]}
+    document = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 1, "resources": resources}
+    validator = Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6")))
+    if valid:
+        validator.validate(document)
+        FpmLibraryMetadata.model_validate(document)
+    else:
+        with pytest.raises(ValidationError):
+            validator.validate(document)
+        with pytest.raises(ValueError):
+            FpmLibraryMetadata.model_validate(document)
+
+
 def test_entry_checks_report_unreadable_files_and_missing_native_columns(root, profile):
     make_entry(root, profile)
     library = root / ENTRY / "fpm/fpm_forward_perf.parquet"
@@ -1479,15 +1664,25 @@ def test_dataset_check_reports_index_digest_and_entry_mismatches(root, profile):
     assert reference["sha256"] != _sha((root / MANIFEST).read_bytes())
 
 
-def test_entry_check_accepts_a_legacy_profile_entry(root, profile):
+@pytest.mark.parametrize("valid", [True, False])
+def test_entry_check_parses_a_legacy_profile_entry(root, profile, valid):
     make_entry(root, profile)
     document = json.loads((root / MANIFEST).read_text())
     keep = [a for a in document["artifacts"] if a["role"] == "legacy-configuration-manifest"]
     keep[0] = {**keep[0], "role": "fpm-profile"}
     document["artifacts"] = keep
+    (root / keep[0]["path"]).write_text(json.dumps(profile if valid else {}))
+    keep[0] = _artifact(root, keep[0]["path"], "fpm-profile", "json", "unversioned")
     (root / MANIFEST).write_text(json.dumps(document))
-    (root / keep[0]["path"]).write_bytes(b"{}")
-    assert check_fpm_entry(root, MANIFEST) == []
+    if valid:
+        assert check_fpm_entry(root, MANIFEST) == []
+        assert FpmLoader().load(root, MANIFEST).profile == load_fpm_profile(profile)
+    else:
+        assert [f.code for f in check_fpm_entry(root, MANIFEST)] == ["invalid-profile"]
+        with pytest.raises(ValueError):
+            FpmLoader().load(root, MANIFEST)
+    (root / keep[0]["path"]).write_text("edited without updating its hash")
+    assert [f.code for f in check_fpm_entry(root, MANIFEST)] == ["hash-mismatch"]
 
 
 def test_entry_check_applies_the_reconstruction_contract(root, profile):
