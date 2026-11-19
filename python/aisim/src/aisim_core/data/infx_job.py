@@ -83,7 +83,9 @@ def load_state(root: Path) -> dict[str, Any]:
     if state.get("schema_version") != STATE_SCHEMA:
         raise ValueError(f"unsupported ingestion state schema {state.get('schema_version')!r}")
     for key in ("qualified", "candidate"):
-        entry = state.get(key)
+        if key not in state:
+            raise ValueError(f"ingestion state is missing required pointer {key}")
+        entry = state[key]
         if entry is None:
             continue
         if not isinstance(entry, dict):

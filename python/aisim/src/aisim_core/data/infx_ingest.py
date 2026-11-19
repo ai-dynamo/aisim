@@ -59,7 +59,6 @@ from aisim_core.data.e2e import (
     load_e2e,
     read_snapshot,
     snapshot_id,
-    verify_snapshot_members,
     write_configuration,
     write_snapshot,
 )
@@ -199,6 +198,8 @@ class InfxClient:
                 last = f"transport error: {exc!r}"
             else:
                 status = response.status
+                if status == 304 and not headers.get("If-None-Match"):
+                    raise IncompleteAcquisitionError(f"{url}: 304 without a conditional request validator")
                 if status in (200, 304):
                     declared = response.headers.get("content-length")
                     if (
@@ -465,6 +466,10 @@ class Acquirer:
             for run in info.get("runs", []):
                 entry = runs.setdefault(run["html_url"], {})
                 attempt = run.get("run_attempt")
+                if attempt is not None and (type(attempt) is not int or attempt < 1):
+                    raise IncompleteAcquisitionError(
+                        f"workflow-info {date}: run_attempt must be a positive integer or null"
+                    )
                 if attempt is not None and entry.get("run_attempt") not in (None, attempt):
                     raise ContradictionError(
                         f"workflow-info {date}: run {run['html_url']} reports two run_attempt values"
@@ -515,6 +520,8 @@ def plan_snapshot(acq: Acquisition) -> SnapshotPlan:
         configurations = inferencex_to_configurations(acq.records, acq.runs)
     except OverflowError as exc:
         raise IncompleteAcquisitionError("benchmark metric exceeds the supported numeric range") from exc
+    except ValueError as exc:
+        raise IncompleteAcquisitionError(f"invalid benchmark configuration: {exc}") from exc
     # Keep original response bytes as well as the normalized, deduplicated record bundle.
     # These hash-linked artifacts survive removal of the mutable acquisition cache.
     originals: dict[str, list[ProvenanceFile]] = {}
@@ -557,23 +564,33 @@ def snapshot_path(sid: str) -> str:
     return f"snapshots/{sid}/snapshot.json"
 
 
+def _verify_planned_configuration(root: Path, manifest_path: str, expected: E2eConfigurationData) -> None:
+    actual = load_e2e(root, manifest_path)
+    if actual.manifest.configuration_id != expected.body.configuration_id() or {
+        row.observation_id: row.record_sha256 for row in actual.observations
+    } != {row.observation_id: row.record_sha256 for row in expected.observations}:
+        raise ValueError(f"snapshot member does not match configuration contents: {manifest_path}")
+
+
 def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
     """Write shards and the immutable snapshot document; returns its path. An existing snapshot is never rewritten."""
     root = Path(root)
     path = snapshot_path(plan.snapshot_id)
     if (root / path).exists():
-        snapshot, members = read_snapshot(root, path)
+        snapshot, _ = read_snapshot(root, path)
         if snapshot.snapshot_id != plan.snapshot_id:
             raise ValueError("existing snapshot ID differs from the planned snapshot")
         if snapshot.completeness != "complete":
             raise ValueError("existing snapshot must be complete")
-        verify_snapshot_members(root, members)
+        for data in plan.configurations:
+            prefix = plan.configuration_prefixes[data.body.configuration_id()]
+            _verify_planned_configuration(root, f"{prefix}/{configuration_dir(data.body)}/manifest.json", data)
         return path
     for data in plan.configurations:
         prefix = plan.configuration_prefixes[data.body.configuration_id()]
         manifest_path = f"{prefix}/{configuration_dir(data.body)}/manifest.json"
         if (root / manifest_path).exists():
-            load_e2e(root, manifest_path)  # verify reused shards without replacing any of their bytes
+            _verify_planned_configuration(root, manifest_path, data)
         else:
             # The manifest is the last file in a multi-file shard. Publish the
             # entire immutable revision only after all writes and verification
@@ -581,13 +598,13 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
             with tempfile.TemporaryDirectory(dir=root) as tmp:
                 staging = Path(tmp)
                 write_configuration(staging, data, prefix=prefix)
-                load_e2e(staging, manifest_path)
+                _verify_planned_configuration(staging, manifest_path, data)
                 destination = root / prefix
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     os.rename(staging / prefix, destination)
                 except FileExistsError:
-                    load_e2e(root, manifest_path)
+                    _verify_planned_configuration(root, manifest_path, data)
     (root / path).parent.mkdir(parents=True, exist_ok=True)
     pending = path + ".pending"
     try:

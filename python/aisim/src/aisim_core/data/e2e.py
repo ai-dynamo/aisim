@@ -1334,6 +1334,13 @@ def inferencex_metrics(
             continue  # a parallelism degree: mapped by inferencex_metric_parallelism, kept in the raw artifact
         else:
             unmapped.append(key)
+    canonical = {}
+    for row in rows:
+        key = (row.metric, row.statistic, row.scope, row.normalization, row.observer)
+        value = (row.status, row.value, row.unit, row.source_value)
+        if key in canonical and canonical[key] != value:
+            raise ValueError(f"{observation_id}: conflicting canonical metric {key}")
+        canonical[key] = value
     rows.extend(missing_required_metrics(observation_id, rows))
     return rows, unmapped
 
@@ -1372,8 +1379,13 @@ def _ifx_body(
     config: Mapping[str, Any], gaps: list[dict], metric_parallelism: Mapping[str, Mapping[str, int]] | None = None
 ) -> E2eManifestBody:
     disagg = bool(config["disagg"])
-    if not disagg and config.get("decode_num_workers") == 0:
-        raise ValueError("aggregated decode_num_workers must not be zero; a serving worker is required")
+    if not disagg and type(config.get("decode_num_workers")) is int and config["decode_num_workers"] == 0:
+        # The source uses zero for this irrelevant aggregated field. Preserve the
+        # original in source_config_json and record the normalization explicitly.
+        config = {**config, "decode_num_workers": 1}
+        gaps.append(
+            {"field": "workers.aggregated.num_workers", "reason": "source zero sentinel normalized to one replica"}
+        )
     roles = ("prefill", "decode") if disagg else ("decode",)
     # Aggregated InferenceX records carry the serving worker under the decode_* fields.
     parallelism: dict[str, dict[str, int]] = {}

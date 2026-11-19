@@ -52,18 +52,6 @@
       "default": null,
       "title": "Acc N Scored"
     },
-    "acc_prediction_fingerprint": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Acc Prediction Fingerprint"
-    },
     "acc_record_id": {
       "anyOf": [
         {

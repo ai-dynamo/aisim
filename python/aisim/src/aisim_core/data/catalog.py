@@ -8,7 +8,7 @@ the last prediction, how good was the collection and what did it cost" without
 touching any payload. It is Parquet (zstd), sharded by category and hardware so
 an agent working on one GPU reads one small file per layer::
 
-    catalog/op-latency/<hardware>.parquet    schema aisim-catalog/v1
+    catalog/op-latency/<hardware>.parquet    schema aisim-catalog/v2
     catalog/fpm/<hardware>.parquet
     catalog/e2e/<hardware>.parquet
     catalog/systems.parquet                  schema aisim-catalog-systems/v1
@@ -54,7 +54,8 @@ from aisim_core.data.hygiene import bounded_json_bytes, json_sidecar_value
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
 
-CATALOG_SCHEMA_ID = "aisim-catalog/v1"
+CATALOG_SCHEMA_ID = "aisim-catalog/v2"
+CATALOG_READ_SCHEMA_IDS = ("aisim-catalog/v1", CATALOG_SCHEMA_ID)
 SYSTEMS_SCHEMA_ID = "aisim-catalog-systems/v1"
 CATALOG_DIR = "catalog"
 SYSTEMS_FILE = "systems.parquet"
@@ -96,8 +97,10 @@ def read_catalog_coverage(root: Path) -> CatalogCoverage:
         raise ValueError("catalog coverage JSON exceeds the nesting limit") from exc
 
 
-class CatalogRow(_Row):
+class CatalogRowV1(_Row):
     """One cell summary. ``model`` is null for the model-independent op layer."""
+
+    model_config = ConfigDict(title="CatalogRow")
 
     layer: Layer
     model: str | None
@@ -115,12 +118,17 @@ class CatalogRow(_Row):
     acc_record_id: str | None = None
     acc_created_at: str | None = None
     acc_spec_sha256: str | None = None
-    acc_prediction_fingerprint: str | None = None  # includes code_version, spec and profile hashes
     collection_quality_json: str | None = None  # latest record's collection_quality, canonical JSON
     gpu_seconds: float | None = Field(default=None, ge=0)  # sum over recorded gpu_time; null if none recorded
     gpu_n_recorded: int = Field(default=0, ge=0)  # records contributing to gpu_seconds
     spec_sha256_current: str | None = None  # current packaged spec hash for this hardware
     stale_reason: str | None = None
+
+
+class CatalogRow(CatalogRowV1):
+    """V2 cell summary adds the exact prediction fingerprint to v1."""
+
+    acc_prediction_fingerprint: str | None = None  # includes code_version, spec and profile hashes
 
 
 class SystemRow(_Row):
@@ -147,12 +155,12 @@ _ROW_FIELDS = {
     "acc_record_id": pa.string(),
     "acc_created_at": pa.string(),
     "acc_spec_sha256": pa.string(),
-    "acc_prediction_fingerprint": pa.string(),
     "collection_quality_json": pa.string(),
     "gpu_seconds": pa.float64(),
     "gpu_n_recorded": pa.int32(),
     "spec_sha256_current": pa.string(),
     "stale_reason": pa.string(),
+    "acc_prediction_fingerprint": pa.string(),
 }
 assert list(_ROW_FIELDS) == list(CatalogRow.model_fields)
 
@@ -408,7 +416,7 @@ class Catalog:
     ) -> list[CatalogRow]:
         out = []
         for path in self._shards(hardware, layer):
-            for item in read_parquet(path, CATALOG_SCHEMA_ID).to_pylist():
+            for item in read_parquet(path, CATALOG_READ_SCHEMA_IDS).to_pylist():
                 row = CatalogRow(**item)
                 if (
                     (model is None or row.model == model)

@@ -22,7 +22,8 @@ reviewed. The steps, all enforced by :func:`plan_promotion` and
    regenerated, and the target must then pass the ``public`` profile of the validator;
    otherwise the target is restored.
 
-The private promotion ledger (``mirror/promotions/<digest>.json``) keeps the lineage:
+The private promotion ledger (``.<source-name>.promotion-ledger/promotions/<digest>.json``
+beside the source checkout) keeps the lineage without changing the reviewed source:
 the source commit, every promoted file hash and the hash of each unredacted original.
 It never reaches the public dataset.
 
@@ -52,7 +53,6 @@ from aisim_core.data.eval import load_record, record_paths
 from aisim_core.data.hygiene import Finding, bounded_json_bytes, json_sidecar_value
 from aisim_core.data.mirror import (
     INTERNAL_REPO,
-    MIRROR_CONTROL_DIR,
     NEVER_PROMOTED,
     list_tree,
     snapshot_documents,
@@ -60,6 +60,7 @@ from aisim_core.data.mirror import (
 )
 from aisim_core.data.redaction import (
     DEFAULT_POLICY,
+    LEDGER_PATH,
     RedactionPolicy,
     check_publishable,
     load_ledger,
@@ -191,6 +192,13 @@ def _check_source_checkout(source: Path, commit: str) -> None:
             raise PromotionError("source HEAD differs from request.source_commit")
         if git("status", "--porcelain", "--untracked-files=all", "--ignored"):
             raise PromotionError("source changed: checkout has uncommitted or ignored files")
+        # Status omits assume-unchanged/skip-worktree paths. The visibility used
+        # by both gates must still be the ledger in the recorded source revision.
+        committed = git("ls-tree", "--format=%(objectname)", commit, "--", LEDGER_PATH)
+        ledger = source / LEDGER_PATH
+        actual = git("hash-object", "--no-filters", LEDGER_PATH) if ledger.is_file() else ""
+        if actual != committed:
+            raise PromotionError("source visibility ledger differs from the reviewed revision")
     except (OSError, subprocess.CalledProcessError) as exc:
         raise PromotionError("source must be a readable Git checkout") from exc
 
@@ -512,7 +520,12 @@ def _apply_promotion(
                 f"public validator rejects the result: {first.code} {first.path or ''}: {first.message}"
             )
         if write_ledger:  # lineage is part of the promotion: a target without its record is rolled back
-            ledger = source / MIRROR_CONTROL_DIR / "promotions" / f"{plan.digest}.json"
+            ledger = (
+                source.resolve().parent
+                / f".{source.resolve().name}.promotion-ledger"
+                / "promotions"
+                / f"{plan.digest}.json"
+            )
             ledger.parent.mkdir(parents=True, exist_ok=True)
             ledger.write_text(_ledger_text(plan, report.fingerprint), encoding="utf-8")
     except BaseException:

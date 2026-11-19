@@ -269,6 +269,29 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
     }
     schema = "aisim-infx-ingestion-state/v1"
 
+    local_git_keys = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    }
+    git_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in local_git_keys and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    }
+
     def git(path, *args):
         return subprocess.check_output(
             [
@@ -282,10 +305,11 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
                 *args,
             ],
             text=True,
+            env=git_env,
         ).strip()
 
     remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True, env=git_env)
     seed = tmp_path / "seed"
     seed.mkdir()
     git(seed, "init", "-qb", "main")
@@ -314,7 +338,9 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
 
     workspace = tmp_path / "work"
     workspace.mkdir()
-    subprocess.run(["git", "clone", "-q", "--branch", "main", str(remote), str(workspace / "cache-repo")], check=True)
+    subprocess.run(
+        ["git", "clone", "-q", "--branch", "main", str(remote), str(workspace / "cache-repo")], check=True, env=git_env
+    )
     (workspace / "cache-repo/ingestion-state.json").write_text(
         json.dumps({"schema_version": schema, "qualified": qualified_b, "candidate": pending})
     )
@@ -338,7 +364,7 @@ def test_recurring_snapshot_keeps_historical_reviews_and_reuses_only_current_pen
         ["sh", "-eu", "-c", script],
         cwd=workspace,
         env={
-            **os.environ,
+            **git_env,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "CI_PIPELINE_ID": "42",
             "INFX_CACHE_WRITE_TOKEN": "",

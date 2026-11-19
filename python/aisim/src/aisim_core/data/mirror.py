@@ -68,7 +68,7 @@ from aisim_core.data.hygiene import (
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.schemas import check_snapshots, render_all
 
-VALIDATOR_VERSION = "8"
+VALIDATOR_VERSION = "9"
 INTERNAL_REPO = "ai-dynamo/aisim-data-internal"
 INFX_CACHE_REPO = "ai-dynamo/aisim-infx-cache"
 # Never a promotion source: private caches whose terms forbid public export.
@@ -159,9 +159,22 @@ def _check_root_metadata(root: Path, tree: list[CandidateFile], profile: Profile
             report.add("metadata-invalid", "repository metadata must be UTF-8 text", file.path)
             continue
         if profile == "public":
-            from aisim_core.data.redaction import DEFAULT_POLICY, scan_value
+            from aisim_core.data.redaction import DEFAULT_POLICY, scan_value, scan_yaml
 
             report.findings.extend(scan_value(text, DEFAULT_POLICY, file.path, "repository metadata"))
+            lines = text.splitlines(keepends=True)
+            if file.path == "README.md" and lines and lines[0].strip() == "---":
+                end = next((i for i in range(1, len(lines)) if lines[i].strip() in {"---", "..."}), None)
+                try:
+                    if end is None:
+                        raise ValueError("dataset card front matter has no closing delimiter")
+                    report.findings.extend(
+                        scan_yaml(
+                            "".join(lines[1:end]).encode(), DEFAULT_POLICY, file.path, "dataset card front matter"
+                        )
+                    )
+                except ValueError as exc:
+                    report.add("metadata-invalid", str(exc).splitlines()[0], file.path)
 
 
 def list_tree(root: Path) -> list[CandidateFile]:
@@ -197,7 +210,7 @@ def _check_manifest_any(root: Path, rel: str, category: str):
     return manifest
 
 
-def _check_indexes(root: Path, report: TreeReport, declared: set[str]) -> dict[str, Manifest]:
+def _check_indexes(root: Path, report: TreeReport, declared: set[str], eligible: set[str]) -> dict[str, Manifest]:
     index_rel = f"{CATALOG_DIR}/dataset.json"
     if not (root / index_rel).is_file():
         report.add("dataset-index-missing", "catalog/dataset.json is missing", index_rel)
@@ -211,6 +224,8 @@ def _check_indexes(root: Path, report: TreeReport, declared: set[str]) -> dict[s
     manifests: dict[str, Manifest] = {}
     for category, ref in dataset.categories.items():
         try:
+            if ref.index.path not in eligible:
+                raise ValueError("category index must be a listed dataset payload file")
             _verify(root, ref.index)
         except (ValueError, OSError) as exc:
             report.add("index-integrity", str(exc), ref.index.path)
@@ -251,6 +266,7 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
     eval_root = root / "eval"
     if not eval_root.is_dir():
         return
+    verified = {}
     for path in record_paths(eval_root, recursive=True):
         rel = path.relative_to(root).as_posix()
         try:
@@ -267,8 +283,12 @@ def _check_eval(root: Path, report: TreeReport, declared: set[str]) -> None:
         except (ValueError, ValidationError, OSError) as exc:
             report.add("eval-record-invalid", str(exc).splitlines()[0], rel)
             continue
+        verified[(path.parent, record.record_id)] = (rel, record)
         declared.add(rel)
         report.eval_records += 1
+    for (directory, _), (rel, record) in verified.items():
+        if record.supersedes is not None and (directory, record.supersedes) not in verified:
+            report.add("eval-predecessor-missing", "superseded record must be verified in the same directory", rel)
 
 
 def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:
@@ -432,7 +452,8 @@ def validate_tree(
         return report
 
     declared: set[str] = set()
-    manifests = _check_indexes(root, report, declared)
+    eligible = {f.path for f in listing if not check_listing(_tree_policy(()), [f])}
+    manifests = _check_indexes(root, report, declared, eligible)
     report.manifests = manifests
     system_files = _check_system_bundles(root, report)
     declared.update(system_files)
@@ -453,7 +474,8 @@ def validate_tree(
     _check_eval(root, report, declared)
     _check_snapshots(root, report, declared, manifests)
     _check_schema_snapshots(root, report, declared)
-    _check_catalog_drift(root, report, declared)
+    if not any(f.code == "index-integrity" for f in report.errors):
+        _check_catalog_drift(root, report, declared)
 
     evidence_findings, _ = check_evidence(root, [f.path for f in evidence if not f.is_symlink], manifests=manifests)
     report.findings.extend(evidence_findings)

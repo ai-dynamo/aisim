@@ -9,6 +9,7 @@ All HTTP is faked; the response shapes mirror the live documented endpoints
 
 import ast
 import gzip
+import hashlib
 import http.client
 import io
 import json
@@ -93,10 +94,11 @@ class FakeInfx:
                 "workflow-info": self.workflow}[route]  # fmt: skip
         if route == "benchmarks" and isinstance(body, dict):  # per-date rows (exact=true is "as of" that date)
             body = body[url.split("date=")[1].split("&")[0]]
-        etag = f'"{abs(hash(json.dumps(body, sort_keys=True))) % 10**8}"'
+        body_bytes = json.dumps(body).encode()
+        etag = f'"{hashlib.sha256(body_bytes).hexdigest()}"'
         if headers.get("If-None-Match") == etag:
             return HttpResponse(304, {"etag": etag}, b"")
-        return HttpResponse(200, {"etag": etag}, json.dumps(body).encode())
+        return HttpResponse(200, {"etag": etag}, body_bytes)
 
 
 def ok(body, **headers):
@@ -1373,15 +1375,16 @@ def _assert_failed_acquisition_report(root, tmp_path, monkeypatch, fake, message
     assert message in result["error"] and tree(root) == before
 
 
-def test_aggregated_zero_decode_workers_are_rejected_before_storage(root, tmp_path):
-    first, _ = make_run(tmp_path, FakeInfx())
-    promote(root, first.snapshot_id, "Reviewer", NOW)
-    before = tree(root)
+def test_aggregated_zero_decode_workers_are_normalized_with_evidence(root, tmp_path):
     result, _ = make_run(tmp_path, FakeInfx(rows=[row(1, decode_num_workers=0), row(2, "h200")]))
-    assert result.status == "failed" and "decode_num_workers" in result.error
-    assert tree(root) == before
-    with pytest.raises(ValueError, match="decode_num_workers"):
-        e2e_module.inferencex_to_configurations([row(1, decode_num_workers=0)])
+    assert result.status == "candidate"
+    _, members = read_snapshot(root, infx_ingest.snapshot_path(result.snapshot_id))
+    member = next(m for m in members if m.observation_id == "inferencex:1")
+    dataset = load_e2e(root, member.manifest_path)
+    assert dataset.body.workers["aggregated"].num_workers == 1
+    assert json.loads(dataset.observations[0].source_config_json)["decode_num_workers"] == 0
+    assert any("zero sentinel" in gap["reason"] for gap in dataset.body.evidence_gaps)
+    assert evaluation_points(dataset)[0].metrics[("ttft", "mean")] == 100.0
 
 
 def test_duplicate_ingestion_state_keys_are_rejected_and_missing_is_first_run(root, tmp_path):
@@ -1397,3 +1400,100 @@ def test_duplicate_ingestion_state_keys_are_rejected_and_missing_is_first_run(ro
     result, _ = make_run(tmp_path, FakeInfx())
     assert result.status == "failed" and "duplicate JSON key" in result.error
     assert tree(root) == before
+
+
+def test_unconditional_304_does_not_revalidate_cached_evidence(root, tmp_path):
+    fake = FakeInfx()
+    fake.respond("views/options", ok(OPTIONS))  # the cached 200 has no ETag
+    first, _ = make_run(tmp_path, fake)
+    assert first.status == "candidate"
+    before = tree(root)
+    fake.respond("views/options", HttpResponse(304, {}, b""))
+    result, _ = make_run(tmp_path, fake)
+    assert result.status == "failed" and "conditional request validator" in result.error
+    assert "If-None-Match" not in fake.calls[-1][1]
+    assert tree(root) == before
+
+
+@pytest.mark.parametrize("attempt", [-1, 0, True, "2", 1.5, [], {}])
+def test_invalid_workflow_attempts_cannot_enter_a_snapshot(root, tmp_path, attempt):
+    workflow = {**WORKFLOW, "runs": [{"html_url": RUN, "run_attempt": attempt}]}
+    result, _ = make_run(tmp_path, FakeInfx(workflow=workflow))
+    assert result.status == "failed" and "run_attempt must be a positive integer or null" in result.error
+    assert not tree(root)
+
+
+@pytest.mark.parametrize("spelling", ["p99.9_ttft", "p99_9_ttft", "both-equal", "both-conflicting"])
+def test_canonical_metric_aliases_are_unambiguous(root, tmp_path, spelling):
+    metrics = {"mean_ttft": 0.1}
+    if spelling.startswith("both"):
+        metrics.update({"p99.9_ttft": 0.1, "p99_9_ttft": 0.2 if spelling == "both-conflicting" else 0.1})
+    else:
+        metrics[spelling] = 0.1
+    result, _ = make_run(tmp_path, FakeInfx(rows=[row(1, metrics=metrics)], availability=[avail()]))
+    if spelling == "both-conflicting":
+        assert result.status == "failed" and "conflicting canonical metric" in result.error
+        assert not tree(root)
+    else:
+        assert result.status == "candidate"
+        _, members = read_snapshot(root, infx_ingest.snapshot_path(result.snapshot_id))
+        point = evaluation_points(load_e2e(root, members[0].manifest_path))[0]
+        assert point.metrics[("ttft", "p99.9")] == 100.0  # independent seconds -> milliseconds expectation
+
+
+@pytest.mark.parametrize("stale_manifest", ["none", "old-record", "extra-observation"])
+def test_orphan_revision_reuse_checks_the_planned_observations(root, tmp_path, stale_manifest):
+    def acquire(fake):
+        return infx_ingest.Acquirer(InfxClient(fake), infx_ingest.AcquisitionCache(tmp_path / "cache")).acquire()
+
+    old_rows = [row(1), row(2, "h200")]
+    if stale_manifest == "extra-observation":
+        old_rows.append(row(3))
+    old = acquire(FakeInfx(rows=old_rows))
+    old_plan = infx_ingest.plan_snapshot(old)
+    infx_ingest.write_candidate(root, old, old_plan)
+    new_row = row(1) if stale_manifest == "extra-observation" else row(1, metrics={"mean_ttft": 0.3})
+    corrected = acquire(FakeInfx(rows=[new_row, row(2, "h200")]))
+    plan = infx_ingest.plan_snapshot(corrected)
+    path = infx_ingest.write_candidate(root, corrected, plan)
+    (root / path).unlink()  # interrupted publication left valid orphan revisions
+    member = next(m for m in plan.members if m.observation_id == "inferencex:1")
+    if stale_manifest != "none":
+        old_member = next(m for m in old_plan.members if m.observation_id == member.observation_id)
+        (root / member.manifest_path).write_bytes((root / old_member.manifest_path).read_bytes())
+    before = tree(root)
+    if stale_manifest != "none":
+        with pytest.raises(ValueError, match="snapshot member does not match"):
+            infx_ingest.write_candidate(root, corrected, plan)
+        assert tree(root) == before
+    else:
+        assert infx_ingest.write_candidate(root, corrected, plan) == path
+        point = evaluation_points(load_e2e(root, member.manifest_path))[0]
+        assert point.metrics[("ttft", "mean")] == 300.0
+
+
+@pytest.mark.parametrize("missing", ["candidate", "qualified"])
+def test_existing_ingestion_state_requires_explicit_pointers(root, tmp_path, missing):
+    path = root / infx_job.STATE_FILE
+    state = {"schema_version": infx_job.STATE_SCHEMA, "candidate": None, "qualified": None}
+    path.write_text(json.dumps(state))
+    assert infx_job.load_state(root) == state
+    del state[missing]
+    path.write_text(json.dumps(state))
+    before = tree(root)
+    with pytest.raises(ValueError, match=f"missing required pointer {missing}"):
+        infx_job.load_state(root)
+    result, _ = make_run(tmp_path, FakeInfx())
+    assert result.status == "failed" and f"missing required pointer {missing}" in result.error
+    assert tree(root) == before
+
+
+def test_fake_etag_tracks_exact_response_bytes():
+    fake = FakeInfx(rows=[row(1)])
+    url = InfxClient(fake).url("benchmarks")
+    first = fake(url, {}, 1)
+    fake.rows = [dict(reversed(list(fake.rows[0].items())))]
+    second = fake(url, {"If-None-Match": first.headers["etag"]}, 1)
+    assert second.status == 200 and second.body != first.body
+    assert second.headers["etag"] != first.headers["etag"]
+    assert fake(url, {"If-None-Match": second.headers["etag"]}, 1).status == 304

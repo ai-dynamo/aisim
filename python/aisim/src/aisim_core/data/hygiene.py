@@ -279,6 +279,8 @@ def _check_yaml_merge_budget(root, limit=100_000):
 
 
 class _SidecarLoader(yaml.SafeLoader):
+    preserve_merges = False
+
     def get_single_data(self):
         node = self.get_single_node()
         if node is None:
@@ -316,13 +318,30 @@ class _SidecarLoader(yaml.SafeLoader):
                 seen.add(value)
             except TypeError as exc:
                 raise ValueError("YAML mapping keys must be scalar") from exc
-        super().flatten_mapping(node)
+        if self.preserve_merges:
+            # Keep every source value for disclosure scanning, including defaults
+            # that an explicit override would otherwise erase.
+            for key, _ in node.value:
+                if key.tag == "tag:yaml.org,2002:merge":
+                    # A literal string key "<<" is legal alongside a merge key.
+                    # Keep the source map under a collision-free scan-only name.
+                    name = "<<"
+                    while name in seen:
+                        name += "<"
+                    key.value = name
+                    key.tag = "tag:yaml.org,2002:str"
+        else:
+            super().flatten_mapping(node)
 
 
-def yaml_sidecar_value(data: bytes):
+class _SourceSidecarLoader(_SidecarLoader):
+    preserve_merges = True
+
+
+def yaml_sidecar_value(data: bytes, *, preserve_merges: bool = False):
     """Safely read operation metadata; retain shared YAML aliases without expanding them."""
     try:
-        value = yaml.load(data.decode("utf-8"), Loader=_SidecarLoader)
+        value = yaml.load(data.decode("utf-8"), Loader=_SourceSidecarLoader if preserve_merges else _SidecarLoader)
     except (yaml.YAMLError, RecursionError, KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"invalid YAML sidecar: {exc}") from exc
     if not isinstance(value, dict):
