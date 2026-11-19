@@ -492,7 +492,13 @@ def _check_hf_model_id(hf_id: str) -> None:
 def _check_hf_revision(revision: str) -> None:
     """Reject revisions that are not a commit, branch or tag name before any lookup."""
     path = Path(revision)
-    if not revision or path.is_absolute() or ".." in path.parts or "\\" in revision or "\x00" in revision:
+    if (
+        not revision
+        or path.is_absolute()
+        or any(part in ("", ".", "..") for part in revision.split("/"))
+        or "\\" in revision
+        or "\x00" in revision
+    ):
         raise HuggingFaceDownloadError(
             f"unsupported Hugging Face revision {revision!r}: expected a commit hash, branch or tag name "
             "(for example main, v1.0 or release/v1)"
@@ -845,6 +851,8 @@ def _qwen_pixel_bounds(processor_cfg: dict | None) -> tuple[int, int]:
         return QWEN3_VL_PIXEL_BOUNDS
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in bounds):
         raise ValueError(f"Qwen preprocessor pixel budget must be positive integers, got {bounds!r}")
+    if bounds[0] > bounds[1]:
+        raise ValueError(f"Qwen preprocessor pixel budget minimum must not exceed maximum, got {bounds!r}")
     return bounds
 
 
@@ -2298,7 +2306,12 @@ def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, re
         for filename, key in files:
             if os.path.isdir(model_path):
                 path = Path(model_path) / filename
-                data = _load_json_with_infinity(path) if path.is_file() else None
+                if not path.is_file():
+                    continue
+                data = _load_json_with_infinity(path)
+                if data is None:
+                    family = "Kimi" if kimi else "Qwen3-VL"
+                    raise ValueError(f"{family} {filename} must be an object")
             else:
                 data = _download_hf_companion_json(model_path, filename, revision=revision)
             if data is not None:
@@ -2389,11 +2402,16 @@ class _ModelConfigCacheEntry:
     processor_lock: Lock = field(default_factory=Lock)
 
 
+@dataclass(slots=True)
+class _ModelConfigLoad:
+    readers: int = 0
+
+
 def _cache_raw_model_config(load):
     """Keep a base until its parsed readers finish; evict only if all fail."""
     entries = {}
-    # Tokens live only until a cold load publishes or fails. Removing a token
-    # invalidates unfinished reads without retaining per-model eviction history.
+    # A token tracks concurrent cold loads until the last one finishes.
+    # Eviction/clear invalidates it without retaining per-model history.
     loading = {}
     hits = misses = 0
     lock = Lock()
@@ -2408,24 +2426,24 @@ def _cache_raw_model_config(load):
                     hits += 1
                     return entries[model_path].raw
                 misses += 1
-                token = loading.setdefault(model_path, object())
+                token = loading.setdefault(model_path, _ModelConfigLoad())
+                token.readers += 1
             try:
                 config = load(model_path)
-            except BaseException:
                 with lock:
+                    # Concurrent cold loads use the first still-published base.
+                    if model_path in entries:
+                        return entries[model_path].raw
                     if loading.get(model_path) is token:
+                        entries[model_path] = _ModelConfigCacheEntry(config)
+                        return config
+                    # An eviction/clear invalidated this read. Resolve again rather
+                    # than republishing a base read before the source was repaired.
+            finally:
+                with lock:
+                    token.readers -= 1
+                    if not token.readers and loading.get(model_path) is token:
                         del loading[model_path]
-                raise
-            with lock:
-                # Concurrent cold loads use the first still-published base.
-                if model_path in entries:
-                    return entries[model_path].raw
-                if loading.get(model_path) is token:
-                    entries[model_path] = _ModelConfigCacheEntry(config)
-                    del loading[model_path]
-                    return config
-                # An eviction/clear invalidated this read. Resolve again rather
-                # than republishing a base read before the source was repaired.
 
     def clear():
         nonlocal hits, misses
@@ -2455,6 +2473,7 @@ def _cache_raw_model_config(load):
                 entry.parsed |= succeeded
                 if not entry.readers and not entry.parsed and entries.get(model_path) is entry:
                     del entries[model_path]
+                    loading.pop(model_path, None)
 
     def clear_parsed():
         with lock:

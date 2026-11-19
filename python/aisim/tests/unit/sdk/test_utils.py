@@ -364,6 +364,62 @@ def test_local_qwen_inline_processor_bounds_and_sidecar_precedence(tmp_path, sid
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "model_id,sidecar",
+    [
+        ("Qwen/Qwen3-VL-8B-Instruct", "preprocessor_config.json"),
+        ("moonshotai/Kimi-K2.5", "preprocessor_config.json"),
+        ("moonshotai/Kimi-K2.5", "video_preprocessor_config.json"),
+        ("moonshotai/Kimi-K3", "preprocessor_config.json"),
+        ("moonshotai/Kimi-K3", "video_preprocessor_config.json"),
+    ],
+)
+def test_local_null_processor_is_rejected_and_can_be_repaired(tmp_path, sidecar, model_id):
+    config = utils._load_pre_downloaded_hf_config(model_id)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    processor_path = tmp_path / sidecar
+    processor_path.write_text("null")
+    try:
+        with pytest.raises(ValueError, match=rf"{sidecar} must be an object"):
+            get_model_config_from_model_path(str(tmp_path))
+        processor_path.unlink()
+        assert get_model_config_from_model_path(str(tmp_path))["architecture"] == config["architectures"][0]
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
+@pytest.mark.parametrize("inline_native", [False, True])
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        {"size": {"shortest_edge": 2097152}},
+        {"min_pixels": 2097152},
+        {"size": {"longest_edge": 65536}},
+        {"max_pixels": 65536},
+    ],
+)
+def test_qwen_rejects_inverted_merged_pixel_bounds(tmp_path, inline_native, sidecar):
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    config["preprocessor_config"] = (
+        {"size": {"shortest_edge": 131072, "longest_edge": 1048576}}
+        if inline_native
+        else {"min_pixels": 131072, "max_pixels": 1048576}
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    processor_path = tmp_path / "preprocessor_config.json"
+    processor_path.write_text(json.dumps(sidecar))
+    try:
+        with pytest.raises(ValueError, match="minimum must not exceed maximum"):
+            get_model_config_from_model_path(str(tmp_path))
+        processor_path.write_text('{"size": {"shortest_edge": 262144}}')
+        encoder = get_model_config_from_model_path(str(tmp_path))["extra_params"]
+        assert (encoder.min_pixels, encoder.max_pixels) == (262144, 1048576)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 def test_offline_value_zero_still_downloads(monkeypatch, hf_cache):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     monkeypatch.setattr(
@@ -427,6 +483,21 @@ def test_offline_mode_reads_a_ref_containing_a_slash(monkeypatch, hf_cache):
     assert utils._download_hf_json("org/model", "config.json", revision="release/v1") == {"branch": "release/v1"}
     with pytest.raises(utils.HuggingFaceDownloadError):
         utils._download_hf_json("org/model", "config.json", revision="release/v2")
+
+
+@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize("revision", ["release/./v1", "./release/v1", "release/v1/."])
+def test_malformed_dot_revision_does_not_alias_cached_branch(monkeypatch, hf_cache, offline, revision):
+    commit = "f" * 40
+    _cache_file(hf_cache, "org/model", "config.json", {"branch": True}, ref="release/v1", commit=commit)
+    if offline:
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    with pytest.raises(utils.HuggingFaceDownloadError, match="unsupported Hugging Face revision"):
+        utils._download_hf_json("org/model", "config.json", revision=revision)
+    if not offline:
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert utils._download_hf_json("org/model", "config.json", revision="release/v1") == {"branch": True}
+    assert utils._download_hf_json("org/model", "config.json", revision=commit) == {"branch": True}
 
 
 @pytest.mark.parametrize("revision", ["../../escape", "main/../../escape"])
@@ -1200,6 +1271,46 @@ def test_cold_load_reloads_after_invalidation_before_publication(monkeypatch, tm
             assert pending.result(timeout=10)["generation"] == 2
             assert utils._load_model_config_from_model_path(model)["generation"] == 2
             assert get_model_config_from_model_path(model)["raw_config"]["generation"] == 2
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            utils.get_model_config_from_model_path.cache_clear()
+
+
+def test_failed_cold_reader_does_not_invalidate_successful_reader(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    model = str(tmp_path)
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    paused = Event()
+    resume = Event()
+    real_load = utils._load_local_config
+    calls = []
+
+    def load(path):
+        calls.append(path)
+        if len(calls) > 1:
+            raise OSError("model source became unavailable")
+        raw = real_load(path)
+        paused.set()
+        assert resume.wait(10)
+        return raw
+
+    monkeypatch.setattr(utils, "_load_local_config", load)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(utils._load_model_config_from_model_path, model)
+        try:
+            assert paused.wait(10)
+            with pytest.raises(OSError, match="model source became unavailable"):
+                utils._load_model_config_from_model_path(model)
+            resume.set()
+            raw = pending.result(timeout=10)
+            assert raw["architectures"] == config["architectures"]
+            assert utils._load_model_config_from_model_path(model) is raw
+            assert get_model_config_from_model_path(model)["architecture"] == config["architectures"][0]
+            assert calls == [model, model]
         finally:
             resume.set()
             utils._load_model_config_from_model_path.cache_clear()
