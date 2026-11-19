@@ -302,6 +302,17 @@ def test_packed_qkv_declaration_precedes_split_entries():
     assert _projection_modes(raw, "*", NVFP4)["qkv_gemm"] == {FP8: 1}
 
 
+def test_generic_target_does_not_bypass_split_qkv_exclusions():
+    def raw(*excluded):
+        ignore = [f"backbone.layers.0.mixer.{name}" for name in excluded]
+        return {"quantization_config": {"config_groups": _groups(all=(8, ["Linear"])), "ignore": ignore}}
+
+    # Linear also matches the unlisted packed qkv_proj; the split exclusions still win.
+    assert _projection_modes(raw("q_proj", "k_proj", "v_proj"), "*", FP8)["qkv_gemm"] == {BF16: 1}
+    with pytest.raises(ValueError, match="disagree on precision"):
+        _projection_modes(raw("q_proj"), "*", FP8)
+
+
 @pytest.mark.parametrize("projection", ["qkv_proj", "q_proj", "k_proj", "v_proj"])
 def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path, projection):
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")

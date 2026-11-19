@@ -158,10 +158,14 @@ class CheckpointPrecision:
             for key, modules in kinds_to_modules.get(kind, {}).items():
                 packed = packed_modules.get(key) if packed_modules else None
                 if packed:
-                    excluded, algos = self.module(layer_paths(layer, packed))
+                    paths = layer_paths(layer, packed)
                     # Serving resolves an explicitly declared packed module before its split
-                    # checkpoint names. Without a packed declaration, compare every split mode.
-                    if excluded or algos:
+                    # checkpoint names. A generic pattern (``Linear``) is no packed declaration:
+                    # it would bypass the split exclusions, so compare every split mode then.
+                    if any(
+                        self._excluded(path) or path in self.exact or path in self.conflicts or path in self.descendants
+                        for path in paths
+                    ):
                         modules = (packed,)
                 entries = [(module, *self.module(layer_paths(layer, module))) for module in modules]
                 if packed and self.listed:
