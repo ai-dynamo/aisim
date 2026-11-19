@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -195,14 +195,17 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
         seen.add(marker)
     if isinstance(value, Mapping):
         for k, v in value.items():
-            yield "", str(k)  # content rules apply to keys; field-name rules apply only to their values
+            # Arrow binary map keys arrive as bytes: decode them strictly (invalid UTF-8 raises, as for binary
+            # values) so the field-name rules see "password", not "b'password'". Entries stay separate.
+            name = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+            yield "", name  # content rules apply to keys; field-name rules apply only to their values
             context = (
                 key
                 if _IMAGE_KEY.search(key)
                 or _PATCH_KEY.search(key)
                 or _RUN_KEY.search(key)
                 or _CREDENTIAL_KEY.search(key)
-                else str(k)
+                else name
             )
             yield from _walk(v, context, seen)
     elif isinstance(value, (list, tuple)):
@@ -428,9 +431,9 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
     return out
 
 
-def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy) -> list[Finding]:
+def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy, payload: set[str]) -> list[Finding]:
     bounded_json_bytes(checked_path(root, rel))
-    snapshot, _ = read_snapshot(root, rel)
+    snapshot, _ = read_snapshot(root, rel, payload=payload)
     out = scan_value(snapshot.model_dump(mode="json", by_alias=True), policy, rel, "snapshot metadata")
     for artifact in (snapshot.members, snapshot.acquisition):
         if artifact is not None:
@@ -444,7 +447,12 @@ def _check_snapshot(root: Path, rel: str, policy: RedactionPolicy) -> list[Findi
 
 
 def _check_eval_record(
-    root: Path, rel: str, policy: RedactionPolicy, infx_ids: set[str], classified_ids: set[str]
+    root: Path,
+    rel: str,
+    policy: RedactionPolicy,
+    infx_ids: set[str],
+    classified_ids: set[str],
+    snapshot_configurations: Callable[[str], set[str] | None],
 ) -> list[Finding]:
     record = load_record(root / rel)
     out = scan_value(record.model_dump(mode="json", by_alias=True), policy, rel, "eval record")
@@ -454,6 +462,20 @@ def _check_eval_record(
                 "eval-configuration-unresolved", f"cannot classify evaluated configurations: {sorted(missing)}", rel
             )
         )
+    # A named input snapshot is truth provenance too: classify its configurations as well as the listed ones.
+    snapshot_id = record.truth.snapshot_id
+    members = None if snapshot_id is None else snapshot_configurations(snapshot_id)
+    if snapshot_id is not None:
+        if members is None:
+            out.append(Finding("eval-configuration-unresolved", f"cannot resolve snapshot {snapshot_id}", rel))
+        elif unclassified := members - classified_ids:
+            out.append(
+                Finding(
+                    "eval-configuration-unresolved",
+                    f"cannot classify snapshot configurations: {sorted(unclassified)}",
+                    rel,
+                )
+            )
     for artifact in record.truth.artifacts:
         path = _verify((root / rel).parent, artifact)
         artifact_rel = path.relative_to(root).as_posix()
@@ -475,7 +497,9 @@ def _check_eval_record(
         path = _verify((root / rel).parent, artifact)
         if policy.allow_provenance_artifacts and artifact.format == "json":
             out.extend(scan_json_file(path, policy, path.relative_to(root).as_posix(), "eval findings JSON"))
-    if policy.inferencex_disclosure == "aggregates-only" and infx_ids & set(record.truth.configuration_ids):
+    if policy.inferencex_disclosure == "aggregates-only" and infx_ids & (
+        set(record.truth.configuration_ids) | (members or set())
+    ):
         out.append(Finding("infx-aggregates-only", "record scores InferenceX-derived truth; publish aggregates", rel))
     return out
 
@@ -499,6 +523,7 @@ def check_publishable(
     from aisim_core.data.mirror import DATA_ROOTS, list_tree, snapshot_documents
 
     tree = list_tree(root)
+    payload_paths = {f.path for f in tree if f.path.startswith(DATA_ROOTS)}
     for f in tree:
         if f.is_symlink:
             findings.append(Finding("symlink", "symbolic links are not published", f.path))
@@ -510,6 +535,21 @@ def check_publishable(
     if findings:
         return findings
     eval_records = {p.relative_to(root).as_posix() for p in record_paths(root / "eval", recursive=True)}
+    snapshot_members: dict[str, set[str]] | None = None
+
+    def snapshot_configurations(snapshot_id: str) -> set[str] | None:
+        """Configurations of the tree's snapshot with this ID (read once, on first use); None when absent."""
+        nonlocal snapshot_members
+        if snapshot_members is None:
+            snapshot_members = {}
+            for document in sorted(snapshot_documents(root, (f.path for f in tree))):
+                try:
+                    snapshot, members = read_snapshot(root, document)
+                except (OSError, ValidationError, ValueError, RecursionError):
+                    continue  # unreadable documents resolve nothing; the validators report them
+                snapshot_members.setdefault(snapshot.snapshot_id, set()).update(m.configuration_id for m in members)
+        return snapshot_members.get(snapshot_id)
+
     for rel in chosen:
         if rel.endswith("/manifest.json") and rel not in loaded:
             try:
@@ -537,7 +577,6 @@ def check_publishable(
         try:
             dataset = DatasetIndex.model_validate_json(bounded_json_bytes(checked_path(root, index_rel)))
             indexes = {index_rel: dataset}
-            payload_paths = {f.path for f in tree if f.path.startswith(DATA_ROOTS)}
             for ref in dataset.categories.values():
                 if ref.index.path not in payload_paths:
                     raise ValueError("category index must be a listed dataset payload file")
@@ -581,13 +620,20 @@ def check_publishable(
         # Match the snapshot documents declared by mirror._check_snapshots.
         if rel in snapshots:
             try:
-                findings.extend(_check_snapshot(root, rel, policy))
+                findings.extend(_check_snapshot(root, rel, policy, payload_paths))
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
         if rel in eval_records:
             try:
                 findings.extend(
-                    _check_eval_record(root, rel, policy, infx_ids, {m.configuration_id for m in loaded.values()})
+                    _check_eval_record(
+                        root,
+                        rel,
+                        policy,
+                        infx_ids,
+                        {m.configuration_id for m in loaded.values()},
+                        snapshot_configurations,
+                    )
                 )
             except (OSError, ValidationError, ValueError, RecursionError) as exc:
                 findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))

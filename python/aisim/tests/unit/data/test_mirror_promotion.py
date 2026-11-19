@@ -129,7 +129,7 @@ def _config(model="synthetic/model-a", *, clean=True, **kw):
     return cfg
 
 
-def _eval(root, configuration_ids, *, case_ids=5, inputs=None):
+def _eval(root, configuration_ids, *, case_ids=5, inputs=None, snapshot_id=None):
     rows = [(f"s{i}", {"tokens": 10 * i, **(inputs or {})}, 10.0 * i) for i in range(1, case_ids + 1)]
     art = write_truth_table(root / "truth.parquet", rows)
     ident = Identity(
@@ -144,6 +144,7 @@ def _eval(root, configuration_ids, *, case_ids=5, inputs=None):
             "prediction": PredictionIdentity.build("fpm_interpolation", {"p": "b" * 64}, "a" * 64).model_dump(),
             "truth": {
                 "layer": "e2e",
+                "snapshot_id": snapshot_id,
                 "configuration_ids": configuration_ids,
                 "identity": ident.model_dump(),
                 "artifacts": [art.model_dump(by_alias=True)],
@@ -1203,6 +1204,48 @@ def test_eval_record_scoring_infx_truth_is_aggregates_only(tmp_path):
     assert "infx-aggregates-only" in {f.code for f in plan.findings}
     relaxed = RedactionPolicy(inferencex_disclosure="point-level")
     assert "infx-aggregates-only" not in {f.code for f in check_publishable(root, files, policy=relaxed)}
+
+
+@pytest.mark.parametrize("snapshot", ["infx", "self-collected", "unknown"])
+def test_eval_snapshot_reference_is_classified_for_infx_disclosure(tmp_path, snapshot):
+    from aisim_core.data import Manifest
+    from aisim_core.data.e2e import SnapshotMember, write_snapshot
+
+    root = tmp_path / "m"
+    root.mkdir()
+    (infx,) = inferencex_to_configurations([_infx()])
+    infx = dataclasses.replace(
+        infx, observations=[o.model_copy(update=CLEAN) for o in infx.observations], provenance=[], requests=[]
+    )
+    infx_manifest = write_configuration(root, infx, prefix="data")
+    own_manifest = write_configuration(root, _config("synthetic/model-a"), prefix="data")
+    register_manifests(root, [infx_manifest, own_manifest], INTERNAL_REPO)
+    build_catalog(root)
+    own_cid = Manifest.model_validate_json((root / own_manifest).read_bytes()).configuration_id
+    manifest = {"infx": infx_manifest, "self-collected": own_manifest}.get(snapshot, own_manifest)
+    members = [
+        SnapshotMember(
+            configuration_id=o.configuration_id, observation_id=o.observation_id,
+            record_sha256=o.record_sha256, manifest_path=manifest,
+        )
+        for o in load_e2e(root, manifest).observations
+    ]  # fmt: skip
+    (root / "data/e2e-snapshots/s1").mkdir(parents=True)
+    named = write_snapshot(
+        root, "data/e2e-snapshots/s1/snapshot.json", members,
+        source_scope={"kind": "synthetic"}, selection_policy="p", completeness="complete",
+    ).snapshot_id  # fmt: skip
+    # The record lists only the self-collected configuration but names the InferenceX snapshot as its truth input.
+    record = _eval(root, [own_cid], snapshot_id="f" * 64 if snapshot == "unknown" else named)
+    build_catalog(root)
+    # Publish only the self-collected configuration, the snapshot and the record; the InferenceX shard is not selected.
+    selected = [str(Path(own_manifest).parent), "data/e2e-snapshots", "eval"]
+    files = [p.relative_to(root).as_posix() for d in selected for p in (root / d).rglob("*") if p.is_file()]
+    manifests = {m: Manifest.model_validate_json((root / m).read_bytes()) for m in (infx_manifest, own_manifest)}
+    codes = {f.code for f in check_publishable(root, files, manifests=manifests)}
+    assert ("infx-aggregates-only" in codes) is (snapshot == "infx")
+    assert ("eval-configuration-unresolved" in codes) is (snapshot == "unknown")
+    _ = record
 
 
 def test_request_table_text_is_scanned(tmp_path):
@@ -2783,15 +2826,17 @@ def test_public_validation_rejects_populated_password_fields(tmp_path, redacted)
 
 @pytest.mark.parametrize("redacted", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
-def test_public_validation_preserves_arrow_map_disclosure_context(tmp_path, redacted, nested):
+@pytest.mark.parametrize("binary_keys", [False, True])
+def test_public_validation_preserves_arrow_map_disclosure_context(tmp_path, redacted, nested, binary_keys):
     import pyarrow.parquet as pq
 
     root, directory, _ = _op_mirror(tmp_path, "future_text", None)
     shard = root / directory / "gemm_perf.parquet"
     table = pq.read_table(shard)
     value = "[REDACTED]" if redacted else "private-worker:v1"
-    dtype = pa.map_(pa.string(), pa.string())
-    cell = [("image", value), ("image", "[REDACTED]")]
+    key = b"image" if binary_keys else "image"
+    dtype = pa.map_(pa.binary() if binary_keys else pa.string(), pa.string())
+    cell = [(key, value), (key, "[REDACTED]")]
     if nested:
         dtype = pa.struct([pa.field("nested", pa.list_(dtype))])
         cell = {"nested": [cell]}
@@ -2814,6 +2859,30 @@ def test_public_validation_preserves_arrow_map_disclosure_context(tmp_path, reda
     report = validate_tree(root, profile="public")
     assert ("image-name" in {f.code for f in report.errors}) is not redacted
     assert report.ok is redacted, report.errors
+
+
+@pytest.mark.parametrize("value", ["plain-synthetic-value", "[REDACTED]"])
+@pytest.mark.parametrize("key", [b"password", "password"])
+def test_binary_map_keys_keep_their_field_name_context(key, value):
+    from aisim_core.data.redaction import DEFAULT_POLICY, scan_value
+
+    # Arrow returns a binary map key as bytes; "b'password'" must not hide the credential-field rule.
+    findings = scan_value([{key: value}], DEFAULT_POLICY, "p", "t")
+    assert ("secret" in {f.code for f in findings}) is (value != "[REDACTED]")
+
+
+def test_binary_and_text_map_keys_stay_separate_entries():
+    from aisim_core.data.redaction import DEFAULT_POLICY, scan_value
+
+    findings = scan_value([{b"password": "[REDACTED]", "password": "plain-synthetic-value"}], DEFAULT_POLICY, "p", "t")
+    assert "secret" in {f.code for f in findings}
+
+
+def test_invalid_utf8_map_key_is_refused():
+    from aisim_core.data.redaction import DEFAULT_POLICY, scan_value
+
+    with pytest.raises(UnicodeDecodeError):
+        scan_value([{b"\xff": "[REDACTED]"}], DEFAULT_POLICY, "p", "t")
 
 
 @pytest.mark.parametrize("name", ["snapshot.JSON", "frozen-view.JSON"])
@@ -3132,15 +3201,50 @@ def test_aggregate_status_accepts_ordinary_values(value):
     assert check_disclosure([{"n_scored": 5, "status": value}]) == []
 
 
+@pytest.mark.parametrize("lead", ["", "\n", "\n\n  \n"])  # Hugging Face accepts front matter after whitespace
 @pytest.mark.parametrize("value", ["plain-synthetic-value", "[REDACTED]"])
-def test_dataset_card_front_matter_credential_fields(tmp_path, value):
+def test_dataset_card_front_matter_credential_fields(tmp_path, value, lead):
     root, _ = _mirror(tmp_path)
-    (root / "README.md").write_text(f'---\npassword: "{value}"\n---\n# Synthetic dataset\n')
+    (root / "README.md").write_text(f'{lead}---\npassword: "{value}"\n---\n# Synthetic dataset\n')
     shutil.rmtree(root / "mirror", ignore_errors=True)
     report = validate_tree(root, profile="public")
     secrets = [f for f in report.errors if f.code == "secret" and f.path == "README.md"]
     assert bool(secrets) == (value != "[REDACTED]")
     assert report.ok == (value == "[REDACTED]"), report.errors
+
+
+@pytest.mark.parametrize("which", ["members", "acquisition"])
+@pytest.mark.parametrize("location", [".git/hidden-table.parquet", "data/elsewhere/table.parquet"])
+def test_snapshot_tables_must_be_dataset_payloads(tmp_path, monkeypatch, which, location):
+    from aisim_core.data.e2e import read_snapshot
+
+    root, directories = _snapshot_mirror(
+        tmp_path, acquisition={"acquired_at": "2026-11-07T00:00:00Z", "source_uri": "https://example.test"}
+    )
+    document = root / directories[1] / "snapshot.json"
+    snapshot, _ = read_snapshot(root, document.relative_to(root).as_posix())
+    table = getattr(snapshot, which)
+    destination = root / location
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    (root / table.path).rename(destination)
+    document.write_text(
+        snapshot.model_copy(update={which: table.model_copy(update={"path": location})}).model_dump_json(by_alias=True)
+    )
+    hidden = location.startswith(".git/")
+    if hidden:
+        real_open = Path.open
+
+        def refuse_hidden_table(self, *args, **kwargs):
+            if self == destination:
+                pytest.fail("validation opened a snapshot table outside the dataset payload")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", refuse_hidden_table)
+    shutil.rmtree(root / "mirror", ignore_errors=True)
+    report = validate_tree(root, profile="public")
+    assert ("snapshot-invalid" in {f.code for f in report.errors}) is hidden
+    # A noncanonical table path inside the payload inventory stays supported.
+    assert hidden or report.ok, report.errors
 
 
 @pytest.mark.parametrize("profile", ["mirror", "public"])

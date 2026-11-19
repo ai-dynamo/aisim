@@ -163,14 +163,19 @@ def _check_root_metadata(root: Path, tree: list[CandidateFile], profile: Profile
 
             report.findings.extend(scan_value(text, DEFAULT_POLICY, file.path, "repository metadata"))
             lines = text.splitlines(keepends=True)
-            if file.path == "README.md" and lines and lines[0].strip() == "---":
-                end = next((i for i in range(1, len(lines)) if lines[i].strip() in {"---", "..."}), None)
+            # Hugging Face's card parser accepts the opening delimiter after leading whitespace, blank lines included.
+            start = next((i for i, line in enumerate(lines) if line.strip()), None)
+            if file.path == "README.md" and start is not None and lines[start].strip() == "---":
+                end = next((i for i in range(start + 1, len(lines)) if lines[i].strip() in {"---", "..."}), None)
                 try:
                     if end is None:
                         raise ValueError("dataset card front matter has no closing delimiter")
                     report.findings.extend(
                         scan_yaml(
-                            "".join(lines[1:end]).encode(), DEFAULT_POLICY, file.path, "dataset card front matter"
+                            "".join(lines[start + 1 : end]).encode(),
+                            DEFAULT_POLICY,
+                            file.path,
+                            "dataset card front matter",
                         )
                     )
                 except ValueError as exc:
@@ -319,12 +324,15 @@ def snapshot_documents(root: Path, paths: Iterable[str]) -> set[str]:
     return found
 
 
-def _check_snapshots(root: Path, report: TreeReport, declared: set[str], manifests: dict[str, Manifest]) -> None:
+def _check_snapshots(
+    root: Path, report: TreeReport, declared: set[str], manifests: dict[str, Manifest], eligible: set[str]
+) -> None:
     candidates = (p.relative_to(root).as_posix() for p in (root / "data").rglob("*") if p.suffix.lower() == ".json")
     for rel in sorted(snapshot_documents(root, candidates)):
         try:
             bounded_json_bytes(checked_path(root, rel))
-            snapshot, members = read_snapshot(root, rel)
+            # A fresh checkout only has the dataset payload: tables outside it (e.g. under .git) cannot be loaded.
+            snapshot, members = read_snapshot(root, rel, payload=eligible)
             for member in members:
                 checked_path(root, member.manifest_path)
                 manifest = manifests.get(member.manifest_path)
@@ -477,7 +485,7 @@ def validate_tree(
         if Path(f.path).suffix.lower() == ".yaml" and f.path not in yaml_sidecars | system_files:
             report.add("yaml-sidecar", "YAML must be a declared operation collection/reuse sidecar", f.path)
     _check_eval(root, report, declared)
-    _check_snapshots(root, report, declared, manifests)
+    _check_snapshots(root, report, declared, manifests, eligible)
     _check_schema_snapshots(root, report, declared)
     if not any(f.code == "index-integrity" for f in report.errors):
         _check_catalog_drift(root, report, declared)

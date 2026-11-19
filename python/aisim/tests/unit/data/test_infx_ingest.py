@@ -1148,6 +1148,9 @@ def test_model_keys_require_consistent_display_names(root, tmp_path, conflicting
         ("num_decode_gpu", "8"),
         ("is_multinode", "false"),
         ("decode_dp_attention", 1),
+        # The live source reports a boolean for both roles, also on aggregated rows; null cannot be converted.
+        ("prefill_dp_attention", None),
+        ("decode_dp_attention", None),
     ],
 )
 def test_malformed_deployment_preserves_qualified_state(root, tmp_path, field, value):
