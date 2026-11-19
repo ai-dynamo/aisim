@@ -53,9 +53,9 @@ from aisim_core.data.eval import load_record, record_paths
 from aisim_core.data.hygiene import (
     DuplicateJsonKeyError,
     Finding,
+    _unique_json_keys,
     bounded_json_bytes,
     checked_path,
-    json_sidecar_value,
     yaml_sidecar_value,
 )
 from aisim_core.data.parquet import read_parquet
@@ -213,7 +213,7 @@ def _walk(value: Any, key: str = "", seen: set[tuple[int, str]] | None = None) -
 
 def _json_text(text: str) -> Any:
     try:
-        return json_sidecar_value(text.encode("utf-8"))
+        return json.loads(text, object_pairs_hook=_unique_json_keys)
     except DuplicateJsonKeyError:
         raise
     except (ValueError, RecursionError):
