@@ -994,6 +994,7 @@ pub(crate) mod energy_test_fixtures {
         SystemSpec {
             data_dir: "data".into(),
             gpu: GpuSpec {
+                vendor: None,
                 fp32_flops: None,
                 mem_bw: 7.7e12,
                 mem_bw_empirical_scaling_factor: 0.92,
