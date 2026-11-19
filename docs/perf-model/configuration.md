@@ -285,7 +285,11 @@ total past KV, widens the former and preserves the latter.
 
 The canonical constructor currently supports explicit speculative schemes with
 OP/SOL timing. FPM interpolation and regression are unsupported candidates for
-these schemes. An explicit FPM request with `fallback_policy="deny"` fails;
+these schemes, except that an explicit vLLM `fpm_regression` request prices an
+MTP scheme at the depth it was fitted at (see
+[engine replay timing](#engine-replay-timing)) and is selected as for legacy
+`nextn`. Otherwise an explicit FPM request with
+`fallback_policy="deny"` fails;
 `auto` or an explicit mode with `fallback_policy="allow"` can select a supported
 OP candidate while preserving the complete speculative identity. They do not
 drop speculation to obtain an autoregressive estimate. Separately, an ordinary
@@ -862,7 +866,9 @@ A vLLM regression fitted at `nextn > 0` gives a valid estimate only when its
 training timings cover complete MTP rounds, drafting and verification, as a
 measured speculative-round profile's do; `nextn` records the depth, not how
 the timings were obtained. Replay times such a role only at that depth:
-the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. Each
+the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. An MTP
+draft is `depth` extra target-shaped layers, so the snapshot also times an
+engine configured with `speculation: {kind: mtp, params: {depth: N}}`. Each
 decode request counts once in the totals with its past KV, as in the
 telemetry; only its `extend_lengths` entry carries the tokens it verifies: one
 plus the drafts the scheduler gave it, fewer than `nextn` when the token budget
@@ -876,9 +882,10 @@ decode in one rank pass; an SGLang rank runs a prefill batch alone (mixed chunk
 is not modeled), so it does not. Every aggregated worker whose engine runs
 attention DP above one also needs cross-rank aggregated. A regression store is
 ready with a usable fit and a learned store when the forest has it. It rejects
-a rank hosting the vision encoder, a speculation scheme, `nextn > 0` for a
-learned model or a non-vLLM regression (SGLang's telemetry reports an MTP
-decode request's extend as 1), bounded decoder replay, and an automatic selection that
+a rank hosting the vision encoder, a speculation scheme other than MTP,
+`nextn > 0` or MTP for a learned model or a non-vLLM regression (SGLang's
+telemetry reports an MTP decode request's extend as 1), bounded decoder replay,
+and an automatic selection that
 would fall back to an untrained regression. Replay also rejects such a role
 whose engine sets a `decode_speedup_ratio` other than 1: replay then prices
 each rank's phases, which these estimators never do. A pass on which no rank
@@ -951,34 +958,44 @@ Each config is an entry.
   - a perf-model file, a template file named by `from`, and inline JSON;
   - the value written under `engine.ais_perf_model` or
     `search_space.ais_perf_model` in a `predict`, `recommend` or search YAML
-    file, when `aisim predict`, `aisim recommend`,
+    or JSON file, when `aisim predict`, `aisim recommend`,
     `CorePredictionConfig.from_yaml`, `CoreRecommendationConfig.from_yaml` or
     `SmartSearchConfig.from_yaml` reads the file.
 
-  A configuration file reports it like this:
+  These configuration readers select JSON for `.json` filenames (case
+  insensitive) and YAML otherwise.
+  A YAML configuration file reports it like this:
   `engine.ais_perf_model in predict.yaml: the key 'estimation_mode' is written twice (lines 9 and 11); write it once`.
+  A JSON configuration file reports it like this:
+  `predict.json: engine.ais_perf_model.estimation_mode is written twice`.
+  JSON errors use decoded key paths without line numbers, so escaped and
+  literal spellings of the same key count as a repeat.
   `aisim predict` and `aisim recommend` then exit with code `2`
-  before they touch the output directory. A key that a YAML merge (`<<`)
+  before they touch the output directory. In YAML, a key that a merge (`<<`)
   brings in does not repeat a key written next to it.
 - The same commands and loaders reject a configuration file that writes
   `ais_perf_model` itself twice in its section. They also reject a file that
   writes the section (`engine`, or `search_space` in a search file) twice
-  when one of these sections writes `ais_perf_model`. The YAML reader would
-  keep the last one and drop the others without a word. The error has the
-  same form and names the first and the last line:
+  when one of these sections writes `ais_perf_model`. Without this check,
+  the reader for the file's format would keep the last one and drop the
+  others without a word. YAML errors name the first and the last line:
   `engine.ais_perf_model in predict.yaml: the key 'ais_perf_model' is written twice (lines 8 and 10); write it once`
   or
   `engine.ais_perf_model in predict.yaml: the key 'engine' is written twice (lines 1 and 14); write it once`.
+  JSON errors name the decoded path instead:
+  `predict.json: engine.ais_perf_model is written twice` or
+  `predict.json: engine is written twice`.
   A file with several of these repeats reports the section first, then
   `ais_perf_model`, then a key inside the value.
 - `ais_perf_model`, or its section, that a YAML merge (`<<`) brings in next
   to a written one is not a repeat: the written one is used. When only a
   merge brings the value in, the value that the YAML reader keeps is the one
   that is checked for a key written twice.
-- A key written twice is not checked in a value given with `--set`. The YAML
-  reader keeps the last value there. It does the same for a key repeated
-  anywhere else in a configuration file, such as an old estimator field, and
-  for a section written twice when none of them writes `ais_perf_model`.
+- A key written twice is not checked in a value given with `--set`, which
+  always uses YAML parsing and keeps the last value. Elsewhere in a
+  configuration file, the reader for the file's format keeps the last
+  value of a repeated key, such as an old estimator field, or a section
+  written twice when none of them writes `ais_perf_model`.
   `aisim perf-model migrate` makes the same checks when it reads a file.
   Python data passed to `model_validate` cannot hold a key twice.
 - When a consumer needs a worker type the value does not have, the error lists
@@ -1496,7 +1513,8 @@ model, which records no identity; a native snapshot without an enabled, ready
 correction store for the iterations replay prices for the role (prefill, decode,
 or any of prefill, decode and mixed for an aggregated worker); a snapshot
 without `kv_block_size`; one saved for another worker role, model or hardware;
-and snapshots with an FPM profile, speculation, pipeline parallelism (engine
+and snapshots with an FPM profile, speculation other than the vLLM MTP
+regression case below, pipeline parallelism (engine
 replay runs only `pipeline: 1`) or context parallelism.
 `engine.estimator_config.state_snapshot` is rejected: a snapshot belongs to one
 role.
@@ -1544,7 +1562,7 @@ handled as follows:
 | `tp`, `pp`, `attention_dp`, `moe_tp_size` or `moe_ep_size` `unknown` | The role needs one explicit value for each unknown width, such as `parallelism: {preset: false, tensor: 1, pipeline: 1, attention_data: 1}`; known widths are still pinned. `tp * pp * attention_dp` must equal `deployment_limits.num_gpus` when known. |
 | `deployment_limits.max_kv_tokens` | Required. The role's KV capacity is fixed to that many tokens in whole `kv_block_size` blocks and KV memory is not searched; a different fixed capacity or a `memory_fraction` search is a conflict. |
 | `deployment_limits.max_num_batched_tokens`, `max_num_seqs` | Required. The role's `max_batched_tokens` and `max_sequences` domains keep only values at most the recorded limit; an empty domain is an error. |
-| `nextn > 0` | For a vLLM regression, pinned as for a native snapshot: `engine.nextn` takes the saved depth, and `engine.nextn_accepted` is required. Rejected for other backends. |
+| `nextn > 0` or `speculation: {kind: mtp, params: {depth: N}}` | For a vLLM `fpm_regression` snapshot fitted with either spelling, the depth is pinned as for a native snapshot. Replay accepts only 1–5 draft tokens; larger MTP depths remain valid for cost prediction and snapshot restoration, but replay rejects them. Recommendation uses `engine.nextn` and requires `engine.nextn_accepted`; prediction also accepts `engine.speculation: {kind: mtp, params: {depth: N}, expected_accepted_tokens: A}` at the same depth. Rejected for other backends and for `fpm_learned`. |
 
 A snapshot whose `backend_version` is unset (`null`) is rejected: save the
 deployed version or `"unknown"`. `deployment_limits.num_gpus` and
