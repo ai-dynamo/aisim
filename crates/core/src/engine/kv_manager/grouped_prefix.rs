@@ -189,7 +189,15 @@ impl GroupedPrefixRules {
                 cacheable,
             });
         }
-        let scheduler_block = rules.iter().fold(1, |acc, rule| lcm(acc, rule.block));
+        // vLLM's `math.lcm` cannot overflow; refuse an LCM above usize.
+        let Some(scheduler_block) = rules.iter().try_fold(1usize, |acc, rule| {
+            (acc / gcd(acc, rule.block)).checked_mul(rule.block)
+        }) else {
+            bail!(
+                "kv_cache_groups with enable_prefix_caching=true require the least common multiple of every group's block_size_tokens (the scheduler block) to be at most {}; choose block_size_tokens with a smaller least common multiple",
+                usize::MAX
+            );
+        };
         ensure!(
             scheduler_block.is_multiple_of(hash_block),
             "the scheduler block of kv_cache_groups must be a multiple of prefix_match_unit"
@@ -407,8 +415,10 @@ impl GroupedPrefixRules {
     /// Modified simulation of the align split (v0.31 `sched:414-527`, v0.32
     /// `sched:443-556`). `known` is the request's token count and `budget`
     /// the step budget. Without a State rule the split is off and returns
-    /// `desired`. During the prefill, `desired` is clamped to the tokens the
-    /// request has.
+    /// `desired`. Inside the prefill, `desired` is clamped to the tokens
+    /// the request has. At `start >= prefill_end`, `desired` is returned
+    /// unchanged, as in vLLM (v0.31 `sched:436-438`, v0.32 `sched:465-467`),
+    /// and the caller bounds the count.
     pub(crate) fn align_split(
         &self,
         start: usize,

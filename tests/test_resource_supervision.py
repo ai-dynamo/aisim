@@ -112,12 +112,16 @@ def test_child_exit_code_is_preserved(tmp_path):
 
 @pytest.mark.parametrize("failure", ["missing", "malformed", "override", "resources"])
 @pytest.mark.parametrize("stack", ["engine", "missing-stack"])
-def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack):
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack, suffix):
     import subprocess
 
-    config = tmp_path / "config.yaml"
+    config = tmp_path / f"config{suffix}"
     if failure != "missing":
-        config.write_text("[" if failure == "malformed" else "execution:\n  resources:\n    memory_limit_gb: -1\n")
+        serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+        config.write_text(
+            "[" if failure == "malformed" else serialize({"execution": {"resources": {"memory_limit_gb": -1}}})
+        )
     output = tmp_path / "output"
     output.mkdir()
     original = {"prediction.json": '{"old":true}', "resource-runtime.json": '{"old_runtime":true}'}
@@ -145,6 +149,7 @@ def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, fai
         assert "missing-stack" in result.stderr
         assert "could not read configuration" not in result.stderr
         assert "malformed YAML" not in result.stderr
+        assert "malformed JSON" not in result.stderr
         assert "invalid --set" not in result.stderr
 
 
