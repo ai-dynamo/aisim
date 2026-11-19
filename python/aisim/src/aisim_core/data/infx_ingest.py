@@ -41,7 +41,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,11 +50,13 @@ from urllib.parse import urlencode
 from aisim_core.data.e2e import (
     INFERENCEX_CONFIG_FIELDS,
     E2eConfigurationData,
+    ProvenanceFile,
     SnapshotAcquisition,
     SnapshotMember,
     configuration_dir,
     inferencex_to_configurations,
     load_e2e,
+    read_snapshot,
     snapshot_id,
     write_configuration,
     write_snapshot,
@@ -66,7 +68,8 @@ SELECTION_POLICY = "inferencex-all-observations-in-scope/v1"
 REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl")
 # ``exact=true&date=D`` returns the logical snapshot as of D, so one benchmark id can reappear on later
 # dates. Only these per-view context fields differ between appearances (verified against the live API);
-# they are not measured content and are excluded from the stored record and from contradiction checks.
+# they are not measured content and are excluded from normalized records and contradiction checks.
+# The original HTTP responses are retained unchanged as hash-linked provenance.
 VIEW_CONTEXT_PREFIX = "curve_"
 _AVAILABILITY_KEY = (
     "model", "hardware", "framework", "precision", "spec_method", "disagg", "benchmark_type", "isl", "osl",
@@ -270,6 +273,7 @@ class Acquisition:
     empty_scope: bool = False  # valid-empty: nothing declared for the scope (not a failure)
     undeclared: list[str] = field(default_factory=list)  # benchmark rows availability did not list (warning)
     requests_made: int = 0
+    responses: dict[str, bytes] = field(default_factory=dict)  # immutable original benchmark response evidence
 
 
 def _json(fetched: Fetched, body: bytes, expect: type) -> Any:
@@ -286,6 +290,8 @@ class Acquirer:
     def __init__(self, client: InfxClient, cache: AcquisitionCache, now: Callable[[], datetime] | None = None):
         self.client, self.cache = client, cache
         self.now = now or (lambda: datetime.now(UTC))
+        self.responses: dict[str, bytes] = {}
+        self.selected_models: set[str] | None = None
 
     def _page(self, route: str, params: Mapping[str, Any] | None, expect: type) -> tuple[Any, str, str]:
         """Fetch with a conditional request; returns (value, acquired_at, status 'acquired'|'inherited')."""
@@ -295,13 +301,20 @@ class Acquirer:
         if fetched.status == 304:
             if cached is None:
                 raise IncompleteAcquisitionError(f"{url}: 304 without a cached body")
+            self.responses[url] = cached[1]
             return _json(fetched, cached[1], expect), cached[0]["fetched_at"], "inherited"
         value = _json(fetched, fetched.body, expect)  # validate before it can enter the cache
         stamp = _utc(self.now())
         self.cache.put(url, fetched.body, fetched.etag, stamp)
+        self.responses[url] = fetched.body
         return value, stamp, "acquired"
 
-    def acquire(self, models: Sequence[str] | None = None, prior_observation_ids: Sequence[str] = ()) -> Acquisition:
+    def acquire(
+        self,
+        models: Sequence[str] | None = None,
+        prior_observation_ids: Sequence[str] = (),
+        prior_observation_models: Mapping[str, str] | None = None,
+    ) -> Acquisition:
         options, _, _ = self._page("views/options", None, dict)
         by_key: dict[str, str] = {}
         for entry in options.get("models", []):
@@ -313,6 +326,11 @@ class Acquirer:
             known = set(by_key) | set(by_key.values())
             if unknown := sorted(wanted - known):
                 raise InfxError(f"unknown model selector(s) {unknown}; known: {sorted(set(by_key.values()))}")
+            self.selected_models = {k for k, name in by_key.items() if k in wanted or name in wanted}
+            if prior_observation_models is not None:
+                prior_observation_ids = [
+                    oid for oid in prior_observation_ids if prior_observation_models.get(oid) in self.selected_models
+                ]
         declared: dict[tuple[str, str], set[tuple]] = {}
         for row in availability:
             if not isinstance(row, dict) or not {*_AVAILABILITY_KEY, "date"} <= row.keys():
@@ -371,6 +389,7 @@ class Acquirer:
             acquisitions=[acquired[k] for k in sorted(acquired, key=int)],
             undeclared=undeclared,
             requests_made=self.client.requests_made,
+            responses={url: body for url, body in self.responses.items() if "/benchmarks?" in url},
         )
 
     def _runs(self, dates: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -378,6 +397,11 @@ class Acquirer:
         runs: dict[str, dict[str, Any]] = {}
         for date in dates:
             info, _, _ = self._page("workflow-info", {"date": date}, dict)
+            if not all(isinstance(info.get(key), list) for key in ("runs", "runConfigs")):
+                raise IncompleteAcquisitionError(f"workflow-info {date}: runs and runConfigs must be lists")
+            for key in ("runs", "runConfigs"):
+                if any(not isinstance(item, dict) or not isinstance(item.get("html_url"), str) for item in info[key]):
+                    raise IncompleteAcquisitionError(f"workflow-info {date}: malformed {key} entry")
             for run in info.get("runs", []):
                 runs.setdefault(run["html_url"], {})["run_attempt"] = run.get("run_attempt")
             for config in info.get("runConfigs", []):
@@ -419,6 +443,18 @@ def _configuration_prefix(data: E2eConfigurationData) -> str:
 
 def plan_snapshot(acq: Acquisition) -> SnapshotPlan:
     configurations = inferencex_to_configurations(acq.records, acq.runs)
+    # Keep original response bytes as well as the normalized, deduplicated record bundle.
+    # These hash-linked artifacts survive removal of the mutable acquisition cache.
+    originals: dict[str, list[ProvenanceFile]] = {}
+    for url, body in sorted(acq.responses.items()):
+        artifact = ProvenanceFile(
+            "raw-output", body, name=f"inferencex-response-{_sha(url.encode() + body)}", source_tool=url
+        )
+        for model in {row["model"] for row in json.loads(body)}:
+            originals.setdefault(model, []).append(artifact)
+    configurations = [
+        replace(data, provenance=[*data.provenance, *originals.get(data.body.model_id, [])]) for data in configurations
+    ]
     prefixes = {data.body.configuration_id(): _configuration_prefix(data) for data in configurations}
     members = [
         SnapshotMember(
@@ -442,6 +478,9 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
     root = Path(root)
     path = snapshot_path(plan.snapshot_id)
     if (root / path).exists():
+        snapshot, _ = read_snapshot(root, path)
+        if snapshot.snapshot_id != plan.snapshot_id:
+            raise ValueError("existing snapshot ID differs from the planned snapshot")
         return path
     for data in plan.configurations:
         prefix = plan.configuration_prefixes[data.body.configuration_id()]
@@ -451,15 +490,20 @@ def write_candidate(root: Path, acq: Acquisition, plan: SnapshotPlan) -> str:
         else:
             write_configuration(root, data, prefix=prefix)
     (root / path).parent.mkdir(parents=True, exist_ok=True)
-    snapshot = write_snapshot(
-        root,
-        path,
-        plan.members,
-        source_scope=acq.scope,
-        selection_policy=SELECTION_POLICY,
-        completeness="complete",
-        acquisition=acq.acquisitions,
-    )
+    pending = path + ".pending"
+    try:
+        snapshot = write_snapshot(
+            root,
+            pending,
+            plan.members,
+            source_scope=acq.scope,
+            selection_policy=SELECTION_POLICY,
+            completeness="complete",
+            acquisition=acq.acquisitions,
+        )
+        os.replace(root / pending, root / path)
+    finally:
+        (root / pending).unlink(missing_ok=True)
     assert snapshot.snapshot_id == plan.snapshot_id
     return path
 

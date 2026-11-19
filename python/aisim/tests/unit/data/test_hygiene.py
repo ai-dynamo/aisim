@@ -69,6 +69,26 @@ def test_gz_suffix_follows_the_policy_allow_list():
     assert "suffix" in codes(check_listing(pkl, [CandidateFile("data/x.pkl", 1)]))  # code stays forbidden
 
 
+def test_root_matching_uses_directory_boundaries():
+    policy = dataclasses.replace(POLICY, allowed_roots=("data",))
+    assert check_listing(policy, [CandidateFile("data/x.json", 2)]) == []
+    assert "path-root" in codes(check_listing(policy, [CandidateFile("database/x.json", 2)]))
+
+
+def test_deep_json_is_reported_as_invalid():
+    import json
+
+    depth = 10000  # also exceeds CPython 3.12's separate C JSON decoder recursion limit
+    doc = b"[" * depth + b"0" + b"]" * depth
+    policy = CandidatePolicy()
+    file = CandidateFile("data/deep.json", len(doc))
+    assert check_listing(policy, [file]) == []
+    with pytest.raises(RecursionError):
+        json.loads(doc)
+    assert "json-invalid" in codes(check_content(policy, file, doc))
+    assert check_content(POLICY, CandidateFile("data/shallow.json", 3), b"[0]") == []
+
+
 def test_listing_limits_and_duplicates():
     many = [CandidateFile(f"data/{i}.json", 1) for i in range(4)]
     assert "too-many-files" in codes(check_listing(POLICY, many))

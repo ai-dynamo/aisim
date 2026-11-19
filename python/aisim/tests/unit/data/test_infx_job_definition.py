@@ -46,7 +46,12 @@ def test_promotion_is_manual_with_a_named_reviewer_and_staleness_is_alert_only(d
 
 
 def test_failure_alert_job_exists(definition):
-    assert definition["alert_failure"]["when"] == "on_failure" and "notify" in _text(definition["alert_failure"])
+    alert = definition["alert_failure"]
+    assert alert["when"] == "on_failure" and alert["stage"] == "notify"
+    assert "needs" not in alert and "extends" not in alert and "before_script" not in alert
+    assert "AISIM_REPO_URL" not in _text(alert) and "JOB_PY" not in _text(alert)
+    rules = " ".join(r["if"] for r in alert["rules"])
+    assert '$AISIM_JOB == "staleness"' in rules and '$AISIM_JOB == "ingest"' in rules
 
 
 def test_ci_contract_clean_workspace_default_pipelines_and_staleness_status(definition):
@@ -55,3 +60,59 @@ def test_ci_contract_clean_workspace_default_pipelines_and_staleness_status(defi
     assert '$AISIM_JOB == "ingest"' in rules and "== null" in rules and "!=" not in rules  # promote never acquires
     assert "ls-remote --exit-code --heads origin" in _text(definition["publish_candidate"])
     assert "||" not in _text(definition["staleness"])  # unexpected statuses must fail the job
+
+
+def test_staleness_only_uses_the_read_credential(definition):
+    assert "INFX_CACHE_READ_TOKEN" in _text(definition["staleness"])
+    assert "INFX_CACHE_WRITE_TOKEN" not in _text(definition["staleness"])
+    for name in ("publish_candidate", "promote"):
+        assert definition[name]["environment"] == {"name": "infx-cache-writer", "action": "access"}
+    assert "environment" not in definition["staleness"] and "environment" not in definition["alert_failure"]
+
+
+@pytest.mark.parametrize("slack_fails", [False, True])
+def test_failure_notification_works_without_repository_fetch(definition, monkeypatch, slack_fails):
+    import smtplib
+    import urllib.request
+
+    for key, value in {
+        "CI_PIPELINE_URL": "https://ci.example.test/pipeline/1",
+        "AISIM_REPO_URL": "/unavailable-repository",
+        "SLACK_WEBHOOK_URL": "https://alerts.example.test/hook",
+        "SMTP_HOST": "smtp.example.test",
+        "SMTP_FROM": "bot@example.test",
+        "AISIM_JOB_OWNER_EMAIL": "owner@example.test",
+    }.items():
+        monkeypatch.setenv(key, value)
+    delivered = []
+
+    class Response:
+        def close(self):
+            pass
+
+    def slack(request, timeout):
+        delivered.append("slack")
+        if slack_fails:
+            raise OSError("fixture Slack failure")
+        return Response()
+
+    class SMTP:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def send_message(self, message):
+            assert message["To"] == "owner@example.test" and "pipeline/1" in message.get_content()
+            delivered.append("mail")
+
+    monkeypatch.setattr(urllib.request, "urlopen", slack)
+    monkeypatch.setattr(smtplib, "SMTP", SMTP)
+    script = _text(definition["alert_failure"]).split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    with pytest.raises(SystemExit) as exc:
+        exec(compile(script, "gitlab-notification", "exec"), {})
+    assert exc.value.code == int(slack_fails) and delivered == ["slack", "mail"]

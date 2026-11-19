@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -63,7 +64,6 @@ from aisim_core.data.redaction import (
 pytestmark = pytest.mark.unit
 
 PUBLIC = "nvidia/aisim-data-test"
-COMMIT = "a" * 40
 CLEAN = {"producer_id": None, "image": None, "raw_artifact_id": None, "log_artifact_id": None, "evidence_refs": []}
 
 
@@ -173,11 +173,33 @@ def _reviewers():
     return PromotionPolicy(reviewers=frozenset({"alice", "bob"}))
 
 
-def _request(directories, plan=None, **kw):
+def _commit_source(root):
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+    if not (root / ".git").exists():
+        git("init", "-q")
+    git("add", "-A")
+    git(
+        "-c",
+        "user.name=Synthetic Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-qm",
+        "synthetic dataset",
+    )
+    return git("rev-parse", "HEAD")
+
+
+def _request(root, directories, plan=None, **kw):
+    if not (root / ".git").exists():
+        _commit_source(root)
+    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     approvals = [Approval(reviewer="alice", approved_at="2026-11-09", content_digest=plan.digest)] if plan else []
     return PromotionRequest(
         target_repo=PUBLIC,
-        source_commit=COMMIT,
+        source_commit=kw.pop("source_commit", commit),
         directories=directories,
         requested_by="carol",
         approvals=approvals,
@@ -365,7 +387,9 @@ def test_text_rules_cover_patch_image_and_secret_values():
     )  # fmt: skip
     codes = {f.code for f in hits}
     assert {"patch-reference", "image-name", "secret", "run-url", "internal-host"} <= codes
-    assert not [f for f in hits if "dispatch" in f.message]  # "dispatch" is not a patch key
+    assert not [
+        f for f in scan_value({"dispatch_mode": "fast"}, DEFAULT_POLICY, "p", "t") if f.code == "patch-reference"
+    ]
 
 
 def test_inferencex_derived_is_aggregates_only_by_default(tmp_path):
@@ -422,9 +446,9 @@ def _target(tmp_path):
 def test_sample_configuration_is_promoted_by_copy_only_and_passes_public_validator(tmp_path):
     """Exit gate for AISIM-2344."""
     root, directory = _promotable(tmp_path)
-    draft = plan_promotion(root, _request([directory]), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert draft.content_ok and not draft.ok  # needs approval
-    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     assert plan.ok, plan.findings
 
     target = _target(tmp_path)
@@ -436,7 +460,7 @@ def test_sample_configuration_is_promoted_by_copy_only_and_passes_public_validat
     assert report.ok, report.errors
     assert report.configurations == 1
     entry = json.loads(ledger.read_text())
-    assert entry["approved_by"] == ["alice"] and entry["source_commit"] == COMMIT
+    assert entry["approved_by"] == ["alice"] and entry["source_commit"] == plan.request.source_commit
     # The source tree still validates as a mirror with its new ledger entry.
     assert validate_tree(root, repo=INTERNAL_REPO).ok
 
@@ -444,34 +468,34 @@ def test_sample_configuration_is_promoted_by_copy_only_and_passes_public_validat
 def test_unlabeled_and_restricted_paths_are_not_promoted(tmp_path):
     root, manifests = _mirror(tmp_path)
     directory = str(Path(manifests[0]).parent)
-    plan = plan_promotion(root, _request([directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert "not-public" in {f.code for f in plan.findings}
     write_ledger(root, VisibilityLedger(entries=[VisibilityEntry(path=directory, label="restricted")]))
-    assert "not-public" in {f.code for f in plan_promotion(root, _request([directory]), _reviewers()).findings}
+    assert "not-public" in {f.code for f in plan_promotion(root, _request(root, [directory]), _reviewers()).findings}
 
 
 def test_approval_rules(tmp_path):
     root, directory = _promotable(tmp_path)
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    stale = _request([directory], draft)
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    stale = _request(root, [directory], draft)
     stale = stale.model_copy(
         update={"approvals": [Approval(reviewer="alice", approved_at="d", content_digest="0" * 64)]}
     )
     assert "approval-stale" in {f.code for f in plan_promotion(root, stale, _reviewers()).findings}
-    self_approved = _request([directory], draft).model_copy(update={"requested_by": "alice"})
+    self_approved = _request(root, [directory], draft).model_copy(update={"requested_by": "alice"})
     assert "approval-self" in {f.code for f in plan_promotion(root, self_approved, _reviewers()).findings}
-    stranger = _request([directory], draft).model_copy(
+    stranger = _request(root, [directory], draft).model_copy(
         update={"approvals": [Approval(reviewer="mallory", approved_at="d", content_digest=draft.digest)]}
     )
     assert "approval-reviewer" in {f.code for f in plan_promotion(root, stranger, _reviewers()).findings}
     # No reviewers configured: fail closed.
-    assert not plan_promotion(root, _request([directory], draft), PromotionPolicy()).ok
+    assert not plan_promotion(root, _request(root, [directory], draft), PromotionPolicy()).ok
 
 
 def test_changed_bytes_invalidate_approval_and_apply(tmp_path):
     root, directory = _promotable(tmp_path)
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     (root / directory / "metrics.parquet").write_bytes(b"changed")
     with pytest.raises(PromotionError, match="source changed"):
         apply_promotion(plan, root, _target(tmp_path))
@@ -486,22 +510,24 @@ def test_dirty_content_blocks_promotion_even_if_labeled_public(tmp_path):
     build_catalog(root)
     directory = str(Path(path).parent)
     _public(root, directory)
-    plan = plan_promotion(root, _request([directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert "provenance-withheld" in {f.code for f in plan.findings}
     assert not plan.content_ok
 
 
 def test_infx_cache_and_same_repo_are_never_sources(tmp_path):
     root, directory = _promotable(tmp_path)
-    cache = _request([directory], source_repo=INFX_CACHE_REPO)
+    cache = _request(root, [directory], source_repo=INFX_CACHE_REPO)
     assert "never-promoted" in {f.code for f in plan_promotion(root, cache, _reviewers()).findings}
-    same = _request([directory], source_repo=PUBLIC)
+    same = _request(root, [directory], source_repo=PUBLIC)
     assert "same-repo" in {f.code for f in plan_promotion(root, same, _reviewers()).findings}
 
 
 def test_selection_must_be_inside_data_or_eval_and_exist(tmp_path):
     root, directory = _promotable(tmp_path)
-    codes = {f.code for f in plan_promotion(root, _request(["catalog", "../x", "data/nope"]), _reviewers()).findings}
+    codes = {
+        f.code for f in plan_promotion(root, _request(root, ["catalog", "../x", "data/nope"]), _reviewers()).findings
+    }
     assert {"selection-root", "selection-path", "selection-missing"} <= codes
 
 
@@ -510,8 +536,8 @@ def test_target_is_restored_when_public_validator_rejects(tmp_path):
     target = _target(tmp_path)
     (target / "data").mkdir()
     (target / "data" / "stray.py").write_text("x")  # public tree already invalid: the result must be refused
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     with pytest.raises(PromotionError, match="public validator rejects"):
         apply_promotion(plan, root, target)
     assert [p.name for p in (target / "data").iterdir()] == ["stray.py"] and not (target / "catalog").exists()
@@ -538,7 +564,7 @@ def test_snapshot_never_spans_private_and_public(tmp_path):
         source_scope={"kind": "synthetic"}, selection_policy="p", completeness="complete",
     )  # fmt: skip
     _public(root, public_dir, "data/e2e-snapshots/s1")
-    plan = plan_promotion(root, _request([public_dir, "data/e2e-snapshots/s1"]), _reviewers())
+    plan = plan_promotion(root, _request(root, [public_dir, "data/e2e-snapshots/s1"]), _reviewers())
     assert "snapshot-spans" in {f.code for f in plan.findings}
     _ = private_dir
 
@@ -598,8 +624,8 @@ def test_snapshot_text_blocks_promotion_and_public_validation(tmp_path, location
     root, directories = _snapshot_mirror(tmp_path, **updates)
     private = validate_tree(root, repo=INTERNAL_REPO)
     assert private.ok, private.errors  # valid, hash-linked private data; all referenced configurations are selected
-    draft = plan_promotion(root, _request(directories), _reviewers())
-    plan = plan_promotion(root, _request(directories, draft), _reviewers())
+    draft = plan_promotion(root, _request(root, directories), _reviewers())
+    plan = plan_promotion(root, _request(root, directories, draft), _reviewers())
     assert not plan.content_ok and not plan.ok  # valid approvals cannot override content checks
     filename = "snapshot.json" if location == "metadata" else f"snapshot-{location}.parquet"
     path = f"{directories[-1]}/{filename}"
@@ -620,8 +646,8 @@ def test_clean_snapshot_is_promoted_by_copy_and_passes_public_validation(tmp_pat
         member={"future_text": value},
         acquisition={"source_uri": value, "future_text": value} if with_acquisition else None,
     )
-    draft = plan_promotion(root, _request(directories), _reviewers())
-    plan = plan_promotion(root, _request(directories, draft), _reviewers())
+    draft = plan_promotion(root, _request(root, directories), _reviewers())
+    plan = plan_promotion(root, _request(root, directories, draft), _reviewers())
     assert plan.ok, plan.findings
     target = _target(tmp_path)
     apply_promotion(plan, root, target)
@@ -641,10 +667,10 @@ def test_eval_record_is_promoted_with_its_configuration(tmp_path):
     eval_dir = str(record.parent.relative_to(root))
     cfg_dir = str(Path(manifests[0]).parent)
     _public(root, cfg_dir, eval_dir)
-    alone = plan_promotion(root, _request([eval_dir]), _reviewers())
+    alone = plan_promotion(root, _request(root, [eval_dir]), _reviewers())
     assert "eval-truth-not-selected" in {f.code for f in alone.findings}
-    draft = plan_promotion(root, _request([cfg_dir, eval_dir]), _reviewers())
-    plan = plan_promotion(root, _request([cfg_dir, eval_dir], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [cfg_dir, eval_dir]), _reviewers())
+    plan = plan_promotion(root, _request(root, [cfg_dir, eval_dir], draft), _reviewers())
     assert plan.ok, plan.findings
     target = _target(tmp_path)
     apply_promotion(plan, root, target)
@@ -657,8 +683,8 @@ def test_lineage_of_redacted_originals_is_recorded_privately(tmp_path):
     original = "e" * 64
     path = f"{directory}/metrics.parquet"
     _public(root, directory, original_sha256={path: original})
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     ledger = apply_promotion(plan, root, _target(tmp_path))
     assert json.loads(ledger.read_text())["original_sha256"] == {path: original}
 
@@ -700,7 +726,7 @@ def test_evidence_root_is_internal_only_and_hash_checked(tmp_path):
 def test_evidence_is_never_promoted(tmp_path):
     root, _ = _mirror(tmp_path)
     _evidence(root)
-    plan = plan_promotion(root, _request(["evidence/data"]), _reviewers())
+    plan = plan_promotion(root, _request(root, ["evidence/data"]), _reviewers())
     assert "selection-root" in {f.code for f in plan.findings}
 
 
@@ -724,7 +750,7 @@ def test_eval_record_scoring_infx_truth_is_aggregates_only(tmp_path):
     files = [p.relative_to(root).as_posix() for d in (cfg_dir, eval_dir) for p in (root / d).rglob("*") if p.is_file()]
     codes = {f.code for f in check_publishable(root, files)}
     assert "infx-aggregates-only" in codes
-    plan = plan_promotion(root, _request([cfg_dir, eval_dir]), _reviewers())
+    plan = plan_promotion(root, _request(root, [cfg_dir, eval_dir]), _reviewers())
     assert "infx-aggregates-only" in {f.code for f in plan.findings}
     relaxed = RedactionPolicy(inferencex_disclosure="point-level")
     assert "infx-aggregates-only" not in {f.code for f in check_publishable(root, files, policy=relaxed)}
@@ -763,7 +789,7 @@ def test_observation_text_blocks_promotion_and_public_validation(tmp_path, colum
     directory = str(Path(manifest).parent)
     _public(root, directory)
     assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data, including extension columns
-    plan = plan_promotion(root, _request([directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert not plan.content_ok
     assert any(f.code == code and f"column {column}" in f.message for f in plan.findings)
     assert code in {f.code for f in validate_tree(root, profile="public").errors}
@@ -811,8 +837,8 @@ def test_metric_and_series_text_blocks_promotion_and_public_validation(tmp_path,
     directory = str(Path(manifest).parent)
     _public(root, directory)
     assert validate_tree(root, repo=INTERNAL_REPO).ok  # valid private data, not an orphan or corrupt table
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     assert not plan.content_ok and not plan.ok  # approval does not override disclosure checks
     artifact_path = f"{directory}/{table}.parquet"
     assert any(f.code == code and f.path == artifact_path and f"column {column}" in f.message for f in plan.findings)
@@ -844,8 +870,8 @@ def test_clean_metric_and_series_text_can_be_promoted(tmp_path, value):
     build_catalog(root)
     directory = str(Path(manifest).parent)
     _public(root, directory)
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    plan = plan_promotion(root, _request([directory], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory], draft), _reviewers())
     assert plan.ok, plan.findings
     target = _target(tmp_path)
     apply_promotion(plan, root, target)
@@ -872,7 +898,7 @@ def test_eval_truth_text_blocks_promotion_and_public_validation(tmp_path, inputs
     eval_dir = record.parent.relative_to(root).as_posix()
     _public(root, cfg_dir, eval_dir)
     assert validate_tree(root, repo=INTERNAL_REPO).ok  # hashes and schemas are valid
-    plan = plan_promotion(root, _request([cfg_dir, eval_dir]), _reviewers())
+    plan = plan_promotion(root, _request(root, [cfg_dir, eval_dir]), _reviewers())
     assert not plan.content_ok
     assert any(f.code == code and f.path == f"{eval_dir}/truth.parquet" for f in plan.findings)
     assert code in {f.code for f in validate_tree(root, profile="public").errors}
@@ -894,18 +920,21 @@ def test_conflicting_ledger_entries_resolve_to_the_most_restrictive_label():
 def test_unreferenced_file_blocks_promotion_and_public_validation(tmp_path):
     root, directory = _promotable(tmp_path)
     (root / directory / "notes.json").write_text('{"token": "private"}')
-    plan = plan_promotion(root, _request([directory]), _reviewers())
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert "orphan-file" in {f.code for f in plan.findings}
     assert any(
         f.code == "orphan-file" and f.severity == "error" for f in validate_tree(root, profile="public").findings
     )
-    assert all(f.severity == "warning" for f in validate_tree(root).findings if f.code == "orphan-file")
+    assert any(
+        f.severity == "warning" and f.code == "orphan-file" and f.path == f"{directory}/notes.json"
+        for f in validate_tree(root).findings
+    )
 
 
 def test_one_reviewer_in_two_spellings_counts_once(tmp_path):
     root, directory = _promotable(tmp_path)
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    two = _request([directory], draft).model_copy(
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    two = _request(root, [directory], draft).model_copy(
         update={
             "approvals": [
                 Approval(reviewer="alice", approved_at="d", content_digest=draft.digest),
@@ -925,8 +954,8 @@ def test_one_reviewer_in_two_spellings_counts_once(tmp_path):
 
 def _approved(tmp_path):
     root, directory = _promotable(tmp_path)
-    draft = plan_promotion(root, _request([directory]), _reviewers())
-    return root, directory, plan_promotion(root, _request([directory], draft), _reviewers())
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    return root, directory, plan_promotion(root, _request(root, [directory], draft), _reviewers())
 
 
 def test_symlinked_target_directory_is_refused_without_writing_outside(tmp_path):
@@ -966,3 +995,307 @@ def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch)
     with pytest.raises(PermissionError):
         apply_promotion(plan, root, target)
     assert not any(p.is_file() for p in target.rglob("*"))
+
+
+@pytest.mark.parametrize("case", ["alias", "configuration"])
+def test_evidence_rejects_aliases_and_wrong_configuration(tmp_path, case):
+    root, _ = _mirror(tmp_path)
+    directory = _evidence(root, {"raw.log": b"fixture"})
+    path = directory / "evidence-manifest.json"
+    doc = json.loads(path.read_bytes())
+    if case == "alias":
+        doc["artifacts"].append({**doc["artifacts"][0], "path": "./raw.log", "kind": "another-kind"})
+        code = "evidence-artifact"
+    else:
+        doc["configuration_id"] = "cfg-" + "b" * 64
+        code = "evidence-configuration"
+    path.write_text(json.dumps(doc))
+    assert code in {f.code for f in validate_tree(root).errors}
+
+
+@pytest.mark.parametrize("extension", [["Bearer " + "a" * 24], {"nested": "node.corp.nvidia.com"}])
+def test_nested_table_extension_text_blocks_publication(tmp_path, extension):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisim_core.data import Manifest
+
+    root, manifests = _mirror(tmp_path)
+    path = root / manifests[0]
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    metrics = next(a for a in manifest.artifacts if a.artifact_schema == "aisim-e2e-metrics/v1")
+    table = pq.read_table(root / metrics.path)
+    table = table.append_column("extension", pa.array([extension] * table.num_rows))
+    pq.write_table(table, root / metrics.path)
+    artifacts = [
+        a.model_copy(
+            update={
+                "sha256": hashlib.sha256((root / a.path).read_bytes()).hexdigest(),
+                "bytes": (root / a.path).stat().st_size,
+            }
+        )
+        if a == metrics
+        else a
+        for a in manifest.artifacts
+    ]
+    path.write_text(manifest.model_copy(update={"artifacts": artifacts}).model_dump_json(by_alias=True))
+    code = "secret" if isinstance(extension, list) else "internal-host"
+    assert code in {f.code for f in check_publishable(root, manifests)}
+    register_manifests(root, manifests, INTERNAL_REPO)
+    build_catalog(root)
+    assert code in {f.code for f in validate_tree(root, profile="public").errors}
+
+
+def test_declared_json_sidecar_is_scanned(tmp_path):
+    from aisim_core.data import Artifact, Manifest
+
+    root, manifests = _mirror(tmp_path)
+    path = root / manifests[0]
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    rel = path.parent.relative_to(root).as_posix() + "/errors.json"
+    payload = b'{"errors":["Bearer aaaaaaaaaaaaaaaaaaaaaaaa node.corp.nvidia.com"]}'
+    (root / rel).write_bytes(payload)
+    artifact = Artifact(
+        artifact_id="errors",
+        path=rel,
+        role="errors",
+        format="json",
+        schema="collector-errors/unversioned",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        bytes=len(payload),
+    )
+    path.write_text(
+        manifest.model_copy(update={"artifacts": [*manifest.artifacts, artifact]}).model_dump_json(by_alias=True)
+    )
+    register_manifests(root, manifests, INTERNAL_REPO)
+    build_catalog(root)
+    directory = path.parent.relative_to(root).as_posix()
+    _public(root, directory)
+    assert validate_tree(root).ok
+    assert {"secret", "internal-host"} <= {f.code for f in check_publishable(root, manifests)}
+    assert "secret" in {f.code for f in plan_promotion(root, _request(root, [directory]), _reviewers()).findings}
+    assert "secret" in {f.code for f in validate_tree(root, profile="public").errors}
+
+
+def test_malformed_e2e_body_returns_findings(tmp_path):
+    root, manifests = _mirror(tmp_path)
+    path = root / manifests[0]
+    doc = json.loads(path.read_bytes())
+    doc["provenance"] = {}
+    path.write_text(json.dumps(doc))
+    findings = check_publishable(root, manifests)
+    assert any(f.code == "document-invalid" and f.path == manifests[0] for f in findings)
+    assert not validate_tree(root, profile="public").ok
+
+
+@pytest.mark.parametrize("value", [[0.1, 0.2], {"case-a": 0.1}, True, float("nan")])
+def test_aggregate_shapes_cannot_carry_point_level_measurements(value):
+    assert "not-aggregate" in {f.code for f in check_disclosure([{"n_scored": 5, "coverage": value}])}
+    assert (
+        check_disclosure([{"n_scored": 5, "coverage": 0.9, "residual_quantiles_pct": {"p50": -1.0, "p99": 2.0}}]) == []
+    )
+    assert "not-aggregate" in {
+        f.code for f in check_disclosure([{"n_scored": 5, "residual_quantiles_pct": {"p50": [1.0, 2.0]}}])
+    }
+
+
+def test_text_keys_and_json_encoded_field_context_are_scanned():
+    from aisim_core.data.redaction import DEFAULT_POLICY, scan_value
+
+    for value in (True, None):
+        assert "secret" in {f.code for f in scan_value({"Bearer " + "a" * 24: value}, DEFAULT_POLICY, "p", "t")}
+    for value in ("private-image:tag", json.dumps(["private-image:tag"]), json.dumps({"name": "private-image:tag"})):
+        assert "image-name" in {f.code for f in scan_value({"image": value}, DEFAULT_POLICY, "p", "t")}
+    assert scan_value({"image": "[REDACTED]", "dispatch_mode": "fast"}, DEFAULT_POLICY, "p", "t") == []
+
+
+@pytest.mark.parametrize("profile", ["mirror", "public"])
+def test_symlinked_documents_are_rejected_before_any_read(tmp_path, monkeypatch, profile):
+    root, _ = _mirror(tmp_path)
+    index = root / "catalog/dataset.json"
+    outside = tmp_path / "external.json"
+    index.replace(outside)
+    index.symlink_to(outside)
+    original = Path.read_bytes
+    reads = []
+
+    def observe(path):
+        reads.append(path)
+        assert path.resolve() != outside.resolve(), "validator followed a document symlink"
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", observe)
+    report = validate_tree(root, profile=profile)
+    assert "symlink" in {f.code for f in report.errors} and not reads
+    assert "symlink" in {f.code for f in check_publishable(root, ["catalog/dataset.json"])}
+    assert not reads
+
+
+def test_category_index_io_error_is_reported(tmp_path, monkeypatch):
+    from aisim_core.data import mirror
+
+    root, _ = _mirror(tmp_path)
+    real = mirror._verify
+
+    def deny(root, artifact):
+        if artifact.path == "catalog/e2e.json":
+            raise PermissionError("denied fixture index")
+        return real(root, artifact)
+
+    monkeypatch.setattr(mirror, "_verify", deny)
+    output = tmp_path / "report.json"
+    assert mirror_main(["validate", "--root", str(root), "--output", str(output)]) == 1
+    assert "index-integrity" in {f["code"] for f in json.loads(output.read_bytes())["findings"]}
+
+
+@pytest.mark.parametrize("change", ["missing", "configuration", "observation", "hash", "none"])
+def test_standalone_snapshot_validation_checks_member_contents(tmp_path, change):
+    root, directories = _snapshot_mirror(tmp_path)
+    path = directories[0] + "/manifest.json"
+    snapshot_dir = directories[1]
+    obs = load_e2e(root, path).observations[0]
+    member = SnapshotMember(
+        configuration_id=obs.configuration_id,
+        observation_id=obs.observation_id,
+        record_sha256=obs.record_sha256,
+        manifest_path=path,
+    )
+    updates = {
+        "missing": {"manifest_path": "data/e2e/missing/manifest.json"},
+        "configuration": {"configuration_id": "cfg-" + "f" * 64},
+        "observation": {"observation_id": "absent"},
+        "hash": {"record_sha256": "f" * 64},
+        "none": {},
+    }
+    write_snapshot(
+        root,
+        snapshot_dir + "/snapshot.json",
+        [member.model_copy(update=updates[change])],
+        source_scope={"kind": "synthetic"},
+        selection_policy="synthetic",
+        completeness="complete",
+    )
+    shutil.rmtree(root / "mirror")  # a standalone public tree has no private visibility ledger
+    report = validate_tree(root, profile="public")
+    if change == "none":
+        assert report.ok, report.errors
+    else:
+        assert "snapshot-invalid" in {f.code for f in report.errors}
+
+
+def test_nondefault_disclosure_policy_is_rejected_during_planning(tmp_path):
+    root, directory = _promotable(tmp_path)
+    policy = PromotionPolicy(
+        reviewers=frozenset({"alice"}), redaction=RedactionPolicy(inferencex_disclosure="point-level")
+    )
+    plan = plan_promotion(root, _request(root, [directory]), policy)
+    assert not plan.content_ok and "redaction-policy" in {f.code for f in plan.findings}
+
+
+def test_rollback_restores_a_removed_catalog_directory(tmp_path, monkeypatch):
+    from aisim_core.data import promote as promotion
+    from aisim_core.data.hygiene import Finding
+    from aisim_core.data.mirror import TreeReport
+
+    root, _, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    stale = target / "catalog/fpm/obsolete.parquet"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale fixture shard")
+    monkeypatch.setattr(
+        promotion,
+        "validate_tree",
+        lambda *a, **k: TreeReport(repo=PUBLIC, profile="public", findings=[Finding("late", "rejected")]),
+    )
+    with pytest.raises(PromotionError, match="late"):
+        apply_promotion(plan, root, target)
+    assert stale.read_bytes() == b"stale fixture shard"
+    assert [p for p in target.rglob("*") if p.is_file()] == [stale]
+
+
+def test_promotion_rechecks_visibility_without_selected_byte_changes(tmp_path):
+    root, directory, plan = _approved(tmp_path)
+    selected_before = {rel: (root / rel).read_bytes() for rel in plan.files}
+    write_ledger(root, VisibilityLedger(entries=[VisibilityEntry(path=directory, label="restricted")]))
+    target = _target(tmp_path)
+    with pytest.raises(PromotionError, match="visibility"):
+        apply_promotion(plan, root, target)
+    assert not list(target.iterdir())
+    assert selected_before == {rel: (root / rel).read_bytes() for rel in plan.files}
+
+
+def test_promotion_source_commit_and_clean_checkout_are_enforced(tmp_path):
+    root, directory, plan = _approved(tmp_path)
+    wrong = _request(root, [directory], source_commit="a" * 40)
+    assert "source-checkout" in {f.code for f in plan_promotion(root, wrong, _reviewers()).findings}
+    dirty = root / "mirror/extra.json"
+    dirty.write_text("{}")
+    assert "source-checkout" in {f.code for f in plan_promotion(root, plan.request, _reviewers()).findings}
+    with pytest.raises(PromotionError, match="uncommitted"):
+        apply_promotion(plan, root, _target(tmp_path))
+    _commit_source(root)
+    with pytest.raises(PromotionError, match="HEAD"):
+        apply_promotion(plan, root, tmp_path / "another-target")
+
+
+def _extra_truth_artifact(root, manifests, name, payload, artifact_format):
+    from aisim_core.data import Artifact
+    from aisim_core.data.eval import load_record
+
+    cid = load_e2e(root, manifests[0]).manifest.configuration_id
+    original = _eval(root, [cid])
+    record = load_record(original)
+    path = original.parent / name
+    path.write_bytes(payload)
+    artifact = Artifact(
+        artifact_id="extra-truth",
+        path=name,
+        role="truth",
+        format=artifact_format,
+        schema="extra-truth/v1",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        bytes=len(payload),
+        rows=1 if artifact_format == "parquet" else None,
+    )
+    truth = record.truth.model_copy(update={"artifacts": [*record.truth.artifacts, artifact]})
+    record = record.model_copy(update={"truth": truth, "supersedes": record.record_id})
+    new_path = write_record(root, record)
+    build_catalog(root)
+    return new_path.relative_to(root).as_posix()
+
+
+@pytest.mark.parametrize(
+    "payload,code",
+    [(b"\x7fELFmalicious", "forbidden-content"), (b"version https://git-lfs.github.com/spec/v1\n", "lfs-pointer")],
+)
+def test_declared_gzip_still_receives_content_checks(tmp_path, payload, code):
+    root, manifests = _mirror(tmp_path)
+    _extra_truth_artifact(root, manifests, "raw.gz", payload, "gzip")
+    report = validate_tree(root)
+    assert code in {f.code for f in report.errors}
+
+
+def test_gzip_truth_is_withheld_from_publication(tmp_path):
+    import gzip
+
+    root, manifests = _mirror(tmp_path)
+    rel = _extra_truth_artifact(root, manifests, "raw.gz", gzip.compress(b"private original output"), "gzip")
+    assert validate_tree(root).ok
+    assert "provenance-withheld" in {f.code for f in check_publishable(root, [rel])}
+    assert "provenance-withheld" in {f.code for f in validate_tree(root, profile="public").errors}
+
+
+def test_uppercase_large_parquet_uses_its_footer(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root, manifests = _mirror(tmp_path)
+    path = tmp_path / "large.parquet"
+    table = pa.table({"payload": ["x" * (5 * 1024 * 1024)]}).replace_schema_metadata(
+        {b"aisim.schema": b"extra-truth/v1"}
+    )
+    pq.write_table(table, path, compression=None, use_dictionary=False)
+    assert path.stat().st_size > 4 * 1024 * 1024
+    _extra_truth_artifact(root, manifests, "large.PARQUET", path.read_bytes(), "parquet")
+    report = validate_tree(root)
+    assert report.ok, report.errors

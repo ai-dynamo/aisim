@@ -32,7 +32,9 @@ def _load(text):
 @pytest.fixture(scope="module")
 def text():
     if not TEMPLATE.is_file():
-        pytest.skip("template not present in this checkout")
+        if (TEMPLATE.parents[2] / "pyproject.toml").exists() or (TEMPLATE.parents[2] / ".git").exists():
+            pytest.fail(f"required mirror workflow template is missing: {TEMPLATE}")
+        pytest.skip("distribution omits repository workflow templates")
     return TEMPLATE.read_text()
 
 
@@ -56,3 +58,11 @@ def test_least_privilege_and_pinned_actions(text):
     checkouts = [st for st in doc["jobs"]["validate"]["steps"] if st.get("uses", "").startswith("actions/checkout@")]
     assert checkouts and all(st["with"]["persist-credentials"] is False for st in checkouts)
     assert all(re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", u) for u in re.findall(r"uses:\s*(\S+)", text))
+
+
+def test_missing_template_fails_in_a_source_checkout(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    (root / ".git").mkdir(parents=True)
+    monkeypatch.setitem(globals(), "TEMPLATE", root / ".github/mirror/missing.yml")
+    with pytest.raises(pytest.fail.Exception, match="required mirror workflow"):
+        text.__wrapped__()
