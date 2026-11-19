@@ -415,19 +415,19 @@ impl VllmKvcrAdapter {
                     if !in_own && peer.is_none() {
                         break;
                     }
-                    let plan = plan.get_or_insert_with(|| tier.plan_external(keys, now));
                     if !(in_own || in_peer_local || in_peer_g2) {
                         partial = true;
                         // KVCR only sees keys for which vLLM can reserve a
                         // destination. An unrequestable miss cannot select
                         // source-step waiting or change FIFO reader semantics.
-                        if tier.plan_has_room(plan) {
-                            asks_absent = true;
-                        } else {
-                            no_room = Some(key);
-                        }
+                        // Only an already staged local-memory pull can change
+                        // service mode; a cold miss needs no reservation plan.
+                        asks_absent = !local_keys.is_empty()
+                            && g2_keys.is_empty()
+                            && plan.as_ref().is_some_and(|plan| tier.plan_has_room(plan));
                         break;
                     }
+                    let plan = plan.get_or_insert_with(|| tier.plan_external(keys, now));
                     if !tier.plan_reserve(plan, key) {
                         (partial, no_room) = (true, Some(key));
                         break;
@@ -939,7 +939,10 @@ pub(super) fn planned_meta(
 mod tests {
     use super::*;
     use crate::engine::host_offload::StoreOutcome;
-    use crate::engine::host_offload::{C, HostTierHandle, per_rank};
+    use crate::engine::host_offload::{
+        C, HostOffloadObservation, HostOffloadObservationData, HostOffloadObserver, HostTierHandle,
+        per_rank,
+    };
     use crate::engine::kvcr::{KvcrLocalG2Stats, KvcrPullCounts, KvcrRegistry, KvcrStats};
     use crate::engine::{KvcrConfig, KvcrLocalG2Config};
 
@@ -1096,6 +1099,85 @@ mod tests {
             );
             self.registry.lock().unwrap().start_parked();
             staged
+        }
+    }
+
+    #[derive(Default)]
+    struct CapacityRetries(Mutex<Vec<HostBlockKey>>);
+
+    impl HostOffloadObserver for CapacityRetries {
+        fn record(&self, observation: HostOffloadObservation<'_>) {
+            if let HostOffloadObservationData::CapacityRetry { blocks, .. } = observation.event {
+                self.0.lock().unwrap().extend_from_slice(blocks);
+            }
+        }
+    }
+
+    #[test]
+    fn kvcr_review_capacity_retry_requires_an_available_source() {
+        for local in [
+            None,
+            Some(KvcrLocalG2Policy::Lru),
+            Some(KvcrLocalG2Policy::Fifo),
+        ] {
+            for source_keys in [&[][..], &[1][..]] {
+                // k0 is a protected target hit in its only G2 slot. A peer
+                // miss on k1 must not report destination capacity pressure.
+                let f = match local {
+                    None => Fixture::with_registry(1.0, 1.0, 1, source_keys, &[0]),
+                    Some(policy) => Fixture::with_local_g2(3, policy, 0.0, 1, source_keys, &[0]),
+                };
+                let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+                let keys = f.keys(&[0, 1]);
+                let observer = Arc::new(CapacityRetries::default());
+                let mut target = f.target.lock();
+                target.set_observer(observer.clone());
+                for now in [0.0, 1.0] {
+                    assert!(!adapter.stage_at(
+                        &mut target,
+                        f.owner,
+                        f.source,
+                        &mut restore,
+                        &keys,
+                        now,
+                    ));
+                }
+                let expected = if source_keys.is_empty() {
+                    vec![]
+                } else {
+                    vec![keys[1], keys[1]]
+                };
+                assert_eq!(*observer.0.lock().unwrap(), expected, "{local:?}");
+                assert_eq!(target.lookup(keys[0]), Lookup::Hit);
+                assert_eq!(target.lookup(keys[1]), Lookup::Miss);
+                assert!(!adapter.has_work());
+            }
+        }
+    }
+
+    #[test]
+    fn kvcr_review_a_cold_peer_miss_leaves_no_restore_work() {
+        for local in [
+            None,
+            Some(KvcrLocalG2Policy::Lru),
+            Some(KvcrLocalG2Policy::Fifo),
+        ] {
+            let f = match local {
+                None => Fixture::new(&[], &[]),
+                Some(policy) => Fixture::with_local_g2(8, policy, 0.0, 8, &[], &[]),
+            };
+            let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
+            // An 8,192-block hint whose first key is absent must stop there.
+            let keys = (0..8192).map(HostBlockKey::new).collect::<Vec<_>>();
+            let mut target = f.target.lock();
+            assert!(!adapter.stage_at(&mut target, f.owner, f.source, &mut restore, &keys, 0.0,));
+            assert!(!adapter.is_pulling(f.owner));
+            assert!(!adapter.has_work());
+            assert!(adapter.next_deadline().is_none());
+            assert!(!adapter.advance(&mut target, 10.0));
+            assert_eq!(f.stats().blocks, 0);
+            assert_eq!(f.stats().pulls, KvcrPullCounts::default());
+            assert_eq!(target.lookup(keys[0]), Lookup::Miss);
         }
     }
 
