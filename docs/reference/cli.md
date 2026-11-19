@@ -259,8 +259,9 @@ Specifically, overwrite may replace `prediction.json`, `report.html`, `recommend
 `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
 configuration loading, overrides, core-schema validation, unknown top-level sections, stacks or
-output adapters that are not installed, and, with `--overwrite`, agentic warmup policies that the
-stack does not advertise leave existing artifacts intact. So does a resource refusal, timeout or
+output adapters that are not installed, and agentic warmup policies that the stack does not
+advertise leave existing artifacts intact, including a failed run's diagnostics, with or without
+`--overwrite`. So does a resource refusal, timeout or
 interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
 a run writes no resource reports. A signal-terminated support probe exits `130`, as does cancellation
 with Ctrl-C. Errors raised while importing an installed plugin or inside an

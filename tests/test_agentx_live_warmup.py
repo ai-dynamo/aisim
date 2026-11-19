@@ -719,7 +719,7 @@ def test_cli_runs_warmup_only_on_a_stack_that_advertises_it(tmp_path, monkeypatc
     assert f"before selecting {policy}" in capsys.readouterr().err
 
 
-def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True):
+def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True, leftovers=None):
     (tmp_path / "warmup_stacks.py").write_text(
         "from dataclasses import replace\n\n"
         "from aisim.runner import EngineReplayRunnerFactory\n\n\n"
@@ -780,7 +780,7 @@ def run_installed_stack(tmp_path, command, stack, policy, *, overwrite=True):
             "execution-events.jsonl": "old events\n",
         }
         if overwrite
-        else {}
+        else dict(leftovers or {})
     )
     for name, contents in original.items():
         (output / name).write_text(contents)
@@ -814,9 +814,34 @@ def test_cli_without_overwrite_refuses_an_unsupported_policy_with_exit_2(tmp_pat
     result, _, outputs = run_installed_stack(tmp_path, command, "silent", policy, overwrite=False)
     assert result.returncode == 2, result.stderr
     assert f"before selecting {policy}" in result.stderr
-    assert "prediction.json" not in outputs
-    assert "recommendation.json" not in outputs
-    assert json.loads(outputs["resource-runtime.json"])["exit_code"] == 2
+    # Refused before resource admission and output adapters: the run writes nothing.
+    assert outputs == {}
+
+
+FAILED_RUN = {
+    "fpm-coverage.json": "{}",
+    "resource-runtime.json": json.dumps({"schema_version": 1, "status": "failed"}),
+}
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_retry_keeps_failed_run_diagnostics_when_the_stack_lacks_the_policy(tmp_path, command):
+    result, original, outputs = run_installed_stack(
+        tmp_path, command, "silent", "primers_only", overwrite=False, leftovers=FAILED_RUN
+    )
+    assert result.returncode == 2, result.stderr
+    assert "before selecting primers_only" in result.stderr
+    assert outputs == original == FAILED_RUN
+
+
+def test_retry_reuses_failed_run_diagnostics_when_the_stack_advertises_the_policy(tmp_path):
+    result, _, outputs = run_installed_stack(
+        tmp_path, "predict", "advertising", "primers_only", overwrite=False, leftovers=FAILED_RUN
+    )
+    assert result.returncode == 0, result.stderr
+    assert "removed diagnostics left by a failed run" in result.stderr
+    assert "prediction.json" in outputs
+    assert json.loads(outputs["resource-runtime.json"])["status"] == "completed"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX child signal return codes")
@@ -837,8 +862,9 @@ def test_installed_plugin_failure_keeps_exit_1(tmp_path, command, overwrite):
     assert result.returncode == 1, result.stderr
     assert "broken plugin" in result.stderr
     assert json.loads(outputs["resource-runtime.json"])["exit_code"] == 1
-    # A positive-exit probe failure still reaches the execution child for normal error reporting.
-    assert (tmp_path / "capabilities.log").read_text() == "called\n" * (2 if overwrite else 1)
+    # A positive-exit probe failure still reaches the execution child for normal error reporting,
+    # so the plugin is asked twice, with or without --overwrite.
+    assert (tmp_path / "capabilities.log").read_text() == "called\n" * 2
 
 
 def test_overwrite_replaces_outputs_on_an_installed_stack_with_the_policy(tmp_path):

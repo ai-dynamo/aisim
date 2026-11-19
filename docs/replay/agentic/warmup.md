@@ -189,8 +189,8 @@ Set `traffic.load.agentic_warmup_policy: live_trajectory_v1` together with
 profile is not supported by this policy, because shared-cursor lane recycling
 belongs to profile orchestration. The CLI requires offline execution and a
 stack that advertises `supports_agentic_live_warmup`, such as `--stack engine`,
-and rejects a stack without that capability before `--overwrite` removes
-outputs. SDK integrations need that capability and the new native JSON field;
+and rejects a stack without that capability before it removes any output
+or estimates resources. SDK integrations need that capability and the new native JSON field;
 passing only the warmup boolean is not equivalent. Existing configuration
 serialization and seed sampling remain unchanged when the policy is omitted.
 

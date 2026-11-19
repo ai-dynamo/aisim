@@ -522,8 +522,9 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
         worker_command = [sys.executable, "-m", "aisim.resource_worker", "cli"]
         if raw is not None:
             warmup = "repeated_prefixes" if config.traffic is None else config.traffic.load.agentic_warmup_policy
-            if args.overwrite and args.stack not in _BUILTIN_STACKS and warmup != "repeated_prefixes":
-                # Only the stack knows its warmup support; ask a supervised process before --overwrite removes outputs.
+            if args.stack not in _BUILTIN_STACKS and warmup != "repeated_prefixes":
+                # Only the stack knows its warmup support. Ask a supervised process before output cleanup
+                # (--overwrite, or reuse of a failed run's directory), resource admission or output adapters.
                 directory = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="aisim-warmup-"))
                 refusal = Path(directory) / "refusal"
                 command = [sys.executable, "-m", "aisim.resource_worker", "warmup-support", str(refusal), args.stack]
