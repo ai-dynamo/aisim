@@ -701,3 +701,54 @@ def test_fixed_timing_drops_the_forward_model_field(monkeypatch):
     assert "aic_forward_model" not in deployment.agg_engine_args
     assert deployment.agg_engine_args["timing_model"]["type"] == "fixed"
     assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "op_level"
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_non_kimi_host_offload_auto_kv_respects_dcp_stripes(tmp_path, dcp):
+    import json
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 1024,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 4,
+                "intermediate_size": 2048,
+                "vocab_size": 1000,
+            }
+        )
+    )
+    sample = unroll_sample(
+        search_space=_space(model_name=str(tmp_path), agg_native_host_offload={"num_host_blocks": 10}),
+        selection=_agg_selection(backend="vllm"),
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=8, dp=1, moe_tp=8, moe_ep=1), replicas=1),
+    )
+    sample["dcp"] = dcp
+    deployment = build_backend_deployment(sample, backend_version=BACKEND_VERSION)
+    # TP8 replicates each of two KV heads on four ranks. A single rank
+    # has K/V * 1 head * 128 dimensions * 4 layers * BF16 / DCP.
+    assert deployment.agg_engine_args["kv_cache_bytes_per_token"] == 2048 // dcp
+
+
+def test_auto_dcp_cannot_shard_distinct_kv_heads(tmp_path):
+    import json
+
+    from aisimulate.capacity import estimate_kv_bytes_per_token
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 1024,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 4,
+                "intermediate_size": 2048,
+                "vocab_size": 1000,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="not exceed KV-head replication=1"):
+        estimate_kv_bytes_per_token(str(tmp_path), tp_size=8, pp_size=1, dcp_size=2)

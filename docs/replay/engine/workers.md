@@ -41,7 +41,7 @@ engine:
 | `workers.<role>.parallelism.moe_tensor` | `1` | Searched | MoE tensor parallelism. Repartitions the worker's GPUs and does not add GPUs. |
 | `workers.<role>.parallelism.moe_expert` | `1` | Searched | MoE expert parallelism. Repartitions the worker's GPUs and does not add GPUs. |
 | `workers.<role>.parallelism.prefill_context` | Unset (1) | predict only | Prefill context parallelism (vLLM `-pcp`, SGLang `--attn-cp-size`). Adds GPUs. |
-| `workers.<role>.parallelism.decode_context` | Unset (1) | predict only | Decode context parallelism (vLLM `-dcp`, SGLang `--dcp-size`). Must divide `tensor`; adds no GPUs. |
+| `workers.<role>.parallelism.decode_context` | Unset (1) | predict only | Decode context parallelism (vLLM `-dcp`, SGLang `--dcp-size`). Must divide `tensor`; adds no GPUs. Auto scalar KV sizing divides rank-local bytes by DCP, within the model's KV replication limit. |
 | `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass on one attention-DP rank. See [SGLang note](#batch-limits). |
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
@@ -105,7 +105,10 @@ Engine replay reports each role's GPUs per worker as
 parallelism greater than one before capacity estimation. GPU-hours sum each
 role's worker-seconds times this count, divided by 3600. Aggregated workers use
 the `decode_gpus_per_worker` and `decode_worker_seconds` report fields. Neither
-DCP nor MoE EP adds another multiplier.
+DCP nor MoE EP adds another multiplier. Auto scalar KV sizing uses
+rank-local token stripes under DCP and checks that the width does not exceed
+the KV-head replication available under TP. It does not shard distinct KV
+heads. Explicit byte rates remain the caller's rank-local values.
 
 [AFD+PD](analytical.md#afd) is the exception. Its companion worker is priced
 analytically, not replayed, so it accepts `pipeline` above one. Its GPU count is

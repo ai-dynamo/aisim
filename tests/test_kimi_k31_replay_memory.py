@@ -213,3 +213,32 @@ def test_k31_snapshot_controls_compile_and_restore_exact_identity(k31_checkpoint
             }
         ]
         assert restored.estimate_forward_pass_time_ms(rank) == original.estimate_forward_pass_time_ms(rank)
+
+
+@pytest.mark.parametrize("explicit_eplb", [None, False])
+def test_saved_eplb_true_reaches_native_restoration(k31_checkpoint, tmp_path, explicit_eplb):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload(k31_checkpoint, state_bytes=2 * BLOCK_BYTES)
+    payload["engine"]["enable_eplb"] = True
+    original_config = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"]["config"]
+    original = RustForwardPassPerfModel.best_available(original_config)
+    pinned = original.save_state_snapshot(tmp_path / "eplb-snapshot")
+    payload["engine"].update(
+        estimator_config=pinned["estimator_config"],
+        estimation_mode=pinned["estimation_mode"],
+        fallback_policy=pinned["fallback_policy"],
+        backend_version=pinned["backend_version"],
+        transfer_policy=pinned["transfer_policy"],
+    )
+    if explicit_eplb is None:
+        payload["engine"].pop("enable_eplb")
+    else:
+        payload["engine"]["enable_eplb"] = explicit_eplb
+    timing = _saved_spec(payload).backend_deployment.agg_engine_args["timing_model"]["config"]
+    assert timing["enable_eplb"] is (explicit_eplb if explicit_eplb is not None else True)
+    if explicit_eplb is False:
+        with pytest.raises(ValueError, match="enable_eplb"):
+            RustForwardPassPerfModel.best_available(timing)
+    else:
+        assert RustForwardPassPerfModel.best_available(timing).diagnostics()["readiness"] == "ready"

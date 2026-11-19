@@ -1138,3 +1138,49 @@ def test_hicache_rejects_disaggregated_and_recommendation_paths() -> None:
     engine["workers"]["aggregated"]["kv_cache"]["hicache"] = {"num_host_blocks": 32}
     with pytest.raises(ValidationError, match="prediction only"):
         CoreRecommendationConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("local_heads", [2, 4])
+def test_auto_text_kv_ignores_malformed_vision_metadata_and_rereads_local_config(tmp_path, local_heads):
+    from copy import deepcopy
+
+    from aisimulate.capacity import estimate_kv_bytes_per_token
+    from aisimulate_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = deepcopy(_load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct"))
+    raw.pop("image_processor_config")
+    raw["text_config"].update(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        num_hidden_layers=4,
+        head_dim=128,
+        no_rope_layers=[0, 0, 0, 0],
+    )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text("{malformed optional image metadata")
+    kwargs = dict(tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16")
+    assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs) == 4096  # 2 K/V * 2 heads * 128 * 4 layers * 2 B
+    raw["text_config"]["num_key_value_heads"] = local_heads
+    config_path.write_text(json.dumps(raw))
+    assert estimate_kv_bytes_per_token(str(tmp_path), **kwargs) == 2048 * local_heads
+
+
+@pytest.mark.parametrize("authored", [None, False, True])
+@pytest.mark.parametrize("saved_eplb", [False, True])
+@pytest.mark.parametrize("roundtrip", [False, True])
+def test_snapshot_eplb_distinguishes_omission_from_explicit_false(authored, saved_eplb, roundtrip):
+    from aisimulate.compiler import _worker_model_control
+
+    payload = _prediction_engine()
+    payload["workers"]["aggregated"]["timing"] = {"type": "default"}
+    if authored is not None:
+        payload["enable_eplb"] = authored
+    config = CorePredictionConfig.model_validate({"engine": payload})
+    if roundtrip:
+        config = CorePredictionConfig.model_validate_json(config.model_dump_json())
+    actual = _worker_model_control(
+        config.engine, config.engine.workers.aggregated, "enable_eplb", {"enable_eplb": saved_eplb}
+    )
+    assert actual is (saved_eplb if authored is None else authored)

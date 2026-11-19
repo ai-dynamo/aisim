@@ -80,7 +80,7 @@ def test_k31_unspecified_kv_requires_fp8_layout(tmp_path, k31_config):
         get_model(_write_checkpoint(tmp_path, k31_config), _model_config(kvcache_quant_mode=None), "sglang")
 
 
-@pytest.mark.parametrize("database_mode", ["SOL", "SILICON"])
+@pytest.mark.parametrize("database_mode", ["SOL", "sol", "SILICON", "silicon"])
 def test_k31_bf16_analytic_task_validation_does_not_claim_measured_coverage(
     tmp_path, k31_config, monkeypatch, database_mode
 ):
@@ -98,7 +98,7 @@ def test_k31_bf16_analytic_task_validation_does_not_claim_measured_coverage(
     # A packed-FP8-only data-presence list must not veto analytic BF16 SOL.
     db = SimpleNamespace(supported_quant_mode={"dsa_context_module": ["bfloat16"], "dsa_generation_module": ["fp8"]})
     monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
-    if database_mode == "SILICON":
+    if database_mode.upper() == "SILICON":
         with pytest.raises(ValueError, match="Unsupported dsa_generation_module quant mode 'bfloat16'"):
             task._check_role_against_db("agg", validate_context=True, validate_generation=True)
     else:
@@ -112,7 +112,7 @@ def test_k31_bf16_analytic_task_validation_does_not_claim_measured_coverage(
                 tp=8,
                 moe_tp_size=1,
                 moe_ep_size=8,
-                database_mode=database_mode,
+                database_mode=database_mode.upper(),
                 estimation_mode="op_level",
                 kvcache_quant_mode="bfloat16",
             )
@@ -136,11 +136,12 @@ def test_k31_bf16_analytic_task_validation_does_not_claim_measured_coverage(
         )
 
 
+@pytest.mark.parametrize("database_mode", ["SILICON", "silicon"])
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize("backend", ["flashmla", "trtllm_mla"])
 @pytest.mark.parametrize("has_requested_lane", [False, True])
 def test_k31_silicon_task_requires_selected_physical_lane(
-    tmp_path, k31_config, monkeypatch, phase, backend, has_requested_lane
+    tmp_path, k31_config, monkeypatch, phase, backend, has_requested_lane, database_mode
 ):
     from aisimulate.sdk.task_v2 import Task
 
@@ -148,7 +149,7 @@ def test_k31_silicon_task_requires_selected_physical_lane(
         model_path=_write_checkpoint(tmp_path, k31_config),
         system_name="b300_sxm",
         backend_name="sglang",
-        database_mode="SILICON",
+        database_mode=database_mode,
         attention_backend=backend,
         gemm_quant_mode=common.GEMMQuantMode.bfloat16,
         kvcache_quant_mode=common.KVCacheQuantMode.fp8,
@@ -573,3 +574,39 @@ def test_local_kimi_moe_mode_matches_checkpoint_identity(tmp_path, k31_config, a
     local = _write_checkpoint(tmp_path, k31_config)
     assert resolve_kimi_k3_moe_arch_mode(local, "b200_sxm", "sglang") == common.MoEQuantMode.w4a8_mxfp4_mxfp8
     assert resolve_kimi_k3_moe_arch_mode(local, "h200_sxm", "sglang") is None
+
+
+@pytest.mark.parametrize("mode", ["SOL", "sol", "SILICON", "silicon"])
+@pytest.mark.parametrize("measured", [False, True])
+def test_inferred_k31_fmha_sol_is_independent_of_measured_rows(tmp_path, k31_config, monkeypatch, mode, measured):
+    from aisimulate.sdk.task_v2 import Task
+
+    # Declare FP8 compute inference while the exact physical DSA slice is BF16.
+    k31_config["quantization_config"] = {"quant_method": "fp8"}
+    k31_config["quant_algo"] = "fp8"
+    path = _write_checkpoint(tmp_path, k31_config)
+    kv = common.KVCacheQuantMode.fp8
+    gemm = common.GEMMQuantMode.bfloat16
+    db = SimpleNamespace(
+        _default_database_mode=common.DatabaseMode[mode.upper()],
+        supported_quant_mode={"dsa_context_module": ["bfloat16"]} if measured else {},
+        _context_dsa_module_data={
+            common.FMHAQuantMode.bfloat16: {kv: {gemm: {ARCHITECTURE: {"flashmla_kv": {12: object()}}}}}
+        }
+        if measured
+        else {},
+    )
+    monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: db)
+    monkeypatch.setattr("aisimulate.sdk.task_v2.resolve_sglang_mla_compute", lambda *args, **kwargs: None)
+    task = Task(
+        model_path=path,
+        system_name="b300_sxm",
+        backend_name="sglang",
+        database_mode=mode,
+        attention_backend="flashmla",
+        gemm_quant_mode=gemm,
+        kvcache_quant_mode=kv,
+    )
+    expected = common.FMHAQuantMode.bfloat16 if measured and mode.upper() == "SILICON" else common.FMHAQuantMode.fp8
+    assert task.fmha_quant_mode == expected
+    assert task.build_model_config(role="agg").fmha_quant_mode == expected

@@ -1435,6 +1435,11 @@ def resolve_context_fmha_by_data(
 
     info = _get_model_info(model_path)
     family = _architecture_to_model_family(info["architecture"])
+    if (
+        info["architecture"] == "KimiK31ForConditionalGeneration"
+        and getattr(database, "_default_database_mode", common.DatabaseMode.SILICON) == common.DatabaseMode.SOL
+    ):
+        return  # Analytic DSA does not depend on measured FMHA slices.
     inferred = _infer_quant_modes_from_raw_config(info.get("raw_config", {}), info.get("architecture"))
     # Joint (fmha, kv) capability: use the kv mode this estimate will actually
     # run with (explicit wins, else the checkpoint inference).

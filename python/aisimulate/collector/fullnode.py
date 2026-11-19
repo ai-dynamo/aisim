@@ -13,6 +13,7 @@ import os
 import random
 import traceback
 from datetime import datetime
+from pathlib import Path
 
 from collector.case_generator import without_models
 from collector.helper import create_test_case_id
@@ -28,11 +29,13 @@ SGLANG_FULLNODE_OPS = {
 }
 
 
-def _resume_errors(module_name, resume_tracker, resume_options, logger) -> list[dict]:
+def _resume_errors(module_name, resume_tracker, resume_options, logger, known_errors=()) -> list[dict]:
     if not (resume_options and resume_options.get("resume")):
         return []
-    unresolved = resume_tracker.unresolved_failed_count()
-    if not unresolved:
+    unresolved = resume_tracker.unresolved_failed_count() - len(
+        {e["task_id"] for e in known_errors if e.get("task_params")}
+    )
+    if unresolved <= 0:
         return []
     logger.warning(
         f"{module_name}: checkpoint holds {unresolved} unresolved failed tasks "
@@ -93,10 +96,14 @@ def collect_sglang_fullnode_op(
     # In particular, moving a native TP module here must not enable an
     # unqualified backend/SM merely because it owns its GPU group exclusively.
     unverified_here = collection.get("unverified") or (
-        sm_version is not None and sm_version in (collection.get("unverified_sms") or ())
+        collection.get("unverified_sms") and (sm_version is None or sm_version in collection["unverified_sms"])
     )
     if unverified_here:
-        scope = "this backend" if collection.get("unverified") else f"SM{sm_version}"
+        scope = (
+            "this backend"
+            if collection.get("unverified")
+            else ("unresolved SM" if sm_version is None else f"SM{sm_version}")
+        )
         logger.warning(f"Skipping {full_name} — registry marks it unverified on {scope}")
         return [
             {
@@ -106,6 +113,14 @@ def collect_sglang_fullnode_op(
                 "classification": "unverified_skipped",
             }
         ]
+
+    if op.startswith("kimi_k31_dsa_") and os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
 
     module_name = collection["module"]
     get_module = __import__(module_name, fromlist=[collection["get_func"]])
@@ -181,12 +196,31 @@ def collect_sglang_fullnode_op(
     else:
         task_infos = raw_task_infos
 
+    error_path = Path(checkpoint_dir) / backend / f"errors_{full_name}.json"
+    errors: list[dict] = []
+    if resume_options and resume_options.get("resume") and error_path.exists():
+        errors = json.loads(error_path.read_text())
+
+    def persist_errors():
+        if not errors and not error_path.exists():
+            return
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = error_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(errors, indent=2))
+        os.replace(temporary, error_path)
+        log_dir = os.environ.get("COLLECTOR_LOG_DIR")
+        if log_dir:
+            report = Path(log_dir) / error_path.name
+            report.parent.mkdir(parents=True, exist_ok=True)
+            temporary = report.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(errors, indent=2))
+            os.replace(temporary, report)
+
     if not task_infos:
         logger.info(f"{full_name}: no full-node tasks to run")
-        return _resume_errors(full_name, resume_tracker, resume_options, logger)
+        return errors + _resume_errors(full_name, resume_tracker, resume_options, logger, errors)
 
     logger.info(f"Running {full_name} full-node collection (bypassing per-GPU worker pool)")
-    errors: list[dict] = []
     task_by_id = {task_info["id"]: task_info["params"] for task_info in task_infos}
     completed = set()
     submitted = set()
@@ -216,12 +250,7 @@ def collect_sglang_fullnode_op(
                     f"{full_name} runner reported failures outside the requested case plan: {unknown_failed}"
                 )
             failed_ids = {batch_ids[str(case)] for case in failed_cases}
-            for task_id in batch_ids.values():
-                completed.add(task_id)
-                if task_id in failed_ids:
-                    resume_tracker.mark_failed(task_id)
-                else:
-                    resume_tracker.mark_passed(task_id)
+            errors[:] = [error for error in errors if error.get("task_id") not in batch_ids.values()]
             for task_id in sorted(failed_ids):
                 case = task_by_id[task_id]
                 detail = failure_details.get(str(case), {})
@@ -248,6 +277,15 @@ def collect_sglang_fullnode_op(
                         "timestamp": datetime.now().isoformat(),
                     }
                 )
+            persist_errors()
+            # mark_failed/mark_passed may themselves flush: publish the exact
+            # error records first, before any cumulative checkpoint can skip them.
+            for task_id in batch_ids.values():
+                completed.add(task_id)
+                if task_id in failed_ids:
+                    resume_tracker.mark_failed(task_id)
+                else:
+                    resume_tracker.mark_passed(task_id)
             resume_tracker.flush(force=True)
     except Exception as e:
         logger.exception(f"{full_name} full-node collection failed")
@@ -265,7 +303,8 @@ def collect_sglang_fullnode_op(
             }
         )
     finally:
+        persist_errors()
         resume_tracker.flush(force=True)
 
-    errors.extend(_resume_errors(full_name, resume_tracker, resume_options, logger))
+    errors.extend(_resume_errors(full_name, resume_tracker, resume_options, logger, errors))
     return errors

@@ -140,3 +140,80 @@ def test_k31_attention_backend_cli_parsing_preserves_dense_validation(backend):
     assert parser.parse_args(["--attention-backend", backend]).attention_backend == backend
     with pytest.raises(UnsupportedAttentionBackendError):
         resolve_attention_override_lanes("sglang", backend)
+
+
+@pytest.mark.parametrize("mode", ["SOL", "SILICON"])
+def test_legacy_k31_estimate_prices_explicit_fp8_fmha_only_analytically(tmp_path, cli_parser, monkeypatch, mode):
+    import json
+    from copy import deepcopy
+
+    from aisimulate.legacy_cli.api import cli_estimate
+    from aisimulate_core.sdk.utils import get_model_config_from_model_path
+
+    # A local extension of the bundled K3 geometry, not downloaded weights.
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K3")["raw_config"])
+    raw["architectures"] = ["KimiK31ForConditionalGeneration"]
+    raw["model_type"] = "kimi_k31"
+    raw["text_config"]["dsa_config"] = {
+        "dsa_layers": list(raw["text_config"]["linear_attn_config"]["full_attn_layers"]),
+        "index_topk": 2048,
+        "index_head_dim": 128,
+        "index_num_heads": 32,
+        "index_rope_dim": 0,
+        "index_k_norm_type": "layernorm",
+        "index_topk_freq": 1,
+        "index_skip_topk_offset": 1,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    import aisimulate.legacy_cli.api as cli_api
+    import aisimulate.legacy_cli.main as cli_main
+
+    results = []
+
+    def record_result(**kwargs):
+        result = cli_estimate(**kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(cli_api, "cli_estimate", record_result)
+    args = cli_parser.parse_args(
+        [
+            "estimate",
+            "--model-path",
+            str(tmp_path),
+            "--system",
+            "b300_sxm",
+            "--backend",
+            "sglang",
+            "--estimate-mode",
+            "static_ctx",
+            "--database-mode",
+            mode,
+            "--attention-backend",
+            "flashmla",
+            "--kvcache-quant-mode",
+            "fp8",
+            "--fmha-quant-mode",
+            "fp8",
+            "--gemm-quant-mode",
+            "bfloat16",
+            "--tp-size",
+            "4",
+            "--moe-tp-size",
+            "1",
+            "--moe-ep-size",
+            "4",
+            "--batch-size",
+            "1",
+            "--isl",
+            "512",
+            "--osl",
+            "1",
+        ]
+    )
+    if mode == "SILICON":
+        with pytest.raises(ValueError, match="fmha_quant_mode=fp8 has no 'dsa_context_module' perf data"):
+            cli_main._run_estimate_mode(args)
+    else:
+        cli_main._run_estimate_mode(args)
+        assert results[0].ttft > 0

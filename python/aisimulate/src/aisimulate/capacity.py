@@ -578,14 +578,21 @@ def estimate_kv_bytes_per_token(
             raise ValueError("grouped FPM cache has no scalar bytes per token; use its cache groups and byte budget")
         return deployment.resources.kv_bytes_per_token
 
+    # Text-only geometry must not load optional vision processor metadata.
+    # The naive loader also rereads local config.json on every compilation.
+    from pathlib import Path
+
     from aisimulate_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY
     from aisimulate_core.sdk.memory import NaiveKVCacheEstimator
     from aisimulate_core.sdk.utils import _load_model_config_from_model_path
 
-    # Share the native loader's cached raw metadata. Dispatch must not force a
-    # second remote fetch, including when get_model's parsed metadata is warm.
-    # Raw configs remain usable by the naive estimator for unparsed families.
-    raw_config = _load_model_config_from_model_path(model_name)
+    raw_config = (
+        NaiveKVCacheEstimator._load_config(model_name, allow_hf_config_download=True)
+        if Path(model_name).is_dir()
+        else _load_model_config_from_model_path(model_name)
+    )
+    if raw_config is None:
+        raise ValueError(f"could not load checkpoint geometry for model {model_name!r}")
     architectures = raw_config.get("architectures") or []
     architecture = architectures[0] if architectures else None
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)
@@ -608,8 +615,9 @@ def estimate_kv_bytes_per_token(
         model = get_model(model_name, model_config, backend)
         return int(model.get_kvcache_rank_bytes_per_token())
 
-    if dcp_size != 1:
-        raise ValueError("naive KV geometry does not support decode context parallelism; dcp_size must be 1")
+    from aisimulate_core.sdk.config import validate_parallel_size
+
+    validate_parallel_size("dcp_size", dcp_size)
     estimator = NaiveKVCacheEstimator.from_hf_config(
         raw_config,
         tp_size=tp_size,
@@ -627,6 +635,17 @@ def estimate_kv_bytes_per_token(
     value = estimator.kv_bytes_per_token()
     if value is None or value <= 0:
         raise ValueError(f"could not derive KV bytes per token for model {model_name!r}")
+    if dcp_size != 1:
+        # Decode CP stripes tokens across ranks that otherwise replicate KV.
+        # Match the native model's replication limit; never shard distinct heads.
+        heads = estimator.geometry.get("num_kv_heads")
+        replication = tp_size if estimator.geometry.get("kv_lora_rank") else tp_size // min(tp_size, heads or tp_size)
+        if tp_size % dcp_size or dcp_size > replication:
+            raise ValueError(
+                f"auto KV geometry dcp_size={dcp_size} must divide tp_size={tp_size} "
+                f"and not exceed KV-head replication={replication}"
+            )
+        return -(-int(value) // dcp_size)
     return int(value)
 
 

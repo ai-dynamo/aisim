@@ -96,6 +96,12 @@ def _quantization_from_engine_config(config_json: str) -> dict[str, str]:
             f"FPM profile identity conflict: comm_quant_mode={supplied_comm!r}, "
             f"profile comm_quant_mode={modes['comm_quant_mode']!r}"
         )
+    supplied_attention = config["extra"].get("attention_backend")
+    if supplied_attention is not None and supplied_attention != modes["attention_backend"]:
+        raise ValueError(
+            f"FPM profile identity conflict: attention_backend={supplied_attention!r}, "
+            f"profile attention_backend={modes['attention_backend']!r}"
+        )
     modes.pop("attention_backend")
     return modes
 

@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,8 +78,14 @@ def test_native_tp_route_uses_common_limit_without_collective_shape_selector(mon
     assert fullnode.select_cases("kimi_k31_dsa_generation_module", cases, limit=None) == cases
 
 
+@pytest.fixture(autouse=True)
+def isolated_collector_workdir(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.mark.parametrize("sm", [103, None])
 @pytest.mark.parametrize("maturity", [{"unverified": True}, {"unverified_sms": (103,)}])
-def test_fullnode_preserves_registry_maturity_gate_before_import(maturity):
+def test_fullnode_preserves_registry_maturity_gate_before_import(maturity, sm):
     _Checkpoint.instances.clear()
     errors = fullnode.collect_sglang_fullnode_op(
         {"name": "sglang", "type": "kimi_k31_dsa_context_module", "module": "must_not_import", **maturity},
@@ -90,7 +97,7 @@ def test_fullnode_preserves_registry_maturity_gate_before_import(maturity):
         resume_options=None,
         model_path=None,
         case_plan=None,
-        sm_version=103,
+        sm_version=sm,
         case_filters=None,
         get_test_cases_for_model=lambda *_args: pytest.fail("planned unverified collector"),
         resume_checkpoint_cls=_Checkpoint,
@@ -524,7 +531,7 @@ def test_real_checkpoint_retry_after_closed_event_attests_only_retry(monkeypatch
 
 def test_real_checkpoint_zero_work_preserves_pending_and_failure_marks_all_selected(monkeypatch, tmp_path):
     cases = [{"shape": 1}, {"shape": 2}]
-    _, _, checkpoint_path = _run_with_real_checkpoint(
+    recorded_errors, _, checkpoint_path = _run_with_real_checkpoint(
         monkeypatch,
         tmp_path,
         cases=cases,
@@ -537,4 +544,99 @@ def test_real_checkpoint_zero_work_preserves_pending_and_failure_marks_all_selec
     assert calls == []
     assert _checkpoint_sets(checkpoint_path)["attempted"] == pending
     assert len(_checkpoint_sets(checkpoint_path)["failed"]) == 2
-    assert any(error["error_type"] == "UnresolvedFailures" for error in errors)
+    assert errors == recorded_errors
+    assert len(errors) == 2
+    assert {error["task_params"] for error in errors} == set(map(str, cases))
+
+
+@pytest.mark.parametrize("sm", [103, None])
+def test_pool_unknown_sm_cannot_bypass_registry_gate(sm):
+    errors = collect_mod.collect_ops(
+        1,
+        [{"name": "sglang", "type": "test", "module": "must_not_import", "unverified_sms": (103,)}],
+        sm_version=sm,
+    )
+    assert len(errors) == 1
+    assert errors[0]["classification"] == "unverified_skipped"
+
+
+def test_native_failure_records_survive_interruption_and_plain_resume(monkeypatch, tmp_path):
+    import logging
+
+    import collector.sglang.collect_kimi_k31_dsa_v1 as native
+    from collector.collect import ReplaySpec, ResumeCheckpoint, load_replay_cases
+    from collector.op_plans import ModuleCase
+
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for heads in (96, 48)]
+    calls = []
+    report_dir = tmp_path / "logs"
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(report_dir))
+
+    def run(*, cases, **kwargs):
+        calls.extend(cases)
+        if len(calls) == 1:
+            return {
+                "failed": cases,
+                "failure_details": {
+                    str(cases[0]): {
+                        "error_type": "RuntimeError",
+                        "error_message": "FIXME(kernel-limit): observed native refusal",
+                    }
+                },
+            }
+        if len(calls) == 2:
+            # A real process/job interruption loses all in-memory errors.
+            assert (report_dir / "errors_sglang.kimi_k31_dsa_context_module.json").exists()
+            raise KeyboardInterrupt("job stopped during next case")
+        return {"failed": []}
+
+    class Checkpoint(ResumeCheckpoint):
+        def mark_failed(self, task_id):
+            saved = json.loads((report_dir / "errors_sglang.kimi_k31_dsa_context_module.json").read_text())
+            assert any(error["task_id"] == task_id for error in saved)
+            super().mark_failed(task_id)
+
+    monkeypatch.setattr(native, "run_kimi_k31_dsa_fullnode", run)
+
+    def collect():
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": "kimi_k31_dsa_context_module",
+                "module": native.__name__,
+                "get_func": "get_kimi_k31_dsa_context_test_cases",
+                "run_func": "run_kimi_k31_dsa_fullnode",
+                "perf_filename": str(tmp_path / "context.txt"),
+            },
+            runtime_version=native.RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options={"checkpoint_dir": str(tmp_path / "checkpoint"), "resume": True},
+            model_path=native.MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_: cases,
+            resume_checkpoint_cls=Checkpoint,
+            logger=logging.getLogger(__name__),
+        )
+
+    with pytest.raises(KeyboardInterrupt):
+        collect()
+    report = report_dir / "errors_sglang.kimi_k31_dsa_context_module.json"
+    before = json.loads(report.read_text())
+    assert len(before) == 1
+    error = before[0]
+    assert error["task_params"] == str(cases[0])
+    assert error["classification"] == "kernel_limit"
+    assert error["error_type"] == "RuntimeError"
+    assert "observed native refusal" in error["error_message"]
+    assert json.loads(error["group"])["num_heads"] == 96
+    requested = load_replay_cases(str(report))
+    replay = ReplaySpec(str(report), requested)
+    assert replay.select("kimi_k31_dsa_context_module", cases, random.Random(42)) == [cases[0]]
+    assert collect() == before
+    assert calls == [cases[0], cases[1], cases[1]]
+    assert collect() == before  # zero-work resumes retain exact records too

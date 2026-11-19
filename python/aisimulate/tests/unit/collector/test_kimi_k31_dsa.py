@@ -201,6 +201,7 @@ def test_native_failure_restores_staging_existence_and_length(monkeypatch, tmp_p
     [
         ("tensor_parallel_sizes", [], "non-empty tensor_parallel_sizes"),
         ("kv_cache_dtypes", [], "non-empty kv_cache_dtypes"),
+        ("native_num_heads", 192, "requires native_num_heads=96"),
         ("tensor_parallel_sizes", [3], "invalid native Kimi K3.1 TP geometry"),
         ("tensor_parallel_sizes", [16], "invalid native Kimi K3.1 TP geometry"),
     ],
@@ -212,6 +213,8 @@ def test_native_plan_rejects_unresolvable_declarations(monkeypatch, phase, field
     rows = [dict(row) for row in module._model_case_values("kimi_k31_dsa_module")]
     assert rows
     rows[0][field] = value
+    if field == "native_num_heads":
+        rows[0]["tensor_parallel_sizes"] = [2]  # 192 / TP2 must not masquerade as native TP1.
     monkeypatch.setattr(module, "_model_case_values", lambda _op: rows)
     with pytest.raises(ValueError, match=message):
         OP_PLANS[f"kimi_k31_dsa_{phase}_module"].expand()
@@ -475,18 +478,26 @@ def test_native_timeout_kills_tp_children_and_fullnode_continues(monkeypatch, ca
         return child
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
-    result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
-    assert result["succeeded"] == 1
-    assert result["failed"] == [cases[0]]
-    assert "timed out" in result["failure_details"][str(cases[0])]["error_message"]
-    assert all(child.poll() is not None for child in children)
-    pid = int(rank_pid.read_text())
     try:
-        status = psutil.Process(pid).status()
-    except psutil.NoSuchProcess:
-        status = None
-    assert status in (None, psutil.STATUS_ZOMBIE)
-    assert "waiting on TP rank" in capfd.readouterr().err
+        result = run_kimi_k31_dsa_fullnode(perf_filename=tmp_path / "dsa_generation_module_perf.txt", cases=cases)
+        assert result["succeeded"] == 1
+        assert result["failed"] == [cases[0]]
+        assert "timed out" in result["failure_details"][str(cases[0])]["error_message"]
+        assert all(child.poll() is not None for child in children)
+        pid = int(rank_pid.read_text())
+        try:
+            status = psutil.Process(pid).status()
+        except psutil.NoSuchProcess:
+            status = None
+        assert status in (None, psutil.STATUS_ZOMBIE)
+        assert "waiting on TP rank" in capfd.readouterr().err
+    finally:
+        for child in children:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
@@ -589,7 +600,10 @@ def test_parent_only_sigterm_kills_native_group_and_rolls_back(tmp_path):
         f"case = module.ModuleCase(4096, 1, 48, 'fp8', 'bfloat16', 'bfloat16', {MODEL!r}, 0)\n"
         f"module.run_kimi_k31_dsa_fullnode(perf_filename={str(output)!r}, cases=[case])\n"
     )
-    with subprocess.Popen([sys.executable, str(driver)], stderr=subprocess.PIPE, text=True) as parent:
+    child_env = dict(os.environ)
+    checkout = str(Path(__file__).resolve().parents[3])
+    child_env["PYTHONPATH"] = os.pathsep.join(filter(None, [checkout, child_env.get("PYTHONPATH")]))
+    with subprocess.Popen([sys.executable, str(driver)], stderr=subprocess.PIPE, text=True, env=child_env) as parent:
         try:
             deadline = time.monotonic() + 30
             while not rank_pid.exists() or not rank_pid.read_text().strip():
@@ -891,7 +905,9 @@ def test_native_fullnode_resumes_after_last_completed_case(monkeypatch, tmp_path
 
     with pytest.raises(KeyboardInterrupt, match="during B"):
         collect()
-    checkpoint = json.loads(next((tmp_path / "checkpoint").rglob("*.json")).read_text())
+    checkpoint = json.loads(
+        (tmp_path / "checkpoint" / "sglang" / "sglang.kimi_k31_dsa_context_module.json").read_text()
+    )
     assert len(checkpoint["done"]) == 1
     assert not checkpoint["failed"]
     assert output.read_text().splitlines() == [str(cases[0])]
@@ -955,12 +971,16 @@ def test_native_batch_failure_leaves_unsubmitted_cases_runnable(monkeypatch, tmp
 
     assert any(error["error_type"] == "FullNodeCollectionFailure" for error in collect())
     assert ran == (cases[:1] if failure == "flush" else cases[:2])
-    checkpoint = json.loads(next((tmp_path / "checkpoint").rglob("*.json")).read_text())
+    checkpoint = json.loads(
+        (tmp_path / "checkpoint" / "sglang" / "sglang.kimi_k31_dsa_context_module.json").read_text()
+    )
     assert len(checkpoint["failed"]) == (0 if failure == "flush" else 1)
     assert len(checkpoint["attempted"]) == len(ran)
     collect()  # ordinary resume skips the submitted failure and runs later cases
     assert ran == cases
-    checkpoint = json.loads(next((tmp_path / "checkpoint").rglob("*.json")).read_text())
+    checkpoint = json.loads(
+        (tmp_path / "checkpoint" / "sglang" / "sglang.kimi_k31_dsa_context_module.json").read_text()
+    )
     assert len(checkpoint["done"]) == (3 if failure == "flush" else 2)
     assert len(checkpoint["failed"]) == (0 if failure == "flush" else 1)
 
@@ -1038,3 +1058,107 @@ def test_native_tp_input_check_observes_other_ranks(monkeypatch, mismatch):
             module._validate_tp_inputs(reqs, "cuda:0")
     else:
         module._validate_tp_inputs(reqs, "cuda:0")
+
+
+@pytest.mark.parametrize("power", ["true", "1"])
+def test_native_power_request_is_rejected_before_import_or_queue(monkeypatch, tmp_path, power):
+    from collector import fullnode
+
+    monkeypatch.setenv("COLLECTOR_MEASURE_POWER", power)
+    with pytest.raises(ValueError, match="does not support --measure_power"):
+        fullnode.collect_sglang_fullnode_op(
+            {"name": "sglang", "type": "kimi_k31_dsa_context_module", "module": "must_not_import"},
+            runtime_version=RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options=None,
+            model_path=MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_: pytest.fail("queued power case"),
+            resume_checkpoint_cls=None,
+            logger=logging.getLogger(__name__),
+        )
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    with pytest.raises(ValueError, match="does not support --measure_power"):
+        run_kimi_k31_dsa_worker(*case, perf_filename=tmp_path / "generation.txt")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native SGLang TP workers use POSIX process groups")
+def test_timeout_inside_writer_releases_lock_for_next_success(monkeypatch, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    real_popen = subprocess.Popen
+    children = []
+    output = tmp_path / "dsa_generation_module_perf.txt"
+    lock = Path(str(output) + ".lock")
+    # Use the real writer, pausing exactly after exclusive-create acquired the
+    # lock and before opening its CSV. No GPU/runtime package is needed.
+    writer = (
+        "import os, time; from collector.helper import log_perf; "
+        "real_open = os.open\n"
+        "def pause_after_lock(path, flags, *args, **kwargs):\n"
+        "    fd = real_open(path, flags, *args, **kwargs)\n"
+        f"    if str(path) == {str(lock)!r}: time.sleep(60)\n"
+        "    return fd\n"
+        "os.open = pause_after_lock\n"
+    )
+    item = dict(perf_item(ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0), "generation", 1.25))
+    call = (
+        f"log_perf([{item!r}], 'SGLang', {RUNTIME_VERSION!r}, 'test_gpu', "
+        f"'dsa_generation_module', 'test_source', {str(output)!r})"
+    )
+
+    def launch(command, **kwargs):
+        case = ModuleCase(*json.loads(command[command.index("--case") + 1]))
+        env = dict(kwargs["env"])
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(None, [str(Path(__file__).resolve().parents[3]), env.get("PYTHONPATH")])
+        )
+        kwargs["env"] = env
+        code = writer + call if case.num_heads == 48 else "from collector.helper import log_perf; " + call
+        child = real_popen([sys.executable, "-c", code], **kwargs)
+        children.append(child)
+        if case.num_heads == 48:
+            deadline = time.monotonic() + 30
+            while not lock.exists():
+                assert child.poll() is None, "writer exited before locking"
+                assert time.monotonic() < deadline, "writer did not lock"
+                time.sleep(0.01)
+            monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 0.1)
+        else:
+            monkeypatch.setattr(module, "NATIVE_CASE_TIMEOUT_S", 30)
+        return child
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", MODEL, 0) for heads in (48, 96)]
+    try:
+        result = run_kimi_k31_dsa_fullnode(perf_filename=output, cases=cases)
+        assert result["failed"] == [cases[0]]
+        assert result["succeeded"] == 1
+        assert "timed out" in result["failure_details"][str(cases[0])]["error_message"]
+        assert output.read_text().count("1.2500") == 1
+        assert not lock.exists()
+    finally:
+        for child in children:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
+
+
+def test_native_output_lock_owned_before_attempt_is_preserved(monkeypatch, tmp_path):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as module
+
+    output = tmp_path / "generation.txt"
+    lock = Path(str(output) + ".lock")
+    lock.write_text("other writer")
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *_a, **_k: pytest.fail("started with a foreign lock"))
+    case = ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", MODEL, 0)
+    with pytest.raises(RuntimeError, match="already has a writer lock"):
+        run_kimi_k31_dsa_worker(*case, perf_filename=output)
+    assert lock.read_text() == "other writer"

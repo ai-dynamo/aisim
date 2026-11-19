@@ -226,9 +226,14 @@ def _native_termination_handler():
 
 
 def _run_native_case(case, device, perf_filename):
+    if os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in ("1", "true", "yes", "on"):
+        raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
     if perf_filename is None:
         raise ValueError("native Kimi K3.1 collection requires an output filename")
     output = Path(perf_filename)
+    writer_lock = Path(str(output) + ".lock")
+    if writer_lock.exists():
+        raise RuntimeError(f"native Kimi K3.1 output already has a writer lock: {writer_lock}")
     existed = output.exists()
     previous_size = output.stat().st_size if existed else 0
     phase = "context" if "context" in Path(perf_filename).name else "generation"
@@ -276,6 +281,12 @@ def _run_native_case(case, device, perf_filename):
                 if stderr:
                     sys.stderr.write(stderr)
             if process.returncode:
+                # A failed launcher can leave a native rank in its session.
+                # Reap the whole attempt before releasing its writer lock.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 for line in reversed(stderr.splitlines()):
                     reason = line.strip().removeprefix("RuntimeError: ")
                     if reason.startswith("FIXME(kernel-limit):"):
@@ -286,6 +297,10 @@ def _run_native_case(case, device, perf_filename):
         if not output.is_file() or output.stat().st_size <= previous_size:
             raise RuntimeError("native K31 worker exited successfully without writing its result row")
     except BaseException:
+        # Every process in the attempt has been killed and the launcher reaped.
+        # log_perf uses an exclusive-create lock; only this attempt could have
+        # created it under the full-node output ownership contract.
+        writer_lock.unlink(missing_ok=True)
         # This route exclusively owns its staged output. Failed attempts must
         # contribute no rows, even if the child appended before it failed.
         if output.exists():

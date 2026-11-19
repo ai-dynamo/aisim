@@ -1570,6 +1570,10 @@ def _kimi_k31_dsa_expand(phase: str) -> Callable[[], list[ModuleCase]]:
         cases = []
         for model in _model_case_values("kimi_k31_dsa_module"):
             heads = model["native_num_heads"]
+            # Local heads encode TP in the persisted case; reject a different
+            # global geometry before that conversion can hide the mismatch.
+            if type(heads) is not int or heads != 96:
+                raise ValueError(f"native Kimi K3.1 requires native_num_heads=96, got {heads!r}")
             for field in ("tensor_parallel_sizes", "kv_cache_dtypes"):
                 if not model[field]:
                     raise ValueError(f"native Kimi K3.1 requires non-empty {field}")

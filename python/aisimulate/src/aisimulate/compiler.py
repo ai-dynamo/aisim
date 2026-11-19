@@ -989,6 +989,8 @@ def _worker_model_control(engine, worker, name: str, saved: dict):
     value = getattr(worker.timing, name, None)
     if value is None:
         value = getattr(engine, name)
+        if name == "enable_eplb" and name not in engine.model_fields_set and name in saved:
+            return saved[name]
     return saved.get(name) if value is None else value
 
 

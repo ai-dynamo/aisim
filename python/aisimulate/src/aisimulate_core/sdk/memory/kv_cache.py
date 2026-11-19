@@ -47,7 +47,7 @@ from typing import Any
 
 from aisimulate_core.sdk import perf_database
 from aisimulate_core.sdk.backends.factory import get_backend
-from aisimulate_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, DefaultHFModels
+from aisimulate_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, MULTIMODAL_TEXT_CONFIG_KEY, DefaultHFModels
 from aisimulate_core.sdk.config import validate_parallel_size
 from aisimulate_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
 from aisimulate_core.sdk.fpm_profile import FpmModelProfile, load_fpm_profile
@@ -700,8 +700,12 @@ class NaiveKVCacheEstimator:
             parsed = _parse_hf_config_json(hf_config)  # supported arch -> normalized parse
         except Exception:
             parsed = None  # unsupported arch (the fallback's target) -> raw-key read
+        # Text geometry remains usable when optional vision metadata prevents
+        # a full SDK model parse. Do not require processor files for KV sizing.
+        text_key = MULTIMODAL_TEXT_CONFIG_KEY.get(architectures[0]) if architectures else None
+        geometry_config = hf_config.get(text_key, hf_config) if text_key else hf_config
         return cls(
-            cls._geometry(hf_config, parsed),
+            cls._geometry(geometry_config, parsed),
             dtype_bytes=cls._dtype_bytes(hf_config),
             tp_size=tp_size,
             pp_size=pp_size,
@@ -1224,6 +1228,8 @@ def estimate_kv_cache(
     if request_occupancy_tokens is not None and fpm_profile is None:
         raise ValueError("request_occupancy_tokens requires an FPM profile")
     if fpm_profile is not None:
+        if moe_kernel_source is not None:
+            raise ValueError("FPM profiles do not support moe_kernel_source")
         if colocated_encoder or reserved_bytes or encoder_parallel is not None:
             # The profile records the rank's memory as measured; it cannot be reshaped by
             # a reservation or an encoder layout the recording did not carry.

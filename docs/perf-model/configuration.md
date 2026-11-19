@@ -115,6 +115,8 @@ and caps its `max_batched_tokens` and `max_sequences` domains at
 [snapshot roles](#recommending-with-a-calibrated-snapshot)). Nothing reads
 `context_length`.
 
+Replay preserves an omitted `engine.enable_eplb` through configuration serialization so a saved snapshot can supply its value. An authored `false` remains an explicit override.
+
 The canonical configuration also carries quantization overrides and `attention_backend`, `moe_backend`, `moe_kernel_source` (default absent), `enable_eplb` (default `false`), and `wideep_num_slots` (default absent). These controls reach model construction, KV memory sizing, and replay provenance. EPLB/slots and nondefault MoE backend or kernel-source selection require an MoE model. Collected FPM interpolation cannot represent EPLB, slots, MoE backend, or kernel-source overrides; it rejects an explicit incompatible request and is skipped during automatic selection for those identities.
 
 `encoder_parallel` (default absent) compiles a VL model's vision tower in the given layout, `tp` (sharded over the tensor-parallel group) or `dp` (replicated, images split across ranks), so the estimator can price encoder calls. It requires a model with a vision encoder, is omitted from the serialized payload when unset, and is part of the estimator identity, cache keys and provenance. Llama 4 rejects `dp`.
@@ -1020,7 +1022,7 @@ These additional public YAML fields are concrete controls:
 | `engine.gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `comm_quant_mode` | Explicit precision overrides; omitted values follow model/profile normalization. |
 | `engine.kvcache_quant_mode` | KV storage precision: `bfloat16`, `fp8`, or `int8`. Omission follows model/profile normalization and can select FP8 for quantized checkpoints. |
 | `engine.attention_backend`, `moe_backend`, `moe_kernel_source` | Runtime graph/backend and exact collected source selectors, subject to canonical validation. |
-| `engine.enable_eplb`, `wideep_num_slots` | Expert load balancing and redundant expert slots; require compatible MoE execution. |
+| `engine.enable_eplb`, `wideep_num_slots` | Expert load balancing and redundant expert slots; require compatible MoE execution. Omitted EPLB inherits a saved snapshot's value; explicit `false` overrides it. |
 | `engine.nextn`, `nextn_accepted` | Compute-side MTP identity and separate expected acceptance assumption; both are required for explicit MTP. |
 | `engine.enable_chunked_prefill` | Override chunked prefill; omission preserves the backend default. |
 

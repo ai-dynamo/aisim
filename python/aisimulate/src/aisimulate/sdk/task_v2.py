@@ -1273,6 +1273,13 @@ class Task:
                 continue
             if self._role_attr(role, "fmha_quant_mode") != common.FMHAQuantMode.fp8:
                 continue
+            if self._architecture == "KimiK31ForConditionalGeneration":
+                database = self._try_load_role_database(role)
+                resolved_mode = getattr(
+                    database, "_default_database_mode", common.DatabaseMode[(self.database_mode or "SILICON").upper()]
+                )
+                if resolved_mode == common.DatabaseMode.SOL:
+                    continue
             ctx_ops = [ctx for ctx, _gen in self._reachable_attention_op_keys(role)]
             supported = {op: self._context_fmha_supported_modes(role, op) for op in ctx_ops}
             informative = [modes for modes in supported.values() if modes]
@@ -2342,6 +2349,11 @@ class Task:
                 )
             return
 
+        resolved_mode = (
+            database.get_default_database_mode()
+            if hasattr(database, "get_default_database_mode")
+            else common.DatabaseMode[(self.database_mode or "SILICON").upper()]
+        )
         supported: dict = getattr(database, "supported_quant_mode", {}) or {}
         is_moe = self._is_moe
 
@@ -2492,7 +2504,7 @@ class Task:
                 raise ValueError("Kimi K3.1 FP8 KV requires attention_backend=flashmla or trtllm_mla")
             if (
                 self._architecture == "KimiK31ForConditionalGeneration"
-                and self.database_mode == "SOL"
+                and resolved_mode == common.DatabaseMode.SOL
                 and (
                     mode
                     in (
@@ -2513,9 +2525,9 @@ class Task:
                 return
 
             def _attention_modes(op):
-                if self._architecture != "KimiK31ForConditionalGeneration" or self.database_mode not in (
-                    None,
-                    "SILICON",
+                if (
+                    self._architecture != "KimiK31ForConditionalGeneration"
+                    or resolved_mode != common.DatabaseMode.SILICON
                 ):
                     return None
                 from aisimulate.sdk.perf_database import context_fmha_supported_modes, dsa_generation_supported_modes

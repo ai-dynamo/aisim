@@ -1410,6 +1410,7 @@ def test_profile_block_budget_preserves_resource_provenance(profile_dict, profil
         ({"max_num_tokens": True}, "positive integer"),
         ({"fmha_quant_mode": "bfloat16"}, "identity conflict"),
         ({"attention_backend": "different"}, "identity conflict"),
+        ({"moe_kernel_source": "pinned_source"}, "do not support moe_kernel_source"),
         # Prefill CP is a supported knob; a profile without that cell fails loud.
         ({"cp_size": 2}, "no matching FPM deployment profile"),
         ({"nextn": 1}, "nextn must be 0"),
@@ -2352,3 +2353,25 @@ def test_linear_profile_memory_requires_recorded_dcp1(profile_memory, dcp):
     else:
         with pytest.raises(ValueError, match="FPM linear profile capacity is recorded at DCP1"):
             profile_memory(dcp_size=dcp)
+
+
+@pytest.mark.parametrize("profile_backend", ["flashmla", "trtllm_mla"])
+@pytest.mark.parametrize("override", [None, "match", "conflict"])
+def test_profile_memory_wire_attention_identity(profile_dict, native_profile_config, profile_backend, override):
+    from aisimulate_core.sdk.fpm_profile import _quantization_from_engine_config
+
+    profile_dict["deployments"][0]["attention_backend"] = profile_backend
+    compile_config, _ = native_profile_config
+    wire = compile_config()
+    supplied = "trtllm_mla" if profile_backend == "flashmla" else "flashmla"
+    if override == "conflict":
+        wire["extra"]["attention_backend"] = supplied
+        with pytest.raises(ValueError, match="identity conflict: attention_backend"):
+            _quantization_from_engine_config(json.dumps(wire))
+    else:
+        if override is None:
+            wire["extra"].pop("attention_backend", None)
+        else:
+            assert wire["extra"]["attention_backend"] == profile_backend
+        modes = _quantization_from_engine_config(json.dumps(wire))
+        assert modes["kvcache_quant_mode"] == profile_dict["deployments"][0]["kv_cache_dtype"]

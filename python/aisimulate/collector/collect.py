@@ -2494,10 +2494,14 @@ def collect_ops(
                 logger.info(f"Skipping {collection['name']}.{collection['type']} — not in collector v2 case plan")
                 continue
             unverified_here = collection.get("unverified") or (
-                sm_version is not None and sm_version in (collection.get("unverified_sms") or ())
+                collection.get("unverified_sms") and (sm_version is None or sm_version in collection["unverified_sms"])
             )
             if unverified_here:
-                scope = "this backend" if collection.get("unverified") else f"SM{sm_version}"
+                scope = (
+                    "this backend"
+                    if collection.get("unverified")
+                    else ("unresolved SM" if sm_version is None else f"SM{sm_version}")
+                )
                 logger.warning(
                     f"Skipping {collection['name']}.{collection['type']} — registry marks it unverified "
                     f"on {scope}; remove the OpEntry marker once the collector is debugged there"
