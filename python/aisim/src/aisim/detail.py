@@ -193,7 +193,10 @@ def _validate_performance_diagnostics(record: dict[str, Any]) -> None:
         for i, rank in enumerate(value["ranks"]):
             rp = f"{path}.ranks[{i}]"
             durations = {"prefill_ms", "decode_ms", "decode_baseline_ms", "marginal_decode_ms"}
-            fields(rank, rp, {"rank", "latency_ms", "queries"} | durations)
+            energies = {"prefill_energy_wms", "decode_energy_wms"}
+            fields(rank, rp, {"rank", "latency_ms", "queries"} | durations, energies)
+            for key in energies & rank.keys():
+                number(rank[key], f"{rp}.{key}")
             require(type(rank["rank"]) is int and rank["rank"] >= 0, f"{rp}.rank", "a nonnegative integer")
             number(rank["latency_ms"], f"{rp}.latency_ms")
             for key in durations:

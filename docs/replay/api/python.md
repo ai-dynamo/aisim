@@ -34,6 +34,11 @@ finally:
     runner.close()
 ```
 
+The existing `from_yaml()` file readers also accept `.json` files (case
+insensitive) using JSON parsing. This applies to `CorePredictionConfig`,
+`CoreRecommendationConfig`, and `SmartSearchConfig`; their typed schemas and
+validation are the same for both formats.
+
 The configuration above is the same core YAML used by `predict --stack engine`.
 `CorePredictionConfig` does not accept optional Router/Planner top-level sections;
 the CLI resolves and compiles those through their selected configuration adapters.

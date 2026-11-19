@@ -504,16 +504,43 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
         CorePredictionConfig.model_validate(raw)
 
 
-@pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
+_MTP = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
+
+
+def test_cold_mtp_regression_with_allowed_fallback_requires_a_fit():
+    raw = _prediction(timing="default")
+    raw["engine"].update(
+        estimation_mode="fpm_regression",
+        fallback_policy="allow",
+        speculation=deepcopy(_MTP),
+    )
+    with pytest.raises(ValueError, match="fpm_regression estimator is not ready: no workload store has a usable fit"):
+        _run(raw)
+
+    raw["engine"]["estimation_mode"] = "op_level"
+    report = _run(raw)
+    assert report.metrics["completed_requests"] == 1
+    assert report.metadata["prediction_provenance"]["aggregated"]["estimator"] == "op_level"
+
+
 @pytest.mark.parametrize("fallback", ["allow", "deny"])
 @pytest.mark.parametrize(
-    "speculation",
+    ("mode", "speculation"),
     [
-        {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5},
-        _SPEC,
-        {**_COST, "expected_accepted_tokens": 1.5},
+        # A vLLM fpm_regression times an MTP scheme instead; see test_recommend_state_snapshot.py.
+        ("fpm_interpolation", _MTP),
+        ("fpm_interpolation", _SPEC),
+        ("fpm_regression", _SPEC),
+        ("fpm_interpolation", {**_COST, "expected_accepted_tokens": 1.5}),
+        ("fpm_regression", {**_COST, "expected_accepted_tokens": 1.5}),
     ],
-    ids=["mtp", "ngram", "generic_ngram"],
+    ids=[
+        "interpolation-mtp",
+        "interpolation-ngram",
+        "regression-ngram",
+        "interpolation-generic_ngram",
+        "regression-generic_ngram",
+    ],
 )
 def test_replay_preserves_canonical_estimator_selection(mode, fallback, speculation):
     raw = _prediction(timing="default")

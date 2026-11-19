@@ -397,6 +397,35 @@ fn rules_refuse_convolution_groups() {
     }
 }
 
+// The values below fit a 64-bit `usize` only.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn rules_refuse_a_scheduler_block_above_usize() {
+    // The group validation has no upper bound for block_size_tokens. The
+    // LCM of these three blocks is 23,058,430,081,399,521,280, above
+    // `usize::MAX`. vLLM computes `math.lcm` on Python integers, which
+    // cannot overflow.
+    let groups = [
+        attention("a", 1 << 31, None),
+        attention("b", (1 << 31) - 1, None),
+        attention("c", 5, None),
+    ];
+    assert!(groups.iter().all(|group| group.validate().is_ok()));
+    let err = GroupedPrefixRules::new(&groups, 1, VllmRuleVersion::V0_31_0)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "kv_cache_groups with enable_prefix_caching=true require the least common multiple of every group's block_size_tokens (the scheduler block) to be at most 18446744073709551615; choose block_size_tokens with a smaller least common multiple"
+    );
+    // Two u32 blocks cannot overflow, and keep their exact LCM.
+    let groups = [
+        attention("a", u32::MAX, None),
+        attention("b", u32::MAX - 1, None),
+    ];
+    assert_eq!(rules(&groups, 1).alignment, 18_446_744_060_824_649_730);
+}
+
 #[test]
 fn alignment_is_the_hash_block_only_with_fine_grained_hits() {
     // coord:687-735. G2 to G5 are state rules with block 2176 and G0 is
