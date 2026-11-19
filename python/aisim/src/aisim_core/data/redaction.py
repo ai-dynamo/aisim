@@ -38,7 +38,14 @@ import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aisim_core.data import Manifest, _verify
-from aisim_core.data.e2e import OBSERVATIONS_SCHEMA, REQUESTS_SCHEMA, E2eManifestBody, body_from_manifest
+from aisim_core.data.e2e import (
+    METRICS_SCHEMA,
+    OBSERVATIONS_SCHEMA,
+    REQUESTS_SCHEMA,
+    SERIES_SCHEMA,
+    E2eManifestBody,
+    body_from_manifest,
+)
 from aisim_core.data.eval import load_record
 from aisim_core.data.hygiene import Finding
 from aisim_core.data.parquet import read_parquet
@@ -254,6 +261,12 @@ def _check_manifest(root: Path, rel: str, manifest: Manifest, policy: RedactionP
             out.extend(_check_observations(root / artifact.path, artifact.path, policy))
         elif artifact.artifact_schema == REQUESTS_SCHEMA and _request_rows_allowed(body, policy):
             out.extend(_check_requests(root / artifact.path, artifact.path, policy))
+        elif artifact.artifact_schema in (METRICS_SCHEMA, SERIES_SCHEMA):
+            out.extend(
+                _check_table_text(
+                    read_parquet(root / artifact.path, artifact.artifact_schema), artifact.path, policy, "column"
+                )
+            )
     out.extend(scan_value(manifest.provenance, policy, rel, "manifest provenance"))
     out.extend(scan_value([manifest.requested_settings, manifest.evidence_gaps], policy, rel, "manifest"))
     return out
@@ -342,7 +355,10 @@ def check_publishable(
     chosen_set = set(chosen)
     for rel, manifest in sorted(loaded.items()):
         if rel in chosen_set:
-            findings.extend(_check_manifest(root, rel, manifest, policy))
+            try:
+                findings.extend(_check_manifest(root, rel, manifest, policy))
+            except (OSError, ValidationError, ValueError) as exc:
+                findings.append(Finding("document-invalid", str(exc).splitlines()[0], rel))
     for rel in chosen:
         if rel.startswith("eval/") and rel.endswith(".json"):
             try:
