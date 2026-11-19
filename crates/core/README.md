@@ -67,9 +67,16 @@ are separate from vLLM's cadence; see the
 
 ## SGLang radix core
 
-The SGLang simulator delegates radix matching, insertion, locking, and LRU eviction to the Torch-free `sglang-radix-tree` dependency. AISimulate owns physical pages, request leases, token accounting, KV events, and its optional Belady forecast. Tree keys are existing page hashes; one tree atom represents one physical KV page, and the adapter converts page counts to tokens.
+The SGLang simulator delegates radix matching, insertion, locking, and leaf removal to the Torch-free `sglang-radix-tree` dependency. AISimulate owns physical pages, request leases, token accounting, KV events, and its optional Belady forecast. Tree keys are existing page hashes; one tree atom represents one physical KV page, and the adapter converts page counts to tokens.
 
 Chunked growth inserts only suffix values and acquires the extended path before releasing its previous lock. Completed requests replay the retained prefix's access updates. LRU follows SGLang's whole-leaf eviction, so it can reclaim more pages than requested. Belady retains page-at-a-time tail eviction and reconsiders the exposed parent against the remaining leaves. Fallible admission snapshots clone tree metadata while sharing immutable key and page buffers; rollback restores the allocator, tree, leases, and buffered event state together.
+
+The adapter maintains incremental LRU/Belady candidate indexes from native
+eligibility and access counters, refreshing changed forecast entries before
+selection. A restored checkpoint rebuilds its derived index once at first
+eviction. Retained suffix-split buffers compact geometrically, bounding both
+copying and retained storage. See the [cache-pressure evidence](src/engine/cache/EVICTION_PRESSURE_EVIDENCE.md)
+for regression coverage, cost bounds, and matched native measurements.
 
 The dependency is pinned to the SGLang radix-core integration branch by immutable revision. Publishing `aisimulate-core` to crates.io requires a published `sglang-radix-tree` version in place of this Git dependency.
 

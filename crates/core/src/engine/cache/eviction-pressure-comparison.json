@@ -1,0 +1,552 @@
+{
+  "schema_version": 1,
+  "artifacts": {
+    "baseline": {
+      "path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261119T074632408104Z/scratch/cargo-target/baseline-release/release/deps/aisimulate_core-a64618c03930d723",
+      "sha256": "35ad52b926ef11762dc362b8fe744ae9d5b8e2c5f6156557b3dde613ac20c280",
+      "commit": "e911d3a4a07750db05dddc3b6911c283358c044c"
+    },
+    "environment": {
+      "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+      "python": "3.12.12",
+      "cargo_build_jobs": "2",
+      "cargo_lock_sha256": "a456f5926c7bfb568f54f0ae666f771bfa227963702a71a829010647148068e0",
+      "python_lock_sha256": "27912793e92d99436659ee30751e6f255dd43edd12f33f6703a5d48ee99e4b0d",
+      "probe_sha256": "63897e297a94400eeb31b64a6e9a48dfa397a38d37d57013fbc8231b6dc501b9",
+      "cpu_quota": "200000 100000",
+      "memory_limit_bytes": 5368709120,
+      "timing_instrumentation": "Candidate cfg(test) candidate-query and key/value-copy counters remain enabled in the optimized probe; the production wheel has neither counter.",
+      "cpu_model": "Intel(R) Core(TM) i9-14900K"
+    },
+    "candidate": {
+      "path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-363-20261119T074632408104Z/scratch/cargo-target/candidate-release/release/deps/aisimulate_core-a64618c03930d723",
+      "sha256": "e4f196b86e60100e1150832b8f66ca71c6d450a65dc4896e96c861adb76cf981",
+      "commit": "2440f4a8bff822eececbfa649874f79f6c33a0e8"
+    }
+  },
+  "cpu": 0,
+  "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "profile": "release; codegen-units=1; lto=thin",
+  "features": [
+    "default"
+  ],
+  "dependency_test_features": [
+    "sglang-radix-tree/inspection"
+  ],
+  "warmups_per_side": 1,
+  "pairs": 5,
+  "timing_scope": "Native eviction plus replacement allocation/insertion for pressure; native drain for compressed leaves. Cache and forecast setup excluded.",
+  "sample_order": "One candidate/baseline warmup, then five pairs indexed 0..4: baseline/candidate for even pairs, candidate/baseline for odd pairs.",
+  "command": [
+    "taskset",
+    "-c",
+    "0",
+    "TEST_BINARY",
+    "eviction_pressure_measurement",
+    "--ignored",
+    "--nocapture"
+  ],
+  "build_command": [
+    "cargo",
+    "test",
+    "--release",
+    "--locked",
+    "--lib",
+    "eviction_pressure_measurement",
+    "--no-run",
+    "--message-format=json"
+  ],
+  "incremental_compilation": false,
+  "correctness": "Every run asserted exact ordered physical victims, physical-capacity restoration, allocator reuse/replacement insertion, and live-checkpoint preservation.",
+  "cases": [
+    {
+      "case": "lru",
+      "evicted_pages": 63,
+      "iterations": 63,
+      "replacement_inserts": 63,
+      "resident_leaves": 64,
+      "baseline": {
+        "elapsed_ms": [
+          0.08598599999999999,
+          0.07765799999999999,
+          0.07806500000000001,
+          0.085247,
+          0.093425
+        ],
+        "warmup_ms": 0.077878,
+        "median_ms": 0.085247,
+        "min_ms": 0.07765799999999999,
+        "max_ms": 0.093425
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.06373100000000001,
+          0.060873,
+          0.069566,
+          0.064339,
+          0.075069
+        ],
+        "warmup_ms": 0.063387,
+        "median_ms": 0.064339,
+        "min_ms": 0.060873,
+        "max_ms": 0.075069
+      }
+    },
+    {
+      "case": "belady",
+      "evicted_pages": 63,
+      "iterations": 63,
+      "replacement_inserts": 63,
+      "resident_leaves": 64,
+      "baseline": {
+        "elapsed_ms": [
+          0.10293000000000001,
+          0.11248599999999999,
+          0.107117,
+          0.102548,
+          0.110151
+        ],
+        "warmup_ms": 0.104753,
+        "median_ms": 0.107117,
+        "min_ms": 0.102548,
+        "max_ms": 0.11248599999999999
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.052709,
+          0.053235000000000005,
+          0.054679000000000005,
+          0.054444,
+          0.053684
+        ],
+        "warmup_ms": 0.052967,
+        "median_ms": 0.053684,
+        "min_ms": 0.052709,
+        "max_ms": 0.054679000000000005
+      }
+    },
+    {
+      "case": "belady_retirement",
+      "evicted_pages": 63,
+      "iterations": 63,
+      "replacement_inserts": 63,
+      "resident_leaves": 64,
+      "baseline": {
+        "elapsed_ms": [
+          0.116495,
+          0.115288,
+          0.119932,
+          0.11900000000000001,
+          0.120382
+        ],
+        "warmup_ms": 0.121486,
+        "median_ms": 0.11900000000000001,
+        "min_ms": 0.115288,
+        "max_ms": 0.120382
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.071814,
+          0.072047,
+          0.085221,
+          0.072938,
+          0.072206
+        ],
+        "warmup_ms": 0.092735,
+        "median_ms": 0.072206,
+        "min_ms": 0.071814,
+        "max_ms": 0.085221
+      }
+    },
+    {
+      "case": "lru",
+      "evicted_pages": 256,
+      "iterations": 256,
+      "replacement_inserts": 256,
+      "resident_leaves": 1024,
+      "baseline": {
+        "elapsed_ms": [
+          1.412269,
+          1.214825,
+          1.240108,
+          1.364566,
+          1.2545950000000001
+        ],
+        "warmup_ms": 1.220174,
+        "median_ms": 1.2545950000000001,
+        "min_ms": 1.214825,
+        "max_ms": 1.412269
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.193438,
+          0.184348,
+          0.20214500000000002,
+          0.226118,
+          0.192866
+        ],
+        "warmup_ms": 0.192114,
+        "median_ms": 0.193438,
+        "min_ms": 0.184348,
+        "max_ms": 0.226118
+      }
+    },
+    {
+      "case": "belady",
+      "evicted_pages": 256,
+      "iterations": 256,
+      "replacement_inserts": 256,
+      "resident_leaves": 1024,
+      "baseline": {
+        "elapsed_ms": [
+          3.896829,
+          3.841202,
+          4.0995729999999995,
+          4.229796,
+          4.169365
+        ],
+        "warmup_ms": 3.967349,
+        "median_ms": 4.0995729999999995,
+        "min_ms": 3.841202,
+        "max_ms": 4.229796
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.21817,
+          0.228395,
+          0.224006,
+          0.21627500000000002,
+          0.228055
+        ],
+        "warmup_ms": 0.224023,
+        "median_ms": 0.224006,
+        "min_ms": 0.21627500000000002,
+        "max_ms": 0.228395
+      }
+    },
+    {
+      "case": "belady_retirement",
+      "evicted_pages": 256,
+      "iterations": 256,
+      "replacement_inserts": 256,
+      "resident_leaves": 1024,
+      "baseline": {
+        "elapsed_ms": [
+          4.681731,
+          4.680199,
+          4.71434,
+          4.916185,
+          4.737400999999999
+        ],
+        "warmup_ms": 4.62434,
+        "median_ms": 4.71434,
+        "min_ms": 4.680199,
+        "max_ms": 4.916185
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.29109399999999996,
+          0.317018,
+          0.30758100000000005,
+          0.29318900000000003,
+          0.286119
+        ],
+        "warmup_ms": 0.318188,
+        "median_ms": 0.29318900000000003,
+        "min_ms": 0.286119,
+        "max_ms": 0.317018
+      }
+    },
+    {
+      "case": "lru",
+      "evicted_pages": 256,
+      "iterations": 256,
+      "replacement_inserts": 256,
+      "resident_leaves": 8192,
+      "baseline": {
+        "elapsed_ms": [
+          12.538659,
+          10.893518,
+          10.531142000000001,
+          11.924811,
+          10.922233
+        ],
+        "warmup_ms": 10.182701,
+        "median_ms": 10.922233,
+        "min_ms": 10.531142000000001,
+        "max_ms": 12.538659
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.259735,
+          0.26453499999999996,
+          0.268229,
+          0.227402,
+          0.262388
+        ],
+        "warmup_ms": 0.243855,
+        "median_ms": 0.262388,
+        "min_ms": 0.227402,
+        "max_ms": 0.268229
+      }
+    },
+    {
+      "case": "belady",
+      "evicted_pages": 256,
+      "iterations": 256,
+      "replacement_inserts": 256,
+      "resident_leaves": 8192,
+      "baseline": {
+        "elapsed_ms": [
+          32.028113,
+          33.216415999999995,
+          34.709709,
+          36.573771,
+          32.964633
+        ],
+        "warmup_ms": 33.177376,
+        "median_ms": 33.216415999999995,
+        "min_ms": 32.028113,
+        "max_ms": 36.573771
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.252383,
+          0.318258,
+          0.31171699999999997,
+          0.25314000000000003,
+          0.43374199999999996
+        ],
+        "warmup_ms": 0.34056000000000003,
+        "median_ms": 0.31171699999999997,
+        "min_ms": 0.252383,
+        "max_ms": 0.43374199999999996
+      }
+    },
+    {
+      "case": "belady_retirement",
+      "evicted_pages": 256,
+      "iterations": 256,
+      "replacement_inserts": 256,
+      "resident_leaves": 8192,
+      "baseline": {
+        "elapsed_ms": [
+          41.47794,
+          40.1121,
+          40.267296,
+          47.29412,
+          40.619229
+        ],
+        "warmup_ms": 39.928004,
+        "median_ms": 40.619229,
+        "min_ms": 40.1121,
+        "max_ms": 47.29412
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.47117200000000004,
+          0.436444,
+          0.518218,
+          0.49883999999999995,
+          0.501188
+        ],
+        "warmup_ms": 0.41145,
+        "median_ms": 0.49883999999999995,
+        "min_ms": 0.436444,
+        "max_ms": 0.518218
+      }
+    },
+    {
+      "case": "belady_compressed_drain",
+      "checkpoint": false,
+      "evicted_pages": 256,
+      "pages": 256,
+      "baseline": {
+        "elapsed_ms": [
+          0.141535,
+          0.137016,
+          0.136629,
+          0.137654,
+          0.13739300000000002
+        ],
+        "warmup_ms": 0.147229,
+        "median_ms": 0.13739300000000002,
+        "min_ms": 0.136629,
+        "max_ms": 0.141535
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.16064900000000001,
+          0.158047,
+          0.150723,
+          0.15721100000000002,
+          0.162477
+        ],
+        "warmup_ms": 0.159378,
+        "median_ms": 0.158047,
+        "min_ms": 0.150723,
+        "max_ms": 0.162477
+      }
+    },
+    {
+      "case": "belady_compressed_drain",
+      "checkpoint": true,
+      "evicted_pages": 256,
+      "pages": 256,
+      "baseline": {
+        "elapsed_ms": [
+          0.133726,
+          0.129724,
+          0.12854300000000002,
+          0.126712,
+          0.13203600000000001
+        ],
+        "warmup_ms": 0.126245,
+        "median_ms": 0.129724,
+        "min_ms": 0.126712,
+        "max_ms": 0.133726
+      },
+      "candidate": {
+        "elapsed_ms": [
+          0.14901899999999998,
+          0.158998,
+          0.1425,
+          0.148014,
+          0.15190399999999998
+        ],
+        "warmup_ms": 0.152203,
+        "median_ms": 0.14901899999999998,
+        "min_ms": 0.1425,
+        "max_ms": 0.158998
+      }
+    },
+    {
+      "case": "belady_compressed_drain",
+      "checkpoint": false,
+      "evicted_pages": 2048,
+      "pages": 2048,
+      "baseline": {
+        "elapsed_ms": [
+          1.33634,
+          1.286747,
+          1.284547,
+          1.2613889999999999,
+          1.388039
+        ],
+        "warmup_ms": 1.2515619999999998,
+        "median_ms": 1.286747,
+        "min_ms": 1.2613889999999999,
+        "max_ms": 1.388039
+      },
+      "candidate": {
+        "elapsed_ms": [
+          1.171239,
+          1.199538,
+          1.1245109999999998,
+          1.176364,
+          1.226013
+        ],
+        "warmup_ms": 1.187975,
+        "median_ms": 1.176364,
+        "min_ms": 1.1245109999999998,
+        "max_ms": 1.226013
+      }
+    },
+    {
+      "case": "belady_compressed_drain",
+      "checkpoint": true,
+      "evicted_pages": 2048,
+      "pages": 2048,
+      "baseline": {
+        "elapsed_ms": [
+          1.287299,
+          1.315075,
+          1.301864,
+          1.27825,
+          1.334633
+        ],
+        "warmup_ms": 1.2262620000000002,
+        "median_ms": 1.301864,
+        "min_ms": 1.27825,
+        "max_ms": 1.334633
+      },
+      "candidate": {
+        "elapsed_ms": [
+          1.203198,
+          1.205957,
+          1.134589,
+          1.140091,
+          1.207423
+        ],
+        "warmup_ms": 1.211846,
+        "median_ms": 1.203198,
+        "min_ms": 1.134589,
+        "max_ms": 1.207423
+      }
+    },
+    {
+      "case": "belady_compressed_drain",
+      "checkpoint": false,
+      "evicted_pages": 8192,
+      "pages": 8192,
+      "baseline": {
+        "elapsed_ms": [
+          11.661506000000001,
+          14.663404,
+          11.639291,
+          11.676212,
+          11.726429999999999
+        ],
+        "warmup_ms": 11.518168000000001,
+        "median_ms": 11.676212,
+        "min_ms": 11.639291,
+        "max_ms": 14.663404
+      },
+      "candidate": {
+        "elapsed_ms": [
+          4.766852,
+          4.693057,
+          4.820989,
+          4.805459,
+          4.870979
+        ],
+        "warmup_ms": 4.615539,
+        "median_ms": 4.805459,
+        "min_ms": 4.693057,
+        "max_ms": 4.870979
+      }
+    },
+    {
+      "case": "belady_compressed_drain",
+      "checkpoint": true,
+      "evicted_pages": 8192,
+      "pages": 8192,
+      "baseline": {
+        "elapsed_ms": [
+          11.794205999999999,
+          13.658266000000001,
+          11.650065,
+          12.052043,
+          11.472194
+        ],
+        "warmup_ms": 13.218343,
+        "median_ms": 11.794205999999999,
+        "min_ms": 11.472194,
+        "max_ms": 13.658266000000001
+      },
+      "candidate": {
+        "elapsed_ms": [
+          4.78354,
+          4.774418,
+          4.774235,
+          4.820856,
+          5.043259
+        ],
+        "warmup_ms": 4.783138,
+        "median_ms": 4.78354,
+        "min_ms": 4.774235,
+        "max_ms": 5.043259
+      }
+    }
+  ]
+}
