@@ -1225,6 +1225,8 @@ at https://github.com/sgl-project/sglang/blob/0bcd822377da7b5718e674eaf9c870d349
 
 ## DeepSeek model configuration files
 
+SPDX license expression for the configuration files identified in this section: `MIT`.
+
 The following model configuration files are copied from, or formatting-only
 adaptations of, the named DeepSeek model repositories:
 
@@ -1272,6 +1274,8 @@ SOFTWARE.
 
 ## Meta Muse Glimmer model configuration
 
+SPDX license expression for the configuration files identified in this section: `Apache-2.0`.
+
 `src/aisim_core/model_configs/meta-models--Muse-Glimmer-30B_config.json`
 is an unmodified copy of `config.json` from the Meta Muse Glimmer model
 repository at immutable revision
@@ -1288,6 +1292,8 @@ The Apache License 2.0 terms are reproduced in this distribution's `LICENSE`
 file.
 
 ## Qwen3.8-Max model configuration files
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-Qwen3.8-Max`.
 
 The following model configuration files are copied byte-for-byte from the
 named Qwen model repositories at the immutable revisions shown:
@@ -1326,6 +1332,8 @@ For any questions regarding this license, please contact model-business@notice.q
 
 ## NVIDIA Qwen3.5-397B-A17B-NVFP4-V2 model configuration files
 
+SPDX license expression for the configuration files identified in this section: `Apache-2.0`.
+
 The following files are unmodified copies of the named Hugging Face
 configuration files at the immutable revision shown:
 
@@ -1351,6 +1359,8 @@ notice. The file digests are recorded in the adjacent
 `src/aisim_core/model_configs/QWEN35_397B_NVFP4_V2_PROVENANCE.md`.
 
 ## StepFun Step-3.7-Flash model configuration files
+
+SPDX license expression for the configuration files identified in this section: `Apache-2.0`.
 
 The following files are modified adaptations of the named Hugging Face
 configuration files at the immutable revisions shown:
@@ -1381,6 +1391,8 @@ that AISim reads, moved to the top level, with these changes:
   `weight_block_size` and `activation_scheme`.
 
 ## Meta Llama 4
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-Llama-4-Community`.
 
 The following bundled model configs are modified copies of Meta Llama 4
 checkpoint configuration files:
@@ -1868,6 +1880,8 @@ https://github.com/vllm-project/vllm/blob/a474da28131f61684849b31e29af0eebaaedc3
 
 ## GLM-5.3 model configuration files
 
+SPDX license expression for the configuration files identified in this section: `LicenseRef-GLM-5.3`.
+
 The same base license also governs `nvidia--GLM-5.3-NVFP4_config.json` and `nvidia--GLM-5.3-NVFP4_hf_quant_config.json`, source revision `e3b8f9f2fad29727dfa95e766c5cac18ea1414bf`: https://huggingface.co/nvidia/GLM-5.3-NVFP4/tree/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf . NVIDIA CORPORATION & AFFILIATES contributes only its export/quantization material; Z.AI retains the base rights. The combined recorded terms remain in the NVIDIA GLM-5.3-NVFP4 section.
 
 The following files are unmodified copies of the named Hugging Face
@@ -1962,6 +1976,8 @@ vendored. The upstream license is preserved by the repository and packaged
 Apache-2.0 `LICENSE` text.
 
 ## NVIDIA GLM-5.3-NVFP4 model configuration files
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement`.
 
 The following files are unmodified copies of the named Hugging Face
 configuration files at the immutable revision shown:
@@ -2089,6 +2105,8 @@ End of terms and conditions
 ```
 
 ## NVIDIA Nemotron 3.5 Super VL NVFP4 model configuration files
+
+SPDX license expression for the configuration files identified in this section: `LicenseRef-OpenMDW-1.1`.
 
 The following files are unmodified copies of the named Hugging Face
 configuration files at the immutable revision shown:
