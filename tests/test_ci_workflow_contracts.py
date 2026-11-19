@@ -4573,6 +4573,7 @@ def test_simulation_dynamo_sglang_adapter_against_current_api(tmp_path, monkeypa
     assert "num_reserved_decode_tokens: SglangConfig::default().num_reserved_decode_tokens," in adapter.read_text()
     assert "disaggregation_decode_extra_slots: None," in adapter.read_text()
     assert "swa_prefix_tails: None," in adapter.read_text()
+    assert "scheduler_select_time_ms: SglangConfig::default().scheduler_select_time_ms," in adapter.read_text()
     assert record["after_sha256"] == hashlib.sha256(adapter.read_bytes()).hexdigest()
 
 

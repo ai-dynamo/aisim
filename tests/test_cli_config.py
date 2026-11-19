@@ -399,6 +399,38 @@ def test_prediction_rejects_invalid_prefill_decode_interval(value) -> None:
         CorePredictionConfig.model_validate({"engine": engine})
 
 
+@pytest.mark.parametrize("value", [-1, float("inf"), True, "1.5"])
+def test_prediction_rejects_invalid_sglang_scheduler_selection_cost(value) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {"scheduler": {"scheduler_select_time_ms": value}}
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+def test_prediction_rejects_serial_selection_cost_with_sglang_host_loop() -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {"host_loop": True, "scheduler": {"scheduler_select_time_ms": 1.5}}
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms requires host_loop=false"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("provider", ["afd", "aic-afd"])
+def test_prediction_schema_rejects_native_external_afd_timing(provider: str) -> None:
+    engine = _engine()
+    engine["backend"] = "sglang"
+    engine["workers"]["aggregated"] = {
+        "scheduler": {"scheduler_select_time_ms": 1.5},
+        "timing": {"type": "external", "provider": provider},
+    }
+    with pytest.raises(ValidationError, match=r"timing\.type") as error:
+        CorePredictionConfig.model_validate({"engine": engine})
+    assert any(
+        item["loc"][-2:] == ("timing", "type") and item["type"] == "literal_error" for item in error.value.errors()
+    )
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm"])
 def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> None:
     engine = _engine()
@@ -413,6 +445,7 @@ def test_prediction_accepts_neutral_backend_scheduler_defaults(backend: str) -> 
     [
         ("vllm", "prefill_decode_interval", 1, "sglang"),
         ("trtllm", "prefill_decode_interval", 1, "sglang"),
+        ("vllm", "scheduler_select_time_ms", 1.5, "sglang"),
         ("sglang", "prefill_schedule_interval", 2, "vllm"),
         ("trtllm", "prefill_schedule_interval", 2, "vllm"),
         ("sglang", "async_scheduling", True, "vllm"),
@@ -1819,6 +1852,26 @@ def test_aggregated_deployment_accepts_one_context_parallel_knob() -> None:
     assert timing["cp_size"] is None
     assert spec.performance_model_metadata["aggregated"]["config"]["dcp"] == 4
     assert "cp_size" not in spec.performance_model_metadata["aggregated"]["config"]
+
+
+def test_afd_prediction_rejects_scheduler_selection_cost():
+    raw = {
+        "engine": {
+            **_engine(),
+            "backend": "sglang",
+            "workers": {
+                "aggregated": {
+                    "type": "afd",
+                    "afd": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8},
+                    "scheduler": {"scheduler_select_time_ms": 0.0},
+                },
+            },
+        },
+    }
+    CorePredictionConfig.model_validate(raw)
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["scheduler_select_time_ms"] = 1.5
+    with pytest.raises(ValidationError, match="scheduler_select_time_ms is unsupported for AFD"):
+        CorePredictionConfig.model_validate(raw)
 
 
 @pytest.mark.parametrize("knob", ["prefill_context", "decode_context"])

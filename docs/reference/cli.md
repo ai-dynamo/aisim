@@ -229,6 +229,17 @@ for `recommendation.json`, CSV, selected YAML and partial-result semantics.
 
 ### Existing Output Directories
 
+One `predict` or `recommend` run owns an output directory at a time. The run takes an advisory
+lock on the directory before it inspects or cleans it and holds it until its last report is
+written; the lock adds no file to the directory. The supervising `aisim` process hands the locked
+descriptor to its worker, so the directory stays locked through the worker's writes even if the
+supervisor exits first. A second run started on the same directory, with or without
+`--overwrite`, exits with code `2` and the message `another AISim run is using output directory
+...`, and removes nothing. A run refused for the directory's contents releases the lock at once.
+A symlinked path to the same directory shares the lock. The lock covers AISim processes only:
+other programs writing into the directory are not blocked, which is why the checks below still
+apply.
+
 Without `--overwrite`, the CLI rejects an existing nonempty output directory, with one exception:
 a directory left by a failed run is cleared and reused, and the CLI prints one line saying so. This
 lets you retry a failed, resource-limited, timed-out or cancelled run in the same directory. It

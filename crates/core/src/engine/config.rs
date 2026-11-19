@@ -399,6 +399,8 @@ pub struct SglangConfig {
     /// any page, as for full attention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swa_prefix_tails: Option<usize>,
+    /// Measured serial batch-selection overhead for a pass with model work.
+    pub scheduler_select_time_ms: f64,
 }
 
 const fn default_reserved_decode_tokens() -> usize {
@@ -424,12 +426,17 @@ impl Default for SglangConfig {
             num_reserved_decode_tokens: default_reserved_decode_tokens(),
             disaggregation_decode_extra_slots: None,
             swa_prefix_tails: None,
+            scheduler_select_time_ms: 0.0,
         }
     }
 }
 
 impl SglangConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.scheduler_select_time_ms.is_finite() && self.scheduler_select_time_ms >= 0.0,
+            "sglang.scheduler_select_time_ms must be finite and non-negative"
+        );
         ensure!(
             self.max_prefill_tokens > 0,
             "sglang.max_prefill_tokens must be positive"
@@ -1684,6 +1691,18 @@ impl EngineConfig {
         ensure!(
             self.backend == Backend::Sglang || !self.sglang.host_loop,
             "sglang.host_loop is supported only for backend=sglang"
+        );
+        ensure!(
+            self.sglang.scheduler_select_time_ms == 0.0
+                || (self.backend == Backend::Sglang
+                    && !self.sglang.host_loop
+                    && self.afd.is_none()
+                    && !matches!(
+                        &self.timing_model,
+                        TimingModelConfig::External { provider, .. }
+                            if matches!(provider.as_str(), "afd" | "aic-afd")
+                    )),
+            "sglang.scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
         );
         ensure!(
             !self.sglang.host_loop || self.worker_type != WorkerType::Decode,
@@ -3327,6 +3346,84 @@ mod tests {
                         .to_string()
                         .contains("prefill_schedule_interval is supported only for backend=vllm")
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn sglang_scheduler_selection_cost_defaults_to_zero_and_validates() {
+        let legacy = serde_json::json!({"backend": "sglang", "sglang": {}});
+        let config: EngineConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(config.sglang.scheduler_select_time_ms, 0.0);
+        config.validate().unwrap();
+
+        for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+            let mut config = config.clone();
+            config.sglang.scheduler_select_time_ms = invalid;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("scheduler_select_time_ms must be finite and non-negative"),
+                "{error}"
+            );
+        }
+
+        let mut config = config;
+        config.sglang.scheduler_select_time_ms = 1.5;
+        config.validate().unwrap();
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: EngineConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.sglang.scheduler_select_time_ms, 1.5);
+
+        for mut unsupported in [
+            EngineConfig::for_backend(Backend::Vllm),
+            EngineConfig {
+                sglang: SglangConfig {
+                    host_loop: true,
+                    ..SglangConfig::default()
+                },
+                ..EngineConfig::for_backend(Backend::Sglang)
+            },
+            EngineConfig {
+                afd: Some(Arc::new(sample_afd_config())),
+                ..EngineConfig::for_backend(Backend::Sglang)
+            },
+        ] {
+            unsupported.validate().unwrap();
+            unsupported.sglang.scheduler_select_time_ms = 1.5;
+            let error = unsupported.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sglang_scheduler_selection_cost_checks_external_provider_without_afd_metadata() {
+        for provider in ["afd", "aic-afd", "aic", "custom"] {
+            let mut config = EngineConfig {
+                timing_model: TimingModelConfig::External {
+                    provider: provider.to_string(),
+                    config: serde_json::json!({}),
+                },
+                ..EngineConfig::for_backend(Backend::Sglang)
+            };
+            assert!(config.afd.is_none());
+            config.validate().unwrap();
+
+            config.sglang.scheduler_select_time_ms = 1.5;
+            if matches!(provider, "afd" | "aic-afd") {
+                let error = config.validate().unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "scheduler_select_time_ms requires a non-overlapped SGLang worker without AFD"
+                    ),
+                    "{provider}: {error}"
+                );
+            } else {
+                config.validate().unwrap();
             }
         }
     }

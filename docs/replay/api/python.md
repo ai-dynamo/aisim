@@ -87,6 +87,14 @@ profiling summaries and per-request clock semantics are unchanged. See the
 Analytical EPD does not provide raw native
 or per-request EPD reports. Large capture can require substantial memory.
 
+Dynamo owns the downstream `ReplayTelemetrySnapshot` TypedDict in `_core.pyi`.
+It is intentionally unsynchronized with the Rust observer's new
+`completion_feedback` field until Dynamo bumps its simulator pin to a release
+that includes the field. The stub update is deferred to that pin bump and
+tracked in [Dynamo PR #18885](https://github.com/ai-dynamo/dynamo/pull/18885).
+See the [Rust observer contract](rust.md#reports-and-capture) for the
+completion feedback fields; telemetry capture does not export this block.
+
 ## HTML dashboard
 
 The CLI `--export-html` flag enables telemetry and writes a standalone
