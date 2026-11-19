@@ -366,14 +366,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         result = run_ingestion(args.root, args.cache_dir, models=args.model)
         report = result.to_json()
+        report_error = None
         if args.report:
-            args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+            try:
+                args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+            except OSError as exc:  # never let a report I/O failure hide the ingestion outcome or its alert
+                report_error = exc
+                print(f"cannot write report {args.report}: {exc}", file=sys.stderr)
         print(json.dumps(report, sort_keys=True))
         if result.status == "failed":
             if not args.no_notify:
                 _env_alert("ingestion failed", f"{result.error}\nThe last qualified snapshot is retained.")
             return 1
-        return 0
+        return 1 if report_error else 0
     if args.command == "promote":
         print(json.dumps(promote(args.root, args.snapshot_id, args.reviewer), sort_keys=True))
         return 0

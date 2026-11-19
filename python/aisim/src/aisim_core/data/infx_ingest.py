@@ -70,6 +70,7 @@ USER_AGENT = "aisim-infx-ingest/1"
 # Bound each upstream page before allocation; this is independent of the request budget.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 SELECTION_POLICY = "inferencex-all-observations-in-scope/v1"
+_PARALLELISM_METRIC = re.compile(r"(?:(?:prefill|decode)_)?(?:pp|pcp_size|dcp_size)")
 REQUIRED_ROW_KEYS = (*INFERENCEX_CONFIG_FIELDS, "id", "metrics", "isl", "osl", "benchmark_type")
 # ``exact=true&date=D`` returns the logical snapshot as of D, so one benchmark id can reappear on later
 # dates. Only these per-view context fields differ between appearances (verified against the live API);
@@ -146,7 +147,7 @@ def parse_retry_after(value: str | None, now: float | None = None) -> float | No
     if not value:
         return None
     value = value.strip()
-    if value.isdigit():
+    if value.isascii() and value.isdigit():  # str.isdigit() also accepts characters float() rejects
         return float(value)
     try:
         when = email.utils.parsedate_to_datetime(value)
@@ -279,8 +280,18 @@ class AcquisitionCache:
         meta = {"url": url, "etag": etag, "body_sha256": _sha(body), "bytes": len(body), "fetched_at": fetched_at}
         for path, data in ((body_path, body), (meta_path, (json.dumps(meta, sort_keys=True) + "\n").encode())):
             with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
-                handle.write(data)
-            os.replace(handle.name, path)  # body first, meta last: a torn write fails the hash check
+                temporary = handle.name
+                try:
+                    handle.write(data)
+                    handle.flush()
+                except BaseException:
+                    Path(temporary).unlink(missing_ok=True)
+                    raise
+            try:
+                os.replace(temporary, path)  # body first, meta last: a torn write fails the hash check
+            except BaseException:
+                Path(temporary).unlink(missing_ok=True)
+                raise
         return meta
 
 
@@ -340,6 +351,7 @@ class Acquirer:
         prior_observation_models: Mapping[str, str] | None = None,
     ) -> Acquisition:
         self.responses = {}
+        self.client.requests_made = 0  # the request budget applies to each acquisition
         self.selected_models = None
         options, _, _ = self._page("views/options", None, dict)
         by_key: dict[str, str] = {}
@@ -363,6 +375,11 @@ class Acquirer:
             known = set(by_key) | set(by_key.values())
             if unknown := sorted(wanted - known):
                 raise InfxError(f"unknown model selector(s) {unknown}; known: {sorted(set(by_key.values()))}")
+            for value in sorted(wanted & set(by_key) & set(by_key.values())):
+                if {k for k, n in by_key.items() if n == value} != {value}:
+                    raise InfxError(
+                        f"model selector {value!r} is both a DB key and another model's display name; it is ambiguous"
+                    )
             # Stored observation model IDs are normalized DB keys, not display names.
             self.selected_models = {
                 normalize("model", k) for k, name in by_key.items() if k in wanted or name in wanted
@@ -405,6 +422,10 @@ class Acquirer:
                 _check_availability_values(row, url)
                 if not isinstance(row["metrics"], dict):
                     raise IncompleteAcquisitionError(f"{url}: metrics must be a mapping")
+                for key, degree in row["metrics"].items():
+                    if _PARALLELISM_METRIC.fullmatch(key) and degree is not None:
+                        if type(degree) is not int or degree < 0:
+                            raise IncompleteAcquisitionError(f"{url}: metrics.{key} must be a non-negative integer")
                 if row.get("run_url") is not None and not isinstance(row["run_url"], str):
                     raise IncompleteAcquisitionError(f"{url}: run_url must be a string or null")
                 if row["model"] not in valid_keys:
@@ -566,9 +587,18 @@ def snapshot_path(sid: str) -> str:
 
 def _verify_planned_configuration(root: Path, manifest_path: str, expected: E2eConfigurationData) -> None:
     actual = load_e2e(root, manifest_path)
-    if actual.manifest.configuration_id != expected.body.configuration_id() or {
-        row.observation_id: row.record_sha256 for row in actual.observations
-    } != {row.observation_id: row.record_sha256 for row in expected.observations}:
+
+    def rows(items):
+        return sorted((row.model_dump_json() for row in items))
+
+    if (
+        actual.manifest.configuration_id != expected.body.configuration_id()
+        or {row.observation_id: row.record_sha256 for row in actual.observations}
+        != {row.observation_id: row.record_sha256 for row in expected.observations}
+        # Producer metadata corrections change rows without changing record hashes.
+        or rows(actual.observations) != rows(expected.observations)
+        or rows(actual.metrics) != rows(expected.metrics)
+    ):
         raise ValueError(f"snapshot member does not match configuration contents: {manifest_path}")
 
 
