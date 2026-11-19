@@ -27,6 +27,23 @@ from .test_runtime_observations import _mutate, _replace_launch, observation_fix
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("runtime", [None, [], {}, {"version": "0.28.0"}])
+def test_unaudited_runtime_does_not_read_k31_manifest(monkeypatch, runtime):
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("unrelated runtime read the K3.1 manifest")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+    assert runtime_k31.is_audited_runtime(runtime) is False
+
+
+def test_audited_runtime_still_requires_complete_source_map():
+    manifest = Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json"
+    runtime = json.loads(manifest.read_text())["runtime"]
+    assert runtime_k31.is_audited_runtime(runtime)
+    runtime["source_files"].pop(next(iter(runtime["source_files"])))
+    assert not runtime_k31.is_audited_runtime(runtime)
+
+
 def _adapter(monkeypatch):
     monkeypatch.setitem(sys.modules, "fpm_memory_observer", legacy)
     return importlib.import_module("collector.fpm_forward.runtime.instrumentation.kimi_k31")
@@ -700,6 +717,46 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(tmp_
         evidence = artifact["evidence"]
         if evidence["kind"] == "worker":
             assert runtime_k31.moe_precision(evidence["initialized_moe"]) == "w4a8_mxfp4_mxfp8_trtllm"
+
+
+@pytest.mark.parametrize("omit", ["indexer", "mla"])
+def test_import_requires_initialized_indexed_mla_despite_consistent_cache_maps(tmp_path, monkeypatch, omit):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def remove_layers(record):
+        cache = record["cache"]
+        group = cache["groups"][0]
+        omitted = {name for name in group["layer_names"] if name.startswith(omit + ".")}
+        group["layer_names"] = [name for name in group["layer_names"] if name not in omitted]
+        for field in ("layer_specs", "layer_classes"):
+            if field in group:
+                group[field] = {name: value for name, value in group[field].items() if name not in omitted}
+        group["representative_layer"] = group["layer_names"][0]
+        group["spec_page_size_bytes"] = sum(spec["spec_page_size_bytes"] for spec in group["layer_specs"].values())
+        if record["kind"] == "worker":
+            cache["layer_components"] = {
+                name: value for name, value in cache["layer_components"].items() if name not in omitted
+            }
+            cache["tensor_allocations"] = [
+                a for a in cache["tensor_allocations"] if not omitted.intersection(a["layers"])
+            ]
+            record["attention_groups"] = [
+                a for a in record["attention_groups"] if not omitted.intersection(a["layer_names"])
+            ]
+            # Keep the summary unchanged: only per-layer evidence establishes
+            # that the indexed MLA path was actually initialized.
+
+    _mutate(path, remove_layers)
+    index = json.loads(path.read_text())
+    references = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]["artifacts"]
+    records = [json.loads((path.parent / ref["path"]).read_text()) for ref in references]
+    worker = next(record for record in records if record["kind"] == "worker")
+    scheduler = next(record for record in records if record["kind"] == "scheduler")
+    # Physical accounting alone still accepts the mutually consistent maps.
+    _physical_views(worker["cache"], scheduler["cache"], "fp8", context=4096)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None, result
+    assert "requires initialized MLA and DSA indexer layers" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("layer,dtype", [("mla.0", "nvfp4"), ("mla.0", "fp8_ds_mla"), ("indexer.0", "fp8_ds_mla")])

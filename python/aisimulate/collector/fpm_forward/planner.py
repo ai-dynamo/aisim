@@ -895,7 +895,7 @@ def _observed_k31_capability(
         if not isinstance(artifacts, list) or not artifacts or not isinstance(capacities, list):
             raise ValueError("K3.1 observed MoE provenance requires worker artifacts and rank capacities")
         workers, schedulers, paths = {}, {}, set()
-        canonical_graph, canonical_hardware = None, None
+        canonical_settings, canonical_hardware = None, None
         for artifact in artifacts:
             if not isinstance(artifact, dict) or not isinstance(artifact.get("evidence"), dict):
                 raise ValueError("K3.1 observed MoE artifact requires inline native evidence")
@@ -929,12 +929,13 @@ def _observed_k31_capability(
                     canonical_hardware = hardware
                 else:
                     observations._same(hardware, canonical_hardware, "hardware across phases/ranks")
-                if canonical_graph is None:
-                    canonical_graph = config["compilation_config"]
+                settings = observations._runtime_settings(config)
+                if canonical_settings is None:
+                    canonical_settings = settings
                 else:
                     observations._same(
-                        config["compilation_config"],
-                        canonical_graph,
+                        settings,
+                        canonical_settings,
                         "effective runtime/graph settings across phases/ranks",
                     )
                 modes.add(moe_precision(record.get("initialized_moe")))

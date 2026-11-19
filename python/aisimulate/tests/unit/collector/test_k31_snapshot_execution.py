@@ -486,7 +486,9 @@ def test_execution_reports_malformed_initialized_weight_shapes(native_execution,
     assert any("initialized expert weights are incomplete" in reason for reason in result["failures"])
 
 
-@pytest.mark.parametrize("mutation", ["null_phase", "list_classes", "null_placement"])
+@pytest.mark.parametrize(
+    "mutation", ["null_phase", "list_classes", "null_placement", "null_cache", "null_group", "null_component"]
+)
 def test_execution_reports_malformed_native_objects_as_failed(native_execution, mutation):
     plan, cell, raw, collection, index_path = native_execution
     if mutation == "null_phase":
@@ -500,13 +502,26 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
                 if mutation == "list_classes":
                     group = record["cache"]["groups"][-1]
                     group["layer_classes"] = group["layer_names"]
+                elif mutation == "null_cache":
+                    record["cache"] = None
+                elif mutation == "null_group":
+                    record["cache"]["groups"][0] = None
+                elif mutation == "null_component":
+                    record["cache"]["layer_components"]["mla.0"] = [None]
                 else:
                     record["cache"]["tensor_allocations"][0] = None
 
         _mutate(index_path, corrupt)
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
     assert result["status"] == "failed", result
-    message = {"null_phase": "phase must be an object", "list_classes": "class coverage", "null_placement": "placement"}
+    message = {
+        "null_phase": "phase must be an object",
+        "list_classes": "class coverage",
+        "null_placement": "placement",
+        "null_cache": "cache must be an object",
+        "null_group": "cache group must be an object",
+        "null_component": "layer component must be an object",
+    }
     assert any(message[mutation] in reason for reason in result["failures"])
 
 

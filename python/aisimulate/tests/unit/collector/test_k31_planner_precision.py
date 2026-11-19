@@ -334,6 +334,71 @@ def test_inline_tp2_proof_requires_matching_effective_graph_settings(inputs, mat
             bind(inputs)
 
 
+@pytest.mark.parametrize("matching", [False, True])
+def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, matching):
+    # Preserve two physical workers while changing the topology to TP1/DP2.
+    # Each DP scheduler agrees with its worker even in the mismatching case.
+    launch = inputs["runtime_launch"]
+    launch["topology"].update(tp=1, dp=2, moe_tp=1, moe_ep=2)
+    inputs["topologies"] = (ParallelTopology(**launch["topology"]),)
+    deployment = inputs["profile"]["deployments"][0]
+    deployment.update(launch["topology"])
+    memory = deployment["resources"]["runtime_memory"]
+    proof = json.loads(memory["provenance"])
+    proof["launch"] = copy.deepcopy(launch)
+    artifacts = []
+    scheduler = next(a for a in proof["artifacts"] if a["evidence"]["kind"] == "scheduler")
+    for artifact in proof["artifacts"]:
+        record = artifact["evidence"]
+        if record["kind"] != "worker":
+            continue
+        dp = record["tp_rank"]
+        record.update(dp_rank=dp, tp_rank=0)
+        copied_scheduler = copy.deepcopy(scheduler)
+        copied_scheduler["path"] += f".dp{dp}"
+        copied_scheduler["evidence"]["dp_rank"] = dp
+        for item in (artifact, copied_scheduler):
+            observed = item["evidence"]
+            observed["launch"] = copy.deepcopy(launch)
+            observed["resolved_config"]["parallel_config"].update(
+                tensor_parallel_size=1,
+                data_parallel_size=2,
+                data_parallel_size_local=2 if matching or dp == 0 else 1,
+                enable_expert_parallel=True,
+            )
+            artifacts.append(item)
+    proof["artifacts"] = artifacts
+    for rank in proof["rank_capacities"]:
+        rank.update(dp_rank=rank["tp_rank"], tp_rank=0)
+    memory["provenance"] = json.dumps(proof)
+    if matching:
+        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
+    else:
+        with pytest.raises(ValueError, match="effective runtime/graph settings across phases/ranks"):
+            bind(inputs)
+
+    # Rebuild the hashed artifact route from the same records to verify that
+    # importing and inline planning apply the same cross-rank contract.
+    index_path = Path(proof["observations_index"]["path"])
+    root = index_path.parent
+    index = json.loads(index_path.read_text())
+    index["configurations"]["tp2"]["launch"] = launch
+    attempt = index["configurations"]["tp2"]["attempts"][0]
+    phase = attempt["phases"]["decode"]
+    context_path = root / phase["launch_manifest"]["path"]
+    context = json.loads(context_path.read_text())
+    context.update(launch=launch, expected_ranks=expected_ranks(launch["topology"]))
+    phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
+    phase["artifacts"] = [
+        {"kind": "observation", **_write(root / a["path"], a["evidence"]), "path": a["path"]} for a in artifacts
+    ]
+    index_path.write_text(json.dumps(index))
+    imported = validate_observations(index_path, {"tp2": launch})["tp2"]
+    assert imported["status"] == ("complete" if matching else "incomplete"), imported
+    if not matching:
+        assert "effective runtime/graph settings across phases/ranks" in str(imported["diagnostics"])
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     [

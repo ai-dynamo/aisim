@@ -237,6 +237,68 @@ def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
     assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == expected
 
 
+@pytest.mark.parametrize(
+    "wrapper,decoder",
+    [
+        ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"),
+        ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"),
+    ],
+)
+def test_text_only_qwen35_decoder_rejects_sol_before_graph_construction(
+    profile_dict, checkpoint_configs, monkeypatch, wrapper, decoder
+):
+    profile_dict["architecture"] = decoder
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": [wrapper],
+        "text_config": {"architectures": [decoder]},
+    }
+    monkeypatch.setattr(engine, "compile_engine", _fail_graph)
+    request = _request(profile_dict)
+    controls = request["estimator_config"]["fpm_interpolation"]
+    controls["text_only"] = True
+    for method in ("auto", "direct"):
+        controls["method"] = method
+        assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+    controls["method"] = "sol"
+    for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            entry_point(request)
+    # Profiles identified by the wrapper retain their existing selection.
+    checkpoint_configs[profile_dict["model"]]["text_config"].pop("architectures")
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    profile_dict["architecture"] = wrapper
+    controls["method"] = "auto"
+    assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == "sol"
+
+
+def test_text_only_qwen35_decoder_queries_unmeasured_point_with_direct_interpolation(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path
+):
+    profile_dict["architecture"] = "Qwen3_5ForCausalLM"
+    profile_dict["deployments"][0]["system"] = "h200_sxm"
+    checkpoint_configs[profile_dict["model"]] = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {"architectures": [profile_dict["architecture"]]},
+    }
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    monkeypatch.setattr(engine, "get_model", _fail_graph)
+    parquet = _write_external_profile_pair(profile_dict, tmp_path)
+    request = _request(profile_dict)
+    request["estimator_config"]["fpm_interpolation"].update(text_only=True, fpm_parquet_path=str(parquet))
+    model = RustForwardPassPerfModel.best_available(request)
+    try:
+        resolved = model.diagnostics()["provenance"]["config"]
+        assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+        assert _normalize(resolved) == resolved
+        # The synthetic decode anchors at KV=1 and KV=64 are both 3 ms;
+        # KV=32 must interpolate without trying the unsupported GDN SOL path.
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 32}}]
+        ) == pytest.approx(3.0)
+    finally:
+        model.close()
+
+
 @pytest.mark.parametrize("wrapper", ["NemotronH_Omni_Reasoning_V3", "InternVLChatModel"])
 def test_profile_architecture_matches_collector_llm_config_view(profile_dict, checkpoint_configs, wrapper):
     checkpoint_configs[profile_dict["model"]] = {

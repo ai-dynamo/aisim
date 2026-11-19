@@ -44,8 +44,10 @@ _NATIVE_SPEC_FIELDS = {
 
 def is_audited_runtime(runtime):
     """Exact inspected version and source map, shared by planning and import."""
+    if not isinstance(runtime, dict) or runtime.get("version") != VERSION:
+        return False
     pinned = json.loads((Path(__file__).parent / "runtime/vllm-kimi-k31.example.json").read_text())["runtime"]
-    return isinstance(runtime, dict) and {key: runtime.get(key) for key in pinned} == pinned
+    return {key: runtime.get(key) for key in pinned} == pinned
 
 
 def _positive(value, label):
@@ -263,6 +265,8 @@ def validate_attention_assignments(worker):
     }
     expected = {}
     for gid, group in enumerate(cache["groups"]):
+        if not isinstance(group, dict):
+            raise ValueError("K3.1 cache group must be an object")
         if not isinstance(group.get("layer_classes"), dict):
             raise ValueError("K3.1 cache layer class coverage is incomplete")
         for name in group["layer_names"]:
@@ -294,6 +298,8 @@ def validate_attention_assignments(worker):
             observed[key] = group["backend"]
     if observed != expected:
         raise ValueError("K3.1 native attention assignments omit initialized layers")
+    if not {selected, "DEEPSEEK_V32_INDEXER"}.issubset(observed.values()):
+        raise ValueError("K3.1 native attention requires initialized MLA and DSA indexer layers")
     return observed
 
 
@@ -422,6 +428,8 @@ def validate_views(cache, precision, count, page):
                 raise ValueError("K3.1 layer component count contradicts native spec")
             component_offset = offset
             for component_index, view in enumerate(components):
+                if not isinstance(view, dict):
+                    raise ValueError("K3.1 layer component must be an object")
                 size = _positive(view.get("element_size_bytes"), "component element bytes")
                 shape, strides = view.get("shape"), view.get("stride_bytes")
                 if (

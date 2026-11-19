@@ -191,13 +191,19 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     from aisimulate_core.sdk.models.base import _MODEL_REGISTRY
 
     family = common.ARCHITECTURE_TO_MODEL_FAMILY.get(analytical_architecture, analytical_architecture)
+    # Qwen3.5's wrapper graph emits GDN, which has no FPM SOL roofline. Do not
+    # promote a decoder profile to SOL through that wrapper. Auto can use
+    # direct interpolation; explicit SOL must fail during validation.
+    unsupported_decoder_graph = analytical_architecture != profile.architecture and family == "QWEN35"
     return json.dumps(
         {
             "profile": profile.model_dump(mode="json"),
             # K3's graph retains MlaModule* fallback primaries whose SOL
             # rooflines are unsupported. Auto must use direct interpolation;
             # K3.1 has its own supported DSA/KDA graph.
-            "registered": family in _MODEL_REGISTRY and analytical_architecture != "KimiK3ForConditionalGeneration",
+            "registered": family in _MODEL_REGISTRY
+            and analytical_architecture != "KimiK3ForConditionalGeneration"
+            and not unsupported_decoder_graph,
             **deployment.quantization_kwargs(),
         }
     )

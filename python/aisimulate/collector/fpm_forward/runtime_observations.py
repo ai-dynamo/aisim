@@ -246,7 +246,10 @@ def _validate_record(
         raise ValueError("runtime observation requires worker or scheduler role")
     from .runtime_k31 import LAYOUT, is_audited_runtime
 
-    if record.get("cache", {}).get("allocation_layout") == LAYOUT and not is_audited_runtime(record.get("runtime")):
+    cache = record.get("cache")
+    if not isinstance(cache, dict):
+        raise ValueError("runtime observation cache must be an object")
+    if cache.get("allocation_layout") == LAYOUT and not is_audited_runtime(record.get("runtime")):
         raise ValueError("K3.1 native cache mapping requires the exact audited runtime source map")
     lifecycle = record.get("lifecycle", {})
     if lifecycle.get("cache_initialized") is not True:
@@ -663,6 +666,14 @@ def _physical_views(
     return groups, accounting
 
 
+def _runtime_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Compare complete validated settings, excluding phase-local prefix caching."""
+    return {
+        **config,
+        "cache_config": {key: value for key, value in config["cache_config"].items() if key != "enable_prefix_caching"},
+    }
+
+
 def _configuration(
     root: Path,
     label: str,
@@ -761,8 +772,7 @@ def _configuration(
                         canonical_hardware,
                         "hardware across phases/ranks",
                     )
-                settings = copy.deepcopy(config)
-                settings["cache_config"].pop("enable_prefix_caching", None)
+                settings = _runtime_settings(config)
                 if canonical_settings is None:
                     canonical_settings = settings
                 else:
