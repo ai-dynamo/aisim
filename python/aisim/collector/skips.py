@@ -118,6 +118,19 @@ SKIPS: list[dict] = [
     # is packaged for this NVFP4 alias, so its cases fail at construction on
     # every run.
     {"backend": "vllm", "op": "moe", "model_name": "RadixArk/Qwen3.8-2.4T-A95B-NVFP4"},
+    # vLLM's NemotronHMoE constructs routed experts at moe_latent_size when set
+    # (vllm/model_executor/models/nemotron_h.py, NemotronHMoE.__init__ @0.31.0).
+    # The outer-width Super/Ultra rows serve SGLang/TRT-LLM only; timing them
+    # through vLLM's native ModelOpt method would record a geometry it never serves.
+    {
+        "backend": "vllm",
+        "op": "moe",
+        "model_name": [
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+            "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+        ],
+        "hidden_size": [4096, 8192],
+    },
     # vLLM: Lightning's routed experts are all ModelOpt W4A16_NVFP4, which vLLM
     # times as its w4a16_nvfp4 lane. The nvfp4 branch requires uniformly NVFP4
     # experts (vllm/collect_moe.py, _modelopt_mixed_expert_prefix), so these cases

@@ -117,7 +117,7 @@ def _task_model(task, model_path, role="agg"):
     return get_model(model_path, task.build_model_config(role=role, parallel=(1, 1, 1, 1, 1, 1)), "vllm")
 
 
-def _latencies(model, system="gb200", **modes):
+def _latencies(model, system="gb200", *, tp=1, moe_tp=1, moe_ep=1, **modes):
     """``{prefill: {op: latency_ms}}`` from the canonical API at decode batch 1 and context 1024."""
     from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
@@ -128,9 +128,9 @@ def _latencies(model, system="gb200", **modes):
             backend="vllm",
             backend_version="0.30.0",
             worker_type="decode",
-            tp=1,
-            moe_tp_size=1,
-            moe_ep_size=1,
+            tp=tp,
+            moe_tp_size=moe_tp,
+            moe_ep_size=moe_ep,
             database_mode="SOL",
             estimation_mode="op_level",
             **{key: mode.name for key, mode in modes.items()},
@@ -282,6 +282,40 @@ def test_regex_exclusions_keep_their_own_capture_groups():
 def test_checkpoint_path_aliases_and_algo_keys(prefix, key):
     raw = _listing({f"{prefix}.layers.0.mixer.shared_experts.up_proj": {key: "NVFP4"}})
     assert _projection_modes(raw, "E", FP8)["shared_up_gemm"] == {NVFP4: 1}
+
+
+@pytest.mark.parametrize("modules", [("qkv_proj",), ("q_proj", "k_proj", "v_proj")])
+def test_qkv_precision_resolves_packed_and_agreeing_split_entries(modules):
+    raw = _listing({f"model.layers.3.mixer.{name}": {"quant_algo": "FP8"} for name in modules})
+    assert _projection_modes(raw, "MMM*", NVFP4)["qkv_gemm"] == {FP8: 1}
+
+
+def test_packed_qkv_declaration_precedes_split_entries():
+    raw = _listing(
+        {
+            "model.layers.0.mixer.qkv_proj": {"quant_algo": "FP8"},
+            "model.layers.0.mixer.q_proj": {"quant_algo": "NVFP4"},
+        }
+    )
+    assert _projection_modes(raw, "*", NVFP4)["qkv_gemm"] == {FP8: 1}
+
+
+def test_packed_qkv_precision_reaches_native_pricing(monkeypatch, tmp_path):
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+
+    def packed_attention(section, _e_layers):
+        # Super's first attention layer is 7; its other seven attention layers
+        # remain unlisted (BF16). This synthetic edit prices one packed FP8 QKV.
+        section["quantized_layers"]["model.layers.7.mixer.qkv_proj"] = {"quant_algo": "FP8"}
+
+    path = _write_super(tmp_path, packed_attention)
+    model = get_model(path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
+    assert _buckets(model.context_ops)["qkv_gemm"] == {BF16: 7, FP8: 1}
+    mixed = _latencies(path)
+    uniform = {mode: _latencies(path, gemm_quant_mode=mode) for mode in (BF16, FP8)}
+    for prefill in (True, False):
+        expected = (7 * uniform[BF16][prefill]["qkv_gemm"] + uniform[FP8][prefill]["qkv_gemm"]) / 8
+        assert mixed[prefill]["qkv_gemm"] == pytest.approx(expected, rel=1e-9)
 
 
 @pytest.mark.parametrize(
@@ -480,20 +514,28 @@ def test_published_exports_price_each_layer_at_its_listed_precision(model_path, 
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
         "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8",
         "nvidia/Nemotron-H-56B-Base-8K",
-        # Lightning lists W4A16_NVFP4 layers, which no packaged table measures, so it keeps the global modes.
-        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
     ],
 )
 def test_models_without_usable_per_layer_metadata_keep_the_global_modes(model_path):
-    import contextlib
-
-    # The W4A16_NVFP4 fallback is reported, not silent.
-    lightning = "Lightning" in model_path
-    with pytest.warns(UserWarning, match="W4A16_NVFP4") if lightning else contextlib.nullcontext():
-        model = get_model(model_path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
+    model = get_model(model_path, ModelConfig(moe_tp_size=1, system="gb200"), backend_name="vllm")
     assert not model._moe_quant_modes
     for name, modes in _buckets(model.context_ops).items():
         assert set(modes) == {model.config.gemm_quant_mode}, name
+
+
+@pytest.mark.parametrize("system", ["gb200", "h200_sxm"])
+def test_lightning_moe_fallback_preserves_checkpoint_projection_precision(system):
+    path = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+    with pytest.warns(UserWarning, match="routed experts are priced at the global MoE mode"):
+        model = get_model(path, ModelConfig(moe_tp_size=1, system=system), backend_name="vllm")
+    for pipeline, scale in ((model.context_ops, 1), (model.generation_ops, model._mtp_scale_factor)):
+        buckets = _buckets(pipeline, scale=scale)
+        # The published Lightning listing declares all 23 shared-expert pairs W4A16_NVFP4.
+        for name in ("shared_up_gemm", "shared_down_gemm"):
+            assert buckets[name] == {common.GEMMQuantMode.w4a16_nvfp4: 23}
+    with pytest.warns(UserWarning, match="W4A16_NVFP4"):
+        override = get_model(path, ModelConfig(moe_tp_size=1, system=system, gemm_quant_mode=BF16), backend_name="vllm")
+    assert all(set(modes) == {BF16} for modes in _buckets(override.context_ops).values())
 
 
 def test_mixed_precision_latency_sums_the_per_precision_layers(monkeypatch, tmp_path):
@@ -539,6 +581,50 @@ def test_entry_points_agree_on_per_layer_experts(monkeypatch, tmp_path, system, 
     # The canonical API prices the per-layer lanes; native FP4 on Hopper would raise MissingSystemFlopsError.
     latencies = _latencies(path, system=system)
     assert all(latencies[prefill]["moe"] > 0 for prefill in (True, False))
+
+
+@pytest.mark.parametrize("system", ["h200_sxm", "gb200"])
+def test_task_and_legacy_estimation_price_the_mixed_experts(monkeypatch, tmp_path, system):
+    from aisim.legacy_cli.api import cli_estimate
+    from aisim.sdk import predict
+
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
+    path = _super_with_fp8_experts(tmp_path)
+    # EP=2 exercises real dispatch/combine communication as well as expert compute.
+    canonical = _latencies(path, system=system, tp=2, moe_ep=2)
+    task_diagnostics = []
+    original_predict = predict.predict_agg_worker
+
+    def capture_prediction(**kwargs):
+        summary = original_predict(**kwargs)
+        task_diagnostics.append(summary.get_per_ops_data())
+        return summary
+
+    monkeypatch.setattr(predict, "predict_agg_worker", capture_prediction)
+    task = _task(path, system=system, version="0.30.0", isl=1024, osl=2)
+    task.run_single_agg(tp=2, moe_tp=1, moe_ep=2, batch_size=1, ctx_tokens=1024)
+    legacy = cli_estimate(
+        path,
+        system,
+        backend_name="vllm",
+        backend_version="0.30.0",
+        database_mode="SOL",
+        isl=1024,
+        osl=2,
+        batch_size=1,
+        ctx_tokens=1024,
+        tp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    assert len(task_diagnostics) == 1
+    for diagnostics in (task_diagnostics[0], legacy.per_ops_data):
+        for prefill, phase, step in ((True, "context", "mix_step"), (False, "generation", "genonly_step")):
+            for name in ("moe", "moe_pre_dispatch", "moe_post_dispatch"):
+                # Require the real named rows; empty phase diagnostics cannot pass.
+                expected = canonical[prefill][name]
+                assert expected > 0
+                assert diagnostics[step][f"{phase}_{name}"] == pytest.approx(expected, rel=1e-9)
 
 
 @pytest.mark.parametrize("serving_mode", ["agg", "disagg"])

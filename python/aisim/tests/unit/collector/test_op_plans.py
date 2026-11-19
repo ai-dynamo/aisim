@@ -46,6 +46,21 @@ def _entry(**keys) -> dict:
     return next(entry for entry in skips.SKIPS if all(entry.get(key) == value for key, value in keys.items()))
 
 
+@pytest.mark.parametrize(
+    ("model_name", "latent", "outer"),
+    [
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", 1024, 4096),
+        ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", 2048, 8192),
+    ],
+)
+def test_vllm_native_latent_experts_exclude_outer_width(monkeypatch, model_name, latent, outer):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", model_name)
+    for backend in BACKENDS:
+        cases = [case for case in plan("moe", backend, 100).cases if case.model_name == model_name]
+        assert cases
+        assert {case.hidden_size for case in cases} == ({latent} if backend == "vllm" else {latent, outer})
+
+
 def _registry(backend: str) -> list:
     """The backend's registry entries, with those of its wide-EP registry."""
     return [

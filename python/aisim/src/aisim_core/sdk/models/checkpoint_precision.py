@@ -142,6 +142,7 @@ class CheckpointPrecision:
         kinds_to_modules: Mapping,
         layer_paths: LayerPaths,
         resolve: Callable[[str | None, bool], object],
+        packed_modules: Mapping[str, str] | None = None,
     ) -> list:
         """``[(layer, kind, key, mode)]`` for every modeled op of every decoder layer.
 
@@ -149,11 +150,19 @@ class CheckpointPrecision:
         the checkpoint modules it prices. ``resolve(algo or None, excluded)`` is a module's
         effective mode, so fused modules are compared after exclusion and unlisted rules
         apply. Conflicting algorithms for one module, or fused modules whose modes differ,
-        are rejected.
+        are rejected. ``packed_modules`` maps an op key to its packed checkpoint module;
+        a declared or excluded packed module is resolved before its split names.
         """
         rows = []
         for layer, kind in enumerate(layer_kinds):
             for key, modules in kinds_to_modules.get(kind, {}).items():
+                packed = packed_modules.get(key) if packed_modules else None
+                if packed:
+                    excluded, algos = self.module(layer_paths(layer, packed))
+                    # Serving resolves an explicitly declared packed module before its split
+                    # checkpoint names. Without a packed declaration, compare every split mode.
+                    if excluded or algos:
+                        modules = (packed,)
                 modes = set()
                 for module in modules:
                     excluded, algos = self.module(layer_paths(layer, module))
@@ -207,6 +216,7 @@ def projection_modes(
     default: common.GEMMQuantMode,
     system: str | None = None,
     systems_path: str | None = None,
+    packed_modules: Mapping[str, str] | None = None,
 ) -> dict:
     """``{key: {mode: number of layers}}`` for every modeled GEMM projection of every decoder layer.
 
@@ -240,7 +250,7 @@ def projection_modes(
         return modes[algo]
 
     resolved = {}
-    for _, _, key, mode in checkpoint.rows(layer_kinds, kinds_to_modules, layer_paths, resolve):
+    for _, _, key, mode in checkpoint.rows(layer_kinds, kinds_to_modules, layer_paths, resolve, packed_modules):
         resolved.setdefault(key, Counter())[mode] += 1
     return {key: dict(counts) for key, counts in resolved.items()}
 

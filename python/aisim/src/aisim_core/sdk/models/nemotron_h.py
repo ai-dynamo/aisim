@@ -33,6 +33,9 @@ _LAYER_PROJECTIONS = {
 # Routed-expert precision of a MoE layer, read from expert 0.
 _EXPERT_MODULES = {"E": ("experts.0.up_proj", "experts.0.down_proj")}
 _LAYER_PATHS = decoder_paths("mixer")
+# vLLM NemotronHAttention constructs QKVParallelLinear at mixer.qkv_proj; ModelOpt
+# resolves that packed prefix before q_proj/k_proj/v_proj (vLLM v0.31.0 nemotron_h.py).
+_PACKED_PROJECTIONS = {"qkv_gemm": "qkv_proj"}
 
 
 def _projection_modes(
@@ -40,7 +43,9 @@ def _projection_modes(
 ) -> dict:
     """``{projection: {mode: number of layers}}`` for every Nemotron-H decoder GEMM (see ``projection_modes``)."""
     checkpoint = checkpoint or checkpoint_precision(raw)
-    return projection_modes(checkpoint, pattern, _LAYER_PROJECTIONS, _LAYER_PATHS, default, system)
+    return projection_modes(
+        checkpoint, pattern, _LAYER_PROJECTIONS, _LAYER_PATHS, default, system, packed_modules=_PACKED_PROJECTIONS
+    )
 
 
 def _moe_modes(
@@ -101,18 +106,18 @@ class NemotronHModel(BaseModel):
             raw = model_info.get("raw_config", {})
             pattern = model_info["extra_params"].hybrid_override_pattern
             checkpoint = checkpoint_precision(raw)
-            # shortcut: a checkpoint with W4A16_NVFP4 layers (Nemotron 3.5 Lightning) keeps the global
-            # modes, because no packaged table has w4a16_nvfp4 MoE rows. Remove once those tables exist.
+            # No packaged table has w4a16_nvfp4 MoE rows. Keep that fallback confined
+            # to routed experts: GEMM has its own W4A16 lane and checkpoint precision.
             per_layer = "w4a16_nvfp4" not in checkpoint.algos
             if not per_layer:
                 warnings.warn(
                     f"{model_info['model_path']}: the checkpoint lists W4A16_NVFP4 layers, which no packaged "
-                    "table measures; every projection and routed expert is priced at the global GEMM/MoE modes.",
+                    "MoE table measures; routed experts are priced at the global MoE mode.",
                     stacklevel=2,
                 )
             # The system resolves under the caller's systems root (canonical API systems_paths).
             system, systems_path = model_config.system, model_config.systems_path
-            if per_layer and not model_info["gemm_quant_mode_is_explicit"]:
+            if not model_info["gemm_quant_mode_is_explicit"]:
                 model._projection_quant_modes = projection_modes(
                     checkpoint,
                     pattern,
@@ -121,6 +126,7 @@ class NemotronHModel(BaseModel):
                     model_config.gemm_quant_mode,
                     system,
                     systems_path=systems_path,
+                    packed_modules=_PACKED_PROJECTIONS,
                 )
             if per_layer and not model_info["moe_quant_mode_is_explicit"]:
                 model._moe_quant_modes = moe_modes(

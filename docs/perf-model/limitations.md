@@ -63,7 +63,8 @@ families keep one precision per op kind.
   or routed expert with that one mode.
 - Loading fails when a module has conflicting or unsupported algorithms, or
   when the modules of one fused op, such as Q, K and V, resolve to different
-  modes.
+  modes. An explicitly declared packed `qkv_proj` takes precedence over the
+  split Q/K/V checkpoint names, matching vLLM's packed-module lookup.
 
 Known limits:
 
@@ -74,7 +75,8 @@ Known limits:
   exclusion that matches the block itself makes the layer BF16.
 - An FP8 projection is dynamic FP8 only when the global mode is dynamic FP8.
 - A checkpoint that lists `W4A16_NVFP4` layers, such as Nemotron 3.5
-  Lightning, keeps the global modes. No packaged table has `w4a16_nvfp4` MoE
+  Lightning, keeps the global MoE mode for routed experts; GEMM projections
+  still use their listed precisions. No packaged table has `w4a16_nvfp4` MoE
   rows yet. Only the vLLM 0.30.0 b200 and gb200 tables and the vLLM 0.31.0
   b200 table have `w4a16_nvfp4` GEMM rows.
 
