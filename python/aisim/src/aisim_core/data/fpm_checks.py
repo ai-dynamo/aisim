@@ -34,6 +34,7 @@ from aisim_core.data.fpm_library import (
     ROLE_METADATA,
     FpmContractError,
     FpmMeasurementManifest,
+    check_library_model,
     read_library_metadata,
     recover_reconstructed_metadata,
 )
@@ -177,6 +178,7 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         add("sidecar-rows", f"sidecar row_count {metadata.get('row_count')} differs from library rows {library.rows}")
     if not found:
         try:  # the check staging applies to a historical reconstructed sidecar
+            check_library_model(metadata, _file(root, library.path), manifest.identity.model)
             recover_reconstructed_metadata(
                 metadata,
                 _file(root, library.path),

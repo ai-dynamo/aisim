@@ -32,7 +32,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
 from aisim_core.fpm_profile import FpmDeploymentProfile, FpmResourceProfile
 
@@ -67,6 +67,13 @@ class FpmResourcesPendingError(FpmContractError):
 # --------------------------------------------------------------------------- schema models (snapshotted)
 
 
+def _coordinate_schema(schema: dict[str, Any]) -> None:
+    # Historical reconstructed sidecars may omit this declaration; an explicit null is never native-valid.
+    schema.pop("anyOf", None)
+    schema.pop("default", None)
+    schema.update(type="string", const="iteration_totals_balanced_v1")
+
+
 class FpmLibraryMetadata(BaseModel):
     """``fpm/fpm_forward_perf.metadata.json`` for ``aic_fpm_forward_perf/v6``.
 
@@ -84,7 +91,10 @@ class FpmLibraryMetadata(BaseModel):
     system: str | None = None
     backend: str | None = None
     backend_version: str | None = None
-    coordinate_system: str | None = None
+    model_paths: list[str] | None = Field(default=None, min_length=1)
+    coordinate_system: Literal["iteration_totals_balanced_v1"] | None = Field(
+        default=None, json_schema_extra=_coordinate_schema
+    )
     measurement_policy: str | None = None
     measurement_repeats: int | None = Field(default=None, strict=True)
     warmup_repeats: int | None = Field(default=None, strict=True)
@@ -94,6 +104,13 @@ class FpmLibraryMetadata(BaseModel):
         json_schema_extra={"properties": {name: {"type": "integer", "minimum": 1} for name in _TOPOLOGY}},
     )
     resources: FpmResourceProfile | None = None
+
+    @field_validator("coordinate_system")
+    @classmethod
+    def _coordinate_system(cls, value):
+        if value is None:
+            raise ValueError("coordinate_system must be iteration_totals_balanced_v1; omit it for recovery")
+        return value
 
     @model_validator(mode="after")
     def _selector_topology(self):
@@ -427,7 +444,6 @@ def stage_fpm_library(
         "systems_paths": [str(p) for p in systems_paths] if systems_paths is not None else None,
         "parquet_path": str(parquet),
         "metadata_path": str(sidecar),
-        "system_definition": {"path": str(source_yaml), "sha256": sha256_file(source_yaml)},
     }
     temporary = None
     if output_dir is None:
@@ -451,6 +467,10 @@ def stage_fpm_library(
         else:
             (target / METADATA_FILE).symlink_to(sidecar)
         if output_dir is not None:
+            marker["system_definition"] = {
+                "path": str(source_yaml),
+                "sha256": sha256_file(build / source_yaml.name),
+            }
             # The selected overlay links, not only the inputs, identify a reusable staging: a root added to or
             # reordered in front of the fallbacks can change which file a link names.
             marker["overlay"] = _overlay_links(build)
@@ -526,6 +546,37 @@ def _check_sidecar_describes_library(metadata: Mapping[str, Any], parquet: Path,
         raise FpmContractError(f"cannot read the FPM library {parquet}: {exc}") from exc
     if metadata.get("row_count") != rows:
         raise FpmContractError(f"FPM sidecar row_count {metadata.get('row_count')} differs from the library ({rows})")
+
+
+def check_library_model(metadata: Mapping[str, Any], parquet: Path, model: str | None) -> None:
+    """Bind an entry's model to a possibly multi-model library and its optional model inventory.
+
+    Collectors publish ``model_paths`` for aggregate tables. Historical sidecars without that inventory remain
+    usable: the verified table's model_path column is authoritative. Scan only that column with bounded batches;
+    native admission still checks the remaining cell identity and estimator support.
+    """
+    import pyarrow.parquet as pq
+
+    try:
+        models: set[str] = set()
+        for batch in pq.ParquetFile(parquet).iter_batches(batch_size=4096, columns=["model_path"]):
+            if "model_path" not in batch.schema.names:
+                raise FpmContractError("FPM library requires model_path to verify the manifest model")
+            values = batch.column("model_path").unique().to_pylist()
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise FpmContractError("FPM library model_path must contain nonblank strings")
+            models.update(values)
+    except FpmContractError:
+        raise
+    except Exception as exc:
+        raise FpmContractError(f"cannot read FPM library model identity: {exc}") from exc
+    declared = metadata.get("model_paths")
+    if declared is not None and set(declared) != models:
+        raise FpmContractError("FPM sidecar model_paths differs from the library model_path values")
+    if model not in models:
+        raise FpmContractError(
+            f"FPM library does not cover manifest model {model!r}; available models: {sorted(models)}"
+        )
 
 
 def _staged_marker(root: Path) -> dict[str, Any] | None:
@@ -636,35 +687,39 @@ def _prepare_system_overlay(
                     raise FpmContractError(
                         f"FPM output_dir {staged} must not be inside the system data tree {source_data_root}"
                     )
-            _link_overlay_entries(source_data_root, target_data_root, backend_name, version)
+            _link_overlay_entries(source_data_root, target_data_root, backend_name, version, destination)
     return target_version
 
 
-def _link_overlay_entries(source_root: Path, target_root: Path, backend: str, version: str) -> None:
+def _link_overlay_entries(
+    source_root: Path, target_root: Path, backend: str, version: str, destination: Path | None
+) -> None:
     """Expose op/SOL data while keeping the selected FPM directory isolated."""
     for entry in source_root.iterdir():
         if entry.name != backend:
-            _link_if_missing(entry, target_root / entry.name)
+            _link_if_missing(entry, target_root / entry.name, destination)
     source_backend, target_backend = source_root / backend, target_root / backend
     if not source_backend.is_dir():
         return
     for entry in source_backend.iterdir():
         if entry.name != version:
-            _link_if_missing(entry, target_backend / entry.name)
+            _link_if_missing(entry, target_backend / entry.name, destination)
     source_version, target_version = source_backend / version, target_backend / version
     if not source_version.is_dir():
         return
     for entry in source_version.iterdir():
         if entry.name not in {LIBRARY_FILE, METADATA_FILE}:
-            _link_if_missing(entry, target_version / entry.name)
+            _link_if_missing(entry, target_version / entry.name, destination)
 
 
-def _link_if_missing(source: Path, target: Path) -> None:
+def _link_if_missing(source: Path, target: Path, destination: Path | None) -> None:
     if not target.exists() and not target.is_symlink():
         try:
             resolved = source.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise FpmContractError(f"cannot resolve FPM overlay source {source}: {exc}") from exc
+        if destination is not None and resolved.is_relative_to(destination.resolve()):
+            raise FpmContractError(f"FPM overlay source {source} resolves inside output_dir {destination}")
         target.symlink_to(resolved, target_is_directory=resolved.is_dir())
 
 
@@ -782,11 +837,12 @@ def resource_metadata_for_deployment(
     identity: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any] | None:
     """Return sidecar resources only for the selected model and deployment."""
+    metadata = _unambiguous_resource_metadata(profile, metadata, identity)
+    return metadata if _resource_metadata_matches(profile, deployment, metadata, identity) else None
+
+
+def _resource_metadata_matches(profile, deployment, metadata, identity) -> bool:
     selector = (metadata or {}).get("configuration_selector") or {}
-    if not selector and _distinct_deployments(profile) > 1:
-        # Without a selector the sidecar does not say which deployment it describes; a profile with several
-        # distinct deployments keeps each of them pending rather than guessing.
-        return None
     applies = all(deployment.get(name, 1) == selector[name] for name in _TOPOLOGY if name in selector)
     wanted = {**{k: selector[k] for k in _IDENTITY_KEYS if k in selector}, **(identity or {})}
     applies = applies and all(
@@ -799,16 +855,7 @@ def resource_metadata_for_deployment(
         applies = applies and deployment.get("worker_type") == wanted["worker_type"]
     # Selectors also pin precision, implementation and model identity. Use the profile's own defaults for
     # omitted deployment fields; never attach resources from a differently selected configuration.
-    selected_identity = {
-        **{name: value for name, value in profile.items() if name != "deployments"},
-        "model_path": profile.get("model"),
-        **{
-            name: info.get_default()
-            for name, info in FpmDeploymentProfile.model_fields.items()
-            if not info.is_required() and name not in {"resources", "execution_profile"}
-        },
-        **deployment,
-    }
+    selected_identity = _resource_deployment_identity(profile, deployment)
     applies = applies and all(
         selected_identity.get(name) == value
         for name, value in selector.items()
@@ -816,19 +863,33 @@ def resource_metadata_for_deployment(
         and name not in _IDENTITY_KEYS
         and (name in selected_identity or name in _PRECISION_KEYS)
     )
-    return metadata if applies else None
+    return applies
 
 
-def _distinct_deployments(profile: Mapping[str, Any]) -> int:
-    deployments = profile.get("deployments")
-    if not isinstance(deployments, list):
-        return 1
-    keys = {
-        json.dumps([d.get(name, 1) for name in _TOPOLOGY] + [d.get("worker_type")], default=str)
-        for d in deployments
-        if isinstance(d, Mapping)
+def _resource_deployment_identity(profile, deployment) -> dict[str, Any]:
+    return {
+        **{name: value for name, value in profile.items() if name != "deployments"},
+        "model_path": profile.get("model"),
+        **{
+            name: info.get_default()
+            for name, info in FpmDeploymentProfile.model_fields.items()
+            if not info.is_required() and name != "resources"
+        },
+        **{name: value for name, value in deployment.items() if name != "resources"},
     }
-    return len(keys)
+
+
+def _unambiguous_resource_metadata(profile, metadata, identity):
+    """A partial (or absent) selector must identify at most one effective deployment identity."""
+    deployments = profile.get("deployments")
+    if not metadata or metadata.get("resources") is None or not isinstance(deployments, list):
+        return metadata
+    keys = {
+        json.dumps(_resource_deployment_identity(profile, d), sort_keys=True, default=str)
+        for d in deployments
+        if isinstance(d, Mapping) and _resource_metadata_matches(profile, d, metadata, identity)
+    }
+    return metadata if len(keys) <= 1 else None
 
 
 def complete_fpm_profile(
@@ -841,8 +902,9 @@ def complete_fpm_profile(
     """Fill deployments that lack ``resources`` from the sidecar; the user's block always wins.
 
     ``profile`` is the user's ``fpm_profile`` dictionary (deployments may omit ``resources``). A sidecar block
-    applies to the deployment its ``configuration_selector`` names (every incomplete deployment when the sidecar
-    has no selector) and only to deployments of the library's own ``identity`` (system, backend, backend_version);
+    applies only when its ``configuration_selector`` and the library's own ``identity`` (system, backend,
+    backend_version) identify one distinct deployment. An absent or partial selector that matches several
+    identities leaves those resources pending, even when another deployment has user-supplied resources;
     a deployment that names another hardware, version or role is left to its own resources. A selector that names
     a role requires that explicit deployment role; an omitted or null role cannot inherit role-specific resources.
     Returns the completed dictionary and the source of each deployment's resources.
@@ -853,6 +915,8 @@ def complete_fpm_profile(
     deployments = out.get("deployments")
     if not isinstance(deployments, list) or not deployments:
         raise FpmContractError("fpm_profile requires at least one deployment")
+    # Resolve ambiguity once, before adding resources, rather than rescanning the profile for each deployment.
+    metadata = _unambiguous_resource_metadata(out, metadata, identity)
     sources: list[str] = []
     for index, deployment in enumerate(deployments):
         if not isinstance(deployment, dict):
@@ -862,7 +926,7 @@ def complete_fpm_profile(
         )
         resolved = resolve_resources(
             deployment.get("resources"),
-            resource_metadata_for_deployment(out, deployment, metadata, identity),
+            metadata if _resource_metadata_matches(out, deployment, metadata, identity) else None,
             where=where,
             required=required,
         )
