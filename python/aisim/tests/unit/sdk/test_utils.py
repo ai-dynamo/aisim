@@ -703,6 +703,38 @@ def test_failed_same_model_reader_preserves_active_readers_snapshot(monkeypatch,
             utils.get_model_config_from_model_path.cache_clear()
 
 
+def test_failed_cached_processor_retries_release_base_configs(monkeypatch, hf_cache):
+    import gc
+    import weakref
+
+    model = "org/reclaimed-processor-retries"
+    config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    _cache_file(hf_cache, model, "config.json", config)
+    _cache_file(hf_cache, model, "preprocessor_config.json", {"min_pixels": True, "max_pixels": 16777216})
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    bases = []
+    real_lookup = utils._config_snapshot_commit
+
+    def observe(raw):
+        bases.append(weakref.ref(raw))
+        return real_lookup(raw)
+
+    monkeypatch.setattr(utils, "_config_snapshot_commit", observe)
+    utils._load_model_config_from_model_path.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    try:
+        for _ in range(5):
+            with pytest.raises(ValueError, match="pixel budget must be positive integers"):
+                utils.get_model_config_from_model_path(model)
+            assert utils._load_model_config_from_model_path.cache_info().currsize == 0
+        gc.collect()
+        assert len(bases) == 5
+        assert all(reference() is None for reference in bases)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 def test_kimi_video_limits_follow_pinned_processor_through_real_parser(monkeypatch, hf_cache):
     model = "org/kimi-video-limits"
     commit = "d" * 40

@@ -665,18 +665,26 @@ def _download_hf_json_at(
 
 # Snapshot provenance for cache-served files. A capture is scoped to one loader
 # call through a context variable, so concurrent loads cannot see each other's
-# commits. The loaded raw config keeps its commit in _CONFIG_PROVENANCE, keyed by
-# the identity of the cached dict (held, so the id cannot be reused).
+# commits. Loaded configs own their provenance so active readers retain it
+# after cache eviction, without a registry keeping failed attempts alive.
 _SNAPSHOT_CAPTURE: contextvars.ContextVar[dict[tuple[str, str], str] | None] = contextvars.ContextVar(
     "aisim_hf_snapshot_capture", default=None
 )
-_CONFIG_PROVENANCE: dict[int, tuple[dict, str]] = {}
+
+
+class _SnapshotConfig(dict):
+    """A normal JSON mapping with non-serialized, object-owned cache provenance."""
+
+    __slots__ = ("__weakref__", "_snapshot_commit")
+
+    def __init__(self, payload: dict, commit: str):
+        super().__init__(payload)
+        self._snapshot_commit = commit
 
 
 def _config_snapshot_commit(raw_config: dict) -> str | None:
     """The cache snapshot commit a loaded raw config came from, or None."""
-    entry = _CONFIG_PROVENANCE.get(id(raw_config))
-    return entry[1] if entry is not None and entry[0] is raw_config else None
+    return raw_config._snapshot_commit if isinstance(raw_config, _SnapshotConfig) else None
 
 
 def _download_hf_config(hf_id: str) -> dict:
@@ -2330,7 +2338,7 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     )
     loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(raw_config, hf_quant_config))
     if commit:
-        _CONFIG_PROVENANCE[id(loaded)] = (loaded, commit)
+        loaded = _SnapshotConfig(loaded, commit)
     return loaded
 
 
@@ -2359,15 +2367,14 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         # raw cache must not keep the base from the failed attempt in that case.
         # Keep other models' base metadata paired with their parsed cache entries.
         _load_model_config_from_model_path.cache_invalidate(model_path, base_config)
-        # Active readers can still hold this base after eviction. Its immutable
-        # snapshot must remain available until those readers finish as well.
+        # Active readers retain the snapshot on their base object after eviction.
         raise
     # Preserve Llama 4's established raw-cache reuse, but only after its
     # processor metadata has passed the parser. Raw loads never fetch it.
     if "image_processor_config" in raw_config:
         base_config["image_processor_config"] = raw_config["image_processor_config"]
-    if commit:
-        _CONFIG_PROVENANCE[id(raw_config)] = (raw_config, commit)
+    if commit and raw_config is not base_config:
+        raw_config = _SnapshotConfig(raw_config, commit)
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))
         logger.warning(
