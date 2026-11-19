@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -25,7 +26,31 @@ from scripts.fpm_accuracy.evaluate import evaluate_case
 from scripts.fpm_accuracy.hf import HfDataset
 from scripts.fpm_accuracy.scenario_contract import validate_scenarios
 from scripts.fpm_accuracy.scenarios import evaluate_scenario_case, scenario_document
-from scripts.release.package_identity import installed_distribution
+from scripts.release.package_identity import installed_distribution, runtime_module
+
+
+def evaluate_configuration(case, scenarios: bool, include_comparison: bool):
+    comparison = {} if include_comparison else None
+    details = []
+    try:
+        row = evaluate_case(case, comparison=comparison, details=details)
+        scenario = evaluate_scenario_case(case) if scenarios else None
+    except SystemExit as error:
+        # A dependency exiting successfully is still an incomplete campaign.
+        raise RuntimeError(f"configuration evaluator exited before returning results: {error.code}") from error
+    return row, details, scenario, comparison
+
+
+def evaluate_isolated(case, scenarios: bool, include_comparison: bool):
+    # Native estimators and training libraries may retain process-wide state.
+    # Reap that state after every configuration; never qualify a lost worker.
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
+        try:
+            return pool.submit(evaluate_configuration, case, scenarios, include_comparison).result()
+        except Exception as error:
+            raise RuntimeError(
+                f"FPM configuration did not complete: {case.configuration.configuration_path}"
+            ) from error
 
 
 def main():
@@ -58,7 +83,7 @@ def main():
     if args.output.exists() and any(args.output.iterdir()):
         raise ValueError("output must be empty")
     # Fail the campaign for a broken installation, rather than publishing all-error rows.
-    if not hasattr(importlib.import_module("aisim_core.sdk"), "RustForwardPassPerfModel"):
+    if not hasattr(runtime_module("aisim_core.sdk"), "RustForwardPassPerfModel"):
         raise RuntimeError("AISim native forward-pass SDK is unavailable")
     distribution = installed_distribution()
     direct = json.loads(distribution.read_text("direct_url.json") or "{}")
@@ -87,9 +112,15 @@ def main():
         started = perf_counter()
         print(f"Evaluating {index}/{len(configurations)}: {configuration.configuration_path}", flush=True)
         case = dataset.measurement_case(configuration.configuration_path, snapshot_id=configuration.snapshot_id)
-        rows.append(evaluate_case(case, comparison=comparison, details=details))
+        row, case_details, scenario, case_comparison = evaluate_isolated(case, args.scenarios, comparison is not None)
+        rows.append(row)
+        details.extend(case_details)
         if args.scenarios:
-            scenario_rows.append(evaluate_scenario_case(case))
+            scenario_rows.append(scenario)
+        if comparison is not None:
+            if comparison.keys() & case_comparison.keys():
+                raise ValueError("duplicate configuration comparison identity")
+            comparison.update(case_comparison)
         print(f"Completed configuration in {perf_counter() - started:.1f}s", flush=True)
     summary = {
         "schema_version": 2,

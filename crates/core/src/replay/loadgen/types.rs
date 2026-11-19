@@ -188,6 +188,11 @@ pub struct AgenticMooncakeRow {
     /// configured engine timing model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_api_time_ms: Option<f64>,
+    /// Source-recorded start offset of a request that `not_before_ms` does not
+    /// hold to the recorded clock. A snapshot reads it for the cut and for the
+    /// request's timer after the cut; replay does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_start_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +267,11 @@ pub struct AgenticNode {
     // recorded request starts. Excluded from the canonical graph contract.
     #[serde(skip)]
     pub(super) recorded_interval_ms: Option<(f64, Option<f64>)>,
+    // The recorded start still holds this request when it resumes after a
+    // snapshot cut with its causal predecessor in history. Excluded like the
+    // interval.
+    #[serde(skip)]
+    pub(super) recorded_start_gates_frontier: bool,
     pub(super) priority: i32,
     pub(super) strict_priority: u32,
     pub(super) policy_class: Option<String>,
