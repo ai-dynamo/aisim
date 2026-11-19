@@ -387,6 +387,33 @@ def test_llama4_missing_offline_processor_reports_revision_and_can_retry(monkeyp
         utils.get_model_config_from_model_path.cache_clear()
 
 
+@pytest.mark.parametrize("consumer", ["sdk", "dspark"])
+def test_llama4_confirmed_missing_required_processor_is_a_metadata_error(monkeypatch, hf_cache, consumer):
+    from aisim.sdk.config_builders import resolve_dspark_nextn
+
+    model = "org/llama4-missing-processor"
+    config = utils._load_pre_downloaded_hf_config("meta-llama/Llama-4-Scout-17B-16E-Instruct")
+    config.pop("image_processor_config")
+
+    def remote(request, *, timeout):
+        if request.full_url.endswith("/config.json"):
+            return _hf_json_response(config)
+        raise utils.urllib.error.HTTPError(request.full_url, 404, "Not Found", {"X-Error-Code": "EntryNotFound"}, None)
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    load = get_model_config_from_model_path if consumer == "sdk" else resolve_dspark_nextn
+    try:
+        with pytest.raises(utils._HuggingFaceMetadataError, match="Missing required preprocessor_config.json") as error:
+            load(model)
+        assert isinstance(error.value.__cause__, utils.urllib.error.HTTPError)
+        assert "c" * 40 in str(error.value)
+        assert "HF_TOKEN" not in str(error.value)
+        assert "authenticate" not in str(error.value)
+    finally:
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+
 @pytest.mark.parametrize("native_inline", [False, True])
 @pytest.mark.parametrize(
     "sidecar,expected",
@@ -1041,16 +1068,25 @@ def test_cached_snapshot_can_be_used_as_a_local_model_directory(monkeypatch, hf_
 @pytest.mark.parametrize("source", ["cache", "network"])
 @pytest.mark.parametrize("filename", ["config.json", "hf_quant_config.json"])
 @pytest.mark.parametrize("consumer", ["sdk", "collector", "dspark"])
-def test_json_integer_conversion_failure_is_a_metadata_error(monkeypatch, hf_cache, source, filename, consumer):
+@pytest.mark.parametrize("failure", ["integer", "recursion"])
+def test_json_decoder_limits_are_metadata_errors(monkeypatch, hf_cache, source, filename, consumer, failure):
     from collector.fpm_forward.model_capability import _download_model_config
 
     from aisim.sdk.config_builders import resolve_dspark_nextn
 
-    limit = sys.get_int_max_str_digits()
-    if not limit:
-        pytest.skip("Python integer string conversion limit is disabled")
-    contents = b'{"oversized":' + b"9" * (limit + 1) + b"}"
-    model = f"org/oversized-{source}-{filename}-{consumer}"
+    if failure == "integer":
+        limit = sys.get_int_max_str_digits()
+        if not limit:
+            pytest.skip("Python integer string conversion limit is disabled")
+        contents = b'{"oversized":' + b"9" * (limit + 1) + b"}"
+        cause_type = ValueError
+        cause_message = "integer string conversion"
+    else:
+        depth = sys.getrecursionlimit() + 100
+        contents = b'{"nested":' + b"[" * depth + b"0" + b"]" * depth + b"}"
+        cause_type = RecursionError
+        cause_message = "recursion depth"
+    model = f"org/oversized-{source}-{filename}-{consumer}-{failure}"
     config = utils._load_pre_downloaded_hf_config("Qwen/Qwen3-32B")
     if source == "cache":
         _cache_file(hf_cache, model, "config.json", config)
@@ -1074,9 +1110,9 @@ def test_json_integer_conversion_failure_is_a_metadata_error(monkeypatch, hf_cac
             load(model)
         metadata_error = error.value.__cause__ if consumer == "collector" else error.value
         assert isinstance(metadata_error, utils._HuggingFaceMetadataError)
-        assert isinstance(metadata_error.__cause__, ValueError)
+        assert isinstance(metadata_error.__cause__, cause_type)
         assert not isinstance(metadata_error.__cause__, json.JSONDecodeError)
-        assert "integer string conversion" in str(metadata_error.__cause__)
+        assert cause_message in str(metadata_error.__cause__)
         assert ("Invalid cached" if source == "cache" else "https://huggingface.co/") in str(metadata_error)
     finally:
         utils._load_model_config_from_model_path.cache_clear()
@@ -2140,9 +2176,15 @@ def test_only_confirmed_missing_optional_file_returns_none(monkeypatch, hf_cache
     monkeypatch.setattr(utils.urllib.request, "urlopen", failing)
     if not required and error_code == "EntryNotFound":
         assert utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=False) is None
+    elif error_code == "EntryNotFound":
+        with pytest.raises(utils._HuggingFaceMetadataError, match="Missing required hf_quant_config.json") as error:
+            utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=True)
+        assert isinstance(error.value.__cause__, utils.urllib.error.HTTPError)
+        assert "HF_TOKEN" not in str(error.value)
     else:
-        with pytest.raises(utils.HuggingFaceDownloadError, match="HTTP error 404"):
+        with pytest.raises(utils.HuggingFaceDownloadError, match="HTTP error 404") as error:
             utils._download_hf_json("org/model", "hf_quant_config.json", raise_on_404=required)
+        assert not isinstance(error.value, utils._HuggingFaceMetadataError)
 
 
 @pytest.mark.parametrize("offline", [True, False])

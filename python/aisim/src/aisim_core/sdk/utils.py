@@ -418,7 +418,7 @@ class HuggingFaceDownloadError(Exception):
 
 
 class _HuggingFaceMetadataError(HuggingFaceDownloadError):
-    """Present metadata is invalid; callers must not treat it as an access failure."""
+    """Metadata is invalid or confirmed incomplete; callers must not treat it as an access failure."""
 
 
 class _HuggingFaceCacheError(_HuggingFaceMetadataError):
@@ -587,7 +587,7 @@ def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[d
         # Match the network JSON decoder, including quoted NaN/Infinity text.
         with path.open("rb") as handle:
             data = json.load(handle)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RecursionError) as error:
         raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: {error}") from error
     if not isinstance(data, dict):
         raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: expected a JSON object")
@@ -704,7 +704,11 @@ def _download_hf_json_at(
             raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: expected a JSON object")
         return data, commit
     except urllib.error.HTTPError as e:
-        if e.code == 404 and not raise_on_404 and (e.headers or {}).get("X-Error-Code") == "EntryNotFound":
+        if e.code == 404 and (e.headers or {}).get("X-Error-Code") == "EntryNotFound":
+            if raise_on_404:
+                raise _HuggingFaceMetadataError(
+                    f"Missing required {filename} for {hf_id} at revision {revision} (HTTP error 404; URL: {url})"
+                ) from e
             return None, None
         if _is_transient_http_error(e):
             return _cached_after_network_failure(hf_id, filename, revision, url, f"HTTP error {e.code}: {e.reason}")
@@ -727,7 +731,7 @@ def _download_hf_json_at(
             raise missing from e
     except _HuggingFaceMetadataError:
         raise
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: {e}") from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e

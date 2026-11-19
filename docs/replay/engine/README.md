@@ -131,12 +131,17 @@ To retry offline, first cache `config.json` and any needed quantization or
 processor files in one invocation under `main` (for a checkpoint publishing all
 these files, `env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json hf_quant_config.json preprocessor_config.json video_preprocessor_config.json --revision main`),
 then set `HF_HUB_OFFLINE=1`. This primes missing files but can reuse corrupt
-cached bytes. To replace a corrupt `config.json` blob at the selected revision,
-run `env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json --revision <revision> --force-download`
-before retrying offline; replace `<revision>` with that branch, tag, or commit.
-Use the same option for any corrupt companion files. An unpinned `engine.model: org/model` needs the
-cache's `refs/main`; downloading only with `--revision <commit>` does not create
-that ref. For an exact commit, cache all required files at that commit and set
+cached bytes. To repair an unpinned `engine.model: org/model`, force-download
+`config.json` and the full required companion file set together under `main`
+before retrying offline. For example, a Llama 4 checkpoint without inline
+processor data needs
+`env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json preprocessor_config.json --revision main --force-download`;
+include `hf_quant_config.json` too if the checkpoint publishes it. Fetching only
+`config.json` can advance `refs/main` to a new snapshot without its required
+processor. An unpinned model ID needs the cache's `refs/main`; downloading only
+with `--revision <commit>` does not create that ref. For an exact commit,
+force-download any corrupt files with `--revision <commit> --force-download`,
+cache all required files at that commit and set
 `engine.model` to its local snapshot directory, or supply another local model
 directory. Replay's `engine.model` takes an ID or directory; the separate FPM
 profile field `profile.model_revision` supports an explicit revision pin.
