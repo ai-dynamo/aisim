@@ -191,6 +191,8 @@ def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None):
     if len(attempts) != 1:
         raise ValueError("runtime model snapshot active attempt is missing or duplicated")
     phase = attempts[0]["phases"][cell.workload_kind]
+    if not isinstance(phase, dict):
+        raise ValueError("runtime model snapshot selected phase must be an object")
     if phase.get("cell_id") != cell.cell_id or phase.get("collector_attempt_id") != collection.collector_attempt_id:
         raise ValueError("runtime model snapshot belongs to a different cell or native attempt")
     result = validate_observation_phase(
@@ -223,7 +225,7 @@ def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None):
 
 
 def _validate_native_attention_groups(groups, worker):
-    from .runtime_k31 import LAYOUT
+    from .runtime_k31 import LAYOUT, validate_attention_assignments
 
     cache = worker.get("cache", {})
     if cache.get("allocation_layout") != LAYOUT:
@@ -270,7 +272,8 @@ def _validate_native_attention_groups(groups, worker):
             raise ValueError("native/execution attention groups differ from initialized cache layer mapping")
         return result
 
-    if mapping(groups, native=False) != mapping(worker.get("attention_groups"), native=True):
+    native = validate_attention_assignments(worker)
+    if mapping(groups, native=False) != native:
         raise ValueError("execution attention backends differ from the validated initialized worker")
 
 

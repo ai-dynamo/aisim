@@ -214,10 +214,16 @@ def test_profile_architecture_matches_collector_text_config_view(profile_dict, c
     assert _normalize(_request(profile_dict))["estimator_config"]["fpm_interpolation"]["method"] == "direct"
 
 
-@pytest.mark.parametrize("text_only, expected", [(None, "direct"), (False, "direct"), (True, "sol")])
-@pytest.mark.parametrize("wrapper", ["KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"])
-def test_kimi_wrapper_registration_requires_explicit_text_scope(
-    profile_dict, checkpoint_configs, text_only, expected, wrapper
+@pytest.mark.parametrize("text_only", [None, False, True])
+@pytest.mark.parametrize(
+    "wrapper, text_method",
+    [
+        ("KimiK3ForConditionalGeneration", "direct"),
+        ("KimiK31ForConditionalGeneration", "sol"),
+    ],
+)
+def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
+    profile_dict, checkpoint_configs, text_only, text_method, wrapper
 ):
     profile_dict["architecture"] = "KimiLinearForCausalLM"
     checkpoint_configs[profile_dict["model"]] = {
@@ -227,6 +233,7 @@ def test_kimi_wrapper_registration_requires_explicit_text_scope(
     request = _request(profile_dict)
     if text_only is not None:
         request["estimator_config"]["fpm_interpolation"]["text_only"] = text_only
+    expected = text_method if text_only is True else "direct"
     assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == expected
 
 

@@ -895,7 +895,7 @@ def _observed_k31_capability(
         if not isinstance(artifacts, list) or not artifacts or not isinstance(capacities, list):
             raise ValueError("K3.1 observed MoE provenance requires worker artifacts and rank capacities")
         workers, schedulers, paths = {}, {}, set()
-        canonical_graph = None
+        canonical_graph, canonical_hardware = None, None
         for artifact in artifacts:
             if not isinstance(artifact, dict) or not isinstance(artifact.get("evidence"), dict):
                 raise ValueError("K3.1 observed MoE artifact requires inline native evidence")
@@ -924,6 +924,11 @@ def _observed_k31_capability(
                 if key in workers:
                     raise ValueError("K3.1 observed MoE worker evidence is duplicated")
                 workers[key] = record
+                hardware = {key: record["hardware"][key] for key in ("gpu", "device_name", "sm")}
+                if canonical_hardware is None:
+                    canonical_hardware = hardware
+                else:
+                    observations._same(hardware, canonical_hardware, "hardware across phases/ranks")
                 if canonical_graph is None:
                     canonical_graph = config["compilation_config"]
                 else:
@@ -1105,6 +1110,12 @@ def build_collection_plan(
     ):
         raise ValueError("Kimi K3.1 FP8 FPM requires --fpm-attention-backend=flashmla or trtllm_mla")
     policies = _backend_policies(options, collector_config, backend=backend, architecture=policy_architecture)
+    if isinstance(runtime_instrumentation, (str, Path)):
+        from .runtime_instrumentation import load_instrumentation
+
+        runtime_instrumentation = load_instrumentation(
+            runtime_instrumentation, expected_version=runtime_backend_version
+        )
     if profile is not None:
         if policy_architecture == "KimiK31ForConditionalGeneration":
             capability = _observed_k31_capability(

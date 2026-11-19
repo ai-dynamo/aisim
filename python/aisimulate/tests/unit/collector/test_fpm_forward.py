@@ -2254,6 +2254,71 @@ def test_native_aggregation_preserves_iteration_totals(tmp_path):
     assert "prefix_length" not in rows[0]
 
 
+def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path):
+    _, _, cell_dir = _synthetic_plan_and_cell(tmp_path)
+    config_path, _ = _kimi_k31_config(tmp_path)
+    plan = build_collection_plan(
+        backend="vllm",
+        model_path=str(tmp_path),
+        model_config_path=str(config_path),
+        system="b200_sxm",
+        selected_ops=set(),
+        has_model_cases=False,
+        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+        options=FPMCollectionOptions.from_args(
+            _args(
+                fpm_gpu_counts=[2],
+                fpm_tp_sizes=[1],
+                fpm_dp_sizes=[2],
+                fpm_moe_tp_sizes=[1],
+                fpm_moe_ep_sizes=[2],
+                fpm_kv_cache_dtypes=["fp8"],
+                fpm_attention_backend="flashmla",
+            )
+        ),
+    )
+    cell = next(cell for cell in plan.cells if cell.workload_kind == "prefill")
+    assert cell.moe_quant_mode == "w4a16_mxfp4"
+    assert plan.fpm_profile is None and plan.runtime_instrumentation is None
+    for path in (cell_dir / "raw").glob("**/benchmark*.json"):
+        provenance_path = path.parent / "collector-provenance.json"
+        _write_provenance(provenance_path, cell_id=cell.cell_id, plan_sha256=plan.sha256)
+        provenance = json.loads(provenance_path.read_text())
+        provenance["runtime"]["backend_version"] = plan.capability.aic_database_version
+        provenance_path.write_text(json.dumps(provenance))
+        (path.parent / "resolved-config-native.json").write_text(
+            json.dumps(
+                {
+                    "config": {
+                        "engine_args": {
+                            "attention_config": {
+                                "backend": "AttentionBackendEnum.FLASHMLA_SPARSE",
+                                "indexer_kv_dtype": "fp8",
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        payload = json.loads(path.read_text())
+
+        def zero_history(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {"total_kv_read_tokens", "sum_prefill_kv_tokens"}:
+                        value[key] = 0
+                    else:
+                        zero_history(item)
+            elif isinstance(value, list):
+                for item in value:
+                    zero_history(item)
+
+        zero_history(payload)
+        path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="publication requires source-bound observed MoE precision"):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
 def test_native_aggregation_rejects_rank_grid_drift(tmp_path):
     plan, cell, cell_dir = _synthetic_plan_and_cell(tmp_path)
     second_rank = next((cell_dir / "raw" / "pod-1").glob("benchmark*.json"))

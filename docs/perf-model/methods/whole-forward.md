@@ -47,16 +47,19 @@ artifacts and independent accuracy validation are still required for each
 deployment. No K3 measurements are relabelled as K3.1-Pro data.
 
 The collector policies and evidence checks are preliminary integration work.
-They do not provide a qualified K3.1 instrumentation manifest: the current
-source-bound memory adapters cover older vLLM builds and still reject unknown
-hybrid KDA/DSA cache representations. A pinned native image, an adapter checked
+They include a source-bound K3.1 adapter pinned to vLLM
+`0.1.dev24216+g266e88c05` for native KDA state and observed FP8 indexer cache;
+unknown cache representations are rejected. This does not qualify the adapter
+for a deployment. A pinned native image, an adapter checked
 against that image, real checkpoint state, complete rank evidence and measured
 rows remain necessary before publishing a K3.1 FPM profile. MXFP4 weight
 configuration alone cannot attest W4A16 execution: the native MoE backend may
-quantize activations, so its initialized arithmetic must also be observed. For a decoder
-profile using a registered multimodal Kimi wrapper, request `text_only=True`
+quantize activations, so its initialized arithmetic must also be observed. For a K3.1 decoder
+profile using its registered multimodal wrapper, request `text_only=True`
 explicitly to compile the language graph; omitting it preserves existing
-`method="auto"` selection. Encoder-resident weights are not silently removed.
+`method="auto"` selection. Kimi-K3 profiles retain direct interpolation because
+their MLA fallback graph does not support SOL transfer. Encoder-resident weights
+are not silently removed.
 
 ## Hybrid FPM/OP deprecation and migration
 

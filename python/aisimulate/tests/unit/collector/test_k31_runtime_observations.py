@@ -22,7 +22,7 @@ from collector.fpm_forward.runtime_observations import _SEMANTICS, _physical_vie
 
 from .test_fpm_runner import _cell
 from .test_fpm_runtime_memory import _Storage, _typed
-from .test_runtime_observations import _replace_launch, observation_fixture
+from .test_runtime_observations import _mutate, _replace_launch, observation_fixture
 
 pytestmark = pytest.mark.unit
 
@@ -159,6 +159,38 @@ def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkey
     assert cache["allocated_cache_bytes"] == 5120
     assert cache["groups"][-1]["state_content_size_bytes"] == 48
     assert cache["groups"][-1]["spec_page_size_bytes"] == 64
+
+
+@pytest.mark.parametrize("elements", [3, 4])
+def test_mixed_state_component_offsets_must_be_element_aligned(monkeypatch, elements):
+    cache, scheduled, _ = _native_fixture(monkeypatch)
+    for record in (cache, scheduled):
+        state = record["groups"][-1]
+        state["state_shapes"][0] = [elements]
+        state["state_content_size_bytes"] = elements * 2 + 32
+    for name in cache["groups"][-1]["layer_names"]:
+        convolution, recurrence = cache["layer_components"][name]
+        convolution.update(shape=[10, elements], stride_bytes=[512, 2])
+        recurrence["storage_offset_bytes"] = convolution["storage_offset_bytes"] + elements * 2
+    if elements == 3:
+        with pytest.raises(ValueError, match="offsets"):
+            _physical_views(cache, scheduled, "fp8", context=4096)
+    else:
+        assert _physical_views(cache, scheduled, "fp8", context=4096)[0][-1]["blocks_per_request"] == 1
+
+
+@pytest.mark.parametrize("omit", ["state", "attention"])
+def test_complete_native_layout_requires_both_attention_and_kda_state(monkeypatch, omit):
+    cache, scheduled, _ = _native_fixture(monkeypatch)
+    omitted = {name for group in cache["groups"] if group["kind"] == omit for name in group["layer_names"]}
+    for record in (cache, scheduled):
+        record["groups"] = [group for group in record["groups"] if not omitted.intersection(group["layer_names"])]
+    scheduled["group_pool_ids"] = ["pool"] * len(scheduled["groups"])
+    cache["tensor_allocations"] = [a for a in cache["tensor_allocations"] if not omitted.intersection(a["layers"])]
+    for name in omitted:
+        del cache["layer_components"][name]
+    with pytest.raises(ValueError, match="requires KDA state and attention"):
+        _physical_views(cache, scheduled, "fp8", context=4096)
 
 
 def test_native_uniform_wrapper_preserves_one_attention_block_table(monkeypatch):
@@ -405,7 +437,7 @@ def test_kernel_offsets_reject_huge_geometry_without_allocating_from_it(monkeypa
 
 
 @pytest.mark.parametrize("mutation", ["none", "out_of_bounds", "overlap"])
-def test_resource_resolver_validates_native_placements_like_the_importer(tmp_path, monkeypatch, mutation):
+def test_legacy_resource_resolver_cannot_accept_native_k31_layouts(tmp_path, monkeypatch, mutation):
     from .test_fpm_runtime_memory import _edit_memory, _evidence, _resolve
 
     monkeypatch.setattr(legacy, "_offloader_type", lambda: "vllm.model_executor.offloader.base.NoopOffloader")
@@ -421,14 +453,12 @@ def test_resource_resolver_validates_native_placements_like_the_importer(tmp_pat
         record["resolved_config"]["cache_config"]["cache_dtype"] = "fp8"
 
     _edit_memory(tmp_path, edit)
-    if mutation == "none":
-        assert _resolve(cell, tmp_path)["runtime_memory"]["kv_cache_bytes"] == 9 * 512
-    else:
+    if mutation != "none":
         match = "exceeds its pool block slot" if mutation == "out_of_bounds" else "within one group overlap"
         with pytest.raises(ValueError, match=match):
             _physical_views(cache, scheduled, "fp8", context=4096)
-        with pytest.raises(ValueError, match=match):
-            _resolve(cell, tmp_path)
+    with pytest.raises(ValueError, match="require the source-bound runtime observation importer"):
+        _resolve(cell, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -670,6 +700,47 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(tmp_
         evidence = artifact["evidence"]
         if evidence["kind"] == "worker":
             assert runtime_k31.moe_precision(evidence["initialized_moe"]) == "w4a8_mxfp4_mxfp8_trtllm"
+
+
+@pytest.mark.parametrize("layer,dtype", [("mla.0", "nvfp4"), ("mla.0", "fp8_ds_mla"), ("indexer.0", "fp8_ds_mla")])
+def test_native_spec_dtype_must_match_each_resolved_cache_layout(tmp_path, monkeypatch, layer, dtype):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def corrupt(record):
+        cache = record["cache"]
+        group = cache["groups"][0]
+        # Update the scheduler projection too: equality alone is insufficient.
+        if "layer_specs" in group:
+            group["layer_specs"][layer]["cache_dtype_str"] = dtype
+        elif layer.startswith("mla."):
+            group["cache_dtype_str"] = dtype
+
+    _mutate(path, corrupt)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete", result
+    assert any("cache spec dtype differs" in reason for reason in result["diagnostics"])
+
+
+def test_import_verifies_the_observation_bytes_it_parses(tmp_path, monkeypatch):
+    from collector.fpm_forward import runtime_observations
+
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    read = runtime_observations.read_json
+    replaced = []
+
+    def replace_before_read(artifact, **kwargs):
+        record = json.loads(artifact.read_text())
+        if record.get("kind") == "worker" and not replaced:
+            record["hardware"]["total_memory_bytes"] += 1
+            artifact.write_text(json.dumps(record))
+            replaced.append(True)
+        return read(artifact, **kwargs)
+
+    monkeypatch.setattr(runtime_observations, "read_json", replace_before_read)
+    result = validate_observations(path, launches)["tp2"]
+    assert replaced == [True]
+    assert result["status"] == "incomplete", result
+    assert any("runtime artifact hash mismatch" in reason for reason in result["diagnostics"])
 
 
 @pytest.mark.parametrize("role", ["worker", "scheduler"])

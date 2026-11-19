@@ -358,6 +358,10 @@ def _validate_record(
             graph_settings.setdefault("max_cudagraph_capture_size", max(graph_settings["cudagraph_capture_sizes"]))
         runtime_memory.validate_requested_graph(record, config, graph_settings)
     _validate_attention_backend(record, launch, config)
+    if native_layout and kind == "worker":
+        from .runtime_k31 import validate_attention_assignments
+
+        validate_attention_assignments(record)
     return config
 
 
@@ -731,7 +735,7 @@ def _configuration(
             if reference.get("kind") != "observation":
                 runtime_artifacts.append(copy.deepcopy(reference))
                 continue
-            record = read_json(path)
+            record = read_json(path, expected_sha256=digest)
             config = _validate_record(
                 record, launch=launch, bundle=bundle, binding={**binding, **(collector_binding or {})}, cell=cell
             )

@@ -242,6 +242,35 @@ def test_native_execution_producer_emits_required_model_and_attention_identity(n
     assert result["status"] == "qualified", (result["missing_evidence"], result["failures"])
 
 
+@pytest.mark.parametrize("observed", [True, False])
+def test_publication_requires_matching_initialized_moe_precision(native_execution, observed):
+    from dataclasses import replace
+
+    from collector.fpm_forward.database import aggregate_cell
+
+    plan, cell, raw, collection, _ = native_execution
+    for path in raw.glob("**/fpm-execution-worker-*.json"):
+        config = json.loads(path.read_text())["resolved_config"]["attention_config"]
+        (path.parent / "resolved-config-native.json").write_text(
+            json.dumps(
+                {
+                    "config": {
+                        "engine_args": {
+                            "attention_config": {**config, "backend": "AttentionBackendEnum." + config["backend"]}
+                        }
+                    }
+                }
+            )
+        )
+    if not observed:
+        cell = replace(cell, moe_quant_mode="w4a16_mxfp4")
+        with pytest.raises(ValueError, match="publication MoE precision differs"):
+            aggregate_cell(plan, cell, raw.parent, expected_attempt_id=collection.collector_attempt_id)
+    else:
+        rows = aggregate_cell(plan, cell, raw.parent, expected_attempt_id=collection.collector_attempt_id)
+        assert rows and {row["moe_quant_mode"] for row in rows} == {"w4a8_mxfp4_mxfp8_trtllm"}
+
+
 @pytest.mark.parametrize("inputs", ["flashmla"], indirect=True)
 @pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "fp8"])
 @pytest.mark.usefixtures("inputs")
@@ -455,6 +484,50 @@ def test_execution_reports_malformed_initialized_weight_shapes(native_execution,
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
     assert result["status"] == "failed"
     assert any("initialized expert weights are incomplete" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("mutation", ["null_phase", "list_classes", "null_placement"])
+def test_execution_reports_malformed_native_objects_as_failed(native_execution, mutation):
+    plan, cell, raw, collection, index_path = native_execution
+    if mutation == "null_phase":
+        index = json.loads(index_path.read_text())
+        index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"] = None
+        index_path.write_text(json.dumps(index))
+    else:
+
+        def corrupt(record):
+            if record["kind"] == "worker":
+                if mutation == "list_classes":
+                    group = record["cache"]["groups"][-1]
+                    group["layer_classes"] = group["layer_names"]
+                else:
+                    record["cache"]["tensor_allocations"][0] = None
+
+        _mutate(index_path, corrupt)
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed", result
+    message = {"null_phase": "phase must be an object", "list_classes": "class coverage", "null_placement": "placement"}
+    assert any(message[mutation] in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("group_index", [0, 1, 2])
+def test_matching_sidecars_cannot_override_selected_native_backend(native_execution, group_index):
+    plan, cell, raw, collection, index_path = native_execution
+
+    def corrupt(record):
+        if record["kind"] == "worker":
+            record["attention_groups"][group_index]["backend"] = "FLASHMLA_SPARSE"
+
+    _mutate(index_path, corrupt)
+    for path in raw.glob("**/fpm-execution-worker-*.json"):
+        payload = json.loads(path.read_text())
+        payload["attention_groups"][group_index]["backend_class"] = (
+            "vllm.v1.attention.backends.mla.flashmla_sparse.FlashMLASparseBackend"
+        )
+        path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed", result
+    assert any("backend differs from the selected policy" in reason for reason in result["failures"])
 
 
 @pytest.mark.parametrize("snapshot", [True], indirect=True)

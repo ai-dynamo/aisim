@@ -235,6 +235,16 @@ def aggregate_cell(
     )
     capability = plan.capability
     model_config = getattr(capability, "model_config", None)
+    if model_config is not None and model_config.payload.get("architectures") == ["KimiK31ForConditionalGeneration"]:
+        from .execution_evidence import _runtime_worker_evidence
+        from .runtime_k31 import moe_precision
+
+        bundle = plan.runtime_instrumentation
+        if bundle is None or plan.runtime_launch is None:
+            raise ValueError("K3.1 publication requires source-bound observed MoE precision")
+        workers, _ = _runtime_worker_evidence(plan, cell, cell_dir / "raw", collection, bundle=bundle)
+        if any(moe_precision(worker.get("initialized_moe")) != cell.moe_quant_mode for worker in workers.values()):
+            raise ValueError("K3.1 publication MoE precision differs from initialized workers")
     # Kimi's native KDA state belongs to a request's actual prefix history.
     # A balanced MoE router does not make that recurrent state content-free.
     # Observe the native seed protocol for each point; never promote a fake

@@ -60,6 +60,11 @@ def inputs(tmp_path, monkeypatch, request):
             config = record["resolved_config"]
             config["cache_config"]["cache_dtype"] = "fp8_ds_mla"
             config["attention_config"]["backend"] = "FLASHMLA_SPARSE"
+            for group in record["cache"]["groups"]:
+                specs = group.get("layer_specs", dict.fromkeys(group["layer_names"], group))
+                for name, spec in specs.items():
+                    if name.startswith("mla."):
+                        spec["cache_dtype_str"] = "fp8_ds_mla"
             if record["kind"] == "worker":
                 record["attention_backend"][0] = "FLASHMLA_SPARSE"
                 record["attention_groups"][0]["backend"] = "FLASHMLA_SPARSE"
@@ -180,6 +185,53 @@ def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(i
     assert calls == [True]
     assert plan.cells and {cell.moe_quant_mode for cell in plan.cells} == {"w4a8_mxfp4_mxfp8_trtllm"}
     assert plan.runtime_instrumentation.sha256 == inputs["runtime_instrumentation"].sha256
+
+
+def test_formal_plan_freezes_the_bundle_used_for_precision_validation(inputs, monkeypatch):
+    from collector.fpm_forward import runtime_instrumentation
+
+    bundle = inputs["runtime_instrumentation"]
+    calls = []
+    load = runtime_instrumentation.load_instrumentation
+
+    def load_once(*args, **kwargs):
+        calls.append(True)
+        # A second read must not substitute different bytes after validation.
+        return bundle if len(calls) == 1 else replace(bundle, sha256="0" * 64)
+
+    monkeypatch.setattr(runtime_instrumentation, "load_instrumentation", load_once)
+    plan = planner.build_collection_plan(
+        backend=inputs["backend"],
+        model_path=inputs["model_path"],
+        system=inputs["system"],
+        selected_ops=set(),
+        options=inputs["options"],
+        has_model_cases=False,
+        model_config_path=inputs["runtime_launch"]["model_config"]["path"],
+        fpm_profile=inputs["profile"],
+        runtime_instrumentation=bundle.manifest_path,
+        runtime_launch=inputs["runtime_launch"],
+        generator_overrides=runtime_probe.probe_generator_overrides(inputs["runtime_launch"]),
+    )
+    assert calls == [True]
+    monkeypatch.setattr(runtime_instrumentation, "load_instrumentation", load)
+    assert plan.runtime_instrumentation.sha256 == bundle.sha256
+
+
+@pytest.mark.parametrize("different_device", [False, True])
+def test_inline_proof_requires_matching_rank_hardware(inputs, different_device):
+    def mutate(proof):
+        for artifact in proof["artifacts"]:
+            worker = artifact["evidence"]
+            if different_device and worker["kind"] == "worker" and worker["tp_rank"] == 1:
+                worker["hardware"]["device_name"] += " variant"
+
+    edit_proof(inputs, mutate)
+    if different_device:
+        with pytest.raises(ValueError, match="hardware across phases/ranks"):
+            bind(inputs)
+    else:
+        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
 
 
 @pytest.mark.parametrize(

@@ -194,7 +194,10 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     return json.dumps(
         {
             "profile": profile.model_dump(mode="json"),
-            "registered": family in _MODEL_REGISTRY,
+            # K3's graph retains MlaModule* fallback primaries whose SOL
+            # rooflines are unsupported. Auto must use direct interpolation;
+            # K3.1 has its own supported DSA/KDA graph.
+            "registered": family in _MODEL_REGISTRY and analytical_architecture != "KimiK3ForConditionalGeneration",
             **deployment.quantization_kwargs(),
         }
     )

@@ -13,8 +13,10 @@ These are original AISimulate adapters written against inspected runtime interfa
 Its [source contract](vllm-kimi-k31.md) covers native block-outer groups,
 mixed BF16/FP32 KDA state and initialized MXFP4/MXFP8 expert precision. Its
 64-character source revision hashes the complete declared source-file map,
-because the wheel exposes only a short Git identifier. The first candidate is
-decode-only with Mamba `none`; source inspection does not qualify a live run.
+because the wheel exposes only a short Git identifier. Independent decode and
+zero-history prefill workers are supported with Mamba `none`. Prefill collection disables prefix caching and rejects explicit
+points with nonzero `total_kv_read_tokens`. These are separate serving-role
+paths; source inspection does not qualify a live run.
 
 ## Runtime interface
 

@@ -152,7 +152,11 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
             raise ValueError("K3.1 cache layer names must be nonempty and unique")
         names.update(layers)
         classes = group.get("layer_classes", {})
-        if set(classes) != set(layers) or any(not isinstance(x, str) or not x for x in classes.values()):
+        if (
+            not isinstance(classes, dict)
+            or set(classes) != set(layers)
+            or any(not isinstance(x, str) or not x for x in classes.values())
+        ):
             raise ValueError("K3.1 cache layer class coverage is incomplete")
         block = _positive(group.get("block_size_tokens"), "block size")
         _positive(group.get("spec_page_size_bytes"), "spec page size")
@@ -237,8 +241,60 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
             or set(classes.values()) - ATTENTION_CLASSES
         ):
             raise ValueError("K3.1 cache spec/kind has no audited mapping")
+        elif any(
+            group.get("cache_dtype_str")
+            not in ({"fp8"} if cls.endswith("KimiK3IndexerCache") else {"fp8", "fp8_ds_mla"})
+            for cls in classes.values()
+        ):
+            raise ValueError("K3.1 attention cache dtype has no audited FP8 mapping")
         result.append(item)
     return result
+
+
+def validate_attention_assignments(worker):
+    """Reconcile initialized layer backends and specs with resolved policy."""
+    cache = worker["cache"]
+    config = worker["resolved_config"]
+    selected = config["attention_config"]["backend"]
+    classes = {
+        "vllm.model_executor.layers.attention.mla_attention.MLAAttention": selected,
+        "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache": "DEEPSEEK_V32_INDEXER",
+        KDA: "KIMI_K3_KDA",
+    }
+    expected = {}
+    for gid, group in enumerate(cache["groups"]):
+        if not isinstance(group.get("layer_classes"), dict):
+            raise ValueError("K3.1 cache layer class coverage is incomplete")
+        for name in group["layer_names"]:
+            cls = group["layer_classes"][name]
+            if cls not in classes:
+                raise ValueError("K3.1 attention layer class has no audited backend mapping")
+            expected[(gid, name)] = classes[cls]
+            if cls in ATTENTION_CLASSES:
+                spec = group["layer_specs"][name] if "layer_specs" in group else group
+                if not isinstance(spec, dict):
+                    raise ValueError("K3.1 native cache spec must be an object")
+                dtype = "fp8" if cls.endswith("KimiK3IndexerCache") else config["cache_config"]["cache_dtype"]
+                if spec.get("cache_dtype_str") != dtype:
+                    raise ValueError("K3.1 native cache spec dtype differs from the resolved cache layout")
+    assignments = worker.get("attention_groups")
+    if not isinstance(assignments, list) or not assignments:
+        raise ValueError("K3.1 native attention group assignments are missing")
+    observed = {}
+    for group in assignments:
+        if not isinstance(group, dict) or type(group.get("group_id")) is not int:
+            raise ValueError("K3.1 native attention group assignment is malformed")
+        names = group.get("layer_names")
+        if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
+            raise ValueError("K3.1 native attention group assignment is malformed")
+        for name in names:
+            key = (group["group_id"], name)
+            if key in observed or key not in expected or group.get("backend") != expected[key]:
+                raise ValueError("K3.1 native attention layer backend differs from the selected policy")
+            observed[key] = group["backend"]
+    if observed != expected:
+        raise ValueError("K3.1 native attention assignments omit initialized layers")
+    return observed
 
 
 def _kernel_view_geometry(mapping, group, view, count, page, width):
@@ -298,6 +354,8 @@ def validate_views(cache, precision, count, page):
     """
     if precision != "fp8":
         raise ValueError("K3.1 native adapter requires FP8 attention/indexer cache")
+    if {group["kind"] for group in cache["groups"]} != {"state", "attention"}:
+        raise ValueError("K3.1 complete native layout requires KDA state and attention groups")
     storages = cache.get("storages")
     if not isinstance(storages, list) or len(storages) != 1 or storages[0].get("size_bytes") != count * page:
         raise ValueError("K3.1 native allocator requires one exact shared storage")
@@ -326,7 +384,8 @@ def validate_views(cache, precision, count, page):
     covered, intervals = set(), {}
     for allocation in allocations:
         if (
-            allocation.get("storage_id") != storage
+            not isinstance(allocation, dict)
+            or allocation.get("storage_id") != storage
             or allocation.get("size") != count * page
             or allocation.get("block_stride") != page
             or allocation.get("host_resident") is not False
@@ -372,6 +431,7 @@ def validate_views(cache, precision, count, page):
                     or len(shape) != len(strides)
                     or view.get("storage_id") != storage
                     or view.get("storage_offset_bytes") != component_offset
+                    or component_offset % size
                 ):
                     raise ValueError("K3.1 component block coverage, offsets or storage disagrees")
                 for value in shape:

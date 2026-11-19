@@ -1399,8 +1399,27 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                         }
                     ]
                 )
-                # Frozen synthetic-oracle results for the two native layouts:
-                # FlashMLA reads 656 bytes per cached entry; TRT-LLM reads 576.
+                # Independent hand ledger, in ms on H200 (HBM=4.8e12 B/s,
+                # link=450e9 B/s), summed from this fixture's graph geometry:
+                # batch        other ops          KDA       DSA FlashMLA / TRT
+                #   1       5.236040377777778    .02283072    .49082880 / .49000960
+                #   3       6.543375746666666    .06849216    .49763446 / .49599646
+                #   4       7.197043431111110    .09132288    .49768448 / .49604608
+                # Other ops sum memory-bound GEMMs (2*(b*n+b*k+n*k) bytes),
+                # routed MoE (0.5*(16*b*3584*2+16*b*3072*3/8
+                # +3584*3072*3/8*16*b) bytes per MoE layer), embedding/norm
+                # byte counts and ring allreduces (4*b*hidden*7/8/link seconds),
+                # with the model's layer multiplicities; PP1 costs zero.
+                # KDA: 69 layers * b*(10*1536+2*12*128*128*4) bytes / HBM.
+                # DSA: 24*(96272384+132*b*s+entry*b*min(s,2048)+9216*b)
+                # bytes / HBM, s=floor(4096/b), entry=656 (FlashMLA) or 576
+                # (TRT). This extends the independent projection/cache ledger
+                # in perf_database/dsa.rs::kimi_k31_fp8_sol_uses_executed_cache_layout.
+                # All terms above convert seconds to ms with *1000.
+                # Let S_b be the row sum. Transfer utilization, not latency:
+                # w_i=1/((log2(i)-log2(3))**2+1e-12), i in {1,4};
+                # result=S_3*(w_1+w_4)/(w_1*S_1/9+w_4*S_4/18).
+                # The 9/18 ms anchors are synthetic input, separate from SOL.
                 # A plain latency interpolation, omitted KDA roofline, or a
                 # shared DSA cache layout cannot satisfy these values.
                 expected_transfer = {
@@ -1471,6 +1490,95 @@ def kimi_fpm_profile(tmp_path, request):
             "correction": {"enabled": False},
         },
     )
+
+
+def test_kimi_k3_unmeasured_batch_uses_direct_interpolation(tmp_path):
+    from aisimulate.sdk.utils import get_model_config_from_model_path
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(get_model_config_from_model_path("moonshotai/Kimi-K3")["raw_config"])
+    )
+    identity = {
+        "tp": "8",
+        "moe_tp": "8",
+        "moe_ep": "1",
+        "fmha_quant_mode": "bfloat16",
+        "moe_quant_mode": "w4a16_mxfp4",
+        "kv_cache_dtype": "fp8",
+        "attention_backend": "FLASHINFER_MLA",
+    }
+    parquet = _write_pair(
+        str(tmp_path / "systems" / "data" / SYSTEM / BACKEND / VERSION),
+        [_row("prefill", 1, 128, 0, 7.0, model_path=str(checkpoint), identity=identity)]
+        + [
+            _row("decode", batch, 0, 128, latency, model_path=str(checkpoint), identity=identity)
+            for batch, latency in [(1, 3.0), (4, 9.0)]
+        ],
+    )
+    profile = {
+        "schema_version": 1,
+        "model": str(checkpoint),
+        "model_revision": "synthetic-test-v1",
+        "architecture": "KimiLinearForCausalLM",
+        "context_length": 4096,
+        "num_experts": 896,
+        "provenance": "Synthetic K3 interpolation fixture; no hardware qualification.",
+        "deployments": [
+            {
+                "system": SYSTEM,
+                "backend": BACKEND,
+                "backend_version": VERSION,
+                "tp": 8,
+                "dp": 1,
+                "moe_tp": 8,
+                "moe_ep": 1,
+                "gemm_quant_mode": "bfloat16",
+                "moe_quant_mode": "w4a16_mxfp4",
+                "fmha_quant_mode": "bfloat16",
+                "comm_quant_mode": "half",
+                "kv_cache_dtype": "fp8",
+                "attention_backend": "FLASHINFER_MLA",
+                "resources": {
+                    "cache_layout": "linear",
+                    "kv_bytes_per_token": 1,
+                    "max_num_tokens": 128,
+                    "max_batch_size": 4,
+                    "provenance": "Synthetic timing-only fixture; memory unresolved and not queried.",
+                },
+            }
+        ],
+    }
+    systems = tmp_path / "systems"
+    systems.mkdir(exist_ok=True)
+    shutil.copyfile(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", systems / f"{SYSTEM}.yaml")
+    config = ForwardPassPerfModelConfig(
+        model=str(checkpoint),
+        system=SYSTEM,
+        backend=BACKEND,
+        backend_version=VERSION,
+        systems_paths=(str(systems),),
+        worker_type="aggregated",
+        tp=8,
+        moe_tp_size=8,
+        moe_ep_size=1,
+        estimation_mode="fpm_interpolation",
+        fallback_policy="deny",
+        fpm_profile=profile,
+        estimator_config={"fpm_interpolation": {"text_only": True, "fpm_parquet_path": parquet}},
+    )
+    model = RustForwardPassPerfModel.best_available(config)
+    try:
+        method = model.diagnostics()["provenance"]["config"]["estimator_config"]["fpm_interpolation"]["method"]
+        assert method == "direct"
+        # Synthetic measured batches 1=3 ms and 4=9 ms: direct linear
+        # interpolation at batch 3 gives 3 + (3-1)/(4-1)*(9-3) = 7 ms.
+        assert model.estimate_forward_pass_time_ms(
+            [{"scheduled_requests": {"num_decode_requests": 3, "sum_decode_kv_tokens": 128}}]
+        ) == pytest.approx(7.0)
+    finally:
+        model.close()
 
 
 @pytest.mark.parametrize("kimi_fpm_profile", [None, 1, 8], indirect=True)

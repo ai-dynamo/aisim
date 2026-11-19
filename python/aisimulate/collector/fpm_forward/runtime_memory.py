@@ -765,11 +765,11 @@ def resolve_runtime_resources(
         count = accounting["num_blocks"]
         free = accounting["initial_free_blocks"]
         allocated = accounting["allocated_cache_bytes"]
-        groups = _normalized_groups(cache, scheduled, allocated // count, context=expected_context_length)
-        from .runtime_k31 import LAYOUT, validate_views
+        from .runtime_k31 import LAYOUT
 
         if cache.get("allocation_layout") == LAYOUT:
-            validate_views(cache, _resolved_cache_dtype(payload["resolved_config"], cell), count, allocated // count)
+            raise ValueError("K3.1 native layouts require the source-bound runtime observation importer")
+        groups = _normalized_groups(cache, scheduled, allocated // count, context=expected_context_length)
         geometry = [{key: value for key, value in group.items() if key != "layer_classes"} for group in cache["groups"]]
         if canonical_groups is None:
             canonical_groups, canonical_geometry = groups, geometry
