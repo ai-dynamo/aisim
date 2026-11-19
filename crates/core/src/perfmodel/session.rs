@@ -791,3 +791,108 @@ pub(crate) fn get_mix_step_ops<'a>(
 
     Ok(total)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::enums::GemmQuantMode;
+    use crate::operators::GemmOp;
+    use crate::perf_database::energy_test_fixtures::{
+        Col, write_energy_systems_root, write_parquet,
+    };
+
+    #[test]
+    fn dsv41_stage_memo_preserves_first_child_error_and_omits_failed_children() {
+        // Valid SILICON queries: BF16 has a measurement, FP8 and NVFP4 do not.
+        // Missing measurements must stay errors, including on memo hits.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = write_energy_systems_root(tmp.path());
+        write_parquet(
+            &data.join("gemm_perf.parquet"),
+            &[
+                Col::Str("gemm_dtype", vec!["bfloat16"]),
+                Col::I64("m", vec![128]),
+                Col::I64("n", vec![1024]),
+                Col::I64("k", vec![1024]),
+                Col::F64("latency", vec![1.0]),
+                Col::F64("power", vec![100.0]),
+            ],
+        );
+        let db = PerfDatabase::load(tmp.path(), "testsys", "vllm", "1.0").unwrap();
+        let child = |name, quant| Op::Gemm(GemmOp::new(name, 1024, 1024, quant));
+        let ctx = RuntimeContext {
+            batch_size: 128,
+            num_tokens: 128,
+            s: 512,
+            ..RuntimeContext::default()
+        };
+        for two_failures in [false, true] {
+            let stage = Dsv41StageOp {
+                name: "generation_stage".into(),
+                is_context: false,
+                decoder_replay: true,
+                bounded: true,
+                window_size: 128,
+                children: vec![
+                    child("before", GemmQuantMode::Bfloat16),
+                    child("first_missing", GemmQuantMode::Fp8),
+                    child("after", GemmQuantMode::Bfloat16),
+                    child(
+                        "last",
+                        if two_failures {
+                            GemmQuantMode::Nvfp4
+                        } else {
+                            GemmQuantMode::Bfloat16
+                        },
+                    ),
+                ],
+            };
+            assert!(
+                stage
+                    .children
+                    .iter()
+                    .all(|op| op.memo_field() == Some(MemoField::NumTokens))
+            );
+            let first_error = stage.children[1].query(&db, &ctx).unwrap_err();
+            assert!(first_error.is_missing_perf_data());
+            let expected = format!("{first_error:?}");
+            assert_eq!(
+                format!("{:?}", stage.query(&db, &ctx).unwrap_err()),
+                expected
+            );
+            if two_failures {
+                let later_error = stage.children[3].query(&db, &ctx).unwrap_err();
+                assert!(later_error.is_missing_perf_data());
+                assert_ne!(format!("{later_error:?}"), expected);
+            }
+
+            let op = Op::Dsv41Stage(stage.clone());
+            let memo = OpMemo::new(16, &[], std::slice::from_ref(&op));
+            assert_eq!(memo.stage_children.len(), 0);
+            // A cold query, a hit at another KV length, and a repeated hit
+            // all report the first failing child, never the later failure.
+            for s in [512, 4096, 4096] {
+                let ctx = RuntimeContext { s, ..ctx };
+                assert_eq!(
+                    format!("{:?}", stage.query(&db, &ctx).unwrap_err()),
+                    expected
+                );
+                let error =
+                    shared_query(Some(&memo), &db, OpList::Generation, 0, &op, &ctx).unwrap_err();
+                assert_eq!(format!("{error:?}"), expected);
+                assert_eq!(memo.stage_children.len(), 1);
+                let key = OpMemo::key(OpList::Generation, 0, ctx.num_tokens);
+                let (stored, _) = memo.stage_children.peek(&key).unwrap();
+                assert_eq!(stored.len(), stage.children.len());
+                // Inspect every child, including successful children after
+                // the failure: only successful queries have a stored result.
+                for (op, cached) in stage.children.iter().zip(stored.iter()) {
+                    match op.query(&db, &ctx) {
+                        Ok(result) => assert_eq!(cached.as_ref(), Some(&result)),
+                        Err(_) => assert!(cached.is_none()),
+                    }
+                }
+            }
+        }
+    }
+}
