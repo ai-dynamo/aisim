@@ -251,6 +251,7 @@ pub struct FpmForwardCell {
     pub direct_decode_rungs: Vec<u32>,
     /// Loaded under the autoregressive native CUDA policy: no speculative timing.
     pub native_ar_only: bool,
+    pub(crate) has_power_column: bool,
     /// Diagnostic state only; no change to table identity, values, or schema.
     warned_fmha_model_modes: Mutex<BTreeSet<String>>,
 }
@@ -1421,6 +1422,7 @@ fn load_pair(
                 direct_decode: BTreeMap::new(),
                 direct_decode_rungs: Vec::new(),
                 native_ar_only: measurement_policy == MeasurementPolicy::NativeArCudaActualSample,
+                has_power_column: power_col.is_some(),
                 warned_fmha_model_modes: Mutex::new(BTreeSet::new()),
             },
         });

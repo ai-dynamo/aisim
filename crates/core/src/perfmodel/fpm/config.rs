@@ -584,6 +584,16 @@ impl ForwardPassPerfModelConfig {
         candidates
     }
 
+    /// The speculative depth a regression prices: an MTP scheme's depth, else
+    /// legacy `nextn`. An MTP draft is `depth` extra target-shaped layers, the
+    /// same identity as `nextn` (`aisim_core.sdk.speculation.mtp`).
+    pub(crate) fn regression_depth(&self) -> Result<u32, AicError> {
+        match &self.speculation {
+            Some(speculation) if speculation.kind == "mtp" => speculation.replay_depth(),
+            _ => Ok(self.nextn),
+        }
+    }
+
     /// Validate profile metadata and pin interpolation without constructing a
     /// graph or opening performance data. This also serves configuration-only
     /// consumers such as memory planning.
@@ -1504,6 +1514,23 @@ mod tests {
                     .contains("fpm_learned requires fallback_policy='deny'")
             );
         }
+    }
+
+    #[test]
+    fn learned_normalization_rejects_mtp_before_reading_the_artifact() {
+        let error = config(serde_json::json!({
+            "estimation_mode": "fpm_learned",
+            "speculation": {"kind": "mtp", "params": {"depth": 3}},
+            "estimator_config": {"fpm_learned": {"artifact_path": "missing-seed.json", "adaptation": "frozen"}}
+        }))
+        .normalize()
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fpm_learned does not support speculative decoding"),
+            "{error}"
+        );
     }
 
     #[test]
