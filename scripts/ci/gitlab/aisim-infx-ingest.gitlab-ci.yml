@@ -97,27 +97,39 @@ publish_candidate:
       git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" ls-remote --heads origin "candidate/${SID}" "candidate/${SID}-*" > ../candidate-refs
       while read -r REV REF; do
         git -c http.extraHeader="Authorization: Bearer ${INFX_CACHE_WRITE_TOKEN}" fetch -q --depth 1 origin "$REF"
-        git show FETCH_HEAD:ingestion-state.json > ../remote-candidate-state.json
-        if python3 - <<'PY'
-      import json
+        git worktree add -q --detach ../remote-candidate FETCH_HEAD
+        if env -u INFX_CACHE_WRITE_TOKEN uv run --frozen --project ../aisim/python/aisim python - <<'PY'
       import sys
+      from pathlib import Path
 
-      with open("ingestion-state.json") as handle:
-          current = json.load(handle)
-      with open("../remote-candidate-state.json") as handle:
-          remote = json.load(handle)
-      pending = remote.get("candidate")
-      same = (
-          remote.get("schema_version") == current["schema_version"]
-          and remote.get("qualified") == current["qualified"]
-          and isinstance(pending, dict)
-          and all(pending.get(k) == current["candidate"][k] for k in ("snapshot_id", "snapshot_path"))
-      )
-      sys.exit(0 if same else 1)
+      from aisim_core.data.e2e import read_snapshot, verify_snapshot_members
+      from aisim_core.data.infx_job import load_state
+
+      remote_root = Path("../remote-candidate")
+      try:
+          current = load_state(Path("."))
+          remote = load_state(remote_root)
+          pending = remote.get("candidate")
+          same = (
+              remote.get("qualified") == current["qualified"]
+              and isinstance(pending, dict)
+              and all(pending.get(k) == current["candidate"][k] for k in ("snapshot_id", "snapshot_path"))
+          )
+          if not same:
+              sys.exit(1)
+          snapshot, members = read_snapshot(remote_root, pending["snapshot_path"])
+          if snapshot.snapshot_id != pending["snapshot_id"] or snapshot.completeness != "complete":
+              sys.exit(1)
+          verify_snapshot_members(remote_root, members)
+      except (OSError, ValueError, RecursionError) as exc:
+          print(f"pending branch is not reusable: {type(exc).__name__}: {exc}", file=sys.stderr)
+          sys.exit(1)
       PY
         then
+          git worktree remove ../remote-candidate
           echo "${REF#refs/heads/} is pending for this baseline: nothing to push"; exit 0
         fi
+        git worktree remove ../remote-candidate
       done < ../candidate-refs
       case "$CI_PIPELINE_ID" in *[!0-9]*|"") echo "numeric CI_PIPELINE_ID required" >&2; exit 2 ;; esac
       BRANCH="candidate/${SID}-${CI_PIPELINE_ID}"

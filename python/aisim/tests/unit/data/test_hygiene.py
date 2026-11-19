@@ -176,6 +176,7 @@ def test_json_overflow_is_not_finite(number, ok):
         ("nested:\n  setting: 1\n  setting: 2\n", False),
         ("config: {<<: {setting: 1, setting: 2}}", False),
         ("config: {<<: [{setting: 1, setting: 2}, {other: 3}]}", False),
+        ("config: {<<: {setting: 1}, <<: {setting: 2}}", False),
         ("defaults: &d {setting: 1}\nconfig: {<<: *d, setting: 2}\nalias: *d\n", True),
     ],
 )
@@ -189,6 +190,13 @@ def test_yaml_explicit_duplicates_and_merge_overrides(text, ok):
     else:
         with pytest.raises(ValueError, match="duplicate YAML key"):
             yaml_sidecar_value(text.encode())
+
+
+def test_single_yaml_merge_sequence_allows_explicit_overrides():
+    from aisim_core.data.hygiene import yaml_sidecar_value
+
+    value = yaml_sidecar_value(b"config: {<<: [{setting: 1}, {other: 3}], setting: 2}")
+    assert value == {"config": {"setting": 2, "other": 3}}
 
 
 def test_yaml_merge_expansion_is_bounded_before_flattening(monkeypatch):

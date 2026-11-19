@@ -370,7 +370,17 @@ def test_encoded_metadata_with_large_numbers_keeps_credential_context(tmp_path):
     assert "secret" in {f.code for f in plan.findings}
 
 
-@pytest.mark.parametrize("value", ["{", "[]", '{"schema_version":"unknown","entries":[]}', '{"entries":[null]}'])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "{",
+        "[]",
+        '{"schema_version":"unknown","entries":[]}',
+        '{"entries":[null]}',
+        '{"entries":[{"path":"data","label":"internal"}],"entries":[{"path":"data","label":"public"}]}',
+        '{"entries":[{"path":"data","label":"internal","label":"public"}]}',
+    ],
+)
 def test_malformed_visibility_is_a_validation_finding_not_a_planning_exception(tmp_path, monkeypatch, value):
     from aisim_core.data import promote as module
 
@@ -2816,3 +2826,154 @@ def test_apply_refuses_an_unapproved_configuration_added_to_the_plan(tmp_path):
     with pytest.raises(PromotionError, match="approved digest"):
         apply_promotion(plan, root, target)
     assert not target.exists()
+
+
+@pytest.mark.parametrize("location", ["directory", "artifact"])
+def test_standalone_evidence_preflights_parent_links_before_reading(tmp_path, monkeypatch, location):
+    from aisim_core.data.evidence import check_evidence
+
+    root = tmp_path / "root"
+    directory = _evidence(root, {"raw.log": b"fixture"})
+    if location == "directory":
+        moved = tmp_path / "outside"
+        directory.rename(moved)
+        directory.symlink_to(moved, target_is_directory=True)
+        paths = [str((directory / p.name).relative_to(root)) for p in moved.iterdir()]
+        forbidden = {directory / p.name for p in moved.iterdir()}
+    else:
+        moved = tmp_path / "outside"
+        moved.mkdir()
+        (directory / "raw.log").rename(moved / "raw.log")
+        (directory / "linked").symlink_to(moved, target_is_directory=True)
+        manifest = directory / "evidence-manifest.json"
+        document = json.loads(manifest.read_text())
+        document["artifacts"][0]["path"] = "linked/raw.log"
+        manifest.write_text(json.dumps(document))
+        paths = [str(p.relative_to(root)) for p in [manifest, directory / "linked/raw.log"]]
+        forbidden = {directory / "linked/raw.log"}
+    original = Path.open
+
+    def opened(path, *args, **kwargs):
+        assert path not in forbidden, "evidence validator opened a file through a linked directory"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+    findings, _ = check_evidence(root, paths)
+    assert any("symlink" in f.message for f in findings)
+
+
+def test_visibility_loader_is_strict_bounded_and_defaults_only_for_absence(tmp_path, monkeypatch):
+    from aisim_core.data.hygiene import CandidatePolicy
+    from aisim_core.data.redaction import load_ledger
+
+    assert load_ledger(tmp_path) == VisibilityLedger()
+    path = tmp_path / "mirror/visibility.json"
+    path.parent.mkdir()
+    for content in [b'{"entries":[],"entries":[]}', b'{"schema_version":"unsupported"}', b"[]", b"{"]:
+        path.write_bytes(content)
+        with pytest.raises(ValueError):
+            load_ledger(tmp_path)
+    path.write_bytes(b" " * (CandidatePolicy().max_json_bytes + 1))
+    with pytest.raises(ValueError, match="exceeds"):
+        load_ledger(tmp_path)
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(OSError):
+        load_ledger(tmp_path)
+
+
+@pytest.mark.parametrize("location", ["manifest", "copy"])
+def test_malformed_system_yaml_writes_cli_report(tmp_path, location):
+    from aisim_core.data import systems
+
+    root, _ = _mirror(tmp_path)
+    systems.publish_system_spec(systems.PACKAGED_SYSTEMS_DIR / "h100_sxm.yaml", root)
+    path = root / "systems/h100_sxm/manifest.yaml"
+    if location == "copy":
+        path = next(p for p in path.parent.glob("*.yaml") if p.name != "manifest.yaml")
+    path.write_text("invalid: !!bool not-a-bool\n")
+    output = tmp_path / "report.json"
+    assert mirror_main(["validate", "--root", str(root), "--output", str(output)]) == 1
+    assert any(f["code"] == "system-spec-invalid" for f in json.loads(output.read_text())["findings"])
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_promotion_stops_before_reopening_oversized_snapshot(tmp_path, monkeypatch, oversized):
+    from aisim_core.data import promote as module
+    from aisim_core.data.hygiene import CandidatePolicy
+
+    root, directories = _snapshot_mirror(tmp_path)
+    if oversized:
+        (root / directories[1] / "snapshot.json").write_bytes(b" " * (CandidatePolicy().max_json_bytes + 1))
+    original = module.read_snapshot
+    calls = []
+
+    def read(*args):
+        calls.append(args)
+        assert not oversized, "planning reopened a snapshot rejected by the size preflight"
+        return original(*args)
+
+    monkeypatch.setattr(module, "read_snapshot", read)
+    plan = plan_promotion(root, _request(root, directories), _reviewers())
+    assert ("source-json-too-large" in {f.code for f in plan.findings}) is oversized
+    assert bool(calls) is not oversized
+    if not oversized:
+        assert plan.content_ok, plan.findings
+
+
+def test_approval_policy_rejects_duplicate_threshold(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text('{"reviewers":["alice"],"min_approvals":2,"min_approvals":1}')
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        PromotionPolicy.from_file(path)
+
+
+def test_narrow_public_label_cannot_clear_inferencex_ancestry(tmp_path):
+    root, manifests = _mirror(tmp_path)
+    directory = str(Path(manifests[0]).parent)
+    write_ledger(
+        root,
+        VisibilityLedger(
+            entries=[
+                VisibilityEntry(path="data", label="internal", origin="inferencex"),
+                VisibilityEntry(path=directory, label="public"),
+            ]
+        ),
+    )
+    plan = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert "not-public" not in {f.code for f in plan.findings}
+    assert {f.path for f in plan.findings if f.code == "infx-aggregates-only"} == set(plan.files)
+
+
+def test_manifest_registration_alone_invalidates_approval(tmp_path):
+    root, manifests = _mirror(tmp_path, dev=("synthetic/model-a", "synthetic/model-b"))
+    directories = [str(Path(manifest).parent) for manifest in manifests]
+    _public(root, *directories)
+    draft = plan_promotion(root, _request(root, directories[:1]), _reviewers())
+    plan = plan_promotion(root, _request(root, directories[:1], draft), _reviewers())
+    assert plan.ok, plan.findings
+    target = _target(tmp_path)
+    shutil.copytree(root / directories[1], target / directories[1])
+    before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+    files = plan.files.copy()
+    digest = plan.digest
+    plan.manifests.append(manifests[1])
+    assert plan.files == files
+    assert plan.digest != digest
+    with pytest.raises(PromotionError, match="approved digest"):
+        apply_promotion(plan, root, target)
+    # Even recomputing approvals cannot register a manifest outside the selected files.
+    plan.approved_digest = plan.digest
+    with pytest.raises(PromotionError, match="manifest.*selection"):
+        apply_promotion(plan, root, target)
+    assert {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("value", ["[0.1,0.2,0.3,0.4,0.5]", '{"case-a":0.1}', "  [1, 2]", "[1, 2"])
+def test_aggregate_status_rejects_serialized_measurements(value):
+    assert "not-aggregate" in {f.code for f in check_disclosure([{"n_scored": 5, "status": value}])}
+
+
+@pytest.mark.parametrize("value", ["complete", "partial", "failed", "have", "missing", "stale"])
+def test_aggregate_status_accepts_ordinary_values(value):
+    assert check_disclosure([{"n_scored": 5, "status": value}]) == []

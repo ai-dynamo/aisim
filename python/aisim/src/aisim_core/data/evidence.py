@@ -25,7 +25,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aisim_core.data import Category, Digest, Manifest
-from aisim_core.data.hygiene import Finding, bounded_json_bytes, json_sidecar_value
+from aisim_core.data.hygiene import Finding, bounded_json_bytes, checked_path, json_sidecar_value
 
 EVIDENCE_ROOT = "evidence/"
 EVIDENCE_MANIFEST = "evidence-manifest.json"
@@ -76,7 +76,7 @@ def check_evidence(
         declared.add(rel)
         directory = posixpath.dirname(rel)
         try:
-            manifest = EvidenceManifest.model_validate(json_sidecar_value(bounded_json_bytes(root / rel)))
+            manifest = EvidenceManifest.model_validate(json_sidecar_value(bounded_json_bytes(checked_path(root, rel))))
         except (OSError, ValidationError, ValueError, RecursionError) as exc:
             findings.append(Finding("document-invalid", f"EvidenceManifest: {str(exc).splitlines()[0]}", rel))
             continue
@@ -97,13 +97,13 @@ def check_evidence(
                 continue
             seen.add(target)
             declared.add(target)
-            actual = root / target
             try:
+                actual = checked_path(root, target)
                 if not actual.is_file() or actual.is_symlink():
                     findings.append(Finding("evidence-missing", "declared evidence file is missing", target))
                 elif actual.stat().st_size != artifact.size or _sha256(actual) != artifact.sha256:
                     findings.append(Finding("evidence-digest", "size or sha256 differs from the manifest", target))
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 findings.append(Finding("evidence-unreadable", str(exc).splitlines()[0], target))
     for rel in files:
         if rel not in declared:

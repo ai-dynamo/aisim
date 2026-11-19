@@ -1224,3 +1224,75 @@ def test_noop_refuses_a_candidate_replaced_during_acquisition(root, tmp_path):
     assert tree(root) == replacement[0]
     retry, _ = make_run(tmp_path, original)
     assert retry.status == "candidate" and retry.snapshot_id == first.snapshot_id
+
+
+@pytest.mark.parametrize("value", [[], {}, False, 0, "", "not-a-sha", "a" * 39, "g" * 40])
+def test_malformed_producer_sha_is_rejected_with_a_report(root, tmp_path, monkeypatch, value):
+    workflow = {**WORKFLOW, "runConfigs": [{"html_url": RUN, "head_sha": value}]}
+    _assert_failed_acquisition_report(root, tmp_path, monkeypatch, FakeInfx(workflow=workflow), "head_sha")
+
+
+@pytest.mark.parametrize("value", [[], {}, False, 1])
+def test_malformed_benchmark_run_url_is_rejected_with_a_report(root, tmp_path, monkeypatch, value):
+    _assert_failed_acquisition_report(root, tmp_path, monkeypatch, FakeInfx(rows=[row(1, run_url=value)]), "run_url")
+
+
+def test_deep_acquisition_json_is_rejected_with_a_report(root, tmp_path, monkeypatch):
+    fake = FakeInfx()
+    fake.respond("views/options", HttpResponse(200, {}, b"[" * 10000 + b"0" + b"]" * 10000))
+    _assert_failed_acquisition_report(root, tmp_path, monkeypatch, fake, "not valid JSON")
+
+
+def _assert_failed_acquisition_report(root, tmp_path, monkeypatch, fake, message):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", NOW)
+    before = tree(root)
+    original = infx_job.run_ingestion
+    monkeypatch.setattr(
+        infx_job, "run_ingestion", lambda *a, **k: original(*a, **k, transport=fake, sleep=lambda _: None)
+    )
+    report = tmp_path / "failure-report.json"
+    assert (
+        infx_job.main(
+            [
+                "run",
+                "--root",
+                str(root),
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--report",
+                str(report),
+                "--no-notify",
+            ]
+        )
+        == 1
+    )
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and "IncompleteAcquisitionError" in result["error"]
+    assert message in result["error"] and tree(root) == before
+
+
+def test_aggregated_zero_decode_workers_are_rejected_before_storage(root, tmp_path):
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", NOW)
+    before = tree(root)
+    result, _ = make_run(tmp_path, FakeInfx(rows=[row(1, decode_num_workers=0), row(2, "h200")]))
+    assert result.status == "failed" and "decode_num_workers" in result.error
+    assert tree(root) == before
+    with pytest.raises(ValueError, match="decode_num_workers"):
+        e2e_module.inferencex_to_configurations([row(1, decode_num_workers=0)])
+
+
+def test_duplicate_ingestion_state_keys_are_rejected_and_missing_is_first_run(root, tmp_path):
+    assert infx_job.load_state(root) == {"schema_version": infx_job.STATE_SCHEMA, "qualified": None, "candidate": None}
+    first, _ = make_run(tmp_path, FakeInfx())
+    promote(root, first.snapshot_id, "Reviewer", NOW)
+    state = infx_job.load_state(root)
+    path = root / infx_job.STATE_FILE
+    path.write_text(json.dumps(state)[:-1] + ', "qualified": null}')
+    before = tree(root)
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        infx_job.load_state(root)
+    result, _ = make_run(tmp_path, FakeInfx())
+    assert result.status == "failed" and "duplicate JSON key" in result.error
+    assert tree(root) == before
