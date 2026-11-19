@@ -818,13 +818,15 @@ pub(crate) struct ConnectorRules {
 }
 
 /// When a load's copy starts, relative to the pass that issued it. The
-/// connector submits it after the pass's launch, in vLLM's post-forward.
+/// connector submits it after the pass's launch, in vLLM's post-forward, and
+/// runs copies one at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoadCopyStart {
-    /// When the launch ends: a copy thread submits it without waiting for
-    /// compute.
+    /// When the launch ends: a copy thread copies the pass's loads as one
+    /// batch, without waiting for compute, and reports them together.
     LaunchEnd,
-    /// When the pass's GPU work ends: the copy stream waits for compute.
+    /// When the pass's GPU work ends: each load is its own copy on a stream
+    /// that waits for compute.
     PassEnd,
 }
 

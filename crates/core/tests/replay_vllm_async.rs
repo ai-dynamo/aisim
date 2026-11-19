@@ -408,3 +408,34 @@ fn a_request_sharing_a_load_waits_for_it_until_vllm_has_seen_the_copy() {
         (Some(790.0), 20, Some(0))
     );
 }
+
+#[test]
+fn work_that_starts_before_an_idle_engine_sees_a_load_runs_before_it() {
+    // The sharing run's G1 with five blocks copying in 8 ms, and R (request
+    // 3) decoding only three tokens: its last decode runs from 710 to 720. A
+    // (request 4) loads request 1's prefix from the pass formed at 700, and
+    // the copy runs from 710 to 718. While R's last decode runs, vLLM takes
+    // an empty step that polls at 710, before the copy ends, then waits for
+    // R. With nothing else to run, it then steps empty and sees the copy:
+    // replay admits A at 720. If N (request 6) arrives at 715, vLLM schedules
+    // N at 720 instead; N's prefill launch polls at 740 and sees the copy, so
+    // A is schedulable two decisions later, at 820, and its pass starts at
+    // 830.
+    let five_blocks_in_8_ms = 320.0 / (8.0 * 1e6);
+    let run = |new_work: bool| {
+        let mut requests = vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 3, 600.0),
+            tokens_request(4, (0..24).collect(), 2, 605.0),
+        ];
+        if new_work {
+            requests.push(tokens_request(6, (3000..3024).collect(), 2, 715.0));
+        }
+        let report = run_tokens(polled_cpu_tier(20, five_blocks_in_8_ms), requests);
+        let admitted = |id| record(&report, id).first_admit_ms;
+        (admitted(4), new_work.then(|| admitted(6)).flatten())
+    };
+    assert_eq!(run(false), (Some(720.0), None));
+    assert_eq!(run(true), (Some(830.0), Some(720.0)));
+}

@@ -83,6 +83,22 @@ struct LoadingPrefix {
     original_g1_tokens: usize,
     loaded_prefix_blocks: usize,
     request_footprint_blocks: usize,
+    /// When the last pending D2H out of its G1 destination ends; the copy
+    /// cannot start earlier.
+    destination_free_ms: f64,
+}
+
+/// A private-lane load's timing, for the load poll.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct LoadTiming {
+    /// When the simulator's lane completes the copy, fixed at issue.
+    pub(super) lane_end_ms: f64,
+    /// When the last pending D2H out of its G1 destination ends.
+    pub(super) destination_free_ms: f64,
+    /// The link's first-byte latency.
+    pub(super) latency_ms: f64,
+    /// How long its bytes hold the H2D lane.
+    pub(super) copy_ms: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -854,14 +870,15 @@ impl VllmHostOffloadAdapter {
         // Only a private lane hands out G1 capacity that is still being
         // copied; a shared pool holds it until the copy completes.
         let dependencies = kv_manager.native_destination_pending_dependencies(&reservation);
-        let mut not_before_ms = now_ms;
+        let mut destination_free_ms = f64::NEG_INFINITY;
         for dependency in dependencies {
             assert!(kv_manager.is_native_source_dependency_pending(dependency));
             let deadline = tier
                 .transfer_deadline(transfer_id(dependency))
                 .expect("pending source dependency must retain a submitted D2H");
-            not_before_ms = not_before_ms.max(deadline);
+            destination_free_ms = destination_free_ms.max(deadline);
         }
+        let not_before_ms = now_ms.max(destination_free_ms);
 
         // Transfer bookkeeping follows the logical prefix, unlike LRU touches.
         let transfer_id =
@@ -904,6 +921,7 @@ impl VllmHostOffloadAdapter {
         }
         self.load_epoch += 1;
         request.load = Some(LoadState::Loading(LoadingPrefix {
+            destination_free_ms,
             transfer_id,
             keys: hit.keys,
             state_slots: hit.state_slots,
@@ -1554,9 +1572,21 @@ impl VllmHostOffloadAdapter {
         true
     }
 
-    /// Load poll: completed loads keep their keys loading until released.
-    pub(super) fn hold_load_keys_until_release(&mut self) {
+    /// Load poll: completed loads keep their keys loading until released,
+    /// and each load's completion follows vLLM's copy ([`Self::retime_load`]).
+    pub(super) fn enable_load_poll(&mut self) {
         self.hold_load_keys = true;
+        self.host.lock().retime_loads(self.host.id());
+    }
+
+    /// Load poll: bring a request's in-flight load forward to vLLM's copy end,
+    /// `completes_at_ms`; see [`HostTier::retime_load`].
+    pub(super) fn retime_load(&self, request: &VllmHostRequestState, completes_at_ms: f64) {
+        if let Some(LoadState::Loading(load)) = &request.load {
+            self.host
+                .lock()
+                .retime_load(load.transfer_id, completes_at_ms);
+        }
     }
 
     fn release_held_load_keys(&mut self, keys: &[HostBlockKey], transfer_id: TransferId) {
@@ -1568,18 +1598,20 @@ impl VllmHostOffloadAdapter {
         }
     }
 
-    /// Load poll: when a request's in-flight load completes on its private
-    /// lane, and how long it takes once the lane is free. `None` on a shared
-    /// pool, whose completion is not fixed at submission.
-    pub(super) fn load_timing(&self, request: &VllmHostRequestState) -> Option<(f64, f64)> {
+    /// Load poll: a request's in-flight load on its private lane. `None` on a
+    /// shared pool, whose completion is not fixed at submission.
+    pub(super) fn load_timing(&self, request: &VllmHostRequestState) -> Option<LoadTiming> {
         let LoadState::Loading(load) = request.load.as_ref()? else {
             return None;
         };
         let tier = self.host.read();
-        Some((
-            tier.transfer_deadline(load.transfer_id)?,
-            tier.load_duration_ms(load.transfer_id)?,
-        ))
+        let (latency_ms, copy_ms) = tier.load_service_ms(load.transfer_id)?;
+        Some(LoadTiming {
+            lane_end_ms: tier.transfer_deadline(load.transfer_id)?,
+            destination_free_ms: load.destination_free_ms,
+            latency_ms,
+            copy_ms,
+        })
     }
 
     /// Drop a load whose copy completed but which was not activated yet (load
@@ -4148,8 +4180,30 @@ mod tests {
         /// needs every G1 block evicts them from G1. With `busy`, request 9
         /// then decodes, one 10 ms pass after another.
         fn new(connector: G2Connector, copy_ms: f64, busy: bool, launch: bool) -> Self {
+            let launch = launch.then_some(Self::LAUNCH);
+            Self::storing(connector, copy_ms, busy, launch, &[(1, 0..22)])
+        }
+
+        /// A 5 ms decode launch and a 50 ms prefill launch.
+        const LAUNCH: crate::engine::PassLaunchConfig = crate::engine::PassLaunchConfig {
+            decode_ms: 5.0,
+            piecewise_ms: 50.0,
+            eager_ms: 150.0,
+            max_cudagraph_capture_size: 4096,
+            eager_queue_fraction: 0.4,
+        };
+
+        /// [`Self::new`] with this `launch`, and each of `stored` storing its
+        /// prompt in G2 before the filler.
+        fn storing(
+            connector: G2Connector,
+            copy_ms: f64,
+            busy: bool,
+            launch: Option<crate::engine::PassLaunchConfig>,
+            stored: &[(u128, std::ops::Range<u32>)],
+        ) -> Self {
+            use crate::engine::TimingModelConfig;
             use crate::engine::common::perf_model::PerfModel;
-            use crate::engine::{PassLaunchConfig, TimingModelConfig};
             // Every pass before the admission is decode-only or prefill-only.
             let timing = crate::engine::timing::built_in_timing_model(&TimingModelConfig::Fixed {
                 prefill_ms: 80.0,
@@ -4171,13 +4225,7 @@ mod tests {
                 ))
                 .perf_model(Arc::new(PerfModel::External { timing }))
                 .max_concurrent_batches(2)
-                .launch(launch.then_some(PassLaunchConfig {
-                    decode_ms: 5.0,
-                    piecewise_ms: 50.0,
-                    eager_ms: 150.0,
-                    max_cudagraph_capture_size: 4096,
-                    eager_queue_fraction: 0.4,
-                }))
+                .launch(launch)
                 .build()
                 .unwrap();
             let mut run = Self {
@@ -4185,8 +4233,8 @@ mod tests {
                 now: 0.0,
                 passes: Vec::new(),
             };
-            for (id, tokens, output) in [(1, (0..22).collect(), 1), (2, (500..560).collect(), 1)] {
-                run.submit(id, tokens, output);
+            for (id, tokens) in stored.iter().cloned().chain([(2, 500..560)]) {
+                run.submit(id, tokens.collect(), 1);
                 while !run.core.is_empty() || run.core.is_ready() {
                     run.step();
                 }
@@ -4209,6 +4257,23 @@ mod tests {
                 arrival_timestamp_ms: Some(self.now),
                 ..Default::default()
             });
+        }
+
+        /// Submit a request that arrived at `arrival_ms`. ([`Self::submit`]
+        /// gives the core no arrival time, so its request joins the next
+        /// decision.)
+        fn submit_at(&mut self, id: u128, tokens: Vec<u32>, output: usize, arrival_ms: f64) {
+            use crate::engine::scheduler::SchedulerCommand;
+            let request = DirectRequest {
+                tokens,
+                max_output_tokens: output,
+                uuid: Some(Uuid::from_u128(id)),
+                arrival_timestamp_ms: Some(arrival_ms),
+                ..Default::default()
+            };
+            self.core
+                .apply_command_effects_at(SchedulerCommand::Submit(request), true, Some(arrival_ms))
+                .unwrap();
         }
 
         fn step(&mut self) {
@@ -4292,6 +4357,184 @@ mod tests {
         assert!(!run.core.test_awaits_poll(follow_up));
         run.submit(4, (0..30).collect(), 2);
         run.until_admitted(4);
+    }
+
+    #[test]
+    fn cancelling_a_load_that_awaits_vllms_poll_wakes_a_peer_waiting_on_its_keys() {
+        // As above, but the peer arrives first: it finds the follow-up's keys
+        // held and waits on the connector. Cancelling the follow-up releases
+        // the keys, which must wake the peer: once request 9 finishes, no
+        // transfer is left to wake it at a deadline.
+        use crate::engine::scheduler::SchedulerCommand;
+        let mut run = PollRun::new(G2Connector::OffloadingV032, 25.0, true, true);
+        run.submit(3, (0..30).collect(), 2);
+        let (follow_up, peer) = (Uuid::from_u128(3), Uuid::from_u128(4));
+        for _ in 0..64 {
+            if run.core.test_awaits_poll(follow_up) {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.test_awaits_poll(follow_up));
+        run.submit(4, (0..30).collect(), 2);
+        for _ in 0..8 {
+            if run.core.test_waits_on_connector_deadline(peer) {
+                break;
+            }
+            run.step();
+        }
+        assert!(run.core.test_awaits_poll(follow_up));
+        assert!(run.core.test_waits_on_connector_deadline(peer));
+        run.core
+            .apply_command(SchedulerCommand::CancelRequest {
+                request_id: follow_up,
+            })
+            .unwrap();
+        assert!(!run.core.test_waits_on_connector_deadline(peer));
+        run.until_admitted(4);
+    }
+
+    /// The pass that admitted `id`, if any.
+    fn admitted_in(run: &PollRun, id: u128) -> Option<usize> {
+        let uuid = Uuid::from_u128(id);
+        run.passes
+            .iter()
+            .position(|pass| pass.admissions.iter().any(|a| a.uuid == uuid))
+    }
+
+    #[test]
+    fn work_that_resumes_before_an_idle_engine_sees_a_load_returns_it_to_the_poll() {
+        // The busy run with a 200 ms copy. Request 9 decodes while the load is
+        // issued, so vLLM starts the copy when that pass's GPU work ends, 10 ms
+        // after the simulator does. Request 9 finishes first: at the
+        // simulator's copy end the engine is idle, and its empty steps would
+        // see the load 10 ms later. Request 7 arrives in between. Its prefill
+        // pass k is decided then and ends the empty steps; its poll, 50 ms
+        // into its launch, sees the copy, so the load is schedulable at k + 2.
+        // Released at vLLM's copy end, it would join pass k + 1.
+        let mut run = PollRun::new(G2Connector::OffloadingV032, 200.0, true, true);
+        run.submit(3, (0..30).collect(), 2);
+        let follow_up = Uuid::from_u128(3);
+        for _ in 0..64 {
+            if run.core.test_awaits_poll(follow_up) {
+                break;
+            }
+            run.step();
+        }
+        let idle_release_ms = run
+            .core
+            .test_unseen_idle_release_ms(follow_up)
+            .expect("an idle engine waits for vLLM's copy end");
+        assert_eq!(idle_release_ms - run.now, 10.0);
+        run.submit(7, (700..708).collect(), 4);
+        run.until_admitted(3);
+        let k = admitted_in(&run, 7).expect("request 7 ran first");
+        assert_eq!(admitted_in(&run, 3), Some(k + 2));
+    }
+
+    /// Run requests 3 and 6, which load different prefixes, under
+    /// `connector` with 8 ms per load while request 9 decodes. Returns the
+    /// pass that issued 3's load and the passes whose decisions released 3's
+    /// and 6's loads.
+    fn release_two_loads(connector: G2Connector) -> (usize, [Option<usize>; 2]) {
+        let mut run = PollRun::storing(
+            connector,
+            8.0,
+            true,
+            Some(PollRun::LAUNCH),
+            &[(1, 0..22), (5, 100..122)],
+        );
+        run.submit(3, (0..22).collect(), 2);
+        run.submit(6, (100..122).collect(), 2);
+        let ids = [Uuid::from_u128(3), Uuid::from_u128(6)];
+        let (mut issued, mut awaited, mut released) = ([None; 2], [false; 2], [None; 2]);
+        while released.iter().any(Option::is_none) && run.passes.len() < 32 {
+            let pass = run.passes.len();
+            run.step();
+            for (i, &uuid) in ids.iter().enumerate() {
+                if issued[i].is_none() && run.core.test_has_host_load(uuid) {
+                    issued[i] = Some(pass);
+                }
+                let awaits = run.core.test_awaits_poll(uuid);
+                if awaited[i] && !awaits && released[i].is_none() {
+                    released[i] = Some(pass);
+                }
+                awaited[i] |= awaits;
+            }
+        }
+        let m = issued[0].expect("request 3 loads");
+        assert_eq!(issued[1], Some(m), "both loads come from one pass");
+        (m, released)
+    }
+
+    #[test]
+    fn loads_issued_together_copy_one_after_the_other() {
+        // Pass m issues both loads; pass k polls at S(k) - 5.
+        // Offloading: each load is its own copy, from the end of m's GPU
+        // work, S(m+1), one after the other: they end at S(m+1) + 8 and
+        // S(m+1) + 16. m+3 polls at S(m+1) + 15 and sees only the first; m+4
+        // sees the second. Decision m+5 releases 3's load and m+6 releases
+        // 6's. (When each runs then depends on other work: 3's prefill makes
+        // m+5 a long pass.)
+        let (m, released) = release_two_loads(G2Connector::OffloadingV032);
+        assert_eq!(released, [Some(m + 5), Some(m + 6)]);
+        // SimpleCPU: one 16 ms copy of both, from the end of m's launch,
+        // S(m) - 5, to S(m) + 11. m+2 polls at S(m) + 15 and sees both, so
+        // decision m+4 releases both.
+        let (m, released) = release_two_loads(G2Connector::SimpleCpuV032);
+        assert_eq!(released, [Some(m + 4), Some(m + 4)]);
+    }
+
+    #[test]
+    fn a_simple_cpu_copy_that_ends_before_replay_forms_its_pass_is_seen_by_the_next_poll() {
+        // A 5 ms prefill launch. Pass P forms at T and was decided at T - 10.
+        // Request 7 arrives after that decision, so the pass decided at T,
+        // P+1, prefills it beside request 9's decode: 90 ms from T + 10, with
+        // its launch ending at T + 5. Request 3 arrives at T + 1, after that
+        // decision too, so pass m = P+2 issues its load. vLLM decides m at
+        // T + 10 and its launch ends at T + 15, when SimpleCPU starts the
+        // 40 ms copy: it ends at T + 55, before replay forms m at the end of
+        // P+1, F = T + 100. m+1 polls at F + 5 and sees it, so decision m+3
+        // releases the load. The simulator's own copy, from F, would end at
+        // F + 40, after m+3 forms at F + 30.
+        let launch = crate::engine::PassLaunchConfig {
+            piecewise_ms: 5.0,
+            ..PollRun::LAUNCH
+        };
+        let mut run = PollRun::storing(
+            G2Connector::SimpleCpuV032,
+            40.0,
+            true,
+            Some(launch),
+            &[(1, 0..22)],
+        );
+        let t = run.now;
+        run.submit_at(7, (700..708).collect(), 4, t - 5.0);
+        run.step();
+        run.submit_at(3, (0..30).collect(), 2, t + 1.0);
+        let follow_up = Uuid::from_u128(3);
+        let (mut issued, mut awaited, mut released) = (None, false, None);
+        while released.is_none() && run.passes.len() < 64 {
+            let pass = run.passes.len();
+            run.step();
+            if issued.is_none() && run.core.test_has_host_load(follow_up) {
+                issued = Some(pass);
+            }
+            let awaits = run.core.test_awaits_poll(follow_up);
+            if awaited && !awaits {
+                released = Some(pass);
+            }
+            awaited |= awaits;
+        }
+        let m = issued.expect("request 3 loads");
+        assert_eq!(
+            admitted_in(&run, 7),
+            Some(m - 1),
+            "m follows request 7's prefill"
+        );
+        assert_eq!(run.passes[m - 1].end_ms, t + 100.0, "P+1 ends at F");
+        assert_eq!(run.passes[m].end_ms - run.passes[m - 1].end_ms, 10.0);
+        assert_eq!(released, Some(m + 3));
     }
 
     #[test]
