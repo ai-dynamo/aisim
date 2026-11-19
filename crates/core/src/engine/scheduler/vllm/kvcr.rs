@@ -226,7 +226,10 @@ impl VllmKvcrAdapter {
         let mut registry = self.registry.lock().unwrap();
         if let Some(config) = registry.local_g2_config() {
             let lru = config.policy == KvcrLocalG2Policy::Lru;
-            let bytes = (block_bytes * gpus_per_rank) as f64;
+            let rank_bytes = block_bytes
+                .checked_mul(gpus_per_rank)
+                .ok_or_else(|| anyhow::anyhow!("kvcr.local_g2 block bytes per rank overflow"))?;
+            let bytes = rank_bytes as f64;
             let rate = bytes_per_ms(config.copy_bandwidth_gbps);
             let copy_ms_per_block = if config.copy_bandwidth_gbps > 0.0 && rate.is_infinite() {
                 // Convert bytes to decimal MB before dividing, so even a
@@ -1403,6 +1406,32 @@ mod tests {
         assert_eq!(local.lock().lru_order(), f.keys(&[1, 4, 2]));
         assert!(!adapter.has_work());
         assert!(adapter.joined.is_empty());
+    }
+
+    #[test]
+    fn local_g2_rejects_per_rank_block_bytes_overflow() {
+        for copy_gbps in [0.0, 6.0] {
+            let f = Fixture::with_local_g2(1, KvcrLocalG2Policy::Lru, copy_gbps, 1, &[], &[]);
+            let result = VllmKvcrAdapter::new(f.registry.clone(), f.target_rank)
+                .with_local_g2(usize::MAX / 2 + 1, 2);
+            let error = result
+                .err()
+                .expect("per-rank byte overflow must fail setup");
+            assert_eq!(
+                error.to_string(),
+                "kvcr.local_g2 block bytes per rank overflow"
+            );
+            // An error must release the registry lock without poisoning it.
+            let adapter = VllmKvcrAdapter::new(f.registry.clone(), f.target_rank)
+                .with_local_g2(usize::MAX / 2, 2)
+                .unwrap();
+            let expected_ms = if copy_gbps == 0.0 {
+                0.0
+            } else {
+                (usize::MAX - 1) as f64 / 6_000_000.0
+            };
+            assert_eq!(adapter.local.unwrap().copy_ms_per_block, expected_ms);
+        }
     }
 
     #[test]

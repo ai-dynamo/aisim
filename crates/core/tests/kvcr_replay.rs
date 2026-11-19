@@ -208,6 +208,24 @@ fn a_hinted_request_pulls_its_prefix_from_a_peer_rank() {
 }
 
 #[test]
+fn local_g2_per_rank_block_bytes_overflow_is_a_setup_error() {
+    let mut rank = kvcr_rank(json!({"local_g2": {"num_blocks": 1}}));
+    rank["native_host_offload"] = json!({"num_host_blocks": 1});
+    // The host block size and one-block capacity fit usize. Multiplying
+    // that size by the two tensor-parallel GPUs does not.
+    rank["block_size"] = json!(2);
+    rank["kv_cache_bytes_per_token"] = json!(usize::MAX / 4 + 1);
+    let engine = json!({"dp_size": 1, "tensor_parallel_size": 2, "rank": rank});
+    let error = run(aggregated(1), engine, vec![request("r0", 0.0, &PROMPT)]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("kvcr.local_g2 block bytes per rank overflow"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn a_pull_moves_the_kv_of_every_tensor_parallel_gpu() {
     let engine = json!({
         "dp_size": 2, "tensor_parallel_size": 4,
