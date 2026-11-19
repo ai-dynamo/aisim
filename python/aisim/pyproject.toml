@@ -45,6 +45,8 @@ dependencies = [
     "google-vizier[jax]==0.1.21",
     # Vizier 0.1.21 requires the pre-1.75.4 operations.proto descriptor name.
     "googleapis-common-protos<1.75.4",
+    # Default predictions download op-latency data on first use (aisim_core.data.fetch.HfTransport).
+    "huggingface_hub>=0.24",
     "jinja2>=3.1.0",
     "jax==0.4.38",
     "jaxlib==0.4.38",
@@ -89,10 +91,8 @@ dev = [
     # fpm_hooks tests build msgspec structs like the engine producers do
     "msgspec>=0.18",
 ]
-hf = [
-    # Hugging Face dataset transport (aisim_core.data.fetch.HfTransport); imported lazily.
-    "huggingface_hub>=0.24",
-]
+# Kept so `pip install 'aisim[hf]'` still resolves; huggingface_hub is now a base dependency.
+hf = []
 learned = [
     # Offline trainer for the learned forward-pass model (aisim_core.sdk.fpm_learned).
     "scikit-learn>=1.4",

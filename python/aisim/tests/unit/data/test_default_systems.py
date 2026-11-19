@@ -5,6 +5,7 @@
 
 import importlib.util
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -100,3 +101,13 @@ def test_explicit_systems_paths_skip_the_dataset(tmp_path):
     explicit = tmp_path / "mine"
     explicit.mkdir()
     assert pdb._normalize_systems_paths([str(explicit)]) == [str(explicit)]  # nothing fetched, no pin read
+
+
+def test_default_download_transport_is_a_base_dependency():
+    """The first default prediction downloads through HfTransport, so a plain `pip install aisim` must ship it."""
+    project = tomllib.loads(Path(__file__).parents[3].joinpath("pyproject.toml").read_text())["project"]
+    base = {
+        re.split(r"[<>=!~\[; ]", requirement, maxsplit=1)[0].lower().replace("-", "_")
+        for requirement in project["dependencies"]
+    }
+    assert "huggingface_hub" in base
