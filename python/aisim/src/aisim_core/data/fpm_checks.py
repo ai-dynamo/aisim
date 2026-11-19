@@ -23,7 +23,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 from pydantic import ValidationError
 
-from aisim_core.data import Manifest, _file, _verify
+from aisim_core.data import Manifest, _file, _verify, configuration_id
 from aisim_core.data.fpm_library import (
     EVALUATION_ROLES,
     LIBRARY_SCHEMA_ID,
@@ -63,6 +63,8 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         return [FpmFinding("invalid-manifest", manifest_path, str(exc).splitlines()[0])]
     if manifest.category != "fpm":
         add("wrong-category", f"expected category fpm, got {manifest.category!r}")
+    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+        add("configuration-identity", "configuration_id does not match the manifest identity")
     by_role = defaultdict(list)
     for artifact in manifest.artifacts:
         by_role[artifact.role].append(artifact)
@@ -82,6 +84,9 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
 
     if library.artifact_schema != LIBRARY_SCHEMA_ID:
         add("library-schema", f"library schema {library.artifact_schema!r}; supported: {LIBRARY_SCHEMA_ID!r}")
+    if library.format != "parquet" or library.rows is None:
+        add("library-declaration", "fpm-library must declare format='parquet' and a row count")
+        return found
     checked = [library, sidecar]
     if include_measurements:
         checked += [a for role in EVALUATION_ROLES for a in by_role.get(role, [])]

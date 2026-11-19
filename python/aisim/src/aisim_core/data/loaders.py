@@ -346,12 +346,19 @@ class FpmLoader(Loader):
                         "backend": identity.framework,
                         "backend_version": identity.framework_version,
                     },
+                    required=require_resources,
                 )
                 out["fpm_profile"] = completed
                 from aisim_core.fpm_profile import load_fpm_profile
 
-                profile = load_fpm_profile(completed)
-                resources = ResolvedResources(profile.deployments[0].resources, sources[0])  # type: ignore[arg-type]
+                # A draft stays a dictionary until every deployment has resources. Do not invent a typed
+                # resource block merely to validate a timing-only load.
+                if "pending" not in sources:
+                    profile = load_fpm_profile(completed)
+                    first_resources = profile.deployments[0].resources
+                else:
+                    first_resources = resolve_resources(completed["deployments"][0].get("resources"), None).resources
+                resources = ResolvedResources(first_resources, sources[0])  # type: ignore[arg-type]
             else:
                 resources = resolve_resources(None, staged.metadata, required=require_resources)
         except FpmContractError:

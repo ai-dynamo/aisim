@@ -15,6 +15,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 
 from aisim_core.data import Identity, Manifest, configuration_id
 from aisim_core.data.fetch import Cache, plan
@@ -335,7 +336,7 @@ def test_sidecar_resources_fill_an_omitted_block_and_round_trip(root, profile, t
 def test_pending_names_exactly_the_missing_fields(root, profile, tmp_path):
     make_entry(root, profile)  # an older entry: no resources in the sidecar
     with pytest.raises(FpmResourcesPendingError) as error:
-        load(root, user_config(profile), tmp_path)
+        load(root, user_config(profile), tmp_path, require_resources=True)
     assert error.value.fields == (
         "cache_layout",
         "max_num_tokens",
@@ -366,6 +367,51 @@ def test_old_entry_without_resources_still_loads_for_timing(root, profile, tmp_p
     with pytest.raises(FpmResourcesPendingError, match="cache_layout"):
         load(root, config, tmp_path / "again", require_resources=True)
     assert "cache_layout" in data.memory_pending and "max_batch_size" in data.memory_pending
+
+
+def test_draft_profile_keeps_pending_resources_until_required(root, profile, tmp_path):
+    make_entry(root, profile)
+    config = user_config(profile)
+    data = load(root, config, tmp_path)
+    assert data.profile is None
+    assert data.resource_sources == ("pending",)
+    assert data.resources.source == "pending" and data.resources.resources is None
+    assert data.config["fpm_profile"] == config["fpm_profile"]
+    assert "cache_layout" in data.memory_pending
+    assert Path(data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"]).is_file()
+    with pytest.raises(FpmResourcesPendingError, match="cache_layout"):
+        load(root, config, tmp_path, require_resources=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "matching", "different"),
+    [
+        ("kv_cache_dtype", "fp8", "bfloat16"),
+        ("gemm_quant_mode", "fp8_block", "bfloat16"),
+        ("moe_quant_mode", "fp8_block", "bfloat16"),
+        ("fmha_quant_mode", "bfloat16", "fp8"),
+        ("comm_quant_mode", "half", "bfloat16"),
+        ("attention_backend", "auto", "flashinfer"),
+        ("moe_backend", "auto", "other"),
+        ("enable_wideep", False, True),
+        ("enable_eplb", False, True),
+        ("model_path", "MiniMaxAI/MiniMax-M2.7", "other/model"),
+        ("model_revision", "profile-test-fixture-v1", "other-revision"),
+    ],
+)
+def test_resources_only_fill_profiles_matching_selector(root, profile, tmp_path, field, matching, different):
+    # Change the sidecar selector, keeping the requested profile valid throughout.
+    selector = {"tp": 4, "dp": 1, "moe_tp": 4, field: matching}
+    make_entry(root, profile, resources=RESOURCES, sidecar_extra={"configuration_selector": selector})
+    assert load(root, user_config(profile), tmp_path).resource_sources == ("metadata",)
+    selector[field] = different
+    make_entry(root, profile, resources=RESOURCES, sidecar_extra={"configuration_selector": selector})
+    pending = load(root, user_config(profile), tmp_path)
+    assert pending.resource_sources == ("pending",)
+    with pytest.raises(FpmResourcesPendingError):
+        load(root, user_config(profile), tmp_path, require_resources=True)
+    user = {**RESOURCES, "provenance": "Explicit user resource override."}
+    assert load(root, user_config(profile, **user), tmp_path, require_resources=True).resource_sources == ("user",)
 
 
 def test_pending_memory_serves_timing_and_blocks_replay(root, profile, tmp_path):
@@ -418,6 +464,113 @@ def test_staging_links_files_and_reuses_a_verified_root(root, profile, tmp_path)
     assert not root_dir.exists()
 
 
+@pytest.mark.parametrize("marker", [None, "not json", "{}", "[]", '{"system": "h200_sxm"}'])
+def test_staging_preserves_an_unrecognized_nonempty_destination(root, profile, tmp_path, marker):
+    make_entry(root, profile)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    sentinel = destination / "keep.txt"
+    sentinel.write_text("unrelated data")
+    if marker is not None:
+        (destination / ".staged.json").write_text(marker)
+    source = root / ENTRY / "fpm"
+    with pytest.raises(FpmContractError, match="staging marker"):
+        stage_fpm_library(
+            source / "fpm_forward_perf.parquet",
+            source / "fpm_forward_perf.metadata.json",
+            system="h200_sxm",
+            backend="vllm",
+            backend_version="0.25.1",
+            output_dir=destination,
+        )
+    assert sentinel.read_text() == "unrelated data"
+
+
+@pytest.mark.parametrize("explicit_roots", [True, False])
+def test_ensure_library_isolates_effective_systems_roots(root, profile, tmp_path, monkeypatch, explicit_roots):
+    from aisim_core.data.ensure import DataPin, ensure_data
+    from aisim_core.data.fpm_library import _stageable_roots
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    manifest = Manifest.model_validate_json((root / MANIFEST).read_bytes())
+    (root / "catalog/fpm").mkdir(parents=True)
+    (root / "catalog/fpm/index.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aisim-category-index/v1",
+                "category": "fpm",
+                "entries": [
+                    {
+                        "configuration_id": manifest.configuration_id,
+                        "purpose": manifest.purpose,
+                        "identity": manifest.identity.model_dump(),
+                        "manifest": _artifact(root, MANIFEST, "manifest", "json", "aisim-artifact-manifest/v1"),
+                    }
+                ],
+            }
+        )
+    )
+    (root / "catalog/dataset.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aisim-dataset-index/v1",
+                "dataset_id": REPO,
+                "categories": {
+                    "fpm": {
+                        "root": "data/fpm",
+                        "layout": "category",
+                        "index": _artifact(root, "catalog/fpm/index.json", "index", "json", "aisim-category-index/v1"),
+                    }
+                },
+            }
+        )
+    )
+    roots = [tmp_path / name for name in ("systems-a", "systems-b")]
+    system_yaml = (_stageable_roots(["default"], None)[0] / "h200_sxm.yaml").read_text()
+    for index, systems in enumerate(roots):
+        systems.mkdir()
+        (systems / "h200_sxm.yaml").write_text(system_yaml + f"\n# fixture systems root: {index}\n")
+        data = systems / "data/h200_sxm/vllm/0.25.1"
+        data.mkdir(parents=True)
+        (data / "operation.txt").write_text(str(index))
+    pin = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+    config = user_config(profile)
+    selected = []
+    if not explicit_roots:
+        empty = tmp_path / "empty-user-root"
+        empty.mkdir()
+        config["systems_paths"] = [str(empty)]
+    for systems in roots:
+        if explicit_roots:
+            config["systems_paths"] = [str(systems)]
+        else:
+            monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [str(systems)])
+        result = ensure_data(config, pin)
+        staged = Path(result.config["systems_paths"][0])
+        inode = (staged / ".staged.json").stat().st_ino
+        again = ensure_data(config, pin)
+        assert again.config == result.config
+        assert (staged / ".staged.json").stat().st_ino == inode
+        if explicit_roots:
+            aliased = ensure_data({**config, "systems_paths": [str(systems) + "/.", str(systems)]}, pin)
+            assert Path(aliased.config["systems_paths"][0]) == staged
+            assert (staged / ".staged.json").stat().st_ino == inode
+        selected.append(result.config)
+    assert selected[0]["systems_paths"][0] != selected[1]["systems_paths"][0]
+    for index, returned_config in enumerate(selected):
+        staged = Path(returned_config["systems_paths"][0])
+        assert (staged / "h200_sxm.yaml").read_text().endswith(f"# fixture systems root: {index}\n")
+        assert (staged / "data/h200_sxm/vllm/0.25.1/operation.txt").read_text() == str(index)
+        model = RustForwardPassPerfModel.best_available(returned_config)
+        try:
+            assert model.estimate_forward_pass_time_ms(
+                {"scheduled_requests": {"num_prefill_requests": 1, "sum_prefill_tokens": 1}}
+            ) == pytest.approx(2.0)
+        finally:
+            model.close()
+
+
 def test_staging_reuse_follows_the_source_paths(root, profile, tmp_path):
     make_entry(root, profile, resources=RESOURCES)
     source = root / ENTRY / "fpm"
@@ -447,7 +600,7 @@ def test_systems_paths_use_the_canonical_default_and_home_forms(monkeypatch, tmp
     monkeypatch.setenv("HOME", str(tmp_path))
     roots = _stageable_roots(["default", "~/custom"], None)
     assert roots[0].name == "systems" and roots[0].is_absolute() and roots[1] == tmp_path / "custom"
-    assert _stageable_roots(["~/custom", "/x"], tmp_path / "custom") == [Path("/x")]
+    assert _stageable_roots(["~/custom", "/x"], tmp_path / "custom") == [Path("/x"), *_stageable_roots(None, None)]
 
 
 def test_sidecar_resources_need_the_library_identity(root, profile):
@@ -629,6 +782,32 @@ def test_entry_checks_report_roles_hashes_and_sidecar_agreement(root, profile):
     assert {f.code for f in check_fpm_entry(root, MANIFEST)} == {"sidecar-hash", "sidecar-rows"}
 
 
+def test_entry_checks_reject_mismatched_configuration_id(root, profile):
+    make_entry(root, profile)
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    document["configuration_id"] = "cfg-" + "0" * 64
+    path.write_text(json.dumps(document))
+    assert [f.code for f in check_fpm_entry(root, MANIFEST)] == ["configuration-identity"]
+    with pytest.raises(LoaderError, match="configuration identity hash mismatch"):
+        FpmLoader().read_manifest(root, MANIFEST, roles=())
+
+
+@pytest.mark.parametrize(("fmt", "rows"), [("json", None), ("json", 3), ("parquet", None)])
+def test_entry_checks_require_parquet_and_rows(root, profile, fmt, rows):
+    make_entry(root, profile)
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    document["artifacts"][0].update(format=fmt, rows=rows)
+    sidecar = root / ENTRY / "fpm/fpm_forward_perf.metadata.json"
+    metadata = json.loads(sidecar.read_text())
+    metadata["row_count"] += 1
+    sidecar.write_text(json.dumps(metadata))
+    document["artifacts"][1].update(sha256=_sha(sidecar.read_bytes()), bytes=sidecar.stat().st_size)
+    path.write_text(json.dumps(document))
+    assert "library-declaration" in {f.code for f in check_fpm_entry(root, MANIFEST)}
+
+
 def test_one_identity_maps_to_at_most_one_entry(root, profile):
     make_entry(root, profile)
     manifest = Manifest.model_validate_json((root / MANIFEST).read_bytes())
@@ -698,6 +877,22 @@ def test_sidecar_model_accepts_published_shapes_and_validates_resources():
     with pytest.raises(ValueError, match="max_num_tokens"):
         FpmLibraryMetadata.model_validate({**base, "resources": {**RESOURCES, "max_num_tokens": 0}})
     assert load_fpm_profile  # the profile class stays the single source for resources
+
+
+def test_sidecar_version_is_constrained_in_model_and_packaged_snapshot():
+    from aisim_core.data.schemas import PACKAGED_SNAPSHOT_DIR, snapshot_filename
+
+    base = {"schema_name": "aic_fpm_forward_perf", "schema_version": 6, "row_count": 2}
+    schema = json.loads((PACKAGED_SNAPSHOT_DIR / snapshot_filename("aic_fpm_forward_perf.metadata/v6")).read_text())
+    validator = Draft202012Validator(schema)
+    validator.validate(base)
+    assert FpmLibraryMetadata.model_validate(base).resources is None
+    for version in (5, 7, 8):
+        unsupported = {**base, "schema_version": version}
+        with pytest.raises(ValueError, match="schema_version"):
+            FpmLibraryMetadata.model_validate(unsupported)
+        with pytest.raises(ValidationError):
+            validator.validate(unsupported)
 
 
 def test_entry_checks_report_unreadable_files_and_missing_native_columns(root, profile):

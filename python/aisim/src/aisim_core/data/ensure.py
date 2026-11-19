@@ -72,6 +72,7 @@ from aisim_core.data.fetch import (
     fetch_support,
     resolve_revision,
 )
+from aisim_core.data.fpm_library import _stageable_roots
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
 from aisim_core.data.op_tree import (
@@ -631,9 +632,13 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
         # the peek hashes no artifact, so a library entry is not hashed twice.
         peek = read_entry_manifest(root, entry, config, loader, roles=())
         if any(a.role == "fpm-library" for a in peek.artifacts):
-            # Library tier: staging is cheap (links), so it is rebuilt from verified files each time.
+            # Roots change the copied system definition and linked op data. Keep each ordered effective root
+            # set in its own materialization so later calls cannot replace an earlier configuration's inputs.
+            roots = tuple(str(p) for p in _stageable_roots(config.get("systems_paths"), output_dir))
+            roots_key = hashlib.sha256(json.dumps(roots).encode()).hexdigest()
+            output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
             output_dir.parent.mkdir(parents=True, exist_ok=True)
-            return loader.load(root, manifest_path, output_dir=output_dir, config=config)
+            return loader.load(root, manifest_path, output_dir=output_dir, config=config, systems_paths=roots)
         manifest = read_entry_manifest(root, entry, config, loader)  # then verifies every declared artifact
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
         # measurements must not be served from the preparation of the old ones.
