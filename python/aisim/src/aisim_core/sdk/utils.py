@@ -2359,7 +2359,8 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         # raw cache must not keep the base from the failed attempt in that case.
         # Keep other models' base metadata paired with their parsed cache entries.
         _load_model_config_from_model_path.cache_invalidate(model_path, base_config)
-        _CONFIG_PROVENANCE.pop(id(base_config), None)
+        # Active readers can still hold this base after eviction. Its immutable
+        # snapshot must remain available until those readers finish as well.
         raise
     # Preserve Llama 4's established raw-cache reuse, but only after its
     # processor metadata has passed the parser. Raw loads never fetch it.

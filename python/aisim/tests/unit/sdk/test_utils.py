@@ -646,6 +646,63 @@ def test_failed_processor_load_can_retry_offline_in_same_process(monkeypatch, hf
         utils.get_model_config_from_model_path.cache_clear()
 
 
+def test_failed_same_model_reader_preserves_active_readers_snapshot(monkeypatch, hf_cache):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    model = "org/concurrent-processor-readers"
+    commit = "c" * 40
+    architecture = "Qwen3VLForConditionalGeneration"
+    _cache_file(hf_cache, model, "config.json", {"architectures": [architecture], "hidden_size": 1024})
+    paused = Event()
+    resume = Event()
+    real_lookup = utils._config_snapshot_commit
+    requests = []
+
+    def lookup(raw):
+        if current_thread().name.startswith("paused-reader"):
+            paused.set()
+            assert resume.wait(10), "failed reader did not release the paused reader"
+        return real_lookup(raw)
+
+    def remote(request, *, timeout):
+        url = request.full_url
+        requests.append(url)
+        if url.endswith("/main/config.json"):
+            raise utils.urllib.error.URLError("config transport failed")
+        if url.endswith("/hf_quant_config.json"):
+            raise _http_error(404, "absent")
+        if url.endswith("/preprocessor_config.json"):
+            if not current_thread().name.startswith("paused-reader"):
+                raise _http_error(503, "processor unavailable")
+            source = "pinned" if f"/{commit}/" in url else "remote-main"
+            return io.BytesIO(json.dumps({"source": source}).encode())
+        pytest.fail(f"unexpected request: {url}")
+
+    monkeypatch.setattr(utils, "_config_snapshot_commit", lookup)
+    monkeypatch.setattr(utils.urllib.request, "urlopen", remote)
+    monkeypatch.setattr(utils, "_parse_hf_config_json", lambda raw: {"architecture": architecture})
+    utils._load_model_config_from_model_path.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="paused-reader") as pool:
+        try:
+            # Both readers use the identical base object from the raw cache.
+            utils._load_model_config_from_model_path(model)
+            pending = pool.submit(utils.get_model_config_from_model_path, model)
+            assert paused.wait(10), "reader did not reach provenance lookup"
+            with pytest.raises(utils.HuggingFaceDownloadError, match="processor unavailable"):
+                utils.get_model_config_from_model_path(model)
+            resume.set()
+            loaded = pending.result(timeout=10)
+            assert loaded["raw_config"]["hidden_size"] == 1024
+            assert loaded["raw_config"]["preprocessor_config"] == {"source": "pinned"}
+            assert not any(url.endswith("/main/preprocessor_config.json") for url in requests)
+        finally:
+            resume.set()
+            utils._load_model_config_from_model_path.cache_clear()
+            utils.get_model_config_from_model_path.cache_clear()
+
+
 def test_kimi_video_limits_follow_pinned_processor_through_real_parser(monkeypatch, hf_cache):
     model = "org/kimi-video-limits"
     commit = "d" * 40
