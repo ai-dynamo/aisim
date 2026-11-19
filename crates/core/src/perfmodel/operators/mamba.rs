@@ -197,8 +197,16 @@ impl Mamba2Op {
             &|b, s| self.sol_latency_ms(db, b, s),
         ) {
             Ok(Some(value)) => {
+                // Convolution rows are cold too. A qualified cached prefill
+                // keeps the cold timing as a proxy, not as a measurement.
+                let source =
+                    if self.state_dtype != "unrecorded" && self.phase == "context" && prefix > 0 {
+                        Source::Estimated
+                    } else {
+                        Source::Silicon
+                    };
                 Ok(
-                    PerformanceResult::with_energy(value.latency, value.energy, Source::Silicon)
+                    PerformanceResult::with_energy(value.latency, value.energy, source)
                         .clamp_non_negative()
                         .scaled(self.scale_factor),
                 )
@@ -1131,7 +1139,8 @@ mod tests {
 
     /// A measured scan row starts from a cold state. A qualified BF16 prefill
     /// with the same new-token count but a cached prefix restores a state, so
-    /// it takes SOL. The cold query and a legacy op keep the measured row.
+    /// it takes SOL. The cold query and a legacy op keep the measured row. A
+    /// cached qualified convolution keeps its cold row as an `estimated` proxy.
     #[test]
     fn qualified_cached_prefill_scan_does_not_read_cold_rows() {
         use crate::common::enums::{DatabaseMode, TransferPolicy};
@@ -1145,18 +1154,21 @@ mod tests {
         write_parquet(
             &data.join("mamba2_perf.parquet"),
             &[
-                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"]),
-                Col::Str("phase", vec!["context"]),
-                Col::I64("batch_size", vec![2]),
-                Col::I64("seq_len", vec![512]),
-                Col::I64("d_model", vec![1024]),
-                Col::I64("d_state", vec![64]),
-                Col::I64("d_conv", vec![4]),
-                Col::I64("nheads", vec![16]),
-                Col::I64("head_dim", vec![64]),
-                Col::I64("n_groups", vec![4]),
-                Col::I64("chunk_size", vec![128]),
-                Col::F64("latency", vec![0.5]),
+                Col::Str(
+                    "kernel_source",
+                    vec!["mamba_chunk_scan_combined", "causal_conv1d_fn"],
+                ),
+                Col::Str("phase", vec!["context"; 2]),
+                Col::I64("batch_size", vec![2; 2]),
+                Col::I64("seq_len", vec![512; 2]),
+                Col::I64("d_model", vec![1024; 2]),
+                Col::I64("d_state", vec![64; 2]),
+                Col::I64("d_conv", vec![4; 2]),
+                Col::I64("nheads", vec![16; 2]),
+                Col::I64("head_dim", vec![64; 2]),
+                Col::I64("n_groups", vec![4; 2]),
+                Col::I64("chunk_size", vec![128; 2]),
+                Col::F64("latency", vec![0.5, 0.25]),
             ],
         );
         let db = PerfDatabase::load(root.path(), "testsys", "test", "1.0")
@@ -1192,6 +1204,25 @@ mod tests {
         // A fully cached qualified prefill has no new token to scan.
         let err = qualified.query_with_prefix(&db, 2, 0, 512).unwrap_err();
         assert!(err.to_string().contains("at least one new token"), "{err}");
+
+        let conv = |state_dtype: &str| Mamba2Op {
+            name: "context_conv1d".into(),
+            kernel_source: "causal_conv1d_fn".into(),
+            ..op(state_dtype)
+        };
+        let cold = conv("bfloat16").query_with_prefix(&db, 2, 512, 0).unwrap();
+        assert_eq!((cold.source, cold.latency_ms), (Source::Silicon, 0.25));
+        let cached = conv("bfloat16")
+            .query_with_prefix(&db, 2, 512, 256)
+            .unwrap();
+        assert_eq!(
+            (cached.source, cached.latency_ms),
+            (Source::Estimated, 0.25)
+        );
+        let legacy = conv("unrecorded")
+            .query_with_prefix(&db, 2, 512, 256)
+            .unwrap();
+        assert_eq!((legacy.source, legacy.latency_ms), (Source::Silicon, 0.25));
     }
 
     /// Mamba2 follows the database-mode semantics of the other table-backed

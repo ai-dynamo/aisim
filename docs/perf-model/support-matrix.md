@@ -86,8 +86,10 @@ Within a matching kernel, phase and model geometry, a prefill lookup uses the
 batch size and the new-token count. The collected scan rows start from a cold
 state, so they do not measure a prefill that restores a cached prefix. A
 qualified scan operation with a cached prefix therefore uses the SOL estimate,
-which counts the restored recurrent state. A legacy operation, one with no
-recorded state dtype, still looks up the cold row. In `SILICON` or `HYBRID`
+which counts the restored recurrent state. The collected convolution rows are
+cold too. A qualified convolution with a cached prefix keeps its cold row as a
+proxy, labeled `estimated`. A legacy operation, one with no recorded state
+dtype, still looks up the cold row. In `SILICON` or `HYBRID`
 mode, a successful lookup labels its result `silicon`. A `HYBRID` lookup that
 misses the model geometry gives `sol`, and `SOL` mode reads no row.
 The native Mamba2 pricing of a packed step reads only the prefill totals of its
@@ -98,9 +100,10 @@ has any cached prefill token, every qualified prefill scan in it uses the SOL
 estimate. For a step that mixes cold and
 cached requests, this choice of source is therefore approximate. Each prefill
 request must compute at least one new token. Take a graph with a qualified
-Mamba2 operation. If a packed step has new prefill tokens, but fewer than
-prefill requests, its estimate fails. Decode work does not change this. A step with no new
-prefill token skips prefill. It prices only its decode work, or zero.
+context Mamba2 operation. If a packed step has new prefill tokens, but fewer
+than prefill requests, its estimate fails. Decode work does not change this.
+A qualified decode operation alone does not apply this check. A step with no
+new prefill token skips prefill. It prices only its decode work, or zero.
 
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different
