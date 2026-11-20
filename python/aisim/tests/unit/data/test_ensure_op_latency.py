@@ -233,3 +233,58 @@ def test_a_changed_packaged_system_spec_does_not_serve_the_old_root(two_families
     (specs / "h200_sxm.yaml").write_text("name: h200_sxm_v2\n")
     second = ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0]
     assert second != first and (Path(second) / "h200_sxm.yaml").read_text() == "name: h200_sxm_v2\n"
+
+
+def test_declared_donor_versions_arrive_in_the_root(tree, tmp_path):  # noqa: F811
+    # gemm 2.0 declares reuse of its gemm_perf from 1.0 (published) and of ghost_perf from 0.9 (not published).
+    published = tmp_path / "published"
+    _build(tree, published)
+    out = ensure_data({**CONFIG, "backend_version": "2.0"}, _pin(published, tmp_path))
+    root = Path(out.config["systems_paths"][0])
+    assert (root / "data/h200_sxm/gemm/vllm/2.0/reuse.yaml").is_file()
+    assert (root / "data/h200_sxm/gemm/vllm/2.0/other_perf.parquet").is_file()
+    assert (root / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file(), "the declared donor must be present"
+    assert not (root / "data/h200_sxm/gemm/vllm/0.9").exists()  # an unpublished donor is skipped, as natively
+    assert len(out.datasets["op-latency"]["configuration_ids"]) == 2
+
+
+def test_a_version_without_reuse_declares_no_donors(tree, tmp_path):  # noqa: F811
+    published = tmp_path / "published"
+    _build(tree, published)
+    out = ensure_data(dict(CONFIG), _pin(published, tmp_path))
+    assert len(out.datasets["op-latency"]["configuration_ids"]) == 1
+
+
+def test_the_hf_pin_fetches_the_declared_donor_selection(tree, tmp_path, monkeypatch):  # noqa: F811
+    from types import SimpleNamespace
+
+    from aisim_core.data import ensure as mod
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    requested = []
+
+    def fake_fetch(selection, pin, transport):
+        requested.append((selection.framework_version, selection.operation_family, selection.configuration_ids))
+        return SimpleNamespace(root=published, downloaded_bytes=0, plan=SimpleNamespace(revision="a" * 40))
+
+    monkeypatch.setattr(mod, "_fetch_pinned", fake_fetch)
+    pin = DataPin(repo="org/data", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    out = ensure_data({**CONFIG, "backend_version": "2.0"}, pin)
+    assert requested == [("2.0", None, ()), ("1.0", "gemm", ())]  # the declared 1.0 donor, then nothing for 0.9
+    assert (Path(out.config["systems_paths"][0]) / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file()
+
+
+@pytest.mark.parametrize(
+    "document", [None, {}, {"reuse": {}}, {"reuse": [{"table": "t"}]}, {"reuse": [{"from_version": 1.0}]}]
+)
+def test_malformed_reuse_declaration_is_refused(document):
+    from aisim_core.data.ensure import _donor_versions
+    from aisim_core.data.loaders import LoaderError
+
+    with pytest.raises(LoaderError, match="from_version"):
+        _donor_versions(document)
+    assert _donor_versions({"reuse": [{"from_version": "1.0"}, {"from_version": "0.9"}, {"from_version": "1.0"}]}) == [
+        "0.9",
+        "1.0",
+    ]

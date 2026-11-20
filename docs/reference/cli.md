@@ -106,7 +106,9 @@ Private datasets use the standard `HF_TOKEN` only while connected; the cache nee
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation
 table fails instead of falling through to packaged or user-supplied operation tables. Packaged
-operation tables are never copied into the pinned root.
+operation tables are never copied into the pinned root. The root also holds the other versions that a selected
+entry's `reuse.yaml` declares as donors, so reused measurements stay available; a donor the dataset does not
+publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs change.
 
 <a id="non-python-consumers"></a>
 

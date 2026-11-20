@@ -22,7 +22,9 @@ Source order, per category named by the :class:`DataPin`:
 system/backend/version is verified and written, with the packaged system specs, into one ``systems/`` root
 (:func:`~aisim_core.data.op_tree.load_op_latency_tree`) that replaces ``systems_paths``. Two entries for the same family
 are a conflict resolved with ``AISIM_DATA_CONFIGURATION``; a family the dataset does not publish is absent, never
-filled from packaged tables by the pin.
+filled from packaged tables by the pin. The versions a selected entry's ``reuse.yaml`` declares as donors are part of
+the root too (the native database reads them beside the requested version and skips a donor that is absent), fetched
+by the same pin; a donor the dataset does not publish is skipped, as it is there.
 
 With no pin the whole step is a no-op and behavior is unchanged. Credentials are
 the standard Hugging Face ones (``HF_TOKEN`` / ``huggingface-cli login``); this
@@ -43,12 +45,13 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import ValidationError
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
@@ -307,7 +310,14 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     if category == "op-latency":
         entries = _one_entry_per_family(entries, selection, where)
         loaded, entry_ids = _load_op_latency(
-            root, entries, out.config, Cache(pin.cache_dir), source_key, selection, where
+            root,
+            entries,
+            out.config,
+            Cache(pin.cache_dir),
+            source_key,
+            selection,
+            where,
+            fetch_donors=None if pin.local_root is not None else lambda wanted: _fetch_pinned(wanted, pin, transport),
         )
         _wire(out.config, category, loaded, None)
         out.datasets[category] = {
@@ -408,6 +418,59 @@ def _one_entry_per_family(entries: list[Entry], selection: Selection, where: str
     return sorted(entries, key=lambda e: e.configuration_id)
 
 
+def _declared_donors(
+    root: Path,
+    entries: list[Entry],
+    manifests: list[Any],
+    selection: Selection,
+    fetch_donors: Callable[[Selection], Any] | None,
+) -> list[Entry]:
+    """Catalog entries of the versions that ``reuse.yaml`` declares as donors of the selected entries.
+
+    The native database resolves a donor one hop from the requested version, only from files under the same
+    root, and skips a donor whose file is absent, so a root without the donor version silently loses the measured
+    coverage the dataset holds. A donor the catalog does not publish is skipped the same way. ``fetch_donors``
+    downloads a donor selection (``None`` for a local root, which already holds everything).
+    """
+    chosen = {e.configuration_id for e in entries}
+    donors: list[Entry] = []
+    for entry, manifest in zip(entries, manifests, strict=True):
+        declaration = next((a for a in manifest.artifacts if a.role == "reuse-declaration"), None)
+        if declaration is None:
+            continue
+        for version in _donor_versions(yaml.safe_load(_verify(root, declaration).read_text(encoding="utf-8"))):
+            wanted = replace(
+                selection,
+                configuration_ids=(),
+                framework_version=version,
+                operation_family=entry.identity.operation_family,
+            )
+            found = _matching_entries(root, wanted)
+            if len(found) > 1:
+                ids = ", ".join(sorted(e.configuration_id for e in found))
+                raise DataConflictError(
+                    f"{len(found)} op-latency entries match donor version {version} of {entry.configuration_id} "
+                    f"({ids}); a donor must be one entry"
+                )
+            if not found or found[0].configuration_id in chosen:
+                continue
+            if fetch_donors is not None:
+                fetch_donors(wanted)
+            chosen.add(found[0].configuration_id)
+            donors.append(found[0])
+    return donors
+
+
+def _donor_versions(document: Any) -> list[str]:
+    """Sorted distinct ``from_version`` values of a parsed ``reuse.yaml``."""
+    reuse = document.get("reuse") if isinstance(document, dict) else None
+    if not isinstance(reuse, list) or not all(
+        isinstance(e, dict) and isinstance(e.get("from_version"), str) and e["from_version"] for e in reuse
+    ):
+        raise LoaderError("reuse.yaml must hold a 'reuse' list whose entries name a from_version string")
+    return sorted({e["from_version"] for e in reuse})
+
+
 def _load_op_latency(
     root: Path,
     entries: list[Entry],
@@ -416,13 +479,19 @@ def _load_op_latency(
     source_key: str,
     selection: Selection,
     where: str,
+    fetch_donors: Callable[[Selection], Any] | None = None,
 ) -> tuple[OpTreeLoad, list[str]]:
-    """Compose every selected family and the system specs into one verified ``systems/`` root."""
+    """Compose every selected family, its declared donor versions and the system specs into one ``systems/`` root."""
     ids = [e.configuration_id for e in entries]
     try:
         loader = LOADERS["op-latency"]()
         # Verifies every artifact in the fetched tree, also when the composed root is reused.
         manifests = [loader.read_manifest(root, entry.manifest.path, config) for entry in entries]
+        donors = _declared_donors(root, entries, manifests, selection, fetch_donors)
+        # A donor is another version of the same system and backend, so the version check of ``config`` is not its own.
+        manifests += [loader.read_manifest(root, donor.manifest.path) for donor in donors]
+        entries = [*entries, *donors]
+        ids = [e.configuration_id for e in entries]
         # Keyed by content, not identity: a dataset republished in place (or a newer package) gets a new root.
         digest = op_latency_inputs_digest(root, manifests, PACKAGED_SYSTEMS_DIR)[:16]
         output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
