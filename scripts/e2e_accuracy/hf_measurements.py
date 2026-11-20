@@ -116,6 +116,15 @@ def _get(cache, transport, sha, path, ref=None):
         raise ValueError("unsafe HF measurement artifact path")
     expected = None
     if ref is not None:
+        size, digest = ref.get("bytes"), ref.get("sha256")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError(f"HF measurement reference for {path} lacks a valid byte count and SHA-256")
         expected = fetch.PlannedFile(
             path,
             ref["bytes"],
