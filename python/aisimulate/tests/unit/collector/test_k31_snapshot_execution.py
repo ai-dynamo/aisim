@@ -311,7 +311,14 @@ def native_execution(snapshot, native_source, request, monkeypatch):
             **{key: payload[key] for key in ("dp_rank", "tp_rank", "pp_rank")},
             audited_version=plan.capability.aic_database_version,
         )
-        assert json.loads(path.read_text())["status"] == "observed"
+        emitted = json.loads(path.read_text())
+        assert emitted["status"] == "observed"
+        # The installed-source fixture above exercises the real producer with
+        # synthetic file hashes. Bind only its source identity to the canonical
+        # map used by the synthetic native observation fixture, leaving all
+        # producer-serialized configuration and attention fields intact.
+        emitted["runtime"] = {key: value for key, value in worker["runtime"].items() if key != "image"}
+        path.write_text(json.dumps(emitted))
     collection = validate_native_collection(
         cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id=collection.collector_attempt_id
     )
@@ -333,6 +340,47 @@ def test_native_execution_producer_emits_required_model_and_attention_identity(n
         }
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
     assert result["status"] == "qualified", (result["missing_evidence"], result["failures"])
+
+
+@pytest.mark.parametrize("image", [False, True])
+def test_execution_accepts_matching_audited_runtime_identity(native_execution, image):
+    plan, cell, raw, collection, index_path = native_execution
+    if image:
+        workers, _ = execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
+        for path in raw.glob("**/fpm-execution-worker-*.json"):
+            payload = json.loads(path.read_text())
+            rank = tuple(payload[key] for key in ("dp_rank", "tp_rank", "pp_rank"))
+            payload["runtime"]["image"] = workers[rank]["runtime"]["image"]
+            path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "qualified", (result["missing_evidence"], result["failures"])
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "source_files", "missing_file", "source_revision", "framework", "version", "image"]
+)
+def test_execution_rejects_sidecar_runtime_contradicting_audited_worker(native_execution, mutation):
+    plan, cell, raw, collection, _ = native_execution
+    path = next(raw.glob("**/fpm-execution-worker-*.json"))
+    payload = json.loads(path.read_text())
+    runtime = payload["runtime"]
+    if mutation == "missing":
+        payload.pop("runtime")
+    elif mutation in {"source_files", "missing_file"}:
+        name = next(iter(runtime["source_files"]))
+        if mutation == "missing_file":
+            runtime["source_files"].pop(name)
+        else:
+            runtime["source_files"][name] = "0" * 64
+        runtime["source_revision"] = hashlib.sha256(
+            json.dumps(runtime["source_files"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    else:
+        runtime[mutation] = "different-runtime-identity"
+    path.write_text(json.dumps(payload))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed", result
+    assert any("execution runtime source identity differs" in reason for reason in result["failures"])
 
 
 @pytest.mark.parametrize(

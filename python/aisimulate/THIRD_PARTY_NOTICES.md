@@ -2316,12 +2316,15 @@ modified for AISimulate's explicit policy and evidence validation contracts.
 
 The ARM64 image child is
 `sha256:52b793567651780dc529647a211a3d15cec11ebc872ac7492636d7d75340eab4`.
-The original path and SHA-256 inventory for 35 source-bound vLLM
-interfaces is in `runtime/vllm-kimi-k31.example.json`. The inspected references
+Within the Python distribution, the original path and SHA-256 inventory for 35
+source-bound vLLM interfaces is in
+[`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
+The inspected references
 `vllm/model_executor/models/config.py`, `vllm/v1/attention/backends/registry.py`,
 and `vllm/v1/attention/backends/mla/indexer.py` listed above are outside that
 hash inventory. The adjacent
-`runtime/instrumentation/vllm-kimi-k31.md` records their observation contracts.
+[`collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md`](collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md)
+records their observation contracts.
 The initialized cache comparison also observes the representative-child projection
 in `vllm/v1/core/kv_cache_utils.py::generate_scheduler_kv_cache_config`, preserving
 the worker's full per-layer cache geometry and physical allocation evidence.

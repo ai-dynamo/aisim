@@ -22,7 +22,7 @@ from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 
 from .test_fpm_forward import _kimi_k31_config
 from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
-from .test_k31_runtime_observations import _complete_fixture, _kernel_view_fixture
+from .test_k31_runtime_observations import _complete_fixture, _kernel_view_fixture, _moe
 from .test_runtime_observations import _replace_launch, _write
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_data")]
@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_dat
 @pytest.fixture
 def inputs(tmp_path, monkeypatch, request):
     index_path, launches = _complete_fixture(tmp_path, monkeypatch)
-    config_path, _ = _kimi_k31_config(tmp_path)
+    config_path, text = _kimi_k31_config(tmp_path)
     launch = launches["tp2"]
     settings = getattr(request, "param", "trtllm_mla")
     attention_backend, packed_indexer = (settings, False) if isinstance(settings, str) else settings
@@ -60,6 +60,8 @@ def inputs(tmp_path, monkeypatch, request):
         if record["dp_rank"] != 0:
             continue
         record["model_config_sha256"] = launch["model_config"]["sha256"]
+        if record["kind"] == "worker":
+            record["initialized_moe"] = _moe(indices=range(1, text["num_hidden_layers"]))
         record["resolved_config"]["parallel_config"].update(
             data_parallel_size=1, data_parallel_size_local=1, enable_expert_parallel=False
         )
@@ -169,6 +171,17 @@ def test_valid_imported_native_proof_changes_only_moe_precision(inputs):
     observed = bind(inputs)
     assert observed == replace(original, dtype=replace(original.dtype, moe_quant_mode="w4a8_mxfp4_mxfp8_trtllm"))
     assert original.dtype.moe_quant_mode == "w4a16_mxfp4"
+
+
+def test_planner_rejects_inline_worker_missing_a_configured_moe_layer(inputs):
+    def omit_layer(proof):
+        worker = next(item["evidence"] for item in proof["artifacts"] if item["evidence"]["kind"] == "worker")
+        worker["initialized_moe"]["layers"].pop()
+        worker["initialized_moe"]["expected_layer_names"].pop()
+
+    edit_proof(inputs, omit_layer)
+    with pytest.raises(ValueError, match="model configuration inventory"):
+        bind(inputs)
 
 
 @pytest.mark.parametrize("instrumentation", [None, [], "verified"])

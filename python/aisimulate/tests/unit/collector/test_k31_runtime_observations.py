@@ -541,8 +541,8 @@ def test_native_state_mode_cannot_be_relabelled_fixed_one_page(monkeypatch, key,
         _physical_views(cache, scheduled, "fp8", context=4096)
 
 
-def _moe():
-    return {
+def _moe(*, indices=(1,)):
+    evidence = {
         "enumeration": "model.named_modules:RoutedExperts",
         "expected_layer_names": ["model.layers.1.experts"],
         "layers": [
@@ -559,6 +559,30 @@ def _moe():
             }
         ],
     }
+    layer = evidence["layers"][0]
+    evidence["layers"] = [{**copy.deepcopy(layer), "name": f"model.layers.{index}.experts"} for index in indices]
+    evidence["expected_layer_names"] = [item["name"] for item in evidence["layers"]]
+    return evidence
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_initialized_moe_coverage_matches_independent_config_inventory(wrapped):
+    config = {"num_hidden_layers": 7, "num_experts": 8, "first_k_dense_replace": 2, "moe_layer_freq": 2}
+    if wrapped:
+        config = {"text_config": config}
+    complete = _moe(indices=(2, 4, 6))
+    assert runtime_k31.moe_precision(complete, model_config=config) == "w4a8_mxfp4_mxfp8_trtllm"
+    # Dropping the layer from both worker-generated lists used to pass.
+    for indices in ((2, 6), (0, 2, 4, 6), (2, 4, 5), (1, 3, 5)):
+        with pytest.raises(ValueError, match="model configuration inventory"):
+            runtime_k31.moe_precision(_moe(indices=indices), model_config=config)
+
+
+def test_initialized_moe_inventory_uses_native_config_defaults():
+    config = {"num_hidden_layers": 3, "num_experts": 8}
+    assert runtime_k31.moe_precision(_moe(indices=(0, 1, 2)), model_config=config) == "w4a8_mxfp4_mxfp8_trtllm"
+    with pytest.raises(ValueError, match="model configuration inventory"):
+        runtime_k31.moe_precision(_moe(indices=(1, 2)), model_config=config)
 
 
 def test_initialized_expert_arithmetic_selects_exact_mode_and_rejects_metadata_guess():
@@ -695,6 +719,16 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
 def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
     path, launches = observation_fixture(tmp_path, version=runtime_k31.VERSION)
     launch = launches["tp2"]
+    model_path = Path(launch["model_config"]["path"])
+    model_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["KimiK31ForConditionalGeneration"],
+                "text_config": {"num_hidden_layers": 4, "num_experts": 8, "first_k_dense_replace": 1},
+            }
+        )
+    )
+    launch["model_config"]["sha256"] = hashlib.sha256(model_path.read_bytes()).hexdigest()
     launch["worker_type"] = workload_kind
     launch["precision"].update(
         gemm_quant_mode="bfloat16",
@@ -726,6 +760,7 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
         record_path = tmp_path / ref["path"]
         record = json.loads(record_path.read_text())
         record["bundle_sha256"] = bundle.sha256
+        record["model_config_sha256"] = launch["model_config"]["sha256"]
         record["runtime"] = {**pinned, "image": launch["deployment"]["image"]}
         config = record["resolved_config"]
         config["parallel_config"].update(
@@ -739,7 +774,7 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
         config["attention_config"] = {"backend": "FLASHINFER_MLA_SPARSE", "indexer_kv_dtype": "fp8"}
         record["cache"] = copy.deepcopy(cache if record["kind"] == "worker" else scheduled)
         if record["kind"] == "worker":
-            record["initialized_moe"] = _moe()
+            record["initialized_moe"] = _moe(indices=(1, 2, 3))
             record["attention_backend"] = ["FLASHINFER_MLA_SPARSE", "KIMI_K3_KDA", "DEEPSEEK_V32_INDEXER"]
             record["attention_groups"] = [
                 {"group_id": 0, "backend": "FLASHINFER_MLA_SPARSE", "layer_names": ["mla.0", "mla.1"]},
@@ -750,6 +785,27 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
         ref["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
     path.write_text(json.dumps(index))
     return path, launches
+
+
+def test_import_rejects_worker_with_self_consistent_but_missing_configured_moe_layer(tmp_path, monkeypatch):
+    from collector.fpm_forward.runtime_observations import validate_observation_phase
+
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    launch = launches["tp2"]
+    assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+
+    def omit_layer(record):
+        if record["kind"] == "worker" and record["dp_rank"] == 0 and record["tp_rank"] == 1:
+            evidence = record["initialized_moe"]
+            evidence["layers"].pop()
+            evidence["expected_layer_names"].pop()
+
+    _mutate(path, omit_layer)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert any("model configuration inventory" in message for message in result["diagnostics"])
+    with pytest.raises(ValueError, match="model configuration inventory"):
+        validate_observation_phase(path, "tp2", launch, phase="decode", attempt_id="attempt-001")
 
 
 @pytest.mark.parametrize("rows", [1, 63, 64, 65])

@@ -11,6 +11,7 @@ raw geometry, configuration, physical views, and pool accounting itself.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import re
 from importlib.resources import files
@@ -297,6 +298,15 @@ def _validate_record(
             or config["cache_config"].get("mamba_cache_mode") != "none"
         ):
             raise ValueError("K3.1 initialization requires native mamba none and prefix caching disabled")
+        if kind == "worker":
+            from .runtime_k31 import moe_precision
+            from .runtime_probe import _model_config_bytes
+
+            # Use the hash-bound checkpoint config, independently of the
+            # worker's model-tree enumeration. All downstream consumers
+            # revalidate this record before admitting its precision evidence.
+            source = _model_config_bytes(launch["model_config"])["model-config.json"]
+            moe_precision(record.get("initialized_moe"), model_config=json.loads(source))
     if launch["identity"]["model_kind"] == "moe":
         parallel = config["parallel_config"]
         enabled = parallel["enable_expert_parallel"]

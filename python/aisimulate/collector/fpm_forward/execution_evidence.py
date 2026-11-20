@@ -610,6 +610,14 @@ def inspect_execution_evidence(
                         is_audited_runtime(native_worker.get("runtime"))
                         and native_worker["runtime"]["version"] == collection.backend_version
                     ):
+                        expected_runtime = dict(native_worker["runtime"])
+                        execution_runtime = payload.get("runtime")
+                        if isinstance(execution_runtime, dict) and "image" not in execution_runtime:
+                            expected_runtime.pop("image", None)
+                        if execution_runtime != expected_runtime:
+                            raise ValueError(
+                                "execution runtime source identity differs from the validated initialized worker"
+                            )
                         audited_runtime_ranks.add(rank)
                     item["runtime_observation_binding"] = snapshot_source
                     _validate_native_attention_groups(groups, native_worker)

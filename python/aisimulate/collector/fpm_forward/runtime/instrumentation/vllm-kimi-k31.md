@@ -90,6 +90,13 @@ is redistributed by this adapter.
   `mxfp4`, to `w4a8_mxfp4_mxfp8_trtllm`. Missing, mixed, BF16 or other backend
   evidence is rejected. Linear layers remain the native unquantized base type.
   A checkpoint's MXFP4 declaration does not establish expert activation dtype.
+  Import independently checks the expert-layer indices against the hash-bound
+  checkpoint's decoder configuration (`num_hidden_layers`, `num_experts`,
+  `first_k_dense_replace`, and `moe_layer_freq`), using the pinned native dense
+  prefix and frequency defaults of 0 and 1. The current PP1 restriction means
+  each worker must cover that complete inventory; matching incomplete model-tree
+  lists cannot establish precision. The referenced local model config must
+  remain available for this check when observations are imported or revalidated.
 * `gpu_worker.py`, both model runners, and the pinned Dynamo scheduler preserve
   the existing post-profile, post-cache-initialization and post-warmup hooks.
   Native exceptions propagate. Probe evidence records actual initialized state;

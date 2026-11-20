@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 VERSION = "0.1.dev24216+g266e88c05"
@@ -63,7 +64,7 @@ def _nonnegative(value, label):
     return value
 
 
-def moe_precision(evidence):
+def moe_precision(evidence, *, model_config=None):
     if not isinstance(evidence, dict) or evidence.get("enumeration") != "model.named_modules:RoutedExperts":
         raise ValueError("Kimi K3.1 runtime weight precision requires initialized MoE backend and activation evidence")
     layers = evidence.get("layers")
@@ -75,6 +76,24 @@ def moe_precision(evidence):
         raise ValueError("K3.1 initialized MoE layer names must be nonempty strings")
     if len(set(names)) != len(names) or set(names) != set(expected) or len(expected) != len(set(expected)):
         raise ValueError("K3.1 initialized MoE layer coverage is inconsistent")
+    if model_config is not None:
+        # Pinned models/kimi_k3/nvidia/model.py::KimiDecoderLayer selects
+        # expert layers by decoder index, dense prefix and MoE frequency.
+        # kimi_linear.py::KimiLinearConfig defaults the latter two to 0/1.
+        # Import currently supports PP1, so each worker owns this inventory;
+        # module-name equality across workers is neither needed nor sufficient.
+        config = model_config.get("text_config", model_config)
+        if not isinstance(config, dict):
+            raise ValueError("K3.1 decoder configuration must be an object")
+        count = _positive(config.get("num_hidden_layers"), "decoder layer count")
+        _positive(config.get("num_experts"), "configured expert count")
+        first = _nonnegative(config.get("first_k_dense_replace", 0), "dense layer prefix")
+        frequency = _positive(config.get("moe_layer_freq", 1), "MoE layer frequency")
+        inventory = {index for index in range(first, count) if index % frequency == 0}
+        matches = [re.search(r"(?:^|\.)layers\.(\d+)\.", name) for name in names]
+        indices = [int(match[1]) for match in matches if match is not None]
+        if len(indices) != len(names) or len(set(indices)) != len(names) or set(indices) != inventory:
+            raise ValueError("K3.1 initialized MoE layer coverage differs from the model configuration inventory")
     modes = set()
     for layer in layers:
         if (
