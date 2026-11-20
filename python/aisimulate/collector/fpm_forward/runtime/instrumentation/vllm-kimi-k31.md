@@ -35,6 +35,14 @@ installed-file pin. The installed helper must also match before observation
 can qualify. This source inspection does not requalify image execution or
 refresh previously collected runtime observations.
 
+The inherited indexer backend implementation in
+[`vllm/v1/attention/backends/mla/indexer.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/attention/backends/mla/indexer.py)
+is also pinned at that immutable revision, with SHA-256
+`b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60`.
+`KimiK3IndexerBackend` delegates FP8 kernel-block selection to
+`DeepseekV32IndexerBackend`, whose CUDA rule is 64 tokens. Matching the
+subclass, backend name and block size does not replace this source check.
+
 ## Source-to-observation mapping
 
 * `v1/kv_cache_interface.py`: `KVCacheTensor.layers`, `layer_stride`,
@@ -78,6 +86,10 @@ refresh previously collected runtime observations.
   `model_executor/layers/attention/mla_attention.py`, and the sparse MLA backends:
   MLA and indexer retain full-history token pages. Explicit `flashmla` or
   `trtllm_mla` policy must match the observed sparse backend and FP8 indexer.
+  Import independently binds MLA payload to checkpoint `kv_lora_rank` and
+  `qk_rope_head_dim`: TRT-LLM uses their FP8 sum; FlashMLA's audited 512/64
+  geometry uses a 656-byte row (512 FP8 latent bytes, 16 scale bytes and
+  128 BF16 RoPE bytes). Native padded page sizes remain separately accounted.
   Native pool-group block sizes remain distinct from an attention backend's
   kernel block size. `worker/gpu/attn_utils.py::init_kv_cache` binds the views
   produced by `worker/utils.py::AttentionGroup.map_kv_cache_to_kernel_blocks`.

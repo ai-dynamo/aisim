@@ -255,6 +255,57 @@ def test_preparation_preserves_slurm_failure_streams_across_retries(runner, monk
     assert all(json.loads(path.joinpath("failure.json").read_text())["executable"] == "srun" for path in records)
 
 
+@pytest.mark.parametrize("overlay", [False, True], ids=["image-only", "pythonpath-overlay"])
+def test_detection_and_attempt_provenance_use_the_same_runtime_environment(runner, monkeypatch, overlay):
+    from collector.fpm_forward.runner import RUNTIME_ENV_FILENAME, _write_runtime_environment
+
+    from aisimulate.support import versioning
+    from aisimulate.support.schema import FPMDeployment
+
+    # Real Python startup and importlib.metadata, with tiny synthetic package
+    # metadata standing in for the image and its mounted runtime overlay.
+    image = runner.cell_dir / "image metadata"
+    mounted = runner.cell_dir / "overlay metadata"
+    for directory, version in ((image, "0.25.1"), (mounted, "0.25.1+overlay")):
+        info = directory / f"vllm-{version}.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: vllm\nVersion: {version}\n")
+    monkeypatch.setenv("PYTHONPATH", str(image))
+    extra_env = [{"name": "PYTHONPATH", "value": str(mounted) + os.pathsep + str(image)}] if overlay else []
+    deployment = FPMDeployment(executor="slurm", image=runner.image, extra_env=extra_env or None)
+
+    def detect(command, **kwargs):
+        return subprocess.run(
+            command[command.index("env") :], check=True, capture_output=True, text=True, timeout=10
+        ).stdout
+
+    monkeypatch.setattr(versioning, "_run", detect)
+    detected = versioning.detect_runtime_versions(deployment)["backend_version"]
+    assert detected == ("0.25.1+overlay" if overlay else "0.25.1")
+    _write_runtime_environment(runner.cell_dir, {"K8sConfig": {"extra_env": extra_env}})
+    runner.hosts = ["test-node"]
+    runner.stage(runner.pods(), [runner.cell_dir / RUNTIME_ENV_FILENAME])
+    raw = runner.cell_dir / "raw/node0000"
+    staged = runner.cell_dir / "slurm-runtime"
+
+    def execute(command, **kwargs):
+        # Substitute only the container mounts; execute the emitted environment,
+        # shell and Python command instead of mocking metadata/version results.
+        program = [
+            arg.replace("/tmp/fpm-bench/", str(staged) + "/").replace("/results", str(raw))
+            for arg in command[command.index("/usr/bin/env") :]
+        ]
+        return subprocess.run(program, check=True, capture_output=True, text=True, timeout=10)
+
+    monkeypatch.setattr(runner, "_command", execute)
+    runner.prepare_attempt(
+        runner.pods(), cell_id="cell", plan_sha256="plan", attempt_id="attempt", runtime_backend_version=detected
+    )
+    provenance = json.loads((raw / "collector-provenance.json").read_text())
+    assert provenance["runtime"]["backend_version"] == detected
+    assert provenance["attempt_id"] == "attempt"
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
 def test_wait_ready_rejects_unbounded_or_invalid_timeout(runner, timeout):
     with pytest.raises(ValueError, match="finite and positive"):
@@ -819,6 +870,10 @@ def test_profile_campaign_observes_slurm_version_before_native_collection(tmp_pa
             )
             assert raw.name == "node0000"
             program = args[args.index("/usr/bin/env") + 6 :]
+            if program[:2] == ["bash", "-c"]:
+                assert program[3] == "fpm-attempt-provenance"
+                assert "source /tmp/fpm-bench/collector-runtime-env.sh" in program[2]
+                program = program[4:]
             if program[:2] == ["python3", "-c"]:
                 # Execute the emitted program with the container's result mount mapped to disk.
                 with monkeypatch.context() as patch:

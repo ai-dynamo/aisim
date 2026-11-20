@@ -2320,8 +2320,8 @@ Within the Python distribution, the baseline original path and SHA-256 inventory
 source-bound vLLM interfaces is in
 [`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](https://github.com/ai-dynamo/aisim/blob/313c2d15fa6cef023bfd36517702cab8c901cec7/python/aisimulate/collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
 The inspected references
-`vllm/model_executor/models/config.py`, `vllm/v1/attention/backends/registry.py`,
-and `vllm/v1/attention/backends/mla/indexer.py` listed above are outside that
+`vllm/model_executor/models/config.py` and `vllm/v1/attention/backends/registry.py`
+listed above are outside that
 hash inventory. The adjacent
 [`collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md`](https://github.com/ai-dynamo/aisim/blob/313c2d15fa6cef023bfd36517702cab8c901cec7/python/aisimulate/collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md)
 records their observation contracts.
@@ -2342,6 +2342,19 @@ revision matches its existing installed-file pin. Observation requires the
 installed helper to match as well; this source inspection does not requalify
 image execution or refresh historical runtime evidence. No upstream code is
 redistributed by this addition.
+The inherited CUDA indexer rule is additionally pinned to the unmodified
+`vllm/v1/attention/backends/mla/indexer.py` at the same immutable commit:
+https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/attention/backends/mla/indexer.py
+(SHA-256 `b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60`).
+The MLA payload checks in `runtime_k31.py` and their synthetic collector tests
+also follow `vllm/models/kimi_k3/nvidia/mla.py`,
+`vllm/model_executor/layers/attention/mla_attention.py`,
+`vllm/v1/kv_cache_interface.py` and
+`vllm/v1/attention/backends/mla/flashmla_sparse.py` at that same revision:
+https://github.com/vllm-project/vllm/tree/266e88c051ca46607fd9de20216bd58426f80052
+These files are Apache-2.0, Copyright contributors to the vLLM project.
+The mappings, manifest, adjacent observation contract and tests are modified
+AISimulate integrations; no upstream implementation is redistributed.
 The source mapping also reads Dynamo's
 `components/src/dynamo/vllm/instrumented_scheduler.py` at immutable commit
 `17628144dc33c9d5916b08789f9d317924217dad`:

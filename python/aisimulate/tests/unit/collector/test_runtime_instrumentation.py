@@ -125,8 +125,14 @@ def test_probe_observer_refuses_layer_strided_cache_records(tmp_path, monkeypatc
     assert "cache" not in record
     assert "layer-strided cache tensor records need an audited instrumentation adapter" in record["error"]
     for field in ("cell_id", "collector_attempt_id"):
-        assert record.get(field) == context.get(field)
+        if field in context:
+            assert record[field] == context[field]
+        else:
+            assert field not in record
     probe.observe("scheduler", _scheduler, version="0.32.0", dp_rank=0, cache_config=_config)
     record = json.loads(next((tmp_path / "out").glob("runtime-observation-scheduler-*.json")).read_text())
     for field in ("cell_id", "collector_attempt_id"):
-        assert record.get(field) == context.get(field)
+        if field in context:
+            assert record[field] == context[field]
+        else:
+            assert field not in record

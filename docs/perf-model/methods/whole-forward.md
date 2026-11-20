@@ -25,8 +25,10 @@ does not require new operation-level timing tables first.
 For autoregressive text inference, select the existing `text_only` FPM option
 and leave speculative decoding disabled. The whole-forward SOL transfer uses
 the original model graph, including the KDA byte model and its fractional
-prefill coordinates. Exact measured hits retain their recorded latency. This
-does not establish support for visual inputs or KDA speculative verification.
+prefill coordinates. Exact measured hits retain their recorded latency before
+online correction (or when correction is disabled). Enabled correction can
+change the public estimate. This does not establish support for visual inputs
+or KDA speculative verification.
 
 FP8 collection requires `--fpm-attention-backend=flashmla` or `trtllm_mla`.
 For the K3.1 vLLM runtime these request `FLASHMLA_SPARSE` and

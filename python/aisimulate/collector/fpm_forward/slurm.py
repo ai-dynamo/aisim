@@ -293,7 +293,7 @@ class SlurmCellRunner:
         expected_backend_version: str | None = None,
         runtime_backend_version: str | None = None,
     ) -> None:
-        from .runner import _attempt_provenance_command
+        from .runner import RUNTIME_ENV_FILENAME, _attempt_provenance_command
 
         command = _attempt_provenance_command(
             cell_id=cell_id,
@@ -302,6 +302,16 @@ class SlurmCellRunner:
             expected_backend_version=expected_backend_version,
             runtime_backend_version=runtime_backend_version,
         )
+        # Match fpm_exec.sh: startup settings must select the runtime before
+        # Python imports package metadata, including a staged PYTHONPATH overlay.
+        command = [
+            "bash",
+            "-c",
+            f"set -e; if [[ -f /tmp/fpm-bench/{RUNTIME_ENV_FILENAME} ]]; then "
+            f'source /tmp/fpm-bench/{RUNTIME_ENV_FILENAME}; fi; exec "$@"',
+            "fpm-attempt-provenance",
+            *command,
+        ]
         for unit in pods:
             self._exec(unit, command, timeout=300)
 

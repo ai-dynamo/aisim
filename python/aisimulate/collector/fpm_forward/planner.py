@@ -877,6 +877,7 @@ def _observed_k31_capability(
     probe = build_runtime_probe_plan("collection", launch, bundle)
     if probe.capability.model_config.sha256 != capability.model_config.sha256:
         raise ValueError("K3.1 observed MoE model configuration differs from the current checkpoint")
+    checkpoint_config = observations._checkpoint_config(launch)
     identity = launch["identity"]
     if (
         (
@@ -952,7 +953,12 @@ def _observed_k31_capability(
             binding = {key: proof[key] for key in ("attempt_id", "configuration", "bundle_sha256")}
             binding["phase"] = phase
             config = observations._validate_record(
-                record, launch=launch, bundle=bundle, binding=binding, cell=observations._launch_cell(launch, phase)
+                record,
+                launch=launch,
+                bundle=bundle,
+                binding=binding,
+                cell=observations._launch_cell(launch, phase),
+                checkpoint_config=checkpoint_config,
             )
             observations._validate_import_binding(record, runtime_binding(), bundle)
             dp, tp, pp = (record.get(key) for key in ("dp_rank", "tp_rank", "pp_rank"))
@@ -997,7 +1003,13 @@ def _observed_k31_capability(
             if not isinstance(capacity, dict):
                 raise ValueError("K3.1 observed MoE rank capacity must be an object")
             key = tuple(capacity.get(name) for name in ("phase", "dp_rank", "tp_rank"))
-            if key in capacity_by_rank or type(key[1]) is not int or type(key[2]) is not int:
+            if (
+                type(key[0]) is not str
+                or key[0] not in options.workload_kinds
+                or type(key[1]) is not int
+                or type(key[2]) is not int
+                or key in capacity_by_rank
+            ):
                 raise ValueError("K3.1 observed MoE rank capacity is duplicated or invalid")
             capacity_by_rank[key] = capacity
         if set(capacity_by_rank) != expected:

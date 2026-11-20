@@ -41,7 +41,12 @@ def test_audited_runtime_still_requires_complete_source_map():
     manifest = Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json"
     runtime = json.loads(manifest.read_text())["runtime"]
     assert runtime_k31.is_audited_runtime(runtime)
-    runtime["source_files"].pop(next(iter(runtime["source_files"])))
+    assert runtime["source_files"].pop("vllm/v1/attention/backends/mla/indexer.py") == (
+        "b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60"
+    )
+    runtime["source_revision"] = hashlib.sha256(
+        json.dumps(runtime["source_files"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     assert not runtime_k31.is_audited_runtime(runtime)
 
 
@@ -73,14 +78,19 @@ class _Tensor:
         return (self.block_stride // self.size, *reversed(result))
 
 
-def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=True, attention_block=64, payload_scale=1):
+def _native_fixture(
+    monkeypatch, *, uniform=False, scheduler_projection=True, attention_block=64, payload_scale=1, mla_width=None
+):
     adapter = _adapter(monkeypatch)
     scale = attention_block // 64 * payload_scale
-    pool_page = 512 * scale
+    mla_page = max(128 * scale, attention_block * 656) if mla_width is not None else 128 * scale
+    pool_page = max(512 * scale, 2 * mla_page + 128 * scale)
+    quantum = 64 * payload_scale
+    pool_page = (pool_page + quantum - 1) // quantum * quantum
     storage = _Storage(1234, 10 * pool_page)
     layers, groups, placements = {}, [], []
     for stem, page, width in (
-        ("mla", 128 * scale, 2 * payload_scale),
+        ("mla", mla_page, mla_width if mla_width is not None else 2 * payload_scale),
         ("indexer", 64 * scale, payload_scale),
         ("kda", 64, None),
     ):
@@ -126,9 +136,9 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=True, at
     if uniform:
         # Native packed grouping places MLA and indexer in the SAME token
         # block table while retaining their different per-layer page sizes.
-        placements[1].offset = 256 * scale
+        placements[1].offset = 2 * mla_page
         for name in groups[1].layer_names:
-            layers[name].kv_cache.offset += 256 * scale
+            layers[name].kv_cache.offset += 2 * mla_page
         wrapped = []
         for entries in (groups[:2], groups[2:]):
             spec = _typed("vllm.v1.kv_cache_interface", "UniformTypeKVCacheSpecs")
@@ -352,20 +362,26 @@ def test_scheduler_projection_retains_exact_native_geometry_checks(monkeypatch, 
         _physical_views(cache, scheduled, "fp8", context=4096)
 
 
-def _kernel_view_fixture(monkeypatch, *, indexer_width=16):
+def _kernel_view_fixture(monkeypatch, *, indexer_width=16, mla_width=None):
     cache, scheduled, _ = _native_fixture(
-        monkeypatch, uniform=True, scheduler_projection=True, attention_block=128, payload_scale=indexer_width
+        monkeypatch,
+        uniform=True,
+        scheduler_projection=True,
+        attention_block=128,
+        payload_scale=indexer_width,
+        mla_width=mla_width,
     )
     cache["kernel_block_views"] = {}
+    stride = cache["tensor_allocations"][0]["block_stride"] // (64 * indexer_width)
     for name in ("indexer.0", "indexer.1"):
         cache["layer_components"][name][0].update(
-            shape=[146, 64, indexer_width], stride_bytes=[64 * indexer_width, indexer_width, 1]
+            shape=[9 * stride + 2, 64, indexer_width], stride_bytes=[64 * indexer_width, indexer_width, 1]
         )
         cache["kernel_block_views"][name] = {
             "attention_group_class": "vllm.v1.worker.utils.AttentionGroup",
             "backend_class": "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend",
             "kernel_block_size": 64,
-            "kernel_block_stride": 16,
+            "kernel_block_stride": stride,
             "kernel_block_offsets": [0, 1],
             # CP1: ceil(4096 / 128) manager entries, aligned to 128
             # tokens, then two kernel entries per manager block.
@@ -765,7 +781,10 @@ def test_observer_preserves_unsupported_runtime_mode_as_failure(monkeypatch, set
         adapter.worker_memory(worker)
 
 
-def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "changed_source", ["vllm/v1/worker/block_table.py", "vllm/v1/attention/backends/mla/indexer.py"]
+)
+def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch, tmp_path, changed_source):
     _adapter(monkeypatch)
     observer = importlib.import_module("collector.fpm_forward.runtime.instrumentation.observer")
     caller = tmp_path / "utils.py"
@@ -773,6 +792,9 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
     path = tmp_path / "block_table.py"
     path.write_text("# synthetic block-table helper source identity fixture\n")
     installed_files = {"vllm/v1/worker/utils.py": caller, "vllm/v1/worker/block_table.py": path}
+    indexer = tmp_path / "indexer.py"
+    indexer.write_text("# synthetic inherited indexer source identity fixture\n")
+    installed_files["vllm/v1/attention/backends/mla/indexer.py"] = indexer
     source_map = {name: hashlib.sha256(source.read_bytes()).hexdigest() for name, source in installed_files.items()}
     source_revision = hashlib.sha256(json.dumps(source_map, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     manifest = {
@@ -789,8 +811,8 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
     observer._runtime(payload, manifest, runtime_k31.VERSION)
     assert payload["source_identity"]["vllm_commit_id"] == "g266e88c05"
     assert payload["runtime"]["source_files"] == source_map
-    path.write_text("# changed after source audit\n")
-    with pytest.raises(ValueError, match="source hash differs: vllm/v1/worker/block_table.py"):
+    installed_files[changed_source].write_text("# changed after source audit\n")
+    with pytest.raises(ValueError, match="source hash differs: " + changed_source):
         observer._runtime(payload, manifest, runtime_k31.VERSION)
     assert hashlib.sha256(caller.read_bytes()).hexdigest() == source_map["vllm/v1/worker/utils.py"]
     build.__commit_id__ = "g99999999"
@@ -808,6 +830,8 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
                 "architectures": ["KimiK31ForConditionalGeneration"],
                 "text_config": {
                     "num_hidden_layers": 4,
+                    "kv_lora_rank": 512,
+                    "qk_rope_head_dim": 64,
                     "num_experts": 8,
                     "first_k_dense_replace": 1,
                     "linear_attn_config": {
@@ -841,11 +865,11 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
     manifest_path.write_text(json.dumps(manifest))
     bundle = load_instrumentation(manifest_path)
     if packed_indexer:
-        cache, scheduled = _kernel_view_fixture(monkeypatch, indexer_width=132)
+        cache, scheduled = _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=576)
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     else:
-        cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, payload_scale=132)
+        cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, payload_scale=132, mla_width=576)
     index = json.loads(path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
     attempt["bundle"]["sha256"] = bundle.sha256
@@ -970,7 +994,9 @@ def test_import_rejects_matching_worker_scheduler_omission_of_one_kda_group(tmp_
 @pytest.mark.parametrize("rows", [1, 63, 64, 65])
 def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, rows):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
-    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132)]
+    cache, _ = [
+        _decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=576)
+    ]
     for mapping in cache["kernel_block_views"].values():
         mapping["kernel_block_table_shape"][1] = rows
 
@@ -993,7 +1019,9 @@ def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, row
 @pytest.mark.parametrize("width", [32, 62, 64, 66])
 def test_import_checks_kernel_table_width_against_reviewed_context(tmp_path, monkeypatch, width):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
-    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132)]
+    cache, _ = [
+        _decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=576)
+    ]
     for mapping in cache["kernel_block_views"].values():
         mapping["kernel_block_table_shape"] = [1, 64, width]
 
@@ -1113,7 +1141,9 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(
     assert result["status"] == "complete", result["diagnostics"]
     assert len(result["resources"]["cache_groups"]) == 2
     assert result["resources"]["cache_groups"][-1]["blocks_per_request"] == 1
-    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 512 * 132
+    # Two 656-byte padded MLA rows plus two 132-byte indexer rows per token,
+    # 64 tokens per block, aligned to 12 indexer kernel pages per pool slot.
+    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 12 * 64 * 132
     assert len(result["provenance"]["rank_capacities"]) == 4
     assert {capacity["phase"] for capacity in result["provenance"]["rank_capacities"]} == {workload_kind}
     for artifact in result["provenance"]["artifacts"]:
@@ -1176,6 +1206,30 @@ def test_import_rejects_self_consistent_indexer_payload_not_matching_checkpoint(
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None
     assert "indexer payload differs from the checkpoint" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["direct-indexer", "mapped-indexer"])
+def test_import_rejects_self_consistent_undersized_mla_payload(tmp_path, monkeypatch, packed):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=packed)
+    assert validate_observations(path, launches)["tp2"]["status"] == "complete"
+
+    def corrupt(record):
+        cache = record["cache"]
+        group = cache["groups"][0]
+        for name, spec in group.get("layer_specs", dict.fromkeys(group["layer_names"], group)).items():
+            if name.endswith(".self_attn.attn"):
+                spec["unpadded_page_size_bytes"] = 512 * spec["block_size_tokens"]
+                if record["kind"] == "worker":
+                    view = cache["layer_components"][name][0]
+                    view["shape"][2] = 512
+                    view["stride_bytes"][1] = 512
+
+    # Matching views and scheduler data still do not prove the checkpoint's
+    # 512 latent + 64 RoPE FP8 payload; leave all padding/allocation unchanged.
+    _mutate(path, corrupt)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert "MLA payload differs from the checkpoint and backend geometry" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("block", [4, 32])

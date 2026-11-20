@@ -77,7 +77,7 @@ def inputs(tmp_path, monkeypatch, request):
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
     if packed_indexer:
         cache, scheduled = [
-            _decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132)
+            _decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=576)
         ]
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
@@ -106,7 +106,12 @@ def inputs(tmp_path, monkeypatch, request):
                 for name, spec in specs.items():
                     if name.endswith(".self_attn.attn"):
                         spec["cache_dtype_str"] = "fp8_ds_mla"
+                        spec["unpadded_page_size_bytes"] = 656 * spec["block_size_tokens"]
             if record["kind"] == "worker":
+                for name, components in record["cache"]["layer_components"].items():
+                    if name.endswith(".self_attn.attn"):
+                        components[0]["shape"][2] = 656
+                        components[0]["stride_bytes"][1] = 656
                 record["attention_backend"][0] = "FLASHMLA_SPARSE"
                 record["attention_groups"][0]["backend"] = "FLASHMLA_SPARSE"
         record["instrumentation_binding"] = {
@@ -214,14 +219,93 @@ def test_valid_imported_native_proof_changes_only_moe_precision(inputs):
     assert original.dtype.moe_quant_mode == "w4a16_mxfp4"
 
 
-def test_planner_rejects_inline_worker_missing_a_configured_moe_layer(inputs):
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_planner_rejects_inline_worker_missing_a_configured_moe_layer(inputs, tp_rank):
     def omit_layer(proof):
-        worker = next(item["evidence"] for item in proof["artifacts"] if item["evidence"]["kind"] == "worker")
+        worker = next(
+            item["evidence"]
+            for item in proof["artifacts"]
+            if item["evidence"]["kind"] == "worker" and item["evidence"]["tp_rank"] == tp_rank
+        )
         worker["initialized_moe"]["layers"].pop()
         worker["initialized_moe"]["expected_layer_names"].pop()
 
     edit_proof(inputs, omit_layer)
     with pytest.raises(ValueError, match="model configuration inventory"):
+        bind(inputs)
+
+
+def test_planner_prepares_one_checkpoint_snapshot_but_checks_each_rank(inputs, monkeypatch):
+    from collector.fpm_forward import runtime_observations as observations
+
+    original_load = observations._checkpoint_config
+    original_validate = observations._validate_record
+    snapshots, workers = [], []
+
+    def load(launch):
+        snapshot = original_load(launch)
+        snapshots.append(snapshot)
+        return snapshot
+
+    def validate(record, **kwargs):
+        assert kwargs["checkpoint_config"] is snapshots[0]
+        if record["kind"] == "worker":
+            workers.append((record["dp_rank"], record["tp_rank"]))
+        return original_validate(record, **kwargs)
+
+    monkeypatch.setattr(observations, "_checkpoint_config", load)
+    monkeypatch.setattr(observations, "_validate_record", validate)
+    assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
+    assert len(snapshots) == 1
+    assert workers == [(0, 0), (0, 1)]
+
+
+@pytest.mark.parametrize("field", ["phase", "dp_rank", "tp_rank"])
+@pytest.mark.parametrize("value", [[], {}, True, None, "invalid"])
+def test_inline_capacity_rejects_malformed_fields_before_hashing(inputs, field, value):
+    edit_proof(inputs, lambda proof: proof["rank_capacities"][0].update({field: value}))
+    with pytest.raises(ValueError, match="rank capacity is duplicated or invalid"):
+        bind(inputs)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_inline_capacity_still_requires_unique_complete_coverage(inputs, duplicate):
+    def change(proof):
+        ranks = proof["rank_capacities"]
+        if duplicate:
+            ranks.append(copy.deepcopy(ranks[0]))
+        else:
+            ranks.pop()
+
+    edit_proof(inputs, change)
+    match = "rank capacity is duplicated" if duplicate else "rank capacity coverage is incomplete"
+    with pytest.raises(ValueError, match=match):
+        bind(inputs)
+
+
+@pytest.mark.parametrize("inputs", ["trtllm_mla", "flashmla"], indirect=True)
+@pytest.mark.parametrize("width", [512, None], ids=["undersized", "native"])
+def test_mla_payload_is_bound_to_checkpoint_and_backend_despite_matching_views(inputs, width):
+    if width is None:
+        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
+        return
+
+    def change(proof):
+        for artifact in proof["artifacts"]:
+            record = artifact["evidence"]
+            group = record["cache"]["groups"][0]
+            for name, spec in group.get("layer_specs", dict.fromkeys(group["layer_names"], group)).items():
+                if name.endswith(".self_attn.attn"):
+                    spec["unpadded_page_size_bytes"] = width * spec["block_size_tokens"]
+            if record["kind"] == "worker":
+                for name, components in record["cache"]["layer_components"].items():
+                    if name.endswith(".self_attn.attn"):
+                        components[0]["shape"][2] = width
+                        components[0]["stride_bytes"][1] = width
+
+    # Preserve native padded pages, offsets, pool accounting and rank capacity.
+    edit_proof(inputs, change)
+    with pytest.raises(ValueError, match="MLA payload differs from the checkpoint and backend geometry"):
         bind(inputs)
 
 

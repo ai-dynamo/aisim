@@ -377,6 +377,28 @@ def metadata_builder_count(config):
     return _positive(parallel.get("num_ubatches"), "metadata builder count") if enabled else 1
 
 
+def _validate_mla_payload(spec, config, model_config):
+    # vLLM 266e88c051ca46607fd9de20216bd58426f80052:
+    # models/kimi_k3/nvidia/mla.py::MultiHeadLatentAttention sets head_size to
+    # kv_lora_rank + qk_rope_head_dim. MLAAttention.get_kv_cache_spec and
+    # v1/kv_cache_interface.py::MLAAttentionSpec use that FP8 latent width
+    # for FLASHINFER_MLA_SPARSE. flashmla_sparse.py documents the separate
+    # 656-byte fp8_ds_mla row: 512 FP8 NoPE + 16 scale + 128 BF16 RoPE bytes.
+    decoder = model_config.get("text_config", model_config)
+    latent = _positive(decoder.get("kv_lora_rank"), "MLA latent dimension")
+    rope = _positive(decoder.get("qk_rope_head_dim"), "MLA RoPE dimension")
+    backend = config["attention_config"]["backend"]
+    if backend == "FLASHINFER_MLA_SPARSE":
+        token_bytes = latent + rope
+    elif backend == "FLASHMLA_SPARSE" and (latent, rope) == (512, 64):
+        token_bytes = 656
+    else:
+        raise ValueError("K3.1 checkpoint MLA geometry has no audited backend payload mapping")
+    # Check logical payload independently of native page padding and allocation.
+    if spec.get("unpadded_page_size_bytes") != token_bytes * spec["block_size_tokens"]:
+        raise ValueError("K3.1 MLA payload differs from the checkpoint and backend geometry")
+
+
 def validate_attention_assignments(worker, *, model_config=None, conv_state_layout="SD"):
     """Reconcile initialized layer backends and dtypes with resolved policy."""
     cache = worker["cache"]
@@ -430,6 +452,8 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
                             raise ValueError("K3.1 indexer payload differs from the checkpoint FP8 geometry")
                 if observed != dtype:
                     raise ValueError("K3.1 native cache spec dtype differs from the resolved cache layout")
+                if not cls.endswith("KimiK3IndexerCache") and model_config is not None:
+                    _validate_mla_payload(spec, config, model_config)
     assignments = worker.get("attention_groups")
     if not isinstance(assignments, list) or not assignments:
         raise ValueError("K3.1 native attention group assignments are missing")
