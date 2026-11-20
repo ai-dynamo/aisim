@@ -689,7 +689,10 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
             raise ValueError("Kimi processor do_resize=False is not modeled")
         if positive_int(settings.get("patch_size", vision_cfg["patch_size"]), "patch_size") != vision_cfg["patch_size"]:
             raise ValueError("Kimi processor patch_size must match vision_config")
-        merge = settings.get("merge_kernel_size", settings.get("merge_size", 2))
+        # A legacy media_proc_cfg container is not a second image processor.
+        # Check any explicit sidecar geometry without inventing defaults for it.
+        merge_default = media.get("merge_kernel_size", media.get("merge_size", 2)) if settings is processor_cfg else 2
+        merge = settings.get("merge_kernel_size", settings.get("merge_size", merge_default))
         if positive_int(merge, "merge_size") != vision_cfg.get("merge_kernel_size", [2, 2])[0]:
             raise ValueError("Kimi processor merge_size must match vision_config")
     for name in ("fixed_output_tokens", "in_patch_limit_video", "max_num_frames_each_video"):
@@ -2043,10 +2046,10 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
 
 
 def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, model_revision: str | None = None) -> dict:
-    """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
+    """Load Llama 4 processor metadata from the same pinned checkpoint."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
         return raw_config
-    if "image_processor_config" in raw_config:
+    if "image_processor_config" in raw_config and model_revision is None:
         return raw_config
     if os.path.isdir(model_path):
         processor_path = Path(model_path) / "preprocessor_config.json"
@@ -2062,6 +2065,9 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, model_
             **({"revision": model_revision} if model_revision else {}),
         )
     if processor_config is not None:
+        # A pinned serving processor loads preprocessor_config.json, rather
+        # than the model's inline image_processor_config. Keep bundled inline
+        # metadata as a fallback when there is no separate processor file.
         raw_config["image_processor_config"] = processor_config
     return raw_config
 

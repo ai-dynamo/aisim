@@ -381,6 +381,7 @@ def _fake_campaign(tmp_path, monkeypatch, *, packed=False, planar=False, version
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
         attempt["phases"][phase] = {
+            "status": "completed",
             "launch_manifest": reference(context_path),
             "artifacts": [{**reference(path), "kind": "observation"} for path in paths],
         }

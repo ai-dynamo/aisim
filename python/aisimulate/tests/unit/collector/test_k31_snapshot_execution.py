@@ -169,7 +169,7 @@ def snapshot(request):
     entry = index["configurations"]["tp2"]
     attempt = next(a for a in entry["attempts"] if a["attempt_id"] == entry["active_attempt_id"])
     phase = attempt["phases"]["decode"]
-    phase.update(cell_id="native-cell", collector_attempt_id="native-attempt")
+    phase.update(status="passed", cell_id="native-cell", collector_attempt_id="native-attempt")
     context_path = root / phase["launch_manifest"]["path"]
     context = json.loads(context_path.read_text())
     context.update(cell_id="native-cell", collector_attempt_id="native-attempt")

@@ -279,7 +279,12 @@ def test_detection_and_attempt_provenance_use_the_same_runtime_environment(runne
 
     def detect(command, **kwargs):
         return subprocess.run(
-            command[command.index("env") :], check=True, capture_output=True, text=True, timeout=10
+            command[command.index("bash") :],
+            input=kwargs["payload"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
         ).stdout
 
     monkeypatch.setattr(versioning, "_run", detect)
@@ -999,7 +1004,7 @@ def test_version_probe_and_attempt_provenance_share_startup_environment(runner, 
     run = subprocess.run
 
     def probe(command, **kwargs):
-        return run(command[command.index("env") :], **kwargs)
+        return run(command[command.index("bash") :], **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(versioning.subprocess, "run", probe)
