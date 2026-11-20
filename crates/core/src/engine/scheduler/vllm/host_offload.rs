@@ -1579,7 +1579,7 @@ impl VllmHostOffloadAdapter {
         self.host.lock().retime_loads(self.host.id());
     }
 
-    /// Load poll: bring a request's in-flight load forward to vLLM's copy end,
+    /// Load poll: set a request's in-flight completion to vLLM's copy end,
     /// `completes_at_ms`; see [`HostTier::retime_load`].
     pub(super) fn retime_load(&self, request: &VllmHostRequestState, completes_at_ms: f64) {
         if let Some(LoadState::Loading(load)) = &request.load {
@@ -4211,7 +4211,11 @@ mod tests {
             })
             .unwrap();
             // Five 64 B blocks restored in `copy_ms`.
-            let h2d_gbps = 320.0 / (copy_ms * 1e6);
+            let h2d_gbps = if copy_ms == 0.0 {
+                0.0 // The public configuration's unlimited-bandwidth setting.
+            } else {
+                320.0 / (copy_ms * 1e6)
+            };
             let args = MockEngineArgs::builder()
                 .num_gpu_blocks(16)
                 .block_size(4)
@@ -4403,12 +4407,12 @@ mod tests {
     }
 
     #[test]
-    fn work_that_resumes_before_an_idle_engine_sees_a_load_returns_it_to_the_poll() {
+    fn work_that_resumes_before_an_idle_engine_sees_a_load_waits_for_the_poll() {
         // The busy run with a 200 ms copy. Request 9 decodes while the load is
         // issued, so vLLM starts the copy when that pass's GPU work ends, 10 ms
-        // after the simulator does. Request 9 finishes first: at the
-        // simulator's copy end the engine is idle, and its empty steps would
-        // see the load 10 ms later. Request 7 arrives in between. Its prefill
+        // after the provisional lane did. Request 9 finishes first. Request
+        // 7 arrives 10 ms before the resolved copy end, while the engine is
+        // idle and the tier correctly still owns the in-flight load. Its prefill
         // pass k is decided then and ends the empty steps; its poll, 50 ms
         // into its launch, sees the copy, so the load is schedulable at k + 2.
         // Released at vLLM's copy end, it would join pass k + 1.
@@ -4416,20 +4420,54 @@ mod tests {
         run.submit(3, (0..30).collect(), 2);
         let follow_up = Uuid::from_u128(3);
         for _ in 0..64 {
-            if run.core.test_awaits_poll(follow_up) {
+            if !run.core.is_ready() {
                 break;
             }
             run.step();
         }
-        let idle_release_ms = run
+        assert!(!run.core.is_ready(), "request 9 finished before the copy");
+        let copy_end_ms = run
             .core
-            .test_unseen_idle_release_ms(follow_up)
-            .expect("an idle engine waits for vLLM's copy end");
-        assert_eq!(idle_release_ms - run.now, 10.0);
+            .next_internal_deadline_ms()
+            .expect("the in-flight load keeps its copy deadline");
+        assert!(copy_end_ms - 10.0 >= run.now);
+        run.now = copy_end_ms - 10.0;
+        run.core.process_internal_work(run.now);
+        assert!(run.core.test_has_host_load(follow_up));
+        assert!(!run.core.test_awaits_poll(follow_up));
+        assert_eq!(run.core.test_unseen_idle_release_ms(follow_up), None);
         run.submit(7, (700..708).collect(), 4);
         run.until_admitted(3);
         let k = admitted_in(&run, 7).expect("request 7 ran first");
         assert_eq!(admitted_in(&run, 3), Some(k + 2));
+    }
+
+    #[derive(Default)]
+    struct LoadCapture {
+        queued: Mutex<Vec<(Uuid, f64, Vec<HostBlockKey>)>>,
+        completed: Mutex<Vec<(Uuid, f64)>>,
+    }
+
+    impl HostOffloadObserver for LoadCapture {
+        fn record(&self, observation: HostOffloadObservation<'_>) {
+            match observation.event {
+                HostOffloadObservationData::LoadQueued {
+                    completes_at_ms,
+                    blocks,
+                    ..
+                } => self.queued.lock().unwrap().push((
+                    observation.request_id,
+                    completes_at_ms,
+                    blocks.to_vec(),
+                )),
+                HostOffloadObservationData::LoadCompleted { at_ms, .. } => self
+                    .completed
+                    .lock()
+                    .unwrap()
+                    .push((observation.request_id, at_ms)),
+                _ => {}
+            }
+        }
     }
 
     /// Run requests 3 and 6, which load different prefixes, under
@@ -4444,16 +4482,50 @@ mod tests {
             Some(PollRun::LAUNCH),
             &[(1, 0..22), (5, 100..122)],
         );
+        let observed = Arc::new(LoadCapture::default());
+        run.core
+            .host_offload()
+            .unwrap()
+            .host
+            .lock()
+            .set_observer(observed.clone());
         run.submit(3, (0..22).collect(), 2);
         run.submit(6, (100..122).collect(), 2);
         let ids = [Uuid::from_u128(3), Uuid::from_u128(6)];
         let (mut issued, mut awaited, mut released) = ([None; 2], [false; 2], [None; 2]);
+        let mut copy_ends = Vec::new();
         while released.iter().any(Option::is_none) && run.passes.len() < 32 {
             let pass = run.passes.len();
             run.step();
             for (i, &uuid) in ids.iter().enumerate() {
                 if issued[i].is_none() && run.core.test_has_host_load(uuid) {
                     issued[i] = Some(pass);
+                    // Five blocks per restore. Offloading copies start at
+                    // this pass's GPU end and serialize; SimpleCPU starts
+                    // at its poll (15 ms before the GPU end) and batches both.
+                    let expected = run.now
+                        + match connector {
+                            G2Connector::OffloadingV032 => 8.0 * (i + 1) as f64,
+                            G2Connector::SimpleCpuV032 => 1.0,
+                            _ => unreachable!(),
+                        };
+                    let queued = observed.queued.lock().unwrap();
+                    let (_, end_ms, keys) = queued.iter().find(|(id, ..)| *id == uuid).unwrap();
+                    assert_eq!(*end_ms, expected, "{connector:?}, load {i}");
+                    assert_eq!(keys.len(), 5);
+                    let tier = run.core.host_offload().unwrap().host.lock();
+                    for &key in keys {
+                        assert_eq!(tier.pins(key), 1, "copy still reads its source");
+                    }
+                    assert!(
+                        !observed
+                            .completed
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(id, _)| *id == uuid)
+                    );
+                    copy_ends.push((uuid, expected));
                 }
                 let awaits = run.core.test_awaits_poll(uuid);
                 if awaited[i] && !awaits && released[i].is_none() {
@@ -4464,6 +4536,13 @@ mod tests {
         }
         let m = issued[0].expect("request 3 loads");
         assert_eq!(issued[1], Some(m), "both loads come from one pass");
+        assert_eq!(*observed.completed.lock().unwrap(), copy_ends);
+        let tier = run.core.host_offload().unwrap().host.lock();
+        for (_, _, keys) in observed.queued.lock().unwrap().iter() {
+            for &key in keys {
+                assert_eq!(tier.pins(key), 0, "completed copy released its source");
+            }
+        }
         (m, released)
     }
 
@@ -4564,6 +4643,27 @@ mod tests {
         // formed at S(m), ends while m runs, and pass m+1 admits the request.
         let (issued, admitted) = poll_load_passes(G2Connector::OffloadingV024, 3.0, true);
         assert_eq!(admitted - issued, 1);
+    }
+
+    #[test]
+    fn the_issuing_poll_is_excluded_when_an_instant_copy_ends_at_that_poll() {
+        // SimpleCPU submits at m's poll, S(m) - 5. Unlimited bandwidth,
+        // zero first-byte latency and no pending D2H make its copy end tie
+        // that poll exactly. Replay conservatively requires a later pass's
+        // poll: m+1 sees it, and decision m+3 releases it (rather than m+2).
+        let mut run = PollRun::new(G2Connector::SimpleCpuV032, 0.0, true, true);
+        let issued = run.passes.len();
+        let uuid = Uuid::from_u128(3);
+        run.submit(3, (0..30).collect(), 2);
+        run.step();
+        assert!(run.core.test_awaits_poll(uuid));
+        for _ in 0..2 {
+            run.step();
+            assert!(run.core.test_awaits_poll(uuid));
+        }
+        run.step();
+        assert!(!run.core.test_awaits_poll(uuid));
+        assert_eq!(admitted_in(&run, 3), Some(issued + 3));
     }
 
     #[test]
