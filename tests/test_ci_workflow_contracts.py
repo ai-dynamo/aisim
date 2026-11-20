@@ -2264,6 +2264,32 @@ def test_containerized_workflows_do_not_require_git_lfs_during_checkout() -> Non
         assert checkout.get("with", {}).get("lfs") != "true"
 
 
+def test_numerics_jobs_run_on_github_hosted_runners() -> None:
+    # Both build AISim from source and use no NVIDIA-internal service. Old and
+    # new snapshots may come from different hosted CPUs; the report blocks only
+    # on status regressions and reports numerical drift.
+    golden = _workflow("ci.yml")["jobs"]["engine-golden-regression"]
+    prediction = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = prediction["collect"]
+
+    assert golden["name"] == "Engine Golden Regression"
+    assert collect["name"] == "Collect prediction snapshot (${{ matrix.side }})"
+    for job in (golden, collect, prediction["report"]):
+        assert job["runs-on"] == "ubuntu-24.04"
+        assert "container" not in job
+        assert "wheel-storage" not in json.dumps(job)
+        assert "WHEEL_STORAGE_URL" not in json.dumps(job)
+
+    # The sentinel check fetches its recorded baseline commit by SHA itself.
+    golden_checkout = next(step for step in golden["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert "fetch-depth" not in golden_checkout["with"]
+    assert "check_prediction_numerics.py --fetch-baseline-only" in _run_commands(golden)
+    # The old side reads setup helpers from the workflow commit, so it keeps full history.
+    collect_checkout = next(step for step in collect["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert collect_checkout["with"]["fetch-depth"] == "0"
+    assert 'git show "${GITHUB_SHA}:scripts/ci/ci_install_build_tools.sh"' in _run_commands(collect)
+
+
 def test_active_workflows_do_not_call_nested_inert_github_assets() -> None:
     for path in WORKFLOW_ROOT.glob("*.yml"):
         assert "./python/aisim/.github/" not in path.read_text(encoding="utf-8")
