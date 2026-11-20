@@ -419,6 +419,25 @@ def test_unsafe_artifact_paths(tmp_path, path):
         hf._get(Cache(tmp_path), FakeTransport({}), "a" * 40, path)
 
 
+@pytest.mark.parametrize(
+    "ref",
+    [
+        dict(bytes=None, sha256="a" * 64),
+        dict(bytes=3, sha256=None),
+        dict(bytes=True, sha256="a" * 64),
+        dict(bytes=-1, sha256="a" * 64),
+        dict(bytes=3, sha256="A" * 64),
+        dict(bytes=3, sha256="a" * 63),
+        dict(bytes=3),
+    ],
+)
+def test_incomplete_integrity_references_are_rejected_before_any_transfer(tmp_path, ref):
+    transport = FakeTransport({"data/e2e/inferencex/file.json": b"abc"})
+    with pytest.raises(ValueError, match="valid byte count and SHA-256"):
+        hf._get(Cache(tmp_path), transport, "a" * 40, "data/e2e/inferencex/file.json", ref)
+    assert not transport.opened
+
+
 def test_failed_download_keeps_another_readers_verified_file(tmp_path, monkeypatch):
     path, body = "data/e2e/inferencex/file.json", b'{"verified": true}'
     ref = dict(bytes=len(body), sha256=hashlib.sha256(body).hexdigest())
