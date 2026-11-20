@@ -13,5 +13,5 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        python -m pip install --quiet pydantic pyarrow pyyaml
+        python -m pip install --quiet pydantic pyarrow pyyaml huggingface_hub
         python scripts/ci/compose_systems_root.py
