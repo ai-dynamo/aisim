@@ -594,6 +594,24 @@ def test_resources_only_fill_profiles_matching_selector(root, profile, tmp_path,
     assert load(root, user_config(profile, **user), tmp_path, require_resources=True).resource_sources == ("user",)
 
 
+@pytest.mark.parametrize(
+    ("field", "matching", "different"),
+    [("system", "h200_sxm", "b200_sxm"), ("backend", "vllm", "sglang"), ("backend_version", "0.25.1", "0.26.0")],
+)
+def test_selector_runtime_identity_must_agree_with_the_library(root, profile, tmp_path, field, matching, different):
+    selector = {"tp": 4, "dp": 1, "moe_tp": 4, field: matching}
+    make_entry(root, profile, resources=RESOURCES, sidecar_extra={"configuration_selector": selector})
+    assert load(root, user_config(profile), tmp_path).resource_sources == ("metadata",)
+    selector[field] = different
+    make_entry(root, profile, resources=RESOURCES, sidecar_extra={"configuration_selector": selector})
+    for config in (user_config(profile), dict(CONFIG)):  # with and without a requested profile
+        data = load(root, config, tmp_path / "again")
+        assert set(data.resource_sources or ("pending",)) == {"pending"}
+        assert data.resources.resources is None and data.memory_pending
+        with pytest.raises(FpmResourcesPendingError):
+            load(root, config, tmp_path / "required", require_resources=True)
+
+
 @pytest.mark.parametrize("dcp", [1, 2])
 def test_dcp_sidecar_resources_do_not_fill_an_unrecorded_profile(root, profile, tmp_path, dcp):
     make_entry(
@@ -2719,6 +2737,97 @@ def test_ensure_rejects_a_non_mapping_estimator_with_a_field_error(root, profile
         ensure_data(config, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
+def _active_systems_root(tmp_path, monkeypatch, marker):
+    """An active systems root with a system definition tagged ``marker`` and an operation table that only it holds."""
+    from aisim_core.data.fpm_library import _stageable_roots
+    from aisim_core.sdk import perf_database
+
+    active = tmp_path / "active"
+    (active / "data/h200_sxm/vllm/0.25.1").mkdir(parents=True)
+    (active / "data/h200_sxm/vllm/0.25.1/packaged_only.txt").write_text("packaged")
+    yaml = (_stageable_roots(["default"], None)[0] / "h200_sxm.yaml").read_text()
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [str(active)])
+
+    def write(tag):
+        (active / "h200_sxm.yaml").write_text(yaml + f"\n# fixture active root: {tag}\n")
+
+    write(marker)
+    return active, write
+
+
+def test_repin_drops_the_generated_roots_of_an_earlier_pin(root, profile, tmp_path, monkeypatch):
+    from aisim_core.data.ensure import DataPin, ensure_data
+
+    other = tmp_path / "other"
+    for source in (root, other):
+        make_entry(source, profile, resources=RESOURCES)
+        _write_entry_catalog(source)
+    _, write = _active_systems_root(tmp_path, monkeypatch, "old")
+    config = user_config(profile)
+    first = ensure_data(config, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
+    write("new")  # the active system definition changes before the saved configuration is repinned
+    pin = DataPin(local_root=other, categories=("fpm",), cache_dir=tmp_path / "cache")
+    repinned, fresh = ensure_data(first.config, pin), ensure_data(config, pin)
+    staged = Path(fresh.config["systems_paths"][0])
+    assert (staged / "h200_sxm.yaml").read_text().endswith("# fixture active root: new\n")
+    assert repinned.config["systems_paths"] == fresh.config["systems_paths"]
+    assert Path(first.config["systems_paths"][0]) not in map(Path, repinned.config["systems_paths"])
+
+
+def test_op_latency_pin_keeps_the_fpm_staging_off_other_roots(root, profile, tmp_path, monkeypatch):
+    from aisim_core.data import ensure as ensure_mod
+    from aisim_core.data.ensure import DataPin, ensure_data
+    from aisim_core.data.fpm_library import _stageable_roots
+    from aisim_core.data.op_tree import OpTreeLoad
+
+    make_entry(root, profile, resources=RESOURCES)
+    _write_entry_catalog(root)
+    manifest = Manifest.model_validate_json((root / MANIFEST).read_bytes())
+    identity = manifest.identity.model_copy(update={"model": None, "operation_family": "gemm"})
+    cfg_id = configuration_id("op-latency", "operation-tables", identity)
+    (root / "catalog/op-latency").mkdir(parents=True)
+    (root / "catalog/op-latency/index.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "aisim-category-index/v1",
+                "category": "op-latency",
+                "entries": [
+                    {
+                        "configuration_id": cfg_id,
+                        "purpose": "operation-tables",
+                        "identity": identity.model_dump(),
+                        "manifest": _artifact(root, MANIFEST, "manifest", "json", "aisim-artifact-manifest/v1"),
+                    }
+                ],
+            }
+        )
+    )
+    dataset = json.loads((root / "catalog/dataset.json").read_text())
+    dataset["categories"]["op-latency"] = {
+        "root": "data/op-latency",
+        "layout": "category",
+        "index": _artifact(root, "catalog/op-latency/index.json", "index", "json", "aisim-category-index/v1"),
+    }
+    (root / "catalog/dataset.json").write_text(json.dumps(dataset))
+    # The pinned root holds the system definition but not the table that only the active root has.
+    pinned = tmp_path / "pinned/systems"
+    (pinned / "data/h200_sxm/vllm/0.25.1").mkdir(parents=True)
+    shutil.copyfile(_stageable_roots(["default"], None)[0] / "h200_sxm.yaml", pinned / "h200_sxm.yaml")
+    _active_systems_root(tmp_path, monkeypatch, "active")
+    monkeypatch.setattr(
+        ensure_mod,
+        "_load_op_latency",
+        lambda *args, **kwargs: (OpTreeLoad(pinned, 1, 0, 0, (), frozenset(), 0.0), [cfg_id]),
+    )
+    for categories in (("op-latency", "fpm"), ("fpm", "op-latency")):
+        pin = DataPin(local_root=root, categories=categories, cache_dir=tmp_path / "cache")
+        result = ensure_data(user_config(profile), pin)
+        staged, *rest = map(Path, result.config["systems_paths"])
+        assert rest == [pinned.resolve()] or rest == [pinned]
+        assert not (staged / "data/h200_sxm/vllm/0.25.1/packaged_only.txt").exists()
+        assert (staged / "h200_sxm.yaml").read_text() == (pinned / "h200_sxm.yaml").read_text()
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("new_resources", [None, {**RESOURCES, "max_num_tokens": 1024}])
 def test_repin_resolves_metadata_resources_and_preserves_user_blocks(root, profile, tmp_path, explicit, new_resources):
@@ -2920,3 +3029,41 @@ def test_effective_sidecar_must_match_native_admission(mutation, message):
     metadata = {k: v for k, v in metadata.items() if v is not None}
     with pytest.raises(FpmContractError, match=message):
         check_effective_measurement_policy(metadata, system="s", backend="vllm", backend_version="1")
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("with_inventory", [False, True])
+def test_shared_library_resources_need_a_selector_naming_the_model(root, profile, tmp_path, named, with_inventory):
+    selector = {"tp": 4, "dp": 1, "moe_tp": 4, **({"model_path": "MiniMaxAI/MiniMax-M2.7"} if named else {})}
+    make_entry(root, profile, resources=RESOURCES, sidecar_extra={"configuration_selector": selector})
+    table = pq.read_table(root / ENTRY / "fpm/fpm_forward_perf.parquet")
+    models = ["MiniMaxAI/MiniMax-M2.7"] * (table.num_rows - 1) + ["other/model"]
+    inventory = {"model_paths": sorted(set(models))} if with_inventory else {}
+    _republish_library(root, _with_column(table, "model_path", models), configuration_selector=selector, **inventory)
+    for config in (user_config(profile), dict(CONFIG)):  # with and without a requested profile
+        data = load(root, config, tmp_path / "shared")
+        sources = set(data.resource_sources or (data.resources.source,))
+        assert sources == ({"metadata"} if named else {"pending"})
+        if not named:
+            with pytest.raises(FpmResourcesPendingError):
+                load(root, config, tmp_path / "required", require_resources=True)
+    # Explicit user resources keep working for a shared library.
+    assert load(root, user_config(profile, **RESOURCES), tmp_path / "user").resource_sources == ("user",)
+
+
+def test_library_without_profile_builds_through_the_default_estimator_search(root, profile):
+    make_entry(root, profile, resources=RESOURCES)
+    data = load(root, dict(CONFIG), root.parent / "out")
+    assert data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"].endswith(".parquet")
+    model = RustForwardPassPerfModel.best_available(data.config)
+    saved = model.diagnostics()["provenance"]["config"]
+    # The op-level engine is compiled without the library path; the saved canonical configuration keeps the pin.
+    assert saved["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(
+        data.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"]
+    )
+    # An explicitly selected estimator that never reads a library is not handed one.
+    for mode in ("op_level", "fpm_regression"):
+        explicit = load(root, {**CONFIG, "estimation_mode": mode}, root.parent / f"out-{mode}")
+        assert "fpm_parquet_path" not in explicit.config.get("estimator_config", {}).get("fpm_interpolation", {})
+    interpolation = load(root, {**CONFIG, "estimation_mode": "fpm_interpolation"}, root.parent / "out-fpm")
+    assert interpolation.config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"].endswith(".parquet")

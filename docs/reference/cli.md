@@ -125,6 +125,7 @@ same backend and the other backends the pinned `perf_data_reuse_manifest` allows
 does not publish is skipped. The root is rebuilt whenever the entries' artifact digests or the packaged specs
 change. An omitted `backend_version` or a slot alias (`current`, `previous`, `next`) is resolved from the pinned
 dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
+An FPM library pinned together with it is staged from that root alone, with no active systems root as a fallback.
 
 For FPM dataset selection, omitted topology leaves parallelism unfiltered. If both TP1 and TP4 entries
 match, `ensure_data` raises an ambiguity error; supply an explicit topology or set

@@ -438,6 +438,9 @@ is used whole, never merged field by field. Sidecar resources apply only when th
 model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
 requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
 A sidecar with no selector applies to the single deployment the load requests; it never selects among several.
+A selector's `system`, `backend` and `backend_version` must equal the library's verified identity; a contradicting
+selector leaves the resources pending. In a library that holds several models, the selector must name `model_path`,
+otherwise the sidecar resources attach to no model.
 The selector and verified library identity must identify one distinct deployment. An absent or partial selector
 matching several deployments (for example, `tp: 1` matching both DEP4 and DEP8) leaves their resources pending.
 Supplying resources explicitly for one deployment does not disambiguate the sidecar evidence for the others.
@@ -536,7 +539,8 @@ follows the configured estimator ordering and policy.
   The corresponding top-level quant mode must remain unset. This selects null
   profile values exactly; it does not make precision matching a wildcard.
   `fpm_parquet_path` selects an external FPM parquet with its same-stem metadata
-  sidecar. Unknown fields are rejected.
+  sidecar. Automatic search compiles its `op_level` candidate without this path (the op-level engine rejects one)
+  and keeps it in the saved configuration for the interpolation candidate. Unknown fields are rejected.
 
 Sampling defaults to `bins_per_axis: [4, 4]` and `max_observations: 64` per
 logical store. Rectangular grids were already supported. Regression's
