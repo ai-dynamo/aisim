@@ -386,7 +386,7 @@ def test_a_partly_refreshed_local_dataset_is_refused_against_the_catalog_pin(tmp
             (root / path).write_bytes(data)
 
     publish()
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     first = ensure_data(CONFIG, local).config["systems_paths"][0]
     # Refresh only the profile and its manifest; the catalog still pins the old manifest digest.
     table = write_parquet(pa.table({"x": [7, 8, 9, 10]}), tmp_path / "new.parquet", "aisim.test/v1").read_bytes()
@@ -420,7 +420,7 @@ def test_an_entry_whose_manifest_belongs_to_another_model_is_refused(tmp_path):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
     with pytest.raises(MissingDataError, match="failed verification"):
-        ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
 @pytest.mark.parametrize("categories", [("fpm", "op-latency"), ("op-latency", "fpm")])
