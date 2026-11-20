@@ -1342,7 +1342,11 @@ sub-block matching without an explicit full-state scratch count.
   it runs the gate of each rank. It does not check equal tensor
   parallelism, or the version that the profile records. P/D moves whole blocks of
   full-attention groups, the last blocks of window groups and one block of
-  each state group. The prefill of a model with recurrent state layers stops
+  each state group.
+  A request of zero input tokens owns no block and moves no state block; vLLM
+  refuses an empty prompt (v0.31.0 `vllm/v1/engine/input_processor.py:516-517`,
+  v0.32.0 `:565-566`).
+  The prefill of a model with recurrent state layers stops
   one token short, and the decode worker recomputes that token. The prefill
   of a one-token prompt computes that token, and the decode worker computes
   it again. A `state` group with `prefix_cacheable: true` marks such layers.
