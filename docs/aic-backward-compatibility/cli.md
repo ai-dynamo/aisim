@@ -3,6 +3,10 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
+<!-- Documentation corrections adapted and modified from AIConfigurator PR #1612:
+https://github.com/ai-dynamo/aiconfigurator/blob/bff1492d4f668232b9dd411f9b28d849a2776000/docs/cli_user_guide.md
+-->
+
 # AIC compatibility CLI
 
 This guide documents the legacy `aiconfigurator cli` compatibility commands that still ship
@@ -568,7 +572,9 @@ Let's run `aiconfigurator cli default --model-path Qwen/Qwen3-32B-FP8 --total-gp
     - TTFT: 202.65ms
     - TPOT: 8.07ms
 ```
-This shows that for model `Qwen/Qwen3-32B-FP8` to deploy on 32 H200, if you require your TTFT to be less than 1000ms and TPOT to be less than 10ms, and your problem is isl=3000 osl=512, then disagg will be 1.43x of agg. The target result is shown as Overall Best Configuration.
+This shows that for model `Qwen/Qwen3-32B-FP8` to deploy on 32 H200, if you require your TTFT to be less than 1000ms and TPOT to be at most 10ms, and your problem is isl=3000 osl=512, then disagg will be 1.43x of agg. The target result is shown as Overall Best Configuration.
+
+The disaggregated prefill filter requires corrected TTFT to be strictly below the target: a candidate exactly at 1000ms is excluded before rate matching. The aggregated sweep accepts TTFT equal to the target.
 
 **Python API equivalent:**
 ```python
@@ -621,7 +627,13 @@ print(result.best_configs["disagg"])
      0                60                 120               180              240
 tokens/s/gpu                        tokens/s/user
 ```
-Pareto frontier shows the trade-off betwen generation speed `tokens/s/user` and throughput `tokens/s/gpu`. The best points is tagged as `x`. As you want the TPOT to be less than 10ms, which means the generation speed is faster than 1000/10ms = 100 tokens/s/user, then by reading the pareto froniter, you will get the point tagged as x. You can see that, if you want different TPOT, you will have different result. Sometimes, agg will be better than disagg (higher throughput at same tokens/s/user)
+The Pareto frontier shows the trade-off between generation speed `tokens/s/user` and throughput `tokens/s/gpu`. In this compatibility CLI example, generation speed is `1000 / TPOT_ms`, so a TPOT limit of 10 ms requires at least 100 tokens/s/user. Select the highest-throughput point at or to the right of that threshold; the boundary at 100 tokens/s/user qualifies. Points to its left exceed the TPOT limit. Changing the limit can change the selected configuration or whether aggregated or disaggregated serving has higher throughput.
+
+Without `--strict-sla`, the plotted frontier can include points that violate the TPOT limit. Within each experiment, the top-N picker prefers configurations within the limit. When none meet it, the picker first keeps the configuration with the highest `tokens/s/gpu_cluster` value in each parallel group (`parallel` for aggregated serving, `(d)parallel` for disaggregated serving), then orders those representatives by increasing TPOT for its top-N results.
+
+If no configuration meets the TPOT constraint, the terminal worker setup table omits the fallback configurations and reports that none met the constraint. Use `--save-dir DIR` and open `best_config_topn.csv` in the experiment's output directory to see those configurations. See [strict SLA filtering](#strict-sla-filtering).
+
+The unified Sweeper uses a different aggregate per-user metric; see [Pareto objectives](../sweeper/optimization-goals.md#pareto) before interpreting its x-axis as a TPOT threshold.
 
 3. Worker setup
 ```
@@ -931,6 +943,8 @@ disagg Top Configurations: (Sorted by tokens/s/gpu)
 AIC's TPOT metric is the inter-token latency during the decode phase — it does not include TTFT. Pass `--inclusive-tpot` to report TPOT as `(ttft + tpot × (osl − 1)) / osl`, which spreads the TTFT cost across all output tokens. This matches the end-to-end per-token latency reported by GuideLLM and other benchmarking tools, making predicted values directly comparable to benchmark measurements.
 
 The flag only affects terminal output and saved CSV — SLA filtering always uses inter-token latency.
+
+<a id="strict-sla-filtering"></a>
 
 #### Strict SLA filtering (`--strict-sla`)
 
