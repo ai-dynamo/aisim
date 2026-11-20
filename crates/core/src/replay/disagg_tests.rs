@@ -2615,8 +2615,10 @@ fn state_cache_handoff_adds_one_state_copy_to_transfer_time() {
 /// `version`. A live run measured the attention value and the sum of the
 /// other five groups (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`).
 /// The split of that sum among the groups is a reading of the connector
-/// code. Every page is 13,045,120 bytes, and the pool holds 128 pages. Prefix
-/// caching is off.
+/// code. On vLLM 0.33.0 a log of each group measured the six values, and the
+/// run moved the rows of vLLM 0.32.0
+/// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`). Every page is
+/// 13,045,120 bytes, and the pool holds 128 pages. Prefix caching is off.
 fn grouped_glm_disagg_config(version: &str, checkpoint: bool) -> TestDisaggConfig {
     use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
     const GLM_PAGE: u64 = 13_045_120;
@@ -2624,7 +2626,7 @@ fn grouped_glm_disagg_config(version: &str, checkpoint: bool) -> TestDisaggConfi
         "0.31.0" => [
             13_045_120, 13_045_120, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
         ],
-        "0.32.0" => [
+        "0.32.0" | "0.33.0" => [
             21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
         ],
         _ => unreachable!("no measured GLM-5.3-Flash transfer bytes"),
@@ -2693,8 +2695,9 @@ fn grouped_glm_transfer_ms(config: &TestDisaggConfig, requests: &[DirectRequest]
 #[test]
 fn grouped_glm_shaped_handoff_moves_the_measured_bytes() {
     // Each case is a measured row of
-    // `benchmarks/evidence/nixl-pd-transfer-bytes-20261115/` with a cold
-    // decode rank: the bytes that the connector reads on one rank for a
+    // `benchmarks/evidence/nixl-pd-transfer-bytes-20261115/` or, for vLLM
+    // 0.33.0, of `benchmarks/evidence/nixl-pd-transfer-bytes-20261117/` with a
+    // cold decode rank: the bytes that the connector reads on one rank for a
     // prompt of N tokens. The prefill rank computes N - 1 tokens, every
     // attention block of them moves whole, and each state group moves one
     // block.
@@ -2712,6 +2715,17 @@ fn grouped_glm_shaped_handoff_moves_the_measured_bytes() {
         ),
         (
             "0.32.0",
+            [
+                (1_000, 61_146_624),
+                (2_176, 61_146_624),
+                (2_177, 61_146_624),
+                (5_000, 105_103_616),
+                (30_000, 346_867_072),
+                (130_000, 1_357_877_888),
+            ],
+        ),
+        (
+            "0.33.0",
             [
                 (1_000, 61_146_624),
                 (2_176, 61_146_624),
@@ -2750,14 +2764,16 @@ fn grouped_destination_missing_mode_moves_the_missing_blocks_and_the_state() {
         request(2, 5_000, 2, 1_000.0),
         request(3, 2_177, 2, 2_000.0),
     ];
-    // vLLM 0.31.0, then vLLM 0.32.0 without and with FlashKDA checkpoint
-    // blocks. A state group moves its running block only, and the decode rank
-    // reserves no checkpoint block, so both vLLM 0.32.0 rows expect the same
-    // times.
+    // vLLM 0.31.0, then vLLM 0.32.0 and vLLM 0.33.0, each without and with
+    // FlashKDA checkpoint blocks. A state group moves its running block only,
+    // and the decode rank reserves no checkpoint block, so the two rows of a
+    // version expect the same times.
     for (version, checkpoint, new_bytes, again_bytes, fixed_bytes) in [
         ("0.31.0", false, 91_256_320, 65_166_080, 52_120_960),
         ("0.32.0", false, 105_103_616, 61_146_624, 39_168_128),
         ("0.32.0", true, 105_103_616, 61_146_624, 39_168_128),
+        ("0.33.0", false, 105_103_616, 61_146_624, 39_168_128),
+        ("0.33.0", true, 105_103_616, 61_146_624, 39_168_128),
     ] {
         let mut config = grouped_glm_disagg_config(version, checkpoint);
         for args in [&mut config.prefill_args, &mut config.decode_args] {

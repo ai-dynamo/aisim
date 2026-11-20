@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Modified simulation of the vLLM v0.31.0 and v0.32.0 NIXL connector rules
-//! that decide the P/D transfer payload of each KV cache group, with the
+//! Modified simulation of the vLLM v0.31.0, v0.32.0 and v0.33.0 NIXL connector
+//! rules that decide the P/D transfer payload of each KV cache group, with the
 //! in-window block count of a decode rank from the KV cache manager. No
 //! speculative decoding, no HiSparse, no bounded replay window and no `all`
 //! Mamba cache mode. Copyright contributors to the vLLM project. Sources: the
-//! files below at `db9527a46873454610df6dbedf79a36d6bf1a7f6` and at
-//! `5df63a7203cdb9328d824a27b682e77c7b9928be`. See THIRD_PARTY_NOTICES.md.
+//! files below at `db9527a46873454610df6dbedf79a36d6bf1a7f6`, at
+//! `5df63a7203cdb9328d824a27b682e77c7b9928be` and at
+//! `4ba787ec9959e566d3b587a796dff07673324da5`. See THIRD_PARTY_NOTICES.md.
 //! Apache-2.0.
 //!
 //! - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
@@ -25,6 +26,14 @@
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/utils.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
 //!
 //! The payload of a request is, for each group, the blocks of the group that
 //! vLLM's NIXL connector transfers for one request on one TP rank times the
@@ -33,13 +42,15 @@
 //! rank moves its own copy (`nixl/tp_mapping.py:88-98`, the same in V31 and
 //! V32). The connector makes one region for each distinct layer address, and
 //! layers of different groups at one address share a region (V31
-//! `nixl/base_worker.py:1702-1724`, V32 `:1623-1645`). In a model with a Mamba
-//! state, it reads a block of an attention group in every region, a block of a
-//! `CircularBufferSpec` ring in its own regions only, and a block of a Mamba
-//! group in every Mamba region (V31 `nixl/base_worker.py:274-304`, V32
-//! `:236-266`), except that a `tp_replicated` state group reads its own region
-//! only (V31 `:616-633`, V32 `:581-598`). So the bytes of one block depend on the addresses that the
-//! layers of all groups share, and they can be more than the page of the group.
+//! `nixl/base_worker.py:1702-1724`, V32 `:1623-1645`, V33 `:1744-1766`). In a
+//! model with a Mamba state, it reads a block of an attention group in every
+//! region, a block of a `CircularBufferSpec` ring in its own regions only, and
+//! a block of a Mamba group in every Mamba region (V31
+//! `nixl/base_worker.py:274-304`, V32 `:236-266`, V33 `:242-272`), except that
+//! a `tp_replicated` state group reads its own region only (V31 `:616-633`,
+//! V32 `:581-598`, V33 `:680-697`). So the bytes of one block depend on the
+//! addresses that the layers of all groups share, and they can be more than
+//! the page of the group.
 //! In V31 the ring of GLM-5.3-Flash is a `KpoolTailSpec` and not a
 //! `CircularBufferSpec` (V31 `kvi:1015-1016`), so its block is read in every
 //! region. In V32 that model runs a block-outer layout (V32
@@ -47,20 +58,31 @@
 //! where the layers of other groups have addresses of their own in a block row,
 //! so a full-attention block is read in those regions too. The rules compute no
 //! bytes: they take them from the profile. For GLM-5.3-Flash at TP 4 the test
-//! profiles hold the values of a live run on both versions, and the rules give
+//! profiles hold the values of a live run on V31 and V32, and the rules give
 //! the bytes of every request of that run
 //! (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`).
 //!
-//! The rules hold for vLLM 0.31.0 (V31) and vLLM 0.32.0 (V32). They count the
-//! same blocks in both versions and take the bytes of a block from the
-//! profile, so they take no version. Two rules differ in code and give the
-//! same value for every request that replay sends. The V32
+//! The rules hold for vLLM 0.31.0 (V31), vLLM 0.32.0 (V32) and vLLM 0.33.0
+//! (V33). They count the same blocks in the three versions and take the bytes
+//! of a block from the profile, so they take no version. Two rules differ in
+//! code and give the same value for every request that replay sends. The V32
 //! backoff adds a term for a bounded replay window (V31
 //! `nixl/base_scheduler.py:385-398`, V32 `:379-394`), and GLM-5.3-Flash has
 //! none. The V32 truncation skips a request that skips reading the prefix
 //! cache (V32 `nixl/base_scheduler.py:421-423`), and replay sends no such
-//! request. A model with a bounded replay window, or a replay that skips the
-//! prefix cache, needs a version row here.
+//! request. Between V32 and V33 one more rule differs in code: V33
+//! `nixl/tp_mapping.py:104` computes `is_mla` with a parameter for a draft
+//! model, which `:107-108` read, and without speculative decoding the value is
+//! the V32 one. A model with a bounded replay window, or a replay that skips
+//! the prefix cache, needs a version row here.
+//! vLLM 0.33.0 counts the same blocks as vLLM 0.32.0: the clip of each group
+//! (V33 `nixl/base_scheduler.py:253-294`), the backoff and the truncation
+//! (V33 `:385-441`), the blocks that a decode rank pulls (V33
+//! `nixl/pull_scheduler.py:59-65`, `:149-156`) and the copy on each TP rank
+//! (V33 `nixl/tp_mapping.py:107-117`). For GLM-5.3-Flash at TP 4 with an fp8
+//! cache, a live run measured the bytes of one block of each group on V33,
+//! and they equal the V32 values
+//! (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`).
 //!
 //! Grouped P/D uses four different blocks. These rules read two of them. The
 //! transfer unit of a full-attention group and the window count read the
@@ -368,13 +390,16 @@ mod tests {
     /// block, `11 * 71_808 + 19 * 1_114_112 + 10 * 2_048`, and the 11 own
     /// regions of the `CircularBufferSpec` ring, `71_808 + 10 * 2_048`. A KDA
     /// block is read in the 9 state regions on both versions:
-    /// `9 * (36_864 + 1_048_576)`, also for a group of 8 layers.
+    /// `9 * (36_864 + 1_048_576)`, also for a group of 8 layers. On vLLM
+    /// 0.33.0 a log of each group measured the six values, and the run moved
+    /// the rows of vLLM 0.32.0
+    /// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`).
     fn glm_transfer_bytes(version: &str) -> [u64; 6] {
         match version {
             "0.31.0" => [
                 13_045_120, 13_045_120, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
             ],
-            "0.32.0" => [
+            "0.32.0" | "0.33.0" => [
                 21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
             ],
             _ => unreachable!("no measured GLM-5.3-Flash transfer bytes"),
@@ -420,7 +445,9 @@ mod tests {
     /// `benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`: prompt tokens, the full-attention
     /// blocks that the decode rank already holds, and the bytes of one rank.
     /// The decode rank holds 2 blocks when the same prompt of 5,000 tokens
-    /// comes again.
+    /// comes again. On vLLM 0.33.0 a log of each group measured the six
+    /// values, and the run moved the rows of vLLM 0.32.0
+    /// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`).
     fn measured_rows(version: &str) -> [(usize, usize, u64); 7] {
         match version {
             "0.31.0" => [
@@ -432,7 +459,7 @@ mod tests {
                 (30_000, 0, 234_752_640),
                 (130_000, 0, 834_828_160),
             ],
-            "0.32.0" => [
+            "0.32.0" | "0.33.0" => [
                 (1_000, 0, 61_146_624),
                 (2_176, 0, 61_146_624),
                 (2_177, 0, 61_146_624),
@@ -454,7 +481,11 @@ mod tests {
         // running block only (V32 `utils.py:37-44`), never the vLLM 0.32.0
         // FlashKDA checkpoint block, so the profile with it gives the same
         // rows.
-        for (version, checkpoints) in [("0.31.0", &[false][..]), ("0.32.0", &[false, true])] {
+        for (version, checkpoints) in [
+            ("0.31.0", &[false][..]),
+            ("0.32.0", &[false, true]),
+            ("0.33.0", &[false, true]),
+        ] {
             for &checkpoint in checkpoints {
                 let mut groups = glm_groups(version);
                 if checkpoint {
@@ -485,6 +516,7 @@ mod tests {
         for (version, block, fixed) in [
             ("0.31.0", 13_045_120, 52_120_960),
             ("0.32.0", 21_978_496, 39_168_128),
+            ("0.33.0", 21_978_496, 39_168_128),
         ] {
             let rules = rules(&glm_groups(version));
             // T 999 has 1 block and 5 are held: the missing count floors at 0.
@@ -515,7 +547,11 @@ mod tests {
         // With the hand-made page as the bytes of a block, the six groups give
         // `6 * 13_045_120 = 78_270_720` bytes for 999 tokens (computed), not
         // the measured 65,166,080 of vLLM 0.31.0 or 61,146,624 of vLLM 0.32.0.
-        for (version, measured) in [("0.31.0", 65_166_080), ("0.32.0", 61_146_624)] {
+        for (version, measured) in [
+            ("0.31.0", 65_166_080),
+            ("0.32.0", 61_146_624),
+            ("0.33.0", 61_146_624),
+        ] {
             let pages: Vec<_> = glm_groups(version)
                 .into_iter()
                 .map(|mut group| {
@@ -598,6 +634,7 @@ mod tests {
         for (version, fixed, payload) in [
             ("0.31.0", 52_120_960, 65_166_080),
             ("0.32.0", 39_168_128, 61_146_624),
+            ("0.33.0", 39_168_128, 61_146_624),
         ] {
             let rules = rules(&glm_groups(version));
             assert_eq!(rules.fixed_bytes(0), 0, "{version}");

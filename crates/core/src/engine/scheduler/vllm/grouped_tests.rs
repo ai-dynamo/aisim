@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project.
 // Tests of a modified Rust simulation of the vLLM v0.31.0
-// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules and grouped KV
-// handoff rules and of the v0.33.0 (4ba787ec9959e566d3b587a796dff07673324da5)
-// grouped KV rules.
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules and grouped KV
+// handoff rules.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 use std::sync::{Arc, Mutex};
@@ -252,14 +252,16 @@ fn glm_groups(checkpoint: bool) -> Vec<FpmCacheGroup> {
 /// five groups, the fixed bytes of a request: 52,120,960 on vLLM 0.31.0 and
 /// 39,168,128 on vLLM 0.32.0
 /// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`). The split of that
-/// sum among the groups is a reading of the connector code.
+/// sum among the groups is a reading of the connector code. On vLLM 0.33.0 a
+/// log of each group measured the six values, and the run moved the rows of
+/// vLLM 0.32.0 (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`).
 fn glm_transfer_groups(version: &str, checkpoint: bool) -> Vec<FpmCacheGroup> {
     let mut groups = glm_groups(checkpoint);
     let bytes = match version {
         "0.31.0" => [
             13_045_120, 13_045_120, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
         ],
-        "0.32.0" => [
+        "0.32.0" | "0.33.0" => [
             21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
         ],
         _ => unreachable!("no measured GLM-5.3-Flash transfer bytes"),
@@ -272,7 +274,7 @@ fn glm_transfer_groups(version: &str, checkpoint: bool) -> Vec<FpmCacheGroup> {
 
 /// Five GLM cores: vLLM 0.31.0, and vLLM 0.32.0 and 0.33.0 each without and
 /// with checkpoint blocks, which GLM-5.3-Flash takes only under the FlashKDA
-/// prefill backend.
+/// prefill backend. The P/D transfer rules cover the same versions.
 const GLM_CORES: [(&str, bool); 5] = [
     ("0.31.0", false),
     ("0.32.0", false),
@@ -280,10 +282,6 @@ const GLM_CORES: [(&str, bool); 5] = [
     ("0.33.0", false),
     ("0.33.0", true),
 ];
-
-/// The GLM cores of the vLLM versions whose P/D transfer rules replay
-/// models: vLLM 0.31.0, and vLLM 0.32.0 without and with checkpoint blocks.
-const GLM_PD_CORES: [(&str, bool); 3] = [("0.31.0", false), ("0.32.0", false), ("0.32.0", true)];
 
 fn prefix_core(
     groups: Vec<FpmCacheGroup>,
@@ -638,38 +636,40 @@ fn grouped_aggregated_rank_refuses_source_commands() {
 fn grouped_decode_rank_refuses_source_commands() {
     // A decode rank has transfer rules but holds no source: only a prefill
     // rank frees the skipped blocks of a source that it holds.
-    let byte_mode = pd_core(
-        glm_transfer_groups("0.32.0", false),
-        128 * GLM_PAGE,
-        8192,
-        WorkerType::Decode,
-        None,
-    );
-    for (mode, mut core) in [
-        ("byte", byte_mode),
-        (
-            "block",
-            block_mode_decode_core(128 * GLM_PAGE, "0.32.0", false),
-        ),
-    ] {
-        let handoff_id = HandoffId::new(Uuid::from_u128(1640));
-        for command in [
-            SchedulerCommand::SubmitHandoffPrefill {
-                handoff_id,
-                request: source_request(1641, 1_000),
-            },
-            SchedulerCommand::ReleaseSource { handoff_id },
-            SchedulerCommand::CancelSource { handoff_id },
+    for version in ["0.32.0", "0.33.0"] {
+        let byte_mode = pd_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            WorkerType::Decode,
+            None,
+        );
+        for (mode, mut core) in [
+            ("byte", byte_mode),
+            (
+                "block",
+                block_mode_decode_core(128 * GLM_PAGE, version, false),
+            ),
         ] {
-            let error = core.apply_command(command).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "a grouped decode rank holds no KV handoff source",
-                "{mode} mode"
-            );
+            let handoff_id = HandoffId::new(Uuid::from_u128(1640));
+            for command in [
+                SchedulerCommand::SubmitHandoffPrefill {
+                    handoff_id,
+                    request: source_request(1641, 1_000),
+                },
+                SchedulerCommand::ReleaseSource { handoff_id },
+                SchedulerCommand::CancelSource { handoff_id },
+            ] {
+                let error = core.apply_command(command).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "a grouped decode rank holds no KV handoff source",
+                    "{mode} mode"
+                );
+            }
+            assert!(core.is_drained(), "{mode} mode");
+            assert_eq!(grouped_pool(&core).active_blocks(), 0, "{mode} mode");
         }
-        assert!(core.is_drained(), "{mode} mode");
-        assert_eq!(grouped_pool(&core).active_blocks(), 0, "{mode} mode");
     }
 }
 
@@ -677,36 +677,38 @@ fn grouped_decode_rank_refuses_source_commands() {
 fn grouped_prefill_rank_refuses_a_destination() {
     // A prefill rank has transfer rules but loads no handoff: only a decode
     // rank reserves a destination.
-    let byte_mode = pd_core(
-        glm_transfer_groups("0.32.0", false),
-        128 * GLM_PAGE,
-        8192,
-        WorkerType::Prefill,
-        None,
-    );
-    let mut args = prefix_core(
-        glm_transfer_groups("0.32.0", false),
-        128 * GLM_PAGE,
-        8192,
-        2176,
-        "0.32.0",
-    )
-    .args;
-    args.worker_type = WorkerType::Prefill;
-    for (mode, mut core) in [("byte", byte_mode), ("block", VllmCore::new(args))] {
-        let error = core
-            .apply_command(SchedulerCommand::ReserveDestination {
-                handoff_id: HandoffId::new(Uuid::from_u128(1642)),
-                request: pd_request(1643, 1_000, 3),
-            })
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "a grouped prefill rank reserves no KV handoff destination",
-            "{mode} mode"
+    for version in ["0.32.0", "0.33.0"] {
+        let byte_mode = pd_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            WorkerType::Prefill,
+            None,
         );
-        assert!(core.is_drained(), "{mode} mode");
-        assert_eq!(grouped_pool(&core).active_blocks(), 0, "{mode} mode");
+        let mut args = prefix_core(
+            glm_transfer_groups(version, false),
+            128 * GLM_PAGE,
+            8192,
+            2176,
+            version,
+        )
+        .args;
+        args.worker_type = WorkerType::Prefill;
+        for (mode, mut core) in [("byte", byte_mode), ("block", VllmCore::new(args))] {
+            let error = core
+                .apply_command(SchedulerCommand::ReserveDestination {
+                    handoff_id: HandoffId::new(Uuid::from_u128(1642)),
+                    request: pd_request(1643, 1_000, 3),
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "a grouped prefill rank reserves no KV handoff destination",
+                "{mode} mode"
+            );
+            assert!(core.is_drained(), "{mode} mode");
+            assert_eq!(grouped_pool(&core).active_blocks(), 0, "{mode} mode");
+        }
     }
 }
 
@@ -717,36 +719,39 @@ fn grouped_prefill_source_keeps_only_the_blocks_inside_its_window() {
     // reads. When a source completes, vLLM frees the blocks that the next
     // query skips (V32 `vllm/v1/core/sched/scheduler.py:3023-3031`):
     // 1,024 - 32 + 1 = 993 tokens, so the 62 blocks below 992 go and 2 stay.
-    let mut window = group("window", 16, 100, Some(32));
-    window.prefix_cacheable = Some(true);
-    window.transfer_bytes_per_block = Some(100);
-    let byte_mode = pd_core(
-        vec![window.clone()],
-        67 * 100,
-        1024,
-        WorkerType::Prefill,
-        None,
-    );
-    let mut args = prefix_core(vec![window], 67 * 100, 1024, 16, "0.32.0").args;
-    args.worker_type = WorkerType::Prefill;
-    for (mode, mut core) in [("byte", byte_mode), ("block", VllmCore::new(args))] {
-        let handoff_id = HandoffId::new(Uuid::from_u128(1626));
-        hold_grouped_source(&mut core, handoff_id, 1625, 1024);
-        let held = |core: &VllmCore| core.kv_manager.grouped().unwrap().active_blocks();
-        assert_eq!(held(&core), 2, "{mode}");
-        core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
-            .unwrap();
-        assert_eq!(held(&core), 0, "{mode}");
-        assert!(core.is_drained(), "{mode}");
+    for version in ["0.32.0", "0.33.0"] {
+        let mut window = group("window", 16, 100, Some(32));
+        window.prefix_cacheable = Some(true);
+        window.transfer_bytes_per_block = Some(100);
+        let byte_mode = pd_core(
+            vec![window.clone()],
+            67 * 100,
+            1024,
+            WorkerType::Prefill,
+            None,
+        );
+        let mut args = prefix_core(vec![window], 67 * 100, 1024, 16, version).args;
+        args.worker_type = WorkerType::Prefill;
+        for (mode, mut core) in [("byte", byte_mode), ("block", VllmCore::new(args))] {
+            let handoff_id = HandoffId::new(Uuid::from_u128(1626));
+            hold_grouped_source(&mut core, handoff_id, 1625, 1024);
+            let held = |core: &VllmCore| core.kv_manager.grouped().unwrap().active_blocks();
+            assert_eq!(held(&core), 2, "{mode}");
+            core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+                .unwrap();
+            assert_eq!(held(&core), 0, "{mode}");
+            assert!(core.is_drained(), "{mode}");
+        }
     }
 }
 
 #[test]
 fn grouped_prefill_source_truncates_one_token_and_prices_the_payload_in_blocks() {
     // N, the N - 1 tokens that the prefill computes, their attention blocks
-    // and the time at 1 GB/s of the bytes of one rank that the live run
-    // measured for this prompt on each version
-    // (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`).
+    // and the time at 1 GB/s of the bytes of one rank that a live run
+    // measured for this prompt on each version: vLLM 0.31.0 and 0.32.0 in
+    // `benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`, and vLLM 0.33.0
+    // in `benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`.
     for (version, block, fixed, rows) in [
         (
             "0.31.0",
@@ -760,6 +765,16 @@ fn grouped_prefill_source_truncates_one_token_and_prices_the_payload_in_blocks()
         ),
         (
             "0.32.0",
+            21_978_496,
+            39_168_128,
+            [
+                (1_000, 999, 1, 61.146624),
+                (2_177, 2_176, 1, 61.146624),
+                (5_000, 4_999, 3, 105.103616),
+            ],
+        ),
+        (
+            "0.33.0",
             21_978_496,
             39_168_128,
             [
@@ -856,94 +871,96 @@ fn grouped_prefill_without_state_layers_keeps_the_whole_prompt() {
 
 #[test]
 fn grouped_prefill_source_in_block_mode_frees_its_checkpoint_blocks_at_completion() {
-    let handoff_id = HandoffId::new(Uuid::from_u128(1606));
-    // `prefix_core` on vLLM 0.32.0 as a prefill rank that holds a source of
-    // `prompt` tokens. Returns the core, its prefill chunks and the timing.
-    let hold = |checkpoint: bool, prompt: usize| {
-        let mut args = prefix_core(
-            glm_transfer_groups("0.32.0", checkpoint),
-            128 * GLM_PAGE,
-            8192,
-            2176,
-            "0.32.0",
-        )
-        .args;
-        args.worker_type = WorkerType::Prefill;
-        args.kv_transfer_bandwidth = Some(1.0);
-        let mut core = VllmCore::new(args);
-        let captured = Arc::new(CapturedDecodeQueries::default());
-        core.args.perf_model = Arc::new(PerfModel::External {
-            timing: captured.clone(),
-        });
-        let timing = hold_grouped_source(&mut core, handoff_id, 1605, prompt);
-        let chunks = captured.1.lock().unwrap().clone();
-        (core, chunks, timing)
-    };
-    // The block of each KDA group keyed at `at` tokens of the prompt
-    // `0..prompt`: active while a request holds it, inactive once only the
-    // cache does.
-    let kda_keys = |core: &VllmCore, prompt: u32, at: usize| -> Vec<Option<bool>> {
-        let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
-        lease.configure_prefix_hashes(&(0..prompt).collect::<Vec<u32>>(), 2176);
-        let hash = lease.prefix_hash_at(at).unwrap();
-        (2..6)
-            .map(|g| block_pool(core).key_hit(g, hash).map(|hit| hit.is_active))
-            .collect()
-    };
-    let release = |core: &mut VllmCore| {
-        core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
-            .unwrap();
-        assert_eq!(block_pool(core).active_blocks(), 0);
-        assert!(core.is_drained());
-    };
-    // When a source completes, vLLM frees in each KDA group every block below
-    // the state of the last computed token (V32
-    // `vllm/v1/core/sched/scheduler.py:3023-3031`,
-    // `vllm/v1/core/single_type_kv_cache_manager.py:1613-1641`). So the held
-    // source keeps only the running block there. A freed block stays cached.
+    for version in ["0.32.0", "0.33.0"] {
+        let handoff_id = HandoffId::new(Uuid::from_u128(1606));
+        // `prefix_core` on `version` as a prefill rank that holds a source of
+        // `prompt` tokens. Returns the core, its prefill chunks and the timing.
+        let hold = |checkpoint: bool, prompt: usize| {
+            let mut args = prefix_core(
+                glm_transfer_groups(version, checkpoint),
+                128 * GLM_PAGE,
+                8192,
+                2176,
+                version,
+            )
+            .args;
+            args.worker_type = WorkerType::Prefill;
+            args.kv_transfer_bandwidth = Some(1.0);
+            let mut core = VllmCore::new(args);
+            let captured = Arc::new(CapturedDecodeQueries::default());
+            core.args.perf_model = Arc::new(PerfModel::External {
+                timing: captured.clone(),
+            });
+            let timing = hold_grouped_source(&mut core, handoff_id, 1605, prompt);
+            let chunks = captured.1.lock().unwrap().clone();
+            (core, chunks, timing)
+        };
+        // The block of each KDA group keyed at `at` tokens of the prompt
+        // `0..prompt`: active while a request holds it, inactive once only the
+        // cache does.
+        let kda_keys = |core: &VllmCore, prompt: u32, at: usize| -> Vec<Option<bool>> {
+            let mut lease = BlockRequestLease::new(Uuid::nil(), Vec::new());
+            lease.configure_prefix_hashes(&(0..prompt).collect::<Vec<u32>>(), 2176);
+            let hash = lease.prefix_hash_at(at).unwrap();
+            (2..6)
+                .map(|g| block_pool(core).key_hit(g, hash).map(|hit| hit.is_active))
+                .collect()
+        };
+        let release = |core: &mut VllmCore| {
+            core.apply_command(SchedulerCommand::ReleaseSource { handoff_id })
+                .unwrap();
+            assert_eq!(block_pool(core).active_blocks(), 0);
+            assert!(core.is_drained());
+        };
+        // When a source completes, vLLM frees in each KDA group every block below
+        // the state of the last computed token (V32
+        // `vllm/v1/core/sched/scheduler.py:3023-3031`,
+        // `vllm/v1/core/single_type_kv_cache_manager.py:1613-1641`). So the held
+        // source keeps only the running block there. A freed block stays cached.
 
-    // With one FlashKDA checkpoint block per KDA group, the truncated prompt
-    // of 8,191 tokens runs in one chunk. Its allocation reaches the end of
-    // that prompt, so each KDA group takes a checkpoint block. Finalize keys
-    // it at 6,528, the last block boundary below the end. A first allocation
-    // from 0 replaces no running block, so no previous block holds that key.
-    let (mut core, chunks, timing) = hold(true, 8_192);
-    assert_eq!(chunks, vec![(1, 8191, 0)]);
-    // The payload is that of byte mode, with the measured bytes of one block
-    // of vLLM 0.32.0 and the fixed bytes computed from them. The checkpoint
-    // block does not move.
-    assert_eq!(timing.full_prompt_tokens, 4);
-    assert_eq!(timing.kv_bytes_per_token, Some(21_978_496));
-    assert_eq!(timing.state_bytes, 39_168_128);
-    // Four attention blocks, the ring block and the running block of each
-    // KDA group. The checkpoint blocks left at completion.
-    assert_eq!(block_pool(&core).active_blocks(), 9);
-    assert_eq!(kda_keys(&core, 8191, 6528), vec![Some(false); 4]);
-    release(&mut core);
-    assert_eq!(kda_keys(&core, 8191, 6528), vec![Some(false); 4]);
+        // With one FlashKDA checkpoint block per KDA group, the truncated prompt
+        // of 8,191 tokens runs in one chunk. Its allocation reaches the end of
+        // that prompt, so each KDA group takes a checkpoint block. Finalize keys
+        // it at 6,528, the last block boundary below the end. A first allocation
+        // from 0 replaces no running block, so no previous block holds that key.
+        let (mut core, chunks, timing) = hold(true, 8_192);
+        assert_eq!(chunks, vec![(1, 8191, 0)]);
+        // The payload is that of byte mode, with the measured bytes of one block
+        // of `version` and the fixed bytes computed from them. The checkpoint
+        // block does not move.
+        assert_eq!(timing.full_prompt_tokens, 4);
+        assert_eq!(timing.kv_bytes_per_token, Some(21_978_496));
+        assert_eq!(timing.state_bytes, 39_168_128);
+        // Four attention blocks, the ring block and the running block of each
+        // KDA group. The checkpoint blocks left at completion.
+        assert_eq!(block_pool(&core).active_blocks(), 9);
+        assert_eq!(kda_keys(&core, 8191, 6528), vec![Some(false); 4]);
+        release(&mut core);
+        assert_eq!(kda_keys(&core, 8191, 6528), vec![Some(false); 4]);
 
-    // Without checkpoint blocks the split stops at 6,528, where finalize
-    // keys the running block. The next chunk replaces it, and the previous
-    // block with that key leaves at completion. The block count and the key
-    // are the same, so only the chunks tell the two cores apart.
-    let (core, chunks, _) = hold(false, 8_192);
-    assert_eq!(chunks, vec![(1, 6528, 0), (1, 1663, 6528)]);
-    assert_eq!(block_pool(&core).active_blocks(), 9);
-    assert_eq!(kda_keys(&core, 8191, 6528), vec![Some(false); 4]);
+        // Without checkpoint blocks the split stops at 6,528, where finalize
+        // keys the running block. The next chunk replaces it, and the previous
+        // block with that key leaves at completion. The block count and the key
+        // are the same, so only the chunks tell the two cores apart.
+        let (core, chunks, _) = hold(false, 8_192);
+        assert_eq!(chunks, vec![(1, 6528, 0), (1, 1663, 6528)]);
+        assert_eq!(block_pool(&core).active_blocks(), 9);
+        assert_eq!(kda_keys(&core, 8191, 6528), vec![Some(false); 4]);
 
-    // A source of 6,529 tokens ties the checkpoint to the truncated prompt
-    // end. Its prompt of 6,528 tokens puts the checkpoint at 4,352. An
-    // untruncated prompt of 6,529 tokens would put it at 6,528.
-    let (mut core, chunks, timing) = hold(true, 6_529);
-    assert_eq!(chunks, vec![(1, 6528, 0)]);
-    assert_eq!(timing.full_prompt_tokens, 3);
-    // Three attention blocks, the ring block and the running block of each
-    // KDA group.
-    assert_eq!(block_pool(&core).active_blocks(), 8);
-    assert_eq!(kda_keys(&core, 6528, 4352), vec![Some(false); 4]);
-    assert_eq!(kda_keys(&core, 6528, 6528), vec![None; 4]);
-    release(&mut core);
-    assert_eq!(kda_keys(&core, 6528, 4352), vec![Some(false); 4]);
+        // A source of 6,529 tokens ties the checkpoint to the truncated prompt
+        // end. Its prompt of 6,528 tokens puts the checkpoint at 4,352. An
+        // untruncated prompt of 6,529 tokens would put it at 6,528.
+        let (mut core, chunks, timing) = hold(true, 6_529);
+        assert_eq!(chunks, vec![(1, 6528, 0)]);
+        assert_eq!(timing.full_prompt_tokens, 3);
+        // Three attention blocks, the ring block and the running block of each
+        // KDA group.
+        assert_eq!(block_pool(&core).active_blocks(), 8);
+        assert_eq!(kda_keys(&core, 6528, 4352), vec![Some(false); 4]);
+        assert_eq!(kda_keys(&core, 6528, 6528), vec![None; 4]);
+        release(&mut core);
+        assert_eq!(kda_keys(&core, 6528, 4352), vec![Some(false); 4]);
+    }
 }
 
 #[test]
@@ -953,47 +970,49 @@ fn grouped_prefill_source_preempted_in_its_prefill_stays_truncated_once() {
     // source. The last token of the first source then needs one attention
     // block and a new running block in each KDA group, 5 blocks, while 4 are
     // free, so the second source is preempted.
-    let mut args = prefix_core(
-        glm_transfer_groups("0.32.0", false),
-        17 * GLM_PAGE,
-        8192,
-        2176,
-        "0.32.0",
-    )
-    .args;
-    args.worker_type = WorkerType::Prefill;
-    let mut core = VllmCore::new(args);
-    let first = HandoffId::new(Uuid::from_u128(1610));
-    let second = HandoffId::new(Uuid::from_u128(1612));
-    for (handoff_id, request) in [
-        (first, source_request(1609, 4_354)),
-        (
-            second,
-            DirectRequest {
-                tokens: (100_000..104_354).collect(),
-                ..source_request(1611, 0)
-            },
-        ),
-    ] {
-        core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
-            handoff_id,
-            request,
-        })
-        .unwrap();
+    for version in ["0.32.0", "0.33.0"] {
+        let mut args = prefix_core(
+            glm_transfer_groups(version, false),
+            17 * GLM_PAGE,
+            8192,
+            2176,
+            version,
+        )
+        .args;
+        args.worker_type = WorkerType::Prefill;
+        let mut core = VllmCore::new(args);
+        let first = HandoffId::new(Uuid::from_u128(1610));
+        let second = HandoffId::new(Uuid::from_u128(1612));
+        for (handoff_id, request) in [
+            (first, source_request(1609, 4_354)),
+            (
+                second,
+                DirectRequest {
+                    tokens: (100_000..104_354).collect(),
+                    ..source_request(1611, 0)
+                },
+            ),
+        ] {
+            core.apply_command(SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id,
+                request,
+            })
+            .unwrap();
+        }
+        assert_eq!(held_timing(&mut core).full_prompt_tokens, 3);
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 1);
+        // The preempted source restarts from 0 on the prompt that its submission
+        // truncated, as vLLM's `_p_side_truncated` guard keeps a rescheduled
+        // request from losing a second token (V31
+        // `nixl/base_scheduler.py:415-423`, V32 `:411-419`).
+        let preempted = &core.state.requests[&Uuid::from_u128(1611)];
+        assert_eq!(preempted.sequence.num_input_tokens(), 4_353);
+        assert_eq!(preempted.num_computed_tokens, 0);
+        core.apply_command(SchedulerCommand::ReleaseSource { handoff_id: first })
+            .unwrap();
+        // 4,353 tokens take 3 attention blocks. A second truncation would give 2.
+        assert_eq!(held_timing(&mut core).full_prompt_tokens, 3);
     }
-    assert_eq!(held_timing(&mut core).full_prompt_tokens, 3);
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 1);
-    // The preempted source restarts from 0 on the prompt that its submission
-    // truncated, as vLLM's `_p_side_truncated` guard keeps a rescheduled
-    // request from losing a second token (V31
-    // `nixl/base_scheduler.py:415-423`, V32 `:411-419`).
-    let preempted = &core.state.requests[&Uuid::from_u128(1611)];
-    assert_eq!(preempted.sequence.num_input_tokens(), 4_353);
-    assert_eq!(preempted.num_computed_tokens, 0);
-    core.apply_command(SchedulerCommand::ReleaseSource { handoff_id: first })
-        .unwrap();
-    // 4,353 tokens take 3 attention blocks. A second truncation would give 2.
-    assert_eq!(held_timing(&mut core).full_prompt_tokens, 3);
 }
 
 /// A destination request as Replay sends it, with its full output budget.
@@ -1143,6 +1162,8 @@ fn grouped_prefill_source_takes_no_copy_of_a_state_published_at_its_end() {
         ("0.31.0", full_and_state("0.31.0", 16), 3),
         ("0.32.0", glm("0.32.0", 128), 6),
         ("0.32.0", full_and_state("0.32.0", 16), 3),
+        ("0.33.0", glm("0.33.0", 128), 6),
+        ("0.33.0", full_and_state("0.33.0", 16), 3),
     ];
     for (index, (version, mut args, held)) in cases.into_iter().enumerate() {
         args.worker_type = WorkerType::Prefill;
@@ -1183,9 +1204,14 @@ fn window_pd_core(
     VllmCore::new(args)
 }
 
-/// The rank modes of `window_pd_core`: byte mode and block mode on both
+/// The rank modes of `window_pd_core`: byte mode and block mode on the three
 /// versions.
-const WINDOW_PD_MODES: [(bool, &str); 3] = [(false, "0.32.0"), (true, "0.31.0"), (true, "0.32.0")];
+const WINDOW_PD_MODES: [(bool, &str); 4] = [
+    (false, "0.32.0"),
+    (true, "0.31.0"),
+    (true, "0.32.0"),
+    (true, "0.33.0"),
+];
 
 /// The blocks that the rank holds for every request but `busy`, which is
 /// running.
@@ -1350,7 +1376,7 @@ fn grouped_prefill_source_that_leaves_before_its_deferred_free_frees_its_skipped
     // S's 20 tokens then hits nothing: a hit at 16 tokens needs the window
     // blocks of tokens 8 to 15. Freed in group order, a full-attention block
     // goes instead, the window block stays, and that prompt hits 16 tokens.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for cancel in [false, true] {
             // One batch, the source leaves after pass 0; async scheduling,
             // after pass 1 (the deferred free first) and after pass 0 (before
@@ -1412,7 +1438,7 @@ fn grouped_prefill_rank_evicts_the_skipped_blocks_of_a_request_that_it_does_not_
     // and 12 to 15. The full-attention block of tokens 8 to 11 stays. Freed
     // in group order, the full-attention blocks of tokens 8 to 19 would go
     // and the window block would stay.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1, 2] {
             let label = format!("{version} {max_concurrent_batches}");
             let mut core = window_prefill_core(version, 12, max_concurrent_batches);
@@ -1471,7 +1497,7 @@ fn grouped_prefill_rank_frees_the_boundary_hit_block_of_an_ending_request_with_i
     // blocks with 6 free, and the pool evicts the four state hit blocks and
     // keeps the two full-attention blocks. Freed with R's other blocks in
     // group order, the full-attention blocks would go first.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1, 2] {
             let label = format!("{version} {max_concurrent_batches}");
             let mut args = pool_args(version, 18, max_concurrent_batches, 16_384);
@@ -2173,7 +2199,7 @@ fn grouped_destination_counts_the_copy_of_a_state_loaded_to_its_partial_tail() {
     // producer, and what it still needs counts the block of the copy (V31
     // single:1770-1777 with sched:3003-3017, V32 single:1732-1739 with
     // sched:3060-3076). Its first step takes that block.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut full = group("full", 32, 100, None);
         full.prefix_cacheable = Some(true);
         full.transfer_bytes_per_block = Some(100);
@@ -2315,27 +2341,29 @@ fn grouped_destination_capacity_counts_the_whole_prompt() {
     // The 2,176 loaded tokens of a 2,177-token prompt fill one attention
     // block, and the last prompt token opens a second one: seven blocks with
     // the five state blocks. A pool of six pages never admits the request.
-    let byte_mode = pd_core(
-        glm_transfer_groups("0.32.0", false),
-        6 * GLM_PAGE,
-        8192,
-        WorkerType::Decode,
-        None,
-    );
-    let block_mode = block_mode_decode_core(6 * GLM_PAGE, "0.32.0", false);
-    for mut core in [byte_mode, block_mode] {
-        let error = core
-            .apply_command(SchedulerCommand::ReserveDestination {
-                handoff_id: HandoffId::new(Uuid::from_u128(1642)),
-                request: pd_request(1641, 2_177, 2),
-            })
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "destination prompt and state exceed the grouped KV pool capacity"
+    for version in ["0.32.0", "0.33.0"] {
+        let byte_mode = pd_core(
+            glm_transfer_groups(version, false),
+            6 * GLM_PAGE,
+            8192,
+            WorkerType::Decode,
+            None,
         );
-        assert!(core.is_drained());
-        assert_eq!(grouped_pool(&core).used_bytes(), 0);
+        let block_mode = block_mode_decode_core(6 * GLM_PAGE, version, false);
+        for mut core in [byte_mode, block_mode] {
+            let error = core
+                .apply_command(SchedulerCommand::ReserveDestination {
+                    handoff_id: HandoffId::new(Uuid::from_u128(1642)),
+                    request: pd_request(1641, 2_177, 2),
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "destination prompt and state exceed the grouped KV pool capacity"
+            );
+            assert!(core.is_drained());
+            assert_eq!(grouped_pool(&core).used_bytes(), 0);
+        }
     }
 }
 
@@ -2386,7 +2414,7 @@ fn grouped_destination_waits_in_fifo_while_the_pool_is_full() {
 
 #[test]
 fn grouped_destination_in_block_mode_pins_the_attention_hit_and_moves_the_state() {
-    for (version, checkpoint) in GLM_PD_CORES {
+    for (version, checkpoint) in GLM_CORES {
         let mut core = block_mode_decode_core(128 * GLM_PAGE, version, checkpoint);
         let mut trace = TraceCollector::default();
         let mut step = 0;
@@ -2484,7 +2512,7 @@ fn grouped_destination_in_block_mode_publishes_only_full_blocks_at_a_boundary() 
     // 8,191 transferred tokens fill three attention blocks and a fourth in
     // part. The KDA state after 8,191 tokens sits at no replay boundary, so
     // no state is keyed.
-    for (version, checkpoint) in GLM_PD_CORES {
+    for (version, checkpoint) in GLM_CORES {
         let mut core = block_mode_decode_core(128 * GLM_PAGE, version, checkpoint);
         let handoff_id = HandoffId::new(Uuid::from_u128(1628));
         assert_eq!(
@@ -2527,66 +2555,68 @@ fn grouped_destination_in_block_mode_waits_in_fifo_when_its_blocks_do_not_fit() 
     // reservation then needs free blocks for the whole prompt: the same
     // seven, the inactive cached attention block of its hit among them,
     // against the five that are free. So it waits before it pins the hit.
-    let mut core = block_mode_decode_core(11 * GLM_PAGE, "0.32.0", false);
-    let mut trace = TraceCollector::default();
-    let mut step = 0;
-    let first = HandoffId::new(Uuid::from_u128(1630));
-    assert_eq!(
-        reserve_grouped(&mut core, first, pd_request(1629, 2_177, 3)),
-        Some(1)
-    );
-    activate(&mut core, first);
-    assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 11), 3);
-    assert_eq!(block_pool(&core).inactive_cached_blocks(), 5);
+    for version in ["0.32.0", "0.33.0"] {
+        let mut core = block_mode_decode_core(11 * GLM_PAGE, version, false);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        let first = HandoffId::new(Uuid::from_u128(1630));
+        assert_eq!(
+            reserve_grouped(&mut core, first, pd_request(1629, 2_177, 3)),
+            Some(1)
+        );
+        activate(&mut core, first);
+        assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 11), 3);
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 5);
 
-    let second = HandoffId::new(Uuid::from_u128(1632));
-    assert_eq!(
-        reserve_grouped(
-            &mut core,
-            second,
-            DirectRequest {
-                tokens: (100_000..101_000).collect(),
-                ..pd_request(1631, 0, 3)
-            }
-        ),
-        Some(1)
-    );
-    activate(&mut core, second);
-    assert_eq!(block_pool(&core).active_blocks(), 6);
-    assert_eq!(block_pool(&core).inactive_cached_blocks(), 5);
+        let second = HandoffId::new(Uuid::from_u128(1632));
+        assert_eq!(
+            reserve_grouped(
+                &mut core,
+                second,
+                DirectRequest {
+                    tokens: (100_000..101_000).collect(),
+                    ..pd_request(1631, 0, 3)
+                }
+            ),
+            Some(1)
+        );
+        activate(&mut core, second);
+        assert_eq!(block_pool(&core).active_blocks(), 6);
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 5);
 
-    let third = HandoffId::new(Uuid::from_u128(1634));
-    assert_eq!(
-        reserve_grouped(&mut core, third, pd_request(1633, 2_177, 3)),
-        None
-    );
-    // The failed reservation pinned nothing: the attention block stays in the
-    // inactive LRU, the pool is as it was, and nothing was preempted.
-    assert!(core.destination_is_held(third));
-    assert_eq!(block_pool(&core).active_blocks(), 6);
-    assert_eq!(block_pool(&core).inactive_cached_blocks(), 5);
-    let hash = prompt_hash(2_177, 2_176);
-    assert!(
-        block_pool(&core)
-            .key_hit(0, hash)
-            .is_some_and(|hit| !hit.is_active)
-    );
-    assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
+        let third = HandoffId::new(Uuid::from_u128(1634));
+        assert_eq!(
+            reserve_grouped(&mut core, third, pd_request(1633, 2_177, 3)),
+            None
+        );
+        // The failed reservation pinned nothing: the attention block stays in the
+        // inactive LRU, the pool is as it was, and nothing was preempted.
+        assert!(core.destination_is_held(third));
+        assert_eq!(block_pool(&core).active_blocks(), 6);
+        assert_eq!(block_pool(&core).inactive_cached_blocks(), 5);
+        let hash = prompt_hash(2_177, 2_176);
+        assert!(
+            block_pool(&core)
+                .key_hit(0, hash)
+                .is_some_and(|hit| !hit.is_active)
+        );
+        assert_eq!(core.mocker_metrics().vllm_preemptions_total, 0);
 
-    // The running request finishes, and the retry serves the head of the
-    // FIFO with its hit pinned: no unit moves.
-    assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 11), 3);
-    let events = core.retry_pending_destinations();
-    assert_eq!(reserved_units(&events, third), Some(0));
-    assert_eq!(block_pool(&core).active_blocks(), 6);
-    assert!(
-        block_pool(&core)
-            .key_hit(0, hash)
-            .is_some_and(|hit| hit.is_active)
-    );
-    activate(&mut core, third);
-    assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 11), 3);
-    assert!(core.is_drained());
+        // The running request finishes, and the retry serves the head of the
+        // FIFO with its hit pinned: no unit moves.
+        assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 11), 3);
+        let events = core.retry_pending_destinations();
+        assert_eq!(reserved_units(&events, third), Some(0));
+        assert_eq!(block_pool(&core).active_blocks(), 6);
+        assert!(
+            block_pool(&core)
+                .key_hit(0, hash)
+                .is_some_and(|hit| hit.is_active)
+        );
+        activate(&mut core, third);
+        assert_eq!(drain_pd(&mut core, &mut trace, &mut step, 11), 3);
+        assert!(core.is_drained());
+    }
 }
 
 /// A full-attention group and a cacheable state group of 16-token blocks,
@@ -2703,7 +2733,7 @@ fn grouped_destination_retries_when_a_pass_releases_the_cached_block_of_a_bounda
     // loop of the step and can reserve B in the waiting loop of the same
     // step, one forward pass earlier. On 7 pages B fits only once L ends, in
     // pass 5, and the retry after pass 5 reserves it.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1, 2] {
             for (pages, reserving_pass) in [(8u64, 1), (7, 5)] {
                 let label = format!("{version} {max_concurrent_batches} {pages}");
@@ -2761,13 +2791,13 @@ struct Arrival {
     output: usize,
 }
 
-/// A decode rank of 16 pages of the full-attention and state groups on vLLM
-/// 0.32.0, with prefix caching on a hash block of 16 tokens and up to 8
+/// A decode rank of 16 pages of the full-attention and state groups on
+/// `version`, with prefix caching on a hash block of 16 tokens and up to 8
 /// running requests. Each pass gets its arrivals, runs, and then retries the
 /// waiting loads, as replay does at a pass boundary. A load that reserves is
 /// activated at once. Returns the core before the retry after the last pass.
-fn scripted_decode_rank(arrivals: &[Arrival], passes: usize) -> VllmCore {
-    scripted_decode_rank_with(arrivals, passes, 1)
+fn scripted_decode_rank(arrivals: &[Arrival], passes: usize, version: &str) -> VllmCore {
+    scripted_decode_rank_with(arrivals, passes, 1, version)
 }
 
 /// `scripted_decode_rank` with `max_concurrent_batches` batches. With more
@@ -2778,10 +2808,11 @@ fn scripted_decode_rank_with(
     arrivals: &[Arrival],
     passes: usize,
     max_concurrent_batches: usize,
+    version: &str,
 ) -> VllmCore {
     let mut groups = full_and_state_transfer_groups();
     groups[1].prefill_checkpoint_blocks = Some(0);
-    let mut args = prefix_core(groups, 1_600, 8192, 16, "0.32.0").args;
+    let mut args = prefix_core(groups, 1_600, 8192, 16, version).args;
     args.worker_type = WorkerType::Decode;
     args.max_num_seqs = Some(8);
     args.max_concurrent_batches = max_concurrent_batches;
@@ -2860,93 +2891,97 @@ fn grouped_destination_retries_when_the_loads_in_flight_need_less() {
         arrival(32, true, 12, 0, 97, 23),
         arrival(33, true, 13, 0, 63, 21),
     ];
-    let mut core = scripted_decode_rank(&arrivals, 35);
-    let head = HandoffId::new(Uuid::from_u128(1_000_010));
-    // Load 10 waits while the loads in flight need 2 blocks. The last pass
-    // releases no block, publishes and evicts no key and leaves the published
-    // epoch, so the retry epoch stays. It is the first pass of a load in
-    // flight, which takes that load out of the need: the need falls from 2
-    // blocks to 0. Load 10 then fits. vLLM sums that need again at each
-    // attempt (V32 `sched:1241-1251`, `:3088-3092`), so the retry after this
-    // pass reserves it.
-    assert_eq!(
-        reserved_units(&core.retry_pending_destinations(), head),
-        Some(1)
-    );
+    for version in ["0.32.0", "0.33.0"] {
+        let mut core = scripted_decode_rank(&arrivals, 35, version);
+        let head = HandoffId::new(Uuid::from_u128(1_000_010));
+        // Load 10 waits while the loads in flight need 2 blocks. The last pass
+        // releases no block, publishes and evicts no key and leaves the published
+        // epoch, so the retry epoch stays. It is the first pass of a load in
+        // flight, which takes that load out of the need: the need falls from 2
+        // blocks to 0. Load 10 then fits. vLLM sums that need again at each
+        // attempt (V32 `sched:1241-1251`, `:3088-3092`), so the retry after this
+        // pass reserves it.
+        assert_eq!(
+            reserved_units(&core.retry_pending_destinations(), head),
+            Some(1)
+        );
+    }
 }
 
 #[test]
 fn grouped_destination_retries_when_a_step_start_makes_a_state_key_a_hit() {
-    // A decode rank of the GLM-5.3-Flash groups on vLLM 0.32.0, 22 pages and a
-    // hash block of 16.
-    let mut args = prefix_core(
-        glm_transfer_groups("0.32.0", false),
-        22 * GLM_PAGE,
-        8192,
-        16,
-        "0.32.0",
-    )
-    .args;
-    args.worker_type = WorkerType::Decode;
-    args.max_num_seqs = Some(8);
-    let mut core = VllmCore::new(args);
-    let mut trace = TraceCollector::default();
-    let mut step = 0;
-    // (pass, load, id, shared, prompt, output)
-    let arrivals: [(usize, bool, u128, u32, u32, usize); 4] = [
-        (4, false, 1, 3264, 1546, 28),
-        (7, false, 2, 3264, 2658, 1),
-        (8, true, 3, 2720, 3446, 5),
-        // A load of the first 2,926 tokens of the shared prefix. It waits.
-        (9, true, 4, 3264, 2926, 8),
-    ];
-    let passes = 11;
-    for pass in 0..passes {
-        for &(_, load, id, shared, prompt, output) in arrivals.iter().filter(|a| a.0 == pass) {
-            let tokens = (0..prompt)
-                .map(|i| {
-                    if i < shared {
-                        i
-                    } else {
-                        1_000_000 * id as u32 + i
+    // A decode rank of the GLM-5.3-Flash groups on vLLM 0.32.0 and on vLLM
+    // 0.33.0, 22 pages and a hash block of 16.
+    for version in ["0.32.0", "0.33.0"] {
+        let mut args = prefix_core(
+            glm_transfer_groups(version, false),
+            22 * GLM_PAGE,
+            8192,
+            16,
+            version,
+        )
+        .args;
+        args.worker_type = WorkerType::Decode;
+        args.max_num_seqs = Some(8);
+        let mut core = VllmCore::new(args);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        // (pass, load, id, shared, prompt, output)
+        let arrivals: [(usize, bool, u128, u32, u32, usize); 4] = [
+            (4, false, 1, 3264, 1546, 28),
+            (7, false, 2, 3264, 2658, 1),
+            (8, true, 3, 2720, 3446, 5),
+            // A load of the first 2,926 tokens of the shared prefix. It waits.
+            (9, true, 4, 3264, 2926, 8),
+        ];
+        let passes = 11;
+        for pass in 0..passes {
+            for &(_, load, id, shared, prompt, output) in arrivals.iter().filter(|a| a.0 == pass) {
+                let tokens = (0..prompt)
+                    .map(|i| {
+                        if i < shared {
+                            i
+                        } else {
+                            1_000_000 * id as u32 + i
+                        }
+                    })
+                    .collect();
+                if load {
+                    let handoff_id = HandoffId::new(Uuid::from_u128(1_000_000 + id));
+                    let request = DirectRequest {
+                        tokens,
+                        ..pd_request(id, 0, output)
+                    };
+                    if reserve_grouped(&mut core, handoff_id, request).is_some() {
+                        activate(&mut core, handoff_id);
                     }
-                })
-                .collect();
-            if load {
-                let handoff_id = HandoffId::new(Uuid::from_u128(1_000_000 + id));
-                let request = DirectRequest {
-                    tokens,
-                    ..pd_request(id, 0, output)
-                };
-                if reserve_grouped(&mut core, handoff_id, request).is_some() {
+                } else {
+                    submit_tokens(&mut core, id, tokens, output);
+                }
+            }
+            step_pd(&mut core, &mut trace, &mut step);
+            if pass + 1 == passes {
+                break;
+            }
+            for event in core.retry_pending_destinations() {
+                if let SchedulerLifecycleEvent::DestinationReserved { handoff_id, .. } = event {
                     activate(&mut core, handoff_id);
                 }
-            } else {
-                submit_tokens(&mut core, id, tokens, output);
             }
         }
-        step_pd(&mut core, &mut trace, &mut step);
-        if pass + 1 == passes {
-            break;
-        }
-        for event in core.retry_pending_destinations() {
-            if let SchedulerLifecycleEvent::DestinationReserved { handoff_id, .. } = event {
-                activate(&mut core, handoff_id);
-            }
-        }
+        let head = HandoffId::new(Uuid::from_u128(1_000_004));
+        // The state keys that the step before the last one published are no hit
+        // in that step, as in vLLM (V31 `single:1726-1734`, V32
+        // `single:1688-1696`), and load 4 waits. The step start of the last pass
+        // makes them hits (V32 `sched:632`, `single:2008-2009`). The last pass
+        // releases no block, publishes and evicts no key and leaves the need of
+        // the loads in flight at 0. Only the published epoch of the coordinator
+        // moves, and load 4 now fits, so the retry after this pass reserves it.
+        assert_eq!(
+            reserved_units(&core.retry_pending_destinations(), head),
+            Some(1)
+        );
     }
-    let head = HandoffId::new(Uuid::from_u128(1_000_004));
-    // The state keys that the step before the last one published are no hit
-    // in that step, as in vLLM (V31 `single:1726-1734`, V32
-    // `single:1688-1696`), and load 4 waits. The step start of the last pass
-    // makes them hits (V32 `sched:632`, `single:2008-2009`). The last pass
-    // releases no block, publishes and evicts no key and leaves the need of
-    // the loads in flight at 0. Only the published epoch of the coordinator
-    // moves, and load 4 now fits, so the retry after this pass reserves it.
-    assert_eq!(
-        reserved_units(&core.retry_pending_destinations(), head),
-        Some(1)
-    );
 }
 
 #[test]
@@ -2974,20 +3009,22 @@ fn grouped_destination_retries_when_a_pass_evicts_a_key() {
         // A load of the first 71 tokens of the shared prefix. It waits.
         arrival(29, true, 12, 80, 71, 15),
     ];
-    let mut core = scripted_decode_rank(&arrivals, 30);
-    let head = HandoffId::new(Uuid::from_u128(1_000_012));
-    // Load 12 waits after its arrival. The last pass releases no block and
-    // publishes no key. It takes two of the five inactive cached blocks, and
-    // one of them holds the last copy of a key, which moves the generation of
-    // the resident keys. A decode rank counts each state group's own hit, so
-    // that eviction can change what load 12 counts. The need of the loads in
-    // flight stays 0, and the published epoch stays. Load 12 now fits, so
-    // the retry after this pass reserves it.
-    assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
-    assert_eq!(
-        reserved_units(&core.retry_pending_destinations(), head),
-        Some(2)
-    );
+    for version in ["0.32.0", "0.33.0"] {
+        let mut core = scripted_decode_rank(&arrivals, 30, version);
+        let head = HandoffId::new(Uuid::from_u128(1_000_012));
+        // Load 12 waits after its arrival. The last pass releases no block and
+        // publishes no key. It takes two of the five inactive cached blocks, and
+        // one of them holds the last copy of a key, which moves the generation of
+        // the resident keys. A decode rank counts each state group's own hit, so
+        // that eviction can change what load 12 counts. The need of the loads in
+        // flight stays 0, and the published epoch stays. Load 12 now fits, so
+        // the retry after this pass reserves it.
+        assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+        assert_eq!(
+            reserved_units(&core.retry_pending_destinations(), head),
+            Some(2)
+        );
+    }
 }
 
 #[test]
@@ -3014,21 +3051,23 @@ fn grouped_destination_retries_when_a_pass_evicts_a_key_with_async_scheduling() 
         arrival(22, true, 11, 96, 69, 25),
         arrival(22, true, 12, 96, 81, 15),
     ];
-    let mut core = scripted_decode_rank_with(&arrivals, 27, 2);
-    let head = HandoffId::new(Uuid::from_u128(1_000_012));
-    // With async scheduling. Load 12 waits after its arrival. The last pass
-    // releases no block and publishes no key, so the pool's own epoch stays.
-    // It takes two of the six inactive cached blocks, and both hold the last
-    // copy of a key, which moves the generation of the resident keys by 2.
-    // The need of the loads in flight stays 0, and the published epoch
-    // stays. Load 12 now fits, so the retry after this pass reserves it with
-    // one transfer unit. Without the key generation in the retry epoch, that
-    // retry skips it.
-    assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
-    assert_eq!(
-        reserved_units(&core.retry_pending_destinations(), head),
-        Some(1)
-    );
+    for version in ["0.32.0", "0.33.0"] {
+        let mut core = scripted_decode_rank_with(&arrivals, 27, 2, version);
+        let head = HandoffId::new(Uuid::from_u128(1_000_012));
+        // With async scheduling. Load 12 waits after its arrival. The last pass
+        // releases no block and publishes no key, so the pool's own epoch stays.
+        // It takes two of the six inactive cached blocks, and both hold the last
+        // copy of a key, which moves the generation of the resident keys by 2.
+        // The need of the loads in flight stays 0, and the published epoch
+        // stays. Load 12 now fits, so the retry after this pass reserves it with
+        // one transfer unit. Without the key generation in the retry epoch, that
+        // retry skips it.
+        assert_eq!(core.kv_manager.grouped_inflight_need(), 0);
+        assert_eq!(
+            reserved_units(&core.retry_pending_destinations(), head),
+            Some(1)
+        );
+    }
 }
 
 #[test]
@@ -3274,21 +3313,23 @@ fn grouped_destination_in_byte_mode_retries_when_a_window_page_leaves() {
 
 #[test]
 fn grouped_destination_on_vllm_0_32_counts_no_checkpoint_block_for_its_load() {
-    // A cold destination of 2,177 tokens on vLLM 0.32.0 with checkpoint
-    // blocks, on 10 pages. The loaded tokens count as computed, so the
-    // query of the whole-prompt test runs from 2,176 to 2,177, where no
+    // A cold destination of 2,177 tokens on vLLM 0.32.0 or 0.33.0 with
+    // checkpoint blocks, on 10 pages. The loaded tokens count as computed, so
+    // the query of the whole-prompt test runs from 2,176 to 2,177, where no
     // checkpoint position fits (V32 `vllm/v1/kv_cache_interface.py:1125-1146`).
     // The test counts 7 blocks, not the 11 of a query from 0, so the load fits.
-    let mut core = block_mode_decode_core(10 * GLM_PAGE, "0.32.0", true);
-    let handoff_id = HandoffId::new(Uuid::from_u128(1720));
-    assert_eq!(
-        reserve_grouped(&mut core, handoff_id, pd_request(1719, 2_177, 3)),
-        Some(1)
-    );
-    assert_eq!(block_pool(&core).active_blocks(), 6);
-    core.apply_command(SchedulerCommand::CancelDestination { handoff_id })
-        .unwrap();
-    assert!(core.is_drained());
+    for version in ["0.32.0", "0.33.0"] {
+        let mut core = block_mode_decode_core(10 * GLM_PAGE, version, true);
+        let handoff_id = HandoffId::new(Uuid::from_u128(1720));
+        assert_eq!(
+            reserve_grouped(&mut core, handoff_id, pd_request(1719, 2_177, 3)),
+            Some(1)
+        );
+        assert_eq!(block_pool(&core).active_blocks(), 6);
+        core.apply_command(SchedulerCommand::CancelDestination { handoff_id })
+            .unwrap();
+        assert!(core.is_drained());
+    }
 }
 
 /// A decode rank with full-attention and state blocks of 16 tokens on
@@ -3324,7 +3365,7 @@ fn grouped_decode_rank_local_hit_inside_a_block_keeps_its_copy_sources() {
     // sched:1434-1442, v0.32 sched:1474-1482). RC holds its 7 blocks and the
     // 5 sources in its pass, and RN waits one pass on pools of 13 to 17
     // blocks, as on an aggregated rank.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for blocks in 12..=18 {
             let expected = match blocks {
                 12 => (0, 4, vec![7, 7, 7, 0, 6, 6, 6, 0], 12),
@@ -3359,7 +3400,7 @@ fn grouped_destination_with_a_local_prefix_inside_a_block_takes_no_copy_source()
     // source. Its activation holds none either. Its first pass takes one
     // block for the copy of the state that the load published at 36 tokens,
     // so the pass holds 5 blocks at its peak.
-    for (version, cached) in [("0.31.0", 36), ("0.32.0", 40)] {
+    for (version, cached) in [("0.31.0", 36), ("0.32.0", 40), ("0.33.0", 40)] {
         let mut groups = full_and_state_transfer_groups();
         if version != "0.31.0" {
             groups[1].prefill_checkpoint_blocks = Some(0);
@@ -3408,7 +3449,12 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
     // 0.32.0 keeps that boundary below the last prompt token (V32
     // `kv_cache_interface.py:1110-1122`, `single:2067-2084`), and a hash
     // block of 16 has no boundary at 1 token, so these take no copy.
-    for (version, unit, copy) in [("0.31.0", 1, 1), ("0.31.0", 16, 0), ("0.32.0", 1, 0)] {
+    for (version, unit, copy) in [
+        ("0.31.0", 1, 1),
+        ("0.31.0", 16, 0),
+        ("0.32.0", 1, 0),
+        ("0.33.0", 1, 0),
+    ] {
         for max_concurrent_batches in [1, 2] {
             let label = format!("{version} {unit} {max_concurrent_batches}");
             let mut core = one_token_load_core(version, unit, 16, max_concurrent_batches);
@@ -3901,69 +3947,71 @@ fn grouped_destination_retries_when_the_local_prefills_need_less() {
 
 #[test]
 fn grouped_destination_in_block_mode_retries_when_the_local_prefills_need_less() {
-    // The GLM-5.3-Flash groups on vLLM 0.32.0 with checkpoint blocks, in
-    // block mode on 20 pages, with a hash block of 16 and one batch of 600
-    // tokens. A local prompt of 5,000 tokens runs chunks of 600 tokens. Below
-    // token 2,176 it holds 1 MLA block, the ring block and 1 block of each of
-    // the 4 KDA groups: 6 blocks, so 14 are free.
-    let mut args = prefix_core(
-        glm_transfer_groups("0.32.0", true),
-        20 * GLM_PAGE,
-        600,
-        16,
-        "0.32.0",
-    )
-    .args;
-    args.worker_type = WorkerType::Decode;
-    let mut core = VllmCore::new(args);
-    let mut trace = TraceCollector::default();
-    let mut step = 0;
-    // The prompt still needs cdiv(5,000, 2,176) - 1 = 2 MLA blocks. The ring
-    // holds its block and needs none. Each KDA group needs 1 block, plus a
-    // checkpoint block while the rest of the prompt can export one (V32
-    // `vllm/v1/core/single_type_kv_cache_manager.py:1724-1773`). The
-    // checkpoint sits at (5,000 - 1) / 16 * 16 = 4,992, and a query exports
-    // it only from a start on a hash block, among other conditions (V32
-    // `vllm/v1/kv_cache_interface.py:1110-1146`). 600 is not on one, so the
-    // need is 2 + 4 = 6 blocks.
-    let local = submit_tokens(&mut core, 1890, (0..5_000).collect(), 1);
-    let need = |core: &VllmCore| {
-        let lease = &core.state.requests[&local].sequence.lease;
-        core.kv_manager.grouped_remaining_need(lease, 5_000)
-    };
-    assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
-    assert_eq!(need(&core), 6);
-    // 1,200 is on a hash block, so the need is 2 + 4 * 2 = 10 blocks. A
-    // distinct load of 1,000 tokens loads 999. Both of its tests count 6
-    // blocks: 1 MLA block, the ring block and 1 block per KDA group. It
-    // waits, as 6 + 10 > 14.
-    assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
-    assert_eq!(block_pool(&core).active_blocks(), 6);
-    assert_eq!(need(&core), 10);
-    let handoff_id = HandoffId::new(Uuid::from_u128(1892));
-    let request = DirectRequest {
-        tokens: (100_000..101_000).collect(),
-        ..pd_request(1891, 0, 2)
-    };
-    assert_eq!(reserve_grouped(&mut core, handoff_id, request), None);
-    // The third chunk ends at 1,800, still inside the first MLA and KDA
-    // blocks. It takes and frees no block, so the pool's retry epoch is still
-    // 0. But 1,800 is not on a hash block, so the need falls to 6 blocks, and
-    // the load fits, as 6 + 6 <= 14.
-    assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
-    assert_eq!(block_pool(&core).active_blocks(), 6);
-    assert_eq!(grouped_pool(&core).retry_epoch(), 0);
-    assert_eq!(need(&core), 6);
-    assert_eq!(
-        reserved_units(&core.retry_pending_destinations(), handoff_id),
-        Some(1)
-    );
+    // The GLM-5.3-Flash groups on vLLM 0.32.0 or 0.33.0 with checkpoint
+    // blocks, in block mode on 20 pages, with a hash block of 16 and one batch
+    // of 600 tokens. A local prompt of 5,000 tokens runs chunks of 600
+    // tokens. Below token 2,176 it holds 1 MLA block, the ring block and 1
+    // block of each of the 4 KDA groups: 6 blocks, so 14 are free.
+    for version in ["0.32.0", "0.33.0"] {
+        let mut args = prefix_core(
+            glm_transfer_groups(version, true),
+            20 * GLM_PAGE,
+            600,
+            16,
+            version,
+        )
+        .args;
+        args.worker_type = WorkerType::Decode;
+        let mut core = VllmCore::new(args);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        // The prompt still needs cdiv(5,000, 2,176) - 1 = 2 MLA blocks. The ring
+        // holds its block and needs none. Each KDA group needs 1 block, plus a
+        // checkpoint block while the rest of the prompt can export one (V32
+        // `vllm/v1/core/single_type_kv_cache_manager.py:1724-1773`). The
+        // checkpoint sits at (5,000 - 1) / 16 * 16 = 4,992, and a query exports
+        // it only from a start on a hash block, among other conditions (V32
+        // `vllm/v1/kv_cache_interface.py:1110-1146`). 600 is not on one, so the
+        // need is 2 + 4 = 6 blocks.
+        let local = submit_tokens(&mut core, 1890, (0..5_000).collect(), 1);
+        let need = |core: &VllmCore| {
+            let lease = &core.state.requests[&local].sequence.lease;
+            core.kv_manager.grouped_remaining_need(lease, 5_000)
+        };
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
+        assert_eq!(need(&core), 6);
+        // 1,200 is on a hash block, so the need is 2 + 4 * 2 = 10 blocks. A
+        // distinct load of 1,000 tokens loads 999. Both of its tests count 6
+        // blocks: 1 MLA block, the ring block and 1 block per KDA group. It
+        // waits, as 6 + 10 > 14.
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
+        assert_eq!(block_pool(&core).active_blocks(), 6);
+        assert_eq!(need(&core), 10);
+        let handoff_id = HandoffId::new(Uuid::from_u128(1892));
+        let request = DirectRequest {
+            tokens: (100_000..101_000).collect(),
+            ..pd_request(1891, 0, 2)
+        };
+        assert_eq!(reserve_grouped(&mut core, handoff_id, request), None);
+        // The third chunk ends at 1,800, still inside the first MLA and KDA
+        // blocks. It takes and frees no block, so the pool's retry epoch is still
+        // 0. But 1,800 is not on a hash block, so the need falls to 6 blocks, and
+        // the load fits, as 6 + 6 <= 14.
+        assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
+        assert_eq!(block_pool(&core).active_blocks(), 6);
+        assert_eq!(grouped_pool(&core).retry_epoch(), 0);
+        assert_eq!(need(&core), 6);
+        assert_eq!(
+            reserved_units(&core.retry_pending_destinations(), handoff_id),
+            Some(1)
+        );
+    }
 }
 
 #[test]
 fn grouped_decode_rank_frees_the_skipped_blocks_of_an_ending_request_first() {
     let hash = prompt_hash(2_177, 2_176);
-    for (version, checkpoint) in GLM_PD_CORES {
+    for (version, checkpoint) in GLM_CORES {
         for drop in [false, true] {
             let mut core = block_mode_decode_core(11 * GLM_PAGE, version, checkpoint);
             let mut trace = TraceCollector::default();
@@ -4093,7 +4141,7 @@ fn grouped_decode_rank_with_async_scheduling_evicts_the_skipped_blocks_of_an_end
             .key_hit(group, lease.prefix_hash_at(end).unwrap())
             .is_some()
     };
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1, 2] {
             let label = format!("{version} {max_concurrent_batches}");
             let mut full = group("full", 4, 100, None);
@@ -4133,7 +4181,7 @@ fn grouped_decode_rank_with_async_scheduling_evicts_the_skipped_blocks_of_an_end
 fn grouped_decode_rank_drop_before_the_first_allocation_takes_no_block() {
     // The shape of `grouped_prefix_waiting_hit_waits_when_its_first_chunk_does_not_fit`
     // on a decode rank of 12 pages, with a ring that every request holds.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let mut args = prefix_core(window_and_ring_transfer_groups(), 12 * 8, 8, 4, version).args;
         args.worker_type = WorkerType::Decode;
         let mut core = VllmCore::new(args);
@@ -4209,7 +4257,7 @@ fn grouped_decode_rank_ending_request_takes_no_copy_of_its_published_state() {
         args.worker_type = WorkerType::Decode;
         VllmCore::new(args)
     };
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         // Two distinct loads of 49 tokens fill 6 pages: each holds 2
         // attention blocks and its running state block. Each activation
         // publishes the loaded state at 48, inside the running block. A
@@ -5576,7 +5624,7 @@ fn grouped_prefill_rank_keeps_copy_sources_until_the_scheduling_pass_ends() {
     // async scheduling RC holds its 7 blocks and the 5 sources in its pass,
     // and RN waits one pass on pools of 13 to 17 blocks, as on an aggregated
     // rank.
-    for version in ["0.31.0", "0.32.0"] {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
         for max_concurrent_batches in [1, 2] {
             for blocks in 12..=18 {
                 let expected = match (blocks, max_concurrent_batches) {
@@ -5706,6 +5754,44 @@ fn grouped_prefix_waiting_hit_follows_the_state_keys_published_in_the_step() {
         assert_eq!(waiting_hit(&core, &mut probe), 0, "{version}");
         core.kv_manager.begin_step();
         assert_eq!(waiting_hit(&core, &mut probe), 12, "{version}");
+    }
+}
+
+#[test]
+fn grouped_pd_rank_on_vllm_0330_holds_no_waiting_request_after_the_step_that_publishes_a_state_key()
+{
+    // vLLM 0.33.0 does not publish again a state block that already has the
+    // key of its position (v0.33 single:2112-2115). So the key does not go
+    // into the set of the step again (v0.33 single:1994-1999), and a request
+    // that hits it waits for the publishing step only (v0.33
+    // single:1704-1712). Replay publishes a state key once. P (40 tokens)
+    // ends its first chunk at the last cacheable stop, (40 - 1) / 16 * 16 =
+    // 32, and publishes its state there. Its second chunk, 32..40, is a
+    // second cache step for that key. W (48 tokens) repeats the prompt of P.
+    for (role, worker_type) in [
+        ("prefill", WorkerType::Prefill),
+        ("decode", WorkerType::Decode),
+    ] {
+        let mut groups = full_and_state_transfer_groups();
+        groups[1].prefill_checkpoint_blocks = Some(0);
+        let mut args = prefix_core(groups, 1_600, 8192, 16, "0.33.0").args;
+        args.worker_type = worker_type;
+        let mut core = VllmCore::new(args);
+        let mut trace = TraceCollector::default();
+        let mut probe = waiting_probe(&core, 2402, (0..48).collect());
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{role}");
+        submit_tokens(&mut core, 2401, (0..40).collect(), 1);
+        // The publishing step: the key at 32 is no hit.
+        let pass = core.execute_pass(&mut trace, 0.0);
+        assert_eq!(pass.admissions.len(), 1, "{role}");
+        assert_eq!(waiting_hit(&core, &mut probe), 0, "{role}");
+        // The next step: P computes 32..40, and W hits 32 tokens.
+        let pass = core.execute_pass(&mut trace, 1.0);
+        assert!(
+            pass.output_signals.iter().all(|output| !output.rejected),
+            "{role}"
+        );
+        assert_eq!(waiting_hit(&core, &mut probe), 32, "{role}");
     }
 }
 

@@ -743,14 +743,15 @@ file is vendored.
 The repository-root file `crates/core/src/engine/kv_manager/grouped_transfer.rs`
 adapts the P/D transfer rules of vLLM's NIXL connector and KV cache manager
 from vLLM v0.31.0, immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`,
-and from vLLM v0.32.0, immutable commit
-`5df63a7203cdb9328d824a27b682e77c7b9928be`: the block clip of each cache
+from vLLM v0.32.0, immutable commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`, and from vLLM v0.33.0, immutable
+commit `4ba787ec9959e566d3b587a796dff07673324da5`: the block clip of each cache
 group, the whole-block reads of a full-attention group, the in-window block
 count of a decode rank for a sliding-window group, the prefill backoff and
 truncation, the blocks that a decode rank pulls, the state pairing and the
-copy on each TP rank. The rules count the same blocks in both versions and
-take the bytes that the connector reads for one block of each group from the
-profile, so one set of rules covers both.
+copy on each TP rank. The rules count the same blocks in the three versions
+and take the bytes that the connector reads for one block of each group from
+the profile, so one set of rules covers them.
 `crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
 tests of these rules.
 
@@ -769,10 +770,19 @@ tests of these rules.
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
 https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
 
 This is a modified Rust simulation adaptation, restricted to no speculative
 decoding, no HiSparse, no bounded replay window and no `all` Mamba cache mode.
