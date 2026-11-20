@@ -17,12 +17,38 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[2] / "python/aisim/src"
 
 
+# Installed wheels expose their SDK under ``aisim_core`` or, before the renames, ``aisimulate_core`` and then
+# ``aiconfigurator_core`` (the order ``scripts.release.package_identity.runtime_module`` uses for the first two).
+HISTORICAL_NAMESPACES = ("aisimulate_core", "aiconfigurator_core")
+
+
+def _installed_wheel_namespace():
+    """Alias the first historical wheel SDK namespace as ``aisim_core``; None when no wheel provides one."""
+    for name in HISTORICAL_NAMESPACES:
+        try:
+            package = importlib.import_module(name)
+            sdk = importlib.import_module(f"{name}.sdk")
+        except ModuleNotFoundError as error:
+            # A shim that re-exports ``aisim_core`` (this checkout's, or a current wheel's) cannot supply a missing
+            # one; any other missing module means the wheel is present but broken: do not mask it with the checkout.
+            if error.name not in {name, f"{name}.sdk", "aisim_core"}:
+                raise
+            continue
+        # Alias the package, preserving its module paths and active database state.
+        sys.modules["aisim_core"] = package
+        sys.modules["aisim_core.sdk"] = sdk
+        return package
+    return None
+
+
 def bind() -> None:
     try:
         import aisim_core
-    except ImportError:  # no wheel: use the evaluator's source tree
-        sys.path.insert(0, str(SOURCE))
-        import aisim_core
+    except ImportError:
+        aisim_core = _installed_wheel_namespace()
+        if aisim_core is None:  # no installed wheel provides an SDK namespace: use the evaluator's source tree
+            sys.path.insert(0, str(SOURCE))
+            import aisim_core
     package = SOURCE / "aisim_core/data"
     loaded = sys.modules.get("aisim_core.data")
     if loaded is not None and Path(loaded.__file__).resolve() == package / "__init__.py":
