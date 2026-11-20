@@ -256,11 +256,17 @@ impl LocalG2 {
                 let read = registry.reads_local(rank, spill.victim);
                 if !read && tier.evict_resident(spill.owner, spill.victim, now) {
                     registry.local_g2_stats().evicted_blocks += 1;
+                    registry.forget_local_retirement(rank, spill.victim);
                     g3.leave_memory(spill.victim, in_g2(spill.victim));
-                } else if (g3.deposits.front()).is_some_and(|deposit| now < deposit.deadline) {
-                    // A store still waits for the slot.
-                    g3.spill = Some(spill);
-                    break;
+                } else {
+                    // The write settled: only existing claims may keep this
+                    // copy, even if its waiting deposit has already expired.
+                    registry.retire_local(rank, spill.victim);
+                    if (g3.deposits.front()).is_some_and(|deposit| now < deposit.deadline) {
+                        // A store still waits for the slot.
+                        g3.spill = Some(spill);
+                        break;
+                    }
                 }
                 // If no store waits any more, a block a read still holds
                 // stays in memory as well as on disk. KVCR drops it from
@@ -330,6 +336,7 @@ impl LocalG2 {
                         let evicted = tier.evict_resident(owner, victim, now);
                         debug_assert!(evicted, "an evictable block leaves");
                         registry.local_g2_stats().evicted_blocks += 1;
+                        registry.forget_local_retirement(rank, victim);
                         g3.leave_memory(victim, in_g2(victim));
                     }
                     continue;
@@ -577,6 +584,12 @@ impl VllmKvcrAdapter {
             .map(HostTierHandle::lock);
         let own_handle = self.local.as_ref().map(|local| local.tier.clone());
         let mut own_local = own_handle.as_ref().map(HostTierHandle::lock);
+        let peer_local_hit = |key| {
+            src_local
+                .as_ref()
+                .is_some_and(|tier| tier.lookup(key) == Lookup::Hit)
+                && source.is_some_and(|rank| !registry.local_is_retiring(rank, key))
+        };
         // With disk, what KVCR holds also changes when a write starts or ends.
         let own_g3 = self.local.as_ref().and_then(|local| local.g3.as_ref());
         let at = (
@@ -590,10 +603,11 @@ impl VllmKvcrAdapter {
             // failure is still relevant only while a source holds its key.
             if let Some(wait) = local.no_room.get(&owner).filter(|wait| {
                 wait.at == at
-                    && ([own_local.as_ref(), src.as_ref(), src_local.as_ref()]
+                    && ([own_local.as_ref(), src.as_ref()]
                         .into_iter()
                         .flatten()
                         .any(|tier| tier.lookup(wait.key) == Lookup::Hit)
+                        || peer_local_hit(wait.key)
                         || (local.g3.as_ref()).is_some_and(|g3| g3.on_disk(wait.key)))
             }) {
                 tier.note_external_capacity_retry(owner, wait.key, now);
@@ -627,9 +641,7 @@ impl VllmKvcrAdapter {
                     let in_own = own == Lookup::Hit;
                     // A block being written is still in memory.
                     let on_disk = !in_own && own_g3.is_some_and(|g3| g3.on_disk(key));
-                    let in_peer_local = src_local
-                        .as_ref()
-                        .is_some_and(|tier| tier.lookup(key) == Lookup::Hit);
+                    let in_peer_local = peer_local_hit(key);
                     let in_peer_g2 = src
                         .as_ref()
                         .is_some_and(|tier| tier.lookup(key) == Lookup::Hit);
@@ -3105,6 +3117,232 @@ mod tests {
         let stats = f.stats();
         assert_eq!(stats.local_g2.unwrap().promoted_blocks, 2);
         assert_eq!(stats.g3.unwrap().read_blocks, 1);
+    }
+
+    #[test]
+    fn a_settled_spill_rejects_new_peer_reads_but_keeps_existing_sources() {
+        for policy in [KvcrLocalG2Policy::Lru, KvcrLocalG2Policy::Fifo] {
+            for reads in [true, false] {
+                for in_g2 in [false, true] {
+                    for in_time in [false, true] {
+                        let g3 = KvcrG3Config {
+                            latency_to_first_byte_ms: 2.0,
+                            write_bandwidth_gbps: 0.0,
+                            spill_timeout_ms: if in_time { 10.0 } else { 1.5 },
+                            ..KvcrG3Config::new(2)
+                        };
+                        let f = Fixture::with_g3(1, policy, 0.0, g3);
+                        if in_g2 {
+                            make_resident(&f.source_g2, &[0]);
+                        }
+                        let (mut source, mut target) = (f.adapter_of(f.source), f.adapter());
+                        let key = f.keys(&[0]);
+                        store((&mut source, &f.source_g2.lock()), &[0], &[0], 0.0);
+                        store((&mut source, &f.source_g2.lock()), &[1], &[1], 0.0);
+                        // The write runs until 2. A peer may still start at 1;
+                        // its copy ends at 3, using a reader or a pin according
+                        // to whether the peer also asks for an absent block.
+                        let asked = f.keys(if reads { &[0] } else { &[0, 99] });
+                        assert!(target.stage_at(
+                            &mut f.target.lock(),
+                            f.owner,
+                            f.source,
+                            &mut RestoreRounds::default(),
+                            &asked,
+                            1.0,
+                        ));
+                        assert_eq!(target.stages.values().next().unwrap().reads, reads);
+                        source.advance_g3(&f.source_g2.lock(), 2.0);
+                        assert_eq!(kvcr_holds(&source, 0), (Lookup::Hit, in_time));
+                        assert_eq!(
+                            f.registry.lock().unwrap().reads_local(f.source, key[0]),
+                            reads
+                        );
+                        assert_eq!(
+                            source.local.as_ref().unwrap().tier.lock().pins(key[0]),
+                            usize::from(!reads)
+                        );
+
+                        let late_rank = KvHintSource {
+                            worker_id: 2,
+                            dp_rank: 0,
+                        };
+                        let late_g2 = HostTierHandle::new(per_rank(8, 0.0, 0.0));
+                        f.registry
+                            .lock()
+                            .unwrap()
+                            .register_worker(2, vec![late_g2.clone()], 1)
+                            .unwrap();
+                        let mut late = f.adapter_of(late_rank);
+                        // The retired memory copy cannot serve a new peer.
+                        // An independent native G2 copy remains a valid source.
+                        assert_eq!(
+                            late.stage_at(
+                                &mut late_g2.lock(),
+                                f.owner,
+                                f.source,
+                                &mut RestoreRounds::default(),
+                                &key,
+                                2.5,
+                            ),
+                            in_g2,
+                            "{policy:?}, readers={reads}, in_g2={in_g2}, in_time={in_time}"
+                        );
+                        if in_g2 {
+                            let stage = late.stages.values().next().unwrap();
+                            assert_eq!(stage.keys, key);
+                            assert!(stage.local_keys.is_empty());
+                            assert_eq!(f.source_pins(&key), [1]);
+                            // Detaching the owner keeps the source claim until
+                            // the already accepted transfer completes.
+                            assert!(late.release(f.owner));
+                        }
+                        assert!(target.advance(&mut f.target.lock(), 3.0));
+                        assert_eq!(f.target.lock().lookup(key[0]), Lookup::Hit);
+                        assert!(!f.registry.lock().unwrap().reads_local(f.source, key[0]));
+                        assert_eq!(source.local.as_ref().unwrap().tier.lock().pins(key[0]), 0);
+                        source.advance_g3(&f.source_g2.lock(), 3.0);
+                        if in_time {
+                            assert_eq!(kvcr_holds(&source, 0), (Lookup::Miss, true));
+                            assert_eq!(kvcr_holds(&source, 1), (Lookup::Hit, false));
+                        }
+                        if in_g2 {
+                            assert!(late.advance(&mut late_g2.lock(), 4.5));
+                            assert_eq!(late_g2.lock().lookup(key[0]), Lookup::Hit);
+                            assert_eq!(f.source_pins(&key), [0]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_capacity_retry_rechecks_peer_retirement() {
+        let g3 = KvcrG3Config {
+            latency_to_first_byte_ms: 2.0,
+            write_bandwidth_gbps: 0.0,
+            ..KvcrG3Config::new(2)
+        };
+        let f = Fixture::with_g3(1, KvcrLocalG2Policy::Lru, 0.0, g3);
+        let (mut source, mut reader) = (f.adapter_of(f.source), f.adapter());
+        store((&mut source, &f.source_g2.lock()), &[0], &[0], 0.0);
+        store((&mut source, &f.source_g2.lock()), &[1], &[1], 0.0);
+        let key = f.keys(&[0]);
+        assert!(reader.stage_at(
+            &mut f.target.lock(),
+            f.owner,
+            f.source,
+            &mut RestoreRounds::default(),
+            &key,
+            1.0,
+        ));
+        let late_rank = KvHintSource {
+            worker_id: 2,
+            dp_rank: 0,
+        };
+        let late_g2 = HostTierHandle::new(per_rank(1, 0.0, 0.0));
+        make_resident(&late_g2, &[99]);
+        f.registry
+            .lock()
+            .unwrap()
+            .register_worker(2, vec![late_g2.clone()], 1)
+            .unwrap();
+        let mut late = f.adapter_of(late_rank);
+        let observer = Arc::new(CapacityRetries::default());
+        late_g2.lock().set_observer(observer.clone());
+        // k99 protects the only G2 slot. Before the write settles k0 is a
+        // source hit, so capacity is the reason this peer cannot restore it.
+        let asked = f.keys(&[99, 0]);
+        assert!(!late.stage_at(
+            &mut late_g2.lock(),
+            f.owner,
+            f.source,
+            &mut RestoreRounds::default(),
+            &asked,
+            1.5,
+        ));
+        assert_eq!(late.local.as_ref().unwrap().no_room.len(), 1);
+        assert_eq!(*observer.0.lock().unwrap(), key);
+        source.advance_g3(&f.source_g2.lock(), 2.0);
+        // The memory remains resident for the original reader, but it is
+        // no longer an available source for the cached capacity retry.
+        assert_eq!(kvcr_holds(&source, 0), (Lookup::Hit, true));
+        assert!(!late.stage_at(
+            &mut late_g2.lock(),
+            f.owner,
+            f.source,
+            &mut RestoreRounds::default(),
+            &asked,
+            2.5,
+        ));
+        assert!(late.local.as_ref().unwrap().no_room.is_empty());
+        assert_eq!(*observer.0.lock().unwrap(), key);
+        assert!(reader.advance(&mut f.target.lock(), 3.0));
+    }
+
+    #[test]
+    fn a_new_memory_copy_can_serve_peers_after_the_old_copy_retires() {
+        // If the deposit expires while its victim is read, advance_spill
+        // forgets the spill. Retirement must still end when that memory copy
+        // is evicted, so a later copy of the same key can serve peers again.
+        for expired in [false, true] {
+            let g3 = KvcrG3Config {
+                latency_to_first_byte_ms: 2.0,
+                write_bandwidth_gbps: 0.0,
+                spill_timeout_ms: 2.5,
+                ..KvcrG3Config::new(2)
+            };
+            let f = Fixture::with_g3(1, KvcrLocalG2Policy::Lru, 0.0, g3);
+            let (mut source, mut target) = (f.adapter_of(f.source), f.adapter());
+            store((&mut source, &f.source_g2.lock()), &[0], &[0], 0.0);
+            store((&mut source, &f.source_g2.lock()), &[1], &[1], 0.0);
+            let key = f.keys(&[0]);
+            assert!(target.stage_at(
+                &mut f.target.lock(),
+                f.owner,
+                f.source,
+                &mut RestoreRounds::default(),
+                &key,
+                1.0,
+            ));
+            source.advance_g3(&f.source_g2.lock(), 2.0);
+            if expired {
+                source.advance_g3(&f.source_g2.lock(), 2.5);
+            }
+            assert!(target.advance(&mut f.target.lock(), 3.0));
+            source.advance_g3(&f.source_g2.lock(), 3.0);
+            // An expired deposit needs a new store to evict the retired copy;
+            // an unexpired one uses its original pending spill at the next poll.
+            store((&mut source, &f.source_g2.lock()), &[2], &[2], 3.0);
+            source.advance_g3(&f.source_g2.lock(), 5.0);
+            assert_eq!(kvcr_holds(&source, 0), (Lookup::Miss, true));
+            store((&mut source, &f.source_g2.lock()), &[0], &[0], 5.0);
+            source.advance_g3(&f.source_g2.lock(), 7.0);
+            assert_eq!(kvcr_holds(&source, 0).0, Lookup::Hit);
+
+            let late_rank = KvHintSource {
+                worker_id: 2,
+                dp_rank: 0,
+            };
+            let late_g2 = HostTierHandle::new(per_rank(8, 0.0, 0.0));
+            f.registry
+                .lock()
+                .unwrap()
+                .register_worker(2, vec![late_g2.clone()], 1)
+                .unwrap();
+            let mut late = f.adapter_of(late_rank);
+            assert!(late.stage_at(
+                &mut late_g2.lock(),
+                f.owner,
+                f.source,
+                &mut RestoreRounds::default(),
+                &key,
+                7.0,
+            ));
+            assert!(late.advance(&mut late_g2.lock(), 9.0));
+            assert_eq!(late_g2.lock().lookup(key[0]), Lookup::Hit);
+        }
     }
 
     #[test]

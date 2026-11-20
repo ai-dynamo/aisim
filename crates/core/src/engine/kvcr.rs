@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::engine::g3_offload::is_zero;
 use crate::engine::host_offload::{HostBlockKey, HostTierHandle};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::offload_transfer::{self, ClientEvent, Direction, FairTransfers, Link};
 use crate::engine::{KvHintSource, KvcrConfig, KvcrG3Config, KvcrLocalG2Config};
@@ -139,6 +139,9 @@ pub(crate) struct KvcrRegistry {
     /// promotion's claim, a reader leaves it where it is in the FIFO queue
     /// (`acquire_readers`).
     local_readers: BTreeMap<KvHintSource, FxHashMap<HostBlockKey, u32>>,
+    /// Memory copies whose spill has settled but existing claims still hold
+    /// them. They stay resident until eviction but cannot serve new peers.
+    retiring_local: FxHashSet<(KvHintSource, HostBlockKey)>,
     /// With `kvcr.g3`: the blocks peers read from each rank's KVCR-owned
     /// memory since the rank last took them, preserving completion batches.
     peer_reads: BTreeMap<KvHintSource, PeerReads>,
@@ -181,6 +184,7 @@ impl KvcrRegistry {
             ranks: BTreeMap::new(),
             local_g2: BTreeMap::new(),
             local_readers: BTreeMap::new(),
+            retiring_local: FxHashSet::default(),
             peer_reads: BTreeMap::new(),
             next_client: 0,
             busy_until_ms: BTreeMap::new(),
@@ -247,6 +251,21 @@ impl KvcrRegistry {
     /// Whether a pull in flight reads `key` of `rank`'s KVCR-owned memory.
     pub(crate) fn reads_local(&self, rank: KvHintSource, key: HostBlockKey) -> bool {
         (self.local_readers.get(&rank)).is_some_and(|readers| readers.contains_key(&key))
+    }
+
+    /// Withdraw a settled spill's memory copy from new peer pulls without
+    /// disturbing the readers and pins already holding it, or native G2.
+    pub(crate) fn retire_local(&mut self, rank: KvHintSource, key: HostBlockKey) {
+        self.retiring_local.insert((rank, key));
+    }
+
+    pub(crate) fn local_is_retiring(&self, rank: KvHintSource, key: HostBlockKey) -> bool {
+        self.retiring_local.contains(&(rank, key))
+    }
+
+    /// The old memory copy has left. A later copy may serve peers again.
+    pub(crate) fn forget_local_retirement(&mut self, rank: KvHintSource, key: HostBlockKey) {
+        self.retiring_local.remove(&(rank, key));
     }
 
     /// A peer read `keys` from `source`'s KVCR-owned memory. KVCR records
@@ -354,6 +373,8 @@ impl KvcrRegistry {
         self.local_g2.retain(|rank, _| rank.worker_id != worker_id);
         self.local_readers
             .retain(|rank, _| rank.worker_id != worker_id);
+        self.retiring_local
+            .retain(|(rank, _)| rank.worker_id != worker_id);
         self.landed.retain(|rank, _| rank.worker_id != worker_id);
         self.peer_reads
             .retain(|rank, _| rank.worker_id != worker_id);

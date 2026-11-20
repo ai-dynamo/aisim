@@ -76,8 +76,9 @@ pub(super) struct Deposit {
 }
 
 /// The disk write in flight; KVCR runs one at a time. Memory keeps `victim`
-/// readable until the write has ended and nothing reads the block
-/// (`resolve_eviction` claims it, `_retire_local_sources` lets it go).
+/// until the write has settled and existing claims have ended; new peer reads
+/// stop when the write settles (`resolve_eviction` claims it,
+/// `_retire_local_sources` lets it go).
 pub(super) struct Spill {
     pub(super) ends: f64,
     pub(super) victim: HostBlockKey,
