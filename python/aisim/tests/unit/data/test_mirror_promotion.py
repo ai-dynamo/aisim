@@ -1962,6 +1962,26 @@ def test_category_support_travels_with_a_promoted_operation_configuration(tmp_pa
     load_op_latency_tree(target, tmp_path / "composed")  # fails without the lookups the pinned fetch needs
 
 
+def test_one_promotion_registers_two_new_categories(tmp_path, op_source):  # noqa: F811
+    from aisim_core.data import DatasetIndex
+
+    root = _publisher_tree_as_mirror(tmp_path, op_source)
+    e2e_manifest = write_configuration(root, _config("synthetic/model-a"), prefix="data")
+    register_manifests(root, [e2e_manifest], INTERNAL_REPO)
+    build_catalog(root)
+    directories = ["data/op-latency/h200_sxm/gemm/vllm/1.0", str(Path(e2e_manifest).parent)]
+    _public(root, "data/op-latency", directories[1])
+    draft = plan_promotion(root, _request(root, directories), _reviewers())
+    assert draft.content_ok, draft.findings
+    approved = plan_promotion(root, _request(root, directories, draft), _reviewers())
+    assert approved.ok, approved.findings
+    target = _target(tmp_path)
+    apply_promotion(approved, root, target)  # a fresh target gains both categories in one apply
+    dataset = DatasetIndex.model_validate_json((target / "catalog/dataset.json").read_bytes())
+    assert set(dataset.categories) == {"op-latency", "e2e"}
+    assert validate_tree(target, repo=PUBLIC, profile="public").ok
+
+
 def test_category_support_is_scanned_like_any_published_file(tmp_path, op_source):  # noqa: F811
     import pyarrow.parquet as pq
 
