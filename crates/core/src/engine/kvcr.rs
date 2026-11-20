@@ -16,7 +16,7 @@
 //! `ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71`:
 //! <https://github.com/ai-dynamo/kvcr/tree/ca61ea0cb1cdbaa86dc6b33ab9007be3e9276f71/src/kvcr>
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, ensure};
@@ -31,7 +31,7 @@ use crate::engine::{KvHintSource, KvcrConfig, KvcrLocalG2Config};
 
 pub(crate) type SharedKvcrRegistry = Arc<Mutex<KvcrRegistry>>;
 
-/// Landed pulls by result, as KVCR's `remote_deliver` results.
+/// Landed pulls classified by whether staging stopped before the prompt ended.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct KvcrPullCounts {
     /// The source held every block the target was missing.
@@ -109,6 +109,7 @@ struct Pull {
 pub(crate) struct KvcrRegistry {
     config: KvcrConfig,
     ranks: BTreeMap<KvHintSource, Rank>,
+    draining: BTreeSet<u64>,
     /// Each rank's KVCR-owned memory, which its adapter adds when it joins.
     local_g2: BTreeMap<KvHintSource, HostTierHandle>,
     /// Blocks of each rank's KVCR-owned memory that pulls in flight read, by
@@ -120,7 +121,7 @@ pub(crate) struct KvcrRegistry {
     busy_until_ms: BTreeMap<u64, f64>,
     pulls: BTreeMap<u64, Pull>,
     /// Pulls staged by passes at the current instant, in submit order. They
-    /// start once every pass starting at that instant has called `note_pass`.
+    /// start once the current drive scan has called `note_pass` for its passes.
     /// `next_deadline` may omit them: they start before the driver asks for
     /// the next timestamp.
     parked: Vec<u64>,
@@ -152,6 +153,7 @@ impl KvcrRegistry {
         Arc::new(Mutex::new(Self {
             config,
             ranks: BTreeMap::new(),
+            draining: BTreeSet::new(),
             local_g2: BTreeMap::new(),
             local_readers: BTreeMap::new(),
             next_client: 0,
@@ -286,7 +288,12 @@ impl KvcrRegistry {
             .retain(|rank, _| rank.worker_id != worker_id);
         self.landed.retain(|rank, _| rank.worker_id != worker_id);
         self.busy_until_ms.remove(&worker_id);
+        self.draining.remove(&worker_id);
         Ok(())
+    }
+
+    pub(crate) fn mark_draining(&mut self, worker_id: u64) {
+        self.draining.insert(worker_id);
     }
 
     /// The worker's current pass ends at `end_ms`; pulls from it start no
@@ -296,9 +303,9 @@ impl KvcrRegistry {
     }
 
     /// Start the parked pulls, each when its source's current pass ends or at
-    /// its submit time if that is later. The driver calls this once every
-    /// pass starting at the submit instant has called `note_pass`, so a
-    /// source pass at that instant delays the pull whatever the worker order.
+    /// its submit time if that is later. The driver calls this after a drive
+    /// scan, so source passes within that scan delay the pull regardless of
+    /// worker order. A later scan at the same instant can start another pass.
     pub(crate) fn start_parked(&mut self) {
         for id in std::mem::take(&mut self.parked) {
             let pull = &self.pulls[&id];
@@ -365,9 +372,21 @@ impl KvcrRegistry {
         stats.source_wait_ms += pull.source_wait_ms;
     }
 
+    /// Queued requests retain hints; recheck draining before reserving or pinning.
+    /// Already staged pulls still use `source` to release their pins on landing.
+    pub(crate) fn source_for_staging(
+        &self,
+        rank: KvHintSource,
+    ) -> Option<(HostTierHandle, Option<HostTierHandle>)> {
+        if self.draining.contains(&rank.worker_id) {
+            return None;
+        }
+        self.source(rank)
+    }
+
     /// Stage a pull of `blocks` blocks from the registered `source` into
     /// `target`. It is parked until `start_parked`, so it waits for the
-    /// source's pass even when that pass starts later at this instant; a DP
+    /// source's pass even when that pass starts later in the drive scan; a DP
     /// sibling (a source on the target's own worker) runs the pass that
     /// staged the pull.
     pub(crate) fn submit(
@@ -424,6 +443,7 @@ impl KvcrRegistry {
             direction: Direction::Read,
             ready: start_ms + self.config.latency_to_first_byte_ms,
             bytes: pull.bytes as f64,
+            // NOTE: Only source bandwidth is bounded; target ingress and H2D/D2H do not contend here.
             links: [
                 Link {
                     id: pull.client,

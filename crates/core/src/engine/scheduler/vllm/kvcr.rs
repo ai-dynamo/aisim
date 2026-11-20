@@ -381,7 +381,7 @@ impl VllmKvcrAdapter {
         let room = tier.room_epoch(now);
         let (held_len, mut deferred) = held.refresh(tier, keys);
         let mut registry = self.registry.lock().unwrap();
-        let peer = source.and_then(|source| registry.source(source));
+        let peer = source.and_then(|source| registry.source_for_staging(source));
         let mut src = peer.as_ref().map(|(g2, _)| g2.lock());
         let mut src_local = peer
             .as_ref()
@@ -410,6 +410,7 @@ impl VllmKvcrAdapter {
             local.no_room.remove(&owner);
         }
         let (mut plan, mut no_room) = (None::<ExternalPlan>, None);
+        // TODO: Count target-capacity truncation separately; an ordinary follow-up extending the source is also partial.
         let (mut partial, mut asks_absent) = (false, false);
         let (mut promoted, mut g2_keys, mut local_keys) = (Vec::new(), Vec::new(), Vec::new());
         let mut end = 0;
