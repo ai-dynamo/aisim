@@ -975,7 +975,7 @@ def test_version_probe_and_attempt_provenance_share_startup_environment(runner, 
         assert f'"backend_version": "{version}"' in actual.stdout
         homes.append(home)
     selected, other = homes
-    # Prove this non-allowlisted setting would change the metadata probe.
+    # Prove this unsupported setting would change the metadata probe.
     cross = subprocess.run(
         [str(selected / "bin/python3"), "-c", versioning._PROBE],
         env={**clean, "PYTHONHOME": str(other)},
@@ -988,8 +988,13 @@ def test_version_probe_and_attempt_provenance_share_startup_environment(runner, 
     monkeypatch.delenv("PYTHONPATH", raising=False)
     environment = [
         {"name": "PATH", "value": str(selected / "bin") + os.pathsep + os.environ["PATH"]},
-        {"name": "PYTHONHOME", "value": str(other)},
     ]
+    with pytest.raises(ValueError, match="PYTHONHOME"):
+        FPMDeployment(
+            executor="slurm",
+            image="synthetic.sqsh",
+            extra_env=[*environment, {"name": "PYTHONHOME", "value": str(other)}],
+        )
     deployment = FPMDeployment(executor="slurm", image="synthetic.sqsh", extra_env=environment)
     run = subprocess.run
 
