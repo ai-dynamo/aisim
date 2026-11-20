@@ -21,6 +21,7 @@ from build_simulation_dynamo import (
     SPECULATION_DEPTH_OLD,
     SPECULATION_DEPTH_PATH,
     SPECULATION_DEPTH_SHA256,
+    locked_pyo3_version,
 )
 
 from scripts.release.package_identity import core_package
@@ -52,18 +53,6 @@ pub mod common { pub mod perf_model {
 }}
 mod callback;
 """
-
-
-def locked_pyo3_version(lock: Path) -> str:
-    """Return the selected source's locked pyo3 version.
-
-    The callback must link the same pyo3 as the selected core: only one package
-    may link `python`, and both sides of a comparison run this script.
-    """
-    versions = re.findall(r'^name = "pyo3"\nversion = "([^"]+)"$', lock.read_text(), re.MULTILINE)
-    if len(versions) != 1:
-        raise ValueError(f"expected one locked pyo3 version in {lock}, found {versions}")
-    return versions[0]
 
 
 def check(source: Path, dynamo: Path) -> None:
