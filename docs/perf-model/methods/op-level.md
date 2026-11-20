@@ -33,6 +33,17 @@ Data-source inheritance and empirical transfer are different. A row inherited
 from an approved measured donor is still collected data. An estimated
 cross-shape or cross-precision transfer must retain its transfer provenance.
 
+For cached-prefix text requests, the XPU vLLM aggregate TTFT estimate prices
+one request's uncached chunks explicitly before applying its burst or admission
+factor. Full prompt tokens remain the native op-level budget coordinates;
+they do not mean that cached tokens are recomputed. For example, a 4096-token
+prompt with 3000 cached tokens and 512 prefill slots after decode reservation
+prices chunks of 512, 512 and 72 new tokens, with prefixes 3000, 3512 and 4024.
+Each chunk retains the mixed step's concurrent decoders. Qualified Mamba
+therefore pays three recurrent-state charges and processes 1096 new prefill
+tokens, rather than scaling one chunk eight times. Per-request dispatch is
+added once. Uncached requests retain the existing XPU scaling heuristic.
+
 ### Context-attention measurement boundaries
 
 TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20` and

@@ -489,3 +489,115 @@ def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch,
     )
     ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 4096, 10, 2048, 1096, **_ttft_kwargs())
     assert ttft == pytest.approx(prefill_ms + 10 * 0.3)
+
+
+@pytest.mark.parametrize("regime", ["burst", "admission"])
+@pytest.mark.parametrize(
+    "prefix,budget,chunks",
+    [
+        (3000, 514, [(3512, 3000), (4024, 3512), (4096, 4024)]),
+        (3072, 514, [(3584, 3072), (4096, 3584)]),
+        (3584, 514, [(4096, 3584)]),
+        (3000, 2050, [(4096, 3000)]),
+        # One complete packed request is already the exact native query.
+        (3000, 4098, []),
+        # The uncached path retains its calibrated linear scaling: eight
+        # complete 512-token chunks, including their decode interference.
+        (0, 514, None),
+    ],
+)
+def test_batched_cached_ttft_prices_native_uncached_chunks(monkeypatch, regime, prefix, budget, chunks):
+    from aisim_core.sdk import operations as ops
+    from aisim_core.sdk.config import ModelConfig, RuntimeConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    # An isolated native accounting fixture, not an XPU calibration claim.
+    # Keep scans and decode attention; no measured data or model weights are needed.
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        "vllm",
+    )
+    model.context_ops = [
+        ops.Mamba2Kernel(
+            "context_mamba_ssm",
+            1,
+            "mamba_chunk_scan_combined",
+            "context",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            8,
+            128,
+            state_dtype="float16",
+        )
+    ]
+    decode_attention = [op for op in model.generation_ops if op._name == "generation_attention"]
+    assert decode_attention
+    model.generation_ops = decode_attention + [
+        ops.Mamba2Kernel(
+            "generation_mamba_ssm",
+            1,
+            "selective_state_update",
+            "generation",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            8,
+            128,
+            state_dtype="float16",
+        )
+    ]
+    model._num_layers = 1
+    runtime = RuntimeConfig(batch_size=4, isl=4096, osl=64, prefix=prefix)
+    backend = VLLMXPUBackend()
+    backend._in_agg = True
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *_: 2)
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+    monkeypatch.setattr(backend, "_effective_decode_bs", lambda *_: 4 if regime == "burst" else 2)
+    monkeypatch.setattr(backend, "_get_genonly_step_latency", lambda *_: (1.0, 0.0, {}, {}, ()))
+    monkeypatch.setattr(backend, "_decode_tpot_ms", lambda *a, **k: 1.5)
+    calls = []
+    estimates = []
+    native_run_mixed = VLLMBackend.run_mixed
+
+    def capture(self, model, database, runtime, step):
+        calls.append((runtime.isl, runtime.prefix, step.context_tokens, step.num_decode_requests))
+        estimate = native_run_mixed(self, model, database, runtime, step)
+        estimates.append(estimate)
+        return estimate
+
+    monkeypatch.setattr(VLLMBackend, "run_mixed", capture)
+    ttft = backend._compute_ttft(model, database, runtime, 4, 4096, 64, budget, prefix, **_ttft_kwargs())
+
+    # A scan transfers 20,608 bytes/new token and reads+writes its 1 MiB
+    # FP16 state per request. There are two decoders alongside every chunk.
+    # For prefix 3000 / budget 514: 1096 new tokens, three prefill states,
+    # six decode tokens/states, at B200's 7.7e12 B/s. The final 72 tokens
+    # pay a full state charge. Dispatch is 0.3 ms once for the whole request.
+    count = max(1, len(chunks)) if chunks is not None else 8
+    activation_bytes = (4096 - prefix) * 20_608
+    state_bytes = count * 2 * 1_048_576
+    decode_scan_ms = (2 * 20_608 + 2 * 2 * 1_048_576) / 7.7e12 * 1000
+    assert estimates[0].per_op_latency_ms["generation_mamba_ssm"] == pytest.approx(decode_scan_ms, rel=1e-9)
+    # Concurrent decoders keep the original native KV shape, independently
+    # of this request's growing prefix. Reuse that component, not its scan
+    # formula, so attention's changing KV footprint is covered too.
+    decode_ms = estimates[0].component_latency_ms["decode_attention"]
+    own_ms = (activation_bytes + state_bytes) / 7.7e12 * 1000 + count * decode_ms + 0.3
+    if regime == "burst":
+        factor = 1 + BURST_A * math.log2(4) ** BURST_BS_EXP * (budget / 4096) ** BURST_CTX_EXP
+        expected = own_ms * min(factor, 4)
+    else:
+        expected = own_ms + (4 - 2) / 2 * (own_ms + 64 * 1.5)
+    assert ttft == pytest.approx(expected, rel=1e-9)
+    assert calls[0] == (4096, prefix, budget - 2, 2)
+    assert calls[1:] == ([] if chunks is None else [(isl, past, isl, 2) for isl, past in chunks])
+    assert (runtime.isl, runtime.prefix, runtime.batch_size) == (4096, prefix, 4)

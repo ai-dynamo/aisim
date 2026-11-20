@@ -6,6 +6,7 @@ TTFT: prefill time x a fitted burst factor when the batch fits the running-batch
 TPOT: mixed prefill/decode steps counted per-request, instead of averaged in the base.
 """
 
+import copy
 import logging
 import math
 from dataclasses import replace
@@ -60,10 +61,11 @@ class VLLMXPUBackend(VLLMBackend):
             # run_agg already summed the actual sequential chunk prices.
             return encoder_latency_ms + prefill_total_ms + self._prefill_dispatch_overhead_ms(model)
         d = 0 if b <= 1 else self._mix_step_gen_tokens(b, ctx_tokens, isl, decode_iterations)
-        # Tokens one request feeds the step: op-level pricing reads prompt tokens (prefix
-        # included), a whole-model FPM reads new tokens.
+        # Native budget coordinates: op-level includes the cached prefix, while
+        # whole-model FPM uses new tokens. Neither recomputes the cached prefix.
         request_tokens = isl
-        if getattr(model, "forward_model", "op_level") == "fpm":
+        is_fpm = getattr(model, "forward_model", "op_level") == "fpm"
+        if is_fpm:
             request_tokens = max(1, isl - prefix)
         # a batch of b provides at most b*isl prefill tokens, so it can't fill more of the ctx
         # budget than that; using the raw ctx over-prices the step and the factor when b*isl < ctx.
@@ -71,7 +73,12 @@ class VLLMXPUBackend(VLLMBackend):
         step = self.run_mixed(
             model, database, runtime_config, MixedStepInput(context_tokens=prefill_ctx, num_decode_requests=d)
         )
-        own_prefill_ms = self._own_prefill_ms(step, model, request_tokens)
+        if b > 1 and prefix > 0 and not is_fpm and isl == runtime_config.isl:
+            # A packed prompt budget is not a multiplier for already-priced
+            # uncached work, especially Mamba's per-chunk recurrent-state cost.
+            own_prefill_ms = self._own_cached_prefill_ms(step, model, database, runtime_config, isl, prefix)
+        else:
+            own_prefill_ms = self._own_prefill_ms(step, model, request_tokens)
         if b <= 1:
             logger.debug(f"ttft(xpu): own_prefill={own_prefill_ms:.2f}ms b<=1 (no queuing)")
             return encoder_latency_ms + own_prefill_ms
@@ -104,6 +111,46 @@ class VLLMXPUBackend(VLLMBackend):
         regime = "admission" if eff_bs < b else "burst"
         logger.debug(f"ttft(xpu): own_prefill={own_prefill_ms:.2f}ms eff_bs={eff_bs} {regime} ttft={ttft:.2f}ms")
         return encoder_latency_ms + ttft
+
+    def _own_cached_prefill_ms(
+        self,
+        step: StepEstimate,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        isl: int,
+        prefix: int,
+    ) -> float:
+        """Price one text request's uncached chunks, retaining the mixed step's decoders.
+
+        The native op-level budget includes each chunk's already processed
+        prefix. Rust removes that prefix and prices the actual new tokens and
+        one recurrent-state charge per chunk, including a short final chunk.
+        """
+        if step.context_tokens == isl:
+            return step.latency_ms + self._prefill_dispatch_overhead_ms(model)
+        chunk_runtime = copy.copy(runtime_config)
+        chunk_runtime.batch_size = 1
+        total_ms = 0.0
+        for past in range(prefix, isl, step.context_tokens):
+            chunk_runtime.prefix = past
+            chunk_runtime.isl = min(isl, past + step.context_tokens)
+            # These shapes are already scheduled: bypass the aggregate XPU
+            # budget conversion so decoders do not shrink the chunk again.
+            chunk = super().run_mixed(
+                model,
+                database,
+                chunk_runtime,
+                MixedStepInput(chunk_runtime.isl, step.num_decode_requests),
+            )
+            # Other requests' decode KV does not change with this request's
+            # prefill progress. Reuse its original native decode component.
+            total_ms += (
+                chunk.component_latency_ms["shared_non_attention"]
+                + chunk.component_latency_ms["context_attention"]
+                + step.component_latency_ms["decode_attention"]
+            )
+        return total_ms + self._prefill_dispatch_overhead_ms(model)
 
     def _own_prefill_ms(self, step: StepEstimate, model: BaseModel, isl: int) -> float:
         """One request's chunked prefill from the mixed step: full attention (undo run_mixed's
