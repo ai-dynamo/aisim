@@ -415,7 +415,10 @@ def test_the_prepared_profile_settings_fill_unspecified_caller_fields(tmp_path, 
     out = ensure_data(config, pin(tmp_path), transport=FakeTransport(files)).config
     assert out["estimation_mode"] == "op_level" and out["enable_shared_layer"] is False
     assert out["estimator_config"]["correction"] == {"enabled": False}
-    assert out["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+    assert out["estimator_config"]["op_level"]["execution_profile"] == {
+        "path": str(_materialized_dir(tmp_path) / "profile.json"),
+        "sha256": PROFILE_SHA,
+    }
 
 
 @pytest.mark.parametrize(
