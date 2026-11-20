@@ -43,6 +43,7 @@ jobs:
           python-version: "3.13"
       - name: Install AISim and development dependencies
         run: python -m pip install './python/aisim[dev]'
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Check Collector V3 data invariants
         working-directory: python/aisim
         run: python tools/perf_database/check_collector_data.py
@@ -70,6 +71,10 @@ jobs:
           python-version: "3.13"
       - name: Install check dependencies
         run: python -m pip install pandas pyarrow numpy pyyaml 'tqdm>=4.0.0'
+      - name: Compose the op-latency systems root
+        run: |
+          python -m pip install pydantic pyarrow pyyaml huggingface_hub
+          python scripts/ci/compose_systems_root.py --github-env
       - name: Run cross-backend consistency checks
         working-directory: python/aisim
         run: |
