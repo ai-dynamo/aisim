@@ -695,12 +695,22 @@ def test_initialized_moe_requires_actual_layer_names(name, target):
         runtime_k31.moe_precision(evidence)
 
 
-def test_preview_bundle_uses_exact_source_map_not_invented_git_commit():
+@pytest.mark.parametrize("source", ["vllm/v1/kv_cache_interface.py", "vllm/v1/worker/block_table.py"])
+def test_preview_bundle_uses_exact_source_map_not_invented_git_commit(source):
     path = Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json"
     bundle = load_instrumentation(path)
     assert runtime_k31.is_audited_runtime(bundle.manifest["runtime"])
     altered = copy.deepcopy(bundle.manifest["runtime"])
-    altered["source_files"]["vllm/v1/kv_cache_interface.py"] = "0" * 64
+    assert source in altered["source_files"]
+    assert (
+        altered["source_revision"]
+        == hashlib.sha256(
+            json.dumps(altered["source_files"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    altered["source_files"][source] = "0" * 64
+    assert not runtime_k31.is_audited_runtime(altered)
+    altered["source_files"].pop(source)
     assert not runtime_k31.is_audited_runtime(altered)
     assert "instrumentation/kimi_k31.py" in bundle.files
     assert json.loads(path.read_text())["runtime"]["version"] == runtime_k31.VERSION
@@ -750,15 +760,18 @@ def test_observer_preserves_unsupported_runtime_mode_as_failure(monkeypatch, set
 def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch, tmp_path):
     _adapter(monkeypatch)
     observer = importlib.import_module("collector.fpm_forward.runtime.instrumentation.observer")
-    path = tmp_path / "source.py"
-    path.write_text("# synthetic source identity fixture\n")
-    source_map = {"vllm/source.py": hashlib.sha256(path.read_bytes()).hexdigest()}
+    caller = tmp_path / "utils.py"
+    caller.write_text("# synthetic caller source identity fixture\n")
+    path = tmp_path / "block_table.py"
+    path.write_text("# synthetic block-table helper source identity fixture\n")
+    installed_files = {"vllm/v1/worker/utils.py": caller, "vllm/v1/worker/block_table.py": path}
+    source_map = {name: hashlib.sha256(source.read_bytes()).hexdigest() for name, source in installed_files.items()}
     source_revision = hashlib.sha256(json.dumps(source_map, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     manifest = {
         "runtime": {"version": runtime_k31.VERSION, "source_revision": source_revision, "source_files": source_map}
     }
     monkeypatch.setattr(legacy.importlib.metadata, "version", lambda _: runtime_k31.VERSION)
-    monkeypatch.setattr(legacy, "_installed_file", lambda _: path)
+    monkeypatch.setattr(legacy, "_installed_file", installed_files.__getitem__)
     real_import = legacy.importlib.import_module
     build = SimpleNamespace(__commit_id__="g266e88c05")
     monkeypatch.setattr(
@@ -769,8 +782,9 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
     assert payload["source_identity"]["vllm_commit_id"] == "g266e88c05"
     assert payload["runtime"]["source_files"] == source_map
     path.write_text("# changed after source audit\n")
-    with pytest.raises(ValueError, match="source hash differs"):
+    with pytest.raises(ValueError, match="source hash differs: vllm/v1/worker/block_table.py"):
         observer._runtime(payload, manifest, runtime_k31.VERSION)
+    assert hashlib.sha256(caller.read_bytes()).hexdigest() == source_map["vllm/v1/worker/utils.py"]
     build.__commit_id__ = "g99999999"
     with pytest.raises(ValueError, match="VCS identifier contradicts"):
         observer._runtime(payload, manifest, runtime_k31.VERSION)

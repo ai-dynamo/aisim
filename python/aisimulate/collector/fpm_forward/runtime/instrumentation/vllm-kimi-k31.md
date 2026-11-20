@@ -26,6 +26,15 @@ including the original trailing newline; temporary download copies are not the
 canonical source. No upstream implementation or model checkpoint
 is redistributed by this adapter.
 
+The block-table width helper in `vllm/v1/worker/block_table.py` is pinned to
+SHA-256 `4068aea7336627f809def92f45401659d7c7c592d4da5dace6a11c90e7850c4a`,
+computed from the exact [upstream source at
+`266e88c051ca46607fd9de20216bd58426f80052`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/worker/block_table.py).
+At that revision, its caller in `vllm/v1/worker/utils.py` matches the existing
+installed-file pin. The installed helper must also match before observation
+can qualify. This source inspection does not requalify image execution or
+refresh previously collected runtime observations.
+
 ## Source-to-observation mapping
 
 * `v1/kv_cache_interface.py`: `KVCacheTensor.layers`, `layer_stride`,

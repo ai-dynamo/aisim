@@ -3,7 +3,7 @@
   "runtime": {
     "framework": "vllm",
     "version": "0.1.dev24216+g266e88c05",
-    "source_revision": "a1e6b422124ec1f62ed64a65d7e905ea81c62ec173359296eca3abcebf20e08f",
+    "source_revision": "1b1e0c5f1eb5c02f2117222d70203fb1aa0123ac093ed5bd4cd59377a209367c",
     "source_files": {
       "vllm/_version.py": "9970596266339f11081588eea94bfcc6281b9b69822338a1a09d4b6476145014",
       "vllm/config/vllm.py": "e06bb920ed9f530afb23d928d549f6bed7d60bbbea82b5144edbe3392f7d4602",
@@ -12,6 +12,7 @@
       "vllm/transformers_utils/configs/kimi_linear.py": "448cdf08c638873f7458516e281880a0c1e80fdcd54a2cd4ad79e38d5e619ca3",
       "vllm/v1/kv_cache_interface.py": "493110057c6c39693053447507d8783d85fc86050eeb95d5419ccf49861bc27a",
       "vllm/v1/worker/utils.py": "47ec797863a78e880abd40fea76c34f250f4e933a633b94dabbbbbfe99257ce5",
+      "vllm/v1/worker/block_table.py": "4068aea7336627f809def92f45401659d7c7c592d4da5dace6a11c90e7850c4a",
       "vllm/v1/worker/gpu_worker.py": "f7985d749e550c2f4af97a16c03fe890f6d231064ab164c77935b6001b770e6e",
       "vllm/v1/worker/gpu_model_runner.py": "3ba41733f7062b9b70801025ee263979a0b11b8c0cea418d5d18caa26de6524d",
       "vllm/v1/worker/gpu/model_runner.py": "d7057581efb2c62873792307bf3bbd6acfd833063eb8bdce982a178c48af3b69",

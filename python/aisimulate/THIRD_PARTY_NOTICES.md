@@ -2316,7 +2316,7 @@ modified for AISimulate's explicit policy and evidence validation contracts.
 
 The ARM64 image child is
 `sha256:52b793567651780dc529647a211a3d15cec11ebc872ac7492636d7d75340eab4`.
-Within the Python distribution, the original path and SHA-256 inventory for 35
+Within the Python distribution, the baseline original path and SHA-256 inventory for 35
 source-bound vLLM interfaces is in
 [`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](https://github.com/ai-dynamo/aisim/blob/313c2d15fa6cef023bfd36517702cab8c901cec7/python/aisimulate/collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
 The inspected references
@@ -2332,6 +2332,16 @@ The strided DSA indexer view additionally follows the initialized kernel-block
 mapping exposed through `vllm/v1/worker/gpu/attn_utils.py` and
 `vllm/v1/attention/backends/mla/compressor_utils.py`. The adapter observes this
 mapping and validates addresses; it does not change native cache views.
+The additional source pin for `vllm/v1/worker/block_table.py::get_block_table_width`
+is SHA-256 `4068aea7336627f809def92f45401659d7c7c592d4da5dace6a11c90e7850c4a`,
+computed from the unmodified upstream file at immutable vLLM commit
+`266e88c051ca46607fd9de20216bd58426f80052`:
+https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/worker/block_table.py
+(Apache-2.0; Copyright contributors to the vLLM project). The caller at this
+revision matches its existing installed-file pin. Observation requires the
+installed helper to match as well; this source inspection does not requalify
+image execution or refresh historical runtime evidence. No upstream code is
+redistributed by this addition.
 The source mapping also reads Dynamo's
 `components/src/dynamo/vllm/instrumented_scheduler.py` at immutable commit
 `17628144dc33c9d5916b08789f9d317924217dad`:
