@@ -651,7 +651,7 @@ def _apply_promotion(
             finally:
                 Path(temporary).unlink(missing_ok=True)
             ledger, ledger_created = path, not existed
-    except BaseException:
+    except BaseException as failure:
         if ledger is not None and ledger_created:
             ledger.unlink(missing_ok=True)
         for path in added:
@@ -674,10 +674,22 @@ def _apply_promotion(
             and not any((target / CATALOG_DIR).iterdir())
         ):
             (target / CATALOG_DIR).rmdir()
-        for rel, data in before.items():
+        # Restore only what this attempt changed (an untouched, possibly read-only file is left alone), and keep
+        # going when one restore fails: a stopped loop would leave the remaining files out of step with the payload.
+        unrestored: list[str] = []
+        for rel, data in sorted(before.items()):
             restored = target / rel
-            restored.parent.mkdir(parents=True, exist_ok=True)
-            restored.write_bytes(data)
+            try:
+                if restored.is_file() and restored.read_bytes() == data:
+                    continue
+                restored.parent.mkdir(parents=True, exist_ok=True)
+                restored.write_bytes(data)
+            except OSError:
+                unrestored.append(rel)
+        if unrestored:
+            raise PromotionError(
+                f"promotion failed and rollback could not restore: {', '.join(unrestored)}"
+            ) from failure
         raise
     return ledger
 
