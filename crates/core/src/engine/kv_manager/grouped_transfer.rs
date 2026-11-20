@@ -592,8 +592,9 @@ mod tests {
     fn an_empty_source_moves_no_state_block() {
         // A source of zero transfer tokens owns no block, so no group moves
         // one. One token moves one attention block and one block of each
-        // state group: the fixed bytes and the measured rows of
-        // `glm_payload_matches_the_vllm_oracle`.
+        // state group. These numbers equal the fixed bytes and the measured
+        // row of 1,000 tokens in `glm_payload_matches_the_vllm_oracle`, which
+        // also fills one attention block.
         for (version, fixed, payload) in [
             ("0.31.0", 52_120_960, 65_166_080),
             ("0.32.0", 39_168_128, 61_146_624),
