@@ -97,8 +97,8 @@ class BudgetExceededError(DataFetchError):
 
     def __init__(self, plan: FetchPlan, max_bytes: int):
         super().__init__(
-            f"plan needs {plan.uncached_bytes + plan.metadata_bytes} uncached bytes ({plan.total_bytes} total) which exceeds "
-            f"max_bytes={max_bytes}; pass allow_over_budget=True to proceed"
+            f"plan needs {plan.uncached_bytes + plan.metadata_bytes} uncached bytes ({plan.total_bytes} total) "
+            f"which exceeds max_bytes={max_bytes}; pass allow_over_budget=True to proceed"
         )
         self.plan = plan
         self.max_bytes = max_bytes

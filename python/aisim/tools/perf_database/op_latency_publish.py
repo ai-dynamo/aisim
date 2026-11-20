@@ -372,8 +372,8 @@ def reuse_manifest_table(document: dict) -> pa.Table:
             "tier": pa.array([g["tier"] for g in groups], pa.string()),
             "systems": pa.array([list(g["systems"]) for g in groups], str_list),
             "frameworks": pa.array([list(g["frameworks"]) for g in groups], str_list),
-            "total_raw_rows": pa.array([g["total_raw_rows"] for g in groups], pa.int64()),
-            "within_framework_dedup_rows": pa.array([g["within_framework_dedup_rows"] for g in groups], pa.int64()),
+            "total_raw_rows": pa.array([g.get("total_raw_rows") for g in groups], pa.int64()),
+            "within_framework_dedup_rows": pa.array([g.get("within_framework_dedup_rows") for g in groups], pa.int64()),
             "median_pct_divergence": pa.array([g.get("median_pct_divergence") for g in groups], pa.float64()),
         }
     )
@@ -382,10 +382,10 @@ def reuse_manifest_table(document: dict) -> pa.Table:
 def reuse_manifest_document(table: pa.Table) -> dict:
     """Inverse of :func:`reuse_manifest_table` (absent optional keys stay absent)."""
     groups = []
+    optional = ("total_raw_rows", "within_framework_dedup_rows", "median_pct_divergence")
     for row in table.to_pylist():
-        group = {k: v for k, v in row.items() if k != "median_pct_divergence"}
-        if row["median_pct_divergence"] is not None:
-            group["median_pct_divergence"] = row["median_pct_divergence"]
+        group = {k: v for k, v in row.items() if k not in optional}
+        group.update({k: row[k] for k in optional if row[k] is not None})  # absent optional keys stay absent
         groups.append(group)
     return {"groups": groups}
 

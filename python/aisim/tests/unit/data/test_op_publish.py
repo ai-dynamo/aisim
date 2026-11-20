@@ -255,3 +255,25 @@ def test_a_sidecar_that_is_not_a_mapping_fails_publication(tree, tmp_path, sidec
     with pytest.raises(PublishError, match="must be a YAML mapping"):
         _build(tree, out)
     assert not out.exists()  # the partial output is removed
+
+
+def test_the_packaged_generated_lookup_manifests_convert_and_round_trip():
+    from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
+
+    reuse = yaml.safe_load((PACKAGED_SYSTEMS_DIR / "perf_data_reuse_manifest.yaml").read_text())
+    assert reuse["groups"] and all("total_raw_rows" not in g for g in reuse["groups"])  # the current format
+    table = op.reuse_manifest_table(reuse)
+    assert table.num_rows == len(reuse["groups"]) and op.reuse_manifest_document(table) == reuse
+    versions = yaml.safe_load((PACKAGED_SYSTEMS_DIR / "query_versions.yaml").read_text())
+    assert op.query_versions_document(op.query_versions_table(versions), versions["schema_version"]) == versions
+
+
+def test_a_publication_with_count_free_reuse_groups_succeeds(tree, tmp_path):
+    groups = [
+        {k: v for k, v in g.items() if k not in ("total_raw_rows", "within_framework_dedup_rows")}
+        for g in yaml.safe_load(REUSE_MANIFEST)["groups"]
+    ]
+    (tree / "perf_data_reuse_manifest.yaml").write_text(yaml.safe_dump({"groups": groups}))
+    out = tmp_path / "published"
+    _build(tree, out)
+    assert (out / "data/op-latency/perf_data_reuse_manifest.parquet").is_file()

@@ -51,8 +51,9 @@ class OpReuseManifestRow(_OpRow):
     tier: str
     systems: list[str]
     frameworks: list[str]
-    total_raw_rows: int
-    within_framework_dedup_rows: int
+    # The generated manifest no longer carries the row statistics (they live in analysis reports); older ones do.
+    total_raw_rows: int | None = None
+    within_framework_dedup_rows: int | None = None
     median_pct_divergence: float | None = None
 
 
