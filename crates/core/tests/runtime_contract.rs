@@ -1252,21 +1252,104 @@ fn grouped_prefill_rank_waits_for_a_transfer_end_after_a_repeated_self_preemptio
 #[test]
 fn grouped_roles_with_two_vllm_versions_cannot_pair() {
     // A grouped handoff follows the transfer rules of one vLLM version, so a
-    // prefill rank of vLLM 0.31.0 cannot hand off to a decode rank of 0.32.0.
-    let mut spec = disaggregated_grouped_spec(vec![request("versions", 0.0, 1000, 4)]);
-    let mut decode = spec.engine["rank"].clone();
-    decode["vllm_version"] = "0.32.0".into();
-    spec.engine["decode"] = serde_json::json!({ "rank": decode });
-    let Err(error) = Replayer::new(spec, ReplayEngineFactory::new())
-        .unwrap()
-        .run()
-    else {
-        panic!("grouped roles of two vLLM versions must be refused");
+    // prefill rank of one vLLM version cannot hand off to a decode rank of
+    // another. vLLM refuses such a pair too: its handshake compares a
+    // compatibility hash of the vLLM version and the connector version
+    // (v0.33.0 `nixl/base_worker.py:1193-1208`). The check is on by default
+    // (`enforce_handshake_compat`, `:1038-1040`).
+    for (prefill_version, decode_version) in [
+        ("0.32.0", "0.33.0"),
+        ("0.33.0", "0.32.0"),
+        ("0.31.0", "0.32.0"),
+    ] {
+        let mut spec = disaggregated_grouped_spec(vec![request("versions", 0.0, 1000, 4)]);
+        spec.engine["rank"]["vllm_version"] = prefill_version.into();
+        let mut decode = spec.engine["rank"].clone();
+        decode["vllm_version"] = decode_version.into();
+        spec.engine["decode"] = serde_json::json!({ "rank": decode });
+        let Err(error) = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+        else {
+            panic!("grouped roles of two vLLM versions must be refused");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid replay spec: vllm_version must be identical on the prefill and decode roles",
+            "{prefill_version} {decode_version}"
+        );
+    }
+}
+
+#[test]
+fn grouped_pd_replay_on_vllm_0330_equals_the_replay_on_vllm_0320_in_every_field() {
+    // The 0.33.0 row of the rule table shares every branch with the 0.32.0
+    // row, and the transfer rules take no version. So one P/D replay under
+    // the two labels gives the same report and the same records.
+    let run = |version: &str, block_mode: bool, async_scheduling: bool| {
+        // A prompt, the same prompt again, a prefix of it and another prompt.
+        let requests = [
+            ("first", 0.0, 0..5_000),
+            ("again", 1_000.0, 0..5_000),
+            ("prefix", 2_000.0, 0..2_177),
+            ("other", 2_000.0, 20_000..22_177),
+        ]
+        .map(|(id, arrival_ms, tokens)| {
+            let tokens: Vec<u32> = tokens.collect();
+            let mut request = request(id, arrival_ms, tokens.len(), 2);
+            request.input_token_ids = Some(tokens);
+            request
+        });
+        let mut spec = disaggregated_grouped_spec(requests.to_vec());
+        let rank = &mut spec.engine["rank"];
+        rank["vllm_version"] = version.into();
+        rank["async_scheduling"] = async_scheduling.into();
+        // The bytes of one block of each group on vLLM 0.32.0 and 0.33.0, and
+        // the checkpoint fields that the runtime probe of vLLM 0.33.0 records.
+        let bytes = [
+            21_978_496_u64,
+            92_288,
+            9_768_960,
+            9_768_960,
+            9_768_960,
+            9_768_960,
+        ];
+        for (group, bytes) in rank["kv_cache_groups"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(bytes)
+        {
+            group["transfer_bytes_per_block"] = bytes.into();
+            if group["kind"] == "state" && group["prefix_cacheable"] == true {
+                group["prefill_checkpoint_blocks"] = 1.into();
+                group["prefill_checkpoint_alignment"] = 16.into();
+            }
+        }
+        if block_mode {
+            rank["enable_prefix_caching"] = true.into();
+            rank["prefix_match_unit"] = 2176.into();
+            rank["max_model_len"] = 131_072.into();
+        }
+        let mut report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .with_capture_options(canonical_options())
+            .run()
+            .unwrap();
+        report.throughput.wall_time_ms = 0.0;
+        (
+            serde_json::to_value(&report).unwrap(),
+            serde_json::to_value(&report.per_request).unwrap(),
+        )
     };
-    assert_eq!(
-        error.to_string(),
-        "invalid replay spec: vllm_version must be identical on the prefill and decode roles"
-    );
+    for block_mode in [false, true] {
+        for async_scheduling in [false, true] {
+            let label = format!("block mode {block_mode}, async scheduling {async_scheduling}");
+            let v33 = run("0.33.0", block_mode, async_scheduling);
+            assert_eq!(v33, run("0.32.0", block_mode, async_scheduling), "{label}");
+            assert_eq!(v33.0["completed_requests"], 4, "{label}");
+        }
+    }
 }
 
 #[test]

@@ -1314,10 +1314,9 @@ pub struct EngineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_capacity_bytes: Option<u64>,
     /// vLLM release whose grouped-cache rules this rank follows. A rank with
-    /// `kv_cache_groups` and `enable_prefix_caching` must set it to `0.31.0`,
-    /// `0.32.0` or `0.33.0`. A grouped prefill or decode rank must set it to
-    /// `0.31.0` or `0.32.0`. A grouped aggregated rank with prefix caching off
-    /// does not read it.
+    /// `kv_cache_groups` and `enable_prefix_caching`, and a grouped prefill or
+    /// decode rank, must set it to `0.31.0`, `0.32.0` or `0.33.0`. A grouped
+    /// aggregated rank with prefix caching off does not read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_version: Option<String>,
     /// Optional framework-native host-offload simulation.
@@ -1686,21 +1685,31 @@ impl EngineConfig {
 
     /// The gate of a grouped prefill or decode rank. `VllmCore` construction
     /// builds `GroupedTransferRules` for such a rank to price its handoff. The
-    /// rules follow vLLM 0.31.0 and 0.32.0, read the marker and the transfer
-    /// bytes of every group, and count the handoff in full-attention blocks of
-    /// one size.
+    /// rules follow vLLM 0.31.0, 0.32.0 and 0.33.0, read the marker and the
+    /// transfer bytes of every group, and count the handoff in full-attention
+    /// blocks of one size.
     fn validate_grouped_transfer(&self) -> Result<()> {
-        // The transfer rules name their own two versions: the rule table of
-        // prefix caching also holds vLLM 0.33.0, whose transfer is not
-        // modeled.
+        // The transfer rules name their own versions, so a later row of the
+        // rule table of prefix caching does not open P/D alone.
+        let version = self
+            .vllm_version
+            .as_deref()
+            .and_then(VllmRuleVersion::parse);
         ensure!(
             matches!(
-                self.vllm_version
-                    .as_deref()
-                    .and_then(VllmRuleVersion::parse),
-                Some(VllmRuleVersion::V0_31_0 | VllmRuleVersion::V0_32_0)
+                version,
+                Some(
+                    VllmRuleVersion::V0_31_0 | VllmRuleVersion::V0_32_0 | VllmRuleVersion::V0_33_0
+                )
             ),
-            "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0 or 0.32.0"
+            "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0, 0.32.0 or 0.33.0"
+        );
+        // vLLM 0.33.0 applies the interval without data parallelism (v0.33
+        // `sched/scheduler.py:396-425`, `:780-791`), with prefix caching on
+        // or off. Replay applies it only for an attention DP size above 1.
+        ensure!(
+            version != Some(VllmRuleVersion::V0_33_0) || self.prefill_schedule_interval == 1,
+            "kv_cache_groups with worker_type=prefill or decode on vLLM 0.33.0 require prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at attention DP size 1 too, and replay does not model that"
         );
         ensure!(
             self.kv_cache_groups.iter().all(|group| {
@@ -3060,7 +3069,7 @@ mod tests {
             (
                 "worker_type",
                 serde_json::json!("decode"),
-                "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0 or 0.32.0",
+                "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0, 0.32.0 or 0.33.0",
             ),
             (
                 "enable_prefix_caching",
@@ -3518,15 +3527,18 @@ mod tests {
     /// and four KDA states. A live run measured the attention value and the
     /// sum of the other five groups
     /// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`). The split of
-    /// that sum is a reading of the connector code. The gate reads neither
-    /// these bytes nor the `num_layers` of this wire.
+    /// that sum is a reading of the connector code. The 0.33.0 groups hold
+    /// one checkpoint block at alignment 16, and a log of each group
+    /// measured their bytes
+    /// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261117/`). The gate
+    /// reads neither these bytes nor the `num_layers` of this wire.
     fn glm_transfer_groups_wire(version: &str) -> serde_json::Value {
-        let mut groups = glm_groups_wire(None);
+        let mut groups = glm_groups_wire((version == "0.33.0").then_some(1));
         let bytes = match version {
             "0.31.0" => [
                 13_045_120, 13_045_120, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
             ],
-            "0.32.0" => [
+            "0.32.0" | "0.33.0" => [
                 21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
             ],
             _ => unreachable!("no measured GLM-5.3-Flash transfer bytes"),
@@ -3563,13 +3575,13 @@ mod tests {
 
     #[test]
     fn grouped_pd_configuration_validates_its_transfer_geometry() {
-        let version = "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0 or 0.32.0";
+        let version = "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0, 0.32.0 or 0.33.0";
         let declare = "kv_cache_groups with worker_type=prefill or decode require every group to declare prefix_cacheable and transfer_bytes_per_block; the runtime probe import does not write transfer_bytes_per_block";
         let one_block = "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups";
         let byte_geometry = "kv_cache_groups cannot use linear cache or KV transfer byte geometry";
         let replay_window = "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and replay a bounded replay window on an aggregated rank with prefix caching off";
         type Refusal = (fn(&mut serde_json::Value), &'static str);
-        let refusals: [Refusal; 16] = [
+        let refusals: [Refusal; 14] = [
             (
                 |wire| {
                     wire.as_object_mut().unwrap().remove("vllm_version");
@@ -3577,18 +3589,6 @@ mod tests {
                 version,
             ),
             (|wire| wire["vllm_version"] = "0.30.0".into(), version),
-            // The transfer rules model no vLLM 0.33.0 profile, also where the
-            // rules of prefix caching hold a row for it.
-            (|wire| wire["vllm_version"] = "0.33.0".into(), version),
-            (
-                |wire| {
-                    wire["enable_prefix_caching"] = true.into();
-                    wire["prefix_match_unit"] = 2176.into();
-                    wire["max_model_len"] = 131_072.into();
-                    wire["vllm_version"] = "0.33.0".into();
-                },
-                version,
-            ),
             // With prefix caching on, the rule of the role fires before the
             // version rule of prefix caching.
             (
@@ -3691,6 +3691,20 @@ mod tests {
             v32["vllm_version"] = "0.32.0".into();
             v32["kv_cache_groups"] = glm_transfer_groups_wire("0.32.0");
             validates(v32);
+            // The measured bytes of vLLM 0.33.0, with prefix caching off and on.
+            let mut v33 = glm_pd_wire(role);
+            v33["vllm_version"] = "0.33.0".into();
+            v33["kv_cache_groups"] = glm_transfer_groups_wire("0.33.0");
+            validates(v33.clone());
+            v33["enable_prefix_caching"] = true.into();
+            v33["prefix_match_unit"] = 2176.into();
+            v33["max_model_len"] = 131_072.into();
+            validates(v33);
+            // A vLLM 0.33.0 rank whose groups hold no transfer bytes gets the text of the markers.
+            let mut unmarked = glm_pd_wire(role);
+            unmarked["vllm_version"] = "0.33.0".into();
+            unmarked["kv_cache_groups"] = glm_groups_wire(Some(1));
+            assert_eq!(validation_error(unmarked), declare, "{role}");
             let mut prefix_caching = glm_pd_wire(role);
             prefix_caching["enable_prefix_caching"] = true.into();
             prefix_caching["prefix_match_unit"] = 2176.into();
@@ -3778,6 +3792,48 @@ mod tests {
         off.as_object_mut().unwrap().remove("prefix_match_unit");
         off["prefill_schedule_interval"] = 2.into();
         validates(off);
+    }
+
+    #[test]
+    fn grouped_pd_rank_on_vllm_0330_refuses_a_prefill_schedule_interval_above_one() {
+        // vLLM 0.33.0 applies the interval without data parallelism (v0.33
+        // sched:396-425, :780-791), with prefix caching on or off. Replay
+        // applies it only for an attention DP size above 1.
+        let interval = "kv_cache_groups with worker_type=prefill or decode on vLLM 0.33.0 require prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at attention DP size 1 too, and replay does not model that";
+        for role in ["prefill", "decode"] {
+            for prefix_caching in [false, true] {
+                let mut wire = glm_pd_wire(role);
+                wire["vllm_version"] = "0.33.0".into();
+                wire["kv_cache_groups"] = glm_transfer_groups_wire("0.33.0");
+                if prefix_caching {
+                    wire["enable_prefix_caching"] = true.into();
+                    wire["prefix_match_unit"] = 2176.into();
+                    wire["max_model_len"] = 131_072.into();
+                }
+                wire["prefill_schedule_interval"] = 2.into();
+                assert_eq!(
+                    validation_error(wire.clone()),
+                    interval,
+                    "{role} {prefix_caching}"
+                );
+                wire["prefill_schedule_interval"] = 1.into();
+                validates(wire);
+            }
+            // The interval comes before the markers.
+            let mut unmarked = glm_pd_wire(role);
+            unmarked["vllm_version"] = "0.33.0".into();
+            unmarked["kv_cache_groups"] = glm_groups_wire(Some(1));
+            unmarked["prefill_schedule_interval"] = 2.into();
+            assert_eq!(validation_error(unmarked), interval, "{role}");
+            // The rows of 0.31.0 and 0.32.0 keep the interval.
+            for version in ["0.31.0", "0.32.0"] {
+                let mut wire = glm_pd_wire(role);
+                wire["vllm_version"] = version.into();
+                wire["kv_cache_groups"] = glm_transfer_groups_wire(version);
+                wire["prefill_schedule_interval"] = 2.into();
+                validates(wire);
+            }
+        }
     }
 
     #[test]

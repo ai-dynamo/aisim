@@ -1656,6 +1656,16 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                 if engine.nextn or engine.speculation is not None:
                     raise ValueError("grouped FPM cache supports only vLLM without speculative decoding")
                 cache = worker.kv_cache
+                # vLLM 0.33.0 holds prefills at attention DP size 1 too, with prefix caching on or off. A prefill or
+                # decode rank gets the P/D text first, as the Rust gate gives it, whose remedy holds with prefix
+                # caching off too.
+                if (
+                    pd_pair
+                    and role != "aggregated"
+                    and backend_version == "0.33.0"
+                    and worker.scheduler.prefill_schedule_interval != 1
+                ):
+                    raise ValueError(GROUPED_PD_INTERVAL_TEXT)
                 if cache.prefix_caching:
                     grouped_prefix_caching_requirements(
                         deployment,
@@ -1793,8 +1803,12 @@ def grouped_prefix_caching_requirements(
     return hash_block
 
 
-GROUPED_PD_VERSIONS = ("0.31.0", "0.32.0")
-GROUPED_PD_VERSION_TEXT = "grouped FPM cache P/D is modeled for vLLM 0.31.0 and 0.32.0 only"
+GROUPED_PD_VERSIONS = ("0.31.0", "0.32.0", "0.33.0")
+GROUPED_PD_VERSION_TEXT = "grouped FPM cache P/D is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only"
+GROUPED_PD_INTERVAL_TEXT = (
+    "grouped FPM cache P/D on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at "
+    "attention DP size 1 too, and replay does not model that"
+)
 GROUPED_PD_REPLAY_WINDOW_TEXT = (
     "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with "
     "prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and "

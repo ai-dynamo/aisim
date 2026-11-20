@@ -321,7 +321,11 @@ _PD_MARKERS = (
     "set both on each cache group of the profile, with the transfer_bytes_per_block from evidence for each group, "
     "for the deployment's vLLM version"
 )
-_PD_VERSION = "grouped FPM cache P/D is modeled for vLLM 0.31.0 and 0.32.0 only"
+_PD_VERSION = "grouped FPM cache P/D is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only"
+_PD_INTERVAL = (
+    "grouped FPM cache P/D on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 holds prefills at "
+    "attention DP size 1 too, and replay does not model that"
+)
 _PD_TRANSFER = "grouped FPM cache derives kv_transfer.bytes_per_token from its cache groups; set it to auto"
 _PD_REPLAY_WINDOW = (
     "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with "
@@ -1060,6 +1064,7 @@ def test_grouped_unsupported_execution_modes_fail_before_replay(grouped_case, ch
     [
         ("vllm_0310", None),
         ("vllm_0320", None),
+        ("vllm_0330", None),
         ("no_markers", _PD_MARKERS),
         ("vllm_0300", _PD_VERSION),
         ("unequal_tp", _PD_PAIRING),
@@ -1074,7 +1079,7 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
-    version = {"vllm_0320": "0.32.0", "vllm_0300": "0.30.0"}.get(case, "0.31.0")
+    version = {"vllm_0320": "0.32.0", "vllm_0330": "0.33.0", "vllm_0300": "0.30.0"}.get(case, "0.31.0")
     if case == "linear_decode":
         profile = _mixed_profile(profile)
     profile = _with_transfer_markers(profile, version=version)
@@ -1128,49 +1133,118 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
         SearchSpace.model_validate(search)
 
 
-def test_grouped_pd_of_a_probe_profile_gets_the_version_text(grouped_case):
+def test_grouped_pd_of_a_probe_profile_gets_the_markers_text(grouped_case):
     # A profile as the import of a vLLM 0.33.0 runtime probe writes it: prefix_cacheable on every group, the recorded
-    # version 0.33.0 and no transfer bytes. No transfer bytes can make P/D of that version run, so the version text
-    # comes first.
+    # version 0.33.0 and no transfer bytes. Replay models P/D for vLLM 0.33.0, so the profile gets the text of the
+    # markers.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
     for deployment in profile["deployments"]:
         deployment["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
-    with pytest.raises(ValidationError, match=re.escape(_PD_VERSION)):
+    with pytest.raises(ValidationError, match=re.escape(_PD_MARKERS)):
         CorePredictionConfig.model_validate(_pd_prediction(profile, root))
-    with pytest.raises(ValidationError, match=re.escape(_PD_VERSION)):
+    with pytest.raises(ValidationError, match=re.escape(_PD_MARKERS)):
         SearchSpace.model_validate(_pd_search(profile, root))
 
 
 @pytest.mark.parametrize("prefix_caching", [False, True])
-def test_grouped_pd_refuses_vllm_0330_with_prefix_caching_on_and_off(grouped_case, prefix_caching):
-    # Replay has grouped prefix-caching rules for vLLM 0.33.0 but no P/D transfer rules for it. A profile of vLLM 0.33.0
-    # with prefix evidence and both P/D markers gets the text of the P/D rule, with prefix caching on or off: a prefill
-    # or decode rank checks the P/D version before the rest of the prefix-caching rule, as the Rust gate does.
+def test_grouped_pd_accepts_vllm_0330_with_prefix_caching_on_and_off(grouped_case, prefix_caching):
+    # Replay has grouped prefix-caching rules and P/D transfer rules for vLLM 0.33.0. A profile of vLLM 0.33.0 with
+    # prefix evidence and both P/D markers passes the prediction and the search, with prefix caching on or off.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
     profile = _with_transfer_markers(profile, version="0.33.0")
     raw = _pd_prediction(profile, root)
+    raw["engine"]["context_length"] = profile["deployments"][0]["resources"]["runtime_memory"]["max_model_len"]
     for worker in raw["engine"]["workers"].values():
         worker["kv_cache"]["prefix_caching"] = prefix_caching
     search = _pd_search(profile, root)
     search["prefill_enable_prefix_caching"] = prefix_caching
-    with pytest.raises(ValidationError, match=re.escape(_PD_VERSION)):
-        CorePredictionConfig.model_validate(raw)
-    with pytest.raises(ValidationError, match=re.escape(_PD_VERSION)):
+    CorePredictionConfig.model_validate(raw)
+    SearchSpace.model_validate(search)
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_grouped_pd_rank_on_vllm_0330_refuses_a_prefill_schedule_interval_above_one(grouped_case, prefix_caching):
+    # vLLM 0.33.0 applies the interval without data parallelism, with prefix caching on or off, and replay does not
+    # model that. A prefill or decode rank gets the P/D text first, whose remedy holds with prefix caching off too.
+    profile, root = grouped_case
+
+    def prediction(version, role, interval):
+        versioned = _with_prefix_evidence(_with_state_group(profile), version=version)
+        versioned = _with_transfer_markers(versioned, version=version)
+        raw = _pd_prediction(versioned, root)
+        raw["engine"]["context_length"] = versioned["deployments"][0]["resources"]["runtime_memory"]["max_model_len"]
+        for worker in raw["engine"]["workers"].values():
+            worker["kv_cache"]["prefix_caching"] = prefix_caching
+        raw["engine"]["workers"][role]["scheduler"]["prefill_schedule_interval"] = interval
+        return raw
+
+    for role in ("prefill", "decode"):
+        with pytest.raises(ValidationError, match=re.escape(_PD_INTERVAL)):
+            CorePredictionConfig.model_validate(prediction("0.33.0", role, 2))
+        CorePredictionConfig.model_validate(prediction("0.33.0", role, 1))
+        # The interval comes before the markers.
+        unmarked = prediction("0.33.0", role, 2)
+        for deployment in unmarked["engine"]["fpm_profile"]["deployments"]:
+            for group in deployment["resources"]["cache_groups"]:
+                del group["transfer_bytes_per_block"]
+        with pytest.raises(ValidationError, match=re.escape(_PD_INTERVAL)):
+            CorePredictionConfig.model_validate(unmarked)
+        # The rows of 0.31.0 and 0.32.0 keep the interval.
+        for version in ("0.31.0", "0.32.0"):
+            CorePredictionConfig.model_validate(prediction(version, role, 2))
+    if not prefix_caching:
+        # A prefill worker beside the aggregated worker of an aggregated prediction is no P/D rank. It fails on its
+        # role, not on the P/D text.
+        raw = _prediction(_with_prefix_evidence(_with_state_group(profile), version="0.33.0"), root)
+        raw["engine"].update(mode="aggregated", backend_version="0.33.0")
+        workers = raw["engine"]["workers"]
+        workers["prefill"] = deepcopy(workers["aggregated"])
+        workers["prefill"]["kv_cache"]["prefix_caching"] = False
+        workers["prefill"]["scheduler"]["prefill_schedule_interval"] = 2
+        with pytest.raises(ValidationError, match="aggregated mode rejects prefill/decode workers") as refused:
+            CorePredictionConfig.model_validate(raw)
+        assert _PD_INTERVAL not in str(refused.value)
+
+
+def test_grouped_pd_refuses_roles_whose_evidence_records_two_vllm_versions(grouped_case):
+    # A prefill deployment with vLLM 0.32.0 evidence beside a decode deployment with vLLM 0.33.0 evidence, under the
+    # label 0.33.0. Replay follows the rules of one version for a handoff, so the pair is refused.
+    from aisim.sweeper.config import SearchSpace
+
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    profile = _with_transfer_markers(profile, version="0.33.0")
+    prefill = profile["deployments"][0]
+    decode = {**deepcopy(prefill), "worker_type": "decode"}
+    prefill["resources"]["runtime_memory"]["runtime_framework_version"] = "0.32.0"
+    decode["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
+    profile["deployments"][:1] = [{**prefill, "worker_type": "prefill"}, decode]
+    search = _pd_search(profile, root)
+    pin = {"tp": 2, "moe_tp": 2}
+    search["parallel_configs_by_mode"] = {"disagg": [{"prefill": pin, "decode": pin}]}
+    error = (
+        "grouped FPM cache P/D requires runtime_memory.runtime_framework_version (0.32.0) to equal the deployment's "
+        "backend_version (0.33.0)"
+    )
+    with pytest.raises(ValidationError, match=re.escape(error)):
+        CorePredictionConfig.model_validate(_pd_prediction(profile, root))
+    with pytest.raises(ValidationError, match=re.escape(error)):
         SearchSpace.model_validate(search)
 
 
 @pytest.mark.parametrize(("case", "error"), [("non_cacheable_window", _PD_REPLAY_WINDOW), ("vllm_0300", _PD_VERSION)])
 def test_grouped_pd_with_prefix_caching_gives_the_texts_whose_remedies_hold_on_a_pd_rank(grouped_case, case, error):
     # With prefix caching on, the prefix-caching rule runs before the P/D rule. A bounded replay window and a version
-    # that P/D does not model fail on a prefill or decode rank with prefix caching off too, so the texts of the
-    # prefix-caching rule ("turn prefix caching off", vLLM 0.33.0) would point to a setting that is refused again. A
-    # prefill or decode rank checks them first and gets the P/D texts, as the Rust gate does.
+    # that P/D does not model fail on a prefill or decode rank with prefix caching off too. So the window text of the
+    # prefix-caching rule ("turn prefix caching off") would point to a setting that is refused again, and its version
+    # text would name prefix caching for a rank that fails on its P/D version. A prefill or decode rank checks them
+    # first and gets the P/D texts, as the Rust gate does.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
@@ -1194,8 +1268,8 @@ def test_grouped_pd_with_prefix_caching_gives_the_texts_whose_remedies_hold_on_a
 
 def test_grouped_pd_of_a_probe_profile_under_another_label_gets_the_recorded_version_text(grouped_case):
     # A profile from the vLLM 0.33.0 runtime probe under the label 0.32.0: prefix_cacheable on every group, the
-    # recorded version 0.33.0 and no transfer bytes. No transfer bytes can make P/D of the recorded version run, so
-    # the rule on the recorded version comes before the markers.
+    # recorded version 0.33.0 and no transfer bytes. The label differs from the recorded version, and no transfer
+    # bytes change that, so the rule on the recorded version comes before the markers.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
@@ -1291,9 +1365,28 @@ def test_grouped_prediction_whose_roles_do_not_fit_its_mode_keeps_the_role_error
             with pytest.raises(ValidationError, match=re.escape(error)) as refused:
                 CorePredictionConfig.model_validate(raw)
             assert _PD_VERSION not in str(refused.value), (mode, role)
+    # The same stray worker with a bounded replay window, in both shapes, gets the window text of the prefix-caching
+    # rule, not the one of the P/D rule.
+    windowed = deepcopy(profile)
+    for deployment in windowed["deployments"]:
+        deployment["resources"]["cache_groups"][1]["prefix_cacheable"] = False
+    prefix_window = "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group"
+    for mode, role in (("aggregated", "prefill"), ("disaggregated", "prefill"), ("disaggregated", "decode")):
+        raw = _prediction(windowed, root)
+        raw["engine"].update(mode=mode, backend_version="0.33.0")
+        raw["engine"]["context_length"] = windowed["deployments"][0]["resources"]["runtime_memory"]["max_model_len"]
+        workers = raw["engine"]["workers"]
+        stray = deepcopy(workers["aggregated"])
+        stray["kv_cache"]["prefix_caching"] = True
+        if mode == "disaggregated":
+            workers.clear()
+        workers[role] = stray
+        with pytest.raises(ValidationError, match=re.escape(prefix_window)) as refused:
+            CorePredictionConfig.model_validate(raw)
+        assert _PD_REPLAY_WINDOW not in str(refused.value), (mode, role)
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_grouped_pd_prediction_replays_one_p_one_d(grouped_case, tmp_path, version):
     profile, root = grouped_case
     profile = _with_transfer_markers(_with_state_group(profile), version=version)
@@ -1305,8 +1398,8 @@ def test_grouped_pd_prediction_replays_one_p_one_d(grouped_case, tmp_path, versi
         # A grouped rank derives the transfer payload from its groups, so it has no scalar bytes per token.
         assert "kv_transfer_bytes_per_token" not in args
         assert (args["kv_transfer_bandwidth"], args["kv_transfer_timing_mode"]) == (1.0, "destination_missing")
-        # The Rust gate refuses a grouped prefill or decode rank without vLLM 0.31.0 or 0.32.0, also with prefix
-        # caching off.
+        # The Rust gate refuses a grouped prefill or decode rank without vLLM 0.31.0, 0.32.0 or 0.33.0, also with
+        # prefix caching off.
         assert (args["enable_prefix_caching"], args["vllm_version"]) == (False, version)
         assert "prefix_match_unit" not in args
     groups = materialize_aic_num_gpu_blocks(prefill)["kv_cache_groups"]
@@ -1319,7 +1412,7 @@ def test_grouped_pd_prediction_replays_one_p_one_d(grouped_case, tmp_path, versi
     assert json.loads((output / "prediction.json").read_text())["completed_requests"] == 2
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_grouped_pd_prediction_with_prefix_caching_on_both_ranks(grouped_case, tmp_path, version):
     # Planning writes prefix_caching: true into an accepted role's worker.yaml, so a composed P/D prediction of two
     # planned roles runs both ranks in block mode.
@@ -1353,7 +1446,7 @@ def test_grouped_pd_prediction_with_prefix_caching_on_both_ranks(grouped_case, t
     assert delays == [pytest.approx(1216e-6, abs=1e-9), pytest.approx(704e-6, abs=1e-9)]
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_grouped_pd_prediction_with_prefix_caching_on_the_prefill_rank_only(grouped_case, tmp_path, version):
     # A search with prefix evidence defaults to prefix caching on prefill workers and off on decode workers.
     profile, root = grouped_case
@@ -1751,8 +1844,11 @@ def test_grouped_sweeper_pd_candidate_ranks_take_the_vllm_version(grouped_case, 
 
 
 @reads_saved_config
+@pytest.mark.parametrize("version", ["0.31.0", "0.33.0"])
 @pytest.mark.parametrize("prefix_caching", [False, True])
-def test_grouped_pd_recommendation_replays_every_candidate(grouped_case, tmp_path, monkeypatch, prefix_caching):
+def test_grouped_pd_recommendation_replays_every_candidate(
+    grouped_case, tmp_path, monkeypatch, prefix_caching, version
+):
     from aisim.recommend import _run_recommendation
     from aisim.sweeper import SweepResult
     from aisim.sweeper.result import CandidateStatus
@@ -1760,12 +1856,12 @@ def test_grouped_pd_recommendation_replays_every_candidate(grouped_case, tmp_pat
     monkeypatch.setattr("aisim.recommend.run_recommendation", _run_recommendation)
     profile, root = grouped_case
     if prefix_caching:
-        profile = _with_prefix_evidence(_with_state_group(profile))
-    profile = _with_transfer_markers(profile)
-    _write_timings(root, profile, version="0.31.0")
+        profile = _with_prefix_evidence(_with_state_group(profile), version=version)
+    profile = _with_transfer_markers(profile, version=version)
+    _write_timings(root, profile, version=version)
     raw = _pd_prediction(profile, root, bandwidth=1.0)
     if prefix_caching:
-        aggregated = _prefix_caching_prediction(profile, root, "0.31.0")
+        aggregated = _prefix_caching_prediction(profile, root, version)
         raw["engine"]["context_length"] = aggregated["engine"]["context_length"]
         raw["traffic"] = aggregated["traffic"]
     for worker in raw["engine"]["workers"].values():
@@ -2732,14 +2828,16 @@ def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(grouped
 # The bytes that vLLM's NIXL connector reads for one block of each GLM-5.3-Flash group at TP 4 on one rank: attention,
 # ring and four KDA states. A live run measured the attention value and the sum of the other five groups
 # (benchmarks/evidence/nixl-pd-transfer-bytes-20261115). The split of that sum among the groups is a reading of the
-# connector code.
+# connector code. On vLLM 0.33.0 a log of each group measured the six values
+# (benchmarks/evidence/nixl-pd-transfer-bytes-20261117).
 _GLM_TRANSFER_BYTES = {
     "0.31.0": (13_045_120, 13_045_120, 9_768_960, 9_768_960, 9_768_960, 9_768_960),
     "0.32.0": (21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960),
+    "0.33.0": (21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960),
 }
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0"])
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
 def test_glm_shaped_grouped_pd_transfer_time_matches_the_oracle(grouped_case, tmp_path, version):
     profile, root = grouped_case
     profile = _glm_shaped_profile(profile, version)
@@ -2779,8 +2877,9 @@ def test_glm_shaped_grouped_pd_transfer_time_matches_the_oracle(grouped_case, tm
         assert cli.main(["predict", "-c", str(path), "--output-dir", str(output)]) == 0
         mean_ttft[bandwidth] = json.loads((output / "prediction.json").read_text())["mean_ttft_ms"]
     # The prefill computes 999 tokens, so one 2,176-token attention block moves with one block of each state group:
-    # the measured row of 1,000 tokens, 65,166,080 bytes on vLLM 0.31.0 and 61,146,624 on vLLM 0.32.0, over 1 GB/s.
-    measured_bytes = {"0.31.0": 65_166_080, "0.32.0": 61_146_624}[version]
+    # the measured row of 1,000 tokens, 65,166,080 bytes on vLLM 0.31.0 and 61,146,624 on vLLM 0.32.0 and 0.33.0, over
+    # 1 GB/s.
+    measured_bytes = {"0.31.0": 65_166_080, "0.32.0": 61_146_624, "0.33.0": 61_146_624}[version]
     assert mean_ttft[1.0] - mean_ttft[None] == pytest.approx(measured_bytes / 1e6, abs=1e-3)
 
 
