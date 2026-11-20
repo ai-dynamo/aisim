@@ -1455,7 +1455,7 @@ def _supported_fpm_validation_config() -> dict[str, object]:
 def test_nemotron_super_fp8_native_estimation_uses_packaged_moe_data() -> None:
     """Issue #1522: the exact deployed MoE key must estimate successfully.
 
-    HYBRID: vLLM ships no Mamba2 table, and SILICON readiness now reports that (AISIM-2194).
+    HYBRID: vLLM ships no Mamba2 table, and SILICON readiness now reports that.
     """
     pytest.importorskip("aisim_core")
     from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
