@@ -493,10 +493,11 @@ impl HostTier {
         self.client(client).retimes_loads = true;
     }
 
-    /// Bring a queued private-lane load's completion forward to
-    /// `completes_at_ms`, never before the pool's current time and never
-    /// later than its lane completes it, and report its queueing if that was
-    /// waiting for this call. Returns the completion.
+    /// Set a queued private-lane load's completion to the connector's resolved
+    /// `completes_at_ms`, never before the pool's current time, and report its
+    /// queueing if that was waiting for this call. The owner resolves copy
+    /// ordering and destination fences; this replaces the provisional lane
+    /// deadline, either earlier or later. Returns the completion.
     pub(crate) fn retime_load(&mut self, transfer_id: TransferId, completes_at_ms: f64) -> f64 {
         assert_valid_time("host load completion", completes_at_ms);
         let transfer = &self.transfers[&transfer_id];
@@ -504,8 +505,8 @@ impl HostTier {
         let lane_ms = transfer
             .deadline
             .expect("a retimed load is queued on a private lane");
-        let at_ms = completes_at_ms.max(self.current_time_ms).min(lane_ms);
-        if at_ms < lane_ms {
+        let at_ms = completes_at_ms.max(self.current_time_ms);
+        if at_ms != lane_ms {
             let Transport::Fifo { deadlines, .. } = &mut self.transport else {
                 unreachable!("a deadline belongs to a private lane")
             };
@@ -2858,13 +2859,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn deferred_load_retime_clamps_deadlines_and_observes_queue_once() {
+    fn deferred_load_retime_floors_deadlines_and_observes_queue_once() {
         for (requested, expected) in [
             (0.0, 12.0),
             (12.0, 12.0),
             (15.0, 15.0),
             (20.0, 20.0),
-            (30.0, 20.0),
+            (30.0, 30.0),
         ] {
             let (mut tier, load, observer) = deferred_load();
             assert!(tier.tick(C, 12.0).0.is_empty());
@@ -2885,6 +2886,7 @@ pub(crate) mod tests {
             assert_eq!(tier.retime_load(load, requested), expected);
             if expected > 12.0 {
                 assert!(tier.tick(C, expected - 0.5).0.is_empty());
+                assert_eq!(tier.pins(key(1)), 1);
             }
             assert_eq!(
                 tier.tick(C, expected).0,
@@ -2914,8 +2916,8 @@ pub(crate) mod tests {
     #[test]
     fn deferred_load_queue_is_observed_once_before_cancellation() {
         // Cancel both before the owner retimes the load and after retiming
-        // shortens the deadline or leaves it clamped to the lane deadline.
-        for (requested, expected) in [(None, 20.0), (Some(15.0), 15.0), (Some(30.0), 20.0)] {
+        // shortens or extends the deadline.
+        for (requested, expected) in [(None, 20.0), (Some(15.0), 15.0), (Some(30.0), 30.0)] {
             let (mut tier, load, observer) = deferred_load();
             if let Some(requested) = requested {
                 assert_eq!(tier.retime_load(load, requested), expected);
@@ -2938,6 +2940,41 @@ pub(crate) mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn a_retimed_load_keeps_sources_pinned_under_store_pressure_until_its_copy_ends() {
+        let (mut tier, load, observer) = deferred_load();
+        tier.retime_load(load, 30.0);
+        // The provisional lane ended at 20, but the connector is still
+        // reading until 30. A competing store cannot reclaim its source.
+        for now in [20.0, 29.5] {
+            assert_eq!(
+                tier.prepare_store(C, Uuid::from_u128(2), &[key(2)], None, now),
+                StoreOutcome::RetryCapacity {
+                    structurally_unfittable: false,
+                }
+            );
+            assert_eq!(tier.lookup(key(1)), Lookup::Hit);
+            assert_eq!(tier.pins(key(1)), 1);
+        }
+        assert_eq!(tier.tick(C, 30.0).0.len(), 1);
+        assert_eq!(tier.pins(key(1)), 0);
+        assert!(matches!(
+            tier.prepare_store(C, Uuid::from_u128(2), &[key(2)], None, 30.0),
+            StoreOutcome::Prepared { .. }
+        ));
+        assert_eq!(tier.lookup(key(1)), Lookup::Miss);
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [
+                ObservedLoadEvent::Queued {
+                    at_ms: 10.0,
+                    completes_at_ms: 30.0,
+                },
+                ObservedLoadEvent::Completed { at_ms: 30.0 },
+            ]
+        );
     }
 
     #[test]

@@ -2182,7 +2182,9 @@ impl VllmCore {
 
     /// Load poll (vLLM v0.32.0): `schedule(m)` issues the load and the worker
     /// submits it in `post_forward` at the end of `sample_tokens(m)`, where
-    /// the copy starts at the connector's [`LoadCopyStart`]. Every later pass
+    /// the copy starts at the connector's [`LoadCopyStart`]. The issuing
+    /// pass's poll is conservatively excluded even when an instantaneous
+    /// copy ends at that same timestamp. Every later pass
     /// polls in its own `post_forward`: the first pass f whose poll comes at
     /// or after the copy end reports it, and `update_from_output(f)` records
     /// it. With vLLM's two-batch queue `schedule(f+1)` runs before
@@ -2288,10 +2290,11 @@ impl VllmCore {
                 .get_mut(&uuid)
                 .expect("collected above")
                 .vllm_end_ms = Some(end_ms);
-            // SimpleCPU starts the copy when the launch ends, which can be
-            // before replay forms the pass and starts its own copy: the
-            // simulator's completion comes forward so that the poll that
-            // sees the copy can release it. It never moves later.
+            // Replace the provisional lane completion with the resolved
+            // connector copy end, preserving the clock floor. SimpleCPU can
+            // start before replay forms this pass; Offloading waits for GPU
+            // work, and a SimpleCPU batch may outlast an individual load.
+            // Moving later keeps G2 sources pinned until the copy ends.
             if let Some(host) = self
                 .state
                 .requests
