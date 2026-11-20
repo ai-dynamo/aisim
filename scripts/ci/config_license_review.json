@@ -18,9 +18,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M2.5_config.json",
+        "sha256": "3ff405539448d89e911d14d7f22eefe92c11b1294b74c1d7a0d100eb1bdd644c",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model"
+        ],
+        "license_text_sha256": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary. The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT. Scoped approval remains pending. Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary. The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-MiniMax-M2.5-Model": {
@@ -36,9 +50,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M2.7_config.json",
+        "sha256": "697c30492781d55ac516011f937b5cdec045710b5b0c9ca39a6ea277785df9aa",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial"
+        ],
+        "license_text_sha256": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-MiniMax-M2.7-Noncommercial": {
@@ -54,9 +82,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/MiniMaxAI--MiniMax-M3_config.json",
+        "sha256": "7726ac24cb99116b67275430374140fcebd0525e55869b80ce3acb53848bc636",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M3-Community",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-MiniMax-M3-Community"
+        ],
+        "license_text_sha256": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-MiniMax-M3-Community": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-MiniMax-M3-Community": {
@@ -392,9 +434,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B-FP8_config.json",
+        "sha256": "b7396b749964c6afb5387c58e6425db8628e85f8ae66739d284eb1c8f42c4d4e",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-Qwen3.8-Max",
+        "required_licenses": [
+          "LicenseRef-Qwen3.8-Max"
+        ],
+        "license_text_sha256": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Qwen3.8-Max": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
+        }
       },
-      "review_note": "Yes, subject to the identified license and retained notices. Commercial branding and separate-license conditions are conditional. They are not established as triggered for this stated noncommercial release; the separate-license test is written at licensee/affiliate business level, not solely the behavior of AISim."
+      "review_note": "Yes, subject to the identified license and retained notices. Commercial branding and separate-license conditions are conditional. They are not established as triggered for this stated noncommercial release; the separate-license test is written at licensee/affiliate business level, not solely the behavior of AISim. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving."
     },
     {
       "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B_config.json",
@@ -402,9 +458,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/Qwen--Qwen3.8-2.4T-A95B_config.json",
+        "sha256": "4e3819548967e319ab435d044a3a331dbe3b078590ce822e9d74b79430533987",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-Qwen3.8-Max",
+        "required_licenses": [
+          "LicenseRef-Qwen3.8-Max"
+        ],
+        "license_text_sha256": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Qwen3.8-Max": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
+        }
       },
-      "review_note": "Yes, subject to the identified license and retained notices. Commercial branding and separate-license conditions are conditional. They are not established as triggered for this stated noncommercial release; the separate-license test is written at licensee/affiliate business level, not solely the behavior of AISim."
+      "review_note": "Yes, subject to the identified license and retained notices. Commercial branding and separate-license conditions are conditional. They are not established as triggered for this stated noncommercial release; the separate-license test is written at licensee/affiliate business level, not solely the behavior of AISim. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving."
     },
     {
       "path": "aisim_core/model_configs/XiaomiMiMo--MiMo-7B-Base_config.json",
@@ -528,9 +598,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/meta-llama--Llama-4-Maverick-17B-128E-Instruct_config.json",
+        "sha256": "39f9056ad8911d045fc44a9174e9b4acb8b42f9fc583dc92e62a9e107491bd18",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-Llama-4-Community",
+        "required_licenses": [
+          "LicenseRef-Llama-4-Community"
+        ],
+        "license_text_sha256": "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Llama-4-Community": "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f"
+        }
       },
-      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving."
     },
     {
       "path": "aisim_core/model_configs/meta-llama--Llama-4-Scout-17B-16E-Instruct_config.json",
@@ -538,9 +622,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/meta-llama--Llama-4-Scout-17B-16E-Instruct_config.json",
+        "sha256": "5eda6f9bdb2bd6b6959455679f75c4c107ea763b3cce0f9e0c74091ca80d1906",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-Llama-4-Community",
+        "required_licenses": [
+          "LicenseRef-Llama-4-Community"
+        ],
+        "license_text_sha256": "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Llama-4-Community": "747b9ee8c0338f86a41799b6af9e7fdcce17cc8fb8b8b8d628f97bc68166710f"
+        }
       },
-      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed."
+      "review_note": "Yes, subject to the identified license and retained notices. Built with Llama is a redistribution condition, independent of MaaS/commercial use. The additional 700-million-MAU clause is licensee/affiliate-wide; its applicability or a separate NVIDIA grant was not verified, and no breach is presumed. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving."
     },
     {
       "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-405B_config.json",
@@ -548,9 +646,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-405B_config.json",
+        "sha256": "b75e46be030e920b46bc5e92de48554ce07937ced57b1b2fe1ba722cc94ffc76",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-Llama-3.1-Community"
+        ],
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-Llama-3.1-Community": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-Llama-3.1-Community": {
@@ -566,9 +678,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-70B_config.json",
+        "sha256": "5866f0abbb3050fd6948c0afde03651b2445a16480338ff01dc11d4a12ccd3f2",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-Llama-3.1-Community"
+        ],
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-Llama-3.1-Community": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-Llama-3.1-Community": {
@@ -584,9 +710,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/meta-llama--Meta-Llama-3.1-8B_config.json",
+        "sha256": "398adf8b93f20e64932517492099d4e471e36a1723b5bf4e1311638f6a13f909",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-Llama-3.1-Community"
+        ],
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-Llama-3.1-Community": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-Llama-3.1-Community": {
@@ -636,9 +776,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/moonshotai--Kimi-K2-Instruct_config.json",
+        "sha256": "17caf15bd0614a4580e066eec2f459f5b0b1372648e355e6d770305b092662ce",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2-Instruct-Modified-MIT",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-Kimi-K2-Instruct-Modified-MIT"
+        ],
+        "license_text_sha256": "93663f288a42860b69743a59ba301a2b7fc9e73792ab6d27e26225a183d90e5b",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-Kimi-K2-Instruct-Modified-MIT": "93663f288a42860b69743a59ba301a2b7fc9e73792ab6d27e26225a183d90e5b"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-Kimi-K2-Instruct-Modified-MIT": {
@@ -654,9 +808,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/moonshotai--Kimi-K2.5_config.json",
+        "sha256": "1a8a4903e63893b0f5be0450a089cee4a36778900cafae913e0c21208b462ce0",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT"
+        ],
+        "license_text_sha256": "b9187cd88244972781dccb574056705994b92c3de30fd6500eaf25765dd70438",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT": "b9187cd88244972781dccb574056705994b92c3de30fd6500eaf25765dd70438"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-Kimi-K2.5-Modified-MIT": {
@@ -672,9 +840,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/moonshotai--Kimi-K3_config.json",
+        "sha256": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K3",
+        "required_licenses": [
+          "Apache-2.0 AND LicenseRef-Kimi-K3"
+        ],
+        "license_text_sha256": "a270c9a6e214d3f09f332a11ee6ef513292fac94a19928e913940f4d837e2a39",
+        "license_text_sha256_by_license": {
+          "Apache-2.0 AND LicenseRef-Kimi-K3": "a270c9a6e214d3f09f332a11ee6ef513292fac94a19928e913940f4d837e2a39"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "nvidia_contribution_licenses": [],
       "license_notices": {
         "LicenseRef-Kimi-K3": {
@@ -1336,9 +1518,23 @@
         "LicenseRef-GLM-5.3"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_config.json",
+        "sha256": "b0b6b9ab922a82e3688bc39a4117bc443e106fcf88969ef48b3627778f4bdf7b",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement",
+        "required_licenses": [
+          "LicenseRef-GLM-5.3"
+        ],
+        "license_text_sha256": "799db03d1d23633b94d4984ac08aed81e72d34ff8c83bba33124825388bf1ea5",
+        "license_text_sha256_by_license": {
+          "LicenseRef-GLM-5.3": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1"
+        }
       },
-      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The packaged inventory and canonical notice identify an immutable source and modification status. Source-to-wheel bytes were verified; this does not independently reconstruct historical collection.",
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The packaged inventory and canonical notice identify an immutable source and modification status. Source-to-wheel bytes were verified; this does not independently reconstruct historical collection. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "url": "https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/README.md",
         "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
@@ -1366,9 +1562,23 @@
         "LicenseRef-GLM-5.3"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--GLM-5.3-NVFP4_hf_quant_config.json",
+        "sha256": "13799d4fed353c20dde2264fbdd7f68a780b514782f8d80bba96ac5e44aa9bba",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-GLM-5.3 AND LicenseRef-NVIDIA-Open-Model-Agreement",
+        "required_licenses": [
+          "LicenseRef-GLM-5.3"
+        ],
+        "license_text_sha256": "799db03d1d23633b94d4984ac08aed81e72d34ff8c83bba33124825388bf1ea5",
+        "license_text_sha256_by_license": {
+          "LicenseRef-GLM-5.3": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1"
+        }
       },
-      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The packaged inventory and canonical notice identify an immutable source and modification status. Source-to-wheel bytes were verified; this does not independently reconstruct historical collection.",
+      "review_note": "NVIDIA releasing its own contribution needs no extra NVIDIA self-permission. Underlying third-party terms remain independently reviewed. The packaged inventory and canonical notice identify an immutable source and modification status. Source-to-wheel bytes were verified; this does not independently reconstruct historical collection. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "url": "https://huggingface.co/nvidia/GLM-5.3-NVFP4/blob/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf/README.md",
         "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
@@ -1532,9 +1742,23 @@
         "LicenseRef-Kimi-K2.5-Modified-MIT"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Kimi-K2.5-NVFP4_config.json",
+        "sha256": "c375d7d566b6fa706ba46fec9ef938e829c5ba1accb20541d4f0c75dddefcd8f",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2.5-Modified-MIT",
+        "required_licenses": [
+          "LicenseRef-Kimi-K2.5-Modified-MIT"
+        ],
+        "license_text_sha256": "b9187cd88244972781dccb574056705994b92c3de30fd6500eaf25765dd70438",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Kimi-K2.5-Modified-MIT": "8b22e3918250a78292ec17e8b2596808318d044684e866719e9d8a1a928ea46d"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1574,9 +1798,23 @@
         "LicenseRef-Kimi-K2.6-Modified-MIT"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Kimi-K2.6-NVFP4_config.json",
+        "sha256": "af4c0fea7ec43d5438532eeef8daa9fcabbdf97ddedc9da2319aa675f68f51ff",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2.6-Modified-MIT",
+        "required_licenses": [
+          "LicenseRef-Kimi-K2.6-Modified-MIT"
+        ],
+        "license_text_sha256": "a6c205937203b51cf56acfed485534b4a1a738faa09d510da3d571a3c75c2a36",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Kimi-K2.6-Modified-MIT": "941ddde5de6c074eac890c67856db540e48bd4653e34d4d9e38d1a9fae4344b8"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1616,9 +1854,23 @@
         "LicenseRef-Kimi-K2.6-Modified-MIT"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Kimi-K2.6-NVFP4_hf_quant_config.json",
+        "sha256": "6ee4be1d46bf2b5204284b6641ed7bb5d9fc2fc7e8157a4eb06d5fe500dddc3a",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2.6-Modified-MIT",
+        "required_licenses": [
+          "LicenseRef-Kimi-K2.6-Modified-MIT"
+        ],
+        "license_text_sha256": "a6c205937203b51cf56acfed485534b4a1a738faa09d510da3d571a3c75c2a36",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Kimi-K2.6-Modified-MIT": "941ddde5de6c074eac890c67856db540e48bd4653e34d4d9e38d1a9fae4344b8"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1658,9 +1910,23 @@
         "LicenseRef-Kimi-K2.7-Code-Modified-MIT"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_config.json",
+        "sha256": "b203b07a34c3462df0b30eea7c99cc31b3d682c365cacc75edb8823a0ab97758",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2.7-Code-Modified-MIT",
+        "required_licenses": [
+          "LicenseRef-Kimi-K2.7-Code-Modified-MIT"
+        ],
+        "license_text_sha256": "86c40b0e4d23e36595522ec3cd98d355518bfdbfeb53aa8d161139e93bf6e58c",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Kimi-K2.7-Code-Modified-MIT": "0bc1a42b295528b3d531d8bac9d831836c9b22bf43fc40733530da9186b753d8"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1700,9 +1966,23 @@
         "LicenseRef-Kimi-K2.7-Code-Modified-MIT"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Kimi-K2.7-Code-NVFP4_hf_quant_config.json",
+        "sha256": "4baf41307796a29aa0dc67de3ab33d590b9ad20bac5042b22dac842b3ecb766c",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Kimi-K2.7-Code-Modified-MIT",
+        "required_licenses": [
+          "LicenseRef-Kimi-K2.7-Code-Modified-MIT"
+        ],
+        "license_text_sha256": "86c40b0e4d23e36595522ec3cd98d355518bfdbfeb53aa8d161139e93bf6e58c",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Kimi-K2.7-Code-Modified-MIT": "0bc1a42b295528b3d531d8bac9d831836c9b22bf43fc40733530da9186b753d8"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1742,9 +2022,23 @@
         "LicenseRef-Llama-3.1-Community"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_config.json",
+        "sha256": "cfd56137fa9c0632c022a322e8e19e4dcc0474e1b2f0c7d9f7cc64d212c9fd18",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
+        "required_licenses": [
+          "LicenseRef-Llama-3.1-Community"
+        ],
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Llama-3.1-Community": "f247b541404c402d906d71f47818179d4fe79d426f3a13514759680669f710a2"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1784,9 +2078,23 @@
         "LicenseRef-Llama-3.1-Community"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Llama-3.1-70B-Instruct-FP8_hf_quant_config.json",
+        "sha256": "8d26f1ffdd8b22de0f7b280923af5806dfaff6b0dc5aacc454782732cc0795dd",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Llama-3.1-Community",
+        "required_licenses": [
+          "LicenseRef-Llama-3.1-Community"
+        ],
+        "license_text_sha256": "1c779f92a3da59c85945bbaddcc81ba9a4eed6d41dd028302bf9937076cddee9",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Llama-3.1-Community": "f247b541404c402d906d71f47818179d4fe79d426f3a13514759680669f710a2"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1826,9 +2134,23 @@
         "LicenseRef-Llama-3.3-Community"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--Llama-3_3-Nemotron-Super-49B-v1_config.json",
+        "sha256": "ea288aea647aa22e9a233aca6db14cd9ef0ee96773074dbf34cbcd9cc53a4747",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-Llama-3.3-Community",
+        "required_licenses": [
+          "LicenseRef-Llama-3.3-Community"
+        ],
+        "license_text_sha256": "b5c7be2418fefa3283f75e19d8a85f6429f82035e15c4affe3a549469cc5669c",
+        "license_text_sha256_by_license": {
+          "LicenseRef-Llama-3.3-Community": "1beaed4a9925af5f6d4d07eebcc351c2c59b00bbb3cdeac59d780adffadcfcdb"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1868,9 +2190,23 @@
         "LicenseRef-MiniMax-M2.5-Model"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_config.json",
+        "sha256": "c59bf551a0c315a6d8101afaf441fd53108792e997796e0e3e9cfe75903362fd",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model",
+        "required_licenses": [
+          "LicenseRef-MiniMax-M2.5-Model"
+        ],
+        "license_text_sha256": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b",
+        "license_text_sha256_by_license": {
+          "LicenseRef-MiniMax-M2.5-Model": "be2c470faf49a31a57dc43322b85d7161a7781b8795b9fb69585b93adb971179"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary. The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT. Scoped approval remains pending. Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary. The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1910,9 +2246,23 @@
         "LicenseRef-MiniMax-M2.5-Model"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--MiniMax-M2.5-NVFP4_hf_quant_config.json",
+        "sha256": "253ea166454ff40d6a5387379973156c8bf9aee56e34d3d08e543925ab9f0b19",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M2.5-Model",
+        "required_licenses": [
+          "LicenseRef-MiniMax-M2.5-Model"
+        ],
+        "license_text_sha256": "afcfcb3aab51377faef0defdc8ae4499cc15efeedc0293f6fd9eb47de58e521b",
+        "license_text_sha256_by_license": {
+          "LicenseRef-MiniMax-M2.5-Model": "be2c470faf49a31a57dc43322b85d7161a7781b8795b9fb69585b93adb971179"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary. The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT. Scoped approval remains pending. Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary. The pinned HF tree supplies LICENSE-MODEL with a redistribution grant. Its README points to an unavailable modified-MIT reference; the conservative recorded grant is LICENSE-MODEL, not standard MIT.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1952,9 +2302,23 @@
         "LicenseRef-MiniMax-M2.7-Noncommercial"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_config.json",
+        "sha256": "24abe73e3a7d4d2e8e0d20ea13f322b8823a804e6598a4d0f7bfc0d0d367ea9d",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial",
+        "required_licenses": [
+          "LicenseRef-MiniMax-M2.7-Noncommercial"
+        ],
+        "license_text_sha256": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a",
+        "license_text_sha256_by_license": {
+          "LicenseRef-MiniMax-M2.7-Noncommercial": "ae0f00538d47e6894db9452498083b896a60676a26a06dbaa73a59d9aa7de2b9"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -1994,9 +2358,23 @@
         "LicenseRef-MiniMax-M2.7-Noncommercial"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--MiniMax-M2.7-NVFP4_hf_quant_config.json",
+        "sha256": "b8c904443b70ab92b6c6ca3b54081cbce84c60a215e50a6ed59e28a4dcc45d0e",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M2.7-Noncommercial",
+        "required_licenses": [
+          "LicenseRef-MiniMax-M2.7-Noncommercial"
+        ],
+        "license_text_sha256": "02863ccc6e457c24602ef7d0860f45934f7e69866c183d4bc21e0374ad62cb9a",
+        "license_text_sha256_by_license": {
+          "LicenseRef-MiniMax-M2.7-Noncommercial": "ae0f00538d47e6894db9452498083b896a60676a26a06dbaa73a59d9aa7de2b9"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -2036,9 +2414,23 @@
         "LicenseRef-MiniMax-M3-Community"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--MiniMax-M3-NVFP4_config.json",
+        "sha256": "440d22038ffa0bcb93fa01e8d2d555e3840d939167c08eace81b9cce386fb117",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M3-Community",
+        "required_licenses": [
+          "LicenseRef-MiniMax-M3-Community"
+        ],
+        "license_text_sha256": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd",
+        "license_text_sha256_by_license": {
+          "LicenseRef-MiniMax-M3-Community": "a42faa56fb186ca55475fad45ddee0073da4fe0ad9db517676e4fad209a32029"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -2078,9 +2470,23 @@
         "LicenseRef-MiniMax-M3-Community"
       ],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/nvidia--MiniMax-M3-NVFP4_hf_quant_config.json",
+        "sha256": "11581ca203bcd77dae53cc77b49392cb17545b097586249dfac12e093bfaa1ec",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "Apache-2.0 AND LicenseRef-MiniMax-M3-Community",
+        "required_licenses": [
+          "LicenseRef-MiniMax-M3-Community"
+        ],
+        "license_text_sha256": "9df48aec80f44b8f9027c0bcd13141201c04666aeeb9da6fbae25b4a5d48f9cd",
+        "license_text_sha256_by_license": {
+          "LicenseRef-MiniMax-M3-Community": "a42faa56fb186ca55475fad45ddee0073da4fe0ad9db517676e4fad209a32029"
+        }
       },
-      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms.",
+      "review_note": "Exact bytes copied from NVIDIA AIConfigurator final synchronization boundary.  Provenance and notice completeness are separate from approval of any required custom third-party terms. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving.",
       "ownership_evidence": {
         "kind": "nvidia_repository",
         "url": "https://github.com/ai-dynamo/aiconfigurator/blob/c8aee02f0887547a334c3d6cd192c42757e4b40e/LICENSE",
@@ -3169,9 +3575,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/zai-org--GLM-5.3-BF16_config.json",
+        "sha256": "ca8f2f47b07919a514c0ca223dc2ea2bc7445afaa5ac76c013a3784e096426ca",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-GLM-5.3",
+        "required_licenses": [
+          "LicenseRef-GLM-5.3"
+        ],
+        "license_text_sha256": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1",
+        "license_text_sha256_by_license": {
+          "LicenseRef-GLM-5.3": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1"
+        }
       },
-      "review_note": "Yes, subject to the identified license and retained notices. The Z.AI security-review condition concerns qualifying licensee/affiliate MaaS businesses using the software commercially. No such commercial trigger is established for this release."
+      "review_note": "Yes, subject to the identified license and retained notices. The Z.AI security-review condition concerns qualifying licensee/affiliate MaaS businesses using the software commercially. No such commercial trigger is established for this release. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving."
     },
     {
       "path": "aisim_core/model_configs/zai-org--GLM-5.3-Flash_config.json",
@@ -3197,9 +3617,23 @@
       "ownership": "third_party",
       "underlying_licenses": [],
       "approval": {
-        "status": "pending"
+        "status": "approved",
+        "path": "aisim_core/model_configs/zai-org--GLM-5.3_config.json",
+        "sha256": "3ac72612095574542f7fff847ada8e59d9199dd8af44bdf625d7e02615572e69",
+        "approved_by": "Harrison Saturley-Hall (saturley-hall)",
+        "approved_on": "2026-11-19",
+        "reference": "https://github.com/ai-dynamo/aisim/pull/953#scoped-config-redistribution-approval",
+        "scope": "oss-config-redistribution",
+        "reported_license": "LicenseRef-GLM-5.3",
+        "required_licenses": [
+          "LicenseRef-GLM-5.3"
+        ],
+        "license_text_sha256": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1",
+        "license_text_sha256_by_license": {
+          "LicenseRef-GLM-5.3": "4dd72e54620487ea94f094d711f210a547768220ae6347eec4323083c5efd7f1"
+        }
       },
-      "review_note": "Yes, subject to the identified license and retained notices. The Z.AI security-review condition concerns qualifying licensee/affiliate MaaS businesses using the software commercially. No such commercial trigger is established for this release."
+      "review_note": "Yes, subject to the identified license and retained notices. The Z.AI security-review condition concerns qualifying licensee/affiliate MaaS businesses using the software commercially. No such commercial trigger is established for this release. Release-owner approval for OSS config redistribution was explicitly directed by Harrison Saturley-Hall on 2026-11-19 and recorded by Codex. This records that project decision; it does not assert a separate OSRB decision or permission for model weights or model serving."
     },
     {
       "path": "aisim_core/model_configs/zai-org--GLM-5_config.json",

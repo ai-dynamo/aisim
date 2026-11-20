@@ -186,7 +186,8 @@ def test_cli_nvidia_repository_cannot_exempt_recorded_base_license(tmp_path, nam
     item = records[path]
     original_mapping = copy.deepcopy(item["ownership_evidence"]["config_mapping"])
     base = gate.provenance.inventory_entries(root / gate.provenance.INVENTORY)[path]["base_license"]
-    assert item["approval"]["status"] == "pending"
+    # Exercise missing approval independently of the committed decisions.
+    item["approval"] = {"status": "pending"}
     if transpose:
         item["underlying_licenses"], item["nvidia_contribution_licenses"] = (
             item["nvidia_contribution_licenses"],
@@ -691,7 +692,8 @@ def test_minimax_identified_base_still_requires_scoped_approval():
     assert len(selected) == 2
     for item in selected:
         assert item["underlying_licenses"] == ["LicenseRef-MiniMax-M2.5-Model"]
-        assert item["approval"]["status"] == "pending"
+        # Exercise missing approval independently of the committed decisions.
+        item["approval"] = {"status": "pending"}
         result = gate.assess([entries[item["path"]]], records, root=root)[0]
         assert result["problems"] == ["unapproved_license"]
 
