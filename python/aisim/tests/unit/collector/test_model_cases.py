@@ -36,6 +36,33 @@ def _planned_moe_modes(monkeypatch, backend: str, model_path: str, sm_version: i
     return {case.moe_type for case in plan("moe", backend, sm_version).cases if case.model_name == model_path}
 
 
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_moe_explicit_only_rejects_non_boolean_values(monkeypatch, value):
+    from collector import case_generator
+
+    monkeypatch.setattr(
+        case_generator,
+        "_required_base_common_case_values",
+        lambda _op: {"quantization_modes": [{"name": "bfloat16", "explicit_only": value}]},
+    )
+    with pytest.raises(TypeError, match=r"moe\.quantization_modes\.explicit_only must be a boolean"):
+        get_moe_quantization_specs()
+
+
+@pytest.mark.parametrize("field", [{}, {"explicit_only": False}, {"explicit_only": True}])
+def test_moe_explicit_only_controls_inherited_and_declared_modes(monkeypatch, field):
+    from collector import case_generator
+
+    monkeypatch.setattr(
+        case_generator,
+        "_required_base_common_case_values",
+        lambda _op: {"quantization_modes": [{"name": "bfloat16", **field}]},
+    )
+    assert get_moe_quantization_specs()[0].explicit_only is field.get("explicit_only", False)
+    assert case_generator.moe_planned_modes("test/model", None) == ([] if field.get("explicit_only") else ["bfloat16"])
+    assert case_generator.moe_planned_modes("test/model", ("bfloat16",)) == ["bfloat16"]
+
+
 def test_model_case_plan_merges_required_base_and_framework_specific_ops():
     plan = build_collection_case_plan(backend="sglang", model_path="deepseek-ai/DeepSeek-V3")
 

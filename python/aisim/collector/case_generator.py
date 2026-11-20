@@ -1119,6 +1119,9 @@ def get_moe_quantization_specs(backend: str | None = None) -> list[MoeQuantizati
         module_config = raw_mode.get("module_config", {})
         if not isinstance(module_config, dict):
             raise TypeError(f"common_case_values.{section}.quantization_modes module_config must be a mapping")
+        explicit_only = raw_mode.get("explicit_only", False)
+        if not isinstance(explicit_only, bool):
+            raise TypeError(f"common_case_values.{section}.quantization_modes.explicit_only must be a boolean")
         specs.append(
             MoeQuantizationSpec(
                 name=str(raw_mode["name"]),
@@ -1141,7 +1144,7 @@ def get_moe_quantization_specs(backend: str | None = None) -> list[MoeQuantizati
                         field_name=f"{section}.quantization_modes.allowed_model_paths",
                     )
                 ),
-                explicit_only=bool(raw_mode.get("explicit_only", False)),
+                explicit_only=explicit_only,
                 module_config=dict(module_config),
             )
         )
