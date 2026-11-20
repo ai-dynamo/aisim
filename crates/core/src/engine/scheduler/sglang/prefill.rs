@@ -40,6 +40,9 @@ pub(super) struct AdmitResult {
 /// when querying capacity so the offsets charge them exactly once; prefix locks
 /// remain excluded from the live evictable capacity.
 /// With no fresh-admission slot budget, only existing chunks may continue.
+/// Fixed-output running reservation follows SGLang v0.5.22:
+/// https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/managers/schedule_policy.py
+/// See THIRD_PARTY_NOTICES.md for license and attribution.
 pub(super) fn get_new_batch_prefill(
     waiting: &mut WaitingQueue,
     kv_manager: &mut SglangKvManager,
@@ -55,7 +58,8 @@ pub(super) fn get_new_batch_prefill(
             let remaining_output = req
                 .remaining_output_tokens()
                 .min(config.clip_max_new_tokens);
-            remaining_output as f64 * new_token_ratio
+            let ratio = if req.ignore_eos { 1.0 } else { new_token_ratio };
+            remaining_output as f64 * ratio
         })
         .sum();
     let mut current_offset = 0.0;

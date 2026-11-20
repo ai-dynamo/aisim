@@ -339,6 +339,7 @@ fn request(id: &str, arrival_time_ms: f64, input: Vec<u32>, output_tokens: usize
         input_token_ids: Some(input),
         output_tokens,
         output_token_ids: None,
+        ignore_eos: false,
         dp_rank: None,
         prefill_dp_rank: None,
         kv_hints: None,

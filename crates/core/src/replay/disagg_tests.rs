@@ -4,6 +4,11 @@
 // Modified behavioral adaptation of SGLang v0.5.20; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/94602c9c2b7cbdb8efd5c52802dac6a1c180089e
 
+// The fixed-output reservation consumer regression adapts schedule_policy.py at
+// https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/srt/managers/schedule_policy.py
+// Copyright SGLang Team and contributors, Apache-2.0. Modified for the disaggregated
+// Replay adapter and real decode worker; see THIRD_PARTY_NOTICES.md.
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -633,6 +638,85 @@ fn request(
         dp_rank: 0,
         arrival_timestamp_ms: Some(arrival_ms),
         ..Default::default()
+    }
+}
+
+#[test]
+fn disagg_adapter_preserves_fixed_output_reservation_at_the_decode_consumer() {
+    use crate::engine::generalized::{EngineIdentity, SchedulerCommand};
+    use crate::engine::{Command, EngineFactory, TimingModelConfig};
+    use std::num::NonZeroU32;
+
+    for ignore_eos in [false, true] {
+        let mut config = MockEngineArgs::for_backend(EngineType::Sglang);
+        // Exercise the actual decode worker's fresh-KV path, which is also
+        // used when a disaggregated decode request is retracted and re-prefilled.
+        config.worker_type = WorkerType::Decode;
+        config.block_size = 128;
+        config.num_gpu_blocks = 32;
+        config.max_num_seqs = 32;
+        config.sglang.chunked_prefill_size = 4096;
+        config.sglang.schedule_conservativeness = 0.3;
+        config.timing_model = TimingModelConfig::Fixed {
+            prefill_ms: 1.0,
+            decode_ms: 1.0,
+        };
+        let mut engine = EngineFactory::new(config)
+            .unwrap()
+            .build(EngineIdentity::new(0), NonZeroU32::new(1).unwrap())
+            .unwrap();
+        let native = |id| {
+            direct_to_native(
+                DirectRequest {
+                    tokens: vec![id as u32; 1792],
+                    max_output_tokens: 288,
+                    uuid: Some(Uuid::from_u128(id)),
+                    ignore_eos,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+        };
+        let mut now = 0.0;
+        engine
+            .apply_command_effects(SchedulerCommand::new(0, Command::Submit(native(1))), now)
+            .unwrap();
+        let mut completed = 0;
+        let mut retractions = 0;
+        let mut admissions = Vec::new();
+        for _ in 0..1000 {
+            let pass = engine
+                .execute_pass(now)
+                .unwrap()
+                .expect("requests must make progress");
+            let effects = &pass.by_rank[0].effects;
+            admissions.push(effects.admissions.len());
+            retractions += effects.pressure_events.len();
+            let done = engine.complete_pass(pass.pass_id, pass.end_ms).unwrap();
+            completed += done.effects.by_rank[0]
+                .effects
+                .outputs
+                .iter()
+                .filter(|o| o.completed)
+                .count();
+            now = pass.end_ms;
+            if admissions.len() == 1 {
+                engine
+                    .apply_command_effects(
+                        SchedulerCommand::new(0, Command::Submit(native(2))),
+                        now,
+                    )
+                    .unwrap();
+            }
+            if completed == 2 {
+                break;
+            }
+        }
+        assert_eq!(admissions[0], 1);
+        assert_eq!(admissions[1], usize::from(!ignore_eos));
+        assert_eq!(completed, 2);
+        assert_eq!(retractions, usize::from(!ignore_eos));
     }
 }
 

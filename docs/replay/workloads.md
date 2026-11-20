@@ -705,6 +705,19 @@ AgentX parity. Pinned revisions, licenses and known differences are listed in
 [agentic warmup](agentic/warmup.md#reference-and-validation-boundary) and
 [continuous agentic profiles](agentic/continuous-profiles.md#behavioral-reference).
 
+### Authored Rust/JSON request reservation
+
+The low-level `ReplaySpec.requests` array and programmatic `DirectRequest`
+accept the following per-request reservation control. This is not a
+`traffic.source` YAML or Mooncake-row option.
+
+| Field | Default | Semantics |
+|---|---|---|
+| `ignore_eos` | `false` | For SGLang, reserve the clipped remaining output of running requests without the early-EOS discount. Match this to the native request's `sampling_params.ignore_eos`. Other backends ignore it. |
+
+The output limit and optional exact output IDs still determine generated
+tokens. Supplying exact IDs alone does not imply `ignore_eos: true`.
+
 <a id="mooncake-and-mooncake-delta-jsonl"></a>
 
 ## Mooncake and Mooncake Delta JSONL
