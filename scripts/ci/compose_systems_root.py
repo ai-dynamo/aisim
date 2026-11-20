@@ -5,7 +5,8 @@
 
 Rust tests and other consumers that never run the Python data library read operation tables from a directory named
 by ``AICONFIGURATOR_SYSTEMS_PATH``. The first call downloads the pinned dataset into the data cache; later calls
-reuse it. Only needs ``pydantic``, ``pyarrow`` and ``pyyaml`` (it does not import the native extension)::
+reuse it. Only needs ``pydantic``, ``pyarrow``, ``pyyaml`` and ``huggingface_hub`` (the download transport; it does not
+import the native extension)::
 
     export AICONFIGURATOR_SYSTEMS_PATH="$(python scripts/ci/compose_systems_root.py)"
     # GitHub Actions: python scripts/ci/compose_systems_root.py --github-env
