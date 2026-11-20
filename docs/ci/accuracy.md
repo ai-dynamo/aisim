@@ -16,6 +16,11 @@ publication, and notifications behind those views.
 
 ## Public PR validation
 
+> **Planned.** The workflow described here (`.github/workflows/pr-validation.yml`)
+> is not in this tree; it lands with the governance PR. This tree ships only the
+> library entry points it calls (`aisim_core.data.validate`, `run` and `recheck`).
+> The text below is the intended behavior, not instructions to run today.
+
 `.github/workflows/pr-validation.yml` lets a maintainer validate a
 PR that relies on a public Hugging Face candidate. The contributor publishes the candidate as
 an HF PR revision and adds a request file (`aisim-pr-validation/v1`, default path
@@ -48,6 +53,9 @@ other data is never substituted. The workflow's predictor factory defaults to
 registered, and the module only loads factories under `aisim_core.` or `aisim.`.
 
 ### Candidate hygiene
+
+> **Planned.** `aisim_core.data.hygiene` is not in this tree; it lands with the
+> governance PR. Do not rely on these checks until then.
 
 `aisim_core.data.hygiene` holds the pure checks to run before a candidate reaches any
 workflow: `CandidatePolicy` lists the HF users who may create candidates (empty means nobody),
@@ -651,6 +659,12 @@ changed datasets, missing runs, daylight-saving cutoffs, deduplication, and
 interrupted thread delivery without sending fake alarms to Slack.
 
 ## Private mirror and promotion to the public dataset
+
+> **Planned.** The mirror validator (`aisim_core.data.mirror`), the promotion tool
+> (`aisim_core.data.promote`) and the mirror CI template
+> (`.github/mirror/aisim-data-internal-validate.yml`) are not in this tree; they land
+> with the governance PR. This section describes the intended design, not commands
+> that work today.
 
 `ai-dynamo/aisim-data-internal` has the same layout and schemas as the public
 dataset, for sensitive hardware and models. `ai-dynamo/aisim-infx-cache` stays a
