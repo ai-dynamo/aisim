@@ -791,6 +791,89 @@ mod pd_admission_v0522 {
         assert_eq!(core.destination_reservation_attempts(), 3);
     }
 
+    #[rstest::rstest]
+    fn impossible_destination_rejects_atomically_and_allows_a_fitting_retry(
+        #[values(false, true)] cached_prefix: bool,
+    ) {
+        let mut args = decode_args(1024, 8);
+        args.sglang
+            .as_mut()
+            .unwrap()
+            .disaggregation_decode_enable_radix_cache = cached_prefix;
+        let mut core = SglangCore::new(args);
+        let tokens = vec![2; 768];
+        if cached_prefix {
+            let cached = core.kv_manager.allocate_for_request(&tokens).unwrap();
+            core.kv_manager.finish(&tokens, cached.lease);
+        }
+        let available = core.kv_manager.cache().available_tokens();
+        let evictable = core.kv_manager.cache().evictable_size;
+        let request_id = Uuid::from_u128(90_001);
+        let handoff_id = HandoffId::from(request_id);
+        let mut request = direct_request(tokens.clone(), 1);
+        request.uuid = Some(request_id);
+
+        let error = core
+            .apply_command_effects(
+                SchedulerCommand::ReserveDestination {
+                    handoff_id,
+                    request: request.clone(),
+                },
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "destination prompt and reserved decode tokens exceed the KV pool capacity"
+            )
+        );
+        assert!(core.is_drained(), "rejection must not leave pending work");
+        assert!(!core.waiting_for_external_command());
+        assert_eq!(core.destination_reservation_attempts(), 0);
+        assert_eq!(core.kv_manager.cache().available_tokens(), available);
+        assert_eq!(core.kv_manager.cache().evictable_size, evictable);
+        assert_eq!(
+            core.kv_manager.cache().prefix_match_len(&tokens),
+            if cached_prefix { 768 } else { 0 }
+        );
+
+        // Prefix hits still occupy protected pages in the same pool. They do
+        // not let a 768-token prompt plus a 512-token reserve fit in 1024.
+        // At the exact boundary, the rejected identifiers must be reusable.
+        request.tokens.truncate(512);
+        let accepted = core
+            .apply_command_effects(
+                SchedulerCommand::ReserveDestination {
+                    handoff_id,
+                    request,
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            accepted.result,
+            SchedulerCommandResult::DestinationAccepted { request_id }
+        );
+        assert!(matches!(
+            accepted.lifecycle_events.as_slice(),
+            [SchedulerLifecycleEvent::DestinationReserved {
+                handoff_id: reserved_handoff,
+                request_id: reserved_request,
+                transferable_prompt_tokens,
+            }] if *reserved_handoff == handoff_id
+                && *reserved_request == request_id
+                && *transferable_prompt_tokens == if cached_prefix { 0 } else { 512 }
+        ));
+        activate(&mut core, request_id.as_u128());
+        let pass = core.execute_hidden_pass(0.0);
+        assert!(matches!(
+            pass.output_signals.as_slice(),
+            [OutputSignal { uuid, completed: true, rejected: false, .. }]
+                if *uuid == request_id
+        ));
+        assert!(core.is_drained());
+    }
+
     #[test]
     fn matched_prefix_is_protected_and_a_failed_candidate_releases_its_pin() {
         let mut args = decode_args(128, 8);

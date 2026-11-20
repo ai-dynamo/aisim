@@ -54,6 +54,7 @@ engine:
 | `workers.<role>.parallelism.decode_context` | Unset (1) | predict only | Decode context parallelism (vLLM `-dcp`, SGLang `--dcp-size`). Must divide `tensor`; adds no GPUs. |
 | `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass: per attention-DP rank on vLLM, the worker's launch value on SGLang. See [SGLang note](#batch-limits). |
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
+| `workers.decode.scheduler.reserved_decode_tokens` | Unset (512) | Fixed scalar | Non-negative integer for native SGLang PD decode. See [SGLang PD decode reserve](#sglang-pd-decode-reserve). |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
 | `workers.<role>.scheduler.scheduler_select_time_ms` | `0` | predict only | A positive cost requires the built-in engine, `backend: sglang`, `host_loop: false`, and no AFD on the worker. See [SGLang batch-selection cost](#sglang-batch-selection-cost). |
@@ -280,7 +281,10 @@ The native Rust/JSON `engine.sglang` controls are:
 | `num_reserved_decode_tokens` | `512` | Decode headroom per preallocated request. A smaller value supports intentionally small synthetic KV pools; zero still retains the completion guard. |
 | `disaggregation_decode_extra_slots` | unset | Extra decode request rows for transfers. Unset uses twice the explicit per-rank sequence limit when it is at most 32, otherwise zero. |
 
-These controls apply to PD decode and are not YAML scheduler fields.
+These controls apply to PD decode. The YAML field
+[`workers.decode.scheduler.reserved_decode_tokens`](#sglang-pd-decode-reserve)
+maps to `num_reserved_decode_tokens`; `disaggregation_decode_extra_slots`
+remains native-only.
 The effective running-request limit is capped at half the KV token capacity.
 With native `max_num_seqs: null`, it is derived from KV capacity and context
 length, bounded to 2,048–4,096 before that cap. An omitted `max_num_seqs` keeps
@@ -501,6 +505,17 @@ the `afd` or `aic-afd` external provider, including when AFD metadata is absent.
 
 Use this option with forward-only timing and exclude any time already priced
 by the configured timing provider, such as an observed whole-iteration cost.
+
+### SGLang PD decode reserve
+
+Set `workers.decode.scheduler.reserved_decode_tokens` to model the serving
+knob `--num-reserved-decode-tokens` in a native SGLang disaggregated replay.
+The decode scheduler reserves this many logical tokens per admitted request
+when deciding whether to accept another P/D transfer; it does not allocate
+those tokens as KV pages. Unset uses the native default of 512. Setting it
+to zero disables the fixed reserve while retaining the completion guard.
+Recommendation accepts it as a pinned scalar and carries it into the
+saved prediction configuration.
 
 <a id="sglang-prefilldecode-interval"></a>
 

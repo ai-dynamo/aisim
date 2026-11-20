@@ -40,6 +40,7 @@ _DEFAULT_GPU_MEMORY_UTILIZATION = {
     "trtllm": 0.9,
     "vllm": 0.9,
 }
+_DEFAULT_SGLANG_DECODE_RESERVE = 512
 
 
 def _as_mapping(value: Any, *, label: str) -> dict[str, Any]:
@@ -121,6 +122,13 @@ def _role_sizing(
     architecture: str | None = None,
 ) -> tuple[RoleSizing, int]:
     prefix = "" if role == "agg" else f"{role}_"
+    reserve_key = f"{role}_reserved_decode_tokens"
+    reserve = config.get(reserve_key)
+    if reserve is not None and (type(reserve) is not int or reserve != _DEFAULT_SGLANG_DECODE_RESERVE):
+        raise SweeperCandidateError(
+            f"candidate.config.{reserve_key}={reserve!r} cannot be rendered by the deployment generator; "
+            f"select a candidate using the default ({_DEFAULT_SGLANG_DECODE_RESERVE}) for generation"
+        )
 
     tp = _positive_int(config.get(f"{prefix}tp"), path=f"candidate.config.{prefix}tp")
     pp = _positive_int(config.get(f"{prefix}pp"), path=f"candidate.config.{prefix}pp")

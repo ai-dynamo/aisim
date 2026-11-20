@@ -157,6 +157,9 @@ class PassLaunchConfig(StrictModel):
 class SchedulerPredictionConfig(StrictModel):
     max_batched_tokens: PositiveInt = 8192
     max_sequences: PositiveInt = 256
+    reserved_decode_tokens: NonNegativeU64 | None = Field(
+        default=None, description="SGLang PD decode headroom per admitted request. Unset uses the native default."
+    )
     scheduler_select_time_ms: NonNegativeFloat = Field(
         default=0.0, description="SGLang only: measured serial batch-selection cost per pass with model work."
     )
@@ -1275,6 +1278,7 @@ class EnginePredictionConfig(EstimatorPolicyConfig):
         _validate_prediction_hicache(self)
         _validate_prediction_state_cache(self)
         _validate_backend_block_sizes(backends={self.backend}, modes={self.mode}, workers=self.workers)
+        _validate_sglang_decode_reserve(modes={self.mode}, backends={self.backend}, workers=self.workers)
         _validate_prediction_scheduler_backend(self)
         _validate_prediction_launch(self)
         _validate_prediction_host(self)
@@ -1354,6 +1358,7 @@ class ParallelismRecommendationConfig(StrictModel):
 class SchedulerRecommendationConfig(StrictModel):
     max_batched_tokens: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
     max_sequences: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
+    reserved_decode_tokens: NonNegativeU64 | None = None
 
 
 class KvCapacityRecommendationConfig(StrictModel):
@@ -1545,6 +1550,7 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
         _validate_recommendation_host(self, modes=modes, backends=backends)
         _validate_speculation(self, modes=modes, backends=backends)
         _validate_backend_block_sizes(backends=backends, modes=modes, workers=self.workers)
+        _validate_sglang_decode_reserve(modes=modes, backends=backends, workers=self.workers)
         _validate_decode_radix_cache(
             backends=backends,
             workers=self.workers,
@@ -1842,6 +1848,20 @@ def _workers_with_host_offload(workers) -> list[tuple[str, Any]]:
 
 def _configured_worker_roles(workers) -> set[str]:
     return {role for role in ("aggregated", "prefill", "decode") if getattr(workers, role) is not None}
+
+
+def _validate_sglang_decode_reserve(
+    *, modes: set[str], backends: set[str], workers: WorkersPredictionConfig | WorkersRecommendationConfig
+) -> None:
+    for role in ("aggregated", "prefill", "decode"):
+        worker = getattr(workers, role)
+        if worker is None or worker.scheduler is None or worker.scheduler.reserved_decode_tokens is None:
+            continue
+        if role != "decode" or "disaggregated" not in modes or backends != {"sglang"} or has_afd(workers):
+            raise ValueError(
+                f"workers.{role}.scheduler.reserved_decode_tokens "
+                "requires native disaggregated decode with backend=sglang"
+            )
 
 
 def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> None:

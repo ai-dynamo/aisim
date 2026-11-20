@@ -2168,7 +2168,10 @@ def test_sglang_decode_radix_cache_rejects_unsupported_settings(backend, decode,
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_recommendation_carries_the_sglang_decode_radix_cache_to_the_sweeper(enabled) -> None:
+@pytest.mark.parametrize("reserve", [None, 0, 384])
+def test_recommendation_round_trips_sglang_decode_controls(enabled, reserve) -> None:
+    from aisim.compiler import prediction_to_replay_spec
+
     worker = {
         "kv_cache": {"capacity": {"type": "fixed", "blocks": 2048}},
         "timing": {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
@@ -2180,7 +2183,11 @@ def test_recommendation_carries_the_sglang_decode_radix_cache_to_the_sweeper(ena
         "context_length": 4096,
         "workers": {
             "prefill": worker,
-            "decode": {**worker, "kv_cache": {**worker["kv_cache"], "decode_radix_cache": enabled}},
+            "decode": {
+                **worker,
+                "kv_cache": {**worker["kv_cache"], "decode_radix_cache": enabled},
+                "scheduler": {"reserved_decode_tokens": reserve} if reserve is not None else {},
+            },
         },
     }
     config = CoreRecommendationConfig.model_validate(
@@ -2198,6 +2205,7 @@ def test_recommendation_carries_the_sglang_decode_radix_cache_to_the_sweeper(ena
 
     space = recommendation_to_sweeper(config).search_space
     assert space.decode_radix_cache is enabled
+    assert space.decode_reserved_decode_tokens == reserve
     assert space.decode_enable_prefix_caching is True
     replica = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
     sample = unroll_sample(
@@ -2213,22 +2221,74 @@ def test_recommendation_carries_the_sglang_decode_radix_cache_to_the_sweeper(ena
         parallel_config=DisaggParallelConfig(replica, replica),
     )
     deployment = build_backend_deployment(sample, backend_version="0.5.22")
-    assert (
-        deployment.decode_engine_args.get("sglang", {}).get("disaggregation_decode_enable_radix_cache", False)
-        is enabled
+    expected = {"disaggregation_decode_enable_radix_cache": True} if enabled else {}
+    if reserve is not None:
+        expected["num_reserved_decode_tokens"] = reserve
+    assert deployment.decode_engine_args.get("sglang", {}) == expected
+    assert "num_reserved_decode_tokens" not in deployment.prefill_engine_args.get("sglang", {})
+
+    spec = ReplaySpec(
+        backend_deployment=deployment,
+        workload={"isl": 16, "osl": 4, "concurrency": 1, "num_request_ratio": 2},
+        goal={"target": "throughput"},
     )
-    report = (
-        EngineReplayRunnerFactory()
-        .create(0)
-        .run(
-            ReplaySpec(
-                backend_deployment=deployment,
-                workload={"isl": 16, "osl": 4, "concurrency": 1, "num_request_ratio": 2},
-                goal={"target": "throughput"},
-            )
-        )
+    prediction = _candidate_prediction(config, sample, spec, adapter_sections={})
+    restored = CorePredictionConfig.model_validate(yaml.safe_load(yaml.safe_dump(prediction)))
+    assert restored.engine.workers.decode.scheduler.reserved_decode_tokens == reserve
+    compiled = prediction_to_replay_spec(restored).backend_deployment
+    assert compiled.decode_engine_args.get("sglang", {}) == expected
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 2
+
+
+@pytest.mark.parametrize("schema", [CorePredictionConfig, CoreRecommendationConfig])
+@pytest.mark.parametrize(
+    ("backend", "role", "value", "invalid_scope"),
+    [
+        ("vllm", "decode", 384, True),
+        ("sglang", "prefill", 384, True),
+        ("sglang", "decode", True, False),
+        ("sglang", "decode", 1.0, False),
+        ("sglang", "decode", -1, False),
+    ],
+)
+def test_sglang_decode_reserve_rejects_invalid_config(schema, backend, role, value, invalid_scope):
+    engine = _disaggregated_engine(backend, {})
+    engine["workers"][role]["scheduler"] = {"reserved_decode_tokens": value}
+    needle = (
+        "reserved_decode_tokens requires native disaggregated decode with backend=sglang"
+        if invalid_scope
+        else "reserved_decode_tokens"
     )
-    assert report.metrics["completed_requests"] == 2
+    with pytest.raises(ValidationError, match=needle):
+        schema.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("schema", [CorePredictionConfig, CoreRecommendationConfig])
+@pytest.mark.parametrize(
+    ("mode", "afd_role"),
+    [("aggregated", None), ("aggregated", "aggregated"), ("disaggregated", "prefill"), ("disaggregated", "decode")],
+)
+def test_sglang_decode_reserve_rejects_aggregated_and_afd_workers(schema, mode, afd_role):
+    roles = ("aggregated",) if mode == "aggregated" else ("prefill", "decode")
+    engine = {**_engine(), "backend": "sglang", "mode": mode, "workers": {role: {} for role in roles}}
+    if afd_role is not None:
+        topology = {"tp_a": 1, "a_batch_size": 8}
+        if schema is CorePredictionConfig:
+            topology.update(n_a_nodes=1, n_f_nodes=1)
+        engine["workers"][afd_role] = {
+            "type": "afd",
+            "afd": topology,
+        }
+    config = {"engine": engine}
+    if schema is CoreRecommendationConfig:
+        config["optimization"] = {"constraints": {"max_candidate_gpus": 16}}
+    schema.model_validate(config)
+    reserve_role = "aggregated" if mode == "aggregated" else "decode"
+    engine["workers"][reserve_role]["scheduler"] = {"reserved_decode_tokens": 0}
+    with pytest.raises(
+        ValidationError, match="reserved_decode_tokens requires native disaggregated decode with backend=sglang"
+    ):
+        schema.model_validate(config)
 
 
 @pytest.mark.parametrize(
