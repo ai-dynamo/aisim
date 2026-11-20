@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import tempfile
 from collections.abc import Iterable
@@ -140,6 +141,27 @@ def _tree_policy(extra_roots: tuple[str, ...]) -> CandidatePolicy:
     )
 
 
+_CARD_OPENING = re.compile(r"\s*---[ \t]*(?:\r\n|\n|\r|\Z)")
+# The Hub's closing delimiter: an unindented ``---`` alone on its line (an indented one is YAML block-scalar text).
+_CARD_CLOSING = re.compile(r"(?:^|(?<=[\r\n]))---(?=\r\n|\n|\Z)")
+
+
+def _card_front_matter(text: str) -> str | None:
+    """The YAML front matter of a dataset card, with the Hub parser's delimiter rules; None without any.
+
+    Leading whitespace may precede the opening ``---``. Raises ``ValueError`` for an opening delimiter with no
+    closing one, so a card never hides metadata from the structured scan.
+    """
+    opening = _CARD_OPENING.match(text)
+    if opening is None:
+        return None
+    rest = text[opening.end() :]
+    closing = _CARD_CLOSING.search(rest)
+    if closing is None:
+        raise ValueError("dataset card front matter has no closing delimiter")
+    return rest[: closing.start()]
+
+
 def _check_root_metadata(root: Path, tree: list[CandidateFile], profile: Profile, report: TreeReport) -> None:
     for file in tree:
         if file.path not in ROOT_METADATA_FILES:
@@ -162,24 +184,14 @@ def _check_root_metadata(root: Path, tree: list[CandidateFile], profile: Profile
             from aisim_core.data.redaction import DEFAULT_POLICY, scan_value, scan_yaml
 
             report.findings.extend(scan_value(text, DEFAULT_POLICY, file.path, "repository metadata"))
-            lines = text.splitlines(keepends=True)
-            # Hugging Face's card parser accepts the opening delimiter after leading whitespace, blank lines included.
-            start = next((i for i, line in enumerate(lines) if line.strip()), None)
-            if file.path == "README.md" and start is not None and lines[start].strip() == "---":
-                end = next((i for i in range(start + 1, len(lines)) if lines[i].strip() in {"---", "..."}), None)
-                try:
-                    if end is None:
-                        raise ValueError("dataset card front matter has no closing delimiter")
+            try:
+                front_matter = _card_front_matter(text) if file.path == "README.md" else None
+                if front_matter is not None:
                     report.findings.extend(
-                        scan_yaml(
-                            "".join(lines[start + 1 : end]).encode(),
-                            DEFAULT_POLICY,
-                            file.path,
-                            "dataset card front matter",
-                        )
+                        scan_yaml(front_matter.encode(), DEFAULT_POLICY, file.path, "dataset card front matter")
                     )
-                except ValueError as exc:
-                    report.add("metadata-invalid", str(exc).splitlines()[0], file.path)
+            except ValueError as exc:
+                report.add("metadata-invalid", str(exc).splitlines()[0], file.path)
 
 
 def list_tree(root: Path) -> list[CandidateFile]:
@@ -241,6 +253,15 @@ def _check_indexes(root: Path, report: TreeReport, declared: set[str], eligible:
             continue
         if entries.category != category:
             report.add("index-category", "category index identity mismatch", ref.index.path)
+        for artifact in entries.support:  # files every selection of the category needs, pinned by this index
+            try:
+                if artifact.path not in eligible:
+                    raise ValueError(f"support artifact {artifact.path} must be a listed dataset payload file")
+                _verify(root, artifact)
+            except (ValueError, OSError) as exc:
+                report.add("index-integrity", str(exc).splitlines()[0], artifact.path)
+                continue
+            declared.add(artifact.path)
         seen: set[str] = set()
         for entry in entries.entries:
             path = entry.manifest.path

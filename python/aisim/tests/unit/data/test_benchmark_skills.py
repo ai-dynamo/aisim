@@ -286,6 +286,40 @@ def test_record_gpu_time_rejects_restarted_pods(tmp_path, capsys, restarts):
         assert status == 0 and json.loads(captured.out)["gpu_time"]["gpu_seconds"] == 600 * 4
 
 
+@pytest.mark.parametrize("restarts", [0, 1])
+def test_record_gpu_time_rejects_a_restarted_failed_pod_before_its_replacement(tmp_path, capsys, restarts):
+    tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
+    job = {
+        "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
+        "status": {"succeeded": 1},
+        "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
+    }
+
+    def pod(name, phase, start, end, restart_count):
+        return {
+            "metadata": {"name": name, "ownerReferences": [{"kind": "Job", "uid": "job-a"}]},
+            "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]},
+            "status": {
+                "phase": phase,
+                "containerStatuses": [
+                    {"restartCount": restart_count, "state": {"terminated": {"startedAt": start, "finishedAt": end}}}
+                ],
+            },
+        }
+
+    # The failed Pod's final 10-minute execution is all the parser sees; a restart hid an earlier 30-minute one.
+    failed = pod("j-a", "Failed", "2026-01-01T00:20:00Z", "2026-01-01T00:30:00Z", restarts)
+    replacement = pod("j-b", "Succeeded", "2026-01-01T00:40:00Z", "2026-01-01T01:00:00Z", 0)
+    (tmp_path / "job.json").write_text(json.dumps(job))
+    (tmp_path / "pods.json").write_text(json.dumps({"items": [failed, replacement]}))
+    status = tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")])
+    captured = capsys.readouterr()
+    if restarts:
+        assert status == 2 and not captured.out and "restarted" in captured.err
+    else:
+        assert status == 0 and json.loads(captured.out)["gpu_time"]["failed"]["gpu_seconds"] == 600 * 4
+
+
 @pytest.mark.parametrize(
     "job,pods",
     [
