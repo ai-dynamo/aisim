@@ -1566,12 +1566,16 @@ def inferencex_metrics(
         else:
             unmapped.append(key)
     canonical = {}
+    unique = []
     for row in rows:
         key = (row.metric, row.statistic, row.scope, row.normalization, row.observer)
         value = (row.status, row.value, row.unit, row.source_value)
         if key in canonical and canonical[key] != value:
             raise ValueError(f"{observation_id}: conflicting canonical metric {key}")
+        if key not in canonical:  # equal alias spellings (p99.9 and p99_9) are one reported value, not two
+            unique.append(row)
         canonical[key] = value
+    rows = unique
     rows.extend(missing_required_metrics(observation_id, rows))
     return rows, unmapped
 
