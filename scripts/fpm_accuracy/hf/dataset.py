@@ -301,7 +301,17 @@ class HfDataset:
                     f"envelope {entry.manifest.path} declares a measurement file outside the FPM layout"
                 ) from exc
             current.append(logical)
-            for value in self._read_json(logical).get("history") or ():
+            document = self._read_json(logical)
+            libraries = {logical_path(a.path): a.sha256 for a in envelope.artifacts if a.role == "fpm-library"}
+            for value in document.get("fpm") or ():
+                if isinstance(value, Mapping) and isinstance(value.get("path"), str):
+                    library = PurePosixPath(value["path"]).as_posix()
+                    declared = libraries.get(library)
+                    if declared is None:
+                        raise DataError(f"FPM library {library} is not declared by envelope {entry.manifest.path}")
+                    if declared != value.get("sha256"):
+                        raise DataError(f"leaf {leaf.path} FPM library {library} digest differs from its envelope")
+            for value in document.get("history") or ():
                 if isinstance(value, Mapping) and isinstance(value.get("manifest_path"), str):
                     history[value["manifest_path"]] = str(value.get("manifest_sha256"))
         return {
