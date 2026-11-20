@@ -260,14 +260,17 @@ class ForwardPassPerfModelConfig:
         )
         return cls(**json.loads(payload))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, resolve_systems_paths: bool = True) -> dict[str, Any]:
+        """Wire form. ``resolve_systems_paths=False`` leaves an empty ``systems_paths`` for a dataset pin to fill."""
         payload = asdict(self)
         # Additive identity stays out of payloads that do not set it.
         for name in ("encoder_parallel", "deployment_limits", "afd_routing_location", "afd_pool_role"):
             if payload[name] is None:
                 payload.pop(name)
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
-        if self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths:
+        if resolve_systems_paths and (
+            self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths
+        ):
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(
                 self.systems_paths, require_directories=not _carries_state_snapshot(self.estimator_config)
             )
@@ -1031,7 +1034,10 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     pin = pin if pin is not None else pin_from_environment()
     if pin is None:
         return None
-    payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    # Paths stay unresolved here: an empty list is for the pin to fill, not for the default dataset to answer first.
+    payload = (
+        config.to_dict(resolve_systems_paths=False) if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    )
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
     return ensure_data(payload, pin)
@@ -1082,16 +1088,21 @@ def _validate_worker_type(worker_type: str) -> str:
 
 
 def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
-    from aisim_core.data.default_systems import default_systems_path
+    from aisim_core.data.default_systems import default_systems_path, resolved_default_systems_path
 
-    packaged = None  # the default root, composed only when something asks for it
     if not entries:
-        from aisim_core.sdk.perf_database import get_systems_paths
+        from aisim_core.sdk.perf_database import explicit_systems_paths
 
-        configured = get_systems_paths()
-        packaged = default_systems_path()
+        # A root named by set_systems_paths() or AICONFIGURATOR_SYSTEMS_PATH is used as is; the default dataset is
+        # composed (and may be fetched) only when neither names one.
+        held = explicit_systems_paths()
         env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-        entries = tuple([env_root] if configured == [packaged] and env_root is not None else configured)
+        if held is not None and held != [resolved_default_systems_path()]:
+            entries = tuple(held)
+        elif env_root is not None:
+            entries = (env_root,)
+        else:
+            entries = (default_systems_path(),)
     resolved: list[str] = []
     for entry in entries:
         if not isinstance(entry, str) or not entry.strip():
