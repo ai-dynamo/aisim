@@ -518,7 +518,9 @@ def _fetch_pinned(selection: Selection, pin: DataPin, transport: Transport | Non
     try:
         return fetch(selection, transport=transport, max_bytes=pin.max_bytes, **common)
     except BudgetExceededError as exc:
-        raise DataTooLargeError(exc.plan.uncached_bytes, pin.max_bytes, _command(pin, selection)) from exc
+        raise DataTooLargeError(
+            exc.plan.uncached_bytes + exc.plan.metadata_bytes, pin.max_bytes, _command(pin, selection)
+        ) from exc
     except SelectionError as exc:
         raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
 

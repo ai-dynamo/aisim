@@ -350,26 +350,49 @@ def _gpus_requested(spec: Mapping[str, Any], resource: str) -> int:
     return total
 
 
-def _pod_window(pod: Mapping[str, Any]) -> tuple[datetime, datetime]:
-    """Start and end of container execution; excludes scheduling/queue wait.
+def _terminated_window(term: Mapping[str, Any]) -> tuple[datetime, datetime] | None:
+    """(start, end) of a terminated state, ``None`` when the container never started."""
+    if not term.get("startedAt"):
+        return None
+    if not term.get("finishedAt"):
+        raise KubeParseError("a container started but has no finish time")
+    return _ts(term["startedAt"], "startedAt"), _ts(term["finishedAt"], "finishedAt")
+
+
+def _pod_window(pod: Mapping[str, Any]) -> tuple[datetime, datetime, list[float]]:
+    """Start, end and earlier-restart runs of the pod's container execution; excludes scheduling/queue wait.
+
+    Init containers hold the pod's GPUs while they run, so they widen the window like app containers do. A
+    container restarted in place (``restartPolicy: OnFailure``) keeps only its last run in ``state``; the run
+    before it is in ``lastState`` and is returned as a separate duration (seconds). A container restarted more
+    than once has lost earlier runs, so its record is incomplete and rejected rather than under-reported.
 
     A pod whose containers never started raises :class:`_NeverStarted`; a container with a partial or corrupt
     execution record (started, never finished; bad timestamps) raises :class:`KubeParseError`.
     """
     status = pod.get("status") or {}
     name = (pod.get("metadata") or {}).get("name", "?")
-    starts, ends = [], []
-    for cs in status.get("containerStatuses") or []:
+    starts, ends, earlier = [], [], []
+    for cs in [*(status.get("initContainerStatuses") or []), *(status.get("containerStatuses") or [])]:
         state = cs.get("state") or {}
-        term = state.get("terminated")
-        if term and term.get("startedAt") and term.get("finishedAt"):
-            starts.append(_ts(term["startedAt"], "startedAt"))
-            ends.append(_ts(term["finishedAt"], "finishedAt"))
-        elif (term or {}).get("startedAt") or (state.get("running") or {}).get("startedAt"):
-            raise KubeParseError(f"pod {name} has a container that started but has no finish time")
-    if not starts:
+        try:
+            window = _terminated_window(state.get("terminated") or {})
+            if window is None and (state.get("running") or {}).get("startedAt"):
+                raise KubeParseError("a container started but has no finish time")
+            restarts = cs.get("restartCount") or 0
+            if restarts > 1:
+                raise KubeParseError(f"container restarted {restarts} times; earlier runs are not recorded")
+            prior = _terminated_window((cs.get("lastState") or {}).get("terminated") or {}) if restarts else None
+        except KubeParseError as exc:
+            raise KubeParseError(f"pod {name}: {exc}") from exc
+        if window is not None:
+            starts.append(window[0])
+            ends.append(window[1])
+        if prior is not None:
+            earlier.append((prior[1] - prior[0]).total_seconds())
+    if not ends:
         raise _NeverStarted(f"pod {name} has no terminated container times")
-    return min(starts), max(ends)
+    return min(starts), max(ends), earlier
 
 
 def gpu_time_from_kubernetes(
@@ -402,7 +425,7 @@ def gpu_time_from_kubernetes(
             raise KubeParseError(f"pod {(pod.get('metadata') or {}).get('name', '?')} is {phase}; not final")
         gpus = _gpus_requested(pod.get("spec") or {}, gpu_resource) or _gpus_requested(template_spec, gpu_resource)
         try:
-            start, end = _pod_window(pod)
+            start, end, earlier = _pod_window(pod)
         except _NeverStarted:
             if phase != "Succeeded":
                 # A failed pod that never started consumed no allocated GPU time.
@@ -412,6 +435,7 @@ def gpu_time_from_kubernetes(
         seconds = (end - start).total_seconds()
         if seconds < 0:
             raise KubeParseError("pod finished before it started")
+        failed.extend((run, gpus) for run in earlier)  # runs of restarted containers that did not finish the job
         if phase == "Succeeded":
             ok.append((pod, seconds, gpus))
         else:

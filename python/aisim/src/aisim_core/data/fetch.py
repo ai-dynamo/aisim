@@ -97,7 +97,7 @@ class BudgetExceededError(DataFetchError):
 
     def __init__(self, plan: FetchPlan, max_bytes: int):
         super().__init__(
-            f"plan needs {plan.uncached_bytes} uncached bytes ({plan.total_bytes} total) which exceeds "
+            f"plan needs {plan.uncached_bytes + plan.metadata_bytes} uncached bytes ({plan.total_bytes} total) which exceeds "
             f"max_bytes={max_bytes}; pass allow_over_budget=True to proceed"
         )
         self.plan = plan
@@ -108,7 +108,7 @@ class BudgetExceededError(DataFetchError):
             **super().to_dict(),
             "max_bytes": self.max_bytes,
             "total_bytes": self.plan.total_bytes,
-            "uncached_bytes": self.plan.uncached_bytes,
+            "uncached_bytes": self.plan.uncached_bytes + self.plan.metadata_bytes,
         }
 
 
@@ -250,6 +250,8 @@ class FetchPlan:
     # Offline only: files that are needed but absent, including files whose
     # content (a manifest) could not be read so the closure is incomplete.
     missing: list[str] = field(default_factory=list)
+    # Bytes of catalog, index and manifest files downloaded while planning; they count against ``max_bytes``.
+    metadata_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:
@@ -273,6 +275,7 @@ class FetchPlan:
             "missing": list(self.missing),
             "total_bytes": self.total_bytes,
             "uncached_bytes": self.uncached_bytes,
+            "metadata_bytes": self.metadata_bytes,
         }
 
 
@@ -412,9 +415,14 @@ def _ref(artifact: Artifact, role: str) -> PlannedFile:
     )
 
 
+# A metadata file without a declared size (the root catalog) is refused past this many bytes.
+_METADATA_CAP_BYTES = 16 * 1024 * 1024
+
+
 class _Planner:
-    def __init__(self, transport: Transport | None, cache: Cache, plan: FetchPlan):
+    def __init__(self, transport: Transport | None, cache: Cache, plan: FetchPlan, budget: int | None = None):
         self.transport, self.cache, self.plan = transport, cache, plan
+        self.budget = budget  # what the whole fetch may still download; metadata is charged against it
         self._seen: dict[str, PlannedFile] = {}
 
     def _add(self, ref: PlannedFile) -> None:
@@ -456,7 +464,20 @@ class _Planner:
             self._add(ref)
             plan.missing.append(ref.path)
             return None
-        chunks = list(self.transport.open_file(plan.repo, plan.revision, ref.path))
+        # Bounded while it is received: the declared size (or a fixed cap when none is declared) and the remaining
+        # budget stop an oversized stream before it is held in memory. A transport that finishes the whole
+        # download before yielding (Hugging Face) can only be checked once its bytes arrive.
+        limit = ref.bytes if ref.bytes is not None else _METADATA_CAP_BYTES
+        chunks: list[bytes] = []
+        received = 0
+        for chunk in self.transport.open_file(plan.repo, plan.revision, ref.path):
+            received += len(chunk)
+            if received > limit:
+                raise IntegrityError(ref.path, f"metadata transfer exceeds {limit} bytes")
+            if self.budget is not None and plan.metadata_bytes + received > self.budget:
+                raise BudgetExceededError(plan, self.budget)
+            chunks.append(chunk)
+        plan.metadata_bytes += received
         if validate is not None:
             validate(b"".join(chunks))
         self.cache.discard(plan.repo, plan.revision, ref.path)
@@ -473,6 +494,7 @@ def plan(
     transport: Transport | None = None,
     cache: Cache | None = None,
     offline: bool = False,
+    max_bytes: int | None = None,
     _resolved: str | None = None,
 ) -> FetchPlan:
     """List the files a selection needs: catalog, index, manifests and artifacts.
@@ -485,7 +507,7 @@ def plan(
     cache = cache or Cache()
     sha = _resolved or resolve_revision(transport, repo, revision, offline=offline)
     out = FetchPlan(repo=repo, revision=sha, requested_revision=revision, offline=offline)
-    planner = _Planner(transport, cache, out)
+    planner = _Planner(transport, cache, out, budget=max_bytes)
 
     def parse(model, raw: bytes, path: str):
         try:
@@ -556,14 +578,25 @@ def fetch(
     cache = cache or Cache()
     sha = resolve_revision(transport, repo, revision, offline=offline)
     result_plan = plan(
-        selection, repo=repo, revision=revision, transport=transport, cache=cache, offline=offline, _resolved=sha
+        selection,
+        repo=repo,
+        revision=revision,
+        transport=transport,
+        cache=cache,
+        offline=offline,
+        max_bytes=None if allow_over_budget else max_bytes,
+        _resolved=sha,
     )
     if offline or transport is None:
         # Without a transport the cache is all there is: a miss is a typed error, never an assertion.
         absent = sorted({*result_plan.missing, *(f.path for f in result_plan.files if not f.cached)})
         if absent:
             raise OfflineMissingError(absent)
-    elif max_bytes is not None and result_plan.uncached_bytes > max_bytes and not allow_over_budget:
+    elif (
+        max_bytes is not None
+        and result_plan.metadata_bytes + result_plan.uncached_bytes > max_bytes
+        and not allow_over_budget
+    ):
         raise BudgetExceededError(result_plan, max_bytes)
 
     downloaded = 0

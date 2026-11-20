@@ -290,3 +290,70 @@ def test_a_failed_pod_that_never_started_costs_nothing():
     assert gpu_time_from_kubernetes(_JOB, [never, good]).failed is None
     full = _pod("full", "Failed", "2026-11-07T00:01:00Z", "2026-11-07T00:02:00Z")
     assert gpu_time_from_kubernetes(_JOB, [full, good]).failed.gpu_seconds == 240
+
+
+def _container(started, finished, restart_count=0, last=None):
+    status = {"state": {"terminated": {"startedAt": started, "finishedAt": finished}}, "restartCount": restart_count}
+    if last is not None:
+        status["lastState"] = {"terminated": {"startedAt": last[0], "finishedAt": last[1]}}
+    return status
+
+
+def _pod_with(statuses, init=None, name="p"):
+    pod = {
+        "metadata": {"name": name},
+        "spec": {"containers": [{"resources": {"requests": {"nvidia.com/gpu": "1"}}}]},
+        "status": {"phase": "Succeeded", "containerStatuses": statuses},
+    }
+    if init is not None:
+        pod["status"]["initContainerStatuses"] = init
+    return pod
+
+
+def test_a_container_restarted_in_place_reports_its_earlier_run_as_failed_cost():
+    from aisim_core.data.gpu_time import gpu_time_from_kubernetes
+
+    job = {**_JOB, "spec": {}}  # the pod spec carries the one GPU
+    # Failed after 60 s, restarted, then succeeded after 30 s.
+    pod = _pod_with(
+        [
+            _container(
+                "2026-11-07T00:02:00Z",
+                "2026-11-07T00:02:30Z",
+                restart_count=1,
+                last=("2026-11-07T00:00:00Z", "2026-11-07T00:01:00Z"),
+            )
+        ]
+    )
+    gt = gpu_time_from_kubernetes(job, [pod])
+    assert gt.wall_seconds == 30 and gt.gpu_seconds == 30
+    assert gt.failed.count == 1 and gt.failed.wall_seconds == 60 and gt.failed.gpu_seconds == 60
+
+
+def test_a_container_restarted_more_than_once_has_an_incomplete_record():
+    from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
+
+    pod = _pod_with(
+        [
+            _container(
+                "2026-11-07T00:05:00Z",
+                "2026-11-07T00:05:30Z",
+                restart_count=2,
+                last=("2026-11-07T00:02:00Z", "2026-11-07T00:03:00Z"),
+            )
+        ]
+    )
+    with pytest.raises(KubeParseError, match="restarted 2 times"):
+        gpu_time_from_kubernetes({**_JOB, "spec": {}}, [pod])
+
+
+def test_init_containers_count_toward_the_gpu_window_and_must_have_finished():
+    from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
+
+    job = {**_JOB, "spec": {}}
+    init = [_container("2026-11-07T00:00:00Z", "2026-11-07T00:01:00Z")]  # 60 s before the app container
+    app = [_container("2026-11-07T00:01:00Z", "2026-11-07T00:01:30Z")]
+    assert gpu_time_from_kubernetes(job, [_pod_with(app, init=init)]).wall_seconds == 90
+    unfinished = [{"state": {"terminated": {"startedAt": "2026-11-07T00:00:00Z"}}}]
+    with pytest.raises(KubeParseError, match="no finish time"):
+        gpu_time_from_kubernetes(job, [_pod_with(app, init=unfinished)])

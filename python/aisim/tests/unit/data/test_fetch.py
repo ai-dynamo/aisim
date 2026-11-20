@@ -285,12 +285,16 @@ def test_offline_rejects_unresolved_ref(files, tmp_path):
 def test_over_budget_refused_before_artifact_transfer(files, tmp_path):
     t = FakeTransport(files)
     size = len(files["fpm/m1/data.parquet"])
+    metadata = plan(
+        SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "p")
+    ).metadata_bytes
+    assert metadata > 0
     with pytest.raises(BudgetExceededError) as err:
-        fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"), max_bytes=size - 1)
+        fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"), max_bytes=size + metadata - 1)
     assert err.value.plan.uncached_bytes == size
     assert "fpm/m1/data.parquet" not in t.opened
     # At the limit, and with explicit opt-in, it proceeds.
-    fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c1"), max_bytes=size)
+    fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c1"), max_bytes=size + metadata)
     fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c2"), max_bytes=0, allow_over_budget=True)
 
 
@@ -461,3 +465,36 @@ def test_a_cache_miss_without_a_transport_is_a_typed_error_and_a_warm_cache_stil
         fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=cache)
     fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
     assert fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=cache).downloaded_bytes == 0
+
+
+def test_planning_metadata_counts_against_the_budget(files, tmp_path):
+    t = FakeTransport(files)
+    with pytest.raises(BudgetExceededError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"), max_bytes=100)
+    assert "fpm/m1/data.parquet" not in t.opened  # the budget stopped planning long before any artifact
+
+
+def test_an_index_stream_longer_than_its_declared_size_is_cut_off(files, tmp_path):
+    class Endless(FakeTransport):
+        def open_file(self, repo, sha, path):
+            self.opened.append(path)
+            if path == "catalog/fpm.json":
+                yield files[path]
+                for _ in range(10_000):  # far more than the declared size; must never be fully consumed
+                    self.consumed = getattr(self, "consumed", 0) + 1
+                    yield b"x" * 1024
+            else:
+                yield from super().open_file(repo, sha, path)
+
+    t = Endless(files)
+    with pytest.raises(IntegrityError, match="exceeds"):
+        plan(SEL, repo=REPO, revision=SHA, transport=t, cache=Cache(tmp_path / "c"))
+    assert t.consumed < 10  # stopped as soon as the declared size was exceeded
+
+
+def test_a_root_catalog_without_a_declared_size_has_an_explicit_cap(files, tmp_path, monkeypatch):
+    from aisim_core.data import fetch as fetch_module
+
+    monkeypatch.setattr(fetch_module, "_METADATA_CAP_BYTES", 10)
+    with pytest.raises(IntegrityError, match="exceeds 10 bytes"):
+        plan(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
