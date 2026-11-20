@@ -828,14 +828,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install AISim and development dependencies
-        run: python -m pip install './python/aisim[dev]'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "${RUNNER_TEMP}/python-compatibility"
+          compat_python="${RUNNER_TEMP}/python-compatibility/bin/python"
+          "${compat_python}" -m pip install uv==0.12.6
+          "${compat_python}" -m uv pip install --python "${compat_python}" './python/aisim[dev]'
+          "${compat_python}" -c 'import aisim, numpy, pytest'
       - name: Verify interpreter and dependency compatibility
         run: |
-          python -m pip check
-          python -c 'import sys, numpy; from packaging.version import Version; assert f"{sys.version_info.major}.{sys.version_info.minor}" == "${{ matrix.python-version }}"; assert Version("2.1") <= Version(numpy.__version__) < Version("3")'
+          "${RUNNER_TEMP}/python-compatibility/bin/python" -m pip check
+          "${RUNNER_TEMP}/python-compatibility/bin/python" -c 'import sys, numpy, pytest; from packaging.version import Version; assert f"{sys.version_info.major}.{sys.version_info.minor}" == "${{ matrix.python-version }}"; assert Version("2.1") <= Version(numpy.__version__) < Version("3")'
       - name: Test unified-package contracts
         run: >-
-          python -m pytest -q
+          "${RUNNER_TEMP}/python-compatibility/bin/python" -m pytest -q
           python/aisim/tests/cross_package
 
   engine-golden-regression:
