@@ -362,6 +362,36 @@ def measured_acceptance(point, depth):
     return accepted
 
 
+def recorded_profile(phase):
+    """Validate receipt timing before corpus work, without an installed AISim wheel."""
+    profile = {
+        "duration_seconds": phase["duration"],
+        "global_idle_cap_seconds": phase["system_idle_gap_cap_seconds"],
+        "tree_idle_cap_seconds": 300,
+        "response_grace_seconds": phase["grace_period"],
+        "cancel_drain_seconds": 10,
+    }
+    # Keep timing types/bounds aligned with AgenticProfileOptions in
+    # aisim/config/traffic.py. Full config/capability validation stays in the predictor.
+    numbers = {}
+    for name, value in profile.items():
+        if type(value) not in {int, float}:
+            raise ValueError(f"Invalid recorded profile {name}")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"Invalid recorded profile {name}") from None
+        positive = name in {"duration_seconds", "global_idle_cap_seconds", "tree_idle_cap_seconds"}
+        if not math.isfinite(number) or number < 0 or (positive and number == 0):
+            raise ValueError(f"Invalid recorded profile {name}")
+        numbers[name] = number
+    if any(not math.isfinite(value * 1000.0) for value in numbers.values()) or not math.isfinite(
+        (numbers["duration_seconds"] + numbers["response_grace_seconds"] + numbers["cancel_drain_seconds"]) * 1000.0
+    ):
+        raise ValueError("Recorded profile deadlines overflow")
+    return profile
+
+
 def replay_config(root, run):
     """Simulation policy lives in CI; measured settings come from verified receipts."""
     if (run["backend"], run["model"], run["hardware"], run["tensor_parallel"], run["precision"]) not in {
@@ -461,20 +491,17 @@ def replay_config(root, run):
                 selection["source_play_id"] = f"{namespaces[identity]}:play:{identity}"
         if len(snapshot["initial_selections"]) != run["lanes"]:
             raise ValueError("Missing recorded lane selections")
-        phase = document(root, run, "feature_harness_receipt")["input_config"]["phases"][0]
+        phases = document(root, run, "feature_harness_receipt")["input_config"]["phases"]
+        if not isinstance(phases, list) or not phases:
+            raise ValueError("Feature harness receipt has no valid phases")
+        phase = phases[0]
         traffic["source"].update(format="weka", block_size=64, nested_timestamp_basis="absolute")
         traffic["load"].update(
             agentic_lanes=run["lanes"],
             agentic_warmup=True,
             agentic_warmup_policy="live_trajectory_v1",
             agentic_snapshot=snapshot,
-            agentic_profile={
-                "duration_seconds": phase["duration"],
-                "global_idle_cap_seconds": phase["system_idle_gap_cap_seconds"],
-                "tree_idle_cap_seconds": 300,
-                "response_grace_seconds": phase["grace_period"],
-                "cancel_drain_seconds": 10,
-            },
+            agentic_profile=recorded_profile(phase),
         )
     else:
         raise ValueError("No reviewed replay policy for this backend")
@@ -498,7 +525,13 @@ def replay_config(root, run):
         if set(selections) != set(range(run["lanes"])) or list(positions.values()) != sorted(set(positions.values())):
             raise ValueError("Missing or unordered initial lane selections")
         harness = document(root, run, "harness_receipt")
-        phase = harness["phases"][0]
+        phases = harness["phases"]
+        if not isinstance(phases, list) or not phases:
+            raise ValueError("Harness receipt has no valid phases")
+        phase = phases[0]
+        datasets = harness["datasets"]
+        if not isinstance(datasets, list) or not datasets:
+            raise ValueError("Harness receipt has no valid datasets")
         traffic["source"].update(format="weka", block_size=64, nested_timestamp_basis="absolute")
         traffic["load"] = {
             "type": "trace_timestamps",
@@ -506,17 +539,11 @@ def replay_config(root, run):
             "agentic_warmup": True,
             "agentic_warmup_policy": "live_trajectory_v1",
             "agentic_snapshot": {
-                "seed": harness["datasets"][0]["random_seed"],
+                "seed": datasets[0]["random_seed"],
                 "corpus_cursor": max(positions.values()) + 1,
                 "initial_selections": [selections[i] for i in range(run["lanes"])],
             },
-            "agentic_profile": {
-                "duration_seconds": phase["duration"],
-                "global_idle_cap_seconds": phase["system_idle_gap_cap_seconds"],
-                "tree_idle_cap_seconds": 300,
-                "response_grace_seconds": phase["grace_period"],
-                "cancel_drain_seconds": 10,
-            },
+            "agentic_profile": recorded_profile(phase),
         }
     config["prediction_database_version"] = {"vllm": "0.31.0", "sglang": "0.5.21"}[run["backend"]]
     return config

@@ -140,6 +140,18 @@ def fetch(revision, output, *, metadata_only=False, campaign_catalog=None, previ
                 name = safe_path(path.parent, value["path"]).relative_to(output).as_posix()
                 if not (output / name).exists():
                     download(name, value)
+    (output / INDEX).parent.mkdir(parents=True, exist_ok=True)
+    (output / INDEX).write_bytes(canonical(catalog))
+    runs = load_runs(output, catalog)
+    if not metadata_only:
+        errors = []
+        for run in runs:
+            try:
+                replay_config(output, run)
+            except (AttributeError, KeyError, TypeError, ValueError) as error:
+                errors.append(f"{run['id']}: {error}")
+        if errors:
+            raise ValueError("AgentX replay input preflight failed:\n" + "\n".join(errors))
     for identity in sorted(corpora) if not metadata_only else []:
         descriptor = registry["sources"][identity]
         source = Path(
@@ -150,9 +162,6 @@ def fetch(revision, output, *, metadata_only=False, campaign_catalog=None, previ
         target = safe_path(output / "corpora", identity + ".jsonl")
         target.parent.mkdir(parents=True, exist_ok=True)
         reconstruct(descriptor, source, target)
-    (output / INDEX).parent.mkdir(parents=True, exist_ok=True)
-    (output / INDEX).write_bytes(canonical(catalog))
-    load_runs(output, catalog)
 
 
 def artifact(root, run, name):
@@ -373,8 +382,8 @@ def run_one(root, run, directory, timeout, context):
     observations = read(artifact(root, run, "observations"))
     if sum(r["phase"] == "profile" for r in observations) != run["measured_requests"]:
         raise ValueError("Measured cohort count mismatch")
-    trace = prepare_trace(root, run, directory)
     config = replay_config(root, run)
+    trace = prepare_trace(root, run, directory)
     config["traffic"]["source"]["paths"] = [str(trace.resolve())]
     config_path = directory / "input-config.json"
     config_path.write_bytes(canonical(config))
