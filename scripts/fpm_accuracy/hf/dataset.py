@@ -1161,7 +1161,15 @@ def _select_entries(
     hardware: Sequence[str] | None,
     configuration_paths: Sequence[str] | None,
 ) -> list[Entry]:
-    """Catalog entries matching every given filter; a model filter uses the loader's selection rule."""
+    """Catalog entries matching every given filter; a model filter uses the loader's selection rule.
+
+    Explicit configuration paths are validated against the whole catalog first, so a path that exists but is
+    excluded by the model or hardware filter drops out of the intersection instead of being reported unknown.
+    """
+    if configuration_paths:
+        unknown = sorted(set(configuration_paths) - {_entry_configuration_path(entry) for entry in index.entries})
+        if unknown:
+            raise ConfigurationError(f"unknown smoke configuration: {unknown}")
     entries: list[Entry] = []
     for entry in index.entries:
         if hardware and entry.identity.hardware not in set(hardware):
