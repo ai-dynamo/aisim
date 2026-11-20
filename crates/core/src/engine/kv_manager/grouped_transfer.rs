@@ -253,8 +253,10 @@ impl GroupedTransferRules {
     /// The worker trims the prefill list to the decode count (V31
     /// `nixl/base_worker.py:3485-3490`, `:3529-3534`, V32 `:3450-3455`,
     /// `:3493-3498`). A state group moves one block (V31
-    /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`). The bytes saturate
-    /// at `u64::MAX`, as in `bytes_per_full_block`.
+    /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`). A source of zero
+    /// tokens owns no block and moves none, and vLLM refuses an empty prompt
+    /// (V31 `vllm/v1/engine/input_processor.py:516-517`, V32 `:565-566`).
+    /// The bytes saturate at `u64::MAX`, as in `bytes_per_full_block`.
     pub(crate) fn fixed_bytes(&self, transfer_tokens: usize) -> u64 {
         self.groups
             .iter()
@@ -271,7 +273,7 @@ impl GroupedTransferRules {
                         debug_assert!(blocks <= (window as usize).div_ceil(block) + 1);
                         blocks
                     }
-                    TransferKind::State => 1,
+                    TransferKind::State => usize::from(transfer_tokens > 0),
                 };
                 (blocks as u64).saturating_mul(group.bytes_per_block)
             })
@@ -584,6 +586,30 @@ mod tests {
         let rings = states(false);
         assert_eq!(rings.backoff_tokens(), 0);
         assert_eq!(rings.transfer_tokens(1_000), 1_000);
+    }
+
+    #[test]
+    fn an_empty_source_moves_no_state_block() {
+        // A source of zero transfer tokens owns no block, so no group moves
+        // one. One token moves one attention block and one block of each
+        // state group. These numbers equal the fixed bytes and the measured
+        // row of 1,000 tokens in `glm_payload_matches_the_vllm_oracle`, which
+        // also fills one attention block.
+        for (version, fixed, payload) in [
+            ("0.31.0", 52_120_960, 65_166_080),
+            ("0.32.0", 39_168_128, 61_146_624),
+        ] {
+            let rules = rules(&glm_groups(version));
+            assert_eq!(rules.fixed_bytes(0), 0, "{version}");
+            assert_eq!(rules.payload_bytes(0, 0), 0, "{version}");
+            let empty =
+                rules.handoff_transfer_timing(0, Some(1.0), KvTransferTimingMode::FullPrompt);
+            assert_eq!(empty.full_prompt_tokens, 0, "{version}");
+            assert_eq!(empty.state_bytes, 0, "{version}");
+            assert!(close(empty.delay_ms(0), 0.0), "{version}");
+            assert_eq!(rules.fixed_bytes(1), fixed, "{version}");
+            assert_eq!(rules.payload_bytes(1, 0), payload, "{version}");
+        }
     }
 
     #[test]
