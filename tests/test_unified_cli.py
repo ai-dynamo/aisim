@@ -7,6 +7,8 @@ import csv
 import io
 import json
 import math
+import os
+import threading
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -1480,13 +1482,17 @@ def test_engine_stack_rejects_explicit_unavailable_component(tmp_path, monkeypat
     assert "engine.router" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(("sla_field", "bound"), [("ttft_ms", 800.0), ("itl_ms", 30.0)])
+@pytest.mark.parametrize("input_suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    ("sla_field", "bound"), [("ttft_ms", 800.0), ("itl_ms", 30.0), ("ttft_ms", 1e-7), ("e2e_ms", 1e21)]
+)
 def test_partial_sla_recommendation_yaml_round_trips_into_predict(
-    tmp_path, monkeypatch, capsys, sla_field: str, bound: float
+    tmp_path, monkeypatch, capsys, sla_field: str, bound: float, input_suffix: str
 ) -> None:
-    config_path = tmp_path / "recommendation.yaml"
+    config_path = tmp_path / f"recommendation{input_suffix}"
+    serialize = json.dumps if input_suffix == ".json" else yaml.safe_dump
     config_path.write_text(
-        yaml.safe_dump(
+        serialize(
             {
                 "engine": {
                     "mode": "aggregated",
@@ -2117,6 +2123,320 @@ def test_overwrite_only_removes_known_outputs(tmp_path) -> None:
     assert not (recommendations / "0001.yaml").exists()
 
 
+def _runtime_report(root, status, **extra):
+    (root / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": status, **extra}))
+
+
+def test_prepare_output_directory_accepts_missing_and_empty_directories(tmp_path) -> None:
+    missing = tmp_path / "missing"
+    assert prepare_output_directory(missing, overwrite=False) == missing
+    assert missing.is_dir()
+    assert prepare_output_directory(missing, overwrite=False) == missing
+
+
+@pytest.mark.parametrize("status", ["failed", "resource_limited", "timed_out", "cancelled"])
+def test_failed_run_leftovers_are_reused_without_overwrite(tmp_path, capsys, status) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "fpm-coverage.json").write_text("{}")
+    (root / "resource-plan.json").write_text("{}")
+    (root / "execution-events.jsonl").write_text("{}\n")
+    (root / "recommendations").mkdir()
+    _runtime_report(root, status)
+
+    assert prepare_output_directory(root, overwrite=False) == root
+
+    assert root.is_dir()
+    assert not any(root.iterdir())
+    assert "removed diagnostics left by a failed run" in capsys.readouterr().err
+
+
+def test_lone_events_file_is_never_removed(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "execution-events.jsonl").write_text("user data\n")
+
+    with pytest.raises(ValueError, match="without a runtime report that records a failed run"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / "execution-events.jsonl").read_text() == "user data\n"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        "",
+        "not json",
+        "[]",
+        "{}",
+        json.dumps({"status": "failed"}),
+        json.dumps({"schema_version": 2, "status": "failed"}),
+        json.dumps({"schema_version": 1}),
+        json.dumps({"schema_version": 1, "status": "running"}),
+        json.dumps({"schema_version": 1, "status": "exploded"}),
+        json.dumps({"schema_version": 1, "status": None}),
+        json.dumps({"schema_version": True, "status": "failed"}),
+        json.dumps({"schema_version": 1.0, "status": "failed"}),
+        json.dumps({"schema_version": 1, "status": []}),
+        json.dumps({"schema_version": 1, "status": {}}),
+    ],
+    ids=[
+        "empty",
+        "unparsable",
+        "not-object",
+        "no-fields",
+        "no-schema",
+        "other-schema",
+        "missing-status",
+        "running",
+        "unknown",
+        "null-status",
+        "bool-schema",
+        "float-schema",
+        "list-status",
+        "dict-status",
+    ],
+)
+def test_ambiguous_runtime_reports_preserve_the_directory(tmp_path, report) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "execution-events.jsonl").write_text("{}\n")
+    (root / "resource-runtime.json").write_text(report)
+
+    with pytest.raises(ValueError, match="not empty"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / "execution-events.jsonl").exists()
+    assert (root / "resource-runtime.json").read_text() == report
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+@pytest.mark.timeout(30)
+def test_fifo_runtime_report_is_refused_without_blocking(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "execution-events.jsonl").write_text("{}\n")
+    os.mkfifo(root / "resource-runtime.json")
+    result: dict[str, object] = {}
+
+    def prepare() -> None:
+        try:
+            prepare_output_directory(root, overwrite=False)
+        except ValueError as exc:
+            result["error"] = str(exc)
+
+    worker = threading.Thread(target=prepare, daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "preparation blocked on a FIFO runtime report"
+    assert "not empty" in str(result.get("error"))
+    assert sorted(entry.name for entry in root.iterdir()) == ["execution-events.jsonl", "resource-runtime.json"]
+
+
+def test_prediction_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, monkeypatch) -> None:
+    from aisim import output as output_module
+
+    root = tmp_path / "out"
+    root.mkdir()
+    real_dump = output_module.json.dump
+
+    def replace_then_fail(obj, fp, **kwargs):
+        # Another writer swaps in its own report while this call is serializing.
+        (root / "prediction.json").unlink()
+        (root / "prediction.json").write_text("replacement\n")
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(output_module.json, "dump", replace_then_fail)
+    try:
+        with pytest.raises(RuntimeError, match="serialization failed"):
+            output_module.write_prediction_report(root, {"a": 1}, exclusive=True)
+    finally:
+        monkeypatch.setattr(output_module.json, "dump", real_dump)
+    assert (root / "prediction.json").read_text() == "replacement\n"
+
+
+def test_symlinked_diagnostic_is_named_as_the_refusal_reason(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}))
+    (tmp_path / "elsewhere.jsonl").write_text("{}\n")
+    (root / "execution-events.jsonl").symlink_to(tmp_path / "elsewhere.jsonl")
+
+    with pytest.raises(ValueError, match=r"not regular files \(execution-events.jsonl\)"):
+        prepare_output_directory(root, overwrite=False)
+    assert (root / "execution-events.jsonl").is_symlink()
+    assert (root / "resource-runtime.json").exists()
+
+
+def test_recommendation_yaml_failure_keeps_the_existing_file(tmp_path) -> None:
+    from aisim import output as output_module
+
+    root = tmp_path / "out"
+    (root / "recommendations").mkdir(parents=True)
+    existing = root / "recommendations" / "0001.yaml"
+    existing.write_text("previous: true\n")
+
+    with pytest.raises(yaml.representer.RepresenterError):
+        output_module.write_recommendations(root, [{"bad": object()}])
+    assert existing.read_text() == "previous: true\n"
+
+
+def test_telemetry_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, monkeypatch) -> None:
+    from aisim import output as output_module
+
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "telemetry-samples.jsonl").write_text("theirs\n")
+    real_open = output_module._open_result
+
+    def open_then_replace(path, *, exclusive):
+        handle = real_open(path, exclusive=exclusive)
+        if path.name == "telemetry-requests.jsonl":
+            # Another writer swaps in its own requests file after this call created one.
+            path.unlink()
+            path.write_text("replacement\n")
+        return handle
+
+    monkeypatch.setattr(output_module, "_open_result", open_then_replace)
+    telemetry = {"requests": [{"a": 1}], "samples": [{"b": 2}], "lifecycle": []}
+    with pytest.raises(ValueError, match="appeared after the output directory was prepared"):
+        output_module.write_telemetry(root, telemetry, exclusive=True)
+    assert (root / "telemetry-requests.jsonl").read_text() == "replacement\n"
+    assert (root / "telemetry-samples.jsonl").read_text() == "theirs\n"
+
+
+@pytest.mark.parametrize("link", ["resource-runtime.json", "execution-events.jsonl", "recommendations"])
+def test_symlinked_leftovers_preserve_the_directory(tmp_path, link) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "execution-events.jsonl").write_text("{}\n")
+    _runtime_report(root, "failed")
+    target = outside / link
+    if link == "recommendations":
+        target.mkdir()
+    else:
+        (root / link).replace(target)
+    (root / link).symlink_to(target, target_is_directory=link == "recommendations")
+
+    with pytest.raises(ValueError, match="not empty"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / link).is_symlink()
+    assert target.exists()
+
+
+@pytest.mark.parametrize(
+    "result",
+    ["prediction.json", "recommendation.json", "recommendation.csv", "report.html", "requests.jsonl"],
+)
+def test_finished_run_results_are_refused_without_overwrite(tmp_path, result) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    _runtime_report(root, "failed")
+    (root / result).write_text("old")
+
+    with pytest.raises(ValueError, match="results from an earlier AISim run that ended with status 'failed'"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / result).read_text() == "old"
+    assert (root / "resource-runtime.json").exists()
+
+
+def test_completed_runtime_or_numbered_recommendations_are_refused(tmp_path) -> None:
+    completed = tmp_path / "completed"
+    completed.mkdir()
+    _runtime_report(completed, "completed")
+    (completed / "resource-plan.json").write_text("{}")
+    with pytest.raises(ValueError, match="results from a finished AISim run"):
+        prepare_output_directory(completed, overwrite=False)
+    assert (completed / "resource-plan.json").exists()
+
+    numbered = tmp_path / "numbered"
+    (numbered / "recommendations").mkdir(parents=True)
+    (numbered / "recommendations" / "0001.yaml").write_text("old")
+    _runtime_report(numbered, "failed")
+    with pytest.raises(ValueError, match="results from an earlier AISim run"):
+        prepare_output_directory(numbered, overwrite=False)
+    assert (numbered / "recommendations" / "0001.yaml").exists()
+
+
+def test_unknown_files_are_refused_and_named(tmp_path) -> None:
+    root = tmp_path / "out"
+    root.mkdir()
+    _runtime_report(root, "failed")
+    (root / "notes.txt").write_text("keep")
+
+    with pytest.raises(ValueError, match=r"files AISim did not write \(notes\.txt\)"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / "notes.txt").read_text() == "keep"
+    assert (root / "resource-runtime.json").exists()
+
+
+def test_change_between_inspection_and_cleanup_stops_removal(tmp_path, monkeypatch) -> None:
+    import aisim.output as output_module
+
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "execution-events.jsonl").write_text("{}\n")
+    _runtime_report(root, "failed")
+    inspect = output_module._unfinished_run_leftovers
+
+    def inspect_then_finish_elsewhere(directory):
+        leftovers = inspect(directory)
+        # Another process completes a run in the same directory before cleanup starts.
+        _runtime_report(directory, "completed", padding="x" * 64)
+        (directory / "execution-events.jsonl").write_text("{}\n{}\n")
+        return leftovers
+
+    monkeypatch.setattr(output_module, "_unfinished_run_leftovers", inspect_then_finish_elsewhere)
+
+    with pytest.raises(ValueError, match="changed while AISim was preparing it"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert json.loads((root / "resource-runtime.json").read_text())["status"] == "completed"
+    assert (root / "execution-events.jsonl").read_text() == "{}\n{}\n"
+
+
+def test_result_appearing_after_cleanup_is_refused(tmp_path, monkeypatch) -> None:
+    import aisim.output as output_module
+
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "execution-events.jsonl").write_text("{}\n")
+    _runtime_report(root, "failed")
+    clear = output_module._clear_unfinished_run
+
+    def clear_then_publish(directory, leftovers):
+        (directory / "prediction.json").write_text("someone else's result")
+        clear(directory, leftovers)
+
+    monkeypatch.setattr(output_module, "_clear_unfinished_run", clear_then_publish)
+
+    with pytest.raises(ValueError, match="changed while AISim was preparing it"):
+        prepare_output_directory(root, overwrite=False)
+
+    assert (root / "prediction.json").read_text() == "someone else's result"
+
+
+def test_result_writers_refuse_to_replace_files_that_appeared(tmp_path) -> None:
+    from aisim.output import write_prediction_report, write_requests
+
+    root = prepare_output_directory(tmp_path / "out", overwrite=False)
+    (root / "prediction.json").write_text("someone else's result")
+    (root / "requests.jsonl").write_text("theirs\n")
+
+    with pytest.raises(ValueError, match="appeared after the output directory was prepared"):
+        write_prediction_report(root, {"summary": {}}, exclusive=True)
+    with pytest.raises(ValueError, match="appeared after the output directory was prepared"):
+        write_requests(root, [{"id": 1}], exclusive=True)
+
+    assert (root / "prediction.json").read_text() == "someone else's result"
+    assert (root / "requests.jsonl").read_text() == "theirs\n"
+
+
 @pytest.mark.parametrize("resource_limited", [0, 1])
 def test_recommendation_writes_an_empty_result_before_returning_failure(
     tmp_path, monkeypatch, capsys, resource_limited
@@ -2410,7 +2730,7 @@ def test_detail_schema_rejects_incomplete_or_unsupported_sections(section):
         validate({"schema_version": "1.0", "sections": section, "skipped": {}}, _detail_schema())
 
 
-@pytest.mark.parametrize("kv_mode", ["fp8", "bfloat16"])
+@pytest.mark.parametrize("kv_mode", ["fp8", "bfloat16", "nvfp4"])
 def test_detail_partial_memory_preserves_unavailable_role_reason(kv_mode):
     from jsonschema import ValidationError, validate
 
@@ -2886,8 +3206,9 @@ def test_recommend_emits_explicit_hybrid_pin_with_native_capacity(tmp_path):
 
 @pytest.mark.parametrize("output_format", ["table", "json"])
 @pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("database_mode", ["omitted", None, "SILICON", "HYBRID", "EMPIRICAL", "SOL"])
 def test_predict_reports_effective_timing_provenance_without_details(
-    tmp_path, monkeypatch, capsys, output_format, available
+    tmp_path, monkeypatch, capsys, output_format, available, database_mode
 ):
     provenance = {
         "aggregated": {
@@ -2897,6 +3218,8 @@ def test_predict_reports_effective_timing_provenance_without_details(
             "data_version_unavailable_reason": None,
         }
     }
+    if database_mode != "omitted":
+        provenance["aggregated"]["database_mode"] = database_mode
 
     class ProvenanceRunner(_Runner):
         def run(self, *args, **kwargs):
@@ -2921,6 +3244,10 @@ def test_predict_reports_effective_timing_provenance_without_details(
         assert json.loads(stdout)["prediction_provenance"] == saved
     elif available:
         assert "Timing (aggregated): estimator=op_level; source=aic; data_version=0.24.0" in stdout
+        if database_mode not in ("omitted", None):
+            assert f"; database_mode={database_mode}" in stdout
+        else:
+            assert "database_mode=" not in stdout
     else:
         assert "Timing (runner): unavailable (runner did not report" in stdout
 
@@ -2949,6 +3276,35 @@ def test_predict_rejects_malformed_runner_provenance_before_output(tmp_path, mon
     output = tmp_path / "out"
     assert cli.main(["predict", "-c", str(path), "--output-dir", str(output)]) == 1
     assert "runner prediction_provenance" in capsys.readouterr().err
+    assert not (output / "prediction.json").exists()
+
+
+@pytest.mark.parametrize("output_format", ["table", "json"])
+@pytest.mark.parametrize("database_mode", [{}, [], "UNKNOWN", "hybrid", "SOL_FULL", "", True, 1])
+def test_predict_rejects_invalid_database_mode_before_output(
+    tmp_path, monkeypatch, capsys, output_format, database_mode
+):
+    class MalformedRunner(_Runner):
+        def run(self, *args, **kwargs):
+            report = super().run(*args, **kwargs)
+            report.metadata["prediction_provenance"] = {
+                "aggregated": {
+                    "estimator": "op_level",
+                    "timing_source": "aic",
+                    "data_version": "0.24.0",
+                    "database_mode": database_mode,
+                }
+            }
+            return report
+
+    monkeypatch.setattr(cli, "resolve_runner_factory", lambda _: _Factory(MalformedRunner()))
+    path = tmp_path / "prediction.yaml"
+    path.write_text(yaml.safe_dump(_prediction_config().model_dump(mode="json", exclude_none=True)))
+    output = tmp_path / "out"
+    assert cli.main(["predict", "-c", str(path), "--format", output_format, "--output-dir", str(output)]) == 1
+    captured = capsys.readouterr()
+    assert "prediction_provenance.aggregated.database_mode" in captured.err
+    assert "Timing (" not in captured.out
     assert not (output / "prediction.json").exists()
 
 

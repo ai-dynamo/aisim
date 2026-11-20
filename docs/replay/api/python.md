@@ -34,6 +34,11 @@ finally:
     runner.close()
 ```
 
+The existing `from_yaml()` file readers also accept `.json` files (case
+insensitive) using JSON parsing. This applies to `CorePredictionConfig`,
+`CoreRecommendationConfig`, and `SmartSearchConfig`; their typed schemas and
+validation are the same for both formats.
+
 The configuration above is the same core YAML used by `predict --stack engine`.
 `CorePredictionConfig` does not accept optional Router/Planner top-level sections;
 the CLI resolves and compiles those through their selected configuration adapters.
@@ -91,6 +96,14 @@ before `factory.create` to perform the same check.
 Analytical EPD does not provide raw native
 or per-request EPD reports. Large capture can require substantial memory.
 
+Dynamo owns the downstream `ReplayTelemetrySnapshot` TypedDict in `_core.pyi`.
+It is intentionally unsynchronized with the Rust observer's new
+`completion_feedback` field until Dynamo bumps its simulator pin to a release
+that includes the field. The stub update is deferred to that pin bump and
+tracked in [Dynamo PR #18885](https://github.com/ai-dynamo/dynamo/pull/18885).
+See the [Rust observer contract](rust.md#reports-and-capture) for the
+completion feedback fields; telemetry capture does not export this block.
+
 ## HTML dashboard
 
 The CLI `--export-html` flag enables telemetry and writes a standalone
@@ -133,6 +146,14 @@ handling, especially for long agentic profiles. Use
 [local resource controls](../../reference/local-resources.md) when executing
 through the CLI or guarded Sweeper. The native JSON bridge and private runner
 lowering helpers are implementation interfaces, not replacements for this API.
+
+`run_replay_json` reads a payload with one `spec` key that holds a replay, or a
+configured key such as `capture_telemetry` or `traffic`, as a configured
+payload. A field error in a configured payload is reported, never replaced by
+a bare `ReplaySpec` run. Any other payload is a bare `ReplaySpec`, whose extra
+keys (also non-replay `spec` keys) are ignored. Repeated `spec` keys are
+refused when one holds a replay. The Engine runner always sends a configured
+payload.
 
 Source: [compiler](../../../python/aisim/src/aisim/compiler.py),
 [runner](../../../python/aisim/src/aisim/runner.py), and

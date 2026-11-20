@@ -300,11 +300,12 @@ def _kv_cache_scheme(quant: Mapping[str, Any]) -> dict[str, Any]:
     if scheme is None:
         return {}
     if isinstance(scheme, str):
-        if scheme.strip().upper() == "FP8":
-            return {"num_bits": 8, "type": "float"}
-        raise ValueError("unsupported quantization_config.kv_cache_scheme string; supported value is FP8")
+        bits = {"FP8": 8, "NVFP4": 4}.get(scheme.strip().upper())
+        if bits is None:
+            raise ValueError("unsupported quantization_config.kv_cache_scheme string; supported values are FP8, NVFP4")
+        return {"num_bits": bits, "type": "float"}
     if not isinstance(scheme, dict):
-        raise ValueError("quantization_config.kv_cache_scheme must be an object or FP8")
+        raise ValueError("quantization_config.kv_cache_scheme must be an object, FP8 or NVFP4")
     return scheme
 
 
@@ -606,7 +607,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
     """Load local config/ModelOpt metadata with separate byte-level provenance."""
     # Imported here, not at module level: tests/unit/test_fpm_config_imports.py and the repository-root
     # tests/test_resource_supervision.py fail when aisim_core.decoder_config loads before a config is read.
-    from aisim_core.decoder_config import decoder_config_key
+    from aisim_core.decoder_config import decoder_config_key, nested_decoder_ambiguity
 
     path = Path(path).expanduser().absolute()
     payload = path.read_bytes()
@@ -631,10 +632,8 @@ def load_model_config(path: str | Path) -> ModelConfig:
                 f"{decoder_key} must be a nonempty object describing one text decoder; "
                 "supply its decoder config or a complete --fpm-profile"
             )
-        if decoder_key in decoder:
-            raise ValueError(
-                f"ambiguous nested {decoder_key}; supply one text decoder config or a complete --fpm-profile"
-            )
+        if (ambiguity := nested_decoder_ambiguity(decoder_key, decoder)) is not None:
+            raise ValueError(f"{ambiguity}; supply one text decoder config or a complete --fpm-profile")
         raw = dict(decoder)
         notes["decoder_config"] = f"config {decoder_key}; outer model and encoder geometry are excluded"
         inherited = []
@@ -843,7 +842,7 @@ def _precision_facts(config: ModelConfig) -> dict[str, tuple[str, str]]:
                 if key in modes
             )
         kv = inferred.get("kv_cache_quant_algo")
-        if kv in {"fp8", "bfloat16"}:
+        if kv in {"fp8", "nvfp4", "bfloat16"}:
             result["kv_cache_dtype"] = (
                 kv,
                 "explicit config/ModelOpt KV quantization metadata (independent of weight quantization)",
@@ -897,10 +896,15 @@ def _precision_facts(config: ModelConfig) -> dict[str, tuple[str, str]]:
         result = dict.fromkeys(("gemm_quant_mode", "moe_quant_mode"), ("nvfp4", source))
     scheme = _kv_cache_scheme(quant)
     if scheme.get("num_bits") == 8 and scheme.get("type") in {"float", "int"}:
-        result["kv_cache_dtype"] = (
-            "fp8" if scheme["type"] == "float" else "int8",
-            "explicit config quantization_config.kv_cache_scheme (independent of weight quantization)",
-        )
+        kv = "fp8" if scheme["type"] == "float" else "int8"
+    elif scheme.get("num_bits") == 4 and scheme.get("type") == "float" and method.startswith("modelopt"):
+        kv = "nvfp4"  # vLLM reads a 4-bit float scheme as NVFP4 only under ModelOpt
+    else:
+        return result
+    result["kv_cache_dtype"] = (
+        kv,
+        "explicit config quantization_config.kv_cache_scheme (independent of weight quantization)",
+    )
     return result
 
 
@@ -1534,12 +1538,27 @@ def derive_profile(
     return ProfileDraft(profile, values, {}, sources, notes=notes)
 
 
-def _cache_group_shapes(groups: list[Any]) -> Counter[str]:
-    """Cache groups as a multiset of their geometry. Names and order carry none, and the probe chooses both."""
+# The cache group fields that only a runtime probe import writes. A cache_groups claim gives the geometry, so it may
+# leave them out.
+_PROBE_GROUP_FIELDS = (
+    "prefix_cacheable",
+    "transfer_bytes_per_block",
+    "prefill_checkpoint_blocks",
+    "prefill_checkpoint_alignment",
+)
+
+
+def _cache_group_shapes(groups: list[Any], ignored: tuple[str, ...] = ()) -> Counter[str]:
+    """Cache groups as a multiset of their geometry. Names and order carry none, and the probe chooses both.
+
+    The ``ignored`` fields are left out of every shape.
+    """
     shapes: Counter[str] = Counter()
     for group in groups:
         shape = FpmCacheGroup.model_validate(group).model_dump(mode="json")
         del shape["name"]
+        for name in ignored:
+            shape.pop(name, None)
         shapes[json.dumps(shape, sort_keys=True)] += 1
     return shapes
 
@@ -1605,13 +1624,17 @@ def linear_runtime_resources(resources: Mapping[str, Any]) -> dict[str, Any] | N
 
     Every group must be an attention group without a window, all groups must have one block size of at least 2
     tokens, and the exact sum of page_size_bytes / block_size_tokens must be a whole number of bytes per token.
-    Every other field, such as runtime_memory and the resource provenance, is kept. Import, acceptance,
+    Every other field, such as runtime_memory and the resource provenance, is kept, except the vLLM version of the
+    cache group evidence. Import, acceptance,
     finalization and validation all use this function.
     """
     if _linear_layout_gap(resources) is not None:
         return None
     linear = {key: deepcopy(value) for key, value in resources.items() if key != "cache_groups"}
     linear.update(cache_layout="linear", kv_bytes_per_token=int(_measured_kv_bytes(resources)))
+    # The version of the cache group evidence leaves with the groups, so a linear profile keeps its bytes.
+    if isinstance(linear.get("runtime_memory"), dict):
+        linear["runtime_memory"].pop("runtime_framework_version", None)
     return linear
 
 
@@ -1640,7 +1663,9 @@ def _matches_observation(key: str, typed: Any, resources: Mapping[str, Any]) -> 
     """Whether a resource override agrees with what the runtime probe measured."""
     if key == "cache_groups":
         measured = resources.get(key)
-        return measured is not None and _cache_group_shapes(typed) == _cache_group_shapes(measured)
+        # A probe-only field is compared when a claimed group states it, and then on every group.
+        unstated = tuple(name for name in _PROBE_GROUP_FIELDS if all(group.get(name) is None for group in typed))
+        return measured is not None and _cache_group_shapes(typed, unstated) == _cache_group_shapes(measured, unstated)
     if key == "kv_bytes_per_token" or (key == "cache_layout" and typed == "linear"):
         # The vLLM probe reports a grouped cache; full-attention groups without a window have a per-token size.
         measured = _measured_kv_bytes(resources)
@@ -1685,6 +1710,22 @@ def _observation_mismatch(key: str, typed: Any, resources: Mapping[str, Any]) ->
     if resources.get(measured_key) is None:
         layout = f" for its {resources['cache_layout']} cache_layout" if resources.get("cache_layout") else ""
         return f"{claim}, but the runtime probe measured no {measured_key}{layout}; {remedy}"
+    # The probe import of a vLLM 0.33.0 record writes no transfer bytes, so a stated value has nothing to match. When
+    # the claim matches without them, only removing them from the override helps.
+    if (
+        key == "cache_groups"
+        and any(group.get("transfer_bytes_per_block") is not None for group in typed)
+        and all(group.get("transfer_bytes_per_block") is None for group in resources[key])
+        and _matches_observation(
+            key,
+            [{name: value for name, value in group.items() if name != "transfer_bytes_per_block"} for group in typed],
+            resources,
+        )
+    ):
+        return (
+            f"{claim} states transfer_bytes_per_block, but the runtime probe evidence holds no "
+            "transfer_bytes_per_block for its cache groups; remove transfer_bytes_per_block from the override."
+        )
     return f"{claim} differs from the runtime probe's measured {key}={compact(resources[key])}; {remedy}"
 
 
@@ -1700,9 +1741,10 @@ def profile_from_observations(
     Runtime grouping need not match config-derived planning groups. No estimated
     geometry or non-KV byte declaration is substituted for the observation. Cache
     geometry, scheduler and precision overrides must agree with it, and the
-    measurement is authoritative: cache groups compare without names or order,
-    and a cache_layout: linear or kv_bytes_per_token claim compares with the
-    measured bytes per token.
+    measurement is authoritative: cache groups compare without names or order
+    and a state group compares its blocks_per_request, and a cache_layout:
+    linear or kv_bytes_per_token claim compares with the measured bytes per
+    token.
     """
     supplied = validate_overrides(overrides)
     metadata = {key: config.suggestions[key] for key in _MODEL_FIELDS if key in config.suggestions}

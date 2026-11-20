@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 from pathlib import Path
@@ -215,17 +216,44 @@ class OptimizerConfig(StrictModel):
     seed: NonNegativeStrictInt = 42
 
 
-def load_yaml(path: str | Path) -> dict[str, Any]:
+def load_config_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Read JSON for a .json suffix (case insensitive), otherwise YAML.
+
+    Return the mapping and original text, which retains evidence of repeated keys.
+    Keep YAML as the default for existing files without a recognized suffix.
+    """
+    return _load_mapping_with_text(path, is_json=Path(path).name.lower().endswith(".json"))
+
+
+def _load_mapping_with_text(path: str | Path, *, is_json: bool) -> tuple[dict[str, Any], str]:
     source = Path(path)
+    format_name = "JSON" if is_json else "YAML"
     try:
-        data = yaml.safe_load(source.read_text(encoding="utf-8"))
+        text = source.read_text(encoding="utf-8")
+        data = json.loads(text, parse_constant=_reject_json_constant) if is_json else yaml.safe_load(text)
     except OSError as exc:
         raise ValueError(f"could not read configuration {source}: {exc}") from exc
-    except yaml.YAMLError as exc:
-        raise ValueError(f"malformed YAML in {source}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"could not read configuration {source}: the file is not valid UTF-8 text ({exc})") from exc
+    except (ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"malformed {format_name} in {source}: {exc}") from exc
     if not isinstance(data, dict):
-        raise ValueError(f"configuration {source} must contain one YAML mapping")
-    return data
+        expected = "JSON object" if is_json else "YAML mapping"
+        raise ValueError(f"configuration {source} must contain one {expected}")
+    return data, text
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"{value} is not a valid JSON number")
+
+
+def load_yaml_with_text(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Read YAML regardless of filename, preserving the existing YAML-only contract."""
+    return _load_mapping_with_text(path, is_json=False)
+
+
+def load_yaml(path: str | Path) -> dict[str, Any]:
+    return load_yaml_with_text(path)[0]
 
 
 CONFIG_ADAPTER_ENTRY_POINT_GROUP = "aisim.config_adapters"

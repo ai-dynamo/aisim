@@ -13,11 +13,19 @@ environment is required for collection and deployment benchmarks.
 
 Documentation on `main` describes the current source. A published wheel may
 predate a documented feature. Record your installed version before comparing
-results or reporting a problem:
+results or reporting a problem. For current `aisim` installs, use:
 
 ```bash
+aisim --version
 python -c 'import aisim; print(aisim.__version__)'
 python -c 'import aisim, aisim._runtime; print(aisim.__file__); print(aisim._runtime.__file__)'
+```
+
+For historical `aisimulate` installs, use the original Python namespace; those releases may not provide the `aisim` command or its new `--version` flag:
+
+```bash
+python -c 'import aisimulate; print(aisimulate.__version__)'
+python -c 'import aisimulate, aisimulate._runtime; print(aisimulate.__file__); print(aisimulate._runtime.__file__)'
 ```
 
 ### Published packages
@@ -33,7 +41,7 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install 'aisimulate==0.12.1'
-aisim --help
+aisimulate --help
 ```
 
 An exact version pin makes the choice explicit. To discover newer published
@@ -75,6 +83,8 @@ python -m pip download --no-deps --only-binary=:all: \
 This checks only AISim's wheel, not all transitive dependencies. A missing
 wheel on an unlisted host does not establish source-build support there.
 
+Current `aisim` wheels provide both `aisim --version` and `aisimulate --version`; these report the installed distribution as `aisim VERSION`. The two launchers expose the same `predict`, `recommend`, and `onboard` commands and options. Help and parser errors retain the invoked command name, including `python -m aisim`, `python -m aisimulate`, and supervised workers.
+
 ## Migrate to the renamed distribution
 
 Current source builds `aisim` / `aisim-core`; historical published releases use
@@ -88,26 +98,31 @@ engine-only environment, remove the old distribution first, then install the
 selected new wheel (or `aisim==<published-version>`):
 
 ```bash
-python -m pip uninstall -y aisimulate
-python -m pip install /absolute/path/to/aisim-VERSION-PLATFORM.whl
-python -m pip check
-aisim --help
+python -m pip uninstall -y aisimulate && \
+python -m pip install /absolute/path/to/aisim-VERSION-PLATFORM.whl && \
+python -m pip check && \
+aisim --help && \
 aisimulate --help
 ```
 
 AISim checks distribution metadata during import and CLI startup. If both `aisim` and `aisimulate` are installed, it raises an `ImportError` with repair commands before loading the native runtime. This check does not prevent pip from installing or overwriting shared files. An old distribution installed last can overwrite the legacy entry points and bypass the check through those old paths.
 
-Use that same ordering for upgrades. If both distributions have already been
-installed, uninstall `aisimulate` and use `pip install --force-reinstall` for
-the selected `aisim` wheel, because uninstalling the old distribution can remove
-files listed in both RECORDs. Both CLI names remain available after migration;
-Canonical Python imports are `aisim` and `aisim_core`; `aisimulate` and `aisimulate_core` remain forwarding aliases.
+Use that same ordering for upgrades. To repair an environment where both distributions were installed, remove the old distribution and reinstall the exact selected wheel. Preserve the existing dependency set during this repair and validate it afterward:
 
-Dynamo and other consumers must change their **distribution dependency** to
-`aisim` before sharing the new environment. Do not migrate the historical Dynamo
-pair documented below in place; its dependency still selects `aisimulate`.
-Use a compatible downstream release and run `pip check` after installing the
-complete environment. Skipping dependency installation is not a substitute for
+```bash
+python -m pip uninstall -y aisimulate && \
+python -m pip install --force-reinstall --no-deps /absolute/path/to/aisim-VERSION-PLATFORM.whl && \
+python -m pip check
+```
+
+If pip or uv cannot uninstall the legacy distribution because its file records are missing, create a fresh environment and install the selected `aisim` wheel there. The in-place repair requires successful removal of the old distribution.
+
+Uninstalling the old distribution can remove files listed in both RECORDs. Both CLI names remain available after migration. Canonical Python imports are `aisim` and `aisim_core`; `aisimulate` and `aisimulate_core` remain forwarding aliases.
+
+Dynamo and other consumers must declare the **distribution dependency**
+`aisim` before sharing the new environment. Use the matching Dynamo release
+[documented below](#optional-dynamo-integration) and run `pip check` after
+installing the complete environment. Skipping dependency installation is not a substitute for
 updating that requirement.
 
 ## Use current source
@@ -122,6 +137,17 @@ uv sync --project python/aisim --extra dev
 source python/aisim/.venv/bin/activate
 aisim --help
 ```
+
+To repair an existing source-checkout environment after installing a legacy distribution, run these commands from that same checkout:
+
+```bash
+project_python="$(uv run --project python/aisim --no-sync python -c 'import sys; print(sys.executable)')" && \
+uv pip uninstall --python "$project_python" aisimulate && \
+uv sync --project python/aisim --extra dev --frozen --inexact --reinstall-package aisim && \
+uv pip check --python "$project_python"
+```
+
+The first command locates the checkout's existing project interpreter without syncing or importing AISim. It honors `UV_PROJECT_ENVIRONMENT`, including paths relative to `python/aisim`; otherwise, uv uses `python/aisim/.venv`. Keep that setting unchanged for the whole block so uninstall, sync, and check select the same environment. The sync command reinstalls this checkout and its CLI entry points using the existing lockfile, including shared files removed by the uninstall. `--inexact` retains unselected packages, including dependencies of other installed extras such as `service` or `learned`; the final check validates the resulting environment.
 
 Install `uv`, a Rust toolchain with Cargo, and a C/C++ compiler plus platform
 linker before syncing: Maturin compiles the native extension. On macOS, install
@@ -147,8 +173,12 @@ alone does not establish that validation completed. The nightly path is
 `nightly/<run_id>/`, not a public PyPI release channel.
 
 Obtain the wheel for your platform from Artifactory using your organization's
-authenticated artifact access. Obtain `provenance.json` and `SHA256SUMS.txt`
-from the same run's `nightly-dist-amd64` or `nightly-dist-arm64` GitHub artifact.
+authenticated artifact access. For new runs, download the same run's `nightly-dist-amd64-manifest` or
+`nightly-dist-arm64-manifest` Actions artifact. Its `wheel-manifest.json` identifies
+the verified wheel, `provenance.json`, and `SHA256SUMS.txt` objects in Artifactory.
+Fetch them with authenticated artifact access and verify the recorded sizes and
+SHA-256 digests. Older runs retain these files in `nightly-dist-<arch>` archives;
+see the [handoff contract](../ci/release.md#intermediate-wheel-storage).
 Verify the recorded source revision and wheel SHA-256, then install that exact
 downloaded file:
 
@@ -162,26 +192,14 @@ The [artifact contract](../ci/release.md) describes wheel/crate versioning.
 
 ## Optional Dynamo integration
 
-The engine stack does not require Dynamo. For `--stack dynamo`, install a
-Dynamo distribution that supplies the required runner and adapters into the
-same environment. The root [README](../../README.md#with-dynamo) records a validated pair: `ai-dynamo==1.7.0.dev20261028` and
-`aisim==0.13.0.dev202610240000000082`, from the NVIDIA prerelease index.
-Installation, `pip check`, CPU prediction, an eight-trial recommendation, and
-prediction of the best candidate pass with Python 3.12 on Linux.
+For `--stack dynamo`, install the AISim 0.14 RC4 and matching Dynamo 1.7 RC
+wheels in a fresh Linux Python 3.12 environment, following the
+[root README](../../README.md#with-dynamo). Keep AISim aligned with Dynamo's
+declared dependency and run `pip check` after installation.
 
-The AISim wheel corresponds to source
-[`f3a3e3156530574f5e7a10446f19e571b82db871`](https://github.com/ai-dynamo/aisim/commit/f3a3e3156530574f5e7a10446f19e571b82db871)
-and [nightly run 40076769417](https://github.com/ai-dynamo/aisim/actions/runs/40076769417).
-The Dynamo wheel is the October 28 nightly build.
-This is a README simulation qualification, not a claim that Dynamo's entire
-nightly pipeline passed. Full CI README checks retest the installed artifacts
-when relevant files change.
-
-Keep this environment separate from a current AISim source checkout.
-Dynamo pins an exact AISim nightly; substituting TOT violates that package
-contract. Public Dynamo 1.4.2 lacks the modern stack registration, and 1.5.0 uses
-removed AISim imports when forced alongside TOT. Do not bypass dependency
-resolution with `--no-deps` or independently upgrade AISim in this pair.
+Planner requires additional dependencies from the same Dynamo revision as the
+installed wheels; see the
+[Planner installation example](../../examples/cli/dynamo-planner/README.md).
 
 The [Dynamo deployment guide](../sweeper/deployment-generation.md)
 separately explains generated serving artifacts and runtime version pins.

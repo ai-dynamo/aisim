@@ -5,6 +5,7 @@
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -198,6 +199,28 @@ def test_ngram_turns_vllm_async_scheduling_off_for_every_timing_model(mode, timi
     config = CorePredictionConfig.model_validate(raw)
     with pytest.raises(ValueError, match="does not support async scheduling with ngram"):
         EngineReplayRunnerFactory(runtime=_RecordingRuntime()).create(0).run(prediction_to_replay_spec(config))
+
+
+def test_ngram_rejects_launch_before_turning_async_scheduling_off():
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    raw = _prediction()
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    deployment = spec.backend_deployment
+    deployment = replace(deployment, agg_engine_args={**deployment.agg_engine_args, "launch": launch})
+    with pytest.raises(ValueError, match="launch requires async scheduling, which vLLM turns off with ngram"):
+        EngineReplayRunnerFactory(runtime=_RecordingRuntime()).create(0).run(
+            replace(spec, backend_deployment=deployment)
+        )
+
+    raw["engine"]["workers"]["aggregated"]["scheduler"]["launch"] = launch
+    with pytest.raises(ValidationError, match="scheduler.launch requires async scheduling, which vLLM turns off"):
+        CorePredictionConfig.model_validate(raw)
 
 
 def _busy_arrival(tmp_path, *, speculation=True, async_scheduling=None):
@@ -481,16 +504,43 @@ def test_generic_speculation_fixed_capacity_error_identifies_scheme_and_role(rol
         CorePredictionConfig.model_validate(raw)
 
 
-@pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
+_MTP = {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5}
+
+
+def test_cold_mtp_regression_with_allowed_fallback_requires_a_fit():
+    raw = _prediction(timing="default")
+    raw["engine"].update(
+        estimation_mode="fpm_regression",
+        fallback_policy="allow",
+        speculation=deepcopy(_MTP),
+    )
+    with pytest.raises(ValueError, match="fpm_regression estimator is not ready: no workload store has a usable fit"):
+        _run(raw)
+
+    raw["engine"]["estimation_mode"] = "op_level"
+    report = _run(raw)
+    assert report.metrics["completed_requests"] == 1
+    assert report.metadata["prediction_provenance"]["aggregated"]["estimator"] == "op_level"
+
+
 @pytest.mark.parametrize("fallback", ["allow", "deny"])
 @pytest.mark.parametrize(
-    "speculation",
+    ("mode", "speculation"),
     [
-        {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1.5},
-        _SPEC,
-        {**_COST, "expected_accepted_tokens": 1.5},
+        # A vLLM fpm_regression times an MTP scheme instead; see test_recommend_state_snapshot.py.
+        ("fpm_interpolation", _MTP),
+        ("fpm_interpolation", _SPEC),
+        ("fpm_regression", _SPEC),
+        ("fpm_interpolation", {**_COST, "expected_accepted_tokens": 1.5}),
+        ("fpm_regression", {**_COST, "expected_accepted_tokens": 1.5}),
     ],
-    ids=["mtp", "ngram", "generic_ngram"],
+    ids=[
+        "interpolation-mtp",
+        "interpolation-ngram",
+        "regression-ngram",
+        "interpolation-generic_ngram",
+        "regression-generic_ngram",
+    ],
 )
 def test_replay_preserves_canonical_estimator_selection(mode, fallback, speculation):
     raw = _prediction(timing="default")

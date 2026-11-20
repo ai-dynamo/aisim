@@ -77,7 +77,7 @@ the current SA convention.
 | `traffic.load.agentic_snapshot.initial_selections` | unset | `x` | `-` | Exact initial `{source_play_id, t_star_ms}` selections in lane order, one per lane, in the loaded graph's clock (Weka: per-play relative milliseconds). Requires `corpus_cursor`. Unset retains the original seed-based sampler. |
 | `traffic.load.agentic_snapshot.corpus_cursor` | unset | `x` | `-` | Unsigned 64-bit next sequential corpus draw, including any skipped initial draws. Requires `initial_selections` and must be at least the lane count. Recycled plays start at turn zero. |
 | `traffic.load.agentic_warmup` | `false` | `x` | `-` | Optional boolean; `true` requires `agentic_snapshot` and positive `agentic_lanes`. Primes caches before measurement; see [warmup](#agentic-warmup). |
-| `traffic.load.agentic_warmup_policy` | `repeated_prefixes` | `x` | `-` | `repeated_prefixes` preserves the original frontier; `live_trajectory_v1` advances the live dependency graph during ten additional one-token requests per lane; `primers_only` sends only the primers. The live policy requires `agentic_warmup: true` and `agentic_profile`, `primers_only` requires `agentic_warmup: true`, and both are offline `--stack engine` only. |
+| `traffic.load.agentic_warmup_policy` | `repeated_prefixes` | `x` | `-` | `repeated_prefixes` preserves the original frontier; `live_trajectory_v1` advances the live dependency graph during ten additional one-token requests per lane; `primers_only` sends only the primers. The live policy requires `agentic_warmup: true` and `agentic_profile`, `primers_only` requires `agentic_warmup: true`, and both require offline execution on a stack that advertises them (`supports_agentic_live_warmup`, `supports_agentic_primers_only`), such as `--stack engine`. |
 | `traffic.load.agentic_profile` | `null` (unset) | `x` | `-` | Optional object; `{}` enables continuous lane replenishment with the defaults below and releases requests that depend on others in their play from dependency events alone, as AIPerf does. Requires `trace_timestamps`, positive `agentic_lanes`, and `agentic_snapshot`; cannot be combined with `traffic.stop.max_virtual_time_seconds`. Unset preserves finite replay. See [continuous profile](#agentic-profile). |
 | `traffic.load.agentic_profile.duration_seconds` | `3600` when enabled | `x` | `-` | Positive finite admission duration, starting at the preparation barrier or simulation start without warmup. No new workload requests or replacement plays are issued after the deadline. |
 | `traffic.load.agentic_profile.response_grace_seconds` | `30` when enabled | `x` | `-` | Nonnegative finite time for already submitted requests to respond after the admission deadline; remaining client requests are then canceled. |
@@ -361,6 +361,12 @@ follows the AgentX client, the AIPerf fork in the
   offset from the turn's start.
 - The joining turn waits for every child with no added gap, and for its own
   recorded delay after the previous main turn.
+- Only a play's root is held to its recorded offset. Every other request is
+  timed by its dependency edges alone, so a replay that runs faster than the
+  recording, or whose idle gaps are capped, does not wait for recorded
+  timestamps. After an `agentic_snapshot` cut, a request whose previous or
+  spawning turn lies before the cut also waits for its recorded offset from the
+  cut.
 - A subagent that no main turn precedes is dropped. A flattened chain that no
   main turn precedes is spawned by the first one.
 - Each stream is its own chat conversation: its first request is one user
@@ -408,11 +414,11 @@ Supported runtimes: offline `engine` stack, vLLM or SGLang, aggregated or P/D
 workers and HBM-only KV cache, including
 [speculative decoding](engine/speculation.md) with explicit acceptance
 assumptions; ngram requires vLLM. vLLM additionally
-supports [G2 host offload](engine/kv-cache.md#agentic-g2) with static workers:
-one aggregated worker, 1P1D, or several aggregated workers with
-`scope: dp_rank_local`; `attention_data: 1` on every role. Speculation with G2
-is limited to canonical MTP on a single aggregated worker with local G2 and
-prefix caching. TensorRT-LLM, G3 offload and online
+supports [G2 host offload](engine/kv-cache.md#agentic-g2) with static workers
+of any count and `attention_data`. Speculation with G2 is limited to canonical
+MTP with prefix caching, and to MTP on a
+[hybrid G2](engine/kv-cache.md#hybrid-g2) with `engine.speculation.disable_eagle_block_drop`.
+TensorRT-LLM, G3 offload and online
 P/D are rejected. Results are qualified `functional_only`, not hardware
 accuracy. [Start an AgentX simulation](agentic/quickstart.md) walks through a
 complete run.
@@ -447,8 +453,9 @@ holds, can continue after the lane moves on.
 Inside a play, a child request starts when the source request it depends on is
 dispatched or completes, as the trace records, plus the recorded delay.
 Background children run without a join. Without `agentic_profile`, a request
-also waits for its authored offset from the play start (or snapshot cut), so a
-play never runs ahead of its source clock. A
+also waits for its authored offset from the play start (or snapshot cut). With
+`traffic.source.client: agentx`, only play roots carry that offset; other
+requests follow their dependency edges, with the snapshot exception below. A
 [continuous profile](#agentic-profile) drops that wait for requests that depend
 on other requests.
 
@@ -459,9 +466,13 @@ on other requests.
 `agentic_snapshot: {seed: S}` starts each initial lane partway through its play.
 The cut is sampled uniformly between 25% and 75% of the play's span of request
 start times. Requests that started before the cut become history and are not
-replayed; the rest are replayed with their original timers. The same corpus,
-lane count and seed always give the same cuts. `S` is an unsigned 64-bit
-integer.
+replayed, even if their recorded service interval crosses the cut. Requests at
+or after the cut remain live. With `traffic.source.client: agentx`, a live
+request whose previous or spawning turn lies before the cut also waits for its
+recorded offset from the cut, even if a live join or replay barrier still gates
+it. Requests whose previous or spawning turn remains live follow dependency
+events. The same corpus, lane count and seed always give the same cuts. `S` is
+an unsigned 64-bit integer.
 
 A snapshot is cut at request boundaries. It does not model partial decode
 progress or restore an engine checkpoint: without warmup, the caches start
@@ -597,9 +608,10 @@ counts and latency distributions. Active partially warmed plays retain their
 identities and get a formal measurement origin at the barrier. An aborted live
 warmup has an empty formal cohort; its request ledger remains in
 `agentic_phases`. See [live trajectory warmup](agentic/warmup.md#live-trajectory-policy)
-for qualification boundaries. Unsupported CLI stacks are rejected before
-`--overwrite` prepares the output directory; external SDK adapters must
-explicitly advertise `supports_agentic_live_warmup` and forward the policy.
+for qualification boundaries. The CLI rejects a stack that does not advertise
+the policy before it prepares the output directory; external stacks
+and SDK adapters must explicitly advertise `supports_agentic_live_warmup` and
+forward the policy.
 
 `agentic_warmup_policy: primers_only` models AIPerf's snapshot warmup when no
 cache-pressure warmup is configured: the live policy's primers, timed the same
@@ -621,9 +633,14 @@ complete, plus the recorded delay; its authored offset no longer holds it
 back. A follow-up turn therefore starts its recorded think time after its
 predecessor actually completes, and a subagent starts from its parent's actual
 completion. A turn that joins children waits for both their completion and its
-own recorded delay after its predecessor. Only play roots and, after a snapshot
-cut, each stream's next request whose predecessor lies before the cut keep
-their source-clock timers.
+own recorded delay after its predecessor. Only play roots keep a source-clock
+timer. After a snapshot cut, rows carrying `recorded_start_ms` also keep a timer
+relative to the cut when their previous or spawning turn lies before it.
+Legacy Agentic Mooncake dependent rows without this field gain no such timer:
+they can dispatch at the cut once dependency delays have elapsed. Live joins
+and replay barriers still gate dispatch. With
+`traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer rule
+also applies without a continuous profile.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -716,20 +733,44 @@ double-count prior context.
 
 ## Agentic Mooncake JSONL
 
-`agentic_mooncake` includes all Mooncake request fields above, but `request_id` is required, nonempty,
-and unique. Each row is an independently schedulable request node rather than a turn inferred only
-from session order. It adds these fields:
+### Legacy rows
+
+Headerless `agentic_mooncake` includes all Mooncake request fields above, but
+`request_id` is required, nonempty, and unique. Each row is an independently
+schedulable request node rather than a turn inferred only from session order.
+It adds these fields:
 
 | Field | Default | Semantics |
 |---|---:|---|
 | `wait_for` | `[]` | Request IDs that must all complete first. Unknown IDs, self-dependencies, and cycles are rejected. |
 | `delay` / `delay_ms` | `0` | Delay after the last dependency completes. |
 | `tool_wait_ms` | `0` | Additional tool wait after dependencies; scheduling delay is `delay + tool_wait_ms`. |
-| `timestamp` / `created_time` | `0` for roots | Ready time for a node with an empty `wait_for`; dependent-node timestamps do not control release. |
+| `timestamp` / `created_time` | `0` for roots | Ready time for a node with an empty `wait_for`; dependent-node timestamps do not control release. When present, also supplies the recorded start for snapshot history classification, including on dependent nodes. |
 | `request_kind`, `branches`, `prefix_reset`, `tool_events` | Empty | Producer metadata accepted by the format. Scheduling is controlled by `wait_for`, and cache identity is carried by `hash_ids`; these metadata fields do not independently change replay behavior. |
 
 A dependent node becomes ready after the latest request in `wait_for` completes, plus its `delay` and
 `tool_wait_ms`. `speedup` therefore scales both authored root arrivals and those post-dependency waits.
+
+### Versioned rows (v2)
+
+The versioned format starts with a header whose `schema` is
+`"dynamo.agentic_mooncake"` and `version` is `2`. It also requires a positive
+`block_size`, `hash_id_scope: "local"`, and a `source` object with nonempty
+`format` and `digest` strings.
+Each subsequent JSONL row is an
+[`AgenticMooncakeRow`](../../crates/core/src/replay/loadgen/types.rs), with required
+`request_id`, `play_id`, `session_id`, `model`, and `not_before_ms` fields.
+`load_agentic_mooncake` detects the header and routes these rows through
+`AgenticTrace::from_agentic_mooncake`.
+
+| Field | Default | Semantics |
+|---|---:|---|
+| `not_before_ms` | Required | Finite, nonnegative authored release offset in milliseconds. Dependency events can delay dispatch further. |
+| `dependencies` | `[]` | Typed edges with `request_id`, `trigger` (`dispatch` or `completion`), `delay_ms`, and `relation` (`sequence`, `spawn`, `join`, or `replay_barrier`); replaces legacy `wait_for`. |
+| `recorded_start_ms` | unset | Optional finite, nonnegative recorded start offset in milliseconds. Weka sets it on edge-timed requests for `traffic.source.client: agentx`, leaving it unset for `client: recorded`. With `traffic.load.agentic_snapshot`, it supplies the recorded start for cut sampling and history classification, and preserves the remaining source-clock timer when the previous or spawning turn is history. Live joins and replay barriers still gate dispatch; without a sequence or spawn edge, any live dependency prevents this added timer. Omitted when unset and ignored by replay without a snapshot. |
+
+Legacy rows take snapshot recorded starts from `timestamp` / `created_time`;
+their loader does not read `recorded_start_ms`.
 
 <a id="applied-compute-agentic-jsonl"></a>
 

@@ -249,7 +249,12 @@ def checkpoint_launch(
                 "max_prefill_cudagraph_size": collection.max_prefill_cudagraph_size,
                 **{
                     field: getattr(collection, field)
-                    for field in ("cudagraph_mode", "cudagraph_capture_sizes", "max_cudagraph_capture_size")
+                    for field in (
+                        "cudagraph_mode",
+                        "cudagraph_capture_sizes",
+                        "max_cudagraph_capture_size",
+                        "warmup_iterations",
+                    )
                     if getattr(collection, field) is not None
                 },
             },
@@ -361,6 +366,51 @@ def _resource_values(resources: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
+# Cache group fields that sessions imported before these fields existed did not save. The import of a vLLM 0.33.0
+# record writes prefix_cacheable and no transfer_bytes_per_block.
+_LATER_GROUP_FIELDS = ("prefix_cacheable", "transfer_bytes_per_block")
+# The runtime memory field that such sessions did not save. The import of a vLLM 0.33.0 record writes it.
+_LATER_MEMORY_FIELDS = ("runtime_framework_version",)
+
+
+def as_saved_resources(saved: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
+    """A fresh import of saved evidence, without each later field that the saved resources lack in its place.
+
+    A session imported before these fields existed saved its cache groups and its runtime memory without them, and it
+    still matches a fresh import of the same evidence. Each field of each group, and each later field of the runtime
+    memory, counts on its own: a saved record that states a field must state the fresh value, and a saved record that
+    states a field that the fresh import leaves out does not match.
+    """
+    result = deepcopy(fresh)
+    saved_memory, memory = saved.get("runtime_memory"), result.get("runtime_memory")
+    if isinstance(saved_memory, dict) and isinstance(memory, dict):
+        for name in _LATER_MEMORY_FIELDS:
+            if name not in saved_memory:
+                memory.pop(name, None)
+    saved_groups, groups = saved.get("cache_groups"), result.get("cache_groups")
+    if isinstance(saved_groups, list) and isinstance(groups, list) and len(saved_groups) == len(groups):
+        for old, new in zip(saved_groups, groups, strict=True):
+            if isinstance(old, dict) and isinstance(new, dict):
+                for name in _LATER_GROUP_FIELDS:
+                    if name not in old:
+                        new.pop(name, None)
+    return result
+
+
+def prefix_caching_evidence(resources: dict[str, Any]) -> dict[str, Any]:
+    """Remove the prefix-caching settings from a runtime memory record and return them.
+
+    The record holds the settings of one phase: the first collection phase of the role that its validation covers.
+    Records of vLLM 0.27.0 and 0.28.0 hold none, so they give an empty result.
+    """
+    runtime = resources["runtime_memory"]
+    return {
+        key: runtime.pop(key)
+        for key in ("enable_prefix_caching", "mamba_cache_mode", "hash_block_size_tokens")
+        if key in runtime
+    }
+
+
 def _request_launch(request: SupportRequest, launch: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(launch)
     if request.worker_type is None:
@@ -461,7 +511,7 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
         raise ValueError("runtime probe evidence is incomplete: " + "; ".join(result["diagnostics"]))
     if _request_launch(request, launch) != launch:
         raise ValueError("runtime-affecting draft edits require a compatible fresh probe")
-    expected = _resource_values(result["resources"])
+    expected = as_saved_resources(manifest["observed_resources"], _resource_values(result["resources"]))
     if manifest["observed_resources"] != expected:
         raise ValueError("saved observed resources differ from immutable runtime evidence")
     selected = request.profile_deployment()
@@ -469,7 +519,9 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     observed_capacity = expected["runtime_memory"].pop("kv_cache_bytes")
     actual_capacity = actual["runtime_memory"].pop("kv_cache_bytes")
     # The draft holds the grouped evidence, or the same evidence in the linear layout. Only the evidence decides
-    # which layouts exist.
+    # which layouts exist. Import validated the complete role of this evidence with the same rule, so both records
+    # hold the prefix-caching settings of the same phase, and the whole records compare. The draft records no other
+    # phase: the source artifact hashes above pin the records, and so the settings, of every phase.
     linear = linear_runtime_resources(expected)
     if actual != expected and actual != linear:
         raise ValueError("runtime cache geometry or settings changed; a compatible fresh probe is required")
@@ -680,6 +732,10 @@ def verify_collection_runtime(
         if source["provenance"][field] != result["provenance"][field]:
             raise ValueError(f"formal runtime {field} differs from the accepted probe; review a fresh compatible probe")
 
+    # Both validations cover the complete role of the same launch with the same rule. Their first worker records
+    # and their resource records therefore belong to the same phase, so the raw groups and the whole records,
+    # including that phase's prefix-caching settings, compare as they are. The settings and the cache geometry of
+    # the other phases compare per phase below.
     def geometry(evidence):
         groups = next(
             item["evidence"]["cache"]["groups"]
@@ -696,6 +752,23 @@ def verify_collection_runtime(
     capacity = actual["runtime_memory"].pop("kv_cache_bytes")
     if actual != expected:
         raise ValueError("formal runtime cache layout or settings differ from the accepted probe")
+    # vLLM 0.27.0 and 0.28.0 imports record no prefix-caching evidence.
+    accepted = source["provenance"].get("prefix_caching", {})
+    formal = result["provenance"].get("prefix_caching", {})
+    for phase in accepted:
+        if phase in formal and formal[phase] != accepted[phase]:
+            raise ValueError(f"{phase}: runtime prefix-caching settings differ from the accepted probe")
+    # Import lets another phase differ from the first phase's groups only in state group block sizes, which it records
+    # in phase_geometry_differences, and in the Mamba cache mode, which follows the prefix-caching settings compared
+    # above. Equal differences therefore give every phase the cache geometry of the accepted probe. Only an import
+    # of hybrid cache evidence, which vLLM 0.33.0 probe records hold, records differences.
+    accepted_geometry = source["provenance"].get("phase_geometry_differences", [])
+    formal_geometry = result["provenance"].get("phase_geometry_differences", [])
+    for phase in request.collection_phases:
+        if [item for item in formal_geometry if item.startswith(f"{phase}: ")] != [
+            item for item in accepted_geometry if item.startswith(f"{phase}: ")
+        ]:
+            raise ValueError(f"{phase}: runtime cache group geometry differs from the accepted probe")
     bound = request.profile_deployment().resources.runtime_memory.kv_cache_bytes
     if memory_request is not None:
         if collection_checkpoint is None:
@@ -730,6 +803,10 @@ def _verify_memory_revision(original: SupportRequest, revised: SupportRequest, o
         resources["runtime_memory"]["provenance"] = selected.resources.runtime_memory.provenance
         resources["provenance"] = selected.resources.provenance
         payload["fpm_profile"]["provenance"] = original.fpm_profile.provenance
+        # An original imported before the later group fields existed matches a revision that states them.
+        payload["fpm_profile"]["deployments"][position]["resources"] = as_saved_resources(
+            selected.resources.model_dump(mode="json"), resources
+        )
     except (KeyError, TypeError, IndexError) as exc:
         raise ValueError("memory revision requires the original runtime profile and deployment") from exc
     if payload != original.model_dump(mode="json"):

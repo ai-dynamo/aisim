@@ -11,11 +11,12 @@ queries, Replay feature support, and measured accuracy are separate results.
 
 | Path | Required evidence | Coverage boundary |
 | --- | --- | --- |
-| `op_level` + `SILICON` | Registered graph and required collected operation data | A model can construct while a later shape lacks data. Analytical-only operations retain their own source labels. |
+| `op_level` + `SILICON` | Registered graph and required collected operation data | A model can construct while a later shape lacks data. Analytical-only operations retain their own source labels. Linear-attention operations (Mamba2, GDN, KDA) require a table with rows for each kernel the model runs; a missing table or kernel is a construction miss, and only the other modes keep their analytic estimate; a kernel whose rows do not cover the model's per-shard shape prices at the analytic estimate labeled `sol`, as in the other modes. |
 | `op_level` + `HYBRID` / `EMPIRICAL` | Applicable analytical operations and permitted calibration/transfer slices | A transfer is an estimate, not a newly measured cell. Missing calibration remains an error. |
 | `op_level` + `SOL` | Analytical operation and system specifications | Lower-bound modeling does not certify a serving runtime or kernel accuracy. |
 | `fpm_interpolation`, `method: direct` | Verified architecture metadata, resource profile, genuine phase measurements | Exact identity and measured brackets; no out-of-domain extrapolation or analytical graph. |
 | `fpm_interpolation`, `method: sol` | Registered analytical model and matching forward table/sidecar | Only the implemented SOL transfer domain; not every analytical operation is supported by the FPM SOL evaluator. |
+| FPM Replay and legacy aggregate power | Supported non-speculative schema-v8 measurements and at least 90% active-time coverage | Mixed-step watts are **unqualified** pending measured validation. A mixed decode marginal requires measured power for the target and the selected KV-floor baseline. |
 | `fpm_regression` | Valid observed iterations for the selected workload store | Cold or unusable stores return no nonempty prediction. One ready store does not train another. |
 | `fpm_learned` | Explicit selection with `fallback_policy: deny` and exactly one inference artifact or checkpoint; online adaptation requires a training/runtime checkpoint, and the causal selector requires a training seed | Standalone canonical API with complete per-iteration `ForwardPassMetrics`; absent learned stores return `None`. Replay, engine CLI prediction/recommendation, and Sweeper timing price each pass with one iteration query and require the role's forest stores; latency-only. |
 
@@ -66,12 +67,41 @@ quantization recipe. Its routed experts are NVFP4. Its Gated DeltaNet (GDN)
 projections and its shared-expert projections are static per-tensor FP8, and
 its KV cache is FP8. AISim prices those projections as `fp8_static`, the
 routed experts as `nvfp4`, and the router, shared-expert gate and LM-head
-GEMMs in BF16, as the export stores them. Two lanes are approximations. The
-export keeps the GDN `in_proj_a` and `in_proj_b` projections in BF16, but
-AISim prices them with the other GDN projections as `fp8_static`. The
-export also keeps its multi-token prediction (MTP) layer in BF16. With
-`nextn` above zero, AISim scales the decode graph by `(nextn + L) / L`
-for `L` decoder layers, so it prices that layer with the decoder-layer lanes.
+GEMMs in BF16, as the export stores them. The export keeps the GDN
+`in_proj_a` and `in_proj_b` projections in BF16, and AISim prices their
+fused `in_proj_ba` GEMM in BF16 too. The bundled Qwen3.6 NVFP4 exports leave
+the same two projections out of their quantized layers, and a targets-only
+MIXED_PRECISION export (one whose header declares no base precision lane)
+leaves an unlisted module unquantized, so AISim prices that GEMM in BF16
+for them as well. An export that keeps a base lane, such as `quant_method: fp8`
+with a block size, quantizes its unlisted non-expert GEMMs through that lane
+instead. The remaining approximation is the MTP layer. The export
+keeps its multi-token prediction (MTP) layer in BF16. With `nextn` above zero,
+AISim scales the decode graph by `(nextn + L) / L` for `L` decoder
+layers, so it prices that layer with the decoder-layer lanes.
+
+## Modeled power
+
+Power support is a separate result from latency support. A path can return
+latency and still publish no watts. The [modeled-power contract](power.md)
+defines coverage and the 0.9 publication gate.
+
+| Path | Power support |
+| --- | --- |
+| `op_level` with operation tables that carry power | Operation energy in every consumer, including Replay. Replay, unified prediction and recommendation, and the legacy CLI publish watts only at 0.9 coverage; the SDK reports raw watts with their coverage. |
+| `fpm_interpolation`, SOL or direct method, schema-8 vLLM self-benchmark table: AIC-compatible static, aggregated and disaggregated paths without EPD | Numeric watts at coverage of at least 0.9. Checked by synthetic contract tests only; not yet qualified against measured power. |
+| Non-speculative schema-8 `fpm_interpolation` in Replay, unified `predict` and `recommend` | Numeric watts at coverage of at least 0.9, including attention DP. Mixed-step watts remain unqualified pending measured validation. |
+| `fpm_interpolation`, `estimate_forward_pass_time_ms()` iteration queries | Latency only. |
+| `fpm_interpolation` language-model workers under EPD | Withheld: the row would mix op-level encoder and FPM energy. See [withheld paths](power.md#withheld-or-unsupported). |
+| Non-speculative schema-8 `fpm_interpolation`, FPM components of an aggregate mixed step | Measured prefill energy and marginal decode energy with per-component coverage. Mixed-step watts remain unqualified pending measured validation. |
+| `fpm_interpolation` with a draft scheme, speculative Option 1 or Option 2, or a multimodal `text_only` model | Withheld or latency-only. |
+| `fpm_interpolation` over schema-6 or 7 tables, or schema-7 GLM-5.3-Flash native-median, SGLang native-FPM or native-CUDA tables | Latency-only; `power_w` is `null`. |
+| `fpm_regression`, `fpm_learned` | Latency-only. |
+
+Within a schema-8 table, decode points with short context per request, and
+decode points of hybrid, sliding-window and Mamba KV-warmup shadow layouts,
+carry no power. See [whole-forward FPM power](power.md#whole-forward-fpm-power)
+for the reasons and for the collection requirement.
 
 ## Published FPE matrix
 

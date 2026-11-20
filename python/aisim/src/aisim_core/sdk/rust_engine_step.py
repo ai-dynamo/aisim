@@ -1294,23 +1294,86 @@ def estimate_static_latency_breakdown_with_rust(
     context_source, generation_source, moe_comm_fallbacks)``.
     """
     handle = _cached_engine_handle(model, database)
-    engine_mode = mode if mode in {"static", "static_ctx", "static_gen"} else "static"
     try:
         context_ops, generation_ops = handle._run_static_per_op_with_metadata(
-            batch_size=int(runtime_config.batch_size),
-            isl=int(runtime_config.isl),
-            osl=int(runtime_config.osl),
-            prefix=int(runtime_config.prefix or 0),
-            beam_width=int(runtime_config.beam_width or 1),
-            seq_imbalance_correction_scale=_scale_or_one(runtime_config.seq_imbalance_correction_scale),
-            gen_seq_imbalance_correction_scale=_scale_or_one(runtime_config.gen_seq_imbalance_correction_scale),
-            mode=engine_mode,
-            stride=int(stride),
+            **_static_engine_kwargs(runtime_config, mode, stride)
         )
     except ValueError as exc:
         _reraise_engine_error(exc)
     _note_rust_provenance(handle)
+    return _fold_static_phases(context_ops, generation_ops, latency_correction_scale)
 
+
+def estimate_static_breakdown_with_power_coverage_with_rust(
+    model: Any,
+    database: Any,
+    runtime_config: RuntimeConfig,
+    mode: str,
+    stride: int,
+    latency_correction_scale: float,
+) -> tuple[
+    tuple[
+        dict[str, float],
+        dict[str, float],
+        dict[str, float],
+        dict[str, float],
+        dict[str, str],
+        dict[str, str],
+        tuple[MoECommFallback, ...],
+    ],
+    tuple[float, float],
+]:
+    """``estimate_static_latency_breakdown_with_rust`` plus power-covered latency.
+
+    Returns ``(breakdown, (context_covered_ms, generation_covered_ms))`` from
+    the same engine walk. The engine counts a query result as covered when its
+    own energy is positive, before results are name-folded: decode steps that
+    resolve powered and unpowered FPM rows fold into one
+    ``fpm_forward_decode`` entry whose positive energy no longer shows how
+    much of its latency had power. The covered latency carries the same
+    ``latency_correction_scale`` as the latency dicts.
+    """
+    handle = _cached_engine_handle(model, database)
+    try:
+        context_ops, generation_ops, context_covered_ms, generation_covered_ms = (
+            handle._run_static_per_op_with_coverage(**_static_engine_kwargs(runtime_config, mode, stride))
+        )
+    except ValueError as exc:
+        _reraise_engine_error(exc)
+    _note_rust_provenance(handle)
+    return (
+        _fold_static_phases(context_ops, generation_ops, latency_correction_scale),
+        (context_covered_ms * latency_correction_scale, generation_covered_ms * latency_correction_scale),
+    )
+
+
+def _static_engine_kwargs(runtime_config: RuntimeConfig, mode: str, stride: int) -> dict[str, Any]:
+    return {
+        "batch_size": int(runtime_config.batch_size),
+        "isl": int(runtime_config.isl),
+        "osl": int(runtime_config.osl),
+        "prefix": int(runtime_config.prefix or 0),
+        "beam_width": int(runtime_config.beam_width or 1),
+        "seq_imbalance_correction_scale": _scale_or_one(runtime_config.seq_imbalance_correction_scale),
+        "gen_seq_imbalance_correction_scale": _scale_or_one(runtime_config.gen_seq_imbalance_correction_scale),
+        "mode": mode if mode in {"static", "static_ctx", "static_gen"} else "static",
+        "stride": int(stride),
+    }
+
+
+def _fold_static_phases(
+    context_ops: Any,
+    generation_ops: Any,
+    latency_correction_scale: float,
+) -> tuple[
+    dict[str, float],
+    dict[str, float],
+    dict[str, float],
+    dict[str, float],
+    dict[str, str],
+    dict[str, str],
+    tuple[MoECommFallback, ...],
+]:
     context_latency, context_energy, context_source, context_fallbacks = _fold_per_op(
         context_ops, latency_correction_scale
     )
@@ -1390,14 +1453,16 @@ def estimate_mixed_step_breakdown_with_rust(
     """
     handle = _cached_engine_handle(model, database)
     try:
-        shared_ops, ctx_attn_ops, decode_attn_ops = handle._mixed_step_breakdown_per_op_with_metadata(
-            int(ctx_tokens),
-            int(gen_tokens),
-            int(isl),
-            int(osl),
-            int(prefix or 0),
-            seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
-            gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+        (shared_ops, ctx_attn_ops, decode_attn_ops), covered_latency_ms = (
+            handle._mixed_step_breakdown_per_op_with_metadata(
+                int(ctx_tokens),
+                int(gen_tokens),
+                int(isl),
+                int(osl),
+                int(prefix or 0),
+                seq_imbalance_correction_scale=_scale_or_one(seq_imbalance_correction_scale),
+                gen_seq_imbalance_correction_scale=_scale_or_one(gen_seq_imbalance_correction_scale),
+            )
         )
     except ValueError as exc:
         _reraise_engine_error(exc)
@@ -1437,6 +1502,10 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": ctx_attention_energy,
         "decode_attention": dec_attention_energy,
     }
+    if covered_latency_ms is None:
+        covered_latency_ms = sum(
+            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
+        )
     return {
         "latency_ms": sum(component_latency_ms.values()),
         "energy_wms": sum(component_energy_wms.values()),
@@ -1444,9 +1513,7 @@ def estimate_mixed_step_breakdown_with_rust(
         "component_energy_wms": component_energy_wms,
         "per_op_latency_ms": per_op_latency_ms,
         "per_op_energy_wms": per_op_energy_wms,
-        "covered_latency_ms": sum(
-            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
-        ),
+        "covered_latency_ms": covered_latency_ms,
         "per_op_source": per_op_source,
         "moe_comm_fallbacks": fallbacks,
     }

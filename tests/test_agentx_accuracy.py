@@ -125,6 +125,42 @@ def seal(files, snapshot=None):
     )
 
 
+@pytest.mark.parametrize(
+    "corruption", ["later_identity", "later_provenance", "earlier_accounting", "later_feature_parameters"]
+)
+def test_incomplete_silicon_evidence_cannot_hide_bundle_corruption(corruption):
+    from test_benchmark_features import silicon_metadata
+
+    features = silicon_metadata("incomplete-silicon")
+    features["features"][0].update(state="unknown", evidence=[])
+    first = result(id="incomplete-silicon", category="self_collected", feature_metadata=features)
+    second = result(id="later-result")
+    if corruption == "later_feature_parameters":
+        offload = next(row for row in features["features"] if row["id"] == "cache.g2")
+        offload["parameters"] = [{"name": "scope", "value": "local"}]
+        expected_error = "Resolved offload scope required"
+    elif corruption == "earlier_accounting":
+        first["request_errors"]["ttft_ms"]["count"] += 1
+        expected_error = "Request denominator does not reconcile"
+    elif corruption == "later_provenance":
+        second["simulation_features"] = simulation_record("later-result", revision="f" * 40)
+        expected_error = "Simulation features differ"
+    else:
+        expected_error = "overview and detail disagree"
+    files = bundle(first)
+    other = bundle(second)
+    summary = json.loads(files["summary.json"])
+    summary["runs"].extend(json.loads(other["summary.json"])["runs"])
+    files["summary.json"] = canonical(summary)
+    detail = json.loads(other["details/later-result.json"])
+    if corruption == "later_identity":
+        detail["lanes"] += 1
+    files["details/later-result.json"] = canonical(detail)
+    seal(files)
+    with pytest.raises(ValueError, match=expected_error):
+        validate_bundle(files)
+
+
 def test_macro_points_micro_requests_and_no_error_of_means():
     a = score([observation()], [observation(ttft_ms=200)], "successful_profile_span")
     b = score(
@@ -175,6 +211,7 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     )
     modules = {
         "aisim": api,
+        "aisim_core": SimpleNamespace(),
         "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=lambda value: value),
         # No get_latest_database_version: the reviewed pin must take precedence.
         "aisim.sdk.perf_database": SimpleNamespace(),
@@ -188,10 +225,18 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
             resources=SimpleNamespace(files=lambda package: tmp_path),
         ),
     )
+    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     missing = agentx_predict.predict(config, tmp_path)
     assert missing["reason"] == "database_unavailable"
     assert missing["prediction_backend_version"] == version
     assert not captured
+
+    def unavailable_resources(_):
+        raise ModuleNotFoundError("Older wheel has no core resources")
+
+    monkeypatch.setattr(agentx_predict.importlib.resources, "files", unavailable_resources)
+    assert agentx_predict.predict(config, tmp_path) == missing
+    monkeypatch.setattr(agentx_predict.importlib.resources, "files", lambda _: tmp_path)
     relative = (
         f"sparse_attention/sglang/{version}/dsa_generation_module_perf.parquet"
         if backend == "sglang"
@@ -206,6 +251,55 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     assert "prediction_database_version" not in captured[0]
 
 
+@pytest.mark.parametrize("missing", ["utils", "common", "lookup"])
+def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkeypatch, missing):
+    parsed = SimpleNamespace(engine=SimpleNamespace(model="test/model"), model_dump=lambda **_: {})
+    api = SimpleNamespace(
+        ReplayOutputRequirements=lambda **_: {},
+        CorePredictionConfig=SimpleNamespace(model_validate=lambda _: parsed),
+        EngineReplayRunnerFactory=lambda: SimpleNamespace(
+            capabilities=lambda: SimpleNamespace(require_compatible=lambda _: None)
+        ),
+    )
+    modules = {
+        "aisim": api,
+        "aisim_core": SimpleNamespace(),
+        "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=lambda _: {}),
+        "aisim.sdk.perf_database": SimpleNamespace(),
+        "aisim.replay.dashboard": SimpleNamespace(),
+        "aisim_core.sdk.utils": SimpleNamespace()
+        if missing == "lookup"
+        else SimpleNamespace(get_model_config_from_model_path=lambda _: {}),
+        "aisim_core.sdk.common": SimpleNamespace(),
+    }
+
+    def import_module(name):
+        if name == "aisim_core.sdk." + missing:
+            raise ModuleNotFoundError(name)
+        return modules[name]
+
+    monkeypatch.setattr(
+        agentx_predict,
+        "importlib",
+        SimpleNamespace(import_module=import_module, resources=SimpleNamespace(files=lambda _: tmp_path)),
+    )
+    monkeypatch.setattr(agentx_predict, "runtime_module", import_module)
+    monkeypatch.setattr(agentx_predict, "asdict", lambda value: value)
+    data = tmp_path / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b"synthetic op-data")
+    config = tmp_path / "config.json"
+    config.write_bytes(
+        canonical({"engine": {"backend": "vllm", "hardware": "B300"}, "prediction_database_version": "0.31.0"})
+    )
+    (tmp_path / "feature-context.json").write_text("{}")
+    assert agentx_predict.predict(config, tmp_path) == {
+        "outcome": "unsupported",
+        "reason": "replay_telemetry_unavailable",
+        "prediction_backend_version": "0.31.0",
+    }
+
+
 def test_historical_driver_digest_preserves_the_original_file_closure():
     names = (
         "agentx_contract.py",
@@ -218,6 +312,16 @@ def test_historical_driver_digest_preserves_the_original_file_closure():
         canonical({name: hashlib.sha256(name.encode()).hexdigest() for name in names})
     ).hexdigest()
     assert driver_digest(files.__getitem__) == expected
+
+
+def test_driver_digest_includes_runtime_namespace_selection():
+    root = Path(__file__).resolve().parents[1]
+
+    def changed(name):
+        content = (root / name).read_bytes()
+        return content + b"\n# changed namespace policy\n" if name == "scripts/release/package_identity.py" else content
+
+    assert driver_digest(changed) != driver_digest()
 
 
 @pytest.mark.parametrize("historical", [False, True])
@@ -519,7 +623,7 @@ def test_checksum_failure_before_replay(tmp_path):
         )
 
 
-def silicon_inputs(tmp_path, run):
+def silicon_inputs(tmp_path, run, features=None):
     from scripts.e2e_accuracy.agentx_contract import IDENTITY
 
     source = {k: run[k] for k in IDENTITY}
@@ -530,37 +634,43 @@ def silicon_inputs(tmp_path, run):
     )
     from scripts.e2e_accuracy.benchmark_features import SILICON_FEATURES
 
-    features = {
-        "schema": "aisimulate.benchmark.features.v1",
-        "benchmark_id": run["id"],
-        "taxonomy": None,
-        "features": [
-            {
-                "id": key,
-                "state": "unknown",
-                "observed": {"state": "unknown", "count": None},
-                "evidence": [],
-                "parameters": (
-                    [{"name": "scope", "value": "unknown"}]
-                    if key in {"cache.g2", "cache.g3"}
-                    else [
-                        {"name": "method", "value": "unknown"},
-                        {"name": "draft_length", "value": None},
-                    ]
-                    if key == "speculation"
-                    else []
-                ),
-            }
-            for key in sorted(SILICON_FEATURES)
-        ],
-    }
+    features = (
+        features
+        if features is not None
+        else {
+            "schema": "aisimulate.benchmark.features.v1",
+            "benchmark_id": run["id"],
+            "taxonomy": None,
+            "features": [
+                {
+                    "id": key,
+                    "state": "unknown",
+                    "observed": {"state": "unknown", "count": None},
+                    "evidence": [],
+                    "parameters": (
+                        [{"name": "scope", "value": "unknown"}]
+                        if key in {"cache.g2", "cache.g3"}
+                        else [
+                            {"name": "method", "value": "unknown"},
+                            {"name": "draft_length", "value": None},
+                        ]
+                        if key == "speculation"
+                        else []
+                    ),
+                }
+                for key in sorted(SILICON_FEATURES)
+            ],
+        }
+    )
+    category = "official" if run["category"] == "agentx" else "self-collected"
     base = (
         tmp_path
-        / f"data/e2e/agentx/official/model/B300/sglang/version/tp8/{source['configuration_id']}/active/{run['id']}"
+        / f"data/e2e/agentx/{category}/model/B300/sglang/version/tp8/{source['configuration_id']}/active/{run['id']}"
     )
     base.mkdir(parents=True)
     source["artifacts"] = {}
     for role, value in {
+        "feature_receipt": {"settings": {"synthetic": True}},
         "feature_metadata": features,
         "configuration": {
             "schema": "aisimulate.agentx.silicon-config.v1",
@@ -632,7 +742,194 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     assert validate_bundle(files)["runs"][0]["id"] == run["id"]
 
 
-def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "problem",
+    [
+        None,
+        "missing_metadata",
+        "unknown",
+        "na_without_evidence",
+        "broad_inventory",
+        "sub_block",
+        "hybrid",
+        "host",
+        "storage",
+        "scope",
+        "speculation_method",
+        "speculation_length",
+        "disabled_speculation",
+        "unretained",
+        "pointer",
+        "result_drift",
+    ],
+)
+def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_path, problem):
+    from argparse import Namespace
+
+    from test_benchmark_features import metadata, silicon_metadata
+
+    from scripts.e2e_accuracy.run_agentx_accuracy import qualify
+
+    identity = "fresh-silicon"
+    features = silicon_metadata(identity)
+    indexed = {row["id"]: row for row in features["features"]}
+    if problem == "unknown":
+        for row in features["features"]:
+            row.update(state="unknown", evidence=[])
+        indexed["speculation"]["parameters"][0]["value"] = "unknown"
+    elif problem == "na_without_evidence":
+        for row in features["features"]:
+            row.update(state="not_applicable", evidence=[])
+    elif problem == "broad_inventory":
+        features = metadata()
+        features["benchmark_id"] = identity
+    elif problem in {"sub_block", "hybrid", "host", "storage"}:
+        key = {
+            "sub_block": "cache.sub_block_prefix_reuse",
+            "hybrid": "cache.hybrid_state",
+            "host": "cache.g2",
+            "storage": "cache.g3",
+        }[problem]
+        indexed[key]["state"] = "enabled"
+        if problem in {"host", "storage"}:
+            indexed[key]["parameters"] = [{"name": "scope", "value": "local"}]
+    elif problem == "scope":
+        indexed["cache.g2"]["parameters"][0]["value"] = "unknown"
+    elif problem in {"speculation_method", "speculation_length"}:
+        indexed["speculation"].update(
+            state="enabled",
+            parameters=[
+                {"name": "method", "value": "unknown" if problem == "speculation_method" else "mtp"},
+                {"name": "draft_length", "value": None if problem == "speculation_length" else 3},
+            ],
+        )
+    elif problem == "disabled_speculation":
+        indexed["speculation"]["parameters"] = [
+            {"name": "method", "value": "mtp"},
+            {"name": "draft_length", "value": 3},
+        ]
+    elif problem in {"unretained", "pointer"}:
+        indexed["cache.g1_prefix"]["evidence"][0].update(
+            {"sha256": "f" * 64} if problem == "unretained" else {"pointer": "/missing"}
+        )
+    run = result(
+        id=identity,
+        category="self_collected",
+        feature_metadata=features,
+        simulation_features=simulation_record(identity),
+    )
+    if problem == "missing_metadata":
+        del run["feature_metadata"]
+    catalog = silicon_inputs(tmp_path, run, features)
+    if problem == "result_drift":
+        run["feature_metadata"] = json.loads(json.dumps(features))
+        run["feature_metadata"]["features"][0]["state"] = "not_applicable"
+    snapshot = json.loads(bundle()["summary.json"])["snapshot"]
+    snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
+    args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
+    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [run]}))
+    if problem is not None:
+        with pytest.raises(ValueError):
+            qualify(args)
+        # A checksum-valid publication cannot bypass the public receipt contract.
+        if problem not in {"unretained", "pointer", "result_drift"}:
+            with pytest.raises(ValueError):
+                validate_bundle(bundle(run))
+    else:
+        qualify(args)
+        files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
+        published = validate_bundle(files)["runs"][0]["feature_metadata"]
+        assert published == features
+        assert all(row["observed"] == {"state": "unknown", "count": None} for row in published["features"])
+
+
+@pytest.mark.parametrize("incomplete_first", [True, False])
+@pytest.mark.parametrize("missing_metadata", [True, False])
+def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
+    tmp_path, monkeypatch, incomplete_first, missing_metadata
+):
+    from test_benchmark_features import silicon_metadata
+
+    from scripts.pages import agentx_pages as publisher
+
+    release = "release/0.14.0"
+    incomplete = silicon_metadata("fresh-weka")
+    incomplete["features"][0].update(state="unknown", evidence=[])
+    incomplete_run = result(id="fresh-weka", category="self_collected", feature_metadata=incomplete)
+    if missing_metadata:
+        del incomplete_run["feature_metadata"]
+    archives, artifacts, jobs = {}, [], []
+    for identity, branch, files in (
+        (9, "main", bundle(incomplete_run)),
+        (10, release, bundle()),
+    ):
+        for name in files.keys() - {"qualification.json"}:
+            value = json.loads(files[name])
+            value["snapshot"].update(branch=branch, driver_sha256=driver_digest())
+            files[name] = canonical(value)
+        seal(files)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            for name, content in files.items():
+                zipped.writestr(name, content)
+        archives[identity] = archive.getvalue()
+        key = publisher.artifact_key(branch)
+        artifacts.append({"id": identity, "name": f"e2e-agentx-web-{key}", "expired": False})
+        jobs.append(
+            {
+                "name": f"Qualify AgentX accuracy ({key})",
+                "status": "completed",
+                "conclusion": "success",
+                "run_id": 123,
+                "head_sha": "a" * 40,
+            }
+        )
+    if not incomplete_first:
+        artifacts.reverse()
+    run = {
+        "id": 123,
+        "run_attempt": 1,
+        "event": "schedule",
+        "head_branch": "main",
+        "head_sha": "a" * 40,
+        "path": ".github/workflows/e2e-accuracy.yml",
+        "conclusion": "success",
+        "repository": {"full_name": "ai-dynamo/aisim"},
+        "head_repository": {"full_name": "ai-dynamo/aisim"},
+    }
+
+    def api(path, **kwargs):
+        if path.endswith("/zip"):
+            return archives[int(path.split("/")[-2])]
+        return {"workflow_runs": [run]} if "workflows/" in path else run
+
+    def git(args, **kwargs):
+        if "for-each-ref" in args:
+            return release + "\n"
+        return (Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]).read_bytes()
+
+    monkeypatch.setattr(publisher, "api", api)
+    monkeypatch.setattr(publisher, "api_items", lambda path, _: artifacts if path.endswith("/artifacts") else jobs)
+    monkeypatch.setattr(publisher, "ancestor", lambda *args: True)
+    monkeypatch.setattr(publisher.subprocess, "check_output", git)
+    output = tmp_path / "published"
+    publisher.prepare(tmp_path, output)
+    assert not (output / publisher.artifact_key("main")).exists()
+    accepted = output / publisher.artifact_key(release)
+    assert validate_bundle(
+        {path.relative_to(accepted).as_posix(): path.read_bytes() for path in accepted.rglob("*.json")}
+    )
+    assert json.loads((output / "updates.json").read_text()) == {
+        "main": {"status": "failed", "run_id": "123"},
+        release: {"status": "success", "run_id": "123"},
+    }
+
+
+@pytest.mark.parametrize("incomplete_corruption", ["driver", "run", "job"])
+@pytest.mark.parametrize("missing_metadata", [True, False])
+def test_publisher_requires_successful_trusted_job_and_exact_driver(
+    tmp_path, monkeypatch, incomplete_corruption, missing_metadata
+):
     from scripts.e2e_accuracy.agentx_contract import driver_digest
     from scripts.pages import agentx_pages as publisher
 
@@ -697,3 +994,57 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(tmp_path, mo
     job["head_sha"] = "e" * 40
     with pytest.raises(ValueError, match="Untrusted"):
         publisher.prepare(tmp_path, tmp_path / "foreign")
+
+    # Retained results from an older receipt contract cannot publish, but must
+    # not take down the rest of the documentation deployment.
+    from test_benchmark_features import silicon_metadata
+
+    job["head_sha"] = run["head_sha"]
+    job["conclusion"] = "success"
+    features = silicon_metadata("fresh-weka")
+    features["features"][0].update(state="unknown", evidence=[])
+    incomplete_run = result(id="fresh-weka", category="self_collected", feature_metadata=features)
+    if missing_metadata:
+        del incomplete_run["feature_metadata"]
+    files = bundle(incomplete_run)
+    for name in ("summary.json", "details/fresh-weka.json"):
+        value = json.loads(files[name])
+        value["snapshot"]["driver_sha256"] = driver_digest()
+        files[name] = canonical(value)
+    seal(files)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, content in files.items():
+            zipped.writestr(name, content)
+    publisher.prepare(tmp_path, tmp_path / "incomplete")
+    assert not (tmp_path / "incomplete" / key).exists()
+    assert json.loads((tmp_path / "incomplete/updates.json").read_text())["main"]["status"] == "failed"
+    # Recoverable receipt age cannot bypass exact producer verification.
+    corrupted = dict(files)
+    if incomplete_corruption == "job":
+        job["head_sha"] = "f" * 40
+        expected_error = "Untrusted AgentX qualification job"
+    else:
+        for name in ("summary.json", "details/fresh-weka.json"):
+            value = json.loads(corrupted[name])
+            value["snapshot"]["driver_sha256" if incomplete_corruption == "driver" else "run_id"] = (
+                "f" * 64 if incomplete_corruption == "driver" else "999"
+            )
+            corrupted[name] = canonical(value)
+        seal(corrupted)
+        expected_error = "driver differs" if incomplete_corruption == "driver" else "attempt mismatch"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, content in corrupted.items():
+            zipped.writestr(name, content)
+    with pytest.raises(ValueError, match=expected_error):
+        publisher.prepare(tmp_path, tmp_path / "incomplete-corrupt")
+    job["head_sha"] = run["head_sha"]
+    # Structural corruption is still an error, independently of receipt age.
+    files["summary.json"] += b" "
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, content in files.items():
+            zipped.writestr(name, content)
+    with pytest.raises(ValueError, match="checksum"):
+        publisher.prepare(tmp_path, tmp_path / "corrupt")

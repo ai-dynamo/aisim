@@ -52,7 +52,7 @@ flowchart TD
         MainGuard["Check for a new main commit"] -->|Changed| Licenses["Check Python dependency licenses"]
         Licenses --> Build["Build nightly wheels and crate"]
         Build --> NightlyStage["Protected Artifactory staging"]
-        NightlyStage --> Verify["Download and verify staged wheel<br/>Preserve artifacts and provenance"]
+        NightlyStage --> Verify["Download and verify staged wheel<br/>Preserve verified Artifactory bundle<br/>Retain Actions manifest"]
         Verify --> Smoke["Installed-wheel smoke tests"]
         Smoke --> MainFPE["FPE Support Matrix: main<br/>Discover and probe all shards"]
         Smoke --> Evidence["Generate license evidence"]
@@ -106,6 +106,7 @@ Manual dispatches and site-change triggers are listed below.
 | --- | --- | --- |
 | [Fast CI](../../.github/workflows/fast-ci.yml) | PR open/update/reopen and ready-for-review; pushes to `main`, `release/*`, and trusted `pull-request/*`; manual dispatch with `expected_sha` | Quick checks and `Fast CI Success` |
 | [Full CI](../../.github/workflows/ci.yml) | Pushes to `main`, `release/*`, and trusted `pull-request/*`; manual dispatch with `expected_sha` | Selects and aggregates compiled validation |
+| [Full CI fail-fast](../../.github/workflows/full-ci-fail-fast.yml) | Full CI enters `in_progress`, including reruns | Cancels that attempt's remaining computation after a blocking job fails |
 | [Main branch nightly CI](../../.github/workflows/nightly-ci.yml) | Daily at 08:00 UTC; manual dispatch from `main` | Builds, stages, qualifies, and hands off artifacts for publication; skips unchanged scheduled `main` and requires approval for manual sources |
 | [Validate platform wheels](../../.github/workflows/validate-platform-wheels.yml) | Called by Full CI; manual dispatch | Linux x86-64/ARM64 and macOS ARM64 package validation |
 | [Collector Data Check](../../.github/workflows/collector-check.yml) | Called by Full CI; manual dispatch | Collector-data integrity and informational sanity reports |
@@ -113,9 +114,9 @@ Manual dispatches and site-change triggers are listed below.
 | [FPE Support Matrix](../../.github/workflows/fpe-support-matrix.yml) | Called by Main branch nightly CI; manual dispatch with `expected_sha` | Broad native operation-level support qualification |
 | [Release branch nightly CI](../../.github/workflows/release-nightly-ci.yml) | Daily at 09:23 UTC; manual dispatch on `main` | Schedules FPE support-matrix refreshes for discovered `release/*` branches |
 | [FPE Support Matrix (release)](../../.github/workflows/fpe-release-qualify.yml) | Called once per release by Release branch nightly CI | Builds the release wheel, probes all shards, and uploads its qualified matrix artifact |
-| [codeowners](../../.github/workflows/codeowners.yml) | PRs and pushes to `main` | Independent ownership coverage and generated-file checks; overlaps with Fast CI |
+| [codeowners](../../.github/workflows/fast-ci.yml) | Part of every Fast CI run | Required repository-policy status, including ownership coverage and generated-file checks |
 | [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; selects relevant PR files before benchmarking; manual dispatch for a PR | Paired base/head prediction-runtime benchmark, outside Full CI |
-| [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one explicit SHA | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
+| [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one evaluated SHA, plus preview-only pinned `agentx_revision` and optional `agentx_campaign_catalog` ([constraints](#agentx-accuracy-extension)) | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
 | [GitHub Pages](../../.github/workflows/pages.yml) | FPE Support Matrix, Main branch nightly CI, Release branch nightly CI, E2E Accuracy Matrix, or FPM Accuracy Matrix completion; relevant site changes on PRs/`main`; daily at 09:17 UTC; manual dispatch | Validates qualified FPE and accuracy snapshots, tests FPE branch selection in Chromium, and builds public pages; deployment is restricted to trusted `main` |
 
 Forward performance uses the same selection pattern as Full CI: a small
@@ -135,8 +136,9 @@ packages and requires no additional runner or manual dispatch.
 Gate documentation-only changes do not select a benchmark or an additional
 controller run.
 
-Ownership checks, prediction performance, E2E accuracy, and Pages run independently
-of the Fast/Full validation gates. E2E accuracy does not gate nightly staging.
+Prediction performance, E2E accuracy, and Pages run independently
+of the Fast/Full validation gates. Ownership validation is part of Fast CI and
+also supplies the required `codeowners` status. E2E accuracy does not gate nightly staging.
 Pages consumes qualification evidence after producer completion.
 The DCO sign-off check and review services are additional PR signals, not jobs
 inside Fast CI. See [CONTRIBUTING.md](../../CONTRIBUTING.md) for DCO requirements.
@@ -175,15 +177,42 @@ Fast CI has three substantive jobs, followed by an aggregate result:
 
 | Job | Checks |
 | --- | --- |
-| Repository Policy | Copyright and packaged legal files; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
+| codeowners (repository policy) | Copyright and packaged legal files; bundled-configuration provenance; local documentation links; script dependency locks when relevant; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
 | Python Static Checks | Ruff lint and formatting on the configured AISim/test paths, Python syntax compilation, and changed-line whitespace |
 | Rust Format | `cargo fmt --all -- --check` |
 | Fast CI Success | Requires the three jobs to succeed for every PR, branch push, or manual run |
 
 Draft and non-draft PRs run the same Fast CI checks without a label requirement.
 The aggregate fails if any required job fails, is canceled, or is skipped.
-The exact Ruff paths are listed in [the workflow](../../.github/workflows/fast-ci.yml);
-this is not a claim that every migrated source file is linted.
+Ruff checks all Python packages under `python/aisim/src/`, including
+`aisim_core` and the legacy import shims, plus `python/aisim/collector/`.
+The [workflow](../../.github/workflows/fast-ci.yml) also lists the test paths
+checked by Ruff.
+
+The repository-policy job retains the required check name `codeowners`; the
+separate ownership workflow is consolidated into this job. It validates the
+exact PR head first, including rejection of shadow `.github/CODEOWNERS` and
+`docs/CODEOWNERS` files. For PR events it also validates GitHub's proposed merge
+when that commit's tree differs from the head. Identical trees reuse the head
+result. Both checks use the same ownership-test, full-tree coverage, and
+generated-file validation commands. Other policy checks run once on the head.
+Pushes and manual runs validate their exact target. The required `codeowners`
+status and its Infra/maintainer review routing remain in place.
+
+Script lock regeneration runs when the complete change touches its manifest,
+requirements locks, uv configuration, or the selection/validation machinery.
+PRs and trusted copies use the complete PR diff, not only the latest push.
+Lifecycle pushes use the entire push range. Manual runs, missing history,
+changed PR heads, and unavailable comparison metadata regenerate every lock
+conservatively. Hash-verified dependency installation and all other validation
+continue on every run. This reduces repeated resolver work; it is not a change
+to application-test coverage or a promise of a large latency reduction.
+
+The [PR #896 evidence record](../../benchmarks/evidence/ci-pr-896/README.md)
+contains the historical raw timing excerpts and their limitations. Quantified
+runner-work and elapsed-time savings remain unmeasured hypotheses: the
+unpaired runs do not establish a net improvement or exercise hosted lock
+skipping. The selector tests establish skip/regenerate behavior separately.
 
 Every standalone run publishes `Fast CI Success`. Full CI contains only a
 lightweight **Require Fast CI** job, which reads the standalone run and verifies
@@ -193,6 +222,56 @@ separate Fast run; this preserves validation in both admission contexts.
 
 
 ## Full CI
+
+### Reusing pinned README dependencies
+
+The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
+three-wheel bundle is built on a miss and reused through Artifactory on matching
+subsequent runs. The key includes both source revisions, the build recipe and
+storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
+job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
+the bundle. Cross-run reuse accepts successful Full CI producers from this
+repository's `main`, or the exact same admitted PR head; another PR cannot
+populate the cache for this PR or for `main`.
+
+Pinned RCs are test dependencies, so the Dynamo profile uses `pr-wheel-staging`
+on both main and PR refs. Main seeds its RC bundle under `preview/` in that test
+repository; PR producers use their verified `pr/<number>/` namespace. This
+enables trusted-main reuse without giving PR jobs access to official release
+storage. Source, development, release, and macOS README profiles run in a
+separate job with no environment binding or storage secrets. The reusable
+workflow receives only the named `ARTIFACTORY_TOKEN`; only the Dynamo job
+references it, using the selected environment's value. The release-artifact
+contract now binds the same ref-selected storage environment as its application
+wheel producer; other wheel handoffs keep their existing environments.
+The `pr_number` input comes from Full CI's verified target validation; a nonempty
+value selects `pr` upload scope and enables discovery of that exact admitted PR
+head alongside trusted main preview producers.
+
+The Dynamo profile runs in the existing NVIDIA-connected AMD64 pool and CI job
+image because GitHub-hosted runners cannot resolve NVIDIA Artifactory. It checks
+storage DNS before compilation. Native prerequisites are prepared before key
+generation so cold and reused jobs have the same fingerprint. The other four
+README profiles keep their original runner placement; all README commands and
+the separate platform/Python compatibility matrices remain in place.
+
+The existing wheel-storage action checks the source SHA, producer run/attempt,
+architecture, scope, sizes, and checksums. The README job additionally verifies
+the build-input record and the complete three-package wheel set. Only the
+completion manifest and provenance reports are retained in GitHub Actions; wheels stay in Artifactory.
+On a cache hit, the consumer identity is preserved as diagnostic evidence and
+then removed from the restore directory; verification requires the producer's
+checksum-verified build-input record, including when a manifest omits it.
+Every README command and result assertion still executes in a fresh environment
+on both cold and reused builds. Full CI selection, test suites, platforms,
+Python versions, and required gates are unchanged.
+
+Release-artifact contracts consume the same exact-source, per-architecture
+manylinux wheel already built for application tests. They continue to build the
+Rust crate, verify the complete two-artifact package contract, install into a
+clean environment, check dependencies and versions, and exercise both CLIs.
+Standalone release builders still build a fresh wheel by default; only callers
+supplying a verified `--prebuilt-wheel` reuse one.
 
 Full CI first verifies the target commit, checks the standalone Fast CI
 prerequisite, and calculates validation scope. Expensive jobs wait for the
@@ -232,18 +311,39 @@ marked it N/A.
 
 ### Validation components
 
+The separate **Full CI fail-fast** controller polls job results every minute and
+requests cancellation of the watched run after the first failed or timed-out
+blocking job. Validation groups retain their existing parallelism. The
+`Collector Data / Perf data sanity (informational)` job is advisory and cannot
+trigger cancellation. A canceled run is not successful Full CI evidence: the
+original failing job remains visible and the exact revision must pass
+`Full CI Success` before merging. Cancellation may leave the aggregate check
+canceled and takes time for runners to terminate work and perform cleanup.
+
+The controller uses a GitHub-hosted runner, outside the self-hosted validation
+pools. Only this separate workflow has cancellation permission. Its code is
+checked out at its immutable default-branch workflow commit; it never executes
+the watched revision's code or downloads its artifacts. It validates repository,
+workflow, branch, SHA and attempt, paginates the attempt's job list, and refreshes
+run identity immediately before requesting cancellation. It stops once
+`Full CI Success` completes, leaving protected wheel staging alone. API errors
+or its two-hour monitoring timeout leave Full CI running; they do not approve,
+skip, or cancel validation. It becomes active after its workflow is merged into
+the default branch. Changes to advisory-job names must update the controller's
+explicit exception and its workflow contract test.
+
 | Component | Coverage |
 | --- | --- |
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification reuses it |
+| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
 | Collector Data | Data-tree invariants (`check_collector_data.py` R1-R7) and the backend-facts registry; the cross-backend sanity scan is informational |
 | Prediction Regression | Collect old/new static, scheduling, and silicon-reference snapshots; fail when a previously working case stops working |
-| Release Artifact Contract | Build the wheel and crate; verify installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
+| Release Artifact Contract | Reuse the same-architecture application test wheel with `--prebuilt-wheel` and build the crate; verify package contents, installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
 
 ### Numerical and installed-package evidence
 
@@ -418,14 +518,11 @@ gh run list --repo ai-dynamo/aisim --workflow ci.yml --branch main --limit 10
 gh run view --repo ai-dynamo/aisim
 ```
 
-For a maintainer-admitted manual Full CI run, first ensure the checked-out
-branch is pushed to this repository and its current commit has the required
-review evidence. Launch standalone Fast CI, then Full CI; both verify the supplied
-commit. Full CI waits for the Fast result:
+Manual Full CI accepts only `main`, `release/<version>`, or a trusted `pull-request/<number>` branch. For a PR, use `/ok to test <sha>` to admit its reviewed current head to the trusted copy first. Ensure the selected branch is pushed and has the required review evidence, then launch standalone Fast CI followed by Full CI; both verify the supplied commit. Full CI waits for the Fast result:
 
 ```bash
-ci_branch="$(git branch --show-current)"
-ci_sha="$(git rev-parse HEAD)"
+ci_branch="main"  # Select main, release/0.14.0, or an admitted pull-request/<number> branch.
+ci_sha="$(gh api "repos/ai-dynamo/aisim/git/ref/heads/${ci_branch}" --jq .object.sha)"
 gh workflow run fast-ci.yml --repo ai-dynamo/aisim \
   --ref "${ci_branch}" -f expected_sha="${ci_sha}"
 gh workflow run ci.yml --repo ai-dynamo/aisim \
@@ -499,6 +596,12 @@ qualification are outside that target. Compare exact run SHAs and selected
 components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
+
+The application wheel-build job allows ten minutes on AMD64 and fifteen on
+ARM64. The ARM64 build budget includes cold release compilation, manylinux
+repair, provenance checks, and wheel handoff; compilation can consume most of
+ten minutes before those final steps run. Application test shards retain their
+separate fifteen-minute job budget and all per-test timeouts.
 
 The implementation reduces repeated work through wheel reuse, 24 application
 shards, pytest workers, and uv installation. Wheel verification overlaps test
@@ -585,6 +688,13 @@ rotation configuration stops delivery. See the
 
 ### AgentX accuracy extension
 
+Manual preview dispatch also accepts `agentx_revision`, a 40-character lowercase
+HF commit SHA requiring `preview: true`. `agentx_campaign_catalog` requires both
+that pinned revision and preview mode, and must match
+`catalog/e2e/agentx/qualifications/<name>.json` with a lowercase alphanumeric/hyphen
+name. It selects explicitly unscored failed/stopped silicon evidence for a
+trusted preview; it cannot publish to production Pages.
+
 The daily E2E branch matrix also evaluates the reviewed AgentX catalog. Each branch
 uses its exact wheel and the same single resolved HF revision as InfX. Two bounded
 CPU shards run one replay at a time; no new GPU measurements are collected.
@@ -620,7 +730,9 @@ independent InfX jobs retain their existing behavior. See the
 
 The repository's canonical name is `ai-dynamo/aisim`, the product name is AISim, and the project Pages URL is `https://ai-dynamo.org/aisim/`. The Python project lives under `python/aisim/`; canonical application and estimator imports are `aisim` and `aisim_core`, backed by `aisim._runtime`. The distribution and Rust crate are `aisim` and `aisim-core`, and the Rust library is `aisim_core`. New CLI examples use `aisim`. The `aisimulate` executable and Python packages remain forwarding compatibility aliases; both import paths share classes, module state, native bindings, and bundled resources. Existing plugin registrations under `aisimulate.*` are discovered alongside `aisim.*`. The `python/aisimulate` symlink preserves the former checkout path.
 
-Serialized schema identifiers and v1 field names, historical measurements and release distribution identities, immutable upstream source citations, Hugging Face dataset identifiers, and Artifactory repository names remain compatibility/provenance contracts. This source rename does not migrate those external assets. Retained accuracy snapshots may record either GitHub repository URL. Dedicated runner selectors retain the deployed `prod-aisimulate-default-amd64-v1` and `prod-aisimulate-default-arm64-v1` labels so this PR can validate before the infrastructure cutover. Coordinate any later runner-label migration with [Velonix #882](https://github.com/ai-dynamo/velonix/pull/882) and update workflow selectors only when matching pools are registered.
+Serialized schema identifiers and v1 field names, historical measurements and release distribution identities, immutable upstream source citations, Hugging Face dataset identifiers, and Artifactory repository names remain compatibility/provenance contracts. This source rename does not migrate those external assets. Retained accuracy snapshots may record either GitHub repository URL.
+
+Dedicated runner selectors use the deployed `prod-aisim-default-amd64-v1` and `prod-aisim-default-arm64-v1` labels. [Velonix #882](https://github.com/ai-dynamo/velonix/pull/882) registered the replacement pools, and [AISim #861](https://github.com/ai-dynamo/aisim/pull/861) updated the workflow consumers. The shared pool remains `dynamo-cpu-4gi-amd64`. Keep selectors and `.github/actionlint.yaml` aligned with registered pools; do not restore retired labels on active branches. The `runner-canary.yml` workflow checks exact source, architecture, writable `HOME`, and dedicated `/scratch`. Its production matrix declares `HOME: /__w/aisim/aisim` at job level so steps retain that value even when container setup supplies `/github/home`.
 
 ### Approved hash namespace change
 
@@ -648,13 +760,13 @@ After #796 merges, verify generated CODEOWNERS review routing and repository acc
 ### Prepare the cutover
 
 1. Confirm that `ai-dynamo/aisim` is available and record the repository ID, existing Pages settings, and current runner registration. Prepare the AISim rename PR and the [companion Velonix runner PR](https://github.com/ai-dynamo/velonix/pull/882) together. Keep both as drafts until the cutover is scheduled; the new repository guards and runner registration targets are intended for the new name.
-2. Review the Velonix changes to both dedicated ARC scale sets' `githubConfigUrl` and `velonix.nvidia.com/approved-repository`, the shared organization runner's repository allowlist, and the job hook's `HOME` path. Retain the deployed `prod-aisimulate-default-amd64-v1` and `prod-aisimulate-default-arm64-v1` runner labels when retargeting the dedicated scale sets. If a later change renames those labels, register matching pools and update workflow selectors in the same coordinated window. Preserve service accounts, IAM trust, node-pool identities, shared-pool names, and capacity. Re-dispatch queued old-label jobs from the updated workflow revision. No Terraform change is required for a repository target change with those identities preserved. Drain running jobs and avoid dispatching new jobs during the transition; do not depend on redirects for ARC registration or admission checks.
+2. Review the Velonix changes to both dedicated ARC scale sets' `githubConfigUrl` and `velonix.nvidia.com/approved-repository`, the shared organization runner's repository allowlist, and the job hook's `HOME` path. Coordinate scale-set replacement and workflow selectors in the same window: register matching pools before switching consumers, then validate both architectures. The completed #882/#861 cutover uses the `prod-aisim-default-amd64-v1` and `prod-aisim-default-arm64-v1` labels. Preserve service accounts, IAM trust, node-pool identities, shared-pool names, and capacity. Re-dispatch queued old-label jobs from the updated workflow revision. No Terraform change is required for a repository target change with those identities preserved. Drain running jobs and avoid dispatching new jobs during the transition; do not depend on redirects for ARC registration or admission checks.
 3. Inventory external consumers: workflows calling reusable workflows or actions through `uses: ai-dynamo/aisim/...`, Dynamo dependency/source URLs, GitHub Apps including ARC and copy-pr-bot, repository-specific webhook filters, organization rulesets, runner-group access, cloud OIDC trust subjects, PyPI trusted publishers, and GitLab/security handoffs. Update configured repository names where present. Secrets, environments, and branch rules belong to the same repository, but external name-based matches need verification. Historical release branches retain their committed workflows; audit and backport repository guards, provenance checks, URLs, and workspace fixes needed by active release automation.
 4. Arrange the old Pages path redirect with the owner of the organization site or HTTP edge. The Pages API currently reports workflow publication with no repository-specific custom domain; the `ai-dynamo.org` domain is inherited from the organization site. A custom organization domain does not preserve a renamed project path.
 
 ### Rename and validate
 
-1. In the repository's **Settings → General → Repository name**, enter `aisim` and choose **Rename**. Rename the existing repository rather than making a replacement repository. Run #796's required checks against its approved head using the deployed `prod-aisimulate-*` runner labels before merging. Coordinate the repository rename with Velonix #882 and verify Flux reconciliation and runner registration under those same labels before resuming dispatch; adapt the infrastructure PR if it still proposes new labels. Coordinate any controller-specific scale-set recreation through the runner operator if retargeting an existing set cannot complete in place; do not delete active runners during jobs.
+1. In the repository's **Settings → General → Repository name**, enter `aisim` and choose **Rename**. Rename the existing repository rather than making a replacement repository. Run the source rename's required checks against its approved head using the pools deployed at validation time. Coordinate the repository rename with Velonix #882 and verify Flux reconciliation and runner registration before switching workflow consumers to the replacement labels. Validate the updated workflows before resuming normal dispatch. Coordinate any controller-specific scale-set recreation through the runner operator if retargeting an existing set cannot complete in place; do not delete active runners during jobs.
 2. Change the GitHub repository website field to `https://ai-dynamo.org/aisim/`. Keep **Settings → Pages → Build and deployment → Source** set to **GitHub Actions**, verify the `github-pages` environment rules, and run the Pages workflow from updated `main`. Verify its deployment URL, all dashboard sections, assets, branch switching, query parameters, and links to source and workflow runs. A PR preview build alone does not prove a deployed site works.
 3. Configure an HTTP 301 or 308 redirect from `/aisimulate` and `/aisimulate/<path>` to `/aisim/` and `/aisim/<path>`, preserving the suffix and query string. Browser fragments never reach the server, so check representative anchored links as well. GitHub Pages supplies no automatic redirect for renamed project sites and cannot implement server redirects using a repository `_redirects` file. If no HTTP edge is available, the organization site can publish client-side landing and 404 redirects for the old prefix, but those are not HTTP redirects and need separate testing. Do not create a replacement `ai-dynamo/aisimulate` repository to host redirects: reusing the name breaks GitHub's repository redirects.
 4. Update local clones with `git remote set-url origin git@github.com:ai-dynamo/aisim.git`. GitHub redirects ordinary repository web and Git traffic, including existing issue/PR/commit links, but action references in workflow `uses:` entries must be updated explicitly. Do not reuse the old repository name.

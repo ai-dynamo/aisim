@@ -67,9 +67,10 @@ vLLM and SGLang replay with either aggregated workers or separate prefill/decode
 pools and HBM-only KV cache, including
 [speculative decoding](../engine/speculation.md) with explicit acceptance
 assumptions; ngram requires vLLM. vLLM also supports local or shared
-[G2 host offload](../engine/kv-cache.md#agentic-g2) on a static single aggregated worker or 1P1D,
-or local G2 on several static aggregated workers, with attention DP1 on every role and
-speculative decoding disabled. For example:
+[G2 host offload](../engine/kv-cache.md#agentic-g2) on static workers of any count and
+attention DP; speculative decoding with G2 is limited to canonical MTP, or to MTP on a
+[hybrid G2](../engine/kv-cache.md#hybrid-g2) with
+`engine.speculation.disable_eagle_block_drop`. For example:
 
 ```yaml
 traffic:
@@ -92,7 +93,8 @@ it remains resident on every worker.
 
 Weka, Agentic Mooncake, and agentic Dynamo trace inputs use this same offline
 path. Reading a Dynamo trace does not require the Dynamo integration. Agentic
-TensorRT-LLM, G3 offload, speculative decoding with G2 offload, and online P/D
+TensorRT-LLM, G3 offload, G2 offload with speculation other than those MTP
+cases, and online P/D
 are rejected;
 the built-in runner does not silently change the requested configuration.
 Dynamo-owned routing and online integration require separate downstream
@@ -157,8 +159,13 @@ recommendation use the same field.
 This is a request-boundary snapshot. Requests whose recorded start is strictly
 before the cut are history, including requests whose recorded service interval
 crosses the cut. Requests at or after the cut remain in the continuation.
-Recorded service intervals provide dependency-timer provenance. Dynamo request
-traces retain their existing first-request clock origin and preserve all source
+With `traffic.source.client: agentx` and `agentic_snapshot`, a continuing
+request whose previous or spawning turn lies before the cut also waits for its
+recorded offset from the cut. Live joins and replay barriers still gate
+dispatch; requests whose previous or spawning turn remains live follow
+dependency events. Recorded service intervals provide dependency-timer
+provenance. Dynamo request traces retain their existing first-request clock
+origin and preserve all source
 intervals separately from completion-relative execution gates; legacy graph
 serialization and digests are unchanged. The snapshot
 does not estimate partial decode progress or restore a physical engine checkpoint.
@@ -180,12 +187,12 @@ These APIs reuse the existing dependency executor and runtime feedback contract.
 Set `traffic.load.agentic_warmup_policy: live_trajectory_v1` together with
 `agentic_warmup: true` and `agentic_profile`. Finite warmup without a continuous
 profile is not supported by this policy, because shared-cursor lane recycling
-belongs to profile orchestration. The CLI currently requires offline
-`--stack engine`; it rejects unsupported execution before output-directory
-cleanup. SDK integrations need the explicit `supports_agentic_live_warmup`
-capability and the new native JSON field; passing only the warmup boolean is
-not equivalent. Existing configuration serialization and seed sampling remain
-unchanged when the policy is omitted.
+belongs to profile orchestration. The CLI requires offline execution and a
+stack that advertises `supports_agentic_live_warmup`, such as `--stack engine`,
+and rejects a stack without that capability before it removes any output
+or estimates resources. SDK integrations need that capability and the new native JSON field;
+passing only the warmup boolean is not equivalent. Existing configuration
+serialization and seed sampling remain unchanged when the policy is omitted.
 
 The policy follows the accelerated request-count warmup contract in
 [AIPerf `754356e9`](https://github.com/SemiAnalysisAI/aiperf/blob/754356e9a39acc6cc6afb242d123bb57c3fb6f75/src/aiperf/timing/strategies/agentic_replay.py):

@@ -157,3 +157,81 @@ def test_estimate_epd_warns_from_task_row_before_early_return(cli_parser, monkey
         "Estimated MoE communication latency used fallback silicon data: "
         "context/deepep_ht: requested EP32/node8; using EP8/node1 silicon data." in caplog.messages
     )
+
+
+@pytest.mark.parametrize("power_w", [None, float("nan")])
+def test_epd_worker_table_reports_withheld_power_as_unavailable(power_w):
+    row = {
+        "backend": "sglang",
+        "tokens/s/gpu": 10.0,
+        "tokens/s/user": 1.0,
+        "request_rate": 1.0,
+        "ttft": 100.0,
+        "tpot": 10.0,
+        "request_latency": 200.0,
+        "concurrency": 1,
+        "bs": 8,
+        "tp": 1,
+        "pp": 1,
+        "dp": 1,
+        "num_total_gpus": 1,
+        "(a)workers": 1,
+        "(e)workers": 1,
+        "(e)tp": 1,
+        "(e)bs": 4,
+        "power_w": power_w,
+    }
+    table = _plot_worker_setup_table(
+        "agg",
+        pd.DataFrame([row]),
+        total_gpus=2,
+        tpot_target=50.0,
+        top=1,
+        is_moe=False,
+        request_latency_target=None,
+        show_power=True,
+    )
+    assert "n/a" in table
+
+
+@pytest.mark.parametrize("encoder_workers", [0, 1], ids=["disagg", "epd"])
+@pytest.mark.parametrize("power_w", [None, float("nan"), 450.0], ids=["withheld", "nan", "powered"])
+def test_disagg_worker_table_preserves_power_absence(encoder_workers, power_w):
+    row = {
+        "backend": "sglang",
+        "tokens/s/gpu": 10.0,
+        "tokens/s/user": 1.0,
+        "request_rate": 1.0,
+        "ttft": 100.0,
+        "tpot": 10.0,
+        "request_latency": 200.0,
+        "concurrency": 1,
+        "num_total_gpus": 2 + encoder_workers,
+        "(p)workers": 1,
+        "(p)tp": 1,
+        "(p)pp": 1,
+        "(p)bs": 8,
+        "(d)workers": 1,
+        "(d)tp": 1,
+        "(d)pp": 1,
+        "(d)bs": 8,
+        "power_w": power_w,
+    }
+    if encoder_workers:
+        row.update({"(e)workers": encoder_workers, "(e)tp": 1, "(e)bs": 4})
+    table = _plot_worker_setup_table(
+        "disagg",
+        pd.DataFrame([row]),
+        total_gpus=row["num_total_gpus"],
+        tpot_target=50.0,
+        top=1,
+        is_moe=False,
+        request_latency_target=None,
+        show_power=True,
+    )
+    header, cells = [
+        [cell.strip() for cell in line.split("|")[1:-1]] for line in table.splitlines() if line.startswith("|")
+    ]
+    expected = ("n/a" if encoder_workers else "") if pd.isna(power_w) else "450.0W"
+    assert cells[header.index("power_w")] == expected
+    assert "0.0W" not in cells

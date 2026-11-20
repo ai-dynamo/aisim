@@ -1004,6 +1004,11 @@ def _parse_hf_config_json(config: dict) -> dict:
             # Optional: latent compression dim for routed experts (Nemotron-3-Super).
             # HF config uses None to mean "no compression"; map to 0 here.
             moe_latent_size=config.get("moe_latent_size") or 0,
+            # Optional: SSM state cache dtype; HF config may omit it or set it to None.
+            # Any other value passes through so that set_hybrid_config can reject it.
+            mamba_ssm_cache_dtype=(
+                "float32" if config.get("mamba_ssm_cache_dtype") is None else config["mamba_ssm_cache_dtype"]
+            ),
         )
         logger.info(
             f"NemotronH hybrid config: pattern={extra_params.hybrid_override_pattern}, "
@@ -1876,14 +1881,20 @@ def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
 
     if kv_cache_algo is None:
         kv_cache_scheme = quant_cfg.get("kv_cache_scheme")
-        if isinstance(kv_cache_scheme, dict):
+        modelopt = str(quant_cfg.get("quant_method", "")).lower().startswith("modelopt")
+        if isinstance(kv_cache_scheme, str) and modelopt:
+            # ModelOpt writes non-FP8 KV formats as a string; unknown ones fail as unsupported.
+            kv_cache_algo = _normalize_kv_cache_algo(kv_cache_scheme)
+        elif isinstance(kv_cache_scheme, dict):
             scheme_type = str(kv_cache_scheme.get("type", "")).lower()
             num_bits = kv_cache_scheme.get("num_bits")
             if "fp8" in scheme_type:
                 kv_cache_algo = "fp8"
             elif scheme_type == "float" and isinstance(num_bits, int):
-                # TODO: 4bit kv cache support
-                if num_bits <= 8:
+                # vLLM reads a 4-bit float scheme as NVFP4 only under ModelOpt.
+                if num_bits == 4 and modelopt:
+                    kv_cache_algo = "nvfp4"
+                elif num_bits <= 8:
                     kv_cache_algo = "fp8"
                 elif num_bits >= 16:
                     kv_cache_algo = "bfloat16"

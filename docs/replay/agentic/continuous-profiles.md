@@ -37,11 +37,12 @@ Sweeper workloads, and the native JSON execution boundary.
 The built-in engine supports offline vLLM and SGLang with aggregated or separate
 prefill/decode workers and HBM-only KV cache, including speculative decoding
 with explicit acceptance assumptions and a compatible timing model.
-vLLM also supports local or shared [G2 host offload](../engine/kv-cache.md#agentic-g2) on a static
-single aggregated worker or 1P1D, or local G2 on several static aggregated workers,
-with attention DP=1 on every role and speculative decoding disabled. The supported
-exception is canonical MTP on a single aggregated worker with local G2 and prefix
-caching; see the [combined scope](../engine/speculation.md#registered-schemes).
+vLLM also supports local or shared [G2 host offload](../engine/kv-cache.md#agentic-g2) on static
+workers of any count and attention DP. Speculative decoding with G2 is limited
+to canonical MTP with prefix caching (see the
+[combined scope](../engine/speculation.md#registered-schemes)), and to MTP on a
+[hybrid G2](../engine/kv-cache.md#hybrid-g2) with
+`engine.speculation.disable_eagle_block_drop`.
 Weka, Agentic Mooncake, and agentic Dynamo traces share this path. Online execution,
 other backends, and Dynamo-owned routing need their own qualified integration.
 
@@ -60,10 +61,16 @@ plus the recorded delay, never at its authored source offset, so a server that
 answers faster than the recorded API shortens the play. A turn that joins
 children waits for them and for its own recorded delay after its predecessor.
 The first request of a detected chain, which the trace anchors only with a
-replay barrier, starts when that barrier clears. Only play roots and, after a
-snapshot cut, each stream's next request whose predecessor lies before the cut
-keep a source-clock timer. Finite replay without a profile still waits for
-authored offsets.
+replay barrier, starts when that barrier clears. Only play roots keep a
+source-clock timer. After a snapshot cut, rows carrying `recorded_start_ms`
+also keep a timer relative to the cut when their previous or spawning turn
+lies before it. Legacy Agentic Mooncake dependent rows without this field
+gain no such timer: they can dispatch at the cut once dependency delays have
+elapsed. Live joins and replay barriers still gate dispatch.
+With `traffic.source.client: agentx` and `agentic_snapshot`, this snapshot timer
+rule also applies to finite replay without a profile; other AgentX requests
+follow dependency events. With `client: recorded`, finite replay still waits
+for authored offsets.
 
 Idle guards advance pending workload timers after a tree or the whole client
 workload has no outstanding requests for its configured cap. Requests queued

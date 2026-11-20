@@ -586,7 +586,7 @@
           "minimum": 0
         },
         "kvcache_quant_mode": {
-          "enum": ["bfloat16", "int8", "fp8"]
+          "enum": ["bfloat16", "int8", "fp8", "nvfp4"]
         },
         "total_kv_size_tokens": {
           "type": "integer",
@@ -1481,6 +1481,16 @@
             "number",
             "null"
           ],
+          "minimum": 0
+        },
+        "prefill_energy_wms": {
+          "description": "Native prefill energy before timing correction.",
+          "type": "number",
+          "minimum": 0
+        },
+        "decode_energy_wms": {
+          "description": "Native full or marginal decode energy before timing correction.",
+          "type": "number",
           "minimum": 0
         },
         "queries": {

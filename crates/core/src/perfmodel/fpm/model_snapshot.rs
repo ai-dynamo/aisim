@@ -395,6 +395,7 @@ fn check_identity(
             .resolve()?
         }
     };
+    let (expected, base) = (mtp_as_nextn(expected), mtp_as_nextn(base));
     if expected != base {
         return Err(identity_mismatch(&expected, &base));
     }
@@ -408,6 +409,28 @@ fn check_identity(
         )));
     }
     Ok(())
+}
+
+/// A regression fitted at `nextn` N also restores for an MTP scheme of depth
+/// N, and one fitted with the scheme for `nextn` N, so identities compare with
+/// the scheme as its depth. Replay's draft-width limit applies when replay
+/// times the role, not here.
+fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelConfig {
+    if config.estimation_mode == EstimationMode::FpmRegression
+        && let Some(depth) = config
+            .speculation
+            .as_ref()
+            .filter(|speculation| speculation.kind == "mtp")
+            // The SDK accepts integer-valued JSON floats and preserves their
+            // spelling. All u32 depths are exactly representable as f64.
+            .and_then(|speculation| speculation.params.get("depth")?.as_f64())
+            .filter(|depth| depth.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(depth))
+            .map(|depth| depth as u32)
+    {
+        config.nextn = depth;
+        config.speculation = None;
+    }
+    config
 }
 
 /// First differing JSON path, for actionable identity-mismatch errors.
@@ -1145,6 +1168,8 @@ fn restore_verified(
             model.provenance = Some(ForwardPassPerfProvenance {
                 requested_estimation_mode: config.estimation_mode,
                 selected_estimation_mode: config.estimation_mode,
+                requested_database_mode: config.database_mode,
+                selected_database_mode: None,
                 config: config.clone(),
                 selected_systems_root: None,
                 selection_failures: Vec::new(),

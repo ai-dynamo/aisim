@@ -80,6 +80,12 @@ snapshot until that release has a qualified campaign. See the
 [accuracy campaign contract](../../pages/e2e-accuracy/README.md)
 for pinned scheduler settings, measurement selection, and provenance.
 
+AgentX snapshots that lack silicon receipts required by the current contract
+are rejected and shown as failed refreshes. Pages can still deploy the other
+qualified results and documentation. Missing measured speculative acceptance
+continues to fail AgentX evaluation; no default acceptance or partial cohort
+can qualify as a complete campaign.
+
 ### Weekly accuracy Slack report
 
 [Accuracy Slack Weekly](../../.github/workflows/accuracy-digest.yml) combines the day's
@@ -101,6 +107,12 @@ on CPU. Branch results remain in Actions artifacts for 90 days. Pages validates
 and publishes successful branch results independently; failed refreshes retain
 the prior qualified result. Accuracy is advisory, outside PR prediction campaigns
 and release staging gates. See [FPM details](../../pages/fpm-accuracy/README.md).
+
+Each configuration runs in a fresh worker process so native estimator and
+training state is released between configurations. A lost worker or an early
+dependency exit fails the campaign; partial results cannot qualify. Evaluators
+use the import namespaces and project layout shipped by each exact release wheel,
+including releases that predate the AISim package rename.
 
 Manual dispatch accepts optional `hf_revision`, a full 40-character dataset commit.
 Use it to evaluate a migrated dataset branch with compatible preview consumers
@@ -293,15 +305,60 @@ The page links to the CI run and shows both tested source and probe tooling.
 
 To reproduce a release result, check out the recorded tooling commit at the
 workspace root and the recorded release source under `release-source/`.
-Download the run's `fpe-release-wheel-<version>` artifact into the workspace (preserving
-its `fpe-release-wheel/` directory and `fpe-release-shards.json`), install the
-release's locked environment and exact wheel as in the workflow. The matrix's
-per-cell command uses `release-source/python/aisim/.venv/bin/python`
+For a local restore, set `FPE_RELEASE` to the recorded release version,
+`FPE_SOURCE_SHA` to its full release source SHA, `FPE_TOOLING_SHA` to the full
+tooling SHA, and `FPE_RUN_ID` to the producing **Release branch nightly CI** run ID
+(not a local retry or a later consumer run). Obtain `WHEEL_STORAGE_URL` and
+`WHEEL_STORAGE_REPO` from that run's `automated-release` environment
+configuration, and supply an authorized read credential as `ARTIFACTORY_TOKEN`
+through your local secret manager or environment. Authenticate `gh` with access
+to the producing run; the GitHub token and Artifactory token are separate.
+
+Run the following from the tooling checkout root. It downloads the run's
+`fpe-release-wheel-<version>-manifest` Actions artifact, which contains only
+`wheel-manifest.json`, then invokes the transfer script directly:
+
+```bash
+set -euo pipefail
+
+gh run download "${FPE_RUN_ID:?}" --repo ai-dynamo/aisim \
+  --name "fpe-release-wheel-${FPE_RELEASE:?}-manifest" --dir release-wheel-manifest
+
+GITHUB_REPOSITORY=ai-dynamo/aisim \
+GITHUB_REPOSITORY_ID="$(gh api repos/ai-dynamo/aisim --jq .id)" \
+GITHUB_SHA="${FPE_TOOLING_SHA:?}" \
+GITHUB_RUN_ID="${FPE_RUN_ID:?}" \
+STORAGE_MODE=download \
+STORAGE_SCOPE=official \
+STORAGE_PR_NUMBER='' \
+STORAGE_NAME="fpe-release-wheel-${FPE_RELEASE:?}" \
+STORAGE_PATH=. \
+STORAGE_URL="${WHEEL_STORAGE_URL:?}" \
+STORAGE_REPO="${WHEEL_STORAGE_REPO:?}" \
+STORAGE_TOKEN="${ARTIFACTORY_TOKEN:?}" \
+STORAGE_RUN_ID="${FPE_RUN_ID:?}" \
+STORAGE_SOURCE_SHA="${FPE_SOURCE_SHA:?}" \
+STORAGE_ARCHITECTURE=amd64 \
+STORAGE_MANIFEST=release-wheel-manifest/wheel-manifest.json \
+python3 .github/actions/wheel-storage/transfer.py
+```
+
+The script from the recorded tooling commit restores `fpe-release-wheel/`
+(including the wheel and its provenance), `fpe-release-shards.json`, and
+`fpe-release-probes.json` into the workspace. It binds the release source,
+tooling commit, producer run, repository, and `amd64` architecture, reads the
+producer attempt from the manifest, and verifies each object's size and SHA-256
+before replacing local files. No `GITHUB_RUN_ATTEMPT` is needed for a download.
+Install the release's locked environment and exact restored wheel as in the
+workflow. The matrix's per-cell command uses the selected release source project's
+`.venv/bin/python` (`release-source/python/aisim` or `release-source/python/aisimulate`)
 directly to run the verified release wrapper with the recorded source, tooling,
 and branch. Each invocation requires a fresh `release-probe-harness/` directory;
 remove only that generated directory between reproductions. Raw shard reports
-and the wheel are retained for seven
-days; the smaller qualified web dataset is retained for 90 days.
+remain Actions artifacts for seven days, as does the completion manifest.
+Configure Artifactory retention for the handoff payload to at least seven days;
+the wheel payload is not retained in Actions. The smaller qualified web dataset
+is retained for 90 days.
 
 The deployed `data/fpe-support-matrix/branches.json` catalog lists available
 and unavailable branches. Main retains the existing data path, and release

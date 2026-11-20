@@ -336,6 +336,48 @@ def test_engine_predict_cli_cases(config_path: Path, tmp_path: Path) -> None:
         assert "requested='auto', resolved='absolute'" in result.stderr
 
 
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_config_formats_reach_native_recommend_and_predict(tmp_path: Path, suffix: str) -> None:
+    raw = yaml.safe_load((_REPO_ROOT / _CONFIG_ROOT / "recommend/engine/03-preset-off-ttft.yaml").read_text())
+    raw["evaluation"] = {"sla": {"ttft_ms": 1e-7, "itl_ms": 1e-6}}
+    raw["optimization"]["target"] = "throughput"
+    serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+    config = tmp_path / f"input{suffix}"
+    config.write_text(serialize(raw))
+    output = tmp_path / "recommend"
+    result = _run_cli(
+        "recommend",
+        "--config",
+        str(config),
+        "--set",
+        "optimizer.max_trials=1",
+        "--output-dir",
+        str(output),
+        "--format",
+        "json",
+    )
+    assert len(json.loads(result.stdout)) == 1
+    report = json.loads((output / "recommendation.json").read_text())
+    assert len(report["candidates"]) == 1
+    generated = yaml.safe_load((output / "recommendations/0001.yaml").read_text())
+    assert generated["evaluation"]["sla"] == raw["evaluation"]["sla"]
+
+    prediction = tmp_path / f"prediction{suffix}"
+    prediction.write_text(serialize(generated))
+    result = _run_cli(
+        "predict",
+        "--config",
+        str(prediction),
+        "--set",
+        "traffic.stop.requests=2",
+        "--output-dir",
+        str(tmp_path / "predict"),
+        "--format",
+        "json",
+    )
+    assert json.loads(result.stdout)["completed_requests"] == 2
+
+
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 @pytest.mark.parametrize("trace", ["weka-two-plays.jsonl", "weka-relative.json"])
 def test_agentx_replay_cli_matches_public_python(backend: str, trace: str, tmp_path: Path) -> None:
@@ -538,12 +580,15 @@ def test_min_gpus_real_engine_ranks_and_round_trips(load_type: str, tmp_path: Pa
     result = SweepResult.from_json((output / "recommendation.json").read_text())
     counts = [candidate.used_gpus for candidate in result.selected_candidates]
     assert counts == sorted(counts)
-    assert set(counts) == {1, 2}
+    assert set(counts) <= {1, 2}
     candidate = result.selected_candidates[0]
     assert candidate.used_gpus == 1
     assert candidate.score == -1
     assert all(c.metrics["mean_e2e_latency_ms"] <= 100 for c in result.selected_candidates)
-    assert {row.used_gpus for row in result.candidates} == {1, 2}
+    # min_gpus tries the smallest shapes first and stops suggesting larger ones once
+    # 1 GPU qualifies, so 2-GPU shapes run only if suggested in the same round.
+    assert 1 in {row.used_gpus for row in result.candidates}
+    assert {row.used_gpus for row in result.candidates} <= {1, 2}
     if load_type != "concurrency":
         assert all(c.metrics["goodput_request_throughput_rps"] >= 5 for c in result.selected_candidates)
     selected_path = sorted((output / "recommendations").glob("*.yaml"))[0]

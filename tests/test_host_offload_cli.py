@@ -165,7 +165,6 @@ def test_canonical_mtp_host_config_roundtrips_and_preserves_cost_identity(
     "change,error",
     [
         ({"scheduler": {"async_scheduling": True}}, "async_scheduling=false"),
-        ({"parallelism": {"attention_data": 2}}, "attention_data=1"),
         (
             {"kv_cache": {"host_offload": {"scope": "cluster_shared", "num_host_blocks": 16}}},
             "dp_rank_local",
@@ -191,9 +190,34 @@ def test_canonical_mtp_host_config_preserves_composition_limits(change, error) -
         CorePredictionConfig.model_validate({"engine": engine})
 
 
-def test_canonical_mtp_host_config_rejects_disaggregated_workers() -> None:
-    with pytest.raises(ValidationError, match="aggregated vllm"):
-        CorePredictionConfig.model_validate({"engine": _mtp_host_engine(mode="disaggregated")})
+def test_canonical_mtp_host_config_takes_attention_dp() -> None:
+    engine = _mtp_host_engine()
+    engine["workers"]["aggregated"]["parallelism"]["attention_data"] = 2
+    runtime = _RecordingRuntime()
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    lowered = runtime.execution_spec["spec"]["engine"]
+    assert lowered["dp_size"] == 2
+    assert lowered["rank"]["aic_nextn"] == 2
+
+
+def test_canonical_mtp_host_config_takes_prefill_and_decode_workers_without_kvcr() -> None:
+    engine = _mtp_host_engine(mode="disaggregated")
+    # These workers take either pool scope; an aggregated worker only a local pool.
+    engine["workers"]["prefill"]["kv_cache"]["host_offload"]["scope"] = "cluster_shared"
+    runtime = _RecordingRuntime()
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(config))
+    lowered = runtime.execution_spec["spec"]["engine"]
+    assert lowered["prefill"]["rank"]["native_host_offload"]["scope"] == "cluster_shared"
+    assert lowered["decode"]["rank"]["native_host_offload"] == _host_offload()
+    for role in ("prefill", "decode"):
+        assert lowered[role]["rank"]["aic_nextn"] == 2
+    # KVCR needs a local pool, and MTP then rejects it on this role.
+    engine["workers"]["prefill"]["kv_cache"]["host_offload"]["scope"] = "dp_rank_local"
+    engine["workers"]["prefill"]["kv_cache"]["kvcr"] = {}
+    with pytest.raises(ValidationError, match="kvcr on workers.prefill"):
+        CorePredictionConfig.model_validate({"engine": engine})
 
 
 @pytest.mark.parametrize("canonical_mtp", [False, True])
@@ -607,7 +631,7 @@ def test_native_speculative_field_is_not_part_of_public_engine_schema() -> None:
 
 
 def _kvcr_defaults() -> dict:
-    return {"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 50.0}
+    return {"latency_to_first_byte_ms": 1.0, "bandwidth_gbps": 32.0}
 
 
 @pytest.mark.parametrize(
@@ -707,6 +731,41 @@ def test_kvcr_defaults_and_overrides() -> None:
         "latency_to_first_byte_ms": 0.0,
         "bandwidth_gbps": 0.0,
     }
+    # KVCR-owned memory is part of the descriptor only when configured.
+    cache["kvcr"] = {"local_g2": {"num_blocks": 4}}
+    assert KvCachePredictionConfig.model_validate(cache).kvcr.model_dump() == {
+        **_kvcr_defaults(),
+        "local_g2": {"num_blocks": 4, "policy": "lru", "copy_bandwidth_gbps": 6.0},
+    }
+    for local_g2 in ({"num_blocks": 0}, {"num_blocks": 4, "policy": "g3_lru"}, {"policy": "fifo"}):
+        cache["kvcr"] = {"local_g2": local_g2}
+        with pytest.raises(ValidationError, match="local_g2"):
+            KvCachePredictionConfig.model_validate(cache)
+
+
+@pytest.mark.parametrize("num_blocks", [1, (1 << 64) - 1])
+def test_kvcr_local_g2_block_count_accepts_u64_boundaries(num_blocks: int) -> None:
+    cache = {
+        "bytes_per_token": 131_072,
+        "host_offload": _host_offload(),
+        "kvcr": {"local_g2": {"num_blocks": num_blocks}},
+    }
+    config = KvCachePredictionConfig.model_validate(cache)
+    assert config.kvcr.local_g2.num_blocks == num_blocks
+    assert KvCachePredictionConfig.model_validate_json(config.model_dump_json()) == config
+
+
+@pytest.mark.parametrize("num_blocks", [0, -1, 1 << 64, True, 1.0])
+def test_kvcr_local_g2_block_count_rejects_values_outside_rust_contract(num_blocks: object) -> None:
+    engine = _prediction_engine()
+    engine["workers"]["aggregated"]["kv_cache"].update(
+        bytes_per_token=131_072,
+        host_offload=_host_offload(),
+        kvcr={"local_g2": {"num_blocks": num_blocks}},
+    )
+    with pytest.raises(ValidationError) as error:
+        CorePredictionConfig.model_validate({"engine": engine})
+    assert any(issue["loc"][-3:] == ("kvcr", "local_g2", "num_blocks") for issue in error.value.errors())
 
 
 def test_kvcr_defaults_match_the_rust_runtime() -> None:
@@ -864,9 +923,9 @@ def test_authored_kv_hints_pull_through_the_python_runtime() -> None:
     # Four blocks of 4 tokens at 250,000 bytes per token.
     assert (kvcr["blocks"], kvcr["bytes"]) == (4, 4_000_000)
     # Default timing: the pull starts at b's arrival (rank 0 is idle), waits 1 ms
-    # for its first byte, then moves 4 MB at 50 GB/s.
+    # for its first byte, then moves 4 MB at 32 GB/s.
     assert kvcr["source_wait_ms"] == 0.0
-    assert kvcr["remote_deliver_ms"] == 1.08
+    assert kvcr["remote_deliver_ms"] == 1.125
     assert kvcr["loaded_blocks"] == 4
     assert "bypassed" not in kvcr
     # b reuses all four blocks from its own G2, where the pull put them.

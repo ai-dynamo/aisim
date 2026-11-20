@@ -19,8 +19,8 @@ use aisim_core::engine::{
 use aisim_core::replay::{
     AggregatedRoundRobinPlacement, EncoderSpec, NoEngineEvents, NoReplayMetadata,
     PoolRoundRobinPlacement, ProviderSpec, ReplayAdapters, ReplayCaptureOptions, ReplayComposition,
-    ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory, ReplayReport, ReplayRequest,
-    ReplayRequestPool, ReplayRoleConfig, ReplayScalingDecision, ReplayScalingPolicy,
+    ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory, ReplayError, ReplayReport,
+    ReplayRequest, ReplayRequestPool, ReplayRoleConfig, ReplayScalingDecision, ReplayScalingPolicy,
     ReplayScalingSnapshot, ReplaySpec, ReplayTerminalStatus, ReplayTopology, Replayer,
     WorkerPoolSpec, WorkerTopology, run_engine_replay, run_engine_replay_with_optional_role_timing,
     run_engine_replay_with_timing,
@@ -465,36 +465,65 @@ fn aggregated_replay_rejects_prefill_dp_rank() {
     assert!(error.to_string().contains("cannot specify prefill_dp_rank"));
 }
 
-#[test]
-fn disaggregated_replay_validates_authored_rank_per_role() {
-    for (prefill_dp_rank, decode_dp_rank, expected) in [
-        (Some(2), Some(0), "prefill placement"),
-        (Some(0), Some(4), "decode placement"),
-    ] {
-        let mut replay = disaggregated_spec(
-            Backend::Vllm,
-            TimingModelConfig::Fixed {
-                prefill_ms: 1.0,
-                decode_ms: 1.0,
-            },
-            TimingModelConfig::Fixed {
-                prefill_ms: 1.0,
-                decode_ms: 1.0,
-            },
-        );
-        let mut config: ReplayEngineConfig = serde_json::from_value(replay.engine.clone()).unwrap();
-        config.prefill.as_mut().unwrap().dp_size = 2;
-        config.decode.as_mut().unwrap().dp_size = 4;
-        replay.engine = serde_json::to_value(config).unwrap();
-        replay.requests = vec![ReplayRequest {
-            dp_rank: decode_dp_rank,
-            prefill_dp_rank,
-            ..request("out-of-range", 0.0, 4, 2)
-        }];
+fn disaggregated_out_of_range_rank_error(
+    dp_rank: Option<u32>,
+    prefill_dp_rank: Option<u32>,
+) -> ReplayError {
+    let mut replay = disaggregated_spec(
+        Backend::Vllm,
+        TimingModelConfig::Fixed {
+            prefill_ms: 1.0,
+            decode_ms: 1.0,
+        },
+        TimingModelConfig::Fixed {
+            prefill_ms: 1.0,
+            decode_ms: 1.0,
+        },
+    );
+    let mut config: ReplayEngineConfig = serde_json::from_value(replay.engine.clone()).unwrap();
+    config.prefill.as_mut().unwrap().dp_size = 2;
+    config.decode.as_mut().unwrap().dp_size = 4;
+    replay.engine = serde_json::to_value(config).unwrap();
+    replay.requests = vec![ReplayRequest {
+        dp_rank,
+        prefill_dp_rank,
+        ..request("out-of-range", 0.0, 4, 2)
+    }];
 
-        let error = run_engine_replay(replay).unwrap_err();
-        assert!(error.to_string().contains(expected), "{error:#}");
-    }
+    run_engine_replay(replay).unwrap_err()
+}
+
+#[test]
+fn disaggregated_replay_rejects_out_of_range_explicit_prefill_dp_rank() {
+    assert_eq!(
+        disaggregated_out_of_range_rank_error(Some(0), Some(2)),
+        ReplayError::InvalidSpec(
+            "request \"out-of-range\" prefill placement: preferred attention-DP rank 2 is out of range for dp_size 2"
+                .to_string(),
+        )
+    );
+}
+
+#[test]
+fn disaggregated_replay_rejects_out_of_range_dp_rank_prefill_fallback() {
+    assert_eq!(
+        disaggregated_out_of_range_rank_error(Some(2), None),
+        ReplayError::InvalidSpec(
+            "request \"out-of-range\" prefill placement: preferred attention-DP rank 2 is out of range for dp_size 2"
+                .to_string(),
+        )
+    );
+}
+
+#[test]
+fn disaggregated_replay_rejects_out_of_range_decode_dp_rank_with_valid_prefill_rank() {
+    assert_eq!(
+        disaggregated_out_of_range_rank_error(Some(4), Some(1)),
+        ReplayError::InvalidSpec(
+            "request \"out-of-range\" decode placement: preferred attention-DP rank 4 is out of range for dp_size 4"
+                .to_string(),
+        )
+    );
 }
 
 #[test]
@@ -2189,6 +2218,56 @@ fn native_trtllm_disaggregated_replay_completes() {
     assert_eq!(report.request_counts.completed_requests, 1);
     assert_eq!(report.request_counts.total_input_tokens, 4);
     assert_eq!(report.request_counts.total_output_tokens, 2);
+}
+
+#[test]
+fn sglang_scheduler_selection_delays_productive_passes_without_changing_forward_metrics() {
+    let mut config = sglang_interval_config(2);
+    config.sglang.scheduler_select_time_ms = 1.5;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    for rank in 0..2 {
+        submit_interval_request(&mut engine, rank, u128::from(rank) + 1, 8, 2, now_ms);
+    }
+    // Both ranks select work in parallel. Each productive pass adds 1.5 ms
+    // once to the group clock. Deferred rounds and forward metrics keep their
+    // existing boundaries.
+    let first = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(first.duration_ms, 8.5);
+    for rank in &first.ranks {
+        assert_eq!(rank.forward_pass_metrics.duration_ms, 7.0);
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            step_interval_engine(&mut engine, &mut now_ms).duration_ms,
+            0.0
+        );
+    }
+    let last_prefill = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(last_prefill.duration_ms, 8.5);
+    let decode = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(decode.duration_ms, 3.5);
+    for rank in &decode.ranks {
+        assert_eq!(rank.forward_pass_metrics.duration_ms, 2.0);
+    }
+    assert_eq!(now_ms, 20.5);
+}
+
+#[test]
+fn sglang_scheduler_selection_is_excluded_from_idle_rank_telemetry() {
+    let mut config = sglang_interval_config(0);
+    config.sglang.scheduler_select_time_ms = 1.5;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    submit_interval_request(&mut engine, 0, 1, 4, 2, now_ms);
+
+    let prefill = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(prefill.duration_ms, 8.5);
+    assert_interval_work(&prefill, 0, 1, 0);
+    assert_interval_work(&prefill, 1, 0, 0);
+    for rank in &prefill.ranks {
+        assert_eq!(rank.forward_pass_metrics.duration_ms, 7.0);
+    }
 }
 
 #[test]

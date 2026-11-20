@@ -28,7 +28,7 @@ from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
 
 from .capacity import materialize_aic_num_gpu_blocks, reject_pipeline_parallelism, resolve_model_context_length
 from .config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control
-from .config.engine import StateCacheConfig
+from .config.engine import StateCacheConfig, _validate_hybrid_host_offload
 from .power import normalize_power_summary, power_metadata
 from .sweeper.provider import JSONValue
 from .sweeper.replay import (
@@ -134,7 +134,13 @@ class EngineReplayRuntime(Protocol):
     """Serialized execution seam used by the engine-only Runner."""
 
     def run_replay_json(self, execution_spec_json: str) -> str:
-        """Run one serialized execution spec and return serialized report JSON."""
+        """Run one serialized execution spec and return serialized report JSON.
+
+        A payload with a replay-valued ``spec`` key or any configured key (such
+        as ``capture_telemetry``) is a configured payload, and its field errors
+        are reported. Any other payload runs as a bare ``ReplaySpec``. See
+        ``docs/replay/api/python.md`` (Lifecycle and errors).
+        """
 
 
 @dataclass(frozen=True)
@@ -172,6 +178,7 @@ class EngineReplayRunnerFactory:
             supports_tokenization=True,
             supports_detokenization=True,
             supports_telemetry=True,
+            supports_scheduler_launch=True,
             supports_sglang_host_loop=True,
             supported_trace_formats=(
                 "mooncake",
@@ -883,7 +890,7 @@ def _materialize_engine_execution_spec(
         # Reject ordinary-role PP before either role estimates capacity.
         for raw, role in ((raw_prefill, "prefill"), (raw_decode, "decode")):
             if role not in deployment.afd_roles:
-                _reject_role_pipeline_parallelism(deployment.parallel_config, raw, role)
+                _reject_role_pipeline_parallelism(deployment.parallel_config, raw, role, deployment.backend)
         prefill = _materialize_deployment_role(deployment, spec, raw_prefill, "prefill", memory_diagnostics)
         decode = _materialize_deployment_role(deployment, spec, raw_decode, "decode", memory_diagnostics)
         _require_parallel_match(
@@ -931,6 +938,9 @@ def _materialize_engine_execution_spec(
     if max_sim_time_ms is not None:
         max_sim_time_ms = _nonnegative_time(max_sim_time_ms, "max_sim_time_ms")
 
+    placement_config: dict[str, JSONValue] | None = None
+    if deployment_mode == "disagg" and raw_decode.get("load_balance_method") is not None:
+        placement_config = {"load_balance_method": raw_decode["load_balance_method"]}
     execution_spec: dict[str, JSONValue] = {
         "version": 1,
         "topology": topology,
@@ -938,7 +948,7 @@ def _materialize_engine_execution_spec(
         "adapters": {
             "placement": {
                 "provider": "round_robin",
-                "config": None,
+                "config": placement_config,
             },
             "scaling": {
                 "provider": "none",
@@ -1302,14 +1312,18 @@ def materialize_engine_launch_config(
 
 
 def _reject_role_pipeline_parallelism(
-    parallel_config: Mapping[str, JSONValue], role_config: Mapping[str, JSONValue], role: str
-) -> None:
+    parallel_config: Mapping[str, JSONValue], role_config: Mapping[str, JSONValue], role: str, backend: str
+) -> tuple[int | None, int | None]:
+    """Reject unpriced pipeline widths.
+
+    Returns a deployment width the rank does not state yet, and the role's resolved width.
+    """
     # `rank: null` falls back to the flat role fields during materialization.
     rank = role_config.get("rank")
     if rank is None:
         rank = role_config
     if not isinstance(rank, Mapping):
-        return
+        return None, None
     timing = rank.get("timing_model")
     timing_config = timing.get("config") if isinstance(timing, Mapping) else None
     if not isinstance(timing_config, Mapping):
@@ -1325,7 +1339,48 @@ def _reject_role_pipeline_parallelism(
             for value in (timing_config.get("pp", 1), timing_config.get("pp_size", 1))
             if value != UNKNOWN_IDENTITY
         ),
+        backend=backend,
     )
+    # Only AIC timing reads a pipeline width; any other model would replay the
+    # stages as one.
+    if timing is not None and not (
+        isinstance(timing, Mapping) and timing.get("type") == "external" and timing.get("provider") in ("aic", "ais")
+    ):
+        widths = (
+            parallel_config.get("pp" if role == "aggregated" else f"{role}_pp", 1),
+            role_config.get("aic_pp_size", 1),
+            rank.get("aic_pp_size", 1),
+        )
+        if any(width not in (None, 1) for width in widths):
+            kind = timing.get("type") if isinstance(timing, Mapping) else timing
+            raise ValueError(f"pipeline parallelism on {role} requires an AIC timing model, not {kind!r} timing")
+        return None, None
+    # The AIC timing width must agree with the deployment's, which it inherits when unstated.
+    deployment = parallel_config.get("pp" if role == "aggregated" else f"{role}_pp")
+    if deployment is not None:
+        deployment = _positive_int(deployment, f"{role} pipeline width")
+    stated = {
+        _positive_int(value, f"{role} {name}")
+        for name, value in (
+            ("aic_pp_size", role_config.get("aic_pp_size")),
+            ("rank aic_pp_size", rank.get("aic_pp_size")),
+            ("timing pp", timing_config.get("pp")),
+            ("timing pp_size", timing_config.get("pp_size")),
+        )
+        if value is not None and value != UNKNOWN_IDENTITY
+    }
+    if len(stated | ({deployment} if deployment is not None else set())) > 1:
+        raise ValueError(
+            f"{role} pipeline widths conflict: deployment {deployment!r}, timing {sorted(stated, key=repr)!r}"
+        )
+    width = next(iter(stated), deployment)
+    # Native replay runs an unknown timing width as one stage, so it cannot price a wider role.
+    if width not in (None, 1) and any(timing_config.get(name) == UNKNOWN_IDENTITY for name in ("pp", "pp_size")):
+        raise ValueError(
+            f"pipeline parallelism on {role} requires a timing model that records its pipeline width, "
+            f"not {UNKNOWN_IDENTITY!r}"
+        )
+    return (deployment if deployment not in (None, 1) and not stated else None), width
 
 
 def _materialize_engine_role(
@@ -1343,9 +1398,14 @@ def _materialize_engine_role(
     # New generic schemes use caller-authored capacity; leave the existing
     # Ngram/NextN capacity paths unchanged.
     requested_rank = role_config.get("rank", role_config)
-    _reject_role_pipeline_parallelism(parallel_config, role_config, role)
+    pipeline, pipeline_width = _reject_role_pipeline_parallelism(parallel_config, role_config, role, deployment_backend)
+    # A nested rank carries the inherited width itself; the flat form and `rank: null` keep it on the role.
+    if pipeline is not None and not isinstance(role_config.get("rank"), Mapping):
+        role_config["aic_pp_size"] = pipeline
     if isinstance(requested_rank, Mapping):
         requested_rank = dict(requested_rank)
+        if pipeline is not None:
+            requested_rank["aic_pp_size"] = pipeline
         if "rank" in role_config:
             role_config["rank"] = requested_rank
         else:
@@ -1394,6 +1454,7 @@ def _materialize_engine_role(
         }
         memory_diagnostics[role] = role_memory
     capacity_materialized = False
+    state_cache_from_profile = False
     num_gpu_blocks_is_explicit = False
     # A nested canonical timing config carries the CP knobs too; check them
     # against parallel_config BEFORE capacity materialization resolves them
@@ -1442,10 +1503,18 @@ def _materialize_engine_role(
         if state_cache is not None:
             role_config["state_cache"] = state_cache.model_dump(mode="json", exclude_none=True)
         else:
+            # A width only the timing model states still sizes the capacity estimate. It stays a
+            # capacity input, so the timing config does not gain a second width.
+            timing_only_width = pipeline_width not in (None, 1) and role_config.get("aic_pp_size") is None
+            if timing_only_width:
+                role_config["aic_pp_size"] = pipeline_width
             role_config = materialize_aic_num_gpu_blocks(
                 role_config,
                 **({"memory_diagnostics": role_memory} if role_memory is not None else {}),
             )
+            if timing_only_width:
+                role_config.pop("aic_pp_size", None)
+            state_cache_from_profile = role_config.get("state_cache") is not None
             if role_memory is not None and "total_gpu_capacity_bytes" in role_memory:
                 role_memory["status"] = "available"
                 if "num_gpu_blocks" in role_memory:
@@ -1462,6 +1531,12 @@ def _materialize_engine_role(
             )
     role_config.pop("worker_type", None)
     role_config.pop("startup_time", None)
+    load_balance_method = role_config.pop("load_balance_method", None)
+    nested = role_config.get("rank")
+    if isinstance(nested, Mapping) and "load_balance_method" in nested:
+        raise ValueError(f"{role} load_balance_method is a flat engine argument, not a rank field")
+    if load_balance_method not in (None, "round_robin") and role != "decode":
+        raise ValueError(f"{role} load_balance_method={load_balance_method!r} applies only to the decode role")
     model = role_config.pop("aic_model_path", None)
     system = role_config.pop("aic_system", None)
     # Capacity-only input. It has already been consumed by the Python AIC
@@ -1525,7 +1600,7 @@ def _materialize_engine_role(
         # role mappings may use the same shorthand.
         rank = role_config
 
-    state_cache = _manual_state_cache(rank, deployment_backend, role)
+    state_cache = None if state_cache_from_profile else _manual_state_cache(rank, deployment_backend, role)
     if state_cache is not None:
         # A state pool is explicit unless the compiler derived it from an FPM profile's recorded runtime memory.
         num_gpu_blocks_is_explicit = rank.pop("num_gpu_blocks_is_explicit", True)
@@ -1713,6 +1788,8 @@ def _materialize_engine_role(
             rank["aic_nextn_accept_rates"] = ",".join(str(rate) for rate in speculation.acceptance_rates)
         else:
             rank["aic_nextn_accepted"] = speculation.expected_accepted_tokens
+            if speculation.disable_eagle_block_drop:
+                rank["disable_eagle_block_drop"] = True
         rank["aic_mtp_seed"] = speculation.seed
 
     kind = speculation.kind if speculation is not None else canonical_kind
@@ -1722,31 +1799,40 @@ def _materialize_engine_role(
         and any(rank.get(key) is not None for key in ("aic_nextn", "nextn"))
     ):
         raise ValueError("native_host_offload with speculative decoding requires canonical mtp speculation")
+    state_cache = rank.get("state_cache")
+    recurrent = isinstance(state_cache, Mapping) and state_cache.get("sliding_window") is None
     if kind not in (None, "none"):
         supported = {"vllm"} if kind == "ngram" else {"vllm", "sglang"}
         if backend not in supported:
             raise ValueError(f"{kind} speculation requires a supported backend")
         host_offload = rank.get("native_host_offload")
-        if host_offload is not None and not (
+        if host_offload is not None and recurrent:
+            # Replay does not model the EAGLE block drop hiding the last block,
+            # and the recurrent state, that a host load restored. A sliding
+            # window resumes one block lower instead.
+            if kind != "mtp" or rank.get("disable_eagle_block_drop") is not True:
+                raise ValueError(
+                    f"{kind} speculation with host_offload and state_cache requires mtp and disable_eagle_block_drop"
+                )
+        elif host_offload is not None and not (
             kind == "mtp"
             and backend == "vllm"
-            and role == "aggregated"
-            and dp_size == 1
             and rank.get("enable_prefix_caching", True) is True
-            and isinstance(host_offload, Mapping)
-            and host_offload.get("scope", "dp_rank_local") == "dp_rank_local"
+            and (
+                role != "aggregated"
+                or (isinstance(host_offload, Mapping) and host_offload.get("scope", "dp_rank_local") == "dp_rank_local")
+            )
             and rank.get("g3_offload") is None
-            and rank.get("state_cache") is None
             and rank.get("prefix_match_unit") is None
             and not rank.get("kv_cache_groups")
         ):
             raise ValueError(
-                f"{kind} speculation with host_offload supports only aggregated vllm MTP, attention DP=1, "
-                "prefix caching, scope=dp_rank_local, and uniform G1/G2 without G3 or state cache"
+                f"{kind} speculation with host_offload supports only vllm MTP with prefix caching, "
+                "scope=dp_rank_local on aggregated workers, and uniform G1/G2 without G3"
             )
     if rank.get("async_scheduling") is not None and not isinstance(rank["async_scheduling"], bool):
         raise ValueError(f"engine provider {role} async_scheduling must be a boolean")
-    if kind == "mtp" and rank.get("native_host_offload") is not None:
+    if kind == "mtp" and rank.get("native_host_offload") is not None and not recurrent:
         if rank.get("async_scheduling") is True:
             raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
         rank["async_scheduling"] = False
@@ -1759,6 +1845,11 @@ def _materialize_engine_role(
             raise ValueError(
                 f"engine provider {role} async_scheduling: vLLM does not support async scheduling "
                 "with ngram speculative decoding"
+            )
+        if rank.get("launch") is not None:
+            raise ValueError(
+                f"engine provider {role} launch requires async scheduling, which vLLM turns off with ngram "
+                "speculative decoding"
             )
         rank["async_scheduling"] = False
 
@@ -1941,14 +2032,24 @@ def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) 
         rank.get("prefix_match_unit") is not None
         and rank["prefix_match_unit"] != rank.get("block_size")
         and rank.get("aic_nextn") is not None
+        and state_cache.num_speculative_states is None
     ):
         raise ValueError("sub-block prefix_match_unit does not support speculative decoding")
     if backend != "vllm" or role not in ("aggregated", "prefill", "decode"):
-        raise ValueError("state_cache requires backend=vllm and an aggregated, prefill or decode G1 worker")
-    if rank.get("native_host_offload") is not None:
-        raise ValueError("state_cache supports G1 only; native_host_offload is not supported")
+        raise ValueError("state_cache requires backend=vllm and an aggregated, prefill or decode worker")
+    host = rank.get("native_host_offload")
+    if isinstance(host, dict):
+        # Inferred geometry checks the unit against the resolved block_size.
+        block_size = rank.get("block_size") if state_cache.bytes_per_request is not None else None
+        _validate_hybrid_host_offload(
+            host.get("connector", "offloading_v0_24"),
+            rank.get("prefix_match_unit"),
+            block_size,
+            window=state_cache.sliding_window is not None,
+            kvcr=rank.get("kvcr") is not None,
+        )
     if rank.get("g3_offload") is not None:
-        raise ValueError("state_cache supports G1 only; g3_offload is not supported")
+        raise ValueError("state_cache does not support g3_offload")
     # Only prefill and decode roles transfer KV.
     transfer = ("kv_transfer_bytes_per_token", "kv_transfer_bandwidth") if role == "aggregated" else ()
     conflicts = [
@@ -1967,8 +2068,16 @@ def _manual_state_cache(rank: Mapping[str, JSONValue], backend: str, role: str) 
         value = rank.get(name)
         if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= (1 << 64) - 1:
             raise ValueError(f"state_cache requires explicit positive {name} within u64")
-    if rank["num_gpu_blocks"] < state_cache.state_blocks(rank["block_size"], rank["kv_cache_bytes_per_token"]) + 1:
-        raise ValueError("state_cache capacity must fit one token block and one request state")
+    if (
+        rank["num_gpu_blocks"]
+        < state_cache.state_blocks(rank["block_size"], rank["kv_cache_bytes_per_token"])
+        * (1 + (state_cache.num_speculative_states or 0))
+        + 1
+    ):
+        raise ValueError(
+            "state_cache capacity must fit one token block and one request state "
+            "plus its num_speculative_states scratch copies"
+        )
     return state_cache
 
 

@@ -3,6 +3,7 @@
 
 """Core Sweeper orchestration parity through the RunnerFactory/ReplaySpec boundary."""
 
+import json
 from concurrent.futures import Future
 from copy import deepcopy
 from pathlib import Path
@@ -258,6 +259,55 @@ def test_min_gpus_gates_before_optimizer_feedback_and_top_n(monkeypatch, small_r
     assert result.counts.infeasible == int(not failed)
     assert result.counts.feasible == 2
     assert result.selected_candidates[0].metrics["goodput_request_throughput_rps"] == 5
+
+
+@pytest.mark.parametrize("algorithm", ["bayesian", "random"])
+def test_min_gpus_default_sampler_finds_smallest_qualifying_shape(monkeypatch, algorithm):
+    # Regression: the Bayesian sampler ignored prefer_smallest, so a large budget
+    # and a small trial count could skip every 1-GPU shape and report 2 or more.
+    shapes = tuple(_pc(tp=1, replicas=replicas) for replicas in (8, 6, 4, 3, 2, 1))
+    branch = BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=shapes,
+        supported_backends={shape: frozenset({"trtllm"}) for shape in shapes},
+        knob_choices={
+            "backend": ["trtllm"],
+            "agg_max_num_batched_tokens": [8192],
+            "agg_max_num_seqs": [256, 512],
+        },
+    )
+    _stub(monkeypatch, branch)
+
+    class Runner(_FakeRunner):
+        def run(self, spec):
+            return ReplayReport(
+                metrics={
+                    "completed_requests": 10.0,
+                    "num_e2e_latency_samples": 10.0,
+                    "mean_e2e_latency_ms": 50.0,
+                    "goodput_request_throughput_rps": 5.0,
+                    "goodput_output_throughput_tok_s": 1000.0,
+                }
+            )
+
+    config = SmartSearchConfig(
+        search_space=_config().search_space,
+        workload={"isl": 1024, "osl": 128, "request_rate": 10, "num_request_ratio": 2},
+        sweep={
+            "max_trials": 2,
+            "parallel_evals": 1,
+            "candidates_per_round": 1,
+            "max_eval_seconds": None,
+            "algorithm": algorithm,
+        },
+        goal={"target": "min_gpus", "sla": {"e2e_ms": 100}, "min_goodput_rps": 5},
+    )
+    result = Sweeper(runner_factory=_FakeRunnerFactory(Runner()), show_progress=False).run(config, top_n=1)
+
+    assert [candidate.used_gpus for candidate in result.selected_candidates] == [1]
+    # The first qualifying 1-GPU shape prunes every larger shape; the remaining
+    # trial revisits knob settings at 1 GPU.
+    assert {candidate.used_gpus for candidate in result.candidates} == {1}
 
 
 def test_pinned_backend_version_bypasses_latest_resolution(monkeypatch):
@@ -535,6 +585,38 @@ def test_resource_aware_candidates_are_checkpointed_then_reported_in_suggestion_
         ("candidate_completed", 768.0),
         ("on_candidate", 768.0),
     ]
+
+
+def test_checkpoints_omit_runner_metadata_that_grows_with_the_trace(monkeypatch, tmp_path):
+    branch = _branch(_pc())
+    _stub(monkeypatch, branch)
+    snapshots = ["x" * 2**21]  # agentic snapshots outgrow the 1 MiB event cap on long traces
+
+    class AgenticRunner(_FakeRunner):
+        def run(self, spec):
+            return ReplayReport(metrics=super().run(spec).metrics, metadata={"agentic_snapshots": snapshots})
+
+    class ResourceFactory(_FakeRunnerFactory):
+        def admit_wave(self, specs):
+            raise AssertionError("scheduler boundary is replaced below")
+
+    def in_order(specs, *, factory, **kwargs):
+        runner = factory.create(0)
+        for index, spec in enumerate(specs):
+            yield index, search_mod._run_replay_detailed(spec, runner)
+
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setattr("aisim.supervision.runtime_budget", lambda: {"events_path": str(events)})
+    monkeypatch.setattr("aisim.resource_scheduler.evaluate_waves", in_order)
+
+    result = Sweeper(
+        runner_factory=ResourceFactory(AgenticRunner()), sampler_factory=_FakeSampler, show_progress=False
+    ).run(_config(parallel_evals=3), top_n=None)
+
+    lines = events.read_text().splitlines()
+    assert len(lines) == 3
+    assert all("runner_metadata" not in json.loads(line)["value"]["provenance"] for line in lines)
+    assert all(record.provenance.runner_metadata["agentic_snapshots"] == snapshots for record in result.candidates)
 
 
 def test_timed_out_wave_is_gated_and_pool_is_replaced(monkeypatch):

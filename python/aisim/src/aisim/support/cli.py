@@ -36,7 +36,13 @@ from .config_profile import (
     validate_overrides,
 )
 from .fpm import run_fpm
-from .plan import MEMORY_OBSERVATION_VERSIONS, audited_memory_release, create_plan, request_id
+from .plan import (
+    MEMORY_OBSERVATION_VERSIONS,
+    audited_memory_release,
+    create_plan,
+    prefix_caching_note,
+    request_id,
+)
 from .schema import (
     AGENTX_REFERENCE_CONTEXT,
     CUDAGRAPH_MODES,
@@ -642,6 +648,8 @@ def _review_config_profile(
         print("  Resource *_bytes values are bytes per rank; kv_bytes_per_token is bytes per cached token per rank.")
         if draft.resolved.get("cache_layout") == "grouped":
             print("  Grouped pages retain full history or the declared window, with separate convolution state.")
+            if any(group.get("kind") == "state" for group in draft.resolved.get("cache_groups") or ()):
+                print("  State groups hold a fixed block count per request.")
             print("  Group page_size_bytes sums every group layer per rank; verify runtime block sizes and padding.")
             print(
                 "  Config-derived pages are minimum packed tensor estimates; edit cache_groups for runtime allocation."
@@ -941,8 +949,10 @@ def _probe_guidance(draft: ProfileDraft, shortlist: str | None = None, *, starti
     # matching per-token size then gives back a linear profile.
     if draft.layout_markers:
         lines.append(
-            "Importing cache groups other than full or sliding attention (for example recurrent state) is not "
-            "supported yet. Import reports such probes as incomplete."
+            "Import maps vLLM recurrent-state and one-block-per-request cache specs to state cache groups only from "
+            "vLLM 0.33.0 probe records. On another runtime version, the probe reports these specs, such as MambaSpec, "
+            "as unsupported runtime cache specs (guide: "
+            "docs/perf-model/fpm-self-service/implementation.md#choose-or-author-the-instrumentation-bundle)."
         )
     elif not draft.declares_window:
         lines.append(
@@ -1377,6 +1387,9 @@ def _plan(args: argparse.Namespace) -> int:
     request = SupportRequest.from_yaml(args.config)
     root = Path(args.output_dir).expanduser().resolve()
     plan = create_plan(request, root, overwrite=args.overwrite)
+    note = prefix_caching_note(request)
+    if note is not None:
+        print(note, file=sys.stderr)
     _print(
         {
             "request_id": plan["request_id"],

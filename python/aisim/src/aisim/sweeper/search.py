@@ -1271,6 +1271,8 @@ class Sweeper:
         goal = config.goal
         capabilities = runner_factory.capabilities()
         capabilities.require_replay_spec_version(REPLAY_SPEC_API_VERSION)
+        # Each candidate's runner check would only mark it failed, so refuse unsupported warmup once here.
+        capabilities.require_agentic_warmup_policy(config.workload.agentic_warmup_policy)
         encoder_catalog = None
         output_requirements = self._output_requirements
         language_replays: dict[str, _ReplayEvaluation] | None = None
@@ -1646,7 +1648,11 @@ class Sweeper:
                 if resource_aware:
                     from ..supervision import checkpoint
 
-                    checkpoint("candidate_completed", record.model_dump(mode="json"))
+                    # Runner metadata grows with the trace; recommendation.json keeps it.
+                    checkpoint(
+                        "candidate_completed",
+                        record.model_dump(mode="json", exclude={"provenance": {"runner_metadata"}}),
+                    )
                 if on_candidate is not None:
                     # Detach: on_candidate must not be able to mutate the ledger
                     # entry that SweepResult is built from.

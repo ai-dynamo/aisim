@@ -64,6 +64,7 @@ areas:
       - tests/test_output_adapter_context.py
       - tests/test_power_diagnostics.py
       - tests/test_unified_cli.py
+      - tests/test_output_lock.py
       - tests/test_replay_dashboard.py
       - tests/browser/
       - tests/test_ngram_cli.py
@@ -83,6 +84,7 @@ areas:
       - tests/test_runner.py
       - tests/test_aiperf_metrics.py
       - tests/fixtures/aiperf_0.13.0_request_metrics.json
+      - tests/test_sglang_pd_replay.py
       - tests/test_traffic.py
       - tests/e2e/
   - label: mocker
@@ -107,7 +109,11 @@ areas:
       - scripts/
       - benchmarks/
       - tests/test_aic_sync.py
+      - tests/test_cloud_agent_install.py
       - tests/test_ci_workflow_contracts.py
+      - tests/test_fast_ci_policy.py
+      - tests/test_full_ci_fail_fast.py
+      - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
       - tests/test_pages_site.py
       - tests/test_release_fpe.py
@@ -146,6 +152,8 @@ shared:
     owners: [forward-pass-engine, replay, infra, maintainers]
   - glob: benchmarks/reports/perf-data/
     owners: [forward-pass-engine, infra, maintainers]
+  - glob: skills/
+    owners: [maintainers]
   - glob: .agents/skills/aisim-fpe-performance/
     owners: [forward-pass-engine, maintainers]
   - glob: .claude/skills/aisim-fpe-performance
@@ -154,6 +162,10 @@ shared:
     owners: [replay, mocker, maintainers]
   - glob: .claude/skills/aisim-replay-performance
     owners: [replay, mocker, maintainers]
+  - glob: .agents/skills/aisim-agentx-collect/
+    owners: [replay, forward-pass-engine, infra, maintainers]
+  - glob: .claude/skills/aisim-agentx-collect
+    owners: [replay, forward-pass-engine, infra, maintainers]
   - glob: .agents/skills/aisim-agentx-gap-debug/
     owners: [replay, forward-pass-engine, maintainers]
   - glob: .claude/skills/aisim-agentx-gap-debug
@@ -288,6 +300,8 @@ shared:
     owners: [replay, forward-pass-engine, maintainers]
   - glob: tests/test_unified_cli.py
     owners: [replay, sweeper, forward-pass-engine, maintainers]
+  - glob: tests/test_output_lock.py
+    owners: [replay, sweeper, forward-pass-engine, maintainers]
   - glob: tests/test_replay_dashboard.py
     owners: [replay, maintainers]
   - glob: tests/browser/
@@ -326,6 +340,8 @@ shared:
     owners: [replay, sweeper, maintainers]
   - glob: tests/fixtures/aiperf_0.13.0_request_metrics.json
     owners: [replay, sweeper, maintainers]
+  - glob: tests/test_sglang_pd_replay.py
+    owners: [replay, maintainers]
   - glob: tests/test_traffic.py
     owners: [replay, maintainers]
   - glob: tests/e2e/
@@ -357,6 +373,8 @@ shared:
   - glob: deny.toml
     owners: [infra, maintainers]
   - glob: pytest.ini
+    owners: [infra, maintainers]
+  - glob: .cursor/
     owners: [infra, maintainers]
   - glob: scripts/
     owners: [infra, maintainers]
@@ -409,7 +427,9 @@ shared:
     owners: [infra, maintainers]
   - glob: .github/codeowners/
     owners: [infra, maintainers]
-  - glob: .github/workflows/codeowners.yml
+  - glob: .github/workflows/fast-ci.yml
+    owners: [infra, maintainers]
+  - glob: .github/workflows/request-nvskills-ci.yml
     owners: [infra, maintainers]
   - glob: CODEOWNERS
     owners: [infra, maintainers]

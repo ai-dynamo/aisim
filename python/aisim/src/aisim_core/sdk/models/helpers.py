@@ -241,10 +241,11 @@ def modelopt_mixed_precision_targets(raw_config: dict) -> dict[str, str | None] 
     2. a non-empty ``quantized_layers`` map exists in either source (the two
        are merged; one module with two different algorithms is an error);
     3. the language ``quantization_config.quant_method`` is absent,
-       ``modelopt`` or ``mixed_precision``, i.e. the header declares no base
-       lane. Expert-only requants that keep a base lane (DeepSeek-V4-*-NVFP4:
-       ``quant_method: fp8`` + ``weight_block_size``) quantize their
-       non-expert GEMMs through that lane and are out of scope.
+       ``modelopt``, ``modelopt_mixed`` or ``mixed_precision``, i.e. the
+       header declares no base lane. Expert-only requants that keep a base
+       lane (DeepSeek-V4-*-NVFP4: ``quant_method: fp8`` +
+       ``weight_block_size``) quantize their non-expert GEMMs through that
+       lane and are out of scope.
 
     In scope, a module without an entry runs unquantized on vLLM and SGLang
     (see ``_MODELOPT_ATTENTION_PACKED_MODULES``). Returns ``None`` otherwise,
@@ -260,7 +261,8 @@ def modelopt_mixed_precision_targets(raw_config: dict) -> dict[str, str | None] 
     )
     if algo != "mixed_precision":
         return None
-    if _normalize_quant_algo(quant_config.get("quant_method")) not in (None, "modelopt", "mixed_precision"):
+    quant_method = _normalize_quant_algo(quant_config.get("quant_method"))
+    if quant_method not in (None, "modelopt", "modelopt_mixed", "mixed_precision"):
         return None
     targets: dict[str, str | None] = {}
     for layer_map in (hf_section.get("quantized_layers"), quant_config.get("quantized_layers")):
@@ -959,9 +961,10 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         overrides["moe_quant_mode"] = common.MoEQuantMode.w4a8_mxfp4_mxfp8
 
     # KVCache quant mode
-    # TODO: support fp4 kv cache
     if kv_cache_algo == "fp8":
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
+    elif kv_cache_algo == "nvfp4":
+        overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.nvfp4
     elif kv_cache_algo in ("bfloat16", "none"):
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.bfloat16
     elif kv_cache_algo is not None:
@@ -970,7 +973,8 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
     # DSV4 is served with an FP8 KV cache: the packed fp8_ds_mla pool on Hopper and
     # the plain FP8 pool elsewhere (TRT-LLM's recommended configuration, SGLang's
     # default). A BF16 pool boots on Blackwell too; model it with an explicit kv=bf16.
-    if architecture in {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"}:
+    # A declared nvfp4 cache is kept, so get_model refuses it instead of sizing FP8.
+    if architecture in {"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"} and kv_cache_algo != "nvfp4":
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
     # FMHA quant mode
@@ -981,7 +985,7 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
         overrides["fmha_quant_mode"] = common.FMHAQuantMode.bfloat16
     elif quant_algo is not None and (quant_algo in ("fp8", "fp8_block", "nvfp4") or kv_cache_algo in ("fp8",)):
         overrides["fmha_quant_mode"] = common.FMHAQuantMode.fp8
-        if kv_cache_algo is None or kv_cache_algo != "fp8":
+        if kv_cache_algo not in ("fp8", "nvfp4"):
             overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.fp8
 
     return overrides
