@@ -1144,7 +1144,9 @@ def test_default_indexer_spec_requires_resolved_fp8_configuration(tmp_path, monk
     _mutate(path, lambda record: record["resolved_config"]["attention_config"].update(indexer_kv_dtype=resolved))
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None
-    assert "native K3.1 attention configuration" in str(result["diagnostics"])
+    assert "runtime precision requires the selected native attention backend and FP8 indexer" in str(
+        result["diagnostics"]
+    )
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["direct", "mapped"])
