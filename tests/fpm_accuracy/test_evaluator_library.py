@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The evaluator's dataset library is used even when the wheel under test predates it (AISIM-2338)."""
+"""The evaluator's dataset library is used even when the wheel under test predates it."""
 
 from __future__ import annotations
 

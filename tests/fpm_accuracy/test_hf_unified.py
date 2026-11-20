@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FPM accuracy dataset on the unified ``data/fpm/`` layout (AISIM-2338).
+"""FPM accuracy dataset on the unified ``data/fpm/`` layout.
 
 The unified tree is produced from the legacy fixture by the library's own migration, so the legacy
 spelling inside moved files (logical keys) is exercised exactly as in the published dataset.

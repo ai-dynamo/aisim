@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Set or check the unified FPM dataset pin in every consumer (AISIM-2338).
+"""Set or check the unified FPM dataset pin in every consumer.
 
 The single source is ``scripts/fpm_accuracy/dataset_pin.json``. ``--revision SHA`` rewrites it and the
 ``repo_id``/``revision`` of every pin file that already uses ``data/fpm/`` paths: the packaged FPM profiles

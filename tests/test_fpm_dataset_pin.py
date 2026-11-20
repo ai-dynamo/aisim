@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""One pin for every FPM consumer of the unified dataset (AISIM-2338)."""
+"""One pin for every FPM consumer of the unified dataset."""
 
 from __future__ import annotations
 

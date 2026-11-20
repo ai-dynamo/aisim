@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Trust boundary of the credentialed E2E accuracy job (AISIM-2335).
+"""Trust boundary of the credentialed E2E accuracy job.
 
 The private HF read token may only reach steps that run main's code (``trusted/``) in a virtualenv that
 never receives the evaluated wheel. Preview and PR-controlled code never shares a step, interpreter or

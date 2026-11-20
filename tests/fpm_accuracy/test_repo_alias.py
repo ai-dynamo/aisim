@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The FPM accuracy consumers accept both public repository names (AISIM-2339)."""
+"""The FPM accuracy consumers accept both public repository names."""
 
 from __future__ import annotations
 

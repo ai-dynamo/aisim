@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Old and new public FPM repository names both resolve (AISIM-2339).
+"""Old and new public FPM repository names both resolve.
 
 Historical pins name ``nvidia/aisimulate-fpm-dataset`` + a commit SHA and must keep resolving there,
 byte for byte. Current pins name ``ai-dynamo/aisim-data`` and the ``data/fpm/`` paths. A symbolic
