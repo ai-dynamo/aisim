@@ -55,7 +55,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Entry, Manifest, _file, _verified_bytes, _verify
+from aisim_core.data import CategoryIndex, DatasetIndex, Entry, _file, _verify
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
