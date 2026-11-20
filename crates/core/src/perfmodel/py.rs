@@ -1714,6 +1714,7 @@ pub(crate) struct ForwardPassProfileFacts {
     pub profile: serde_json::Map<String, serde_json::Value>,
     pub registered: bool,
     pub supports_sol: bool,
+    pub supports_sol_state: bool,
     pub gemm_quant_mode: String,
     pub moe_quant_mode: String,
     pub fmha_quant_mode: String,

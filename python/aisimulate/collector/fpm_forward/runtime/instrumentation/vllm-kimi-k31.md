@@ -43,6 +43,14 @@ is also pinned at that immutable revision, with SHA-256
 `DeepseekV32IndexerBackend`, whose CUDA rule is 64 tokens. Matching the
 subclass, backend name and block size does not replace this source check.
 
+The FlashInfer sparse MLA row-addressing helper
+[`vllm/v1/attention/backends/mla/sparse_utils.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/attention/backends/mla/sparse_utils.py)
+is pinned at that immutable revision with SHA-256
+`00085f41c69ade02afc08e1321d9bad764df16dec99412ab9ad096d2f6bb1a08`.
+`flat_kv_row_view` addresses contiguous token-byte rows while retaining padding
+between manager blocks. Its installed bytes must match before import qualifies;
+the source check does not establish image execution or refresh old observations.
+
 ## Source-to-observation mapping
 
 * `v1/kv_cache_interface.py`: `KVCacheTensor.layers`, `layer_stride`,
@@ -125,8 +133,9 @@ subclass, backend name and block size does not replace this source check.
   `first_k_dense_replace`, and `moe_layer_freq`), using the pinned native dense
   prefix and frequency defaults of 0 and 1. The current PP1 restriction means
   each worker must cover that complete inventory; matching incomplete model-tree
-  lists cannot establish precision. The referenced local model config must
-  remain available for this check when observations are imported or revalidated.
+  lists cannot establish precision. Retain the phase's hash-verified frozen
+  `model-config.json` and any declared `hf_quant_config.json` sidecar for import
+  and revalidation. The original host model-config path need not remain available.
 * `gpu_worker.py`, both model runners, and the pinned Dynamo scheduler preserve
   the existing post-profile, post-cache-initialization and post-warmup hooks.
   Native exceptions propagate. Probe evidence records actual initialized state;

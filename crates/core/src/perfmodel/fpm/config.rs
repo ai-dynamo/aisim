@@ -636,7 +636,14 @@ impl ForwardPassPerfModelConfig {
                 self.comm_quant_mode = Some(facts.comm_quant_mode);
                 self.attention_backend = Some(facts.attention_backend);
                 self.fpm_resources()?;
-                (Some(facts.registered), Some(facts.supports_sol))
+                // Auto must have a roofline for the observed state precision.
+                // Preserve explicit SOL's measured-hit/query-time contract:
+                // unsupported KDA transfer still fails at the operator boundary.
+                let supports_sol = facts.supports_sol
+                    && (self.estimator_config.fpm_interpolation.method
+                        != super::FpmInterpolationMethod::Auto
+                        || facts.supports_sol_state);
+                (Some(facts.registered), Some(supports_sol))
             }
             #[cfg(not(feature = "python"))]
             return Err(invalid_config(

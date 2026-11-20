@@ -56,6 +56,7 @@ from aisimulate_core.sdk.errors import InvalidEngineConfigurationError as Invali
 from aisimulate_core.sdk.fpm_profile import (
     FpmDeploymentProfile,
     FpmModelProfile,
+    _fpm_kda_state_dtype,
     load_fpm_profile,
 )
 from aisimulate_core.sdk.models import get_model
@@ -206,27 +207,7 @@ def _bind_fpm_kda_state_dtype(spec: dict, deployment: FpmDeploymentProfile) -> N
     if not kda_ops:
         return
 
-    runtime = deployment.resources.runtime_memory
-    dtype = None
-    if runtime is not None:
-        try:
-            evidence = json.loads(runtime.provenance)
-        except (ValueError, TypeError):
-            evidence = None
-        if isinstance(evidence, dict):
-            # A completed collection wraps each phase's imported provenance;
-            # the accepted probe retains a single runtime_settings object.
-            observations = [evidence]
-            if evidence.get("source") == "bound_collection_phases":
-                phases = evidence.get("phases")
-                observations = list(phases.values()) if isinstance(phases, dict) else []
-            recorded = []
-            for observation in observations:
-                settings = observation.get("runtime_settings") if isinstance(observation, dict) else None
-                cache = settings.get("cache_config") if isinstance(settings, dict) else None
-                recorded.append(cache.get("mamba_ssm_cache_dtype") if isinstance(cache, dict) else None)
-            if recorded and isinstance(recorded[0], str) and all(value == recorded[0] for value in recorded):
-                dtype = recorded[0]
+    dtype = _fpm_kda_state_dtype(deployment)
     for op in kda_ops:
         op["recurrent_state_dtype"] = dtype
 

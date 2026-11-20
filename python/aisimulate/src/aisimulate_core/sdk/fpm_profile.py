@@ -19,6 +19,48 @@ from aisimulate_core.fpm_profile import FpmSpeculativeExecutionProfile as FpmSpe
 from aisimulate_core.fpm_profile import load_fpm_profile as load_fpm_profile
 
 
+def _fpm_kda_state_dtype(deployment: FpmDeploymentProfile) -> str | None:
+    """Read unanimous recurrent precision from probe, collection or finalized evidence.
+
+    Finalization retains each cell's provenance, including when raw artifacts
+    are replaced by hash-bound source references. Missing or conflicting cells
+    must not establish an analytical element width.
+    """
+
+    def from_provenance(provenance):
+        try:
+            evidence = json.loads(provenance)
+        except (ValueError, TypeError):
+            return None
+        return from_evidence(evidence)
+
+    def from_evidence(evidence):
+        if not isinstance(evidence, dict):
+            return None
+        if "cell_observations" in evidence:
+            cells = evidence["cell_observations"]
+            if not isinstance(cells, list):
+                return None
+            recorded = [
+                from_provenance(cell.get("runtime_memory", {}).get("provenance"))
+                if isinstance(cell, dict) and isinstance(cell.get("runtime_memory"), dict)
+                else None
+                for cell in cells
+            ]
+        elif evidence.get("source") == "bound_collection_phases":
+            phases = evidence.get("phases")
+            recorded = [from_evidence(phase) for phase in phases.values()] if isinstance(phases, dict) else []
+        else:
+            settings = evidence.get("runtime_settings")
+            cache = settings.get("cache_config") if isinstance(settings, dict) else None
+            dtype = cache.get("mamba_ssm_cache_dtype") if isinstance(cache, dict) else None
+            return dtype if isinstance(dtype, str) else None
+        return recorded[0] if recorded and recorded[0] is not None and all(d == recorded[0] for d in recorded) else None
+
+    runtime = deployment.resources.runtime_memory
+    return from_provenance(runtime.provenance) if runtime is not None else None
+
+
 def _require_forward_pass_profile_memory(config: dict) -> None:
     """Check simulation readiness after canonical identity normalization.
 
@@ -195,6 +237,9 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     # FPM SOL roofline. This applies to wrapper and decoder profiles alike.
     # Auto can use direct interpolation; explicit SOL fails during validation.
     unsupported_sol_graph = family in {"QWEN35", "NEMOTRONH"}
+    unsupported_kda_state = analytical_architecture == "KimiK31ForConditionalGeneration" and _fpm_kda_state_dtype(
+        deployment
+    ) not in {"float32", "auto"}
     return json.dumps(
         {
             "profile": profile.model_dump(mode="json"),
@@ -205,6 +250,7 @@ def _validate_forward_pass_profile(config_json: str) -> str:
             "supports_sol": family in _MODEL_REGISTRY
             and analytical_architecture not in {"KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration"}
             and not unsupported_sol_graph,
+            "supports_sol_state": not unsupported_kda_state,
             **deployment.quantization_kwargs(),
         }
     )

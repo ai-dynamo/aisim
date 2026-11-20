@@ -717,6 +717,17 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                 if (
                     not state
                     and name not in kernel_views
+                    and group["layer_classes"].get(name)
+                    == "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
+                    and group.get("cache_dtype_str") in {"fp8", "fp8_e4m3"}
+                    and strides[1:] != [shape[2], 1]
+                ):
+                    # flashinfer_mla_sparse.py -> sparse_utils.flat_kv_row_view
+                    # addresses contiguous token rows, retaining inter-block padding.
+                    raise ValueError("K3.1 direct FlashInfer MLA requires native token-byte strides")
+                if (
+                    not state
+                    and name not in kernel_views
                     and (logical != group["unpadded_page_size_bytes"] or span != logical)
                 ):
                     raise ValueError("K3.1 attention components must retain complete native contiguous payloads")

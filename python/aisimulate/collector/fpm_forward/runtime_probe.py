@@ -284,6 +284,13 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
     if k31_native:
         if launch.get("worker_type") not in {"prefill", "decode"}:
             raise ValueError("K3.1 native state probing requires an independent prefill or decode worker")
+        compute_dtype = {"bfloat16": "bfloat16", "float16": "half", "half": "half"}.get(
+            config.get("dtype") or config.get("torch_dtype")
+        )
+        if compute_dtype is None or precision["fmha_quant_mode"] != compute_dtype:
+            raise ValueError(
+                "K3.1 native probe requires FMHA precision matching the supported checkpoint compute dtype"
+            )
         if precision["moe_quant_mode"] != "w4a8_mxfp4_mxfp8_trtllm":
             raise ValueError("K3.1 native probe requires the initialized TRTLLM MXFP4/MXFP8 candidate")
         if precision["kvcache_quant_mode"] != "fp8" or precision["attention_backend"] not in {

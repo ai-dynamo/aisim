@@ -212,8 +212,11 @@ def require_kda_real_kv(plan, cell, collection):
     warmup = collection.kvwarm_meta
     if (
         warmup is None
+        or warmup.get("enabled") is not True
+        or warmup.get("warm_eligible") is not True
         or warmup.get("skip_reason")
         or any("kvwarm_real_kv" not in (item.point.get("sample_reasons") or []) for item in collection.points)
+        or any("kvwarm_fake_fallback" in (item.point.get("sample_reasons") or []) for item in collection.points)
     ):
         raise KdaSeedError("KDA decode publication requires real_kv seeding of the request's recurrent state")
 

@@ -1235,6 +1235,25 @@ def _k31_native_probe_inputs(tmp_path):
     return launch, manifest, marker
 
 
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+@pytest.mark.parametrize("fmha", ["fp8", "half", "bfloat16"])
+def test_k31_probe_rejects_fmha_without_checkpoint_compute_mapping(tmp_path, worker_type, fmha):
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = worker_type
+    launch["precision"]["fmha_quant_mode"] = fmha
+    if fmha == "bfloat16":
+        plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+        assert plan.cells[0].fmha_quant_mode == "bfloat16"
+        assert plan.cells[0].kv_cache_dtype == "fp8"
+    else:
+        with pytest.raises(ValueError, match="FMHA precision matching the supported checkpoint compute dtype"):
+            runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    assert not marker.exists()
+
+
 def test_k31_probe_binds_native_activation_candidate_and_private_decode_state(tmp_path):
     from collector.fpm_forward import runner, runtime_probe
     from collector.fpm_forward.runtime_instrumentation import load_instrumentation
@@ -1360,7 +1379,15 @@ def test_k31_explicit_points_require_zero_historical_kv_for_every_prefill(tmp_pa
 
 
 @pytest.mark.parametrize("worker_type", ["prefill", "decode"])
-@pytest.mark.parametrize("flag", ["--enable-prefix-caching", "--enable-prefix-caching=true"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--enable-prefix-caching",
+        "--enable-prefix-caching=true",
+        "--enable_prefix_caching",
+        "--enable_prefix_caching=true",
+    ],
+)
 def test_k31_native_state_policy_cannot_reenable_prefix_caching(tmp_path, worker_type, flag):
     from dataclasses import replace
 
@@ -1375,6 +1402,40 @@ def test_k31_native_state_policy_cannot_reenable_prefix_caching(tmp_path, worker
         plan.cells[0], backend_policy=BackendPolicy("test", {"params": {"agg": {"extra_cli_args": [flag]}}}, {})
     )
     with pytest.raises(ValueError, match="cannot change K3.1 observed private state, prefix caching"):
+        runner._cell_generator_overrides(plan, cell, {})
+
+
+@pytest.mark.parametrize(
+    "flag,message",
+    [
+        ("--mamba_ssm_cache_dtype=bfloat16", "cannot change K3.1"),
+        ("--mamba_cache_dtype=float32", "cannot change K3.1"),
+        ("--mamba_cache_mode=align", "cannot change K3.1"),
+        ("--speculative_config={}", "cannot change K3.1"),
+        ("--no_language_model_only", "cannot change K3.1"),
+        ("--worker_cls=OtherWorker", "observer worker class"),
+        ("--scheduler_cls=OtherScheduler", "observer scheduler class"),
+        ("--kv_cache_memory_bytes=1234", "automatic cache sizing"),
+        ("--num_gpu_blocks_override=123", "automatic cache sizing"),
+        ("--async_scheduling", "requires synchronous scheduling"),
+        ("--gpu_memory_utilization=0.5", "cannot override --fpm-gpu-memory-utilization"),
+        ("--enforce_eager", "eager execution must be supplied"),
+        ("--benchmark_points_file=other.json", "benchmark points must be supplied"),
+    ],
+)
+def test_runtime_observation_policy_guards_accept_parser_option_spellings(tmp_path, flag, message):
+    from dataclasses import replace
+
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.planner import BackendPolicy
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    cell = replace(
+        plan.cells[0], backend_policy=BackendPolicy("test", {"params": {"agg": {"extra_cli_args": [flag]}}}, {})
+    )
+    with pytest.raises(ValueError, match=message):
         runner._cell_generator_overrides(plan, cell, {})
 
 

@@ -2808,6 +2808,29 @@ def test_kda_decode_preserves_real_seed_evidence(tmp_path):
     assert rows[0]["latency_ms"] == 10.0  # Fixture's measured 0.01 seconds, unchanged.
 
 
+@pytest.mark.parametrize("damage", ["disabled", "contradictory"])
+def test_kda_decode_rejects_real_stamp_without_unambiguous_warmup(tmp_path, damage):
+    warmup = dict(_WARM_ELIGIBLE)
+    markers = ("kvwarm_real_kv",)
+    if damage == "disabled":
+        warmup["enabled"] = False
+    plan, cell, cell_dir = _synthetic_decode_cell(tmp_path, kvwarm=warmup, markers=markers, parallel_strategy="tp")
+    if damage == "contradictory":
+        artifact = cell_dir / "raw/pod-0/benchmark.json"
+        payload = json.loads(artifact.read_text())
+        # Both stamps on the same point, with no row-level seed regime.
+        for point in (payload["results"][0]["point"], payload["iteration_groups"][0]["point"]):
+            point["sample_reasons"].append("kvwarm_fake_fallback")
+        artifact.write_text(json.dumps(payload))
+    plan.capability.model_config = ResolvedModelConfig(
+        {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
+        source_kind="test",
+        source_reference="synthetic KDA geometry",
+    )
+    with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
 def test_native_validation_rejects_cross_rank_kvwarm_disagreement(tmp_path):
     """The kvwarm regime describes one shared measurement protocol; DP ranks
     reporting different warm_eligible/skip_reason facts are a contract

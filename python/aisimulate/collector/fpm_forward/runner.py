@@ -1520,7 +1520,8 @@ def _cell_generator_overrides(
     merged = with_kv_warmup_defaults(merged)
 
     policy_args = ((policy.get("params") or {}).get("agg") or {}).get("extra_cli_args") or []
-    policy_flags = {str(argument).split("=", 1)[0].split(" ", 1)[0] for argument in policy_args}
+    # vLLM's FlexibleArgumentParser accepts underscores in option names too.
+    policy_flags = {str(argument).split("=", 1)[0].split(" ", 1)[0].replace("_", "-") for argument in policy_args}
     if k31_native_state and policy_flags & {
         "--mamba-cache-mode",
         "--mamba-ssm-cache-dtype",
@@ -1540,32 +1541,22 @@ def _cell_generator_overrides(
         raise ValueError("backend policy cannot replace runtime execution/memory observer scheduler class")
     if observe_memory and policy_flags & {"--kv-cache-memory-bytes", "--num-gpu-blocks-override"}:
         raise ValueError("backend policy cannot replace runtime memory observer classes or automatic cache sizing")
-    if observe_memory and any(
-        str(argument).split("=", 1)[0].split(" ", 1)[0] == "--async-scheduling" for argument in policy_args
-    ):
+    if observe_memory and "--async-scheduling" in policy_flags:
         raise ValueError("runtime memory collection requires synchronous scheduling in both phases")
-    if gpu_memory_utilization is not None and any(
-        str(argument).split("=", 1)[0].split(" ", 1)[0] == "--gpu-memory-utilization" for argument in policy_args
-    ):
+    if gpu_memory_utilization is not None and "--gpu-memory-utilization" in policy_flags:
         raise ValueError("backend policy cannot override --fpm-gpu-memory-utilization with extra CLI arguments")
     if cell.workload_kind == "prefill" and profile.cudagraph_policy == "runtime":
         graph_options = ("--compilation-config", "--cudagraph-capture-sizes", "--max-cudagraph-capture-size")
-        if any(str(argument).split("=", 1)[0] in graph_options for argument in policy_args):
+        if policy_flags.intersection(graph_options):
             raise ValueError("runtime prefill CUDA-graph policy cannot use backend capture overrides")
-    if any(str(arg).split("=", 1)[0] in {"--enforce-eager", "--no-enforce-eager"} for arg in policy_args):
+    if policy_flags & {"--enforce-eager", "--no-enforce-eager"}:
         raise ValueError("eager execution must be supplied through --fpm-enforce-eager")
-    if any(str(arg).split("=", 1)[0] == "--benchmark-points-file" for arg in policy_args):
+    if "--benchmark-points-file" in policy_flags:
         raise ValueError("benchmark points must be supplied through --fpm-benchmark-points-file")
     if cell.workload_kind == "decode":
         prefix_caching = _decode_prefix_caching_mode(cell, plan)
-        policy_disables = any(
-            str(argument) == "--no-enable-prefix-caching" or str(argument).startswith("--no-enable-prefix-caching=")
-            for argument in policy_args
-        )
-        policy_enables = any(
-            str(argument) == "--enable-prefix-caching" or str(argument).startswith("--enable-prefix-caching=")
-            for argument in policy_args
-        )
+        policy_disables = "--no-enable-prefix-caching" in policy_flags
+        policy_enables = "--enable-prefix-caching" in policy_flags
         if prefix_caching == "enabled" and policy_disables:
             raise ValueError(f"FPM decode strategy {cell.parallel_strategy!r} requires prefix caching for KV warm-up")
         if prefix_caching == "disabled" and policy_enables:

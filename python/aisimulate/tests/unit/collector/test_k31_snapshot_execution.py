@@ -19,6 +19,7 @@ from .test_fpm_repeatability import _write_campaign
 from .test_fpm_runner import _write_provenance
 from .test_fpm_runtime_memory import _typed, _vllm_config
 from .test_k31_planner_precision import inputs  # noqa: F401
+from .test_k31_runtime_observations import _set_state_dtypes
 from .test_runtime_observations import _mutate, _replace_launch, _write
 
 pytestmark = pytest.mark.unit
@@ -449,13 +450,13 @@ def test_execution_checks_initialized_worker_local_dp_bound(native_execution):
     assert any("initialized worker local DP size exceeds global DP size" in s for s in result["failures"])
 
 
-@pytest.mark.parametrize("observed", [True, False])
-def test_publication_requires_matching_initialized_moe_precision(native_execution, observed):
+@pytest.mark.parametrize("damage", [None, "moe_precision", "state_precision"])
+def test_publication_requires_matching_initialized_native_precision(native_execution, damage):
     from dataclasses import replace
 
     from collector.fpm_forward.database import aggregate_cell
 
-    plan, cell, raw, collection, _ = native_execution
+    plan, cell, raw, collection, index = native_execution
     for path in raw.glob("**/fpm-execution-worker-*.json"):
         config = json.loads(path.read_text())["resolved_config"]["attention_config"]
         (path.parent / "resolved-config-native.json").write_text(
@@ -469,7 +470,15 @@ def test_publication_requires_matching_initialized_moe_precision(native_executio
                 }
             )
         )
-    if not observed:
+    if damage == "state_precision":
+        from collector.fpm_forward.runtime_observations import validate_observations
+
+        _mutate(index, lambda record: _set_state_dtypes(record, "bfloat16", "bfloat16", "bfloat16", "bfloat16"))
+        standalone = validate_observations(index, {"tp2": plan.runtime_launch})["tp2"]
+        assert standalone["status"] == "complete", standalone["diagnostics"]
+        with pytest.raises(ValueError, match="formal collection requires effective float32 recurrent state"):
+            aggregate_cell(plan, cell, raw.parent, expected_attempt_id=collection.collector_attempt_id)
+    elif damage == "moe_precision":
         cell = replace(cell, moe_quant_mode="w4a16_mxfp4")
         with pytest.raises(ValueError, match="publication MoE precision differs"):
             aggregate_cell(plan, cell, raw.parent, expected_attempt_id=collection.collector_attempt_id)

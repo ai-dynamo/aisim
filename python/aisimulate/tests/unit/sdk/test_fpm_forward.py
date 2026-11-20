@@ -1260,7 +1260,7 @@ def test_text_only_kimi_profile_preserves_encoder_weights_and_dcp_identity():
 
 @pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
 @pytest.mark.parametrize("state_dtype", ["float32", "auto", "bfloat16", None])
-@pytest.mark.parametrize("provenance_kind", ["probe", "collection"])
+@pytest.mark.parametrize("provenance_kind", ["probe", "collection", "finalized", "finalized_references"])
 def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
     tmp_path, attention_backend, state_dtype, provenance_kind
 ):
@@ -1356,6 +1356,36 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
             }
         ],
     }
+    if provenance_kind.startswith("finalized"):
+        from aisimulate.support.finalization import _merge_resources
+
+        # Exercise the real finalizer's output, including its source-reference
+        # form, rather than constructing a lookalike provenance envelope.
+        observation = deepcopy(profile["deployments"][0]["resources"])
+        observation.pop("kv_bytes_per_token")
+        group = {
+            "name": "synthetic-state",
+            "kind": "state",
+            "num_layers": 1,
+            "block_size_tokens": 4096,
+            "page_size_bytes": 1024,
+            "blocks_per_request": 1,
+        }
+        observation.update(cache_layout="grouped", cache_groups=[group])
+        evidence = {
+            **state_provenance,
+            "artifacts": [
+                {
+                    "path": "synthetic-worker.json",
+                    "sha256": "a" * 64,
+                    "evidence": {"kind": "worker", "cache": {"groups": [group]}},
+                }
+            ],
+        }
+        observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+        profile["deployments"][0]["resources"] = _merge_resources(
+            [observation, deepcopy(observation)], {}, source_references=provenance_kind == "finalized_references"
+        )
     config = ForwardPassPerfModelConfig(
         model=str(checkpoint),
         system=SYSTEM,
@@ -1453,6 +1483,20 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
                 ) == pytest.approx(3.0 + 2.0 / 3.0)
             finally:
                 direct.close()
+            resolved["estimator_config"]["fpm_interpolation"]["method"] = "auto"
+            automatic = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**resolved))
+            try:
+                expected_method = "sol" if state_dtype in {"float32", "auto"} else "direct"
+                auto_config = automatic.diagnostics()["provenance"]["config"]
+                assert auto_config["estimator_config"]["fpm_interpolation"]["method"] == expected_method
+                # Missing/BF16 state still admits an unmeasured query through
+                # direct interpolation, without invoking the KDA roofline.
+                if expected_method == "direct":
+                    assert automatic.estimate_forward_pass_time_ms(
+                        [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 256}}]
+                    ) == pytest.approx(3.0 + 2.0 / 3.0)
+            finally:
+                automatic.close()
         finally:
             restored.close()
     finally:

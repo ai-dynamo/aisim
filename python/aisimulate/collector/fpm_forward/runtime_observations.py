@@ -321,6 +321,13 @@ def _validate_record(
             or config["cache_config"].get("mamba_cache_mode") != "none"
         ):
             raise ValueError("K3.1 initialization requires native mamba none and prefix caching disabled")
+        if binding.get("collector_attempt_id") is not None and config["cache_config"].get(
+            "mamba_ssm_cache_dtype"
+        ) not in {"auto", "float32"}:
+            # Formal collection renders --mamba-ssm-cache-dtype float32.
+            # Standalone observations may still describe verified BF16 state.
+            # The native tensor checks independently bind auto to effective FP32.
+            raise ValueError("K3.1 formal collection requires effective float32 recurrent state")
         if kind == "worker":
             from .runtime_k31 import moe_precision
 

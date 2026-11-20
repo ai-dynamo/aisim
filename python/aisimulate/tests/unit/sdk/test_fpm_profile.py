@@ -215,6 +215,7 @@ def test_profile_architecture_matches_collector_text_config_view(profile_dict, c
 
 
 @pytest.mark.parametrize("text_only", [None, False, True])
+@pytest.mark.parametrize("state_dtype", ["float32", "bfloat16", None])
 @pytest.mark.parametrize(
     "wrapper, text_method",
     [
@@ -224,17 +225,29 @@ def test_profile_architecture_matches_collector_text_config_view(profile_dict, c
     ],
 )
 def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
-    profile_dict, checkpoint_configs, text_only, text_method, wrapper
+    profile_dict, checkpoint_configs, text_only, text_method, wrapper, state_dtype
 ):
     profile_dict["architecture"] = "KimiLinearForCausalLM"
     checkpoint_configs[profile_dict["model"]] = {
         "architectures": [wrapper],
         "text_config": {"architectures": [profile_dict["architecture"]]},
     }
+    if state_dtype is not None:
+        resources = profile_dict["deployments"][0]["resources"]
+        for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+            resources.pop(key)
+        resources["runtime_memory"] = {
+            "kv_cache_bytes": 1024,
+            "gpu_memory_utilization": 0.8,
+            "max_model_len": 4096,
+            "provenance": json.dumps({"runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": state_dtype}}}),
+        }
     request = _request(profile_dict)
     if text_only is not None:
         request["estimator_config"]["fpm_interpolation"]["text_only"] = text_only
     expected = text_method if text_only is True else "direct"
+    if wrapper == "KimiK31ForConditionalGeneration" and state_dtype != "float32":
+        expected = "direct"
     assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == expected
 
 

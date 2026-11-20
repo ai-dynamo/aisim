@@ -45,6 +45,10 @@ def test_unaudited_runtime_does_not_read_k31_manifest(monkeypatch, runtime):
             "b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60",
         ),
         ("vllm/v1/worker/ubatch_utils.py", "8aef5a51c45d603ac1408d1224301f0cd536d59698975d704f53af84410453dd"),
+        (
+            "vllm/v1/attention/backends/mla/sparse_utils.py",
+            "00085f41c69ade02afc08e1321d9bad764df16dec99412ab9ad096d2f6bb1a08",
+        ),
     ],
 )
 def test_audited_runtime_still_requires_complete_source_map(source, digest):
@@ -1095,6 +1099,34 @@ def test_import_rejects_self_consistent_unsupported_cuda_kernel_blocks(tmp_path,
         assert any("CUDA indexer requires 64-token" in message for message in result["diagnostics"])
 
 
+def _set_state_dtypes(record, convolution, recurrence, observed, observed_convolution):
+    record["resolved_config"]["cache_config"].update(mamba_cache_dtype=convolution, mamba_ssm_cache_dtype=recurrence)
+    state = record["cache"]["groups"][-1]
+    sizes = [2 if dtype == "bfloat16" else 4 for dtype in (observed_convolution, observed)]
+    for spec in state.get("layer_specs", {"representative": state}).values():
+        spec.update(
+            state_dtypes=[f"torch.{observed_convolution}", f"torch.{observed}"],
+            state_content_size_bytes=sum(
+                math.prod(shape) * size for shape, size in zip(spec["state_shapes"], sizes, strict=True)
+            ),
+        )
+    if record["kind"] == "worker":
+        for name in state["layer_names"]:
+            components = record["cache"]["layer_components"][name]
+            offset = components[0]["storage_offset_bytes"]
+            for component, dtype, size in zip(components, (observed_convolution, observed), sizes, strict=True):
+                component.update(
+                    dtype=f"torch.{dtype}",
+                    element_size_bytes=size,
+                    stride_bytes=[
+                        component["stride_bytes"][0],
+                        *[math.prod(component["shape"][i + 1 :]) * size for i in range(1, len(component["shape"]))],
+                    ],
+                    storage_offset_bytes=offset,
+                )
+                offset += math.prod(component["shape"][1:]) * size
+
+
 @pytest.mark.parametrize("convolution", ["auto", "bfloat16", "float32"])
 @pytest.mark.parametrize("recurrence", ["auto", "bfloat16", "float32"])
 @pytest.mark.parametrize("observed", ["bfloat16", "float32"])
@@ -1107,33 +1139,7 @@ def test_import_binds_native_state_dtypes_to_resolved_cache_settings(
     expected = "float32" if recurrence == "auto" else recurrence
 
     def change_state(record):
-        record["resolved_config"]["cache_config"].update(
-            mamba_cache_dtype=convolution, mamba_ssm_cache_dtype=recurrence
-        )
-        state = record["cache"]["groups"][-1]
-        sizes = [2 if dtype == "bfloat16" else 4 for dtype in (observed_convolution, observed)]
-        for spec in state.get("layer_specs", {"representative": state}).values():
-            spec.update(
-                state_dtypes=[f"torch.{observed_convolution}", f"torch.{observed}"],
-                state_content_size_bytes=sum(
-                    math.prod(shape) * size for shape, size in zip(spec["state_shapes"], sizes, strict=True)
-                ),
-            )
-        if record["kind"] == "worker":
-            for name in state["layer_names"]:
-                components = record["cache"]["layer_components"][name]
-                offset = components[0]["storage_offset_bytes"]
-                for component, dtype, size in zip(components, (observed_convolution, observed), sizes, strict=True):
-                    component.update(
-                        dtype=f"torch.{dtype}",
-                        element_size_bytes=size,
-                        stride_bytes=[
-                            component["stride_bytes"][0],
-                            *[math.prod(component["shape"][i + 1 :]) * size for i in range(1, len(component["shape"]))],
-                        ],
-                        storage_offset_bytes=offset,
-                    )
-                    offset += math.prod(component["shape"][1:]) * size
+        _set_state_dtypes(record, convolution, recurrence, observed, observed_convolution)
 
     _mutate(path, change_state)
     result = validate_observations(path, launches)["tp2"]
@@ -1730,7 +1736,7 @@ def test_import_native_indexer_storage_dtype(tmp_path, monkeypatch, dtype):
         assert "indexer requires torch.uint8" in str(result["diagnostics"])
 
 
-@pytest.mark.parametrize("component", ["state", "indexer"])
+@pytest.mark.parametrize("component", ["state", "indexer", "mla"])
 def test_import_rejects_transposed_native_axis_strides(tmp_path, monkeypatch, component):
     path, launches = _complete_fixture(tmp_path, monkeypatch)
 
@@ -1740,14 +1746,16 @@ def test_import_rejects_transposed_native_axis_strides(tmp_path, monkeypatch, co
         for name, views in record["cache"]["layer_components"].items():
             if component == "state" and len(views) == 2:
                 views[1]["stride_bytes"][-2:] = reversed(views[1]["stride_bytes"][-2:])
-            elif component == "indexer" and ".indexer." in name:
+            elif (component == "indexer" and ".indexer." in name) or (
+                component == "mla" and len(views) == 1 and ".indexer." not in name
+            ):
                 view = views[0]
                 view["stride_bytes"][1:] = [1, view["shape"][1]]
 
     _mutate(path, transpose)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete", result
-    assert ("axis-order" if component == "state" else "BLHNC") in str(result["diagnostics"])
+    assert {"state": "axis-order", "indexer": "BLHNC", "mla": "FlashInfer MLA"}[component] in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("damage", ["missing", "changed", "sidecar_missing", "sidecar_changed", None])
