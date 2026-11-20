@@ -353,6 +353,10 @@ def _afd_deployment(
     )
     backend_version = engine.backend_version or resolve_backend_version(engine.hardware, engine.backend)
     resolved_engine = engine.model_copy(update={"backend_version": backend_version})
+    if profile_path is not None:
+        # The precision selector belongs to the measured stage, not the
+        # companion worker's timing identity or performance-model metadata.
+        resolved_engine.moe_quant_mode = None
     companion_role = "decode" if topology.phase.value == "prefill" else "prefill"
     companion_worker = getattr(engine.workers, companion_role) if topology.combined_with_pd else None
     companion: ReplicaParallelConfig | None = None

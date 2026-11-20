@@ -385,6 +385,62 @@ def test_prediction_config_attaches_the_profile_stage(tmp_path):
     assert attention.requests[0].topology.ffn_gpus == 8
 
 
+@pytest.mark.parametrize("precision", ["w4a8_mxfp4_mxfp8", "fp8"])
+@pytest.mark.parametrize("companion_timing", ["default", "fixed"])
+def test_prediction_config_selects_profile_precision(tmp_path, precision, companion_timing):
+    fp8_entry = {**_entry(moe_precision="fp8"), "latency_ms": STAGE_MS * 2}
+    raw = _prediction(_profile(tmp_path, [_entry(), fp8_entry]))
+    raw["engine"]["moe_quant_mode"] = precision
+    if companion_timing == "default":
+        raw["engine"]["workers"]["prefill"].pop("timing")
+
+    config = CorePredictionConfig.model_validate(raw)
+    config = CorePredictionConfig.model_validate_json(config.model_dump_json())
+    assert config.engine.moe_quant_mode == precision
+
+    deployment = prediction_to_replay_spec(config, afd_performance_model=_Attention()).backend_deployment
+    (measurement,) = deployment.performance_model_metadata["afd"]["measurements"]
+    stage = measurement["provenance"]["stage"]
+    expected_ms = fp8_entry["latency_ms"] if precision == "fp8" else STAGE_MS
+    assert stage["key"]["moe_precision"] == precision
+    assert measurement["ffn_ms"] == pytest.approx(expected_ms / (LAYERS * 2))
+    # The precision selects the measured stage, not the companion's estimator.
+    assert "moe_quant_mode" not in deployment.performance_model_metadata["prefill"]["config"]
+
+
+@pytest.mark.parametrize("precision", [None, "unmeasured"])
+def test_prediction_config_rejects_ambiguous_or_unmeasured_precision(tmp_path, precision):
+    raw = _prediction(_profile(tmp_path, [_entry(), _entry(moe_precision="fp8")]))
+    raw["engine"]["moe_quant_mode"] = precision
+    config = CorePredictionConfig.model_validate(raw)
+    match = "set engine.moe_quant_mode" if precision is None else "no FastAFD split MoE stage measurement"
+    with pytest.raises(AFDInfeasible, match=match):
+        prediction_to_replay_spec(config, afd_performance_model=_Attention())
+
+
+def test_afd_precision_control_still_requires_a_profile(tmp_path):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"]["moe_quant_mode"] = "fp8"
+    raw["engine"]["afd"].update(fastafd_profile_path=None, fastafd_moe_backend=None)
+    with pytest.raises(ValidationError, match="engine model controls require default timing"):
+        CorePredictionConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"gemm_quant_mode": "fp8"},
+        {"enable_eplb": True},
+        {"nextn": 1, "nextn_accepted": 0.5},
+    ],
+)
+def test_profile_precision_does_not_enable_other_afd_model_controls(tmp_path, controls):
+    raw = _prediction(_profile(tmp_path))
+    raw["engine"].update(moe_quant_mode="fp8", **controls)
+    with pytest.raises(ValidationError, match="engine model controls require default timing"):
+        CorePredictionConfig.model_validate(raw)
+
+
 def test_prediction_config_rejects_a_profile_for_another_topk(tmp_path):
     config = CorePredictionConfig.model_validate(_prediction(_profile(tmp_path, [_entry(routed_topk=4)])))
     with pytest.raises(AFDInfeasible, match="no FastAFD split MoE stage measurement"):

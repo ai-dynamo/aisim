@@ -50,6 +50,7 @@ engine:
 | `engine.afd.boundary_on_attn` | `true` | fixed | A/F boundary convention. |
 | `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. |
 | `engine.afd.fastafd_moe_backend` | `null` | Prediction only | Required with `fastafd_profile_path`; `megamoe` or `deepep_deepgemm`. |
+| `engine.moe_quant_mode` | `null` | FastAFD prediction only | Exact profile `moe_precision` selector; required when otherwise matching entries differ in precision. Does not override attention or companion-worker timing. Unsupported for AFD without a FastAFD profile. |
 | `engine.afd.max_af_ratio`, `max_candidates` | `4.0`, `10000` | Recommend only | Bounds on the generated topology space. |
 
 Workers:
@@ -95,9 +96,13 @@ Consumed components must be finite and non-negative, and attention compute plus
 combine must reconcile
 with the provider's attention total (relative tolerance `1e-9`, absolute tolerance
 `1e-12` ms). A positive `a_router_ms` is required. When several entries
-differ only in `moe_precision`, `engine.moe_quant_mode` selects one. The profile
-entry, its producer and the attention composition are recorded in the
-measurement provenance. FastAFD is not a runtime dependency.
+differ only in `moe_precision`, set `engine.moe_quant_mode` to the exact profile
+precision, for example `fp8`; an unset selector is ambiguous, and an unmeasured
+precision is infeasible. In FastAFD prediction this selects only the measured
+stage, leaving attention and companion-worker timing unchanged. Other engine
+model controls remain unsupported for AFD. The profile entry, its producer and
+the attention composition are recorded in the measurement provenance. FastAFD
+is not a runtime dependency.
 
 Requirements: fixed synthetic input and output lengths and no trace.
 `kv_capacity_fraction` load is rejected because the A/F pools have no

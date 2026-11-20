@@ -501,11 +501,18 @@ class EstimatorPolicyConfig(StrictModel):
             raise ValueError("nextn requires explicit nextn_accepted")
         if self.nextn_accepted is not None and (not self.nextn or self.nextn_accepted > self.nextn):
             raise ValueError("nextn_accepted requires nextn > 0 and must be within [0, nextn]")
-        active = self.nextn or any(
-            is_active_engine_model_control(name, getattr(self, name)) for name in ENGINE_MODEL_CONTROL_FIELDS
-        )
         mode = getattr(self, "mode", "aggregated")
         modes = mode.choices if hasattr(mode, "choices") else [mode]
+        # FastAFD uses this field only to select an exact measured-stage entry;
+        # it does not change the attention or companion worker estimators.
+        profile_precision = (
+            mode == "afd" and getattr(getattr(self, "afd", None), "fastafd_profile_path", None) is not None
+        )
+        active = self.nextn or any(
+            is_active_engine_model_control(name, getattr(self, name))
+            for name in ENGINE_MODEL_CONTROL_FIELDS
+            if not (profile_precision and name == "moe_quant_mode")
+        )
         if "afd" in modes and self.enable_chunked_prefill is not None:
             raise ValueError("enable_chunked_prefill is unsupported for AFD")
         workers = getattr(self, "workers", None)
