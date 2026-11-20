@@ -3006,17 +3006,28 @@ mod tests {
         };
         assert_eq!(stats.g3, Some(on_disk(3, 1)));
 
-        // A write that outlasts the wait fails, and KVCR drops its block.
+        // A write that outlasts the wait fails, and KVCR drops its block. With
+        // a 1 ms wait and a 10 ms write, the waiting store gives up when the
+        // write ends: G2 holds its block until 10 ms, where KVCR's stops at 1.
         let g3 = KvcrG3Config {
-            spill_timeout_ms: 0.5,
+            latency_to_first_byte_ms: 10.0,
+            write_bandwidth_gbps: 0.0,
+            spill_timeout_ms: 1.0,
             ..g3
         };
         let f = Fixture::with_g3(1, KvcrLocalG2Policy::Lru, 0.0, g3);
-        let (mut adapter, g2) = (f.adapter(), f.target.lock());
+        make_resident(&f.target, &[1]);
+        let (mut adapter, mut g2) = (f.adapter(), f.target.lock());
+        let held = f.keys(&[1]);
         for key in [0, 1] {
             store((&mut adapter, &g2), &[key], &[key], 0.0);
         }
-        adapter.advance_g3(&g2, 1.0);
+        adapter.pin_store(&mut g2, TransferId::new(1), &held);
+        assert_eq!(adapter.next_deadline(), Some(10.0));
+        for (now, released) in [(1.0, &[][..]), (10.0, &held[..])] {
+            adapter.advance_g3(&g2, now);
+            assert_eq!(adapter.take_g2_unpins(), released, "at {now}");
+        }
         assert_eq!(kvcr_holds(&adapter, 0), (Lookup::Miss, false));
         assert_eq!(kvcr_holds(&adapter, 1), (Lookup::Miss, false));
         assert_eq!(f.stats().g3, Some(on_disk(0, 0)));

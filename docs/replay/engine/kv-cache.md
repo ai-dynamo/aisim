@@ -800,6 +800,8 @@ that misses G2 and that memory reads it back into G2. With `g3`, the
   finished write when its pass ends, so a busy rank finishes at most one
   write per pass. While a block waits, G2 cannot evict any block of its
   store, so a long `spill_timeout_ms` with a slow disk can hold most of G2.
+  A store that times out keeps this hold until the write in flight ends, up
+  to one write past `spill_timeout_ms`; KVCR ends it at the timeout.
 - **Evict.** A full disk drops a block by the memory's policy, never one
   being read; when all are being read, the block memory evicts is dropped
   unsaved. Under `lru` a block keeps the rank it had in memory and the same
