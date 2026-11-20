@@ -33,7 +33,9 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_dat
 def inputs(tmp_path, monkeypatch, request):
     settings = getattr(request, "param", "trtllm_mla")
     workload_kind = "prefill" if settings == "prefill" else "decode"
-    index_path, launches = _complete_fixture(tmp_path, monkeypatch, workload_kind=workload_kind)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    index_path, launches = _complete_fixture(evidence, monkeypatch, workload_kind=workload_kind)
     config_path, text = _kimi_k31_config(tmp_path)
     # Keep the independent checkpoint layout small and consistent with the
     # synthetic native views, including two distinct KDA decoder branches.
@@ -51,32 +53,42 @@ def inputs(tmp_path, monkeypatch, request):
     if settings == "explicit-moe":
         launch["precision"]["moe_backend"] = "flashinfer_trtllm"
         settings = "trtllm_mla"
+    with_sidecar = settings == "sidecar"
+    if with_sidecar:
+        settings = "trtllm_mla"
     attention_backend, packed_indexer = (settings, False) if isinstance(settings, str) else settings
     launch["precision"]["attention_backend"] = attention_backend
     launch["model_config"] = {"path": str(config_path), "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()}
+    if with_sidecar:
+        sidecar = config_path.parent / "hf_quant_config.json"
+        sidecar.write_text("{}")
+        launch["model_config"]["source_files"] = {sidecar.name: hashlib.sha256(sidecar.read_bytes()).hexdigest()}
     launch["topology"].update(dp=1, moe_tp=2, moe_ep=1)
     launch = runtime_probe.normalize_probe_launch(launch)
     launches["tp2"] = launch
     _replace_launch(index_path, launches)
     index = json.loads(index_path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
-    bundle = load_instrumentation(tmp_path / attempt["bundle"]["manifest"])
+    bundle = load_instrumentation(evidence / attempt["bundle"]["manifest"])
     phase = attempt["phases"][workload_kind]
-    context_path = tmp_path / phase["launch_manifest"]["path"]
+    context_path = evidence / phase["launch_manifest"]["path"]
     context = json.loads(context_path.read_text())
     context.update(expected_ranks=expected_ranks(launch["topology"]), instrumentation_binding=runtime_binding())
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
     if packed_indexer:
-        cache, scheduled = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch)]
+        cache, scheduled = [
+            _decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132)
+        ]
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     retained = []
     for ref in phase["artifacts"]:
-        record_path = tmp_path / ref["path"]
+        record_path = evidence / ref["path"]
         record = json.loads(record_path.read_text())
         if record["dp_rank"] != 0:
             continue
         record["model_config_sha256"] = launch["model_config"]["sha256"]
+        record["model_config_source_files"] = launch["model_config"].get("source_files", {})
         if record["kind"] == "worker":
             record["initialized_moe"] = _moe(indices=range(1, text["num_hidden_layers"]))
         record["resolved_config"]["parallel_config"].update(
@@ -462,10 +474,10 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
             if observed["kind"] == "worker":
                 for name in state["layer_names"]:
                     convolution, recurrent = observed["cache"]["layer_components"][name]
-                    convolution.update(shape=[10, 1, 12], stride_bytes=[512, 24, 2])
+                    convolution.update(shape=[10, 1, 12], stride_bytes=[convolution["stride_bytes"][0], 24, 2])
                     recurrent.update(
                         shape=[10, 2, 2, 2],
-                        stride_bytes=[512, 16, 8, 4],
+                        stride_bytes=[recurrent["stride_bytes"][0], 16, 8, 4],
                         storage_offset_bytes=convolution["storage_offset_bytes"] + 24,
                     )
             if difference == "geometry" and not matching and dp == 1:
@@ -537,6 +549,10 @@ def onboarding_wrapper(inputs):
     (index.parent / "model-config.json").write_bytes(
         Path(inputs["runtime_launch"]["model_config"]["path"]).read_bytes()
     )
+    for name in inputs["runtime_launch"]["model_config"].get("source_files", {}):
+        (index.parent / name).write_bytes(
+            (Path(inputs["runtime_launch"]["model_config"]["path"]).parent / name).read_bytes()
+        )
     resources = copy.deepcopy(inputs["profile"]["deployments"][0]["resources"])
     resources.pop("provenance", None)
     resources["runtime_memory"].pop("provenance", None)
@@ -558,10 +574,38 @@ def onboarding_wrapper(inputs):
     return wrapper
 
 
+@pytest.mark.parametrize("inputs", ["trtllm_mla", "sidecar"], indirect=True)
 def test_canonical_onboarding_wrapper_revalidates_native_evidence(inputs):
     expected = bind(inputs)
-    onboarding_wrapper(inputs)
+    wrapper = onboarding_wrapper(inputs)
+    # Onboarding archives the checkpoint outside its original input directory.
+    original = Path(inputs["runtime_launch"]["model_config"]["path"])
+    assert not original.is_relative_to(Path(wrapper["observations_index"]).parent)
+    assert str(original) not in {ref["path"] for ref in wrapper["source_artifacts"]}
     assert bind(inputs) == expected
+
+
+@pytest.mark.parametrize("change", ["archive-bytes", "archive-digest", "original-bytes"])
+@pytest.mark.parametrize("artifact", ["model-config.json", "hf_quant_config.json"])
+@pytest.mark.parametrize("inputs", ["sidecar"], indirect=True)
+def test_onboarding_config_archive_and_launch_input_remain_independently_bound(inputs, change, artifact):
+    wrapper = onboarding_wrapper(inputs)
+    archived = Path(wrapper["observations_index"]).parent / artifact
+    if change == "original-bytes":
+        original = Path(inputs["runtime_launch"]["model_config"]["path"])
+        if artifact != "model-config.json":
+            original = original.parent / artifact
+        original.write_text(original.read_text() + "\n")
+    else:
+        archived.write_text(archived.read_text() + "\n")
+        if change == "archive-digest":
+            # An internally consistent manifest cannot relabel the archive as
+            # the configuration actually loaded by the recorded launch.
+            ref = next(ref for ref in wrapper["source_artifacts"] if ref["path"] == str(archived))
+            ref["sha256"] = hashlib.sha256(archived.read_bytes()).hexdigest()
+            inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]["provenance"] = json.dumps(wrapper)
+    with pytest.raises(ValueError, match="source artifact changed|missing immutable source artifact|SHA-256"):
+        bind(inputs)
 
 
 @pytest.mark.parametrize("registered", [False, True])

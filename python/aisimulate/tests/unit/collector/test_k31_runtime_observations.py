@@ -73,13 +73,17 @@ class _Tensor:
         return (self.block_stride // self.size, *reversed(result))
 
 
-def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=True, attention_block=4):
+def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=True, attention_block=64, payload_scale=1):
     adapter = _adapter(monkeypatch)
-    scale = attention_block // 4
+    scale = attention_block // 64 * payload_scale
     pool_page = 512 * scale
     storage = _Storage(1234, 10 * pool_page)
     layers, groups, placements = {}, [], []
-    for stem, page, width in (("mla", 128 * scale, 32), ("indexer", 64 * scale, 16), ("kda", 64, None)):
+    for stem, page, width in (
+        ("mla", 128 * scale, 2 * payload_scale),
+        ("indexer", 64 * scale, payload_scale),
+        ("kda", 64, None),
+    ):
         spec = _typed("vllm.v1.kv_cache_interface", "MambaSpec" if stem == "kda" else "MLAAttentionSpec")
         spec.block_size, spec.page_size_bytes = (4096 if stem == "kda" else attention_block), page
         if stem == "kda":
@@ -89,7 +93,7 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=True, at
             spec.num_prefill_checkpoint_blocks, spec.prefill_checkpoint_alignment = 1, 64
             spec.max_num_blocks_per_req = lambda *_: 1
         else:
-            spec.dtype, spec.cache_dtype_str = "torch.uint8", "fp8"
+            spec.dtype, spec.cache_dtype_str = "torch.uint8", None if stem == "indexer" else "fp8"
             spec.unpadded_page_size_bytes = attention_block * width
         names = [f"{stem}.{i}" for i in range(2)]
         groups.append(SimpleNamespace(layer_names=names, kv_cache_spec=spec, host_resident=False, is_eagle_group=False))
@@ -195,10 +199,10 @@ def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkey
 def test_direct_attention_views_cover_native_payload_with_optional_page_padding(monkeypatch, padded, truncated):
     cache, scheduled, worker = _native_fixture(monkeypatch)
     spec = worker.model_runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
-    spec.unpadded_page_size_bytes = 96 if padded else 128
+    spec.unpadded_page_size_bytes = 64 if padded else 128
     for name in ("mla.0", "mla.1"):
         tensor = worker.vllm_config.compilation_config.static_forward_context[name].kv_cache
-        tensor.shape = (10, 4, 1 if truncated else spec.unpadded_page_size_bytes // 4)
+        tensor.shape = (10, 64, (2 if padded else 1) if truncated else spec.unpadded_page_size_bytes // 64)
     cache = _adapter(monkeypatch).worker_memory(worker)
     cache["pool_id"] = "pool"
     cache["semantics"] = {**_SEMANTICS, "retention": "full_or_state"}
@@ -348,11 +352,15 @@ def test_scheduler_projection_retains_exact_native_geometry_checks(monkeypatch, 
         _physical_views(cache, scheduled, "fp8", context=4096)
 
 
-def _kernel_view_fixture(monkeypatch):
-    cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, scheduler_projection=True, attention_block=128)
+def _kernel_view_fixture(monkeypatch, *, indexer_width=16):
+    cache, scheduled, _ = _native_fixture(
+        monkeypatch, uniform=True, scheduler_projection=True, attention_block=128, payload_scale=indexer_width
+    )
     cache["kernel_block_views"] = {}
     for name in ("indexer.0", "indexer.1"):
-        cache["layer_components"][name][0].update(shape=[146, 64, 16], stride_bytes=[1024, 16, 1])
+        cache["layer_components"][name][0].update(
+            shape=[146, 64, indexer_width], stride_bytes=[64 * indexer_width, indexer_width, 1]
+        )
         cache["kernel_block_views"][name] = {
             "attention_group_class": "vllm.v1.worker.utils.AttentionGroup",
             "backend_class": "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend",
@@ -810,7 +818,7 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
                         "head_dim": 2,
                         "short_conv_kernel_size": 2,
                     },
-                    "dsa_config": {"dsa_layers": [3, 4]},
+                    "dsa_config": {"dsa_layers": [3, 4], "index_head_dim": 128},
                 },
             }
         )
@@ -833,11 +841,11 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
     manifest_path.write_text(json.dumps(manifest))
     bundle = load_instrumentation(manifest_path)
     if packed_indexer:
-        cache, scheduled = _kernel_view_fixture(monkeypatch)
+        cache, scheduled = _kernel_view_fixture(monkeypatch, indexer_width=132)
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     else:
-        cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
+        cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, payload_scale=132)
     index = json.loads(path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
     attempt["bundle"]["sha256"] = bundle.sha256
@@ -962,7 +970,7 @@ def test_import_rejects_matching_worker_scheduler_omission_of_one_kda_group(tmp_
 @pytest.mark.parametrize("rows", [1, 63, 64, 65])
 def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, rows):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
-    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch)]
+    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132)]
     for mapping in cache["kernel_block_views"].values():
         mapping["kernel_block_table_shape"][1] = rows
 
@@ -985,7 +993,7 @@ def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, row
 @pytest.mark.parametrize("width", [32, 62, 64, 66])
 def test_import_checks_kernel_table_width_against_reviewed_context(tmp_path, monkeypatch, width):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
-    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch)]
+    cache, _ = [_decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132)]
     for mapping in cache["kernel_block_views"].values():
         mapping["kernel_block_table_shape"] = [1, 64, width]
 
@@ -1064,7 +1072,7 @@ def test_import_binds_native_state_dtypes_to_resolved_cache_settings(
                         dtype=f"torch.{dtype}",
                         element_size_bytes=size,
                         stride_bytes=[
-                            512,
+                            component["stride_bytes"][0],
                             *[math.prod(component["shape"][i + 1 :]) * size for i in range(1, len(component["shape"]))],
                         ],
                         storage_offset_bytes=offset,
@@ -1082,8 +1090,9 @@ def test_import_binds_native_state_dtypes_to_resolved_cache_settings(
 
 @pytest.mark.parametrize("workload_kind", ["prefill", "decode"])
 @pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+@pytest.mark.parametrize("indexer_spec", [None, "fp8"])
 def test_complete_rank_import_preserves_native_grouping_state_and_precision(
-    tmp_path, monkeypatch, workload_kind, cache_dtype
+    tmp_path, monkeypatch, workload_kind, cache_dtype, indexer_spec
 ):
     path, launches = _complete_fixture(tmp_path, monkeypatch, workload_kind=workload_kind)
 
@@ -1094,6 +1103,8 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(
             for name, spec in group["layer_specs"].items():
                 if name.endswith(".self_attn.attn"):
                     spec["cache_dtype_str"] = cache_dtype
+                elif name.endswith(".self_attn.indexer.k_cache"):
+                    spec["cache_dtype_str"] = indexer_spec
         else:
             group["cache_dtype_str"] = cache_dtype
 
@@ -1102,7 +1113,7 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(
     assert result["status"] == "complete", result["diagnostics"]
     assert len(result["resources"]["cache_groups"]) == 2
     assert result["resources"]["cache_groups"][-1]["blocks_per_request"] == 1
-    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 512
+    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 512 * 132
     assert len(result["provenance"]["rank_capacities"]) == 4
     assert {capacity["phase"] for capacity in result["provenance"]["rank_capacities"]} == {workload_kind}
     for artifact in result["provenance"]["artifacts"]:
@@ -1125,6 +1136,57 @@ def test_import_rejects_e4m3_spelling_for_indexer_even_with_matching_scheduler(t
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None, result
     assert "cache spec dtype differs" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("resolved", [None, "auto", "mxfp4", "fp8_e4m3"])
+def test_default_indexer_spec_requires_resolved_fp8_configuration(tmp_path, monkeypatch, resolved):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    _mutate(path, lambda record: record["resolved_config"]["attention_config"].update(indexer_kv_dtype=resolved))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert "native K3.1 attention configuration" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["direct", "mapped"])
+def test_import_rejects_self_consistent_indexer_payload_not_matching_checkpoint(tmp_path, monkeypatch, packed):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=packed)
+
+    def corrupt(record):
+        group = record["cache"]["groups"][0]
+        for name, spec in group.get("layer_specs", {}).items():
+            if not name.endswith(".self_attn.indexer.k_cache"):
+                continue
+            # Keep padded allocation and placement unchanged while inventing
+            # a smaller, internally consistent logical payload (16 vs 132 B).
+            spec["unpadded_page_size_bytes"] = group["block_size_tokens"] * 16
+            if record["kind"] == "worker":
+                view = record["cache"]["layer_components"][name][0]
+                view["shape"][2] = 16
+                view["stride_bytes"][1] = 16
+                if packed:
+                    mapping = record["cache"]["kernel_block_views"][name]
+                    stride = record["cache"]["tensor_allocations"][0]["block_stride"] // (64 * 16)
+                    mapping["kernel_block_stride"] = stride
+                    view["shape"][0] = 9 * stride + 2
+                    view["stride_bytes"][0] = 64 * 16
+
+    _mutate(path, corrupt)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete" and result["resources"] is None
+    assert "indexer payload differs from the checkpoint" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("block", [4, 32])
+def test_unmapped_indexer_requires_exactly_64_token_blocks(monkeypatch, block):
+    cache, _, _ = _native_fixture(monkeypatch)
+    group = cache["groups"][1]
+    group["block_size_tokens"] = block
+    # Preserve both the page and the logical payload, so the old shape and
+    # byte-count checks alone would accept this unsupported kernel geometry.
+    for name in group["layer_names"]:
+        cache["layer_components"][name][0].update(shape=[10, block, 64 // block], stride_bytes=[512, 64 // block, 1])
+    with pytest.raises(ValueError, match="CUDA indexer requires 64-token"):
+        runtime_k31.validate_views(cache, "fp8", 10, 512, context=4096)
 
 
 @pytest.mark.parametrize("quantization", ["absent", "wrong_method", "wrong_class"])
@@ -1178,7 +1240,7 @@ def test_import_requires_initialized_indexed_mla_despite_consistent_cache_maps(t
             # that the indexed MLA path was actually initialized.
         elif omit == "mla":
             # The indexer is now the scheduler's first-child projection.
-            group.update(spec_page_size_bytes=64, unpadded_page_size_bytes=64)
+            group.update(spec_page_size_bytes=64 * 132, unpadded_page_size_bytes=64 * 132, cache_dtype_str=None)
 
     _mutate(path, remove_layers)
     index = json.loads(path.read_text())
@@ -1388,17 +1450,20 @@ def test_import_indexer_subdivision_requires_observed_mapping(tmp_path, monkeypa
                 for name in group["layer_names"]:
                     view = cache["layer_components"][name][0]
                     width = view["shape"][1] * view["shape"][2] // block
-                    view.update(shape=[10, block, width], stride_bytes=[512, width, 1])
+                    view.update(shape=[10, block, width], stride_bytes=[view["stride_bytes"][0], width, 1])
         elif not mapped and record["kind"] == "worker":
             for name in cache.pop("kernel_block_views"):
-                cache["layer_components"][name][0].update(shape=[10, 128, 16], stride_bytes=[16384, 16, 1])
+                cache["layer_components"][name][0].update(
+                    shape=[10, 128, 132],
+                    stride_bytes=[cache["tensor_allocations"][0]["block_stride"], 132, 1],
+                )
 
     _mutate(path, direct_view)
     result = validate_observations(path, launches)["tp2"]
     valid = block == 64 or mapped
     assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
     if not valid:
-        assert "requires native kernel-block mapping coverage" in str(result["diagnostics"])
+        assert "64-token blocks or native kernel-block mapping coverage" in str(result["diagnostics"])
 
 
 def test_configuration_reads_hash_bound_checkpoint_once_for_all_native_ranks(tmp_path, monkeypatch):
@@ -1442,7 +1507,8 @@ def test_import_kda_convolution_shape_follows_reviewed_layout(tmp_path, monkeypa
             spec["state_shapes"][0] = [6, 1]
         if record["kind"] == "worker":
             for name in state["layer_names"]:
-                record["cache"]["layer_components"][name][0].update(shape=[10, 6, 1], stride_bytes=[512, 2, 2])
+                view = record["cache"]["layer_components"][name][0]
+                view.update(shape=[10, 6, 1], stride_bytes=[view["stride_bytes"][0], 2, 2])
 
     _mutate(path, orient)
     result = validate_observations(path, launches)["tp2"]

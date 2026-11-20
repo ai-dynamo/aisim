@@ -790,11 +790,8 @@ def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProf
         {"path": str(manifest.parent / name), "sha256": digest} for name, digest in instrumentation["files"].items()
     )
     model = launch["model_config"]
-    consumed.append(model)
-    consumed.extend(
-        {"path": str(Path(model["path"]).parent / name), "sha256": digest}
-        for name, digest in model.get("source_files", {}).items()
-    )
+    consumed.append({"path": "model-config.json", "sha256": model["sha256"]})
+    consumed.extend({"path": name, "sha256": digest} for name, digest in model.get("source_files", {}).items())
     for artifact in consumed:
         path = (index.parent / artifact["path"]).resolve()
         if covered.get(str(path)) != artifact["sha256"]:

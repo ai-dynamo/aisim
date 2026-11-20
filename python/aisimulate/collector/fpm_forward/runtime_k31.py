@@ -272,7 +272,7 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
             raise ValueError("K3.1 cache spec/kind has no audited mapping")
         elif any(
             group.get("cache_dtype_str")
-            not in ({"fp8"} if cls.endswith("KimiK3IndexerCache") else {"fp8", "fp8_e4m3", "fp8_ds_mla"})
+            not in ({None, "fp8"} if cls.endswith("KimiK3IndexerCache") else {"fp8", "fp8_e4m3", "fp8_ds_mla"})
             for cls in classes.values()
         ):
             raise ValueError("K3.1 attention cache dtype has no audited FP8 mapping")
@@ -407,7 +407,28 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
                     _validate_state_shapes(spec, config, model_config, conv_state_layout)
             if cls in ATTENTION_CLASSES:
                 dtype = "fp8" if cls.endswith("KimiK3IndexerCache") else config["cache_config"]["cache_dtype"]
-                if spec.get("cache_dtype_str") != dtype:
+                observed = spec.get("cache_dtype_str")
+                if cls.endswith("KimiK3IndexerCache"):
+                    # Pinned DeepseekV32IndexerCache.get_kv_cache_spec leaves
+                    # MLAAttentionSpec.cache_dtype_str at None. The resolved
+                    # attention configuration, not that optional marker, owns
+                    # the indexer's format.
+                    if config["attention_config"].get("indexer_kv_dtype") != "fp8":
+                        raise ValueError("K3.1 indexer requires resolved FP8 cache configuration")
+                    if observed is None:
+                        observed = dtype
+                    if model_config is not None:
+                        decoder = model_config.get("text_config", model_config)
+                        dsa = decoder.get("dsa_config")
+                        if not isinstance(dsa, dict):
+                            raise ValueError("K3.1 checkpoint indexer configuration is missing")
+                        # Pinned kimi_k3/common/dsa_cache.py::indexer_cache_entry_bytes:
+                        # each FP8 key carries one FP32 scale. Bind the logical
+                        # payload only; native padded pages still own placement.
+                        token_bytes = _positive(dsa.get("index_head_dim"), "indexer head dimension") + 4
+                        if spec.get("unpadded_page_size_bytes") != token_bytes * spec["block_size_tokens"]:
+                            raise ValueError("K3.1 indexer payload differs from the checkpoint FP8 geometry")
+                if observed != dtype:
                     raise ValueError("K3.1 native cache spec dtype differs from the resolved cache layout")
     assignments = worker.get("attention_groups")
     if not isinstance(assignments, list) or not assignments:
@@ -570,10 +591,10 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                 raise ValueError("K3.1 kernel-block mapping is not an observed native indexer cache")
             if (
                 group["layer_classes"].get(name) == "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache"
-                and group["block_size_tokens"] > 64
+                and group["block_size_tokens"] != 64
                 and name not in kernel_views
             ):
-                raise ValueError("K3.1 subdivided indexer requires native kernel-block mapping coverage")
+                raise ValueError("K3.1 CUDA indexer requires 64-token blocks or native kernel-block mapping coverage")
             if not isinstance(components, list) or len(components) != (2 if state else 1):
                 raise ValueError("K3.1 layer component count contradicts native spec")
             component_offset = offset
