@@ -64,6 +64,8 @@ jobs:
       fail-fast: false
       matrix:
         side: [old, new]
+        # DO NOT MERGE: temporary repeat legs that sample hosted CPU models.
+        sample: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout comparison revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -120,11 +122,16 @@ jobs:
           mkdir -p /tmp/gate-snapshot
           touch /tmp/gate-snapshot/NO_HARNESS.txt
           echo "::notice::comparison revision predates the prediction-regression harness"
+      - name: "DO NOT MERGE: record hosted CPU"
+        if: always()
+        run: |
+          mkdir -p /tmp/gate-snapshot
+          lscpu | tee /tmp/gate-snapshot/runner-cpu.txt
       - name: Upload prediction snapshot
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: prediction-gate-${{ matrix.side }}
+          name: prediction-gate-${{ matrix.side }}${{ matrix.sample != 1 && format('-sample-{0}', matrix.sample) || '' }}
           path: /tmp/gate-snapshot
           retention-days: 30
 
@@ -160,6 +167,24 @@ jobs:
         with:
           pattern: prediction-gate-*
           path: /tmp/prediction-snapshots
+      - name: "DO NOT MERGE: require identical snapshots across hosted samples"
+        working-directory: /tmp/prediction-snapshots
+        run: |
+          set -euo pipefail
+          status=0
+          for side in old new; do
+            for sample in "prediction-gate-${side}" prediction-gate-"${side}"-sample-*; do
+              cpu="$(grep -m 1 '^Model name:' "${sample}/runner-cpu.txt" | sed 's/^Model name: *//' || true)"
+              if diff -rq --exclude=runner-cpu.txt "prediction-gate-${side}" "${sample}" > /dev/null; then
+                echo "${sample} (${cpu}): identical to prediction-gate-${side}"
+              else
+                echo "::error::${sample} (${cpu}) differs from prediction-gate-${side}"
+                diff -r --exclude=runner-cpu.txt "prediction-gate-${side}" "${sample}" | head -n 40 || true
+                status=1
+              fi
+            done
+          done
+          exit "${status}"
       - name: Compare predictions and enforce the gate
         working-directory: python/aisim
         run: |

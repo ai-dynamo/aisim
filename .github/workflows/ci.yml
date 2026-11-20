@@ -972,6 +972,11 @@ jobs:
     # sentinel step fetches its own baseline commit, so no full history.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # DO NOT MERGE: temporary repeat legs that sample hosted CPU models.
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -997,11 +1002,16 @@ jobs:
         run: |
           python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
           python scripts/prediction_regression/check_prediction_numerics.py --output numerical-sentinels.json
+      - name: "DO NOT MERGE: record hosted CPU"
+        if: always()
+        run: lscpu | tee runner-cpu.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: native-prediction-numerics
-          path: numerical-sentinels.json
+          name: native-prediction-numerics-sample-${{ matrix.sample }}
+          path: |
+            numerical-sentinels.json
+            runner-cpu.txt
           if-no-files-found: error
 
 
