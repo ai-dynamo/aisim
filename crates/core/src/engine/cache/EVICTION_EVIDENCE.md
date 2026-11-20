@@ -85,10 +85,44 @@ unit tests in Full CI.
 
 The original evidence-only repair at `9664b5ba9bc33ac02e7e0f727679c00587b08733`
 used Rust 1.91.1, Python 3.12.12, the frozen Python lockfile,
-and an optimized wheel built from `python/aisimulate` with:
+and an optimized wheel. To reproduce the validation, activate a scratch Python
+environment with the frozen development dependencies, pip, and maturin installed.
+From the repository root, build into a fresh wheel directory, install that exact
+wheel, and verify the loaded extension before running the suites. Every `python`
+command below must use that same environment's interpreter:
 
 ```bash
-python -m maturin build --release --locked --auditwheel skip --out "$TMPDIR/wheels"
+set -euo pipefail
+parity_wheel_dir=$(mktemp -d "$TMPDIR/radix-parity-wheels.XXXXXX")
+(cd python/aisimulate && python -m maturin build \
+  --release --locked --auditwheel skip --out "$parity_wheel_dir")
+parity_wheels=("$parity_wheel_dir"/aisimulate-*.whl)
+test "${#parity_wheels[@]}" -eq 1
+python -m pip install --no-deps --force-reinstall "${parity_wheels[0]}"
+python - "${parity_wheels[0]}" <<'PY'
+import hashlib
+from importlib.metadata import distribution
+from pathlib import Path
+import sys
+from zipfile import ZipFile
+
+import aisimulate._runtime as runtime
+
+wheel_path = Path(sys.argv[1]).resolve()
+loaded_path = Path(runtime.__file__).resolve()
+member = f"aisimulate/{loaded_path.name}"
+installed_path = Path(distribution("aisimulate").locate_file(member)).resolve()
+with ZipFile(wheel_path) as wheel:
+    wheel_sha256 = hashlib.sha256(wheel.read(member)).hexdigest()
+loaded_sha256 = hashlib.sha256(loaded_path.read_bytes()).hexdigest()
+print(f"interpreter: {sys.executable}")
+print(f"wheel: {wheel_path}")
+print(f"loaded extension: {loaded_path}")
+print(f"loaded SHA-256: {loaded_sha256}")
+print(f"wheel extension SHA-256: {wheel_sha256}")
+if loaded_path != installed_path or loaded_sha256 != wheel_sha256:
+    raise SystemExit("Loaded extension does not match the installed wheel")
+PY
 python -m pytest -q -rx -n 4 -c python/aisimulate/pytest.ini \
   crates/core/parity_tests/perfmodel/test_engine_step_parity.py
 python -m pytest -q -rx -n 4 -c python/aisimulate/pytest.ini \
@@ -97,7 +131,7 @@ python scripts/check_prediction_numerics.py --fetch-baseline-only
 python scripts/check_prediction_numerics.py --output "$TMPDIR/numerical-sentinels.json"
 ```
 
-The suites passed **301/301** and **85/85** cases, respectively, with their
+The historical suites passed **301/301** and **85/85** cases, respectively, with their
 original assertions and 120-second per-test timeout. All **16 numerical
 sentinels** passed; their baseline commit was already present, so no fetch was
 needed. Native wheel features were `extension-module` (including `python` and
