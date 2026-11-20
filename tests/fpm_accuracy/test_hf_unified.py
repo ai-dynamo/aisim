@@ -1,0 +1,289 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""FPM accuracy dataset on the unified ``data/fpm/`` layout.
+
+The unified tree is produced from the legacy fixture by the library's own migration, so the legacy
+spelling inside moved files (logical keys) is exercised exactly as in the published dataset.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from scripts.fpm_accuracy.exceptions import ConfigurationError, DataError
+from scripts.fpm_accuracy.hf import HfDataset
+from scripts.fpm_accuracy.hf import dataset as dataset_module
+from tests.fpm_accuracy import legacy_migration as fpm_migration
+from tests.fpm_accuracy.test_hf_dataset import CONFIGURATION_PATH, REVISION, _build_dataset, _fpm_payload
+
+REPO = "ai-dynamo/aisim-data"
+
+
+def _legacy_and_unified(tmp_path: Path, edit=None) -> tuple[Path, Path]:
+    legacy = tmp_path / "legacy"
+    content = f"{json.dumps(_fpm_payload())}\n".encode()
+    _build_dataset(
+        legacy,
+        protocol_id="forward-pass-measurement-v1",
+        files=[("truth", "truth.jsonl", content)],
+    )
+    (legacy / "catalog/fpm.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "path": f"{CONFIGURATION_PATH}/fpm/fpm.parquet",
+                        "schema_name": "aic_fpm_forward_perf",
+                        "schema_version": 6,
+                    }
+                ],
+            }
+        )
+    )
+    if edit is not None:
+        edit(legacy)
+    unified = tmp_path / "unified"
+    fpm_migration.migrate(legacy, unified, revision=REVISION, repo=REPO)
+    return legacy, unified
+
+
+def _signature(case) -> dict:
+    configuration = case.configuration
+    return {
+        "case_id": case.case_id,
+        "membership": case.measurement_membership_sha256,
+        "status": case.status.value,
+        "configuration": configuration.configuration_id,
+        "configuration_path": configuration.configuration_path,
+        "truth": [(f.measurement_file_id, f.path, f.sha256) for f in case.truth_files],
+        "helpers": [(f.measurement_file_id, f.path, f.sha256) for f in case.helper_files],
+        "fpm": [(a.artifact_id, a.path, a.sha256, a.row_count) for a in case.fpm_artifacts],
+        "observations": [(o.observation_id, o.source_path, o.actual_ms) for o in case.observations],
+    }
+
+
+def test_unified_resolution_is_identical_to_legacy(tmp_path: Path) -> None:
+    legacy_root, unified_root = _legacy_and_unified(tmp_path)
+    legacy = HfDataset.from_local(legacy_root, revision=REVISION, repo_id=REPO)
+    unified = HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO)
+
+    assert (legacy.layout, unified.layout) == ("legacy", "unified")
+    assert [c.configuration_id for c in unified.configurations()] == [
+        c.configuration_id for c in legacy.configurations()
+    ]
+    assert _signature(unified.measurement_case(CONFIGURATION_PATH)) == _signature(
+        legacy.measurement_case(CONFIGURATION_PATH)
+    )
+
+
+def test_links_use_the_physical_path_and_identity_keeps_the_logical_key(tmp_path: Path) -> None:
+    _, unified_root = _legacy_and_unified(tmp_path)
+    case = HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO).measurement_case(CONFIGURATION_PATH)
+
+    assert case.configuration.configuration_path == CONFIGURATION_PATH  # data/<model>/..., unchanged
+    assert all("/data/fpm/Org--Model/" in url for url in case.provenance_urls)
+    assert all(f"/{REPO}/blob/{REVISION}/" in url for url in case.provenance_urls)
+
+
+def test_leaf_manifest_tamper_is_caught_by_the_envelope_hash(tmp_path: Path) -> None:
+    _, unified_root = _legacy_and_unified(tmp_path)
+    leaf = unified_root / "data/fpm/Org--Model/h100-sxm/vllm/1.0/single/manifest.json"
+    leaf.write_text(leaf.read_text() + " ")
+    with pytest.raises(DataError, match="hash mismatch"):
+        HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO)
+
+
+def _refresh_index_hashes(unified: Path) -> None:
+    category_path = unified / fpm_migration.CATEGORY_INDEX
+    category = json.loads(category_path.read_text())
+    for entry in category["entries"]:
+        path = unified / entry["manifest"]["path"]
+        entry["manifest"].update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    category_path.write_text(json.dumps(category))
+    dataset_path = unified / fpm_migration.DATASET_INDEX
+    dataset = json.loads(dataset_path.read_text())
+    dataset["categories"]["fpm"]["index"].update(
+        sha256=hashlib.sha256(category_path.read_bytes()).hexdigest(), bytes=category_path.stat().st_size
+    )
+    dataset_path.write_text(json.dumps(dataset))
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_envelope_and_leaf_must_agree_on_the_library_digest(tmp_path: Path, conflict: bool) -> None:
+    _, unified = _legacy_and_unified(tmp_path)
+    if conflict:
+        path = unified / fpm_migration.target_path(f"{CONFIGURATION_PATH}/aisim-manifest.json")
+        envelope = json.loads(path.read_text())
+        next(a for a in envelope["artifacts"] if a["role"] == "fpm-library")["sha256"] = "0" * 64
+        path.write_text(json.dumps(envelope))
+        _refresh_index_hashes(unified)
+        with pytest.raises(DataError, match="FPM library.*digest differs from its envelope"):
+            HfDataset.from_local(unified, revision=REVISION, repo_id=REPO)
+    else:
+        assert HfDataset.from_local(unified, revision=REVISION, repo_id=REPO).measurement_case(CONFIGURATION_PATH)
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+@pytest.mark.parametrize("role", ["measurement-manifest", "measurement-data"])
+def test_envelope_and_leaf_must_agree_on_the_measurement_digests(tmp_path: Path, role: str, conflict: bool) -> None:
+    _, unified = _legacy_and_unified(tmp_path)
+    if conflict:
+        # The local files and the hash-valid leaf agree with each other; only the envelope disagrees.
+        path = unified / fpm_migration.target_path(f"{CONFIGURATION_PATH}/aisim-manifest.json")
+        envelope = json.loads(path.read_text())
+        next(a for a in envelope["artifacts"] if a["role"] == role)["sha256"] = "0" * 64
+        path.write_text(json.dumps(envelope))
+        _refresh_index_hashes(unified)
+    dataset = HfDataset.from_local(unified, revision=REVISION, repo_id=REPO)
+    if conflict:
+        with pytest.raises(DataError, match="measurement file .* digest differs from its envelope"):
+            dataset.measurement_case(CONFIGURATION_PATH)
+    else:
+        assert dataset.measurement_case(CONFIGURATION_PATH).truth_files
+
+
+@pytest.mark.parametrize("spelling", ["data/", "./data/"])
+def test_unified_reader_resolves_dotted_leaf_measurement_paths(tmp_path: Path, spelling: str) -> None:
+    def edit(legacy: Path) -> None:
+        leaf_path = legacy / CONFIGURATION_PATH / "manifest.json"
+        leaf = json.loads(leaf_path.read_text())
+        manifest_path = leaf["measurements"]["manifest_path"]
+        assert manifest_path.startswith("data/")
+        leaf["measurements"]["manifest_path"] = spelling + manifest_path.removeprefix("data/")
+        leaf_path.write_text(json.dumps(leaf))
+
+    _, unified = _legacy_and_unified(tmp_path, edit)
+
+    case = HfDataset.from_local(unified, revision=REVISION, repo_id=REPO).measurement_case(CONFIGURATION_PATH)
+
+    assert case.truth_files
+    assert f"/blob/{REVISION}/data/fpm/" in case.configuration.measurements.provenance_url
+
+
+def test_migration_rejects_an_output_inside_the_source_snapshot(tmp_path: Path) -> None:
+    legacy, _ = _legacy_and_unified(tmp_path)
+    nested = legacy / "migrated"
+
+    with pytest.raises(fpm_migration.MigrationError, match="outside the source snapshot"):
+        fpm_migration.migrate(legacy, nested, revision=REVISION, repo=REPO)
+    assert not nested.exists()
+    # Control: the sibling directory migrates and audits cleanly.
+    assert fpm_migration.audit(legacy, tmp_path / "unified")["passed"]
+
+
+def test_migration_rejects_a_stale_measurement_manifest_digest_before_creating_output(tmp_path: Path) -> None:
+    def edit(legacy: Path) -> None:
+        leaf_path = legacy / CONFIGURATION_PATH / "manifest.json"
+        leaf = json.loads(leaf_path.read_text())
+        leaf["measurements"]["manifest_sha256"] = "0" * 64
+        leaf_path.write_text(json.dumps(leaf))
+
+    with pytest.raises(fpm_migration.MigrationError, match="manifest_sha256 differs"):
+        _legacy_and_unified(tmp_path, edit)
+    assert not (tmp_path / "unified").exists()
+
+
+@pytest.mark.parametrize("command", ["audit", "plan-upload"])
+def test_reports_and_plans_stay_out_of_the_dataset_trees(tmp_path: Path, command: str) -> None:
+    legacy, unified = _legacy_and_unified(tmp_path)
+    evidence = "--report-dir" if command == "audit" else "--plan-out"
+    listing = tmp_path / "listing.json"
+    listing.write_text('{"files": {}}')
+    arguments = [command, "--source", str(legacy), "--output", str(unified), "--listing", str(listing)]
+    for tree in (legacy, unified):
+        with pytest.raises(fpm_migration.MigrationError, match="outside the dataset trees"):
+            fpm_migration.main([*arguments, evidence, str(tree / "reports")])
+        assert not (tree / "reports").exists()
+
+
+def test_selection_filters_before_any_artifact_is_needed(tmp_path: Path) -> None:
+    _, unified_root = _legacy_and_unified(tmp_path)
+    by_model = HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO, models=["Org/Model"])
+    assert len(by_model.configurations()) == 1
+    assert (
+        len(HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO, hardware=["h100_sxm"]).configurations())
+        == 1
+    )
+    by_path = HfDataset.from_local(
+        unified_root, revision=REVISION, repo_id=REPO, configuration_paths=[CONFIGURATION_PATH]
+    )
+    assert len(by_path.configurations()) == 1
+    with pytest.raises(ConfigurationError, match="no FPM configuration matches"):
+        HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO, models=["Other/Model"])
+
+
+def _two_configuration_index(unified_root: Path):
+    """The migrated category index plus a second configuration of another model."""
+    from aisim_core.data import CategoryIndex
+
+    index = CategoryIndex.model_validate_json((unified_root / fpm_migration.CATEGORY_INDEX).read_bytes())
+    first = index.entries[0]
+    second = first.model_copy(
+        update={
+            "configuration_id": "cfg-" + "1" * 64,
+            "identity": first.identity.model_copy(update={"model": "Other/Model"}),
+            "manifest": first.manifest.model_copy(
+                update={"path": first.manifest.path.replace("Org--Model", "Other--Model")}
+            ),
+        }
+    )
+    return index.model_copy(update={"entries": [first, second]}), first, second
+
+
+def test_explicit_paths_are_validated_against_the_whole_catalog_before_the_model_filter(tmp_path: Path) -> None:
+    from scripts.fpm_accuracy.hf.dataset import _entry_configuration_path, _select_entries
+
+    _, unified_root = _legacy_and_unified(tmp_path)
+    index, first, second = _two_configuration_index(unified_root)
+    paths = [_entry_configuration_path(first), _entry_configuration_path(second)]
+    assert paths[0] != paths[1]
+
+    # B exists but the model filter matches only A: B drops out of the intersection and is not "unknown".
+    assert _select_entries(index, ["Org/Model"], None, paths) == [first]
+    assert _select_entries(index, None, None, paths) == [first, second]  # control: no filter keeps both
+    with pytest.raises(ConfigurationError, match="unknown smoke configuration"):
+        _select_entries(index, ["Org/Model"], None, [paths[0], "data/Missing--Model/h100-sxm/vllm/1.0/single"])
+
+
+class _FakeTransport:
+    """Serves a local unified tree; records every opened path."""
+
+    root: Path
+    opened: list[str]
+
+    def __init__(self, token: str | None = None) -> None:
+        self.opened = type(self).opened
+
+    def resolve_revision(self, repo: str, revision: str) -> str:
+        assert repo == REPO
+        return REVISION
+
+    def open_file(self, repo: str, sha: str, path: str) -> Iterator[bytes]:
+        self.opened.append(path)
+        yield (type(self).root / path).read_bytes()
+
+
+def test_from_hub_selects_before_downloading_and_skips_excluded_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, unified_root = _legacy_and_unified(tmp_path)
+    provenance = "data/fpm/Org--Model/h100-sxm/vllm/1.0/single/fpm/provenance/source.tar.gz"
+    _FakeTransport.root, _FakeTransport.opened = unified_root, []
+    monkeypatch.setattr(dataset_module, "HfTransport", _FakeTransport)
+
+    dataset = HfDataset.from_hub(REPO, revision="main", cache_dir=tmp_path / "cache", models=["Org/Model"])
+
+    assert dataset.revision == REVISION
+    assert len(dataset.measurement_case(CONFIGURATION_PATH).observations) == 1
+    assert "catalog/dataset.json" in _FakeTransport.opened
+    assert provenance not in _FakeTransport.opened
+    assert not any(path.startswith("data/") and "Org--Model" not in path for path in _FakeTransport.opened)
+    with pytest.raises(ConfigurationError, match="no FPM configuration matches"):
+        HfDataset.from_hub(REPO, revision="main", cache_dir=tmp_path / "cache", models=["Missing/Model"])

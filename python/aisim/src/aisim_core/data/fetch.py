@@ -46,6 +46,7 @@ from aisim_core.data import (
     Entry,
     Manifest,
     _relative,
+    configuration_id,
 )
 from aisim_core.data.parquet import read_parquet_schema_id
 
@@ -419,6 +420,16 @@ def _ref(artifact: Artifact, role: str) -> PlannedFile:
 _METADATA_CAP_BYTES = 16 * 1024 * 1024
 
 
+def _check_manifest(manifest: Manifest, entry: Entry, category: str, path: str) -> None:
+    """The manifest must hash to its own ID and describe exactly the catalog entry that selected it."""
+    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+        raise IntegrityError(path, "manifest configuration identity hash mismatch")
+    if manifest.configuration_id != entry.configuration_id:
+        raise IntegrityError(path, "manifest configuration ID differs from the catalog entry")
+    if (manifest.category, manifest.purpose, manifest.identity) != (category, entry.purpose, entry.identity):
+        raise IntegrityError(path, "manifest category, purpose or identity differs from the catalog entry")
+
+
 class _Planner:
     def __init__(self, transport: Transport | None, cache: Cache, plan: FetchPlan, budget: int | None = None):
         self.transport, self.cache, self.plan = transport, cache, plan
@@ -481,7 +492,8 @@ class _Planner:
         plan.metadata_bytes += received
         if validate is not None:
             validate(b"".join(chunks))
-        self.cache.discard(plan.repo, plan.revision, ref.path)
+        # ``store`` verifies a temporary file and atomically replaces the destination, so an existing entry
+        # (possibly another reader's verified download) is never removed ahead of a transfer that may fail.
         self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
         self._add(ref)
         return self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
@@ -542,13 +554,7 @@ def plan(
         if raw is None:
             continue
         manifest = parse(Manifest, raw, entry.manifest.path)
-        if manifest.configuration_id != entry.configuration_id:
-            raise IntegrityError(entry.manifest.path, "manifest configuration ID differs from the catalog entry")
-        # A digest-correct manifest of another hardware or model can carry a copied ID; its identity and purpose must
-        # be the entry's before any of its artifacts is planned (the category stamp is not compared: legacy
-        # stamps are valid where the loader permits them).
-        if manifest.identity != entry.identity or manifest.purpose != entry.purpose:
-            raise IntegrityError(entry.manifest.path, "manifest identity or purpose differs from the catalog entry")
+        _check_manifest(manifest, entry, selection.category, entry.manifest.path)
         for artifact in manifest.artifacts:
             if artifact.role not in selection.exclude_roles:
                 planner._add(_ref(artifact, "artifact"))
@@ -609,7 +615,6 @@ def fetch(
     for f in result_plan.files:
         if f.cached:
             continue
-        cache.discard(repo, sha, f.path)
         _, size = cache.store(repo, sha, f.path, transport.open_file(repo, sha, f.path), f)
         downloaded += size
         f.cached = True
@@ -685,7 +690,6 @@ def fetch_support(
         if not cache.valid(repo, sha, ref.path, ref):
             if offline or transport is None:
                 raise OfflineMissingError([ref.path])
-            cache.discard(repo, sha, ref.path)
             cache.store(repo, sha, ref.path, transport.open_file(repo, sha, ref.path), ref)
         paths[ref.path] = cache.path_for(repo, sha, ref.path)
     return sha, index, paths
