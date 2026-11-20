@@ -167,6 +167,42 @@ def test_unified_reader_resolves_dotted_leaf_measurement_paths(tmp_path: Path, s
     assert f"/blob/{REVISION}/data/fpm/" in case.configuration.measurements.provenance_url
 
 
+def test_migration_rejects_an_output_inside_the_source_snapshot(tmp_path: Path) -> None:
+    legacy, _ = _legacy_and_unified(tmp_path)
+    nested = legacy / "migrated"
+
+    with pytest.raises(fpm_migration.MigrationError, match="outside the source snapshot"):
+        fpm_migration.migrate(legacy, nested, revision=REVISION, repo=REPO)
+    assert not nested.exists()
+    # Control: the sibling directory migrates and audits cleanly.
+    assert fpm_migration.audit(legacy, tmp_path / "unified")["passed"]
+
+
+def test_migration_rejects_a_stale_measurement_manifest_digest_before_creating_output(tmp_path: Path) -> None:
+    def edit(legacy: Path) -> None:
+        leaf_path = legacy / CONFIGURATION_PATH / "manifest.json"
+        leaf = json.loads(leaf_path.read_text())
+        leaf["measurements"]["manifest_sha256"] = "0" * 64
+        leaf_path.write_text(json.dumps(leaf))
+
+    with pytest.raises(fpm_migration.MigrationError, match="manifest_sha256 differs"):
+        _legacy_and_unified(tmp_path, edit)
+    assert not (tmp_path / "unified").exists()
+
+
+@pytest.mark.parametrize("command", ["audit", "plan-upload"])
+def test_reports_and_plans_stay_out_of_the_dataset_trees(tmp_path: Path, command: str) -> None:
+    legacy, unified = _legacy_and_unified(tmp_path)
+    evidence = "--report-dir" if command == "audit" else "--plan-out"
+    listing = tmp_path / "listing.json"
+    listing.write_text('{"files": {}}')
+    arguments = [command, "--source", str(legacy), "--output", str(unified), "--listing", str(listing)]
+    for tree in (legacy, unified):
+        with pytest.raises(fpm_migration.MigrationError, match="outside the dataset trees"):
+            fpm_migration.main([*arguments, evidence, str(tree / "reports")])
+        assert not (tree / "reports").exists()
+
+
 def test_selection_filters_before_any_artifact_is_needed(tmp_path: Path) -> None:
     _, unified_root = _legacy_and_unified(tmp_path)
     by_model = HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO, models=["Org/Model"])

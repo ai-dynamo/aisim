@@ -131,7 +131,7 @@ def _canonical(document: Any) -> bytes:
 
 def load_listing(path: Path) -> dict[str, dict[str, Any]]:
     """Read a listing saved by :func:`download_snapshot`: path -> {size, lfs_sha256, blob_id}."""
-    document = json.loads(Path(path).read_text())
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
     return {f["path"]: f for f in document["files"]}
 
 
@@ -205,7 +205,7 @@ def discover_leaves(root: Path, files: Iterable[str]) -> list[Leaf]:
     for relative in data_files:
         path = PurePosixPath(relative)
         if path.name == LEGACY_LEAF_MANIFEST and "measurements" not in path.parts:
-            manifest = json.loads((root / relative).read_text())
+            manifest = json.loads((root / relative).read_text(encoding="utf-8"))
             leaves[path.parent.as_posix()] = manifest
     members: dict[str, list[str]] = defaultdict(list)
     orphans = []
@@ -225,7 +225,7 @@ def _fpm_schemas(root: Path) -> dict[str, str]:
     path = root / "catalog" / "fpm.json"
     if not path.is_file():
         return {}
-    records = json.loads(path.read_text())["records"]
+    records = json.loads(path.read_text(encoding="utf-8"))["records"]
     return {r["path"]: f"{r['schema_name']}/v{r['schema_version']}" for r in records}
 
 
@@ -275,7 +275,7 @@ def _schema_label(role: str, legacy_path: str, schemas: Mapping[str, str], file:
         except KeyError:
             raise MigrationError(f"no legacy catalog record for FPM library {legacy_path}") from None
     if role in ("legacy-configuration-manifest", "measurement-manifest"):
-        version = json.loads(file.read_text()).get("manifest_version")
+        version = json.loads(file.read_text(encoding="utf-8")).get("manifest_version")
         name = "configuration-manifest" if role == "legacy-configuration-manifest" else "measurement-manifest"
         return f"{name}/v{version}"
     return "unversioned"
@@ -339,6 +339,27 @@ def _gaps(leaf: Leaf) -> list[dict[str, Any]]:
     if (m.get("provenance") or {}).get("producer_identity_missing"):
         gaps.append({"field": "producer_identity", "reason": "legacy provenance reports producer_identity_missing"})
     return gaps
+
+
+def _measurement_manifest_problem(root: Path, leaf: Leaf) -> str | None:
+    """The leaf's recorded measurement-manifest digest must name the manifest bytes it ships with."""
+    measurements = leaf.manifest.get("measurements")
+    if not isinstance(measurements, dict):
+        return f"{leaf.directory} has no measurements reference"
+    path = measurements.get("manifest_path")
+    if not isinstance(path, str) or PurePosixPath(path).as_posix() not in leaf.files:
+        return f"{leaf.directory} measurements manifest is absent from the source: {path!r}"
+    if measurements.get("manifest_sha256") != sha256_file(root / PurePosixPath(path).as_posix()):
+        return f"{leaf.directory} measurements.manifest_sha256 differs from {path}"
+    return None
+
+
+def _reject_evidence_inside(evidence: Path, *trees: Path) -> None:
+    """Reports and plans must not land in a dataset tree, where the next plan would upload them."""
+    resolved = evidence.resolve()
+    for tree in trees:
+        if resolved.is_relative_to(tree.resolve()):
+            raise MigrationError(f"evidence directory must be outside the dataset trees: {evidence}")
 
 
 def build_manifest(
@@ -448,12 +469,17 @@ def migrate(
     from aisim_core.data import catalog as cat
 
     source, output = Path(source), Path(output)
+    if output.resolve().is_relative_to(source.resolve()):
+        raise MigrationError(f"output must be outside the source snapshot: {output}")
     if output.exists():
         raise MigrationError(f"output already exists: {output}")
     files = list_files(source)
     leaves = discover_leaves(source, files)
     if not leaves:
         raise MigrationError("no configuration leaves found")
+    for leaf in leaves:
+        if problem := _measurement_manifest_problem(source, leaf):
+            raise MigrationError(problem)
     schemas = _fpm_schemas(source)
     output.mkdir(parents=True)
     try:
@@ -463,7 +489,7 @@ def migrate(
             if relative.startswith(OLD_PREFIX):
                 _place(source / relative, output / target_path(relative), link)
             elif relative == ".gitattributes":
-                text = (source / relative).read_text()
+                text = (source / relative).read_text(encoding="utf-8")
                 (output / relative).write_text(rewrite_gitattributes(text))
                 modified.append(relative)
             else:
@@ -592,6 +618,10 @@ def audit(
             }
         )
 
+    for leaf in discover_leaves(source, source_files):
+        if problem := _measurement_manifest_problem(source, leaf):
+            failures.append(problem)
+
     # (d) library check
     try:
         index = check_dataset(output)
@@ -628,7 +658,7 @@ def audit(
     legacy_history: list[str] = []
     legacy_index = source / "catalog" / "index.json"
     if legacy_index.is_file():
-        document = json.loads(legacy_index.read_text())
+        document = json.loads(legacy_index.read_text(encoding="utf-8"))
         legacy_current = document.get("configuration_manifests", [])
         legacy_history = document.get("history_manifests", [])
     sibling = lambda p: target_path(p)[: -len(LEGACY_LEAF_MANIFEST)] + ENVELOPE_NAME
@@ -832,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     listing = load_listing(args.listing) if args.listing else None
     if args.command == "audit":
+        _reject_evidence_inside(args.report_dir, args.source, args.output)
         report = audit(args.source, args.output, listing=listing, revision=args.revision)
         for path in write_audit_report(report, args.report_dir):
             print(path)
@@ -840,6 +871,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report["passed"] else 1
     if listing is None:
         parser.error("plan-upload requires --listing")
+    _reject_evidence_inside(args.plan_out, args.source, args.output)
     plan = plan_upload(listing, args.output, args.source)
     write_upload_plan(plan, args.plan_out)
     print(json.dumps({k: v for k, v in plan.items() if k != "operations"}, indent=2))
