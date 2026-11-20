@@ -131,6 +131,20 @@ def test_no_other_step_receives_a_secret_and_secrets_are_not_job_or_workflow_wid
     assert not references_secret(wheel)
 
 
+def test_every_job_that_seals_or_opens_artifacts_uses_the_same_key_secret():
+    """The artifact key derives from HF_TOKEN, so producers and consumers must name the same secret."""
+    expected = "${{ secrets.HF_READ_AISIM_INFX_CACHE }}"
+    seen = {"seal": set(), "open": set()}
+    for name in NAMES:
+        for job_id, _, step in steps(name):
+            for action in re.findall(r"private_artifacts\.py (seal|open)\b", step.get("run", "")):
+                assert step["env"]["HF_TOKEN"] == expected, f"{name}:{job_id}: {step.get('name')}"
+                seen[action].add(job_id)
+    # Every producer has a consumer in another job (the environments differ between them).
+    assert {"measurements", "shards", "agentx"} <= seen["seal"]
+    assert {"shards", "campaign", "qualify-agentx"} <= seen["open"]
+
+
 def test_credentialed_jobs_declare_the_environment_and_check_out_main():
     for name, job_ids in (
         ("e2e-accuracy.yml", ["resolve"]),

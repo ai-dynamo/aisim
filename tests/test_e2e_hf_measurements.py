@@ -528,8 +528,9 @@ def test_private_artifact_tamper_never_leaves_plaintext(sealed, monkeypatch, dam
         data = bytearray(path.read_bytes())
         data[-20] ^= 1
         path.write_bytes(data)
-    with pytest.raises(InvalidTag):
+    with pytest.raises(InvalidTag, match="HF_READ_AISIM_INFX_CACHE") as raised:
         private_artifacts.transfer(encrypted, opened, decrypt=True)
+    assert isinstance(raised.value, private_artifacts.PrivateArtifactAuthenticationError)
     assert not list(opened.rglob("*"))
 
 
