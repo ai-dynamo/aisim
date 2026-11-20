@@ -47,7 +47,11 @@ def _redact_diagnostic(
                 r"\1<redacted>",
                 diagnostic,
             )
-            diagnostic = diagnostic.replace('"value": ' + json.dumps(value), '"value": "<redacted>"')
+            diagnostic = re.sub(
+                r'("value"\s*:\s*)' + re.escape(json.dumps(value)),
+                r'\1"<redacted>"',
+                diagnostic,
+            )
     return diagnostic
 
 

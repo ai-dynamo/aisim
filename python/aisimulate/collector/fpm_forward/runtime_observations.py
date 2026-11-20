@@ -409,7 +409,11 @@ def _validate_record(
     if native_layout and kind == "worker":
         from .runtime_k31 import validate_attention_assignments
 
-        environment = {item["name"]: item["value"] for item in launch["deployment"].get("extra_env") or ()}
+        environment = {
+            item["name"]: item["value"]
+            for item in launch["deployment"].get("extra_env") or ()
+            if item["name"] == "VLLM_SSM_CONV_STATE_LAYOUT" and "value" in item
+        }
         validate_attention_assignments(
             record,
             model_config=checkpoint_config,

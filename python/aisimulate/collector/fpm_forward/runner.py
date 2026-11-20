@@ -46,7 +46,12 @@ from aisimulate.fpm_contract import (
     fpm_workload_node_count,
 )
 
-from .config import FPM_RUNTIME_STARTUP_ENV, archive_generator_overrides, with_kv_warmup_defaults
+from .config import (
+    FPM_RUNTIME_STARTUP_ENV,
+    archive_generator_overrides,
+    resolve_archived_generator_overrides,
+    with_kv_warmup_defaults,
+)
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
@@ -1500,6 +1505,8 @@ def _cell_generator_overrides(
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise TypeError("K8sConfig.extra_env entries must be {name, value} mappings")
         name = item["name"]
+        if name == "PYTHONHOME":
+            raise ValueError("K8sConfig.extra_env does not support PYTHONHOME; use the image's Python prefix")
         existing = resolved_env.get(name)
         if existing is not None and existing != item:
             raise ValueError(f"conflicting FPM environment value for {name}")
@@ -1706,7 +1713,7 @@ def _render_cell(
     overrides = _cell_generator_overrides(
         plan,
         cell,
-        generator_overrides,
+        resolve_archived_generator_overrides(generator_overrides),
         smoke=smoke,
     )
     # A Dynamo release is provenance, not collection compatibility or template
@@ -1746,7 +1753,9 @@ def _render_cell(
     if errors:
         raise ValueError(f"invalid GeneratorRequest for {cell.cell_id}: {errors}")
     artifacts = generate_from_request(request, output_dir=str(cell_dir))
-    _atomic_json(cell_dir / "generator-request.json", params)
+    # Scripts deliver concrete environment values to the worker. Retained
+    # request evidence uses digest-bound inputs, like the campaign archive.
+    _atomic_json(cell_dir / "generator-request.json", archive_generator_overrides(params))
     _write_runtime_environment(cell_dir, overrides)
     return artifacts
 
@@ -2157,7 +2166,7 @@ def _run_collection_impl(
             )
             return False
         if record["status"] == "passed" and not formal_database_terminal:
-            from .database import _is_k31, require_k31_worker_evidence
+            from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence
 
             if _is_k31(plan):
                 try:
@@ -2166,6 +2175,7 @@ def _run_collection_impl(
                         cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
                     )
                     require_k31_worker_evidence(plan, cell, raw_root, collection)
+                    _validate_backend_markers(cell, raw_root.parent)
                 except (OSError, KeyError, TypeError, ValueError) as error:
                     record.update(status="failed", error_type=type(error).__name__, error=str(error))
                     logger.warning("Rejecting archived K3.1 worker evidence for %s: %s", cell.cell_id, error)

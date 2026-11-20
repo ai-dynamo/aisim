@@ -44,6 +44,7 @@ def test_environment_reaches_formal_generator_arguments(tmp_path):
         [{"name": "PYTHONPATH", "value": "x"}, {"name": "PYTHONPATH", "value": "y"}],
         [{"name": "PYTHONPATH", "value": "x", "unknown": "x"}],
         [{"name": "PYTHONPATH", "value": "x\x00y"}],
+        [{"name": "PYTHONHOME", "value": "/alternate/python"}],
     ],
 )
 def test_deployment_rejects_ambiguous_environment(env):
@@ -125,6 +126,15 @@ def test_short_environment_values_preserve_diagnostic_numbers():
     assert _redact_diagnostic(diagnostic, ("1",), ("HF_HUB_OFFLINE",)) == (
         "HF_HUB_OFFLINE=<redacted> --nodes=1 exit status 1 node1 version 0.1.1"
     )
+
+
+@pytest.mark.parametrize("separator", [":", ": ", ":  "])
+def test_short_credentials_redacted_in_json_diagnostics(separator):
+    from aisimulate.support.versioning import _redact_diagnostic
+
+    diagnostic = '{"name":"CUSTOM_AUTH","value"' + separator + '"s3cr3t","exit_code":1}'
+    redacted = _redact_diagnostic(diagnostic, ("s3cr3t",), ("CUSTOM_AUTH",))
+    assert json.loads(redacted) == {"name": "CUSTOM_AUTH", "value": "<redacted>", "exit_code": 1}
 
 
 @pytest.mark.parametrize("failure", ["timeout", "oserror", "returncode"])

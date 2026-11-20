@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import statistics
 import sys
@@ -1866,16 +1867,25 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
     archive = archive_generator_overrides(overrides)
     path = source / "generator-overrides.json"
     path.write_text(json.dumps(archive))
-    assert token not in path.read_text()
+    entry = next(
+        item for item in json.loads(path.read_text())["K8sConfig"]["extra_env"] if item["name"] == "CUSTOM_AUTH"
+    )
+    assert entry == {
+        "name": "CUSTOM_AUTH",
+        "value_from_env": "CUSTOM_AUTH",
+        "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+    }
     assert repeatability._deployment_hashes(archive) & repeatability._deployment_hashes(overrides)
     monkeypatch.delenv("CUSTOM_AUTH", raising=False)
+    if historical == "current":
+        assert repeatability.load_repeatability_deployment(source) == archive
     with pytest.raises(ValueError, match="requires the original value"):
-        repeatability.load_repeatability_deployment(source)
+        repeatability.load_repeatability_deployment(source, resolve_environment=True)
     monkeypatch.setenv("CUSTOM_AUTH", token + "changed")
     with pytest.raises(ValueError, match="requires the original value"):
-        repeatability.load_repeatability_deployment(source)
+        repeatability.load_repeatability_deployment(source, resolve_environment=True)
     monkeypatch.setenv("CUSTOM_AUTH", token)
-    resolved = repeatability.load_repeatability_deployment(source)
+    resolved = repeatability.load_repeatability_deployment(source, resolve_environment=True)
     assert resolved == with_kv_warmup_defaults(overrides)
     _, compared, _ = _collection_controls(plan.cells, resolved)
     assert compared["K8sConfig"]["extra_env"][0] == {"name": "CUSTOM_AUTH", "value": token}

@@ -26,6 +26,7 @@ from . import planner
 from .capabilities import ModelCapabilityProfile, ResolvedDTypeProfile
 from .config import (
     FPMCollectionOptions,
+    archive_generator_overrides,
     resolve_archived_generator_overrides,
     semantic_generator_overrides,
     with_kv_warmup_defaults,
@@ -73,7 +74,9 @@ def _deployment_hashes(overrides: dict[str, Any]) -> set[str]:
     }
 
 
-def load_repeatability_deployment(source_campaign_dir: str | Path) -> dict[str, Any]:
+def load_repeatability_deployment(
+    source_campaign_dir: str | Path, *, resolve_environment: bool = False
+) -> dict[str, Any]:
     """Load the archived effective deployment inputs and verify their plan hash."""
     root = Path(source_campaign_dir).expanduser().resolve()
     path = root / "generator-overrides.json"
@@ -89,16 +92,18 @@ def load_repeatability_deployment(source_campaign_dir: str | Path) -> dict[str, 
         raise ValueError("archived deployment inputs must be an object")
     if not isinstance(overrides.get("K8sConfig", {}), dict):
         raise ValueError("archived K8sConfig must be an object")
+    archive_generator_overrides(overrides)  # Validate before inspecting entry fields.
     references = any("value_from_env" in item for item in overrides.get("K8sConfig", {}).get("extra_env", []) or [])
     hashes = _deployment_hashes(overrides)
     # A resumed historical plan can retain its original literal-value hash
     # while its archive is upgraded to references. Reconstruct that hash only
     # with verified caller values; never trust a hash declared by the archive.
-    resolved = resolve_archived_generator_overrides(overrides) if references else overrides
-    if saved["generator_config_sha256"] not in hashes | _deployment_hashes(resolved):
-        raise ValueError("archived deployment inputs differ from the source plan")
-    if references:
-        return resolved
+    if saved["generator_config_sha256"] not in hashes:
+        resolved = resolve_archived_generator_overrides(overrides) if references else overrides
+        if saved["generator_config_sha256"] not in _deployment_hashes(resolved):
+            raise ValueError("archived deployment inputs differ from the source plan")
+    if references and resolve_environment:
+        return resolve_archived_generator_overrides(overrides)
     return overrides
 
 
@@ -1076,6 +1081,7 @@ def run_repeatability(
     """
     if retry_failed and not resume:
         raise ValueError("repeatability retry_failed requires resume")
+    generator_overrides = resolve_archived_generator_overrides(generator_overrides)
     if source_plan.generator_config_sha256 not in _deployment_hashes(generator_overrides):
         raise ValueError("repeatability deployment inputs differ from the original launch")
     root = Path(output_dir).expanduser().resolve()

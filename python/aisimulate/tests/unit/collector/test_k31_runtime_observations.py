@@ -1706,11 +1706,11 @@ def test_configuration_reads_hash_bound_checkpoint_once_for_all_native_ranks(tmp
 
 
 def test_generic_import_does_not_load_k31_checkpoint_snapshot(tmp_path, monkeypatch):
-    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward import runtime_observations
 
     path, launches = observation_fixture(tmp_path)
     monkeypatch.setattr(
-        runtime_probe, "_model_config_bytes", lambda *_: pytest.fail("generic import loaded K3.1 config")
+        runtime_observations, "_checkpoint_config", lambda *_, **__: pytest.fail("generic import loaded K3.1 config")
     )
     assert validate_observations(path, launches)["tp2"]["status"] == "complete"
 
@@ -2066,3 +2066,28 @@ def test_import_binds_trtllm_timing_identity_to_initialized_launcher(tmp_path, m
     assert result["status"] == ("complete" if launcher == "trtllm" else "incomplete"), result["diagnostics"]
     if launcher != "trtllm":
         assert "publication requires the initialized trtllm launcher" in str(result["diagnostics"])
+
+
+def test_archived_launch_environment_keeps_credentials_out_of_resource_provenance(tmp_path, monkeypatch):
+    from collector.fpm_forward.runtime_probe import normalize_probe_launch
+
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    token = 'synthetic-"private"-$746'
+    launches["tp2"]["deployment"]["extra_env"] = [
+        {"name": "HF_TOKEN", "value": token},
+        {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "SD"},
+    ]
+    launches["tp2"] = normalize_probe_launch(launches["tp2"])
+    _replace_launch(path, launches)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    archived = result["provenance"]["launch"]["deployment"]["extra_env"]
+    assert archived == [
+        {"name": "HF_TOKEN", "value_from_env": "HF_TOKEN", "value_sha256": hashlib.sha256(token.encode()).hexdigest()},
+        {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "SD"},
+    ]
+    assert json.loads(result["resources"]["runtime_memory"]["provenance"])["launch"] == result["provenance"]["launch"]
+    for artifact in result["provenance"]["artifacts"]:
+        assert artifact["evidence"]["launch"] == launches["tp2"]
+    for source in path.parent.rglob("*.json"):
+        assert token not in source.read_text()

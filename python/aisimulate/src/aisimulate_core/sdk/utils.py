@@ -462,10 +462,10 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
 def _resolve_hf_revision(model: str, revision: str) -> str:
     """Bind a Hub alias once; full commit IDs and local checkpoints need no lookup."""
     if (
-        Path(model).expanduser().exists()
+        re.fullmatch(r"[0-9a-fA-F]{40}", revision)
+        or Path(model).expanduser().exists()
         or Path(model).is_absolute()
         or model.startswith(("./", "../", "~"))
-        or re.fullmatch(r"[0-9a-fA-F]{40}", revision)
     ):
         return revision
     url = f"https://huggingface.co/api/models/{model}/revision/{quote(revision, safe='')}"
@@ -2068,6 +2068,7 @@ def _load_model_config_from_model_path(model_path: str, *, model_revision: str |
         ValueError: If the model config cannot be found
         HuggingFaceDownloadError: If fetching from HuggingFace fails
     """
+    model_path = os.path.expanduser(model_path)
     # Check if it's a local path
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
@@ -2102,8 +2103,15 @@ def _load_model_config_from_model_path(model_path: str, *, model_revision: str |
     return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
 
 
-@cache
 def get_model_config_from_model_path(model_path: str, *, model_revision: str | None = None) -> dict:
+    """Resolve moving Hub aliases before consulting immutable metadata caches."""
+    if model_revision is not None:
+        model_revision = _resolve_hf_revision(model_path, model_revision)
+    return _get_model_config_from_resolved_path(os.path.expanduser(model_path), model_revision=model_revision)
+
+
+@cache
+def _get_model_config_from_resolved_path(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration from model path and parse it into model configuration parameters.
 
@@ -2114,8 +2122,6 @@ def get_model_config_from_model_path(model_path: str, *, model_revision: str | N
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
-    if model_revision is not None:
-        model_revision = _resolve_hf_revision(model_path, model_revision)
     raw_config = (
         _load_model_config_from_model_path(model_path, model_revision=model_revision)
         if model_revision is not None
@@ -2150,6 +2156,12 @@ def get_model_config_from_model_path(model_path: str, *, model_revision: str | N
                     family = "Kimi" if kimi else "Qwen3-VL"
                     raise ValueError(f"{family} {filename} must be an object")
                 if key is None:
+                    if qwen_vl and isinstance(data.get("size"), dict):
+                        # Sidecar bounds supersede inline bounds across the two
+                        # native formats, independently for each endpoint.
+                        for legacy, native in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
+                            if native in data["size"]:
+                                processor.pop(legacy, None)
                     processor.update(data)
                 else:
                     processor[key] = data
@@ -2170,6 +2182,9 @@ def get_model_config_from_model_path(model_path: str, *, model_revision: str | N
     )
     parsed["raw_config"] = raw_config
     return parsed
+
+
+get_model_config_from_model_path.cache_clear = _get_model_config_from_resolved_path.cache_clear
 
 
 class ListFlowDumper(yaml.SafeDumper):

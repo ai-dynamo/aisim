@@ -3744,3 +3744,36 @@ def test_k31_prefill_resume_retries_historical_kv_and_retains_zero_history(tmp_p
     assert bool(errors) == bool(history)
     if not history:
         assert record["attempt_id"] == "original"
+
+
+def test_real_renderer_archives_environment_digest_and_delivers_runtime_value(tmp_path):
+    import hashlib
+    import subprocess
+
+    token = 'synthetic-"private"-$746'
+    cell = _cell(dp=4)
+    _render_cell(_plan(cell), cell, tmp_path, {"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": token}]}})
+    saved = json.loads((tmp_path / "generator-request.json").read_text())
+    entry = next(item for item in saved["K8sConfig"]["extra_env"] if item["name"] == "HF_TOKEN")
+    assert entry == {
+        "name": "HF_TOKEN",
+        "value_from_env": "HF_TOKEN",
+        "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+    }
+    # Inspect the engine script's literal shell export through Bash, without
+    # starting the benchmark or evaluating other generated launch commands.
+    line = next(line for line in (tmp_path / "run.sh").read_text().splitlines() if line.startswith("export HF_TOKEN="))
+    result = subprocess.run(
+        ["bash", "-c", line + '\nprintf %s "$HF_TOKEN"'], check=True, text=True, capture_output=True
+    )
+    assert result.stdout == token
+
+
+def test_pythonhome_is_rejected_before_fpm_startup_artifacts(tmp_path):
+    cell = _cell(dp=4)
+    with pytest.raises(ValueError, match="PYTHONHOME"):
+        _render_cell(
+            _plan(cell), cell, tmp_path, {"K8sConfig": {"extra_env": [{"name": "PYTHONHOME", "value": "/alternate"}]}}
+        )
+    assert not (tmp_path / "fpm_env.sh").exists()
+    assert not (tmp_path / "run.sh").exists()

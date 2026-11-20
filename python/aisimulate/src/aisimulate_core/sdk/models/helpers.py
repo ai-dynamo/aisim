@@ -22,6 +22,7 @@ from aisimulate_core.sdk import common, config
 from aisimulate_core.sdk.utils import (
     _get_language_quantization_config,
     _normalize_quant_algo,
+    _resolve_hf_revision,
     get_model_config_from_model_path,
     parse_compressed_tensors_quant,
 )
@@ -611,8 +612,14 @@ def validate_trtllm_large_ep(
         )
 
 
-@cache
 def _get_model_info(model_path: str, *, model_revision: str | None = None) -> dict:
+    if model_revision is not None:
+        model_revision = _resolve_hf_revision(model_path, model_revision)
+    return _get_resolved_model_info(model_path, model_revision=model_revision)
+
+
+@cache
+def _get_resolved_model_info(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration info from model path.
 
@@ -634,6 +641,9 @@ def _get_model_info(model_path: str, *, model_revision: str | None = None) -> di
     info["num_shared_experts"] = _derive_num_shared_experts(info)
     info["num_moe_layers"] = _derive_num_moe_layers(info)
     return info
+
+
+_get_model_info.cache_clear = _get_resolved_model_info.cache_clear
 
 
 def _moe_source_config(info: dict) -> dict:

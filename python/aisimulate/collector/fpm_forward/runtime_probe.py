@@ -16,14 +16,21 @@ import shutil
 import uuid
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from aisimulate.fpm_advisory import prefill_graph_advisory
 
 from . import runner
-from .config import FPM_WARMUP_ITERATIONS, FPMCollectionOptions, collection_phases, semantic_generator_overrides
+from .config import (
+    FPM_WARMUP_ITERATIONS,
+    FPMCollectionOptions,
+    archive_generator_overrides,
+    collection_phases,
+    resolve_archived_generator_overrides,
+    semantic_generator_overrides,
+)
 from .entry import _load_generator_overrides
 from .model_capability import ResolvedModelConfig, load_model_config
 from .planner import FPMCell, _backend_policies, _canonical_hash
@@ -59,6 +66,7 @@ class RuntimeProbePlan:
     cells: tuple[FPMCell, ...]
     runtime_instrumentation: Any
     sha256: str
+    _environment: list[dict[str, str]] | None = field(default=None, repr=False, compare=False)
 
     @property
     def launch(self) -> dict[str, Any]:
@@ -201,6 +209,16 @@ def normalize_probe_launch(value: dict[str, Any], *, allow_pending_version: bool
             raise ValueError("CPU deployment options require the Slurm executor")
         if type(cpus) is not int or cpus < 1 or binding not in {"cores", "none"}:
             raise ValueError("Slurm CPU policy requires positive cpus_per_task and cpu_bind cores or none")
+    if deployment.get("extra_env") is not None:
+        # Keep the public KDA layout input readable by offline validation.
+        original = deployment["extra_env"]
+        archived = archive_generator_overrides({"K8sConfig": {"extra_env": original}})["K8sConfig"]["extra_env"]
+        by_name = {item["name"]: item for item in original}
+        deployment["extra_env"] = [
+            by_name.get(item["name"], item) if item["name"] == "VLLM_SSM_CONV_STATE_LAYOUT" else item
+            for item in archived
+            if item["name"] in by_name
+        ]
     return launch
 
 
@@ -227,7 +245,7 @@ def _model_config_bytes(config: dict[str, Any]) -> dict[str, bytes]:
     return contents
 
 
-def probe_generator_overrides(launch: dict[str, Any]) -> dict[str, Any]:
+def probe_generator_overrides(launch: dict[str, Any], *, resolve_environment: bool = False) -> dict[str, Any]:
     """Translate the existing deployment options through their shared parser."""
 
     deployment = launch["deployment"]
@@ -236,7 +254,6 @@ def probe_generator_overrides(launch: dict[str, Any]) -> dict[str, Any]:
         generator_config=None,
         generator_set=[
             f"K8sConfig.k8s_image={json.dumps(image)}",
-            f"K8sConfig.extra_env={json.dumps(deployment.get('extra_env', []), ensure_ascii=False)}",
         ],
         generator_dynamo_version=deployment.get("dynamo_version"),
         generated_config_version=None,
@@ -245,7 +262,9 @@ def probe_generator_overrides(launch: dict[str, Any]) -> dict[str, Any]:
         image_pull_secret=deployment.get("image_pull_secret"),
         model_cache=deployment.get("model_cache"),
     )
-    return _load_generator_overrides(args)
+    overrides = _load_generator_overrides(args)
+    overrides.setdefault("K8sConfig", {})["extra_env"] = copy.deepcopy(deployment.get("extra_env") or [])
+    return resolve_archived_generator_overrides(overrides) if resolve_environment else overrides
 
 
 def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: Any) -> RuntimeProbePlan:
@@ -380,6 +399,7 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
         cells,
         bundle,
         sha256,
+        copy.deepcopy(facts.get("deployment", {}).get("extra_env")),
     )
 
 
@@ -1048,7 +1068,12 @@ def probe_runtime(
                 phase = attempt["phases"][cell.workload_kind] = {"status": "running", "artifacts": []}
                 resource = None
                 try:
-                    runner._render_cell(plan, cell, phase_dir, probe_generator_overrides(plan.launch))
+                    delivery = plan.launch
+                    if plan._environment is not None:
+                        delivery["deployment"]["extra_env"] = plan._environment
+                    runner._render_cell(
+                        plan, cell, phase_dir, probe_generator_overrides(delivery, resolve_environment=True)
+                    )
                     context = launch_context(plan, cell, configuration=configuration, attempt_id=attempt_id)
                     extras = stage_runtime_instrumentation(frozen, phase_dir, context)
                     phase["launch_manifest"] = {

@@ -213,6 +213,8 @@ class FPMDeployment(StrictModel):
     def _environment(cls, values: list[dict[str, str]] | None) -> list[dict[str, str]] | None:
         names = set()
         for item in values or ():
+            if item.get("name") == "PYTHONHOME":
+                raise ValueError("extra_env does not support PYTHONHOME; use the image's Python prefix")
             if (
                 set(item) != {"name", "value"}
                 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item["name"])

@@ -156,11 +156,14 @@ def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
 def resolve_archived_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
     """Resolve archived references without revealing missing or changed values."""
     resolved = archive_generator_overrides(overrides)
+    literals = {
+        item["name"]: item["value"] for item in overrides.get("K8sConfig", {}).get("extra_env") or [] if "value" in item
+    }
     for item in resolved["K8sConfig"]["extra_env"]:
         if "value_from_env" not in item:
             continue
         name = item["value_from_env"]
-        value = os.environ.get(name)
+        value = literals[name] if name in literals else os.environ.get(name)
         if value is None or hashlib.sha256(value.encode()).hexdigest() != item["value_sha256"]:
             raise ValueError(f"archived environment {name} requires the original value in the caller's environment")
         item.clear()
@@ -172,12 +175,20 @@ def with_kv_warmup_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
     """Resolve declared warm-up switches without replacing explicit choices."""
 
     resolved = copy.deepcopy(overrides)
+    if not isinstance(resolved, dict):
+        raise ValueError("archived deployment inputs must be an object")
     k8s = resolved.setdefault("K8sConfig", {})
+    if not isinstance(k8s, dict):
+        raise ValueError("archived K8sConfig must be an object")
     environment = k8s.setdefault("extra_env", [])
     if environment is None:
         environment = k8s["extra_env"] = []
+    if not isinstance(environment, list):
+        raise ValueError("archived environment must be a list")
     declared = set()
     for item in environment:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ValueError("archived environment requires named entries")
         name = item["name"]
         if name in FPM_KV_WARMUP_DEFAULTS:
             value = item.get("value")

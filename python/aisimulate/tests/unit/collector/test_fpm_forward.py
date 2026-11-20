@@ -23,6 +23,7 @@ from collector.fpm_forward.config import (
     FPMCollectionOptions,
     PrefillSamplingProfile,
     add_fpm_arguments,
+    archive_generator_overrides,
     reject_fpm_arguments_without_fpm,
 )
 from collector.fpm_forward.database import (
@@ -4269,3 +4270,13 @@ def test_profileless_k31_can_plan_but_cannot_execute(tmp_path, monkeypatch, smok
             smoke=smoke,
         )
     assert not (tmp_path / "artifacts").exists()
+
+
+@pytest.mark.parametrize("environment", [[{}], [None], [1], "invalid", {"name": "CUSTOM_AUTH"}])
+def test_archive_rejects_malformed_environment_with_value_error(environment):
+    with pytest.raises(ValueError, match="environment"):
+        archive_generator_overrides({"K8sConfig": {"extra_env": environment}})
+
+
+def test_archive_missing_and_null_environment_are_equivalent():
+    assert archive_generator_overrides({}) == archive_generator_overrides({"K8sConfig": {"extra_env": None}})

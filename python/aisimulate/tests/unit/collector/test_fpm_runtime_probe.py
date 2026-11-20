@@ -1530,14 +1530,27 @@ def test_k31_decode_rendering_uses_one_native_state_resolution(tmp_path):
     assert "--no-enable-prefix-caching" in rendered["params"]["agg"]["extra_cli_args"]
 
 
-@pytest.mark.parametrize("failure", ["worker_evidence", "before_staging"])
+@pytest.mark.parametrize("failure", ["worker_evidence", "backend_markers", "before_staging"])
 def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path, monkeypatch, failure):
     from collector.fpm_forward import cli, database, entry, runner, runtime_probe
     from collector.model_cases import build_collection_case_plan
 
     from .test_fpm_runner import _native_payload
 
-    argv, extra, _ = _formal_cli_inputs(tmp_path)
+    argv, extra, launch = _formal_cli_inputs(tmp_path)
+    token = "synthetic-secret-746-runtime"
+    environment = [{"name": "HF_TOKEN", "value": token}]
+    launch["deployment"]["extra_env"] = environment
+    if failure == "backend_markers":
+        # Use a supported explicit policy to require a resolved-config sidecar.
+        launch["precision"]["moe_backend"] = "triton"
+        profile_path = Path(argv[argv.index("--fpm-model-profile") + 1])
+        profile = json.loads(profile_path.read_text())
+        profile["deployments"][0]["moe_backend"] = "triton"
+        profile_path.write_text(json.dumps(profile))
+        argv.extend(["--fpm-moe-backend", "triton"])
+    Path(extra[extra.index("--fpm-runtime-launch") + 1]).write_text(json.dumps(launch))
+    argv.extend(["--generator-set", "K8sConfig.extra_env=" + json.dumps(environment)])
     args = cli._parser().parse_args([*argv, *extra])
     cases = build_collection_case_plan(backend="vllm", model_path=args.model_path, gpu_type=args.gpu)
     plan, overrides = entry.resolve_inputs(args, cases)
@@ -1557,9 +1570,26 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
                 "runtime": {"backend": "vllm", "backend_version": "0.28.0"},
             }
             (raw / "collector-provenance.json").write_text(json.dumps(provenance))
-            (raw / "benchmark.json").write_text(
-                json.dumps(_native_payload(phase=self.cell.workload_kind, rank=0, dp=1))
-            )
+            payload = _native_payload(phase=self.cell.workload_kind, rank=0, dp=1)
+            if self.cell.workload_kind == "prefill":
+
+                def zero_history(value):
+                    if isinstance(value, dict):
+                        for key, item in value.items():
+                            if key in {"total_kv_read_tokens", "sum_prefill_kv_tokens", "sum_decode_kv_tokens"}:
+                                value[key] = 0
+                            else:
+                                zero_history(item)
+                    elif isinstance(value, list):
+                        for item in value:
+                            zero_history(item)
+
+                zero_history(payload)
+            (raw / "benchmark.json").write_text(json.dumps(payload))
+            if failure == "backend_markers" and len(executions) != 1:
+                (raw / "resolved-config-native.json").write_text(
+                    json.dumps({"config": {"engine_args": {"kernel_config": {"moe_backend": "triton"}}}})
+                )
             if failure == "worker_evidence" and len(executions) == 1:
                 rejected.add(self.identity["attempt_id"])
 
@@ -1590,6 +1620,7 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         retry_failed=False,
         publish_database=False,
     )
+    assert token not in json.dumps(plan.to_dict())
     errors = runner.run_collection(plan, **kwargs)
     checkpoint_path = checkpoint_dir / "fpm_forward.json"
     first = json.loads(checkpoint_path.read_text())
@@ -1599,8 +1630,14 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     assert first["cells"][decode.cell_id]["status"] == "passed"
     root = artifact_root / plan.sha256[:16]
     cell_dir = root / "cells" / prefill.cell_id
-    if failure == "worker_evidence":
+    if failure in {"worker_evidence", "backend_markers"}:
         assert errors and first["cells"][prefill.cell_id]["status"] == "failed"
+        message = (
+            "synthetic unresolved worker evidence"
+            if failure == "worker_evidence"
+            else "requires resolved-config evidence"
+        )
+        assert message in first["cells"][prefill.cell_id]["error"]
     else:
         assert errors == []
         first["cells"][prefill.cell_id]["status"] = "failed"
@@ -1629,3 +1666,69 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     ]["attempts"][-1]["phase_attempts"]["prefill"]
     assert any(item["collector_attempt_id"] == original_id for item in history)
     assert executions == [("tp4", "prefill"), ("tp4", "decode"), ("tp4", "prefill")]
+    for retained in root.rglob("*.json"):
+        assert token not in retained.read_text(), retained
+    assert runner.shlex.quote(token) in (cell_dir / "run.sh").read_text()
+
+
+def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(tmp_path, monkeypatch):
+    from collector.fpm_forward import runner, runtime_probe
+
+    launch, manifest, _ = _inputs(tmp_path)
+    token = 'synthetic-"private"-$746'
+    environment = [{"name": "HF_TOKEN", "value": token}, {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"}]
+    launch["deployment"]["extra_env"] = environment
+    delivered = []
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            saved = json.loads((self.cell_dir / "generator-request.json").read_text())
+            auth = next(item for item in saved["K8sConfig"]["extra_env"] if item["name"] == "HF_TOKEN")
+            assert auth == {
+                "name": "HF_TOKEN",
+                "value_from_env": "HF_TOKEN",
+                "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            }
+            script = (self.cell_dir / "run.sh").read_text()
+            assert runner.shlex.quote(token) in script
+            delivered.append(self.cell.workload_kind)
+            super().execute(pods)
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    output = tmp_path / "probe"
+    for execute in (False, True):
+        report = runtime_probe.probe_runtime(
+            {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=execute
+        )
+        assert report["status"] == ("completed" if execute else "preview")
+        assert token not in json.dumps(report)
+    assert delivered == ["prefill", "decode"]
+
+    def assert_archived(value):
+        if isinstance(value, dict):
+            assert value.get("value") != token
+            if value.get("name") == "HF_TOKEN":
+                assert value == {
+                    "name": "HF_TOKEN",
+                    "value_from_env": "HF_TOKEN",
+                    "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                }
+            for item in value.values():
+                assert_archived(item)
+        elif isinstance(value, list):
+            for item in value:
+                assert_archived(item)
+        elif isinstance(value, str):
+            assert token not in value
+
+    for path in output.rglob("*.json"):
+        assert_archived(json.loads(path.read_text()))
+    saved = json.loads((output / "probe-plan.json").read_text())
+    frozen = saved["configurations"]["tp4"]
+    assert (
+        next(item for item in frozen["deployment"]["extra_env"] if item["name"] == "VLLM_SSM_CONV_STATE_LAYOUT")[
+            "value"
+        ]
+        == "DS"
+    )
+    assert runtime_probe.normalize_probe_launch(frozen) == frozen

@@ -2302,7 +2302,10 @@ def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog
     assert "no pixel budget" in caplog.text
 
 
-@pytest.mark.parametrize("sidecar", [None, {"min_pixels": 3136, "max_pixels": 1003520}])
+@pytest.mark.parametrize(
+    "sidecar",
+    [None, {"min_pixels": 3136, "max_pixels": 1003520}, {"size": {"shortest_edge": 3136, "longest_edge": 1003520}}],
+)
 def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar):
     from copy import deepcopy
 
@@ -2329,9 +2332,57 @@ def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar):
     utils.get_model_config_from_model_path.cache_clear()
     monkeypatch.setattr(utils, "_download_hf_json", download)
     parsed = utils.get_model_config_from_model_path(model, model_revision=revision)
-    bounds = sidecar or raw["preprocessor_config"]
+    bounds = utils._qwen_pixel_bounds(sidecar or raw["preprocessor_config"])
     assert (parsed["extra_params"].min_pixels, parsed["extra_params"].max_pixels) == (
-        bounds["min_pixels"],
-        bounds["max_pixels"],
+        bounds[0],
+        bounds[1],
     )
     assert reads == ["config.json", "hf_quant_config.json", "preprocessor_config.json"]
+
+
+def test_local_checkpoint_tilde_reads_config_and_processor(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(_QWEN3VL_HF_CONFIG))
+    (checkpoint / "preprocessor_config.json").write_text(json.dumps({"min_pixels": 3136, "max_pixels": 1003520}))
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *_, **__: pytest.fail("local checkpoint used Hub"))
+    relative = utils.get_model_config_from_model_path("~/checkpoint", model_revision="a" * 40)
+    absolute = utils.get_model_config_from_model_path(str(checkpoint), model_revision="a" * 40)
+    assert relative == absolute
+    assert (relative["extra_params"].min_pixels, relative["extra_params"].max_pixels) == (3136, 1003520)
+
+
+@pytest.mark.parametrize("model_info", [False, True])
+def test_moving_hub_alias_resolves_before_metadata_caches(monkeypatch, model_info):
+    from copy import deepcopy
+
+    from aisimulate_core.sdk import fpm_profile
+    from aisimulate_core.sdk.models import helpers
+
+    commits = iter(["a" * 40, "b" * 40])
+
+    def resolve(model, revision):
+        return next(commits) if revision == "release-candidate" else revision
+
+    def download(model, filename, *, revision, **kwargs):
+        if filename != "config.json":
+            return None
+        raw = deepcopy(_QWEN3VL_HF_CONFIG)
+        raw["text_config"]["hidden_size"] = 4096 if revision == "a" * 40 else 8192
+        raw["vision_config"]["out_hidden_size"] = raw["text_config"]["hidden_size"]
+        return raw
+
+    monkeypatch.setattr(utils, "_resolve_hf_revision", resolve)
+    monkeypatch.setattr(helpers, "_resolve_hf_revision", resolve)
+    monkeypatch.setattr(utils, "_download_hf_json", download)
+    utils.get_model_config_from_model_path.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
+    helpers._get_model_info.cache_clear()
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    load = helpers._get_model_info if model_info else utils.get_model_config_from_model_path
+    first = load("test/moving-qwen", model_revision="release-candidate")
+    second = load("test/moving-qwen", model_revision="release-candidate")
+    pinned = load("test/moving-qwen", model_revision="a" * 40)
+    assert first["hidden_size"] == pinned["hidden_size"] == 4096
+    assert second["hidden_size"] == 8192
