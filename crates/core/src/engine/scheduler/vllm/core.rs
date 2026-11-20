@@ -2392,6 +2392,13 @@ impl VllmCore {
                 },
                 at @ LoadRelease::At { .. } => at,
             };
+            if matches!(*release, LoadRelease::At { at_ms, .. } if at_ms <= now_ms) {
+                // Empty steps see this load only now, after the last pass
+                // ended. The resumed pass needs a fresh decision here even
+                // when last_pass_end_ms makes it appear back to back. Its
+                // launch, and thus the next arrival cutoff, starts here.
+                self.next_decision_ms = self.next_decision_ms.max(now_ms);
+            }
         }
     }
 
