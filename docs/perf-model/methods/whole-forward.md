@@ -43,6 +43,9 @@ publish under that timing identity.
 
 Every decode point must report native `real_kv` seeding. A balanced MoE router
 or synthetic KV allocation does not establish the request's recurrent state.
+This real-state requirement applies to all KDA decode models, including
+non-K3.1 balanced-MoE TP cells and recovery from archived attempts; approved
+warm-up skips do not exempt their decode points.
 Only zero-history prefill with prefix caching disabled is supported; cached
 prefill with historical KV remains unsupported even with `real_prefix` seeding.
 These checks retain the native protocol evidence; they do not inspect recurrent
@@ -74,7 +77,10 @@ are not silently removed.
 
 KDA SOL transfer currently supports FP32 recurrent state only. Profile compilation
 carries `mamba_ssm_cache_dtype` from the imported runtime memory provenance into
-the analytical graph; the audited runtime's `auto` setting resolves to FP32.
+the analytical graph; `auto` resolves to FP32 only when the provenance contains
+the audited runtime's exact version and source digest map. A literal profile
+`backend_version` alone cannot establish the effective dtype; unaudited `auto`
+state uses direct interpolation.
 Finalized profiles retain this precision through their per-cell provenance.
 With BF16 state or missing dtype evidence, `method: auto` selects direct
 interpolation. An explicit `method: sol` still raises `SolNotImplemented`

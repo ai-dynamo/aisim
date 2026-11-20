@@ -397,6 +397,9 @@ def _validate_mla_payload(spec, config, model_config):
         # tensor bytes cannot qualify geometry the serving backend rejects.
         if latent + rope not in (512, 576):
             raise ValueError("K3.1 FlashInfer MLA head size must be 512 or 576")
+        # Pinned FlashInferMLASparseBackend.supports_combination with RoPE enabled.
+        if rope and decoder.get("qk_nope_head_dim") not in (128, 192):
+            raise ValueError("K3.1 FlashInfer MLA with RoPE requires qk_nope_head_dim 128 or 192")
         token_bytes = latent + rope
         block_multiple = 32
     elif backend == "FLASHMLA_SPARSE" and (latent, rope) == (512, 64):
@@ -695,10 +698,10 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                     and group["layer_classes"].get(name)
                     == "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
                     and (
-                        group.get("cache_dtype_str") == "fp8"
+                        group.get("cache_dtype_str") in {"fp8", "fp8_e4m3"}
                         or (group.get("cache_dtype_str") == "fp8_ds_mla" and component_block > 64)
                     )
-                    and strides[0] % (shape[2] * (64 if group.get("cache_dtype_str") == "fp8_ds_mla" else 1))
+                    and strides[0] % (shape[2] * (64 if group.get("cache_dtype_str") == "fp8_ds_mla" else 32))
                 ):
                     # Pinned sparse_utils.flat_kv_row_view addresses complete
                     # latent/RoPE rows, including gaps between native blocks.
@@ -706,7 +709,7 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                     # subdivided path into 64-row pages; gaps must align too.
                     raise ValueError(
                         "K3.1 sparse MLA block stride must contain whole cache rows "
-                        "(64-row pages for subdivided FlashMLA)"
+                        "(32-row pages for FlashInfer, 64-row pages for subdivided FlashMLA)"
                     )
                 span = size
                 for stride, dimension in sorted(zip(strides[1:], shape[1:], strict=True)):

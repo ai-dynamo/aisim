@@ -1487,7 +1487,7 @@ def test_k31_probe_rejects_multiple_architectures_before_launch(tmp_path, locati
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-@pytest.mark.parametrize("warmup", [None, "on", "off"])
+@pytest.mark.parametrize("warmup", [None, "on", "off", "OFF", "0", "false"])
 def test_k31_disabled_decode_warmup_rejected_before_scheduling(tmp_path, role, warmup):
     from collector.fpm_forward import runner, runtime_probe
     from collector.fpm_forward.runtime_instrumentation import load_instrumentation
@@ -1496,7 +1496,7 @@ def test_k31_disabled_decode_warmup_rejected_before_scheduling(tmp_path, role, w
     launch["worker_type"] = role
     plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
     base = {"K8sConfig": {"extra_env": [{"name": "DYN_BENCH_KV_WARMUP", "value": warmup}]}} if warmup else {}
-    if role == "decode" and warmup == "off":
+    if role == "decode" and (warmup or "").lower() in {"off", "0", "false"}:
         with pytest.raises(ValueError, match="requires DYN_BENCH_KV_WARMUP enabled"):
             runner._cell_generator_overrides(plan, plan.cells[0], base)
     else:

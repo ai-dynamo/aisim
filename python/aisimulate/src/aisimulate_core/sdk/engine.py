@@ -752,7 +752,11 @@ def compile_engine(
         and model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
     ):
         resolve_trtllm_mla_compute(model_config, model_path, backend, load_system_spec(system, systems_path))
-    model = get_model(model_path, model_config, backend)
+    model = (
+        get_model(model_path, model_config, backend, model_revision=profile.model_revision)
+        if profile is not None
+        else get_model(model_path, model_config, backend)
+    )
     if deployment is not None and forward_model == "fpm":
         from aisimulate_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
 

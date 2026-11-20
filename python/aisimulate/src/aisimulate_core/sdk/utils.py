@@ -2004,7 +2004,7 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     return raw_config
 
 
-def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
+def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, model_revision: str | None = None) -> dict:
     """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
         return raw_config
@@ -2013,18 +2013,23 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
     if os.path.isdir(model_path):
         processor_path = Path(model_path) / "preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
-    elif model_path in DefaultHFModels:
+    elif model_revision is None and model_path in DefaultHFModels:
         processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False)
+        processor_config = _download_hf_json(
+            model_path,
+            "preprocessor_config.json",
+            raise_on_404=False,
+            **({"revision": model_revision} if model_revision else {}),
+        )
     if processor_config is not None:
         raw_config["image_processor_config"] = processor_config
     return raw_config
 
 
 @cache
-def _load_model_config_from_model_path(model_path: str) -> dict:
+def _load_model_config_from_model_path(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration from model path.
 
@@ -2047,6 +2052,19 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
+    if model_revision is not None:
+        from aisimulate_core.sdk.fpm_profile import _load_pinned_checkpoint_config
+
+        # Use the same immutable config as profile eligibility, including for
+        # models with bundled configs whose source revision is not recorded.
+        config = _attach_llama4_processor_config(
+            dict(_load_pinned_checkpoint_config(model_path, model_revision)), model_path, model_revision=model_revision
+        )
+        hf_quant_config = _download_hf_json(
+            model_path, "hf_quant_config.json", raise_on_404=False, revision=model_revision
+        )
+        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
         config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
@@ -2064,7 +2082,7 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
 
 
 @cache
-def get_model_config_from_model_path(model_path: str) -> dict:
+def get_model_config_from_model_path(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration from model path and parse it into model configuration parameters.
 
@@ -2075,7 +2093,11 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
-    raw_config = _load_model_config_from_model_path(model_path)
+    raw_config = (
+        _load_model_config_from_model_path(model_path, model_revision=model_revision)
+        if model_revision is not None
+        else _load_model_config_from_model_path(model_path)
+    )
     architecture = (raw_config.get("architectures") or [None])[0]
     kimi = architecture in (
         "KimiK25ForConditionalGeneration",
@@ -2083,7 +2105,7 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         "KimiK31ForConditionalGeneration",
     )
     qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
-    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
+    if (kimi or qwen_vl) and (model_revision is not None or model_path not in DefaultHFModels):
         # Only Kimi and Qwen3-VL consume these processor files. Bundled
         # checkpoints use the pinned processor defaults; local/downloaded
         # checkpoints may override them with the original media_proc_cfg or
@@ -2097,7 +2119,9 @@ def get_model_config_from_model_path(model_path: str) -> dict:
                 path = Path(model_path) / filename
                 data = _load_json_with_infinity(path) if path.is_file() else None
             else:
-                data = _download_hf_json(model_path, filename, raise_on_404=False)
+                data = _download_hf_json(
+                    model_path, filename, raise_on_404=False, **({"revision": model_revision} if model_revision else {})
+                )
             if data is not None:
                 if not isinstance(data, dict):
                     family = "Kimi" if kimi else "Qwen3-VL"

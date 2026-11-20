@@ -105,10 +105,10 @@ def _native_fixture(
     mla_page = max(128 * scale, attention_block * 656) if mla_width is not None else 128 * scale
     pool_page = max(512 * scale, 2 * mla_page + 128 * scale)
     quantum = 64 * payload_scale
-    if mla_width is not None and attention_block > 64:
+    if mla_width is not None:
         # Native sparse kernels flatten complete token rows across block
         # gaps; packed fixtures must satisfy both MLA and indexer alignment.
-        quantum = math.lcm(quantum, mla_width * mla_page_rows)
+        quantum = math.lcm(quantum, mla_width * max(32, mla_page_rows))
     pool_page = (pool_page + quantum - 1) // quantum * quantum
     storage = _Storage(1234, 10 * pool_page)
     layers, groups, placements = {}, [], []
@@ -862,6 +862,7 @@ def _complete_fixture(
                     "num_hidden_layers": 4,
                     "kv_lora_rank": mla_latent,
                     "qk_rope_head_dim": 64,
+                    "qk_nope_head_dim": 128,
                     "num_experts": 8,
                     "first_k_dense_replace": 1,
                     "linear_attn_config": {
@@ -1197,8 +1198,9 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(
     assert len(result["resources"]["cache_groups"]) == 2
     assert result["resources"]["cache_groups"][-1]["blocks_per_request"] == 1
     # Two 656-byte padded MLA rows plus two 132-byte indexer rows per token,
-    # 64 tokens per block, aligned to 12 indexer kernel pages per pool slot.
-    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 12 * 64 * 132
+    # 64 tokens per block, aligned to 24 indexer kernel pages per pool slot:
+    # lcm(32 * 576 MLA bytes, 64 * 132 indexer bytes) = 202752 bytes.
+    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 24 * 64 * 132
     assert len(result["provenance"]["rank_capacities"]) == 4
     assert {capacity["phase"] for capacity in result["provenance"]["rank_capacities"]} == {workload_kind}
     for artifact in result["provenance"]["artifacts"]:
@@ -1334,11 +1336,17 @@ def test_import_checks_mla_block_size_independently_of_indexer(tmp_path, monkeyp
         assert "MLA block size must be a multiple of" in str(result["diagnostics"])
 
 
-@pytest.mark.parametrize("padding", [0, 4, 576, 1152])
-def test_import_requires_whole_mla_rows_in_padded_pool_stride(tmp_path, monkeypatch, padding):
+@pytest.mark.parametrize("padding", [0, 4, 576, 1152, 32 * 576])
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+def test_import_requires_whole_mla_rows_in_padded_pool_stride(tmp_path, monkeypatch, padding, cache_dtype):
     path, launches = _complete_fixture(tmp_path, monkeypatch)
 
     def pad_slots(record):
+        record["resolved_config"]["cache_config"]["cache_dtype"] = cache_dtype
+        group = record["cache"]["groups"][0]
+        for name, spec in group.get("layer_specs", dict.fromkeys(group["layer_names"], group)).items():
+            if name.endswith(".self_attn.attn"):
+                spec["cache_dtype_str"] = cache_dtype
         if record["kind"] != "worker":
             return
         cache = record["cache"]
@@ -1356,7 +1364,7 @@ def test_import_requires_whole_mla_rows_in_padded_pool_stride(tmp_path, monkeypa
 
     _mutate(path, pad_slots)
     result = validate_observations(path, launches)["tp2"]
-    if padding % 576 == 0:
+    if padding % (32 * 576) == 0:
         assert result["status"] == "complete", result["diagnostics"]
         assert result["resources"]["runtime_memory"] is not None
     else:
@@ -1954,6 +1962,48 @@ def test_import_checks_backend_head_size_even_when_payload_and_views_match(tmp_p
     assert result["status"] == ("incomplete" if latent == 384 else "complete"), result["diagnostics"]
     if latent == 384:
         assert "FlashInfer MLA head size must be 512 or 576" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("nope", [64, 128, 192])
+def test_import_binds_flashinfer_nope_dimension_to_checkpoint(tmp_path, monkeypatch, nope):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    launch = launches["tp2"]
+    config_path = Path(launch["model_config"]["path"])
+    config = json.loads(config_path.read_text())
+    config["text_config"]["qk_nope_head_dim"] = nope
+    config_path.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    _replace_launch(path, launches)
+    _mutate(path, lambda record: record.update(model_config_sha256=launch["model_config"]["sha256"]))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("incomplete" if nope == 64 else "complete"), result["diagnostics"]
+    if nope == 64:
+        assert "requires qk_nope_head_dim 128 or 192" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+@pytest.mark.parametrize("stride", [576 * 96, 576 * 97, 576 * 96 + 4])
+def test_flashinfer_pool_stride_uses_32_row_pages(monkeypatch, cache_dtype, stride):
+    cache, _, _ = _native_fixture(monkeypatch, mla_width=576)
+    # One MLA layer fits in 96 rows; retain native group overlay and all
+    # component/placement checks while changing only the pool slot padding.
+    group = cache["groups"][0]
+    group["layer_names"].remove("mla.1")
+    del group["layer_classes"]["mla.1"]
+    del cache["layer_components"]["mla.1"]
+    cache["tensor_allocations"][0]["layers"].remove("mla.1")
+    group["cache_dtype_str"] = cache_dtype
+    cache["storages"][0]["size_bytes"] = 10 * stride
+    for allocation in cache["tensor_allocations"]:
+        allocation.update(size=10 * stride, block_stride=stride)
+    for components in cache["layer_components"].values():
+        for component in components:
+            component["stride_bytes"][0] = stride
+    if stride == 576 * 96:
+        runtime_k31.validate_views(cache, "fp8", 10, stride, context=4096)
+    else:
+        with pytest.raises(ValueError, match="32-row pages for FlashInfer"):
+            runtime_k31.validate_views(cache, "fp8", 10, stride, context=4096)
 
 
 @pytest.mark.parametrize("launcher", [None, "prims_ts", "trtllm"])

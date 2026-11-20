@@ -2738,6 +2738,27 @@ def test_detected_layout_publishes_real_prefix_and_uncached_prefill(tmp_path, re
     assert [(row["total_kv_read_tokens"], row["kv_seed_regime"]) for row in rows] == [(kv_tokens, "n/a")]
 
 
+@pytest.mark.parametrize("k31", [False, True])
+@pytest.mark.parametrize("kv_tokens", [0, 128])
+def test_k31_publication_rejects_archived_prefill_history(tmp_path, monkeypatch, k31, kv_tokens):
+    from collector.fpm_forward import database
+
+    plan, cell, cell_dir = _seeded_prefill_cell(tmp_path, "real_prefix" if kv_tokens else None, kv_tokens=kv_tokens)
+    plan.capability.template_id = GENERIC_RUNTIME_TEMPLATE_ID
+    plan.capability.architecture = "KimiK31ForConditionalGeneration" if k31 else "OtherModel"
+    # Worker qualification is covered independently. Even accepted workers
+    # cannot qualify a retained timing point with unsupported prefix history.
+    accepted = []
+    monkeypatch.setattr(database, "require_k31_worker_evidence", lambda *args: accepted.append(True))
+    if k31 and kv_tokens:
+        with pytest.raises(ValueError, match="K3.1 prefill publication requires zero historical KV tokens"):
+            aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    else:
+        rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+        assert [row["total_kv_read_tokens"] for row in rows] == [kv_tokens]
+    assert accepted == [True]
+
+
 _WARM_ELIGIBLE = {"enabled": True, "warm_eligible": True, "skip_reason": None}
 _DENSE_LABEL = {"enabled": True, "warm_eligible": False, "skip_reason": "dense_model_content_insensitive"}
 
@@ -4130,11 +4151,19 @@ def test_formal_database_preserves_runtime_provenance_when_legacy_row_sorts_firs
 
 
 @pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv"])
-def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marker):
+@pytest.mark.parametrize("approved_skip", [False, True])
+def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marker, approved_skip):
     from collector.fpm_forward import runner
 
     plan, cell, cell_dir = _synthetic_decode_cell(
-        tmp_path, kvwarm=_WARM_ELIGIBLE, markers=(marker,), parallel_strategy="tp"
+        tmp_path,
+        kvwarm=(
+            {"enabled": True, "warm_eligible": False, "skip_reason": "moe_tp_balanced_by_construction"}
+            if approved_skip
+            else _WARM_ELIGIBLE
+        ),
+        markers=(marker,),
+        parallel_strategy="tp",
     )
     plan.capability.model_config = ResolvedModelConfig(
         {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
@@ -4152,7 +4181,7 @@ def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marke
     before = {p.relative_to(raw): p.read_bytes() for p in raw.rglob("*") if p.is_file()}
     entry = {"status": "failed", "attempt_id": "attempt"}
     recovered = runner._recover_completed_attempt(plan, cell, root, entry)
-    if marker == "kvwarm_fake_fallback":
+    if marker == "kvwarm_fake_fallback" or approved_skip:
         assert recovered is None
         with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
             runner._runtime_collection_summary(cell, raw, plan=plan, expected_attempt_id="attempt")

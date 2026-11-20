@@ -56,7 +56,9 @@ def _fpm_kda_cache_dtype(deployment: FpmDeploymentProfile, field: str) -> str | 
             dtype = cache.get(field) if isinstance(cache, dict) else None
             if dtype == "auto":
                 if field == "mamba_ssm_cache_dtype":
-                    return "float32"
+                    from collector.fpm_forward.runtime_k31 import is_audited_runtime
+
+                    return "float32" if is_audited_runtime(evidence.get("runtime")) else "auto"
                 model = settings.get("model_config")
                 dtype = model.get("dtype") if isinstance(model, dict) else None
             return dtype.removeprefix("torch.") if isinstance(dtype, str) else None
@@ -246,13 +248,22 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     # FPM SOL roofline. This applies to wrapper and decoder profiles alike.
     # Auto can use direct interpolation; explicit SOL fails during validation.
     unsupported_sol_graph = family in {"QWEN35", "NEMOTRONH"}
+    unsupported_sol_reason = None
     if analytical_architecture == "KimiK31ForConditionalGeneration":
         # The fused decode graph models BF16 convolution state. FP32 uses a
         # separate native convolution update whose traffic is not modeled.
-        unsupported_sol_graph |= _fpm_kda_cache_dtype(deployment, "mamba_cache_dtype") != "bfloat16"
-    unsupported_kda_state = (
-        analytical_architecture == "KimiK31ForConditionalGeneration" and _fpm_kda_state_dtype(deployment) != "float32"
+        convolution_dtype = _fpm_kda_cache_dtype(deployment, "mamba_cache_dtype")
+        unsupported_sol_graph |= convolution_dtype != "bfloat16"
+        if convolution_dtype == "float32":
+            unsupported_sol_reason = (
+                "K3.1 SOL does not support FP32 convolution state; "
+                "use estimator_config.fpm_interpolation.method='direct' or 'auto'"
+            )
+    state_dtype = (
+        _fpm_kda_state_dtype(deployment) if analytical_architecture == "KimiK31ForConditionalGeneration" else None
     )
+    unsupported_kda_state = analytical_architecture == "KimiK31ForConditionalGeneration" and state_dtype != "float32"
+    unsupported_sol_graph |= analytical_architecture == "KimiK31ForConditionalGeneration" and state_dtype == "auto"
     return json.dumps(
         {
             "profile": profile.model_dump(mode="json"),
@@ -264,6 +275,7 @@ def _validate_forward_pass_profile(config_json: str) -> str:
             and analytical_architecture not in {"KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration"}
             and not unsupported_sol_graph,
             "supports_sol_state": not unsupported_kda_state,
+            "unsupported_sol_reason": unsupported_sol_reason,
             **deployment.quantization_kwargs(),
         }
     )

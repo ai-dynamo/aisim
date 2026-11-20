@@ -43,6 +43,15 @@ is also pinned at that immutable revision, with SHA-256
 `DeepseekV32IndexerBackend`, whose CUDA rule is 64 tokens. Matching the
 subclass, backend name and block size does not replace this source check.
 
+The installed configuration hook
+[`vllm/model_executor/models/config.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/model_executor/models/config.py)
+is pinned with SHA-256
+`6197a358cd4b16b7497aad85950aecd5b7641e98c9326a3919aa1c5cdf639b88`.
+Its `KimiK3ForConditionalGenerationConfig` selects cache dtype and rewrites the
+checkpoint quantization method. Matching reported settings cannot replace
+verification of these installed bytes. This source check does not requalify
+runtime execution or refresh previously collected observations.
+
 The FlashInfer sparse MLA row-addressing helper
 [`vllm/v1/attention/backends/mla/sparse_utils.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/attention/backends/mla/sparse_utils.py)
 is pinned at that immutable revision with SHA-256

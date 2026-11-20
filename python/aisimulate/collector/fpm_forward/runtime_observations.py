@@ -241,6 +241,7 @@ def _validate_record(
     binding: dict[str, str],
     cell: FPMCell,
     checkpoint_config: dict[str, Any] | None = None,
+    formal_collection: bool = False,
 ) -> dict[str, Any]:
     if record.get("schema_version") != OBSERVATION_SCHEMA:
         raise ValueError("unsupported runtime observation schema")
@@ -321,7 +322,7 @@ def _validate_record(
             or config["cache_config"].get("mamba_cache_mode") != "none"
         ):
             raise ValueError("K3.1 initialization requires native mamba none and prefix caching disabled")
-        if binding.get("collector_attempt_id") is not None and config["cache_config"].get(
+        if (formal_collection or binding.get("collector_attempt_id") is not None) and config["cache_config"].get(
             "mamba_ssm_cache_dtype"
         ) not in {"auto", "float32"}:
             # Formal collection renders --mamba-ssm-cache-dtype float32.

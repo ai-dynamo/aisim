@@ -379,7 +379,9 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         if command[0] == "srun" or "logs" in command:
             return "AISIMULATE_RUNTIME_VERSION=" + json.dumps(result) + "\n"
         if "pvc" in command:
-            return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv"}})
+            return json.dumps(
+                {"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv", "accessModes": ["ReadWriteMany"]}}
+            )
         if "get" in command:
             return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
         return ""
@@ -933,7 +935,9 @@ def test_runtime_version_probe_mounts_whole_model_pvc(monkeypatch, model_cache, 
         if "logs" in command:
             return 'AISIMULATE_RUNTIME_VERSION={"backend_version": "0.28.0+overlay"}\n'
         if "pvc" in command:
-            return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv"}})
+            return json.dumps(
+                {"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv", "accessModes": ["ReadWriteMany"]}}
+            )
         if "get" in command:
             return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
         return ""
@@ -972,3 +976,68 @@ def test_version_probe_refuses_to_be_first_consumer_of_model_pvc(monkeypatch, st
         versioning.detect_runtime_versions(FPMDeployment(image="fixture:image", model_cache="cache"))
     assert len(calls) == 1
     assert "create" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    "modes,consumer_nodes,valid",
+    [
+        (["ReadWriteMany"], ["node-a"], True),
+        (["ReadWriteOnce"], ["node-a"], True),
+        (["ReadWriteOnce"], ["node-a", "node-a"], True),
+        (["ReadWriteOnce"], [], True),
+        (["ReadWriteOnce"], [None], False),
+        (["ReadWriteOnce"], ["node-a", "node-b"], False),
+        (["ReadWriteOncePod"], ["node-a"], False),
+        (["ReadOnlyMany"], [], False),
+        ([], [], False),
+    ],
+)
+def test_version_probe_honors_model_cache_access_mode(monkeypatch, modes, consumer_nodes, valid):
+    from aisimulate.support import versioning
+
+    manifests = []
+
+    def run(command, *, payload=None, sensitive_values=()):
+        if "pvc" in command:
+            return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "pv", "accessModes": modes}})
+        if "pods" in command:
+            pods = [
+                {
+                    "spec": {"nodeName": node, "volumes": [{"persistentVolumeClaim": {"claimName": "cache"}}]},
+                    "status": {"phase": "Running" if node else "Pending"},
+                }
+                for node in consumer_nodes
+            ]
+            # Finished consumers and unrelated live claims cannot constrain placement.
+            pods.extend(
+                [
+                    {"spec": {"nodeName": "other", "volumes": [{"persistentVolumeClaim": {"claimName": "other"}}]}},
+                    {
+                        "spec": {"nodeName": "old", "volumes": [{"persistentVolumeClaim": {"claimName": "cache"}}]},
+                        "status": {"phase": "Succeeded"},
+                    },
+                ]
+            )
+            return json.dumps({"items": pods})
+        if payload:
+            manifests.append(json.loads(payload))
+        if "logs" in command:
+            return 'AISIMULATE_RUNTIME_VERSION={"backend_version":"fixture-version"}\n'
+        if "get" in command:
+            return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
+        return ""
+
+    monkeypatch.setattr(versioning, "_run", run)
+    deployment = FPMDeployment(image="fixture:image", model_cache="cache")
+    if not valid:
+        with pytest.raises(ValueError, match="ReadWrite"):
+            versioning.detect_runtime_versions(deployment)
+        assert manifests == []
+        return
+    assert versioning.detect_runtime_versions(deployment) == {"backend_version": "fixture-version"}
+    spec = manifests[0]["spec"]
+    if modes == ["ReadWriteOnce"] and consumer_nodes:
+        terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        assert terms == [{"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["node-a"]}]}]
+    else:
+        assert "affinity" not in spec

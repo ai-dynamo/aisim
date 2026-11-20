@@ -1715,6 +1715,7 @@ pub(crate) struct ForwardPassProfileFacts {
     pub registered: bool,
     pub supports_sol: bool,
     pub supports_sol_state: bool,
+    pub unsupported_sol_reason: Option<String>,
     pub gemm_quant_mode: String,
     pub moe_quant_mode: String,
     pub fmha_quant_mode: String,

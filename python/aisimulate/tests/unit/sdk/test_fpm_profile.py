@@ -22,21 +22,33 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture
 def checkpoint_configs(monkeypatch):
+    from aisimulate_core.sdk.models.helpers import _get_model_info
+
     fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    _get_model_info.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
     configs = {
         "test/unknown-decoder": {"architectures": ["UnregisteredDecoderForCausalLM"]},
-        "nvidia/GLM-5.2-NVFP4": {"architectures": ["GlmMoeDsaForCausalLM"]},
-        "MiniMaxAI/MiniMax-M2.7": {"architectures": ["MiniMaxM2ForCausalLM"]},
+        # Reuse bundled metadata as synthetic pinned Hub responses. Both
+        # eligibility and real graph compilation must consume these bytes.
+        "nvidia/GLM-5.2-NVFP4": utils._load_pre_downloaded_hf_config("nvidia/GLM-5.2-NVFP4"),
+        "MiniMaxAI/MiniMax-M2.7": utils._load_pre_downloaded_hf_config("MiniMaxAI/MiniMax-M2.7"),
     }
 
-    def download(model, filename, *, revision):
-        assert filename == "config.json"
+    def download(model, filename, *, revision, raise_on_404=True):
         assert revision == "profile-test-fixture-v1"
-        return copy.deepcopy(configs[model])
+        if filename == "config.json":
+            return copy.deepcopy(configs[model])
+        assert filename == "hf_quant_config.json"
+        return None
 
     monkeypatch.setattr(utils, "_download_hf_json", download)
     yield configs
     fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    _get_model_info.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
 
 
 @pytest.fixture
@@ -242,9 +254,14 @@ def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
             "max_model_len": 4096,
             "provenance": json.dumps(
                 {
+                    "runtime": json.loads(
+                        (
+                            Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json"
+                        ).read_text()
+                    )["runtime"],
                     "runtime_settings": {
                         "cache_config": {"mamba_cache_dtype": "bfloat16", "mamba_ssm_cache_dtype": state_dtype}
-                    }
+                    },
                 }
             ),
         }
@@ -681,7 +698,8 @@ def test_registered_build_failure_is_not_direct_fallback(profile_dict, monkeypat
     monkeypatch.setattr(engine, "_literal_backend_version", lambda _s, _b, version, *_args: version)
     observed = []
 
-    def broken_model(_path, config, _backend):
+    def broken_model(_path, config, _backend, *, model_revision):
+        assert model_revision == profile_dict["model_revision"]
         observed.append(config.fmha_quant_mode.name)
         raise RuntimeError("registered model has an unrelated implementation error")
 
@@ -2008,8 +2026,9 @@ def test_registered_glm_auto_retains_sol_with_explicit_fp8_fmha(profile_dict, mo
     real_get_model = engine.get_model
     built_models = []
 
-    def record_model(*args):
-        model = real_get_model(*args)
+    def record_model(*args, **kwargs):
+        assert kwargs["model_revision"] == profile_dict["model_revision"]
+        model = real_get_model(*args, **kwargs)
         built_models.append(model)
         return model
 
@@ -2569,7 +2588,13 @@ def test_kda_effective_recurrent_dtype_requires_unanimous_evidence(profile_dict,
     resources = profile_dict["deployments"][0]["resources"]
     for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
         resources.pop(key)
-    evidence = [{"runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": dtype}}} for dtype in recorded]
+    runtime = json.loads(
+        (Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json").read_text()
+    )["runtime"]
+    evidence = [
+        {"runtime": runtime, "runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": dtype}}}
+        for dtype in recorded
+    ]
     if kind == "collection":
         provenance = {
             "source": "bound_collection_phases",
@@ -2585,6 +2610,47 @@ def test_kda_effective_recurrent_dtype_requires_unanimous_evidence(profile_dict,
     }
     deployment = load_fpm_profile(profile_dict).deployments[0]
     assert fpm_profile._fpm_kda_state_dtype(deployment) == expected
+
+
+@pytest.mark.parametrize("identity", ["audited", "absent", "version", "source_revision", "source_files"])
+def test_kda_auto_state_requires_runtime_identity_not_profile_version(profile_dict, checkpoint_configs, identity):
+    from collector.fpm_forward.runtime_k31 import VERSION
+
+    profile_dict["architecture"] = "KimiK31ForConditionalGeneration"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [profile_dict["architecture"]]}
+    deployment = profile_dict["deployments"][0]
+    deployment["backend_version"] = VERSION
+    resources = deployment["resources"]
+    for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        resources.pop(key)
+    runtime = json.loads(
+        (Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json").read_text()
+    )["runtime"]
+    if identity == "version":
+        runtime["version"] = "0.0.0+unaudited"
+    elif identity == "source_revision":
+        runtime["source_revision"] = "0" * 64
+    elif identity == "source_files":
+        runtime["source_files"]["vllm/model_executor/models/config.py"] = "0" * 64
+    evidence = {
+        "runtime_settings": {"cache_config": {"mamba_cache_dtype": "bfloat16", "mamba_ssm_cache_dtype": "auto"}}
+    }
+    if identity != "absent":
+        evidence["runtime"] = runtime
+    resources["runtime_memory"] = {
+        "kv_cache_bytes": 1024,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 4096,
+        "provenance": json.dumps(evidence),
+    }
+    request = _request(profile_dict)
+    request["backend_version"] = VERSION
+    facts = json.loads(fpm_profile._validate_forward_pass_profile(json.dumps({**request, "pp": 1})))
+    assert facts["supports_sol"] is (identity == "audited")
+    assert facts["supports_sol_state"] is (identity == "audited")
+    assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == (
+        "sol" if identity == "audited" else "direct"
+    )
 
 
 def test_op_level_sol_database_does_not_validate_unused_auto_direct(profile_dict, checkpoint_configs, monkeypatch):

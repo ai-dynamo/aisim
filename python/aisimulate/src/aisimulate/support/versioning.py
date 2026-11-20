@@ -120,6 +120,42 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                     "runtime version probe requires a model-cache PVC already bound for the collection GPU topology; "
                     "initialize it with the collection workload before probing"
                 )
+            modes = claim.get("spec", {}).get("accessModes", [])
+            if "ReadWriteMany" not in modes:
+                if modes != ["ReadWriteOnce"]:
+                    raise ValueError("runtime version probe requires a ReadWriteMany or ReadWriteOnce model-cache PVC")
+                # RWO shares a volume only within one node. Retain the live
+                # consumer's node while leaving normal volume topology checks
+                # to the scheduler. RWOP cannot share a live consumer at all.
+                pods = json.loads(run([*prefix, "get", "pods", "-o", "json"]))["items"]
+                consumers = [
+                    pod
+                    for pod in pods
+                    if pod.get("status", {}).get("phase") not in {"Succeeded", "Failed"}
+                    and any(
+                        volume.get("persistentVolumeClaim", {}).get("claimName") == parts[0]
+                        for volume in pod.get("spec", {}).get("volumes", [])
+                    )
+                ]
+                nodes = {pod.get("spec", {}).get("nodeName") for pod in consumers}
+                if nodes and (None in nodes or len(nodes) != 1):
+                    raise ValueError(
+                        "runtime version probe cannot establish one node for the ReadWriteOnce PVC consumers"
+                    )
+                if nodes:
+                    manifest["spec"]["affinity"] = {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    {
+                                        "matchFields": [
+                                            {"key": "metadata.name", "operator": "In", "values": sorted(nodes)}
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
             manifest["spec"]["volumes"] = [{"name": "model-cache", "persistentVolumeClaim": {"claimName": parts[0]}}]
             manifest["spec"]["containers"][0]["volumeMounts"] = [
                 {

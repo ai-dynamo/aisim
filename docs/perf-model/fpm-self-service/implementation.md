@@ -1083,7 +1083,7 @@ For a model without an analytical class, create a JSON or YAML FPM profile and p
 | Profile fields | Required meaning |
 | --- | --- |
 | `schema_version` | Integer `1`. |
-| `model`, `model_revision`, `architecture` | Exact timing model identity, pinned checkpoint revision, and architecture identifier matching the checkpoint configuration. An analytical model class is optional for direct interpolation. |
+| `model`, `model_revision`, `architecture` | Exact timing model identity, pinned checkpoint revision used for both validation and analytical graph metadata, and architecture identifier matching the checkpoint configuration. An analytical model class is optional for direct interpolation. |
 | `context_length`, `num_experts`, `provenance` | Declared context limit, routed expert count (`0` for dense), and how the metadata was obtained. |
 | `deployments` | One or more exact deployment records, with one precision/resource identity per hardware/runtime/full parallel tuple. |
 | Deployment `system`, `backend`, `backend_version` | GPU system, `vllm`, and the exact backend identity label selected by onboarding. Custom strings are allowed; this label is distinct from the observed runtime package version. `backend_version: null` is allowed while collection identity awaits the target-image probe; publication and simulation require the resolved label. |
@@ -1101,6 +1101,10 @@ For complete legacy declarations, automatic KV admission subtracts these non-KV 
 The declared checkpoint revision is preserved for review and replay. Existing FPM tables may not pin a checkpoint revision; supplying one in a profile does not prove that the historical measurements came from that exact revision. Record that limitation in `provenance` when validating existing data.
 
 Ordinary FPM model construction reads `config.json` from the local checkpoint or the declared remote `model_revision` and verifies the profile's architecture against the checkpoint's text-model architecture before selecting interpolation. Missing or malformed architecture metadata and mismatched names fail explicitly. This verification loads no weights and constructs no analytical model graph. A verified architecture without a registered analytical class remains valid for direct interpolation. Schema-only parsing and onboarding request creation do not require this runtime metadata check.
+
+When analytical compilation is selected, remote model configuration, optional
+quantization sidecars and processor metadata use that same `model_revision`.
+Bundled or default-ref metadata cannot override the pinned graph configuration.
 
 ## Plan, preview, and explicitly execute
 
@@ -1567,7 +1571,11 @@ including these interpreter and Hub settings. Engine-only entries outside that
 allowlist, such as `PYTHONHOME`, are not applied to either metadata step; they
 cannot establish the detected runtime identity.
 The GPU-free Kubernetes version probe requires a model-cache PVC already bound
-for the collection workload. For a Pending `WaitForFirstConsumer` claim, launch a
+for the collection workload. It supports `ReadWriteMany` and `ReadWriteOnce`.
+For `ReadWriteOnce`, it lists live claim consumers and constrains the probe to
+their node; unplaced or conflicting consumers are rejected before Pod creation.
+An unused claim retains normal scheduler placement. Other access modes,
+including `ReadWriteOncePod`, are rejected. For a Pending `WaitForFirstConsumer` claim, launch a
 separate cache-initialization Pod or Job before `collect-fpm --execute`: collection
 performs version detection before launching its GPU workload, so it cannot bind
 the claim itself. For example, save this as `cache-init.yaml`, substitute your

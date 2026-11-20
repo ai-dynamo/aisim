@@ -47,6 +47,10 @@ def native_source(tmp_path, monkeypatch):
     sources["vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"] = hashlib.sha256(
         expert.read_bytes()
     ).hexdigest()
+    config = Path(packages["vllm"].__path__[0]) / "model_executor/models/config.py"
+    config.parent.mkdir(parents=True)
+    config.write_text("# synthetic installed config hook fixture\n")
+    sources["vllm/model_executor/models/config.py"] = hashlib.sha256(config.read_bytes()).hexdigest()
     manifest = tmp_path / "source-manifest.json"
     manifest.write_text(
         json.dumps(
@@ -72,6 +76,7 @@ def native_source(tmp_path, monkeypatch):
         (None, None),
         ("vllm_source", "source hash differs: vllm/source.py"),
         ("expert_source", "source hash differs: vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"),
+        ("config_source", "source hash differs: vllm/model_executor/models/config.py"),
         ("dynamo_source", "source hash differs: dynamo/source.py"),
         ("missing_source", "source path must resolve uniquely"),
         ("duplicate_source", "source path must resolve uniquely"),
@@ -95,6 +100,9 @@ def test_k31_execution_checks_installed_source_before_observed(native_source, tm
     elif corruption == "expert_source":
         expert = Path(packages["vllm"].__path__[0]) / "model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"
         expert.write_text("# changed synthetic expert implementation\n")
+    elif corruption == "config_source":
+        config = Path(packages["vllm"].__path__[0]) / "model_executor/models/config.py"
+        config.write_text("# changed synthetic config hook\n")
     elif corruption == "duplicate_source":
         packages["vllm"].__path__ *= 2
     elif corruption == "imported_version":
@@ -934,14 +942,23 @@ def test_execution_reports_unresolved_native_moe_backend_without_crashing(native
     assert any("kernel_config.moe_backend differs" in reason for reason in result["failures"])
 
 
-def test_packaged_k31_manifest_binds_selected_trtllm_expert_implementation():
+@pytest.mark.parametrize(
+    "source,digest",
+    [
+        (
+            "vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py",
+            "6cd47f0edf4dd941138e482b63cd1d366a25d7290bbaa57579827ef309600b6f",
+        ),
+        ("vllm/model_executor/models/config.py", "6197a358cd4b16b7497aad85950aecd5b7641e98c9326a3919aa1c5cdf639b88"),
+    ],
+)
+def test_packaged_k31_manifest_binds_selected_implementations(source, digest):
     from collector.fpm_forward import runtime_k31
 
     manifest = json.loads((Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json").read_text())
     runtime = manifest["runtime"]
-    source = "vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"
     # Exact upstream Git blob at the immutable revision cited in source notes.
-    assert runtime["source_files"][source] == "6cd47f0edf4dd941138e482b63cd1d366a25d7290bbaa57579827ef309600b6f"
+    assert runtime["source_files"][source] == digest
     assert (
         runtime["source_revision"]
         == hashlib.sha256(

@@ -172,6 +172,8 @@ def get_model(
     model_path: str,
     model_config: config.ModelConfig,
     backend_name: str,
+    *,
+    model_revision: str | None = None,
 ) -> BaseModel:
     """Build a model from a HuggingFace model path.
 
@@ -209,7 +211,11 @@ def get_model(
         raise InvalidEngineConfigurationError("fpm_fmha_quant_mode requires forward_model='fpm'")
 
     # Shallow-copy so mutations below don't poison the @cache'd original.
-    model_info = dict(_get_model_info(model_path))
+    model_info = dict(
+        _get_model_info(model_path, model_revision=model_revision)
+        if model_revision is not None
+        else _get_model_info(model_path)
+    )
     raw_config = model_info.get("raw_config", {})
     architecture = model_info["architecture"]
     model_family = _architecture_to_model_family(architecture)

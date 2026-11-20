@@ -23,7 +23,13 @@ from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 
 from .test_fpm_forward import _kimi_k31_config
 from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
-from .test_k31_runtime_observations import _complete_fixture, _decoder_cache_names, _kernel_view_fixture, _moe
+from .test_k31_runtime_observations import (
+    _complete_fixture,
+    _decoder_cache_names,
+    _kernel_view_fixture,
+    _moe,
+    _set_state_dtypes,
+)
 from .test_runtime_observations import _replace_launch, _write
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_data")]
@@ -224,6 +230,25 @@ def test_valid_imported_native_proof_changes_only_moe_precision(inputs):
     observed = bind(inputs)
     assert observed == replace(original, dtype=replace(original.dtype, moe_quant_mode="w4a8_mxfp4_mxfp8_trtllm"))
     assert original.dtype.moe_quant_mode == "w4a16_mxfp4"
+
+
+@pytest.mark.parametrize("recurrence", ["bfloat16", "float32", "auto"])
+def test_formal_plan_requires_fp32_recurrence_but_standalone_import_accepts_bf16(inputs, recurrence):
+    memory = inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]
+    proof = json.loads(memory["provenance"])
+    index_path = Path(proof["observations_index"]["path"])
+    from .test_runtime_observations import _mutate
+
+    observed = "float32" if recurrence == "auto" else recurrence
+    _mutate(index_path, lambda record: _set_state_dtypes(record, "auto", recurrence, observed, "bfloat16"))
+    imported = validate_observations(index_path, {"tp2": inputs["runtime_launch"]})["tp2"]
+    assert imported["status"] == "complete", imported["diagnostics"]
+    inputs["profile"]["deployments"][0]["resources"] = imported["resources"]
+    if recurrence == "bfloat16":
+        with pytest.raises(ValueError, match="formal collection requires effective float32 recurrent state"):
+            bind(inputs)
+    else:
+        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])

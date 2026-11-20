@@ -628,6 +628,13 @@ impl ForwardPassPerfModelConfig {
             #[cfg(feature = "python")]
             {
                 let facts = crate::py::validate_forward_pass_profile(&self)?;
+                if self.estimator_config.fpm_interpolation.method
+                    == super::FpmInterpolationMethod::Sol
+                {
+                    if let Some(reason) = facts.unsupported_sol_reason {
+                        return Err(invalid_config(&reason));
+                    }
+                }
                 self.fpm_profile = Some(facts.profile);
                 self.gemm_quant_mode = Some(facts.gemm_quant_mode);
                 self.moe_quant_mode = Some(facts.moe_quant_mode);

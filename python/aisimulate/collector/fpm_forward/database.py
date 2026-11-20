@@ -230,6 +230,12 @@ def require_k31_worker_evidence(plan, cell, raw_root, collection) -> None:
 
 
 def require_kda_real_kv(plan, cell, collection):
+    """All recurrent decode requires real history, including balanced-MoE TP.
+
+    Protocol-approved topology skips remain publishable only for models/phases
+    without this request-specific recurrent-state requirement. Recovery uses
+    this same guard before accepting retained artifacts.
+    """
     config = getattr(getattr(plan, "capability", None), "model_config", None)
     if cell.workload_kind != "decode" or config is None or config.effective_payload.get("linear_attn_config") is None:
         return
@@ -326,7 +332,7 @@ def aggregate_cell(
         if kvwarm_meta is None:
             return "legacy"
         skip_reason = kvwarm_meta.get("skip_reason")
-        if skip_reason in approved_skip_reasons:
+        if skip_reason in approved_skip_reasons and not (has_kda_state and phase == "decode"):
             return f"skip:{skip_reason}"
         reasons = point.get("sample_reasons") or []
         if "kvwarm_real_kv" in reasons:
@@ -348,6 +354,8 @@ def aggregate_cell(
         batch = int(point["batch_size"])
         total_prefill = int(point["total_prefill_tokens"])
         total_kv = int(point["total_kv_read_tokens"])
+        if _is_k31(plan) and phase == "prefill" and total_kv != 0:
+            raise ValueError("K3.1 prefill publication requires zero historical KV tokens")
         if has_kda_state and phase == "decode" and _kv_seed_regime(point, phase) != "real_kv":
             raise ValueError("KDA decode publication requires real_kv seeding of the request's recurrent state")
         if (

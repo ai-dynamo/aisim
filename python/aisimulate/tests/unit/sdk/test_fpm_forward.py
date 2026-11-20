@@ -1264,14 +1264,16 @@ def test_text_only_kimi_profile_preserves_encoder_weights_and_dcp_identity():
     [
         ("float32", "bfloat16"),
         ("auto", "bfloat16"),
+        ("unaudited_auto", "bfloat16"),
         ("bfloat16", "bfloat16"),
         (None, "bfloat16"),
         ("float32", "float32"),
     ],
 )
 @pytest.mark.parametrize("provenance_kind", ["probe", "collection", "finalized", "finalized_references"])
+@pytest.mark.parametrize("model_location", ["local", "hub"])
 def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
-    tmp_path, attention_backend, state_dtype, conv_dtype, provenance_kind
+    tmp_path, monkeypatch, attention_backend, state_dtype, conv_dtype, provenance_kind, model_location
 ):
     # Extend the repository's K3 fixture with independently declared sparse
     # geometry. Neither this config nor the synthetic timing anchors are a
@@ -1295,6 +1297,20 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text(json.dumps(raw))
+    if model_location == "hub":
+        from aisimulate_core.sdk import fpm_profile, utils
+
+        checkpoint = "test/pinned-k31"
+        fpm_profile._load_pinned_checkpoint_config.cache_clear()
+        utils._load_model_config_from_model_path.cache_clear()
+        utils.get_model_config_from_model_path.cache_clear()
+
+        def pinned_download(model, filename, *, revision="main", raise_on_404=True):
+            assert model == checkpoint
+            assert revision == "synthetic-test-v1", "graph construction read an unpinned/default revision"
+            return deepcopy(raw) if filename == "config.json" else None
+
+        monkeypatch.setattr(utils, "_download_hf_json", pinned_download)
     systems = tmp_path / "systems"
     systems.mkdir()
     shutil.copyfile(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", systems / f"{SYSTEM}.yaml")
@@ -1319,8 +1335,15 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
     # Same envelope as the native probe and the final collection importer;
     # values are synthetic declarations, not hardware observations.
     state_provenance = {
-        "runtime_settings": {"cache_config": {"mamba_cache_dtype": conv_dtype, "mamba_ssm_cache_dtype": state_dtype}}
+        "runtime": json.loads(
+            (Path(__file__).parents[3] / "collector/fpm_forward/runtime/vllm-kimi-k31.example.json").read_text()
+        )["runtime"],
+        "runtime_settings": {"cache_config": {"mamba_cache_dtype": conv_dtype, "mamba_ssm_cache_dtype": state_dtype}},
     }
+    if state_dtype == "unaudited_auto":
+        state_provenance["runtime_settings"]["cache_config"]["mamba_ssm_cache_dtype"] = "auto"
+        # Keep the reported version, but alter the actual runtime's source map.
+        state_provenance["runtime"]["source_files"]["vllm/model_executor/models/config.py"] = "0" * 64
     if provenance_kind == "collection":
         state_provenance = {
             "source": "bound_collection_phases",
@@ -1412,8 +1435,11 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
         systems_paths=(str(systems),),
         estimator_config={"fpm_interpolation": {"method": "sol", "text_only": True, "fpm_parquet_path": parquet}},
     )
-    if conv_dtype == "float32":
-        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+    if conv_dtype == "float32" or state_dtype == "unaudited_auto":
+        diagnostic = (
+            "FP32 convolution state; .*'direct' or 'auto'" if conv_dtype == "float32" else "SOL interpolation requires"
+        )
+        with pytest.raises(ValueError, match=diagnostic):
             RustForwardPassPerfModel.best_available(config)
         from dataclasses import replace
 
@@ -1460,7 +1486,7 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
                 # their per-request contexts (4096 and 1024) straddle top-k.
                 # This requires KDA SOL and distinguishes native DSA layouts.
                 transfer_metrics = [{"scheduled_requests": {"num_decode_requests": 3, "sum_decode_kv_tokens": 4096}}]
-                if conv_dtype == "float32":
+                if conv_dtype == "float32" or state_dtype == "unaudited_auto":
                     assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
                     # Linear interpolation between measured B1=9ms and B4=18ms.
                     assert predictor.estimate_forward_pass_time_ms(transfer_metrics) == pytest.approx(15.0)
@@ -1517,9 +1543,8 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
                 # Missing/BF16 state still admits an unmeasured query through
                 # direct interpolation, without invoking the KDA roofline.
                 if expected_method == "direct":
-                    assert automatic.estimate_forward_pass_time_ms(
-                        [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 256}}]
-                    ) == pytest.approx(3.0 + 2.0 / 3.0)
+                    # Linear interpolation between measured B1=9ms and B4=18ms.
+                    assert automatic.estimate_forward_pass_time_ms(transfer_metrics) == pytest.approx(15.0)
             finally:
                 automatic.close()
         finally:

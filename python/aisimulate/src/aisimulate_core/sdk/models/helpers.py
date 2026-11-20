@@ -612,7 +612,7 @@ def validate_trtllm_large_ep(
 
 
 @cache
-def _get_model_info(model_path: str) -> dict:
+def _get_model_info(model_path: str, *, model_revision: str | None = None) -> dict:
     """
     Get model configuration info from model path.
 
@@ -626,7 +626,11 @@ def _get_model_info(model_path: str) -> dict:
     """
     # Shallow-copy: get_model_config_from_model_path is @cache'd, so mutating
     # its return value would poison every other caller's dict.
-    info = dict(get_model_config_from_model_path(model_path))
+    info = dict(
+        get_model_config_from_model_path(model_path, model_revision=model_revision)
+        if model_revision is not None
+        else get_model_config_from_model_path(model_path)
+    )
     info["num_shared_experts"] = _derive_num_shared_experts(info)
     info["num_moe_layers"] = _derive_num_moe_layers(info)
     return info

@@ -959,6 +959,7 @@ def _observed_k31_capability(
                 binding=binding,
                 cell=observations._launch_cell(launch, phase),
                 checkpoint_config=checkpoint_config,
+                formal_collection=True,
             )
             observations._validate_import_binding(record, runtime_binding(), bundle)
             dp, tp, pp = (record.get(key) for key in ("dp_rank", "tp_rank", "pp_rank"))
