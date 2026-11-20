@@ -294,6 +294,18 @@ def test_invalid_packaged_system_fails_before_download(dataset, packaged_dataset
     assert not cache.exists()
 
 
+def test_a_file_target_inside_another_file_target_fails_before_download(dataset):
+    path, manifest, _, calls, cache = dataset
+    manifest["profiles"]["gb300-full"]["files"].append(
+        {"path": "archive/extra", "target": "gb300.yaml/extra", "sha256": "0" * 64}
+    )
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="inside another file target"):
+        fpm_dataset.materialize_fpm_profile(path, "gb300-full", cache_dir=cache)
+    assert not calls
+    assert not cache.exists()
+
+
 @pytest.mark.parametrize("system", ["../gb300", "nested/gb300", r"nested\gb300", "gb300.yaml", 123])
 def test_packaged_system_must_be_a_system_name(dataset, packaged_dataset, system):
     path, manifest, _, calls, cache = dataset
