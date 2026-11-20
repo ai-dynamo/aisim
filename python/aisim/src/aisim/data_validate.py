@@ -112,6 +112,8 @@ def _dataset_root(path: Path, manifests: list[Path]) -> Path:
             first = (document.get("artifacts") or [])[0]["path"]
         except (OSError, ValueError, LookupError, TypeError):
             break
+        if not isinstance(first, str):
+            break  # the manifest check reports an invalid artifact path
         for candidate in candidates:
             if (candidate / first).is_file():
                 return candidate

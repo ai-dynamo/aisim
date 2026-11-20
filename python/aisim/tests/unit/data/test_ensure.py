@@ -721,9 +721,10 @@ def test_pin_from_environment_uses_saved_init_source(tmp_path):
 
 
 @pytest.mark.unit
-def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path):
+def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path, monkeypatch):
     from aisim_core.data.config import ConfigError, InitConfig, resolve_source, save_config, shipped_pin
 
+    monkeypatch.setenv("AISIM_DATASET", f"other/dataset@{'c' * 40}")  # the process environment must not leak in
     env = {"AISIM_DATA_CACHE": str(tmp_path)}
     cfg = tmp_path / "config.json"
     save_config(InitConfig(mode="on-demand", revision=SHA), cfg)  # revision only
@@ -731,7 +732,8 @@ def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path):
     assert (p.repo, p.revision) == (shipped_pin()[0], SHA)
     save_config(InitConfig(mode="on-demand", repo=shipped_pin()[0]), cfg)  # shipped repository, no revision
     p = pin_from_environment(env)
-    assert (p.repo, p.revision) == resolve_source(config=InitConfig(mode="on-demand", repo=shipped_pin()[0]))
+    saved = InitConfig(mode="on-demand", repo=shipped_pin()[0])
+    assert (p.repo, p.revision) == resolve_source(env=env, config=saved)
     cfg.write_text("{truncated")  # corrupt saved config is reported, not ignored
     with pytest.raises(ConfigError):
         pin_from_environment(env)
@@ -739,3 +741,12 @@ def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path):
 
 def test_default_pin_names_only_the_op_database():
     assert DataPin(local_root=Path("x")).categories == ("op-latency",)
+
+
+def test_fpm_only_pin_without_categories_fails_naming_the_variable(tmp_path, files):
+    env = {"AISIM_DATASET": f"{REPO}@{SHA}", "AISIM_DATA_CACHE": str(tmp_path)}
+    with pytest.raises(MissingDataError, match=r"no 'op-latency' category.*AISIM_DATA_CATEGORIES") as e:
+        ensure_data(CONFIG, pin_from_environment(env), transport=FakeTransport(files))  # an FPM-only dataset
+    assert "op-latency" in str(e.value) and e.value.source == f"{REPO}@{SHA}"
+    named = pin_from_environment({**env, "AISIM_DATA_CATEGORIES": "fpm"})
+    assert ensure_data(CONFIG, named, transport=FakeTransport(files)).revisions == {"fpm": SHA}

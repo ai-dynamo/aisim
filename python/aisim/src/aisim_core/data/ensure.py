@@ -581,7 +581,8 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     where = f"{pin.repo}@{revision}" if pin.local_root is None else str(root)
     if not entries:
         raise MissingDataError(
-            f"no {category} data for {_describe(selection)} in {where}; there is no fallback to other data",
+            f"no {category} data for {_describe(selection)} in {where}; there is no fallback to other data"
+            + _categories_hint(pin),
             selection=selection,
             source=where,
         )
@@ -639,6 +640,12 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     }
 
 
+def _categories_hint(pin: DataPin) -> str:
+    return (
+        f"; this pin loads {', '.join(pin.categories)} (set AISIM_DATA_CATEGORIES to load other categories, e.g. fpm)"
+    )
+
+
 def _fetch_pinned(
     selection: Selection, pin: DataPin, transport: Transport | None, out: EnsuredData | None = None
 ) -> FetchResult:
@@ -672,7 +679,9 @@ def _fetch_pinned(
             ) from exc
     except SelectionError as exc:
         # Cached catalog exists but matches nothing: the answer is final for this revision.
-        raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
+        raise MissingDataError(
+            f"{exc} ({_describe(selection)} in {where}){_categories_hint(pin)}", selection=selection, source=where
+        ) from exc
     try:
         # The auto-download allowance belongs to the whole pin: a donor fetched after the primary selection gets only
         # what the earlier fetches left.
@@ -688,7 +697,9 @@ def _fetch_pinned(
             already_downloaded=spent,
         ) from exc
     except SelectionError as exc:
-        raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
+        raise MissingDataError(
+            f"{exc} ({_describe(selection)} in {where}){_categories_hint(pin)}", selection=selection, source=where
+        ) from exc
 
 
 def _materialization_is_intact(systems: Path, manifest) -> bool:

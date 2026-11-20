@@ -157,6 +157,10 @@ operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an expli
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
 
+A pin without `AISIM_DATA_CATEGORIES` loads only `op-latency`; it used to load `fpm`. A run that needs FPM data
+sets `AISIM_DATA_CATEGORIES=fpm` (or `op-latency,fpm`). If the pinned dataset has no data for a category the pin
+loads, the run fails with a missing-data error that names this variable; it never switches to other data.
+
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation
 table fails instead of falling through to packaged or user-supplied operation tables. Packaged
