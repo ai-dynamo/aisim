@@ -11,6 +11,7 @@ import pytest
 
 from aisim.main import main
 from aisim_core.data import ensure as ensure_mod
+from aisim_core.sdk import perf_database
 from aisim_core.sdk import rust_engine_step as res
 from tests.unit.data.test_ensure_op_latency import native_dataset  # noqa: F401
 from tests.unit.data.test_fetch import REPO, SHA, SHA2, FakeTransport
@@ -25,6 +26,8 @@ def isolated_dataset_environment(monkeypatch, tmp_path):
         if name.startswith("AISIM_DATA"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("AISIM_DATA_CACHE", str(tmp_path / "cache"))
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+    monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", list(perf_database._SYSTEMS_PATHS))  # restored afterwards
 
 
 def test_no_pin_does_not_touch_config(monkeypatch):
@@ -142,6 +145,42 @@ def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names
     own.mkdir()
     _, request = _sweeper_request(model, systems_paths=[str(own)], mode=mode)
     assert res._ensure_dataset(request, None) is None
+
+
+@pytest.mark.parametrize("how", ["environment", "set_systems_paths"])
+@pytest.mark.parametrize("mode", ["op_level", "auto"])
+def test_configured_roots_outrank_the_saved_source_whether_or_not_the_request_names_them(
+    native_dataset,  # noqa: F811
+    monkeypatch,
+    tmp_path,
+    how,
+    mode,
+):
+    """``AICONFIGURATOR_SYSTEMS_PATH`` and ``set_systems_paths`` are choices; the Sweeper's default expansion is not."""
+    published, systems, config = native_dataset
+    transport = FakeTransport(_tree(published))
+    monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    own = tmp_path / "configured-roots"
+    own.mkdir()
+    if how == "environment":
+        monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(own))
+    else:
+        perf_database.set_systems_paths([str(own)])
+
+    # The request names no roots; the consumer expands them to the configured ones, and those win.
+    _, request = _sweeper_request(config.model, mode=mode)
+    assert list(request.systems_paths) == [str(own)]
+    assert res._ensure_dataset(request, None) is None
+    # The same holds when the roots are not named in the request at all.
+    unnamed = {"estimation_mode": mode, "system": "h200_sxm", "backend": "vllm"}
+    assert res._ensure_dataset(unnamed, None) is None
+
+    # Nothing configured: the packaged roots are a default, and the saved source applies again.
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+    perf_database.set_systems_paths(None)
+    _, request = _sweeper_request(config.model, mode=mode)
+    assert res._ensure_dataset(request, None) is not None
 
 
 @pytest.mark.parametrize("override", ["saved", "environment-repo", "environment-local", "explicit-pin"])
