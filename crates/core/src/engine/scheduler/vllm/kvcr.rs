@@ -35,7 +35,7 @@ use crate::engine::host_offload::{
 };
 use crate::engine::kvcr::{KvcrRegistry, SharedKvcrRegistry};
 use crate::engine::offload_transfer::bytes_per_ms;
-use crate::engine::{KvEventData, KvEventTier, KvHintSource, KvcrLocalG2Policy, StoredBlocks};
+use crate::engine::{KvEventData, KvEventTier, KvHintSource, KvcrLocalG2Policy};
 
 struct Stage {
     owner: Option<Uuid>,
@@ -233,7 +233,6 @@ impl LocalG2 {
             return;
         }
         let mut tier = tier.lock();
-        let in_g2 = |key| g2.lookup(key) == Lookup::Hit;
         // The blocks the front store's searches for a victim have passed:
         // its own and those peers read, which stay where they are meanwhile.
         let mut passed = EvictionCursor::default();
@@ -259,11 +258,13 @@ impl LocalG2 {
                 if !read && tier.evict_resident(spill.owner, spill.victim, now) {
                     registry.local_g2_stats().evicted_blocks += 1;
                     registry.forget_local_retirement(rank, spill.victim);
-                    g3.leave_memory(spill.victim, in_g2(spill.victim));
+                    g3.leave_memory(spill.victim);
                 } else {
                     // The write settled: only existing claims may keep this
                     // copy, even if its waiting deposit has already expired.
+                    // KVCR no longer lists it, so the router loses it now.
                     registry.retire_local(rank, spill.victim);
+                    tier.unpublish(spill.victim);
                     if (g3.deposits.front()).is_some_and(|deposit| now < deposit.deadline) {
                         // A store still waits for the slot.
                         g3.spill = Some(spill);
@@ -299,9 +300,11 @@ impl LocalG2 {
                     // The store's last block re-ranks its request's blocks.
                     let rerank = if more { None } else { deposit.touch.take() };
                     let store = deposit.store;
-                    let reservation = tier.reserve_planned(LOCAL_G2_CLIENT, owner, plan, None, now);
                     // G2 has held the block since its store completed.
-                    g3.enter_memory(key, g2.meta(key));
+                    let meta = g2.meta(key);
+                    g3.enter_memory(key, meta);
+                    let meta = meta.map(|meta| vec![meta.clone()]);
+                    let reservation = tier.reserve_planned(LOCAL_G2_CLIENT, owner, plan, meta, now);
                     let last = fills.back().map_or(now, |copy| copy.ends.max(now));
                     let ends = last + *copy_ms_per_block;
                     if ends <= now {
@@ -339,7 +342,7 @@ impl LocalG2 {
                         debug_assert!(evicted, "an evictable block leaves");
                         registry.local_g2_stats().evicted_blocks += 1;
                         registry.forget_local_retirement(rank, victim);
-                        g3.leave_memory(victim, in_g2(victim));
+                        g3.leave_memory(victim);
                     }
                     continue;
                 } else {
@@ -983,16 +986,14 @@ impl VllmKvcrAdapter {
 
     /// Copy the blocks `keys` of a completed G2 store into KVCR-owned memory,
     /// evicting for each one that needs room; a block that finds none is not
-    /// copied. Returns the evicted blocks `g2` does not hold either, which
-    /// have left the rank's host memory. The blocks become readable when the
-    /// copy ends. Under LRU the request's blocks up to the store's last one
-    /// then become the most recently used, the later ones evicted first
-    /// (`align_sequence` in `_poll_finished_jobs`).
+    /// copied. The blocks become readable when the copy ends. Under LRU the
+    /// request's blocks up to the store's last one then become the most
+    /// recently used, the later ones evicted first (`align_sequence` in
+    /// `_poll_finished_jobs`).
     ///
     /// With `kvcr.g3` an evicted block is written to disk first, one write
     /// at a time, so a block that finds no free slot waits its turn
-    /// ([`LocalG2::advance_spill`]) and residency changes are published
-    /// through [`Self::take_events`].
+    /// ([`LocalG2::advance_spill`]).
     pub(super) fn store_local(
         &mut self,
         g2: &HostTier,
@@ -1000,9 +1001,9 @@ impl VllmKvcrAdapter {
         store: TransferId,
         keys: &[HostBlockKey],
         now: f64,
-    ) -> Vec<u64> {
+    ) {
         let Some(local) = &mut self.local else {
-            return Vec::new();
+            return;
         };
         let rerank = local.store_prefixes.remove(&store);
         let mut registry = self.registry.lock().unwrap();
@@ -1036,22 +1037,21 @@ impl VllmKvcrAdapter {
         } else {
             (None, rerank)
         };
-        let (mut completed, mut evicted, mut left) = (0, 0, Vec::new());
+        let (mut completed, mut evicted) = (0, 0);
         let mut copied = false;
         if let Some(plan) = plan.filter(|plan| !plan.reserved().is_empty()) {
             let blocks = plan.reserved().len();
             evicted = plan.victims().len();
-            left.extend(
-                (plan.victims().iter())
-                    .filter(|key| g2.lookup(**key) != Lookup::Hit)
-                    .map(|key| key.sequence_hash()),
-            );
             if let Some(g3) = &mut local.g3 {
                 for key in plan.reserved() {
                     g3.enter_memory(*key, g2.meta(*key));
                 }
             }
-            let reservation = tier.reserve_planned(LOCAL_G2_CLIENT, owner, plan, None, now);
+            // The router identities G2 keeps while the rank publishes.
+            let meta = (plan.reserved().iter())
+                .map(|key| g2.meta(*key).cloned())
+                .collect();
+            let reservation = tier.reserve_planned(LOCAL_G2_CLIENT, owner, plan, meta, now);
             let last = local.fills.back().map(|copy| copy.ends);
             let ends = local.copy_end(last, blocks, now);
             copied = true;
@@ -1099,7 +1099,6 @@ impl VllmKvcrAdapter {
         stats.dropped_blocks += dropped;
         stats.evicted_blocks += evicted as u64;
         local.advance_spill(g2, &mut registry, self.rank, now);
-        left
     }
 
     /// Keep the blocks `keys` of the completed G2 store `store` in G2 while
@@ -1155,12 +1154,33 @@ impl VllmKvcrAdapter {
             .unwrap_or_default()
     }
 
-    /// The residency changes of KVCR-owned disk and, with it, of host memory
-    /// that the rank has not published yet, in order.
+    /// Publish the residency of the rank's KVCR-owned memory, apart from
+    /// its G2's, through [`Self::take_events`].
+    pub(super) fn publish_local_g2(&mut self) {
+        if let Some(local) = &self.local {
+            local.tier.lock().subscribe(LOCAL_G2_CLIENT);
+        }
+    }
+
+    /// The residency changes of KVCR-owned disk, then those of KVCR-owned
+    /// memory (`HostPinned`), that the rank has not published yet, each
+    /// tier's in order: the cache owner's events. A block written to disk is
+    /// thus published there before it leaves memory.
     pub(super) fn take_events(&mut self) -> Vec<(KvEventTier, KvEventData)> {
-        let g3 = self.local.as_mut().and_then(|local| local.g3.as_mut());
-        g3.map(|g3| std::mem::take(&mut g3.events))
-            .unwrap_or_default()
+        let Some(local) = &mut self.local else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        if let Some(g3) = &mut local.g3 {
+            events.extend(g3.events.drain(..).map(|event| (KvEventTier::Disk, event)));
+        }
+        let memory = local.tier.lock().take_events(LOCAL_G2_CLIENT);
+        events.extend(
+            memory
+                .into_iter()
+                .map(|event| (KvEventTier::HostPinned, event)),
+        );
+        events
     }
 
     /// Under LRU, remember the request's blocks up to the last one the G2
@@ -1202,55 +1222,6 @@ impl VllmKvcrAdapter {
             // The finish ranks every block again, whoever ranked it last.
             if let Some(g3) = &mut local.g3 {
                 g3.touch(keys);
-            }
-        }
-    }
-
-    /// Publish a residency `event` of the rank's G2 without the blocks
-    /// KVCR-owned memory holds. Such a block was published when it entered
-    /// host memory and stays published until it has left both caches.
-    pub(super) fn publish_unheld(&self, event: KvEventData, mut publish: impl FnMut(KvEventData)) {
-        let Some(local) = &self.local else {
-            return publish(event);
-        };
-        let tier = local.tier.lock();
-        // A block being copied in is held: it was published with its G2 store.
-        let held = |hash: u64| tier.lookup(HostBlockKey::new(hash)) != Lookup::Miss;
-        match event {
-            KvEventData::Removed { mut block_hashes } => {
-                block_hashes.retain(|hash| !held(*hash));
-                if !block_hashes.is_empty() {
-                    publish(KvEventData::Removed { block_hashes });
-                }
-            }
-            KvEventData::Stored(stored) if !stored.blocks.iter().any(|b| held(b.block_hash)) => {
-                publish(KvEventData::Stored(stored));
-            }
-            KvEventData::Stored(mut stored) => {
-                // Each run of blocks around the held ones is its own event.
-                let blocks = std::mem::take(&mut stored.blocks);
-                let (first, mut parent) = (stored.start_position, stored.parent_hash);
-                let mut run: Option<StoredBlocks> = None;
-                for (index, block) in blocks.into_iter().enumerate() {
-                    let hash = block.block_hash;
-                    if held(hash) {
-                        if let Some(run) = run.take() {
-                            publish(KvEventData::Stored(run));
-                        }
-                    } else {
-                        run.get_or_insert_with(|| StoredBlocks {
-                            parent_hash: parent,
-                            start_position: first.map(|first| first + index),
-                            ..stored.clone()
-                        })
-                        .blocks
-                        .push(block);
-                    }
-                    parent = Some(hash);
-                }
-                if let Some(run) = run {
-                    publish(KvEventData::Stored(run));
-                }
             }
         }
     }
@@ -1394,6 +1365,17 @@ mod tests {
         source_g2: HostTierHandle,
         target: HostTierHandle,
         owner: Uuid,
+    }
+
+    /// The router identity of a prompt's block `position`, hashed as itself.
+    fn block_meta(position: u64) -> HostBlockMeta {
+        HostBlockMeta {
+            cache_salt: None,
+            parent: position.checked_sub(1),
+            tokens_hash: position,
+            position: position as usize,
+            session_id: None,
+        }
     }
 
     fn make_resident(tier: &HostTierHandle, keys: &[u64]) {
@@ -2238,16 +2220,12 @@ mod tests {
             .read_local(f.target_rank, &resident);
         let incoming = f.keys(&(BLOCKS..2 * BLOCKS).chain(0..BLOCKS).collect::<Vec<_>>());
         let started = std::time::Instant::now();
-        assert!(
-            adapter
-                .store_local(
-                    &f.target.lock(),
-                    f.owner,
-                    TransferId::new(1),
-                    &incoming,
-                    0.0
-                )
-                .is_empty()
+        adapter.store_local(
+            &f.target.lock(),
+            f.owner,
+            TransferId::new(1),
+            &incoming,
+            0.0,
         );
         eprintln!("read-protected store: {:?}", started.elapsed());
         let stats = f.stats().local_g2.unwrap();
@@ -2289,15 +2267,7 @@ mod tests {
         let f = Fixture::new(&[0, 1, 2, 3], &[]);
         let (mut adapter, mut restore) = (f.adapter(), RestoreRounds::default());
         let keys = f.keys(&[0, 1, 2, 3]);
-        let meta = (0..4_u64)
-            .map(|position| HostBlockMeta {
-                cache_salt: None,
-                parent: position.checked_sub(1),
-                tokens_hash: position,
-                position: position as usize,
-                session_id: None,
-            })
-            .collect::<Vec<_>>();
+        let meta = (0..4).map(block_meta).collect::<Vec<_>>();
         let mut target = f.target.lock();
         target.subscribe(C);
         assert!(adapter.stage(
@@ -2505,13 +2475,13 @@ mod tests {
         // with k0, then k5 k6; the first request's store of k1 then
         // completes, after that request may have finished.
         // The copies take no time, or 1 ms a block and are landed afterwards.
-        for (policy, copy_gbps, victim, left_host_memory) in [
+        for (policy, copy_gbps, victim) in [
             // That request's blocks are the newest; of k5 k6 the later goes.
-            (Lru, 0.0, 6, vec![6]),
-            (Lru, 1.0, 6, vec![6]),
-            // The first block stored goes; G2 still holds it.
-            (Fifo, 0.0, 0, vec![]),
-            (Fifo, 1.0, 0, vec![]),
+            (Lru, 0.0, 6),
+            (Lru, 1.0, 6),
+            // The first block stored goes.
+            (Fifo, 0.0, 0),
+            (Fifo, 1.0, 0),
         ] {
             let f = Fixture::with_local_g2(4, policy, copy_gbps, 8, &[], &[0]);
             let mut adapter = f.adapter();
@@ -2523,14 +2493,14 @@ mod tests {
                 adapter.store_local(&f.target.lock(), f.owner, store, &f.keys(keys), 0.0)
             };
             let store = |adapter: &mut VllmKvcrAdapter, keys: &[u64]| store_of(adapter, keys, keys);
-            assert!(store(&mut adapter, &[0]).is_empty());
-            assert!(store(&mut adapter, &[5, 6]).is_empty());
+            store(&mut adapter, &[0]);
+            store(&mut adapter, &[5, 6]);
             // The store re-ranks the request's blocks up to its last one.
-            assert!(store_of(&mut adapter, &[0, 1], &[1]).is_empty());
+            store_of(&mut adapter, &[0, 1], &[1]);
             // A block KVCR memory holds is not copied again.
-            assert!(store(&mut adapter, &[5]).is_empty());
+            store(&mut adapter, &[5]);
             land(&mut adapter);
-            assert_eq!(store(&mut adapter, &[9]), left_host_memory, "{policy:?}");
+            store(&mut adapter, &[9]);
             land(&mut adapter);
             let local = adapter.local.as_ref().unwrap().tier.clone();
             let held = |key| local.lock().lookup(key) == Lookup::Hit;
@@ -2540,7 +2510,7 @@ mod tests {
             in_use.retain(|key| held(*key));
             assert_eq!(in_use.len(), 4);
             local.lock().pin_external(&in_use);
-            assert!(store(&mut adapter, &[8]).is_empty());
+            store(&mut adapter, &[8]);
             assert!(!held(HostBlockKey::new(8)));
             assert_eq!(
                 f.stats().local_g2,
@@ -2643,11 +2613,6 @@ mod tests {
             assert_eq!(f.stats().local_g2.unwrap().stored_blocks, 0);
             assert!(matches!(in_kvcr(keys[0]), Lookup::Pending { .. }));
             assert!(adapter.has_work());
-            // G2 dropping k0 meanwhile does not remove it from host memory.
-            let dropped = KvEventData::Removed {
-                block_hashes: vec![0],
-            };
-            adapter.publish_unheld(dropped, |event| panic!("published {event:?}"));
             // A block is neither promoted nor pulled while it is copied in.
             assert!(!stage(&mut adapter, &mut target, 0.0));
             assert_eq!(target.lookup(keys[0]), Lookup::Miss);
@@ -2834,55 +2799,6 @@ mod tests {
             assert!(adapter.advance(&mut target, lands_at_ms));
             store(4);
             assert!(!held(second_victim), "{policy:?} {pulled:?}");
-        }
-    }
-
-    #[test]
-    fn g2_events_leave_out_the_blocks_kvcr_memory_holds() {
-        use crate::engine::KvBlock;
-        // KVCR memory holds k1.
-        let f = Fixture::with_local_g2(4, KvcrLocalG2Policy::Lru, 0.0, 8, &[], &[]);
-        let mut adapter = f.adapter();
-        adapter.store_local(
-            &f.target.lock(),
-            f.owner,
-            TransferId::new(0),
-            &f.keys(&[1]),
-            0.0,
-        );
-        let stored = |parent_hash, start: usize, hashes: &[u64]| {
-            KvEventData::Stored(StoredBlocks {
-                parent_hash,
-                start_position: Some(start),
-                blocks: (hashes.iter().copied())
-                    .map(|block_hash| KvBlock {
-                        block_hash,
-                        tokens_hash: block_hash,
-                        token_ids: None,
-                    })
-                    .collect(),
-                session_id: None,
-                cache_salt: None,
-            })
-        };
-        let removed = |hashes: &[u64]| KvEventData::Removed {
-            block_hashes: hashes.to_vec(),
-        };
-        let cases = [
-            // A run around k1 becomes two runs, the second parented on k1.
-            (
-                stored(None, 0, &[0, 1, 2, 3]),
-                vec![stored(None, 0, &[0]), stored(Some(1), 2, &[2, 3])],
-            ),
-            (stored(Some(0), 1, &[1]), vec![]),
-            (stored(None, 5, &[5, 6]), vec![stored(None, 5, &[5, 6])]),
-            (removed(&[1, 5]), vec![removed(&[5])]),
-            (removed(&[1]), vec![]),
-        ];
-        for (event, expected) in cases {
-            let mut published = Vec::new();
-            adapter.publish_unheld(event, |event| published.push(event));
-            assert_eq!(published, expected);
         }
     }
 
@@ -3270,9 +3186,23 @@ mod tests {
         };
         let f = Fixture::with_g3(1, KvcrLocalG2Policy::Lru, 0.0, g3);
         let (mut source, mut reader) = (f.adapter_of(f.source), f.adapter());
-        store((&mut source, &f.source_g2.lock()), &[0], &[0], 0.0);
-        store((&mut source, &f.source_g2.lock()), &[1], &[1], 0.0);
         let key = f.keys(&[0]);
+        // The source publishes residency. Its G2 held k0, with its router
+        // identity, when the store completed, and has dropped it since.
+        source.publish_local_g2();
+        let then = HostTierHandle::new(per_rank(1, 0.0, 0.0));
+        {
+            let (mut g2, meta) = (then.lock(), block_meta(0));
+            g2.subscribe(C);
+            let StoreOutcome::Prepared { transfer_id, .. } =
+                g2.reserve_external(C, Uuid::nil(), &key, Some(&[meta]), 0.0)
+            else {
+                panic!("free G2 slot")
+            };
+            g2.complete_external(transfer_id);
+        }
+        store((&mut source, &then.lock()), &[0], &[0], 0.0);
+        store((&mut source, &f.source_g2.lock()), &[1], &[1], 0.0);
         assert!(reader.stage_at(
             &mut f.target.lock(),
             f.owner,
@@ -3312,6 +3242,21 @@ mod tests {
         // The memory remains resident for the original reader, but it is
         // no longer an available source for the cached capacity retry.
         assert_eq!(kvcr_holds(&source, 0), (Lookup::Hit, true));
+        // The router sees it leave KVCR memory then, after it reached disk.
+        let (stored, removed) = (
+            KvEventData::Stored(block_meta(0).stored(key[0])),
+            KvEventData::Removed {
+                block_hashes: vec![0],
+            },
+        );
+        assert_eq!(
+            source.take_events(),
+            [
+                (KvEventTier::Disk, stored.clone()),
+                (KvEventTier::HostPinned, stored),
+                (KvEventTier::HostPinned, removed),
+            ]
+        );
         assert!(!late.stage_at(
             &mut late_g2.lock(),
             f.owner,
@@ -3323,6 +3268,10 @@ mod tests {
         assert!(late.local.as_ref().unwrap().no_room.is_empty());
         assert_eq!(*observer.0.lock().unwrap(), key);
         assert!(reader.advance(&mut f.target.lock(), 3.0));
+        // Its eviction once the reader is done publishes nothing more.
+        source.advance_g3(&f.source_g2.lock(), 3.0);
+        assert_eq!(kvcr_holds(&source, 0), (Lookup::Miss, true));
+        assert!(source.take_events().is_empty());
     }
 
     #[test]

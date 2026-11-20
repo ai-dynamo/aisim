@@ -1937,6 +1937,16 @@ impl HostTier {
         events
     }
 
+    /// Publish resident `key` as removed: its owner stopped serving it. Its
+    /// eviction then publishes nothing.
+    pub(crate) fn unpublish(&mut self, key: HostBlockKey) {
+        if self.meta.remove(&key).is_some() {
+            self.publish(|| KvEventData::Removed {
+                block_hashes: vec![key.sequence_hash()],
+            });
+        }
+    }
+
     fn publish(&mut self, event: impl Fn() -> KvEventData) {
         for client in self.clients.values_mut() {
             if let Some(events) = &mut client.events {

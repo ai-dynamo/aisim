@@ -750,8 +750,11 @@ the GPU, so the two caches work as a chain:
   KVCR-owned memory holds every block the rank asks for, the pull starts when
   it is requested; otherwise it waits for the source's pass as before. Pulled
   blocks land in the target's G2 only.
-- **Router events.** A block is published as `HostPinned` when it enters
-  either cache and removed when it has left both.
+- **Router events.** KVCR-owned memory is published as `HostPinned` in the
+  cache-owner domain (`"domain": "cache_owner"` in serialized events): a
+  block is stored when its copy ends and removed when memory evicts it or
+  its disk write ends. `HostPinned` events of the worker, which carry no
+  `domain`, describe G2 alone.
 
 A copy between the two caches takes its bytes, a block's KV for every GPU of
 the rank, divided by `copy_bandwidth_gbps`. Each direction runs a rank's
@@ -811,9 +814,9 @@ that misses G2 and that memory reads it back into G2. With `g3`, the
   before the hinted peer. It stays on disk and does not return to KVCR-owned
   memory.
 - **Peer pulls.** A peer cannot pull a block that is only on disk.
-- **Router events.** A block is published with tier `Disk` (`"tier": "disk"`
-  in serialized events) when its write ends and removed from that tier when
-  the disk drops it.
+- **Router events.** A block is published with tier `Disk` in the
+  cache-owner domain (`"tier": "disk", "domain": "cache_owner"` in serialized
+  events) when its write ends and removed when the disk drops it.
 
 The timing defaults describe a local NVMe drive; set the values of your
 storage. With them a 9.4 MB block, its KV for every GPU of the rank, is

@@ -73,7 +73,7 @@ use crate::engine::kv_manager::{
     SourceReuseDependency, StateHandoff,
 };
 use crate::engine::{
-    HostOffloadObserver, KvEventData, KvEventTier, KvHintSource, NativeHostOffloadConfig,
+    HostOffloadObserver, KvEventDomain, KvEventTier, KvHintSource, NativeHostOffloadConfig,
 };
 
 struct LoadingPrefix {
@@ -510,8 +510,11 @@ impl VllmHostOffloadAdapter {
         gpus_per_rank: usize,
     ) -> anyhow::Result<HostTierHandle> {
         let block_bytes = self.host.lock().block_bytes();
-        let kvcr = super::kvcr::VllmKvcrAdapter::new(registry, rank)
+        let mut kvcr = super::kvcr::VllmKvcrAdapter::new(registry, rank)
             .with_local_g2(block_bytes, gpus_per_rank)?;
+        if self.publishes_residency {
+            kvcr.publish_local_g2();
+        }
         self.kvcr = Some(kvcr);
         Ok(self.host.tier_handle())
     }
@@ -962,43 +965,35 @@ impl VllmHostOffloadAdapter {
         }
         // Drain after G3 and KVCR: a promotion or pull landing in G2 above
         // publishes residency that no later deadline would otherwise deliver.
-        let mut publish =
-            |event| kv_manager.publish_residency_event(event, KvEventTier::HostPinned);
-        match &mut self.kvcr {
-            Some(kvcr) if kvcr.has_local_g2() => {
-                for event in tier.take_events(client) {
-                    kvcr.publish_unheld(event, &mut publish);
-                }
-                // What KVCR holds changes here, after the G2 events it
-                // filters: a disk write ends, then a completed store starts
-                // its copy into KVCR-owned memory.
-                kvcr.advance_g3(&tier, now_ms);
-                for transfer in &completed {
-                    if let CompletedTransfer::Store {
-                        request_id,
-                        transfer_id,
-                        blocks,
-                    } = transfer
-                    {
-                        let block_hashes =
-                            kvcr.store_local(&tier, *request_id, *transfer_id, blocks, now_ms);
-                        kvcr.pin_store(&mut tier, *transfer_id, blocks);
-                        if self.publishes_residency && !block_hashes.is_empty() {
-                            publish(KvEventData::Removed { block_hashes });
-                        }
-                    }
-                }
-                // The stores whose last waiting block has its outcome. A
-                // release moves G2's room epoch, so only a real one may.
-                let unpin = kvcr.take_g2_unpins();
-                if !unpin.is_empty() {
-                    tier.unpin_external(&unpin);
-                }
-                for (tier, event) in kvcr.take_events() {
-                    kv_manager.publish_residency_event(event, tier);
+        for event in tier.take_events(client) {
+            let (tier, domain) = (KvEventTier::HostPinned, KvEventDomain::Worker);
+            kv_manager.publish_residency_event(event, tier, domain);
+        }
+        if let Some(kvcr) = (self.kvcr.as_mut()).filter(|kvcr| kvcr.has_local_g2()) {
+            // What KVCR holds changes here: a disk write ends, then a
+            // completed store starts its copy into KVCR-owned memory.
+            kvcr.advance_g3(&tier, now_ms);
+            for transfer in &completed {
+                if let CompletedTransfer::Store {
+                    request_id,
+                    transfer_id,
+                    blocks,
+                } = transfer
+                {
+                    kvcr.store_local(&tier, *request_id, *transfer_id, blocks, now_ms);
+                    kvcr.pin_store(&mut tier, *transfer_id, blocks);
                 }
             }
-            _ => tier.take_events(client).into_iter().for_each(publish),
+            // The stores whose last waiting block has its outcome. A
+            // release moves G2's room epoch, so only a real one may.
+            let unpin = kvcr.take_g2_unpins();
+            if !unpin.is_empty() {
+                tier.unpin_external(&unpin);
+            }
+            // KVCR publishes what it owns apart from the rank's G2.
+            for (tier, event) in kvcr.take_events() {
+                kv_manager.publish_residency_event(event, tier, KvEventDomain::CacheOwner);
+            }
         }
         let mut loads = Vec::new();
         for transfer in completed {
@@ -1722,7 +1717,9 @@ mod tests {
     use crate::engine::kv_manager::NativeAllocation;
     use crate::engine::scheduler::vllm::core::VllmCore;
     use crate::engine::trace::TraceCollector;
-    use crate::engine::{G2Connector, HostOffloadObservation, HostOffloadObservationData};
+    use crate::engine::{
+        G2Connector, HostOffloadObservation, HostOffloadObservationData, KvEventData,
+    };
 
     fn adapter(capacity_blocks: usize) -> VllmHostOffloadAdapter {
         VllmHostOffloadAdapter::new(
@@ -2537,6 +2534,7 @@ mod tests {
                 session_id: Some("producer-session".into()),
             }),
             tier: KvEventTier::HostPinned,
+            domain: KvEventDomain::Worker,
         };
         for producer_publishes in [true, false] {
             let binding = G2Binding {
@@ -2679,9 +2677,10 @@ mod tests {
     /// The residency changes of `tier` among `events`, in order.
     fn residency(
         events: &[Vec<crate::engine::KvEvent>],
-        tier: KvEventTier,
+        (tier, domain): (KvEventTier, KvEventDomain),
     ) -> Vec<(&'static str, Vec<u64>)> {
-        let of_tier = events.iter().flatten().filter(|event| event.tier == tier);
+        let of_tier =
+            (events.iter().flatten()).filter(|event| event.tier == tier && event.domain == domain);
         of_tier
             .map(|event| match &event.data {
                 KvEventData::Stored(stored) => (
@@ -2691,6 +2690,18 @@ mod tests {
                 KvEventData::Removed { block_hashes } => ("removed", block_hashes.clone()),
             })
             .collect()
+    }
+
+    /// The domain of what a rank's KVCR store holds.
+    const KVCR: KvEventDomain = KvEventDomain::CacheOwner;
+
+    /// The residency changes of a one-block cache that holds `blocks` in turn.
+    fn one_at_a_time(blocks: &[u64]) -> Vec<(&'static str, Vec<u64>)> {
+        let mut changes = vec![("stored", vec![blocks[0]])];
+        for pair in blocks.windows(2) {
+            changes.extend([("removed", vec![pair[0]]), ("stored", vec![pair[1]])]);
+        }
+        changes
     }
 
     #[test]
@@ -2736,7 +2747,7 @@ mod tests {
                 |hash| ("removed", vec![hash]),
             );
             assert_eq!(
-                residency(&events, KvEventTier::Disk),
+                residency(&events, (KvEventTier::Disk, KVCR)),
                 [
                     stored(a),
                     stored(x),
@@ -2746,30 +2757,35 @@ mod tests {
                     stored(z)
                 ]
             );
-            // A block leaves host memory once it is on disk and G2 lacks it. X
-            // comes back into G2, which drops it again for V; it stays on disk.
+            // KVCR-owned memory is the cache owner's host memory: a block
+            // enters when its copy ends and leaves once it is on disk.
             assert_eq!(
-                residency(&events, KvEventTier::HostPinned),
+                residency(&events, (KvEventTier::HostPinned, KVCR)),
                 [
                     stored(a),
                     stored(x),
-                    stored(y),
                     removed(a),
+                    stored(y),
+                    removed(x),
                     stored(z),
-                    removed(x),
-                    stored(w),
                     removed(y),
-                    stored(x),
-                    removed(x),
-                    stored(v),
+                    stored(w),
                     removed(z),
+                    stored(v),
                 ]
+            );
+            // The worker's host memory is G2 alone, which holds the latest
+            // prompt. X comes back into it from disk and is dropped for V.
+            assert_eq!(
+                residency(&events, (KvEventTier::HostPinned, KvEventDomain::Worker)),
+                one_at_a_time(&[a, x, y, z, w, x, v])
             );
             let stats = stats.unwrap();
             // The names the report and the event stream serialize.
             let report = serde_json::to_value(&stats).unwrap();
             assert_eq!(report["g3"]["stored_blocks"], 4);
             assert_eq!(serde_json::to_value(KvEventTier::Disk).unwrap(), "disk");
+            assert_eq!(serde_json::to_value(KVCR).unwrap(), "cache_owner");
             assert_eq!(
                 stats.local_g2,
                 Some(KvcrLocalG2Stats {
@@ -2792,7 +2808,7 @@ mod tests {
     }
 
     #[test]
-    fn kvcr_memory_restores_what_g2_evicted_and_publishes_host_memory_once() {
+    fn kvcr_memory_restores_what_g2_evicted_and_publishes_as_a_cache_owner() {
         use crate::engine::{KvcrConfig, KvcrLocalG2Config, KvcrLocalG2Stats};
         // One-block prompts A X Y Z W, A again, then V: a one-block G2 keeps
         // only the latest, five blocks of KVCR memory keep the rest.
@@ -2819,14 +2835,24 @@ mod tests {
         let (events, host_reused, stats) = served_kvcr_events(host(), Some(kvcr), &waves);
         // A is promoted from KVCR memory into G2 and loaded from there.
         assert_eq!(host_reused, vec![0, 0, 0, 0, 0, 4, 0]);
-        // Each block is stored once when G2 takes it. G2 evictions and the
-        // promotion change nothing a router sees; only X leaving KVCR memory,
-        // the least recently used block there once V arrives, is a removal.
-        let mut expected: Vec<_> = [0, 1, 2, 3, 4, 6]
-            .map(|index| ("stored", vec![block(index)]))
-            .into();
-        expected.push(("removed", vec![block(1)]));
-        assert_eq!(residency(&events, KvEventTier::HostPinned), expected);
+        let (stored, removed) = (
+            |index| ("stored", vec![block(index)]),
+            |index| ("removed", vec![block(index)]),
+        );
+        // KVCR memory publishes a block when its copy ends. X, the least
+        // recently used block there once V arrives, is its only removal.
+        let mut expected: Vec<_> = [0, 1, 2, 3, 4].map(stored).into();
+        expected.extend([removed(1), stored(6)]);
+        assert_eq!(
+            residency(&events, (KvEventTier::HostPinned, KVCR)),
+            expected
+        );
+        // The worker's host memory is G2 alone: each prompt replaces the one
+        // before it, A the second time through its promotion.
+        assert_eq!(
+            residency(&events, (KvEventTier::HostPinned, KvEventDomain::Worker)),
+            one_at_a_time(&[0, 1, 2, 3, 4, 0, 6].map(block))
+        );
         assert_eq!(
             stats.unwrap().local_g2,
             Some(KvcrLocalG2Stats {

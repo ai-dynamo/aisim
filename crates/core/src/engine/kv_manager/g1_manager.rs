@@ -468,8 +468,9 @@ impl G1Manager {
         &mut self,
         data: crate::engine::KvEventData,
         tier: crate::engine::KvEventTier,
+        domain: crate::engine::KvEventDomain,
     ) {
-        self.inner.publish_residency_event(data, tier);
+        self.inner.publish_residency_event(data, tier, domain);
     }
 
     pub(crate) fn satisfy_native_source_dependency(

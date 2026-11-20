@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use super::kvcr::{Rerank, transfer_ms};
 use crate::engine::host_offload::{HostBlockKey, HostBlockMeta, TransferId};
-use crate::engine::{KvEventData, KvEventTier, KvcrG3Config};
+use crate::engine::{KvEventData, KvcrG3Config};
 
 /// The use that last ranked a block and the block's place in that use's key
 /// list. The lowest is evicted first: an earlier use, then a later place.
@@ -127,8 +127,8 @@ pub(super) struct G3 {
     reads: FxHashMap<TransferId, Vec<HostBlockKey>>,
     pub(super) deposits: VecDeque<Deposit>,
     pub(super) spill: Option<Spill>,
-    /// Residency changes to publish, in order.
-    pub(super) events: Vec<(KvEventTier, KvEventData)>,
+    /// The disk's residency changes to publish, in order.
+    pub(super) events: Vec<KvEventData>,
     /// G2 blocks to release for the deposits that ended with no copy of
     /// their store in flight.
     pub(super) unpin: Vec<HostBlockKey>,
@@ -211,24 +211,13 @@ impl G3 {
         }
     }
 
-    /// `key` left KVCR-owned memory: it has left host memory unless `in_g2`,
-    /// and KVCR unless it is on disk.
-    pub(super) fn leave_memory(&mut self, key: HostBlockKey, in_g2: bool) {
+    /// `key` left KVCR-owned memory, and KVCR unless it is on disk.
+    pub(super) fn leave_memory(&mut self, key: HostBlockKey) {
         let held = self.held.get_mut(&key).expect("KVCR ranks its blocks");
         held.in_memory = false;
-        let on_disk = held.disk != Disk::No;
-        if !in_g2 && self.metas.contains_key(&key) {
-            self.removed(KvEventTier::HostPinned, key);
-        }
-        if !on_disk {
+        if held.disk == Disk::No {
             self.forget(key);
         }
-    }
-
-    fn removed(&mut self, tier: KvEventTier, key: HostBlockKey) {
-        let block_hashes = vec![key.sequence_hash()];
-        self.events
-            .push((tier, KvEventData::Removed { block_hashes }));
     }
 
     /// Start writing `victim`, which memory is about to evict, taking a free
@@ -245,7 +234,8 @@ impl G3 {
             held.disk = Disk::No;
             let (published, kept) = (self.metas.contains_key(&oldest), held.in_memory);
             if published {
-                self.removed(KvEventTier::Disk, oldest);
+                let block_hashes = vec![oldest.sequence_hash()];
+                self.events.push(KvEventData::Removed { block_hashes });
             }
             if !kept {
                 self.forget(oldest);
@@ -277,8 +267,7 @@ impl G3 {
         held.rank = newest.unwrap_or(held.rank);
         let rank = held.rank;
         if let Some(meta) = self.metas.get(&victim) {
-            let stored = KvEventData::Stored(meta.stored(victim));
-            self.events.push((KvEventTier::Disk, stored));
+            self.events.push(KvEventData::Stored(meta.stored(victim)));
         }
         self.evictable.insert((rank, victim));
     }
@@ -497,7 +486,7 @@ mod tests {
                                 2 => g3.touch(&[keys[11], keys[1]]),
                                 3 => g3.align(&[keys[0], keys[11]]),
                                 4 => {
-                                    g3.leave_memory(keys[0], true);
+                                    g3.leave_memory(keys[0]);
                                     g3.enter_memory(keys[0], None);
                                 }
                                 // This suffix key has place zero, like a
@@ -516,7 +505,7 @@ mod tests {
                         for g3 in [&mut actual, &mut eager] {
                             g3.write(keys[end - 1], 0.0).unwrap();
                             g3.finish_write(keys[end - 1], true);
-                            g3.leave_memory(keys[end - 1], true);
+                            g3.leave_memory(keys[end - 1]);
                         }
                     }
                     if end == 5 {

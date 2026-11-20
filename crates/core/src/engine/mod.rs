@@ -63,9 +63,9 @@ pub use kvcr::{KvcrG3Stats, KvcrLocalG2Stats, KvcrPullCounts, KvcrStats};
 pub use protocol::{
     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,
     EncoderShape, ForwardPassMetrics, HostCacheMetrics, ImageSpec, KvBlock, KvEvent, KvEventData,
-    KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output, PassCompletionEffects,
-    PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind, PressureState, Request,
-    StoredBlocks, TtftMilestone,
+    KvEventDomain, KvEventTier, KvHintSource, LifecycleEvent, Metrics, Output,
+    PassCompletionEffects, PassStartEffects, PrefixCacheLookupCounts, PressureEvent, PressureKind,
+    PressureState, Request, StoredBlocks, TtftMilestone,
 };
 pub use runtime::{Engine, EngineFactory};
 pub use scheduler::SchedulerRank;
