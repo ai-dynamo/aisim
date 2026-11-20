@@ -472,6 +472,71 @@ def test_native_kernel_table_width_includes_context_alignment(monkeypatch):
         _physical_views(cache, scheduled, "fp8", context=4225, sequences=8)
 
 
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda c: c["kernel_block_views"].pop("indexer.0"), "coverage"),
+        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_stride=15), "stride"),
+        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_size=3), "subdivision"),
+        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_offsets=[0, 2]), "offsets"),
+        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_table_dtype="torch.int64"), "table"),
+        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_table_shape=[1, 8, 31]), "table"),
+        (lambda c: c["kernel_block_views"]["indexer.0"].update(backend_class="other.Backend"), "address mapping"),
+        (
+            lambda c: c["kernel_block_views"]["indexer.0"].update(writes_kv_cache_from_block_table=False),
+            "address mapping",
+        ),
+        (lambda c: c["kernel_block_views"].update({"unknown.layer": {}}), "layer coverage"),
+        (lambda c: c["layer_components"]["indexer.0"][0].update(shape=[(_BLOCKS - 1) * 16 + 1, 64, 16]), "coverage"),
+        (lambda c: c["layer_components"]["indexer.0"][0].update(stride_bytes=[31, 16, 1]), "stride"),
+        (lambda c: c["layer_components"]["indexer.0"][0].update(storage_offset_bytes=8193), "offsets"),
+        (lambda c: c["tensor_allocations"][1].update(layer_stride=32), "overlap"),
+    ],
+)
+def test_kernel_view_mapping_cannot_hide_pool_or_layer_corruption(monkeypatch, mutation, match):
+    cache, scheduled = _kernel_view_fixture(monkeypatch)
+    mutation(cache)
+    with pytest.raises(ValueError, match=match):
+        _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda g: g["layer_specs"].pop("indexer.0"), "every native per-layer"),
+        (lambda g: g.update(spec_page_size_bytes=385), "page sum"),
+        (lambda g: g["layer_specs"]["indexer.0"].update(block_size_tokens=8), "incompatible per-layer"),
+    ],
+)
+def test_native_uniform_wrapper_requires_exact_child_geometry(monkeypatch, mutation, match):
+    cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
+    mutation(cache["groups"][0])
+    with pytest.raises(ValueError, match=match):
+        _physical_views(cache, scheduled, "fp8", context=4096)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda c, s: c["layer_components"]["kda.0"].pop(), "component count"),
+        (lambda c, s: c["layer_components"]["kda.0"][1].update(dtype="torch.uint8"), "shape/dtype"),
+        (lambda c, s: c["layer_components"]["kda.0"][1].update(storage_offset_bytes=0), "offsets"),
+        (lambda c, s: c["layer_components"]["kda.0"][0]["stride_bytes"].__setitem__(0, 256), "coverage"),
+        (lambda c, s: c["tensor_allocations"][-1].update(layer_stride=32), "overlap"),
+        (lambda c, s: c["tensor_allocations"][-1].update(block_stride=64), "block-outer"),
+        (lambda c, s: c["tensor_allocations"][-1].update(host_resident=True), "device"),
+        (lambda c, s: c["tensor_allocations"].pop(), "omit"),
+        (lambda c, s: c["layer_components"]["mla.0"][0]["shape"].__setitem__(0, _BLOCKS * 2), "coverage"),
+        (lambda c, s: s["groups"][-1].update(mamba_cache_mode="align"), "geometry"),
+    ],
+)
+def test_native_component_or_allocation_corruption_is_rejected(monkeypatch, mutation, match):
+    cache, scheduled, _ = _native_fixture(monkeypatch)
+    mutation(cache, scheduled)
+    with pytest.raises(ValueError, match=match):
+        _physical_views(cache, scheduled, "fp8", context=4096)
+
+
 def test_uniform_attention_child_cannot_override_parent_kind_with_state_components(monkeypatch):
     cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
     child = cache["groups"][0]["layer_specs"]["mla.0"]
