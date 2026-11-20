@@ -976,11 +976,11 @@ impl ForwardPassPerfModel {
             let mut candidate = config.clone();
             candidate.estimation_mode = mode;
             loop {
-                // The op-level engine never reads an FPM library and rejects a library path, so the
-                // automatic search compiles it without the interpolation candidate's path. The
-                // path stays in `candidate`, which becomes the saved canonical configuration.
-                let op_level_without_library = (requested_estimation_mode == EstimationMode::Auto
-                    && mode == EstimationMode::OpLevel
+                // The op-level engine never reads an FPM library and rejects a library path, so it
+                // is compiled without one, whether it was selected by the automatic search or
+                // named. The path stays in `candidate`, which becomes the saved canonical
+                // configuration, so that configuration rebuilds the same model.
+                let op_level_without_library = (mode == EstimationMode::OpLevel
                     && candidate
                         .estimator_config
                         .fpm_interpolation

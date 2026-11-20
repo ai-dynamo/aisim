@@ -539,8 +539,9 @@ follows the configured estimator ordering and policy.
   The corresponding top-level quant mode must remain unset. This selects null
   profile values exactly; it does not make precision matching a wildcard.
   `fpm_parquet_path` selects an external FPM parquet with its same-stem metadata
-  sidecar. Automatic search compiles its `op_level` candidate without this path (the op-level engine rejects one)
-  and keeps it in the saved configuration for the interpolation candidate. Unknown fields are rejected.
+  sidecar. The op-level engine never reads a library, so it is compiled without this path, whether automatic search
+  selected it or it was named; the saved configuration keeps the path and rebuilds the same model.
+  Unknown fields are rejected.
 
 Sampling defaults to `bins_per_axis: [4, 4]` and `max_observations: 64` per
 logical store. Rectangular grids were already supported. Regression's
