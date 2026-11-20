@@ -142,11 +142,11 @@ _MODEL_CONFIG_DIR = os.path.join(
     "model_configs",
 )
 _GLM5_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
-# SGLang runs NVFP4 on FP4 kernels on capability majors 10, 11 and 12 (utils/common.py,
-# is_blackwell_supported). On SM80 to SM90 it serves an NVFP4 checkpoint through Marlin, a
-# weight-only W4A16 path (layers/quantization/fp4_utils.py, initialize_fp4_gemm_config;
-# layers/quantization/modelopt_quant.py, ModelOptNvFp4FusedMoEMethod). The collector does not
-# collect that path.
+# SGLang's Blackwell capability majors are 10, 11 and 12 (utils/common.py, is_blackwell_supported).
+# Its FP4 GEMM selection (layers/quantization/fp4_utils.py, initialize_fp4_gemm_config) takes Marlin
+# by default only below capability 10.0. On SM80 to SM90 it serves an NVFP4 checkpoint through Marlin,
+# a weight-only W4A16 path (layers/quantization/modelopt_quant.py, ModelOptNvFp4FusedMoEMethod). The
+# collector does not collect that path.
 _NATIVE_NVFP4_SM_MAJORS = (10, 11, 12)
 
 
@@ -610,8 +610,8 @@ def _model_native_gemm_quant(model_id: str) -> str | None:
     * ``quantization_config`` with another ``quant_method`` → ``quant_method`` +
       ``weight_block_size`` (block-fp8 → ``"fp8_block"``, an FP4 method → ``"nvfp4"``)
     * ``compression_config`` → ``None``
-    * ModelOpt ``*_hf_quant_config.json`` → ``quantization.quant_algo``
-      (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
+    * ``*_hf_quant_config.json`` with a pure algorithm, with any ``quant_method`` →
+      ``quantization.quant_algo`` (``NVFP4`` → ``"nvfp4"``, ``FP8`` → ``"fp8_block"``)
     * ModelOpt ``MIXED_PRECISION`` export (one lane per module in
       ``quantized_layers``) in either ModelOpt section → ``"nvfp4"`` when a
       lane is NVFP4 or W4A16_NVFP4

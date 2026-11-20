@@ -226,8 +226,9 @@ class TestMixedPrecisionExport:
 
     @pytest.mark.parametrize("section", ["config.json", "hf_quant_config.json"])
     def test_lower_case_quant_algo_is_not_the_mixed_recipe(self, mod, tmp_path, section):
-        # SGLang compares quant_algo to "MIXED_PRECISION" exactly (configs/model_config.py:1145,
-        # 1153), so a lower-case value is not the mixed recipe to the framework either.
+        # SGLang compares quant_algo to "MIXED_PRECISION" exactly (configs/model_config.py,
+        # ModelConfig._parse_modelopt_quant_config), so a lower-case value is not the mixed recipe to
+        # the framework either.
         if section == "config.json":
             _write_config(tmp_path, _mixed_config(GLM53_LANES, quant_algo="mixed_precision"))
         else:
@@ -322,7 +323,7 @@ class TestMixedPrecisionExport:
 
     def test_compression_config_takes_precedence_over_the_sidecar(self, mod, tmp_path):
         # SGLang resolves ``quantization_config``, then ``compression_config``, then the ModelOpt sidecar
-        # (configs/model_config.py:1029, 1046 and 1117), so a checkpoint that declares
+        # (configs/model_config.py, ModelConfig._parse_quant_hf_config), so a checkpoint that declares
         # ``compression_config`` reaches the mixed recipe only through its own ``quantization_config``,
         # never through the sidecar.
         payload = {
@@ -434,6 +435,15 @@ class TestSectionOrder:
     def test_modelopt_quantization_config_without_a_sidecar(self, mod, tmp_path, quantization_config, expected):
         _write_config(tmp_path, quantization_config)
         assert mod._model_native_gemm_quant(MODEL_ID) == expected
+
+    def test_pure_sidecar_algorithm_is_read_with_any_quant_method(self, mod, tmp_path):
+        _write_config(tmp_path)
+        _write_hf_quant(tmp_path, {"quant_method": "compressed-tensors", "quant_algo": "NVFP4"})
+        assert mod._model_native_gemm_quant(MODEL_ID) == "nvfp4"
+
+    def test_mxfp4_quantization_config_without_a_sidecar(self, mod, tmp_path):
+        _write_config(tmp_path, {"quant_method": "mxfp4"})
+        assert mod._model_native_gemm_quant(MODEL_ID) == "nvfp4"
 
 
 def _declared_module_model_ids():
