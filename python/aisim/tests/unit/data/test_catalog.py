@@ -314,3 +314,26 @@ def test_a_category_index_edited_after_indexing_is_refused(dataset):
 def test_hardware_cannot_name_a_path_outside_the_shard_directory(tmp_path, hardware):
     with pytest.raises(ValueError, match="path component"):
         shard_path(tmp_path, "fpm", hardware)
+
+
+def test_the_latest_accuracy_is_chosen_by_time_not_by_string(dataset):
+    older = _record(_ident(QWEN), "fpm", 1.0, NEW, "2026-11-01T00:00:00Z")
+    newer = _record(_ident(QWEN), "fpm", 2.0, NEW, "2026-11-01T00:00:00.1Z")
+    assert "2026-11-01T00:00:00Z" > "2026-11-01T00:00:00.1Z"  # as strings the older one sorts last
+    for order in ([older, newer], [newer, older]):
+        assert catalog_module._latest_accuracy(order).results.mape_pct == 2.0
+
+
+def test_a_manifest_beside_eval_records_is_not_loaded_as_a_record(dataset):
+    from aisim_core.data.eval import record_dir
+
+    root, systems = dataset
+    directory = record_dir(root, _ident(QWEN))
+    (directory / "manifest.json").write_text('{"schema_version": "aisim-artifact-manifest/v1"}')
+    rows = build_catalog(root, systems_dir=systems)
+    assert any(r.model == QWEN and r.acc_mape_pct is not None for r in rows)
+    # Corrupt content at a valid record filename is still refused.
+    victim = next(p for p in directory.glob("*.json") if p.name != "manifest.json")
+    victim.write_text(victim.read_text().replace("2026-11", "2027-01"))
+    with pytest.raises(ValueError, match="content hash"):
+        build_catalog(root, systems_dir=systems)

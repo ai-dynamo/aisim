@@ -359,7 +359,7 @@ def _terminated_window(term: Mapping[str, Any]) -> tuple[datetime, datetime] | N
     return _ts(term["startedAt"], "startedAt"), _ts(term["finishedAt"], "finishedAt")
 
 
-def _pod_window(pod: Mapping[str, Any]) -> tuple[datetime, datetime, list[float]]:
+def _pod_window(pod: Mapping[str, Any]) -> tuple[datetime, datetime, list[tuple[datetime, datetime]]]:
     """Start, end and earlier-restart runs of the pod's container execution; excludes scheduling/queue wait.
 
     Init containers hold the pod's GPUs while they run, so they widen the window like app containers do. A
@@ -389,7 +389,7 @@ def _pod_window(pod: Mapping[str, Any]) -> tuple[datetime, datetime, list[float]
             starts.append(window[0])
             ends.append(window[1])
         if prior is not None:
-            earlier.append((prior[1] - prior[0]).total_seconds())
+            earlier.append(prior)
     if not ends:
         raise _NeverStarted(f"pod {name} has no terminated container times")
     return min(starts), max(ends), earlier
@@ -435,7 +435,14 @@ def gpu_time_from_kubernetes(
         seconds = (end - start).total_seconds()
         if seconds < 0:
             raise KubeParseError("pod finished before it started")
-        failed.extend((run, gpus) for run in earlier)  # runs of restarted containers that did not finish the job
+        for run_start, run_end in earlier:
+            if run_start < end and run_end > start:
+                # A GPU-second belongs to one bucket: an earlier run inside the final window (another container was
+                # running throughout) would be charged both as failed and as measured time.
+                raise KubeParseError(
+                    "an earlier container run overlaps the pod's final window; cost cannot be attributed"
+                )
+            failed.append(((run_end - run_start).total_seconds(), gpus))  # a restarted run that did not finish the job
         if phase == "Succeeded":
             ok.append((pod, seconds, gpus))
         else:

@@ -39,6 +39,7 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -46,7 +47,7 @@ import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, path_component
-from aisim_core.data.eval import EvalRecord, Layer, current_records
+from aisim_core.data.eval import EvalRecord, Layer, current_records, record_files
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
 
@@ -196,7 +197,7 @@ def _read_eval_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
     eval_root = root / "eval"
     if not eval_root.is_dir():
         return
-    directories = sorted({p.parent for p in eval_root.rglob("*.json")})
+    directories = sorted({p.parent for p in eval_root.rglob("*.json") if record_files(p.parent)})
     for directory in directories:
         for record in current_records(directory):
             ident = record.truth.identity
@@ -208,7 +209,13 @@ def _read_eval_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
 
 def _latest_accuracy(records: list[EvalRecord]) -> EvalRecord | None:
     scored = [r for r in records if r.results.mape_pct is not None and r.status != "failed"]
-    return max(scored, key=lambda r: (r.created_at, r.record_id), default=None)
+    return max(scored, key=lambda r: (_instant(r.created_at), r.record_id), default=None)
+
+
+def _instant(timestamp: str) -> datetime:
+    """The moment an RFC 3339 timestamp names; strings of differing fractional precision do not sort as times."""
+    when = datetime.fromisoformat(timestamp)
+    return when if when.tzinfo is not None else when.replace(tzinfo=UTC)
 
 
 def _summarize(key: tuple, cell: _Cell | None, current_specs: Mapping[str, str]) -> CatalogRow:

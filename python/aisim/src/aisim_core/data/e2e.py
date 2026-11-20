@@ -937,6 +937,8 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
     if not data.observations:
         raise ValueError("a configuration needs at least one observation")
     known = {o.observation_id for o in data.observations}
+    if len(known) != len(data.observations):
+        raise ValueError("duplicate observation_id in a configuration")
     for o in data.observations:
         if o.configuration_id != cid:
             raise ValueError(f"observation {o.observation_id} belongs to a different configuration")
@@ -974,6 +976,11 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
             provenance={"e2e": body.model_dump(mode="json")},
             evidence_gaps=body.evidence_gaps,
         )
+        artifact_ids = {a.artifact_id for a in artifacts}
+        for o in data.observations:
+            for ref in (o.raw_artifact_id, o.log_artifact_id, *o.evidence_refs):
+                if ref is not None and ref not in artifact_ids:
+                    raise ValueError(f"observation {o.observation_id} references unknown artifact {ref}")
         relative = f"{directory}/manifest.json"
         (stage / relative).write_text(
             json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False)
@@ -1067,7 +1074,7 @@ class EvaluationPoint:
     unavailable: frozenset[tuple[str, str]]
     # Per-device tokens/s by throughput metric, normalized explicitly.
     per_device_throughput: dict[str, float]
-    # Which timing boundary (``client`` or ``server``) reported each value; ``None`` when the row does not say.
+    # Which timing boundary (``client`` or ``server``) reported each ``metrics`` key (``None``: the row is silent).
     observers: dict[tuple[str, str], str | None] = field(default_factory=dict)
 
 
@@ -1084,7 +1091,7 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
     points = []
     for obs in dataset.observations:
         values, unavailable, device = {}, set(), {}
-        reported: dict[tuple[str, str, str], str | None] = {}
+        reported: dict[tuple[str, str], str | None] = {}  # evaluator output key -> observer
         for row in metrics.get(obs.observation_id, []):
             if row.scope != "run" or (observer is not None and row.observer != observer):
                 continue
@@ -1093,18 +1100,20 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
             if name_findings("metric", "", row.metric) or name_findings("statistic", "", row.statistic):
                 continue
             key = (row.metric, row.statistic)
-            slot = (*key, row.normalization)
-            if slot in reported:
+            # Uniqueness is checked on the key the point actually returns: throughput keys carry their
+            # normalization (total and per-device never mix); every other metric is keyed by (metric, statistic),
+            # so rows that differ only in normalization or observer would otherwise overwrite one another.
+            out_key = (f"{row.metric}:{row.normalization}", row.statistic) if row.metric.endswith("throughput") else key
+            if out_key in reported:
                 raise ValueError(
-                    f"observation {obs.observation_id}: {row.metric}/{row.statistic} is reported by observers "
-                    f"{reported[slot]!r} and {row.observer!r}; select one with observer="
+                    f"observation {obs.observation_id}: {out_key[0]}/{row.statistic} is reported by observers "
+                    f"{reported[out_key]!r} and {row.observer!r}; select one with observer="
                 )
-            reported[slot] = row.observer
+            reported[out_key] = row.observer
             if row.status != "valid":
                 unavailable.add(key)
             elif row.metric.endswith("throughput"):
-                # Throughput keys carry their normalization: total and per-device never mix.
-                values[(f"{row.metric}:{row.normalization}", row.statistic)] = row.value
+                values[out_key] = row.value
                 if row.normalization == "total" and row.device_count is None and obs.device_count:
                     row = row.model_copy(update={"device_count": obs.device_count})
                 if row.normalization == "per_device" or (row.normalization == "total" and row.device_count):
@@ -1121,7 +1130,7 @@ def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> li
                 values,
                 frozenset(unavailable),
                 device,
-                {(m, st): who for (m, st, _), who in reported.items()},
+                reported,
             )
         )
     return points

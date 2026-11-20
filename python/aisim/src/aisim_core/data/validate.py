@@ -214,9 +214,16 @@ def check_current(
     request_digest: str,
     evaluator_rev: str,
     dataset_sha: str | None = None,
+    pr_number: int | None = None,
+    base_sha: str | None = None,
 ) -> list[str]:
     """Why ``report`` no longer applies; empty means it is still current."""
     stale: list[str] = []
+    # Two pull requests can share a head commit and a request, so the report is also bound to its PR and base.
+    if pr_number is not None and report.pr_number != pr_number:
+        stale.append(f"report is for PR #{report.pr_number}, not #{pr_number}")
+    if base_sha is not None and report.base_sha != base_sha:
+        stale.append(f"PR base changed: validated {report.base_sha}, now {base_sha}")
     if report.code_sha != head_sha:
         stale.append(f"PR head changed: validated {report.code_sha}, now {head_sha}")
     if report.request_digest != request_digest:
@@ -327,9 +334,6 @@ def run_validation(
     )
 
 
-_IDENTITY_FIELDS = ("hardware", "framework", "framework_version", "model", "operation_family")
-
-
 def _identity_problem(record: EvalRecord, request: ValidationRequest, result) -> str | None:
     """Why the record's truth identity disagrees with the evidence that was selected, else ``None``.
 
@@ -351,7 +355,9 @@ def _identity_problem(record: EvalRecord, request: ValidationRequest, result) ->
     if not owners:
         return f"record {request.record_path!r} is not listed by any selected manifest"
     for manifest in owners:
-        differing = [f for f in _IDENTITY_FIELDS if getattr(manifest.identity, f) != getattr(truth, f)]
+        # Everything configuration_id hashes: effective settings, parallelism, precision, deployment and the rest.
+        envelope = manifest.identity.model_dump()
+        differing = sorted(name for name, value in truth.model_dump().items() if envelope.get(name) != value)
         if differing:
             return f"record identity differs from its selected manifest in {differing}"
     return None
@@ -465,6 +471,8 @@ def main(argv: list[str] | None = None, *, transport: Transport | None = None) -
             head_sha=pr.head_sha,
             request_digest=request.digest(),
             evaluator_rev=evaluator_revision(args.trusted_sha),
+            pr_number=pr.number,
+            base_sha=pr.base_sha,
         )
         for reason in stale:
             print(f"STALE: {reason}", file=sys.stderr)

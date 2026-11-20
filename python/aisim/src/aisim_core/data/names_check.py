@@ -34,21 +34,33 @@ class PathFinding:
         return {"path": self.path, "kind": f.kind, "location": f.location, "value": f.value, "canonical": f.canonical}
 
 
-def iter_manifests(root: Path) -> list[Path]:
-    """Configuration manifests under ``root`` (a file is checked on its own)."""
+def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
+    """``(manifests, errors)`` under ``root``; a file is checked on its own.
+
+    A file with a manifest name that cannot be read or parsed is an error, never silently dropped: a truncated
+    manifest in a directory must fail the check as it does when the file is checked directly. A readable JSON
+    document with another schema is simply not ours.
+    """
     root = Path(root)
     if root.is_file():
-        return [root]
-    found = []
+        return [root], []
+    found: list[Path] = []
+    errors: list[str] = []
     for name in MANIFEST_NAMES:
         for path in sorted(root.rglob(name)):
             try:
                 head = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                errors.append(f"{path.relative_to(root).as_posix()}: {type(exc).__name__}: {exc}")
                 continue
             if isinstance(head, dict) and head.get("schema_version") == MANIFEST_SCHEMA:
                 found.append(path)
-    return found
+    return found, errors
+
+
+def iter_manifests(root: Path) -> list[Path]:
+    """Configuration manifests under ``root`` (see :func:`discover_manifests` for the unreadable ones)."""
+    return discover_manifests(root)[0]
 
 
 def _identity_findings(manifest: Manifest) -> list[NameFinding]:
@@ -82,7 +94,9 @@ def check_names(root: Path | str) -> tuple[list[PathFinding], list[str]]:
     base = root if root.is_dir() else root.parent
     findings: list[PathFinding] = []
     errors: list[str] = []
-    for path in iter_manifests(root):
+    manifests, discovery_errors = discover_manifests(root)
+    errors.extend(discovery_errors)
+    for path in manifests:
         relative = path.relative_to(base).as_posix()
         try:
             manifest = Manifest.model_validate_json(path.read_text(encoding="utf-8"))

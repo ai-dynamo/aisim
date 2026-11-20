@@ -93,6 +93,51 @@ def read_entry_manifest(tree: Path, entry: Entry, config: Mapping[str, Any] | No
     return manifest
 
 
+def composed_root_matches(
+    systems: Path,
+    tree: Path,
+    manifests: Iterable[Manifest],
+    packaged_systems: Path | None = PACKAGED_SYSTEMS_DIR,
+) -> bool:
+    """True when a composed root still holds exactly what :func:`load_op_latency_tree` writes.
+
+    That is every runtime artifact at its declared digest, the lookup YAML rebuilt from the pinned tables, and the
+    packaged specs and support files the consumer reads beside them. The source digest cannot see an edit to
+    these copies, so a reused root is checked file by file and rebuilt by the caller when this is false.
+    """
+    systems, tree = Path(systems), Path(tree)
+    try:
+        for manifest in manifests:
+            for artifact in manifest.artifacts:
+                if artifact.runtime_path is not None:
+                    _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
+        lookups = set()
+        for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME):
+            lookups.add(f"{name}.yaml")
+            expected = lookup_yaml(tree / DATA_PREFIX / f"{name}.parquet")
+            if (systems / f"{name}.yaml").read_bytes() != expected:
+                return False
+        if packaged_systems is not None:
+            for source in sorted(Path(packaged_systems).iterdir()):
+                if source.name == _DATA_DIR or source.name in lookups:
+                    continue
+                if not _same_tree(source, systems / source.name):
+                    return False
+    except (OSError, ValueError, LoaderError):
+        return False
+    return True
+
+
+def _same_tree(source: Path, copy: Path) -> bool:
+    """True when ``copy`` holds the same files with the same bytes as ``source`` (a file or a directory)."""
+    if source.is_dir():
+        if not copy.is_dir():
+            return False
+        names = {p.name for p in source.iterdir()}
+        return all(_same_tree(source / n, copy / n) for n in names)
+    return copy.is_file() and hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256(copy.read_bytes()).digest()
+
+
 def verify_op_latency_support(tree: Path) -> None:
     """Verify every file the category index pins as support (the lookup tables) against its digest.
 

@@ -345,3 +345,15 @@ def test_the_prepared_profile_settings_fill_unspecified_caller_fields(tmp_path, 
 def test_an_explicit_choice_that_conflicts_with_the_prepared_profile_is_reported(tmp_path, files, change, message):
     with pytest.raises(DataConflictError, match=message):
         ensure_data({**CONFIG, **change}, pin(tmp_path), transport=FakeTransport(files))
+
+
+def test_an_online_pin_repairs_a_corrupt_cached_catalog_and_an_offline_pin_reports_it(tmp_path, files):
+    cache = Cache(tmp_path / "cache")
+    ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    catalog = cache.path_for(REPO, SHA, "catalog/dataset.json")
+    catalog.write_bytes(b"corrupt")
+    with pytest.raises(MissingDataError, match="cached catalog .* is corrupt"):
+        ensure_data(CONFIG, pin(tmp_path, offline=True))
+    transport = FakeTransport(files)
+    ensure_data(CONFIG, pin(tmp_path), transport=transport)  # the online path replaces the bad copy
+    assert "catalog/dataset.json" in transport.opened and catalog.read_bytes() == files["catalog/dataset.json"]

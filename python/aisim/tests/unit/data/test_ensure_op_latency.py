@@ -682,3 +682,30 @@ def test_ensuring_the_real_configuration_connected_makes_the_offline_run_complet
     offline = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=cache, offline=True)
     out = ensure_data(config, offline)  # no transport: everything must come from the cache
     assert (Path(out.config["systems_paths"][0]) / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file()
+
+
+@pytest.mark.parametrize("victim", ["query_versions.yaml", "perf_data_reuse_manifest.yaml", "h200_sxm.yaml"])
+def test_copied_specs_and_generated_lookups_are_verified_before_a_root_is_reused(two_families, tmp_path, victim):
+    first = Path(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+    original = (first / victim).read_bytes()
+    (first / victim).write_bytes(original + b"\n# edited in the cache\n")
+    second = Path(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+    assert (second / victim).read_bytes() == original  # rebuilt, not served damaged
+
+
+def test_an_edited_cached_system_spec_does_not_reach_the_native_predictor(native_dataset, tmp_path):
+    published, systems, config = native_dataset
+    shutil.rmtree(systems / "data")
+    payload = config.to_dict()
+    payload.pop("systems_paths")
+    pin = _pin(published, tmp_path)
+    baseline = res.RustForwardPassPerfModel.best_available(dict(payload), dataset=pin).predict_prefill_latency(1, 4)
+    cached = Path(ensure_data(dict(payload), pin).config["systems_paths"][0]) / "h200_sxm.yaml"
+    text = cached.read_text()
+    assert "mem_empirical_constant_latency" in text
+    cached.write_text(
+        text.replace("mem_empirical_constant_latency: 0.000003", "mem_empirical_constant_latency: 1.000003")
+    )
+    assert cached.read_text() != text
+    again = res.RustForwardPassPerfModel.best_available(dict(payload), dataset=pin).predict_prefill_latency(1, 4)
+    assert again == baseline  # the damaged copy was rebuilt from the packaged spec

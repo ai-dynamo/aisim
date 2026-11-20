@@ -357,3 +357,22 @@ def test_init_containers_count_toward_the_gpu_window_and_must_have_finished():
     unfinished = [{"state": {"terminated": {"startedAt": "2026-11-07T00:00:00Z"}}}]
     with pytest.raises(KubeParseError, match="no finish time"):
         gpu_time_from_kubernetes(job, [_pod_with(app, init=unfinished)])
+
+
+def test_an_earlier_run_overlapping_the_final_window_is_not_charged_twice():
+    from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
+
+    job = {**_JOB, "spec": {}}
+    # The main container runs 0-60 s, restarts and runs 60-90 s; a helper container runs the whole 0-90 s.
+    main = _container(
+        "2026-11-07T00:01:00Z",
+        "2026-11-07T00:01:30Z",
+        restart_count=1,
+        last=("2026-11-07T00:00:00Z", "2026-11-07T00:01:00Z"),
+    )
+    helper = _container("2026-11-07T00:00:00Z", "2026-11-07T00:01:30Z")
+    with pytest.raises(KubeParseError, match="cannot be attributed"):
+        gpu_time_from_kubernetes(job, [_pod_with([main, helper])])
+    # Disjoint runs keep the existing split (earlier run failed cost, final run measured).
+    gt = gpu_time_from_kubernetes(job, [_pod_with([main])])
+    assert (gt.wall_seconds, gt.failed.wall_seconds) == (30, 60)

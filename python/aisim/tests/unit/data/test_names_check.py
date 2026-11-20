@@ -121,3 +121,14 @@ def test_e2e_artifacts_resolve_from_the_dataset_root_whatever_is_checked(tmp_pat
     findings, errors = check_names(target)
     assert errors == []
     assert {(f.finding.kind, f.finding.value) for f in findings} == {("hardware", "B300")}
+
+
+def test_a_truncated_manifest_in_a_directory_is_an_error_like_the_file_checked_directly(tmp_path, capsys):
+    manifest = _e2e(tmp_path)
+    path = tmp_path / manifest
+    path.write_text(path.read_text()[:40])  # truncated
+    findings, errors = check_names(tmp_path)
+    assert findings == [] and len(errors) == 1 and errors[0].startswith(manifest)
+    assert check_names(path)[1], "checking the file directly reports an error too"
+    assert run_check_names(argparse.Namespace(path=str(tmp_path))) == 1  # the documented directory precheck fails
+    assert json.loads(capsys.readouterr().out)["ok"] is False

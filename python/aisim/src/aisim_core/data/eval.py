@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -317,8 +318,17 @@ def current_records(directory: str | Path) -> list[EvalRecord]:
     return [r for r in records if r.record_id not in gone]
 
 
+_RECORD_FILENAME = re.compile(r"^[0-9a-f]{64}\.json$")
+
+
+def record_files(directory: str | Path) -> list[Path]:
+    """The content-addressed record files of a directory; manifests and other JSON beside them are not records."""
+    return sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+
+
 def _load_all(directory: str | Path) -> list[EvalRecord]:
-    return [load_record(p) for p in sorted(Path(directory).glob("*.json"))]
+    # Corrupt content at a valid record filename is still rejected by load_record.
+    return [load_record(p) for p in record_files(directory)]
 
 
 # --- truth table and metrics ------------------------------------------------

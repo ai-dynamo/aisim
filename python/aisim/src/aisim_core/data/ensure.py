@@ -62,6 +62,7 @@ from aisim_core.data.fetch import (
     Cache,
     DataFetchError,
     FetchResult,
+    IntegrityError,
     OfflineMissingError,
     RevisionError,
     Selection,
@@ -76,6 +77,7 @@ from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
 from aisim_core.data.op_tree import (
     OpTreeLoad,
     _op_latency_index,
+    composed_root_matches,
     load_op_latency_tree,
     lookup_yaml,
     op_latency_inputs_digest,
@@ -383,9 +385,9 @@ def _version_policy(pin: DataPin, transport: Transport | None):
             common = {"repo": pin.repo, "revision": pin.revision, "cache": cache}
             try:
                 _, index, paths = fetch_support("op-latency", transport=None, offline=True, **common)
-            except (OfflineMissingError, RevisionError) as exc:
+            except (OfflineMissingError, RevisionError, IntegrityError) as exc:
                 if pin.offline:
-                    raise MissingDataError(f"offline: the version policy of {where} is not cached: {exc}") from exc
+                    raise MissingDataError(f"offline: the version policy of {where} is not usable: {exc}") from exc
                 _, index, paths = fetch_support("op-latency", transport=transport, **common)
             path = paths.get(name)
         if path is None or not Path(path).is_file():
@@ -527,6 +529,12 @@ def _fetch_pinned(
                 selection=selection,
                 source=where,
             ) from exc
+    except IntegrityError as exc:
+        # A corrupt cached catalog: an online pin repairs it by fetching again, an offline one cannot.
+        if pin.offline:
+            raise MissingDataError(
+                f"offline: the cached catalog of {where} is corrupt: {exc}", selection=selection, source=where
+            ) from exc
     except RevisionError as exc:
         if pin.offline:
             raise MissingDataError(
@@ -593,18 +601,6 @@ def _one_entry_per_family(entries: list[Entry], selection: Selection, where: str
             "set AISIM_DATA_CONFIGURATION (DataPin.configuration_id) to choose one"
         )
     return sorted(entries, key=lambda e: e.configuration_id)
-
-
-def _root_matches(systems: Path, manifests: list[Any]) -> bool:
-    """True when every runtime file of the composed root still has the digest its manifest declares."""
-    try:
-        for manifest in manifests:
-            for artifact in manifest.artifacts:
-                if artifact.runtime_path is not None:
-                    _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
-    except ValueError:
-        return False
-    return True
 
 
 def _declared_donors(
@@ -798,7 +794,7 @@ def _load_op_latency(
         digest = op_latency_inputs_digest(root, manifests, PACKAGED_SYSTEMS_DIR)[:16]
         output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
         if (output_dir / "systems").is_dir():
-            if _root_matches(output_dir / "systems", manifests):
+            if composed_root_matches(output_dir / "systems", root, manifests, PACKAGED_SYSTEMS_DIR):
                 return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
             shutil.rmtree(output_dir, ignore_errors=True)  # edited or damaged in place: rebuild from the dataset
         output_dir.parent.mkdir(parents=True, exist_ok=True)

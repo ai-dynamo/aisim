@@ -71,7 +71,16 @@ def _identity():
     )
 
 
-def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions=False, record_hardware=None):
+def build_dataset(
+    tmp_path,
+    claim_scale=1.0,
+    *,
+    list_truth=True,
+    drop_exclusions=False,
+    record_hardware=None,
+    identity_update=None,
+    record_identity=None,
+):
     rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, 5)] + [("bad", {"tokens": 1}, None)]
     art = write_truth_table(tmp_path / "t.parquet", rows)
     truth_bytes = (tmp_path / "t.parquet").read_bytes()
@@ -81,7 +90,7 @@ def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions
     if drop_exclusions:  # a producer that omits an exclusion but keeps every aggregate
         results = results.model_copy(update={"exclusions": []})
     pred = PredictionIdentity.build("fpm_interpolation", {"p": PIN}, SPEC)
-    ident = _identity()
+    ident = _identity().model_copy(update=identity_update or {})
     cfg = configuration_id("eval", "evaluation-record", ident)
     record = EvalRecord.model_validate(
         {
@@ -90,8 +99,8 @@ def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions
             "truth": {
                 "layer": "fpm",
                 "configuration_ids": [cfg],
-                "identity": (
-                    ident.model_copy(update={"hardware": record_hardware}) if record_hardware else ident
+                "identity": ident.model_copy(
+                    update={**({"hardware": record_hardware} if record_hardware else {}), **(record_identity or {})}
                 ).model_dump(),
                 "artifacts": [art.model_dump(by_alias=True)],
                 "truth_table_artifact_id": "truth-table",
@@ -503,3 +512,39 @@ def test_the_request_filters_bind_the_record_identity(tmp_path):
     for field, value in (("hardware", "h100_sxm"), ("model", "Qwen/Other")):
         r = run(tmp_path, files, request(rec, cfg, **{field: value}))
         assert r.verdict != "pass", field  # no catalog entry matches the filter
+
+
+@pytest.mark.parametrize(
+    "envelope,record",
+    [
+        ({"parallelism": {"aggregated": {"tp": 4}}}, {"parallelism": {"aggregated": {"tp": 8}}}),
+        ({"precision": {"weights": "bfloat16"}}, {"precision": {"weights": "fp8"}}),
+        ({"deployment": "aggregated"}, {"deployment": "disaggregated"}),
+        ({"effective_settings": {"max_num_seqs": 64}}, {"effective_settings": {"max_num_seqs": 128}}),
+    ],
+)
+def test_the_whole_effective_identity_is_bound_to_the_selected_manifest(tmp_path, envelope, record):
+    files, rec, cfg, _ = build_dataset(tmp_path, identity_update=envelope, record_identity=record)
+    received = []
+
+    def spying_factory(loaded):
+        received.append(loaded.truth.identity)
+        return factory(loaded)
+
+    r = run(tmp_path, files, request(rec, cfg), factory=spying_factory)
+    assert r.verdict == "fail" and "differs from its selected manifest" in r.problems[0]
+    assert received == []
+    # The matching identity still passes.
+    (tmp_path / "ok").mkdir()
+    matching, rec, cfg, _ = build_dataset(tmp_path / "ok", identity_update=envelope)
+    assert run(tmp_path / "ok", matching, request(rec, cfg)).verdict == "pass"
+
+
+def test_a_report_for_another_pull_request_is_not_current(tmp_path):
+    files, rec, cfg, _ = build_dataset(tmp_path)
+    req = request(rec, cfg)
+    r = run(tmp_path, files, req)  # validated as PR 7 at base BASE
+    kwargs = dict(head_sha=HEAD, request_digest=req.digest(), evaluator_rev=evaluator_revision(TRUSTED))
+    assert check_current(r, **kwargs, pr_number=7, base_sha=BASE) == []  # the unchanged report still applies
+    assert any("PR #7, not #8" in reason for reason in check_current(r, **kwargs, pr_number=8, base_sha=BASE))
+    assert any("base changed" in reason for reason in check_current(r, **kwargs, pr_number=7, base_sha="9" * 40))

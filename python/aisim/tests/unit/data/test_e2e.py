@@ -498,3 +498,41 @@ def test_the_inferencex_transfer_backend_is_part_of_the_configuration_identity()
     assert plain.body.framework == mori.body.framework == "sglang"
     assert mori.body.identity_settings["kv_transfer_backend"] == "mori"
     assert plain.body.configuration_id() != mori.body.configuration_id()
+
+
+def test_rejected_replacements_leave_the_previous_configuration_loadable(tmp_path):
+    import dataclasses
+
+    cfg = _dev_config()
+    path = write_configuration(tmp_path, cfg)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    changed = [cfg.metrics[0].model_copy(update={"value": 12345.0}), *cfg.metrics[1:]]
+    observation = cfg.observations[0]
+    duplicated = dataclasses.replace(cfg, metrics=changed, observations=[observation, observation])
+    with pytest.raises(ValueError, match="duplicate observation_id"):
+        write_configuration(tmp_path, duplicated)
+    dangling = observation.model_copy(update={"raw_artifact_id": "raw-output:missing"})
+    with pytest.raises(ValueError, match="references unknown artifact raw-output:missing"):
+        write_configuration(tmp_path, dataclasses.replace(cfg, metrics=changed, observations=[dangling]))
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    assert len(load_e2e(tmp_path, path).metrics) == len(cfg.metrics)
+
+
+@pytest.mark.parametrize("client_first", [True, False])
+def test_rows_that_differ_only_in_normalization_collide_on_the_returned_key(tmp_path, client_first):
+    import dataclasses
+
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    per_user = make_metric(
+        "dev:1", "interactivity", "mean", 40.0, "tokens/s/user", normalization="per_user", observer="client"
+    )
+    plain = make_metric(
+        "dev:1", "interactivity", "mean", 90.0, "tokens/s/user", normalization="none", observer="server"
+    )
+    both = dataclasses.replace(ds, metrics=[*ds.metrics, *([per_user, plain] if client_first else [plain, per_user])])
+    with pytest.raises(ValueError, match="select one with observer"):
+        evaluation_points(both)
+    (client,) = evaluation_points(both, observer="client")
+    (server,) = evaluation_points(both, observer="server")
+    assert client.metrics[("interactivity", "mean")] == 40.0 and client.observers[("interactivity", "mean")] == "client"
+    assert server.metrics[("interactivity", "mean")] == 90.0
