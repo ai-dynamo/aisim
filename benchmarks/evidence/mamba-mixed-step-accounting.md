@@ -1310,3 +1310,65 @@ past-only convention belongs to whole-model FPM. A maintainer must withdraw
 the past-only request for this diagnostic or authorize a separate migration
 of the packed contract and all callers. The requested subtraction is left
 unapplied.
+
+### Cached visual aggregate repair
+
+The baseline for this repair is `9cf0096bf14ca70a49911d996b1696c5b4d1ffc6`.
+The corrected `base_backend.py` has Git blob
+`14c8cb5f262e3b47c66138e162e7427e58c29b35`.
+Single-request visual op-level aggregates retain the existing mean-field
+query. Its attention and visual-mask prices are divided by
+`ceil(effective_isl / budget)`, so aggregate weighting now uses that same
+count. The queue heuristic still reads the uncached chunk count. Shared
+work retains the legacy mean-field approximation; this does not establish
+exact visual chunk scheduling. Text chunk folding and whole-model FPM
+keep their uncached schedules.
+
+`test_run_agg_visual_fallback_preserves_whole_prefill_attention` uses
+synthetic whole-prefill prices of 12 ms / 1200 W-ms for native attention
+and 4 ms / 400 W-ms for visual-mask work, plus 2 ms / 200 W-ms of shared
+work per mean-field step. Effective ISL is 4096 (3072 text + 1024 visual).
+These are accounting fixtures, not silicon measurements. For prefix 2048
+and budget 1024, four mean-field weights restore 16 ms of attention and
+8 ms of shared work: TTFT is `24 * 1.95 = 46.8` ms. The baseline instead
+uses two weights and reports 23.4 ms. Energy is weighted identically.
+The regression also checks throughput, per-op energy and covered latency;
+uncached, single-step and whole-model FPM controls remain unchanged.
+
+The native regression isolates context attention from the bundled
+`Qwen/Qwen3-32B` graph in B200/vLLM SOL mode and compares the aggregate
+against an unamortized static query. No model weights or measured rows are
+required. The executed baseline results were:
+
+| Prefix / budget | Baseline aggregate attention ms | Static whole-prefill reference ms |
+| --- | ---: | ---: |
+| 2048 / 1024 | 2.932555295403 | 5.865110590805 |
+| 2816 / 512 | 1.546581442560 | 4.124217180160 |
+
+The new regressions first gave five expected failures and four passing
+controls on the baseline release wheel. On the corrected release wheel,
+the complete base-backend, XPU-backend, FPM-forward and single-oracle-contract
+suites pass: 332 tests. Reproduce with an installed release wheel:
+
+```bash
+python -m pytest -c python/aisim/pytest.ini \
+  python/aisim/tests/unit/sdk/backends/test_base_backend.py \
+  python/aisim/tests/unit/sdk/backends/test_vllm_xpu_backend.py \
+  python/aisim/tests/unit/sdk/test_fpm_forward.py \
+  python/aisim/tests/cross_package/test_single_oracle_contract.py
+```
+
+The required native parity suites also pass, with 390 tests and no golden
+changes:
+
+```bash
+python -m pytest -c python/aisim/pytest.ini \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py \
+  crates/core/parity_tests/perfmodel/test_compile_engine_parity.py
+```
+
+Host-cost assessment: this adds one bounded branch and one scalar division
+on an aggregate-cache miss. Visual queries still make one mixed-step call,
+with unchanged preparation, native binary and retained memory. Cache hits
+return before the branch. This is a source-level cost bound, not a timing
+benchmark or a serving-accuracy qualification.

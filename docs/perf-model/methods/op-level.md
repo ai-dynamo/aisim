@@ -44,6 +44,16 @@ therefore pays three recurrent-state charges and processes 1096 new prefill
 tokens, rather than scaling one chunk eight times. Per-request dispatch is
 added once. Uncached requests retain the existing XPU scaling heuristic.
 
+Single-request op-level aggregates with visual tokens retain mean-field pricing
+when the uncached prompt exceeds the prefill budget. Native context attention
+and the visual-mask overlay amortize a whole-prefill query over
+`ceil(effective_isl / ctx_tokens)` steps, where `effective_isl` includes visual
+tokens. Aggregate TTFT, throughput and energy use that same weight to retain
+the full contribution. The queuing factor still uses the uncached step count.
+This fallback does not model the exact placement of visual tokens in chunks;
+shared operations retain the existing mean-field approximation. Whole-model
+FPM instead retains its average over uncached chunks.
+
 ### Context-attention measurement boundaries
 
 TRT-LLM `torch_flow` context-attention rows produced by `1.3.0rc20` and

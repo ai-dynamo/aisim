@@ -1374,3 +1374,152 @@ def test_run_agg_single_request_counts_every_prefill_chunk(
     assert groups["mix_step"].energy_wms == pytest.approx(prefill_energy)
     assert groups["mix_step"].covered_latency_ms == pytest.approx(prefill_ms)
     assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
+
+
+@pytest.mark.parametrize(
+    "prefix,budget,expected_steps,qf",
+    [
+        (2048, 1024, 4, 1.95),
+        (1792, 1024, 4, 2.00),  # partial final uncached chunk
+        (2816, 512, 8, 2.00),
+        (0, 1024, 4, 2.05),
+        (3000, 2048, 1, 1.90),  # all uncached tokens fit
+        (2048, 4096, 1, 1.90),
+    ],
+)
+def test_run_agg_visual_fallback_preserves_whole_prefill_attention(
+    backend, model, database, monkeypatch, prefix, budget, expected_steps, qf
+):
+    from aisim.sdk.backends import base_backend as base_backend_module
+
+    # Effective ISL is 4096: 3072 text + 1024 image tokens. The unchanged
+    # native mean-field contract amortizes a whole-prefill attention price
+    # over ceil(effective ISL / budget), even with a cached prefix. Use an
+    # independent synthetic price of 12 ms / 1200 W-ms for that whole query,
+    # 4 ms / 400 W-ms of visual-mask work, and 2 ms / 200 W-ms shared per step.
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = [_StaticOp("visual_attention", 4.0, 400.0)]
+    calls = []
+
+    def native_breakdown(_model, _database, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["isl"] == 4096
+        scale = -(-4096 // kwargs["ctx_tokens"])
+        latency = {"shared_non_attention": 2.0, "context_attention": 12.0 / scale}
+        energy = {"shared_non_attention": 200.0, "context_attention": 1200.0 / scale}
+        return {
+            "latency_ms": sum(latency.values()),
+            "energy_wms": sum(energy.values()),
+            "component_latency_ms": latency,
+            "component_energy_wms": energy,
+            "per_op_latency_ms": {"shared": 2.0, "context_attention (scaled)": 12.0 / scale},
+            "per_op_energy_wms": {"shared": 200.0, "context_attention (scaled)": 1200.0 / scale},
+            "per_op_source": {"shared": "silicon", "context_attention (scaled)": "silicon"},
+            "covered_latency_ms": sum(latency.values()),
+            "moe_comm_fallbacks": (),
+        }
+
+    monkeypatch.setattr(base_backend_module, "estimate_mixed_step_breakdown_with_rust", native_breakdown)
+    monkeypatch.setattr(
+        backend,
+        "_run_visual_context_phase",
+        lambda *_: ({"visual_attention": 4.0}, {"visual_attention": 400.0}, {"visual_attention": "silicon"}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_genonly_step_estimate",
+        lambda *_: _decode_step(3.0, 90.0, {"decode": 3.0}, {"decode": "silicon"}, ()),
+    )
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3072,
+            prefix=prefix,
+            osl=2,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        ctx_tokens=budget,
+    )
+    assert len(calls) == 1  # retain the visual mean-field fallback
+    prefill_ms = 16.0 + 2.0 * expected_steps
+    prefill_energy = 1600.0 + 200.0 * expected_steps
+    result = summary.get_result_dict()
+    assert result["ttft"] == pytest.approx(prefill_ms * qf)
+    assert result["tokens/s"] == pytest.approx(1000 / (prefill_ms + 3))
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["context_attention (scaled)"] == pytest.approx(12.0)
+    assert group.per_op_latency_ms["visual_attention"] == pytest.approx(4.0)
+    assert group.per_op_energy_wms["context_attention (scaled)"] == pytest.approx(1200.0)
+    assert group.per_op_energy_wms["visual_attention"] == pytest.approx(400.0)
+    assert group.latency_ms == pytest.approx(prefill_ms)
+    assert group.energy_wms == pytest.approx(prefill_energy)
+    assert group.covered_latency_ms == pytest.approx(prefill_ms)
+    assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
+
+
+@pytest.mark.parametrize("prefix,budget", [(2048, 1024), (2816, 512)])
+def test_run_agg_visual_fallback_retains_native_attention(backend, prefix, budget):
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.rust_engine_step import estimate_static_latency_breakdown_with_rust
+
+    # Isolate real native attention from a bundled graph; no weights or
+    # measured data are needed. Its static whole-prefill query is the
+    # independent, unamortized reference for the aggregate consumer.
+    model = get_model("Qwen/Qwen3-32B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops = [op for op in model.context_ops if op._name == "context_attention"]
+    assert model.context_ops
+    model.encoder_config = _vision_encoder_config()
+    model.encoder_ops = []
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    reference = estimate_static_latency_breakdown_with_rust(
+        model, database, RuntimeConfig(batch_size=1, isl=4096, prefix=prefix, osl=1), "static_ctx", 1, 1.0
+    )
+    attention_ms = sum(reference[0].values())
+    assert attention_ms > 0
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3072,
+            prefix=prefix,
+            osl=1,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+        ),
+        ctx_tokens=budget,
+    )
+    assert summary.get_aggregate_energy_breakdown()["mix_step"].latency_ms == pytest.approx(attention_ms)
+
+
+def test_run_agg_visual_fpm_keeps_uncached_step_count(backend, model, database, monkeypatch):
+    # Whole-model FPM already averages its actual uncached chunks. Its 5 ms
+    # step must be counted twice, independently of the op-level fallback.
+    model.forward_model = "fpm"
+    model.encoder_config = _vision_encoder_config()
+    monkeypatch.setattr(backend, "run_mixed", lambda *_: StepEstimate(latency_ms=5.0, energy_wms=500.0))
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(latency_ms=0.0, energy_wms=0.0))
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3072,
+            prefix=2048,
+            osl=1,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        ctx_tokens=1024,
+    )
+    assert summary.get_result_dict()["ttft"] == pytest.approx(10.0 * 1.95)
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.latency_ms == pytest.approx(10.0)
+    assert group.energy_wms == pytest.approx(1000.0)

@@ -2089,6 +2089,12 @@ class BaseBackend:
                 # chunk count and in the queuing factor's input.
                 ttft_ctx_tokens = isl
                 ttft_steps_to_finish_ctx = 1
+            if img_ctx_tokens > 0 and num_mix_steps > 1 and not _is_fpm_model(model):
+                # Visual op-level pricing retains the mean-field step: native
+                # attention and the visual-mask overlay divide whole-prefill
+                # work by ceil(isl / budget). Match that weight in every
+                # aggregate total; the queue still counts uncached steps.
+                num_mix_steps = math.ceil(isl / num_mix_ctx_tokens)
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
             num_genonly_tokens = 1
