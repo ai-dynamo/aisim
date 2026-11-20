@@ -623,13 +623,46 @@ def test_cached_pin_must_match_the_manifest_and_materialized_profile(tmp_path):
     assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached())
 
 
+def test_a_local_manifest_must_match_the_digest_the_catalog_records(tmp_path, files):
+    root = tmp_path / "local"
+    for path, data in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(data)
+    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    ensure_data(CONFIG, local)  # the published pair loads
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["provenance"] = {"edited": "after indexing"}
+    (root / "fpm/m1/manifest.json").write_text(json.dumps(manifest))  # the catalog still records the old digest
+    with pytest.raises(MissingDataError, match="integrity"):
+        ensure_data(CONFIG, local)
+
+
 def test_generated_library_path_is_dropped_but_a_user_override_stays(tmp_path):
-    materialized = tmp_path / "cache" / "materialized"
-    generated = materialized / "repo-aaa" / "cfg-1-hash" / "systems" / "fpm_forward_perf.parquet"
-    config = {"estimator_config": {"fpm_interpolation": {"fpm_parquet_path": str(generated), "other": 1}}}
-    cleaned = ensure_mod._drop_generated_library_path(config, materialized)
-    assert cleaned["estimator_config"]["fpm_interpolation"] == {"other": 1}
-    assert config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(generated)  # input untouched
-    mine = {"estimator_config": {"fpm_interpolation": {"fpm_parquet_path": "/user/lib.parquet"}}}
-    assert ensure_mod._drop_generated_library_path(mine, materialized) == mine
-    assert ensure_mod._drop_generated_library_path({}, materialized) == {}
+    def staged_library(cache):
+        root = cache / "materialized" / "repo-aaa" / ("cfg-1-" + "a" * 64)
+        library = root / "data/h200_sxm/vllm/0.1/fpm_forward_perf.parquet"
+        library.parent.mkdir(parents=True)
+        (root / ".staged.json").write_text("{}")  # the marker records that AISim staged this root
+        return library
+
+    def config_for(path):
+        return {"estimator_config": {"fpm_interpolation": {"fpm_parquet_path": str(path), "other": 1}}}
+
+    # Staged by an earlier call, in this cache or another one: generated, so a repin must not keep it.
+    for generated in (staged_library(tmp_path / "cache"), staged_library(tmp_path / "other-cache")):
+        config = config_for(generated)
+        cleaned = ensure_mod._drop_generated_library_path(config)
+        assert cleaned["estimator_config"]["fpm_interpolation"] == {"other": 1}
+        assert config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(generated)  # untouched
+    # A user's own file stays, including one that only sits inside a cache's materialized directory, or one under
+    # a staged-looking name that AISim did not write (no marker).
+    manual = tmp_path / "cache" / "materialized" / "manual" / "custom.parquet"
+    manual.parent.mkdir(parents=True)
+    manual.write_bytes(b"mine")
+    lookalike = tmp_path / "cache" / "materialized" / "repo-aaa" / ("cfg-2-" + "b" * 64) / "lib.parquet"
+    lookalike.parent.mkdir(parents=True)
+    lookalike.write_bytes(b"mine")
+    for path in (manual, lookalike, "/user/lib.parquet"):
+        mine = config_for(path)
+        assert ensure_mod._drop_generated_library_path(mine) == mine
+    assert ensure_mod._drop_generated_library_path({}) == {}

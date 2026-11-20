@@ -127,11 +127,12 @@ change. An omitted `backend_version` or a slot alias (`current`, `previous`, `ne
 dataset's `query_versions` lookup, and the whole pin shares one `AISIM_DATA_MAX_BYTES` allowance.
 An FPM library pinned together with it is staged from that root alone, with no active systems root as a fallback.
 
-For FPM dataset selection, omitted topology leaves parallelism unfiltered. If both TP1 and TP4 entries
+For FPM dataset selection, a mapping that omits topology leaves parallelism unfiltered. If both TP1 and TP4 entries
 match, `ensure_data` raises an ambiguity error; supply an explicit topology or set
-`AISIM_DATA_CONFIGURATION` to choose an entry. Explicit all-ones topology selects TP1. A typed `ForwardPassPerfModelConfig` applies its topology defaults (all ones) before `ensure_data`,
-so a typed instance built without topology selects TP1 rather than raising ambiguity; pass the
-topology explicitly to choose another entry.
+`AISIM_DATA_CONFIGURATION` to choose an entry. An explicit all-ones topology selects TP1. A typed
+`ForwardPassPerfModelConfig` always carries topology (`tp=1` by default), so it requests the TP1 entry; pass a mapping
+that omits topology to be told about several matches. An FPM entry's manifest must match the digest its catalog
+records, also for a local root.
 
 <a id="non-python-consumers"></a>
 

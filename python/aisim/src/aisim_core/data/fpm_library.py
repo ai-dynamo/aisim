@@ -747,6 +747,20 @@ def _system_definition(system: str, systems_paths: Sequence[str | Path]) -> Path
 ROOT_POLICY_FILES = ("perf_data_reuse_manifest.yaml", "query_versions.yaml", "attention_lane_defaults.yaml")
 
 
+def staged_inputs_digest(system: str, systems_paths: Sequence[str | Path]) -> str:
+    """Digest of the copied inputs a staging of ``system`` from ``systems_paths`` would take.
+
+    A staging copies the system definition and the root-level policy files from the first root that has each, so a
+    root whose copy would differ must not share a staging directory with an earlier configuration. The ordered roots
+    identify the linked data; these contents identify what is copied.
+    """
+    digest = hashlib.sha256()
+    for name in (f"{system}.yaml", *ROOT_POLICY_FILES):
+        source = next((Path(root) / name for root in systems_paths if (Path(root) / name).is_file()), None)
+        digest.update(f"{name}\0{sha256_file(source) if source is not None else ''}\n".encode())
+    return digest.hexdigest()
+
+
 def _prepare_system_overlay(
     systems_root: Path,
     source_yaml: Path,

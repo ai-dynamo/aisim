@@ -321,3 +321,17 @@ def test_legacy_fpm_cold_fetch_keeps_auxiliary_measurement_provenance(dataset, t
     loaded = FpmLoader().load(fetched.root, path, output_dir=tmp_path / "loaded", config=CONFIG)
     model = RustForwardPassPerfModel.best_available(loaded.config)
     assert model.predict_prefill_latency(1, 4, 0) == 6.0
+
+
+def test_catalog_parallelism_keeps_omitted_topology_distinct_from_explicit_all_ones():
+    from aisim_core.data.loaders import _parallelism
+    from aisim_core.sdk import ForwardPassPerfModelConfig
+
+    assert _parallelism({"model": "m", "system": "h200"}) is None  # omitted: the catalog stays unfiltered
+    assert _parallelism({"tp": 1}) == ()  # explicit all-ones selects the single-GPU identity
+    assert _parallelism({"tp": 4, "attention_dp": 1, "moe_ep_size": 4}) == (("ep", 4), ("tp", 4))
+    # A typed configuration always carries topology (tp=1 by default), so it requests the single-GPU entry.
+    typed = ForwardPassPerfModelConfig(
+        model="m", system="h200", backend="vllm", backend_version="1", worker_type="aggregated"
+    )
+    assert _parallelism(typed.to_dict()) == ()
