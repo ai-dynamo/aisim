@@ -148,9 +148,14 @@ The credentialed part of the campaign is a default-branch job, not a PR workflow
   `.github/e2e-accuracy-dataset.json`, so a preview of a pin change is evaluated
   after the pin lands on `main`.
 - **What PR-controlled code does see.** Preview evaluation runs the PR's wheel on
-  the decrypted measurement tables (data, not a credential). Treat that as the
-  residual exposure of a maintainer-approved preview; private data is never uploaded
-  unencrypted, and preview results are never published.
+  the decrypted measurement tables (data, not a credential). The shard job does not
+  restrict outbound network access, so that code can read the tables and could send
+  them off the runner in plaintext; no control in the workflow prevents that. Treat it
+  as the residual exposure of a maintainer-approved preview of one exact head. What the
+  workflow does guarantee is narrower: it uploads no private data unencrypted, and
+  preview results are never published. Evaluated-checkout requirements are installed
+  only after the last step that holds the token in the aggregation and qualification
+  jobs, so install-time code cannot reach it there.
 - **Data layout.** Measurements are read through `aisim_core.data`. The pin file
   names the layout: `legacy-inferencex` (the default, today's cache) or `aisim-e2e/v1`
   once the migrated dataset is published and the pin is changed.
