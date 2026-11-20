@@ -15,7 +15,7 @@ SPDX-License-Identifier: Apache-2.0
 
 The export also declares an FP8 KV cache algorithm.
 
-The SGLang MLA and DSA module collector reads this checkpoint as `"nvfp4"` (`_model_native_gemm_quant` in `python/aisim/collector/sglang/collect_mla_module.py`). `load_model_runner` then asks SGLang for `modelopt_fp4`, and SGLang replaces that request with `modelopt_mixed`. The comment in `_model_native_gemm_quant` holds the reasons. This bundle gives the SGLang source lines of those reasons at each release. It also holds a load probe and a narrow collector run on a Blackwell GPU. Nobody ran this load path before this bundle.
+The SGLang MLA and DSA module collector reads this checkpoint as `"nvfp4"` (`_model_native_gemm_quant` in `python/aisim/collector/sglang/collect_mla_module.py`). `load_model_runner` then asks SGLang for `modelopt_fp4`, and SGLang replaces that request with `modelopt_mixed`. The comment in `_model_native_gemm_quant` holds the reasons. This bundle gives the SGLang source lines of those reasons at each release. It also holds a load probe and a narrow collector run on a Blackwell GPU.
 
 The bundle has three files and the run results:
 
@@ -27,10 +27,11 @@ The bundle has three files and the run results:
 
 The runs use SGLang 0.5.21 and SGLang 0.5.23 on one SM100 GPU. Each SGLang version gets two probe runs and one collector run. If all runs pass, they show these facts for each version:
 
-1. The collector's `modelopt_fp4` request for this checkpoint resolves to `modelopt_mixed` (`model_runner.model_config.quantization`).
-2. Each linear module inside `model.layers[i].self_attn` uses `UnquantizedLinearMethod` and has a BF16 weight. This covers the DSA projections and the DSA indexer projections. So the `bfloat16` label of the DSA module rows describes the loaded projections.
-3. The KV pool dtype follows the `kv_cache_dtype` that the collector passes, and not the FP8 KV algorithm of the export. The `bfloat16` probe run proves this, because a BF16 pool is not what the export asks for.
-4. The collector runs the two `[0, 256, 64, ...]` rows of the `dsa_context_module` plan on this load path and writes rows with both KV dtypes.
+1. The collector reads this checkpoint as `"nvfp4"` and asks SGLang for `modelopt_fp4` (`server_args.quantization`). SGLang resolves that request to `modelopt_mixed` (`model_runner.model_config.quantization`).
+2. Each linear module inside `model.layers[i].self_attn` uses `UnquantizedLinearMethod` and has a BF16 weight. This covers the DSA projections and the DSA indexer projections, and the probe requires at least one indexer projection. So the `bfloat16` label of the DSA module rows describes the loaded projections.
+3. The model has two layers, and each layer has a dense MLP (`is_layer_sparse` is `False` and the `mlp` is `DeepseekV2MLP`).
+4. The KV pool dtype follows the `kv_cache_dtype` that the collector passes, and not the FP8 KV algorithm of the export. The `bfloat16` probe run proves this, because a BF16 pool is not what the export asks for.
+5. The collector runs the two `[0, 256, 64, ...]` rows of the `dsa_context_module` plan on this load path and writes rows with both KV dtypes.
 
 ## What the two runs do not prove
 
@@ -147,20 +148,32 @@ The probe takes the `dsa_context_module` plan row that starts with `[0, 256, 64,
 |---|---|
 | `sglang_version` | The installed `sglang` package version |
 | `gpu_name`, `capability` | The device name and the compute capability |
+| `checkpoint_quant` | The value of `_model_native_gemm_quant` for the model |
 | `requested_quantization` | `server_args.quantization`, the request of the collector |
 | `resolved_quantization` | `model_runner.model_config.quantization` |
-| `linear_modules` | Per `LinearBase` module: qualified name, quantization method class, weight dtype, and whether it is an attention projection |
+| `num_layers` | The number of layers in `model_runner.model.model.layers` |
+| `load_format` | `server_args.load_format` |
+| `layers` | Per layer: class, `is_layer_sparse`, `mlp` class, indexer class, and the counts of attention and indexer projections |
+| `linear_modules` | Per `LinearBase` module: qualified name, quantization method class, weight dtype, and whether it is an attention projection and an indexer projection |
+| `attention_projection_count`, `indexer_projection_count` | The totals over all layers |
 | `kv_cache_dtype` | The dtype of the KV pool (`token_to_kv_pool.dtype`), with the storage dtype under `kv_pool` |
 | `failures` | The failed conditions, empty on success |
 
-The probe exits with code 1 in each of these cases:
+The probe writes the JSON and then exits with code 1 in each of these cases:
 
+- `checkpoint_quant` is not `"nvfp4"`.
+- `server_args.quantization` is missing, or it is not `modelopt_fp4`.
 - `resolved_quantization` is not `modelopt_mixed`.
-- It finds no attention projection.
+- The model has a number of layers other than 2.
+- A layer has `is_layer_sparse` other than `False`, or an `mlp` other than `DeepseekV2MLP`.
+- It finds no attention projection, or no indexer projection.
 - An attention projection has a method other than `UnquantizedLinearMethod`, or a weight dtype other than `bfloat16`.
+- A `LinearBase` module has no `quant_method` attribute.
 - The KV pool dtype does not correspond to `--kv-cache-dtype` through the collector's `SGLANG_KV_DTYPE` (`fp8` gives `float8_e4m3fn`, `bfloat16` gives `bfloat16`).
 
-The docstring of the probe gives the module tree that it reads, and the SGLang classes that make that tree.
+The docstring of the probe gives the module tree that it reads, and the SGLang source that makes that tree. It also gives the source that proves an indexer in both loaded layers. The load format is recorded, not asserted.
+
+The probe does not set the environment that `collect.py` sets for SGLang before it starts workers: `FLASHINFER_LOG_LEVEL=ERROR`, `SGLANG_OPT_DEEPGEMM_HC_PRENORM=1`, `SGLANG_OPT_USE_TILELANG_MHC_PRE=1`, `COLLECTOR_MEASURE_POWER` and `PYTHONWARNINGS`. It also imports `collector.sglang.collect_mla_module`, where the collector worker imports the top-level module `collect_mla_module`. These differences change no quantization method and no KV dtype.
 
 ### What the narrow collection selects
 
