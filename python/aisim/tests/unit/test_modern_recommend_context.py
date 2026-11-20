@@ -247,8 +247,14 @@ def test_dense_gemma4_public_recommendation_is_expert_parallel_free(monkeypatch)
     MoE-gated call site reached by a real recommendation is exercised.
     """
     from aisim.recommend import run_recommendation
+    from aisim.resources import HostResources
     from aisim_core.sdk import RustForwardPassPerfModel, perf_database
 
+    # Admission should depend on this test's budget, not concurrent host load.
+    monkeypatch.setattr(
+        "aisim.resources.discover_host",
+        lambda: HostResources(total_memory_bytes=64 * 1024**3, available_memory_bytes=48 * 1024**3, cpu_count=8),
+    )
     monkeypatch.setattr("aisim.supervision.in_supervised_process", lambda: True)
     monkeypatch.setattr(_OfflinePerfModel, "requests", [])
     monkeypatch.setattr(RustForwardPassPerfModel, "best_available", _OfflinePerfModel.best_available)
