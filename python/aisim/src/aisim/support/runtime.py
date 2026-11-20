@@ -1039,6 +1039,9 @@ def import_observations(
             reason = json.loads(request.fpm_profile.provenance).get("cache_layout_reason")
             if reason is not None:
                 results[name]["cache_layout_reason"] = reason
+            # Why the import wrote no transfer_bytes_per_block, which a grouped P/D rank needs.
+            if "transfer_bytes_reason" in result:
+                results[name]["transfer_bytes_reason"] = result["transfer_bytes_reason"]
     state, _ = save_checkpoint(
         checkpoint, patch={"configurations": patches}, expected_revision=state.revision, accept=[]
     )

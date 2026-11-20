@@ -2837,15 +2837,8 @@ _GLM_TRANSFER_BYTES = {
 }
 
 
-@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
-def test_glm_shaped_grouped_pd_transfer_time_matches_the_oracle(grouped_case, tmp_path, version):
-    profile, root = grouped_case
-    profile = _glm_shaped_profile(profile, version)
-    for deployment in profile["deployments"]:
-        for group, transfer_bytes in zip(
-            deployment["resources"]["cache_groups"], _GLM_TRANSFER_BYTES[version], strict=True
-        ):
-            group["transfer_bytes_per_block"] = transfer_bytes
+def _glm_pd_transfer_ms(profile, root, tmp_path, version):
+    """The mean TTFT of one 1,000-token P/D request with a transfer at 1 GB/s, less its TTFT without a bandwidth."""
     (Path(profile["model"]) / "config.json").write_text(json.dumps({"architectures": [profile["architecture"]]}))
     import aisim_core
 
@@ -2876,11 +2869,23 @@ def test_glm_shaped_grouped_pd_transfer_time_matches_the_oracle(grouped_case, tm
         output = tmp_path / f"prediction-{bandwidth}"
         assert cli.main(["predict", "-c", str(path), "--output-dir", str(output)]) == 0
         mean_ttft[bandwidth] = json.loads((output / "prediction.json").read_text())["mean_ttft_ms"]
+    return mean_ttft[1.0] - mean_ttft[None]
+
+
+@pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
+def test_glm_shaped_grouped_pd_transfer_time_matches_the_oracle(grouped_case, tmp_path, version):
+    profile, root = grouped_case
+    profile = _glm_shaped_profile(profile, version)
+    for deployment in profile["deployments"]:
+        for group, transfer_bytes in zip(
+            deployment["resources"]["cache_groups"], _GLM_TRANSFER_BYTES[version], strict=True
+        ):
+            group["transfer_bytes_per_block"] = transfer_bytes
     # The prefill computes 999 tokens, so one 2,176-token attention block moves with one block of each state group:
     # the measured row of 1,000 tokens, 65,166,080 bytes on vLLM 0.31.0 and 61,146,624 on vLLM 0.32.0 and 0.33.0, over
     # 1 GB/s.
     measured_bytes = {"0.31.0": 65_166_080, "0.32.0": 61_146_624, "0.33.0": 61_146_624}[version]
-    assert mean_ttft[1.0] - mean_ttft[None] == pytest.approx(measured_bytes / 1e6, abs=1e-3)
+    assert _glm_pd_transfer_ms(profile, root, tmp_path, version) == pytest.approx(measured_bytes / 1e6, abs=1e-3)
 
 
 _EVIDENCE = Path(__file__).resolve().parents[1] / "benchmarks/evidence"
@@ -2971,3 +2976,41 @@ def test_nixl_transfer_evidence_of_vllm_0330_holds_the_region_table_of_the_live_
     assert sum(lengths) == measured["attention"]
     assert sum(lengths[index] for index in table["scratch_region_indices"]) == measured["ring"]
     assert len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]) == measured["kda_group_0"]
+
+
+_PROBE_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "python/aisim/tests/unit/collector/fixtures/glm53flash_vllm_0330_probe"
+)
+
+
+def test_grouped_pd_prediction_runs_on_the_cache_groups_of_a_vllm_0330_probe_import(grouped_case, tmp_path):
+    # The import of the tracked probe record of GLM-5.3-Flash gives the six cache groups with their transfer bytes.
+    # A P/D prediction on vLLM 0.33.0 takes them as they are. The pool of 64 pages is hand-made, as in
+    # _glm_shaped_profile. The fixture leaves out the staged model configuration, which equals the bundled one.
+    import shutil
+
+    from collector.fpm_forward.runtime_observations import validate_observation_phase
+
+    import aisim_core
+
+    campaign = tmp_path / "probe"
+    shutil.copytree(_PROBE_FIXTURE, campaign)
+    index = campaign / "observations.json"
+    ((label, saved),) = json.loads(index.read_text())["configurations"].items()
+    bundled = Path(aisim_core.__file__).parent / "model_configs/zai-org--GLM-5.3-Flash_config.json"
+    for reference in saved["attempts"][0]["phases"]["prefill"]["artifacts"]:
+        if Path(reference["path"]).name == "model-config.json":
+            shutil.copyfile(bundled, index.parent / reference["path"])
+    imported = validate_observation_phase(
+        index, label, saved["launch"], phase="prefill", attempt_id=saved["active_attempt_id"]
+    )
+    groups = imported["resources"]["cache_groups"]
+    assert [group["transfer_bytes_per_block"] for group in groups] == [9_768_960] * 4 + [21_978_496, 92_288]
+    profile, root = grouped_case
+    profile = _glm_shaped_profile(profile, "0.33.0")
+    for deployment in profile["deployments"]:
+        resources = deployment["resources"]
+        resources["cache_groups"] = deepcopy(groups)
+        resources["runtime_memory"].update(kv_cache_bytes=64 * 13_516_800, runtime_framework_version="0.33.0")
+    # One attention block and one block of each state group move: the measured row of 1,000 tokens, 61,146,624 bytes.
+    assert _glm_pd_transfer_ms(profile, root, tmp_path, "0.33.0") == pytest.approx(61_146_624 / 1e6, abs=1e-3)

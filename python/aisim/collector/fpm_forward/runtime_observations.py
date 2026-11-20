@@ -1495,7 +1495,11 @@ _MLA_SPEC = _SPEC_MODULE + "MLAAttentionSpec"
 # bytes do not depend on it.
 # benchmarks/evidence/nixl-pd-transfer-bytes-20261117 holds the measured bytes and the region table of a live run.
 def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str | None:
-    """The text of the first transfer-writer condition that the cache does not meet, or None when it meets all six."""
+    """The text of the first transfer-writer condition that the cache does not meet, or None when it meets all six.
+
+    After condition 1, layer specs or an allocation plan that lack a field of the rule give _TRANSFER_EVIDENCE_GAP,
+    which is the text of no condition. After condition 5, a Mamba state of an unknown data type gives it too.
+    """
     if runtime_version != HYBRID_EVIDENCE_VERSION or not runtime_memory._hybrid_evidence(cache):
         return _TRANSFER_HYBRID_REFUSAL
     layers = _transfer_layers(cache)
@@ -1745,6 +1749,7 @@ def _configuration(
     capacities, artifacts, launch_artifacts, runtime_artifacts, import_bindings = [], [], [], [], []
     prefix_caching: dict[str, dict[str, Any] | None] = {}
     geometry_differences: list[str] = []
+    transfer_outcomes: list[list[int] | str] = []
     used_paths: set[str] = set()
     for phase in required_phases:
         result = phases[phase]
@@ -1844,6 +1849,10 @@ def _configuration(
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"]),
                 release,
             )
+            refusal = _transfer_shape_refusal(worker["cache"], release)
+            transfer_outcomes.append(
+                refusal if refusal is not None else _region_table_bytes(_nixl_region_table(worker["cache"]))
+            )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
             ]
@@ -1881,6 +1890,15 @@ def _configuration(
         if prefix_caching[phase] is not None:
             for _, scheduler in sorted(schedulers.items()):
                 _validate_startup_concurrency(scheduler)
+    # The import of one phase writes the transfer bytes only for a phase with prefix caching. Another record gets no
+    # value, and the result gives the reason in its own key, outside the provenance and the profile.
+    transfer_bytes = _merged_transfer_bytes(transfer_outcomes)
+    # The writer never makes an import fail: values that do not cover each cache group once give no value.
+    if not isinstance(transfer_bytes, str) and len(transfer_bytes) != len(normalized):
+        transfer_bytes = _TRANSFER_EVIDENCE_GAP
+    if not isinstance(transfer_bytes, str):
+        for group, value in zip(normalized, transfer_bytes, strict=True):
+            group["transfer_bytes_per_block"] = value
     # The record holds the prefix-caching values of the role's first collection phase that this validation covers.
     record_phase = next(item for item in collection_phases(launch.get("worker_type")) if item in required_phases)
     # Only vLLM 0.33.0 evidence adds these keys. Its records carry prefix caching, which every
@@ -1943,7 +1961,10 @@ def _configuration(
         "and ranks, including padding and permanent reservations.",
     }
     FpmResourceProfile.model_validate(resources)
-    return {"status": "complete", "resources": resources, "diagnostics": [], "provenance": provenance}
+    result = {"status": "complete", "resources": resources, "diagnostics": [], "provenance": provenance}
+    if isinstance(transfer_bytes, str):
+        result["transfer_bytes_reason"] = transfer_bytes
+    return result
 
 
 def validate_observation_phase(

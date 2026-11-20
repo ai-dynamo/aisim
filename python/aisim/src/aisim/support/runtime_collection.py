@@ -404,11 +404,13 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
                     raise ValueError("runtime hardware across phases differs from the accepted probe")
             # The accepted record holds the prefix-caching settings and state block sizes of the role's first
             # phase, and this record holds those of the bound phase. Both leave the whole-record comparison: the
-            # raw groups above compared the block sizes, and the settings compare per phase below.
+            # raw groups above compared the block sizes, and the settings compare per phase below. The import of one
+            # phase writes the transfer bytes only for a phase with prefix caching, so they follow the phase too.
             expected, actual = _resource_values(source["resources"]), _resource_values(result["resources"])
             for values in (expected, actual):
                 prefix_caching_evidence(values)
                 for group in values["cache_groups"]:
+                    group.pop("transfer_bytes_per_block", None)
                     if group["kind"] == "state":
                         group.pop("block_size_tokens")
             expected["runtime_memory"].pop("kv_cache_bytes")

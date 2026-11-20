@@ -21,7 +21,7 @@ import aisim.main as cli
 from aisim.support.checkpoint import _load, report, save_checkpoint
 from aisim.support.schema import SupportRequest
 
-from .collector.test_runtime_observations import observation_fixture
+from .collector.test_runtime_observations import _mutate, _shift_group, observation_fixture
 
 pytestmark = [
     pytest.mark.unit,
@@ -922,8 +922,8 @@ def test_linear_draft_with_a_changed_value_is_refused_at_acceptance(tmp_path, ca
 
 # The groups that the GLM-5.3-Flash TP4 probe fixture imports, as the import of its live vLLM 0.33.0 record gives them:
 # four KDA groups with one prefill checkpoint block aligned to 16 tokens each, the 11 MLA and 11 indexer layers and the
-# 11 tail layers. Every page is one pool block of 13,516,800 bytes. Only the tail takes no part in prefix caching. No
-# group holds transfer bytes, which the record does not decide.
+# 11 tail layers. Every page is one pool block of 13,516,800 bytes. Only the tail takes no part in prefix caching. Each
+# group holds the transfer bytes that the import computes for this cache shape.
 _GLM_GROUPS = [
     {
         "name": f"runtime_group_{index}",
@@ -935,6 +935,7 @@ _GLM_GROUPS = [
         **({} if index == 4 else {"blocks_per_request": 1}),
         **({"prefill_checkpoint_blocks": 1, "prefill_checkpoint_alignment": 16} if index < 4 else {}),
         "prefix_cacheable": index != 5,
+        "transfer_bytes_per_block": 21_978_496 if index == 4 else 92_288 if index == 5 else 9_768_960,
     }
     for index, layers in enumerate((9, 9, 8, 8, 22, 11))
 ]
@@ -943,7 +944,8 @@ _GLM_GROUPS = [
 def test_glm_state_groups_import_into_a_grouped_draft(tmp_path, capsys):
     from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
 
-    _, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    _, _, request, result = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    assert "transfer_bytes_reason" not in result
     resources = request.profile_deployment().resources
     assert resources.cache_layout == "grouped"
     groups = resources.cache_groups
@@ -1014,6 +1016,11 @@ _PROBE_FIELDS = (
         ({"prefix_cacheable": [True, True, True, True, True, False]}, True),
         ({"prefix_cacheable": [True] * 6}, False),
         ({"prefix_cacheable": [None, None, None, None, None, False]}, False),
+        # The stated transfer bytes match the values that the import computes for this cache shape.
+        ({"transfer_bytes_per_block": [9_768_960] * 4 + [21_978_496, 92_288]}, True),
+        # The page is not the transfer size of a group.
+        ({"transfer_bytes_per_block": [13_516_800] * 6}, False),
+        ({"transfer_bytes_per_block": [None, None, None, None, 21_978_496, None]}, False),
     ],
 )
 def test_cache_group_claim_compares_probe_fields_only_when_stated(tmp_path, capsys, stated, accepted):
@@ -1048,15 +1055,26 @@ _TRANSFER_CLAIM = (
     [([0], False), (range(6), False), ([0], True)],
     ids=["one_group", "every_group", "and_a_wrong_page"],
 )
-def test_cache_group_claim_with_transfer_bytes_is_refused(tmp_path, capsys, groups, wrong_geometry):
-    # The import of a vLLM 0.33.0 record writes no transfer bytes, so a stated value has no measurement to match.
+def test_cache_group_claim_with_transfer_bytes_is_refused_for_evidence_without_them(
+    tmp_path, capsys, groups, wrong_geometry
+):
+    # A decode role that the probe ran without prefix caching. The import gives no transfer bytes for it, so a stated
+    # value has no value to match. Without prefix caching a KDA block holds the whole context.
     claim = [{key: value for key, value in group.items() if key not in _PROBE_FIELDS} for group in _GLM_GROUPS]
+    for group in claim[:4]:
+        group["block_size_tokens"] = 1_048_576
     for index in groups:
         claim[index]["transfer_bytes_per_block"] = claim[index]["page_size_bytes"]
     if wrong_geometry:
         claim[1]["page_size_bytes"] += 1
     checkpoint, index, _ = _campaign(
-        tmp_path, tp=4, layout="glm_tp4", checkpoint=(1, 16), resource_overrides={"cache_groups": claim}
+        tmp_path,
+        tp=4,
+        layout="glm_tp4",
+        checkpoint=(1, 16),
+        worker_type="decode",
+        decode_prefix_caching=False,
+        resource_overrides={"cache_groups": claim},
     )
     status = _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2"])
     result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
@@ -1068,6 +1086,20 @@ def test_cache_group_claim_with_transfer_bytes_is_refused(tmp_path, capsys, grou
         assert _TRANSFER_CLAIM not in diagnostics
     else:
         assert _TRANSFER_CLAIM in diagnostics
+
+
+@pytest.mark.parametrize(
+    ("layout", "tp", "reason"),
+    [
+        ("mamba_hybrid", 2, "the cache is not one storage of whole block rows with one block stride"),
+        ("attention", 2, "the record holds no hybrid cache evidence of vLLM 0.33.0"),
+    ],
+)
+def test_import_result_gives_the_reason_for_a_draft_without_transfer_bytes(tmp_path, capsys, layout, tp, reason):
+    _, _, request, result = _imported(tmp_path, capsys, tp=tp, layout=layout)
+    assert all(group.transfer_bytes_per_block is None for group in request.profile_deployment().resources.cache_groups)
+    assert result["transfer_bytes_reason"] == reason
+    assert json.loads(Path(result["validation"]).read_text())["transfer_bytes_reason"] == reason
 
 
 def test_cache_group_claim_with_transfer_bytes_against_evidence_without_groups_keeps_main_text():
@@ -2223,6 +2255,58 @@ def test_formal_phase_binding_compares_prefix_caching_per_phase(tmp_path, capsys
         verify_collection_runtime_bindings(request, bindings())
 
 
+def _write_transfer_bytes_for_every_cache_shape(monkeypatch):
+    """Keep only the phase condition of the transfer writer, so that the import writes values for mamba_hybrid records.
+
+    The formal campaigns of these tests hold mamba_hybrid records, which are outside the measured cache shape.
+    """
+    from collector.fpm_forward import runtime_observations
+
+    def refusal(cache, runtime_version):
+        if cache["prefix_caching"]["enable_prefix_caching"]:
+            return None
+        return runtime_observations._TRANSFER_PHASE_REFUSAL
+
+    monkeypatch.setattr(runtime_observations, "_transfer_shape_refusal", refusal)
+
+
+def test_formal_phase_binding_leaves_the_transfer_bytes_to_the_phases_with_prefix_caching(
+    tmp_path, capsys, monkeypatch
+):
+    from aisim.support.runtime import verify_collection_runtime_bindings
+
+    # The accepted probe takes its transfer bytes from the prefill phase. The decode phase runs without prefix
+    # caching, so its own import holds none, and the binding still matches the accepted probe.
+    _write_transfer_bytes_for_every_cache_shape(monkeypatch)
+    request, _, bindings = _formal_phase_bindings(tmp_path, capsys)
+    accepted = [group.transfer_bytes_per_block for group in request.profile_deployment().resources.cache_groups]
+    assert None not in accepted
+    result = verify_collection_runtime_bindings(request, bindings())
+    assert result["status"] == "complete"
+    phases = {
+        phase: [group.get("transfer_bytes_per_block") for group in item["resources"]["cache_groups"]]
+        for phase, item in result["phases"].items()
+    }
+    assert phases == {"prefill": accepted, "decode": [None, None, None]}
+    assert [group["transfer_bytes_per_block"] for group in result["resources"]["cache_groups"]] == accepted
+
+
+def test_formal_observations_of_the_whole_role_compare_the_transfer_bytes(tmp_path, capsys):
+    from aisim.support.runtime import runtime_probe_manifest, verify_collection_runtime
+
+    # The formal observations copy the accepted probe evidence. One Mamba group then lies 4,096 bytes further in
+    # every worker record: the cache groups stay the same, and only the transfer bytes of the import differ.
+    checkpoint, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    state = _load(checkpoint)
+    save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    formal = tmp_path / "formal"
+    shutil.copytree(Path(runtime_probe_manifest(request)["observations_index"]).parent, formal)
+    assert verify_collection_runtime(request, formal / "observations.json")["compatibility"]["status"] == "compatible"
+    _mutate(formal / "observations.json", _shift_group(3))
+    with pytest.raises(ValueError, match="formal runtime cache layout or settings differ from the accepted probe"):
+        verify_collection_runtime(request, formal / "observations.json")
+
+
 def test_reversed_phase_bindings_merge_into_the_record_of_the_first_collection_phase(tmp_path, capsys):
     from aisim.support.runtime import verify_collection_runtime_bindings
 
@@ -2832,6 +2916,21 @@ def _save_without_evidence_version(monkeypatch):
     monkeypatch.setattr(runtime_observations, "_configuration", saved)
 
 
+def _save_without_transfer_bytes(monkeypatch):
+    """Make the head's import leave out the transfer bytes, for a session imported before the import wrote them."""
+    from collector.fpm_forward import runtime_observations
+
+    configuration = runtime_observations._configuration
+
+    def saved(*args, **kwargs):
+        result = configuration(*args, **kwargs)
+        for group in result["resources"]["cache_groups"]:
+            group.pop("transfer_bytes_per_block", None)
+        return result
+
+    monkeypatch.setattr(runtime_observations, "_configuration", saved)
+
+
 def _saved_memory_keys(request):
     from aisim.support.runtime import runtime_probe_manifest
 
@@ -2869,6 +2968,27 @@ def test_a_saved_draft_without_the_group_marks_verifies(tmp_path, capsys, monkey
     assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
 
 
+def test_a_saved_draft_without_the_transfer_bytes_verifies_and_a_new_import_states_them(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_runtime_profile
+
+    _save_without_transfer_bytes(monkeypatch)
+    checkpoint, index, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    monkeypatch.undo()
+    assert "transfer_bytes_per_block" not in _saved_group_keys(request)
+    assert verify_runtime_profile(request) is not None
+    state = _load(checkpoint)
+    state, _ = save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    assert report(state, checkpoint)["configurations"]["tp2"]["profile_accepted"]
+    # A new import of the same observations states the transfer bytes. The saved draft still verifies beside it.
+    assert _import(checkpoint, index, tmp_path / "upgraded-drafts", configurations=["tp2"]) == 0
+    result = json.loads(capsys.readouterr().out)["configurations"]["tp2"]
+    upgraded = SupportRequest.from_yaml(result["request"])
+    groups = upgraded.profile_deployment().resources.cache_groups
+    assert [group.transfer_bytes_per_block for group in groups] == [9_768_960] * 4 + [21_978_496, 92_288]
+    assert verify_runtime_profile(upgraded) is not None
+    assert verify_runtime_profile(request) is not None
+
+
 def _finalized(tmp_path, capsys, request, root):
     target = tmp_path / "finalized"
     from aisim.support.finalization import finalize
@@ -2900,6 +3020,21 @@ def test_an_old_collection_finalizes_without_the_group_marks(tmp_path, capsys, m
     groups = final.profile_deployment().resources.model_dump(mode="json")["cache_groups"]
     assert not {"prefix_cacheable", "transfer_bytes_per_block"} & {key for group in groups for key in group}
     assert final.profile_deployment().resources.runtime_memory.runtime_framework_version is None
+    assert verify_runtime_profile(final) is None
+
+
+def test_an_old_collection_finalizes_without_the_transfer_bytes(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_runtime_profile
+
+    # The session imported, accepted and collected before the import wrote transfer bytes. This tree finalizes it,
+    # and its import now writes them for these records.
+    _save_without_transfer_bytes(monkeypatch)
+    _, request, _, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
+    monkeypatch.undo()
+    _write_transfer_bytes_for_every_cache_shape(monkeypatch)
+    final = _finalized(tmp_path, capsys, request, root)
+    groups = final.profile_deployment().resources.model_dump(mode="json")["cache_groups"]
+    assert all("transfer_bytes_per_block" not in group for group in groups)
     assert verify_runtime_profile(final) is None
 
 

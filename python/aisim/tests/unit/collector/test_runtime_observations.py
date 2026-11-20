@@ -1666,8 +1666,8 @@ def glm_tp4_cache_groups():
     The four KDA groups come first, each with one prefill checkpoint block aligned to 16 tokens, then the attention
     group and the tail group. Every page is one 13,516,800-byte pool block.
 
-    Only the tail ring takes no part in prefix caching. No group holds transfer bytes, which the record does not
-    decide.
+    Only the tail ring takes no part in prefix caching. Every group holds the transfer bytes that the import computes
+    for this cache shape.
     """
     page = 13_516_800
     return [
@@ -1683,6 +1683,7 @@ def glm_tp4_cache_groups():
                 "prefill_checkpoint_blocks": 1,
                 "prefill_checkpoint_alignment": 16,
                 "prefix_cacheable": True,
+                "transfer_bytes_per_block": 9_768_960,
             }
             for index, layers in enumerate((9, 9, 8, 8))
         ),
@@ -1694,6 +1695,7 @@ def glm_tp4_cache_groups():
             "page_size_bytes": page,
             "sliding_window": None,
             "prefix_cacheable": True,
+            "transfer_bytes_per_block": 21_978_496,
         },
         {
             "name": "runtime_group_5",
@@ -1704,6 +1706,7 @@ def glm_tp4_cache_groups():
             "sliding_window": None,
             "blocks_per_request": 1,
             "prefix_cacheable": False,
+            "transfer_bytes_per_block": 92_288,
         },
     ]
 
@@ -3816,21 +3819,22 @@ def test_the_live_glm53flash_record_of_vllm_0330_passes_the_grouped_prefix_cachi
         gate("0.32.0")
 
 
-def test_import_writes_no_transfer_bytes_for_a_record_of_vllm_0330(tmp_path):
-    groups = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))["resources"][
-        "cache_groups"
+def test_import_writes_the_transfer_bytes_of_the_live_glm53flash_record(tmp_path):
+    result = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))
+    groups = result["resources"]["cache_groups"]
+    # The marker and the transfer bytes of every group: the four KDA groups and the attention group take part in
+    # prefix caching, the ring does not.
+    assert [(group["name"], group["prefix_cacheable"], group["transfer_bytes_per_block"]) for group in groups] == [
+        *((f"runtime_group_{index}", True, 9_768_960) for index in range(4)),
+        ("runtime_group_4", True, 21_978_496),
+        (LIVE_RING_GROUP, False, 92_288),
     ]
-    # What the P/D connector of vLLM 0.33.0 moves for one block depends on facts that the record does not hold, so no
-    # group holds the key. The marker of every group: the four KDA groups and the attention group take part in prefix
-    # caching, the ring does not.
-    assert [(group["name"], group["prefix_cacheable"], "transfer_bytes_per_block" in group) for group in groups] == [
-        *((f"runtime_group_{index}", True, False) for index in range(5)),
-        (LIVE_RING_GROUP, False, False),
-    ]
+    assert "transfer_bytes_reason" not in result
 
 
-def test_import_writes_no_transfer_bytes_for_a_padded_page_of_an_attention_layer(tmp_path):
-    # The latent layer views 64 x 28 bf16 values of its 3,840-byte page, so 256 bytes of the page are padding.
+def test_import_writes_no_transfer_bytes_for_a_cache_outside_the_measured_shape(tmp_path):
+    # One MLA group without a Mamba group and without a ring. The connector reads such a cache in another way, which
+    # no run measured. The latent layer views 64 x 28 bf16 values of its 3,840-byte page, so 256 bytes are padding.
     path, launches = observation_fixture(tmp_path, layout="kernel_view")
     _edit_view(path, "latent.0", shape=[8, 64, 28])
     result = validate_observations(path, launches)["tp2"]
@@ -3838,6 +3842,7 @@ def test_import_writes_no_transfer_bytes_for_a_padded_page_of_an_attention_layer
     (group,) = result["resources"]["cache_groups"]
     assert group["prefix_cacheable"] is True
     assert "transfer_bytes_per_block" not in group
+    assert result["transfer_bytes_reason"] == "the cache groups hold no Mamba group or no ring group"
 
 
 # The bytes that the NIXL connector of vLLM 0.33.0 reads for one block of each group of the live record on one TP
@@ -4053,3 +4058,112 @@ def test_region_table_of_a_cache_without_its_evidence_is_empty(edit):
     edit(cache)
     assert runtime_observations._nixl_region_table(cache) == {}
     assert runtime_observations._region_table_bytes({}) == []
+
+
+@pytest.mark.parametrize("decode_prefix_caching", [True, False])
+def test_import_takes_the_transfer_bytes_from_the_phases_with_prefix_caching(tmp_path, decode_prefix_caching):
+    # The records have the cache shape of the live record, in a launch of two TP ranks.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4", decode_prefix_caching=decode_prefix_caching)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    groups = result["resources"]["cache_groups"]
+    assert [group["transfer_bytes_per_block"] for group in groups] == LIVE_TRANSFER_BYTES
+    assert "transfer_bytes_reason" not in result
+    # The values are no part of the provenance, which a finalized session compares byte for byte.
+    assert "transfer_bytes" not in result["resources"]["runtime_memory"]["provenance"]
+    # The import of the decode phase alone.
+    attempt_id = json.loads(path.read_text())["configurations"]["tp2"]["active_attempt_id"]
+    decode = runtime_observations.validate_observation_phase(
+        path, "tp2", launches["tp2"], phase="decode", attempt_id=attempt_id
+    )
+    values = [group.get("transfer_bytes_per_block") for group in decode["resources"]["cache_groups"]]
+    if decode_prefix_caching:
+        assert values == LIVE_TRANSFER_BYTES and "transfer_bytes_reason" not in decode
+    else:
+        assert values == [None] * 6 and decode["transfer_bytes_reason"] == _TRANSFER_REFUSALS[5]
+
+
+def _attention_without_mla(record):
+    """Give the attention layers of the glm_tp4 records the spec of full attention, which is no MLA spec."""
+    group = record["cache"]["groups"][4]
+    for spec in group["layer_specs"].values():
+        spec["spec_type"] = "vllm.v1.kv_cache_interface.FullAttentionSpec"
+        spec.pop("cache_role", None)
+    if record["kind"] == "scheduler":
+        group["spec_type"] = "vllm.v1.kv_cache_interface.FullAttentionSpec"
+
+
+def _other_state_dtype(record):
+    """Give one Mamba group of the glm_tp4 records other state data types of the same sizes."""
+    record["cache"]["groups"][3]["state"]["dtypes"] = ["torch.float16", "torch.float32"]
+
+
+def _shift_group(index, *, tp=None):
+    """Move the allocation and the layer views of one cache group by 4,096 bytes in the worker records of ``tp``.
+
+    The cache groups stay the same. Only the region table of the connector, and so the transfer bytes, change.
+    """
+
+    def edit(record):
+        if record["kind"] != "worker" or (tp is not None and record["tp_rank"] != tp):
+            return
+        cache = record["cache"]
+        names = set(cache["groups"][index]["layer_names"])
+        for allocation in cache["tensor_allocations"]:
+            if set(allocation["layers"]) <= names:
+                allocation["offset"] += 4096
+                for name in allocation["layers"]:
+                    for view in cache["layer_tensors"][name]:
+                        view["storage_offset_bytes"] += 4096
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    ("layout", "edit", "condition"),
+    [
+        ("attention", None, 1),
+        ("mamba_hybrid", None, 2),
+        ("block_outer_short", None, 3),
+        ("kernel_view", None, 3),
+        ("glm_tp4", _attention_without_mla, 4),
+        ("glm_tp4", _other_state_dtype, 5),
+    ],
+    ids=["attention", "mamba_hybrid", "block_outer_short", "kernel_view", "attention_without_mla", "other_state_dtype"],
+)
+def test_import_of_a_record_outside_the_conditions_is_complete_and_gives_the_reason(tmp_path, layout, edit, condition):
+    path, launches = observation_fixture(tmp_path, layout=layout)
+    if edit is not None:
+        _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+    assert all("transfer_bytes_per_block" not in group for group in result["resources"]["cache_groups"])
+    assert result["transfer_bytes_reason"] == _TRANSFER_REFUSALS[condition - 1]
+    # The reason is no part of the provenance, which a finalized session compares byte for byte.
+    assert "transfer_bytes" not in result["resources"]["runtime_memory"]["provenance"]
+
+
+@pytest.mark.parametrize("moved", ["tp_rank_1", "decode_phase"])
+def test_import_of_ranks_that_give_different_values_is_complete_and_gives_the_reason(tmp_path, moved):
+    # One Mamba group lies 4,096 bytes further in its block row in the worker records of TP rank 1, or in those of the
+    # decode phase, which runs with prefix caching too. The ranks or the phases then give different values.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+    if moved == "tp_rank_1":
+        _mutate(path, _shift_group(3, tp=1))
+    else:
+        move = _shift_group(3)
+        _mutate(path, lambda record: move(record) if record["phase"] == "decode" else None)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+    assert all("transfer_bytes_per_block" not in group for group in result["resources"]["cache_groups"])
+    assert result["transfer_bytes_reason"] == runtime_observations._TRANSFER_VALUES_DIFFER
+
+
+def test_import_of_values_that_do_not_cover_each_cache_group_is_complete_and_gives_the_reason(tmp_path, monkeypatch):
+    # With every cache shape let through, the records of one MLA group give a region table without groups.
+    monkeypatch.setattr(runtime_observations, "_transfer_shape_refusal", lambda cache, runtime_version: None)
+    path, launches = observation_fixture(tmp_path, layout="kernel_view")
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+    assert all("transfer_bytes_per_block" not in group for group in result["resources"]["cache_groups"])
+    assert result["transfer_bytes_reason"] == _TRANSFER_EVIDENCE_GAP
