@@ -2,7 +2,7 @@
 name: aisim-deployment-search
 description: Ranks serving configs for one model on a GPU type and budget already chosen, simulated on CPU with AISim. For how many GPUs a load needs, use aisim-gpu-selection-and-sizing.
 license: Apache-2.0
-compatibility: "Python 3.11-3.13; aisim 0.14.x (targets 0.14.0; full evals pending); CPU only for the search; optional GPU spot-check needs a Dynamo host or Kubernetes cluster"
+compatibility: "Python 3.11-3.13; aisim 0.14.x (targets 0.14.0); CPU only for the search; optional GPU spot-check needs a Dynamo host or Kubernetes cluster"
 allowed-tools: Bash Read Write
 permissions: [env, file_read, file_write, network, shell, kubectl_exec]
 metadata:
