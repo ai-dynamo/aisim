@@ -92,6 +92,10 @@ impl G1Manager {
         self.inner.grouped()
     }
 
+    pub(crate) fn grouped_inflight_need(&self) -> u64 {
+        self.inner.grouped_inflight_need()
+    }
+
     pub(crate) fn set_grouped_prefix_rules(
         &mut self,
         rules: GroupedPrefixRules,
@@ -117,6 +121,12 @@ impl G1Manager {
     /// The whole-prompt blocks of `known_tokens` without a prefix hit.
     pub(crate) fn grouped_cold_admission_blocks(&self, known_tokens: usize) -> usize {
         self.inner.grouped_cold_admission_blocks(known_tokens)
+    }
+
+    /// The bytes that a grouped destination of `prompt_tokens` needs for its
+    /// loaded tokens. `None` without a grouped cache.
+    pub(crate) fn grouped_destination_required_bytes(&self, prompt_tokens: usize) -> Option<u64> {
+        self.inner.grouped_destination_required_bytes(prompt_tokens)
     }
 
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
@@ -187,6 +197,11 @@ impl G1Manager {
 
     pub(crate) fn release_grouped_copy_sources(&mut self) {
         self.inner.release_grouped_copy_sources();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grouped_copy_source_count(&self) -> usize {
+        self.inner.grouped_copy_source_count()
     }
 
     pub(crate) fn accepts_sequence_length(&self, tokens: usize) -> bool {

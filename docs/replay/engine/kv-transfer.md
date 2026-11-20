@@ -22,13 +22,17 @@ engine:
 Omitting `kv_transfer` is the same as `{}`: the transfer happens with no delay.
 A native ReplaySpec or Sweeper search space whose prefill rank sets a positive
 `kv_transfer_bandwidth` without `kv_transfer_bytes_per_token` is rejected; the
-YAML above always resolves the bytes.
+YAML above always resolves the bytes. A rank with `kv_cache_groups` is the
+exception. It takes the bytes from its groups, and it refuses
+`kv_transfer_bytes_per_token`. The YAML leaves that field out for such a rank.
+A native ReplaySpec needs identical `kv_cache_groups` and the same
+`vllm_version` on its prefill and decode roles.
 
 ## Transfer fields
 
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
-| `engine.kv_transfer.bytes_per_token` | `auto` | fixed | Positive integer or `auto`. Bytes moved per prompt token. `auto` derives it from the model and the prefill role's TP/PP/MoE shape. For DeepSeek V4 it is the per-token share of vLLM's padded `fp8_ds_mla` pool row, which holds the compressed KV and indexer keys, not the dense per-layer formula; without `state_cache` the transfer leaves out V4's sliding-window KV and compressor state (about 26 MB per request for V4 Flash at TP8). It can differ from either worker's `kv_cache.bytes_per_token`. With `state_cache`, `auto` uses the prefill role's resolved `kv_cache.bytes_per_token`. Without it, an `fpm_profile` supplies its selected deployment's `kv_bytes_per_token`, which takes precedence over the model estimate, DeepSeek V4 included. |
+| `engine.kv_transfer.bytes_per_token` | `auto` | fixed | Positive integer or `auto`. Bytes moved per prompt token. `auto` derives it from the model and the prefill role's TP/PP/MoE shape. For DeepSeek V4 it is the per-token share of vLLM's padded `fp8_ds_mla` pool row, which holds the compressed KV and indexer keys, not the dense per-layer formula; without `state_cache` the transfer leaves out V4's sliding-window KV and compressor state (about 26 MB per request for V4 Flash at TP8). It can differ from either worker's `kv_cache.bytes_per_token`. With `state_cache`, `auto` uses the prefill role's resolved `kv_cache.bytes_per_token`. Without it, an `fpm_profile` supplies its selected deployment's `kv_bytes_per_token`, which takes precedence over the model estimate, DeepSeek V4 included. A grouped FPM profile, which has no `kv_bytes_per_token`, does not use this field, and a value other than `auto` is refused. The transfer then takes its bytes from the `transfer_bytes_per_block` of each cache group, as described below. |
 | `engine.kv_transfer.bandwidth_gb_per_second` | `null` | fixed | Positive, in decimal GB/s. Bandwidth of each prefill rank's sending link and each decode rank's receiving link; concurrent transfers [share them](#link-sharing). `null` means no transfer delay, not a zero-bandwidth link. |
 | `engine.kv_transfer.timing_mode` | `destination_missing` | fixed | `destination_missing` charges prompt KV absent from the chosen decode worker's cache; SGLang bills whole uncached pages, including unused tail slots. `full_prompt` charges the logical prompt length without page rounding. |
 
@@ -60,6 +64,65 @@ even when compute time does not change. `state_bytes` is the prefill role's
 `state_cache.bytes_per_request` for
 [hybrid-KV models](kv-cache.md#state-cache), and 0 otherwise.
 
+For a [grouped profile](kv-cache.md#other-cache-modes) the transferred bytes
+are `full_blocks × bytes_per_full_block + fixed_bytes`. `full_blocks` is the
+number of full-attention blocks of the transferred prompt, a partly filled last
+block included. When the prefill stops one token short, the transferred prompt
+leaves out the last prompt token, as the [request flow](#handoff) shows.
+`fixed_bytes` holds one block of each state group and the window blocks of
+each group with a `sliding_window`. Such a group moves only the blocks of the
+transferred prompt inside the window of the next token. The decode worker
+allocates only these blocks. With `T` transferred tokens, that is
+`cdiv(T, block) - floor(max(0, T - window + 1) / block)` blocks. `block` is the
+group's own `block_size_tokens`. The bytes of one block come from the profile's
+`transfer_bytes_per_block`. `bytes_per_full_block` adds them up over the
+full-attention groups. With `destination_missing`, a decode worker that already
+caches a prefix of the prompt does not receive the full-attention blocks of
+that prefix again. The state moves with every transfer that moves at least one
+token.
+A request of zero input tokens owns no block on the prefill worker and moves
+no state block; vLLM refuses an empty prompt, see vLLM v0.31.0
+[`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517)
+and vLLM v0.32.0
+[`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566).
+`transfer_bytes_per_block` is the bytes that vLLM's NIXL connector
+reads for one block of the group on one TP rank, on vLLM 0.31.0 or vLLM
+0.32.0. So the result is the bytes that the connector reads for the request on
+one rank. A live run of GLM-5.3-Flash measured the bytes of whole transfers on
+both versions. They give the value of the full-attention group and the sum of
+the other groups. The values of the ring and the four KDA state groups in the
+GLM-5.3-Flash test profiles are a reading, not a measurement of each group:
+they come from the regions that the connector logged at start and a reading of
+the connector code, checked against that sum and the descriptor counts.
+The evidence folder
+[`nixl-pd-transfer-bytes-20261115`](../../../benchmarks/evidence/nixl-pd-transfer-bytes-20261115/README.md)
+holds the numbers and the reading.
+[Memory accounting](../../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
+tells what a measurement gives for a profile and when a group's value stays
+unset.
+
+Replay differs from vLLM in these known ways for a grouped profile:
+
+- When the decode worker already caches every full-attention block of the
+  transferred prompt, vLLM moves nothing, but replay still charges
+  `fixed_bytes`. Only a prefill that stops one token short can reach this case.
+  It needs a prompt of `N` tokens whose first `N - 1` tokens fill whole
+  full-attention blocks, all cached on the decode worker. If the decode worker
+  lacks the state of those tokens, vLLM computes the prompt again from the hit
+  that every group agrees on. Replay computes one token. With a hash block
+  smaller than the full-attention block, vLLM also loads nothing when the first
+  `N - 1` tokens end on a hash block boundary and are all cached, while replay
+  rounds its hit down to the full-attention block and moves one attention block
+  and `fixed_bytes`. The live run did not measure either case.
+- `fixed_bytes` charges every block of a sliding-window group inside the
+  window, whatever the decode worker caches. vLLM moves only the window blocks
+  that the decode worker does not cache. GLM-5.3-Flash has no sliding-window
+  group.
+
+The decode-side differences under
+[grouped caches](kv-cache.md#other-cache-modes) can also change the
+transferred blocks.
+
 <a id="link-sharing"></a>
 
 ### Link sharing
@@ -88,14 +151,19 @@ unlimited, so only the prefill ranks' sending links are shared.
 
 ## Request flow
 
-1. The prefill worker runs the prompt and produces the first token.
+1. The prefill worker runs the prompt. A grouped profile with recurrent state
+   layers stops the prefill one token short, as vLLM does. The prefill of a
+   one-token prompt computes that token, and the decode worker computes it
+   again.
 2. The request is handed to a decode worker at the same virtual time. KV
    transfer starts, and the prefill worker's copy stays reserved until the
    transfer finishes.
-3. After the transfer completes, the decode worker admits the request and
-   generates the remaining tokens.
+3. After the transfer completes, the decode worker admits the request. Its
+   first step produces the first token. On vLLM, that step computes the last
+   prompt token. Later steps generate the remaining tokens.
 
-The reported TTFT includes prefill queueing, prefill compute and the transfer.
+The reported TTFT includes prefill queueing, prefill compute, the transfer, the
+decode worker's queue and its first step.
 Transfer events share one virtual clock with compute and arrivals.
 
 Backends order the handoff differently:
