@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity
 from aisim_core.data.gpu_time import Finding, GpuTime, check_gpu_time, gpu_time_ok
+from aisim_core.data.hygiene import bounded_json_bytes
 from aisim_core.data.parquet import read_parquet, write_parquet
 
 EVAL_SCHEMA_ID = "aisim-eval/v1"
@@ -299,9 +300,13 @@ def write_record(root: str | Path, record: EvalRecord) -> Path:
 
 
 def load_record(path: str | Path) -> EvalRecord:
-    """Load a record and check its file name equals its content hash."""
+    """Load a record and check its file name equals its content hash.
+
+    The read is bounded (the shared structured-JSON limit), so discovering records among large unrelated
+    JSON files never reads them whole; an oversized file is refused with a ``ValueError``.
+    """
     path = Path(path)
-    record = EvalRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    record = EvalRecord.model_validate_json(bounded_json_bytes(path))
     if path.stem != record.record_id:
         raise ValueError(f"{path.name}: file name does not match record content hash {record.record_id}")
     return record
@@ -324,6 +329,26 @@ _RECORD_FILENAME = re.compile(r"^[0-9a-f]{64}\.json$")
 def record_files(directory: str | Path) -> list[Path]:
     """The content-addressed record files of a directory; manifests and other JSON beside them are not records."""
     return sorted(p for p in Path(directory).glob("*.json") if _RECORD_FILENAME.fullmatch(p.name))
+
+
+def record_paths(directory: str | Path, *, recursive: bool = False) -> list[Path]:
+    """Discover records separately from their declared JSON sidecars.
+
+    Undeclared JSON is still a record candidate, so malformed records fail in the
+    caller. A successfully loaded record is never hidden by an artifact reference.
+    """
+    root = Path(directory)
+    paths = sorted(root.rglob("*.json") if recursive else root.glob("*.json"))
+    records: set[Path] = set()
+    artifacts: set[Path] = set()
+    for path in paths:
+        try:
+            record = load_record(path)
+        except (OSError, ValueError):
+            continue  # only an explicit artifact declaration can exclude this file
+        records.add(path)
+        artifacts.update(path.parent / a.path for a in [*record.truth.artifacts, *record.findings])
+    return [p for p in paths if p in records or p not in artifacts]
 
 
 def _load_all(directory: str | Path) -> list[EvalRecord]:

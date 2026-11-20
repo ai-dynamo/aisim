@@ -59,7 +59,7 @@ import tempfile
 import types
 import typing
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -1058,6 +1058,12 @@ def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None
     info_ids = {p.artifact_id for p in body.provenance_artifacts}
     if info_ids - artifact_ids or {a.artifact_id for a in tables.manifest.artifacts if a.format == "gzip"} - info_ids:
         raise LoaderError("provenance artifacts and manifest body disagree")
+    for artifact in tables.manifest.artifacts:
+        if artifact.format == "gzip":  # tables are verified by the loader; provenance bytes must be too
+            try:
+                _verify(root, artifact)
+            except (ValueError, OSError) as exc:
+                raise LoaderError(f"provenance artifact {artifact.artifact_id} failed verification: {exc}") from exc
     return E2eDataset(tables, body, observations, metrics, requests, series)
 
 
@@ -1212,10 +1218,18 @@ def write_snapshot(
     return snapshot
 
 
-def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[SnapshotMember]]:
-    """Verify a snapshot document, its tables, counts and ID."""
+def read_snapshot(
+    root: Path, path: str, *, payload: Collection[str] | None = None
+) -> tuple[E2eInputSnapshot, list[SnapshotMember]]:
+    """Verify a snapshot document, its tables, counts and ID.
+
+    ``payload`` optionally lists the dataset payload files; a table outside it is refused before it is opened.
+    """
     root = Path(root)
     snapshot = E2eInputSnapshot.model_validate_json(_file(root, path).read_bytes())
+    for table in (snapshot.members, snapshot.acquisition):
+        if payload is not None and table is not None and table.path not in payload:
+            raise ValueError(f"snapshot table {table.path} must be a listed dataset payload file")
     members = table_to_rows(
         SNAPSHOT_MEMBERS_SCHEMA, read_parquet(_verify(root, snapshot.members), SNAPSHOT_MEMBERS_SCHEMA)
     )
@@ -1230,6 +1244,21 @@ def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[Snapsho
     if snapshot.snapshot_id != snapshot_id(members, snapshot.source_scope, snapshot.selection_policy):
         raise ValueError("snapshot ID does not match its membership")
     return snapshot, members
+
+
+def verify_snapshot_members(root: Path, members: Sequence[SnapshotMember]) -> None:
+    """Verify that every member still reaches the exact observation it pins."""
+    by_path: dict[str, tuple[str, dict[str, str]]] = {}
+    for member in members:
+        if member.manifest_path not in by_path:
+            data = load_e2e(root, member.manifest_path)
+            by_path[member.manifest_path] = (
+                data.manifest.configuration_id,
+                {o.observation_id: o.record_sha256 for o in data.observations},
+            )
+        cid, observations = by_path[member.manifest_path]
+        if cid != member.configuration_id or observations.get(member.observation_id) != member.record_sha256:
+            raise ValueError(f"snapshot member does not match configuration contents: {member.observation_id}")
 
 
 # --------------------------------------------------------------------------- InferenceX converter
@@ -1319,6 +1348,17 @@ def inferencex_metrics(
             continue  # a parallelism degree: mapped by inferencex_metric_parallelism, kept in the raw artifact
         else:
             unmapped.append(key)
+    canonical = {}
+    unique = []
+    for row in rows:
+        key = (row.metric, row.statistic, row.scope, row.normalization, row.observer)
+        value = (row.status, row.value, row.unit, row.source_value)
+        if key in canonical and canonical[key] != value:
+            raise ValueError(f"{observation_id}: conflicting canonical metric {key}")
+        if key not in canonical:  # equal alias spellings (p99.9 and p99_9) are one reported value, not two
+            unique.append(row)
+        canonical[key] = value
+    rows = unique
     rows.extend(missing_required_metrics(observation_id, rows))
     return rows, unmapped
 
@@ -1357,6 +1397,13 @@ def _ifx_body(
     config: Mapping[str, Any], gaps: list[dict], metric_parallelism: Mapping[str, Mapping[str, int]] | None = None
 ) -> E2eManifestBody:
     disagg = bool(config["disagg"])
+    if not disagg and type(config.get("decode_num_workers")) is int and config["decode_num_workers"] == 0:
+        # The source uses zero for this irrelevant aggregated field. Preserve the
+        # original in source_config_json and record the normalization explicitly.
+        config = {**config, "decode_num_workers": 1}
+        gaps.append(
+            {"field": "workers.aggregated.num_workers", "reason": "source zero sentinel normalized to one replica"}
+        )
     roles = ("prefill", "decode") if disagg else ("decode",)
     # Aggregated InferenceX records carry the serving worker under the decode_* fields.
     parallelism: dict[str, dict[str, int]] = {}
@@ -1522,6 +1569,7 @@ def inferencex_to_configurations(
             merged[cid] = E2eConfigurationData(body, observations, metrics, [], [])
             continue
         target = existing.body
+        target.evidence_gaps.extend(gap for gap in body.evidence_gaps if gap not in target.evidence_gaps)
         ids = set(target.source_fields.get("source_config_ids", [target.source_config_id]))  # type: ignore[arg-type]
         ids.add("hf:" + source_config)
         target.source_config_id = None

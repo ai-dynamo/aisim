@@ -20,7 +20,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from aisim_core.data import CategoryIndex, DatasetIndex, Manifest
-from aisim_core.data.catalog import CatalogRow, SystemRow
+from aisim_core.data.catalog import CatalogCoverage, CatalogRow, CatalogRowV1, SystemRow
 from aisim_core.data.e2e import (
     E2eInputSnapshot,
     E2eManifestBody,
@@ -45,8 +45,10 @@ from aisim_core.data.op_schema import (
 # never edit an existing entry's meaning.
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "aisim-artifact-manifest/v1": Manifest,
+    "aisim-catalog-coverage/v1": CatalogCoverage,
     "aisim-catalog-systems/v1": SystemRow,
-    "aisim-catalog/v1": CatalogRow,
+    "aisim-catalog/v1": CatalogRowV1,
+    "aisim-catalog/v2": CatalogRow,
     "aisim-category-index/v1": CategoryIndex,
     "aisim-dataset-index/v1": DatasetIndex,
     "aisim-e2e-input-snapshot/v1": E2eInputSnapshot,
