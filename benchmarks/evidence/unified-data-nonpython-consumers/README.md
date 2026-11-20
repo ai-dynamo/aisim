@@ -1,4 +1,4 @@
-# Packaged operation data and the wheel (AISIM-2341)
+# Packaged operation data and the wheel
 
 Measured on the `simonec/2341-nonpython-consumers` tree (based on `simonec/unified-data`)
 with `python3 scripts/ci/measure_wheel_data.py`; raw output is `wheel-data-estimate.json`.

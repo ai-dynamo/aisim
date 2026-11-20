@@ -695,8 +695,8 @@ with `[REDACTED]` the producer run URL (`producer_id`), image names and digests,
 references and credentials; omit logs, raw tool output and per-request tables.
 `check_publishable` fails on any of these. When the labeled bytes are a redaction, the
 entry's `original_sha256` records the original hash; it reaches only the private
-promotion ledger. InferenceX-derived data is published as aggregates only (decision
-AISIM-2312 default): configurations and evaluation records built on it are not
+promotion ledger. InferenceX-derived data is published as aggregates only (the default
+disclosure decision): configurations and evaluation records built on it are not
 promotable, and a public page may show rows that pass `check_disclosure` (allowed
 fields only, at least five scored points per cell). `RedactionPolicy` holds each default.
 

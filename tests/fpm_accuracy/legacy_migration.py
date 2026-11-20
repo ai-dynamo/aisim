@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""One-time move of the public FPM dataset into the unified ``data/fpm/`` layout (AISIM-2337).
+"""One-time move of the public FPM dataset into the unified ``data/fpm/`` layout.
 
 The move follows DEP #435 "FPM alignment":
 
