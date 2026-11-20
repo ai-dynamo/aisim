@@ -2972,6 +2972,35 @@ def test_a_corrected_pair_under_new_file_names_gets_its_own_staging(root, profil
         model_b.close()
 
 
+def test_a_table_that_resolves_to_a_higher_priority_root_gets_its_own_staging(root, profile, tmp_path, monkeypatch):
+    from aisim_core.data.ensure import DataPin, ensure_data
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    _write_entry_catalog(root)
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [])
+    table = "gemm/vllm/0.25.1/gemm_perf.parquet"
+    first = _systems_root_with_tables(tmp_path, "first", {})
+    second = _systems_root_with_tables(tmp_path, "second", {table: b"second"})
+    config = {**user_config(profile), "systems_paths": [str(first), str(second)]}
+    pin = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+
+    def staged_table(result):
+        return Path(result.config["systems_paths"][0]) / "data/h200_sxm" / table
+
+    earlier = ensure_data(config, pin)
+    assert staged_table(earlier).read_bytes() == b"second"  # only the fallback root has the table
+    unchanged = ensure_data(config, pin)
+    assert Path(unchanged.config["systems_paths"][0]) == Path(earlier.config["systems_paths"][0])  # same plan: reused
+    # The higher-priority root now provides the same relative path, so the table resolves elsewhere.
+    (first / "data/h200_sxm" / table).parent.mkdir(parents=True)
+    (first / "data/h200_sxm" / table).write_bytes(b"first")
+    later = ensure_data(config, pin)
+    assert Path(later.config["systems_paths"][0]) != Path(earlier.config["systems_paths"][0])
+    assert staged_table(later).read_bytes() == b"first"
+    assert staged_table(earlier).read_bytes() == b"second"  # the configuration returned earlier is not rewritten
+
+
 def test_the_key_and_the_staging_read_the_same_active_roots(root, profile, tmp_path, monkeypatch):
     from aisim_core.data.ensure import DataPin, ensure_data
     from aisim_core.sdk import perf_database
@@ -3255,6 +3284,30 @@ def test_sidecar_rejects_invalid_declared_dcp_selector(dcp):
     }
     with pytest.raises(ValueError, match="dcp"):
         FpmLibraryMetadata.model_validate(metadata)
+
+
+@pytest.mark.parametrize("dcp", [True, 0, "bad", 2**32, 1, 2**32 - 1])
+def test_selector_dcp_matches_exported_schema(dcp):
+    document = {
+        "schema_name": "aic_fpm_forward_perf",
+        "schema_version": 6,
+        "row_count": 1,
+        "parquet_sha256": "0" * 64,
+        "coordinate_system": "iteration_totals_balanced_v1",
+        "configuration_selector": {"dcp": dcp},
+    }
+    validator = Draft202012Validator(json.loads(render_snapshot("aic_fpm_forward_perf.metadata/v6")))
+    if type(dcp) is int and dcp in (
+        1,
+        2**32 - 1,
+    ):  # the bounds of a positive u32 are valid in the schema and the validator
+        validator.validate(document)
+        assert FpmLibraryMetadata.model_validate(document).configuration_selector == {"dcp": dcp}
+    else:
+        with pytest.raises(ValidationError):
+            validator.validate(document)
+        with pytest.raises(ValueError, match="dcp"):
+            FpmLibraryMetadata.model_validate(document)
 
 
 @pytest.mark.parametrize(

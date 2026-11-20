@@ -680,6 +680,11 @@
           "minimum": 1,
           "type": "integer"
         },
+        "dcp": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
         "dp": {
           "minimum": 1,
           "type": "integer"

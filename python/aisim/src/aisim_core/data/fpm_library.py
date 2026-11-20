@@ -51,6 +51,7 @@ EVALUATION_ROLES = ("measurement-data", "measurement-manifest", "measurement-pro
 MEASUREMENT_MANIFEST_VERSION = 5
 MAX_WORKLOAD_COORDINATE = 2**32 - 1
 _TOPOLOGY = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
+MAX_SELECTOR_DCP = 2**32 - 1  # native admission reads the selector's DCP as a positive u32
 
 
 class FpmContractError(ValueError):
@@ -78,7 +79,10 @@ def _coordinate_schema(schema: dict[str, Any]) -> None:
 def _selector_schema(schema: dict[str, Any]) -> None:
     schema.pop("anyOf", None)
     schema.pop("default", None)
-    schema.update(type="object", properties={name: {"type": "integer", "minimum": 1} for name in _TOPOLOGY})
+    properties = {name: {"type": "integer", "minimum": 1} for name in _TOPOLOGY}
+    # The same range as the validator below and native admission: a positive u32.
+    properties["dcp"] = {"type": "integer", "minimum": 1, "maximum": MAX_SELECTOR_DCP}
+    schema.update(type="object", properties=properties)
 
 
 def _policy_schema(schema: dict[str, Any]) -> None:
@@ -146,8 +150,8 @@ class FpmLibraryMetadata(BaseModel):
                 raise ValueError(f"configuration_selector.{name} must be a positive integer")
         if "dcp" in (self.configuration_selector or {}):
             dcp = self.configuration_selector["dcp"]
-            if type(dcp) is not int or not 1 <= dcp <= 2**32 - 1:
-                raise ValueError("configuration_selector.dcp must be an integer in 1..4294967295")
+            if type(dcp) is not int or not 1 <= dcp <= MAX_SELECTOR_DCP:
+                raise ValueError(f"configuration_selector.dcp must be an integer in 1..{MAX_SELECTOR_DCP}")
         return self
 
 
@@ -747,17 +751,29 @@ def _system_definition(system: str, systems_paths: Sequence[str | Path]) -> Path
 ROOT_POLICY_FILES = ("perf_data_reuse_manifest.yaml", "query_versions.yaml", "attention_lane_defaults.yaml")
 
 
-def staged_inputs_digest(system: str, systems_paths: Sequence[str | Path]) -> str:
-    """Digest of the copied inputs a staging of ``system`` from ``systems_paths`` would take.
+def staged_inputs_digest(system: str, backend: str, backend_version: str, systems_paths: Sequence[str | Path]) -> str:
+    """Digest of what a staging of ``system`` from ``systems_paths`` would copy and link.
 
-    A staging copies the system definition and the root-level policy files from the first root that has each, so a
-    root whose copy would differ must not share a staging directory with an earlier configuration. The ordered roots
-    identify the linked data; these contents identify what is copied.
+    A staging copies the system definition and the root-level policy files from the first root that has each, and
+    links every other entry from the first root that provides it. A staging directory must not be shared with an
+    earlier configuration when either differs: not a copy whose contents changed in place, and not a link that
+    now resolves to another root's file (a higher-priority root that gained a table at the same relative path).
+    The digest is taken from the same overlay the build makes, before anything is installed.
     """
     digest = hashlib.sha256()
-    for name in (f"{system}.yaml", *ROOT_POLICY_FILES):
-        source = next((Path(root) / name for root in systems_paths if (Path(root) / name).is_file()), None)
-        digest.update(f"{name}\0{sha256_file(source) if source is not None else ''}\n".encode())
+    with TemporaryDirectory(prefix="aisim-fpm-plan-") as scratch:
+        build = Path(scratch)
+        try:
+            _prepare_system_overlay(
+                build, _system_definition(system, systems_paths), backend, backend_version, systems_paths
+            )
+        except FpmContractError as error:
+            # The staging reports its own error; do not share a directory with a valid plan.
+            digest.update(f"unstageable\0{error}".encode())
+            return digest.hexdigest()
+        for name in (f"{system}.yaml", *ROOT_POLICY_FILES):
+            digest.update(f"{name}\0{sha256_file(build / name) if (build / name).is_file() else ''}\n".encode())
+        digest.update(json.dumps(_overlay_links(build)).encode())
     return digest.hexdigest()
 
 

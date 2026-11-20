@@ -719,14 +719,17 @@ def _load(
                 for p in _stageable_roots(config.get("systems_paths"), output_dir, include_active=not isolate_roots)
                 if not _is_generated_root(p)
             )
-            # The key covers the ordered roots and the contents the staging copies, so a definition edited in place
-            # gets its own directory rather than replacing the one an earlier configuration still points at.
+            # The key covers the ordered roots and the copies and links the build would make, so a definition edited in
+            # place, or a table that now resolves to another root, gets its own directory rather than replacing the
+            # one an earlier configuration still points at. An unchanged plan reuses its directory.
             # It also covers the verified library pair, so a corrected pair published under the same configuration ID
             # (even under new file names) is staged beside the earlier one rather than over it.
             pair = sorted((a.role, a.path, a.sha256, a.bytes) for a in peek.artifacts if a.role in PREDICTION_ROLES)
             inputs = {
                 "roots": roots,
-                "copied": staged_inputs_digest(entry.identity.hardware, roots),
+                "staged": staged_inputs_digest(
+                    entry.identity.hardware, entry.identity.framework, entry.identity.framework_version, roots
+                ),
                 "pair": pair,
             }
             roots_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
