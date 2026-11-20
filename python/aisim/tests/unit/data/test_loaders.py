@@ -236,3 +236,33 @@ def test_e2e_rejects_corrupt_and_path_escape(tmp_path):
     p.write_bytes(p.read_bytes()[:-1] + b"x")
     with pytest.raises(ValueError, match="integrity"):
         E2eLoader().load(root, "e2e/m/manifest.json")
+
+
+def test_e2e_tables_are_parsed_from_the_verified_bytes(tmp_path, monkeypatch):
+    """A file replaced after verification, with the same schema ID, never reaches the caller."""
+    import os
+
+    from aisim_core.data import loaders as loaders_module
+    from aisim_core.data.e2e import load_e2e, write_configuration
+    from tests.unit.data.test_e2e import _dev_config
+
+    expected = _dev_config()
+    path = write_configuration(tmp_path, expected)
+    table = next(tmp_path.rglob("metrics.parquet"))
+    schema_id = next(
+        a["schema"]
+        for a in json.loads((tmp_path / path).read_text())["artifacts"]
+        if a["path"].endswith("metrics.parquet")
+    )
+    replacement = write_parquet(pa.table({"observation_id": ["x"]}), tmp_path / "evil.parquet", schema_id)
+    real = loaders_module._verified_bytes
+    swapped = []
+
+    def verify_then_swap(root, artifact):
+        data = real(root, artifact)
+        if artifact.path.endswith("metrics.parquet") and not swapped:
+            swapped.append(os.replace(replacement, table))  # replaced right after the check
+        return data
+
+    monkeypatch.setattr(loaders_module, "_verified_bytes", verify_then_swap)
+    assert len(load_e2e(tmp_path, path).metrics) == len(expected.metrics)

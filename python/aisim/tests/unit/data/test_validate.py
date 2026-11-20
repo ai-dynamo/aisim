@@ -448,3 +448,34 @@ def test_default_predictor_fails_closed(tmp_path):
 
     with pytest.raises(PrValidationError):
         no_predictor(build_dataset(tmp_path)[3])
+
+
+def test_required_cases_use_the_rows_that_were_verified_not_a_replaced_file(tmp_path, monkeypatch):
+    import pyarrow as pa
+
+    from aisim_core.data import validate as validate_module
+    from aisim_core.data.eval import TRUTH_SCHEMA_ID
+    from aisim_core.data.parquet import write_parquet
+
+    files, rec, cfg, _ = build_dataset(tmp_path)
+    cache = Cache(tmp_path / "cache")
+    real_verify = validate_module.verify_record
+
+    def verify_then_replace(*args, **kwargs):
+        report = real_verify(*args, **kwargs)
+        # After verification the cached table is swapped for one that calls an unverified case "zz" by s1's inputs.
+        table = pa.table({"case_id": ["zz"], "inputs_json": ['{"tokens":10}'], "truth_value": [10.0]})
+        write_parquet(table, cache.path_for(REPO, DSHA, "eval/truth.parquet"), TRUTH_SCHEMA_ID)
+        return report
+
+    monkeypatch.setattr(validate_module, "verify_record", verify_then_replace)
+    r = run_validation(
+        request(rec, cfg, required_cases=["zz"]),
+        pr(),
+        trusted_sha=TRUSTED,
+        transport=FakeTransport(files),
+        predictor_factory=factory,
+        cache=cache,
+    )
+    assert r.verdict == "fail"
+    assert [(o.case_id, o.status, o.reason) for o in r.required_cases] == [("zz", "fail", "not in truth table")]

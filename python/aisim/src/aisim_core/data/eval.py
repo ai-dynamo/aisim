@@ -404,6 +404,9 @@ class VerificationReport(BaseModel):
     ok: bool
     problems: list[str]
     recomputed: Results | None = None
+    # The checked truth rows: case_id -> canonical JSON of that case's inputs, from the bytes that passed the digest
+    # check. Consumers that need per-case facts (required cases) use this, never a second read of the table.
+    case_inputs: dict[str, str] = Field(default_factory=dict)
 
 
 def _close(a: float | None, b: float | None) -> bool:
@@ -445,6 +448,7 @@ def verify_record(
         return VerificationReport(ok=False, problems=["duplicate case_id in truth table"])
     truths = table.column("truth_value").to_pylist()
     cases = []
+    case_inputs: dict[str, str] = {}
     for case_id, inputs_json, truth in zip(ids, table.column("inputs_json").to_pylist(), truths, strict=True):
         try:
             inputs = json.loads(inputs_json)
@@ -453,6 +457,7 @@ def verify_record(
         if not isinstance(inputs, Mapping):
             # A data defect in the truth table is a failed verification, never an exception for the caller.
             return VerificationReport(ok=False, problems=[f"truth row {case_id!r} has no valid inputs_json object"])
+        case_inputs[case_id] = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
         cases.append((case_id, truth, predict(inputs)))
     # Exclusions recorded by the producer are honored only if they name real rows.
     unknown = [e.case_id for e in record.results.exclusions if e.case_id not in set(ids)]
@@ -473,11 +478,11 @@ def verify_record(
     if [o.case_id for o in got.worst_n] != [o.case_id for o in claimed.worst_n]:
         problems.append("worst_n case ordering differs from recomputation")
     elif not all(
-        _close(a.predicted, b.predicted) and _close(a.rel_error_pct, b.rel_error_pct)
+        _close(a.truth, b.truth) and _close(a.predicted, b.predicted) and _close(a.rel_error_pct, b.rel_error_pct)
         for a, b in zip(got.worst_n, claimed.worst_n, strict=True)
     ):
         problems.append("worst_n values differ from recomputation")
-    return VerificationReport(ok=not problems, problems=problems, recomputed=got)
+    return VerificationReport(ok=not problems, problems=problems, recomputed=got, case_inputs=case_inputs)
 
 
 def attest(record: EvalRecord, report: VerificationReport, tier: Tier = "verified") -> EvalRecord:

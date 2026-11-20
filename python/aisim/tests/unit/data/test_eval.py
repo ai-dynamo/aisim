@@ -251,3 +251,15 @@ def test_a_truth_row_without_an_inputs_object_fails_verification(built, inputs_j
     broken = record.model_copy(update={"truth": record.truth.model_copy(update={"artifacts": [art]})})
     report = verify_record(broken, root, _predict, broken.prediction.fingerprint)
     assert not report.ok and "inputs_json" in report.problems[0]
+
+
+def test_outlier_truth_is_compared_with_the_truth_table(built):
+    root, record = built
+    outlier = record.results.worst_n[0]
+    forged = record.results.model_copy(
+        update={"worst_n": [outlier.model_copy(update={"truth": outlier.truth + 50.0}), *record.results.worst_n[1:]]}
+    )
+    lying = record.model_copy(update={"results": forged})
+    report = verify_record(lying, root, _predict, lying.prediction.fingerprint)
+    assert not report.ok and any("worst_n values" in p for p in report.problems)
+    assert verify_record(record, root, _predict, record.prediction.fingerprint).ok

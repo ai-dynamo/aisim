@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
@@ -229,6 +230,21 @@ def _verify(root: Path, artifact: Artifact) -> Path:
     return path
 
 
+def _verified_bytes(root: Path, artifact: Artifact) -> bytes:
+    """The bytes of an artifact after the same size, digest and Parquet row-count checks as :func:`_verify`.
+
+    Parse these bytes, not the path again: a file replaced after the check would otherwise be read unverified.
+    """
+    data = _file(root, artifact.path).read_bytes()
+    if len(data) != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
+        raise ValueError(f"artifact integrity mismatch: {artifact.path}")
+    if artifact.format == "parquet" and (
+        artifact.rows is None or pq.ParquetFile(pa.BufferReader(data)).metadata.num_rows != artifact.rows
+    ):
+        raise ValueError(f"Parquet row count mismatch: {artifact.path}")
+    return data
+
+
 def check_manifest(root: Path, path: str) -> Manifest:
     """Check one manifest and all declared inputs without network access."""
     root = Path(root)
@@ -322,6 +338,16 @@ def prepare_execution_profile(root: Path, manifest_path: str, output_dir: Path) 
     declared_identity = (manifest.identity.hardware, manifest.identity.framework, manifest.identity.framework_version)
     if declared_identity != (config.get("system"), config.get("backend"), config.get("backend_version")):
         raise ValueError("manifest identity differs from predictor configuration")
+    declared_model, configured_model = manifest.identity.model, config.get("model")
+    if (
+        declared_model is not None
+        and configured_model is not None
+        and declared_model != configured_model
+        # A local model directory stands in for the published ID, so only a named model can disagree.
+        and not Path(str(configured_model)).is_dir()
+    ):
+        # Rust admission sees only the configuration: a bundle for model A must not come back as one for model B.
+        raise ValueError("manifest model differs from predictor configuration")
     inputs = {a.runtime_path: a for a in manifest.artifacts if a.runtime_path is not None}
     profile_doc = json.loads(profile_bytes)
     retained = profile_doc.get("retained_files") if isinstance(profile_doc, dict) else None

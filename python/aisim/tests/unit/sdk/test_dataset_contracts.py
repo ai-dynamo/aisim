@@ -458,6 +458,21 @@ def test_preparation_rejects_manifest_predictor_identity_mismatch(dataset, field
     assert not output.exists()
 
 
+def test_preparation_rejects_a_manifest_for_another_model_before_creating_output(dataset):
+    root, path, manifest = dataset
+    assert manifest["identity"]["model"] is not None  # an execution profile belongs to one model
+    manifest["identity"]["model"] = "org/another-model"
+    manifest["configuration_id"] = configuration_id(
+        manifest["category"], manifest["purpose"], Identity(**manifest["identity"])
+    )
+    write(root, path, manifest)
+    check_manifest(root, path)  # self-consistent, but labels a different model than the predictor configuration
+    output = root.parent / "rejected-model"
+    with pytest.raises(ValueError, match="manifest model differs from predictor configuration"):
+        prepare_execution_profile(root, path, output)
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("dataset_id", ["public/example", "internal/example"])
 def test_identical_schema_for_public_and_private(dataset, dataset_id):
     root, path, manifest = dataset

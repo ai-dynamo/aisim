@@ -83,9 +83,24 @@ def read_entry_manifest(tree: Path, entry: Entry, config: Mapping[str, Any] | No
     """
     _verify(Path(tree), entry.manifest)
     manifest = OpLatencyLoader().read_manifest(Path(tree), entry.manifest.path, config)
-    if manifest.configuration_id != entry.configuration_id:
+    if (manifest.configuration_id, manifest.identity, manifest.purpose) != (
+        entry.configuration_id,
+        entry.identity,
+        entry.purpose,
+    ):
+        # An entry that lists one hardware but points at another's manifest would materialize the wrong files.
         raise LoaderError(f"manifest {entry.manifest.path} does not match its catalog entry")
     return manifest
+
+
+def verify_op_latency_support(tree: Path) -> None:
+    """Verify every file the category index pins as support (the lookup tables) against its digest.
+
+    Reusing a composed root is only safe after this passes, exactly as a cold build requires.
+    """
+    tree = Path(tree)
+    for artifact in _op_latency_index(tree).support:
+        _verify(tree, artifact)
 
 
 def load_op_latency_tree(

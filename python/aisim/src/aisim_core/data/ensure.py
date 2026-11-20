@@ -79,6 +79,7 @@ from aisim_core.data.op_tree import (
     lookup_yaml,
     op_latency_inputs_digest,
     read_entry_manifest,
+    verify_op_latency_support,
 )
 from aisim_core.data.repos import resolve_ref
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs
@@ -670,6 +671,7 @@ def _load_op_latency(
     ids = [e.configuration_id for e in entries]
     try:
         # Verifies every artifact in the fetched tree, also when the composed root is reused.
+        verify_op_latency_support(root)  # a reused root must pass the same checks as a cold build
         manifests = [read_entry_manifest(root, entry, config) for entry in entries]
         donors = _declared_donors(root, entries, manifests, selection, fetch_donors)
         donors += _collective_dependencies(root, entries + donors, config, selection, fetch_donors)

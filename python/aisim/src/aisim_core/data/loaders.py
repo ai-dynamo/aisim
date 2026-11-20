@@ -37,6 +37,7 @@ from aisim_core.data import (
     Identity,
     Manifest,
     _file,
+    _verified_bytes,
     _verify,
     configuration_id,
     prepare_execution_profile,
@@ -277,8 +278,9 @@ class E2eLoader(Loader):
                 continue
             if self.accepted_schemas is not None and artifact.artifact_schema not in self.accepted_schemas:
                 raise LoaderError(f"unsupported table schema: {artifact.artifact_schema}")
+            # Parse the verified bytes, so a file replaced after the check cannot reach the caller unverified.
             tables[artifact.artifact_id] = read_parquet(
-                _verify(root, artifact),
+                pa.BufferReader(_verified_bytes(root, artifact)),
                 artifact.artifact_schema,
                 columns=(columns or {}).get(artifact.artifact_id),
             )

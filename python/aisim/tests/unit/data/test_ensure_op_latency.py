@@ -478,3 +478,40 @@ def test_the_hf_pin_fetches_the_collective_entries(with_nccl, tmp_path):
 def test_a_dataset_without_the_declared_collective_library_is_not_an_error_here(two_families, tmp_path):
     out = ensure_data(dict(CONFIG), _pin(two_families, tmp_path))
     assert len(out.datasets["op-latency"]["configuration_ids"]) == 2
+
+
+def test_an_entry_whose_manifest_belongs_to_other_hardware_is_refused(tree, tmp_path):  # noqa: F811
+    import json
+
+    from aisim_core.data.loaders import LoaderError
+    from aisim_core.data.op_tree import load_op_latency_tree, op_latency_entries, read_entry_manifest
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    (entry,) = [e for e in op_latency_entries(published) if e.identity.framework_version == "1.0"]
+    liar = entry.model_copy(update={"identity": entry.identity.model_copy(update={"hardware": "b200_sxm"})})
+    with pytest.raises(LoaderError, match="does not match its catalog entry"):
+        read_entry_manifest(published, liar)
+    with pytest.raises(LoaderError, match="does not match its catalog entry"):
+        load_op_latency_tree(published, tmp_path / "dest", entries=[liar])
+    assert not (tmp_path / "dest").exists() and json.loads((published / entry.manifest.path).read_text())
+
+
+def test_a_reused_root_still_verifies_the_indexed_lookup_digests(tree, tmp_path):  # noqa: F811
+    import json
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    ensure_data(dict(CONFIG), _pin(published, tmp_path))  # warm: the composed root now exists in the cache
+    index_path = next(published.rglob("op-latency.json"))
+    index = json.loads(index_path.read_text())
+    index["support"][0]["sha256"] = "0" * 64  # the pinned digest changes; the lookup file itself does not
+    index_path.write_text(json.dumps(index))
+    dataset_path = published / "catalog/dataset.json"
+    dataset = json.loads(dataset_path.read_text())
+    reference = dataset["categories"]["op-latency"]["index"]
+    reference["sha256"] = __import__("hashlib").sha256(index_path.read_bytes()).hexdigest()
+    reference["bytes"] = index_path.stat().st_size
+    dataset_path.write_text(json.dumps(dataset))
+    with pytest.raises(MissingDataError, match="integrity mismatch"):
+        ensure_data(dict(CONFIG), _pin(published, tmp_path))

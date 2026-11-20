@@ -39,7 +39,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from aisim_core.data.eval import (
-    TRUTH_SCHEMA_ID,
     VERIFIER_VERSION,
     EvalRecord,
     Results,
@@ -54,7 +53,6 @@ from aisim_core.data.fetch import (
     Transport,
     fetch,
 )
-from aisim_core.data.parquet import read_parquet
 
 REQUEST_SCHEMA_ID = "aisim-pr-validation/v1"
 REPORT_SCHEMA_ID = "aisim-pr-validation-report/v1"
@@ -306,11 +304,10 @@ def run_validation(
             return value
 
         report = verify_record(record, result.root, recording, fingerprint)
-        table = read_parquet(result.root / table_art.path, TRUTH_SCHEMA_ID) if report.recomputed else None
     except (PrValidationError, ValueError, KeyError, OSError, TypeError, ValidationError, StopIteration) as exc:
         return failed("fail", [f"record could not be verified: {type(exc).__name__}: {exc}"], dataset_sha=sha)
 
-    outcomes = _required_outcomes(request.required_cases, report.recomputed, table, seen, report.ok)
+    outcomes = _required_outcomes(request.required_cases, report.recomputed, report.case_inputs, seen, report.ok)
     accuracy = None
     if report.recomputed is not None:
         r: Results = report.recomputed
@@ -326,16 +323,13 @@ def run_validation(
     )
 
 
-def _required_outcomes(required, recomputed: Results | None, table, seen, verified: bool) -> list[CaseOutcome]:
+def _required_outcomes(
+    required, recomputed: Results | None, inputs_by_case: Mapping[str, str], seen, verified: bool
+) -> list[CaseOutcome]:
     # The verifier's own exclusions, not the producer's list: a producer can omit an exclusion and still match
-    # every aggregate, but a case the verifier does not score is not covered.
+    # every aggregate, but a case the verifier does not score is not covered. The case inputs come from the same
+    # verified bytes the recomputation scored.
     excluded = {e.case_id: e.reason for e in recomputed.exclusions} if recomputed is not None else {}
-    inputs_by_case: dict[str, str] = {}
-    if table is not None:
-        for case_id, inputs_json in zip(
-            table.column("case_id").to_pylist(), table.column("inputs_json").to_pylist(), strict=True
-        ):
-            inputs_by_case[case_id] = _canonical_inputs(json.loads(inputs_json))
     out = []
     for case_id in required:
         if not verified:
