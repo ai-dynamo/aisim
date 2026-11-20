@@ -599,7 +599,9 @@ class RustForwardPassPerfModel:
         Iterations whose workload kind
         has no trained store return ``None``.
         """
-        _configure_default_data_roots()
+        # A learned artifact is self-contained: no operation tables are read, so the default dataset is neither
+        # resolved nor fetched here (a cold cache on an offline host must not break construction).
+        _configure_default_data_roots(systems=False)
         import aisim_core
 
         if isinstance(source, dict):
@@ -2122,8 +2124,9 @@ def _moe_quant_to_dtype(value: Any) -> str | None:
     return _quant_to_dtype(value)
 
 
-def _configure_default_data_roots() -> None:
-    if "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ:
+def _configure_default_data_roots(*, systems: bool = True) -> None:
+    """Export the default roots the native engine reads; ``systems=False`` leaves operation data unresolved."""
+    if systems and "AICONFIGURATOR_SYSTEMS_PATH" not in os.environ:
         from aisim_core.data.default_systems import default_systems_path
 
         systems_root = _python_sdk_systems_root() or Path(default_systems_path())
