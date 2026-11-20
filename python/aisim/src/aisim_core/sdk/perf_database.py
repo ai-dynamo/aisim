@@ -219,6 +219,12 @@ def _load_query_slots_doc(systems_paths: tuple[str, ...]) -> dict | None:
     return None
 
 
+def _read_system_yaml(path: str):
+    """Return the raw parse of a system spec YAML; callers own defaults and errors."""
+    with open(path, encoding="utf-8") as f:
+        return yaml.load(f, Loader=yaml.SafeLoader)
+
+
 def get_version_slots(system: str, backend: str, systems_paths: str | list[str] | None = None) -> dict[str, str] | None:
     """Resolved slots for (system, backend): {'current': v[, 'previous': v][, 'next': v]}.
 
@@ -250,8 +256,7 @@ def get_version_slots(system: str, backend: str, systems_paths: str | list[str] 
         if not os.path.isfile(system_yaml_path):
             continue
         try:
-            with open(system_yaml_path) as f:
-                system_spec = yaml.safe_load(f) or {}
+            system_spec = _read_system_yaml(system_yaml_path) or {}
             data_dir = os.path.join(systems_root, system_spec.get("data_dir", ""))
             if any(True for _ in _iter_backend_version_dirs(data_dir, backend)):
                 has_any_version_dir = True
@@ -306,8 +311,7 @@ def _derive_fleet_next(
             if entry[: -len(".yaml")] in exclude_systems:
                 continue
             try:
-                with open(os.path.join(systems_root, entry)) as f:
-                    system_spec = yaml.safe_load(f) or {}
+                system_spec = _read_system_yaml(os.path.join(systems_root, entry)) or {}
                 data_dir = os.path.join(systems_root, system_spec.get("data_dir", ""))
                 if not os.path.isdir(data_dir):
                     continue
@@ -372,8 +376,7 @@ def _load_system_spec_from_paths(systems_paths: tuple[str, ...], system_name: st
     for systems_root in systems_paths:
         spec_path = os.path.join(systems_root, f"{system_name}.yaml")
         if os.path.exists(spec_path):
-            with open(spec_path, encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
+            return _read_system_yaml(spec_path) or {}
     return {}
 
 
@@ -554,8 +557,7 @@ def get_supported_databases(
             system = entry[:-5]
             system_yaml_path = os.path.join(systems_root, entry)
             try:
-                with open(system_yaml_path) as f:
-                    system_spec = yaml.safe_load(f)
+                system_spec = _read_system_yaml(system_yaml_path)
 
                 data_dir = os.path.join(systems_root, system_spec.get("data_dir", ""))
                 if not os.path.isdir(data_dir):
@@ -600,8 +602,7 @@ def _iter_database_version_paths(
         if not os.path.isfile(system_yaml_path):
             continue
         try:
-            with open(system_yaml_path) as f:
-                system_spec = yaml.safe_load(f) or {}
+            system_spec = _read_system_yaml(system_yaml_path) or {}
         except Exception as e:
             logger.warning("Could not process system config %s: %s", os.path.basename(system_yaml_path), e)
             continue
@@ -1403,8 +1404,7 @@ def get_database(
             continue
         cache_key = (systems_root, system, shared_flag, effective_strict)
         try:
-            with open(system_yaml_path) as f:
-                system_spec = yaml.load(f, Loader=yaml.SafeLoader)
+            system_spec = _read_system_yaml(system_yaml_path)
             data_dir = system_spec["data_dir"]
         except Exception:
             logger.warning(f"failed to read system spec at {system_yaml_path}, continuing searching")
@@ -1688,8 +1688,7 @@ def _iter_system_yaml_files(systems_paths: list[str]):
 
 def _load_system_spec(system_yaml_path: str) -> dict | None:
     try:
-        with open(system_yaml_path) as f:
-            system_spec = yaml.load(f, Loader=yaml.SafeLoader)
+        system_spec = _read_system_yaml(system_yaml_path)
     except Exception as e:
         logger.warning("Could not process system config %s: %s", os.path.basename(system_yaml_path), e)
         return None
@@ -2472,8 +2471,7 @@ class PerfDatabase:
         # HYBRID control. Read at query time by op get_empirical, so it can be retuned on
         # the (cached, shared) instance like the default database mode.
         self._transfer_policy: frozenset[common.TransferKind] = common.ALL_TRANSFERS
-        with open(os.path.join(systems_root, system + ".yaml")) as f:
-            self.system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
+        self.system_spec = SystemSpec(_read_system_yaml(os.path.join(systems_root, system + ".yaml")))
         self._default_database_mode = common.DatabaseMode.SILICON  # default mode is SILICON
 
         # Per-op-file source diagnostics (design §6.5 guardrail), lazily populated
