@@ -49,12 +49,10 @@ def is_unified(path: Path) -> bool:
     return all(p.startswith("data/fpm/") for p in _paths(json.loads(path.read_text(encoding="utf-8"))))
 
 
-def _set_text(path: Path, repo_id: str, revision: str) -> bool:
-    text = path.read_text(encoding="utf-8")
-    new = re.sub(r'("repo_id": ")[^"]*(")', rf"\g<1>{repo_id}\g<2>", text, count=1)
-    new = re.sub(r'("revision": ")[0-9a-f]{40}(")', rf"\g<1>{revision}\g<2>", new, count=1)
-    path.write_text(new, encoding="utf-8")
-    return new != text
+def _with_pin(text: str, repo_id: str, revision: str) -> str:
+    """``text`` with the first ``repo_id`` and ``revision`` values replaced, whatever JSON whitespace it uses."""
+    new = re.sub(r'("repo_id"\s*:\s*")[^"]*(")', lambda m: m[1] + repo_id + m[2], text, count=1)
+    return re.sub(r'("revision"\s*:\s*")[^"]*(")', lambda m: m[1] + revision + m[2], new, count=1)
 
 
 def main() -> int:
@@ -81,8 +79,25 @@ def main() -> int:
             moved[readme] = text.replace(f"/tree/{current}/", f"/tree/{revision}/")
             if f"/tree/{revision}/" not in moved[readme]:
                 parser.error(f"{readme}: does not link the pinned revision {current}")
+        rewritten = {}
+        for path in consumers():
+            if is_unified(path):
+                text = path.read_text(encoding="utf-8")
+                new = _with_pin(text, pin["repo_id"], pin["revision"])
+                try:
+                    document = json.loads(new)
+                    updated = (document["repo_id"], document["revision"]) == (pin["repo_id"], pin["revision"])
+                except (ValueError, KeyError):
+                    updated = False
+                if not updated:
+                    parser.error(f"{path}: cannot update the pin fields in place")
+                rewritten[path] = (text, new)
         PIN_FILE.write_text(json.dumps(pin, indent=2) + "\n", encoding="utf-8")
-        changed = [p for p in consumers() if is_unified(p) and _set_text(p, pin["repo_id"], pin["revision"])]
+        changed = []
+        for path, (text, new) in rewritten.items():
+            if new != text:
+                path.write_text(new, encoding="utf-8")
+                changed.append(path)
         for readme, text in moved.items():
             if text != readme.read_text(encoding="utf-8"):
                 readme.write_text(text, encoding="utf-8")
@@ -102,7 +117,8 @@ def main() -> int:
         problems.append("the dataset pin is still the placeholder")
     for problem in problems:
         print(problem, file=sys.stderr)
-    return 1 if problems and (args.check or args.require_set) else 0
+    # An update that leaves any consumer inconsistent has failed, as a check does.
+    return 1 if problems and (args.check or args.require_set or args.revision or args.repo_id) else 0
 
 
 if __name__ == "__main__":

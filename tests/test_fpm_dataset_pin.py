@@ -68,6 +68,37 @@ def test_set_pin_rewrites_every_consumer_and_check_agrees(tmp_path, monkeypatch,
         assert f"/tree/{revision}/" in text and f"/tree/{previous[manifest]}/" not in text
 
 
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", " : ")])
+def test_update_reaches_consumers_with_any_json_whitespace(tmp_path, monkeypatch, separators):
+    _pin_copy(tmp_path, monkeypatch)
+    consumers = pin_tool.consumers()
+    recipe = next(path for path in consumers if path.parent == pin_tool.RECIPES)
+    profile = next(path for path in consumers if path.name == "hf_dataset.json")
+    for path in (recipe, profile):
+        path.write_text(json.dumps(json.loads(path.read_text()), separators=separators))
+    monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--revision", "c" * 40])
+    assert pin_tool.main() == 0
+    assert {json.loads(path.read_text())["revision"] for path in consumers} == {"c" * 40}
+    monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--check", "--require-set"])
+    assert pin_tool.main() == 0
+
+
+def test_an_update_that_cannot_reach_a_consumer_fails_before_any_write(tmp_path, monkeypatch, capsys):
+    _pin_copy(tmp_path, monkeypatch)
+    recipe = next(path for path in pin_tool.consumers() if path.parent == pin_tool.RECIPES)
+    document = json.loads(recipe.read_text())
+    document["revision"] = 7  # not a string, so the in-place rewrite cannot reach it
+    recipe.write_text(json.dumps(document))
+    files = [pin_tool.PIN_FILE, *pin_tool.consumers(), *pin_tool.revision_readmes()]
+    before = {path: path.read_bytes() for path in files}
+    monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--revision", "c" * 40])
+    with pytest.raises(SystemExit) as raised:
+        pin_tool.main()
+    assert raised.value.code != 0
+    assert "cannot update the pin fields" in capsys.readouterr().err
+    assert before == {path: path.read_bytes() for path in files}
+
+
 def test_check_rejects_a_readme_that_lags_the_pin(tmp_path, monkeypatch, capsys):
     _pin_copy(tmp_path, monkeypatch)
     monkeypatch.setattr("sys.argv", ["set_fpm_dataset_pin.py", "--check", "--require-set"])
