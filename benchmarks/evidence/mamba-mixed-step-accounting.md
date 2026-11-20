@@ -1001,13 +1001,10 @@ qualified split. The raw runs are in
   estimates, so it still derives each folded operation's coverage from its
   energy.
 - One model family, one modeled platform, synthetic shapes.
-- The whole-model FPM mixed step prices every draft context operation at
-  `ceil(ctx_tokens / (isl - prefix))` requests of `isl - prefix` new tokens,
-  as main does. A qualified draft scan is no exception. With `isl = 512`,
-  `prefix = 256` and `ctx_tokens = 384`, the target query prices 384 new
-  tokens, but a draft scan prices 2 requests of 256 tokens, 512 tokens. The
-  scheduled chunks are 256 and 128 tokens. This change keeps one rule for all
-  draft operations. It does not split only the qualified draft scan.
+- Whole-model FPM mixed steps retain uniform request lengths for unqualified
+  draft context operations. Qualified Mamba draft scans instead price the
+  scheduled full requests and final partial request separately, as checked
+  below.
 - A pure-prefill packed step prices every operation except qualified Mamba
   at the integer mean of its new tokens per request, as main does. Two
   prefills of 8 and 9 new tokens price those operations as two of 8. The
@@ -1141,3 +1138,33 @@ completed all input and output tokens. Nano's modeled mean TTFT changes from
 actual chunk/prefix groups replace balanced coordinates. The control's
 modeled results are identical. These are functional and cost checks, not
 silicon accuracy qualification.
+
+### Qualified FPM draft-scan chunk correction
+
+Against starting head `51934c0eb98bb8490163eb304cff080c631b4ea8`,
+`fpm_hybrid_qualified_draft_scan_uses_scheduled_chunks` reproduces the
+remaining draft-tail overcount. Its valid hybrid graph has a whole-model
+FPM target and a top-level qualified BF16 context scan. Synthetic target
+rows cover the exact queries; they are fixture inputs, not measurements.
+
+For `isl=512`, `prefix=256`, `ctx_tokens=384`, the target keeps one query
+for two requests and 384 new tokens (plus eight verification tokens from
+one decoder). The scan now queries `(1,256)` and `(1,128)`, instead of
+`(2,256)`. The hand-derived scan traffic is 18,560 activation bytes per new
+token plus 2,097,152 bytes for one recurrent-state read/write pair per
+request. Traffic therefore falls from 13,697,024 to 11,321,344 bytes;
+at the fixture's 7.7 TB/s bandwidth, the scan falls from
+0.001778834286 to 0.001470304416 ms. Both requests still pay their state
+traffic. These are accounting oracles, not silicon accuracy results.
+
+The regression also covers 512 tokens as one `(2,256)` query, 640 tokens
+as `(2,256)` plus `(1,128)`, and 1500 tokens as `(1,1096)` plus `(1,404)`
+with a 3000-token prefix. It checks each scan query, the unchanged target
+fixture latency, scalar/per-op totals, SOL source and zero power coverage.
+The existing context walker receives at most two stack-allocated groups:
+one query for full requests and at most one for the partial request per
+qualified scan. There is no per-request allocation, new cache or retained
+state; target and unqualified draft operations keep their existing queries.
+Hybrid FPM graphs remain rejected by native Replay's rank dispatch, so this
+correction changes aggregate mixed-step prediction rather than scheduler
+execution or Replay accounting.

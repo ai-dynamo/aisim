@@ -37,8 +37,7 @@ use crate::perfmodel::engine::spec::{EncoderImageShape, EngineSpec, VisionSpec};
 use crate::session::{
     ContextOpFilter, OpListPlan, OpMemo, QueryMemo, context_op_runtime, generation_op_runtime,
     get_mix_step_ops, query_context_op, query_generation_op, run_context_ops_planned,
-    run_context_ops_with, run_generation_ops_step, run_generation_ops_step_beamed_with,
-    run_generation_ops_step_planned,
+    run_generation_ops_step, run_generation_ops_step_beamed_with, run_generation_ops_step_planned,
 };
 use crate::{ForwardPassMetrics, ForwardPassWorkerType, validate_forward_pass_metrics};
 
@@ -3118,15 +3117,31 @@ impl Engine {
             // Draft precompute is absent from the whole-model target curve.
             // Keep energy, provenance and executed fallback metadata together
             // with its latency for the native per-op reporting endpoint.
-            run_context_ops_with(
+            // Qualified scans restore/store state once per scheduled request.
+            // A final partial request must not inherit the full scan length;
+            // exact multiples retain one batched query. Other draft ops keep
+            // their existing uniform shape, as does the target query above.
+            let remainder = scheduled % tokens;
+            let chunks = [
+                [batch - u32::from(remainder > 0), tokens, prefix],
+                [1, remainder, prefix],
+            ];
+            let chunks = &chunks[..if remainder == 0 { 1 } else { 2 }];
+            run_context_ops_planned(
                 ctx_tail,
+                None,
+                None,
                 &self.db,
                 batch,
                 tokens,
                 prefix,
                 seq_imbalance_correction_scale,
                 ContextOpFilter::All,
-                |op, draft| {
+                false,
+                None,
+                Some(chunks),
+                |_, op, _, draft| {
+                    let draft = draft.into_owned();
                     let covered = covered_latency(&draft);
                     on_op(MixedPass::SharedNonAttention, op, draft.clone(), covered);
                     result = std::mem::take(&mut result).plus(draft);
@@ -4630,6 +4645,7 @@ pub(crate) mod tests {
     };
     use crate::perfmodel::EngineConfig;
     use crate::perfmodel::engine::spec::EngineSpec;
+    use crate::session::run_context_ops_with;
     use crate::{BackendKind, ParallelMapping, QuantizationConfig};
 
     fn systems_root() -> PathBuf {
@@ -10245,6 +10261,112 @@ pub(crate) mod tests {
             with_tail - without
         );
     }
+
+    #[test]
+    fn fpm_hybrid_qualified_draft_scan_uses_scheduled_chunks() {
+        use crate::perf_database::fpm_forward::tests::{RowSpec, default_rows, write_pair};
+        let tmp = tempfile::tempdir().unwrap();
+        let (spec, db) = fpm_hybrid_spec(
+            tmp.path(),
+            Some(7),
+            8,
+            vec![],
+            vec![qualified_mamba(true, 1)],
+        );
+        // Exact synthetic target rows: batch, scheduled + 8 decode tokens,
+        // and batch * prefix. These small shapes extend the default domain.
+        let mut rows = default_rows();
+        for (batch_size, total_prefill_tokens, total_kv_read_tokens, latency_ms) in [
+            (2, 392, 512, 12.0),
+            (2, 520, 512, 14.0),
+            (3, 648, 768, 16.0),
+            (2, 1508, 6000, 18.0),
+        ] {
+            rows.push(RowSpec {
+                workload_kind: "prefill",
+                batch_size,
+                total_prefill_tokens,
+                total_kv_read_tokens,
+                latency_ms,
+                ..RowSpec::default()
+            });
+        }
+        write_pair(tmp.path(), &rows);
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        let (prefill, decode, tail, _) = engine.fpm_split().unwrap();
+        // Hand-derived traffic for this scan: 18,560 activation bytes per new
+        // token and one read/write pair of a 1 MiB state per request. Cached
+        // scans use SOL, so each query's latency reveals its token/state count.
+        let ms = |batch: u32, length: u32| {
+            f64::from(batch) * (f64::from(length) * 18_560.0 + 2_097_152.0)
+                / engine.db.system_spec.gpu.mem_bw
+                * 1000.0
+        };
+        for (scheduled, isl, prefix, groups, target_ms) in [
+            (384, 512, 256, &[(1, 256), (1, 128)][..], 12.0),
+            (512, 512, 256, &[(2, 256)][..], 14.0),
+            (640, 512, 256, &[(2, 256), (1, 128)][..], 16.0),
+            (1500, 4096, 3000, &[(1, 1096), (1, 404)][..], 18.0),
+        ] {
+            let mut scans = Vec::new();
+            let mut targets = Vec::new();
+            let (context, _) = engine
+                .fpm_mixed_step_components(
+                    prefill,
+                    decode,
+                    tail,
+                    scheduled,
+                    1,
+                    isl,
+                    1,
+                    prefix,
+                    1.0,
+                    1.0,
+                    |pass, op, result, covered| {
+                        if matches!(pass, MixedPass::SharedNonAttention) {
+                            assert_eq!(covered, 0.0);
+                            if op.is_qualified_mamba() {
+                                scans.push(result.latency_ms);
+                            } else {
+                                targets.push(result.latency_ms);
+                            }
+                        }
+                    },
+                )
+                .unwrap();
+            let expected: Vec<_> = groups
+                .iter()
+                .map(|&(batch, length)| ms(batch, length))
+                .collect();
+            assert_eq!(scans.len(), expected.len(), "scheduled={scheduled}");
+            for (got, want) in scans.iter().zip(&expected) {
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "scheduled={scheduled}: {got} vs {want}"
+                );
+            }
+            // One target query retains the exact scheduled-token coordinate.
+            assert_eq!(targets, vec![target_ms]);
+            assert!((context.latency_ms - target_ms - expected.iter().sum::<f64>()).abs() < 1e-12);
+            let scalar = engine
+                .mixed_step_latency(scheduled, 1, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            let (shared, context_rows, decode_rows) = engine
+                .mixed_step_breakdown_per_op(scheduled, 1, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            assert!(context_rows.is_empty());
+            let scan_row = shared
+                .iter()
+                .find(|row| row.0 == "draft_context_ssm")
+                .unwrap();
+            assert!((scan_row.1 - expected.iter().sum::<f64>()).abs() < 1e-12);
+            assert_eq!(scan_row.2, 0.0);
+            assert_eq!(scan_row.3, "sol");
+            let detailed: f64 = shared.iter().chain(&decode_rows).map(|row| row.1).sum();
+            assert!((detailed - scalar).abs() < 1e-12);
+        }
+    }
+
     #[test]
     fn fpm_hybrid_rejects_invalid_widths_and_unclassified_tails() {
         let tmp = tempfile::tempdir().unwrap();
