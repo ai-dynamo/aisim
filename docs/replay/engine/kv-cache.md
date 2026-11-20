@@ -801,10 +801,10 @@ that misses G2 and that memory reads it back into G2. With `g3`, the
   block per pass. While a block waits, G2 cannot evict any block of its
   store, so a long `spill_timeout_ms` with a slow disk can hold most of G2.
 - **Evict.** A full disk drops a block by the memory's policy, never one
-  being read; if every block on disk is being read, the block memory evicts
-  is dropped without a disk copy. Under `lru` a block keeps the rank it had
-  in memory and the same uses count on disk; `fifo` drops the block unused
-  longest since it was written or last read.
+  being read; when all are being read, the block memory evicts is dropped
+  unsaved. Under `lru` a block keeps the rank it had in memory and the same
+  uses count on disk; `fifo` drops the block unused longest since it was
+  written or last read.
 - **Read.** A block found only on disk is read into G2, like a promotion and
   before the hinted peer. It stays on disk and does not return to KVCR-owned
   memory.
@@ -834,9 +834,8 @@ With `g3` the `kvcr` summary gains a `g3` section of block counts:
 then includes the blocks written to disk, `dropped_blocks` the blocks that
 waited too long and `loaded_blocks` the blocks read from disk.
 
-`kvcr.g3` requires `--stack engine` without configured adapters. It is rejected
-with an adapter stack such as `--stack dynamo`, whose own AISim core does not
-know the `disk` tier yet, and with adapters configured on the engine stack.
+`kvcr.g3` runs on `--stack engine`; another stack is rejected unless its
+runner declares support.
 
 ### Supported
 

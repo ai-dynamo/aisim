@@ -22,7 +22,6 @@ from aisim_core.sdk.utils import get_model_config_from_model_path
 
 from .compiler import prediction_to_replay_spec
 from .config.cli import CorePredictionConfig
-from .config.engine import has_kvcr_g3
 from .config_adapter import PredictionAdapterContext, SimulationConfigAdapter
 from .detail import SERVING_LATENCY_METRICS, SERVING_THROUGHPUT_METRICS, prediction_summary
 from .power import normalize_power_summary
@@ -117,9 +116,6 @@ def run_prediction(
     """
     adapter_configs = dict(adapter_configs or {})
     providers = dict(providers or {})
-    # Another stack runs its own AISim core, which has to know the disk tier's events.
-    if has_kvcr_g3(config.engine.workers) and (stack != "engine" or adapter_configs):
-        raise ValueError("kvcr.g3 requires the engine stack without adapters")
     encoder = config.engine.workers.encoder
     analytical_epd = encoder is not None and encoder.mode == "analytical"
     adapter_specs = compile_prediction_adapters(config, adapter_configs, providers, stack=stack)

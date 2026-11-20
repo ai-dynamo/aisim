@@ -281,7 +281,7 @@ note = "Static workers of any count and attention DP, local or shared pool; cano
 name = "G3 offload, KVCR"
 doc = "replay/engine/kv-cache.md#agentic-g2"
 cells = ["limited:KVCR unqualified", "not_supported", "not_supported"]
-note = "g3_offload is rejected for AgentX. KVCR pulls nothing without router hints; KVCR-owned memory and disk (kvcr.local_g2, kvcr.g3) are accepted on the engine stack without adapters but are not qualified for AgentX."
+note = "g3_offload is rejected for AgentX. KVCR pulls nothing without router hints; KVCR-owned memory and disk (kvcr.local_g2, kvcr.g3) are accepted but are not qualified for AgentX."
 
 [[sections.rows]]
 name = "Speculative decoding"

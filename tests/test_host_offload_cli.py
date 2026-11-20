@@ -796,7 +796,7 @@ def test_kvcr_defaults_match_the_rust_runtime() -> None:
     assert launch["engine"]["kvcr"] == KvcrConfig(**role["rank"]["kvcr"]).model_dump()
 
 
-def test_kvcr_g3_reaches_the_native_rank_and_is_rejected_outside_the_engine_stack() -> None:
+def test_kvcr_g3_reaches_the_native_rank() -> None:
     engine = _prediction_engine()
     engine["workers"]["aggregated"]["kv_cache"].update(
         bytes_per_token=131_072,
@@ -806,10 +806,6 @@ def test_kvcr_g3_reaches_the_native_rank_and_is_rejected_outside_the_engine_stac
     config = CorePredictionConfig.model_validate({"engine": engine})
     rank = prediction_to_replay_spec(config).backend_deployment.agg_engine_args
     assert rank["kvcr"]["g3"]["num_blocks"] == 8
-    # Another stack runs its own AISim core, with or without an adapter section.
-    for stack, adapters in (("dynamo", None), ("engine", {"router": {}})):
-        with pytest.raises(ValueError, match="kvcr.g3 requires the engine stack without adapters"):
-            run_prediction(config, adapter_configs=adapters, stack=stack, runner_factory=None)
 
 
 @pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
@@ -955,7 +951,7 @@ def test_kvcr_recommendation_is_rejected_not_silently_dropped() -> None:
         CoreRecommendationConfig.model_validate({"engine": engine})
 
 
-def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys, monkeypatch) -> None:
+def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys) -> None:
     from aisim import _runtime
 
     assert callable(_runtime.run_replay_json)
@@ -984,14 +980,6 @@ def test_predict_cli_runs_kvcr_through_the_real_runtime(tmp_path, capsys, monkey
         "source_wait_ms": 0.0,
         "loaded_blocks": 0,
     }
-
-    # Another stack runs its own AISim core, so KVCR's disk tier is rejected there before anything runs.
-    engine["workers"]["aggregated"]["kv_cache"]["kvcr"] = {"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}}
-    path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    monkeypatch.setattr(cli, "resolve_runner_factory", lambda _stack: None)
-    with pytest.raises(SystemExit):
-        cli.main([*argv[:1], "--stack", "dynamo", *argv[3:]])
-    assert "kvcr.g3 requires --stack engine without adapters" in capsys.readouterr().err
 
 
 def _hinted_replay(*, kvcr: bool) -> dict:

@@ -880,12 +880,6 @@ def has_afd(workers) -> bool:
     return any(is_afd_worker(getattr(workers, role)) for role in ("aggregated", "prefill", "decode"))
 
 
-def has_kvcr_g3(workers) -> bool:
-    """Whether a worker role configures KVCR's disk tier."""
-    caches = (getattr(getattr(workers, role), "kv_cache", None) for role in ("aggregated", "prefill", "decode"))
-    return any(cache is not None and cache.kvcr is not None and cache.kvcr.g3 is not None for cache in caches)
-
-
 def _default_worker_type(value):
     if isinstance(value, dict) and "type" not in value:
         return {"type": "monolithic", **value}
