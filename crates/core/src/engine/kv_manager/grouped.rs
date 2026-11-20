@@ -229,7 +229,11 @@ impl GroupedBlockPool {
     }
 
     /// See [`VllmBlockPool::grouped_keys_in_block`].
-    pub(crate) fn keys_in_block(&self, group: u16, first: SequenceHash) -> &[u32] {
+    pub(crate) fn keys_in_block(
+        &self,
+        group: u16,
+        first: SequenceHash,
+    ) -> impl DoubleEndedIterator<Item = u32> + '_ {
         self.pool.grouped_keys_in_block(group, first)
     }
 

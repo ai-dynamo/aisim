@@ -934,8 +934,10 @@ impl GroupedPrefixCoordinator {
     ) -> Option<usize> {
         // A request that ends before the block's first hash has no key in it.
         let first = lease.prefix_hash_at(floor + self.rules.hash_block)?;
-        let listed = pool.keys_in_block(spec.groups[0] as u16, first);
-        let mut ends = listed.iter().rev().map(|&offset| floor + offset as usize);
+        let mut ends = pool
+            .keys_in_block(spec.groups[0] as u16, first)
+            .rev()
+            .map(|offset| floor + offset as usize);
         let found = ends.find(|&end| end <= top && hits(end));
         let alignment = self.rules.alignment;
         debug_assert!(

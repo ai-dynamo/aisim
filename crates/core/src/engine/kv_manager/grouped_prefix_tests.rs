@@ -1062,6 +1062,51 @@ fn hybrid_partial_hash_truncates_full_attention_hit_length() {
     }
 }
 
+#[test]
+fn shared_first_hash_miss_probes_each_distinct_offset_once() {
+    use std::cell::Cell;
+
+    let groups = [attention("full", 64, None), state("s", 64, true, false)];
+    let hash_block = 4;
+    let coordinator = with_limits(rules(&groups, hash_block));
+    let spec = &coordinator.rules.specs[0];
+    let request = lease(49, hash_block);
+    let mut kv = kv_pool(&groups, 1024);
+    let pool = kv.block_pool_mut().unwrap();
+    for i in 0..1024 {
+        // All prompts share the first hash, but diverge at the fifth token.
+        let mut tokens: Vec<u32> = (0..49).collect();
+        tokens[4] = 1000 + i;
+        let mut cached = BlockRequestLease::new(Uuid::nil(), Vec::new());
+        cached.configure_prefix_hashes(&tokens, hash_block);
+        let mut reservation = pool.reserve(&[], 1).unwrap();
+        let id = pool.take_private(&mut reservation);
+        assert!(pool.cache_at(
+            id,
+            grouped_key(0, cached.prefix_hash_at(48)).unwrap(),
+            key_in_block(&cached, hash_block, 64, 48),
+        ));
+        pool.release(id);
+
+        if i == 0 || i == 1023 {
+            let probes = Cell::new(0);
+            let found = coordinator.hit_in_block(pool, &request, spec, 0, 48, |end| {
+                probes.set(probes.get() + 1);
+                GroupedPrefixCoordinator::spec_resident(pool, &request, spec, end)
+            });
+            assert_eq!(found, None);
+            // Debug builds also run the independent linear-scan oracle.
+            let oracle_probes = if cfg!(debug_assertions) { 48 / 4 } else { 0 };
+            assert_eq!(probes.get(), 1 + oracle_probes, "{} cached keys", i + 1);
+            assert_eq!(coordinator.find_longest_hit(pool, &request, 49).tokens, 0);
+            assert_eq!(
+                coordinator.full_attention_hit(pool, &cached, spec, 48).1,
+                48,
+            );
+        }
+    }
+}
+
 /// Two full-attention groups of one spec and a state group, all at block 64.
 fn two_full_groups_and_a_state() -> [FpmCacheGroup; 3] {
     [

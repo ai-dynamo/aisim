@@ -230,10 +230,10 @@ impl StateIndex {
 struct GroupedIndex {
     by_key: FxHashMap<(u16, SequenceHash), HashCopies>,
     by_copy: FxHashMap<BlockCopyId, (u16, Option<KeyInBlock>)>,
-    /// The offsets, ascending, of the cached copies whose key lies inside a
-    /// block, by group and the block's first hash, so that a hit search
-    /// probes those positions only.
-    in_block: FxHashMap<(u16, SequenceHash), Vec<u32>>,
+    /// Distinct offsets, ascending, with their cached-copy counts, by group
+    /// and the block's first hash. A hit search probes each position once,
+    /// even when different keys or multiple copies share that position.
+    in_block: FxHashMap<(u16, SequenceHash), Vec<(u32, usize)>>,
 }
 
 enum CopyRemoval {
@@ -985,7 +985,10 @@ impl VllmBlockPool {
                 );
                 if let Some(at) = at {
                     let offsets = index.in_block.entry((group, at.first)).or_default();
-                    offsets.insert(offsets.partition_point(|&o| o < at.offset), at.offset);
+                    match offsets.binary_search_by_key(&at.offset, |&(offset, _)| offset) {
+                        Ok(i) => offsets[i].1 += 1,
+                        Err(i) => offsets.insert(i, (at.offset, 1)),
+                    }
                 }
                 let (became_visible, became_redundant) =
                     Self::index_copy(&mut index.by_key, (group, hash), id);
@@ -1407,12 +1410,16 @@ impl VllmBlockPool {
         self.state_key(id).unwrap_or(CacheKey::Token(hash))
     }
 
-    /// The token offsets, ascending, of the cached copies of `group` inside the
-    /// block whose first hash position has the chained hash `first`.
-    pub(crate) fn grouped_keys_in_block(&self, group: u16, first: SequenceHash) -> &[u32] {
+    /// Distinct token offsets, ascending, of the cached keys of `group` inside
+    /// the block whose first hash position has the chained hash `first`.
+    pub(crate) fn grouped_keys_in_block(
+        &self,
+        group: u16,
+        first: SequenceHash,
+    ) -> impl DoubleEndedIterator<Item = u32> + '_ {
         let index = self.grouped_index.as_ref();
         let offsets = index.and_then(|index| index.in_block.get(&(group, first)));
-        offsets.map(Vec::as_slice).unwrap_or_default()
+        offsets.into_iter().flatten().map(|&(offset, _)| offset)
     }
 
     fn first_copy(&self, hash: CacheKey) -> Option<BlockCopyId> {
@@ -1452,8 +1459,13 @@ impl VllmBlockPool {
                         panic!("a copy inside a block is listed under its block")
                     };
                     let listed = offsets.get_mut();
-                    let i = listed.binary_search(&at.offset);
-                    listed.remove(i.expect("a copy inside a block is listed"));
+                    let i = listed
+                        .binary_search_by_key(&at.offset, |&(offset, _)| offset)
+                        .expect("a copy inside a block is listed");
+                    listed[i].1 -= 1;
+                    if listed[i].1 == 0 {
+                        listed.remove(i);
+                    }
                     if listed.is_empty() {
                         offsets.remove();
                     }
@@ -2954,30 +2966,37 @@ mod tests {
 
     #[test]
     fn grouped_copy_inside_a_block_is_listed_until_it_is_evicted() {
-        let mut pool = VllmBlockPool::new(3);
+        let mut pool = VllmBlockPool::new(4);
         let key = |hash| CacheKey::Grouped { group: 0, hash };
         let inside = |offset| Some(KeyInBlock { first: 14, offset });
-        let mut reservation = reserve(&mut pool, &[], 3).reservation;
-        let ids: [BlockCopyId; 3] =
+        let mut reservation = reserve(&mut pool, &[], 4).reservation;
+        let ids: [BlockCopyId; 4] =
             std::array::from_fn(|_| pool.allocate_private(&mut reservation));
         pool.cancel(reservation);
-        // Two copies of the key at offset 8, then the key at offset 4.
+        // Two copies of one key and a different key at offset 8, then offset 4.
         assert!(pool.cache_private_key_at(ids[0], key(18), inside(8)));
         assert!(!pool.cache_private_key_at(ids[1], key(18), inside(8)));
-        assert!(pool.cache_private_key_at(ids[2], key(14), inside(4)));
-        assert_eq!(pool.grouped_keys_in_block(0, 14), [4, 8, 8]);
+        assert!(pool.cache_private_key_at(ids[2], key(19), inside(8)));
+        assert!(pool.cache_private_key_at(ids[3], key(14), inside(4)));
+        assert_eq!(
+            pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(),
+            [4, 8]
+        );
         // Another group and another block list nothing.
-        assert!(pool.grouped_keys_in_block(1, 14).is_empty());
-        assert!(pool.grouped_keys_in_block(0, 18).is_empty());
+        assert!(pool.grouped_keys_in_block(1, 14).next().is_none());
+        assert!(pool.grouped_keys_in_block(0, 18).next().is_none());
 
-        // Eviction follows the release order, and each copy takes its entry.
+        // Eviction follows release order; the last copy removes its offset.
         for id in ids {
             pool.release(id);
         }
         let mut pressure = Vec::new();
-        for remaining in [&[4, 8][..], &[4], &[]] {
+        for remaining in [&[4, 8][..], &[4, 8], &[4], &[]] {
             pressure.push(reserve(&mut pool, &[], 1).reservation);
-            assert_eq!(pool.grouped_keys_in_block(0, 14), remaining);
+            assert_eq!(
+                pool.grouped_keys_in_block(0, 14).collect::<Vec<_>>(),
+                remaining
+            );
         }
         assert!(pool.grouped_index.as_ref().unwrap().in_block.is_empty());
     }
