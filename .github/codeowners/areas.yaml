@@ -21,6 +21,7 @@ areas:
       - CONTRIBUTING.md
       - CONTRIBUTORS.md
       - docs/
+      - skills/
       - pages/
       - python/aisim/src/aisim/__init__.py
       - tests/conftest.py
@@ -138,6 +139,14 @@ areas:
 # stays visible on subsystem changes without requiring every listed team to
 # approve: any listed code owner can satisfy GitHub's code-owner gate.
 shared:
+  - glob: skills/aisim-explain-results/
+    owners: [replay, sweeper, forward-pass-engine, maintainers]
+  - glob: skills/aisim-replay-workload/
+    owners: [replay, maintainers]
+  - glob: skills/aisim-validate-benchmarks/
+    owners: [replay, forward-pass-engine, maintainers]
+  - glob: skills/aisim-fpm-self-service/
+    owners: [forward-pass-engine, maintainers]
   - glob: docs/replay/
     owners: [replay, maintainers]
   - glob: docs/adapters/

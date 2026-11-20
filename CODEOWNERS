@@ -28,6 +28,7 @@
 /docs/                                                 @ai-dynamo/access-aisim-maintain
 /pages/                                                @ai-dynamo/access-aisim-maintain
 /LICENSE                                               @ai-dynamo/access-aisim-maintain
+/skills/                                               @ai-dynamo/access-aisim-maintain
 /AGENTS.md                                             @ai-dynamo/access-aisim-maintain
 /CLAUDE.md                                             @ai-dynamo/access-aisim-maintain
 /README.md                                             @ai-dynamo/access-aisim-maintain
@@ -231,9 +232,12 @@
 /benchmarks/reports/perf-data/                         @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/.coderabbit.yaml                         @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/eslint.config.js                         @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
+/skills/aisim-explain-results/                         @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
+/skills/aisim-replay-workload/                         @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_agentx_accuracy.py                         @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_stack_discovery.py                         @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/replay/                        @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
+/skills/aisim-fpm-self-service/                        @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_e2e_accuracy_ui.mjs                        @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_host_offload_cli.py                        @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_replay_dashboard.py                        @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
@@ -251,6 +255,7 @@
 /tests/test_state_cache_config.py                      @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-mocker-codeowners @ai-dynamo/access-aisim-maintain
 /docs/reference/local-resources.md                     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
 /python/aisim/src/aisim/traffic.py                     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/access-aisim-maintain
+/skills/aisim-validate-benchmarks/                     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_e2e_hf_measurements.py                     @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_simulation_features.py                     @ai-dynamo/aisim-forward-pass-engine-codeowners @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-infra-codeowners @ai-dynamo/access-aisim-maintain
 /tests/test_weka_host_resources.py                     @ai-dynamo/aisim-replay-codeowners @ai-dynamo/aisim-sweeper-codeowners @ai-dynamo/access-aisim-maintain
