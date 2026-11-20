@@ -86,6 +86,64 @@ def test_a_saved_source_never_replaces_the_roots_the_caller_named(monkeypatch, t
     assert res._ensure_dataset(named, None) == "ensured"  # a source the environment names overrides them
 
 
+def _sweeper_request(model, systems_paths=None, mode="op_level"):
+    """The request the recommendation consumer builds; it expands unset roots to the default ones itself."""
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
+
+    space = {
+        "model_name": str(model),
+        "hardware_sku": "h200_sxm",
+        "backend": ["vllm"],
+        "backend_version": "1.0",
+        "estimation_mode": mode,
+        "estimator_config": {"correction": {"enabled": False}},
+    }
+    if systems_paths is not None:
+        space["systems_paths"] = systems_paths
+    sample = {
+        "backend": "vllm",
+        "hardware_sku": "h200_sxm",
+        "prefill_moe_tp": 1,
+        "prefill_moe_ep": 1,
+        "prefill_tp": 1,
+        "prefill_pp": 1,
+        "prefill_attention_dp": 1,
+        "prefill_block_size": None,
+    }
+    resolver = ForwardPassEstimatorResolver(SearchSpace.model_validate(space))
+    return resolver, resolver._request(sample, "prefill")
+
+
+@pytest.mark.parametrize("mode", ["op_level", "auto"])
+def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names_roots(
+    native_dataset,  # noqa: F811
+    monkeypatch,
+    tmp_path,
+    mode,
+):
+    published, systems, config = native_dataset
+    transport = FakeTransport(_tree(published))
+    monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    model = config.model
+
+    # No roots given: the consumer still expands them to the default ones, and the saved source wins over those.
+    resolver, request = _sweeper_request(model, mode=mode)
+    assert request.systems_paths, "the consumer hands over the expanded default roots"
+    shutil.rmtree(systems / "data")
+    built = res.RustForwardPassPerfModel.best_available(request)
+    assert built.dataset_revisions == {"op-latency": SHA}
+    selected = Path(built.diagnostics()["provenance"]["selected_systems_root"])
+    assert selected.is_relative_to(Path(os.environ["AISIM_DATA_CACHE"]) / "materialized")
+
+    # Roots the user gave win over the saved source.
+    own = tmp_path / "own-roots"
+    own.mkdir()
+    _, request = _sweeper_request(model, systems_paths=[str(own)], mode=mode)
+    assert res._ensure_dataset(request, None) is None
+
+
 @pytest.mark.parametrize("override", ["saved", "environment-repo", "environment-local", "explicit-pin"])
 def test_init_source_reaches_native_prediction(native_dataset, monkeypatch, override):  # noqa: F811
     published, systems, config = native_dataset

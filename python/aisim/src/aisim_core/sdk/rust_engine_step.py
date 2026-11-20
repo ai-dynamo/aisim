@@ -1046,9 +1046,18 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
 
 
 def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> bool:
-    """Whether the caller itself named ``systems_paths`` (``to_dict`` fills in the default roots otherwise)."""
+    """Whether the caller named roots other than the default ones.
+
+    Callers such as the Sweeper expand an unset ``systems_paths`` to the default roots before construction, so
+    roots equal to that default expansion are not a choice. Roots that differ from it are.
+    """
     named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
-    return bool(named)
+    if not named:
+        return False
+    named = tuple(named)
+    return _resolve_forward_pass_systems_paths(named, require_directories=False) != _resolve_forward_pass_systems_paths(
+        (), require_directories=False
+    )
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
