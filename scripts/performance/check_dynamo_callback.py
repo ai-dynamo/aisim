@@ -54,6 +54,18 @@ mod callback;
 """
 
 
+def locked_pyo3_version(lock: Path) -> str:
+    """Return the selected source's locked pyo3 version.
+
+    The callback must link the same pyo3 as the selected core: only one package
+    may link `python`, and both sides of a comparison run this script.
+    """
+    versions = re.findall(r'^name = "pyo3"\nversion = "([^"]+)"$', lock.read_text(), re.MULTILINE)
+    if len(versions) != 1:
+        raise ValueError(f"expected one locked pyo3 version in {lock}, found {versions}")
+    return versions[0]
+
+
 def check(source: Path, dynamo: Path) -> None:
     source, dynamo = source.resolve(), dynamo.resolve()
     callback = dynamo / SPECULATION_DEPTH_PATH
@@ -98,7 +110,8 @@ def check(source: Path, dynamo: Path) -> None:
             "[dependencies]\n"
             f"aisimulate-core = {{ package = {json.dumps(core_package(core))}, "
             f'path = {json.dumps(str(core))}, features = ["embed-python"] }}\n'
-            'pyo3 = { version = "0.30.1", features = ["auto-initialize", "abi3-py311"] }\n'
+            f'pyo3 = {{ version = "={locked_pyo3_version(source / "Cargo.lock")}", '
+            'features = ["auto-initialize", "abi3-py311"] }\n'
             'serde_json = "1"\nanyhow = "1"\n[profile.dev]\ndebug = 0\n[profile.test]\ndebug = 0\n'
         )
         shutil.copyfile(source / "Cargo.lock", root / "Cargo.lock")
