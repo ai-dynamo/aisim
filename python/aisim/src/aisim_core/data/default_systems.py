@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The default ``systems/`` root: packaged specs plus op-latency data from the pinned dataset (AISIM-2063).
+"""The default ``systems/`` root: packaged specs plus op-latency data from the pinned dataset.
 
 Operation tables are no longer packaged. The default systems root is composed on first use from the
 ``ai-dynamo/aisim-data`` revision named in ``op_latency_pin.json`` (a full commit SHA that ships in the wheel):
