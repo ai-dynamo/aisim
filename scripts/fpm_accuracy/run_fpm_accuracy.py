@@ -126,7 +126,9 @@ def main():
     if args.configuration:
         selected = set(args.configuration)
         configurations = tuple(item for item in configurations if item.configuration_path in selected)
-        if {item.configuration_path for item in configurations} != selected:
+        # A unified dataset validated the paths against its whole catalog while selecting, and --model/--hardware
+        # may legitimately drop some; a legacy snapshot has no catalog, so every path must have loaded.
+        if dataset.layout == "legacy" and {item.configuration_path for item in configurations} != selected:
             raise ValueError("unknown smoke configuration")
     comparison = {} if args.comparison_output else None
     rows = []

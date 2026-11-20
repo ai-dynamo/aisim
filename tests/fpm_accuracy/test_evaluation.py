@@ -278,6 +278,56 @@ def test_cli_selects_from_a_legacy_local_snapshot_after_loading(tmp_path, monkey
         assert not evaluated
 
 
+def test_cli_accepts_explicit_configurations_that_the_model_filter_drops(case, tmp_path, monkeypatch):
+    from scripts.fpm_accuracy import run_fpm_accuracy as cli
+
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for model-filter test")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "runtime_module", lambda _: SimpleNamespace(RustForwardPassPerfModel=object()))
+    monkeypatch.setattr(
+        cli,
+        "installed_distribution",
+        lambda: SimpleNamespace(read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})),
+    )
+    requested = {}
+
+    def from_hub(*args, **kwargs):
+        requested.update(kwargs)
+        # The unified catalog validated both paths; the model filter left only the first.
+        return SimpleNamespace(
+            revision="a" * 40,
+            layout="unified",
+            configurations=lambda: [case.configuration],
+            measurement_case=lambda *a, **k: case,
+        )
+
+    monkeypatch.setattr(cli.HfDataset, "from_hub", from_hub)
+    evaluated = []
+
+    class Stop(Exception):
+        pass
+
+    def evaluate(selected, *_):
+        evaluated.append(selected.configuration.configuration_path)
+        raise Stop
+
+    monkeypatch.setattr(cli, "evaluate_isolated", evaluate)
+    second = "data/Other--Model/h100-sxm/vllm/1.0/single"
+    arguments = ["--configuration", CONFIGURATION_PATH, "--configuration", second, "--model", "Org/Model"]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_fpm_accuracy", "--branch", "main", "--commit", "a" * 40, "--evaluator-sha", "a" * 40]
+        + ["--hf-revision", "a" * 40, "--wheel", str(wheel), "--run-id", "1", "--run-attempt", "1"]
+        + ["--output", str(tmp_path / "public"), *arguments],
+    )
+    with pytest.raises(Stop):
+        cli.main()
+    assert evaluated == [CONFIGURATION_PATH]
+    assert requested["configuration_paths"] == [CONFIGURATION_PATH, second] and requested["models"] == ["Org/Model"]
+
+
 @pytest.mark.parametrize("namespace", ["aisim_core", "aisimulate_core"])
 def test_fpm_predictor_reaches_current_and_historical_runtime_namespaces(tmp_path, namespace):
     package = tmp_path / namespace

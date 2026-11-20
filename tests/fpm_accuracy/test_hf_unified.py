@@ -219,6 +219,39 @@ def test_selection_filters_before_any_artifact_is_needed(tmp_path: Path) -> None
         HfDataset.from_local(unified_root, revision=REVISION, repo_id=REPO, models=["Other/Model"])
 
 
+def _two_configuration_index(unified_root: Path):
+    """The migrated category index plus a second configuration of another model."""
+    from aisim_core.data import CategoryIndex
+
+    index = CategoryIndex.model_validate_json((unified_root / fpm_migration.CATEGORY_INDEX).read_bytes())
+    first = index.entries[0]
+    second = first.model_copy(
+        update={
+            "configuration_id": "cfg-" + "1" * 64,
+            "identity": first.identity.model_copy(update={"model": "Other/Model"}),
+            "manifest": first.manifest.model_copy(
+                update={"path": first.manifest.path.replace("Org--Model", "Other--Model")}
+            ),
+        }
+    )
+    return index.model_copy(update={"entries": [first, second]}), first, second
+
+
+def test_explicit_paths_are_validated_against_the_whole_catalog_before_the_model_filter(tmp_path: Path) -> None:
+    from scripts.fpm_accuracy.hf.dataset import _entry_configuration_path, _select_entries
+
+    _, unified_root = _legacy_and_unified(tmp_path)
+    index, first, second = _two_configuration_index(unified_root)
+    paths = [_entry_configuration_path(first), _entry_configuration_path(second)]
+    assert paths[0] != paths[1]
+
+    # B exists but the model filter matches only A: B drops out of the intersection and is not "unknown".
+    assert _select_entries(index, ["Org/Model"], None, paths) == [first]
+    assert _select_entries(index, None, None, paths) == [first, second]  # control: no filter keeps both
+    with pytest.raises(ConfigurationError, match="unknown smoke configuration"):
+        _select_entries(index, ["Org/Model"], None, [paths[0], "data/Missing--Model/h100-sxm/vllm/1.0/single"])
+
+
 class _FakeTransport:
     """Serves a local unified tree; records every opened path."""
 
