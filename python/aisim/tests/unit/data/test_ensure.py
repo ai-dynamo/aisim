@@ -408,3 +408,55 @@ def test_an_entry_whose_manifest_belongs_to_another_model_is_refused(tmp_path):
         (root / path).write_bytes(data)
     with pytest.raises(MissingDataError, match="failed verification"):
         ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+
+
+@pytest.mark.parametrize("categories", [("fpm", "op-latency"), ("op-latency", "fpm")])
+def test_a_configuration_id_constrains_only_the_category_that_lists_it(tmp_path, monkeypatch, categories):
+    seen = {}
+
+    def fake_ids(pin_, transport, category):
+        return {"cfg-fpm": {"cfg-a", "cfg-b"}, "cfg-op": {"cfg-x"}}.get(
+            {"fpm": "cfg-fpm", "op-latency": "cfg-op"}[category], set()
+        )
+
+    def fake_ensure_category(out, category, pin_, transport):
+        seen[category] = pin_.configuration_id
+
+    monkeypatch.setattr(ensure_mod, "_category_configuration_ids", fake_ids)
+    monkeypatch.setattr(ensure_mod, "_ensure_category", fake_ensure_category)
+    ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=categories, configuration_id="cfg-b"))
+    assert seen == {"fpm": "cfg-b", "op-latency": None}
+    seen.clear()
+    ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=categories, configuration_id="cfg-x"))
+    assert seen == {"fpm": None, "op-latency": "cfg-x"}
+    with pytest.raises(MissingDataError, match=r"cfg-nope is not in any category of the pin"):
+        ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=categories, configuration_id="cfg-nope"))
+
+
+def test_a_single_category_pin_keeps_its_plain_configuration_id_behavior(tmp_path, monkeypatch):
+    seen = []
+
+    def fail_lookup(*args):
+        raise AssertionError("a single-category pin needs no ownership lookup")
+
+    monkeypatch.setattr(ensure_mod, "_category_configuration_ids", fail_lookup)
+    monkeypatch.setattr(
+        ensure_mod, "_ensure_category", lambda out, category, pin_, transport: seen.append(pin_.configuration_id)
+    )
+    ensure_data(CONFIG, DataPin(local_root=tmp_path, categories=("fpm",), configuration_id="cfg-whatever"))
+    assert seen == ["cfg-whatever"]
+
+
+def test_the_ownership_lookup_reads_each_category_index(tmp_path, files):
+    ids = [e["configuration_id"] for e in json.loads(files["catalog/fpm.json"])["entries"]]
+    root = tmp_path / "local"
+    for path, data in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(data)
+    local = DataPin(local_root=root, categories=("fpm", "op-latency"))
+    assert ensure_mod._category_configuration_ids(local, None, "fpm") == set(ids)
+    assert (
+        ensure_mod._category_configuration_ids(local, None, "op-latency") == set()
+    )  # this dataset has no such category
+    remote = pin(tmp_path, categories=("fpm", "op-latency"))
+    assert ensure_mod._category_configuration_ids(remote, FakeTransport(files), "fpm") == set(ids)

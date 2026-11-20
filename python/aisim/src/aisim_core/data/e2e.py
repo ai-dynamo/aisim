@@ -977,6 +977,11 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
             evidence_gaps=body.evidence_gaps,
         )
         artifact_ids = {a.artifact_id for a in artifacts}
+        # The loader's provenance rule, applied before anything is published: a retained entry whose artifact was
+        # not regenerated here (or a stored artifact without an entry) would make the new configuration unreadable.
+        info_ids = {p.artifact_id for p in infos}
+        if info_ids - artifact_ids or {a.artifact_id for a in artifacts if a.format == "gzip"} - info_ids:
+            raise ValueError("provenance artifacts and manifest body disagree")
         for o in data.observations:
             for ref in (o.raw_artifact_id, o.log_artifact_id, *o.evidence_refs):
                 if ref is not None and ref not in artifact_ids:

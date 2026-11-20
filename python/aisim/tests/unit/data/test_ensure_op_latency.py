@@ -381,21 +381,20 @@ def test_manifests_declaring_different_bytes_for_one_runtime_path_conflict(tree,
     assert not (tmp_path / "dest").exists()
 
 
-def test_concurrent_materializations_do_not_share_a_staging_directory(two_families, tmp_path, monkeypatch):
-    from aisim_core.data import ensure as mod
+def test_concurrent_materializations_of_one_pin_agree_and_leave_no_staging(two_families, tmp_path):
+    import threading
 
-    real = mod.load_op_latency_tree
-    started, nested = [], []
+    results = []
 
-    def interleaved(*args, **kwargs):
-        if not started:  # a second worker of this process builds and publishes while the first is still writing
-            started.append(True)
-            nested.append(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
-        return real(*args, **kwargs)
+    def ensure():
+        results.append(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
 
-    monkeypatch.setattr(mod, "load_op_latency_tree", interleaved)
-    first = ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0]
-    assert first == nested[0] and (Path(first) / "h200_sxm.yaml").is_file()
+    threads = [threading.Thread(target=ensure) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert len(results) == 4 and len(set(results)) == 1 and (Path(results[0]) / "h200_sxm.yaml").is_file()
     assert not list((tmp_path / "cache").rglob("*.tmp"))
 
 
@@ -709,3 +708,65 @@ def test_an_edited_cached_system_spec_does_not_reach_the_native_predictor(native
     assert cached.read_text() != text
     again = res.RustForwardPassPerfModel.best_available(dict(payload), dataset=pin).predict_prefill_latency(1, 4)
     assert again == baseline  # the damaged copy was rebuilt from the packaged spec
+
+
+def test_a_local_policy_file_that_the_index_does_not_list_cannot_choose_the_version(tree, tmp_path):  # noqa: F811
+    import hashlib
+    import json
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    index_path = next(published.rglob("op-latency.json"))
+    index = json.loads(index_path.read_text())
+    index.pop("support")  # an index that does not pin the lookups: the parquet beside it is a stray file
+    index_path.write_text(json.dumps(index))
+    dataset_path = published / "catalog/dataset.json"
+    dataset = json.loads(dataset_path.read_text())
+    reference = dataset["categories"]["op-latency"]["index"]
+    reference.update(sha256=hashlib.sha256(index_path.read_bytes()).hexdigest(), bytes=index_path.stat().st_size)
+    dataset_path.write_text(json.dumps(dataset))
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    with pytest.raises(MissingDataError, match="does not index"):
+        ensure_data(config, _pin(published, tmp_path))
+    # An explicit version never consults the policy.
+    assert ensure_data(dict(CONFIG), _pin(published, tmp_path)).config["backend_version"] == "1.0"
+
+
+def test_a_stale_repair_cannot_delete_a_root_another_caller_just_rebuilt(two_families, tmp_path, monkeypatch):
+    import threading
+
+    from aisim_core.data import ensure as mod
+
+    first = Path(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+    table = first / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+    original = table.read_bytes()
+    table.write_bytes(b"damaged")
+    paused, resume, calls = threading.Event(), threading.Event(), []
+    real = mod.composed_root_matches
+
+    def pausing(*args, **kwargs):
+        matches = real(*args, **kwargs)
+        if not matches and not calls:  # the first caller has just decided the root is damaged
+            calls.append(True)
+            paused.set()
+            assert resume.wait(20)
+        return matches
+
+    monkeypatch.setattr(mod, "composed_root_matches", pausing)
+    results: dict[str, Path] = {}
+
+    def ensure(name):
+        results[name] = Path(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+
+    a = threading.Thread(target=ensure, args=("a",))
+    a.start()
+    assert paused.wait(20)
+    b = threading.Thread(target=ensure, args=("b",))
+    b.start()
+    b.join(1.0)
+    assert b.is_alive(), "the second caller must wait for the first repair instead of racing it"
+    resume.set()
+    a.join(20)
+    b.join(20)
+    assert results["a"] == results["b"]
+    assert (results["a"] / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == original

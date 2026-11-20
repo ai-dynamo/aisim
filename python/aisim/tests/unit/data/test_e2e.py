@@ -15,6 +15,7 @@ from aisim_core.data.e2e import (
     E2eManifestBody,
     MetricRow,
     ProvenanceFile,
+    ProvenanceInfo,
     Setting,
     SnapshotAcquisition,
     SnapshotMember,
@@ -536,3 +537,24 @@ def test_rows_that_differ_only_in_normalization_collide_on_the_returned_key(tmp_
     (server,) = evaluation_points(both, observer="server")
     assert client.metrics[("interactivity", "mean")] == 40.0 and client.observers[("interactivity", "mean")] == "client"
     assert server.metrics[("interactivity", "mean")] == 90.0
+
+
+def test_a_retained_provenance_entry_without_its_artifact_is_rejected_before_publishing(tmp_path):
+    import dataclasses
+
+    cfg = _dev_config()
+    path = write_configuration(tmp_path, cfg)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    stale = ProvenanceInfo(
+        artifact_id="raw-output:retired", observation_id="dev:1", kind="raw-output", redacted=True, truncated=False,
+        full_sha256="0" * 64, full_bytes=1, stored_bytes=1, cap_bytes=1,
+    )  # fmt: skip
+    body = cfg.body.model_copy(update={"provenance_artifacts": [stale]})
+    observation = cfg.observations[0].model_copy(
+        update={"raw_artifact_id": None, "log_artifact_id": None, "evidence_refs": []}
+    )
+    replacement = dataclasses.replace(cfg, body=body, observations=[observation], provenance=[])
+    with pytest.raises(ValueError, match="provenance artifacts and manifest body disagree"):
+        write_configuration(tmp_path, replacement)
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    assert len(load_e2e(tmp_path, path).metrics) == len(cfg.metrics)

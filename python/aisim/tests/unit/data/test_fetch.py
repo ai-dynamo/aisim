@@ -498,3 +498,14 @@ def test_a_root_catalog_without_a_declared_size_has_an_explicit_cap(files, tmp_p
     monkeypatch.setattr(fetch_module, "_METADATA_CAP_BYTES", 10)
     with pytest.raises(IntegrityError, match="exceeds 10 bytes"):
         plan(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+
+
+def test_a_manifest_for_other_hardware_with_a_copied_id_plans_no_artifacts(files, tmp_path):
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["identity"]["hardware"] = "b200"  # digest-correct manifest of another hardware, ID copied from the entry
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
+    _repin(files, "fpm/m1/manifest.json")
+    transport = FakeTransport(files)
+    with pytest.raises(IntegrityError, match="identity or purpose differs"):
+        plan(SEL, repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "c"))
+    assert "fpm/m1/data.parquet" not in transport.opened

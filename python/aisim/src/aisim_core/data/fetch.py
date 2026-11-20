@@ -544,6 +544,11 @@ def plan(
         manifest = parse(Manifest, raw, entry.manifest.path)
         if manifest.configuration_id != entry.configuration_id:
             raise IntegrityError(entry.manifest.path, "manifest configuration ID differs from the catalog entry")
+        # A digest-correct manifest of another hardware or model can carry a copied ID; its identity and purpose must
+        # be the entry's before any of its artifacts is planned (the category stamp is not compared: legacy
+        # stamps are valid where the loader permits them).
+        if manifest.identity != entry.identity or manifest.purpose != entry.purpose:
+            raise IntegrityError(entry.manifest.path, "manifest identity or purpose differs from the catalog entry")
         for artifact in manifest.artifacts:
             if artifact.role not in selection.exclude_roles:
                 planner._add(_ref(artifact, "artifact"))

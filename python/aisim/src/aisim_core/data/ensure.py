@@ -309,8 +309,11 @@ def ensure_data(
     with _guard():
         if "op-latency" in pin.categories:
             _resolve_backend_version(out, pin, transport)
+        owner = _configuration_owner(pin, transport)
         for category in pin.categories:
-            _ensure_category(out, category, pin, transport)
+            # A configuration ID names one entry of one category: it constrains only that category.
+            category_pin = pin if owner in (None, category) else replace(pin, configuration_id=None)
+            _ensure_category(out, category, category_pin, transport)
         if "op-latency" in out.roots and "fpm" in out.roots:
             _compose_pinned_roots(out)
     return out
@@ -346,6 +349,49 @@ def _compose_pinned_roots(out: EnsuredData) -> None:
     out.config["systems_paths"] = [*map(str, fpm_roots), str(op_root)]
 
 
+def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | None:
+    """The category whose index lists ``pin.configuration_id``; ``None`` when no choice has to be made.
+
+    A single-category pin keeps its plain behavior (the category reports a miss itself). With several categories
+    the ID must belong to exactly one of them, or the pin cannot complete and says which categories it searched.
+    """
+    if pin.configuration_id is None or len(pin.categories) < 2:
+        return None
+    owners = [c for c in pin.categories if pin.configuration_id in _category_configuration_ids(pin, transport, c)]
+    if not owners:
+        raise MissingDataError(
+            f"configuration {pin.configuration_id} is not in any category of the pin {list(pin.categories)}"
+        )
+    return owners[0]
+
+
+def _category_configuration_ids(pin: DataPin, transport: Transport | None, category: str) -> set[str]:
+    """Configuration IDs listed by one category index of the pinned dataset (empty when it has no such category)."""
+    from aisim_core.data.fetch import load_category_index
+
+    try:
+        if pin.local_root is not None:
+            root = Path(pin.local_root).absolute()
+            dataset = DatasetIndex.model_validate_json(_file(root, DATASET_INDEX_PATH).read_bytes())
+            reference = dataset.categories.get(category)
+            if reference is None:
+                return set()
+            index = CategoryIndex.model_validate_json(_verify(root, reference.index).read_bytes())
+        else:
+            common = {"repo": pin.repo, "revision": pin.revision, "cache": Cache(pin.cache_dir)}
+            try:
+                _, index, _ = load_category_index(category, transport=None, offline=True, **common)
+            except (OfflineMissingError, RevisionError, IntegrityError) as exc:
+                if pin.offline:
+                    raise MissingDataError(f"offline: the {category} catalog is not usable: {exc}") from exc
+                _, index, _ = load_category_index(category, transport=transport, **common)
+    except SelectionError:
+        return set()
+    except (ValueError, ValidationError) as exc:
+        raise MissingDataError(f"the {category} catalog is unusable: {exc}") from exc
+    return {e.configuration_id for e in index.entries}
+
+
 _SLOT_ALIASES = ("current", "previous", "next")
 
 
@@ -376,10 +422,14 @@ def _version_policy(pin: DataPin, transport: Transport | None):
             root = Path(pin.local_root).absolute()
             index = _op_latency_index(root)
             support = {a.path: a for a in index.support}
-            if name in support:
-                path = _verify(root, support[name])
-            else:
-                path = root / name
+            if name not in support:
+                # An unindexed file has no pinned digest; remote pins resolve the policy only through the index, so
+                # a local root must too, or a stray file could pick the backend version.
+                raise MissingDataError(
+                    f"{where} does not index {name}; the backend version cannot be resolved (pass an explicit "
+                    "backend_version, or republish the dataset with the current publisher)"
+                )
+            path = _verify(root, support[name])
         else:
             cache = Cache(pin.cache_dir)
             common = {"repo": pin.repo, "revision": pin.revision, "cache": cache}
@@ -768,6 +818,21 @@ def _donor_versions(document: Any) -> list[str]:
     return sorted({e["from_version"] for e in reuse})
 
 
+@contextmanager
+def _cache_lock(target: Path):
+    """An exclusive advisory lock for one cache key (``<target>.lock``), shared by threads and processes."""
+    lock = target.with_name(f"{target.name}.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a+b") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except ImportError:  # no flock (Windows): private staging still protects the build itself
+            pass
+        yield
+
+
 def _load_op_latency(
     root: Path,
     entries: list[Entry],
@@ -795,23 +860,26 @@ def _load_op_latency(
         # Keyed by content, not identity: a dataset republished in place (or a newer package) gets a new root.
         digest = op_latency_inputs_digest(root, manifests, PACKAGED_SYSTEMS_DIR)[:16]
         output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
-        if (output_dir / "systems").is_dir():
-            if composed_root_matches(output_dir / "systems", root, manifests, PACKAGED_SYSTEMS_DIR):
-                return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
-            shutil.rmtree(output_dir, ignore_errors=True)  # edited or damaged in place: rebuild from the dataset
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        # Build in a directory private to this attempt (threads of one process share a PID) and rename it, so a
-        # concurrent worker never sees a half-written root and never deletes another worker's staging.
-        staging = Path(tempfile.mkdtemp(prefix=f"{output_dir.name}.", suffix=".tmp", dir=output_dir.parent))
-        try:
-            load_op_latency_tree(root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR)
+        # Validation, repair and build of one cache key are serialized: two callers that both found a root damaged must
+        # not let the slower one delete what the faster one just rebuilt. The decision is made under the lock.
+        with _cache_lock(output_dir):
+            if (output_dir / "systems").is_dir():
+                if composed_root_matches(output_dir / "systems", root, manifests, PACKAGED_SYSTEMS_DIR):
+                    return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
+                shutil.rmtree(output_dir, ignore_errors=True)  # edited or damaged in place: rebuild from the dataset
+            # Build in a directory private to this attempt and rename it, so a concurrent reader never sees a
+            # half-written root.
+            staging = Path(tempfile.mkdtemp(prefix=f"{output_dir.name}.", suffix=".tmp", dir=output_dir.parent))
             try:
-                staging.rename(output_dir)
-            except OSError:
-                if not (output_dir / "systems").is_dir():  # another attempt won the race: its root is equivalent
-                    raise
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
+                load_op_latency_tree(root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR)
+                try:
+                    staging.rename(output_dir)
+                except OSError:
+                    if not (output_dir / "systems").is_dir():  # another attempt won the race: its root is equivalent
+                        raise
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
         return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
     except (LoaderError, ValueError) as exc:
         raise MissingDataError(
