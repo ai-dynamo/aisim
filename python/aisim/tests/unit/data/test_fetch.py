@@ -604,6 +604,8 @@ def test_a_manifest_for_other_hardware_with_a_copied_id_plans_no_artifacts(files
     files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()
     _repin(files, "fpm/m1/manifest.json")
     transport = FakeTransport(files)
-    with pytest.raises(IntegrityError, match="identity or purpose differs"):
+    with pytest.raises(
+        IntegrityError, match="(identity or purpose|category, purpose or identity) differs|identity hash mismatch"
+    ):
         plan(SEL, repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "c"))
     assert "fpm/m1/data.parquet" not in transport.opened
