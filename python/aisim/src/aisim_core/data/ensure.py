@@ -644,8 +644,8 @@ def _cached_pin_is_valid(output_dir: Path, manifest, cached: Mapping[str, Any]) 
 def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) -> dict[str, Any]:
     """Copy of ``config`` without an ``fpm_parquet_path`` that an earlier ensure call generated.
 
-    Such a path names a staged library of another materialization; keeping it would pair a new dataset revision
-    with the old library. A path the user set elsewhere is a genuine override and stays.
+    Such a path names a staged library of another materialization, in this cache or another one; keeping it would
+    pair a new dataset revision with the old library. A path the user set elsewhere is a genuine override and stays.
     """
     out = dict(config)
     estimator = out.get("estimator_config")
@@ -653,24 +653,33 @@ def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) 
     path = interpolation.get("fpm_parquet_path") if isinstance(interpolation, Mapping) else None
     # The generated file itself is a symlink to the dataset source. Resolve its
     # parent to identify the materialization without following that final link.
-    if path is not None and Path(path).expanduser().parent.resolve().is_relative_to(materialized.resolve()):
-        interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
-        out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
+    if path is not None:
+        parent = Path(path).expanduser().parent.resolve()
+        if parent.is_relative_to(materialized.resolve()) or any(
+            _is_generated_root(ancestor) for ancestor in (parent, *parent.parents)
+        ):
+            interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
+            out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
     return out
 
 
 _GENERATED_ROOT_NAME = re.compile(r".+-[0-9a-f]{64}")
 
 
-def _is_generated_root(path: str | Path, materialized: Path) -> bool:
-    """True for a staged library root that an earlier ensure call wrote under ``materialized``, for any pin."""
+def _is_generated_root(path: str | Path, materialized: Path | None = None) -> bool:
+    """True for a staged library root that an earlier ensure call wrote, under ``materialized`` or any cache.
+
+    A root has the shape ``<cache>/materialized/<source key>/<configuration>-<roots digest>``; a configuration saved
+    with another cache directory names such a root too, and it must not outlive its pin as an explicit root.
+    """
     resolved = Path(path).expanduser().resolve()
-    return (
-        resolved.parent.parent == materialized.resolve() and _GENERATED_ROOT_NAME.fullmatch(resolved.name) is not None
+    under = resolved.parent.parent
+    return (under.name == "materialized" if materialized is None else under == materialized.resolve()) and (
+        _GENERATED_ROOT_NAME.fullmatch(resolved.name) is not None
     )
 
 
-def _drop_generated_roots(config: Mapping[str, Any], materialized: Path) -> Mapping[str, Any]:
+def _drop_generated_roots(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """``config`` without the staged roots of earlier ensure calls in ``systems_paths``.
 
     A returned configuration lists its own staging root. Keeping it as an explicit root when the configuration is
@@ -679,7 +688,7 @@ def _drop_generated_roots(config: Mapping[str, Any], materialized: Path) -> Mapp
     paths = config.get("systems_paths")
     if not paths:
         return config
-    kept = [p for p in paths if not _is_generated_root(p, materialized)]
+    kept = [p for p in paths if not _is_generated_root(p)]
     return config if len(kept) == len(paths) else {**config, "systems_paths": kept}
 
 
@@ -705,11 +714,11 @@ def _load(
             # the same inputs, not a different user root, so it must not key this materialization or shadow it.
             # With an op-latency pin the pinned root is the only source: no active root may fill a missing family.
             materialized = output_dir.parent.parent
-            config = _drop_generated_roots(_drop_generated_library_path(config, materialized), materialized)
+            config = _drop_generated_roots(_drop_generated_library_path(config, materialized))
             roots = tuple(
                 str(p)
                 for p in _stageable_roots(config.get("systems_paths"), output_dir, include_active=not isolate_roots)
-                if not _is_generated_root(p, materialized)
+                if not _is_generated_root(p)
             )
             roots_key = hashlib.sha256(json.dumps(roots).encode()).hexdigest()
             output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")

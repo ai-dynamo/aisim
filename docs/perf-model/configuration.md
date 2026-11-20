@@ -485,7 +485,10 @@ A staging `output_dir` holds one library at a time: staging another library ther
 configuration returned for the earlier library then reads the new one. Give each library whose configuration stays
 in use its own `output_dir`. The staged root also carries `perf_data_reuse_manifest.yaml`, `query_versions.yaml` and
 `attention_lane_defaults.yaml` from the first source root that has each, so donor-backed operations price as they do
-through the source roots; a change to one of them restages the root.
+through the source roots; a change to one of them restages the root. Directories that several source roots provide,
+such as a family directory, are merged, and the earlier root wins for a file both provide. Staging again repairs an
+installed root that lost a file, and a repin drops the generated library path and staged roots of an earlier pin
+whichever cache directory held them, keeping any path you set yourself.
 
 For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
 a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`

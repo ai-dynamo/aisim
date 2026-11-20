@@ -538,7 +538,8 @@ def stage_fpm_library(
             marker["overlay"] = _overlay_links(build)
             (build / STAGED_MARKER).write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
             with _INSTALL_LOCK:  # one installer or reader of a destination at a time within the process
-                if _check_staging_destination(root) == marker:  # an earlier verified staging: reuse it
+                if _check_staging_destination(root) == marker and _installed_root_is_intact(build, root):
+                    # an earlier verified staging whose files are all still installed: reuse it
                     shutil.rmtree(build, ignore_errors=True)
                 else:
                     _replace_staged_root(build, root, marker)
@@ -589,6 +590,24 @@ class _StagingMarker(BaseModel):
     system_definition: dict[str, str] | None = None
     policy_files: dict[str, str] | None = None
     overlay: list[list[str]] | None = None
+
+
+def _installed_root_is_intact(build: Path, installed: Path) -> bool:
+    """True when ``installed`` holds every link and regular file of the fresh ``build`` (marker aside).
+
+    A matching marker only says what was staged; a removed link or an edited copy would otherwise be reused.
+    """
+    if _overlay_links(build) != _overlay_links(installed):
+        return False
+    for directory, _, files in os.walk(build):
+        for name in files:
+            built = Path(directory) / name
+            if built.is_symlink() or name == STAGED_MARKER:
+                continue
+            counterpart = installed / built.relative_to(build)
+            if counterpart.is_symlink() or not counterpart.is_file() or sha256_file(counterpart) != sha256_file(built):
+                return False
+    return True
 
 
 def _overlay_links(build: Path) -> list[list[str]]:
@@ -800,6 +819,19 @@ def _link_if_missing(source: Path, target: Path, destination: Path | None) -> No
         if destination is not None and resolved.is_relative_to(destination.resolve()):
             raise FpmContractError(f"FPM overlay source {source} resolves inside output_dir {destination}")
         target.symlink_to(resolved, target_is_directory=resolved.is_dir())
+        return
+    if not (source.is_dir() and target.is_dir()):
+        return  # the same file in an earlier root wins
+    # Two roots provide this directory (for example a family directory): merge them, so a table that only the
+    # later root has stays reachable while the earlier root keeps precedence for files both provide.
+    if target.is_symlink():
+        earlier = target.resolve()
+        target.unlink()
+        target.mkdir()
+        for child in earlier.iterdir():
+            _link_if_missing(child, target / child.name, destination)
+    for child in source.iterdir():
+        _link_if_missing(child, target / child.name, destination)
 
 
 def _safe_relative_path(value: Any, field_name: str) -> Path:
