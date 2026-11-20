@@ -307,6 +307,9 @@ struct SessionRuntime {
     session_id: String,
     turns: Vec<TurnRuntime>,
     cumulative_tokens: Vec<u32>,
+    // Replay hashes of `cumulative_tokens`' complete blocks as of the last
+    // dispatch, so each turn hashes only the blocks it adds.
+    cumulative_hashes: ReplayRequestHashes,
     next_turn_index: usize,
     next_ready_at_ms: Option<f64>,
     in_flight: Option<Uuid>,
@@ -2136,6 +2139,7 @@ impl WorkloadDriver {
                         deterministic_request_id: Some(snapshot.request_uuid(source_index)?),
                     }],
                     cumulative_tokens: Vec::new(),
+                    cumulative_hashes: ReplayRequestHashes::default(),
                     next_turn_index: 0,
                     next_ready_at_ms: None,
                     in_flight: None,
@@ -2464,6 +2468,7 @@ impl WorkloadDriver {
                     deterministic_request_id: Some(deterministic_request_id),
                 }],
                 cumulative_tokens: Vec::new(),
+                cumulative_hashes: ReplayRequestHashes::default(),
                 next_turn_index: 0,
                 next_ready_at_ms: None,
                 in_flight: None,
@@ -2645,6 +2650,7 @@ impl WorkloadDriver {
                     session_id: session.session_id,
                     turns,
                     cumulative_tokens: Vec::with_capacity(cumulative_capacity),
+                    cumulative_hashes: ReplayRequestHashes::default(),
                     next_turn_index: 0,
                     next_ready_at_ms,
                     in_flight: None,
@@ -3003,7 +3009,10 @@ impl WorkloadDriver {
                     );
                     let request_tokens = session.cumulative_tokens.clone();
                     let replay_hashes = self.include_replay_hashes.then(|| {
-                        ReplayRequestHashes::from_tokens(&request_tokens, self.engine_block_size)
+                        session
+                            .cumulative_hashes
+                            .extend_from_tokens(&request_tokens, self.engine_block_size);
+                        session.cumulative_hashes.clone()
                     });
                     let request = ReplayRequestPayload::materialized(DirectRequest {
                         cache_salt: None,
@@ -3505,6 +3514,7 @@ impl WorkloadDriver {
         session.next_ready_at_ms = next_ready_at_ms;
         if session_ended {
             session.cumulative_tokens = Vec::new();
+            session.cumulative_hashes = ReplayRequestHashes::default();
         }
         if next_ready_at_ms.is_some()
             && outcome == TurnOutcome::Completed
@@ -4633,6 +4643,53 @@ mod tests {
 
         let second = driver.pop_ready(1.0, usize::MAX);
         assert_eq!(second[0].request.tokens, vec![10, 20, 21, 12]);
+    }
+
+    #[test]
+    fn accumulating_delta_mode_extends_replay_hashes_across_turns() {
+        // Engine blocks of 4 tokens straddle turn inputs and emitted outputs,
+        // and every turn but the last leaves a partial trailing block.
+        let turn = |hash_ids: Vec<u32>, output: Vec<u32>| TurnTrace {
+            input_length: hash_ids.len(),
+            max_output_tokens: output.len(),
+            output_token_ids: Some(output),
+            hash_ids,
+            ..Default::default()
+        };
+        let trace = Trace {
+            block_size: 1,
+            sessions: vec![SessionTrace {
+                session_id: "a".into(),
+                first_arrival_timestamp_ms: Some(0.0),
+                turns: vec![
+                    turn(vec![10, 11, 12], vec![20, 21]),
+                    turn(vec![13, 14], vec![22]),
+                    turn(vec![15, 16, 17, 18, 19, 30], vec![23]),
+                    turn(vec![31, 32], vec![]),
+                ],
+            }],
+        };
+        let mut driver = WorkloadDriver::new_concurrency_accumulating_deltas(trace, 4, 1).unwrap();
+
+        let mut blocks_per_turn = Vec::new();
+        for now_ms in 0..4 {
+            let ready = driver.pop_ready(f64::from(now_ms), usize::MAX);
+            let hashes = ready[0].replay_hashes.as_ref().unwrap();
+            assert_eq!(
+                hashes,
+                &ReplayRequestHashes::from_tokens(&ready[0].request.tokens, 4)
+            );
+            blocks_per_turn.push(hashes.sequence_hashes.len());
+            for &token in ready[0].request.output_token_ids.as_ref().unwrap() {
+                driver
+                    .on_output_token(ready[0].request_uuid, token)
+                    .unwrap();
+            }
+            driver
+                .on_complete(ready[0].request_uuid, f64::from(now_ms))
+                .unwrap();
+        }
+        assert_eq!(blocks_per_turn, vec![0, 1, 3, 4]);
     }
 
     #[test]
