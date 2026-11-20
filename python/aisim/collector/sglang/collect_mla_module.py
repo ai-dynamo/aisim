@@ -142,7 +142,16 @@ _MODEL_CONFIG_DIR = os.path.join(
     "model_configs",
 )
 _GLM5_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
-_NATIVE_NVFP4_SMS = {100, 103, 120}
+# SGLang runs NVFP4 on FP4 kernels on capability majors 10, 11 and 12 (utils/common.py,
+# is_blackwell_supported). On SM80 to SM90 it serves an NVFP4 checkpoint through Marlin, a
+# weight-only W4A16 path (layers/quantization/fp4_utils.py, initialize_fp4_gemm_config;
+# layers/quantization/modelopt_quant.py, ModelOptNvFp4FusedMoEMethod). The collector does not
+# collect that path.
+_NATIVE_NVFP4_SM_MAJORS = (10, 11, 12)
+
+
+def _has_native_nvfp4(sm_version: int) -> bool:
+    return sm_version // 10 in _NATIVE_NVFP4_SM_MAJORS
 
 
 # Per-subprocess sum of the point phase times printed by run_mla_module.
@@ -739,8 +748,16 @@ def _build_wideep_mla_test_cases(mode: str):
     if _skip_sm120_deepgemm_attention_modules():
         return []
     model_specs = get_mla_module_model_specs(attention_type="mla", wideep_mla=True)
-    if get_sm_version() not in _NATIVE_NVFP4_SMS:
-        model_specs = [spec for spec in model_specs if _model_native_gemm_quant(spec.model_path) != "nvfp4"]
+    sm_version = get_sm_version()
+    if not _has_native_nvfp4(sm_version):
+        kept_specs = [spec for spec in model_specs if _model_native_gemm_quant(spec.model_path) != "nvfp4"]
+        removed_paths = sorted({spec.model_path for spec in model_specs if spec not in kept_specs})
+        if removed_paths:
+            print(
+                f"[MLA] wideep {mode}: left out {len(removed_paths)} NVFP4 checkpoint(s) on SM{sm_version} "
+                f"({removed_paths}): the collector records NVFP4 only on capability majors 10, 11 and 12"
+            )
+        model_specs = kept_specs
     sweep = get_mla_module_sweep_spec("sglang")
     backends = _get_mla_backend_list()
     cases = []
@@ -1072,10 +1089,11 @@ def load_model_runner(
     """
     native_quant = _model_native_gemm_quant(model_path)
     sm_version = get_sm_version()
-    if native_quant == "nvfp4" and sm_version not in _NATIVE_NVFP4_SMS:
+    if native_quant == "nvfp4" and not _has_native_nvfp4(sm_version):
         raise ValueError(
-            f"SGLang has no collector-supported native NVFP4 model-loader backend on SM{sm_version}; "
-            "Marlin is valid only for INT4-WO"
+            f"SGLang has no collector-supported native NVFP4 model-loader backend on SM{sm_version}: "
+            "SGLang serves NVFP4 there through Marlin (weight-only W4A16), and the collector records "
+            "NVFP4 only from the FP4 kernels of capability majors 10, 11 and 12"
         )
 
     from sglang.srt.configs.model_config import ModelConfig
