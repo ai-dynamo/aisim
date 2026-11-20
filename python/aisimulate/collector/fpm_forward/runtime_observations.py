@@ -608,6 +608,18 @@ def _physical_views(
         validate_views(
             cache, precision, count, page, context=context, sequences=sequences, metadata_builders=metadata_builders
         )
+        # Pinned vLLM kv_cache_interface.py::max_memory_usage_bytes and
+        # kv_cache_utils.py::check_enough_kv_cache_memory_available sum demand
+        # once per shared-pool group. Uniform specs share a block table;
+        # non-speculative Mamba mode none retains one page per request.
+        demand = sum(
+            group["blocks_per_request"]
+            if group["kind"] == "state"
+            else (context + group["block_size_tokens"] - 1) // group["block_size_tokens"]
+            for group in groups
+        )
+        if accounting["initial_free_blocks"] < demand:
+            raise ValueError(f"K3.1 native pool cannot hold one request at the reviewed context: needs {demand} blocks")
         return groups, accounting
     layer_groups = {}
     for group_id, group in enumerate(cache["groups"]):
@@ -781,6 +793,7 @@ def _configuration(
     _same(bundle.sha256, attempt["bundle"].get("sha256"), "instrumentation bundle hash")
     if not bundle.manifest.get("source_notes") or not bundle.manifest["runtime"].get("source_files"):
         raise ValueError("runtime source mapping requires hashed source_notes and runtime.source_files")
+    bulk_import = phase is None
     phases = attempt.get("phases", {})
     required_phases = collection_phases(launch.get("worker_type"))
     if phase is not None:
@@ -795,12 +808,24 @@ def _configuration(
     for phase in required_phases:
         checkpoint_config = None
         result = phases[phase]
+        collector_phase = all(
+            isinstance(result.get(key), str) and result[key] for key in ("cell_id", "collector_attempt_id")
+        )
+        expected_status = "passed" if collector_phase else "completed"
+        if bulk_import and result.get("status") != expected_status:
+            raise ValueError(
+                f"{phase} runtime probe phase status is {result.get('status')!r}, expected {expected_status}"
+            )
         binding = {"attempt_id": active, "configuration": label, "phase": phase, "bundle_sha256": bundle.sha256}
         launch_path, digest = _artifact(root, result["launch_manifest"])
         context = read_json(launch_path, expected_sha256=digest)
         if context.get("schema_version") != LAUNCH_SCHEMA:
             raise ValueError("unsupported runtime launch manifest schema")
         for name, value in {**binding, "launch": launch, "expected_ranks": ranks}.items():
+            _same(context.get(name), value, f"launch manifest {name}")
+        for name, value in (
+            {key: result[key] for key in ("cell_id", "collector_attempt_id")} if collector_phase else {}
+        ).items():
             _same(context.get(name), value, f"launch manifest {name}")
         for name, value in (collector_binding or {}).items():
             _same(result.get(name), value, f"selected phase {name}")

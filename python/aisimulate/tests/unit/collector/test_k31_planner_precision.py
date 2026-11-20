@@ -224,6 +224,23 @@ def edit_proof(inputs, mutation):
     memory["provenance"] = json.dumps(proof)
 
 
+def reimport_inline_source(inputs):
+    """Write a synthetic source change, then import its new immutable proof."""
+    deployment = inputs["profile"]["deployments"][0]
+    proof = json.loads(deployment["resources"]["runtime_memory"]["provenance"])
+    index_path = Path(proof["observations_index"]["path"])
+    index = json.loads(index_path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"][inputs["options"].worker_type]
+    phase["artifacts"] = [
+        {"kind": "observation", **_write(index_path.parent / a["path"], a["evidence"]), "path": a["path"]}
+        for a in proof["artifacts"]
+    ]
+    index_path.write_text(json.dumps(index))
+    imported = validate_observations(index_path, {"tp2": inputs["runtime_launch"]})["tp2"]
+    assert imported["status"] == "complete", imported
+    deployment["resources"] = imported["resources"]
+
+
 def test_valid_imported_native_proof_changes_only_moe_precision(inputs):
     original = inputs["capability"]
     assert original.dtype.moe_quant_mode == "w4a16_mxfp4"
@@ -274,13 +291,13 @@ def test_planner_prepares_one_checkpoint_snapshot_but_checks_each_rank(inputs, m
     original_validate = observations._validate_record
     snapshots, workers = [], []
 
-    def load(launch):
-        snapshot = original_load(launch)
+    def load(launch, **kwargs):
+        snapshot = original_load(launch, **kwargs)
         snapshots.append(snapshot)
         return snapshot
 
     def validate(record, **kwargs):
-        assert kwargs["checkpoint_config"] is snapshots[0]
+        assert kwargs["checkpoint_config"] is snapshots[-1]
         if record["kind"] == "worker":
             workers.append((record["dp_rank"], record["tp_rank"]))
         return original_validate(record, **kwargs)
@@ -288,8 +305,8 @@ def test_planner_prepares_one_checkpoint_snapshot_but_checks_each_rank(inputs, m
     monkeypatch.setattr(observations, "_checkpoint_config", load)
     monkeypatch.setattr(observations, "_validate_record", validate)
     assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
-    assert len(snapshots) == 1
-    assert workers == [(0, 0), (0, 1)]
+    assert len(snapshots) == 2  # independent inline semantics and immutable-source validation
+    assert workers == [(0, 0), (0, 1)] * 2
 
 
 @pytest.mark.parametrize("field", ["phase", "dp_rank", "tp_rank"])
@@ -544,6 +561,7 @@ def test_inline_tp2_proof_requires_matching_effective_graph_settings(inputs, mat
 
     edit_proof(inputs, captured)
     if matching:
+        reimport_inline_source(inputs)
         assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
     else:
         with pytest.raises(ValueError, match="effective runtime/graph settings across phases/ranks"):
@@ -590,9 +608,11 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
             if observed["kind"] == "worker":
                 for name in state["layer_names"]:
                     convolution, recurrent = observed["cache"]["layer_components"][name]
-                    convolution.update(shape=[10, 1, 12], stride_bytes=[convolution["stride_bytes"][0], 24, 2])
+                    convolution.update(
+                        shape=[convolution["shape"][0], 1, 12], stride_bytes=[convolution["stride_bytes"][0], 24, 2]
+                    )
                     recurrent.update(
-                        shape=[10, 2, 2, 2],
+                        shape=[recurrent["shape"][0], 2, 2, 2],
                         stride_bytes=[recurrent["stride_bytes"][0], 16, 8, 4],
                         storage_offset_bytes=convolution["storage_offset_bytes"] + 24,
                     )
@@ -610,9 +630,7 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
     for rank in proof["rank_capacities"]:
         rank.update(dp_rank=rank["tp_rank"], tp_rank=0)
     memory["provenance"] = json.dumps(proof)
-    if matching:
-        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
-    else:
+    if not matching:
         message = "effective runtime/graph settings" if difference == "settings" else "cache geometry"
         with pytest.raises(ValueError, match=message + " across phases/ranks"):
             bind(inputs)
@@ -637,6 +655,9 @@ def test_inline_and_imported_dp_proofs_require_matching_full_settings(inputs, ma
     assert imported["status"] == ("complete" if matching else "incomplete"), imported
     if not matching:
         assert message + " across phases/ranks" in str(imported["diagnostics"])
+    else:
+        deployment["resources"] = imported["resources"]
+        assert bind(inputs).dtype.moe_quant_mode == "w4a8_mxfp4_mxfp8_trtllm"
 
 
 @pytest.mark.parametrize(
@@ -865,3 +886,19 @@ def test_native_state_rendering_checks_decode_warmup_before_scheduling(inputs, s
             # This source-bound TP2 / EP1 plan uses native state seeding even
             # though older runtimes skipped balanced TP-only MoE warm-up.
             assert cell.topology.tp == 2 and cell.topology.moe_ep == 1
+
+
+@pytest.mark.parametrize("mutation", ["digest", "unavailable", "source-change"])
+def test_inline_proof_requires_unchanged_source_artifacts(inputs, mutation):
+    proof = json.loads(inputs["profile"]["deployments"][0]["resources"]["runtime_memory"]["provenance"])
+    if mutation == "digest":
+        edit_proof(inputs, lambda value: value["artifacts"][0].update(sha256="e" * 64))
+    else:
+        index = Path(proof["observations_index"]["path"])
+        if mutation == "unavailable":
+            index.unlink()
+        else:
+            artifact = index.parent / proof["artifacts"][0]["path"]
+            artifact.write_text(artifact.read_text() + "\n")
+    with pytest.raises(ValueError, match="source.*(evidence|index)"):
+        bind(inputs)

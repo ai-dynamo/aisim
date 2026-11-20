@@ -51,6 +51,23 @@ from .schema import (
 from .topology import TopologySuggestions, suggest_topologies
 
 
+def _extra_env_argument(value: str):
+    from collector.fpm_forward.config import resolve_archived_generator_overrides
+
+    try:
+        environment = json.loads(value)
+        if not isinstance(environment, list):
+            raise ValueError("extra-env must be a JSON list")
+        resolved = resolve_archived_generator_overrides({"K8sConfig": {"extra_env": environment}})
+        # Validate the public literal contract after execution references resolve.
+        names = {entry["name"] for entry in environment}
+        return FPMDeployment(
+            extra_env=[item for item in resolved["K8sConfig"]["extra_env"] if item["name"] in names]
+        ).extra_env
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def add_support_parser(subparsers: Any) -> None:
     onboard = subparsers.add_parser(
         "onboard",
@@ -264,6 +281,9 @@ def add_deployment_arguments(parser: Any, *, default_executor: str | None = "kub
         help="Collection executor (default: kubernetes); Slurm uses an existing sbatch/salloc allocation.",
     )
     deployment.add_argument("--dynamo-version", help="Optional Dynamo version metadata; does not select templates.")
+    deployment.add_argument(
+        "--extra-env", type=_extra_env_argument, help="Deployment environment as a JSON list of {name, value} objects."
+    )
     deployment.add_argument(
         "--image", help="Collector container image; required for Slurm. Prefer an immutable digest."
     )

@@ -23,6 +23,7 @@ from aisimulate_core.sdk.utils import (
     _get_language_quantization_config,
     _normalize_quant_algo,
     _resolve_hf_revision,
+    _resolved_model_source,
     get_model_config_from_model_path,
     parse_compressed_tensors_quant,
 )
@@ -613,6 +614,7 @@ def validate_trtllm_large_ep(
 
 
 def _get_model_info(model_path: str, *, model_revision: str | None = None) -> dict:
+    model_path = _resolved_model_source(model_path)
     if model_revision is not None:
         model_revision = _resolve_hf_revision(model_path, model_revision)
     return _get_resolved_model_info(model_path, model_revision=model_revision)

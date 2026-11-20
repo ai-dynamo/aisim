@@ -109,6 +109,7 @@ def checkpoint_launch(
     *,
     resolve_cpu_defaults: bool = False,
     resume_output_dir: Path | None = None,
+    private_environment: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Resolve stage-2 facts; configuration names never determine topology."""
     from collector.fpm_forward.runtime_probe import normalize_probe_launch
@@ -255,6 +256,8 @@ def checkpoint_launch(
     max_sequences = collection.max_batch_size or (selected.resources.max_batch_size if selected else 256)
     if max_tokens < max_sequences:
         raise ValueError("resolved collection max_num_tokens must be at least max_batch_size")
+    if private_environment is not None:
+        private_environment[name] = deepcopy(deployment.get("extra_env"))
     launch = normalize_probe_launch(
         {
             **({"worker_type": payload["worker_type"]} if payload.get("worker_type") is not None else {}),
@@ -618,8 +621,32 @@ def runtime_collection_inputs(
     if result is None:
         return [], deployment
     root = Path(manifest["observations_index"]).parent
-    observed_deployment = FPMDeployment.model_validate(result["provenance"]["launch"]["deployment"])
-    if deployment is not None and deployment != observed_deployment:
+    from collector.fpm_forward.config import archive_generator_overrides
+
+    observed = deepcopy(result["provenance"]["launch"]["deployment"])
+    environment = observed.get("extra_env")
+    if environment is not None:
+        archived = archive_generator_overrides({"K8sConfig": {"extra_env": environment}})["K8sConfig"]["extra_env"]
+        names = {item["name"] for item in environment}
+        environment = [item for item in archived if item["name"] in names]
+        # Validate deployment policy and names using digest placeholders, then
+        # preserve references for offline comparison and generated commands.
+        observed["extra_env"] = [
+            {"name": item["name"], "value": "/__aisimulate_environment_reference__/" + item["value_sha256"]}
+            if "value_from_env" in item
+            else item
+            for item in environment
+        ]
+    observed_deployment = FPMDeployment.model_validate(observed).model_copy(update={"extra_env": environment})
+
+    def identity(value):
+        payload = value.model_dump(mode="json", exclude_none=True)
+        payload["extra_env"] = archive_generator_overrides({"K8sConfig": {"extra_env": value.extra_env or []}})[
+            "K8sConfig"
+        ]["extra_env"]
+        return payload
+
+    if deployment is not None and identity(deployment) != identity(observed_deployment):
         raise ValueError(
             "collection deployment differs from the runtime probe; use matching options or probe the changed deployment"
         )
@@ -1012,7 +1039,7 @@ def run_runtime_command(args: argparse.Namespace) -> int:
     names = _selected(state, args.configuration)
     output = _new_root(args.output_dir, checkpoint, fresh=False)
     overrides = {key: getattr(args, key) for key in FPMDeployment.model_fields if getattr(args, key, None) is not None}
-    launches, failed = {}, {}
+    launches, failed, private_environment = {}, {}, {}
     for name in names:
         try:
             _, launches[name], _ = checkpoint_launch(
@@ -1022,6 +1049,7 @@ def run_runtime_command(args: argparse.Namespace) -> int:
                 overrides,
                 resolve_cpu_defaults=not args.resume,
                 resume_output_dir=output if args.resume else None,
+                private_environment=private_environment,
             )
             if args.execute and launches[name]["identity"].get("runtime_framework_version") is None:
                 from collector.fpm_forward.config import resolve_archived_generator_overrides
@@ -1030,7 +1058,7 @@ def run_runtime_command(args: argparse.Namespace) -> int:
 
                 deployment = dict(launches[name]["deployment"])
                 deployment["extra_env"] = resolve_archived_generator_overrides(
-                    {"K8sConfig": {"extra_env": deployment.get("extra_env", [])}}
+                    {"K8sConfig": {"extra_env": private_environment[name] or []}}
                 )["K8sConfig"]["extra_env"]
                 observed = detect_runtime_versions(FPMDeployment.model_validate(deployment))
                 actual = observed["backend_version"]
@@ -1046,7 +1074,12 @@ def run_runtime_command(args: argparse.Namespace) -> int:
             failed[name] = {"status": "incomplete", "diagnostics": [str(exc)]}
     result = (
         probe_runtime(
-            launches, instrumentation=args.instrumentation, output_dir=output, execute=args.execute, resume=args.resume
+            launches,
+            instrumentation=args.instrumentation,
+            output_dir=output,
+            execute=args.execute,
+            resume=args.resume,
+            private_environment=private_environment,
         )
         if launches
         else {"status": "failed", "configurations": {}}

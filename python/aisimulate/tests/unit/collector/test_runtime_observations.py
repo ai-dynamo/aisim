@@ -187,7 +187,7 @@ def observation_fixture(root: Path, *, packed=False, planar=False, dense=False, 
         }
         ref = _write(root / phase / "launch.json", context)
         ref["path"] = str(Path(ref["path"]).relative_to(root))
-        result = {"launch_manifest": ref, "artifacts": []}
+        result = {"status": "completed", "launch_manifest": ref, "artifacts": []}
         attempt["phases"][phase] = result
         for rank in expected["workers"] + [{**r, "tp_rank": None, "pp_rank": None} for r in expected["schedulers"]]:
             worker = rank["tp_rank"] is not None
@@ -855,3 +855,18 @@ def test_invented_observer_verdict_does_not_authorize_invalid_physical_evidence(
     result = validate_observations(path, launch)["tp2"]
     assert result["status"] == "incomplete"
     assert "overlap" in " ".join(result["diagnostics"])
+
+
+@pytest.mark.parametrize("status", ["failed", "cleanup_failed", "interrupted", "running", None])
+def test_bulk_import_retains_terminal_phase_status_without_blocking_staged_validation(tmp_path, status):
+    from collector.fpm_forward.runtime_observations import validate_observation_phase
+
+    path, launches = observation_fixture(tmp_path)
+    index = json.loads(path.read_text())
+    index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]["status"] = status
+    path.write_text(json.dumps(index))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete"
+    assert any(f"decode runtime probe phase status is {status!r}" in item for item in result["diagnostics"])
+    staged = validate_observation_phase(path, "tp2", launches["tp2"], phase="decode", attempt_id="attempt-001")
+    assert staged["status"] == "complete"

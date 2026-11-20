@@ -2037,7 +2037,17 @@ def test_pending_probe_version_detection_reports_unresolved_environment(tmp_path
     save_checkpoint(
         checkpoint,
         patch={
-            "inputs": {"collection_deployment": {"extra_env": [{"name": "HF_TOKEN", "value": "original"}]}},
+            "inputs": {
+                "collection_deployment": {
+                    "extra_env": [
+                        {
+                            "name": "HF_TOKEN",
+                            "value_from_env": "HF_TOKEN",
+                            "value_sha256": hashlib.sha256(b"original").hexdigest(),
+                        }
+                    ]
+                }
+            },
             "configurations": {"tp2": {"draft_request": draft}},
         },
         expected_revision=state.revision,
@@ -2108,3 +2118,104 @@ def test_mixed_known_and_pending_probe_preview_records_every_configuration(tmp_p
     assert state.configurations["tp2"].history[-1]["result"]["status"] == "deferred"
     assert state.configurations["incomplete"].history[-1]["result"]["status"] == "pending_runtime_version"
     assert not output.exists()
+
+
+@pytest.mark.parametrize("known_version", [True, False])
+def test_first_public_probe_delivers_literal_token_without_export(tmp_path, monkeypatch, known_version):
+    from collector.fpm_forward import runner
+
+    from aisimulate.support import versioning
+
+    from .collector.test_fpm_runtime_probe import _SyntheticExecutor
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    draft = copy.deepcopy(state.configurations["tp2"].draft_request)
+    if not known_version:
+        draft["identity"]["framework_version"] = None
+    token = "synthetic-unexported-first-probe-746"
+    environment = [{"name": "HF_TOKEN", "value": token}]
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    save_checkpoint(
+        checkpoint,
+        patch={
+            "inputs": {"collection_deployment": {"extra_env": environment}},
+            "configurations": {"tp2": {"draft_request": draft}},
+        },
+        expected_revision=state.revision,
+        accept=[],
+    )
+    delivered = []
+
+    def detect(deployment):
+        assert all(entry in deployment.extra_env for entry in environment)
+        return {"backend_version": "0.27.0"}
+
+    class Executor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            super().stage(pods, files)
+            assert runner.shlex.quote(token) in self.files["run.sh"].read_text()
+            delivered.append(self.cell.workload_kind)
+
+    monkeypatch.setattr(versioning, "detect_runtime_versions", detect)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    output = tmp_path / "first-probe"
+    assert (
+        cli.main(
+            [
+                "onboard",
+                "probe-runtime",
+                "--checkpoint",
+                str(checkpoint),
+                "--configuration",
+                "tp2",
+                "--output-dir",
+                str(output),
+                "--execute",
+            ]
+        )
+        == 0
+    )
+    assert delivered == ["prefill", "decode"]
+    for artifact in output.rglob("*"):
+        if artifact.is_file():
+            assert token.encode() not in artifact.read_bytes(), artifact
+
+
+def test_probe_backed_plan_command_roundtrips_private_extra_env(tmp_path, capsys, monkeypatch):
+    from aisimulate.support import runtime
+
+    from .collector.test_runtime_observations import _replace_launch
+
+    original = observation_fixture
+    token = "synthetic-generated-command-746"
+    environment = [{"name": "HF_TOKEN", "value": token}, {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"}]
+
+    def with_environment(*args, **kwargs):
+        index, launches = original(*args, **kwargs)
+        for name, launch in launches.items():
+            launch["deployment"]["extra_env"] = environment
+            launches[name] = normalize_probe_launch(launch)
+        _replace_launch(index, launches)
+        return index, launches
+
+    monkeypatch.setattr(sys.modules[__name__], "observation_fixture", with_environment)
+    _, _, request, files = _imported(tmp_path, capsys, capacity_multiplier=10)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    root = tmp_path / "collection"
+    assert (
+        cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root), "--format", "json"]) == 0
+    )
+    command = json.loads((root / "commands.json").read_text())["fpm_run_local"]
+    encoded = command[command.index("--extra-env") + 1]
+    assert token not in encoded and "value_sha256" in encoded
+    monkeypatch.setenv("HF_TOKEN", token)
+    parsed = cli.build_parser().parse_args(command[1:])
+    assert parsed.extra_env == environment
+    from aisimulate.support.schema import FPMDeployment
+
+    deployment = FPMDeployment(
+        **{key: getattr(parsed, key) for key in FPMDeployment.model_fields if getattr(parsed, key, None) is not None}
+    )
+    flags, _ = runtime.runtime_collection_inputs(request, deployment)
+    assert "--fpm-runtime-launch" in flags

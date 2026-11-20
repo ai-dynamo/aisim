@@ -764,3 +764,45 @@ def test_mixed_kimi_processor_layout_rejects_conflicting_patch_limits(tmp_path, 
     else:
         parsed = get_model_config_from_model_path(model_path)
         assert parsed["encoder_config"].image_max_patches == sidecar
+
+
+@pytest.mark.parametrize("resize", [True, False])
+@pytest.mark.parametrize("inline_limit", [None, 8192])
+def test_mixed_kimi_processor_validates_sidecar_image_settings(tmp_path, resize, inline_limit):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    media = {"patch_limit_on_one_side": 512}
+    if inline_limit is not None:
+        media["in_patch_limit"] = inline_limit
+    raw["preprocessor_config"] = {"media_proc_cfg": media}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"max_patches": 8192, "do_resize": resize}))
+    if not resize:
+        with pytest.raises(ValueError, match="do_resize=False"):
+            get_model_config_from_model_path(str(tmp_path))
+    else:
+        assert get_model_config_from_model_path(str(tmp_path))["encoder_config"].image_max_patches == 8192
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("exclusions", [[], ["vision_tower.*", "mm_projector.*"]])
+def test_kimi_sidecar_preserves_language_scope_and_model_exclusions(tmp_path, nested, exclusions):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    raw.pop("quantization_config", None)
+    if nested:
+        raw["text_config"]["quantization_config"] = {"quant_method": "fp8"}
+    else:
+        raw["text_config"].pop("quantization_config", None)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps({"quantization": {"quant_algo": "FP8", "exclude_modules": exclusions}})
+    )
+    if not nested and not exclusions:
+        with pytest.raises(ValueError, match="does not explicitly exclude both"):
+            get_model_config_from_model_path(str(tmp_path))
+    else:
+        parsed = get_model_config_from_model_path(str(tmp_path))
+        assert parsed["encoder_config"] is not None
+        if nested:
+            assert "quantization_config" not in parsed["raw_config"]
+        else:
+            assert parsed["raw_config"]["quantization_config"]["ignore"] == exclusions

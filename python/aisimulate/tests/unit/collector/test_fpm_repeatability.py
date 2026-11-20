@@ -1925,6 +1925,18 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
     monkeypatch.setenv("CUSTOM_AUTH", token)
     resolved = repeatability.load_repeatability_deployment(source, resolve_environment=True)
     assert resolved == with_kv_warmup_defaults(overrides)
+    handed_off = repeatability.load_repeatability_deployment(source)
+    assert plan.generator_config_sha256 in repeatability._deployment_hashes(handed_off)
+    if historical != "current":
+        assert handed_off == resolved
+
+    calls = _fake_collector(monkeypatch)
+    report = repeatability.run_repeatability(
+        **_args((plan, source, checkpoint), tmp_path, generator_overrides=handed_off)
+    )
+    assert report["status"] == "passed", report
+    assert calls
+
     _, compared, _ = _collection_controls(plan.cells, resolved)
     assert compared["K8sConfig"]["extra_env"][0] == {"name": "CUSTOM_AUTH", "value": token}
     # Inspection needs no access to the caller's credentials, but still checks

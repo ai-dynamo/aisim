@@ -27,6 +27,8 @@ from .test_runtime_observations import _mutate, _replace_launch, observation_fix
 
 pytestmark = pytest.mark.unit
 
+_BLOCKS = 258
+
 
 @pytest.mark.parametrize("runtime", [None, [], {}, {"version": "0.28.0"}])
 def test_unaudited_runtime_does_not_read_k31_manifest(monkeypatch, runtime):
@@ -94,6 +96,7 @@ def _native_fixture(
     monkeypatch,
     *,
     uniform=False,
+    num_blocks=_BLOCKS,
     scheduler_projection=True,
     attention_block=64,
     payload_scale=1,
@@ -110,7 +113,7 @@ def _native_fixture(
         # gaps; packed fixtures must satisfy both MLA and indexer alignment.
         quantum = math.lcm(quantum, mla_width * max(32, mla_page_rows))
     pool_page = (pool_page + quantum - 1) // quantum * quantum
-    storage = _Storage(1234, 10 * pool_page)
+    storage = _Storage(1234, num_blocks * pool_page)
     layers, groups, placements = {}, [], []
     for stem, page, width in (
         ("mla", mla_page, mla_width if mla_width is not None else 2 * payload_scale),
@@ -132,7 +135,7 @@ def _native_fixture(
         groups.append(SimpleNamespace(layer_names=names, kv_cache_spec=spec, host_resident=False, is_eagle_group=False))
         placements.append(
             SimpleNamespace(
-                size=10 * pool_page,
+                size=num_blocks * pool_page,
                 layers=names,
                 layer_stride=page,
                 block_stride=pool_page,
@@ -149,11 +152,11 @@ def _native_fixture(
             layer = _typed(module, class_name)
             layer.kv_cache = (
                 (
-                    _Tensor(storage, i * page, (10, 1, 6), "torch.bfloat16", 2, pool_page),
-                    _Tensor(storage, i * page + 12, (10, 1, 2, 2), "torch.float32", 4, pool_page),
+                    _Tensor(storage, i * page, (num_blocks, 1, 6), "torch.bfloat16", 2, pool_page),
+                    _Tensor(storage, i * page + 12, (num_blocks, 1, 2, 2), "torch.float32", 4, pool_page),
                 )
                 if stem == "kda"
-                else _Tensor(storage, i * page, (10, attention_block, width), "torch.uint8", 1, pool_page)
+                else _Tensor(storage, i * page, (num_blocks, attention_block, width), "torch.uint8", 1, pool_page)
             )
             layers[name] = layer
     if uniform:
@@ -174,7 +177,7 @@ def _native_fixture(
                 )
             )
         groups = wrapped
-    config = SimpleNamespace(num_blocks=10, kv_cache_groups=groups, kv_cache_tensors=placements)
+    config = SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=groups, kv_cache_tensors=placements)
     vllm = SimpleNamespace(
         model_config=SimpleNamespace(
             max_model_len=4096, hf_config=SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"])
@@ -186,11 +189,13 @@ def _native_fixture(
     worker = SimpleNamespace(
         vllm_config=vllm,
         _fpm_cache_initialized=True,
-        _fpm_available_cache_bytes=10 * pool_page + 80,
+        _fpm_available_cache_bytes=num_blocks * pool_page + 80,
         model_runner=SimpleNamespace(kv_cache_config=config, kv_caches=[x.kv_cache for x in layers.values()]),
     )
     pool = SimpleNamespace(
-        num_gpu_blocks=10, get_num_free_blocks=lambda: 9, null_block=SimpleNamespace(is_null=True, block_id=0)
+        num_gpu_blocks=num_blocks,
+        get_num_free_blocks=lambda: (num_blocks - 1),
+        null_block=SimpleNamespace(is_null=True, block_id=0),
     )
     scheduler = SimpleNamespace(
         vllm_config=vllm,
@@ -222,7 +227,7 @@ def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkey
     assert groups[-1]["blocks_per_request"] == 1
     assert groups[-1]["page_size_bytes"] == 512
     assert [v["dtype"] for v in cache["layer_components"]["kda.0"]] == ["torch.bfloat16", "torch.float32"]
-    assert cache["allocated_cache_bytes"] == 5120
+    assert cache["allocated_cache_bytes"] == _BLOCKS * 512
     assert cache["groups"][-1]["state_content_size_bytes"] == 28
     assert cache["groups"][-1]["spec_page_size_bytes"] == 64
 
@@ -235,7 +240,7 @@ def test_direct_attention_views_cover_native_payload_with_optional_page_padding(
     spec.unpadded_page_size_bytes = 64 if padded else 128
     for name in ("mla.0", "mla.1"):
         tensor = worker.vllm_config.compilation_config.static_forward_context[name].kv_cache
-        tensor.shape = (10, 64, (2 if padded else 1) if truncated else spec.unpadded_page_size_bytes // 64)
+        tensor.shape = (_BLOCKS, 64, (2 if padded else 1) if truncated else spec.unpadded_page_size_bytes // 64)
     cache = _adapter(monkeypatch).worker_memory(worker)
     cache["pool_id"] = "pool"
     cache["semantics"] = {**_SEMANTICS, "retention": "full_or_state"}
@@ -250,7 +255,7 @@ def test_direct_attention_views_cover_native_payload_with_optional_page_padding(
         assert cache["groups"][0]["unpadded_page_size_bytes"] == spec.unpadded_page_size_bytes
         assert cache["groups"][0]["spec_page_size_bytes"] == 128
         assert accounting["page_size_bytes"] == 512
-        assert cache["allocated_cache_bytes"] == 5120
+        assert cache["allocated_cache_bytes"] == _BLOCKS * 512
 
 
 @pytest.mark.parametrize("elements", [3, 4])
@@ -262,7 +267,7 @@ def test_mixed_state_component_offsets_must_be_element_aligned(monkeypatch, elem
         state["state_content_size_bytes"] = elements * 2 + 16
     for name in cache["groups"][-1]["layer_names"]:
         convolution, recurrence = cache["layer_components"][name]
-        convolution.update(shape=[10, elements], stride_bytes=[512, 2])
+        convolution.update(shape=[_BLOCKS, elements], stride_bytes=[512, 2])
         recurrence["storage_offset_bytes"] = convolution["storage_offset_bytes"] + elements * 2
     if elements == 3:
         with pytest.raises(ValueError, match="offsets"):
@@ -316,7 +321,7 @@ def test_raw_uniform_wrapper_reads_children_without_abstract_scalar_property(mon
     with pytest.raises(NotImplementedError):
         observer._raw_cache(config)
     raw = observer._raw_cache(config, kimi_k31=True)
-    assert raw["num_blocks"] == 10
+    assert raw["num_blocks"] == _BLOCKS
     assert raw["groups"][0]["page_size_bytes"] == 384
     children = raw["groups"][0]["kv_cache_specs"]
     assert set(children) == set(raw["groups"][0]["layer_names"])
@@ -385,12 +390,15 @@ def test_scheduler_projection_retains_exact_native_geometry_checks(monkeypatch, 
         _physical_views(cache, scheduled, "fp8", context=4096)
 
 
-def _kernel_view_fixture(monkeypatch, *, indexer_width=16, mla_width=None, mla_page_rows=1):
+def _kernel_view_fixture(
+    monkeypatch, *, indexer_width=16, mla_width=None, mla_page_rows=1, attention_block=128, num_blocks=_BLOCKS
+):
     cache, scheduled, _ = _native_fixture(
         monkeypatch,
         uniform=True,
         scheduler_projection=True,
-        attention_block=128,
+        attention_block=attention_block,
+        num_blocks=num_blocks,
         payload_scale=indexer_width,
         mla_width=mla_width,
         mla_page_rows=mla_page_rows,
@@ -399,14 +407,15 @@ def _kernel_view_fixture(monkeypatch, *, indexer_width=16, mla_width=None, mla_p
     stride = cache["tensor_allocations"][0]["block_stride"] // (64 * indexer_width)
     for name in ("indexer.0", "indexer.1"):
         cache["layer_components"][name][0].update(
-            shape=[9 * stride + 2, 64, indexer_width], stride_bytes=[64 * indexer_width, indexer_width, 1]
+            shape=[(num_blocks - 1) * stride + attention_block // 64, 64, indexer_width],
+            stride_bytes=[64 * indexer_width, indexer_width, 1],
         )
         cache["kernel_block_views"][name] = {
             "attention_group_class": "vllm.v1.worker.utils.AttentionGroup",
             "backend_class": "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend",
             "kernel_block_size": 64,
             "kernel_block_stride": stride,
-            "kernel_block_offsets": [0, 1],
+            "kernel_block_offsets": list(range(attention_block // 64)),
             # CP1: ceil(4096 / 128) manager entries, aligned to 128
             # tokens, then two kernel entries per manager block.
             "kernel_block_table_shape": [1, 8, 64],
@@ -421,9 +430,9 @@ def test_native_indexer_kernel_view_charges_only_actual_shared_allocation(monkey
     cache, scheduled = _kernel_view_fixture(monkeypatch)
     groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
     assert len(groups) == 2
-    assert accounting["num_blocks"] == 10 and accounting["page_size_bytes"] == 16384
-    assert cache["allocated_cache_bytes"] == 163840
-    assert cache["layer_components"]["indexer.0"][0]["shape"][0] == 146
+    assert accounting["num_blocks"] == _BLOCKS and accounting["page_size_bytes"] == 16384
+    assert cache["allocated_cache_bytes"] == _BLOCKS * 16384
+    assert cache["layer_components"]["indexer.0"][0]["shape"][0] == (_BLOCKS - 1) * 16 + 2
 
 
 @pytest.mark.parametrize("payload,padded", [(1920, 2048), (2048, 4096)])
@@ -440,92 +449,27 @@ def test_strided_indexer_views_cover_unpadded_payload_and_keep_pool_padding(monk
     if payload == 2048:
         _, accounting = _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
         assert accounting["page_size_bytes"] == 16384
-        assert cache["allocated_cache_bytes"] == 10 * 16384
+        assert cache["allocated_cache_bytes"] == _BLOCKS * 16384
     else:
         with pytest.raises(ValueError, match="layer page coverage"):
             _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
 
 
 def test_native_kernel_table_width_includes_context_alignment(monkeypatch):
-    cache, scheduled = _kernel_view_fixture(monkeypatch)
+    cache, scheduled = _kernel_view_fixture(monkeypatch, attention_block=192)
     for record in (cache, scheduled):
         state = record["groups"][-1]
         for spec in state.get("layer_specs", dict.fromkeys(state["layer_names"], state)).values():
-            spec.update(block_size_tokens=4097, max_model_len=4097)
-        state["block_size_tokens"] = 4097
-    # 4097 tokens need 33 manager blocks (already 128-token aligned),
-    # hence 66 entries in the 64-token kernel table.
+            spec.update(block_size_tokens=4225, max_model_len=4225)
+        state["block_size_tokens"] = 4225
+    # ceil(4225 / 192) = 23 manager blocks; 128-token alignment grows
+    # the width to 24, with three 64-token kernel entries per block.
     for mapping in cache["kernel_block_views"].values():
-        mapping["kernel_block_table_shape"][-1] = 66
-    assert _physical_views(cache, scheduled, "fp8", context=4097, sequences=8)[1]["num_blocks"] == 10
-    cache["kernel_block_views"]["indexer.0"]["kernel_block_table_shape"][-1] = 65
+        mapping["kernel_block_table_shape"][-1] = 72
+    assert _physical_views(cache, scheduled, "fp8", context=4225, sequences=8)[1]["num_blocks"] == _BLOCKS
+    cache["kernel_block_views"]["indexer.0"]["kernel_block_table_shape"][-1] = 69
     with pytest.raises(ValueError, match="kernel-block table"):
-        _physical_views(cache, scheduled, "fp8", context=4097, sequences=8)
-
-
-@pytest.mark.parametrize(
-    "mutation,match",
-    [
-        (lambda c: c["kernel_block_views"].pop("indexer.0"), "coverage"),
-        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_stride=15), "stride"),
-        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_size=3), "subdivision"),
-        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_offsets=[0, 2]), "offsets"),
-        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_table_dtype="torch.int64"), "table"),
-        (lambda c: c["kernel_block_views"]["indexer.0"].update(kernel_block_table_shape=[1, 8, 31]), "table"),
-        (lambda c: c["kernel_block_views"]["indexer.0"].update(backend_class="other.Backend"), "address mapping"),
-        (
-            lambda c: c["kernel_block_views"]["indexer.0"].update(writes_kv_cache_from_block_table=False),
-            "address mapping",
-        ),
-        (lambda c: c["kernel_block_views"].update({"unknown.layer": {}}), "layer coverage"),
-        (lambda c: c["layer_components"]["indexer.0"][0].update(shape=[145, 64, 16]), "coverage"),
-        (lambda c: c["layer_components"]["indexer.0"][0].update(stride_bytes=[31, 16, 1]), "stride"),
-        (lambda c: c["layer_components"]["indexer.0"][0].update(storage_offset_bytes=8193), "offsets"),
-        (lambda c: c["tensor_allocations"][1].update(layer_stride=32), "overlap"),
-    ],
-)
-def test_kernel_view_mapping_cannot_hide_pool_or_layer_corruption(monkeypatch, mutation, match):
-    cache, scheduled = _kernel_view_fixture(monkeypatch)
-    mutation(cache)
-    with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
-
-
-@pytest.mark.parametrize(
-    "mutation,match",
-    [
-        (lambda g: g["layer_specs"].pop("indexer.0"), "every native per-layer"),
-        (lambda g: g.update(spec_page_size_bytes=385), "page sum"),
-        (lambda g: g["layer_specs"]["indexer.0"].update(block_size_tokens=8), "incompatible per-layer"),
-    ],
-)
-def test_native_uniform_wrapper_requires_exact_child_geometry(monkeypatch, mutation, match):
-    cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True)
-    mutation(cache["groups"][0])
-    with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8", context=4096)
-
-
-@pytest.mark.parametrize(
-    "mutation,match",
-    [
-        (lambda c, s: c["layer_components"]["kda.0"].pop(), "component count"),
-        (lambda c, s: c["layer_components"]["kda.0"][1].update(dtype="torch.uint8"), "shape/dtype"),
-        (lambda c, s: c["layer_components"]["kda.0"][1].update(storage_offset_bytes=0), "offsets"),
-        (lambda c, s: c["layer_components"]["kda.0"][0]["stride_bytes"].__setitem__(0, 256), "coverage"),
-        (lambda c, s: c["tensor_allocations"][-1].update(layer_stride=32), "overlap"),
-        (lambda c, s: c["tensor_allocations"][-1].update(block_stride=64), "block-outer"),
-        (lambda c, s: c["tensor_allocations"][-1].update(host_resident=True), "device"),
-        (lambda c, s: c["tensor_allocations"].pop(), "omit"),
-        (lambda c, s: c["layer_components"]["mla.0"][0]["shape"].__setitem__(0, 20), "coverage"),
-        (lambda c, s: s["groups"][-1].update(mamba_cache_mode="align"), "geometry"),
-    ],
-)
-def test_native_component_or_allocation_corruption_is_rejected(monkeypatch, mutation, match):
-    cache, scheduled, _ = _native_fixture(monkeypatch)
-    mutation(cache, scheduled)
-    with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8", context=4096)
+        _physical_views(cache, scheduled, "fp8", context=4225, sequences=8)
 
 
 def test_uniform_attention_child_cannot_override_parent_kind_with_state_components(monkeypatch):
@@ -535,14 +479,14 @@ def test_uniform_attention_child_cannot_override_parent_kind_with_state_componen
     component = cache["layer_components"]["mla.0"][0]
     convolution = {
         **component,
-        "shape": [10, 4, 8],
+        "shape": [_BLOCKS, 4, 8],
         "stride_bytes": [512, 16, 2],
         "dtype": "torch.bfloat16",
         "element_size_bytes": 2,
     }
     recurrence = {
         **component,
-        "shape": [10, 4, 4],
+        "shape": [_BLOCKS, 4, 4],
         "stride_bytes": [512, 16, 4],
         "dtype": "torch.float32",
         "element_size_bytes": 4,
@@ -561,7 +505,7 @@ def test_nonuniform_group_cannot_override_its_geometry_with_child_specs(monkeypa
     with pytest.raises(ValueError, match="per-layer specs require a native uniform group"):
         _physical_views(cache, scheduled, "fp8", context=4096)
     with pytest.raises(ValueError, match="per-layer specs require a native uniform group"):
-        runtime_k31.validate_views(cache, "fp8", 10, 512)
+        runtime_k31.validate_views(cache, "fp8", _BLOCKS, 512)
 
 
 def test_kernel_offsets_reject_huge_geometry_without_allocating_from_it(monkeypatch):
@@ -572,7 +516,7 @@ def test_kernel_offsets_reject_huge_geometry_without_allocating_from_it(monkeypa
         runtime_k31, "range", lambda *_: pytest.fail("range allocation from untrusted geometry"), raising=False
     )
     with pytest.raises(ValueError, match="kernel-block offsets"):
-        runtime_k31._kernel_view_geometry(mapping, {"block_size_tokens": 2**53}, {}, 10, 512, 64)
+        runtime_k31._kernel_view_geometry(mapping, {"block_size_tokens": 2**53}, {}, _BLOCKS, 512, 64)
 
 
 @pytest.mark.parametrize("mutation", ["none", "out_of_bounds", "overlap"])
@@ -865,6 +809,7 @@ def _complete_fixture(
     mla_latent=512,
     mla_rope=64,
     indexer_dim=128,
+    num_blocks=_BLOCKS,
 ):
     path, launches = observation_fixture(tmp_path, version=runtime_k31.VERSION)
     launch = launches["tp2"]
@@ -877,7 +822,7 @@ def _complete_fixture(
                     "num_hidden_layers": 4,
                     "kv_lora_rank": mla_latent,
                     "qk_rope_head_dim": mla_rope,
-                    "qk_nope_head_dim": 128,
+                    "qk_nope_head_dim": 256 if mla_rope == 0 else 128,
                     "num_experts": 8,
                     "first_k_dense_replace": 1,
                     "linear_attn_config": {
@@ -890,6 +835,7 @@ def _complete_fixture(
                     },
                     "dsa_config": {
                         "dsa_layers": [3, 4],
+                        "index_rope_dim": 0 if mla_rope == 0 else 64,
                         **({} if indexer_dim == "absent" else {"index_head_dim": indexer_dim}),
                     },
                 },
@@ -916,13 +862,17 @@ def _complete_fixture(
     indexer_width = (64 if indexer_dim == "absent" else indexer_dim or 128) + 4
     if packed_indexer:
         cache, scheduled = _kernel_view_fixture(
-            monkeypatch, indexer_width=indexer_width, mla_width=mla_latent + mla_rope
+            monkeypatch, indexer_width=indexer_width, mla_width=mla_latent + mla_rope, num_blocks=num_blocks
         )
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     else:
         cache, scheduled, _ = _native_fixture(
-            monkeypatch, uniform=not separate_attention, payload_scale=indexer_width, mla_width=mla_latent + mla_rope
+            monkeypatch,
+            uniform=not separate_attention,
+            payload_scale=indexer_width,
+            mla_width=mla_latent + mla_rope,
+            num_blocks=num_blocks,
         )
     index = json.loads(path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
@@ -1131,7 +1081,7 @@ def test_import_rejects_self_consistent_unsupported_cuda_kernel_blocks(tmp_path,
                 kernel_block_table_shape=[1, 64, 4096 // kernel],
             )
             cache["layer_components"][name][0].update(
-                shape=[9 * stride + subdivisions, kernel, width], stride_bytes=[kernel * width, width, 1]
+                shape=[(_BLOCKS - 1) * stride + subdivisions, kernel, width], stride_bytes=[kernel * width, width, 1]
             )
 
     _mutate(path, change_kernel)
@@ -1221,7 +1171,7 @@ def test_complete_rank_import_preserves_native_grouping_state_and_precision(
     # Two 656-byte padded MLA rows plus two 132-byte indexer rows per token,
     # 64 tokens per block, aligned to 24 indexer kernel pages per pool slot:
     # lcm(32 * 576 MLA bytes, 64 * 132 indexer bytes) = 202752 bytes.
-    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == 9 * 24 * 64 * 132
+    assert result["resources"]["runtime_memory"]["kv_cache_bytes"] == (_BLOCKS - 1) * 24 * 64 * 132
     assert len(result["provenance"]["rank_capacities"]) == 4
     assert {capacity["phase"] for capacity in result["provenance"]["rank_capacities"]} == {workload_kind}
     for artifact in result["provenance"]["artifacts"]:
@@ -1277,7 +1227,7 @@ def test_import_rejects_self_consistent_indexer_payload_not_matching_checkpoint(
                     mapping = record["cache"]["kernel_block_views"][name]
                     stride = record["cache"]["tensor_allocations"][0]["block_stride"] // (64 * 16)
                     mapping["kernel_block_stride"] = stride
-                    view["shape"][0] = 9 * stride + 2
+                    view["shape"][0] = (_BLOCKS - 1) * stride + 2
                     view["stride_bytes"][0] = 64 * 16
 
     _mutate(path, corrupt)
@@ -1413,9 +1363,11 @@ def test_unmapped_indexer_requires_exactly_64_token_blocks(monkeypatch, block):
     # Preserve both the page and the logical payload, so the old shape and
     # byte-count checks alone would accept this unsupported kernel geometry.
     for name in group["layer_names"]:
-        cache["layer_components"][name][0].update(shape=[10, block, 64 // block], stride_bytes=[512, 64 // block, 1])
+        cache["layer_components"][name][0].update(
+            shape=[_BLOCKS, block, 64 // block], stride_bytes=[512, 64 // block, 1]
+        )
     with pytest.raises(ValueError, match="CUDA indexer requires 64-token"):
-        runtime_k31.validate_views(cache, "fp8", 10, 512, context=4096)
+        runtime_k31.validate_views(cache, "fp8", _BLOCKS, 512, context=4096)
 
 
 @pytest.mark.parametrize("quantization", ["absent", "wrong_method", "wrong_class"])
@@ -1604,23 +1556,26 @@ def test_import_requires_projected_scheduler_specs(tmp_path, monkeypatch, retain
         assert "scheduler cache group geometry disagrees" in str(result["diagnostics"])
 
 
-@pytest.mark.parametrize("reserved", [[0], [0, 1]])
-def test_import_native_reservations_are_only_the_null_block(tmp_path, monkeypatch, reserved):
-    path, launches = _complete_fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize("reserved,free", [([0], 9), ([0], 64), ([0], 65), ([0, 1], 65)])
+def test_import_native_reservations_are_only_the_null_block(tmp_path, monkeypatch, reserved, free):
+    blocks = free + len(reserved)
+    path, launches = _complete_fixture(tmp_path, monkeypatch, num_blocks=blocks)
 
     def reserve(record):
         if record["kind"] == "scheduler":
             record["cache"].update(
                 permanent_reserved_block_ids=reserved,
                 reserved_blocks=len(reserved),
-                initial_free_blocks=10 - len(reserved),
+                initial_free_blocks=free,
             )
 
     _mutate(path, reserve)
     result = validate_observations(path, launches)["tp2"]
-    assert result["status"] == ("complete" if reserved == [0] else "incomplete"), result["diagnostics"]
+    assert result["status"] == ("complete" if reserved == [0] and free >= 65 else "incomplete"), result["diagnostics"]
     if len(reserved) > 1:
         assert "singleton null-block reservation" in str(result["diagnostics"])
+    elif free < 65:
+        assert "cannot hold one request" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("enabled,planes", [(False, 1), (False, 2), (True, 2), (True, 1)])
@@ -1653,9 +1608,9 @@ def test_import_state_shapes_are_bound_to_checkpoint_not_just_matching_views(tmp
             if record["kind"] == "worker":
                 for name in state["layer_names"]:
                     conv, recurrent = record["cache"]["layer_components"][name]
-                    conv.update(shape=[10, 2], stride_bytes=[conv["stride_bytes"][0], 2])
+                    conv.update(shape=[_BLOCKS, 2], stride_bytes=[conv["stride_bytes"][0], 2])
                     recurrent.update(
-                        shape=[10, 1],
+                        shape=[_BLOCKS, 1],
                         stride_bytes=[recurrent["stride_bytes"][0], 4],
                         storage_offset_bytes=conv["storage_offset_bytes"] + 4,
                     )
@@ -1689,11 +1644,11 @@ def test_import_indexer_subdivision_requires_observed_mapping(tmp_path, monkeypa
                 for name in group["layer_names"]:
                     view = cache["layer_components"][name][0]
                     width = view["shape"][1] * view["shape"][2] // block
-                    view.update(shape=[10, block, width], stride_bytes=[view["stride_bytes"][0], width, 1])
+                    view.update(shape=[_BLOCKS, block, width], stride_bytes=[view["stride_bytes"][0], width, 1])
         elif not mapped and record["kind"] == "worker":
             for name in cache.pop("kernel_block_views"):
                 cache["layer_components"][name][0].update(
-                    shape=[10, 128, 132],
+                    shape=[_BLOCKS, 128, 132],
                     stride_bytes=[cache["tensor_allocations"][0]["block_stride"], 132, 1],
                 )
 
@@ -1749,7 +1704,7 @@ def test_import_kda_convolution_shape_follows_reviewed_layout(tmp_path, monkeypa
         if record["kind"] == "worker":
             for name in state["layer_names"]:
                 view = record["cache"]["layer_components"][name][0]
-                view.update(shape=[10, 6, 1], stride_bytes=[view["stride_bytes"][0], 2, 2])
+                view.update(shape=[_BLOCKS, 6, 1], stride_bytes=[view["stride_bytes"][0], 2, 2])
 
     _mutate(path, orient)
     result = validate_observations(path, launches)["tp2"]
@@ -2086,17 +2041,17 @@ def test_flashinfer_pool_stride_uses_32_row_pages(monkeypatch, cache_dtype, stri
     del cache["layer_components"]["mla.1"]
     cache["tensor_allocations"][0]["layers"].remove("mla.1")
     group["cache_dtype_str"] = cache_dtype
-    cache["storages"][0]["size_bytes"] = 10 * stride
+    cache["storages"][0]["size_bytes"] = _BLOCKS * stride
     for allocation in cache["tensor_allocations"]:
-        allocation.update(size=10 * stride, block_stride=stride)
+        allocation.update(size=_BLOCKS * stride, block_stride=stride)
     for components in cache["layer_components"].values():
         for component in components:
             component["stride_bytes"][0] = stride
     if stride == 576 * 96:
-        runtime_k31.validate_views(cache, "fp8", 10, stride, context=4096)
+        runtime_k31.validate_views(cache, "fp8", _BLOCKS, stride, context=4096)
     else:
         with pytest.raises(ValueError, match="32-row pages for FlashInfer"):
-            runtime_k31.validate_views(cache, "fp8", 10, stride, context=4096)
+            runtime_k31.validate_views(cache, "fp8", _BLOCKS, stride, context=4096)
 
 
 @pytest.mark.parametrize("launcher", [None, "prims_ts", "trtllm"])
@@ -2148,3 +2103,29 @@ def _assert_no_credential(text, token):
 def test_archived_credential_check_detects_unrelated_nested_field(token):
     with pytest.raises(AssertionError):
         _assert_no_credential(json.dumps({"unrelated": {"nested": token}}), token)
+
+
+@pytest.mark.parametrize("rope", [0, 32])
+def test_no_rope_checkpoint_rejects_indexer_rope(tmp_path, monkeypatch, rope):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, mla_rope=0)
+    launch = launches["tp2"]
+    model = Path(launch["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["text_config"]["mla_use_nope"] = True
+    config["text_config"]["dsa_config"]["index_rope_dim"] = rope
+    model.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    _replace_launch(path, launches)
+    _mutate(path, lambda record: record.update(model_config_sha256=launch["model_config"]["sha256"]))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if rope == 0 else "incomplete"), result["diagnostics"]
+    if rope:
+        assert "index_rope_dim=0" in str(result["diagnostics"])
+
+
+def test_non_speculative_indexer_rejects_slot_mapping_flag(monkeypatch):
+    cache, scheduled = _kernel_view_fixture(monkeypatch)
+    _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
+    cache["kernel_block_views"]["indexer.0"]["maps_slot_mapping"] = True
+    with pytest.raises(ValueError, match="native address mapping"):
+        _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)

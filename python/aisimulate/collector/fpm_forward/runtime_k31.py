@@ -469,6 +469,8 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
                         dsa = decoder.get("dsa_config")
                         if not isinstance(dsa, dict):
                             raise ValueError("K3.1 checkpoint indexer configuration is missing")
+                        if decoder.get("mla_use_nope") is True and dsa.get("index_rope_dim", 64) != 0:
+                            raise ValueError("K3.1 no-RoPE MLA requires index_rope_dim=0")
                         # Pinned kimi_k3/common/dsa_cache.py::indexer_cache_entry_bytes:
                         # each FP8 key carries one FP32 scale. Bind the logical
                         # payload only; native padded pages still own placement.
@@ -517,7 +519,7 @@ def _kernel_view_geometry(
         not isinstance(mapping, dict)
         or mapping.get("attention_group_class") != "vllm.v1.worker.utils.AttentionGroup"
         or mapping.get("backend_class") != "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerBackend"
-        or type(mapping.get("maps_slot_mapping")) is not bool
+        or mapping.get("maps_slot_mapping") is not False
         or mapping.get("writes_kv_cache_from_block_table") is not True
     ):
         raise ValueError("K3.1 kernel-block view has no audited native address mapping")

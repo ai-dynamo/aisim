@@ -180,6 +180,11 @@ def snapshot(request):
         record.update(cell_id="native-cell", collector_attempt_id="native-attempt")
         ref["sha256"] = _write(path, record)["sha256"]
     target.write_text(json.dumps(index))
+    from collector.fpm_forward.runtime_observations import validate_observations
+
+    imported = validate_observations(target, {"tp2": bound_inputs["runtime_launch"]})["tp2"]
+    assert imported["status"] == "complete", imported["diagnostics"]
+    bound_inputs["profile"]["deployments"][0]["resources"] = imported["resources"]
     raw = root / "cells/native-cell/raw"
     raw.mkdir(parents=True)
     plan = SimpleNamespace(
@@ -977,6 +982,9 @@ def test_cell_acceptance_revalidates_archived_worker_evidence(snapshot):
     plan, cell, raw, collection, index = snapshot
     plan.capability = SimpleNamespace(architecture="KimiK31ForConditionalGeneration")
     cell.moe_quant_mode = "w4a8_mxfp4_mxfp8_trtllm"
+    plan.deployment_profile = lambda _: SimpleNamespace(
+        resources=SimpleNamespace(runtime_memory=SimpleNamespace(kv_cache_bytes=1))
+    )
     require_k31_worker_evidence(plan, cell, raw, collection)
 
     def unresolved(record):
@@ -998,3 +1006,23 @@ def test_hashless_sidecar_needs_native_loaded_commit(loaded):
     assert execution_evidence._matches_pinned_hub_snapshot("fixture/model", model, {revision}, native) == (
         loaded == revision
     )
+
+
+@pytest.mark.parametrize("capacity_delta", [-1, 0, 1])
+def test_publication_worker_gate_enforces_reviewed_usable_capacity(snapshot, monkeypatch, capacity_delta):
+    from collector.fpm_forward import database
+    from collector.fpm_forward.runtime_observations import validate_observation_phase
+
+    plan, cell, raw, collection, index = snapshot
+    actual = validate_observation_phase(index, "tp2", plan.runtime_launch, phase="decode", attempt_id="attempt-001")
+    capacity = actual["resources"]["runtime_memory"]["kv_cache_bytes"]
+    plan.capability = SimpleNamespace(architecture="KimiK31ForConditionalGeneration")
+    plan.deployment_profile = lambda _: SimpleNamespace(
+        resources=SimpleNamespace(runtime_memory=SimpleNamespace(kv_cache_bytes=capacity + capacity_delta))
+    )
+    cell.moe_quant_mode = "w4a8_mxfp4_mxfp8_trtllm"
+    if capacity_delta > 0:
+        with pytest.raises(ValueError, match="smaller than the accepted bound"):
+            database.require_k31_worker_evidence(plan, cell, raw, collection)
+    else:
+        database.require_k31_worker_evidence(plan, cell, raw, collection)

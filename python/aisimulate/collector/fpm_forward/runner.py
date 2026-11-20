@@ -18,7 +18,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -48,13 +47,14 @@ from aisimulate.fpm_contract import (
 )
 
 from .config import (
-    FPM_RUNTIME_STARTUP_ENV,
     archive_generator_overrides,
     resolve_archived_generator_overrides,
     with_kv_warmup_defaults,
 )
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
+from .private_inputs import delivery_directory as new_delivery_directory
+from .private_inputs import private_values, reclaim_delivery, redact, redact_diagnostics
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
     MEMORY_SUPPORTED_VERSIONS,
@@ -964,11 +964,16 @@ class KubernetesCellRunner:
                 try:
                     _, completed = future.result()
                 except Exception as error:
-                    (logs_dir / f"{pod}.run.stderr.log").write_text(str(error) + "\n")
-                    failures.append((pod, str(error)))
+                    diagnostic = redact(str(error), getattr(self, "_private_values", ()))
+                    (logs_dir / f"{pod}.run.stderr.log").write_text(diagnostic + "\n")
+                    failures.append((pod, diagnostic))
                     continue
-                (logs_dir / f"{pod}.run.stdout.log").write_text(completed.stdout)
-                (logs_dir / f"{pod}.run.stderr.log").write_text(completed.stderr)
+                (logs_dir / f"{pod}.run.stdout.log").write_text(
+                    redact(completed.stdout, getattr(self, "_private_values", ()))
+                )
+                (logs_dir / f"{pod}.run.stderr.log").write_text(
+                    redact(completed.stderr, getattr(self, "_private_values", ()))
+                )
         except BaseException as error:
             # An interrupt lands here while worker threads sit in kubectl
             # waits they cannot be signalled out of; kill the children first
@@ -1030,7 +1035,10 @@ class KubernetesCellRunner:
                 check=False,
                 timeout=120,
             )
-            (logs_dir / f"{pod}.container.log").write_text(logs.stdout + logs.stderr)
+            (logs_dir / f"{pod}.container.log").write_text(
+                redact(logs.stdout + logs.stderr, getattr(self, "_private_values", ()))
+            )
+        redact_diagnostics(self.cell_dir, getattr(self, "_private_values", ()))
         if require_benchmark and not benchmark_observed:
             raise RuntimeError("FPM cell result manifests contain no benchmark JSON files")
 
@@ -1686,16 +1694,14 @@ def _configured_sampling_metadata(
 
 
 def _write_runtime_environment(cell_dir: Path, overrides: dict[str, Any]) -> None:
-    # Generator owns run.sh and fpm_env.sh. Mirror only startup inputs through
-    # this Collector-owned file: run.sh cannot export settings back to its
-    # parent runtime, and Slurm does not inherit a Kubernetes Pod environment.
-    lines = ["# Generated Collector startup environment; engine settings remain in run.sh."]
+    # Preparation, version detection and the engine must see identical caller
+    # inputs, including package discovery controls such as PYTHONUSERBASE.
+    lines = ["# Generated Collector deployment environment."]
     for item in overrides["K8sConfig"]["extra_env"]:
-        if item["name"] in FPM_RUNTIME_STARTUP_ENV:
-            value = item.get("value")
-            if not isinstance(value, str):
-                raise ValueError(f"Collector startup environment {item['name']} requires a literal string")
-            lines.append(f"export {item['name']}={shlex.quote(value)}")
+        value = item.get("value")
+        if not isinstance(value, str):
+            raise ValueError(f"Collector startup environment {item['name']} requires a literal string")
+        lines.append(f"export {item['name']}={shlex.quote(value)}")
     (cell_dir / RUNTIME_ENV_FILENAME).write_text("\n".join(lines) + "\n")
 
 
@@ -1965,7 +1971,7 @@ def _recover_completed_attempt(
     """
 
     status = entry.get("status")
-    if status not in FPM_RECOVERABLE_STATUSES or "cleanup_error" in entry:
+    if status not in FPM_RECOVERABLE_STATUSES or "cleanup_error" in entry or "private_cleanup_error" in entry:
         return None
     cell_dir = root / "cells" / cell.cell_id
     try:
@@ -2146,6 +2152,7 @@ def _run_collection_impl(
     root.mkdir(parents=True, exist_ok=True)
     _atomic_json(root / "collection-plan.json", plan.to_dict())
     archived_overrides = archive_generator_overrides(generator_overrides)
+    sensitive_values = private_values(generator_overrides)
     _atomic_json(root / "generator-overrides.json", archived_overrides)
     private_delivery = any("value_from_env" in item for item in archived_overrides["K8sConfig"]["extra_env"])
     checkpoint_name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
@@ -2225,6 +2232,33 @@ def _run_collection_impl(
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
     target_cells = plan.cells[: (cell_limit or (1 if smoke else len(plan.cells)))]
+
+    if getattr(plan.options, "executor", "kubernetes") == "slurm":
+        for cell in target_cells:
+            cell_dir = root / "cells" / cell.cell_id
+            if not (cell_dir / ".private-delivery.json").exists():
+                continue
+            try:
+                _cell_runner(plan, cell, cell_dir / FPM_MANIFEST_FILENAME, cell_dir).cleanup()
+                reclaim_delivery(cell_dir)
+            except Exception as error:
+                checkpoint["cells"][cell.cell_id] = {
+                    **checkpoint["cells"].get(cell.cell_id, {}),
+                    "status": "cleanup_failed",
+                    "cleanup_error": redact(str(error), sensitive_values),
+                    "artifact_dir": str(cell_dir),
+                }
+                errors.append(
+                    {
+                        "module": "fpm_forward",
+                        "cell_id": cell.cell_id,
+                        "error_type": type(error).__name__,
+                        "error_message": redact(str(error), sensitive_values),
+                        "classification": "resource_cleanup_failed",
+                    }
+                )
+                observation_archive_failed.add(cell.cell_id)
+                _atomic_json(checkpoint_path, checkpoint)
 
     formal_database_terminal = False
     database_entry = checkpoint.get("database")
@@ -2371,7 +2405,7 @@ def _run_collection_impl(
                     checkpoint["cells"][cell.cell_id] = {
                         **previous,
                         "status": "cleanup_failed",
-                        "cleanup_error": str(error),
+                        "cleanup_error": redact(str(error), sensitive_values),
                         "artifact_dir": str(cell_dir),
                     }
                     errors.append(
@@ -2429,9 +2463,8 @@ def _run_collection_impl(
                 _render_cell(plan, cell, cell_dir, generator_overrides, smoke=smoke, resolve_environment=False)
                 # Retain only digest references. Pyxis staging must share the
                 # campaign filesystem, while the directory remains private.
-                delivery_directory = tempfile.TemporaryDirectory(
-                    prefix="aisimulate-collection-delivery-",
-                    dir=root if getattr(plan.options, "executor", "kubernetes") == "slurm" else None,
+                delivery_directory = new_delivery_directory(
+                    Path(artifact_root), cell_dir, getattr(plan.options, "executor", "kubernetes")
                 )
                 worker_dir = Path(delivery_directory.name)
             _render_cell(plan, cell, worker_dir, generator_overrides, smoke=smoke)
@@ -2445,6 +2478,7 @@ def _run_collection_impl(
                     f"{FPM_ENV_FILENAME}, {FPM_RUN_SCRIPT_FILENAME}, and {RUNTIME_ENV_FILENAME}"
                 )
             resource = _cell_runner(plan, cell, manifest, cell_dir)
+            resource._private_values = sensitive_values
             if private_delivery and getattr(plan.options, "executor", "kubernetes") == "slurm":
                 resource.runtime_dir = worker_dir / "slurm-runtime"
             # A prior invocation may have left the same-named workload alive
@@ -2530,6 +2564,7 @@ def _run_collection_impl(
             phase_marks["execute_wall_s"] = round(time.monotonic() - mark, 3)
             mark = time.monotonic()
             resource.collect(pods)
+            redact_diagnostics(cell_dir, sensitive_values)
             phase_marks["collect_s"] = round(time.monotonic() - mark, 3)
             _validate_points_receipts(plan, cell, cell_dir / "raw", attempt_id)
             runtime_collection = _runtime_collection_summary(
@@ -2565,37 +2600,55 @@ def _run_collection_impl(
                 "status": "failed",
                 "artifact_dir": str(cell_dir),
                 "error_type": type(error).__name__,
-                "error": str(error),
+                "error": redact(str(error), sensitive_values),
             }
             errors.append(
                 {
                     "module": "fpm_forward",
                     "cell_id": cell.cell_id,
                     "error_type": type(error).__name__,
-                    "error_message": str(error),
+                    "error_message": redact(str(error), sensitive_values),
                     "classification": "campaign_cell_failed",
                 }
             )
         finally:
+            teardown_ok = resource is None
             if resource is not None:
                 try:
                     resource.cleanup()
+                    teardown_ok = True
                 except Exception as cleanup_error:
                     record = checkpoint["cells"][cell.cell_id]
                     if record.get("status") == "passed":
                         record["status"] = "cleanup_failed"
-                    checkpoint["cells"][cell.cell_id]["cleanup_error"] = str(cleanup_error)
+                    checkpoint["cells"][cell.cell_id]["cleanup_error"] = redact(str(cleanup_error), sensitive_values)
                     errors.append(
                         {
                             "module": "fpm_forward",
                             "cell_id": cell.cell_id,
                             "error_type": type(cleanup_error).__name__,
-                            "error_message": str(cleanup_error),
+                            "error_message": redact(str(cleanup_error), sensitive_values),
                             "classification": "resource_cleanup_failed",
                         }
                     )
-            if delivery_directory is not None:
-                delivery_directory.cleanup()
+            if delivery_directory is not None and teardown_ok:
+                try:
+                    delivery_directory.cleanup()
+                except Exception as cleanup_error:
+                    record = checkpoint["cells"][cell.cell_id]
+                    if record.get("status") == "passed":
+                        record["status"] = "cleanup_failed"
+                    record["private_cleanup_error"] = redact(str(cleanup_error), sensitive_values)
+                    errors.append(
+                        {
+                            "module": "fpm_forward",
+                            "cell_id": cell.cell_id,
+                            "error_type": type(cleanup_error).__name__,
+                            "error_message": redact(str(cleanup_error), sensitive_values),
+                            "classification": "private_cleanup_failed",
+                        }
+                    )
+            redact_diagnostics(cell_dir, sensitive_values)
             record = checkpoint["cells"][cell.cell_id]
             record["collector_phase_seconds"] = dict(phase_marks)
             record["completed_at"] = _utc_now()

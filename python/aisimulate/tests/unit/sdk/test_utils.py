@@ -2303,10 +2303,14 @@ def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog
 
 
 @pytest.mark.parametrize(
-    "sidecar",
-    [None, {"min_pixels": 3136, "max_pixels": 1003520}, {"size": {"shortest_edge": 3136, "longest_edge": 1003520}}],
+    "sidecar,bounds",
+    [
+        (None, (131072, 1048576)),
+        ({"min_pixels": 3136, "max_pixels": 1003520}, (3136, 1003520)),
+        ({"size": {"shortest_edge": 3136, "longest_edge": 1003520}}, (3136, 1003520)),
+    ],
 )
-def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar):
+def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar, bounds):
     from copy import deepcopy
 
     from aisimulate_core.sdk import fpm_profile
@@ -2332,7 +2336,6 @@ def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar):
     utils.get_model_config_from_model_path.cache_clear()
     monkeypatch.setattr(utils, "_download_hf_json", download)
     parsed = utils.get_model_config_from_model_path(model, model_revision=revision)
-    bounds = utils._qwen_pixel_bounds(sidecar or raw["preprocessor_config"])
     assert (parsed["extra_params"].min_pixels, parsed["extra_params"].max_pixels) == (
         bounds[0],
         bounds[1],
@@ -2395,3 +2398,51 @@ def test_moving_hub_alias_resolves_before_metadata_caches(monkeypatch, model_inf
     pinned = load("test/moving-qwen", model_revision="a" * 40)
     assert first["hidden_size"] == pinned["hidden_size"] == 4096
     assert second["hidden_size"] == 8192
+
+
+@pytest.mark.parametrize("metadata", [[], [["sha", "a" * 40]], None, "revision", 5])
+def test_hub_revision_rejects_non_object_metadata(monkeypatch, metadata):
+    monkeypatch.setattr(utils.urllib.request, "urlopen", lambda *_, **__: io.BytesIO(json.dumps(metadata).encode()))
+    with pytest.raises(utils.HuggingFaceDownloadError, match="immutable checkpoint revision"):
+        utils._resolve_hf_revision("synthetic/non-object-revision", "main")
+
+
+@pytest.mark.parametrize("payload", [[], [["architectures", ["LlamaForCausalLM"]]], None])
+def test_pinned_config_requires_json_object(monkeypatch, payload):
+    from aisimulate_core.sdk import fpm_profile
+
+    monkeypatch.setattr(fpm_profile, "_load_pinned_checkpoint_config", lambda *_: payload)
+    utils._load_model_config_from_model_path.cache_clear()
+    with pytest.raises(ValueError, match="config.json must be an object"):
+        utils.get_model_config_from_model_path("synthetic/non-object-config", model_revision="a" * 40)
+
+
+@pytest.mark.parametrize("model_info", [False, True])
+def test_local_to_hub_source_switch_does_not_reuse_cached_geometry(tmp_path, monkeypatch, model_info):
+    from copy import deepcopy
+
+    from aisimulate_core.sdk.models import helpers
+
+    monkeypatch.chdir(tmp_path)
+    checkpoint = tmp_path / "org/model"
+    checkpoint.mkdir(parents=True)
+    raw = deepcopy(_QWEN3VL_HF_CONFIG)
+    (checkpoint / "config.json").write_text(json.dumps(raw))
+    load = helpers._get_model_info if model_info else utils.get_model_config_from_model_path
+    before = load("org/model", model_revision="b" * 40)
+    (checkpoint / "config.json").unlink()
+    checkpoint.rmdir()
+    raw["text_config"]["num_hidden_layers"] += 7
+    monkeypatch.setattr(
+        utils, "_download_hf_json", lambda _, filename, **__: deepcopy(raw) if filename == "config.json" else None
+    )
+    after = load("org/model", model_revision="b" * 40)
+    assert after["layers"] == before["layers"] + 7
+
+
+def test_qwen_partial_sidecar_cannot_invert_pixel_budget(tmp_path):
+    raw = {**_QWEN3VL_HF_CONFIG, "preprocessor_config": {"size": {"shortest_edge": 131072, "longest_edge": 1048576}}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"size": {"shortest_edge": 2097152}}))
+    with pytest.raises(ValueError, match="min_pixels <= max_pixels"):
+        get_model_config_from_model_path(str(tmp_path))

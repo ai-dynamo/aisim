@@ -2334,11 +2334,18 @@ def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(t
 
 
 @pytest.mark.parametrize("location", ["wrapper", "decoder"])
-def test_k31_collection_rejects_multiple_architectures(tmp_path, location):
+@pytest.mark.parametrize("reverse", [False, True])
+def test_k31_collection_rejects_multiple_architectures(tmp_path, location, reverse):
     config_path, _ = _kimi_k31_config(tmp_path)
     config = json.loads(config_path.read_text())
     target = config if location == "wrapper" else config["text_config"]
-    target["architectures"] = ["KimiK31ForConditionalGeneration", "OtherModel"]
+    target["architectures"] = ["KimiK31ForConditionalGeneration", "KimiK3ForConditionalGeneration"]
+    if reverse:
+        target["architectures"].reverse()
+        if location == "wrapper":
+            config["text_config"].pop("architectures", None)
+        else:
+            config["architectures"] = ["KimiK3ForConditionalGeneration"]
     config_path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="Kimi K3.1 FPM collection requires single-entry architecture lists"):
         build_collection_plan(
@@ -4280,3 +4287,22 @@ def test_archive_rejects_malformed_environment_with_value_error(environment):
 
 def test_archive_missing_and_null_environment_are_equivalent():
     assert archive_generator_overrides({}) == archive_generator_overrides({"K8sConfig": {"extra_env": None}})
+
+
+def test_k31_collection_rejects_conflicting_singleton_wrapper(tmp_path):
+    config_path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["architectures"] = ["OtherModel"]
+    config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="top-level architecture identity"):
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(config_path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"])),
+        )

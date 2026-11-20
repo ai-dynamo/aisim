@@ -472,7 +472,8 @@ def _resolve_hf_revision(model: str, revision: str) -> str:
     try:
         request = urllib.request.Request(url, headers=_get_hf_auth_headers())
         with urllib.request.urlopen(request, timeout=30) as response:
-            commit = json.load(response).get("sha")
+            metadata = json.load(response)
+            commit = metadata.get("sha") if isinstance(metadata, dict) else None
     except (OSError, ValueError) as error:
         raise HuggingFaceDownloadError(f"Cannot resolve checkpoint revision for {model!r}") from error
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -585,6 +586,8 @@ def _qwen_pixel_bounds(processor_cfg: dict | None) -> tuple[int, int]:
         return QWEN3_VL_PIXEL_BOUNDS
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in bounds):
         raise ValueError(f"Qwen preprocessor pixel budget must be positive integers, got {bounds!r}")
+    if bounds[0] > bounds[1]:
+        raise ValueError(f"Qwen preprocessor pixel budget requires min_pixels <= max_pixels, got {bounds!r}")
     return bounds
 
 
@@ -656,7 +659,8 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
     if (
         media is not processor_cfg
         and "max_patches" in processor_cfg
-        and processor_cfg["max_patches"] != media.get("in_patch_limit", media.get("max_patches", 16384))
+        and ("in_patch_limit" in media or "max_patches" in media)
+        and processor_cfg["max_patches"] != media.get("in_patch_limit", media.get("max_patches"))
     ):
         raise ValueError("Kimi processor has conflicting inline and sidecar image-patch limits")
     video = processor_cfg.get("video_processor", {})
@@ -680,7 +684,7 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
     video_default_side = side if "patch_limit_on_one_side" in media else 512
     if side_limit(video, video_default_side) != side:
         raise ValueError("Kimi image and video processor side limits must match")
-    for settings in (media, video):
+    for settings in (processor_cfg, media, video):
         if settings.get("do_resize", True) is not True:
             raise ValueError("Kimi processor do_resize=False is not modeled")
         if positive_int(settings.get("patch_size", vision_cfg["patch_size"]), "patch_size") != vision_cfg["patch_size"]:
@@ -698,7 +702,10 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
         raise ValueError("Kimi processor temporal chunk size must be 4")
     return {
         "resize_mode": "kimi",
-        "image_max_patches": positive_int(media.get("in_patch_limit", media.get("max_patches", 16384)), "max_patches"),
+        "image_max_patches": positive_int(
+            media.get("in_patch_limit", media.get("max_patches", processor_cfg.get("max_patches", 16384))),
+            "max_patches",
+        ),
         "video_max_patches": positive_int(
             media.get("in_patch_limit_each_frame", video.get("max_patches", 4096)), "video max_patches"
         ),
@@ -2024,9 +2031,13 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     if not hf_quant_config:
         return raw_config
     raw_config["hf_quant_config"] = hf_quant_config
-    if "quantization_config" not in raw_config:
+    nested = raw_config.get("text_config")
+    if "quantization_config" not in raw_config and not (isinstance(nested, dict) and "quantization_config" in nested):
         normalized = _normalize_hf_quant_config(hf_quant_config)
         if normalized:
+            section = hf_quant_config.get("quantization", {})
+            if "exclude_modules" in section:
+                normalized = {**section, **normalized, "quant_method": "modelopt", "ignore": section["exclude_modules"]}
             raw_config["quantization_config"] = normalized
     return raw_config
 
@@ -2085,9 +2096,10 @@ def _load_model_config_from_model_path(model_path: str, *, model_revision: str |
 
         # Use the same immutable config as profile eligibility, including for
         # models with bundled configs whose source revision is not recorded.
-        config = _attach_llama4_processor_config(
-            dict(_load_pinned_checkpoint_config(model_path, model_revision)), model_path, model_revision=model_revision
-        )
+        config = _load_pinned_checkpoint_config(model_path, model_revision)
+        if not isinstance(config, dict):
+            raise ValueError("checkpoint config.json must be an object")
+        config = _attach_llama4_processor_config(dict(config), model_path, model_revision=model_revision)
         hf_quant_config = _download_hf_json(
             model_path, "hf_quant_config.json", raise_on_404=False, revision=model_revision
         )
@@ -2111,9 +2123,18 @@ def _load_model_config_from_model_path(model_path: str, *, model_revision: str |
 
 def get_model_config_from_model_path(model_path: str, *, model_revision: str | None = None) -> dict:
     """Resolve moving Hub aliases before consulting immutable metadata caches."""
+    model_path = _resolved_model_source(model_path)
     if model_revision is not None:
         model_revision = _resolve_hf_revision(model_path, model_revision)
     return _get_model_config_from_resolved_path(os.path.expanduser(model_path), model_revision=model_revision)
+
+
+def _resolved_model_source(model_path: str) -> str:
+    """Separate absolute local identities from Hub IDs before cache lookup."""
+    path = Path(model_path).expanduser()
+    if path.exists() or path.is_absolute() or model_path.startswith(("./", "../", "~")):
+        return str(path.absolute())
+    return model_path
 
 
 @cache

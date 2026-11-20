@@ -262,7 +262,8 @@ def _commands(request: SupportRequest, root: Path, recommendation_names: list[st
         _, deployment = runtime_collection_inputs(request, None)
         for name, value in deployment.model_dump(exclude_none=True).items():
             for item in value if name == "container_mount" else [value]:
-                commands["fpm_run_local"].extend(("--" + name.replace("_", "-"), str(item)))
+                encoded = json.dumps(item, ensure_ascii=False) if name == "extra_env" else str(item)
+                commands["fpm_run_local"].extend(("--" + name.replace("_", "-"), encoded))
     if request.fpm_profile is not None and (
         not request.profile_deployment().resources.memory_ready or runtime_probe_manifest(request) is not None
     ):

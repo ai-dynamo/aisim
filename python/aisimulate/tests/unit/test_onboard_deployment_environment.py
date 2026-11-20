@@ -154,3 +154,28 @@ def test_probe_fallback_does_not_format_exception_command(monkeypatch, failure):
     assert "short" not in str(error.value)
     if failure == "returncode":
         assert "CalledProcessError (returncode=1)" in str(error.value)
+
+
+@pytest.mark.parametrize("value", ["/cache/😀", "/cache/𠮷", "/cache/\u2028separator\u2029"])
+def test_public_collection_environment_roundtrips_yaml_unicode(tmp_path, value):
+    from collector.fpm_forward.entry import _inline_overrides
+
+    request = SupportRequest.model_validate(
+        {
+            "identity": {
+                "model": "fixture/model",
+                "model_revision": "a" * 40,
+                "model_kind": "moe",
+                "framework": "vllm",
+                "framework_version": "0.28.0",
+                "gpu": "gb300",
+                "interconnect": "nvlink",
+            }
+        }
+    )
+    env = [{"name": "HF_HOME", "value": value}]
+    command = fpm_cli_args(request, output_dir=tmp_path, plan_only=True, deployment=FPMDeployment(extra_env=env))
+    overrides = [command[index + 1] for index, item in enumerate(command) if item == "--generator-set"]
+    parsed = _inline_overrides(overrides)
+    assert parsed["K8sConfig"]["extra_env"] == env
+    assert parsed["K8sConfig"]["extra_env"][0]["value"].encode() == value.encode()

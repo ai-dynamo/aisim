@@ -102,6 +102,7 @@ def load_repeatability_deployment(
         resolved = resolve_archived_generator_overrides(overrides) if references else overrides
         if saved["generator_config_sha256"] not in _deployment_hashes(resolved):
             raise ValueError("archived deployment inputs differ from the source plan")
+        return resolved
     if references and resolve_environment:
         return resolve_archived_generator_overrides(overrides)
     return overrides

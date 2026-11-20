@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import uuid
 from functools import partial
@@ -86,8 +87,6 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
     sensitive_names = tuple(item["name"] for item in deployment.extra_env or ())
     run = partial(_run, sensitive_values=sensitive_values, sensitive_names=sensitive_names)
     if deployment.executor == "slurm":
-        from collector.fpm_forward.config import FPM_RUNTIME_STARTUP_ENV
-
         if not os.environ.get("SLURM_JOB_ID"):
             raise ValueError("runtime version detection requires a caller-owned Slurm allocation")
         command = [
@@ -101,12 +100,13 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
         ]
         if deployment.container_mount:
             command.append("--container-mounts=" + ",".join(deployment.container_mount))
-        environment = [
-            f"{item['name']}={item['value']}"
-            for item in deployment.extra_env or ()
-            if item["name"] in FPM_RUNTIME_STARTUP_ENV
-        ]
-        output = run([*command, "env", *environment, "python3", "-c", _PROBE])
+        environment = "".join(
+            f"export {item['name']}={shlex.quote(item['value'])}\n" for item in deployment.extra_env or ()
+        )
+        output = run(
+            [*command, "bash", "-c", "set -e; source /dev/stdin; exec python3 -c " + shlex.quote(_PROBE)],
+            payload=environment,
+        )
     else:
         name = "ais-fpm-version-" + uuid.uuid4().hex[:12]
         namespace = deployment.namespace or "default"

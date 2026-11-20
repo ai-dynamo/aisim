@@ -1291,6 +1291,7 @@ def test_probe_deployment_environment_reaches_startup_and_engine(tmp_path):
     environment = [
         {"name": "PYTHONPATH", "value": "/runtime/dynamo:/runtime/wheel"},
         {"name": "PYTHONNOUSERSITE", "value": "1"},
+        {"name": "PYTHONUSERBASE", "value": "/runtime/userbase"},
         {"name": "HF_HOME", "value": "/runtime/hf"},
         {"name": "HF_HUB_OFFLINE", "value": "1"},
         {"name": "TRANSFORMERS_OFFLINE", "value": "1"},
@@ -1470,7 +1471,8 @@ def test_probe_environment_roundtrip_preserves_supplementary_unicode(tmp_path):
 
 
 @pytest.mark.parametrize("location", ["wrapper", "decoder"])
-def test_k31_probe_rejects_multiple_architectures_before_launch(tmp_path, location):
+@pytest.mark.parametrize("reverse", [False, True])
+def test_k31_probe_rejects_multiple_architectures_before_launch(tmp_path, location, reverse):
     from collector.fpm_forward.runtime_instrumentation import load_instrumentation
     from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
 
@@ -1478,7 +1480,13 @@ def test_k31_probe_rejects_multiple_architectures_before_launch(tmp_path, locati
     path = Path(launch["model_config"]["path"])
     config = json.loads(path.read_text())
     target = config if location == "wrapper" else config["text_config"]
-    target["architectures"] = ["KimiK31ForConditionalGeneration", "OtherModel"]
+    target["architectures"] = ["KimiK31ForConditionalGeneration", "KimiK3ForConditionalGeneration"]
+    if reverse:
+        target["architectures"].reverse()
+        if location == "wrapper":
+            config["text_config"].pop("architectures", None)
+        else:
+            config["architectures"] = ["KimiK3ForConditionalGeneration"]
     path.write_text(json.dumps(config))
     launch["model_config"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="single-entry architecture lists"):
@@ -1569,7 +1577,7 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
 
             SlurmCellRunner.stage(self, pods, files)
             assert self.runtime_dir.parent == delivery
-            assert delivery.parent == self.cell_dir.parent.parent
+            assert not delivery.is_relative_to(self.cell_dir.parent.parent)
             assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
             delivery_directories.append(delivery)
 
@@ -1601,6 +1609,7 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
 
                 zero_history(payload)
             (raw / "benchmark.json").write_text(json.dumps(payload))
+            (raw / "raw-config-private.json").write_text(json.dumps({"environment": {"HF_TOKEN": token}}))
             if failure == "backend_markers" and len(executions) != 1:
                 (raw / "resolved-config-native.json").write_text(
                     json.dumps({"config": {"engine_args": {"kernel_config": {"moe_backend": "triton"}}}})
@@ -1721,7 +1730,9 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
     staging = []
     node_local = tmp_path / "node-local-tmp"
     node_local.mkdir()
-    monkeypatch.setattr(runtime_probe.tempfile, "tempdir", str(node_local))
+    from collector.fpm_forward import private_inputs
+
+    monkeypatch.setattr(private_inputs.tempfile, "tempdir", str(node_local))
 
     class Executor(_SyntheticExecutor):
         def stage(self, pods, files):
@@ -1732,7 +1743,7 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
                 staging.append(self.runtime_dir)
                 # Pyxis bind mounts must remain on the campaign's shared
                 # filesystem even when the login node's default tmp is local.
-                assert self.runtime_dir.parent.parent == output
+                assert not self.runtime_dir.is_relative_to(output)
                 assert self.runtime_dir.parent.stat().st_mode & 0o777 == 0o700
                 assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
             self.staged_scripts = {path.name: path.read_text() for path in files if path.suffix == ".sh"}
@@ -1750,8 +1761,22 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
             assert runner.shlex.quote(token) in script
             delivered.append(self.cell.workload_kind)
             super().execute(pods)
+            raw = self.cell_dir / "raw" / pods[0]
+            (raw / "resolved-config-synthetic.json").write_text(
+                json.dumps(
+                    {
+                        "config": {
+                            "engine_args": {"kernel_config": {"moe_backend": "triton"}},
+                            "environment": {"HF_TOKEN": token},
+                        }
+                    }
+                )
+            )
+            logs = self.cell_dir / "logs"
+            logs.mkdir(exist_ok=True)
+            (logs / "synthetic.stderr.log").write_text("worker context " + token)
             if fail_runtime:
-                raise RuntimeError("synthetic worker failure after staging")
+                raise RuntimeError("synthetic worker failure after staging " + token)
 
     monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
     output = tmp_path / "probe"
@@ -1802,6 +1827,9 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
         assert report["status"] == (expected if execute else "preview"), report
         assert_archived(report)
         assert_files_archived()
+    for path in output.rglob("resolved-config-synthetic.json"):
+        assert json.loads(path.read_text())["config"]["engine_args"]["kernel_config"]["moe_backend"] == "triton"
+        assert "<redacted>" in path.read_text()
     assert delivered == ["prefill", "decode"]
     assert len(staging) == (2 if transport == "slurm" else 0)
     assert all(not directory.exists() for directory in staging)
@@ -1853,3 +1881,130 @@ def test_k31_probe_rejects_unaudited_bundle_before_generic_precision_checks(tmp_
     with pytest.raises(ValueError, match="requires an audited instrumentation bundle"):
         runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(unaudited_manifest))
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("dtype,accepted", [("float16", False), ("bfloat16", True)])
+def test_k31_flashmla_checkpoint_dtype_is_checked_before_launch(tmp_path, dtype, accepted):
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    model = Path(launch["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["text_config"]["torch_dtype"] = dtype
+    config["text_config"]["dtype"] = dtype
+    model.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    launch["precision"].update(
+        attention_backend="flashmla",
+        fmha_quant_mode="half" if dtype == "float16" else "bfloat16",
+        gemm_quant_mode="half" if dtype == "float16" else "bfloat16",
+    )
+    if accepted:
+        assert build_runtime_probe_plan("k31", launch, load_instrumentation(manifest)).cells
+    else:
+        with pytest.raises(ValueError, match="FLASHMLA_SPARSE requires a bfloat16 checkpoint"):
+            build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    assert not marker.exists()
+
+
+def test_k31_probe_rejects_conflicting_singleton_outer_identity(tmp_path):
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    model = Path(launch["model_config"]["path"])
+    config = json.loads(model.read_text())
+    config["architectures"] = ["OtherModel"]
+    config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    model.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="top-level architecture identity"):
+        build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_private_probe_cleanup_failure_persists_phase_and_preserves_interrupt(tmp_path, monkeypatch, interrupt):
+    from types import SimpleNamespace
+
+    from collector.fpm_forward import runner, runtime_probe
+
+    launch, manifest, _ = _inputs(tmp_path)
+    launch["deployment"]["extra_env"] = [{"name": "HF_TOKEN", "value": "synthetic-private-cleanup"}]
+    directories = []
+
+    def delivery(*args):
+        path = tmp_path / f"private-{len(directories)}"
+        path.mkdir()
+        directories.append(path)
+
+        def cleanup():
+            raise OSError("private deletion denied")
+
+        return SimpleNamespace(name=str(path), cleanup=cleanup)
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            if interrupt:
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(runtime_probe, "new_delivery_directory", delivery)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    output = tmp_path / "probe"
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    else:
+        report = runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+        assert report["status"] == "failed", report
+    index = json.loads((output / "observations.json").read_text())
+    phase = index["configurations"]["tp4"]["attempts"][0]["phases"]["prefill"]
+    assert phase["status"] == ("interrupted" if interrupt else "cleanup_failed")
+    assert phase["private_cleanup_error"] == "private deletion denied"
+    assert phase["artifacts"]
+
+
+def test_slurm_resume_reclaims_abandoned_private_staging_only_after_teardown(tmp_path, monkeypatch):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.private_inputs import RECEIPT
+
+    launch, manifest, _ = _inputs(tmp_path)
+    launch["deployment"]["extra_env"] = [{"name": "HF_TOKEN", "value": "synthetic-abandoned-staging"}]
+    blocked = True
+    staged = []
+    executions = []
+
+    class Executor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            super().stage(pods, files)
+            staged.append(self.files["run.sh"].parent)
+
+        def execute(self, pods):
+            super().execute(pods)
+            if blocked:
+                raise KeyboardInterrupt
+
+        def cleanup(self):
+            if blocked and executions:
+                raise RuntimeError("Slurm step still running")
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, executions))
+    monkeypatch.setattr(runner, "_salvage_artifacts", lambda *args: None)
+    output = tmp_path / "probe"
+    with pytest.raises(KeyboardInterrupt):
+        runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    old = staged[0]
+    assert old.exists() and not old.is_relative_to(output)
+    receipt = next(output.rglob(RECEIPT))
+    failed = runtime_probe.probe_runtime(
+        {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True, resume=True
+    )
+    assert failed["status"] == "failed" and old.exists() and receipt.exists()
+    blocked = False
+    report = runtime_probe.probe_runtime(
+        {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True, resume=True
+    )
+    assert report["status"] == "completed", report
+    assert not old.exists() and not receipt.exists()
+    assert all(not path.exists() for path in staged)

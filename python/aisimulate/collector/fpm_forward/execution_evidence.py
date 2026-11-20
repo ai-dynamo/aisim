@@ -188,7 +188,7 @@ def _matches_pinned_hub_snapshot(
     )
 
 
-def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None):
+def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None, minimum_capacity=None):
     """Bind canonical initialized-worker evidence to this exact native attempt."""
     from .runtime_instrumentation import read_json
     from .runtime_observations import validate_observation_phase
@@ -227,6 +227,8 @@ def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None):
         or result["provenance"]["instrumentation"].get("import_binding") != "verified"
     ):
         raise ValueError("runtime model snapshot lacks complete matching instrumentation evidence")
+    if minimum_capacity is not None and result["resources"]["runtime_memory"]["kv_cache_bytes"] < minimum_capacity:
+        raise ValueError("K3.1 runtime usable capacity is smaller than the accepted bound; review new evidence")
     models = {}
     for artifact in result["provenance"]["artifacts"]:
         worker = artifact["evidence"]

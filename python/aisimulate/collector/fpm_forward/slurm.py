@@ -84,7 +84,9 @@ class SlurmCellRunner:
                     output = getattr(error, stream, None) or ""
                     if isinstance(output, bytes):
                         output = output.decode(errors="replace")
-                    (logs / f"{stream}.log").write_text(output)
+                    from .private_inputs import redact
+
+                    (logs / f"{stream}.log").write_text(redact(output, getattr(self, "_private_values", ())))
                 (logs / "failure.json").write_text(
                     json.dumps(
                         {
@@ -330,10 +332,14 @@ class SlurmCellRunner:
                     output = getattr(error, stream, None) or ""
                     if isinstance(output, bytes):
                         output = output.decode(errors="replace")
-                    (logs / f"{unit}.{stream}.log").write_text(output)
+                    from .private_inputs import redact
+
+                    (logs / f"{unit}.{stream}.log").write_text(redact(output, getattr(self, "_private_values", ())))
                 raise
-            (logs / f"{unit}.stdout.log").write_text(result.stdout)
-            (logs / f"{unit}.stderr.log").write_text(result.stderr)
+            from .private_inputs import redact
+
+            (logs / f"{unit}.stdout.log").write_text(redact(result.stdout, getattr(self, "_private_values", ())))
+            (logs / f"{unit}.stderr.log").write_text(redact(result.stderr, getattr(self, "_private_values", ())))
 
         scope = CommandScope()
         pool = ThreadPoolExecutor(max_workers=len(pods))
@@ -358,6 +364,9 @@ class SlurmCellRunner:
         return _file_manifest(self.cell_dir / "raw" / unit)
 
     def collect(self, pods: list[str], *, require_benchmark: bool = True) -> None:
+        from .private_inputs import redact_diagnostics
+
+        redact_diagnostics(self.cell_dir, getattr(self, "_private_values", ()))
         if require_benchmark and not any(
             list((self.cell_dir / "raw" / unit).glob(FPM_BENCHMARK_RESULT_GLOB)) for unit in pods
         ):

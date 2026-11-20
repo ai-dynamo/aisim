@@ -731,6 +731,20 @@ def _require_real_prefix_seeding(
             )
 
 
+def _verify_k31_inline_source(proof, launch):
+    from .runtime_observations import validate_observations
+
+    index = proof.get("observations_index")
+    if not isinstance(index, dict) or not isinstance(index.get("path"), str):
+        raise ValueError("K3.1 inline provenance requires its source index; re-import observations")
+    path = Path(index["path"])
+    if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != index.get("sha256"):
+        raise ValueError("K3.1 inline provenance source index changed or is unavailable; re-import observations")
+    result = validate_observations(path, {proof["configuration"]: launch})[proof["configuration"]]
+    if result["status"] != "complete" or _canonical_hash(result["provenance"]) != _canonical_hash(proof):
+        raise ValueError("K3.1 inline provenance differs from verified source evidence; re-import observations")
+
+
 def _k31_runtime_proof(proof: Any, launch: dict[str, Any], profile: FpmModelProfile, *, reviewed_capacity: int) -> Any:
     """Resolve the canonical onboarding wrapper back to immutable native evidence.
 
@@ -833,8 +847,8 @@ def _observed_k31_capability(
     """Bind native expert activation precision to complete imported observations.
 
     Config.json describes MXFP4 weights, not the initialized MoE activation
-    arithmetic. Recheck the imported proof's semantics; its original artifact
-    hashes were verified on import and cannot be reconstructed from inline JSON.
+    arithmetic. Recheck the imported proof's semantics and its hash-bound source artifacts.
+    Inline JSON alone does not establish the original worker observations.
     The final formal launch check and fresh worker observations remain required.
     """
     from . import runtime_observations as observations
@@ -1056,6 +1070,8 @@ def _observed_k31_capability(
             raise ValueError("K3.1 observed MoE profile cache groups differ from native allocation evidence")
         if observed_capacity != min(capacity["kv_cache_bytes"] for capacity in capacities):
             raise ValueError("K3.1 observed MoE profile capacity differs from the imported rank minimum")
+        if saved_proof is proof:
+            _verify_k31_inline_source(proof, launch)
     if len(modes) != 1 or any(deployment.moe_quant_mode not in modes for deployment in deployments):
         raise ValueError("K3.1 observed MoE precision differs across workers or from the selected profile")
     return replace(capability, dtype=replace(capability.dtype, moe_quant_mode=modes.pop()))
@@ -1169,13 +1185,21 @@ def build_collection_plan(
         if (capability.model_config.payload.get("architectures") or [])[:1] == ["KimiK31ForConditionalGeneration"]
         else capability.architecture
     )
-    if policy_architecture == "KimiK31ForConditionalGeneration" and any(
+    k31_listed = any(
+        "KimiK31ForConditionalGeneration" in (config.get("architectures") or [])
+        for config in (capability.model_config.payload, capability.model_config.effective_payload)
+    )
+    if k31_listed and any(
         len(config.get("architectures") or []) > 1
         for config in (capability.model_config.payload, capability.model_config.effective_payload)
     ):
         # The pinned native adapter requires an exact single-entry identity.
         # Do not plan a collection that its probe and worker cannot attest.
         raise ValueError("Kimi K3.1 FPM collection requires single-entry architecture lists for wrapper and decoder")
+    if k31_listed and (capability.model_config.payload.get("architectures") or []) != [
+        "KimiK31ForConditionalGeneration"
+    ]:
+        raise ValueError("Kimi K3.1 requires the K3.1 top-level architecture identity")
     if (
         policy_architecture == "KimiK31ForConditionalGeneration"
         and "fp8" in capability.dtype.kv_cache_dtypes

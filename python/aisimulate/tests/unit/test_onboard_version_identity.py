@@ -392,13 +392,12 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         assert len(calls) == 1
         assert f"--container-image={deployment.image}" in calls[0][0]
         assert "--gpus=0" in calls[0][0]
-        argv = calls[0][0]
-        start, end = argv.index("env") + 1, argv.index("python3")
-        from collector.fpm_forward.config import FPM_RUNTIME_STARTUP_ENV
+        import shlex
 
-        assert argv[start:end] == [
-            f"{item['name']}={item['value']}" for item in environment or () if item["name"] in FPM_RUNTIME_STARTUP_ENV
-        ]
+        assert calls[0][1] == "".join(
+            f"export {item['name']}={shlex.quote(item['value'])}\n" for item in environment or ()
+        )
+        assert "source /dev/stdin" in calls[0][0][-1]
     else:
         manifest = json.loads(next(payload for _, payload in calls if payload is not None))
         assert manifest["metadata"]["namespace"] == deployment.namespace
@@ -565,7 +564,7 @@ def test_probe_subprocess_missing_package_exits_with_runtime_error(monkeypatch, 
     def run(command, **kwargs):
         observed_commands.append(command)
         assert command[0] == "srun"
-        return original_run([sys.executable, "-c", synthetic_runtime + command[-1]], **kwargs)
+        return original_run([sys.executable, "-c", synthetic_runtime + versioning._PROBE], **kwargs)
 
     monkeypatch.setattr(versioning.subprocess, "run", run)
     with pytest.raises(ValueError, match="runtime version detection failed.*", check=lambda exc: "vllm" in str(exc)):

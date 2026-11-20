@@ -584,30 +584,56 @@ def test_prepare_attempt_clears_results_and_writes_runtime_provenance(tmp_path):
     assert command[4] == "collector-provenance.json"
 
 
-@pytest.mark.parametrize("overlay", [False, True])
-def test_kubernetes_detection_and_preparation_use_same_runtime_environment(tmp_path, monkeypatch, overlay):
+@pytest.mark.parametrize("overlay_variable", ["PYTHONPATH", "PYTHONUSERBASE"])
+@pytest.mark.parametrize("overlay,drift", [(False, False), (True, False), (True, True)])
+def test_kubernetes_detection_and_preparation_use_same_runtime_environment(
+    tmp_path, monkeypatch, overlay, drift, overlay_variable
+):
     from aisimulate.support import versioning
     from aisimulate.support.schema import FPMDeployment
 
-    image_site, overlay_site = tmp_path / "image-site", tmp_path / "overlay site"
+    image_site, overlay_site = tmp_path / "image-site", tmp_path / "overlay $(OVERLAY_ROOT) $$ site"
     for site, version in ((image_site, "0.28.0+image"), (overlay_site, "0.28.0+overlay")):
-        metadata = site / f"vllm-{version}.dist-info" / "METADATA"
+        package_site = (
+            site
+            if overlay_variable == "PYTHONPATH"
+            else site / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+        )
+        metadata = package_site / f"vllm-{version}.dist-info" / "METADATA"
         metadata.parent.mkdir(parents=True)
         metadata.write_text(f"Name: vllm\nVersion: {version}\n")
     deployment = FPMDeployment(
         image="synthetic:image",
-        extra_env=[{"name": "PYTHONPATH", "value": str(overlay_site)}] if overlay else None,
+        extra_env=[
+            {"name": "OVERLAY_ROOT", "value": "expanded-wrong-path"},
+            {"name": overlay_variable, "value": str(overlay_site)},
+        ]
+        if overlay
+        else None,
     )
-    image_env = {**os.environ, "PYTHONPATH": str(image_site)}
+    image_env = {**os.environ, overlay_variable: str(image_site)}
+    image_env.pop("PYTHONNOUSERSITE", None)
+    base_python = sys._base_executable
     probe_output = ""
 
     def probe_transport(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         nonlocal probe_output
         if payload is not None:
             container = json.loads(payload)["spec"]["containers"][0]
-            env = {**image_env, **{item["name"]: item["value"] for item in container.get("env", [])}}
+            env = dict(image_env)
+            for item in container.get("env", []):
+                value = item["value"]
+                if item["name"] == overlay_variable:
+                    assert value == str(overlay_site).replace("$", "$$")
+                import re
+
+                env[item["name"]] = re.sub(
+                    r"\$\$|\$\(([A-Za-z_][A-Za-z0-9_]*)\)",
+                    lambda match: "$" if match[0] == "$$" else env.get(match[1], match[0]),
+                    value,
+                )
             probe_output = subprocess.run(
-                container["command"], env=env, capture_output=True, text=True, check=True
+                [base_python, *container["command"][1:]], env=env, capture_output=True, text=True, check=True
             ).stdout
         if "logs" in command:
             return probe_output
@@ -639,9 +665,24 @@ def test_kubernetes_detection_and_preparation_use_same_runtime_environment(tmp_p
     runner = _runner(cell_dir)
 
     def exec_transport(_pod, command, *, timeout):
+        if drift:
+            env_file = cell_dir / "collector-runtime-env.sh"
+            env_file.write_text(env_file.read_text().replace(str(overlay_site), str(image_site)))
+        command = [base_python if arg == "python3" else arg for arg in command]
         return subprocess.run(command, env=image_env, capture_output=True, text=True, check=True, timeout=timeout)
 
     runner._exec_checked = exec_transport
+    if drift:
+        with pytest.raises(subprocess.CalledProcessError, match="non-zero exit status") as error:
+            runner.prepare_attempt(
+                ["pod-0"],
+                cell_id=cell.cell_id,
+                plan_sha256="plan-sha",
+                attempt_id="attempt-1",
+                runtime_backend_version=detected["backend_version"],
+            )
+        assert "FPM observed runtime changed" in error.value.stderr
+        return
     runner.prepare_attempt(
         ["pod-0"],
         cell_id=cell.cell_id,
@@ -1882,7 +1923,8 @@ def test_recovery_rejects_entries_with_cleanup_error(tmp_path):
     assert recovered is not None and recovered["status"] == "passed"
 
 
-def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
+@pytest.mark.parametrize("private_cleanup", [False, True])
+def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, private_cleanup):
     cell = _cell()
     plan = _plan(cell)
 
@@ -1922,7 +1964,7 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
             # fails the cell before any work); only the post-run teardown
             # raises, which is the state this test pins.
             FakeResource.cleanup_calls += 1
-            if FakeResource.cleanup_calls > 1:
+            if FakeResource.cleanup_calls > 1 and not private_cleanup:
                 raise RuntimeError("owned pod remains")
 
     monkeypatch.setattr(fpm_runner, "_render_cell", render_cell)
@@ -1940,9 +1982,22 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
 
+    delivery = tmp_path / "private-staging"
+    if private_cleanup:
+        delivery.mkdir()
+
+        def cleanup():
+            raise OSError("private staging deletion denied")
+
+        monkeypatch.setattr(
+            fpm_runner, "new_delivery_directory", lambda *a: SimpleNamespace(name=str(delivery), cleanup=cleanup)
+        )
+
     errors = run_collection(
         plan,
-        generator_overrides={},
+        generator_overrides={"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": "synthetic-token"}]}}
+        if private_cleanup
+        else {},
         checkpoint_dir=str(checkpoint_dir),
         artifact_root=str(tmp_path / "artifacts"),
         resume=False,
@@ -1951,11 +2006,18 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path):
         cell_limit=1,
     )
 
-    assert [error["classification"] for error in errors] == ["resource_cleanup_failed"]
+    assert [error["classification"] for error in errors] == [
+        "private_cleanup_failed" if private_cleanup else "resource_cleanup_failed"
+    ]
     checkpoint = json.loads((checkpoint_dir / "fpm_forward_smoke.json").read_text())
     record = checkpoint["cells"][cell.cell_id]
     assert record["status"] == "cleanup_failed"
-    assert record["cleanup_error"] == "owned pod remains"
+    if private_cleanup:
+        assert record["private_cleanup_error"] == "private staging deletion denied"
+        assert record["completed_at"] and "duration_seconds" in record
+        assert (tmp_path / "artifacts/plan-sha/smoke/run-manifest.json").exists()
+    else:
+        assert record["cleanup_error"] == "owned pod remains"
     assert "smoke" not in checkpoint
 
 
@@ -3813,3 +3875,99 @@ def test_collection_checks_deployment_identity_before_writing_or_scheduling(tmp_
             resume=False,
             retry_failed=False,
         )
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_kubernetes_worker_streams_redact_configured_private_values(tmp_path, monkeypatch, failure):
+    token = 'synthetic-private-"worker-stream"'
+    resource = _runner(tmp_path)
+    resource._private_values = (token,)
+
+    def run(pod, timeout):
+        if failure:
+            raise RuntimeError("worker stderr " + token)
+        return pod, subprocess.CompletedProcess([], 0, "stdout " + token, "stderr " + token)
+
+    resource._run_pod = run
+    if failure:
+        with pytest.raises(RuntimeError, match="worker stderr <redacted>"):
+            resource.execute(["pod-0"])
+    else:
+        resource.execute(["pod-0"])
+    logs = list((tmp_path / "logs").glob("*.log"))
+    assert logs
+    assert all(token not in path.read_text() and "<redacted>" in path.read_text() for path in logs)
+
+
+@pytest.mark.parametrize("teardown_fails", [False, True])
+def test_collection_reclaims_private_slurm_receipt_after_verified_teardown(tmp_path, monkeypatch, teardown_fails):
+    from collector.fpm_forward.private_inputs import RECEIPT, SlurmDelivery
+
+    cell = _cell()
+    plan = _plan(cell)
+    plan.options.executor = "slurm"
+    plan.options.slurm_cpus_per_task = 8
+    plan.options.slurm_cpu_bind = "cores"
+    artifacts = tmp_path / "artifacts"
+    directory = artifacts / plan.sha256[:16] / "smoke/cells" / cell.cell_id
+    directory.mkdir(parents=True)
+    (directory / "k8s_deploy.yaml").write_text("synthetic owned Slurm identity")
+    abandoned = SlurmDelivery(artifacts, directory)
+    private_path = Path(abandoned.name)
+    (private_path / "run.sh").write_text("synthetic private delivery")
+    events = []
+
+    def cleanup():
+        events.append("teardown")
+        assert private_path.exists() == (len(events) == 1 or teardown_fails)
+        if teardown_fails:
+            raise RuntimeError("owned Slurm step remains")
+
+    def render(*args, **kwargs):
+        events.append("render")
+        assert not private_path.exists()
+        raise RuntimeError("synthetic stop after verified reclaim")
+
+    monkeypatch.setattr(fpm_runner, "_cell_runner", lambda *args: SimpleNamespace(cleanup=cleanup))
+    monkeypatch.setattr(fpm_runner, "_render_cell", render)
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(tmp_path / "checkpoint"),
+        artifact_root=str(artifacts),
+        resume=False,
+        retry_failed=False,
+        smoke=True,
+    )
+    assert errors
+    assert private_path.exists() == teardown_fails
+    assert (directory / RECEIPT).exists() == teardown_fails
+    assert events == (["teardown"] if teardown_fails else ["teardown", "teardown", "render"])
+
+
+def test_config_redaction_keeps_numeric_measurements_and_backend_markers(tmp_path):
+    from collector.fpm_forward.private_inputs import redact_diagnostics
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    measured = raw / "benchmark.json"
+    measured.write_text(json.dumps({"latency_ms": 0.044, "batch_size": 4}))
+    before = measured.read_bytes()
+    config = raw / "resolved-config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "engine_args": {"kernel_config": {"moe_backend": "triton"}},
+                    "environment": {"OMP_NUM_THREADS": "4"},
+                    "max_model_len": 4096,
+                }
+            }
+        )
+    )
+    redact_diagnostics(tmp_path, ("4",))
+    assert measured.read_bytes() == before
+    saved = json.loads(config.read_text())["config"]
+    assert saved["max_model_len"] == 4096
+    assert saved["environment"]["OMP_NUM_THREADS"] == "<redacted>"
+    assert saved["engine_args"]["kernel_config"]["moe_backend"] == "triton"

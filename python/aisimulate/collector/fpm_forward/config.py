@@ -81,28 +81,6 @@ def resolve_slurm_cpu_policy(
 # and feasibility.
 FPM_KV_WARMUP_DEFAULTS = {"DYN_BENCH_KV_WARMUP": "on", "DYN_BENCH_PREFILL_REAL_SEED": "on"}
 
-# Slurm provenance runs before run.sh, so it receives only these startup
-# inputs. Version detection must use the same environment boundary.
-FPM_RUNTIME_STARTUP_ENV = frozenset(
-    {
-        *FPM_KV_WARMUP_DEFAULTS,
-        "FPM_READINESS_TIMEOUT_SECONDS",
-        "FPM_FINALIZATION_TIMEOUT_SECONDS",
-        "PATH",
-        "PYTHONPATH",
-        "PYTHONNOUSERSITE",
-        "HF_HOME",
-        "HF_HUB_OFFLINE",
-        "TRANSFORMERS_OFFLINE",
-        "DYN_FPM_DSV41_REAL_KV",
-        "DYN_FPM_INPUT_TEXT",
-        "DYN_FPM_TOKENIZER_REVISION",
-        "AISIMULATE_RUNTIME_CONTEXT",
-        "AISIMULATE_RUNTIME_INSTRUMENTATION",
-        "AISIMULATE_RUNTIME_OBSERVATION_DIR",
-    }
-)
-
 PARALLEL_AXES = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 PARALLEL_PRESETS = ("auto", "tp", "tep", "dep", "pure_tp")
 
