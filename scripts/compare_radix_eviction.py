@@ -33,10 +33,6 @@ def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
 
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", default=BASELINE)
@@ -58,16 +54,19 @@ def main() -> None:
         parser.error("--work-dir must be outside the source checkout")
     # Refuse reuse: artifacts must belong to exactly the recorded revisions.
     work.mkdir(parents=True, exist_ok=False)
+    # Hash and install the same captured bytes even if sources change mid-build.
+    overlay_paths = (probe,) if lifecycle else (probe, SCENARIOS, COMPARISON)
+    overlays = {relative: (ROOT / relative).read_bytes() for relative in overlay_paths}
     report = {
         "schema_version": 1,
         "probe": args.probe,
-        "probe_sha256": sha256(ROOT / probe),
+        "probe_sha256": hashlib.sha256(overlays[probe]).hexdigest(),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
         "profile": "test",
         "features": [],
     }
     if not lifecycle:
-        report["scenarios_sha256"] = sha256(ROOT / SCENARIOS)
+        report["scenarios_sha256"] = hashlib.sha256(overlays[SCENARIOS]).hexdigest()
     for side in ("baseline", "candidate"):
         revision = git("rev-parse", "--verify", f"{getattr(args, side)}^{{commit}}")
         snapshot = work / side
@@ -91,10 +90,10 @@ def main() -> None:
         with tarfile.open(archive) as source:
             source.extractall(snapshot, filter="data")
         archive.unlink()
-        for relative in (probe,) if lifecycle else (probe, SCENARIOS, COMPARISON):
+        for relative, contents in overlays.items():
             target = snapshot / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes((ROOT / relative).read_bytes())
+            target.write_bytes(contents)
         radix = snapshot / module_file
         if module.strip() not in radix.read_text():
             radix.write_text(radix.read_text() + module)
