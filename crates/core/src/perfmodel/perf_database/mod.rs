@@ -63,12 +63,16 @@ type SharedTablesMemo = Mutex<HashMap<String, (PathBuf, Weak<PerfTables>)>>;
 /// marker identifies the generation (pair digests, system YAML and overlay
 /// targets). Hash only this small preparation record, never the potentially
 /// large parquet on every engine construction. Ordinary roots without a marker
-/// retain their existing immutable-root cache behavior.
-fn staged_generation(systems_root: &Path) -> String {
-    std::fs::read(systems_root.join(".staged.json"))
-        .ok()
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .unwrap_or_default()
+/// retain their existing immutable-root cache behavior. Only an absent marker
+/// means "ordinary root"; any other read error fails the load rather than
+/// silently disabling generation tracking.
+fn staged_generation(systems_root: &Path) -> Result<String, AicError> {
+    let path = systems_root.join(".staged.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(blake3::hash(&bytes).to_hex().to_string()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(AicError::Io { path, source }),
+    }
 }
 
 fn shared_tables_key(
@@ -772,7 +776,7 @@ impl PerfDatabase {
         // the marker is unchanged after the load; otherwise reload, so one load
         // never memoizes mixed generations.
         for _ in 0..SHARED_LOAD_GENERATION_ATTEMPTS {
-            let generation = staged_generation(systems_root);
+            let generation = staged_generation(systems_root)?;
             let ctx = Self::resolve_ctx(
                 systems_root,
                 system,
@@ -810,7 +814,7 @@ impl PerfDatabase {
             )?;
             #[cfg(test)]
             tests::after_shared_load_hook();
-            if staged_generation(systems_root) != generation {
+            if staged_generation(systems_root)? != generation {
                 continue;
             }
             let mut map = memo.lock().unwrap();
@@ -1325,6 +1329,45 @@ mod tests {
                 .contains(&root.join("data_two").display().to_string()),
             "sources must come from the generation the tables were read from"
         );
+    }
+
+    #[test]
+    fn staged_generation_is_empty_only_for_an_absent_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(staged_generation(tmp.path()).unwrap(), "");
+        std::fs::write(tmp.path().join(".staged.json"), b"first").unwrap();
+        let first = staged_generation(tmp.path()).unwrap();
+        assert_eq!(first.len(), 64);
+        std::fs::write(tmp.path().join(".staged.json"), b"second").unwrap();
+        assert_ne!(staged_generation(tmp.path()).unwrap(), first);
+        // A marker that exists but cannot be read must not look like an ordinary root.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join(".staged.json")).unwrap();
+        assert!(matches!(
+            staged_generation(unreadable.path()),
+            Err(AicError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_load_fails_when_the_staged_marker_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        energy_test_fixtures::write_energy_systems_root(tmp.path());
+        std::fs::create_dir(tmp.path().join(".staged.json")).unwrap();
+        let memo = SharedTablesMemo::default();
+        let result = PerfDatabase::load_resolved_shared_in(
+            &memo,
+            tmp.path(),
+            "testsys",
+            "vllm",
+            "1.0",
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(matches!(result, Err(AicError::Io { .. })));
+        assert!(memo.lock().unwrap().is_empty());
     }
 
     #[test]

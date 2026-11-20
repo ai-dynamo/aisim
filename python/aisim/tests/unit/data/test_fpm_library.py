@@ -1742,6 +1742,95 @@ def test_entry_checks_report_unreadable_files_and_missing_native_columns(root, p
     assert [f.code for f in findings] == ["library-columns"] and "cell_id" in findings[0].message
 
 
+def _republish_library(root, table=None, **sidecar):
+    """Rewrite the entry's library and/or sidecar, then re-pin both digests in the entry manifest."""
+    library = root / ENTRY / "fpm/fpm_forward_perf.parquet"
+    sidecar_path = root / ENTRY / "fpm/fpm_forward_perf.metadata.json"
+    if table is not None:
+        pq.write_table(table, library)
+    declared = json.loads(sidecar_path.read_text())
+    declared.update(sidecar, parquet_sha256=_sha(library.read_bytes()))
+    sidecar_path.write_text(json.dumps(declared))
+    path = root / MANIFEST
+    document = json.loads(path.read_text())
+    for artifact in document["artifacts"]:
+        for target in (library, sidecar_path):
+            if artifact["path"].endswith(target.name):
+                artifact.update(sha256=_sha(target.read_bytes()), bytes=target.stat().st_size)
+        if artifact["path"].endswith(library.name):
+            artifact["rows"] = pq.ParquetFile(library).metadata.num_rows
+    path.write_text(json.dumps(document))
+    return pq.read_table(library)
+
+
+def _with_column(table, name, values):
+    if name in table.column_names:
+        table = table.drop([name])
+    return table.append_column(name, pa.array(values))
+
+
+def test_entry_checks_bind_row_runtime_identity(root, profile):
+    make_entry(root, profile)
+    assert check_fpm_entry(root, MANIFEST) == []
+    table = pq.read_table(root / ENTRY / "fpm/fpm_forward_perf.parquet")
+    versions = [table.column("backend_version")[0].as_py()] * (table.num_rows - 1) + ["0.26.0"]
+    _republish_library(root, _with_column(table, "backend_version", versions))
+    findings = check_fpm_entry(root, MANIFEST)
+    assert [f.code for f in findings] == ["library-runtime"] and "backend_version" in findings[0].message
+
+
+@pytest.mark.parametrize(
+    ("recorded", "selector", "codes"),
+    [
+        (None, {"dcp": 2}, ["library-dcp"]),  # declared DCP2 against rows that record none
+        (2, {"dcp": 2}, []),  # TP4/DCP2 agrees
+        (2, {}, ["library-dcp"]),  # recorded DCP2 against a selector that declares none
+        (None, {}, []),  # unrecorded DCP without a selector value is not DCP1
+        (3, {"dcp": 3}, ["library-dcp"]),  # DCP must divide tp
+        (0, {"dcp": 1}, ["library-dcp", "library-dcp"]),  # DCP must be positive
+    ],
+)
+def test_entry_checks_bind_declared_dcp_to_rows(root, profile, recorded, selector, codes):
+    make_entry(root, profile)
+    table = pq.read_table(root / ENTRY / "fpm/fpm_forward_perf.parquet")
+    assert set(table.column("tp").to_pylist()) == {4}
+    if recorded is not None:
+        table = _with_column(table, "dcp", [recorded] * table.num_rows)
+    base = {"tp": 4, "pp": 1, "dp": 1, "moe_tp": 4, "moe_ep": 1, "cp": 1}
+    _republish_library(root, table, configuration_selector={**base, **selector})
+    assert [f.code for f in check_fpm_entry(root, MANIFEST)] == codes
+
+
+@pytest.mark.parametrize(
+    "policy", ["per_row_single_sample_or_median_of_3", "per_row_single_sample_or_full_grid_median_v1"]
+)
+def test_entry_checks_require_row_evidence_for_a_per_row_policy(root, profile, policy):
+    median = {
+        "per_row_single_sample_or_median_of_3": "kvwarm_median_of_3",
+        "per_row_single_sample_or_full_grid_median_v1": "independent_full_grid_median_of_3",
+    }[policy]
+    make_entry(root, profile)
+    table = pq.read_table(root / ENTRY / "fpm/fpm_forward_perf.parquet")
+    assert "measurement_policy" not in table.column_names  # the single-sample control needs no row columns
+    assert check_fpm_entry(root, MANIFEST) == []
+    _republish_library(root, table, measurement_policy=policy)
+    assert [f.code for f in check_fpm_entry(root, MANIFEST)] == ["library-measurement-policy"]
+
+    def rows(pairs):
+        evidence = _with_column(table, "measurement_policy", [p for p, _ in pairs])
+        return _with_column(evidence, "measurement_repeats", [r for _, r in pairs])
+
+    size = table.num_rows
+    single, repeated = ("dynamo_native_single_sample_v1", 1), (median, 3)
+    mixed = [single] * (size - 1) + [repeated]
+    _republish_library(root, rows(mixed), measurement_policy=policy)
+    assert check_fpm_entry(root, MANIFEST) == []
+    for inconsistent in [(median, 1), ("dynamo_native_single_sample_v1", 3), ("other_policy", 3)]:
+        _republish_library(root, rows([*mixed[:-1], inconsistent]), measurement_policy=policy)
+        findings = check_fpm_entry(root, MANIFEST)
+        assert [f.code for f in findings] == ["library-measurement-policy"], inconsistent
+
+
 def test_an_unreadable_artifact_is_a_finding_not_a_crash(root, profile, monkeypatch):
     make_entry(root, profile)
 
