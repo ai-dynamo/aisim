@@ -93,7 +93,12 @@ echo "================================================"
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 if [[ "$device" == "cuda" ]]; then
-    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+        # CUDA can enumerate fewer devices than the visibility mask contains.
+        GPU_COUNT=$(python3 -c 'import torch; print(torch.cuda.device_count())') || exit 1
+    else
+        GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    fi
 elif [[ "$device" == "xpu" ]]; then
     GPU_COUNT=$(xpu-smi discovery 2>/dev/null | grep -c "Device Name:")
 fi
