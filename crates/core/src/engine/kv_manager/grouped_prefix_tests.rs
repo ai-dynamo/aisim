@@ -140,6 +140,25 @@ fn seed_states(pool: &mut GroupedBlockPool, groups: &[u16], hash_block: usize, e
     }
 }
 
+/// Seed the key at `end`, inside a block of `block` tokens, in each of
+/// `groups`, listed under its block as `finalize` lists it.
+fn seed_inside(
+    pool: &mut GroupedBlockPool,
+    groups: &[u16],
+    hash_block: usize,
+    block: usize,
+    end: usize,
+) {
+    let in_block = key_in_block(&lease(end, hash_block), hash_block, block, end);
+    assert!(in_block.is_some(), "{end} is a block end");
+    for &group in groups {
+        let mut reservation = pool.reserve(&[], 1).unwrap();
+        let id = pool.take_private(&mut reservation);
+        assert!(pool.cache_at(id, key(group, hash_block, end), in_block));
+        pool.release(id);
+    }
+}
+
 fn hit_exists(pool: &GroupedBlockPool, group: u16, hash_block: usize, tokens: usize) -> bool {
     pool.key_hit(group, hash_at(hash_block, tokens)).is_some()
 }
@@ -1002,8 +1021,9 @@ fn hybrid_partial_hash_truncates_full_attention_hit_length() {
         let hash = 4;
         let mut kv = kv_pool(&groups, 64);
         let pool = kv.block_pool_mut().unwrap();
-        seed_many(pool, 0, hash, &[2176, 4352, 4356]);
-        seed_states(pool, &GLM_STATES, hash, 4356);
+        seed_many(pool, 0, hash, &[2176, 4352]);
+        seed_inside(pool, &[0], hash, GLM_BLOCK as usize, 4356);
+        seed_inside(pool, &GLM_STATES, hash, GLM_BLOCK as usize, 4356);
         let request = lease(4500, hash);
         let hit = coordinator.find_longest_hit(pool, &request, 4500);
         assert_eq!(hit.tokens, 4356);
@@ -1018,13 +1038,27 @@ fn hybrid_partial_hash_truncates_full_attention_hit_length() {
 
         let mut kv = kv_pool(&groups, 64);
         let pool = kv.block_pool_mut().unwrap();
-        seed_many(pool, 0, hash, &[2176, 4352, 4356]);
+        seed_many(pool, 0, hash, &[2176, 4352]);
+        seed_inside(pool, &[0], hash, GLM_BLOCK as usize, 4356);
         seed_states(pool, &GLM_STATES, hash, 4352);
         let hit = coordinator.find_longest_hit(pool, &request, 4500);
         assert_eq!(hit.tokens, 4352);
         // coord:970-977: the full-attention hit of 4,356 minus 4,352.
         assert_eq!(hit.junction_tokens, 4);
         assert!(matches!(&hit.per_group[0], GroupHitBlocks::Attention(keys) if keys.len() == 2));
+
+        // The state search goes down through the blocks to the one position
+        // where all four state groups have a key, 2,180, inside the second
+        // block, and passes 3,000, where one group has a key.
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        seed_many(pool, 0, hash, &[2176, 4352]);
+        seed_inside(pool, &[0], hash, GLM_BLOCK as usize, 4356);
+        seed_inside(pool, &GLM_STATES, hash, GLM_BLOCK as usize, 2180);
+        seed_inside(pool, &GLM_STATES[..1], hash, GLM_BLOCK as usize, 3000);
+        let hit = coordinator.find_longest_hit(pool, &request, 4500);
+        assert_eq!(hit.tokens, 2180);
+        assert_eq!(hit.junction_tokens, 4356 - 2180);
     }
 }
 
@@ -1342,8 +1376,9 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     let hash = 4;
     let mut kv = kv_pool(&groups, 32);
     let pool = kv.block_pool_mut().unwrap();
-    seed_many(pool, 0, hash, &[16, 32, 36]);
-    seed_many(pool, 1, hash, &[36]);
+    seed_many(pool, 0, hash, &[16, 32]);
+    seed_inside(pool, &[0], hash, 16, 36);
+    seed_inside(pool, &[1], hash, 32, 36);
     let request = lease(50, hash);
     let hit = coordinator.find_longest_hit(pool, &request, 50);
     assert_eq!(hit.tokens, 36);
@@ -1383,8 +1418,9 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     // copy at the next allocation (single:1658-1675, index set at :1868).
     let mut kv = kv_pool(&groups, 32);
     let pool = kv.block_pool_mut().unwrap();
-    seed_many(pool, 0, hash, &[16, 32, 36]);
-    seed_many(pool, 1, hash, &[36]);
+    seed_many(pool, 0, hash, &[16, 32]);
+    seed_inside(pool, &[0], hash, 16, 36);
+    seed_inside(pool, &[1], hash, 32, 36);
     let request = lease(70, hash);
     let hit = coordinator.find_longest_hit(pool, &request, 70);
     assert_eq!(hit.tokens, 36);
@@ -1484,9 +1520,7 @@ fn admission_counts_vllms_whole_prompt_blocks_without_the_producer_copy() {
                 let mut kv = kv_pool(&groups, 8);
                 let pool = kv.block_pool_mut().unwrap();
                 let keys = [key(0, 4, hit_tokens), key(1, 4, hit_tokens)];
-                for key in keys {
-                    seed(pool, key);
-                }
+                seed_inside(pool, &[0, 1], 4, 64, hit_tokens);
                 let other = if held {
                     let mut reservation = pool.reserve(&keys, 0).unwrap();
                     let copies = pool.activate(&mut reservation);
@@ -2111,6 +2145,20 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
     assert_eq!(pool.active_blocks(), 0);
     let resend = coordinator.find_longest_hit(pool, &lease(9000, hash), 9000);
     assert_eq!(resend.tokens, 8704);
+
+    // At hash 4 the checkpoint of a 4,500-token prompt lies inside a block,
+    // at (4,500 - 1) / 4 * 4 = 4,496, and a resend hits it there.
+    let mut coordinator = with_limits(rules_glm_hash(VllmRuleVersion::V0_33_0, true, 4));
+    let mut kv = kv_pool(&groups, 64);
+    let pool = kv.block_pool_mut().unwrap();
+    let request = lease(4500, 4);
+    let mut block_lease = coordinator.new_lease();
+    coordinator.begin_step();
+    assert!(coordinator.allocate(pool, &mut block_lease, 4500, 0, 4500, 1));
+    coordinator.finalize(pool, &mut block_lease, &request, 4500, 4500, &hit, 1);
+    coordinator.begin_step();
+    let resend = coordinator.find_longest_hit(pool, &request, 4500);
+    assert_eq!(resend.tokens, 4496);
 }
 
 #[test]
@@ -3360,7 +3408,7 @@ fn a_request_with_a_copy_source_and_a_boundary_hit_releases_the_source_first() {
         with_limits(GroupedPrefixRules::new(&groups, hash, VllmRuleVersion::V0_31_0).unwrap());
     let mut kv = kv_pool(&groups, 16);
     let pool = kv.block_pool_mut().unwrap();
-    seed_many(pool, 0, hash, &[48]);
+    seed_inside(pool, &[0], hash, 64, 48);
     seed_states(pool, &[1], hash, 48);
     let request = lease(100, hash);
     let hit = coordinator.find_longest_hit(pool, &request, 100);
