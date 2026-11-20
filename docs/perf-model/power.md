@@ -135,9 +135,11 @@ from the aggregated role contribute their operation energy, active latency,
 and covered active latency. For a single text request, `run_agg` prices every
 uncached prefill chunk in order, including a shorter final chunk, before its
 decode steps. Each chunk's already computed tokens become the next chunk's
-prefix. TTFT uses the complete prefill latency and its uncached chunk count in
-the existing queuing heuristic. This also applies to unqualified operation
-graphs and whole-model FPM. Visual context retains its existing mean-field
+prefix. The base backend's TTFT path uses the complete prefill latency and
+its uncached chunk count in the existing queuing heuristic. XPU's single-request
+path instead sums prefill, encoder and dispatch latency without a queuing factor.
+Both paths support unqualified operation graphs and whole-model FPM.
+Visual context retains its existing mean-field
 step pricing, with the prefill iteration count applied to the aggregate totals.
 
 For a disaggregated deployment, the prefill and decode roles are combined by

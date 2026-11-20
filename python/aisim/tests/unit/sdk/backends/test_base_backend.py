@@ -1376,6 +1376,29 @@ def test_run_agg_single_request_counts_every_prefill_chunk(
     assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
 
 
+@pytest.mark.parametrize("sources", [("silicon", "sol"), ("silicon", "sol", "silicon"), ("sol", "sol")])
+def test_run_agg_chunk_sources_preserve_mixed_provenance(backend, model, database, monkeypatch, sources):
+    labels = iter(sources)
+
+    def prefill(*_):
+        return StepEstimate(
+            latency_ms=1.0,
+            energy_wms=0.0,
+            per_op_latency_ms={"context_prefill": 1.0},
+            per_op_source={"context_prefill": next(labels)},
+        )
+
+    monkeypatch.setattr(backend, "run_mixed", prefill)
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: _decode_step(1, 0, {}, {}, ()))
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(batch_size=1, isl=1024 * len(sources), osl=2, engine_step_backend="rust"),
+        ctx_tokens=1024,
+    )
+    assert summary.get_per_ops_source()["mix_step"]["context_prefill"] == ("sol" if len(set(sources)) == 1 else "mixed")
+
+
 @pytest.mark.parametrize(
     "prefix,budget,expected_steps,qf",
     [

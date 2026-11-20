@@ -33,6 +33,10 @@ class MixedStepInput:
     at most ``context_tokens`` new tokens. Each chunk query holds its own new
     tokens plus the packed decode tokens, with the prefix and the earlier
     chunks cached, and the step averages the chunk prices.
+
+    Mixed prefill requires a positive uncached suffix (``prefix < isl``).
+    A positive context budget does not make a fully cached prompt valid;
+    native pricing validates this against the model's runtime lengths.
     """
 
     context_tokens: int

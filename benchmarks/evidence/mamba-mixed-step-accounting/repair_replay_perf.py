@@ -140,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix="mamba-repair-replay-") as temp:
                     **{key: report[key] for key in metrics},
                     "cli_seconds": elapsed,
                     "peak_rss_bytes": resources["peak_observed_rss_bytes"],
-                    "build": identities[-1],
+                    "build": identities,
                 }
         assert (
             record["results"]["baseline"]["control"]["duration_ms"]

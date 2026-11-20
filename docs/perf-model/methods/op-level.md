@@ -43,6 +43,11 @@ Each chunk retains the mixed step's concurrent decoders. Qualified Mamba
 therefore pays three recurrent-state charges and processes 1096 new prefill
 tokens, rather than scaling one chunk eight times. Per-request dispatch is
 added once. Uncached requests retain the existing XPU scaling heuristic.
+The aggregate scheduler reserves decode slots from the full token capacity
+before capping prefill by the batch's demand. Whole-model FPM demand counts
+uncached tokens; op-level demand uses full prompt coordinates. The fitted XPU
+burst factor keeps its full-prompt denominator (`isl`), including for FPM:
+changing the query's token coordinates does not recalibrate the fit.
 
 Single-request op-level aggregates with visual tokens retain mean-field pricing
 when the uncached prompt exceeds the prefill budget. Native context attention

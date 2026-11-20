@@ -785,7 +785,9 @@ class RustForwardPassPerfModel:
         Qualified Mamba op-level estimates accept optional
         ``scheduled_requests.prefill_chunks`` groups of
         ``[requests, new_tokens_per_request, prefix_tokens_per_request]``.
-        Their weighted totals must match the prefill counters. Native Replay
+        Each group's request and new-token counts must be positive; its prefix
+        may be zero. Weighted totals must match ``num_prefill_requests``,
+        ``sum_prefill_tokens`` and ``sum_prefill_kv_tokens``. Native Replay
         supplies observed groups; callers without groups retain balanced
         aggregate pricing.
 
@@ -1821,7 +1823,14 @@ def engine_identity(model: Any, database: Any) -> str:
     memo = getattr(model, "_aic_engine_identity_memo", None)
     if memo is not None and memo[0] is database and memo[1] is mode and memo[2] is policy:
         return memo[3]
-    key = _engine_config_json(model, database)
+    from aisim_core.sdk.engine import OpConversionError
+
+    try:
+        key = _engine_config_json(model, database)
+    except OpConversionError as exc:
+        # There is no conversion-independent graph key for a rejected identity.
+        # Retry conversion on later calls; successful identities remain memoized.
+        raise RustEngineUnsupportedError(str(exc)) from exc
     try:
         model._aic_engine_identity_memo = (database, mode, policy, key)
     except (AttributeError, TypeError):
@@ -1846,9 +1855,15 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
     entries = []
     for ops_name in ("context_ops", "generation_ops"):
         for index, op in enumerate(getattr(model, ops_name, ())):
-            # A whole-model FPM op serializes its op-level graph, Mamba2 ops included.
             if isinstance(op, (Operation, FPMForwardOp)):
-                entries.append([ops_name, index, _as_engine_op(op)._spec_json()])
+                # A whole-model FPM op also serializes its op-level graph.
+                spec = _as_engine_op(op)._spec_json()
+            else:
+                # Keep unsupported neighbors in a Mamba graph's key so a warm
+                # valid handle cannot hide them. Normal compilation will reject
+                # and cache this identity; non-Mamba graphs keep their old key.
+                spec = json.dumps({"unsupported_op": [type(op).__module__, type(op).__qualname__, id(op)]})
+            entries.append([ops_name, index, spec])
     # Build validation of a Mamba graph also reads its other ops (names, stages), so a
     # Mamba graph keys on every compiled op; other graphs keep the config-only key.
     return entries if any('"Mamba2"' in entry[2] for entry in entries) else []

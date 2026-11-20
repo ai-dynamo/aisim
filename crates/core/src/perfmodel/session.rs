@@ -21,6 +21,30 @@ use crate::operators::op::MemoField;
 use crate::operators::{Op, RuntimeContext};
 use crate::perf_database::PerfDatabase;
 
+/// Canonicalize exact groups once per walk, before any per-operation queries.
+/// Replay already supplies sorted unique shapes, which borrow without allocating.
+fn coalesced_prefill_chunks(groups: &[[u32; 3]]) -> Result<Cow<'_, [[u32; 3]]>, AicError> {
+    if groups.windows(2).all(|pair| pair[0][1..] < pair[1][1..]) {
+        return Ok(Cow::Borrowed(groups));
+    }
+    let mut groups = groups.to_vec();
+    groups.sort_unstable_by_key(|&[_, new, prefix]| (new, prefix));
+    let mut kept = 0;
+    for index in 0..groups.len() {
+        let [count, new, prefix] = groups[index];
+        if kept > 0 && groups[kept - 1][1..] == [new, prefix] {
+            groups[kept - 1][0] = groups[kept - 1][0].checked_add(count).ok_or_else(|| {
+                AicError::InvalidForwardPassMetrics("prefill_chunks request count overflows".into())
+            })?;
+        } else {
+            groups[kept] = [count, new, prefix];
+            kept += 1;
+        }
+    }
+    groups.truncate(kept);
+    Ok(Cow::Owned(groups))
+}
+
 /// The engine op list an [`OpMemo`] entry belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpList {
@@ -352,6 +376,7 @@ pub(crate) fn run_context_ops_planned<'a>(
     mut on_op: impl FnMut(usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
+    let prefill_chunks = prefill_chunks.map(coalesced_prefill_chunks).transpose()?;
     let mut total = 0.0_f64;
     for (index, op) in ops.iter().enumerate() {
         match filter {
@@ -360,7 +385,7 @@ pub(crate) fn run_context_ops_planned<'a>(
             ContextOpFilter::OnlyContextAttention if !op.is_context_attention() => continue,
             _ => {}
         }
-        if let Some(groups) = prefill_chunks
+        if let Some(groups) = prefill_chunks.as_deref()
             && op.is_qualified_mamba()
         {
             for &[batch, length, past] in groups {
@@ -707,6 +732,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>, f64),
 ) -> Result<f64, AicError> {
     // ---- Pass 1: combined non-attention work (batch=1, isl=ctx+gen) ----
+    let prefill_chunks = prefill_chunks.map(coalesced_prefill_chunks).transpose()?;
     // Python: `run_static` is called with `isl = num_tokens_combined`
     // and `prefix = prefix * floor(ctx_tokens / isl)`, which makes
     // `effective_isl = isl - prefix = ctx_new + gen` (same as
@@ -746,7 +772,7 @@ pub(crate) fn get_mix_step_ops<'a>(
             // the integer mean prefix rounds to zero.
             let prefix = mamba_cached_prefix(op, prefix_per_req, combined_prefix > 0);
             let balanced = [[n - r, q, prefix], [r, q + 1, prefix]];
-            for &[batch, tokens, prefix] in prefill_chunks.unwrap_or(&balanced) {
+            for &[batch, tokens, prefix] in prefill_chunks.as_deref().unwrap_or(&balanced) {
                 if batch == 0 || tokens == 0 {
                     continue;
                 }

@@ -546,6 +546,47 @@ def test_engine_identity_keeps_fpm_wrapped_mamba_ops_distinct():
     assert rust_engine_step.engine_identity(first, database) != rust_engine_step.engine_identity(second, database)
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_unsupported_mamba_neighbor_rejects_with_a_warm_handle(monkeypatch, wrapped):
+    from types import SimpleNamespace
+
+    from aisim_core.sdk import engine, rust_engine_step
+    from aisim_core.sdk.operations import FPMForwardOp
+
+    database = _hybrid_trtllm_database()
+    valid = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    invalid = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    invalid.context_ops.append(SimpleNamespace(_name="unsupported_neighbor"))
+    if wrapped:
+        invalid.context_ops = [FPMForwardOp("prefill", invalid.config, invalid.model_path, sol_ops=invalid.context_ops)]
+    rust_engine_step._engine_handle_cache_clear()
+    with pytest.raises(rust_engine_step.RustEngineUnsupportedError, match="unsupported_neighbor"):
+        rust_engine_step._cached_engine_handle(invalid, database)
+    rust_engine_step._engine_handle_cache_clear()
+    handle = rust_engine_step._cached_engine_handle(valid, database)
+    equivalent = _nano_with_state_dtypes(conv1d="float16", ssm="float16")
+    assert rust_engine_step._cached_engine_handle(equivalent, database) is handle
+    real_convert = engine._as_engine_op
+    conversions = []
+
+    def convert(op):
+        conversions.append(op)
+        return real_convert(op)
+
+    monkeypatch.setattr(engine, "_as_engine_op", convert)
+    for attempt in range(2):
+        previous = len(conversions)
+        with pytest.raises(rust_engine_step.RustEngineUnsupportedError, match="unsupported_neighbor"):
+            rust_engine_step._cached_engine_handle(invalid, database)
+        if attempt and not wrapped:
+            assert len(conversions) == previous  # normal compilation rejection is cached
+        assert rust_engine_step._cached_engine_handle(valid, database) is handle
+    assert conversions  # the malformed graph never reuses the valid identity
+    conversions.clear()
+    assert rust_engine_step._cached_engine_handle(valid, database) is handle
+    assert conversions == []
+
+
 def _renamed(model, **names):
     """``model`` with each context op named by a key of ``names`` renamed to its value."""
     import json
@@ -597,8 +638,8 @@ def test_mixed_power_coverage_counts_each_mamba_query():
             model, database, ctx_tokens=2048, gen_tokens=0, isl=2048, osl=64, prefix=0
         )
 
-    apart = _nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16")
-    shared = _nano_with_state_dtypes(conv1d="bfloat16", ssm="bfloat16")
+    apart = _nano_with_state_dtypes(conv1d="bfloat16", ssm="float16")
+    shared = _nano_with_state_dtypes(conv1d="bfloat16", ssm="float16")
     index = next(i for i, op in enumerate(shared.context_ops) if op._name == "context_mamba_ssm")
     scan = json.loads(shared.context_ops[index]._spec_json())
     scan["Mamba2"]["name"] = "context_mamba_conv1d"

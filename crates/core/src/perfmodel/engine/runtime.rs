@@ -4975,6 +4975,31 @@ pub(crate) mod tests {
         };
         let ragged = metrics(vec![[1, 500, 0], [1, 1000, 0]], false);
         let balanced = metrics(vec![[2, 750, 0]], false);
+        // One measured batch-two row is 11 ms. Two identical groups describe
+        // that same batch, not two separate batch-one launches (7 + 7 ms).
+        let split = metrics(vec![[1, 750, 0], [1, 750, 0]], false);
+        for decode in [0, 8] {
+            for capture in [false, true] {
+                let estimate = |input: &ForwardPassMetrics| {
+                    let mut input = input.clone();
+                    input.scheduled_requests.num_decode_requests = decode;
+                    input.scheduled_requests.sum_decode_kv_tokens = decode * 16;
+                    engine
+                        .forward_pass_estimate(&[input], capture, None)
+                        .unwrap()
+                };
+                let grouped = estimate(&balanced);
+                let split = estimate(&split);
+                assert_eq!(grouped.latency_ms, split.latency_ms);
+                assert_eq!(
+                    serde_json::to_value(&grouped.ranks).unwrap(),
+                    serde_json::to_value(&split.ranks).unwrap()
+                );
+                if decode == 0 {
+                    assert!(close(split.latency_ms.unwrap(), 11.0));
+                }
+            }
+        }
         // Same totals, different actual measured rows: 2 + 3 versus 11 ms.
         for capture in [false, true] {
             for (input, expected) in [(&ragged, 5.0), (&balanced, 11.0), (&ragged, 5.0)] {

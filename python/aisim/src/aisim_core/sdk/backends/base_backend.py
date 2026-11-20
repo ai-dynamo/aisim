@@ -2138,7 +2138,7 @@ class BaseBackend:
                     for name, value in getattr(chunk, field).items():
                         totals[name] += value
                 for name, source in chunk.per_op_source.items():
-                    sources[name] = source if name not in sources or sources[name] == source else "estimated"
+                    sources[name] = source if name not in sources or sources[name] == source else "mixed"
                 fallbacks = merge_moe_comm_fallbacks(fallbacks, chunk.moe_comm_fallbacks)
             # The summary API weights a mean step by its iteration count.
             mix_step_estimate = dataclasses.replace(

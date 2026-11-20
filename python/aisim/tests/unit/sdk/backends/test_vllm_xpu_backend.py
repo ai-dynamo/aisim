@@ -370,7 +370,7 @@ def test_agg_run_mixed_reserves_decode_slots_from_the_budget(monkeypatch) -> Non
     backend = VLLMXPUBackend()
     captured = {}
     _capture_mixed_step(monkeypatch, captured)
-    rc = SimpleNamespace(isl=100, osl=100)
+    rc = SimpleNamespace(isl=100, osl=100, batch_size=16)
     step = MixedStepInput(context_tokens=1000, num_decode_requests=50)
     backend.run_agg(MagicMock(), MagicMock(), rc, step=step)
     # steady_running = round(1000*100/200)=500; cap = min(500, 3) = 3.
@@ -489,6 +489,47 @@ def test_compute_ttft_single_request_counts_a_short_final_fpm_chunk(monkeypatch,
     )
     ttft = backend._compute_ttft(model, MagicMock(), MagicMock(), 1, 4096, 10, 2048, 1096, **_ttft_kwargs())
     assert ttft == pytest.approx(prefill_ms + 10 * 0.3)
+
+
+@pytest.mark.parametrize(
+    "forward_model,prefix,budget,expected",
+    [("fpm", 4088, 4096, 128), ("fpm", 3000, 2048, 2033), ("op_level", 0, 100000, 65536)],
+)
+def test_batched_ttft_caps_prefill_after_reserving_decode(monkeypatch, forward_model, prefix, budget, expected):
+    backend = VLLMXPUBackend()
+    backend._in_agg = True
+    runtime = SimpleNamespace(isl=4096, osl=128, prefix=prefix, batch_size=16)
+    model = SimpleNamespace(forward_model=forward_model, _num_layers=10)
+    seen = []
+
+    def native_step(self, _model, _database, _runtime, step):
+        seen.append((step.context_tokens, step.num_decode_requests))
+        return StepEstimate(latency_ms=10, energy_wms=0, context_tokens=step.context_tokens)
+
+    monkeypatch.setattr(VLLMBackend, "run_mixed", native_step)
+    monkeypatch.setattr(backend, "_visual_context_tokens", lambda *_: 0)
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *_, **__: 1000)
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *_: 15)
+    monkeypatch.setattr(backend, "_effective_decode_bs", lambda *_: 16)
+    monkeypatch.setattr(backend, "_get_genonly_step_latency", lambda *_: (1, 0, {}, {}, ()))
+    monkeypatch.setattr(backend, "_own_cached_prefill_ms", lambda *_: 10)
+    backend._compute_ttft(model, None, runtime, 16, 4096, 128, budget, prefix, **_ttft_kwargs())
+    assert seen == [(expected, 15)]
+
+
+@pytest.mark.parametrize("prefix", [0, 3000, 4088])
+def test_cached_fpm_burst_keeps_prompt_length_calibration(monkeypatch, prefix):
+    # The documented fit is ctx/isl, independent of the suffix used to query
+    # FPM. Hold own-prefill at 10 ms and decode growth at one to isolate it.
+    backend = VLLMXPUBackend()
+    _patch_ttft_deps(monkeypatch, own_prefill=10, eff_bs=16, gen=1)
+    runtime = SimpleNamespace(isl=4096, osl=128, prefix=prefix, batch_size=16)
+    ttft = backend._compute_ttft(
+        SimpleNamespace(forward_model="fpm"), None, runtime, 16, 4096, 128, 2048, prefix, **_ttft_kwargs()
+    )
+    # 1 + .45 * log2(16)^1.10 * sqrt(min(2048,16*suffix)/4096).
+    expected = {0: 24.62054313441224, 3000: 24.62054313441224, 4088: 13.65513578360306}
+    assert ttft == pytest.approx(expected[prefix])
 
 
 @pytest.mark.parametrize("regime", ["burst", "admission"])

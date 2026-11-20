@@ -67,11 +67,14 @@ class VLLMXPUBackend(VLLMBackend):
         is_fpm = getattr(model, "forward_model", "op_level") == "fpm"
         if is_fpm:
             request_tokens = max(1, isl - prefix)
-        # a batch of b provides at most b*isl prefill tokens, so it can't fill more of the ctx
-        # budget than that; using the raw ctx over-prices the step and the factor when b*isl < ctx.
+        # Cap demand after run_mixed reserves decode slots from the total
+        # scheduler budget. The burst fit still reads the capped demand below.
         prefill_ctx = min(ctx_tokens, max(1, b) * request_tokens)
         step = self.run_mixed(
-            model, database, runtime_config, MixedStepInput(context_tokens=prefill_ctx, num_decode_requests=d)
+            model,
+            database,
+            runtime_config,
+            MixedStepInput(context_tokens=ctx_tokens if b > 1 else prefill_ctx, num_decode_requests=d),
         )
         if b > 1 and prefix > 0 and not is_fpm and isl == runtime_config.isl:
             # A packed prompt budget is not a multiplier for already-priced
@@ -103,10 +106,7 @@ class VLLMXPUBackend(VLLMBackend):
             gen_1 = self._get_genonly_step_latency(model, database, runtime_config, 1, isl, osl)[0]
             growth = gen_bs / gen_1 if gen_1 > 0 else 1.0
 
-            factor = (
-                1.0
-                + BURST_A * math.log2(b) ** BURST_BS_EXP * ((prefill_ctx / request_tokens) * growth) ** BURST_CTX_EXP
-            )
+            factor = 1.0 + BURST_A * math.log2(b) ** BURST_BS_EXP * ((prefill_ctx / isl) * growth) ** BURST_CTX_EXP
             ttft = own_prefill_ms * min(factor, float(b))
         regime = "admission" if eff_bs < b else "burst"
         logger.debug(f"ttft(xpu): own_prefill={own_prefill_ms:.2f}ms eff_bs={eff_bs} {regime} ttft={ttft:.2f}ms")
@@ -366,5 +366,9 @@ class VLLMXPUBackend(VLLMBackend):
                 step = replace(step, num_decode_requests=cap)
 
         # total budget -> prefill tokens: subtract the reserved decode slots.
-        step = replace(step, context_tokens=max(1, step.context_tokens - step.num_decode_requests))
+        request_tokens = isl
+        if getattr(model, "forward_model", "op_level") == "fpm":
+            request_tokens = max(1, isl - int(runtime_config.prefix or 0))
+        demand = max(1, int(getattr(runtime_config, "batch_size", 1) or 1)) * request_tokens
+        step = replace(step, context_tokens=max(1, min(demand, step.context_tokens - step.num_decode_requests)))
         return super().run_mixed(model, database, runtime_config, step)

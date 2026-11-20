@@ -1311,6 +1311,60 @@ the past-only request for this diagnostic or authorize a separate migration
 of the packed contract and all callers. The requested subtraction is left
 unapplied.
 
+### Scoped review corrections after `0cfbdb55`
+
+Exact `prefill_chunks` now coalesce equal `(new tokens, prefix)` shapes
+before either the pure-prefill or mixed Mamba walk. In the synthetic measured
+fixture, `[[2, 750, 0]]` and `[[1, 750, 0], [1, 750, 0]]` both select the
+batch-two 11 ms row; previously the latter selected two batch-one 7 ms rows
+and totaled 14 ms. Different lengths and prefixes remain separate. The native
+`qualified_mamba_uses_exact_prefill_groups_and_keys_the_rank_memo` regression
+checks both payloads with zero and eight packed decode tokens, with and without
+diagnostics. These fixture timings are accounting oracles, not measurements.
+Already sorted, unique groups from Replay borrow without allocation. Other
+payloads sort and fold once per walk in O(groups log groups), instead of once
+per operation. The added normal-path shape check is O(groups); queries already
+visit those groups for every qualified operation. Totals-only and pure-decode
+walks do not allocate groups. Successful SDK identities retain their constant-time
+memo hit; failed nested conversions are retried without inventing a partial
+cache key, and ordinary unsupported neighbors use the existing rejection cache.
+
+The XPU scheduler now reserves decoders from the full capacity before capping
+prefill demand. Its burst fit again divides by full prompt length, as the
+pre-FPM-correction implementation (`108835ac^`) and the `ctx/isl` calibration
+comment specify. No coefficients have been refitted. The uncached suffix still
+sets native FPM query coordinates and the capped demand in the ratio's numerator.
+
+Run from the repository root, with the corrected wheel installed:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py OUT.json
+```
+
+The driver reads the baseline class from
+`0cfbdb5535583493e4ab073241e1f74d707acdde` and imports the corrected class.
+It runs the actual XPU budget conversion, own-prefill scaling and burst formula
+over an explicitly synthetic FPM pricing seam: 1 ms per launch, 0.01 ms per new
+token and 0.1 ms per decoder. It holds decode growth at one and admits all 16
+requests. This isolates caller and fit behavior; it does not execute a native
+FPM table or establish XPU serving accuracy. Full inputs, shapes and outputs are
+in [xpu-scoped-repair.json](mamba-mixed-step-accounting/xpu-scoped-repair.json).
+
+| Prefix / token capacity | Pricing input (prefill, decode), before / after | TTFT ms, before / after |
+| --- | --- | --- |
+| 3000 / 2048 | (2033, 15) / (2033, 15) | 58.574076 / 37.688541 |
+| 4088 / 4096 | (124, 4) / (128, 15) | 29.390882 / 4.419143 |
+| 0 / 2048 control | (2033, 15) / (2033, 15) | 176.012263 / 176.012263 |
+
+All points use batch 16, ISL 4096 and OSL 128. In the second baseline point,
+capping the scheduler budget to 128 also incorrectly limits decoders to four;
+the corrected path uses the full 4096-token capacity and retains all 15.
+The SDK regression separately checks an op-level demand cap and a capacity-bound
+control. The repair also preserves `mixed` provenance across two or three
+heterogeneous chunks, retains every process record in new replay-driver reports,
+and makes the power-coverage scan fixture FP16 so measured BF16 scan rows cannot
+accidentally supply its intentionally absent power.
+
 ### Cached visual aggregate repair
 
 The baseline for this repair is `9cf0096bf14ca70a49911d996b1696c5b4d1ffc6`.
