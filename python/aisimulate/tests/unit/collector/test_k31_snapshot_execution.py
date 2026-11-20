@@ -6,6 +6,7 @@
 import copy
 import hashlib
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,11 +15,103 @@ from collector.fpm_forward import execution_evidence
 from collector.fpm_forward.runtime import fpm_memory_observer as observer
 
 from .test_fpm_repeatability import _write_campaign
-from .test_fpm_runtime_memory import _typed
+from .test_fpm_runner import _write_provenance
+from .test_fpm_runtime_memory import _typed, _vllm_config
 from .test_k31_planner_precision import inputs  # noqa: F401
 from .test_runtime_observations import _mutate, _replace_launch, _write
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def native_source(tmp_path, monkeypatch):
+    """Synthetic installed packages with real on-disk source hashes."""
+    from collector.fpm_forward.runtime_k31 import VERSION
+
+    sources = {}
+    packages = {}
+    for name in ("vllm", "dynamo"):
+        root = tmp_path / "installed" / name
+        root.mkdir(parents=True)
+        source = root / "source.py"
+        source.write_text("# synthetic installed source fixture\n")
+        sources[f"{name}/source.py"] = hashlib.sha256(source.read_bytes()).hexdigest()
+        packages[name] = SimpleNamespace(__path__=[str(root)], __version__=VERSION)
+        monkeypatch.setitem(sys.modules, name, packages[name])
+    monkeypatch.setitem(sys.modules, "vllm._version", SimpleNamespace(__commit_id__="g266e88c05"))
+    manifest = tmp_path / "source-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "runtime": {
+                    "version": VERSION,
+                    "source_revision": hashlib.sha256(
+                        json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "source_files": sources,
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("AISIMULATE_RUNTIME_INSTRUMENTATION", str(manifest))
+    monkeypatch.setattr(observer.importlib.metadata, "version", lambda _: VERSION)
+    return packages, manifest
+
+
+@pytest.mark.parametrize(
+    "corruption,match",
+    [
+        (None, None),
+        ("vllm_source", "source hash differs: vllm/source.py"),
+        ("dynamo_source", "source hash differs: dynamo/source.py"),
+        ("missing_source", "source path must resolve uniquely"),
+        ("duplicate_source", "source path must resolve uniquely"),
+        ("imported_version", "imported vllm package reports"),
+        ("metadata_version", "requires audited vLLM"),
+        ("commit", "VCS identifier contradicts"),
+        ("manifest_version", "manifest="),
+    ],
+)
+def test_k31_execution_checks_installed_source_before_observed(native_source, tmp_path, monkeypatch, corruption, match):
+    from collector.fpm_forward.runtime_k31 import VERSION
+
+    packages, manifest = native_source
+    if corruption in {"vllm_source", "dynamo_source", "missing_source"}:
+        name = "dynamo" if corruption == "dynamo_source" else "vllm"
+        source = Path(packages[name].__path__[0]) / "source.py"
+        if corruption == "missing_source":
+            source.unlink()
+        else:
+            source.write_text("# modified installed source\n")
+    elif corruption == "duplicate_source":
+        packages["vllm"].__path__ *= 2
+    elif corruption == "imported_version":
+        packages["vllm"].__version__ = "0.33.0"
+    elif corruption == "metadata_version":
+        monkeypatch.setattr(observer.importlib.metadata, "version", lambda _: "0.28.1")
+    elif corruption == "commit":
+        monkeypatch.setitem(sys.modules, "vllm._version", SimpleNamespace(__commit_id__="g99999999"))
+    elif corruption == "manifest_version":
+        document = json.loads(manifest.read_text())
+        document["runtime"]["version"] = "0.33.0"
+        manifest.write_text(json.dumps(document))
+    _write_provenance(tmp_path / "collector-provenance.json", cell_id="synthetic-cell")
+    monkeypatch.setattr(observer, "RESULTS_DIR", tmp_path)
+    group = SimpleNamespace(
+        backend=type("ResolvedBackend", (), {"__module__": "actual.runtime"}),
+        layer_names=["layer.0"],
+        kv_cache_group_id=0,
+    )
+    worker = SimpleNamespace(vllm_config=_vllm_config(), model_runner=SimpleNamespace(attn_groups=[[group]]))
+    observer.observe_execution(worker, dp_rank=0, tp_rank=0, pp_rank=0, audited_version=VERSION)
+    result = json.loads((tmp_path / "fpm-execution-worker-dp0-tp0-pp0.json").read_text())
+    if corruption is None:
+        assert result["status"] == "observed", result
+        assert result["runtime"]["source_files"] == json.loads(manifest.read_text())["runtime"]["source_files"]
+    else:
+        assert result["status"] == "unresolved", result
+        assert match in result["error"]
+        assert "attention_groups" not in result
 
 
 @pytest.fixture
@@ -118,7 +211,7 @@ def test_snapshot_identity_is_checked_on_the_validated_manifest(snapshot, monkey
 
 
 @pytest.fixture
-def native_execution(snapshot, request, monkeypatch):
+def native_execution(snapshot, native_source, request, monkeypatch):
     from collector.fpm_forward import planner, runtime_probe
     from collector.fpm_forward.native_artifact import validate_native_collection
 
@@ -490,6 +583,8 @@ def test_execution_reports_malformed_initialized_weight_shapes(native_execution,
     "mutation",
     [
         "null_phase",
+        "null_hardware",
+        "list_hardware",
         "list_classes",
         "null_placement",
         "null_cache",
@@ -508,7 +603,9 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
 
         def corrupt(record):
             if record["kind"] == "worker" and mutation != "null_scheduler_group":
-                if mutation == "list_classes":
+                if mutation in {"null_hardware", "list_hardware"}:
+                    record["hardware"] = None if mutation == "null_hardware" else []
+                elif mutation == "list_classes":
                     group = record["cache"]["groups"][-1]
                     group["layer_classes"] = group["layer_names"]
                 elif mutation == "null_cache":
@@ -527,6 +624,8 @@ def test_execution_reports_malformed_native_objects_as_failed(native_execution, 
     assert result["status"] == "failed", result
     message = {
         "null_phase": "phase must be an object",
+        "null_hardware": "hardware must be an object",
+        "list_hardware": "hardware must be an object",
         "list_classes": "class coverage",
         "null_placement": "placement",
         "null_cache": "cache must be an object",

@@ -331,7 +331,7 @@ def _kernel_view_fixture(monkeypatch):
 
 def test_native_indexer_kernel_view_charges_only_actual_shared_allocation(monkeypatch):
     cache, scheduled = _kernel_view_fixture(monkeypatch)
-    groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096)
+    groups, accounting = _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
     assert len(groups) == 2
     assert accounting["num_blocks"] == 10 and accounting["page_size_bytes"] == 512
     assert cache["allocated_cache_bytes"] == 5120
@@ -363,7 +363,7 @@ def test_kernel_view_mapping_cannot_hide_pool_or_layer_corruption(monkeypatch, m
     cache, scheduled = _kernel_view_fixture(monkeypatch)
     mutation(cache)
     with pytest.raises(ValueError, match=match):
-        _physical_views(cache, scheduled, "fp8", context=4096)
+        _physical_views(cache, scheduled, "fp8", context=4096, sequences=8)
 
 
 @pytest.mark.parametrize(
@@ -627,12 +627,12 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
     manifest = {
         "runtime": {"version": runtime_k31.VERSION, "source_revision": source_revision, "source_files": source_map}
     }
-    monkeypatch.setattr(observer.importlib.metadata, "version", lambda _: runtime_k31.VERSION)
-    monkeypatch.setattr(observer, "_installed_file", lambda _: path)
-    real_import = observer.importlib.import_module
+    monkeypatch.setattr(legacy.importlib.metadata, "version", lambda _: runtime_k31.VERSION)
+    monkeypatch.setattr(legacy, "_installed_file", lambda _: path)
+    real_import = legacy.importlib.import_module
     build = SimpleNamespace(__commit_id__="g266e88c05")
     monkeypatch.setattr(
-        observer.importlib, "import_module", lambda name: build if name == "vllm._version" else real_import(name)
+        legacy.importlib, "import_module", lambda name: build if name == "vllm._version" else real_import(name)
     )
     payload = {"launch": {"deployment": {"image": "fixture@sha256:" + "a" * 64}}}
     observer._runtime(payload, manifest, runtime_k31.VERSION)
@@ -701,6 +701,29 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
         ref["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
     path.write_text(json.dumps(index))
     return path, launches
+
+
+@pytest.mark.parametrize("rows", [1, 63, 64, 65])
+def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, rows):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    cache, _ = _kernel_view_fixture(monkeypatch)
+    for mapping in cache["kernel_block_views"].values():
+        mapping["kernel_block_table_shape"][1] = rows
+
+    def set_kernel_views(record):
+        if record["kind"] == "worker":
+            record["cache"]["kernel_block_views"] = copy.deepcopy(cache["kernel_block_views"])
+            for name in cache["kernel_block_views"]:
+                record["cache"]["layer_components"][name] = copy.deepcopy(cache["layer_components"][name])
+
+    _mutate(path, set_kernel_views)
+    assert launches["tp2"]["collection"]["max_num_seqs"] == 64
+    result = validate_observations(path, launches)["tp2"]
+    if rows == 64:
+        assert result["status"] == "complete", result["diagnostics"]
+    else:
+        assert result["status"] == "incomplete", result
+        assert any("kernel-block table" in message for message in result["diagnostics"])
 
 
 @pytest.mark.parametrize("workload_kind", ["prefill", "decode"])

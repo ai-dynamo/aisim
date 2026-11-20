@@ -264,6 +264,8 @@ def _validate_record(
         ):
             raise ValueError("worker warmup and graph capture completion evidence is missing")
         hardware = record.get("hardware", {})
+        if not isinstance(hardware, dict):
+            raise ValueError("runtime observation hardware must be an object")
         _validate_hardware(hardware, launch["identity"])
         total = _positive(hardware.get("total_memory_bytes"), "hardware memory bytes")
         if _positive(record["cache"]["available_cache_bytes"], "profiled cache allowance") > total:
@@ -504,7 +506,12 @@ def _validate_alias_ownership(views: list[tuple[dict[str, Any], int]], count: in
 
 
 def _physical_views(
-    cache: dict[str, Any], scheduled: dict[str, Any], precision: str, *, context: int | None = None
+    cache: dict[str, Any],
+    scheduled: dict[str, Any],
+    precision: str,
+    *,
+    context: int | None = None,
+    sequences: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     from .runtime_k31 import LAYOUT
 
@@ -535,7 +542,7 @@ def _physical_views(
                 or group.get("attention_chunk_size") is not None
             ):
                 raise ValueError("K3.1 cache group pool or retention is unsupported")
-        validate_views(cache, precision, count, page)
+        validate_views(cache, precision, count, page, sequences=sequences)
         return groups, accounting
     layer_groups = {}
     for group_id, group in enumerate(cache["groups"]):
@@ -802,6 +809,7 @@ def _configuration(
                 scheduler["cache"],
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"], cell),
                 context=launch["collection"]["max_model_len"],
+                sequences=launch["collection"]["max_num_seqs"],
             )
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]

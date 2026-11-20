@@ -10,8 +10,6 @@ CPU import use the manifest, never this module. No model or timing code is run.
 from __future__ import annotations
 
 import hashlib
-import importlib
-import importlib.metadata
 import json
 import logging
 import os
@@ -29,59 +27,9 @@ def _json(value: Any) -> Any:
     return legacy._json_value(value)
 
 
-def _installed_file(name: str) -> Path:
-    package, *parts = name.split("/")
-    module = importlib.import_module(package)
-    paths = [Path(root).joinpath(*parts) for root in module.__path__]
-    found = [path for path in paths if path.is_file()]
-    if len(found) != 1:
-        raise ValueError(f"runtime source path must resolve uniquely: {name}")
-    return found[0]
-
-
 def _runtime(payload: dict, manifest: dict, version: str) -> None:
-    actual_version = importlib.metadata.version("vllm")
-    build = importlib.import_module("vllm._version")
-    commit = getattr(build, "__commit_id__", None)
-    pinned = manifest["runtime"]
-    observed = payload["runtime"] = {
-        "framework": "vllm",
-        "version": actual_version,
-        "source_revision": pinned["source_revision"],
-        "source_files": {},
-        "image": payload["launch"]["deployment"]["image"],
-    }
-    payload["source_identity"] = {"vllm_commit_id": commit, "source_revision_basis": "declared source and file hashes"}
-    errors = []
-    if actual_version != version or pinned["version"] != version:
-        errors.append(f"adapter requires vLLM {version}; installed={actual_version}, manifest={pinned['version']}")
-    # Wheels may omit a VCS identifier. The exact inspected source files remain
-    # mandatory; when a wheel supplies an identifier, it must also agree.
-    if len(pinned["source_revision"]) == 64:
-        # Preview wheels need not publish a full Git commit. Bind their complete
-        # inspected source map by SHA-256 instead of inventing a Git revision.
-        source_digest = hashlib.sha256(
-            json.dumps(pinned["source_files"], sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        if source_digest != pinned["source_revision"]:
-            errors.append("source-map SHA-256 contradicts source revision")
-        payload["source_identity"]["source_revision_basis"] = "SHA-256 of canonical source file hash map"
-        if commit is not None and str(commit) not in actual_version:
-            errors.append("installed VCS identifier contradicts exact wheel version")
-    elif commit is not None:
-        short = str(commit).removeprefix("g")
-        if len(short) < 7 or not pinned["source_revision"].startswith(short):
-            errors.append(f"installed vLLM commit {commit!r} contradicts source revision")
-    for name, expected in pinned["source_files"].items():
-        try:
-            digest = hashlib.sha256(_installed_file(name).read_bytes()).hexdigest()
-            observed["source_files"][name] = digest
-            if digest != expected:
-                errors.append(f"runtime source hash differs: {name}")
-        except (OSError, ValueError, AttributeError, ImportError) as error:
-            errors.append(f"runtime source {name}: {error}")
-    if errors:
-        raise ValueError("; ".join(errors))
+    legacy._runtime_source(payload, manifest["runtime"], version)
+    payload["runtime"]["image"] = payload["launch"]["deployment"]["image"]
 
 
 def _loaded_config(owner: Any, payload: dict) -> None:
