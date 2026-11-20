@@ -194,6 +194,8 @@ struct ConfiguredExecutionPayload {
     #[serde(default)]
     tokenization: Option<TokenizationPayload>,
     #[serde(default)]
+    extra_cpu_overhead: Option<ExtraCpuOverheadPayload>,
+    #[serde(default)]
     detokenization: Option<DetokenizationPayload>,
 }
 
@@ -217,6 +219,16 @@ fn default_tokenization_workers() -> usize {
     1
 }
 
+/// Unqueued CPU overhead before the engine: fixed plus per input token.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtraCpuOverheadPayload {
+    #[serde(default)]
+    base_ms: f64,
+    #[serde(default)]
+    per_input_token_ms: f64,
+}
+
 /// Detokenization on every token-emitting worker before the client.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -234,6 +246,7 @@ struct DetokenizationPayload {
 #[derive(Debug, Clone, Copy, Default)]
 struct ServingPath {
     tokenization: Option<TokenizationPayload>,
+    extra_cpu_overhead: Option<ExtraCpuOverheadPayload>,
     detokenization: Option<DetokenizationPayload>,
 }
 
@@ -4129,6 +4142,9 @@ fn run_with_input(
             tokenization.per_input_token_ms,
         )?;
     }
+    if let Some(extra) = serving_path.extra_cpu_overhead {
+        replayer = replayer.with_extra_cpu_overhead(extra.base_ms, extra.per_input_token_ms)?;
+    }
     if let Some(detokenization) = serving_path.detokenization {
         replayer = replayer.with_detokenization(
             detokenization.workers,
@@ -4672,6 +4688,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                     telemetry_sample_interval_ms,
                     determinism,
                     tokenization,
+                    extra_cpu_overhead,
                     detokenization,
                 }) => (
                     spec,
@@ -4680,6 +4697,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                     determinism,
                     ServingPath {
                         tokenization,
+                        extra_cpu_overhead,
                         detokenization,
                     },
                     capture_telemetry.then_some(telemetry_sample_interval_ms),
