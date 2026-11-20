@@ -2739,12 +2739,15 @@ def _main_batch_api(
             assert parse_qs(urlsplit(endpoint).query) == {"per_page": ["1"]}
             return {"status": (compare or {})[path.rsplit("/", 1)[1]]}
         if path == "repos/ai-dynamo/aisim/actions/workflows/ci.yml/runs":
-            assert parse_qs(urlsplit(endpoint).query) == {
+            query = parse_qs(urlsplit(endpoint).query)
+            page = int(query.pop("page", ["1"])[0])
+            assert query == {
                 "branch": ["main"],
                 "event": ["push"],
-                "per_page": [str(full_ci_selector.MAIN_LOOKBACK_RUNS)],
+                "per_page": [str(full_ci_selector.MAIN_RUNS_PER_PAGE)],
             }
-            return {"workflow_runs": list(runs)}
+            start = (page - 1) * full_ci_selector.MAIN_RUNS_PER_PAGE
+            return {"workflow_runs": list(runs[start : start + full_ci_selector.MAIN_RUNS_PER_PAGE])}
         if path.endswith("/jobs"):
             query = parse_qs(urlsplit(endpoint).query)
             page = int(query.pop("page", ["1"])[0])
@@ -2811,6 +2814,38 @@ def test_main_push_keeps_full_scope_and_compares_with_the_last_full_scope_commit
     assert deferred in batch["notes"][1][1] and undecided in batch["notes"][1][1]
     inspected = [call for call in calls if call.endswith("/jobs?filter=latest&per_page=100")]
     assert [call.split("/")[-2] for call in inspected] == ["199", "198", "197"]
+
+
+@pytest.mark.parametrize("superseded_count", [29, 59])
+@pytest.mark.parametrize("newer_count", [0, 30])
+def test_main_push_recovers_a_validated_base_beyond_the_first_history_page(
+    superseded_count: int, newer_count: int
+) -> None:
+    validated = "d" * 40
+    newer = [_main_run(230 - index, MAIN_NEWER) for index in range(newer_count)]
+    superseded = [_main_run(199 - index, f"{index + 1:040x}") for index in range(superseded_count)]
+    validated_run_id = 199 - superseded_count
+    api, calls = _main_batch_api(
+        MAIN_TARGET,
+        compare={f"{validated}...{MAIN_TARGET}": "ahead"},
+        runs=(*newer, _main_run(200, MAIN_TARGET), *superseded, _main_run(validated_run_id, validated)),
+        jobs={
+            **{run["id"]: _scope_jobs("success") for run in superseded},
+            validated_run_id: _scope_jobs("skipped"),
+        },
+    )
+
+    batch = full_ci_selector.resolve_main_push(
+        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=api, sleep=lambda _: None
+    )
+
+    assert batch["superseded"] is False
+    assert batch["comparison_base"] == validated
+    assert all(select_components([], force_all=True, superseded=batch["superseded"])["components"].values())
+    assert all(run["head_sha"] in batch["notes"][1][1] for run in superseded)
+    history_pages = [call for call in calls if "/actions/workflows/ci.yml/runs?" in call]
+    assert len(history_pages) == (newer_count + superseded_count + 1) // 30 + 1
+    assert parse_qs(urlsplit(history_pages[-1]).query)["page"] == [str(len(history_pages))]
 
 
 @pytest.mark.parametrize("marker", ["skipped", None])
@@ -3097,7 +3132,19 @@ def test_main_batching_cli_writes_scope_and_comparison_outputs(
     assert ("::notice::main moved to" in capsys.readouterr().out) is superseded
 
 
-@pytest.mark.parametrize("failure", ["api", "empty history", "superseded parent", "non-ancestor"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "api",
+        "empty history",
+        "superseded parent",
+        "non-ancestor",
+        "history exhausted",
+        "history API error",
+        "history malformed",
+        "history non-ancestor",
+    ],
+)
 def test_main_batching_cli_errors_leave_outputs_unwritten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -3105,14 +3152,32 @@ def test_main_batching_cli_errors_leave_outputs_unwritten(
     runs = () if failure in {"api", "empty history"} else (_main_run(199, MAIN_PARENT),)
     if failure == "non-ancestor":
         runs += (_main_run(198, other),)
-    api, _ = _main_batch_api(
+    if failure.startswith("history "):
+        runs += tuple(_main_run(198 - index, f"{index + 1:040x}") for index in range(29))
+        if failure == "history non-ancestor":
+            runs += (_main_run(169, other),)
+    jobs = {run["id"]: _scope_jobs("success") for run in runs}
+    if failure in {"non-ancestor", "history non-ancestor"}:
+        jobs[runs[-1]["id"]] = _scope_jobs("skipped")
+    api, calls = _main_batch_api(
         MAIN_TARGET,
         failing=("/actions/",) if failure == "api" else (),
         runs=runs,
-        jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
+        jobs=jobs,
         compare={f"{other}...{MAIN_TARGET}": "diverged"},
     )
-    monkeypatch.setattr(full_ci_selector, "github_api", api)
+
+    def read_history(endpoint: str) -> dict:
+        if "/actions/workflows/ci.yml/runs?" in endpoint and "page=2" in endpoint:
+            if failure == "history API error":
+                calls.append(endpoint)
+                raise full_ci_selector.GitHubError("unavailable history page")
+            if failure == "history malformed":
+                calls.append(endpoint)
+                return {"workflow_runs": None}
+        return api(endpoint)
+
+    monkeypatch.setattr(full_ci_selector, "github_api", read_history)
     monkeypatch.setattr(full_ci_selector.time, "sleep", lambda _: None)
     output, summary = tmp_path / "github-output", tmp_path / "summary.md"
     monkeypatch.setattr(
@@ -3141,6 +3206,8 @@ def test_main_batching_cli_errors_leave_outputs_unwritten(
         full_ci_selector.main()
     assert not output.exists()
     assert not summary.exists()
+    if failure.startswith("history "):
+        assert any("/actions/workflows/ci.yml/runs?" in call and "page=2" in call for call in calls)
 
 
 def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:

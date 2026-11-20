@@ -349,12 +349,16 @@ succeeds in a superseded run and is skipped in a full-scope run. Selections that
 are still running, failed, or superseded are passed over, as are full-scope runs
 with missing, unfinished, or unsuccessful comparison jobs. Runs from before
 batching count as full scope but require the same comparison evidence.
-If none of the last 30 main pushes has that evidence, or the selected commit is
-not an ancestor, **Select Full CI Scope** fails without publishing a plan or
-comparison base. It never falls back to an unvalidated parent: that commit may
-already contain deferred changes, hiding them from the comparison. If `main`
-cannot be read, the run selects the full scope and still requires a validated
-comparison ancestor. If earlier runs cannot be read, selection also fails.
+The selector reads main push history in pages of 30 runs, continuing into older
+pages until it finds comparison-validated evidence or exhausts the available
+Actions history. A burst of superseded pushes therefore does not displace the
+baseline from a fixed lookback window. If no available run has that evidence,
+or the selected commit is not an ancestor, **Select Full CI Scope** fails without
+publishing a plan or comparison base. It never falls back to an unvalidated
+parent: that commit may already contain deferred changes, hiding them from the
+comparison. If `main` cannot be read, the run selects the full scope and still
+requires a validated comparison ancestor. If earlier runs cannot be read,
+selection also fails.
 
 Release branches, trusted PR copies, and manual runs are not batched. Every main
 run starts its expensive jobs ten minutes later. Main runs keep unique

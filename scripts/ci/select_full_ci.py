@@ -56,7 +56,7 @@ SUPERSEDED_MAIN_COMPONENTS = {
 # Main batching. Every name below must match .github/workflows/ci.yml: later
 # main runs read the recorded scope of earlier runs through the Actions API.
 MAIN_DEBOUNCE_SECONDS = 600
-MAIN_LOOKBACK_RUNS = 30
+MAIN_RUNS_PER_PAGE = 30
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 SCOPE_JOB = "Select Full CI Scope"
 PLAN_STEP = "Plan required Full CI components"
@@ -399,6 +399,38 @@ def _main_comparisons_succeeded(jobs_page: dict) -> bool:
     return True
 
 
+def _earlier_main_runs(
+    repository: str,
+    sha: str,
+    run_id: int,
+    *,
+    api: Callable[[str], dict],
+) -> Iterable[dict]:
+    """Yield eligible earlier runs, newest first, across available history pages."""
+    query = urlencode({"branch": "main", "event": "push", "per_page": MAIN_RUNS_PER_PAGE})
+    endpoint = f"repos/{repository}/actions/workflows/ci.yml/runs?{query}"
+    page = 1
+    while True:
+        runs = api(endpoint if page == 1 else f"{endpoint}&page={page}").get("workflow_runs")
+        if not isinstance(runs, list):
+            raise GitHubError("GitHub API returned no main Full CI run list")
+        earlier = [
+            run
+            for run in runs
+            if type(run.get("id")) is int
+            and run["id"] < run_id
+            and run.get("path") == WORKFLOW_PATH
+            and run.get("event") == "push"
+            and run.get("head_branch") == "main"
+            and FULL_SHA.fullmatch(str(run.get("head_sha", "")))
+            and run["head_sha"] != sha
+        ]
+        yield from sorted(earlier, key=lambda run: run["id"], reverse=True)
+        if len(runs) < MAIN_RUNS_PER_PAGE:
+            return
+        page += 1
+
+
 def last_full_scope_commit(
     repository: str,
     sha: str,
@@ -409,27 +441,12 @@ def last_full_scope_commit(
 ) -> tuple[str, list[tuple[str, str]]]:
     """Return the newest earlier full-scope main commit with successful comparisons.
 
-    Superseded, still-undecided, and unvalidated comparison runs are skipped.
-    Without a validated ancestor in the bounded window, fail selection rather
-    than compare against a parent that may already contain deferred changes.
+    Superseded, still-undecided, and unvalidated comparison runs are skipped,
+    continuing through older history pages as needed. Without a validated
+    ancestor, fail selection rather than use a possibly unvalidated parent.
     """
-    query = urlencode({"branch": "main", "event": "push", "per_page": MAIN_LOOKBACK_RUNS})
-    runs = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}").get("workflow_runs")
-    if not isinstance(runs, list):
-        raise GitHubError("GitHub API returned no main Full CI run list")
-    earlier = [
-        run
-        for run in runs
-        if type(run.get("id")) is int
-        and run["id"] < run_id
-        and run.get("path") == WORKFLOW_PATH
-        and run.get("event") == "push"
-        and run.get("head_branch") == "main"
-        and FULL_SHA.fullmatch(str(run.get("head_sha", "")))
-        and run["head_sha"] != sha
-    ]
     deferred = []
-    for run in sorted(earlier, key=lambda run: run["id"], reverse=True):
+    for run in _earlier_main_runs(repository, sha, run_id, api=api):
         jobs_page = _main_run_jobs(repository, run["id"], api=api)
         decision = main_scope_decision(jobs_page)
         if decision == "full" and not _main_comparisons_succeeded(jobs_page):
@@ -457,7 +474,7 @@ def last_full_scope_commit(
             )
         return base, notes
     raise GitHubError(
-        f"No full-scope Full CI run with successful comparisons among the last {MAIN_LOOKBACK_RUNS} main pushes; "
+        "No full-scope Full CI run with successful comparisons in available main push history; "
         f"refusing to use unvalidated parent `{parent}` as the comparison base."
     )
 
