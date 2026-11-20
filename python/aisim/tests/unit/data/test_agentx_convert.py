@@ -263,3 +263,68 @@ def test_merged_bundles_keep_each_bundles_lineage_gap_with_its_observation(tmp_p
     assert [g["observation_id"] for g in gaps] == ["unkeyed"]
     (merged,) = agentx_bundles_to_configurations([unkeyed, keyed])
     assert [g["observation_id"] for g in merged.body.evidence_gaps if g["field"] == "requests.lineage"] == ["unkeyed"]
+
+
+def test_a_reported_degree_separates_configurations_even_when_the_gpu_count_is_unknown(tmp_path):
+    pp1, pp2 = _bundle(tmp_path, "pp1"), _bundle(tmp_path, "pp2")
+    _set_effective_parallelism(pp1, tensor_parallel_size=8, pipeline_parallel_size=1)
+    _set_effective_parallelism(pp2, tensor_parallel_size=8, pipeline_parallel_size=2)
+    first, second = agentx_bundle_to_configuration(pp1), agentx_bundle_to_configuration(pp2)
+    assert second.body.parallelism == {"aggregated": {"tp": 8, "pp": 2}}
+    assert first.body.parallelism_complete is False and first.observations[0].device_count is None
+    assert first.body.configuration_id() != second.body.configuration_id()
+    assert len(agentx_bundles_to_configurations([pp1, pp2])) == 2
+
+
+def _set_speculation(path, draft_length):
+    features = {
+        "features": [
+            {
+                "id": "speculation",
+                "state": "enabled",
+                "parameters": [
+                    {"name": "method", "value": "eagle"},
+                    {"name": "num_speculative_tokens", "value": draft_length},
+                ],
+            }
+        ]
+    }
+    (path / "features.json").write_text(json.dumps(features))
+
+
+def test_speculation_parameters_are_part_of_the_serving_identity(tmp_path):
+    short, long_, other_lanes = (_bundle(tmp_path, n, lanes=lanes) for n, lanes in (("s", 4), ("l", 4), ("o", 8)))
+    _set_speculation(short, 2)
+    _set_speculation(long_, 3)
+    _set_speculation(other_lanes, 2)
+    ids = {
+        n: agentx_bundle_to_configuration(p).body.configuration_id()
+        for n, p in (("s", short), ("l", long_), ("o", other_lanes))
+    }
+    assert ids["s"] != ids["l"]  # a different draft length is another configuration
+    assert ids["s"] == ids["o"]  # only the lane count differs: still one configuration
+    assert len(agentx_bundles_to_configurations([short, long_, other_lanes])) == 2
+
+
+def test_a_lineage_correction_changes_the_observation_revision_and_snapshot_id(tmp_path):
+    from aisim_core.data.e2e import SnapshotMember, snapshot_id
+
+    path = _bundle(tmp_path, "lineage")
+    before = agentx_bundle_to_configuration(path).observations[0]
+    workload = json.loads((path / "workload.json").read_text())
+    workload["silicon_reference"]["reference"][0]["conversation_id"] = "c-corrected"
+    (path / "workload.json").write_text(json.dumps(workload))
+    after = agentx_bundle_to_configuration(path).observations[0]
+    assert after.observation_id == before.observation_id and after.configuration_id == before.configuration_id
+    assert after.record_sha256 != before.record_sha256
+
+    def snapshot(observation):
+        member = SnapshotMember(
+            configuration_id=observation.configuration_id,
+            observation_id=observation.observation_id,
+            record_sha256=observation.record_sha256,
+            manifest_path="m",
+        )
+        return snapshot_id([member], {"kind": "k"}, "p")
+
+    assert snapshot(after) != snapshot(before)

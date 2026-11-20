@@ -431,3 +431,70 @@ def test_series_phase_spelling_is_checked(tmp_path):
     series = [SeriesRow(observation_id="dev:1", metric="running_requests", start_ms=0.0, end_ms=1.0, phase="profiling")]
     findings = name_findings_for(ds.body, ds.observations, ds.metrics, ds.requests, series)
     assert [(f.kind, f.location, f.canonical) for f in findings] == [("phase", "series[0].phase", "profile")]
+
+
+def test_aiperf_request_count_is_the_successful_requests(tmp_path):
+    summary = _aiperf_summary(request_count={"avg": 8}, error_request_count={"avg": 2})
+    cfg = aiperf_to_configuration(summary, _aiperf_records(), _dev_body(), observation_id="dev:1", device_count=8)
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, cfg))
+    obs = ds.observations[0]
+    assert (obs.requests_total, obs.requests_completed, obs.requests_failed) == (10, 8, 2)
+
+
+def test_a_failure_while_publishing_restores_the_files_already_replaced(tmp_path, monkeypatch):
+    import dataclasses
+
+    from aisim_core.data import e2e as e2e_module
+
+    cfg = _dev_config()
+    path = write_configuration(tmp_path, cfg)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    changed = [cfg.metrics[0].model_copy(update={"value": 12345.0}), *cfg.metrics[1:]]
+    real_replace = e2e_module.os.replace
+
+    def fail_on_the_second_publish(src, dst):
+        if str(dst).endswith("metrics.parquet") and ".previous" not in str(src):
+            raise OSError("disk full")  # observations.parquet was already replaced when this fires
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(e2e_module.os, "replace", fail_on_the_second_publish)
+    new_observation = cfg.observations[0].model_copy(update={"input_tokens": 999})
+    with pytest.raises(OSError, match="disk full"):
+        write_configuration(tmp_path, dataclasses.replace(cfg, observations=[new_observation], metrics=changed))
+    monkeypatch.setattr(e2e_module.os, "replace", real_replace)
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    assert load_e2e(tmp_path, path).observations[0].input_tokens == cfg.observations[0].input_tokens
+
+
+def test_a_rejected_snapshot_replacement_leaves_the_existing_snapshot_readable(tmp_path):
+    members, kwargs = _snapshot_args("o1")
+    write_snapshot(tmp_path, "baseline.json", members, **kwargs)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    other, kwargs = _snapshot_args("o2")
+    with pytest.raises(ValueError):
+        write_snapshot(tmp_path, "baseline.json", other, **{**kwargs, "selection_policy": ""})
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+    assert [m.observation_id for m in read_snapshot(tmp_path, "baseline.json")[1]] == ["o1"]
+
+
+def test_a_registered_metric_must_be_stored_in_its_canonical_unit():
+    with pytest.raises(ValueError, match="must be stored in 'ms'"):
+        MetricRow(observation_id="o", metric="ttft", statistic="mean", unit="s", status="valid", value=1.0)
+    row = MetricRow(observation_id="o", metric="x_custom", statistic="mean", unit="whatever", status="valid", value=1.0)
+    assert row.unit == "whatever"  # extension metrics keep their own unit
+
+
+def test_the_inferencex_transfer_backend_is_part_of_the_configuration_identity():
+    configs = inferencex_to_configurations(
+        [
+            _infx_record(id=1, framework="sglang"),
+            _infx_record(id=2, framework="mori-sglang"),
+            _infx_record(id=3, framework="mori-sglang", conc=64),  # run telemetry only: merges with id 2
+        ]
+    )
+    assert sorted(len(c.observations) for c in configs) == [1, 2]
+    plain = next(c for c in configs if len(c.observations) == 1)
+    mori = next(c for c in configs if len(c.observations) == 2)
+    assert plain.body.framework == mori.body.framework == "sglang"
+    assert mori.body.identity_settings["kv_transfer_backend"] == "mori"
+    assert plain.body.configuration_id() != mori.body.configuration_id()

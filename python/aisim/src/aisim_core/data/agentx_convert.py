@@ -25,6 +25,7 @@ only; nothing is read from the network and raw prompts, streams and traces are n
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
@@ -41,7 +42,6 @@ from aisim_core.data.e2e import (
     Setting,
     Workload,
     _canonical,
-    _sha,
     make_metric,
     missing_required_metrics,
     producer_run_id,
@@ -126,19 +126,19 @@ _WORLD_DEGREES = (
 _WORLD_DIMENSIONS = tuple(dimension for _, dimension in _WORLD_DEGREES)
 
 
-def _observed_parallelism(effective: Sequence[Mapping[str, Any]]) -> dict[str, int] | None:
-    """Rank-0 parallelism degrees by registry dimension; ``None`` unless every GPU-multiplying degree is recorded.
+def _observed_parallelism(effective: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Every valid rank-0 parallelism degree the bundle records, by registry dimension (possibly none).
 
     ``manifest["tensor_parallel"]`` is only the TP degree. With attention DP, PP or context parallelism the run
-    uses more GPUs, and a bundle that differs in them is another serving configuration.
+    uses more GPUs, and bundles that differ in a recorded degree are other serving configurations even when
+    the GPU count itself cannot be derived.
     """
     parallel = (effective[0].get("parallelism") if effective else None) or {}
     dims: dict[str, int] = {}
     for source, dimension in _WORLD_DEGREES:
         value = parallel.get(source)
-        if type(value) is not int or value < 1:
-            return None
-        dims[dimension] = value
+        if type(value) is int and value >= 1:
+            dims[dimension] = value
     decode_cp = parallel.get("decode_context_parallel_size")
     if type(decode_cp) is int and decode_cp > 1:
         dims["dcp"] = decode_cp
@@ -148,7 +148,7 @@ def _observed_parallelism(effective: Sequence[Mapping[str, Any]]) -> dict[str, i
 def _device_count(effective: Sequence[Mapping[str, Any]]) -> int | None:
     """GPU count the bundle records (the product of the observed GPU-multiplying degrees), else ``None``."""
     dims = _observed_parallelism(effective)
-    if dims is None:
+    if any(dimension not in dims for dimension in _WORLD_DIMENSIONS):
         return None
     count = 1
     for dimension in _WORLD_DIMENSIONS:
@@ -174,6 +174,10 @@ def _body(
         if state == "enabled":
             speculation = {k: v for k, v in spec.items() if v is not None}
             identity_settings["spec_method"] = spec.get("method", "unknown")
+            # Runs that differ in a reported speculation parameter (draft length, ...) are not one configuration.
+            for name, value in sorted(speculation.items()):
+                if name != "method":
+                    identity_settings[f"spec_{name}"] = value
         elif state == "disabled":
             identity_settings["spec_method"] = "none"
     variant = workload.get("variant", {})
@@ -196,8 +200,8 @@ def _body(
         framework=normalize("framework", manifest["backend"]),
         framework_version=manifest["measured_backend_version"],
         # Complete only when every GPU-multiplying degree was observed: otherwise the others are unknown, not 1.
-        parallelism={"aggregated": observed or {"tp": manifest["tensor_parallel"]}},
-        parallelism_complete=observed is not None,
+        parallelism={"aggregated": {"tp": manifest["tensor_parallel"], **observed}},
+        parallelism_complete=all(dimension in observed for dimension in _WORLD_DIMENSIONS),
         precision=precision,
         speculation=speculation,
         identity_settings=identity_settings,
@@ -322,6 +326,30 @@ def _series(observation_id: str, workload: Mapping[str, Any]) -> list[SeriesRow]
     return out
 
 
+_BUNDLE_FILES = ("manifest.json", "configuration.json", "workload.json", "features.json", "observations.json")
+
+
+def _bundle_digest(bundle: Path, observations_bytes: bytes) -> str:
+    """Revision of everything the published rows are derived from, not only the request observations.
+
+    A corrected lineage in ``workload.json`` changes the stored rows without touching ``observations.json``, so the
+    digest covers every bundle file; an input snapshot then tells the two versions apart.
+    """
+    digest = hashlib.sha256()
+    for name in _BUNDLE_FILES:
+        data = (
+            observations_bytes
+            if name == "observations.json"
+            else (bundle / name).read_bytes()
+            if (bundle / name).is_file()
+            else None
+        )
+        if data is not None:
+            digest.update(f"{name}\0{len(data)}\0".encode())
+            digest.update(data)
+    return digest.hexdigest()
+
+
 def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
     """One AgentX bundle directory to one configuration with one observation."""
     bundle = Path(bundle)
@@ -383,7 +411,7 @@ def agentx_bundle_to_configuration(bundle: Path | str) -> E2eConfigurationData:
     observation = ObservationRow(
         observation_id=observation_id,
         configuration_id=body.configuration_id(),
-        record_sha256=_sha(observations_bytes),
+        record_sha256=_bundle_digest(bundle, observations_bytes),
         source_kind="agentx",
         source_observation_id=manifest["id"],
         producer_kind="github-actions" if manifest.get("source_run_url") else None,

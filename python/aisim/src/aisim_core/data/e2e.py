@@ -430,6 +430,10 @@ class MetricRow(_Record):
             raise ValueError("a valid metric needs a finite value")
         if self.status != "valid" and self.value is not None:
             raise ValueError("a missing or invalid metric must not carry a value; missing is never zero")
+        # A registered metric is stored in its one canonical unit; an unregistered (extension) metric keeps its own.
+        registered = CANONICAL_UNIT.get(self.metric) or canonical_unit(self.metric)
+        if registered is not None and self.unit != registered:
+            raise ValueError(f"metric {self.metric!r} must be stored in {registered!r}, not {self.unit!r}")
         return self
 
 
@@ -893,6 +897,33 @@ def _write_table(root: Path, directory: str, name: str, schema_id: str, rows: Se
     )
 
 
+def _publish_staged(stage: Path, root: Path, relatives: Sequence[str]) -> None:
+    """Move staged files into ``root`` in order; if one move fails, restore every file already replaced.
+
+    The previous version of each file is kept as a hard link until all moves succeeded, so a failure in the middle
+    (a full disk on the second table) leaves the old manifest and the old tables it digests exactly as they were.
+    """
+    done: list[tuple[Path, Path | None]] = []
+    try:
+        for relative in relatives:
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            backup = None
+            if destination.exists():
+                backup = stage / ".previous" / relative
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                os.link(destination, backup)
+            done.append((destination, backup))
+            os.replace(stage / relative, destination)
+    except BaseException:
+        for destination, backup in reversed(done):
+            if backup is not None:
+                os.replace(backup, destination)
+            else:
+                destination.unlink(missing_ok=True)
+        raise
+
+
 def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str = "") -> str:
     """Write tables, provenance artifacts and the envelope manifest; return the manifest path.
 
@@ -948,10 +979,7 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
             json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False)
             + "\n"
         )
-        for published in [*(a.path for a in artifacts), relative]:  # the manifest last
-            destination = root / published
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(stage / published, destination)
+        _publish_staged(stage, root, [*(a.path for a in artifacts), relative])  # the manifest last
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     return relative
@@ -1117,7 +1145,11 @@ def write_snapshot(
     completeness: Literal["complete", "partial"],
     acquisition: Sequence[SnapshotAcquisition] = (),
 ) -> E2eInputSnapshot:
-    """Write membership (and optional acquisition) tables plus the snapshot document at ``path``."""
+    """Write membership (and optional acquisition) tables plus the snapshot document at ``path``.
+
+    The request is validated and everything staged before any live file is touched, and the document is
+    published last, so a rejected or failed replacement leaves the existing snapshot readable.
+    """
     root = Path(root)
     directory = str(Path(path).parent)
     ordered = sorted(members, key=lambda m: (m.configuration_id, m.observation_id))
@@ -1125,36 +1157,44 @@ def write_snapshot(
         raise ValueError("duplicate observation in snapshot membership")
     # Tables are named after the document, so sibling snapshots never overwrite each other's frozen members.
     stem = Path(path).stem
-    member_artifact = _write_table(
-        root, directory, f"{stem}-members", SNAPSHOT_MEMBERS_SCHEMA, ordered, "e2e-snapshot-members"
-    )
-    acquisition_artifact = (
-        _write_table(
-            root,
-            directory,
-            f"{stem}-acquisition",
-            SNAPSHOT_ACQUISITION_SCHEMA,
-            list(acquisition),
-            "e2e-snapshot-acquisition",
+    root.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".e2e-stage-", dir=root))
+    try:
+        member_artifact = _write_table(
+            stage, directory, f"{stem}-members", SNAPSHOT_MEMBERS_SCHEMA, ordered, "e2e-snapshot-members"
         )
-        if acquisition
-        else None
-    )
-    snapshot = E2eInputSnapshot(
-        snapshot_id=snapshot_id(ordered, source_scope, selection_policy),
-        source_scope=dict(source_scope),
-        selection_policy=selection_policy,
-        completeness=completeness,
-        counts={
-            "observations": len(ordered),
-            "configurations": len({m.configuration_id for m in ordered}),
-        },
-        members=member_artifact,
-        acquisition=acquisition_artifact,
-    )
-    (root / path).write_text(
-        json.dumps(snapshot.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True) + "\n"
-    )
+        acquisition_artifact = (
+            _write_table(
+                stage,
+                directory,
+                f"{stem}-acquisition",
+                SNAPSHOT_ACQUISITION_SCHEMA,
+                list(acquisition),
+                "e2e-snapshot-acquisition",
+            )
+            if acquisition
+            else None
+        )
+        snapshot = E2eInputSnapshot(
+            snapshot_id=snapshot_id(ordered, source_scope, selection_policy),
+            source_scope=dict(source_scope),
+            selection_policy=selection_policy,
+            completeness=completeness,
+            counts={
+                "observations": len(ordered),
+                "configurations": len({m.configuration_id for m in ordered}),
+            },
+            members=member_artifact,
+            acquisition=acquisition_artifact,
+        )
+        (stage / path).parent.mkdir(parents=True, exist_ok=True)
+        (stage / path).write_text(
+            json.dumps(snapshot.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True) + "\n"
+        )
+        tables = [a.path for a in (member_artifact, acquisition_artifact) if a is not None]
+        _publish_staged(stage, root, [*tables, path])  # the document last
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     return snapshot
 
 
@@ -1368,6 +1408,8 @@ def _ifx_body(
         identity_settings={
             "spec_method": config["spec_method"],
             "workers": {k: v.model_dump(exclude_none=True) for k, v in sorted(workers.items())},
+            # A fused spelling such as ``mori-sglang`` carries a KV transfer backend that plain ``sglang`` lacks.
+            **{k: v for k, v in engine.get("settings", {}).items() if k == "kv_transfer_backend"},
         },
         settings=settings,
         workers=workers,
@@ -1621,9 +1663,10 @@ def aiperf_to_configuration(
         input_tokens=_mean_int(requests, "input_tokens"),
         output_tokens=_mean_int(requests, "output_tokens"),
         outcome="complete" if summary.get("is_complete") and not summary.get("was_cancelled") else "partial",
-        requests_total=int(count) if count is not None else None,
+        # AIPerf's request_count counts the successful requests; error_request_count is reported separately.
+        requests_total=int(count) + int(errors) if count is not None else None,
         requests_failed=int(errors) if count is not None else None,
-        requests_completed=int(count) - int(errors) if count is not None else None,
+        requests_completed=int(count) if count is not None else None,
         device_count=device_count,
         raw_artifact_id=raw_id,
         log_artifact_id=log_id,
