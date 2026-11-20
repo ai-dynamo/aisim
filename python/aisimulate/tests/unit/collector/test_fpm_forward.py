@@ -2746,8 +2746,9 @@ def test_k31_publication_rejects_archived_prefill_history(tmp_path, monkeypatch,
     plan, cell, cell_dir = _seeded_prefill_cell(tmp_path, "real_prefix" if kv_tokens else None, kv_tokens=kv_tokens)
     plan.capability.template_id = GENERIC_RUNTIME_TEMPLATE_ID
     plan.capability.architecture = "KimiK31ForConditionalGeneration" if k31 else "OtherModel"
-    # Worker qualification is covered independently. Even accepted workers
-    # cannot qualify a retained timing point with unsupported prefix history.
+    # Worker qualification is covered independently. A worker that would pass
+    # cannot qualify unsupported prefix history; the shared acceptance guard
+    # now rejects it before the worker audit (and during cell recovery).
     accepted = []
     monkeypatch.setattr(database, "require_k31_worker_evidence", lambda *args: accepted.append(True))
     if k31 and kv_tokens:
@@ -2756,7 +2757,7 @@ def test_k31_publication_rejects_archived_prefill_history(tmp_path, monkeypatch,
     else:
         rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
         assert [row["total_kv_read_tokens"] for row in rows] == [kv_tokens]
-    assert accepted == [True]
+    assert accepted == ([] if k31 and kv_tokens else [True])
 
 
 _WARM_ELIGIBLE = {"enabled": True, "warm_eligible": True, "skip_reason": None}

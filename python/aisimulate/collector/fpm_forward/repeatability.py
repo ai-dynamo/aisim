@@ -24,7 +24,12 @@ from aisimulate.fpm_contract import FPM_MANIFEST_FILENAME
 
 from . import planner
 from .capabilities import ModelCapabilityProfile, ResolvedDTypeProfile
-from .config import FPMCollectionOptions, semantic_generator_overrides, with_kv_warmup_defaults
+from .config import (
+    FPMCollectionOptions,
+    resolve_archived_generator_overrides,
+    semantic_generator_overrides,
+    with_kv_warmup_defaults,
+)
 from .execution_evidence import file_evidence, inspect_execution_evidence
 from .measurement_evidence import compare_measurements, extract_measurement_evidence
 from .memory_admission import DTypeMemoryEstimate, TopologyMemoryDecision
@@ -63,6 +68,7 @@ class _IncompleteSample(ValueError):
 def _deployment_hashes(overrides: dict[str, Any]) -> set[str]:
     return {
         _canonical_hash(semantic_generator_overrides(overrides)),
+        _canonical_hash(semantic_generator_overrides(overrides, archive_environment=False)),
         _canonical_hash(with_kv_warmup_defaults(overrides)),  # Historical schema-v11 launch hash.
     }
 
@@ -83,8 +89,16 @@ def load_repeatability_deployment(source_campaign_dir: str | Path) -> dict[str, 
         raise ValueError("archived deployment inputs must be an object")
     if not isinstance(overrides.get("K8sConfig", {}), dict):
         raise ValueError("archived K8sConfig must be an object")
-    if saved["generator_config_sha256"] not in _deployment_hashes(overrides):
+    references = any("value_from_env" in item for item in overrides.get("K8sConfig", {}).get("extra_env", []) or [])
+    hashes = _deployment_hashes(overrides)
+    # A resumed historical plan can retain its original literal-value hash
+    # while its archive is upgraded to references. Reconstruct that hash only
+    # with verified caller values; never trust a hash declared by the archive.
+    resolved = resolve_archived_generator_overrides(overrides) if references else overrides
+    if saved["generator_config_sha256"] not in hashes | _deployment_hashes(resolved):
         raise ValueError("archived deployment inputs differ from the source plan")
+    if references:
+        return resolved
     return overrides
 
 

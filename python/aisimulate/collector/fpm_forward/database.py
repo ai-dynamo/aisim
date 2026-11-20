@@ -202,7 +202,7 @@ def _dense_synthetic_kv_eligible(
 
 
 class KdaSeedError(ValueError):
-    """A completed native attempt lacks publishable recurrent-state seeding."""
+    """A completed native attempt has unsupported recurrent-state history."""
 
 
 def _is_k31(plan) -> bool:
@@ -236,6 +236,11 @@ def require_kda_real_kv(plan, cell, collection):
     without this request-specific recurrent-state requirement. Recovery uses
     this same guard before accepting retained artifacts.
     """
+    if _is_k31(plan) and any(
+        item.point["point_type"] == "prefill" and int(item.point["total_kv_read_tokens"]) != 0
+        for item in collection.points
+    ):
+        raise KdaSeedError("K3.1 prefill publication requires zero historical KV tokens")
     config = getattr(getattr(plan, "capability", None), "model_config", None)
     if cell.workload_kind != "decode" or config is None or config.effective_payload.get("linear_attn_config") is None:
         return

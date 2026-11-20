@@ -1307,10 +1307,20 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
 
         def pinned_download(model, filename, *, revision="main", raise_on_404=True):
             assert model == checkpoint
-            assert revision == "synthetic-test-v1", "graph construction read an unpinned/default revision"
-            return deepcopy(raw) if filename == "config.json" else None
+            assert revision == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", (
+                "graph construction read an unpinned/default revision"
+            )
+            if filename == "config.json":
+                return deepcopy(raw)
+            if filename == "preprocessor_config.json":
+                return {"patch_limit_on_one_side": 384}
+            return None
 
         monkeypatch.setattr(utils, "_download_hf_json", pinned_download)
+        # Processor loading has its own assertion; the timing fixture below
+        # remains language-only and does not depend on encoder execution.
+        parsed = get_model_config_from_model_path(checkpoint, model_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        assert parsed["extra_params"].vision_config.max_patches_per_side == 384
     systems = tmp_path / "systems"
     systems.mkdir()
     shutil.copyfile(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", systems / f"{SYSTEM}.yaml")
@@ -1352,7 +1362,7 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
     profile = {
         "schema_version": 1,
         "model": str(checkpoint),
-        "model_revision": "synthetic-test-v1",
+        "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "architecture": "KimiLinearForCausalLM",
         "context_length": 4096,
         "num_experts": 896,
@@ -1653,7 +1663,7 @@ def test_kimi_k3_unmeasured_batch_uses_direct_interpolation(tmp_path):
     profile = {
         "schema_version": 1,
         "model": str(checkpoint),
-        "model_revision": "synthetic-test-v1",
+        "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "architecture": "KimiLinearForCausalLM",
         "context_length": 4096,
         "num_experts": 896,

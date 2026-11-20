@@ -373,7 +373,7 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
     calls = []
     result = {"backend_version": "0.28.0+runtime", "dynamo_version": "custom-dynamo"}
 
-    def run(command, *, payload=None, sensitive_values=()):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         assert sensitive_values == tuple(item["value"] for item in environment or ())
         calls.append((command, payload))
         if command[0] == "srun" or "logs" in command:
@@ -901,7 +901,7 @@ def test_metadata_probe_reports_pod_startup_failure_before_cleanup(monkeypatch, 
 
     calls = []
 
-    def run(command, *, payload=None, sensitive_values=()):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         calls.append(command)
         if "wait" in command:
             raise ValueError("synthetic wait timeout")
@@ -929,7 +929,7 @@ def test_runtime_version_probe_mounts_whole_model_pvc(monkeypatch, model_cache, 
 
     manifests = []
 
-    def run(command, *, payload=None, sensitive_values=()):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         if payload:
             manifests.append(json.loads(payload))
         if "logs" in command:
@@ -965,7 +965,7 @@ def test_version_probe_refuses_to_be_first_consumer_of_model_pvc(monkeypatch, st
 
     calls = []
 
-    def run(command, *, payload=None, sensitive_values=()):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         calls.append(command)
         assert "pvc" in command
         # Bound without volumeName is also insufficient.
@@ -997,7 +997,7 @@ def test_version_probe_honors_model_cache_access_mode(monkeypatch, modes, consum
 
     manifests = []
 
-    def run(command, *, payload=None, sensitive_values=()):
+    def run(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         if "pvc" in command:
             return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "pv", "accessModes": modes}})
         if "pods" in command:

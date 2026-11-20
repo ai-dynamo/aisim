@@ -1840,3 +1840,56 @@ def test_historical_dynamo_deployment_hash_loads_executes_and_resumes(campaign, 
         repeatability.run_repeatability(**{**args, "generator_overrides": changed}, resume=True)
     assert len(calls) == count
     assert all(path.read_bytes() == content for path, content in before.items())
+
+
+@pytest.mark.parametrize("historical", ["current", "literal", "semantic"])
+def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tmp_path, monkeypatch, historical):
+    from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides
+
+    from aisimulate.support.runtime_collection import _collection_controls
+
+    plan, source, checkpoint = campaign
+    token = 'synthetic-private-"credential"-$746'
+    overrides = {
+        "generator_dynamo_version": "1.3.0",
+        "K8sConfig": {"extra_env": [{"name": "CUSTOM_AUTH", "value": token}]},
+    }
+    if historical == "literal":
+        normalized = with_kv_warmup_defaults(overrides)
+    else:
+        normalized = semantic_generator_overrides(overrides, archive_environment=historical == "current")
+    plan = replace(plan, generator_config_sha256=repeatability._canonical_hash(normalized))
+    plan = repeatability._subset_plan(
+        plan, {"cell_id": plan.cells[0].cell_id, "benchmark_points": json.loads(plan.options.benchmark_points_json)}
+    )
+    _write_campaign(source, checkpoint, plan, generator_overrides=overrides)
+    archive = archive_generator_overrides(overrides)
+    path = source / "generator-overrides.json"
+    path.write_text(json.dumps(archive))
+    assert token not in path.read_text()
+    assert repeatability._deployment_hashes(archive) & repeatability._deployment_hashes(overrides)
+    monkeypatch.delenv("CUSTOM_AUTH", raising=False)
+    with pytest.raises(ValueError, match="requires the original value"):
+        repeatability.load_repeatability_deployment(source)
+    monkeypatch.setenv("CUSTOM_AUTH", token + "changed")
+    with pytest.raises(ValueError, match="requires the original value"):
+        repeatability.load_repeatability_deployment(source)
+    monkeypatch.setenv("CUSTOM_AUTH", token)
+    resolved = repeatability.load_repeatability_deployment(source)
+    assert resolved == with_kv_warmup_defaults(overrides)
+    _, compared, _ = _collection_controls(plan.cells, resolved)
+    assert compared["K8sConfig"]["extra_env"][0] == {"name": "CUSTOM_AUTH", "value": token}
+    # Inspection needs no access to the caller's credentials, but still checks
+    # the frozen reference/digest representation against the plan.
+    if historical == "current":
+        monkeypatch.delenv("CUSTOM_AUTH")
+    cell = plan.cells[0]
+    raw = source / "cells" / cell.cell_id / "raw"
+    collection = validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id="source")
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "qualified", result
+    archive["K8sConfig"]["k8s_image"] = "changed:image"
+    path.write_text(json.dumps(archive))
+    monkeypatch.setenv("CUSTOM_AUTH", token)
+    with pytest.raises(ValueError, match="differ from the source plan"):
+        repeatability.load_repeatability_deployment(source)

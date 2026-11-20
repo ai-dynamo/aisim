@@ -37,7 +37,7 @@ def checkpoint_configs(monkeypatch):
     }
 
     def download(model, filename, *, revision, raise_on_404=True):
-        assert revision == "profile-test-fixture-v1"
+        assert revision == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         if filename == "config.json":
             return copy.deepcopy(configs[model])
         assert filename == "hf_quant_config.json"
@@ -56,7 +56,7 @@ def profile_dict(checkpoint_configs):
     return {
         "schema_version": 1,
         "model": "test/unknown-decoder",
-        "model_revision": "profile-test-fixture-v1",
+        "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "architecture": "UnregisteredDecoderForCausalLM",
         "context_length": 4096,
         "num_experts": 64,
@@ -2678,3 +2678,54 @@ def test_op_level_sol_database_does_not_validate_unused_auto_direct(profile_dict
         request["estimator_config"]["fpm_interpolation"]["method"] = method
         with pytest.raises(ValueError, match="direct FPM interpolation requires database_mode='SILICON'"):
             _normalize(request)
+
+
+def test_auto_direct_invalid_database_does_not_fall_back_to_regression(profile_dict):
+    # An unregistered architecture skips op-level. Auto must propagate the
+    # direct candidate's configuration error instead of returning regression.
+    request = _request(profile_dict, database_mode="SOL", estimation_mode="auto")
+    with pytest.raises(ValueError, match="direct FPM interpolation requires database_mode='SILICON'"):
+        RustForwardPassPerfModel.best_available(request)
+
+
+def test_profile_alias_is_resolved_once_and_persisted_before_eligibility(profile_dict, checkpoint_configs, monkeypatch):
+    import io
+
+    profile_dict["model_revision"] = "release-candidate"
+    commits = iter(["a" * 40, "b" * 40])
+    resolutions = []
+    reads = []
+
+    def hub_info(request, **kwargs):
+        resolutions.append(request.full_url)
+        return io.BytesIO(json.dumps({"sha": next(commits)}).encode())
+
+    monkeypatch.setattr(utils.urllib.request, "urlopen", hub_info)
+
+    def download(model, filename, *, revision, raise_on_404=True):
+        reads.append((filename, revision))
+        return copy.deepcopy(checkpoint_configs[model]) if filename == "config.json" else None
+
+    monkeypatch.setattr(utils, "_download_hf_json", download)
+    resolved = _normalize(_request(profile_dict))
+    assert resolved["fpm_profile"]["model_revision"] == "a" * 40
+    assert _normalize(resolved) == resolved
+    utils._load_model_config_from_model_path(
+        profile_dict["model"], model_revision=resolved["fpm_profile"]["model_revision"]
+    )
+    assert len(resolutions) == 1
+    assert resolutions[0].endswith("/revision/release-candidate")
+    # A fresh request observes an advancing alias; it cannot reuse commit A's
+    # cached eligibility metadata under the alias with B's sidecars.
+    second = _normalize(_request(profile_dict))
+    assert second["fpm_profile"]["model_revision"] == "b" * 40
+    utils._load_model_config_from_model_path(
+        profile_dict["model"], model_revision=second["fpm_profile"]["model_revision"]
+    )
+    assert len(resolutions) == 2
+    assert reads == [
+        ("config.json", "a" * 40),
+        ("hf_quant_config.json", "a" * 40),
+        ("config.json", "b" * 40),
+        ("hf_quant_config.json", "b" * 40),
+    ]

@@ -459,6 +459,27 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
 
 
+def _resolve_hf_revision(model: str, revision: str) -> str:
+    """Bind a Hub alias once; full commit IDs and local checkpoints need no lookup."""
+    if (
+        Path(model).expanduser().exists()
+        or Path(model).is_absolute()
+        or model.startswith(("./", "../", "~"))
+        or re.fullmatch(r"[0-9a-fA-F]{40}", revision)
+    ):
+        return revision
+    url = f"https://huggingface.co/api/models/{model}/revision/{quote(revision, safe='')}"
+    try:
+        request = urllib.request.Request(url, headers=_get_hf_auth_headers())
+        with urllib.request.urlopen(request, timeout=30) as response:
+            commit = json.load(response).get("sha")
+    except (OSError, ValueError) as error:
+        raise HuggingFaceDownloadError(f"Cannot resolve checkpoint revision for {model!r}") from error
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise HuggingFaceDownloadError(f"Hub did not return an immutable checkpoint revision for {model!r}")
+    return commit
+
+
 def _download_hf_config(hf_id: str) -> dict:
     """
     Download a HuggingFace config.json file from the HuggingFace API.
@@ -2093,6 +2114,8 @@ def get_model_config_from_model_path(model_path: str, *, model_revision: str | N
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
+    if model_revision is not None:
+        model_revision = _resolve_hf_revision(model_path, model_revision)
     raw_config = (
         _load_model_config_from_model_path(model_path, model_revision=model_revision)
         if model_revision is not None
@@ -2110,7 +2133,7 @@ def get_model_config_from_model_path(model_path: str, *, model_revision: str | N
         # checkpoints use the pinned processor defaults; local/downloaded
         # checkpoints may override them with the original media_proc_cfg or
         # native HF layout. Qwen's per-clip video budget is not modeled.
-        processor = {}
+        processor = dict(raw_config.get("preprocessor_config") or {})
         files = [("preprocessor_config.json", None)]
         if kimi:
             files.append(("video_preprocessor_config.json", "video_processor"))

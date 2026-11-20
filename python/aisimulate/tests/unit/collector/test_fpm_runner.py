@@ -601,7 +601,7 @@ def test_kubernetes_detection_and_preparation_use_same_runtime_environment(tmp_p
     image_env = {**os.environ, "PYTHONPATH": str(image_site)}
     probe_output = ""
 
-    def probe_transport(command, *, payload=None, sensitive_values=()):
+    def probe_transport(command, *, payload=None, sensitive_values=(), sensitive_names=()):
         nonlocal probe_output
         if payload is not None:
             container = json.loads(payload)["spec"]["containers"][0]
@@ -1538,7 +1538,9 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
 
     errors = run_collection(
         plan,
-        generator_overrides={},
+        generator_overrides={
+            "K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": "synthetic-private-credential"}]}
+        },
         checkpoint_dir=str(checkpoint_dir),
         artifact_root=str(tmp_path / "artifacts"),
         resume=False,
@@ -1549,6 +1551,14 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
     )
 
     assert errors == []
+    archived = next((tmp_path / "artifacts").rglob("generator-overrides.json")).read_text()
+    assert "synthetic-private-credential" not in archived
+    entry = json.loads(archived)["K8sConfig"]["extra_env"][0]
+    assert entry == {
+        "name": "HF_TOKEN",
+        "value_from_env": "HF_TOKEN",
+        "value_sha256": hashlib.sha256(b"synthetic-private-credential").hexdigest(),
+    }
     assert events.count("execute") == 1
     # One verified delete BEFORE apply (workload names are deterministic, so a
     # fresh checkpoint proves nothing about the cluster) and one after.
@@ -3519,6 +3529,38 @@ def test_checkpoint_metadata_uses_already_audited_bundle_without_reopening_sourc
     ) == {"decode_prefix_caching": "disabled"}
 
 
+@pytest.mark.parametrize("history", [0, 128])
+def test_k31_prefill_acceptance_and_recovery_require_zero_history(tmp_path, history):
+    cell = _cell(phase="prefill")
+    plan = _plan(cell)
+    plan.capability.architecture = "KimiK31ForConditionalGeneration"
+    raw = tmp_path / "cells" / cell.cell_id / "raw" / "pod-0"
+    raw.mkdir(parents=True)
+    payload = _native_payload(phase="prefill", rank=0, dp=1)
+    payload["results"][0]["point"]["total_kv_read_tokens"] = history
+    payload["results"][0]["fpms"][0]["scheduled_requests"]["sum_prefill_kv_tokens"] = history
+    path = raw / "benchmark.json"
+    path.write_text(json.dumps(payload))
+    before = path.read_bytes()
+    _write_provenance(
+        raw / "collector-provenance.json", cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id="attempt"
+    )
+    if history:
+        from collector.fpm_forward.database import KdaSeedError
+
+        with pytest.raises(KdaSeedError, match="zero historical KV"):
+            _runtime_collection_summary(cell, raw.parent, plan=plan)
+    else:
+        assert _runtime_collection_summary(cell, raw.parent, plan=plan)["measured_point_count"] == 1
+    recovered = fpm_runner._recover_completed_attempt(
+        plan, cell, tmp_path, {"status": "failed", "attempt_id": "attempt"}
+    )
+    assert (recovered is None) == bool(history)
+    if not history:
+        assert recovered["status"] == "passed"
+    assert path.read_bytes() == before  # rejection never rewrites retained truth
+
+
 @pytest.mark.parametrize("status", ["passed", "failed"])
 @pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv"])
 def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_path, monkeypatch, status, marker):
@@ -3647,3 +3689,58 @@ def test_k31_native_exact_context_is_required_on_every_decode_rank(tmp_path, mis
     # Older KDA models retain their existing envelope contract.
     plan.capability.architecture = "OtherKdaModel"
     assert _runtime_collection_summary(cell, tmp_path, plan=plan)["measured_point_count"] == 1
+
+
+@pytest.mark.parametrize("history", [0, 128])
+@pytest.mark.parametrize("status", ["passed", "failed"])
+def test_k31_prefill_resume_retries_historical_kv_and_retains_zero_history(tmp_path, monkeypatch, history, status):
+    cell = _cell(phase="prefill")
+    plan = _plan(cell)
+    plan.capability.architecture = "KimiK31ForConditionalGeneration"
+    root = tmp_path / "artifacts" / plan.sha256[:16] / "smoke"
+    raw = root / "cells" / cell.cell_id / "raw" / "pod-0"
+    raw.mkdir(parents=True)
+    payload = _native_payload(phase="prefill", rank=0, dp=1)
+    payload["results"][0]["point"]["total_kv_read_tokens"] = history
+    payload["results"][0]["fpms"][0]["scheduled_requests"]["sum_prefill_kv_tokens"] = history
+    (raw / "benchmark.json").write_text(json.dumps(payload))
+    _write_provenance(
+        raw / "collector-provenance.json", cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id="original"
+    )
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint_path = checkpoint_dir / "fpm_forward_smoke.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema": fpm_runner.CHECKPOINT_SCHEMA,
+                "plan_sha256": plan.sha256,
+                "cells": {cell.cell_id: {"status": status, "attempt_id": "original"}},
+            }
+        )
+    )
+    # This CPU fixture tests retry admission, independently of the existing
+    # source-bound worker/instrumentation qualification tests.
+    monkeypatch.setattr(fpm_runner, "_require_k31_execution_inputs", lambda _: None)
+    attempts = []
+
+    def render(*args, **kwargs):
+        attempts.append(True)
+        raise RuntimeError("synthetic retry admitted; no GPU launch")
+
+    monkeypatch.setattr(fpm_runner, "_render_cell", render)
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(checkpoint_dir),
+        artifact_root=str(tmp_path / "artifacts"),
+        resume=True,
+        retry_failed=True,
+        smoke=True,
+    )
+    record = json.loads(checkpoint_path.read_text())["cells"][cell.cell_id]
+    assert attempts == ([True] if history else [])
+    assert record["status"] == ("failed" if history else "passed")
+    assert bool(errors) == bool(history)
+    if not history:
+        assert record["attempt_id"] == "original"

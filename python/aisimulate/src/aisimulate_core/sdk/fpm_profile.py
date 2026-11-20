@@ -217,6 +217,11 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     """
     config = json.loads(config_json)
     profile = load_fpm_profile(config["fpm_profile"])
+    from aisimulate_core.sdk.utils import _resolve_hf_revision
+
+    # Rust retains this normalized profile in the model and serialized config,
+    # so eligibility, graph sidecars and replay all use the same Hub commit.
+    profile = profile.model_copy(update={"model_revision": _resolve_hf_revision(profile.model, profile.model_revision)})
     version = config.get("backend_version")
     if not isinstance(version, str) or version.lower() in _MUTABLE_REFERENCES | {"previous", "next"}:
         raise ValueError("fpm_profile requires a literal backend_version")

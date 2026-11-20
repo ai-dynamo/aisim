@@ -111,6 +111,8 @@ upstream bytes; the digest does not establish execution or requalify old evidenc
   `model_executor/layers/attention/mla_attention.py`, and the sparse MLA backends:
   MLA and indexer retain full-history token pages. Explicit `flashmla` or
   `trtllm_mla` policy must match the observed sparse backend and FP8 indexer.
+  Collection accepts `trtllm_mla` / `FLASHINFER_MLA_SPARSE` only with the
+  initialized `launcher == "trtllm"`; a `prims_ts` launch is not accepted.
   Import independently binds MLA payload to checkpoint `kv_lora_rank` and
   `qk_rope_head_dim`: TRT-LLM uses their FP8 sum; FlashMLA's audited 512/64
   geometry uses a 656-byte row (512 FP8 latent bytes, 16 scale bytes and

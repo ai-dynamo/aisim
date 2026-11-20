@@ -390,7 +390,7 @@ def _validate_mla_payload(spec, config, model_config):
     # 656-byte fp8_ds_mla row: 512 FP8 NoPE + 16 scale + 128 BF16 RoPE bytes.
     decoder = model_config.get("text_config", model_config)
     latent = _positive(decoder.get("kv_lora_rank"), "MLA latent dimension")
-    rope = _positive(decoder.get("qk_rope_head_dim"), "MLA RoPE dimension")
+    rope = _nonnegative(decoder.get("qk_rope_head_dim"), "MLA RoPE dimension")
     backend = config["attention_config"]["backend"]
     if backend == "FLASHINFER_MLA_SPARSE":
         # Pinned FlashInferMLASparseBackend.get_supported_head_sizes. Matching
@@ -400,6 +400,8 @@ def _validate_mla_payload(spec, config, model_config):
         # Pinned FlashInferMLASparseBackend.supports_combination with RoPE enabled.
         if rope and decoder.get("qk_nope_head_dim") not in (128, 192):
             raise ValueError("K3.1 FlashInfer MLA with RoPE requires qk_nope_head_dim 128 or 192")
+        if not rope and (latent, decoder.get("qk_nope_head_dim")) != (512, 256):
+            raise ValueError("K3.1 FlashInfer MLA without RoPE requires latent/nope dimensions 512/256")
         token_bytes = latent + rope
         block_multiple = 32
     elif backend == "FLASHMLA_SPARSE" and (latent, rope) == (512, 64):
@@ -464,7 +466,9 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
                         # Pinned kimi_k3/common/dsa_cache.py::indexer_cache_entry_bytes:
                         # each FP8 key carries one FP32 scale. Bind the logical
                         # payload only; native padded pages still own placement.
-                        token_bytes = _positive(dsa.get("index_head_dim"), "indexer head dimension") + 4
+                        # Pinned KimiLinearDSAConfig defaults an absent dimension
+                        # to 64; explicit null is not a default declaration.
+                        token_bytes = _positive(dsa.get("index_head_dim", 64), "indexer head dimension") + 4
                         if spec.get("unpadded_page_size_bytes") != token_bytes * spec["block_size_tokens"]:
                             raise ValueError("K3.1 indexer payload differs from the checkpoint FP8 geometry")
                 if observed != dtype:
@@ -740,12 +744,13 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                     and name not in kernel_views
                     and group["layer_classes"].get(name)
                     == "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
-                    and group.get("cache_dtype_str") in {"fp8", "fp8_e4m3"}
+                    and group.get("cache_dtype_str") in {"fp8", "fp8_e4m3", "fp8_ds_mla"}
                     and strides[1:] != [shape[2], 1]
                 ):
                     # flashinfer_mla_sparse.py -> sparse_utils.flat_kv_row_view
-                    # addresses contiguous token rows, retaining inter-block padding.
-                    raise ValueError("K3.1 direct FlashInfer MLA requires native token-byte strides")
+                    # and flashmla_sparse.py::_fp8_kv_pages address contiguous
+                    # token rows, retaining supported inter-block padding.
+                    raise ValueError("K3.1 direct sparse MLA requires native token-byte strides")
                 if (
                     not state
                     and name not in kernel_views

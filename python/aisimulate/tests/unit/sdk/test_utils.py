@@ -2300,3 +2300,38 @@ def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog
         enc_cfg = get_model_config_from_model_path(str(bare))["extra_params"]
     assert (enc_cfg.min_pixels, enc_cfg.max_pixels) == utils.QWEN3_VL_PIXEL_BOUNDS
     assert "no pixel budget" in caplog.text
+
+
+@pytest.mark.parametrize("sidecar", [None, {"min_pixels": 3136, "max_pixels": 1003520}])
+def test_pinned_hub_processor_sidecar_and_inline_fallback(monkeypatch, sidecar):
+    from copy import deepcopy
+
+    from aisimulate_core.sdk import fpm_profile
+
+    model, revision = "test/pinned-qwen-vl", "c" * 40
+    raw = deepcopy(_QWEN3VL_HF_CONFIG)
+    raw["preprocessor_config"] = {"min_pixels": 131072, "max_pixels": 1048576}
+    reads = []
+
+    def download(hf_id, filename, *, revision, raise_on_404=True):
+        assert hf_id == model and revision == "c" * 40
+        reads.append(filename)
+        if filename == "config.json":
+            return deepcopy(raw)
+        if filename == "preprocessor_config.json":
+            assert not raise_on_404
+            return deepcopy(sidecar)  # None is the downloader's HTTP-404 result.
+        assert filename == "hf_quant_config.json"
+        return None
+
+    fpm_profile._load_pinned_checkpoint_config.cache_clear()
+    utils._load_model_config_from_model_path.cache_clear()
+    utils.get_model_config_from_model_path.cache_clear()
+    monkeypatch.setattr(utils, "_download_hf_json", download)
+    parsed = utils.get_model_config_from_model_path(model, model_revision=revision)
+    bounds = sidecar or raw["preprocessor_config"]
+    assert (parsed["extra_params"].min_pixels, parsed["extra_params"].max_pixels) == (
+        bounds["min_pixels"],
+        bounds["max_pixels"],
+    )
+    assert reads == ["config.json", "hf_quant_config.json", "preprocessor_config.json"]

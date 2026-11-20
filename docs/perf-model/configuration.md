@@ -84,6 +84,7 @@ identities must be quoted to preserve their exact spelling:
 | --- | --- | --- |
 | `model` | Required | String model name or path; write a numeric identifier as `model: "123"`. |
 | `backend_version` | `null` | Optional string version; write `backend_version: "0.10"` to preserve the trailing zero. |
+| `fpm_profile.model_revision` | Required with a profile | Checkpoint revision. A Hub alias is resolved to one immutable commit before eligibility validation; the resolved commit is saved and used for all metadata reads and replay. Full commit IDs and local paths require no Hub resolution. |
 | `attention_backend` | absent | Runtime attention selector. Kimi K3.1 accepts `flashmla` or `trtllm_mla`; FP8 KV requires one of these explicit physical cache layouts. The theoretical BF16 mode also permits the default; the pinned native runtime requires FP8 KV. |
 | `system`, `backend_version`, `tp`, `pp`, `attention_dp`, `moe_tp_size`, `moe_ep_size`, `gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kvcache_quant_mode`, `comm_quant_mode`, `attention_backend` | As above | With `estimation_mode` `fpm_regression` or `fpm_learned`, each may be the literal `"unknown"` for a fact the saver did not know. Every other mode, a `fallback_policy` other than `deny` and an `fpm_profile` reject it. The integer fields accept only the string spelling. |
 | `deployment_limits` | absent | Optional mapping of the calibrated deployment's `num_gpus` (GPUs of one worker, `tp * pp * attention_dp`), `max_num_batched_tokens`, `max_num_seqs`, `max_kv_tokens` (KV capacity of one attention-DP rank, in tokens) and `context_length`. Each is a positive integer or `"unknown"`; an omitted entry is `"unknown"`. Absent, it is omitted from the serialized configuration. Accepted in every mode. |
@@ -426,6 +427,10 @@ mismatched declarations fail explicitly. This check reads configuration only:
 no weights or analytical graph are required. An architecture with verified
 metadata remains valid for direct interpolation without a registered analytical
 class. Schema-only profile and application configuration parsing remain lightweight.
+For remote profiles, construction resolves an alias once and retains its immutable
+commit in `fpm_profile.model_revision`. Architecture, quantization and processor
+metadata are read at that commit, including after saving and reloading the model.
+An already supplied full commit ID requires no separate Hub-resolution request.
 
 For measured-only timing, pass `estimation_mode="fpm_interpolation"`,
 `fallback_policy="deny"`, and

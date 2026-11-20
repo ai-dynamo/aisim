@@ -116,3 +116,31 @@ def test_runtime_probe_failures_redact_environment_and_exception_chain(monkeypat
         for encoded in (value, repr(value)[1:-1], json.dumps(value)[1:-1]):
             assert encoded not in rendered
     assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+def test_short_environment_values_preserve_diagnostic_numbers():
+    from aisimulate.support.versioning import _redact_diagnostic
+
+    diagnostic = "HF_HUB_OFFLINE=1 --nodes=1 exit status 1 node1 version 0.1.1"
+    assert _redact_diagnostic(diagnostic, ("1",), ("HF_HUB_OFFLINE",)) == (
+        "HF_HUB_OFFLINE=<redacted> --nodes=1 exit status 1 node1 version 0.1.1"
+    )
+
+
+@pytest.mark.parametrize("failure", ["timeout", "oserror", "returncode"])
+def test_probe_fallback_does_not_format_exception_command(monkeypatch, failure):
+    from aisimulate.support.versioning import _run
+
+    def fail(*args, **kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(["HF_TOKEN=short"], 300)
+        if failure == "returncode":
+            raise subprocess.CalledProcessError(1, ["HF_TOKEN=short"])
+        raise OSError("HF_TOKEN=short")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(ValueError) as error:
+        _run(["HF_TOKEN=short"])
+    assert "short" not in str(error.value)
+    if failure == "returncode":
+        assert "CalledProcessError (returncode=1)" in str(error.value)

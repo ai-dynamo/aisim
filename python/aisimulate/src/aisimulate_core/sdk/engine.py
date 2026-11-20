@@ -830,7 +830,9 @@ def _direct_fpm_spec_json(
 ) -> str:
     """Build whole-forward timing operations from metadata, without a graph."""
     if _database_mode_name(None, database_mode) != "SILICON":
-        raise ValueError("direct FPM interpolation requires database_mode='SILICON'; it has no analytical SOL model")
+        raise InvalidEngineConfigurationError(
+            "direct FPM interpolation requires database_mode='SILICON'; it has no analytical SOL model"
+        )
     identity = deployment.match_identity()
     execution = deployment.execution_profile
     if execution is not None:

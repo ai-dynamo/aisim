@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-from .config import with_kv_warmup_defaults
+from .config import resolve_archived_generator_overrides, semantic_generator_overrides, with_kv_warmup_defaults
 from .cpu_affinity import inspect_cpu_affinity
 from .native_artifact import NativeCollection, _rank_artifacts
 from .planner import FPMCell, FPMCollectionPlan, _canonical_hash
@@ -87,8 +87,20 @@ def _effective_launch(plan: FPMCollectionPlan, cell_dir: Path) -> dict[str, Any]
     mount = deployment.get("K8sConfig", {})
     if not isinstance(mount, dict):
         raise ValueError("archived K8sConfig must be an object")
-    if _canonical_hash(with_kv_warmup_defaults(deployment)) != plan.generator_config_sha256:
-        raise ValueError("archived deployment inputs differ from the source plan")
+    hashes = {
+        _canonical_hash(semantic_generator_overrides(deployment)),
+        _canonical_hash(semantic_generator_overrides(deployment, archive_environment=False)),
+        _canonical_hash(with_kv_warmup_defaults(deployment)),
+    }
+    if plan.generator_config_sha256 not in hashes:
+        # Historical literal-value hashes require the original caller values
+        # if a resumed campaign has upgraded its archive to references.
+        resolved = resolve_archived_generator_overrides(deployment)
+        if plan.generator_config_sha256 not in {
+            _canonical_hash(semantic_generator_overrides(resolved, archive_environment=False)),
+            _canonical_hash(with_kv_warmup_defaults(resolved)),
+        }:
+            raise ValueError("archived deployment inputs differ from the source plan")
     expected_model = plan.model_path
     if mount.get("k8s_model_path_in_pvc"):
         if not mount.get("k8s_pvc_mount_path"):

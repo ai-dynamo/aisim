@@ -46,7 +46,7 @@ from aisimulate.fpm_contract import (
     fpm_workload_node_count,
 )
 
-from .config import FPM_RUNTIME_STARTUP_ENV, with_kv_warmup_defaults
+from .config import FPM_RUNTIME_STARTUP_ENV, archive_generator_overrides, with_kv_warmup_defaults
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
@@ -2109,7 +2109,7 @@ def _run_collection_impl(
         root /= "smoke"
     root.mkdir(parents=True, exist_ok=True)
     _atomic_json(root / "collection-plan.json", plan.to_dict())
-    _atomic_json(root / "generator-overrides.json", with_kv_warmup_defaults(generator_overrides))
+    _atomic_json(root / "generator-overrides.json", archive_generator_overrides(generator_overrides))
     checkpoint_name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
     checkpoint_path = Path(checkpoint_dir).expanduser().resolve() / checkpoint_name
     checkpoint = _load_checkpoint(checkpoint_path, plan, resume)

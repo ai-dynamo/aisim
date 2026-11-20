@@ -849,7 +849,15 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
 
 
 def _complete_fixture(
-    tmp_path, monkeypatch, *, workload_kind="decode", packed_indexer=False, separate_attention=False, mla_latent=512
+    tmp_path,
+    monkeypatch,
+    *,
+    workload_kind="decode",
+    packed_indexer=False,
+    separate_attention=False,
+    mla_latent=512,
+    mla_rope=64,
+    indexer_dim=128,
 ):
     path, launches = observation_fixture(tmp_path, version=runtime_k31.VERSION)
     launch = launches["tp2"]
@@ -861,7 +869,7 @@ def _complete_fixture(
                 "text_config": {
                     "num_hidden_layers": 4,
                     "kv_lora_rank": mla_latent,
-                    "qk_rope_head_dim": 64,
+                    "qk_rope_head_dim": mla_rope,
                     "qk_nope_head_dim": 128,
                     "num_experts": 8,
                     "first_k_dense_replace": 1,
@@ -873,7 +881,10 @@ def _complete_fixture(
                         "head_dim": 2,
                         "short_conv_kernel_size": 2,
                     },
-                    "dsa_config": {"dsa_layers": [3, 4], "index_head_dim": 128},
+                    "dsa_config": {
+                        "dsa_layers": [3, 4],
+                        **({} if indexer_dim == "absent" else {"index_head_dim": indexer_dim}),
+                    },
                 },
             }
         )
@@ -895,13 +906,16 @@ def _complete_fixture(
     manifest["runtime"] = pinned
     manifest_path.write_text(json.dumps(manifest))
     bundle = load_instrumentation(manifest_path)
+    indexer_width = (64 if indexer_dim == "absent" else indexer_dim or 128) + 4
     if packed_indexer:
-        cache, scheduled = _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=mla_latent + 64)
+        cache, scheduled = _kernel_view_fixture(
+            monkeypatch, indexer_width=indexer_width, mla_width=mla_latent + mla_rope
+        )
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     else:
         cache, scheduled, _ = _native_fixture(
-            monkeypatch, uniform=not separate_attention, payload_scale=132, mla_width=mla_latent + 64
+            monkeypatch, uniform=not separate_attention, payload_scale=indexer_width, mla_width=mla_latent + mla_rope
         )
     index = json.loads(path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
@@ -1784,7 +1798,7 @@ def test_import_rejects_transposed_native_axis_strides(tmp_path, monkeypatch, co
     _mutate(path, transpose)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete", result
-    assert {"state": "axis-order", "indexer": "BLHNC", "mla": "FlashInfer MLA"}[component] in str(result["diagnostics"])
+    assert {"state": "axis-order", "indexer": "BLHNC", "mla": "sparse MLA"}[component] in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("damage", ["missing", "changed", "sidecar_missing", "sidecar_changed", None])
@@ -1825,7 +1839,8 @@ def test_import_uses_only_hash_bound_frozen_phase_config(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("padding", [0, 4, 656, 64 * 656])
 @pytest.mark.parametrize("block", [64, 128])
-def test_flashmla_direct_pages_require_page_aligned_pool_stride(tmp_path, monkeypatch, padding, block):
+@pytest.mark.parametrize("transposed", [False, True])
+def test_flashmla_direct_pages_require_page_aligned_pool_stride(tmp_path, monkeypatch, padding, block, transposed):
     path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
     launches["tp2"]["precision"]["attention_backend"] = "flashmla"
     _replace_launch(path, launches)
@@ -1867,16 +1882,48 @@ def test_flashmla_direct_pages_require_page_aligned_pool_stride(tmp_path, monkey
         for index, name in enumerate(mla["layer_names"]):
             cache["layer_components"][name][0].update(
                 shape=[count, block, 656],
-                stride_bytes=[new, 656, 1],
+                stride_bytes=[new, 1, block] if transposed else [new, 656, 1],
                 storage_offset_bytes=allocation["offset"] + index * allocation["layer_stride"],
             )
 
     _mutate(path, flashmla)
     result = validate_observations(path, launches)["tp2"]
-    valid = block == 64 or padding % (64 * 656) == 0
+    valid = not transposed and (block == 64 or padding % (64 * 656) == 0)
     assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
     if not valid:
-        assert "sparse MLA block stride must contain whole cache rows" in str(result["diagnostics"])
+        message = (
+            "token-byte strides"
+            if transposed and (block == 64 or padding % (64 * 656) == 0)
+            else "sparse MLA block stride must contain whole cache rows"
+        )
+        assert message in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("nope", [128, 256])
+def test_import_accepts_pinned_flashinfer_without_rope(tmp_path, monkeypatch, nope):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, mla_rope=0)
+    launch = launches["tp2"]
+    config_path = Path(launch["model_config"]["path"])
+    config = json.loads(config_path.read_text())
+    config["text_config"]["qk_nope_head_dim"] = nope
+    config_path.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    _replace_launch(path, launches)
+    _mutate(path, lambda record: record.update(model_config_sha256=launch["model_config"]["sha256"]))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if nope == 256 else "incomplete"), result["diagnostics"]
+    if nope != 256:
+        assert "without RoPE requires latent/nope dimensions 512/256" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("dimension", ["absent", None, 128])
+@pytest.mark.parametrize("packed", [False, True])
+def test_import_uses_pinned_indexer_default_only_for_absent_dimension(tmp_path, monkeypatch, dimension, packed):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, indexer_dim=dimension, packed_indexer=packed)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("incomplete" if dimension is None else "complete"), result["diagnostics"]
+    if dimension is None:
+        assert "indexer head dimension must be a positive integer" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize(

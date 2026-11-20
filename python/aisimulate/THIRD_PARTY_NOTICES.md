@@ -2318,12 +2318,10 @@ The ARM64 image child is
 `sha256:52b793567651780dc529647a211a3d15cec11ebc872ac7492636d7d75340eab4`.
 Within the Python distribution, the current original path and SHA-256 inventory
 for the source-bound vLLM interfaces is in
-[`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](https://github.com/ai-dynamo/aisim/blob/harrli/kimi-k31-fpm/python/aisimulate/collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
-The inspected references
-`vllm/model_executor/models/config.py` and `vllm/v1/attention/backends/registry.py`
-listed above are outside that
-hash inventory. The adjacent
-[`collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md`](https://github.com/ai-dynamo/aisim/blob/313c2d15fa6cef023bfd36517702cab8c901cec7/python/aisimulate/collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md)
+[`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](https://github.com/ai-dynamo/aisim/blob/d41579ec07970dbdea34df2c884dfda3e69537c6/python/aisimulate/collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
+The inspected reference `vllm/v1/attention/backends/registry.py` listed above
+is outside that hash inventory. The adjacent
+[`collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md`](https://github.com/ai-dynamo/aisim/blob/d41579ec07970dbdea34df2c884dfda3e69537c6/python/aisimulate/collector/fpm_forward/runtime/instrumentation/vllm-kimi-k31.md)
 records their observation contracts.
 The initialized cache comparison also observes the representative-child projection
 in `vllm/v1/core/kv_cache_utils.py::generate_scheduler_kv_cache_config`, preserving

@@ -10,6 +10,8 @@ import copy
 import hashlib
 import json
 import math
+import os
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -105,11 +107,65 @@ PARALLEL_AXES = ("tp", "pp", "dp", "moe_tp", "moe_ep", "cp")
 PARALLEL_PRESETS = ("auto", "tp", "tep", "dep", "pure_tp")
 
 
-def semantic_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+def semantic_generator_overrides(overrides: dict[str, Any], *, archive_environment: bool = True) -> dict[str, Any]:
     """Freeze launch settings without treating declared versions as compatibility."""
-    normalized = with_kv_warmup_defaults(overrides)
+    normalized = archive_generator_overrides(overrides) if archive_environment else with_kv_warmup_defaults(overrides)
     normalized.pop("generator_dynamo_version", None)
     return normalized
+
+
+def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Archive environment references and digests instead of caller credentials.
+
+    Public warm-up switches remain literal. Every other environment value is
+    supplied again by name for replay; its digest freezes the original input.
+    The same representation is used for plan hashing and artifact inspection,
+    which do not require access to replay credentials.
+    """
+    archived = with_kv_warmup_defaults(overrides)
+    environment = archived["K8sConfig"]["extra_env"]
+    if not isinstance(environment, list):
+        raise ValueError("archived environment must be a list")
+    names = set()
+    for item in environment:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item["name"])
+            or item["name"] in names
+        ):
+            raise ValueError("archived environment requires unique valid names")
+        names.add(item["name"])
+        if "value_from_env" in item:
+            if (
+                set(item) != {"name", "value_from_env", "value_sha256"}
+                or item["value_from_env"] != item["name"]
+                or not isinstance(item["value_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["value_sha256"])
+            ):
+                raise ValueError("invalid archived environment reference")
+        else:
+            if set(item) != {"name", "value"} or not isinstance(item["value"], str):
+                raise ValueError("archived environment requires literal string values")
+            if item["name"] not in FPM_KV_WARMUP_DEFAULTS:
+                value = item.pop("value")
+                item.update(value_from_env=item["name"], value_sha256=hashlib.sha256(value.encode()).hexdigest())
+    return archived
+
+
+def resolve_archived_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Resolve archived references without revealing missing or changed values."""
+    resolved = archive_generator_overrides(overrides)
+    for item in resolved["K8sConfig"]["extra_env"]:
+        if "value_from_env" not in item:
+            continue
+        name = item["value_from_env"]
+        value = os.environ.get(name)
+        if value is None or hashlib.sha256(value.encode()).hexdigest() != item["value_sha256"]:
+            raise ValueError(f"archived environment {name} requires the original value in the caller's environment")
+        item.clear()
+        item.update(name=name, value=value)
+    return resolved
 
 
 def with_kv_warmup_defaults(overrides: dict[str, Any]) -> dict[str, Any]:

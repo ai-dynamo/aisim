@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import uuid
 from functools import partial
@@ -26,27 +27,46 @@ print("AISIMULATE_RUNTIME_VERSION=" + json.dumps(result, sort_keys=True))
 """
 
 
-def _redact_diagnostic(diagnostic: str, sensitive_values: tuple[str, ...]) -> str:
-    variants = {
-        encoded
-        for value in sensitive_values
-        if value
-        for variant in (value, value.replace("$", "$$"))
-        for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1])
-    }
+def _redact_diagnostic(
+    diagnostic: str, sensitive_values: tuple[str, ...], sensitive_names: tuple[str, ...] = ()
+) -> str:
+    variants: dict[str, bool] = {}
+    for value in sensitive_values:
+        if not value:
+            continue
+        for variant in (value, value.replace("$", "$$")):
+            for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1]):
+                variants[encoded] = variants.get(encoded, False) or len(value) >= 8
     for value in sorted(variants, key=len, reverse=True):
-        diagnostic = diagnostic.replace(value, "<redacted>")
+        if variants[value]:
+            diagnostic = diagnostic.replace(value, "<redacted>")
+        elif sensitive_names:
+            names = "|".join(re.escape(name) for name in sensitive_names)
+            diagnostic = re.sub(
+                r"(\b(?:" + names + r")[=]['\"]?)" + re.escape(value) + r"(?=$|[\s'\",}\]])",
+                r"\1<redacted>",
+                diagnostic,
+            )
+            diagnostic = diagnostic.replace('"value": ' + json.dumps(value), '"value": "<redacted>"')
     return diagnostic
 
 
-def _run(command: list[str], *, payload: str | None = None, sensitive_values: tuple[str, ...] = ()) -> str:
+def _run(
+    command: list[str],
+    *,
+    payload: str | None = None,
+    sensitive_values: tuple[str, ...] = (),
+    sensitive_names: tuple[str, ...] = (),
+) -> str:
     try:
         result = subprocess.run(command, input=payload, text=True, capture_output=True, timeout=300, check=True)
     except (OSError, subprocess.SubprocessError) as exc:
-        diagnostic = getattr(exc, "stderr", None) or str(exc)
+        diagnostic = getattr(exc, "stderr", None) or (
+            f"{type(exc).__name__} (returncode={getattr(exc, 'returncode', None)})"
+        )
         if isinstance(diagnostic, bytes):
             diagnostic = diagnostic.decode(errors="replace")
-        diagnostic = _redact_diagnostic(diagnostic, sensitive_values)
+        diagnostic = _redact_diagnostic(diagnostic, sensitive_values, sensitive_names)
     else:
         return result.stdout
     # Raise outside the handler: subprocess errors retain the full command
@@ -59,7 +79,8 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
     if deployment.image is None:
         raise ValueError("runtime version detection requires --image for the actual collection container")
     sensitive_values = tuple(item["value"] for item in deployment.extra_env or ())
-    run = partial(_run, sensitive_values=sensitive_values)
+    sensitive_names = tuple(item["name"] for item in deployment.extra_env or ())
+    run = partial(_run, sensitive_values=sensitive_values, sensitive_names=sensitive_names)
     if deployment.executor == "slurm":
         from collector.fpm_forward.config import FPM_RUNTIME_STARTUP_ENV
 
@@ -194,14 +215,14 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 except (AttributeError, TypeError, ValueError):
                     detail = ""
                 if detail:
-                    detail = _redact_diagnostic(detail, sensitive_values)
+                    detail = _redact_diagnostic(detail, sensitive_values, sensitive_names)
                     raise ValueError(f"{wait_error}; pod status: {detail}") from wait_error
                 raise
             output = run([*prefix, "logs", name])
             status = json.loads(run([*prefix, "get", "pod", name, "-o", "json"]))
             terminated = status["status"]["containerStatuses"][0]["state"]["terminated"]
             if terminated["exitCode"] != 0:
-                diagnostic = _redact_diagnostic(output.strip(), sensitive_values)
+                diagnostic = _redact_diagnostic(output.strip(), sensitive_values, sensitive_names)
                 raise ValueError(f"collection image runtime version detection failed: {diagnostic}")
         finally:
             if created:
