@@ -2290,6 +2290,29 @@ def test_numerics_jobs_run_on_github_hosted_runners() -> None:
     assert 'git show "${GITHUB_SHA}:scripts/ci/ci_install_build_tools.sh"' in _run_commands(collect)
 
 
+def test_numerics_jobs_keep_single_run_artifact_contracts() -> None:
+    golden = _workflow("ci.yml")["jobs"]["engine-golden-regression"]
+    prediction = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = prediction["collect"]
+
+    assert "strategy" not in golden
+    assert collect["strategy"]["matrix"] == {"side": ["old", "new"]}
+    golden_upload = next(
+        step for step in golden["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert golden_upload["with"]["name"] == "native-prediction-numerics"
+    assert golden_upload["with"]["path"] == "numerical-sentinels.json"
+    collect_upload = next(
+        step for step in collect["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert collect_upload["with"]["name"] == "prediction-gate-${{ matrix.side }}"
+    assert "--old /tmp/prediction-snapshots/prediction-gate-old" in _run_commands(prediction["report"])
+    assert "--new /tmp/prediction-snapshots/prediction-gate-new" in _run_commands(prediction["report"])
+    for job in (golden, collect, prediction["report"]):
+        assert "sample" not in json.dumps(job)
+        assert "runner-cpu.txt" not in json.dumps(job)
+
+
 def test_active_workflows_do_not_call_nested_inert_github_assets() -> None:
     for path in WORKFLOW_ROOT.glob("*.yml"):
         assert "./python/aisim/.github/" not in path.read_text(encoding="utf-8")
