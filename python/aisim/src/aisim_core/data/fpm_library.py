@@ -457,7 +457,8 @@ def stage_fpm_library(
     Sources outside the destination are linked, never modified; a schema-6 sidecar that needs recovery is
     rewritten in the staged copy. A recovered sidecar inside the destination is copied before replacement;
     the Parquet input must resolve outside the destination. ``output_dir`` is created (a previous staging there
-    is replaced); without it a temporary root
+    is replaced, and a configuration returned for the earlier library then reads the new one, so use one
+    ``output_dir`` per library whose configuration stays in use); without it a temporary root
     is used and removed by :meth:`StagedFpmLibrary.close`. Native validation still decides whether the staged
     table supports the requested estimator and workload.
     """

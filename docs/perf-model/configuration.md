@@ -471,8 +471,16 @@ The sidecar's `row_count`, selector topology degrees and repeat counts, and meas
 JSON integer literals; `1.0`, strings and booleans are rejected. JSON Schema treats `1.0` as an integer,
 so schema validation alone is insufficient for publication. Run
 `aisim_core.data.fpm_checks.check_fpm_dataset(root, include_measurements=True)` before publishing: it uses the
-strict sidecar and measurement-manifest readers in addition to artifact integrity checks. Prediction-only checks
+strict sidecar and measurement-manifest readers in addition to artifact integrity checks. It also binds the
+library rows to the entry: every row's `system`, `backend` and `backend_version` must equal the entry's, a
+declared `configuration_selector` must agree with the rows' recorded `dcp` (an unrecorded `dcp` is not DCP1, and a
+recorded one must be positive and divide `tp`), and a per-row `measurement_policy` requires the row
+`measurement_policy` and `measurement_repeats` columns with consistent values. Prediction-only checks
 leave evaluation files optional.
+
+A staging `output_dir` holds one library at a time: staging another library there replaces it, and a
+configuration returned for the earlier library then reads the new one. Give each library whose configuration stays
+in use its own `output_dir`.
 
 For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
 a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`

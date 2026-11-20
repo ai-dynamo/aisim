@@ -192,6 +192,7 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
         add("sidecar-hash", "sidecar parquet_sha256 differs from the library in the manifest")
     if library.rows is not None and metadata.get("row_count") != library.rows:
         add("sidecar-rows", f"sidecar row_count {metadata.get('row_count')} differs from library rows {library.rows}")
+    effective = None
     if not found:
         try:  # the check staging applies to a historical reconstructed sidecar
             check_library_model(metadata, _file(root, library.path), manifest.identity.model)
@@ -209,7 +210,103 @@ def check_fpm_entry(root: Path, manifest_path: str, *, include_measurements: boo
             )
         except (FpmContractError, OSError, ValueError) as exc:
             add("invalid-sidecar", str(exc))
+    if not found and effective is not None and columns is not None:
+        try:
+            for code, message in _check_row_declarations(_file(root, library.path), effective, manifest, columns):
+                add(code, message)
+        except (OSError, ValueError, pa.ArrowException) as exc:
+            add("library-rows", f"cannot scan the library rows: {exc}")
     return found
+
+
+_MEDIAN_ROW_POLICY = {
+    "per_row_single_sample_or_median_of_3": "kvwarm_median_of_3",
+    "per_row_single_sample_or_full_grid_median_v1": "independent_full_grid_median_of_3",
+}
+_SINGLE_SAMPLE_POLICY = "dynamo_native_single_sample_v1"
+
+
+def _check_row_declarations(
+    parquet: Path, metadata: dict, manifest: Manifest, columns: set[str]
+) -> list[tuple[str, str]]:
+    """Bind the rows to what the sidecar and entry declare, as native admission does (bounded scan).
+
+    Returns ``(code, message)`` findings for: a row naming another system, backend or backend version than the
+    entry; a DCP that disagrees with the sidecar selector or is not positive and a divisor of ``tp``; and the
+    per-row measurement policy and repeat columns that a per-row sidecar policy requires.
+    """
+    identity = manifest.identity
+    wanted = ["system", "backend", "backend_version", "tp", "dcp", "measurement_policy", "measurement_repeats"]
+    present = [name for name in wanted if name in columns]
+    runtime: dict[str, set] = {"system": set(), "backend": set(), "backend_version": set()}
+    dcp_pairs: set[tuple] = set()
+    policy_pairs: set[tuple] = set()
+    dcp_nulls = False
+    for batch in pq.ParquetFile(parquet).iter_batches(batch_size=4096, columns=present):
+        table = pa.Table.from_batches([batch])
+        for name in runtime:
+            runtime[name].update(table.column(name).unique().to_pylist())
+        if "dcp" in columns:
+            dcp_nulls = dcp_nulls or table.column("dcp").null_count > 0
+            dcp_pairs.update((row["tp"], row["dcp"]) for row in table.group_by(["tp", "dcp"]).aggregate([]).to_pylist())
+        if {"measurement_policy", "measurement_repeats"} <= columns:
+            policy_pairs.update(
+                (row["measurement_policy"], row["measurement_repeats"])
+                for row in table.group_by(["measurement_policy", "measurement_repeats"]).aggregate([]).to_pylist()
+            )
+    findings: list[tuple[str, str]] = []
+    declared_runtime = {
+        "system": identity.hardware,
+        "backend": identity.framework,
+        "backend_version": identity.framework_version,
+    }
+    for name, expected in declared_runtime.items():
+        if runtime[name] != {expected}:
+            findings.append(
+                (
+                    "library-runtime",
+                    f"library rows name {name} {sorted(map(str, runtime[name]))}; the entry declares {expected!r}",
+                )
+            )
+    selector = metadata.get("configuration_selector")
+    if "dcp" in columns:
+        if dcp_nulls:
+            findings.append(
+                ("library-dcp", "library dcp must not contain nulls; omit the column when DCP is unrecorded")
+            )
+        for tp, dcp in sorted(dcp_pairs, key=str):
+            if type(dcp) is not int or type(tp) is not int or dcp <= 0 or tp <= 0 or tp % dcp:
+                findings.append(("library-dcp", f"library dcp {dcp!r} must be positive and divide tp {tp!r}"))
+    if isinstance(selector, dict):
+        # Unrecorded DCP is not DCP1: a declared selector must equal the rows' recorded value (or its absence).
+        recorded = {dcp for _, dcp in dcp_pairs} if "dcp" in columns else {None}
+        if recorded != {selector.get("dcp")}:
+            findings.append(
+                (
+                    "library-dcp",
+                    f"library rows record dcp {sorted(recorded, key=str)}; the sidecar selector declares "
+                    f"{selector.get('dcp')!r}",
+                )
+            )
+    median = _MEDIAN_ROW_POLICY.get(metadata.get("measurement_policy"))
+    if median is not None:
+        if not {"measurement_policy", "measurement_repeats"} <= columns:
+            findings.append(
+                (
+                    "library-measurement-policy",
+                    f"per-row policy {metadata['measurement_policy']!r} requires the measurement_policy and "
+                    "measurement_repeats columns",
+                )
+            )
+        elif bad := policy_pairs - {(_SINGLE_SAMPLE_POLICY, 1), (median, 3)}:
+            findings.append(
+                (
+                    "library-measurement-policy",
+                    f"library measurement policy/repeats {sorted(bad, key=str)} are inconsistent with "
+                    f"{metadata['measurement_policy']!r}",
+                )
+            )
+    return findings
 
 
 def _check_measurement_manifest(path: Path, fmt: str) -> None:
