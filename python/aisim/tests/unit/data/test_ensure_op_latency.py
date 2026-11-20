@@ -640,3 +640,45 @@ def test_partial_shape_coverage_predicts_like_the_complete_source_through_best_a
     expected = reference.predict_prefill_latency(1, 4)
     assert pinned.predict_prefill_latency(1, 4) == expected
     assert degraded.predict_prefill_latency(1, 4) != expected, "the fixture must make the older rows matter"
+
+
+def test_a_composed_root_edited_in_place_is_rebuilt_from_the_dataset(two_families, tmp_path):
+    first = Path(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+    table = first / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet"
+    original = table.read_bytes()
+    table.chmod(0o644)
+    table.write_bytes(b"edited in place")
+    second = Path(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+    assert (second / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").read_bytes() == original
+
+
+def test_an_exported_root_never_aliases_the_cached_tables(native_dataset, tmp_path):
+    from aisim_core.data.materialize import materialize_systems_root
+
+    published, systems, config = native_dataset
+    shutil.rmtree(systems / "data")
+    payload = config.to_dict()
+    payload.pop("systems_paths")
+    pin = _pin(published, tmp_path)
+    before = res.RustForwardPassPerfModel.best_available(payload, dataset=pin).predict_prefill_latency(1, 4)
+    exported = materialize_systems_root(payload, pin, tmp_path / "export").root
+    table = exported / "data/h200_sxm/attention/vllm/1.0/context_attention_perf.parquet"
+    assert table.stat().st_nlink == 1  # a copy, not a hard link into the cache
+    pq.write_table(pa.Table.from_pylist([{**pq.read_table(table).to_pylist()[0], "latency": 700.0}]), table)
+    after = res.RustForwardPassPerfModel.best_available(dict(payload), dataset=pin).predict_prefill_latency(1, 4)
+    assert after == before  # the pinned prediction still uses the dataset's 7 ms, not the edited export
+
+
+def test_ensuring_the_real_configuration_connected_makes_the_offline_run_complete(tree, tmp_path):  # noqa: F811
+    """The documented air-gapped recipe: one connected ensure_data prepares donors too, so the offline run works."""
+    from .test_fetch import FakeTransport
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    cache = tmp_path / "cache"
+    connected = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=cache)
+    config = {**CONFIG, "backend_version": "2.0"}  # 2.0 declares 1.0 as a donor
+    ensure_data(config, connected, transport=FakeTransport(_tree_files(published)))
+    offline = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=cache, offline=True)
+    out = ensure_data(config, offline)  # no transport: everything must come from the cache
+    assert (Path(out.config["systems_paths"][0]) / "data/h200_sxm/gemm/vllm/1.0/gemm_perf.parquet").is_file()

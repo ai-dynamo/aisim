@@ -71,7 +71,7 @@ def _identity():
     )
 
 
-def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions=False):
+def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions=False, record_hardware=None):
     rows = [(f"s{i}", {"tokens": 10 * i}, 10.0 * i) for i in range(1, 5)] + [("bad", {"tokens": 1}, None)]
     art = write_truth_table(tmp_path / "t.parquet", rows)
     truth_bytes = (tmp_path / "t.parquet").read_bytes()
@@ -90,7 +90,9 @@ def build_dataset(tmp_path, claim_scale=1.0, *, list_truth=True, drop_exclusions
             "truth": {
                 "layer": "fpm",
                 "configuration_ids": [cfg],
-                "identity": ident.model_dump(),
+                "identity": (
+                    ident.model_copy(update={"hardware": record_hardware}) if record_hardware else ident
+                ).model_dump(),
                 "artifacts": [art.model_dump(by_alias=True)],
                 "truth_table_artifact_id": "truth-table",
             },
@@ -479,3 +481,25 @@ def test_required_cases_use_the_rows_that_were_verified_not_a_replaced_file(tmp_
     )
     assert r.verdict == "fail"
     assert [(o.case_id, o.status, o.reason) for o in r.required_cases] == [("zz", "fail", "not in truth table")]
+
+
+def test_a_record_for_other_hardware_cannot_pass_under_a_selected_envelope(tmp_path):
+    # The catalog entry and envelope stay b200_sxm and the request filters b200_sxm; the record inside says h100_sxm.
+    files, rec, cfg, _ = build_dataset(tmp_path, record_hardware="h100_sxm")
+    received = []
+
+    def spying_factory(record):
+        received.append(record.truth.identity.hardware)
+        return factory(record)
+
+    r = run(tmp_path, files, request(rec, cfg), factory=spying_factory)
+    assert r.verdict == "fail" and "differs" in r.problems[0]
+    assert received == []  # the predictor is never built for the wrong cohort
+
+
+def test_the_request_filters_bind_the_record_identity(tmp_path):
+    files, rec, cfg, _ = build_dataset(tmp_path)
+    assert run(tmp_path, files, request(rec, cfg)).verdict == "pass"
+    for field, value in (("hardware", "h100_sxm"), ("model", "Qwen/Other")):
+        r = run(tmp_path, files, request(rec, cfg, **{field: value}))
+        assert r.verdict != "pass", field  # no catalog entry matches the filter

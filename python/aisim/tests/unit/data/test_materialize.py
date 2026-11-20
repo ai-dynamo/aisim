@@ -84,7 +84,7 @@ def test_copy_failure_cleans_up(tmp_path, layout, stub_ensure, monkeypatch):
     def boom(source, target):
         raise OSError("disk full")
 
-    monkeypatch.setattr(mat, "_link_or_copy", boom)
+    monkeypatch.setattr(mat, "_copy_file", boom)
     with pytest.raises(OSError, match="disk full"):
         mat.materialize_systems_root(
             CONFIG, DataPin(local_root=tmp_path), tmp_path / "root", packaged_systems=layout[0]

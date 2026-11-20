@@ -595,6 +595,18 @@ def _one_entry_per_family(entries: list[Entry], selection: Selection, where: str
     return sorted(entries, key=lambda e: e.configuration_id)
 
 
+def _root_matches(systems: Path, manifests: list[Any]) -> bool:
+    """True when every runtime file of the composed root still has the digest its manifest declares."""
+    try:
+        for manifest in manifests:
+            for artifact in manifest.artifacts:
+                if artifact.runtime_path is not None:
+                    _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
+    except ValueError:
+        return False
+    return True
+
+
 def _declared_donors(
     root: Path,
     entries: list[Entry],
@@ -786,7 +798,9 @@ def _load_op_latency(
         digest = op_latency_inputs_digest(root, manifests, PACKAGED_SYSTEMS_DIR)[:16]
         output_dir = cache.root / "materialized" / source_key / f"op-latency-{digest}"
         if (output_dir / "systems").is_dir():
-            return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
+            if _root_matches(output_dir / "systems", manifests):
+                return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
+            shutil.rmtree(output_dir, ignore_errors=True)  # edited or damaged in place: rebuild from the dataset
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         # Build in a directory private to this attempt (threads of one process share a PID) and rename it, so a
         # concurrent worker never sees a half-written root and never deletes another worker's staging.

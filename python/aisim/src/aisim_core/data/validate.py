@@ -38,6 +38,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
+from aisim_core.data import Manifest
 from aisim_core.data.eval import (
     VERIFIER_VERSION,
     EvalRecord,
@@ -295,6 +296,9 @@ def run_validation(
                 [f"truth table {table_art.artifact_id!r} ({table_dataset_path!r}) is not in the selected evidence"],
                 dataset_sha=sha,
             )
+        mismatch = _identity_problem(record, request, result)
+        if mismatch is not None:
+            return failed("fail", [mismatch], dataset_sha=sha)
         predict, fingerprint = predictor_factory(record)
         seen: dict[str, float | None] = {}
 
@@ -321,6 +325,36 @@ def run_validation(
         accuracy=accuracy,
         downloaded_bytes=result.downloaded_bytes,
     )
+
+
+_IDENTITY_FIELDS = ("hardware", "framework", "framework_version", "model", "operation_family")
+
+
+def _identity_problem(record: EvalRecord, request: ValidationRequest, result) -> str | None:
+    """Why the record's truth identity disagrees with the evidence that was selected, else ``None``.
+
+    The request filters pick catalog entries by their envelope identity; the record inside is a separate
+    document, so a report could otherwise certify another hardware or model cohort than the one selected.
+    """
+    truth = record.truth.identity
+    for field in ("hardware", "model"):
+        wanted = getattr(request, field)
+        if wanted is not None and getattr(truth, field) != wanted:
+            return f"record {field} {getattr(truth, field)!r} differs from the request's {wanted!r}"
+    owners = []
+    for planned in result.plan.files:
+        if planned.role != "manifest":
+            continue
+        manifest = Manifest.model_validate_json(result.paths[planned.path].read_bytes())
+        if any(a.path == request.record_path for a in manifest.artifacts):
+            owners.append(manifest)
+    if not owners:
+        return f"record {request.record_path!r} is not listed by any selected manifest"
+    for manifest in owners:
+        differing = [f for f in _IDENTITY_FIELDS if getattr(manifest.identity, f) != getattr(truth, f)]
+        if differing:
+            return f"record identity differs from its selected manifest in {differing}"
+    return None
 
 
 def _required_outcomes(

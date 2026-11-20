@@ -84,17 +84,27 @@ network request. Pin the dataset to a full commit SHA, because a branch or tag c
 resolved offline.
 
 ```bash
-# 1. Connected: resolve once, check the size, download and verify into a cache.
+# 1. Connected: check the size of the selected version, then prepare the whole closure of the real run.
 aisim data fetch --repo OWNER/NAME --revision <40-hex-sha> --category op-latency \
   --hardware b200_sxm --framework vllm --framework-version 0.24.0 --dry-run --cache-dir ./aisim-cache
-aisim data fetch --repo OWNER/NAME --revision <40-hex-sha> --category op-latency \
-  --hardware b200_sxm --framework vllm --framework-version 0.24.0 --cache-dir ./aisim-cache
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_CATEGORIES=op-latency
+python - <<'PY'
+from aisim_core.data.ensure import ensure_data, pin_from_environment
+
+# The configuration you will predict with: it decides the version, donors, collectives and shared-layer sources.
+ensure_data({"system": "b200_sxm", "backend": "vllm", "backend_version": "0.24.0"}, pin_from_environment())
+PY
 
 # 2. Copy ./aisim-cache to the air-gapped host (any file transfer).
-# 3. Disconnected: check completeness, then pin and run.
-aisim data fetch ... --offline --dry-run --cache-dir ./aisim-cache   # lists `missing`; empty means ready
-export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_OFFLINE=1
+# 3. Disconnected: pin offline and run.
+export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_CATEGORIES=op-latency \
+  AISIM_DATA_OFFLINE=1
 ```
+
+`aisim data fetch ... --offline --dry-run` (an empty `missing` list) only shows that the files of the one selected
+version are cached. The runtime closure also holds donor versions, collective libraries and shared-layer sources
+that `ensure_data` (or `materialize_systems_root`, below) fetches for the real configuration, so run it connected
+before moving the cache. `AISIM_DATA_CATEGORIES` defaults to `fpm`; name `op-latency` for operation tables.
 
 `AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins model construction through
 `RustForwardPassPerfModel.best_available`: the data a configuration needs is taken from the cached revision,
@@ -137,8 +147,8 @@ root = materialize_systems_root(
 # root.env == {"AICONFIGURATOR_SYSTEMS_PATH": "./systems-root"}; pass root.root as `systems_paths` / `systems_path`.
 ```
 
-The root holds the packaged specs and support files plus the verified pinned `data/` tables (hard-linked from
-the cache when possible); it never mixes in packaged tables. The call fails if the destination exists.
+The root holds the packaged specs and support files plus copies of the verified pinned `data/` tables (never hard links,
+so editing the root cannot change the cache); it never mixes in packaged tables. The call fails if the destination exists.
 
 | Consumer | Preparation |
 |---|---|
