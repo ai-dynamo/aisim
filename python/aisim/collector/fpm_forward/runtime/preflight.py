@@ -103,6 +103,12 @@ def main() -> None:
         if "power_window_s" not in config_fields:
             missing_fields.append("BenchmarkConfig.power_window_s")
     required_methods = set(GRAPH_AWARE_METHODS)
+    if power_window_required:
+        # The decode power gate needs each window step's wall time
+        # (power.step_wall_times_s), which Dynamo records in this method; a
+        # build without it would accept the flag and then fail validation
+        # after the whole measurement.
+        required_methods.add("_bench_power_step_completed")
     if real_prefill_requested and not (dsv41_adapter or glm53flash_adapter):
         # Native cached-prefill seeding is separate from decode warm-up:
         # https://github.com/ai-dynamo/dynamo/blob/b83b1d9304ebfc624709ac46db32b1b6f1ff1615/components/src/dynamo/vllm/instrumented_scheduler.py#L3326

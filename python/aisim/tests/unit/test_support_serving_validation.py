@@ -284,10 +284,11 @@ def test_parquet_file_without_its_metadata_file_stops_preparation_for_either_spe
     assert not (tmp_path / "serving").exists()
 
 
-def test_key_written_twice_inside_ais_perf_model_stops_preparation(tmp_path):
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_key_written_twice_inside_ais_perf_model_stops_preparation(tmp_path, suffix):
     trace = tmp_path / "trace.json"
     trace.write_text("{}\n")
-    config = tmp_path / "predict.yaml"
+    config = tmp_path / f"predict{suffix}"
     # The YAML reader keeps the last value, which alone would be accepted.
     config.write_text(
         "engine:\n"
@@ -313,6 +314,17 @@ def test_key_written_twice_inside_ais_perf_model_stops_preparation(tmp_path):
     with pytest.raises(AisPerfModelError, match=f"^{written_twice}$"):
         _prepare_without_a_replay(tmp_path, config, trace)
     assert not (tmp_path / "serving").exists()
+
+
+def test_json_named_prediction_retains_yaml_parsing_and_path_anchoring(tmp_path):
+    config = tmp_path / "predict.json"
+    config.write_text(
+        "engine:\n  ais_perf_model:\n    systems_paths: [profiles]\nevaluation:\n  sla:\n    ttft_ms: 1.0e-7\n",
+        encoding="utf-8",
+    )
+    raw = serving._read_prediction_config(config)
+    assert raw["engine"]["ais_perf_model"]["systems_paths"] == [str(tmp_path / "profiles")]
+    assert raw["evaluation"]["sla"]["ttft_ms"] == 1e-7
 
 
 @pytest.fixture

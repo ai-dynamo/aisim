@@ -72,7 +72,7 @@ use crate::engine::kv_manager::{
     BlockRequestLease, DestinationReservation, G1Acquire, G1Manager, SourceReleaseOrder,
     SourceReuseDependency, StateHandoff,
 };
-use crate::engine::{HostOffloadObserver, KvHintSource, NativeHostOffloadConfig};
+use crate::engine::{HostOffloadObserver, KvEventData, KvHintSource, NativeHostOffloadConfig};
 
 struct LoadingPrefix {
     transfer_id: TransferId,
@@ -136,20 +136,16 @@ impl RestoreRounds {
 }
 
 /// A lookup's walk over G2: the `matched` leading blocks of `range` that G2
-/// holds, and the first of them that waits for a store or load in flight
-/// (`matched` or more for none). The default is a walk of no blocks.
+/// holds, up to the deepest boundary whose state it also holds for a hybrid
+/// model, and whether one of them or a key of that state waits for a store
+/// or load in flight. The default is a walk of no blocks.
 #[derive(Debug, Default, PartialEq)]
 struct HitWalk {
     /// [`HostTier::lookup_epoch`] and the adapter's `load_keys_epoch`.
     epochs: (u64, u64),
     range: (usize, usize),
     matched: usize,
-    first_busy: usize,
-    /// With a state cache: the scan for a state below this walk, which reads
-    /// the tier and the loads like the walk. The deepest boundary it tried,
-    /// the one it found in blocks past the range start (0 for none), and
-    /// whether a key of that state is busy. `None` until a lookup scans.
-    state: Option<(usize, usize, bool)>,
+    busy: bool,
 }
 
 /// Request-local connector cursor and transient load ownership.
@@ -167,7 +163,7 @@ pub(super) struct VllmHostRequestState {
     kv_hint: Option<KvHintSource>,
     /// G3 or KVCR restore rounds; the two are exclusive in v1.
     restore_rounds: RestoreRounds,
-    /// What the latest G3 staging found in G2.
+    /// What the latest G3 or KVCR staging found in G2.
     g3_held: super::g3_offload::HeldPrefix,
     next_store_block: usize,
     latest_store: Option<TransferId>,
@@ -183,6 +179,8 @@ pub(super) struct VllmHostRequestState {
     accessed_blocks: BTreeSet<usize>,
     /// With `touches_prompt`: the latest prompt touch.
     prompt_touch: Option<ReversedTouch>,
+    /// With KVCR-owned memory under LRU: the blocks its stores re-rank there.
+    kvcr_prefix: Option<super::kvcr::SharedStorePrefix>,
     /// The latest lookup's walk. A blocked queue head looks up again on
     /// every pass and reuses it while G2 and the keys being loaded are
     /// unchanged.
@@ -205,6 +203,13 @@ enum CohortWait {
     /// It found no room at this room epoch of the pool.
     NoRoomAt(u64),
     LargerThanPool,
+    /// It misses more blocks than the pool had empty or evictable, among
+    /// them `witness`, when the pool had admitted this many blocks.
+    Short {
+        missing: usize,
+        admitted: u64,
+        witness: HostBlockKey,
+    },
 }
 
 impl VllmHostRequestState {
@@ -257,6 +262,7 @@ impl VllmHostRequestState {
             lookup_pin: None,
             accessed_blocks: BTreeSet::new(),
             prompt_touch: None,
+            kvcr_prefix: None,
             hit_walk: HitWalk::default(),
             accessed_states: BTreeSet::new(),
             unstored_states: Vec::new(),
@@ -499,14 +505,18 @@ impl VllmHostOffloadAdapter {
         &mut self,
         registry: crate::engine::kvcr::SharedKvcrRegistry,
         rank: KvHintSource,
-    ) -> HostTierHandle {
-        self.kvcr = Some(super::kvcr::VllmKvcrAdapter::new(registry, rank));
-        self.host.tier_handle()
+        gpus_per_rank: usize,
+    ) -> anyhow::Result<HostTierHandle> {
+        let block_bytes = self.host.lock().block_bytes();
+        let kvcr = super::kvcr::VllmKvcrAdapter::new(registry, rank)
+            .with_local_g2(block_bytes, gpus_per_rank)?;
+        self.kvcr = Some(kvcr);
+        Ok(self.host.tier_handle())
     }
 
     /// Changes whenever G3 or KVCR stages, lands or loads; drives
     /// same-timestamp retries. `None` without G3 until this rank's first KVCR
-    /// pull, so an idle KVCR schedules exactly like G2 alone.
+    /// pull or copy, so an idle KVCR schedules exactly like G2 alone.
     pub(super) fn retry_epoch(&self) -> Option<u64> {
         let kvcr_epoch = self.kvcr.as_ref().map_or(0, |kvcr| kvcr.epoch);
         (self.g3.is_some() || kvcr_epoch > 0)
@@ -570,6 +580,13 @@ impl VllmHostOffloadAdapter {
             .or((self.shared || self.hybrid.is_some()).then_some(SourceReleaseOrder::TailFirst))
     }
 
+    /// Whether a waiting request that holds G1 for a load is admitted before
+    /// the others: the connector's rule, or any rank that G3 or a KVCR pull
+    /// can wake.
+    pub(super) fn admits_kv_holders_first(&self) -> bool {
+        self.rules.admits_kv_holders_first || self.retry_epoch().is_some()
+    }
+
     /// G1 has a state cache: lookups, loads and stores carry its states.
     pub(super) fn set_hybrid(&mut self, blocks_per_state: usize, kind: StateKind) {
         self.hybrid = Some(HybridStates {
@@ -608,12 +625,11 @@ impl VllmHostOffloadAdapter {
         }
         // vLLM skips a request waiting for its async connector load
         // (`WAITING_FOR_REMOTE_KVS`) without a lookup or LRU touch until the
-        // load finishes; a landing pull or H2D completion wakes it.
+        // load finishes; a landing pull, promotion or H2D completion wakes it.
         if matches!(request.load, Some(LoadState::Loading(_)))
-            || self
-                .kvcr
-                .as_ref()
-                .is_some_and(|kvcr| kvcr.is_pulling(request.owner))
+            || self.kvcr.as_ref().is_some_and(|kvcr| {
+                kvcr.is_pulling(request.owner) || kvcr.is_promoting(request.owner, now_ms)
+            })
         {
             return HostLookup::Deferred;
         }
@@ -689,15 +705,17 @@ impl VllmHostOffloadAdapter {
         {
             HostLookup::Deferred
         } else if let Some(kvcr) = kvcr
-            && let Some(source) = request.kv_hint
+            && (request.kv_hint.is_some() || kvcr.has_local_g2())
             && !request.restore_rounds.bypassed()
             && kvcr.stage(
                 &mut tier,
                 host.id(),
                 request.owner,
-                source,
+                request.kv_hint,
                 &mut request.restore_rounds,
-                &request.block_keys[base_g1_blocks..request.prompt_blocks],
+                &mut request.g3_held,
+                &mut request.kvcr_prefix,
+                (&request.block_keys[..request.prompt_blocks], base_g1_blocks),
                 request
                     .block_meta
                     .as_deref()
@@ -723,41 +741,18 @@ impl VllmHostOffloadAdapter {
                     }
                     matched += 1;
                 }
-                HitWalk {
-                    epochs,
-                    range,
-                    matched,
-                    first_busy,
-                    state: None,
-                }
-            };
-            if (request.hit_walk.epochs, request.hit_walk.range) != (epochs, range) {
-                request.hit_walk = walk();
-            }
-            debug_assert!({
-                let fresh = walk();
-                (request.hit_walk.matched, request.hit_walk.first_busy)
-                    == (fresh.matched, fresh.first_busy)
-            });
-            let HitWalk {
-                mut matched,
-                first_busy,
-                ..
-            } = request.hit_walk;
-            // A hybrid hit ends at the deepest boundary that also holds every
-            // slot of its state. A state that is being loaded, or still being
-            // stored when the connector waits for stores, defers the hit.
-            let mut keys = Vec::new();
-            let mut states_busy = false;
-            if let Some(hybrid) = hybrid {
-                let busy = |key: HostBlockKey| match tier.lookup(key) {
-                    Lookup::Hit => Some(load_by_key.contains_key(&key)),
-                    Lookup::Pending { .. } => rules.waits_for_stores.then_some(true),
-                    Lookup::Miss => None,
-                };
-                let deepest = matched.saturating_sub(usize::from(drops_drafter_block));
-                let scan = || {
-                    (1..=deepest)
+                // A hybrid hit ends at the deepest boundary that also holds every
+                // slot of its state. A state that is being loaded, or still being
+                // stored when the connector waits for stores, defers the hit.
+                let mut states_busy = false;
+                if let Some(hybrid) = hybrid {
+                    let busy = |key: HostBlockKey| match tier.lookup(key) {
+                        Lookup::Hit => Some(load_by_key.contains_key(&key)),
+                        Lookup::Pending { .. } => rules.waits_for_stores.then_some(true),
+                        Lookup::Miss => None,
+                    };
+                    let deepest = matched.saturating_sub(usize::from(drops_drafter_block));
+                    (matched, states_busy) = (1..=deepest)
                         .rev()
                         .find_map(|blocks| {
                             let prefix = request.block_keys[base_g1_blocks + blocks - 1];
@@ -767,27 +762,30 @@ impl VllmHostOffloadAdapter {
                             }
                             Some((blocks, any_busy))
                         })
-                        .unwrap_or_default()
-                };
-                // A blocked queue head looks up again on every pass: reuse
-                // the scan with the walk it follows.
-                (matched, states_busy) = match request.hit_walk.state {
-                    Some((scanned, blocks, busy)) if scanned == deepest => (blocks, busy),
-                    _ => scan(),
-                };
-                debug_assert_eq!((matched, states_busy), scan());
-                request.hit_walk.state = Some((deepest, matched, states_busy));
-                if matched > 0 {
-                    keys = hybrid.keys(request.block_keys[base_g1_blocks + matched - 1]);
+                        .unwrap_or_default();
                 }
+                HitWalk {
+                    epochs,
+                    range,
+                    matched,
+                    busy: states_busy || first_busy < matched,
+                }
+            };
+            if (request.hit_walk.epochs, request.hit_walk.range) != (epochs, range) {
+                request.hit_walk = walk();
             }
-            let state_slots = keys.len();
-            keys.extend_from_slice(&request.block_keys[base_g1_blocks..base_g1_blocks + matched]);
+            debug_assert_eq!(request.hit_walk, walk());
+            let HitWalk { matched, busy, .. } = request.hit_walk;
             if matched == 0 {
                 HostLookup::Miss
-            } else if states_busy || first_busy < matched {
+            } else if busy {
                 HostLookup::Deferred
             } else {
+                let blocks = &request.block_keys[base_g1_blocks..base_g1_blocks + matched];
+                let mut keys =
+                    hybrid.map_or_else(Vec::new, |hybrid| hybrid.keys(blocks[matched - 1]));
+                let state_slots = keys.len();
+                keys.extend_from_slice(blocks);
                 HostLookup::Hit(HostLookupHit {
                     keys,
                     state_slots,
@@ -962,8 +960,31 @@ impl VllmHostOffloadAdapter {
         }
         // Drain after G3 and KVCR: a promotion or pull landing in G2 above
         // publishes residency that no later deadline would otherwise deliver.
-        for event in tier.take_events(client) {
-            kv_manager.publish_host_pinned_event(event);
+        let mut publish = |event| kv_manager.publish_host_pinned_event(event);
+        match &mut self.kvcr {
+            Some(kvcr) if kvcr.has_local_g2() => {
+                for event in tier.take_events(client) {
+                    kvcr.publish_unheld(event, &mut publish);
+                }
+                // A completed store starts its copy into KVCR-owned memory
+                // here, after the G2 events it filters.
+                for transfer in &completed {
+                    if let CompletedTransfer::Store {
+                        request_id,
+                        transfer_id,
+                        blocks,
+                    } = transfer
+                    {
+                        let block_hashes =
+                            kvcr.store_local(&tier, *request_id, *transfer_id, blocks, now_ms);
+                        kvcr.pin_store(&mut tier, *transfer_id, blocks);
+                        if self.publishes_residency && !block_hashes.is_empty() {
+                            publish(KvEventData::Removed { block_hashes });
+                        }
+                    }
+                }
+            }
+            _ => tier.take_events(client).into_iter().for_each(publish),
         }
         let mut loads = Vec::new();
         for transfer in completed {
@@ -1151,13 +1172,33 @@ impl VllmHostOffloadAdapter {
         };
         let start = request.next_store_block;
         let end = end.max(start);
+        // The cohort found no room before; its first failure is on record.
+        let mut parked = false;
         if let Some(wait) = request.cohort_wait {
+            let mut tier = self.host.lock();
             // Applies due completions, as the offer it stands for would.
-            let now = self.host.lock().room_epoch(now_ms);
-            if wait == CohortWait::LargerThanPool || wait == CohortWait::NoRoomAt(now) {
+            let now = tier.room_epoch(now_ms);
+            let waits = match wait {
+                CohortWait::LargerThanPool => true,
+                CohortWait::NoRoomAt(at) => at == now,
+                // Each block that entered G2 since can be one the cohort
+                // missed; with no room at all, one block still missing is
+                // enough.
+                CohortWait::Short {
+                    missing,
+                    admitted,
+                    witness,
+                } => {
+                    let (free, entered) = (tier.free_blocks(), tier.admitted_blocks() - admitted);
+                    (free as u64).saturating_add(entered) < missing as u64
+                        || free == 0 && tier.lookup(witness) == Lookup::Miss
+                }
+            };
+            if waits {
                 return;
             }
             request.cohort_wait = None;
+            parked = true;
         }
         let window = self.hybrid.filter(|hybrid| hybrid.is_window());
         let checkpoints = window.map_or_else(Vec::new, |window| {
@@ -1199,6 +1240,19 @@ impl VllmHostOffloadAdapter {
         }
         if missing_indices.is_empty() && checkpoints.is_empty() {
             request.next_store_block = end;
+            return;
+        }
+        // A parked cohort that still misses more blocks than G2 has empty or
+        // evictable ones cannot fit; it stays parked without being prepared.
+        if parked
+            && (self.kvcr.as_ref()).is_some_and(|kvcr| kvcr.has_local_g2())
+            && tier.free_blocks() < missing_indices.len()
+        {
+            request.cohort_wait = Some(CohortWait::Short {
+                missing: missing_indices.len(),
+                admitted: tier.admitted_blocks(),
+                witness: request.block_keys[missing_indices[0]],
+            });
             return;
         }
         // A cohort of checkpoints alone copies no token block from G1.
@@ -1261,6 +1315,23 @@ impl VllmHostOffloadAdapter {
                     } else {
                         CohortWait::NoRoomAt(tier.room_epoch(now_ms))
                     });
+                } else if !structurally_unfittable
+                    && (self.kvcr.as_ref()).is_some_and(|kvcr| kvcr.has_local_g2())
+                {
+                    // Stores being copied into KVCR-owned memory stay pinned
+                    // and can leave G2 no room for as long as a copy takes.
+                    // A cohort that misses more blocks than G2 has empty or
+                    // evictable ones cannot fit until that changes.
+                    let missing = missing_indices.len();
+                    request.cohort_wait = Some(if tier.free_blocks() < missing {
+                        CohortWait::Short {
+                            missing,
+                            admitted: tier.admitted_blocks(),
+                            witness: request.block_keys[missing_indices[0]],
+                        }
+                    } else {
+                        CohortWait::NoRoomAt(tier.room_epoch(now_ms))
+                    });
                 }
             }
             StoreOutcome::Prepared {
@@ -1300,6 +1371,16 @@ impl VllmHostOffloadAdapter {
                     });
                 }
                 request.latest_store = Some(transfer_id);
+                if let Some(kvcr) = &mut self.kvcr {
+                    // Up to the last block the store copies.
+                    if let Some(last) = missing_indices.last() {
+                        kvcr.expect_store(
+                            transfer_id,
+                            &mut request.kvcr_prefix,
+                            &request.block_keys[..=*last],
+                        );
+                    }
+                }
                 request.next_store_block = resume;
                 if rules.touches_prompt {
                     if let Some(touch) = &mut request.prompt_touch {
@@ -1413,6 +1494,16 @@ impl VllmHostOffloadAdapter {
         if let Some(pinned) = request.lookup_pin.take() {
             self.host.lock().unpin_external(&pinned);
         }
+        if let Some(kvcr) = &mut self.kvcr {
+            // vLLM re-ranks only the blocks the request processed: none for
+            // a request dropped while it waited (`on_request_finished`).
+            let processed = request.prompt_blocks.min(computed_tokens / block_size);
+            kvcr.align_local(
+                request.kvcr_prefix.as_ref(),
+                &request.block_keys[..processed],
+            );
+            kvcr.forget_promotions(request.owner);
+        }
         if self.rules.stores_at_finish {
             // Everything computed is confirmed once the request leaves.
             request.confirmed_tokens = computed_tokens;
@@ -1486,7 +1577,7 @@ impl VllmHostOffloadAdapter {
         if dependencies.is_empty() {
             return;
         }
-        let tier = self.host.lock();
+        let tier = self.host.read();
         for dependency in dependencies {
             let store = transfer_id(*dependency);
             match tier.transfer_deadline(store) {
@@ -1507,7 +1598,7 @@ impl VllmHostOffloadAdapter {
     pub(super) fn preempt_request(&mut self, request: &mut VllmHostRequestState) {
         request.restore_rounds.reset();
         let deadline = {
-            let tier = self.host.lock();
+            let tier = self.host.read();
             if self.rules.preemption_waits_for_all {
                 tier.last_deadline(self.host.id())
             } else {
@@ -1569,8 +1660,7 @@ impl VllmHostOffloadAdapter {
 
     pub(super) fn next_deadline(&self) -> Option<f64> {
         self.host
-            .lock()
-            .next_deadline(self.host.id())
+            .next_deadline()
             .into_iter()
             .chain(self.g3.as_ref().and_then(|g3| g3.next_deadline()))
             .chain(self.kvcr.as_ref().and_then(|kvcr| kvcr.next_deadline()))
@@ -1578,7 +1668,7 @@ impl VllmHostOffloadAdapter {
     }
 
     pub(super) fn current_time_ms(&self) -> f64 {
-        self.host.lock().current_time_ms()
+        self.host.read().current_time_ms()
     }
 
     /// Stores a request prepared when it left between passes. Only the 0.32
@@ -1586,11 +1676,11 @@ impl VllmHostOffloadAdapter {
     /// next step, and `Scheduler.has_requests` keeps the engine stepping until
     /// it has, so an engine boundary submits them.
     pub(super) fn has_unsubmitted_stores(&self) -> bool {
-        self.rules.stores_at_finish && self.host.lock().has_prepared_stores(self.host.id())
+        self.rules.stores_at_finish && self.host.read().has_prepared_stores(self.host.id())
     }
 
     pub(super) fn has_work(&self) -> bool {
-        self.host.lock().has_pending_work(self.host.id())
+        self.host.read().has_pending_work(self.host.id())
             || self.g3.as_ref().is_some_and(|g3| g3.has_work())
             || self.kvcr.as_ref().is_some_and(|kvcr| kvcr.has_work())
     }
@@ -2492,6 +2582,21 @@ mod tests {
         host: Option<NativeHostOffloadConfig>,
         waves: &[&[&[u32]]],
     ) -> (Vec<Vec<crate::engine::KvEvent>>, Vec<usize>) {
+        let (events, host_reused, _) = served_kvcr_events(host, None, waves);
+        (events, host_reused)
+    }
+
+    /// [`served_kv_events`] for a rank that also joins a KVCR pool of its
+    /// own; returns the pool's counters too.
+    fn served_kvcr_events(
+        host: Option<NativeHostOffloadConfig>,
+        kvcr: Option<crate::engine::KvcrConfig>,
+        waves: &[&[&[u32]]],
+    ) -> (
+        Vec<Vec<crate::engine::KvEvent>>,
+        Vec<usize>,
+        Option<crate::engine::KvcrStats>,
+    ) {
         let args = MockEngineArgs::builder()
             .num_gpu_blocks(4)
             .block_size(4)
@@ -2502,6 +2607,18 @@ mod tests {
             .build()
             .unwrap();
         let mut core = VllmCore::new_with_worker_rank(args, 0, 0, 0, true, None).unwrap();
+        let registry = kvcr.map(|config| {
+            let registry = crate::engine::kvcr::KvcrRegistry::new(config);
+            let rank = KvHintSource {
+                worker_id: 0,
+                dp_rank: 0,
+            };
+            let g2 = core.set_kvcr(Arc::clone(&registry), rank, 1).unwrap();
+            let mut pool = registry.lock().unwrap();
+            pool.register_worker(0, vec![g2], 1).unwrap();
+            drop(pool);
+            registry
+        });
         let (mut now_ms, mut next_uuid) = (0.0, 0u128);
         let mut host_reused = Vec::new();
         let events = waves
@@ -2518,7 +2635,7 @@ mod tests {
                     });
                 }
                 let mut events = Vec::new();
-                for _ in 0..8 {
+                for _ in 0..12 {
                     if core.is_ready() {
                         let pass = core.execute_pass(&mut TraceCollector::default(), now_ms);
                         now_ms = pass.end_ms;
@@ -2541,7 +2658,70 @@ mod tests {
                 panic!("wave did not drain")
             })
             .collect();
-        (events, host_reused)
+        let stats = registry.map(|registry| registry.lock().unwrap().stats());
+        (events, host_reused, stats)
+    }
+
+    #[test]
+    fn kvcr_memory_restores_what_g2_evicted_and_publishes_host_memory_once() {
+        use crate::engine::{
+            KvEventData, KvEventTier, KvcrConfig, KvcrLocalG2Config, KvcrLocalG2Stats,
+        };
+        // One-block prompts A X Y Z W, A again, then V: a one-block G2 keeps
+        // only the latest, five blocks of KVCR memory keep the rest.
+        let prompts: Vec<Vec<u32>> = [1, 11, 21, 31, 41, 1, 51]
+            .iter()
+            .map(|first| (*first..first + 5).collect())
+            .collect();
+        let waves: Vec<Vec<&[u32]>> = prompts.iter().map(|prompt| vec![&prompt[..]]).collect();
+        let waves: Vec<&[&[u32]]> = waves.iter().map(|wave| &wave[..]).collect();
+        let host = || Some(NativeHostOffloadConfig::new(1).with_bandwidths(1.0, 1.0));
+        let block = |index: usize| {
+            let (_, _, host) = request(Uuid::nil(), prompts[index].clone());
+            host.block_keys[0].sequence_hash()
+        };
+
+        // G2 alone has dropped A by the time it returns.
+        let (_, host_reused) = served_kv_events(host(), &waves);
+        assert_eq!(host_reused, vec![0; 7]);
+
+        let kvcr = KvcrConfig {
+            local_g2: Some(KvcrLocalG2Config::new(5)),
+            ..Default::default()
+        };
+        let (events, host_reused, stats) = served_kvcr_events(host(), Some(kvcr), &waves);
+        // A is promoted from KVCR memory into G2 and loaded from there.
+        assert_eq!(host_reused, vec![0, 0, 0, 0, 0, 4, 0]);
+        // Each block is stored once when G2 takes it. G2 evictions and the
+        // promotion change nothing a router sees; only X leaving KVCR memory,
+        // the least recently used block there once V arrives, is a removal.
+        let host_events = events
+            .iter()
+            .flatten()
+            .filter(|event| event.tier == KvEventTier::HostPinned)
+            .map(|event| match &event.data {
+                KvEventData::Stored(stored) => (
+                    "stored",
+                    stored.blocks.iter().map(|block| block.block_hash).collect(),
+                ),
+                KvEventData::Removed { block_hashes } => ("removed", block_hashes.clone()),
+            })
+            .collect::<Vec<(&str, Vec<u64>)>>();
+        let mut expected: Vec<_> = [0, 1, 2, 3, 4, 6]
+            .map(|index| ("stored", vec![block(index)]))
+            .into();
+        expected.push(("removed", vec![block(1)]));
+        assert_eq!(host_events, expected);
+        assert_eq!(
+            stats.unwrap().local_g2,
+            Some(KvcrLocalG2Stats {
+                stored_blocks: 6,
+                dropped_blocks: 0,
+                evicted_blocks: 1,
+                promoted_blocks: 1,
+                loaded_blocks: 1,
+            })
+        );
     }
 
     #[test]
@@ -2950,7 +3130,9 @@ mod tests {
         });
         let adapters = [0, 1].map(|index| {
             let mut adapter = adapter(blocks[index]);
-            let g2 = adapter.set_kvcr(Arc::clone(&registry), ranks[index]);
+            let g2 = adapter
+                .set_kvcr(Arc::clone(&registry), ranks[index], 1)
+                .unwrap();
             registry
                 .lock()
                 .unwrap()
@@ -2966,6 +3148,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 1.0,
             bandwidth_gbps: 1.0,
+            local_g2: None,
         };
         // Worker 1 pulls from worker 0.
         let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [4, 4]);
@@ -3032,6 +3215,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 0.0,
             bandwidth_gbps: 0.0,
+            local_g2: None,
         };
         // A pull never evicts its own prefix, but the target's one-block G2
         // holds only one of two one-block prefixes, so each request's pull
@@ -3086,6 +3270,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 1.0,
             bandwidth_gbps: 0.0,
+            local_g2: None,
         };
         let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [4, 4]);
         let owner = Uuid::from_u128(915);
@@ -3135,6 +3320,7 @@ mod tests {
         let config = crate::engine::KvcrConfig {
             latency_to_first_byte_ms: 0.0,
             bandwidth_gbps: 0.0,
+            local_g2: None,
         };
         let (registry, ranks, [mut source, mut target]) = kvcr_workers(config, [2, 2]);
         let owner = Uuid::from_u128(913);
@@ -3167,7 +3353,10 @@ mod tests {
             StartLoad::Retry
         ));
         assert_eq!(registry.lock().unwrap().stats().loaded_blocks, 0);
-        assert_eq!(target.host.lock().take_kvcr_origin(&host.block_keys), 1);
+        assert_eq!(
+            target.host.lock().take_kvcr_origin(&host.block_keys),
+            [1, 0]
+        );
     }
 
     #[test]
@@ -3866,6 +4055,23 @@ mod tests {
             };
             assert_eq!(hit.state_slots, 2, "{connector:?}");
             assert_eq!(hit.keys, [state(1, 0), state(1, 1), blocks[0], blocks[1]]);
+
+            // The request's next lookup sees a store that started since. With
+            // the deeper state's other slot pending, a connector that waits
+            // for stores defers the hit, and SimpleCPU keeps the one it had.
+            let pending =
+                adapter
+                    .host
+                    .lock()
+                    .prepare_store(C, Uuid::nil(), &[state(3, 1)], None, 0.0);
+            assert!(matches!(pending, StoreOutcome::Prepared { .. }));
+            let again = match adapter.lookup(&mut host, &sequence, &cost, 4, 0.0) {
+                HostLookup::Hit(hit) => Some(hit.keys.len()),
+                HostLookup::Miss => Some(0),
+                HostLookup::Deferred => None,
+            };
+            let expected = (connector == G2Connector::SimpleCpuV032).then_some(4);
+            assert_eq!(again, expected, "{connector:?}");
         }
     }
 

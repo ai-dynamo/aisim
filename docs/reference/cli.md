@@ -36,9 +36,9 @@ illustrate the output format. Captured detail examples are simulation results, n
 
 | Option | Type | Default | Meaning |
 |---|---|---:|---|
-| `-c`, `--config PATH` | path | Required | Input YAML file. |
+| `-c`, `--config PATH` | path | Required | Input YAML or JSON file; a `.json` suffix (case insensitive) selects JSON parsing. |
 | `--stack NAME` | string | `engine` | Built-in or discovered execution stack. This selection is CLI-only and is never written into YAML. |
-| `--set PATH=YAML_VALUE` | repeatable assignment | None | Set a supported configuration path after loading YAML. |
+| `--set PATH=YAML_VALUE` | repeatable assignment | None | Set a supported configuration path after loading YAML or JSON; override values use YAML syntax. |
 | `--output-dir PATH` | path | `./aisim-output` | Directory for durable results. |
 | `--overwrite` | flag | `false` | Replace known AISim output files in an existing output directory. |
 | `--format table\|json` | enum | `table` | Standard-output presentation. It does not change durable output files. |
@@ -52,7 +52,7 @@ illustrate the output format. Captured detail examples are simulation results, n
 | `--online` | flag | `false` | Pace prediction against the real wall clock instead of virtual time. The selected stack must advertise online support. |
 
 The CLI deliberately does not expose field-specific flags such as `--request-per-second` or
-`--num-workers`. YAML is the authoritative semantic configuration surface.
+`--num-workers`. The [configuration schema](configuration.md) is the authoritative semantic surface for YAML and JSON.
 
 ### Eager execution and CUDA graphs
 
@@ -175,18 +175,22 @@ supported topologies. The external Dynamo Python adapter's diagnostics export
 requires separate qualification: native Rust compatibility aliases do not establish
 adapter parity. If a selected runner exports no typed evidence, energy details
 state that reason. Native AFD exports operation-energy evidence; numeric power
-depends on operation-energy coverage. Native Replay and unified prediction keep
-FPM, fixed, polynomial, and analytical EPD energy unavailable; their `power_w`
-and `power_coverage` summary fields are explicit nulls where unsupported. This
-includes fully powered schema-8 FPM pairs. Separately, Python static FPM
-`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()` can return
-nonzero operation energy with SOL interpolation. Aggregated results retain
-pure-decode energy and suppress mixed-step energy. The SDK and legacy
-`aiconfigurator cli estimate` (`cli_estimate()`) publish `power_w` for static,
-aggregated, and disaggregated schema-8 FPM results when their latency-weighted
-coverage reaches 90%; below that gate they return null power with numeric
-`power_coverage`. See
-[FPM power](../perf-model/power.md).
+depends on operation-energy coverage. Supported schema-8 FPM runs report numeric
+`power_coverage` in native Replay and unified prediction and publish `power_w`
+at or above 90% coverage. Below the gate, `power_w` is null and coverage stays
+numeric. The SDK and legacy `aiconfigurator cli estimate` (`cli_estimate()`)
+apply the same coverage gate to supported static, aggregate, and disaggregated
+schema-8 FPM results. Static SDK callers can inspect operation energy through
+`get_context_energy_wms_dict()` and `get_generation_energy_wms_dict()`.
+
+Aggregate mixed steps retain prefill energy and the positive decode marginal
+after subtracting the KV-floor baseline. The decode marginal contributes energy
+only when its latency is positive and both the target and baseline have power.
+Mixed-step watts are **unqualified** pending measured validation. FPM power
+remains unavailable for speculative runs, models with encoder operations,
+language-only EPD workers, v6/v7 profiles, and fitted estimators. Native
+fixed, polynomial, and analytical EPD timing also leave power and coverage
+unavailable. See [FPM power](../perf-model/power.md).
 
 <a id="prediction-directory"></a>
 
@@ -229,6 +233,17 @@ for `recommendation.json`, CSV, selected YAML and partial-result semantics.
 
 ### Existing Output Directories
 
+One `predict` or `recommend` run owns an output directory at a time. The run takes an advisory
+lock on the directory before it inspects or cleans it and holds it until its last report is
+written; the lock adds no file to the directory. The supervising `aisim` process hands the locked
+descriptor to its worker, so the directory stays locked through the worker's writes even if the
+supervisor exits first. A second run started on the same directory, with or without
+`--overwrite`, exits with code `2` and the message `another AISim run is using output directory
+...`, and removes nothing. A run refused for the directory's contents releases the lock at once.
+A symlinked path to the same directory shares the lock. The lock covers AISim processes only:
+other programs writing into the directory are not blocked, which is why the checks below still
+apply.
+
 Without `--overwrite`, the CLI rejects an existing nonempty output directory, with one exception:
 a directory left by a failed run is cleared and reused, and the CLI prints one line saying so. This
 lets you retry a failed, resource-limited, timed-out or cancelled run in the same directory. It
@@ -247,9 +262,17 @@ Specifically, overwrite may replace `prediction.json`, `report.html`, `recommend
 `execution-events.jsonl`, `afd-replay-spec.json`, `afd-qualification.json`, and numbered
 `recommendations/NNNN.yaml` files.
 Other files, including non-numbered files inside `recommendations/`, are preserved. Invalid
-configuration loading, overrides, core-schema validation, unknown top-level sections, and stacks or
-output adapters that are not installed leave existing artifacts intact. Errors raised while
-importing an installed plugin or inside an adapter occur after the known outputs are removed.
+configuration loading, overrides, core-schema validation, unknown top-level sections, stacks or
+output adapters that are not installed, and agentic warmup policies that the stack does not
+advertise leave existing artifacts intact, including a failed run's diagnostics, with or without
+`--overwrite`. So does a resource refusal, timeout or
+interrupt while AISim asks an installed stack whether it supports a non-default warmup policy; such
+a run writes no resource reports. A signal-terminated support probe exits `130`, as does cancellation
+with Ctrl-C. Errors raised while importing an installed plugin or inside an
+adapter occur after the known outputs are removed.
+If the effective configuration changes during the warmup support check, including scalar types or
+adapter section order, the command exits `2` before cleanup;
+otherwise execution uses the checked configuration, including path anchoring and `--set` overrides.
 
 For `engine.ais_perf_model`, an entry key that is not a perf-model field is a validation error, so
 existing artifacts stay. A key written twice inside `engine.ais_perf_model` in the configuration
@@ -368,10 +391,11 @@ Memory without evidence is omitted from `details.sections` and listed with a rea
 section with only some estimated roles is `partial` and records
 why other roles are unavailable. Energy retains an explicit unavailable status and reason when
 the runner exports no typed evidence. Missing measurements are never invented as zero;
-energy-aware runs with no covered operations report numeric zero coverage. Native Replay
-with whole-model FPM can report timing/source evidence while its energy details remain
-unsupported and unified `power_w`/`power_coverage` stay null. Python static FPM summary
-energy is a separate path. Fixed/polynomial timing, analytical EPD overlays, and adapters
+energy-aware runs with no covered operations report numeric zero coverage. Supported
+schema-8 FPM Replay exports energy details alongside timing and source evidence.
+Unified prediction reports numeric `power_coverage` and publishes `power_w` at
+or above 90% coverage. Unsupported FPM configurations can still report timing
+and source evidence. Fixed/polynomial timing, analytical EPD overlays, and adapters
 without the native export report operation timing/source evidence unavailable. Serving
 time statistics remain available where exported. See
 [diagnostic availability](../aic-backward-compatibility/migration.md#prediction-details-and-power).
@@ -537,10 +561,15 @@ Without `--output`, `migrate` prints the plan and writes nothing: the new
   file system without hard links, a new `FILE` is empty for a moment before
   the converted text is moved into it.
 - **JSON.** A `FILE` that ends with `.json`, in any letter case, is written as
-  JSON. A `.json` configuration converted in place stays JSON. AISim
-  reads configuration files as YAML. When the JSON text would not be read
-  back as the same config, `migrate` writes nothing and exits `2`:
-  `cannot write small.json as JSON: engine.ais_perf_model.estimator_config.ridge is 1e-05 and would be read back from the file as '1e-05'; name a file that does not end with .json to write YAML`.
+  JSON. A `.json` configuration converted in place stays JSON. AISim reads
+  these files with the JSON parser, preserving scientific notation such as
+  `1e-7` as a number. If a value cannot round-trip through JSON, such as a
+  non-string mapping key or a non-finite number, `migrate` writes nothing and
+  exits `2` with the filename and reason. Use a filename without `.json` to
+  retain YAML-only values. When writing through symlinks or replacing the input
+  through another name, all known names of the output must select the same
+  format. Mixed JSON/YAML aliases are refused before writing; use matching
+  extensions or write a separate output file.
 - **All or nothing.** When one field cannot be converted, nothing is
   converted. `migrate` prints a `cannot convert: <field>: <reason>` line for
   each such field and then `Nothing was converted.`, `--output` writes no

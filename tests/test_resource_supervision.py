@@ -112,12 +112,16 @@ def test_child_exit_code_is_preserved(tmp_path):
 
 @pytest.mark.parametrize("failure", ["missing", "malformed", "override", "resources"])
 @pytest.mark.parametrize("stack", ["engine", "missing-stack"])
-def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack):
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, failure, stack, suffix):
     import subprocess
 
-    config = tmp_path / "config.yaml"
+    config = tmp_path / f"config{suffix}"
     if failure != "missing":
-        config.write_text("[" if failure == "malformed" else "execution:\n  resources:\n    memory_limit_gb: -1\n")
+        serialize = json.dumps if suffix == ".json" else yaml.safe_dump
+        config.write_text(
+            "[" if failure == "malformed" else serialize({"execution": {"resources": {"memory_limit_gb": -1}}})
+        )
     output = tmp_path / "output"
     output.mkdir()
     original = {"prediction.json": '{"old":true}', "resource-runtime.json": '{"old_runtime":true}'}
@@ -145,6 +149,7 @@ def test_invalid_cli_input_preserves_outputs_and_stack_error_order(tmp_path, fai
         assert "missing-stack" in result.stderr
         assert "could not read configuration" not in result.stderr
         assert "malformed YAML" not in result.stderr
+        assert "malformed JSON" not in result.stderr
         assert "invalid --set" not in result.stderr
 
 
@@ -1022,7 +1027,9 @@ def test_failed_run_retry_preserves_input_before_starting_worker(tmp_path, monke
 
     output = tmp_path / "output"
     output.mkdir()
-    config = _small_cli_config(tmp_path, "predict").replace(output / "resource-plan.json")
+    yaml_config = _small_cli_config(tmp_path, "predict")
+    config = output / "resource-plan.json"
+    config.write_text(json.dumps(yaml.safe_load(yaml_config.read_text())))
     (output / "execution-events.jsonl").write_text("{}\n")
     (output / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}))
     before = _output_bytes(output)

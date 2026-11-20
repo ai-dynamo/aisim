@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FPM power window: schema-3 rank artifacts and schema-8 publication (AISIM-1973)."""
+"""FPM power window: schema-3 rank artifacts and schema-8 publication (AISIM-1973, AISIM-2375)."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ pq = pytest.importorskip("pyarrow.parquet")
 
 
 def _power(energy=(), *, window_s=2.5, iterations=200, drift=0):
-    """A measured block in Dynamo's shape (_bench_power_block)."""
+    """A measured block in Dynamo's shape (_bench_power_block), with stable step latencies."""
     return {
         "status": "measured",
         "unavailable_reason": None,
@@ -46,6 +46,7 @@ def _power(energy=(), *, window_s=2.5, iterations=200, drift=0):
         "window_s": window_s,
         "window_iterations": iterations,
         "kv_drift_tokens": drift,
+        "step_wall_times_s": [0.02] * iterations,
     }
 
 
@@ -58,6 +59,7 @@ def _unavailable(reason="nvml_permission"):
         "window_s": None,
         "window_iterations": None,
         "kv_drift_tokens": None,
+        "step_wall_times_s": None,
     }
 
 
@@ -389,18 +391,192 @@ def test_window_disagreement_across_ranks_raises(tmp_path, rank1, message):
         aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
 
 
-@pytest.mark.parametrize(("drift", "powered"), [(128, True), (129, False)])
-def test_decode_kv_drift_gate_keeps_latency(tmp_path, caplog, drift, powered):
-    # total_kv_read_tokens is 1280, so 10% allows 128 appended tokens.
-    power = _power([("GPU-a", 600_000.0), ("GPU-b", 640_000.0)], window_s=2.0, drift=drift)
-    plan, cell, cell_dir = _tp2_decode(tmp_path, power=power)
+def _steps(first, last, *, count=10):
+    """Window step wall times whose first and last five medians are ``first`` and ``last``."""
+    middle = [(first + last) / 2] * (count - 10)
+    return [first, first * 0.5, first, first * 1.5, first, *middle, last, last * 0.5, last, last * 1.5, last]
+
+
+_STABLE_STEPS = object()
+
+
+def _gated(
+    energy=(("GPU-a", 600_000.0), ("GPU-b", 640_000.0)), *, steps=_STABLE_STEPS, window_s=2.0, drift=40, **kwargs
+):
+    """A measured decode block with explicit window step wall times.
+
+    A decode window records one step per repeat, so ``window_iterations``
+    defaults to the step count.
+    """
+    steps = _steps(0.02, 0.02) if steps is _STABLE_STEPS else steps
+    if isinstance(steps, list) and steps:
+        kwargs.setdefault("iterations", len(steps))
+    return {
+        **_power(energy, window_s=window_s, drift=drift, **kwargs),
+        "step_wall_times_s": steps,
+    }
+
+
+def _tp2_gated(tmp_path, power=None, **kwargs):
+    return _tp2_decode(tmp_path, power=power or _gated(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("first", "last", "powered"),
+    [
+        (0.02, 0.022, True),
+        (0.02, 0.018, True),
+        (1.0, 1.1, True),
+        (0.02, 0.02201, False),
+        (0.02, 0.01799, False),
+    ],
+)
+def test_decode_latency_gate_is_inclusive_at_ten_percent(tmp_path, caplog, first, last, powered):
+    plan, cell, cell_dir = _tp2_gated(tmp_path, power=_gated(steps=_steps(first, last, count=40)))
 
     with caplog.at_level("INFO"):
         rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
 
-    assert (rows[0]["power_w"] is not None) is powered
+    assert rows[0]["power_w"] == (pytest.approx(310.0) if powered else None)
     assert rows[0]["latency_ms"] == pytest.approx(4.0)
-    assert f"{0 if powered else 1} above the KV drift bound" in caplog.text
+    assert ("without power: none" if powered else "without power: 1 latency_drift") in caplog.text
+
+
+def test_decode_latency_gate_accepts_stable_latency_despite_large_kv_growth(tmp_path):
+    # 400 appended tokens are 31% of 1280, above the former 10% KV guard.
+    plan, cell, cell_dir = _tp2_gated(tmp_path, power=_gated(drift=400))
+
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] == pytest.approx(310.0)
+    assert rows[0]["latency_ms"] == pytest.approx(4.0)
+
+
+def test_decode_latency_gate_rejects_unstable_latency_despite_small_kv_growth(tmp_path, caplog):
+    plan, cell, cell_dir = _tp2_gated(tmp_path, power=_gated(drift=40, steps=_steps(0.02, 0.025)))
+
+    with caplog.at_level("INFO"):
+        rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] is None
+    assert rows[0]["latency_ms"] == pytest.approx(4.0)
+    assert "without power: 1 latency_drift" in caplog.text
+
+
+def test_decode_latency_gate_applies_to_every_rank(tmp_path, caplog):
+    stable = _gated([("GPU-0", 500_000.0)])
+    drifting = _gated([("GPU-1", 520_000.0)], steps=_steps(0.02, 0.03))
+    plan, cell, cell_dir = _write_cell(tmp_path, phase="decode", dp=2, powers={1: {0: stable, 1: drifting}})
+
+    with caplog.at_level("INFO"):
+        rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] is None
+    assert rows[0]["latency_ms"] == pytest.approx(6.0)
+    assert "without power: 1 latency_drift" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("steps", "reason"),
+    [
+        ([0.02] * 9, "latency_evidence_insufficient"),
+        ([], "latency_evidence_invalid"),
+        ([0.02] * 9 + [float("nan")], "latency_evidence_invalid"),
+        ([0.02] * 9 + [float("inf")], "latency_evidence_invalid"),
+        ([0.02] * 9 + [0.0], "latency_evidence_invalid"),
+        ([0.02] * 9 + [-0.02], "latency_evidence_invalid"),
+        ([0.02] * 9 + [True], "latency_evidence_invalid"),
+        ([0.02] * 9 + ["0.02"], "latency_evidence_invalid"),
+        ([0.02] * 9 + [None], "latency_evidence_invalid"),
+        (None, "latency_evidence_invalid"),
+        ({"0": 0.02}, "latency_evidence_invalid"),
+    ],
+)
+def test_decode_latency_gate_without_valid_evidence_keeps_latency_only(tmp_path, caplog, steps, reason):
+    plan, cell, cell_dir = _tp2_gated(tmp_path, power=_gated(drift=0, steps=steps))
+
+    with caplog.at_level("INFO"):
+        rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] is None
+    assert rows[0]["latency_ms"] == pytest.approx(4.0)
+    assert f"without power: 1 {reason}" in caplog.text
+
+
+@pytest.mark.parametrize("iterations", [11, 200])
+def test_decode_latency_gate_rejects_steps_not_matching_window_iterations(tmp_path, caplog, iterations):
+    # A truncated list is malformed evidence, never gated as if complete.
+    plan, cell, cell_dir = _tp2_gated(tmp_path, power=_gated(drift=0, iterations=iterations))
+
+    with caplog.at_level("INFO"):
+        rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] is None
+    assert rows[0]["latency_ms"] == pytest.approx(4.0)
+    assert "without power: 1 latency_evidence_invalid" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("first_edge", "powered"),
+    [
+        # Median 0.02 and the last edge's median 0.021: a 5% change. The mean
+        # of the first edge is 0.052, so a mean-based gate would reject it.
+        ([0.02, 0.02, 0.02, 0.18, 0.02], True),
+        # Median 0.025 (a 16% change), mean 0.0218 (a 3.7% change).
+        ([0.025, 0.025, 0.025, 0.012, 0.022], False),
+    ],
+)
+def test_decode_latency_gate_uses_the_median_not_the_mean(tmp_path, first_edge, powered):
+    steps = [*first_edge, 0.021, 0.021, 0.021, 0.021, 0.021]
+    plan, cell, cell_dir = _tp2_gated(tmp_path, power=_gated(steps=steps))
+
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] == (pytest.approx(310.0) if powered else None)
+
+
+def test_prefill_power_is_not_latency_gated(tmp_path):
+    rank0 = _gated([("GPU-0", 500_000.0)], window_s=2.5, drift=0, steps=[0.05, 0.09])
+    rank1 = _gated([("GPU-1", 520_000.0)], window_s=2.5, drift=0, steps=[0.05, 0.09])
+    plan, cell, cell_dir = _write_cell(tmp_path, phase="prefill", dp=2, powers={1: {0: rank0, 1: rank1}})
+
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+    assert rows[0]["power_w"] == pytest.approx(204.0)
+
+
+@pytest.mark.parametrize(
+    "power",
+    [
+        # A block from a Dynamo build before the latency gate has no step timings.
+        {key: value for key, value in _gated().items() if key != "step_wall_times_s"},
+        {key: value for key, value in _unavailable().items() if key != "step_wall_times_s"},
+        # An unavailable window reports no evidence.
+        {**_unavailable(), "step_wall_times_s": [0.02] * 10},
+    ],
+)
+def test_power_block_without_the_step_timing_contract_raises(tmp_path, power):
+    plan, cell, cell_dir = _tp2_decode(tmp_path, power=power)
+
+    with pytest.raises(ValueError, match="power"):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
+def test_latency_gated_power_round_trips_through_the_power_window_publication(tmp_path):
+    plan, cell, cell_dir = _tp2_gated(tmp_path)
+
+    collection = validate_native_collection(cell, cell_dir / "raw", expected_attempt_id="attempt")
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    parquet, metadata, _ = write_formal_database(plan, rows, systems_root=tmp_path / "systems")
+
+    assert collection.artifact_schema_version == 3
+    sidecar = json.loads(metadata.read_text())
+    assert (sidecar["schema_version"], sidecar["measurement_policy"]) == (8, POWER_WINDOW_MEASUREMENT_POLICY)
+    (published,) = pq.read_table(parquet).to_pylist()
+    assert published["power_w"] == pytest.approx(310.0)
+    assert published["latency_ms"] == pytest.approx(4.0)
+    assert published["measurement_policy"] == POWER_WINDOW_MEASUREMENT_POLICY
+    assert validate_formal_database_commit(parquet, metadata, plan)["schema_version"] == 8
 
 
 def test_local_power_must_match_the_synchronized_group_copy(tmp_path):

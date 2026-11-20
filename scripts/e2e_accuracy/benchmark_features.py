@@ -5,6 +5,11 @@
 import math
 import re
 
+
+class IncompleteSiliconEvidence(ValueError):
+    """A snapshot cannot publish under the current silicon evidence contract."""
+
+
 SCHEMA = "aisimulate.benchmark.features.v1"
 STATES = {"enabled", "disabled", "not_applicable", "unknown"}
 USAGE = {"exercised", "not_observed", "unknown"}
@@ -240,11 +245,17 @@ def validate(value, benchmark_id=None, *, require_complete=False):
             raise ValueError("Speculation off makes draft length not applicable")
     if require_complete:
         if seen != SILICON_FEATURES:
-            raise ValueError("New self-collected publications require the eight silicon features")
+            raise IncompleteSiliconEvidence("New self-collected publications require the eight silicon features")
+        incomplete_evidence = None
         for row in value["features"]:
             identity, state = row["id"], row["state"]
             if state == "unknown" or not row["evidence"]:
-                raise ValueError(f"New self-collected publications require resolved, evidenced settings: {identity}")
+                if incomplete_evidence is None:
+                    incomplete_evidence = IncompleteSiliconEvidence(
+                        f"New self-collected publications require resolved, evidenced settings: {identity}"
+                    )
+                if state == "unknown":
+                    continue
             params = {p["name"]: p["value"] for p in row["parameters"]}
             if identity in {"cache.g2", "cache.g3"}:
                 scopes = {"local", "shared"} if state == "enabled" else {"not_applicable"}
@@ -268,6 +279,8 @@ def validate(value, benchmark_id=None, *, require_complete=False):
                 methods = STRING_VALUES["method"] - {"off", "unknown"} if state == "enabled" else {"off"}
                 if params.get("method") not in methods:
                     raise ValueError("Resolved speculation method required")
+        if incomplete_evidence is not None:
+            raise incomplete_evidence
     return value
 
 

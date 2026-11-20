@@ -128,12 +128,19 @@ def _run(
     subprocess.run(command, cwd=cwd or ROOT, env=env, check=True)
 
 
-def build(output: Path, py_version: str, crate_version: str) -> None:
+def build(output: Path, py_version: str, crate_version: str, prebuilt_wheel: Path | None = None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise SystemExit(f"output directory must be empty: {output}")
 
-    if sys.platform.startswith("linux"):
+    if prebuilt_wheel is not None:
+        # Full CI has already built this exact source/architecture wheel using
+        # the same manylinux builder. The caller verifies its handoff provenance;
+        # all package-content and installed-artifact contracts still run below.
+        if not prebuilt_wheel.is_file() or prebuilt_wheel.suffix != ".whl":
+            raise ValueError("prebuilt wheel must be an existing .whl file")
+        shutil.copy2(prebuilt_wheel, output / prebuilt_wheel.name)
+    elif sys.platform.startswith("linux"):
         builder = ROOT / "scripts/release/build_manylinux_wheel.py"
         if not builder.is_file():  # Historical release source predates the job layout.
             builder = ROOT / "scripts/build_manylinux_wheel.py"
@@ -221,6 +228,11 @@ def main() -> None:
     parser.add_argument("--root", type=Path, help="Release source checkout")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--prebuilt-wheel",
+        type=Path,
+        help="Reuse a verified wheel built from this exact source/architecture; still build and check the crate",
+    )
     args = parser.parse_args()
 
     if args.root is not None:
@@ -245,7 +257,7 @@ def main() -> None:
 
     py_version, crate_version = check_manifests()
     if not args.check_only:
-        build(args.output_dir.resolve(), py_version, crate_version)
+        build(args.output_dir.resolve(), py_version, crate_version, args.prebuilt_wheel)
 
 
 if __name__ == "__main__":

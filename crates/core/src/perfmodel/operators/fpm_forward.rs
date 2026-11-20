@@ -159,6 +159,10 @@ impl FpmForwardOp {
         Ok(cell)
     }
 
+    pub(crate) fn has_power_column(&self, db: &PerfDatabase) -> Result<bool, AicError> {
+        Ok(self.select_cell(db)?.has_power_column)
+    }
+
     /// Mirror of Python `FPMForwardOp.query`: validate kwargs, map to
     /// iteration-total coordinates, resolve against the selected cell.
     pub fn query(
@@ -773,7 +777,33 @@ impl FpmForwardOp {
         } else {
             DirectFpmResolution::Interpolated
         };
-        let mut result = PerformanceResult::new(latency, Source::Silicon);
+        let power = if cell.has_power_column {
+            support
+                .iter()
+                .map(|point| {
+                    let coordinates = &point.coordinates;
+                    let batch = coordinates.batch_size as u32;
+                    let kv = coordinates.total_kv_read_tokens as u32;
+                    let (table, path, len) = match coordinates.total_prefill_tokens {
+                        Some(tokens) => (&cell.prefill, [batch, tokens as u32, kv], 3),
+                        None => (&cell.decode, [batch, kv, 0], 2),
+                    };
+                    let leaf = path[..len].iter().try_fold(table, |node, key| match node {
+                        crate::perf_database::perf_interp::Node::Branch(rows) => rows.get(key),
+                        _ => None,
+                    });
+                    match leaf {
+                        Some(crate::perf_database::perf_interp::Node::Leaf(value)) => {
+                            value.blend_power() * point.weight
+                        }
+                        _ => f64::NAN,
+                    }
+                })
+                .sum()
+        } else {
+            0.0
+        };
+        let mut result = powered_result(latency, power);
         result.fpm_queries = Some(Box::new(vec![DirectFpmQueryEvidence {
             phase: self.phase.as_str().into(),
             model_path: cell.model_path.clone(),
@@ -1027,7 +1057,7 @@ fn blend_pair((lo_ms, lo_w): (f64, f64), (hi_ms, hi_w): (f64, f64), weight: f64)
     )
 }
 
-/// SOL-path result with `energy = power * latency` (W·ms). Power that is not
+/// Measured/interpolated result with `energy = power * latency` (W·ms). Power that is not
 /// finite and positive (a latency-only v6/v7 leaf, or a resolution that
 /// touched an unpowered v8 row; AISIM-1973 D8) yields energy 0: uncovered.
 fn powered_result(latency: f64, power: f64) -> PerformanceResult {
@@ -3099,20 +3129,20 @@ mod tests {
         close(got.energy_wms, 400.0 * ceiling * scale);
     }
 
-    /// P1: `method: direct` stays latency-only on a fully powered v8 pair,
-    /// with and without a coverage sink.
+    /// Direct lookup uses the same measured anchors for power and latency.
     #[test]
-    fn direct_method_is_latency_only_on_a_powered_pair() {
+    fn direct_method_prices_power_on_the_executed_anchors() {
         let (_v8, powered) = db_for(with_power(default_rows(), default_power));
         let (_v6, legacy) = db_for(default_rows());
         let mut decode = op(FpmPhase::Decode);
         decode.interpolation = FpmInterpolation::Direct;
         let mut prefill = op(FpmPhase::Prefill);
         prefill.interpolation = FpmInterpolation::Direct;
-        for (op, coords) in [
-            (&decode, vec![8.0, 4096.0]),
-            (&decode, vec![8.0, 2048.0]),
-            (&prefill, vec![1.0, 2048.0, 2048.0]),
+        let weight = (2048.0 - 8.0) / (4096.0 - 8.0);
+        for (op, coords, expected_watts) in [
+            (&decode, vec![8.0, 4096.0], 500.0),
+            (&decode, vec![8.0, 2048.0], 450.0 + 50.0 * weight),
+            (&prefill, vec![1.0, 2048.0, 2048.0], 350.0),
         ] {
             let expected = op.query_totals(&legacy, &coords).unwrap().latency_ms;
             let plain = op.query_totals(&powered, &coords).unwrap();
@@ -3121,11 +3151,25 @@ mod tests {
                 .query_totals_with_coverage(&powered, &coords, Some(&mut coverage))
                 .unwrap();
             for result in [plain, covered] {
-                assert_eq!(result.energy_wms, 0.0, "{coords:?}");
+                close(result.energy_wms, expected_watts * expected);
                 assert_eq!(result.latency_ms.to_bits(), expected.to_bits());
             }
         }
         let floor = decode.query_pass_baseline(&powered, 8, 4096.0).unwrap();
-        assert_eq!((floor.latency_ms, floor.energy_wms), (6.0, 0.0));
+        assert_eq!((floor.latency_ms, floor.energy_wms), (6.0, 2700.0));
+        let (_mixed, db) = db_for(with_power(default_rows(), |row| {
+            (row != 5).then_some(500.0)
+        }));
+        assert_eq!(
+            decode.query_totals(&db, &[8.0, 2048.0]).unwrap().energy_wms,
+            0.0
+        );
+        assert_eq!(
+            decode
+                .query_pass_baseline(&db, 8, 4096.0)
+                .unwrap()
+                .energy_wms,
+            0.0
+        );
     }
 }

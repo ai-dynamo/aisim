@@ -114,7 +114,7 @@ Manual dispatches and site-change triggers are listed below.
 | [FPE Support Matrix](../../.github/workflows/fpe-support-matrix.yml) | Called by Main branch nightly CI; manual dispatch with `expected_sha` | Broad native operation-level support qualification |
 | [Release branch nightly CI](../../.github/workflows/release-nightly-ci.yml) | Daily at 09:23 UTC; manual dispatch on `main` | Schedules FPE support-matrix refreshes for discovered `release/*` branches |
 | [FPE Support Matrix (release)](../../.github/workflows/fpe-release-qualify.yml) | Called once per release by Release branch nightly CI | Builds the release wheel, probes all shards, and uploads its qualified matrix artifact |
-| [codeowners](../../.github/workflows/codeowners.yml) | PRs and pushes to `main` | Independent ownership coverage and generated-file checks; overlaps with Fast CI |
+| [codeowners](../../.github/workflows/fast-ci.yml) | Part of every Fast CI run | Required repository-policy status, including ownership coverage and generated-file checks |
 | [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; selects relevant PR files before benchmarking; manual dispatch for a PR | Paired base/head prediction-runtime benchmark, outside Full CI |
 | [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one evaluated SHA, plus preview-only pinned `agentx_revision` and optional `agentx_campaign_catalog` ([constraints](#agentx-accuracy-extension)) | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
 | [GitHub Pages](../../.github/workflows/pages.yml) | FPE Support Matrix, Main branch nightly CI, Release branch nightly CI, E2E Accuracy Matrix, or FPM Accuracy Matrix completion; relevant site changes on PRs/`main`; daily at 09:17 UTC; manual dispatch | Validates qualified FPE and accuracy snapshots, tests FPE branch selection in Chromium, and builds public pages; deployment is restricted to trusted `main` |
@@ -136,8 +136,9 @@ packages and requires no additional runner or manual dispatch.
 Gate documentation-only changes do not select a benchmark or an additional
 controller run.
 
-Ownership checks, prediction performance, E2E accuracy, and Pages run independently
-of the Fast/Full validation gates. E2E accuracy does not gate nightly staging.
+Prediction performance, E2E accuracy, and Pages run independently
+of the Fast/Full validation gates. Ownership validation is part of Fast CI and
+also supplies the required `codeowners` status. E2E accuracy does not gate nightly staging.
 Pages consumes qualification evidence after producer completion.
 The DCO sign-off check and review services are additional PR signals, not jobs
 inside Fast CI. See [CONTRIBUTING.md](../../CONTRIBUTING.md) for DCO requirements.
@@ -176,15 +177,42 @@ Fast CI has three substantive jobs, followed by an aggregate result:
 
 | Job | Checks |
 | --- | --- |
-| Repository Policy | Copyright and packaged legal files; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
+| codeowners (repository policy) | Copyright and packaged legal files; bundled-configuration provenance; local documentation links; script dependency locks when relevant; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
 | Python Static Checks | Ruff lint and formatting on the configured AISim/test paths, Python syntax compilation, and changed-line whitespace |
 | Rust Format | `cargo fmt --all -- --check` |
 | Fast CI Success | Requires the three jobs to succeed for every PR, branch push, or manual run |
 
 Draft and non-draft PRs run the same Fast CI checks without a label requirement.
 The aggregate fails if any required job fails, is canceled, or is skipped.
-The exact Ruff paths are listed in [the workflow](../../.github/workflows/fast-ci.yml);
-this is not a claim that every migrated source file is linted.
+Ruff checks all Python packages under `python/aisim/src/`, including
+`aisim_core` and the legacy import shims, plus `python/aisim/collector/`.
+The [workflow](../../.github/workflows/fast-ci.yml) also lists the test paths
+checked by Ruff.
+
+The repository-policy job retains the required check name `codeowners`; the
+separate ownership workflow is consolidated into this job. It validates the
+exact PR head first, including rejection of shadow `.github/CODEOWNERS` and
+`docs/CODEOWNERS` files. For PR events it also validates GitHub's proposed merge
+when that commit's tree differs from the head. Identical trees reuse the head
+result. Both checks use the same ownership-test, full-tree coverage, and
+generated-file validation commands. Other policy checks run once on the head.
+Pushes and manual runs validate their exact target. The required `codeowners`
+status and its Infra/maintainer review routing remain in place.
+
+Script lock regeneration runs when the complete change touches its manifest,
+requirements locks, uv configuration, or the selection/validation machinery.
+PRs and trusted copies use the complete PR diff, not only the latest push.
+Lifecycle pushes use the entire push range. Manual runs, missing history,
+changed PR heads, and unavailable comparison metadata regenerate every lock
+conservatively. Hash-verified dependency installation and all other validation
+continue on every run. This reduces repeated resolver work; it is not a change
+to application-test coverage or a promise of a large latency reduction.
+
+The [PR #896 evidence record](../../benchmarks/evidence/ci-pr-896/README.md)
+contains the historical raw timing excerpts and their limitations. Quantified
+runner-work and elapsed-time savings remain unmeasured hypotheses: the
+unpaired runs do not establish a net improvement or exercise hosted lock
+skipping. The selector tests establish skip/regenerate behavior separately.
 
 Every standalone run publishes `Fast CI Success`. Full CI contains only a
 lightweight **Require Fast CI** job, which reads the standalone run and verifies
@@ -194,6 +222,56 @@ separate Fast run; this preserves validation in both admission contexts.
 
 
 ## Full CI
+
+### Reusing pinned README dependencies
+
+The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
+three-wheel bundle is built on a miss and reused through Artifactory on matching
+subsequent runs. The key includes both source revisions, the build recipe and
+storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
+job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
+the bundle. Cross-run reuse accepts successful Full CI producers from this
+repository's `main`, or the exact same admitted PR head; another PR cannot
+populate the cache for this PR or for `main`.
+
+Pinned RCs are test dependencies, so the Dynamo profile uses `pr-wheel-staging`
+on both main and PR refs. Main seeds its RC bundle under `preview/` in that test
+repository; PR producers use their verified `pr/<number>/` namespace. This
+enables trusted-main reuse without giving PR jobs access to official release
+storage. Source, development, release, and macOS README profiles run in a
+separate job with no environment binding or storage secrets. The reusable
+workflow receives only the named `ARTIFACTORY_TOKEN`; only the Dynamo job
+references it, using the selected environment's value. The release-artifact
+contract now binds the same ref-selected storage environment as its application
+wheel producer; other wheel handoffs keep their existing environments.
+The `pr_number` input comes from Full CI's verified target validation; a nonempty
+value selects `pr` upload scope and enables discovery of that exact admitted PR
+head alongside trusted main preview producers.
+
+The Dynamo profile runs in the existing NVIDIA-connected AMD64 pool and CI job
+image because GitHub-hosted runners cannot resolve NVIDIA Artifactory. It checks
+storage DNS before compilation. Native prerequisites are prepared before key
+generation so cold and reused jobs have the same fingerprint. The other four
+README profiles keep their original runner placement; all README commands and
+the separate platform/Python compatibility matrices remain in place.
+
+The existing wheel-storage action checks the source SHA, producer run/attempt,
+architecture, scope, sizes, and checksums. The README job additionally verifies
+the build-input record and the complete three-package wheel set. Only the
+completion manifest and provenance reports are retained in GitHub Actions; wheels stay in Artifactory.
+On a cache hit, the consumer identity is preserved as diagnostic evidence and
+then removed from the restore directory; verification requires the producer's
+checksum-verified build-input record, including when a manifest omits it.
+Every README command and result assertion still executes in a fresh environment
+on both cold and reused builds. Full CI selection, test suites, platforms,
+Python versions, and required gates are unchanged.
+
+Release-artifact contracts consume the same exact-source, per-architecture
+manylinux wheel already built for application tests. They continue to build the
+Rust crate, verify the complete two-artifact package contract, install into a
+clean environment, check dependencies and versions, and exercise both CLIs.
+Standalone release builders still build a fresh wheel by default; only callers
+supplying a verified `--prebuilt-wheel` reuse one.
 
 Full CI first verifies the target commit, checks the standalone Fast CI
 prerequisite, and calculates validation scope. Expensive jobs wait for the
@@ -259,13 +337,13 @@ explicit exception and its workflow contract test.
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification reuses it |
+| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
 | Collector Data | Data-tree invariants (`check_collector_data.py` R1-R7) and the backend-facts registry; the cross-backend sanity scan is informational |
 | Prediction Regression | Collect old/new static, scheduling, and silicon-reference snapshots; fail when a previously working case stops working |
-| Release Artifact Contract | Build the wheel and crate; verify installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
+| Release Artifact Contract | Reuse the same-architecture application test wheel with `--prebuilt-wheel` and build the crate; verify package contents, installed versions, allowed distributions, compatibility imports, dependencies, and CLI entry points on both architectures |
 
 ### Numerical and installed-package evidence
 

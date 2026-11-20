@@ -1415,15 +1415,17 @@ pub trait TimingModel: Send + Sync {
 
     /// Return typed evidence accumulated by this provider so far.
     ///
-    /// Latency-only providers retain the default `None`. In particular, the
-    /// built-in polynomial/fixed models and whole-model FPM timing do not
-    /// fabricate energy or coverage values.
+    /// Latency-only providers, including the built-in polynomial/fixed models,
+    /// retain the default `None`. Supported schema-v8 whole-model FPM timing
+    /// supplies component energy and coverage here; unsupported FPM paths do
+    /// not fabricate energy or coverage values.
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
     }
 
-    /// Latency-only whole-model FPM evidence is separate from energy evidence.
-    /// It must not change the provider's existing power publication contract.
+    /// Return whole-model FPM query history for time and source diagnostics.
+    /// Power publication uses the component accumulator returned by
+    /// [`Self::evidence_summary`], independently of query-history capture.
     fn fpm_evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         None
     }

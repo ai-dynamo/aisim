@@ -266,6 +266,7 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
             "chat_template": ((True, "Option<WekaChatTemplate>"), "None"),
         },
         "SglangConfig": {
+            "mamba_cache": ((True, "Option<SglangMambaCacheConfig>"), "None"),
             "hicache": ((True, "Option<SglangHiCacheConfig>"), "None"),
             "host_loop": ((True, "bool"), "false"),
             "vlm_cache_bytes": ((True, "u64"), "SglangConfig::default().vlm_cache_bytes"),
@@ -273,6 +274,7 @@ def _patch_literal(source: str, site: LiteralSite, struct_fields: dict) -> tuple
             "num_reserved_decode_tokens": ((True, "usize"), "SglangConfig::default().num_reserved_decode_tokens"),
             "disaggregation_decode_extra_slots": ((True, "Option<usize>"), "None"),
             "swa_prefix_tails": ((True, "Option<usize>"), "None"),
+            "scheduler_select_time_ms": ((True, "f64"), "SglangConfig::default().scheduler_select_time_ms"),
         },
     }.get(site.struct)
     if defaults is not None:

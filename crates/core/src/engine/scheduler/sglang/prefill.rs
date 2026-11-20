@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team
 // SPDX-License-Identifier: Apache-2.0
+// Hybrid checkpoint contract adapted and modified from SGLang (Apache-2.0).
+// Copyright 2023-2024 SGLang Team and contributors.
+// Source: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/managers/schedule_batch.py
+// See THIRD_PARTY_NOTICES.md for the complete source list and modification scope.
 // Modified behavioral adaptation of SGLang v0.5.22; see THIRD_PARTY_NOTICES.md.
 // Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 
@@ -35,6 +39,7 @@ pub(super) struct AdmitResult {
 /// AISim allocates each selected request immediately. Add those new pages back
 /// when querying capacity so the offsets charge them exactly once; prefix locks
 /// remain excluded from the live evictable capacity.
+/// With no fresh-admission slot budget, only existing chunks may continue.
 pub(super) fn get_new_batch_prefill(
     waiting: &mut WaitingQueue,
     kv_manager: &mut SglangKvManager,
@@ -42,7 +47,7 @@ pub(super) fn get_new_batch_prefill(
     new_token_ratio: f64,
     running: &[SglangRequest],
     mut batch_is_full: bool,
-    occupied_request_slots: usize,
+    occupied_request_slots: Option<usize>,
 ) -> AdmitResult {
     let mut total_offset: f64 = running
         .iter()
@@ -62,9 +67,11 @@ pub(super) fn get_new_batch_prefill(
     let mut admissions = Vec::new();
     let mut prefill_fpm = Vec::new();
 
-    let available_running_slots = config
-        .max_running_requests
-        .saturating_sub(running.len() + occupied_request_slots);
+    let available_running_slots = occupied_request_slots.map(|occupied| {
+        config
+            .max_running_requests
+            .saturating_sub(running.len() + occupied)
+    });
     // An in-flight chunk owns KV and must run before newly matched requests,
     // including under LPM or a full running batch.
     if waiting.has_continuation()
@@ -75,10 +82,16 @@ pub(super) fn get_new_batch_prefill(
     }
     'requests: while let Some(mut req) = waiting.pop_front() {
         let first_admission = req.materialized_tokens == 0;
-        if first_admission && (batch_is_full || can_run.len() >= available_running_slots) {
-            batch_is_full = true;
-            waiting.push_front(req);
-            break;
+        if first_admission {
+            let Some(slots) = available_running_slots else {
+                waiting.push_front(req);
+                break;
+            };
+            if batch_is_full || can_run.len() >= slots {
+                batch_is_full = true;
+                waiting.push_front(req);
+                break;
+            }
         }
         // SGLang `Req.init_next_round_input(tree_cache)`: a waiting request matches its whole
         // prompt against the radix tree once, capped at `input_len - 1` so a request that must
@@ -99,6 +112,12 @@ pub(super) fn get_new_batch_prefill(
         } else {
             Default::default()
         };
+        if first_admission
+            && !kv_manager.check_mamba_match_capacity(&mut req.kv_lease, matched.device_tokens)
+        {
+            waiting.push_front(req);
+            break;
+        }
         let mut host_tokens = matched.host_tokens;
         let (start, chunk_tokens, output_reserve) = loop {
             let cached_prefix = matched.device_tokens + host_tokens;
@@ -211,6 +230,7 @@ pub(super) fn get_new_batch_prefill(
             waiting.push_front(req);
             break;
         };
+        kv_manager.prepare_prefill_checkpoint(&mut lease, prefix_len, chunk_end);
         let tokens_computed = chunk_end.saturating_sub(prefix_len);
         // Cache reuse is what the radix tree supplied at admission; a continuation's `prefix_len`
         // is the request's own earlier chunks and must not be reported as a cache hit.
