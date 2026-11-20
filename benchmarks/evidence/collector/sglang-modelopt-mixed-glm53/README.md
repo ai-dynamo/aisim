@@ -129,7 +129,7 @@ Run these steps inside the image of that version, on one SM100 GPU. Replace `<tr
    python3 $PROBE --model nvidia/GLM-5.3-NVFP4 --kv-cache-dtype bfloat16 --output probe-<ver>-bfloat16.json
    ```
 
-3. Run the narrow collection from another empty directory outside the repository.
+3. Run the narrow collection from another empty directory outside the repository. Use a local file system for this directory. The collector checkpoint needs an atomic rename that does not replace a file, and Lustre does not have it.
 
    ```bash
    export HF_HUB_OFFLINE=1 PYTHONPATH=<tree>/python/aisim
@@ -188,41 +188,41 @@ Both rows have 64 heads and target TP 1. Their points are batch size 256, sequen
 
 ## Run records
 
-Fill one record per SGLang version. Leave no field empty. If a step did not run, write "not run".
+Each SGLang version has one record. The six result files are in this directory.
 
 ### SGLang 0.5.21
 
 | Field | Value |
 |---|---|
-| Date | |
-| GPU and node type | |
-| Image digest seen in the container | |
-| Tree A commit | |
-| `probe-0.5.21-fp8.json` exit code | |
-| `probe-0.5.21-fp8.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | |
-| `probe-0.5.21-bfloat16.json` exit code | |
-| `probe-0.5.21-bfloat16.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | |
-| Method classes of the dense MLP linear modules | |
-| Collector exit code | |
-| `rows-0.5.21.csv`: rows per `kv_cache_dtype` | |
-| Failure records (count and classification) | |
-| Notes | |
+| Date | 2026-11-20 (UTC) |
+| GPU and node type | One NVIDIA B200, compute capability 10.0 (SM100), 183359 MiB, driver 580.82.07, on a Slurm node with 8 GPUs |
+| Image digest seen in the container | The job imported the image by its digest (`sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469`). The container reports `sglang` 0.5.21 and `torch` 2.13.0+cu130. |
+| Tree A commit | `5df15da09bb69a6396e830d182907f1931f8f84f` |
+| `probe-0.5.21-fp8.json` exit code | 0 |
+| `probe-0.5.21-fp8.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | `modelopt_mixed`, `float8_e4m3fn` (stored as `uint8`), 12 projections (4 of the indexer), all `UnquantizedLinearMethod` with `bfloat16` weights |
+| `probe-0.5.21-bfloat16.json` exit code | 0 |
+| `probe-0.5.21-bfloat16.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | `modelopt_mixed`, `bfloat16`, 12 projections (4 of the indexer), all `UnquantizedLinearMethod` with `bfloat16` weights |
+| Method classes of the dense MLP linear modules | `ModelOptFp8LinearMethod` with `float8_e4m3fn` weights for `mlp.gate_up_proj` and `mlp.down_proj` of both layers |
+| Collector exit code | 0 |
+| `rows-0.5.21.csv`: rows per `kv_cache_dtype` | 24 rows: 12 `fp8` and 12 `bfloat16`. Each row has model `nvidia/GLM-5.3-NVFP4`, `gemm_type` `bfloat16` and version `0.5.21`. |
+| Failure records (count and classification) | 0 (`collection_summary_sglang.json`: `total_errors` 0) |
+| Notes | A first job ran the collector from a directory on a Lustre file system. The probes passed, and the collector stopped before the first case with `RuntimeError: Atomic no-replace rename is unsupported by this filesystem`. This record is the second job, which ran the collector from a node-local directory. No code changed between the two jobs. |
 
 ### SGLang 0.5.23
 
 | Field | Value |
 |---|---|
-| Date | |
-| GPU and node type | |
-| Image digest seen in the container | |
-| Tree B: head commit of pull request #777 | |
-| Tree B: commit of this branch that was merged | |
-| `probe-0.5.23-fp8.json` exit code | |
-| `probe-0.5.23-fp8.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | |
-| `probe-0.5.23-bfloat16.json` exit code | |
-| `probe-0.5.23-bfloat16.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | |
-| Method classes of the dense MLP linear modules | |
-| Collector exit code | |
-| `rows-0.5.23.csv`: rows per `kv_cache_dtype` | |
-| Failure records (count and classification) | |
-| Notes | |
+| Date | 2026-11-20 (UTC) |
+| GPU and node type | One NVIDIA B200, compute capability 10.0 (SM100), 183359 MiB, driver 580.82.07, on a Slurm node with 8 GPUs |
+| Image digest seen in the container | The job imported the image by its digest (`sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f`). The container reports `sglang` 0.5.23 and `torch` 2.14.1+cu130. |
+| Tree B: head commit of pull request #777 | `6f3ac1b073a011c38eed05dd7572184e4157055c` |
+| Tree B: commit of this branch that was merged | `5df15da09bb69a6396e830d182907f1931f8f84f` (the merge had no conflict) |
+| `probe-0.5.23-fp8.json` exit code | 0 |
+| `probe-0.5.23-fp8.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | `modelopt_mixed`, `float8_e4m3fn` (stored as `uint8`), 12 projections (4 of the indexer), all `UnquantizedLinearMethod` with `bfloat16` weights |
+| `probe-0.5.23-bfloat16.json` exit code | 0 |
+| `probe-0.5.23-bfloat16.json`: `resolved_quantization`, `kv_cache_dtype`, attention projections | `modelopt_mixed`, `bfloat16`, 12 projections (4 of the indexer), all `UnquantizedLinearMethod` with `bfloat16` weights |
+| Method classes of the dense MLP linear modules | `ModelOptFp8LinearMethod` with `float8_e4m3fn` weights for `mlp.gate_up_proj` and `mlp.down_proj` of both layers |
+| Collector exit code | 0 |
+| `rows-0.5.23.csv`: rows per `kv_cache_dtype` | 42 rows: 21 `fp8` and 21 `bfloat16`. Each row has model `nvidia/GLM-5.3-NVFP4`, `gemm_type` `bfloat16` and version `0.5.23`. |
+| Failure records (count and classification) | 0 (`collection_summary_sglang.json`: `total_errors` 0) |
+| Notes | A first job ran the collector from a directory on a Lustre file system. The probes passed, and the collector stopped before the first case with `RuntimeError: Atomic no-replace rename is unsupported by this filesystem`. This record is the second job, which ran the collector from a node-local directory. No code changed between the two jobs. Pull request #777 adds the prefix lengths 1, 1536 and 3072 to the DSA plan. So each of the two rows has 21 points in tree B, and the run writes 42 rows. |
