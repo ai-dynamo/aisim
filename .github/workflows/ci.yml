@@ -775,13 +775,9 @@ jobs:
         needs.fast-ci.result == 'success' &&
         needs.select-full-ci.result == 'success'
       }}
-    runs-on: prod-aisim-default-amd64-v1
+    # Metadata/license checks need no native build or dedicated runner image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
