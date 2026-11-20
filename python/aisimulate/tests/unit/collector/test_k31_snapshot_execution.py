@@ -883,3 +883,12 @@ def test_execution_moe_backend_matches_each_bound_native_worker(native_execution
     assert result["status"] == ("qualified" if backend == "flashinfer_trtllm" else "failed"), result
     if backend == "auto":
         assert any("kernel_config.moe_backend differs" in reason for reason in result["failures"])
+
+
+@pytest.mark.parametrize("kernel", [None, []])
+def test_execution_reports_unresolved_native_moe_backend_without_crashing(native_execution, kernel):
+    plan, cell, raw, collection, index_path = native_execution
+    _mutate(index_path, lambda record: record["resolved_config"].update(kernel_config=kernel))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed", result
+    assert any("kernel_config.moe_backend differs" in reason for reason in result["failures"])

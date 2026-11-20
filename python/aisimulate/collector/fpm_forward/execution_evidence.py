@@ -480,8 +480,11 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
     if native_worker is not None:
         native_config = native_worker["resolved_config"]
         kernel = config.get("kernel_config")
-        if not isinstance(kernel, dict) or kernel.get("moe_backend") != native_config.get("kernel_config", {}).get(
-            "moe_backend"
+        native_kernel = native_config.get("kernel_config")
+        if (
+            not isinstance(kernel, dict)
+            or not isinstance(native_kernel, dict)
+            or kernel.get("moe_backend") != native_kernel.get("moe_backend")
         ):
             failures.append("runtime kernel_config.moe_backend differs from the validated initialized worker")
         native_parallel = native_config["parallel_config"]
