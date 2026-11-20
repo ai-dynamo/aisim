@@ -116,6 +116,21 @@ def _refresh_index_hashes(unified: Path) -> None:
 
 
 @pytest.mark.parametrize("conflict", [False, True])
+def test_envelope_and_leaf_must_agree_on_the_library_digest(tmp_path: Path, conflict: bool) -> None:
+    _, unified = _legacy_and_unified(tmp_path)
+    if conflict:
+        path = unified / fpm_migration.target_path(f"{CONFIGURATION_PATH}/aisim-manifest.json")
+        envelope = json.loads(path.read_text())
+        next(a for a in envelope["artifacts"] if a["role"] == "fpm-library")["sha256"] = "0" * 64
+        path.write_text(json.dumps(envelope))
+        _refresh_index_hashes(unified)
+        with pytest.raises(DataError, match="FPM library.*digest differs from its envelope"):
+            HfDataset.from_local(unified, revision=REVISION, repo_id=REPO)
+    else:
+        assert HfDataset.from_local(unified, revision=REVISION, repo_id=REPO).measurement_case(CONFIGURATION_PATH)
+
+
+@pytest.mark.parametrize("conflict", [False, True])
 @pytest.mark.parametrize("role", ["measurement-manifest", "measurement-data"])
 def test_envelope_and_leaf_must_agree_on_the_measurement_digests(tmp_path: Path, role: str, conflict: bool) -> None:
     _, unified = _legacy_and_unified(tmp_path)
