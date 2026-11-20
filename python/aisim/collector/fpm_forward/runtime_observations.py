@@ -17,6 +17,12 @@ Zero stride retains the unpacked, zero-offset, single-allocation storage rules.
 vLLM 0.32 places a group's layers in one backing buffer at
 ``offset + layer * layer_stride + block * block_stride``; vLLM 0.33 uses its
 separate audited hybrid mapping.
+
+The transfer bytes of a cache group follow a modified port of the region rule of
+the vLLM v0.33.0 NIXL connector (4ba787ec9959e566d3b587a796dff07673324da5),
+Copyright contributors to the vLLM project, Apache-2.0. The comment above
+``_transfer_shape_refusal`` names the source files, and THIRD_PARTY_NOTICES.md
+holds the entry.
 """
 
 from __future__ import annotations
@@ -1451,6 +1457,242 @@ def _mode_free(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 group["state"].pop("mamba_cache_mode", None)
                 group["state"].pop("startup_blocks_per_request", None)
     return result
+
+
+_TRANSFER_PHASE_REFUSAL = "the record comes from a probe phase without prefix caching"
+_TRANSFER_VALUES_DIFFER = "the worker records of the phases with prefix caching give different values"
+_TRANSFER_EVIDENCE_GAP = (
+    "the record lacks a field that the transfer rule reads, or holds a value that the import does not know"
+)
+_TRANSFER_HYBRID_REFUSAL = f"the record holds no hybrid cache evidence of vLLM {HYBRID_EVIDENCE_VERSION}"
+_RING_SPEC = _SPEC_MODULE + "CircularBufferSpec"
+_MLA_SPEC = _SPEC_MODULE + "MLAAttentionSpec"
+
+
+# The bytes that the NIXL connector of vLLM 0.33.0 (4ba787ec9959e566d3b587a796dff07673324da5) reads for one block
+# of each cache group on one TP rank, in a model with Mamba layers and a ring. A modified port of the region rule of
+# vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py (bw below):
+# https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+# - A ring model registers its layers in the order of the manager views (bw:1573-1580). vLLM builds these views in
+#   the order of the allocation plan (vllm/v1/worker/utils.py:598-627), which tensor_allocations of the record keeps.
+# - In storage of whole block rows (bw:1670-1672), each layer gives one region at the address of its page in block
+#   0, with the page as its length (bw:1646-1657 for a Mamba layer, bw:1716-1719 for every other layer).
+# - Layers at one address share one region. An MLA layer sets its length, and a layer of another group gives it
+#   the group ID -1 (bw:1747-1766). A Mamba layer marks an SSM region, and a ring layer a scratch region
+#   (bw:1774-1786). The connector then sorts the scratch regions (bw:1820).
+# - For one block, a ring group reads its scratch regions, every other attention group reads every region, and a
+#   Mamba group reads its state bytes in every SSM region (bw:237-278). The state bytes are the two state tensors
+#   without padding (vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py:155-156).
+# The record does not hold four facts that the connector reads. The conditions settle three of them. Storage of
+# whole block rows starts only with one kernel block for one manager block (bw:1611-1615, :1670-1672, :1720-1730),
+# because vLLM never splits the block of a group whose layers share block rows (vllm/v1/worker/utils.py:663-675).
+# A ring model accepts a tp_replicated state only in a group of one layer (bw:680-697). The connector asks for
+# another layout only for a model without MLA (vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:148-166).
+# The fourth fact is the mamba_type. The connector starts only for Mamba1, Mamba2 and GDN
+# (ssm_conv_transfer_utils.py:127-136), and their projections fill the whole convolution state (:158-208; for
+# Mamba2 because vllm/model_executor/layers/mamba/mamba_mixer2.py:320-341 and
+# vllm/model_executor/layers/mamba/mamba_utils.py:197-205 make the TP size divide the group columns), so the state
+# bytes do not depend on it.
+# benchmarks/evidence/nixl-pd-transfer-bytes-20261117 holds the measured bytes and the region table of a live run.
+def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str | None:
+    """The text of the first transfer-writer condition that the cache does not meet, or None when it meets all six."""
+    if runtime_version != HYBRID_EVIDENCE_VERSION or not runtime_memory._hybrid_evidence(cache):
+        return _TRANSFER_HYBRID_REFUSAL
+    layers = _transfer_layers(cache)
+    if isinstance(layers, str):
+        return layers
+    storages = cache.get("storages")
+    strides = {allocation["block_stride"] for allocation in cache["tensor_allocations"]}
+    if (
+        not isinstance(storages, list)
+        or len(storages) != 1
+        or not isinstance(storages[0], dict)
+        or len(strides) != 1
+        or not _nonnegative_int(cache.get("num_blocks"))
+        or storages[0].get("size_bytes") != cache["num_blocks"] * next(iter(strides))
+    ):
+        return "the cache is not one storage of whole block rows with one block stride"
+    groups = cache["groups"]
+    classes = [{group["layer_specs"][name]["spec_type"] for name in group["layer_names"]} for group in groups]
+    mamba = [group for group, kinds in zip(groups, classes, strict=True) if kinds == {_MAMBA_SPEC}]
+    if not mamba or {_RING_SPEC} not in classes:
+        return "the cache groups hold no Mamba group or no ring group"
+    if (
+        {_MLA_SPEC} not in classes
+        or any(kinds not in ({_MAMBA_SPEC}, {_RING_SPEC}, {_MLA_SPEC}) for kinds in classes)
+        or any(group.get("sliding_window") is not None for group in groups)
+    ):
+        return (
+            "the cache holds no MLA attention layer, a layer outside the Mamba and ring groups is no MLA attention "
+            "layer, or a group holds a sliding window"
+        )
+    tensors = [_state_tensors(group.get("state")) for group in mamba]
+    if (
+        any(len(group["layer_names"]) < 2 for group in mamba)
+        or any(tensor != tensors[0] for tensor in tensors)
+        or tensors[0] is None
+        or not all(isinstance(part, list) and len(part) == 2 for part in tensors[0])
+    ):
+        return "a Mamba group holds fewer than two layers, or the Mamba layers do not hold the same two state tensors"
+    if _state_sizes(mamba[0]["state"]) is None:
+        return _TRANSFER_EVIDENCE_GAP
+    phase = cache.get("prefix_caching")
+    if not isinstance(phase, dict) or phase.get("enable_prefix_caching") is not True:
+        return _TRANSFER_PHASE_REFUSAL
+    return None
+
+
+def _nonnegative_int(value: Any) -> bool:
+    """Whether a record value is an integer of zero or more."""
+    return type(value) is int and value >= 0
+
+
+def _transfer_layers(cache: Any) -> dict[str, tuple[int, dict[str, Any]]] | str:
+    """The group index and the spec of each layer of a cache, or the refusal text for its layer specs or allocations."""
+    groups = cache.get("groups") if isinstance(cache, dict) else None
+    allocations = cache.get("tensor_allocations") if isinstance(cache, dict) else None
+    if not isinstance(groups, list) or not isinstance(allocations, list) or not allocations:
+        return _TRANSFER_EVIDENCE_GAP
+    layers: dict[str, tuple[int, dict[str, Any]]] = {}
+    for index, group in enumerate(groups):
+        specs = group.get("layer_specs") if isinstance(group, dict) else None
+        if not isinstance(specs, dict):
+            # A hybrid record holds the spec of every layer (runtime_memory._hybrid_evidence).
+            return _TRANSFER_HYBRID_REFUSAL
+        names = group.get("layer_names")
+        if not isinstance(names, list) or not names:
+            return _TRANSFER_EVIDENCE_GAP
+        for name in names:
+            if not isinstance(name, str):
+                return _TRANSFER_EVIDENCE_GAP
+            spec = specs.get(name)
+            if spec is None:
+                return _TRANSFER_HYBRID_REFUSAL
+            if (
+                not isinstance(spec, dict)
+                or not isinstance(spec.get("spec_type"), str)
+                or not _nonnegative_int(spec.get("page_size_bytes"))
+                or name in layers
+            ):
+                return _TRANSFER_EVIDENCE_GAP
+            layers[name] = (index, spec)
+    for allocation in allocations:
+        if (
+            not isinstance(allocation, dict)
+            or not all(_nonnegative_int(allocation.get(key)) for key in ("offset", "layer_stride", "block_stride"))
+            or not isinstance(allocation.get("layers"), list)
+            or any(not isinstance(name, str) for name in allocation["layers"])
+        ):
+            return _TRANSFER_EVIDENCE_GAP
+    return layers
+
+
+def _state_tensors(state: Any) -> tuple[Any, Any] | None:
+    """The shapes and the data types of the state tensors of a Mamba group, or None without a state."""
+    return (state.get("shapes"), state.get("dtypes")) if isinstance(state, dict) else None
+
+
+def _state_sizes(state: Any) -> list[int] | None:
+    """The bytes of each of the two state tensors of a Mamba group, or None without two known state tensors."""
+    shapes, dtypes = _state_tensors(state) or (None, None)
+    if (
+        not isinstance(shapes, list)
+        or not isinstance(dtypes, list)
+        or len(shapes) != 2
+        or len(dtypes) != 2
+        or any(not isinstance(shape, list) or not all(_nonnegative_int(size) for size in shape) for shape in shapes)
+        or any(not isinstance(dtype, str) or dtype not in _STATE_DTYPE_BYTES for dtype in dtypes)
+    ):
+        return None
+    return [math.prod(shape) * _STATE_DTYPE_BYTES[dtype] for shape, dtype in zip(shapes, dtypes, strict=True)]
+
+
+def _nixl_region_table(cache: dict[str, Any]) -> dict[str, Any]:
+    """The region table of the vLLM 0.33.0 NIXL connector for a ring model with Mamba layers in whole block rows.
+
+    For another cache the result is not the connector's table. It is empty without the layer specs or the allocation
+    plan, or without a Mamba group with two known state tensors.
+    """
+    layers = _transfer_layers(cache)
+    if isinstance(layers, str):
+        return {}
+    groups = cache["groups"]
+    mamba = [
+        group
+        for group in groups
+        if {group["layer_specs"][name]["spec_type"] for name in group["layer_names"]} == {_MAMBA_SPEC}
+    ]
+    sizes = _state_sizes(mamba[0].get("state")) if mamba else None
+    if sizes is None:
+        return {}
+    addresses: list[int] = []
+    lengths: list[int] = []
+    group_ids: list[int] = []
+    names: list[str] = []
+    ssm: list[int] = []
+    scratch: list[int] = []
+    for allocation in cache["tensor_allocations"]:
+        for position, name in enumerate(allocation["layers"]):
+            if name not in layers:  # The connector skips a layer without a spec (bw:1587-1594).
+                continue
+            group, spec = layers[name]
+            kind, page = spec["spec_type"], spec["page_size_bytes"]
+            address = allocation["offset"] + position * allocation["layer_stride"]
+            if address in addresses:
+                region = addresses.index(address)
+                if kind == _MLA_SPEC:
+                    lengths[region] = page
+                if group_ids[region] != group:
+                    group_ids[region] = -1
+            else:
+                region = len(addresses)
+                addresses.append(address)
+                lengths.append(page)
+                group_ids.append(group)
+                names.append(name)
+            marks = ssm if kind == _MAMBA_SPEC else scratch if kind == _RING_SPEC else None
+            if marks is not None and region not in marks:
+                marks.append(region)
+    return {
+        "num_regions": len(addresses),
+        "physical_blocks_per_logical": 1,
+        "group_spec_types": [
+            group["layer_specs"][group["layer_names"][0]]["spec_type"].removeprefix(_SPEC_MODULE) for group in groups
+        ],
+        "block_len_per_layer": lengths,
+        "region_group_ids": group_ids,
+        "region_names": names,
+        "ssm_region_indices": ssm,
+        "scratch_region_indices": sorted(scratch),
+        "mamba_ssm_size": sizes,
+    }
+
+
+def _region_table_bytes(table: dict[str, Any]) -> list[int]:
+    """The bytes that one block of each cache group reads from the regions of a region table."""
+    lengths = table.get("block_len_per_layer", [])
+    values = []
+    for kind in table.get("group_spec_types", []):
+        if kind == _MAMBA_SPEC.removeprefix(_SPEC_MODULE):
+            values.append(len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]))
+        elif kind == _RING_SPEC.removeprefix(_SPEC_MODULE):
+            values.append(sum(lengths[region] for region in table["scratch_region_indices"]))
+        else:
+            values.append(sum(lengths))
+    return values
+
+
+def _merged_transfer_bytes(outcomes: list[list[int] | str]) -> list[int] | str:
+    """The transfer bytes of a role from the outcomes of its worker records, or the text that explains their absence."""
+    left = [outcome for outcome in outcomes if outcome != _TRANSFER_PHASE_REFUSAL]
+    if not left:
+        return _TRANSFER_PHASE_REFUSAL
+    texts = [outcome for outcome in left if isinstance(outcome, str)]
+    if texts:
+        return texts[0]
+    if any(outcome != left[0] for outcome in left):
+        return _TRANSFER_VALUES_DIFFER
+    return left[0]
 
 
 def _configuration(

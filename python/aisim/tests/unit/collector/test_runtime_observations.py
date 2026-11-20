@@ -3838,3 +3838,218 @@ def test_import_writes_no_transfer_bytes_for_a_padded_page_of_an_attention_layer
     (group,) = result["resources"]["cache_groups"]
     assert group["prefix_cacheable"] is True
     assert "transfer_bytes_per_block" not in group
+
+
+# The bytes that the NIXL connector of vLLM 0.33.0 reads for one block of each group of the live record on one TP
+# rank: the four KDA groups, the attention group and the ring. A live P/D run measured them
+# (benchmarks/evidence/nixl-pd-transfer-bytes-20261117).
+LIVE_TRANSFER_BYTES = [9_768_960] * 4 + [21_978_496, 92_288]
+_REGION_TABLE = (
+    Path(__file__).resolve().parents[5] / "benchmarks/evidence/nixl-pd-transfer-bytes-20261117/region-table.json"
+)
+# The text for a record outside each of the six conditions of the transfer writer, in their order.
+_TRANSFER_REFUSALS = (
+    "the record holds no hybrid cache evidence of vLLM 0.33.0",
+    "the cache is not one storage of whole block rows with one block stride",
+    "the cache groups hold no Mamba group or no ring group",
+    "the cache holds no MLA attention layer, a layer outside the Mamba and ring groups is no MLA attention layer, or a "
+    "group holds a sliding window",
+    "a Mamba group holds fewer than two layers, or the Mamba layers do not hold the same two state tensors",
+    "the record comes from a probe phase without prefix caching",
+)
+# The text for a record that lacks a field of the rule or holds a value that the import does not know (condition None).
+_TRANSFER_EVIDENCE_GAP = (
+    "the record lacks a field that the transfer rule reads, or holds a value that the import does not know"
+)
+
+
+def _live_worker_caches():
+    paths = sorted((FIXTURES / "glm53flash_vllm_0330_probe").rglob("runtime-observation-worker-*.json"))
+    return [json.loads(path.read_text())["cache"] for path in paths]
+
+
+def test_region_table_of_the_live_glm53flash_record_equals_the_table_of_the_live_connector():
+    logged = json.loads(_REGION_TABLE.read_text())
+    for key in ("schema", "vllm_version", "source"):
+        logged.pop(key)
+    caches = _live_worker_caches()
+    assert len(caches) == 4
+    for cache in caches:
+        assert runtime_observations._transfer_shape_refusal(cache, "0.33.0") is None
+        table = runtime_observations._nixl_region_table(cache)
+        assert table == logged
+        assert runtime_observations._region_table_bytes(table) == LIVE_TRANSFER_BYTES
+
+
+def _plain(cache):
+    for group in cache["groups"]:
+        del group["layer_specs"]
+
+
+def _second_storage(cache):
+    cache["storages"].append({**cache["storages"][0], "storage_id": "other"})
+
+
+def _storage_beyond_the_block_rows(cache):
+    cache["storages"][0]["size_bytes"] += 13_516_800
+
+
+def _second_block_stride(cache):
+    cache["tensor_allocations"][-1]["block_stride"] = 2048
+
+
+def _respec(cache, group, name):
+    for spec in cache["groups"][group]["layer_specs"].values():
+        spec["spec_type"] = _V033_SPEC + name
+
+
+def _one_full_attention_layer(cache):
+    group = cache["groups"][3]
+    group["layer_specs"][group["layer_names"][0]]["spec_type"] = _V033_SPEC + "FullAttentionSpec"
+
+
+def _mamba_group_of_one_layer(cache):
+    group = cache["groups"][3]
+    group["layer_names"] = group["layer_names"][:1]
+
+
+def _no_mla_layer(cache):
+    names = set(cache["groups"].pop(4)["layer_names"])
+    cache["tensor_allocations"] = [
+        allocation for allocation in cache["tensor_allocations"] if names.isdisjoint(allocation["layers"])
+    ]
+
+
+@pytest.mark.parametrize(
+    ("version", "edit", "condition"),
+    [
+        ("0.32.0", lambda cache: None, 1),
+        ("0.33.0", _plain, 1),
+        ("0.33.0", _second_storage, 2),
+        ("0.33.0", _storage_beyond_the_block_rows, 2),
+        ("0.33.0", _second_block_stride, 2),
+        ("0.33.0", lambda cache: _respec(cache, 5, "MLAAttentionSpec"), 3),
+        ("0.33.0", lambda cache: [_respec(cache, index, "MLAAttentionSpec") for index in range(4)], 3),
+        ("0.33.0", _one_full_attention_layer, 4),
+        ("0.33.0", lambda cache: _respec(cache, 3, "SlidingWindowMLASpec"), 4),
+        ("0.33.0", lambda cache: cache["groups"][4].update(sliding_window=4096), 4),
+        ("0.33.0", _mamba_group_of_one_layer, 5),
+        ("0.33.0", lambda cache: cache["groups"][0]["state"].update(shapes=[[3, 6144], [16, 64, 128]]), 5),
+        ("0.33.0", lambda cache: cache["groups"][0]["state"].update(dtypes=["torch.bfloat16", "torch.bfloat16"]), 5),
+        ("0.33.0", lambda cache: [group["state"]["shapes"].append([1]) for group in cache["groups"][:4]], 5),
+        ("0.33.0", lambda cache: cache["prefix_caching"].update(enable_prefix_caching=False), 6),
+        ("0.33.0", lambda cache: cache["storages"][0].update(size_bytes=cache["storages"][0]["size_bytes"] + 1), 2),
+        ("0.33.0", _no_mla_layer, 4),
+        ("0.33.0", lambda cache: cache.pop("prefix_caching"), 6),
+        ("0.33.0", lambda cache: cache.update(prefix_caching=True), 6),
+        ("0.33.0", lambda cache: cache["prefix_caching"].pop("enable_prefix_caching"), 6),
+        ("0.33.0", lambda cache: cache["prefix_caching"].update(enable_prefix_caching=1), 6),
+        ("0.33.0", lambda cache: cache["groups"][5].pop("layer_specs"), 1),
+        ("0.33.0", lambda cache: cache["groups"][5].update(layer_names=[]), None),
+        ("0.33.0", lambda cache: cache.pop("tensor_allocations"), None),
+        ("0.33.0", lambda cache: cache["storages"][0].pop("size_bytes"), 2),
+        (
+            "0.33.0",
+            lambda cache: [
+                group["state"].update(dtypes=["torch.bfloat16", "torch.float64"]) for group in cache["groups"][:4]
+            ],
+            None,
+        ),
+        ("0.33.0", lambda cache: [group.pop("state") for group in cache["groups"][:4]], 5),
+    ],
+    ids=[
+        "another_version",
+        "no_hybrid_evidence",
+        "two_storages",
+        "storage_beyond_the_block_rows",
+        "two_block_strides",
+        "no_ring_group",
+        "no_mamba_group",
+        "full_attention_layer",
+        "sliding_window_mla_layer",
+        "sliding_window",
+        "mamba_group_of_one_layer",
+        "other_state_shapes",
+        "other_state_dtypes",
+        "three_state_tensors",
+        "phase_without_prefix_caching",
+        "storage_tail_below_one_block_row",
+        "no_mla_layer",
+        "no_prefix_caching_evidence",
+        "prefix_caching_no_mapping",
+        "no_enable_prefix_caching",
+        "enable_prefix_caching_not_a_bool",
+        "group_without_layer_specs",
+        "ring_group_without_layers",
+        "no_tensor_allocations",
+        "storage_without_size",
+        "unknown_state_dtype",
+        "no_state",
+    ],
+)
+def test_transfer_writer_refuses_a_record_outside_each_condition(version, edit, condition):
+    cache = _live_worker_caches()[0]
+    edit(cache)
+    expected = _TRANSFER_EVIDENCE_GAP if condition is None else _TRANSFER_REFUSALS[condition - 1]
+    assert runtime_observations._transfer_shape_refusal(cache, version) == expected
+
+
+def test_transfer_bytes_of_a_role_follow_its_phases_with_prefix_caching():
+    merge = runtime_observations._merged_transfer_bytes
+    phase, shape = _TRANSFER_REFUSALS[5], _TRANSFER_REFUSALS[2]
+    assert phase == runtime_observations._TRANSFER_PHASE_REFUSAL
+    assert merge([[1, 2], [1, 2]]) == [1, 2]
+    # A phase without prefix caching takes no part.
+    assert merge([phase, [1, 2], phase]) == [1, 2]
+    assert merge([phase, phase]) == phase
+    assert merge([[1, 2], [1, 3]]) == "the worker records of the phases with prefix caching give different values"
+    # One record outside another condition leaves the role without a value.
+    assert merge([[1, 2], shape]) == shape
+    assert merge([phase, shape]) == shape
+    # The first text of a record outside a condition wins.
+    other = _TRANSFER_REFUSALS[1]
+    assert merge([[1, 2], shape, other]) == shape
+    assert merge([other, shape]) == other
+
+
+def test_region_table_sorts_the_scratch_regions_as_the_connector_does():
+    # The first tail page ends where the first latent page starts, so the first ring layer opens a region after the
+    # latent regions and the second joins the region of the first latent page. The connector sorts the scratch regions
+    # (base_worker.py:1820).
+    cache = _live_worker_caches()[0]
+    cache["tensor_allocations"][-1]["offset"] = 787_840
+    assert runtime_observations._transfer_shape_refusal(cache, "0.33.0") is None
+    table = runtime_observations._nixl_region_table(cache)
+    assert table["scratch_region_indices"] == [19, *range(30, 40)]
+    assert runtime_observations._region_table_bytes(table)[5] == 1_134_592
+
+
+def test_region_table_skips_an_allocated_layer_without_a_spec():
+    # The connector skips a layer without a spec (base_worker.py:1587-1594).
+    logged = json.loads(_REGION_TABLE.read_text())
+    for key in ("schema", "vllm_version", "source"):
+        logged.pop(key)
+    cache = _live_worker_caches()[0]
+    cache["tensor_allocations"][0]["layers"].append("language_model.model.layers.99.self_attn")
+    assert runtime_observations._transfer_shape_refusal(cache, "0.33.0") is None
+    assert runtime_observations._nixl_region_table(cache) == logged
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda cache: cache["groups"][5].pop("layer_specs"),
+        lambda cache: cache.pop("tensor_allocations"),
+        lambda cache: [_respec(cache, index, "MLAAttentionSpec") for index in range(4)],
+        lambda cache: [
+            group["state"].update(dtypes=["torch.bfloat16", "torch.float64"]) for group in cache["groups"][:4]
+        ],
+        lambda cache: [group.pop("state") for group in cache["groups"][:4]],
+    ],
+    ids=["group_without_layer_specs", "no_tensor_allocations", "no_mamba_group", "unknown_state_dtype", "no_state"],
+)
+def test_region_table_of_a_cache_without_its_evidence_is_empty(edit):
+    cache = _live_worker_caches()[0]
+    edit(cache)
+    assert runtime_observations._nixl_region_table(cache) == {}
+    assert runtime_observations._region_table_bytes({}) == []
