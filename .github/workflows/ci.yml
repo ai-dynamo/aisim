@@ -276,6 +276,8 @@ jobs:
             cargo_deny_sha256: 2b3567a60b7491c159d1cef8b7d8479d1ad2a31e29ef49462634ad4552fcc77d
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -317,6 +319,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -338,6 +342,7 @@ jobs:
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 15
     env:
+      HOME: /__w/aisim/aisim
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-feature-tests
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
@@ -382,6 +387,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -413,6 +420,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -462,6 +471,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -602,6 +613,8 @@ jobs:
             container_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:29a6ceb78de5b00494e6e7456a72782a4cb54238de102e7491d15fe47789b4d1
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: 10
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ matrix.container_image }}
       env:
@@ -645,6 +658,8 @@ jobs:
           - {suite: tools-build, group: 1, groups: 1}
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -766,6 +781,8 @@ jobs:
       }}
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -792,6 +809,8 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -821,6 +840,8 @@ jobs:
     if: ${{ needs.select-full-ci.outputs.engine_golden_regression == 'true' }}
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 45
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -873,6 +894,8 @@ jobs:
             # quay.io/pypa/manylinux_2_28_aarch64:2026.08.24-1
             container_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:29a6ceb78de5b00494e6e7456a72782a4cb54238de102e7491d15fe47789b4d1
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ matrix.container_image }}
       env:

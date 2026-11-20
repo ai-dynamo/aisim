@@ -30,6 +30,9 @@ jobs:
             scratch: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    # Step processes receive job env after the runner replaces container HOME.
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:

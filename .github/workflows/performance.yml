@@ -58,6 +58,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:

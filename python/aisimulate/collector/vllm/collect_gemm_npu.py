@@ -160,6 +160,7 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="npu:0"):
             num_warmups=3,
             num_runs=6,
             repeat_n=1,
+            measure_power=False,
             # MVP is eager: ACL graph capture is a follow-up, and
             # benchmark_with_power has no NPU graph arm (helper.py use_graph is
             # CUDA/XPU only), so `used_cuda_graph` is recorded False below.

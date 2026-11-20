@@ -136,6 +136,8 @@ jobs:
     name: Prepare shared E2E measurements
     timeout-minutes: 120
     runs-on: prod-aisim-default-amd64-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -198,6 +200,7 @@ jobs:
         HOME: /__w/aisim/aisim
         USER: runner
     env:
+      HOME: /__w/aisim/aisim
       OPENBLAS_NUM_THREADS: '1'
       OMP_NUM_THREADS: '1'
       RAYON_NUM_THREADS: '1'
@@ -314,6 +317,8 @@ jobs:
     needs: [wheel, shards]
     timeout-minutes: 30
     runs-on: prod-aisim-default-amd64-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -405,6 +410,7 @@ jobs:
         HOME: /__w/aisim/aisim
         USER: runner
     env:
+      HOME: /__w/aisim/aisim
       OPENBLAS_NUM_THREADS: '1'
       OMP_NUM_THREADS: '1'
       RAYON_NUM_THREADS: '1'
@@ -487,6 +493,8 @@ jobs:
     needs: agentx
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 30
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:

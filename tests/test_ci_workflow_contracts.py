@@ -1636,6 +1636,24 @@ def test_omitted_wheel_base_preserves_dockerfile_default() -> None:
     assert omitted_input_arguments == f"WHEEL_BUILD_BASE={docker_default}"
 
 
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name"),
+    [
+        (path.name, job_name)
+        for path in sorted(WORKFLOW_ROOT.glob("*.yml"))
+        for job_name, job in _workflow(path.name)["jobs"].items()
+        if isinstance(job.get("container"), dict) and "HOME" in job["container"].get("env", {})
+    ],
+)
+def test_container_home_is_set_for_steps_after_runner_override(workflow_name: str, job_name: str) -> None:
+    job = _workflow(workflow_name)["jobs"][job_name]
+    # The runner replaces container.env.HOME with /github/home before startup.
+    # Job env is passed to each step and must restore the intended writable home.
+    assert job.get("env", {}).get("HOME") == job["container"]["env"]["HOME"]
+    if workflow_name == "runner-canary.yml":
+        assert 'test "${HOME}" = /__w/aisim/aisim' in _run_commands(job)
+
+
 def test_containerized_workflows_do_not_require_git_lfs_during_checkout() -> None:
     jobs = (
         ("ci.yml", "engine-golden-regression"),

@@ -28,6 +28,8 @@ jobs:
     name: Check collector data
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 20
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -60,6 +62,8 @@ jobs:
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 25
     continue-on-error: true
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:

@@ -263,6 +263,37 @@ def test_run_gemm_logs_eager_row_without_power(collect_gemm_npu, monkeypatch, fr
     collect_gemm_npu.torch.randn.assert_called_once()
 
 
+@pytest.mark.parametrize("power_env", [None, "0", "true"])
+def test_run_gemm_keeps_fixed_repetitions_despite_power_environment(collect_gemm_npu, monkeypatch, power_env):
+    """Exercise the real benchmark helper without hardware or a power sampler."""
+    from collector import helper
+
+    if power_env is None:
+        monkeypatch.delenv("COLLECTOR_MEASURE_POWER", raising=False)
+    else:
+        monkeypatch.setenv("COLLECTOR_MEASURE_POWER", power_env)
+    device_module = MagicMock()
+    # Enough live memory for exactly one packed copy of this case.
+    device_module.mem_get_info.return_value = (15929, 64 * 2**30)
+    device_module.Event.return_value.elapsed_time.return_value = 6.0
+    monkeypatch.setattr(collect_gemm_npu, "setup_distributed", lambda device: None)
+    monkeypatch.setattr(collect_gemm_npu, "get_device_module", lambda device=None: device_module)
+    monkeypatch.setattr(helper, "get_device_module", lambda device=None: device_module)
+    power_monitor = MagicMock()
+    monkeypatch.setattr(helper, "PowerMonitor", power_monitor)
+    logged = {}
+    monkeypatch.setattr(collect_gemm_npu, "log_perf", lambda **kwargs: logged.update(kwargs))
+
+    collect_gemm_npu.run_gemm("bfloat16", 16, 32, 64, perf_filename=PerfFile.GEMM)
+
+    # One layer-init dry run, three warmups, and six timed runs in eager mode.
+    assert collect_gemm_npu.RowParallelLinear.return_value.forward.call_count == 10
+    power_monitor.assert_not_called()
+    assert logged["power_stats"] is None
+    assert logged["item_list"][0]["latency"] == pytest.approx(1.0)
+    assert logged["item_list"][0]["used_cuda_graph"] is False
+
+
 @pytest.mark.parametrize(
     ("m", "n", "k", "free_bytes"),
     [
