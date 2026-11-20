@@ -500,9 +500,12 @@ def _artifact(out: Path, rel: str, *, artifact_id: str, role: str, fmt: str, sch
 def _sidecar_schema(kind: str, source: Path) -> tuple[str, dict]:
     if kind in ("collection-meta", "reuse-declaration"):
         document = yaml.safe_load(source.read_text(encoding="utf-8"))
-        version = document.get("schema_version", 1) if isinstance(document, dict) else 1
+        if not isinstance(document, dict):
+            # Publishing {} for a sidecar that is not a mapping would hide a corrupt declaration.
+            raise PublishError(f"{source.name} must be a YAML mapping, got {type(document).__name__}: {source}")
+        version = document.get("schema_version", 1)
         prefix = "aisim-collection-meta" if kind == "collection-meta" else "aisim-reuse-declaration"
-        return f"{prefix}/v{version}", document if isinstance(document, dict) else {}
+        return f"{prefix}/v{version}", document
     return "collector-errors/unversioned", {}
 
 
@@ -694,7 +697,8 @@ def build_publish_tree(
     allow_dirty: bool = False,
 ) -> BuildResult:
     """Build the publish tree under ``out`` (which must not exist). Local only; never touches the network."""
-    source, out = Path(source_root).resolve(), Path(out).absolute()
+    # Resolve symlinks before the containment check, or a link to the source tree would let output land inside it.
+    source, out = Path(source_root).resolve(), Path(out).resolve()
     if out.exists():
         raise PublishError(f"output directory already exists: {out}")
     if out == source or source in out.parents:

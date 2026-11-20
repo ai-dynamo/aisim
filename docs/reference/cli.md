@@ -96,9 +96,11 @@ aisim data fetch ... --offline --dry-run --cache-dir ./aisim-cache   # lists `mi
 export AISIM_DATASET=OWNER/NAME@<40-hex-sha> AISIM_DATA_CACHE=./aisim-cache AISIM_DATA_OFFLINE=1
 ```
 
-`AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins a predictor run: the data a
-configuration needs is taken from the cached revision, a missing or corrupt file is a precise error, and
-there is no fallback to other data. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
+`AISIM_DATASET` (with `AISIM_DATA_CACHE` and `AISIM_DATA_OFFLINE`) pins model construction through
+`RustForwardPassPerfModel.best_available`: the data a configuration needs is taken from the cached revision,
+a missing or corrupt file is a precise error, and there is no fallback to other data. A run that builds its
+operation tables from `systems_paths` or `AICONFIGURATOR_SYSTEMS_PATH` (an explicit `backend_version` in
+`aisim predict`, `recommend` or `replay`) does not read the pin; prepare a root for it as described below. Other pin variables: `AISIM_DATA_CATEGORIES` (default `fpm`),
 `AISIM_DATA_CONFIGURATION` (choose among several matches), `AISIM_DATA_MAX_BYTES` (auto-download
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
@@ -136,7 +138,8 @@ the cache when possible); it never mixes in packaged tables. The call fails if t
 
 | Consumer | Preparation |
 |---|---|
-| Python predict/recommend/replay | Automatic through the pin; `data fetch` only prefetches. |
+| Python code that builds the model with `best_available` | Automatic through the pin; `data fetch` only prefetches. |
+| `aisim predict`, `recommend` and `replay` runs | Read `systems_paths` / `AICONFIGURATOR_SYSTEMS_PATH`, not the pin: pass a prepared root. |
 | Sweeper, planner, Python embedding of the Rust engine | Pass `systems_paths` or set `AICONFIGURATOR_SYSTEMS_PATH` to the prepared root. |
 | Rust `perf_database` crate users | Same root as `systems_paths`/`DataRoots`; no Python at run time. |
 | Rust tests (about 38 files resolve the in-tree `systems/` directory) | Prepare a root before `cargo test` and route the sites through one resolver; a Phase 6 task. |

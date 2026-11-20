@@ -23,9 +23,11 @@ a reason to store them.
 aisim data check-names <your-data-directory>
 ```
 
-Each finding gives the location, the stored value and the canonical name to use. Fix the data (not the
-registry) until the command prints `"ok": true`. A finding with `"canonical": null` is a name the registry does
-not know.
+Each finding gives the location, the stored value and the canonical name to use. For a known alias (a finding
+with a `"canonical"` name) fix the data, not the registry. A finding with `"canonical": null` is a name the
+registry does not know: if it is genuinely new (for example a new hardware name of a closed kind), register it
+first (`names_registry.json`: name, kind, unit for a metric, aliases) in the same pull request, then rerun the
+checker until it prints `"ok": true`.
 
 ## 3. Keep unknown fields, do not rely on them
 

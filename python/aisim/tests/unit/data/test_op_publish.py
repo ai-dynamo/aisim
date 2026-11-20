@@ -234,3 +234,24 @@ def test_row_models_match_table_columns():
     assert set(op.query_versions_table(qv).column_names) == set(OpQueryVersionsRow.model_fields)
     assert set(op._MAP_COLUMNS) == set(OpSourceMapRow.model_fields)
     assert set(op._declared_reuse_table([]).column_names) == set(OpDeclaredReuseRow.model_fields)
+
+
+def test_build_refuses_an_output_reached_through_a_symlink_into_the_source(tree, tmp_path):
+    link = tmp_path / "source-link"
+    link.symlink_to(tree / "data")  # the source root is systems/data
+    with pytest.raises(PublishError, match="inside the source"):
+        _build(tree, link / "published")
+    assert not (tree / "data/published").exists()  # nothing was created in the source tree
+    _build(tree, tmp_path / "external")  # a normal external output stays accepted
+
+
+@pytest.mark.parametrize(
+    "sidecar", ["data/h200_sxm/gemm/vllm/1.0/collection_meta.yaml", "data/h200_sxm/gemm/vllm/2.0/reuse.yaml"]
+)
+@pytest.mark.parametrize("content", ["[]\n", "- a\n", "just text\n", ""])
+def test_a_sidecar_that_is_not_a_mapping_fails_publication(tree, tmp_path, sidecar, content):
+    (tree / sidecar).write_text(content)
+    out = tmp_path / "published"
+    with pytest.raises(PublishError, match="must be a YAML mapping"):
+        _build(tree, out)
+    assert not out.exists()  # the partial output is removed
