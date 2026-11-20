@@ -514,10 +514,12 @@ def test_input_and_immutable_drift_survive_note_save_while_collector_can_advance
     assert {issue["artifact"] for issue in resumed["integrity_issues"]} == {"source", "collector"}
 
 
-def test_exact_request_and_profile_references(tmp_path, capsys, monkeypatch, request_payload):
+@pytest.mark.parametrize("profile_format", ["json", "yaml"])
+def test_exact_request_and_profile_references(tmp_path, capsys, monkeypatch, request_payload, profile_format):
     path = tmp_path / "checkpoint.json"
     (tmp_path / "request.yaml").write_text(yaml.safe_dump(request_payload))
-    (tmp_path / "profile.json").write_text(json.dumps(request_payload["fpm_profile"]))
+    serialize = json.dumps if profile_format == "json" else yaml.safe_dump
+    (tmp_path / "profile.json").write_text(serialize(request_payload["fpm_profile"]), encoding="utf-8")
     patch = {
         "configurations": {
             "one": {

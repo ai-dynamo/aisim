@@ -86,7 +86,7 @@ self-benchmark collector and `onboard finalize` do not.
 
 ## Onboard with an agent
 
-For a request such as "Help me onboard my model for FPM simulation on my target GPUs," follow these six stages. Claude Code reaches them through the root `CLAUDE.md` import of `AGENTS.md`; other agents use the same `AGENTS.md` entry point. Create one [session checkpoint](#checkpoint-and-resume-an-onboarding-session) during stage 1 and update it after meaningful findings and decisions, including unfinished investigation and partial profile review. Record the selected [profiling route](README.md#choose-a-profiling-route) and reuse choices already supplied. Both routes require identity, resource and evidence review; commands labeled **self-benchmarking** apply only to that route. The GBDT route uses standalone collection helpers, training and model APIs. Session checkpointing records its progress but does not automate those steps.
+For a request such as "Help me onboard my model for FPM simulation on my target GPUs," follow these six stages. The [root agent guide](../../../AGENTS.md#fpm-model-onboarding) points to this workflow. Create one [session checkpoint](#checkpoint-and-resume-an-onboarding-session) during stage 1 and update it after meaningful findings and decisions, including unfinished investigation and partial profile review. Record the selected [profiling route](README.md#choose-a-profiling-route) and reuse choices already supplied. Both routes require identity, resource and evidence review; commands labeled **self-benchmarking** apply only to that route. The GBDT route uses standalone collection helpers, training and model APIs. Session checkpointing records its progress but does not automate those steps.
 
 | Stage | Required result |
 | --- | --- |
@@ -642,7 +642,9 @@ To reuse an archived latency-only campaign, explicitly set
 means `true`, even for a request saved before power collection was introduced;
 readiness rejects that request against the latency-only campaign. The request
 does not record when the field was omitted, so AISim cannot infer a historical
-opt-out. To retain `true`, collect a new campaign with power enabled instead.
+opt-out. Both discovered campaigns and explicitly bound phase plans must
+match this setting. To retain `true`, re-plan in a new directory and collect
+a new campaign with power enabled instead.
 
 ### Serving roles and CUDA graph settings
 

@@ -167,7 +167,7 @@ def _read_prediction_config(path: Path) -> dict[str, Any]:
     """
     text = path.read_text(encoding="utf-8")
     raw = yaml.safe_load(text)
-    reject_repeated_keys(text, "predict", path)
+    reject_repeated_keys(text, "predict", path, json_input=False)
     return anchor_paths(raw, config_folder(path), "predict")
 
 
