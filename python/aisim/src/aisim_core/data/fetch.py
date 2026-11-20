@@ -512,6 +512,8 @@ def plan(
     entries = [e for e in index.entries if selection.matches(e)]
     if not entries:
         raise SelectionError("selection matched no catalog entries")
+    for artifact in index.support:  # files every selection of the category needs, e.g. the op-latency lookups
+        planner._add(_ref(artifact, "artifact"))
     for entry in entries:
         raw = planner.read(_ref(entry.manifest, "manifest"))
         if raw is None:

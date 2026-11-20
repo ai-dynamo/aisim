@@ -288,3 +288,94 @@ def test_malformed_reuse_declaration_is_refused(document):
         "0.9",
         "1.0",
     ]
+
+
+# ---------------------------------------------------------------- pinned lookups and manifests
+
+
+def _tree_files(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_a_cold_fetch_brings_the_pinned_lookup_tables(tree, tmp_path):  # noqa: F811
+    from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
+
+    from .test_fetch import FakeTransport
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    out = ensure_data(dict(CONFIG), pin, transport=FakeTransport(_tree_files(published)))
+    root = Path(out.config["systems_paths"][0])
+    pinned = (tree / "query_versions.yaml").read_text()
+    assert (root / "query_versions.yaml").read_text() == pinned
+    assert pinned != (PACKAGED_SYSTEMS_DIR / "query_versions.yaml").read_text()
+    assert (root / "perf_data_reuse_manifest.yaml").read_text() == (tree / "perf_data_reuse_manifest.yaml").read_text()
+
+
+def test_a_missing_pinned_lookup_fails_instead_of_using_the_packaged_one(tree, tmp_path):  # noqa: F811
+    published = tmp_path / "published"
+    _build(tree, published)
+    next(published.rglob("query_versions.parquet")).unlink()
+    with pytest.raises(MissingDataError, match="query_versions"):
+        ensure_data(dict(CONFIG), _pin(published, tmp_path))
+
+
+def test_a_lookup_rewritten_with_matching_embedded_fields_is_refused(tree, tmp_path):  # noqa: F811
+    import hashlib
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    path = next(published.rglob("query_versions.parquet"))
+    table = pq.read_table(path)
+    forged = b"schema_version: 1\ndefaults: {vllm: {current: '9.9', previous: null}}\noverrides: {}\n"
+    metadata = {
+        **(table.schema.metadata or {}),
+        b"aisim.source_yaml": forged,
+        b"aisim.source_sha256": hashlib.sha256(forged).hexdigest().encode(),
+    }
+    pq.write_table(table.replace_schema_metadata(metadata), path)  # both embedded fields changed together
+    with pytest.raises(MissingDataError, match="integrity mismatch"):
+        ensure_data(dict(CONFIG), _pin(published, tmp_path))
+
+
+def test_a_replacement_manifest_is_refused_and_leaves_no_destination(tree, tmp_path):  # noqa: F811
+    import json
+
+    from aisim_core.data.op_tree import load_op_latency_tree
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    manifest = next(published.rglob("gemm/vllm/1.0/manifest.json"))
+    manifest.write_text(json.dumps(json.loads(manifest.read_text()), indent=4))  # same content, not the pinned bytes
+    destination = tmp_path / "dest"
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        load_op_latency_tree(published, destination)
+    assert not destination.exists()
+
+
+def test_manifests_declaring_different_bytes_for_one_runtime_path_conflict(tree, tmp_path, monkeypatch):  # noqa: F811
+    from aisim_core.data import op_tree
+    from aisim_core.data.loaders import LoaderError
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    real = op_tree.read_entry_manifest
+    seen = []
+
+    def colliding(tree_root, entry, config=None):
+        manifest = real(tree_root, entry, config)
+        runtime = [a for a in manifest.artifacts if a.runtime_path is not None]
+        if not seen:
+            seen.append(runtime[0].runtime_path)
+            return manifest
+        moved = [
+            a.model_copy(update={"runtime_path": seen[0], "sha256": "0" * 64}) if a is runtime[0] else a
+            for a in manifest.artifacts
+        ]
+        return manifest.model_copy(update={"artifacts": moved})
+
+    monkeypatch.setattr(op_tree, "read_entry_manifest", colliding)
+    with pytest.raises(LoaderError, match="different content"):
+        op_tree.load_op_latency_tree(published, tmp_path / "dest")
+    assert not (tmp_path / "dest").exists()

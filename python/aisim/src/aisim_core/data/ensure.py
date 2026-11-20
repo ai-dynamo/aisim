@@ -69,7 +69,7 @@ from aisim_core.data.fetch import (
     fetch,
 )
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
-from aisim_core.data.op_tree import OpTreeLoad, load_op_latency_tree, op_latency_inputs_digest
+from aisim_core.data.op_tree import OpTreeLoad, load_op_latency_tree, op_latency_inputs_digest, read_entry_manifest
 from aisim_core.data.repos import resolve_ref
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
 
@@ -484,12 +484,11 @@ def _load_op_latency(
     """Compose every selected family, its declared donor versions and the system specs into one ``systems/`` root."""
     ids = [e.configuration_id for e in entries]
     try:
-        loader = LOADERS["op-latency"]()
         # Verifies every artifact in the fetched tree, also when the composed root is reused.
-        manifests = [loader.read_manifest(root, entry.manifest.path, config) for entry in entries]
+        manifests = [read_entry_manifest(root, entry, config) for entry in entries]
         donors = _declared_donors(root, entries, manifests, selection, fetch_donors)
         # A donor is another version of the same system and backend, so the version check of ``config`` is not its own.
-        manifests += [loader.read_manifest(root, donor.manifest.path) for donor in donors]
+        manifests += [read_entry_manifest(root, donor) for donor in donors]
         entries = [*entries, *donors]
         ids = [e.configuration_id for e in entries]
         # Keyed by content, not identity: a dataset republished in place (or a newer package) gets a new root.

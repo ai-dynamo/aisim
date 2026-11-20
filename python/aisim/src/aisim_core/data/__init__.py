@@ -152,6 +152,9 @@ class CategoryIndex(_Record):
     schema_version: Literal["aisim-category-index/v1"]
     category: Category
     entries: list[Entry]
+    # Files every selection of the category needs but no entry owns (op-latency: the two lookup tables). Listed
+    # here they are digest-pinned by this index, fetched with any selection and verified before use.
+    support: list[Artifact] = Field(default_factory=list)
 
 
 class CategoryReference(_Record):
@@ -258,6 +261,8 @@ def check_dataset(root: Path) -> DatasetIndex:
         entries = CategoryIndex.model_validate_json(path.read_bytes())
         if entries.category != category:
             raise ValueError("category index identity mismatch")
+        for artifact in entries.support:
+            _verify(root, artifact)
         seen = set()
         for entry in entries.entries:
             if entry.configuration_id in seen:

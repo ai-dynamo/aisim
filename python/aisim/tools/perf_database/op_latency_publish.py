@@ -786,11 +786,28 @@ def _build(source, reuse_manifest, query_versions, out, files, info, dataset_id,
                 ),
             )
         )
+    # The lookup tables belong to no version entry; the category index pins them so a selection fetches them and
+    # the loader can verify them before it rebuilds the lookup YAML.
+    support = [
+        _artifact(
+            out,
+            f"{DATA_PREFIX}/{name}.parquet",
+            artifact_id=name,
+            role="lookup-metadata",
+            fmt="parquet",
+            schema=schema,
+            rows=pq.ParquetFile(out / DATA_PREFIX / f"{name}.parquet").metadata.num_rows,
+        )
+        for name, schema in (
+            (REUSE_MANIFEST_NAME, OP_REUSE_MANIFEST_SCHEMA_ID),
+            (QUERY_VERSIONS_NAME, OP_QUERY_VERSIONS_SCHEMA_ID),
+        )
+    ]
     _write_json(
         out / CATEGORY_INDEX_PATH,
-        CategoryIndex(schema_version="aisim-category-index/v1", category="op-latency", entries=entries).model_dump(
-            by_alias=True, mode="json"
-        ),
+        CategoryIndex(
+            schema_version="aisim-category-index/v1", category="op-latency", entries=entries, support=support
+        ).model_dump(by_alias=True, mode="json"),
     )
     _write_json(
         out / DATASET_INDEX_PATH,

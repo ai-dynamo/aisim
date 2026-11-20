@@ -20,9 +20,10 @@ from __future__ import annotations
 import hashlib
 import shutil
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pyarrow.parquet as pq
 
@@ -49,6 +50,15 @@ class OpTreeLoad:
     seconds: float
 
 
+def _op_latency_index(tree: Path) -> CategoryIndex:
+    tree = Path(tree)
+    dataset = DatasetIndex.model_validate_json(_file(tree, DATASET_INDEX_PATH).read_bytes())
+    reference = dataset.categories.get("op-latency")
+    if reference is None:
+        raise LoaderError(f"{tree} has no op-latency category")
+    return CategoryIndex.model_validate_json(_verify(tree, reference.index).read_bytes())
+
+
 def op_latency_entries(
     tree: Path,
     *,
@@ -56,18 +66,26 @@ def op_latency_entries(
     framework: Iterable[str] | None = None,
 ) -> list[Entry]:
     """Catalog entries of the ``op-latency`` category under ``tree`` (verified index files)."""
-    tree = Path(tree)
-    dataset = DatasetIndex.model_validate_json(_file(tree, DATASET_INDEX_PATH).read_bytes())
-    reference = dataset.categories.get("op-latency")
-    if reference is None:
-        raise LoaderError(f"{tree} has no op-latency category")
-    index = CategoryIndex.model_validate_json(_verify(tree, reference.index).read_bytes())
+    index = _op_latency_index(tree)
     hardware, framework = set(hardware or ()), set(framework or ())
     return [
         e
         for e in index.entries
         if (not hardware or e.identity.hardware in hardware) and (not framework or e.identity.framework in framework)
     ]
+
+
+def read_entry_manifest(tree: Path, entry: Entry, config: Mapping[str, Any] | None = None) -> Manifest:
+    """The verified manifest of a catalog entry: the index's pinned digest first, then the contents, then identity.
+
+    A replacement manifest can keep an identity and declare other table bytes; only the catalog's digest for it
+    says which manifest the dataset published.
+    """
+    _verify(Path(tree), entry.manifest)
+    manifest = OpLatencyLoader().read_manifest(Path(tree), entry.manifest.path, config)
+    if manifest.configuration_id != entry.configuration_id:
+        raise LoaderError(f"manifest {entry.manifest.path} does not match its catalog entry")
+    return manifest
 
 
 def load_op_latency_tree(
@@ -90,7 +108,6 @@ def load_op_latency_tree(
     tree, destination = Path(tree), Path(destination).absolute()
     if destination.exists():
         raise FileExistsError(f"{destination} already exists; choose a new directory")
-    loader = OpLatencyLoader()
     if entries is None:
         entries = op_latency_entries(tree, hardware=hardware, framework=framework)
     if not entries:
@@ -99,12 +116,19 @@ def load_op_latency_tree(
     files = size = 0
     runtime: set[str] = set()
     try:
+        declared: dict[str, tuple[str, int]] = {}
         for entry in sorted(entries, key=lambda e: e.manifest.path):
-            manifest = loader.read_manifest(tree, entry.manifest.path)
+            manifest = read_entry_manifest(tree, entry)
             if manifest.identity.model is not None:
                 raise LoaderError("operation table storage must remain model-independent")
             for artifact in manifest.artifacts:
                 if artifact.runtime_path is None:
+                    continue
+                content = (artifact.sha256, artifact.bytes)
+                if declared.setdefault(artifact.runtime_path, content) != content:
+                    # Two manifests meeting at one destination must agree; neither may silently replace the other.
+                    raise LoaderError(f"manifests declare different content for {artifact.runtime_path}")
+                if artifact.runtime_path in runtime:
                     continue
                 target = destination / artifact.runtime_path
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -161,12 +185,22 @@ def op_latency_inputs_digest(
 
 
 def _write_lookup_yaml(tree: Path, destination: Path) -> tuple[str, ...]:
-    """Rebuild the packaged lookup YAML files from the source text embedded in their Parquet tables."""
+    """Rebuild the lookup YAML files from the source text embedded in their pinned Parquet tables.
+
+    The tables are bound to the category index (``support``) and verified against its digests before their
+    metadata is read. A dataset that does not publish one fails the load: the packaged copy is never a substitute
+    for a pinned lookup. A tree whose index predates ``support`` can still be read from a local directory, with
+    only the checksum embedded in the file to guard it.
+    """
+    support = {a.path: a for a in _op_latency_index(tree).support}
     written = []
     for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME):
-        path = tree / DATA_PREFIX / f"{name}.parquet"
-        if not path.is_file() or path.is_symlink():
-            continue
+        relative = f"{DATA_PREFIX}/{name}.parquet"
+        path = Path(tree) / relative
+        if relative in support:
+            _verify(Path(tree), support[relative])
+        elif not path.is_file() or path.is_symlink():
+            raise LoaderError(f"the dataset does not publish {relative}; it is required and has no packaged substitute")
         metadata = pq.read_metadata(path).metadata or {}
         text = metadata.get(_SOURCE_YAML_KEY)
         expected = metadata.get(b"aisim.source_sha256")

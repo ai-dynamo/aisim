@@ -308,6 +308,13 @@
       "const": "aisim-category-index/v1",
       "title": "Schema Version",
       "type": "string"
+    },
+    "support": {
+      "items": {
+        "$ref": "#/$defs/Artifact"
+      },
+      "title": "Support",
+      "type": "array"
     }
   },
   "required": [
