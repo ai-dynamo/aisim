@@ -141,6 +141,11 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
     clear_all_op_caches()
 
 
+def explicit_systems_paths() -> list[str] | None:
+    """The roots this process holds now (an override or an earlier lookup), or ``None``; never composes the default."""
+    return None if _SYSTEMS_PATHS is None else list(_SYSTEMS_PATHS)
+
+
 def get_systems_paths() -> list[str]:
     global _SYSTEMS_PATHS
     if _SYSTEMS_PATHS is None:

@@ -21,7 +21,7 @@ import math
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
 from dataclasses import field as dataclass_field
 from importlib import resources as pkg_resources
@@ -260,14 +260,17 @@ class ForwardPassPerfModelConfig:
         )
         return cls(**json.loads(payload))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, resolve_systems_paths: bool = True) -> dict[str, Any]:
+        """Wire form. ``resolve_systems_paths=False`` leaves an empty ``systems_paths`` for a dataset pin to fill."""
         payload = asdict(self)
         # Additive identity stays out of payloads that do not set it.
         for name in ("encoder_parallel", "deployment_limits", "afd_routing_location", "afd_pool_role"):
             if payload[name] is None:
                 payload.pop(name)
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
-        if self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths:
+        if resolve_systems_paths and (
+            self.estimation_mode not in {"fpm_regression", "fpm_learned"} or self.systems_paths
+        ):
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(
                 self.systems_paths, require_directories=not _carries_state_snapshot(self.estimator_config)
             )
@@ -1031,7 +1034,10 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
 
     if ensuring():  # the loader's own readiness check constructs a model from the prepared config
         return None
-    payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    # Paths stay unresolved here: an empty list is for the pin to fill, not for the default dataset to answer first.
+    payload = (
+        config.to_dict(resolve_systems_paths=False) if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    )
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
     pin = pin if pin is not None else pin_from_environment()
@@ -1057,10 +1063,18 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     # The literal ``default`` token is an explicit request for the default tables, not an unset value.
     if any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in named or ()):
         return True
-    # An unset value expands to ``set_systems_paths``, then the environment variable, then the default root.
-    roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
     # Default setup never writes this variable, so even an explicit default-root path is a caller choice.
-    return os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None or roots != [_default_systems_root()]
+    if os.environ.get("AICONFIGURATOR_SYSTEMS_PATH") is not None:
+        return True
+    # An unset value expands to ``set_systems_paths`` or the default root. Compare without composing the default
+    # dataset: a saved source answers these runs, and offline hosts may have none cached.
+    if named:
+        roots = _resolve_forward_pass_systems_paths(tuple(named), require_directories=False)
+    else:
+        from aisim_core.sdk.perf_database import explicit_systems_paths
+
+        roots = explicit_systems_paths() or []
+    return bool(roots) and not _is_default_systems_roots(roots)
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
@@ -1112,23 +1126,41 @@ def _validate_worker_type(worker_type: str) -> str:
 
 
 def _default_systems_root() -> str:
-    """The default systems root: composed from the pinned op-latency dataset on first use, never the packaged
-    ``aisim_core/systems`` directory (which no longer holds operation tables)."""
+    """The default systems root: composed (and, on a cold cache, fetched) from the pinned op-latency dataset on first
+    use. It is never the packaged ``aisim_core/systems`` directory, which holds no operation tables."""
     from aisim_core.data.default_systems import default_systems_path
 
     return default_systems_path()
 
 
-def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
-    if not entries:
-        from aisim_core.sdk.perf_database import get_systems_paths
+def _is_default_systems_roots(roots: Iterable[str]) -> bool:
+    """Whether ``roots`` are only the default root this process has already composed.
 
-        entries = tuple(get_systems_paths())
+    Never composes or downloads it: a root list that was not expanded from the default cannot equal a root this
+    process has not built, and a comparison must not make a custom root depend on the dataset cache.
+    """
+    from aisim_core.data.default_systems import resolved_default_systems_path
+
+    default = resolved_default_systems_path()
+    roots = tuple(roots)
+    return default is not None and bool(roots) and all(root == default for root in roots)
+
+
+def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
-    # The default root alone can be a caller's expansion of unset roots; preserve the environment's choice. A literal
-    # ``default`` is an explicit request for the default data (the sweeper keeps the token), so the environment
-    # variable never replaces it.
-    if env_root is not None and entries and all(entry == _default_systems_root() for entry in entries):
+    if not entries:
+        from aisim_core.sdk import perf_database
+
+        # Unset roots follow the SDK's configured roots. With no override held, an environment root is used before
+        # the default dataset is composed (and, on a cold cache, fetched).
+        if env_root is not None and perf_database.explicit_systems_paths() is None:
+            entries = (env_root,)
+        else:
+            entries = tuple(perf_database.get_systems_paths())
+    if env_root is not None and _is_default_systems_roots(entries):
+        # The default root alone is a caller's expansion of unset roots; preserve the environment's choice. A literal
+        # ``default`` is an explicit request for the default data (the sweeper keeps the token), so it never equals
+        # the root and the environment variable never replaces it.
         entries = (env_root,)
     resolved: list[str] = []
     for entry in entries:

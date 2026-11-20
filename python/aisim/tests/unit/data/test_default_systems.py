@@ -111,3 +111,89 @@ def test_default_download_transport_is_a_base_dependency():
         for requirement in project["dependencies"]
     }
     assert "huggingface_hub" in base
+
+
+@pytest.fixture
+def cold_offline(monkeypatch):
+    """No default data anywhere: composing the default root would raise, so success proves it was not touched."""
+    from aisim_core.sdk import perf_database as pdb
+
+    monkeypatch.setenv("AISIM_DATA_OFFLINE", "1")
+    monkeypatch.setattr(pdb, "_SYSTEMS_PATHS", None)
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+    with pytest.raises(MissingDataError):
+        ds.default_systems_path()
+    return pdb
+
+
+def test_environment_root_is_used_before_the_default_is_composed(cold_offline, tmp_path, monkeypatch):
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(custom))
+    assert _resolve_forward_pass_systems_paths(()) == [str(custom)]
+
+
+def test_a_process_override_is_used_without_composing_the_default(cold_offline, tmp_path, monkeypatch):
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
+    custom, other = tmp_path / "custom", tmp_path / "other"
+    custom.mkdir()
+    other.mkdir()
+    cold_offline.set_systems_paths(str(custom))
+    assert _resolve_forward_pass_systems_paths(()) == [str(custom)]
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(other))  # an explicit override still outranks the variable
+    assert _resolve_forward_pass_systems_paths(()) == [str(custom)]
+
+
+def test_without_an_override_the_default_is_still_composed(cold_offline):
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
+    with pytest.raises(MissingDataError, match="no fallback"):
+        _resolve_forward_pass_systems_paths(())
+
+
+def test_a_dataset_pin_selects_its_root_before_the_default_dataset_resolves(cold_offline, tmp_path, monkeypatch):
+    import aisim_core.data.ensure as ensure_module
+    from aisim_core.data.ensure import DataPin
+    from aisim_core.sdk import ForwardPassPerfModelConfig
+    from aisim_core.sdk.rust_engine_step import _ensure_dataset
+
+    seen = []
+    monkeypatch.setattr(ensure_module, "ensure_data", lambda payload, pin: seen.append(payload) or "selected")
+    identity = {"model": "m", "system": "s", "backend": "vllm", "worker_type": "decode"}
+    pin = DataPin(local_root=tmp_path, categories=("op-latency",))
+    typed = ForwardPassPerfModelConfig(**identity)
+    assert _ensure_dataset(typed, pin) == _ensure_dataset(identity, pin) == "selected"
+    assert len(seen) == 2 and not any(payload.get("systems_paths") for payload in seen)  # left for the pin to fill
+    with pytest.raises(MissingDataError):  # the remaining default still resolves when no pin wired a root
+        typed.to_dict()
+
+
+def test_custom_roots_never_compose_the_default_even_when_the_environment_names_one(
+    cold_offline, tmp_path, monkeypatch
+):
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
+    custom, environment = tmp_path / "custom", tmp_path / "environment"
+    custom.mkdir()
+    environment.mkdir()
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(environment))
+    # Only the default root alone is an expansion of unset roots, and it is not composed in this process.
+    assert _resolve_forward_pass_systems_paths((str(custom),)) == [str(custom)]
+
+
+def test_naming_roots_is_decided_without_composing_the_default(cold_offline, tmp_path, monkeypatch):
+    from aisim_core.sdk.rust_engine_step import _names_systems_paths
+
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    assert _names_systems_paths({"systems_paths": [str(custom)]}) is True
+    assert _names_systems_paths({"systems_paths": ["Default"]}) is True  # the literal token is an explicit request
+    assert _names_systems_paths({}) is False  # unset: the default root, which a saved source may answer instead
+    cold_offline.set_systems_paths(str(custom))
+    assert _names_systems_paths({}) is True
+    monkeypatch.setattr(cold_offline, "_SYSTEMS_PATHS", None)  # drop the override; only the variable names roots
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(custom))
+    assert _names_systems_paths({}) is True
