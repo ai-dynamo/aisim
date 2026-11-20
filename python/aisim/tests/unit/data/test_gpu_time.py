@@ -217,3 +217,76 @@ def test_kubernetes_rejects_unfinished_or_gpu_less(job, pods):
         job = {**job, "spec": {}}
     with pytest.raises(KubeParseError):
         gpu_time_from_kubernetes(job, pods)
+
+
+# ------------------------------------------------------------------ review regressions
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"wall_seconds": float("inf"), "gpu_count": 1, "gpu_seconds": 0.0},
+        {"wall_seconds": float("nan"), "gpu_count": 1},
+        {"wall_seconds": 1.0, "gpu_count": 1, "gpu_seconds": float("inf")},
+        {"wall_seconds": 1.0, "gpu_count": 1, "node_hours": float("inf")},
+        {"wall_seconds": 1e308, "gpu_count": 8},  # finite operands whose product overflows
+    ],
+)
+def test_non_finite_gpu_time_is_rejected(kwargs):
+    with pytest.raises(ValueError):
+        GpuTime(authority="measured", **kwargs)
+    assert GpuTime(authority="measured", wall_seconds=0.0, gpu_count=0).gpu_seconds == 0.0  # finite zero stays valid
+
+
+def test_non_finite_attempts_and_phases_are_rejected():
+    from aisim_core.data.gpu_time import Attempts, Phases
+
+    with pytest.raises(ValueError):
+        Attempts(count=1, wall_seconds=float("inf"), gpu_seconds=1.0)
+    with pytest.raises(ValueError):
+        Phases(warmup=float("nan"))
+
+
+def test_malformed_gpu_allocation_is_not_a_zero_gpu_job():
+    from aisim_core.data.gpu_time import SlurmParseError, _gpus_from_tres
+
+    with pytest.raises(SlurmParseError, match="bad GPU allocation"):
+        _gpus_from_tres("cpu=8,gres/gpu=oops")
+    with pytest.raises(SlurmParseError, match="bad GPU allocation"):
+        _gpus_from_tres("gres/gpu:h100=")
+    assert _gpus_from_tres("cpu=8,mem=4G") == (0, None)  # a CPU-only record keeps its intentional zero
+    assert _gpus_from_tres("cpu=8,gres/gpumem=80G,gres/gpu=2")[0] == 2  # other gres/gpu* resources are not GPUs
+
+
+def _failed_pod(container_status):
+    return {
+        "metadata": {"name": "bad"},
+        "spec": {"containers": [{"resources": {"requests": {"nvidia.com/gpu": "4"}}}]},
+        "status": {"phase": "Failed", "containerStatuses": container_status},
+    }
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"terminated": {"startedAt": "2026-11-07T00:01:00Z"}},  # started, never finished
+        {"terminated": {"startedAt": "2026-11-07T00:01:00Z", "finishedAt": "garbage"}},
+        {"running": {"startedAt": "2026-11-07T00:01:00Z"}},
+    ],
+)
+def test_incomplete_failed_pod_execution_records_are_rejected(state):
+    from aisim_core.data.gpu_time import KubeParseError, gpu_time_from_kubernetes
+
+    good = _pod("ok", "Succeeded", "2026-11-07T00:10:00Z", "2026-11-07T00:20:00Z")
+    with pytest.raises(KubeParseError):
+        gpu_time_from_kubernetes(_JOB, [_failed_pod([{"state": state}]), good])
+
+
+def test_a_failed_pod_that_never_started_costs_nothing():
+    from aisim_core.data.gpu_time import gpu_time_from_kubernetes
+
+    good = _pod("ok", "Succeeded", "2026-11-07T00:10:00Z", "2026-11-07T00:20:00Z")
+    never = _failed_pod([{"state": {"waiting": {"reason": "ImagePullBackOff"}}}])
+    assert gpu_time_from_kubernetes(_JOB, [never, good]).failed is None
+    full = _pod("full", "Failed", "2026-11-07T00:01:00Z", "2026-11-07T00:02:00Z")
+    assert gpu_time_from_kubernetes(_JOB, [full, good]).failed.gpu_seconds == 240

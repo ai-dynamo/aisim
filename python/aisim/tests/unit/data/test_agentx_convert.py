@@ -230,11 +230,15 @@ def test_alias_spellings_give_the_same_profile_counts_and_metrics(tmp_path):
         row["status"] = {"completed": "success"}.get(row["status"], row["status"])
     (aliased_path / "observations.json").write_text(json.dumps(rows))
     aliased = agentx_bundle_to_configuration(aliased_path)
-    summary = lambda d: (  # noqa: E731
-        (d.observations[0].requests_total, d.observations[0].requests_completed, d.observations[0].requests_failed),
-        [(m.metric, m.statistic, m.value) for m in d.metrics],
-        [(r.phase, r.status) for r in d.requests],
-    )
+
+    def summary(d):
+        obs = d.observations[0]
+        return (
+            (obs.requests_total, obs.requests_completed, obs.requests_failed),
+            [(m.metric, m.statistic, m.value) for m in d.metrics],
+            [(r.phase, r.status) for r in d.requests],
+        )
+
     assert summary(aliased) == summary(canonical)
     assert canonical.observations[0].requests_total == 3 and canonical.observations[0].requests_completed == 2
 

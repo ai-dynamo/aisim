@@ -16,6 +16,7 @@ Kubernetes capture reads Job and Pod documents through a caller-supplied
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,17 +41,17 @@ class Attempts(_Record):
     """GPU time spent on attempts that did not produce the result."""
 
     count: int = Field(ge=0)
-    wall_seconds: float = Field(ge=0)
-    gpu_seconds: float = Field(ge=0)
+    wall_seconds: float = Field(ge=0, allow_inf_nan=False)
+    gpu_seconds: float = Field(ge=0, allow_inf_nan=False)
 
 
 class Phases(_Record):
     """Wall-second split; every phase is independently nullable (null = not recorded)."""
 
-    setup_load: float | None = Field(default=None, ge=0)
-    warmup: float | None = Field(default=None, ge=0)
-    measure: float | None = Field(default=None, ge=0)
-    teardown: float | None = Field(default=None, ge=0)
+    setup_load: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    warmup: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    measure: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    teardown: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class GpuTime(_Record):
@@ -58,9 +59,9 @@ class GpuTime(_Record):
     authority: Authority
     gpu_type: str | None = Field(default=None, min_length=1)
     gpu_count: int | None = Field(default=None, ge=0)
-    wall_seconds: float | None = Field(default=None, ge=0)
-    gpu_seconds: float | None = Field(default=None, ge=0)
-    node_hours: float | None = Field(default=None, ge=0)
+    wall_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    gpu_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    node_hours: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     phases: Phases | None = None
     failed: Attempts | None = None
     retried: Attempts | None = None
@@ -79,6 +80,8 @@ class GpuTime(_Record):
         if self.gpu_count is None or self.wall_seconds is None:
             raise ValueError(f"authority {self.authority!r} requires gpu_count and wall_seconds")
         expected = self.wall_seconds * self.gpu_count
+        if not math.isfinite(expected):
+            raise ValueError("wall_seconds * gpu_count is not finite")
         if self.gpu_seconds is None:
             object.__setattr__(self, "gpu_seconds", expected)
         elif abs(self.gpu_seconds - expected) > _CONSISTENCY_TOL * max(1.0, expected):
@@ -171,8 +174,13 @@ def _gpus_from_tres(tres: str) -> tuple[int, str | None]:
     typed: dict[str, int] = {}
     untyped = 0
     for item in tres.split(","):
-        match = _TRES_GPU.match(item.strip())
+        item = item.strip()
+        match = _TRES_GPU.match(item)
         if not match:
+            key = item.partition("=")[0]
+            if key == "gres/gpu" or key.startswith("gres/gpu:"):
+                # A GPU entry with an unreadable quantity is a corrupt record, never a zero-GPU job.
+                raise SlurmParseError(f"bad GPU allocation {item!r} in AllocTRES")
             continue
         gpu_type, count = match.groups()
         if gpu_type:
@@ -304,6 +312,10 @@ class KubeParseError(ValueError):
     pass
 
 
+class _NeverStarted(KubeParseError):
+    """A pod with no container execution record at all."""
+
+
 class KubeReader(Protocol):
     """Read-only view of a cluster; implement with kubectl/client or a test fake.
 
@@ -339,16 +351,24 @@ def _gpus_requested(spec: Mapping[str, Any], resource: str) -> int:
 
 
 def _pod_window(pod: Mapping[str, Any]) -> tuple[datetime, datetime]:
-    """Start and end of container execution; excludes scheduling/queue wait."""
+    """Start and end of container execution; excludes scheduling/queue wait.
+
+    A pod whose containers never started raises :class:`_NeverStarted`; a container with a partial or corrupt
+    execution record (started, never finished; bad timestamps) raises :class:`KubeParseError`.
+    """
     status = pod.get("status") or {}
+    name = (pod.get("metadata") or {}).get("name", "?")
     starts, ends = [], []
     for cs in status.get("containerStatuses") or []:
-        term = (cs.get("state") or {}).get("terminated")
+        state = cs.get("state") or {}
+        term = state.get("terminated")
         if term and term.get("startedAt") and term.get("finishedAt"):
             starts.append(_ts(term["startedAt"], "startedAt"))
             ends.append(_ts(term["finishedAt"], "finishedAt"))
+        elif (term or {}).get("startedAt") or (state.get("running") or {}).get("startedAt"):
+            raise KubeParseError(f"pod {name} has a container that started but has no finish time")
     if not starts:
-        raise KubeParseError(f"pod {(pod.get('metadata') or {}).get('name', '?')} has no terminated container times")
+        raise _NeverStarted(f"pod {name} has no terminated container times")
     return min(starts), max(ends)
 
 
@@ -383,7 +403,7 @@ def gpu_time_from_kubernetes(
         gpus = _gpus_requested(pod.get("spec") or {}, gpu_resource) or _gpus_requested(template_spec, gpu_resource)
         try:
             start, end = _pod_window(pod)
-        except KubeParseError:
+        except _NeverStarted:
             if phase != "Succeeded":
                 # A failed pod that never started consumed no allocated GPU time.
                 continue
