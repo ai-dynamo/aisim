@@ -439,3 +439,35 @@ fn work_that_starts_before_an_idle_engine_sees_a_load_runs_before_it() {
     assert_eq!(run(false), (Some(720.0), None));
     assert_eq!(run(true), (Some(830.0), Some(720.0)));
 }
+
+#[test]
+fn an_arrival_during_a_loads_idle_to_busy_launch_joins_the_next_pass() {
+    // As above, A's copy ends at 718, after the empty step's poll at 710.
+    // The engine sees it only after R finishes at 720. A's prefill must be
+    // decided then, so its 20 ms launch ends at 740 and the next decision
+    // includes N, which arrives at 735. A prefills from 720 to 820, and N
+    // joins its next pass at 820. Inheriting the old 710 decision instead
+    // closes the arrival window at 730 and delays N until 830.
+    let five_blocks_in_8_ms = 320.0 / (8.0 * 1e6);
+    let report = run_tokens(
+        polled_cpu_tier(20, five_blocks_in_8_ms),
+        vec![
+            tokens_request(1, (0..20).collect(), 1, 0.0),
+            tokens_request(2, (500..576).collect(), 1, 300.0),
+            tokens_request(3, (900..904).collect(), 3, 600.0),
+            tokens_request(4, (0..24).collect(), 4, 605.0),
+            tokens_request(6, (3000..3012).collect(), 2, 735.0),
+        ],
+    );
+    let restored = record(&report, 4);
+    assert_eq!(restored.first_admit_ms, Some(720.0));
+    assert_eq!(restored.first_admission_host_reused_input_tokens, Some(20));
+    assert_eq!(record(&report, 6).first_admit_ms, Some(820.0));
+    assert_eq!(report.per_request.len(), 5);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|request| request.output_length == request.requested_output_length)
+    );
+}
