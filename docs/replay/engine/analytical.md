@@ -56,6 +56,7 @@ before compilation; conflicting common and AFD-specific values are errors.
 | `workers.<role>.hardware` | Supplies the fallback hardware for both A/F pools; explicit pool hardware overrides this fallback. |
 | `workers.<role>.scheduler.max_sequences` | Optional pool-wide admission cap, at most `A replicas * a_batch_size`. Omission retains that derived cap. Recommend accepts the common integer domains. |
 | `workers.<role>.scheduler.max_batched_tokens` | Sets the SGLang prefill chunk/token budget; must agree with an explicit `afd.chunked_prefill_size`. Omission retains the AFD prompt-window default. |
+| `workers.<role>.scheduler.chunked_prefill_size` | Unsupported for AFD. Set `workers.<role>.afd.chunked_prefill_size` to control the chunk window. |
 | `workers.<role>.scheduler.prefill_decode_interval` | Uses the common SGLang scheduler behavior in predict. |
 | `workers.<role>.kv_cache.prefix_caching` | Preserves the caller's cache setting instead of relying on the native default. |
 | `workers.<role>.kv_cache.block_size` | Only 1 is supported. |

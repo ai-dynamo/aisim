@@ -734,6 +734,8 @@ Serialized schema identifiers and v1 field names, historical measurements and re
 
 Dedicated runner selectors use the deployed `prod-aisim-default-amd64-v1` and `prod-aisim-default-arm64-v1` labels. [Velonix #882](https://github.com/ai-dynamo/velonix/pull/882) registered the replacement pools, and [AISim #861](https://github.com/ai-dynamo/aisim/pull/861) updated the workflow consumers. The shared pool remains `dynamo-cpu-4gi-amd64`. Keep selectors and `.github/actionlint.yaml` aligned with registered pools; do not restore retired labels on active branches. The `runner-canary.yml` workflow checks exact source, architecture, writable `HOME`, and dedicated `/scratch`. Its production matrix declares `HOME: /__w/aisim/aisim` at job level so steps retain that value even when container setup supplies `/github/home`.
 
+Prediction regression collection calls the reusable canary and waits for its dedicated-architecture and shared-runner smoke matrix alongside comparison-ref resolution. Both snapshot jobs use the canary's amd64 pool, container image and job-level `HOME`; a failed, cancelled or skipped canary prevents collection.
+
 ### Approved hash namespace change
 
 The team approved renaming the Weka corpus, Weka semantics, lifecycle, and synthetic token-generation hash domain tags from `aisimulate` to `aisim`. The pinned expectations were independently recalculated before testing. This intentionally changes source and lifecycle fingerprints and the generated token stream; the token generator records version 2 so saved manifests distinguish the new stream. The canonical graph-content digest remains unchanged for the pinned Weka fixture because its lowered graph contents are unchanged.

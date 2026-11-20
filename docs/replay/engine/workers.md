@@ -52,7 +52,8 @@ engine:
 | `workers.<role>.parallelism.moe_expert` | `1` | Searched | MoE expert parallelism. Repartitions the worker's GPUs and does not add GPUs. |
 | `workers.<role>.parallelism.prefill_context` | Unset (1) | predict only | Prefill context parallelism (vLLM `-pcp`, SGLang `--attn-cp-size`). Adds GPUs. |
 | `workers.<role>.parallelism.decode_context` | Unset (1) | predict only | Decode context parallelism (vLLM `-dcp`, SGLang `--dcp-size`). Must divide `tensor`; adds no GPUs. |
-| `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass: per attention-DP rank on vLLM, the worker's launch value on SGLang. See [SGLang note](#batch-limits). |
+| `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass: per attention-DP rank on vLLM, the worker's launch value on SGLang. Also the per-rank SGLang prefill ceiling when an explicit chunk is set. See [SGLang note](#batch-limits). |
+| `workers.<role>.scheduler.chunked_prefill_size` | Unset (backend default) | Fixed, choices, or integer range | SGLang only. Positive worker-wide prefill chunk budget, divided by `attention_data` inside replay. See [Batch limits](#batch-limits). |
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
@@ -193,13 +194,40 @@ the note below). A prefill role defaults
 to `max_sequences: 1`, so each prefill rank runs one request at a time unless
 you raise it.
 
-> **SGLang note.** On a disaggregated `prefill` or an `aggregated` worker,
-> `max_batched_tokens` is the worker's `chunked_prefill_size`
-> (`--chunked-prefill-size`), as SGLang launches it, rounded down to a
-> multiple of `block_size` (at least one block). With attention DP, SGLang
-> splits that launch value across the ranks, so each rank chunks at the
-> rounded value divided by `attention_data`. A decode worker keeps SGLang's
-> 8192-token default.
+> **SGLang note.** Set `scheduler.chunked_prefill_size` to control the prefill
+> chunk budget independently of `max_batched_tokens`. This is a **worker-wide**
+> budget: replay divides it by `attention_data` once. For example, 8192 with
+> two attention-DP ranks gives each rank a 4096-token chunk budget.
+> Each rank must receive at least one KV block. With an explicit chunk,
+> `max_batched_tokens` also sets the per-rank prefill admission ceiling
+> (`--max-prefill-tokens`), consistently in replay and generated deployments.
+> If omitted, aggregated and disaggregated prefill workers use
+> `max_batched_tokens` rounded down to a whole KV block (at least one block).
+> A decode worker keeps SGLang's 8192-token default.
+
+AFD workers configure their chunk window through `afd.chunked_prefill_size`.
+
+Predict takes a positive integer. Recommend also accepts `choices` or an
+integer `range` (linear or logarithmic), independently for each worker role.
+For example, this recommendation fragment searches the prefill worker's chunk
+size while retaining the decode worker's default:
+
+```yaml
+engine:
+  backend: sglang
+  workers:
+    prefill:
+      scheduler:
+        chunked_prefill_size:
+          choices: [4096, 8192, 16384]
+```
+
+The saved candidate prediction config contains the selected integer, so
+replaying it uses the same chunk budget. Explicit chunk settings require
+`backend: sglang`; they cannot be combined with a search over other backends.
+Chunks must satisfy replay's KV block-size alignment. Deployment artifact
+generation additionally requires multiples of 64; it rejects other explicit
+chunks instead of silently rounding the evaluated budget.
 
 <a id="pipeline-parallel-sglang-prefill"></a>
 

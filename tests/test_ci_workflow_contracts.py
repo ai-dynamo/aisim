@@ -43,12 +43,15 @@ WORKFLOW_ROOT = REPOSITORY_ROOT / ".github" / "workflows"
 ACTION_ROOT = REPOSITORY_ROOT / ".github" / "actions"
 
 
-@pytest.mark.parametrize("pool", ["amd64", "arm64"])
+@pytest.mark.parametrize("configuration", ["amd64", "arm64", "prediction"])
 @pytest.mark.parametrize("failed_probe", [None, "machine", "workspace", "scratch"])
-def test_runner_canary_probes_survive_container_home_override(tmp_path, pool, failed_probe):
+def test_runner_canary_probes_survive_container_home_override(tmp_path, configuration, failed_probe):
+    pool = "amd64" if configuration == "prediction" else configuration
     job = _workflow("runner-canary.yml")["jobs"]["canary"]
     entry = next(item for item in job["strategy"]["matrix"]["include"] if item["pool"] == pool)
     step = next(item for item in job["steps"] if "run" in item)
+    if configuration == "prediction":
+        job = _workflow("prediction-regression-gate.yml")["jobs"]["collect"]
     assert job["container"]["env"]["USER"] == "runner"
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"
@@ -909,7 +912,7 @@ def test_restored_workflows_are_active_at_repository_root() -> None:
 
 def test_runner_canary_checks_both_production_architectures_with_step_home() -> None:
     workflow = _workflow("runner-canary.yml")
-    assert set(workflow["on"]) == {"workflow_dispatch", "push"}
+    assert set(workflow["on"]) == {"workflow_call", "workflow_dispatch", "push"}
     assert workflow["on"]["push"]["branches"] == ["pull-request/*"]
     assert workflow["permissions"] == {"contents": "read"}
     production = workflow["jobs"]["canary"]
@@ -929,6 +932,25 @@ def test_runner_canary_checks_both_production_architectures_with_step_home() -> 
     shared = workflow["jobs"]["shared"]
     assert shared["runs-on"] == "dynamo-cpu-4gi-amd64"
     assert "container" not in shared  # Shared admission does not permit container pods.
+
+
+def test_prediction_collection_requires_matching_amd64_canary() -> None:
+    jobs = _workflow("prediction-regression-gate.yml")["jobs"]
+    canary = _workflow("runner-canary.yml")
+    production = canary["jobs"]["canary"]
+    collect = jobs["collect"]
+    assert jobs["canary"]["uses"] == "./.github/workflows/runner-canary.yml"
+    assert "workflow_call" in canary["on"]
+    assert set(collect["needs"]) == {"refs", "canary"}
+    # Default success() must stop both snapshots on failure, cancellation or skip.
+    assert "if" not in jobs["canary"]
+    assert "if" not in collect
+    assert not production.get("continue-on-error")
+    assert not collect.get("continue-on-error")
+    amd64 = next(pool for pool in production["strategy"]["matrix"]["include"] if pool["pool"] == "amd64")
+    assert collect["runs-on"] == amd64["runner"]
+    assert collect["container"] == production["container"]
+    assert collect["env"]["HOME"] == production["env"]["HOME"]
 
 
 def test_workflow_runner_selectors_match_registered_pools_and_runbook() -> None:
