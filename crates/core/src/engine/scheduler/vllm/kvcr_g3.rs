@@ -218,7 +218,7 @@ impl G3 {
     /// when the write ends and whether it dropped a block, or `None`, without
     /// a write, when every block on disk is in use.
     pub(super) fn write(&mut self, victim: HostBlockKey, now: f64) -> Option<(f64, bool)> {
-        let ends = now + (self.latency_ms + self.write_ms_per_block);
+        let ends = now + self.latency_ms + self.write_ms_per_block;
         assert!(ends.is_finite(), "kvcr.g3 write deadline overflow");
         let dropped = self.on_disk == self.capacity;
         if dropped {

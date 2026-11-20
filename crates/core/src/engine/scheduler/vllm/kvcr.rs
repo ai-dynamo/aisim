@@ -865,12 +865,6 @@ impl VllmKvcrAdapter {
         let Some(local) = &mut self.local else {
             return Vec::new();
         };
-        if let Some(g3) = &local.g3 {
-            assert!(
-                (now + g3.timeout_ms).is_finite(),
-                "kvcr.g3 deposit deadline overflow"
-            );
-        }
         let rerank = local.store_prefixes.remove(&store);
         let mut registry = self.registry.lock().unwrap();
         let mut tier = local.tier.lock();
@@ -892,6 +886,12 @@ impl VllmKvcrAdapter {
                     dropped += 1;
                 }
             }
+        }
+        if let Some(g3) = local.g3.as_ref().filter(|_| !waiting.is_empty()) {
+            assert!(
+                (now + g3.timeout_ms).is_finite(),
+                "kvcr.g3 deposit deadline overflow"
+            );
         }
         // Waiting blocks re-rank the request's blocks once the last of them
         // has its outcome.
