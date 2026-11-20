@@ -847,22 +847,14 @@ def test_predict_cli_spills_to_kvcr_g3_through_the_real_runtime(tmp_path, capsys
             "g3": {"num_blocks": 8, "latency_to_first_byte_ms": 0, "write_bandwidth_gbps": 0},
         },
     )
-    # Distinct prompts make the second completed store evict the first from
-    # KVCR memory. Each request leaves enough generation time for its G2 store.
-    trace = tmp_path / "requests.jsonl"
-    trace.write_text(
-        "\n".join(
-            json.dumps({"timestamp": i, "input_length": 33, "output_length": 4, "hash_ids": [i + 1, i + 2, i + 3]})
-            for i in (0, 10)
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    # Distinct synthetic prompts make the second completed store evict the
+    # first from KVCR memory. Generation gives each G2 store time to complete.
     config = {
         "engine": engine,
         "traffic": {
-            "source": {"type": "trace", "paths": [str(trace)], "format": "mooncake", "block_size": 16},
-            "load": {"type": "trace_timestamps"},
+            "source": {"type": "synthetic", "input_tokens": 33, "output_tokens": 4},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 2},
         },
     }
     path = tmp_path / "g3.yaml"
