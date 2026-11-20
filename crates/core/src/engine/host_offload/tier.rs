@@ -169,28 +169,6 @@ pub(crate) struct ExternalPlan {
 }
 
 impl ExternalPlan {
-    /// Partition an already finished plan into two transfers without changing
-    /// its combined capacity or victim selection. Commit both nonempty parts
-    /// before any further planning; the first nonempty part evicts the victims.
-    pub(crate) fn partition(mut self, own: impl FnMut(&HostBlockKey) -> bool) -> (Self, Self) {
-        let (first, second) = std::mem::take(&mut self.reserved)
-            .into_iter()
-            .partition(own);
-        self.reserved = first;
-        let mut other = Self {
-            free: 0,
-            protected: FxHashSet::default(),
-            cursor: None,
-            victims: Vec::new(),
-            evicted: FxHashSet::default(),
-            reserved: second,
-        };
-        if self.reserved.is_empty() {
-            other.victims = std::mem::take(&mut self.victims);
-        }
-        (self, other)
-    }
-
     /// The planned keys, in plan order.
     pub(crate) fn reserved(&self) -> &[HostBlockKey] {
         &self.reserved
@@ -201,6 +179,10 @@ impl ExternalPlan {
         &self.victims
     }
 }
+
+/// The last block the searches of [`HostTier::oldest_evictable`] passed.
+#[derive(Default)]
+pub(crate) struct EvictionCursor(Option<NonZeroU32>);
 
 /// Result of scheduling an H2D selected by a framework adapter.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -816,18 +798,26 @@ impl HostTier {
     }
 
     /// The least recently used resident block that no pin holds and the
-    /// caller does not keep: the one a caller-managed pool evicts next.
+    /// caller does not keep: the one a caller-managed pool evicts next. The
+    /// search resumes after the blocks `passed` records and adds those it
+    /// passes, so start a fresh cursor once `kept` changes or a passed block
+    /// may have been re-ranked.
     pub(crate) fn oldest_evictable(
         &self,
+        passed: &mut EvictionCursor,
         kept: impl Fn(HostBlockKey) -> bool,
     ) -> Option<HostBlockKey> {
-        let evictable = |key: HostBlockKey| {
-            !kept(key)
+        for (node, key) in self.lru.oldest_after(passed.0) {
+            let evictable = !kept(key)
                 && self.entries.get(&key).is_some_and(|entry| {
                     entry.state == EntryState::Resident && entry.load_pins == 0
-                })
-        };
-        self.lru.victims(1, evictable).pop()
+                });
+            if evictable {
+                return Some(key);
+            }
+            passed.0 = Some(node);
+        }
+        None
     }
 
     /// Remove an unpinned resident in a caller-managed pool, publishing the same eviction effects
@@ -949,8 +939,8 @@ impl HostTier {
         self.plan_reserve_unless(plan, key, |_| false)
     }
 
-    /// Whether another absent key can fit, respecting this plan's protected
-    /// prefix and victim cursor without adding a reservation.
+    /// Whether one more external key can fit without evicting a protected
+    /// block. Unlike reserving, this leaves the plan unchanged on success too.
     pub(crate) fn plan_has_room(&self, plan: &ExternalPlan) -> bool {
         plan.free > 0
             || (self.config.eviction != HostEviction::Caller
@@ -1061,6 +1051,52 @@ impl HostTier {
             now_ms,
             Kind::External,
         )
+    }
+
+    /// Apply one prompt-ordered plan as two reservations, classified by
+    /// `first`. Both parts share its capacity decision and protected prefix.
+    /// Evict the victims once, before either part is admitted; no consumer
+    /// can observe the intermediate state of this synchronous operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_planned_partitioned(
+        &mut self,
+        client: u64,
+        owner: Uuid,
+        plan: ExternalPlan,
+        meta: Option<Vec<HostBlockMeta>>,
+        mut first: impl FnMut(HostBlockKey) -> bool,
+        now: f64,
+    ) -> [Option<TransferId>; 2] {
+        let now_ms = self.prepare_mutation(now);
+        let meta = match meta {
+            Some(meta) => meta.into_iter().map(Some).collect::<Vec<_>>(),
+            None => vec![None; plan.reserved.len()],
+        };
+        assert_eq!(meta.len(), plan.reserved.len());
+        let mut keys = [Vec::new(), Vec::new()];
+        let mut metadata = [Vec::new(), Vec::new()];
+        for (key, meta) in plan.reserved.into_iter().zip(meta) {
+            let part = usize::from(!first(key));
+            keys[part].push(key);
+            metadata[part].push(meta);
+        }
+        let mut victims = plan.victims;
+        std::array::from_fn(|part| {
+            if keys[part].is_empty() {
+                return None;
+            }
+            let units = (keys[part].len(), 1);
+            Some(self.admit(
+                client,
+                owner,
+                &std::mem::take(&mut victims),
+                std::mem::take(&mut keys[part]),
+                std::mem::take(&mut metadata[part]),
+                units,
+                now_ms,
+                Kind::External,
+            ))
+        })
     }
 
     /// Record that an external reservation stopped at `key` for lack of space.
@@ -3354,6 +3390,23 @@ pub(crate) mod tests {
             eviction: HostEviction::Caller,
         });
         assert!(result.err().unwrap().to_string().contains("private pool"));
+    }
+
+    #[test]
+    fn a_victim_search_resumes_after_the_blocks_the_last_one_passed() {
+        let mut tier = tier(4);
+        tier.config.eviction = HostEviction::Caller;
+        let now = make_resident(&mut tier, &[key(1), key(2), key(3), key(4)], 0.0);
+        let (passed, calls) = (&mut EvictionCursor::default(), std::cell::Cell::new(0));
+        let kept = |block| {
+            calls.set(calls.get() + 1);
+            block == key(1) || block == key(2)
+        };
+        // The second search starts at k4, not at the kept k1 and k2 again.
+        assert_eq!(tier.oldest_evictable(passed, kept), Some(key(3)));
+        assert!(tier.evict_resident(request_id(), key(3), now));
+        assert_eq!(tier.oldest_evictable(passed, kept), Some(key(4)));
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]

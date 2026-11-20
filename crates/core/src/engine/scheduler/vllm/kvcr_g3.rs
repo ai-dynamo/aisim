@@ -24,9 +24,8 @@ use std::collections::{BTreeSet, VecDeque};
 use rustc_hash::{FxHashMap, FxHashSet};
 use uuid::Uuid;
 
-use super::kvcr::Rerank;
+use super::kvcr::{Rerank, transfer_ms};
 use crate::engine::host_offload::{HostBlockKey, HostBlockMeta, TransferId};
-use crate::engine::offload_transfer::bytes_per_ms;
 use crate::engine::{KvEventData, KvEventTier, KvcrG3Config};
 
 /// The use that last ranked a block and the block's place in that use's key
@@ -106,7 +105,9 @@ pub(super) struct G3 {
     /// Blocks on disk or being written.
     on_disk: usize,
     uses: u64,
-    /// When the last read queued ends; reads run one after another.
+    /// When the last read queued ends; reads run one after another. The
+    /// write in flight does not slow them, nor they it, though a real drive
+    /// serves both.
     read_tail: f64,
     /// The blocks each read in flight holds, by the G2 reservation it fills.
     reads: FxHashMap<TransferId, Vec<HostBlockKey>>,
@@ -129,7 +130,7 @@ impl G3 {
         lru: bool,
         rank_block_bytes: usize,
     ) -> anyhow::Result<Self> {
-        let per_block = |gbps| rank_block_bytes as f64 / bytes_per_ms(gbps);
+        let per_block = |gbps| transfer_ms(rank_block_bytes, gbps);
         let (read_ms_per_block, write_ms_per_block) = (
             per_block(config.read_bandwidth_gbps),
             per_block(config.write_bandwidth_gbps),
@@ -265,23 +266,20 @@ impl G3 {
         self.evictable.insert((rank, victim));
     }
 
-    /// Check the absolute deadline before a caller commits a G2 reservation.
-    pub(super) fn read_end(&self, blocks: usize, now: f64) -> f64 {
-        let duration = self.latency_ms + blocks as f64 * self.read_ms_per_block;
-        let ends = self.read_tail.max(now) + duration;
-        assert!(ends.is_finite(), "kvcr.g3 read deadline overflow");
-        ends
-    }
-
     /// Hold `keys` on disk for a read into the G2 `reservation`, queued at
-    /// `now` behind the reads in flight. Returns when it ends.
+    /// `now` behind the reads in flight. Returns when it ends. The read
+    /// never fails; KVCR fails one that outlasts its operation timeout, 1 s
+    /// by default, which about 530 blocks of 9.4 MB reach at the default
+    /// rate.
     pub(super) fn read(
         &mut self,
         reservation: TransferId,
         keys: Vec<HostBlockKey>,
         now: f64,
     ) -> f64 {
-        let ends = self.read_end(keys.len(), now);
+        let read_ms = self.latency_ms + keys.len() as f64 * self.read_ms_per_block;
+        let ends = self.read_tail.max(now) + read_ms;
+        assert!(ends.is_finite(), "kvcr.g3 read deadline overflow");
         for key in &keys {
             let held = self.held.get_mut(key).expect("a read block is on disk");
             held.readers += 1;

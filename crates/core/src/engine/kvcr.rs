@@ -85,7 +85,7 @@ pub struct KvcrG3Stats {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct KvcrLocalG2Stats {
     /// Written after a G2 store completed (`local_fill`), counted when the
-    /// store completes.
+    /// copy into KVCR-owned memory completes.
     pub stored_blocks: u64,
     /// Not written: every other block was in use, or with `kvcr.g3` the
     /// block waited too long for room.
@@ -117,6 +117,8 @@ struct Pull {
     partial: bool,
     /// Whether the pull starts no earlier than the end of its source's pass.
     waits_for_source: bool,
+    /// Delivery waits for a local promotion as well as this peer transfer.
+    joined: bool,
 }
 
 /// Last completed peer-read batch for each key. Keeping only its last use
@@ -158,6 +160,9 @@ pub(crate) struct KvcrRegistry {
     moving: BTreeMap<KvHintSource, BTreeMap<u64, usize>>,
     /// Landed pulls not yet taken by their target, in landing order.
     landed: BTreeMap<KvHintSource, Vec<(u64, f64)>>,
+    /// Physically completed pulls waiting for their joined G2 reservations
+    /// to become readable. They no longer retain their source worker.
+    deliveries: FxHashMap<u64, Pull>,
     /// Untaken pulls each worker sources or receives.
     in_flight: BTreeMap<u64, usize>,
     next_pull: u64,
@@ -186,6 +191,7 @@ impl KvcrRegistry {
             client_events_stale: false,
             moving: BTreeMap::new(),
             landed: BTreeMap::new(),
+            deliveries: FxHashMap::default(),
             in_flight: BTreeMap::new(),
             next_pull: 0,
             stats,
@@ -402,6 +408,35 @@ impl KvcrRegistry {
             .waits_for_source = false;
     }
 
+    /// Count this pull's delivery only when its joined promotion is ready.
+    pub(crate) fn join_delivery(&mut self, id: u64) {
+        self.pulls
+            .get_mut(&id)
+            .expect("a staged pull exists")
+            .joined = true;
+    }
+
+    /// Both parts of a joined restore are readable in the target's G2.
+    pub(crate) fn complete_joined_delivery(&mut self, id: u64, at_ms: f64) {
+        let pull = self
+            .deliveries
+            .remove(&id)
+            .expect("a joined delivery follows its physical completion");
+        Self::record_delivery(&mut self.stats, &pull, at_ms);
+    }
+
+    fn record_delivery(stats: &mut KvcrStats, pull: &Pull, at_ms: f64) {
+        if pull.partial {
+            stats.pulls.partial += 1;
+        } else {
+            stats.pulls.success += 1;
+        }
+        stats.blocks += pull.blocks as u64;
+        stats.bytes += pull.bytes as u64;
+        stats.remote_deliver_ms += at_ms - pull.submitted_ms;
+        stats.source_wait_ms += pull.source_wait_ms;
+    }
+
     /// Stage a pull of `blocks` blocks from the registered `source` into
     /// `target`. It is parked until `start_parked`, so it waits for the
     /// source's pass even when that pass starts later at this instant; a DP
@@ -434,6 +469,7 @@ impl KvcrRegistry {
                 bytes,
                 partial,
                 waits_for_source: true,
+                joined: false,
             },
         );
         for worker in [target.worker_id, source.worker_id] {
@@ -523,15 +559,9 @@ impl KvcrRegistry {
                     self.moving.remove(&pull.target);
                 }
             }
-            if pull.partial {
-                self.stats.pulls.partial += 1;
-            } else {
-                self.stats.pulls.success += 1;
+            if !pull.joined {
+                Self::record_delivery(&mut self.stats, pull, at_ms);
             }
-            self.stats.blocks += pull.blocks as u64;
-            self.stats.bytes += pull.bytes as u64;
-            self.stats.remote_deliver_ms += at_ms - pull.submitted_ms;
-            self.stats.source_wait_ms += pull.source_wait_ms;
             let landed = self.landed.entry(pull.target).or_default();
             debug_assert!(
                 landed.last().is_none_or(|&(_, last)| last <= at_ms),
@@ -569,6 +599,9 @@ impl KvcrRegistry {
                 if *count == 0 {
                     self.in_flight.remove(&worker);
                 }
+            }
+            if pull.joined {
+                self.deliveries.insert(*id, pull);
             }
         }
         taken
