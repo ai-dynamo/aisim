@@ -1613,6 +1613,13 @@ def _kimi_k31_native_state(plan, bundle=_UNRESOLVED_BUNDLE) -> bool:
     return is_audited_runtime(bundle.manifest["runtime"])
 
 
+def _require_k31_execution_inputs(plan: FPMCollectionPlan) -> None:
+    from .database import _is_k31
+
+    if _is_k31(plan) and (not _kimi_k31_native_state(plan) or plan.runtime_launch is None):
+        raise ValueError("K3.1 execution requires an audited instrumentation bundle and accepted runtime launch")
+
+
 def _decode_prefix_caching_mode(cell: FPMCell, plan=None, *, bundle=_UNRESOLVED_BUNDLE) -> str:
     """Return the rendering/checkpoint policy for one decode strategy."""
     if plan is not None and _kimi_k31_native_state(plan, bundle):
@@ -2083,10 +2090,7 @@ def _run_collection_impl(
     publish_partial: bool = False,
     publish_database: bool = True,
 ) -> list[dict[str, object]]:
-    from .database import _is_k31
-
-    if _is_k31(plan) and (not _kimi_k31_native_state(plan) or plan.runtime_launch is None):
-        raise ValueError("K3.1 execution requires an audited instrumentation bundle and accepted runtime launch")
+    _require_k31_execution_inputs(plan)
     if _frozen_points(plan) is not None and smoke:
         raise ValueError("--fpm-benchmark-points-file cannot be combined with --smoke")
     run_started_at = _utc_now()

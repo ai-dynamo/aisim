@@ -1567,6 +1567,10 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     # Isolate cell lifecycle from model-specific native inventory. The actual
     # archived-worker validator has a separate real-envelope regression.
     monkeypatch.setattr(database, "_is_k31", lambda plan: True)
+    # The synthetic model above exercises both phases in one campaign, unlike
+    # K3.1's independent workers. Its entry requirements are covered separately
+    # by the profileless K3.1 execution rejection and native rendering tests.
+    monkeypatch.setattr(runner, "_require_k31_execution_inputs", lambda plan: None)
 
     def qualify(plan, cell, raw, collection):
         index = json.loads((raw.parent.parent.parent / "runtime-observations.json").read_text())
