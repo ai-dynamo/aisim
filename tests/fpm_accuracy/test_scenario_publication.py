@@ -471,6 +471,7 @@ def test_cli_qualifies_only_complete_pinned_snapshots(
     cases_by_path = {case.configuration.configuration_path: case for case in cases}
     dataset = SimpleNamespace(
         revision="b" * 40 if mode == "hf_revision_mismatch" else revision,
+        layout="unified",
         configurations=lambda: [case.configuration for case in cases],
         measurement_case=lambda configuration_path, **kwargs: cases_by_path[configuration_path],
     )
