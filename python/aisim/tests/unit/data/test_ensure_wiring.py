@@ -53,13 +53,37 @@ def test_a_saved_source_leaves_fpm_estimators_and_their_systems_paths_alone(monk
     config = {"estimation_mode": mode, "system": "h200_sxm", "systems_paths": [str(tmp_path / "fpm-tables")]}
     # The saved op-latency source would replace systems_paths, which carries these modes' FPM tables.
     assert res._ensure_dataset(config, None) is None and seen == []
-    # An operation-table run still uses the saved source ...
-    assert res._ensure_dataset({**config, "estimation_mode": "op_level"}, None) == "ensured"
+    # An operation-table run that names no roots still uses the saved source ...
+    unnamed = {k: v for k, v in config.items() if k != "systems_paths"}
+    assert res._ensure_dataset({**unnamed, "estimation_mode": "op_level"}, None) == "ensured"
     # ... and a source the environment or the caller names applies to every mode.
     monkeypatch.setenv("AISIM_DATASET", f"{REPO}@{SHA}")
     assert res._ensure_dataset(config, None) == "ensured"
     monkeypatch.delenv("AISIM_DATASET")
     assert res._ensure_dataset(config, ensure_mod.DataPin(repo=REPO, revision=SHA)) == "ensured"
+
+
+@pytest.mark.parametrize("mode", ["auto", "op_level"])
+def test_a_saved_source_never_replaces_the_roots_the_caller_named(monkeypatch, tmp_path, mode):
+    # ``auto`` falls back to the FPM estimators, which read their tables from the named roots.
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    seen = []
+    monkeypatch.setattr(ensure_mod, "ensure_data", lambda payload, pin: seen.append(payload) or "ensured")
+    named = {"estimation_mode": mode, "system": "h200_sxm", "systems_paths": [str(tmp_path / "tables")]}
+    assert res._ensure_dataset(named, None) is None and seen == []
+    config = res.ForwardPassPerfModelConfig(
+        model="m",
+        system="h200_sxm",
+        backend="vllm",
+        worker_type="prefill",
+        estimation_mode=mode,
+        systems_paths=(str(tmp_path),),
+    )
+    assert res._ensure_dataset(config, None) is None  # the object form names roots the same way
+    unnamed = {"estimation_mode": mode, "system": "h200_sxm"}
+    assert res._ensure_dataset(unnamed, None) == "ensured"  # no roots named: the op-latency source applies
+    monkeypatch.setenv("AISIM_DATASET", f"{REPO}@{SHA}")
+    assert res._ensure_dataset(named, None) == "ensured"  # a source the environment names overrides them
 
 
 @pytest.mark.parametrize("override", ["saved", "environment-repo", "environment-local", "explicit-pin"])

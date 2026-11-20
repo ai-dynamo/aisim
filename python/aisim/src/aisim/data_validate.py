@@ -18,7 +18,15 @@ from typing import Any, get_args
 from pydantic import ValidationError
 
 from aisim_core.data import Category, CategoryIndex, Manifest, _verify, check_dataset, check_envelope, check_manifest
-from aisim_core.data.fetch import Cache, Selection, SelectionError, Transport, fetch, resolve_revision
+from aisim_core.data.fetch import (
+    Cache,
+    Selection,
+    SelectionError,
+    Transport,
+    fetch,
+    fetch_support,
+    resolve_revision,
+)
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.names_check import check_names, discover_manifests
 
@@ -137,8 +145,11 @@ def validate_repo(repo: str, revision: str, *, transport: Transport, cache: Cach
             fetch(
                 Selection(category=category, select_all=True), repo=repo, revision=sha, transport=transport, cache=cache
             )
-        except SelectionError:  # the dataset has no such category (or it is empty)
-            continue
+        except SelectionError:  # the dataset has no such category, or it has no entries
+            try:
+                fetch_support(category, repo=repo, revision=sha, transport=transport, cache=cache)
+            except SelectionError:
+                continue  # an empty category still has the support files its index declares
     report = validate_local(cache.commit_root(repo, sha))
     report["source"] = {"repo": repo, "revision": sha, "requested_revision": revision}
     return report

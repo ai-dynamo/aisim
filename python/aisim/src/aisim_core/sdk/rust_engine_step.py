@@ -1037,11 +1037,18 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     pin = pin if pin is not None else pin_from_environment()
     if pin is None:
         return None
-    if pin.saved_source and payload.get("estimation_mode") in _FPM_ESTIMATION_MODES:
-        # The op-latency source saved by ``aisim init`` would replace the explicit ``systems_paths`` that carry
-        # these modes' FPM tables; only a source the caller or environment names applies to them.
+    if pin.saved_source and (payload.get("estimation_mode") in _FPM_ESTIMATION_MODES or _names_systems_paths(config)):
+        # The op-latency source saved by ``aisim init`` would replace the ``systems_paths`` the caller named, which
+        # carry the FPM tables of these modes and of the FPM candidates of ``auto``. The saved source is a default
+        # for runs that name no roots; only a source the caller or environment names overrides them.
         return None
     return ensure_data(payload, pin)
+
+
+def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> bool:
+    """Whether the caller itself named ``systems_paths`` (``to_dict`` fills in the default roots otherwise)."""
+    named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
+    return bool(named)
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
