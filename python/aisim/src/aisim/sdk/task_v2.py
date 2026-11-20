@@ -1021,20 +1021,6 @@ class Task:
         }
         base = _infer_quant_modes_from_raw_config(self._raw_config)
 
-        # GPT-OSS on Blackwell (trtllm): default MoE to w4a8_mxfp4_mxfp8 for higher
-        # tensor-core throughput, unless moe_quant_mode was set explicitly.  Applied
-        # before the resolution loop so the explicit-wins check below preserves it.
-        # (Mirrors the legacy V1 TaskConfigFactory gpt-oss-blackwell promotion; each
-        # disagg role is promoted independently based on its own system.)
-        for role in roles:
-            if (
-                self._role_attr(role, "moe_quant_mode") is None
-                and self._role_attr(role, "backend_name") == "trtllm"
-                and self._role_attr(role, "model_path") in _GPTOSS_BLACKWELL_MODELS
-                and is_blackwell_system(self._role_attr(role, "system_name"))
-            ):
-                self._set_role_attr(role, "moe_quant_mode", common.MoEQuantMode.w4a8_mxfp4_mxfp8)
-
         # Track whether fmha came from an explicit field (vs HF/fallback): the
         # data-driven fallback below must NOT fire on an EXPLICIT fp8 -- explicit
         # values are the user's contract and validate fails fast on them.
@@ -1053,32 +1039,7 @@ class Task:
                 # dedicated perf-DB quant mode. Acts at the HF-base layer so an
                 # explicit field still overrides it.
                 if key == "moe_quant_mode":
-                    arch_mode = resolve_dsv4_moe_arch_mode(
-                        self._role_attr(role, "model_path"),
-                        self._role_attr(role, "system_name"),
-                        self._role_attr(role, "backend_name"),
-                        self.moe_backend,
-                    )
-                    if arch_mode is None:
-                        arch_mode = resolve_kimi_k3_moe_arch_mode(
-                            self._role_attr(role, "model_path"),
-                            self._role_attr(role, "system_name"),
-                            self._role_attr(role, "backend_name"),
-                        )
-                    if arch_mode is not None:
-                        from_hf = arch_mode
-                    # HF-base-layer remap: vLLM executes W4A16_NVFP4-labeled
-                    # experts on the w4a4 nvfp4 lane (see the helper). Applied
-                    # to the HF-derived value only, so an explicit field still
-                    # overrides it — and validate fails fast on an explicit
-                    # w4a16_nvfp4, which vLLM has no data lane for.
-                    from_hf = resolve_vllm_moe_execution_mode(
-                        from_hf,
-                        self._role_attr(role, "backend_name"),
-                        self._raw_config.get("architectures", [None])[0]
-                        if isinstance(self._raw_config.get("architectures"), list)
-                        else self._raw_config.get("architecture"),
-                    )
+                    from_hf = self._infer_role_moe_quant_mode(role, base)
                 fallback = _QUANT_FALLBACKS[key]
 
                 if explicit is not None:
@@ -1089,6 +1050,29 @@ class Task:
         self._fmha_explicit = fmha_explicit
         self._kvcache_explicit = kvcache_explicit
         self._fmha_from_data: dict[str, bool] = {}
+
+    def _infer_role_moe_quant_mode(self, role: str, base: dict | None = None) -> common.MoEQuantMode:
+        """Resolve an unset MoE mode identically at construction, clearing and coverage."""
+        model = self._role_attr(role, "model_path")
+        system = self._role_attr(role, "system_name")
+        backend = self._role_attr(role, "backend_name")
+        if backend == "trtllm" and model in _GPTOSS_BLACKWELL_MODELS and is_blackwell_system(system):
+            return common.MoEQuantMode.w4a8_mxfp4_mxfp8
+        mode = resolve_dsv4_moe_arch_mode(model, system, backend, self.moe_backend)
+        if mode is None:
+            mode = resolve_kimi_k3_moe_arch_mode(model, system, backend)
+        if mode is None:
+            if base is None:
+                base = _infer_quant_modes_from_raw_config(self._raw_config)
+            mode = base.get("moe_quant_mode")
+        mode = resolve_vllm_moe_execution_mode(
+            mode,
+            backend,
+            self._raw_config.get("architectures", [None])[0]
+            if isinstance(self._raw_config.get("architectures"), list)
+            else self._raw_config.get("architecture"),
+        )
+        return mode if mode is not None else _QUANT_FALLBACKS["moe_quant_mode"]
 
     def _normalize_nvfp4_mode(self, role: str, key: str, value: Any) -> Any:
         # Non-Blackwell runtimes dequantize NVFP4 weights before the MMA.
@@ -1309,6 +1293,8 @@ class Task:
         coverage: dict[str, dict[str, set[int]]] = {}
         if gpus_per_node and a2a_probe is not None:
             quant_mode = self._role_attr(role, "moe_quant_mode")
+            if quant_mode is None:
+                quant_mode = self._infer_role_moe_quant_mode(role)
             if quant_mode == common.MoEQuantMode.nvfp4 and not is_blackwell_system(system_name):
                 # Probe the lane the Task runs: _apply_fmha_data_fallback, after the search
                 # space, resolves native NVFP4 to weight-only on non-Blackwell systems.
@@ -1877,11 +1863,14 @@ class Task:
         explicit_attr = _QUANT_EXPLICIT_BY_ROLE.get(key, "")
         explicit_by_role = self.__dict__.get(explicit_attr)
         resolved_role = explicit_by_role is not None and role in explicit_by_role
+        is_explicit = value is not None
+        if resolved_role and key == "moe_quant_mode" and value is None:
+            value = self._infer_role_moe_quant_mode(role)
         if resolved_role and key in ("gemm_quant_mode", "moe_quant_mode"):
             value = self._normalize_nvfp4_mode(role, key, value)
         object.__setattr__(self, name, value)
         if resolved_role:
-            object.__setattr__(self, explicit_attr, {**explicit_by_role, role: value is not None})
+            object.__setattr__(self, explicit_attr, {**explicit_by_role, role: is_explicit})
             if key == "fmha_quant_mode":
                 object.__setattr__(
                     self, "_fmha_from_data", {r: v for r, v in self._fmha_from_data.items() if r != role}

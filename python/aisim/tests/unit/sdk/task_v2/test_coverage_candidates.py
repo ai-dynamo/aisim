@@ -594,6 +594,36 @@ def test_live_moe_mode_refreshes_automatic_candidates(synth_vllm_systems, role):
     assert _tuple(dp=32, moe_ep=32) not in [tuple(point) for point in task.iter_parallel(role)]
 
 
+@pytest.mark.parametrize("role", ["agg", "prefill", "decode"])
+def test_clearing_moe_mode_restores_inferred_coverage_and_candidates(synth_vllm_systems, role):
+    mode_field = "moe_quant_mode" if role == "agg" else f"{role}_moe_quant_mode"
+    task = _vllm_mode_task(role, common.MoEQuantMode.fp8_block)
+    fresh = _vllm_mode_task(role, None)
+    assert 32 not in getattr(task, f"{role}_moe_ep_candidates")
+    assert 32 in getattr(fresh, f"{role}_moe_ep_candidates")
+    partner = "decode" if role == "prefill" else "prefill"
+    partner_before = list(task.iter_parallel(partner)) if role != "agg" else None
+
+    setattr(task, mode_field, None)
+
+    assert getattr(task, mode_field) == getattr(fresh, mode_field) == common.MoEQuantMode.bfloat16
+    assert not task._moe_quant_mode_explicit_by_role[role]
+    assert task._compute_large_ep_coverage(role) == fresh._large_ep_coverage(role)
+    assert list(task.iter_parallel(role)) == list(fresh.iter_parallel(role))
+    parallel = _tuple(dp=32, moe_ep=32)
+    built = task.build_model_config(role=role, parallel=parallel)
+    assert built.moe_quant_mode == common.MoEQuantMode.bfloat16
+    assert built.moe_comm_backend == fresh.build_model_config(role=role, parallel=parallel).moe_comm_backend
+    restored = Task.from_yaml(yaml.safe_load(task.to_yaml()))
+    assert list(restored.iter_parallel(role)) == list(task.iter_parallel(role))
+    if role != "agg":
+        assert list(task.iter_parallel(partner)) == partner_before
+
+    # A probe before the setter has resolved an unset field uses the same default.
+    task._set_role_attr(role, "moe_quant_mode", None)
+    assert task._compute_large_ep_coverage(role) == fresh._large_ep_coverage(role)
+
+
 def test_live_moe_mode_preserves_caller_candidates_and_gpu_limits(synth_vllm_systems):
     task = _vllm_mode_task("agg", common.MoEQuantMode.fp8_block, agg_moe_ep_candidates=[8], total_gpus=16)
     task.agg_dp_candidates = list(task.agg_dp_candidates)  # Explicitly pin even the current defaults.

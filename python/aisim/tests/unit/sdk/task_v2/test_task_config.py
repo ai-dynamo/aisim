@@ -22,6 +22,32 @@ from aisim.sdk.task_v2 import Task
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize(
+    "model_path,system,backend",
+    [
+        ("openai/gpt-oss-120b", "b200_sxm", "trtllm"),
+        ("openai/gpt-oss-120b", "h200_sxm", "trtllm"),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", "b200_sxm", "vllm"),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", "h200_sxm", "vllm"),
+        ("RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8", "b200_sxm", "sglang"),
+        ("RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8", "h200_sxm", "sglang"),
+        ("moonshotai/Kimi-K3", "b200_sxm", "sglang"),
+    ],
+)
+def test_cleared_moe_mode_uses_the_constructor_execution_default(model_path, system, backend):
+    identity = dict(model_path=model_path, system_name=system, backend_name=backend)
+    fresh = Task(**identity)
+    task = Task(**identity, moe_quant_mode=common.MoEQuantMode.bfloat16)
+
+    task.moe_quant_mode = None
+
+    assert task.moe_quant_mode == fresh.moe_quant_mode
+    assert not task._moe_quant_mode_explicit_by_role["agg"]
+    assert task.build_model_config(role="agg").moe_quant_mode == fresh.build_model_config(role="agg").moe_quant_mode
+    restored = Task.from_yaml(yaml.safe_load(task.to_yaml()))
+    assert restored.moe_quant_mode == fresh.moe_quant_mode
+
+
 @pytest.mark.parametrize("explicit", [None, common.FMHAQuantMode.fp8])
 @pytest.mark.parametrize("wide_ep", [False, True])
 def test_hopper_mla_task_resolves_execution_before_model_construction(monkeypatch, explicit, wide_ep):
