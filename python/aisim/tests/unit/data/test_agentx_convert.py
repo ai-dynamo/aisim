@@ -189,3 +189,33 @@ def test_unrecorded_gpu_count_is_null_with_an_evidence_gap(tmp_path, parallelism
     assert data.observations[0].device_count is None
     assert next(m for m in data.metrics if m.metric == "output_throughput").device_count is None
     assert any(g["field"] == "device_count" for g in data.body.evidence_gaps)
+
+
+_TP8 = {
+    "tensor_parallel_size": 8,
+    "pipeline_parallel_size": 1,
+    "data_parallel_size": 1,
+    "prefill_context_parallel_size": 1,
+}
+
+
+def test_observed_degrees_enter_the_configuration_identity(tmp_path):
+    dp1, dp2, pp2 = (_bundle(tmp_path, name) for name in ("dp1", "dp2", "pp2"))
+    _set_effective_parallelism(dp1, **_TP8)
+    _set_effective_parallelism(dp2, **{**_TP8, "data_parallel_size": 2})
+    _set_effective_parallelism(pp2, **{**_TP8, "pipeline_parallel_size": 2})
+    configs = {n: agentx_bundle_to_configuration(p) for n, p in (("dp1", dp1), ("dp2", dp2), ("pp2", pp2))}
+    assert configs["dp2"].body.parallelism == {"aggregated": {"tp": 8, "attention_dp": 2}}
+    assert configs["pp2"].body.parallelism == {"aggregated": {"tp": 8, "pp": 2}}
+    assert all(c.body.parallelism_complete for c in configs.values())
+    assert len({c.body.configuration_id() for c in configs.values()}) == 3
+    # TP8/DP1 and TP8/DP2 bundles are different deployments and must not merge.
+    assert len(agentx_bundles_to_configurations([dp1, dp2])) == 2
+
+
+def test_unobserved_degrees_are_not_declared_complete(tmp_path):
+    plain = agentx_bundle_to_configuration(_bundle(tmp_path, "plain"))  # effective settings, no parallelism section
+    assert plain.body.parallelism == {"aggregated": {"tp": 8}} and plain.body.parallelism_complete is False
+    partial_path = _bundle(tmp_path, "partial")
+    _set_effective_parallelism(partial_path, tensor_parallel_size=8)
+    assert agentx_bundle_to_configuration(partial_path).body.parallelism_complete is False

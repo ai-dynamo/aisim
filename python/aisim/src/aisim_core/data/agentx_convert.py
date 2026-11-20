@@ -112,27 +112,44 @@ def _observed_settings(effective: Sequence[Mapping[str, Any]]) -> dict[str, Sett
     return settings
 
 
-_GPU_FACTORS = (
-    "tensor_parallel_size",
-    "pipeline_parallel_size",
-    "data_parallel_size",
-    "prefill_context_parallel_size",
+# vLLM parallelism sizes the bundle records per rank, keyed by the registry dimension they set. The first
+# four multiply the GPU count; ``decode_context_parallel_size`` reuses TP ranks and only enters the identity.
+_WORLD_DEGREES = (
+    ("tensor_parallel_size", "tp"),
+    ("pipeline_parallel_size", "pp"),
+    ("data_parallel_size", "attention_dp"),
+    ("prefill_context_parallel_size", "cp"),
 )
+_WORLD_DIMENSIONS = tuple(dimension for _, dimension in _WORLD_DEGREES)
+
+
+def _observed_parallelism(effective: Sequence[Mapping[str, Any]]) -> dict[str, int] | None:
+    """Rank-0 parallelism degrees by registry dimension; ``None`` unless every GPU-multiplying degree is recorded.
+
+    ``manifest["tensor_parallel"]`` is only the TP degree. With attention DP, PP or context parallelism the run
+    uses more GPUs, and a bundle that differs in them is another serving configuration.
+    """
+    parallel = (effective[0].get("parallelism") if effective else None) or {}
+    dims: dict[str, int] = {}
+    for source, dimension in _WORLD_DEGREES:
+        value = parallel.get(source)
+        if type(value) is not int or value < 1:
+            return None
+        dims[dimension] = value
+    decode_cp = parallel.get("decode_context_parallel_size")
+    if type(decode_cp) is int and decode_cp > 1:
+        dims["dcp"] = decode_cp
+    return dims
 
 
 def _device_count(effective: Sequence[Mapping[str, Any]]) -> int | None:
-    """GPU count the bundle records: the product of the observed rank-0 parallelism degrees, else ``None``.
-
-    ``manifest["tensor_parallel"]`` is only the TP degree; with attention DP, EP or pipeline stages the
-    run uses more GPUs, so it cannot divide a total throughput into a per-device one.
-    """
-    parallel = (effective[0].get("parallelism") if effective else None) or {}
+    """GPU count the bundle records (the product of the observed GPU-multiplying degrees), else ``None``."""
+    dims = _observed_parallelism(effective)
+    if dims is None:
+        return None
     count = 1
-    for name in _GPU_FACTORS:
-        value = parallel.get(name)
-        if type(value) is not int or value < 1:
-            return None
-        count *= value
+    for dimension in _WORLD_DIMENSIONS:
+        count *= dims[dimension]
     return count
 
 
@@ -140,6 +157,7 @@ def _body(
     manifest: Mapping[str, Any], configuration: Mapping[str, Any], workload: Mapping[str, Any], features
 ) -> E2eManifestBody:
     effective = configuration.get("effective") or []
+    observed = _observed_parallelism(effective)
     gaps: list[dict[str, Any]] = [{"field": "settings", "reason": g} for g in configuration.get("evidence_gaps", [])]
     precision_text = manifest.get("precision")
     precision = {"weights": normalize("precision", precision_text)} if precision_text else {}
@@ -174,8 +192,9 @@ def _body(
         hardware=normalize("hardware", manifest["hardware"]),
         framework=normalize("framework", manifest["backend"]),
         framework_version=manifest["measured_backend_version"],
-        parallelism={"aggregated": {"tp": manifest["tensor_parallel"]}},
-        parallelism_complete=bool(effective),
+        # Complete only when every GPU-multiplying degree was observed: otherwise the others are unknown, not 1.
+        parallelism={"aggregated": observed or {"tp": manifest["tensor_parallel"]}},
+        parallelism_complete=observed is not None,
         precision=precision,
         speculation=speculation,
         identity_settings=identity_settings,
