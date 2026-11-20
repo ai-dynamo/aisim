@@ -338,7 +338,12 @@ class FpmLoader(Loader):
             raise LoaderError(f"exactly one {ROLE_LIBRARY} and one {ROLE_METADATA} artifact are required")
         library, sidecar = libraries[0], sidecars[0]
         identity = manifest.identity
-        user_paths = tuple(systems_paths or (config or {}).get("systems_paths") or ()) or None
+        # A caller that supplies the complete list, even an empty one, is not asked to expand it again.
+        user_paths = (
+            tuple(systems_paths)
+            if systems_paths is not None
+            else tuple((config or {}).get("systems_paths") or ()) or None
+        )
         library_file, sidecar_file = _verify(root, library), _verify(root, sidecar)
         estimator = (config or {}).get("estimator_config")
         interpolation = estimator.get("fpm_interpolation") if isinstance(estimator, Mapping) else None
@@ -458,6 +463,13 @@ def _resolve_library_resources(
             profile = load_fpm_profile(completed)
             blocks = [deployment.resources for deployment in profile.deployments]
         else:
+            from aisim_core.fpm_profile import _load_fpm_timing_profile
+
+            # Pending resources do not excuse a malformed draft: reject it before a staging root is replaced.
+            try:
+                _load_fpm_timing_profile(completed)
+            except ValueError as exc:
+                raise FpmContractError(f"invalid fpm_profile: {str(exc).splitlines()[0]}") from exc
             blocks = [resolve_resources(d.get("resources"), None).resources for d in completed["deployments"]]
         by_deployment = tuple(ResolvedResources(block, source) for block, source in zip(blocks, sources, strict=True))
         return by_deployment[0], tuple(sources), profile, by_deployment
@@ -495,8 +507,9 @@ def _resolve_library_resources(
 def _parallelism(config: Mapping[str, Any]) -> tuple[tuple[str, int], ...] | None:
     """Catalog parallelism dimensions (degree 1 dropped), or None when none were requested.
 
-    Omitted topology leaves the catalog unfiltered; ensure_data rejects multiple matches rather than
-    choosing an entry using prediction defaults. Explicit all-ones topology selects the single-GPU identity.
+    A mapping that omits topology leaves the catalog unfiltered; ensure_data rejects multiple matches rather than
+    choosing an entry using prediction defaults. Explicit all-ones topology selects the single-GPU identity. A typed
+    configuration always carries topology (tp=1 by default), so it is explicit and requests that identity.
     """
     keys = {
         "tp": "tp",

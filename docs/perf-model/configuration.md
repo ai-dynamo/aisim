@@ -488,7 +488,10 @@ in use its own `output_dir`. The staged root also carries `perf_data_reuse_manif
 through the source roots; a change to one of them restages the root. Directories that several source roots provide,
 such as a family directory, are merged, and the earlier root wins for a file both provide. Staging again repairs an
 installed root that lost a file, and a repin drops the generated library path and staged roots of an earlier pin
-whichever cache directory held them, keeping any path you set yourself.
+whichever cache directory held them, keeping any path you set yourself. Under `ensure_data` each staging directory is
+keyed by the ordered source roots and by the contents of the copied definition and policy files, so editing one in place
+gives a new directory and leaves a configuration returned earlier reading the definition it was built from; the roots
+that key describes are the complete staging input.
 
 For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
 a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`

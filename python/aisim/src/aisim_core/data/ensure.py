@@ -55,7 +55,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Entry, Manifest, _file, _verify
+from aisim_core.data import CategoryIndex, DatasetIndex, Entry, Manifest, _file, _verified_bytes, _verify
 from aisim_core.data.fetch import (
     DATASET_INDEX_PATH,
     BudgetExceededError,
@@ -72,7 +72,7 @@ from aisim_core.data.fetch import (
     fetch_support,
     resolve_revision,
 )
-from aisim_core.data.fpm_library import _stageable_roots
+from aisim_core.data.fpm_library import STAGED_MARKER, _stageable_roots, staged_inputs_digest
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
 from aisim_core.data.op_tree import (
@@ -641,11 +641,12 @@ def _cached_pin_is_valid(output_dir: Path, manifest, cached: Mapping[str, Any]) 
     return True
 
 
-def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) -> dict[str, Any]:
+def _drop_generated_library_path(config: Mapping[str, Any]) -> dict[str, Any]:
     """Copy of ``config`` without an ``fpm_parquet_path`` that an earlier ensure call generated.
 
     Such a path names a staged library of another materialization, in this cache or another one; keeping it would
-    pair a new dataset revision with the old library. A path the user set elsewhere is a genuine override and stays.
+    pair a new dataset revision with the old library. A path the user set elsewhere, even one inside a cache
+    directory, is a genuine override and stays: only a root AISim staged counts as generated.
     """
     out = dict(config)
     estimator = out.get("estimator_config")
@@ -655,9 +656,7 @@ def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) 
     # parent to identify the materialization without following that final link.
     if path is not None:
         parent = Path(path).expanduser().parent.resolve()
-        if parent.is_relative_to(materialized.resolve()) or any(
-            _is_generated_root(ancestor) for ancestor in (parent, *parent.parents)
-        ):
+        if any(_is_generated_root(ancestor) for ancestor in (parent, *parent.parents)):
             interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
             out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
     return out
@@ -666,17 +665,18 @@ def _drop_generated_library_path(config: Mapping[str, Any], materialized: Path) 
 _GENERATED_ROOT_NAME = re.compile(r".+-[0-9a-f]{64}")
 
 
-def _is_generated_root(path: str | Path, materialized: Path | None = None) -> bool:
-    """True for a staged library root that an earlier ensure call wrote, under ``materialized`` or any cache.
+def _is_generated_root(path: str | Path) -> bool:
+    """True for a staged library root that an earlier ensure call wrote, in any cache directory.
 
-    A root has the shape ``<cache>/materialized/<source key>/<configuration>-<roots digest>``; a configuration saved
-    with another cache directory names such a root too, and it must not outlive its pin as an explicit root.
+    A root has the shape ``<cache>/materialized/<source key>/<configuration>-<roots digest>`` and carries the staging
+    marker that records AISim owns it (a cache directory that no longer exists leaves nothing to own, so the stale
+    name still counts). A configuration saved with another cache directory names such a root too, and it must not
+    outlive its pin as an explicit root; a manual file that only sits under ``materialized`` is not one.
     """
     resolved = Path(path).expanduser().resolve()
-    under = resolved.parent.parent
-    return (under.name == "materialized" if materialized is None else under == materialized.resolve()) and (
-        _GENERATED_ROOT_NAME.fullmatch(resolved.name) is not None
-    )
+    if resolved.parent.parent.name != "materialized" or _GENERATED_ROOT_NAME.fullmatch(resolved.name) is None:
+        return False
+    return (resolved / STAGED_MARKER).is_file() or not resolved.exists()
 
 
 def _drop_generated_roots(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -713,23 +713,26 @@ def _load(
             # A configuration returned by an earlier call lists that call's own staging root; it is derived from
             # the same inputs, not a different user root, so it must not key this materialization or shadow it.
             # With an op-latency pin the pinned root is the only source: no active root may fill a missing family.
-            materialized = output_dir.parent.parent
-            config = _drop_generated_roots(_drop_generated_library_path(config, materialized))
+            config = _drop_generated_roots(_drop_generated_library_path(config))
             roots = tuple(
                 str(p)
                 for p in _stageable_roots(config.get("systems_paths"), output_dir, include_active=not isolate_roots)
                 if not _is_generated_root(p)
             )
-            roots_key = hashlib.sha256(json.dumps(roots).encode()).hexdigest()
+            # The key covers the ordered roots and the contents the staging copies, so a definition edited in place
+            # gets its own directory rather than replacing the one an earlier configuration still points at.
+            inputs = {"roots": roots, "copied": staged_inputs_digest(entry.identity.hardware, roots)}
+            roots_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
             output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
             output_dir.parent.mkdir(parents=True, exist_ok=True)
+            # The tuple above is the complete staging input: staging must not expand the active roots again.
             return loader.load(
                 root,
                 manifest_path,
                 output_dir=output_dir,
                 config=config,
                 systems_paths=roots,
-                isolate_systems_roots=isolate_roots,
+                isolate_systems_roots=True,
             )
         manifest = read_entry_manifest(root, entry, config, loader)  # then verifies every declared artifact
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected

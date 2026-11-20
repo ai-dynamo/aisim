@@ -2916,6 +2916,57 @@ def _active_systems_root(tmp_path, monkeypatch, marker):
     return active, write
 
 
+def test_a_source_definition_edited_in_place_gets_its_own_staging(root, profile, tmp_path, monkeypatch):
+    from aisim_core.data.ensure import DataPin, ensure_data
+
+    make_entry(root, profile, resources=RESOURCES)
+    _write_entry_catalog(root)
+    _, write = _active_systems_root(tmp_path, monkeypatch, "old")
+    pin = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+    first = ensure_data(user_config(profile), pin)
+    write("new")  # the same path now holds another system definition
+    second = ensure_data(user_config(profile), pin)
+    staged_first, staged_second = (Path(c.config["systems_paths"][0]) for c in (first, second))
+    assert staged_first != staged_second
+    # The configuration returned earlier still reads the definition it was built from.
+    assert (staged_first / "h200_sxm.yaml").read_text().endswith("# fixture active root: old\n")
+    assert (staged_second / "h200_sxm.yaml").read_text().endswith("# fixture active root: new\n")
+    again = ensure_data(user_config(profile), pin)  # unchanged inputs reuse the staging
+    assert Path(again.config["systems_paths"][0]) == staged_second
+
+
+def test_the_key_and_the_staging_read_the_same_active_roots(root, profile, tmp_path, monkeypatch):
+    from aisim_core.data.ensure import DataPin, ensure_data
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    _write_entry_catalog(root)
+    first, second = (_systems_root_with_tables(tmp_path, name, {f"gemm/vllm/0.25.1/{name}.txt": b"x"}) for name in "ab")
+    reads = []
+
+    def changing_roots():  # the active roots change after the first read
+        reads.append(1)
+        return [str(first if len(reads) == 1 else second)]
+
+    monkeypatch.setattr(perf_database, "get_systems_paths", changing_roots)
+    out = ensure_data(user_config(profile), DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "c"))
+    staged = Path(out.config["systems_paths"][0])
+    assert (staged / "data/h200_sxm/gemm/vllm/0.25.1/a.txt").exists()  # the roots the key describes
+    assert not (staged / "data/h200_sxm/gemm/vllm/0.25.1/b.txt").exists()  # not a root read after it
+
+
+def test_a_malformed_timing_draft_leaves_the_previous_staging_intact(root, profile, tmp_path):
+    make_entry(root, profile)
+    first = load(root, user_config(profile), tmp_path)
+    marker = first.systems_root / ".staged.json"
+    inode = marker.stat().st_ino
+    draft = {**user_config(profile), "fpm_profile": {"deployments": [{}]}}  # no schema, model or resources
+    with pytest.raises(FpmContractError, match="invalid fpm_profile"):
+        load(root, draft, tmp_path)
+    assert marker.stat().st_ino == inode and first._staged.parquet_path.exists()
+    assert load(root, user_config(profile), tmp_path).kind == "library"  # a valid draft still loads for timing
+
+
 def test_repin_drops_the_generated_roots_of_an_earlier_pin(root, profile, tmp_path, monkeypatch):
     from aisim_core.data.ensure import DataPin, ensure_data
 
