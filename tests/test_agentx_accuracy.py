@@ -226,19 +226,32 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     assert missing["prediction_backend_version"] == version
     assert not captured
 
-    def without_default_systems(name):
-        if name == "aisim_core.data.default_systems":
-            raise ModuleNotFoundError("Older wheel has no default systems root")
-        return modules[name]
-
-    monkeypatch.setattr(agentx_predict, "runtime_module", without_default_systems)
-    assert agentx_predict.predict(config, tmp_path) == missing
-    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     relative = (
         f"sparse_attention/sglang/{version}/dsa_generation_module_perf.parquet"
         if backend == "sglang"
         else f"attention/vllm/{version}/context_attention_perf.parquet"
     )
+
+    # A release wheel from before the dataset cutover (release/0.14.0) has no default_systems module and packages
+    # its operation tables, so the evaluator keeps reading those instead of reporting the database unavailable.
+    def without_default_systems(name):
+        if name == "aisim_core.data.default_systems":
+            raise ModuleNotFoundError("Older wheel has no default systems root")
+        return modules[name]
+
+    legacy = tmp_path / "legacy-wheel"
+    monkeypatch.setattr(agentx_predict, "runtime_module", without_default_systems)
+    monkeypatch.setattr(agentx_predict.importlib.resources, "files", lambda _: legacy)
+    assert agentx_predict.predict(config, tmp_path) == missing  # no tables there either
+    packaged = legacy / "systems/data/b300_sxm" / relative
+    packaged.parent.mkdir(parents=True)
+    packaged.write_bytes(b"packaged fixture data")
+    result = agentx_predict.predict(config, tmp_path)
+    assert result["reason"] == "replay_capability_unavailable"  # past the data check, stopped by the stub capability
+    assert captured[0]["engine"]["backend_version"] == version
+    captured.clear()
+
+    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
     data = tmp_path / "systems/data/b300_sxm" / relative
     data.parent.mkdir(parents=True)
     data.write_bytes(b"fixture data")
