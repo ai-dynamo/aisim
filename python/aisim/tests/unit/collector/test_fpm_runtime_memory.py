@@ -476,7 +476,7 @@ def test_import_marks_prefix_cacheable_groups():
     # The ring takes no part in prefix caching, and a uniform group takes part only when every inner spec does
     # (vLLM 0.33.0 kv_cache_interface.py:998-1000, :1305-1307).
     assert [group["prefix_cacheable"] for group in groups] == [True, False, True]
-    # The group import writes no transfer bytes.
+    # The group import of runtime_memory holds no transfer bytes. runtime_observations._configuration adds them.
     assert all(set(group) & _IMPORTED_PREFIX_FIELDS == {"prefix_cacheable"} for group in groups)
     # A vLLM 0.27.0 record has none of the new keys.
     worker, scheduler, cache_config = _initialized()

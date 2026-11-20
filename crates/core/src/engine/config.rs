@@ -1715,7 +1715,7 @@ impl EngineConfig {
             self.kv_cache_groups.iter().all(|group| {
                 group.prefix_cacheable.is_some() && group.transfer_bytes_per_block.is_some()
             }),
-            "kv_cache_groups with worker_type=prefill or decode require every group to declare prefix_cacheable and transfer_bytes_per_block; the runtime probe import does not write transfer_bytes_per_block"
+            "kv_cache_groups with worker_type=prefill or decode require every group to declare prefix_cacheable and transfer_bytes_per_block; the runtime probe import writes transfer_bytes_per_block only for a vLLM 0.33.0 record of a cache shape that it covers, and its result gives the reason for any other record"
         );
         // A sliding-window attention group that opts out of prefix caching
         // is a bounded replay window (`SlidingWindowMLASpec`, V31
@@ -3576,7 +3576,7 @@ mod tests {
     #[test]
     fn grouped_pd_configuration_validates_its_transfer_geometry() {
         let version = "kv_cache_groups with worker_type=prefill or decode require vllm_version 0.31.0, 0.32.0 or 0.33.0";
-        let declare = "kv_cache_groups with worker_type=prefill or decode require every group to declare prefix_cacheable and transfer_bytes_per_block; the runtime probe import does not write transfer_bytes_per_block";
+        let declare = "kv_cache_groups with worker_type=prefill or decode require every group to declare prefix_cacheable and transfer_bytes_per_block; the runtime probe import writes transfer_bytes_per_block only for a vLLM 0.33.0 record of a cache shape that it covers, and its result gives the reason for any other record";
         let one_block = "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups";
         let byte_geometry = "kv_cache_groups cannot use linear cache or KV transfer byte geometry";
         let replay_window = "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and replay a bounded replay window on an aggregated rank with prefix caching off";

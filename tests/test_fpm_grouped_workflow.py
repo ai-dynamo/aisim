@@ -1134,9 +1134,9 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
 
 
 def test_grouped_pd_of_a_probe_profile_gets_the_markers_text(grouped_case):
-    # A profile as the import of a vLLM 0.33.0 runtime probe writes it: prefix_cacheable on every group, the recorded
-    # version 0.33.0 and no transfer bytes. Replay models P/D for vLLM 0.33.0, so the profile gets the text of the
-    # markers.
+    # A profile as the import of a vLLM 0.33.0 runtime probe writes it for a cache outside the measured shape:
+    # prefix_cacheable on every group, the recorded version 0.33.0 and no transfer bytes. Replay models P/D for vLLM
+    # 0.33.0, so the profile gets the text of the markers.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case
@@ -1267,9 +1267,9 @@ def test_grouped_pd_with_prefix_caching_gives_the_texts_whose_remedies_hold_on_a
 
 
 def test_grouped_pd_of_a_probe_profile_under_another_label_gets_the_recorded_version_text(grouped_case):
-    # A profile from the vLLM 0.33.0 runtime probe under the label 0.32.0: prefix_cacheable on every group, the
-    # recorded version 0.33.0 and no transfer bytes. The label differs from the recorded version, and no transfer
-    # bytes change that, so the rule on the recorded version comes before the markers.
+    # A profile from the vLLM 0.33.0 runtime probe under the label 0.32.0, for a cache outside the measured shape:
+    # prefix_cacheable on every group, the recorded version 0.33.0 and no transfer bytes. The rule on the recorded
+    # version comes before the markers.
     from aisim.sweeper.config import SearchSpace
 
     profile, root = grouped_case

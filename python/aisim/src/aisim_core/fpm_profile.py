@@ -64,7 +64,9 @@ class FpmCacheGroup(_ProfileModel):
     transfer on one TP rank, for the vLLM version of the deployment. It can be
     larger than the page, because the connector reads a block in regions that
     layers of other groups can share. The probe import of a vLLM 0.33.0 record
-    does not write it.
+    writes it for the measured cache shape only, and only from a probe phase
+    with prefix caching. That shape holds Mamba groups, a ring and MLA attention
+    layers.
     ``prefill_checkpoint_blocks`` (0 or 1, state groups only) and
     ``prefill_checkpoint_alignment`` (positive, with one checkpoint block) are
     the prefill checkpoint settings of a Mamba spec.

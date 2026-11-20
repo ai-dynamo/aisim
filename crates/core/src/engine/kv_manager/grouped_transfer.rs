@@ -277,7 +277,8 @@ impl GroupedTransferRules {
     /// `:3493-3498`). A state group moves one block (V31
     /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`). A source of zero
     /// tokens owns no block and moves none, and vLLM refuses an empty prompt
-    /// (V31 `vllm/v1/engine/input_processor.py:516-517`, V32 `:565-566`).
+    /// (V31 `vllm/v1/engine/input_processor.py:516-517`, V32 and V33
+    /// `:565-566`).
     /// The bytes saturate at `u64::MAX`, as in `bytes_per_full_block`.
     pub(crate) fn fixed_bytes(&self, transfer_tokens: usize) -> u64 {
         self.groups

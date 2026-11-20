@@ -78,11 +78,14 @@ pub struct FpmCacheGroup {
     /// a transfer on one TP rank, for the vLLM version of the deployment. The
     /// connector reads a block in regions that layers of other groups can
     /// share, so the value can be larger than `page_size_bytes`. Positive and at
-    /// most 2**53. The probe import of a vLLM 0.33.0 record does not write it:
-    /// what the P/D connector of vLLM 0.33.0 reads for a block depends on facts
-    /// that the record does not hold. Sizing does not read it. The grouped
-    /// P/D transfer rules read it, so a prefill or decode rank with
-    /// `kv_cache_groups` refuses a group that leaves it unset.
+    /// most 2**53. The probe import of a vLLM 0.33.0 record writes it only from
+    /// a probe phase with prefix caching and only for the measured cache shape:
+    /// Mamba groups, a ring and MLA attention layers in one storage of whole
+    /// block rows. For another shape the record does not hold every fact that
+    /// the connector reads. For every other record the import leaves the field
+    /// unset. Sizing does not read it. The grouped P/D transfer rules
+    /// read it, so a prefill or decode rank with `kv_cache_groups` refuses a
+    /// group that leaves it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_bytes_per_block: Option<u64>,
     /// The `num_prefill_checkpoint_blocks` of a Mamba spec: 0 or 1, and only

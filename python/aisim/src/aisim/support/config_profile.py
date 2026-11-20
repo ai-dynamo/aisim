@@ -1710,8 +1710,9 @@ def _observation_mismatch(key: str, typed: Any, resources: Mapping[str, Any]) ->
     if resources.get(measured_key) is None:
         layout = f" for its {resources['cache_layout']} cache_layout" if resources.get("cache_layout") else ""
         return f"{claim}, but the runtime probe measured no {measured_key}{layout}; {remedy}"
-    # The probe import of a vLLM 0.33.0 record writes no transfer bytes, so a stated value has nothing to match. When
-    # the claim matches without them, only removing them from the override helps.
+    # The import writes transfer bytes only for the measured cache shape from a probe phase with prefix caching. Other
+    # evidence holds none, so a stated value has nothing to match. When the claim matches without them, only removing
+    # them from the override helps.
     if (
         key == "cache_groups"
         and any(group.get("transfer_bytes_per_block") is not None for group in typed)
