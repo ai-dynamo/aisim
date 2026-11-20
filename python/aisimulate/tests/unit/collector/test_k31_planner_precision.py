@@ -22,7 +22,7 @@ from aisimulate_core.sdk.fpm_profile import load_fpm_profile
 
 from .test_fpm_forward import _kimi_k31_config
 from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
-from .test_k31_runtime_observations import _complete_fixture
+from .test_k31_runtime_observations import _complete_fixture, _kernel_view_fixture
 from .test_runtime_observations import _replace_launch, _write
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_data")]
@@ -33,7 +33,8 @@ def inputs(tmp_path, monkeypatch, request):
     index_path, launches = _complete_fixture(tmp_path, monkeypatch)
     config_path, _ = _kimi_k31_config(tmp_path)
     launch = launches["tp2"]
-    attention_backend = getattr(request, "param", "trtllm_mla")
+    settings = getattr(request, "param", "trtllm_mla")
+    attention_backend, packed_indexer = (settings, False) if isinstance(settings, str) else settings
     launch["precision"]["attention_backend"] = attention_backend
     launch["model_config"] = {"path": str(config_path), "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()}
     launch["topology"].update(dp=1, moe_tp=2, moe_ep=1)
@@ -48,6 +49,10 @@ def inputs(tmp_path, monkeypatch, request):
     context = json.loads(context_path.read_text())
     context.update(expected_ranks=expected_ranks(launch["topology"]), instrumentation_binding=runtime_binding())
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
+    if packed_indexer:
+        cache, _ = _kernel_view_fixture(monkeypatch)
+        for mapping in cache["kernel_block_views"].values():
+            mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     retained = []
     for ref in phase["artifacts"]:
         record_path = tmp_path / ref["path"]
@@ -56,6 +61,10 @@ def inputs(tmp_path, monkeypatch, request):
             continue
         record["model_config_sha256"] = launch["model_config"]["sha256"]
         record["resolved_config"]["parallel_config"].update(data_parallel_size=1, enable_expert_parallel=False)
+        if packed_indexer and record["kind"] == "worker":
+            record["cache"]["kernel_block_views"] = copy.deepcopy(cache["kernel_block_views"])
+            for name in cache["kernel_block_views"]:
+                record["cache"]["layer_components"][name] = copy.deepcopy(cache["layer_components"][name])
         if attention_backend == "flashmla":
             config = record["resolved_config"]
             config["cache_config"]["cache_dtype"] = "fp8_ds_mla"
@@ -167,7 +176,16 @@ def test_inline_proof_rejects_non_object_instrumentation(inputs, instrumentation
         bind(inputs)
 
 
-def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(inputs, monkeypatch):
+@pytest.mark.parametrize(
+    "inputs",
+    [("trtllm_mla", False), ("trtllm_mla", True), ("flashmla", True)],
+    ids=["manager-blocks", "packed-indexer-trtllm", "packed-indexer-flashmla"],
+    indirect=True,
+)
+@pytest.mark.parametrize("onboarding", [False, True], ids=["inline-proof", "onboarding-proof"])
+def test_formal_plan_uses_observed_precision_and_keeps_final_launch_validation(inputs, monkeypatch, onboarding):
+    if onboarding:
+        onboarding_wrapper(inputs)
     calls = []
     validate = runtime_probe.validate_collection_probe_launch
 

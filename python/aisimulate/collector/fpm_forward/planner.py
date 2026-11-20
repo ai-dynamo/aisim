@@ -971,6 +971,7 @@ def _observed_k31_capability(
                 scheduler["cache"],
                 deployment.kv_cache_dtype,
                 context=launch["collection"]["max_model_len"],
+                sequences=launch["collection"]["max_num_seqs"],
             )
             geometry = [
                 {name: value for name, value in group.items() if name != "pool_id"}
