@@ -195,6 +195,13 @@ def configuration_id(category: str, purpose: str, identity: Identity, version: i
     return "cfg-" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def path_component(value: str) -> str:
+    """``value`` as one directory or file stem; refuses what could leave its parent directory."""
+    if value in ("", ".", "..") or any(c in value for c in "/\\\0"):
+        raise ValueError(f"not a safe path component: {value!r}")
+    return value
+
+
 def _file(root: Path, relative: str) -> Path:
     path = root
     for part in PurePosixPath(_relative(relative)).parts:

@@ -45,7 +45,7 @@ from typing import Literal
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, Field
 
-from aisim_core.data import CategoryIndex, DatasetIndex, Manifest
+from aisim_core.data import CategoryIndex, DatasetIndex, Manifest, _verify, path_component
 from aisim_core.data.eval import EvalRecord, Layer, current_records
 from aisim_core.data.parquet import read_parquet, write_parquet
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR, packaged_system_specs, spec_file_sha256
@@ -143,7 +143,8 @@ def _row_sort_key(row: CatalogRow) -> tuple:
 
 
 def shard_path(root: str | Path, layer: str, hardware: str) -> Path:
-    return Path(root) / CATALOG_DIR / LAYER_CATEGORY[layer] / f"{hardware}.parquet"
+    # Hardware names come from contributed identities: never let one name a path outside the shard directory.
+    return Path(root) / CATALOG_DIR / LAYER_CATEGORY[layer] / f"{path_component(hardware)}.parquet"
 
 
 def catalog_files(root: str | Path) -> list[Path]:
@@ -176,10 +177,15 @@ def _read_indexed_cells(root: Path, cells: dict[tuple, _Cell]) -> None:
         layer = CATEGORY_LAYER.get(category)
         if layer is None:
             continue
-        entries = CategoryIndex.model_validate_json((root / ref.index.path).read_bytes())
+        # Both references are digest-pinned: a manifest edited after indexing must not change published coverage.
+        entries = CategoryIndex.model_validate_json(_verify(root, ref.index).read_bytes())
+        if entries.category != category:
+            raise ValueError(f"category index identity mismatch: {ref.index.path}")
         for entry in entries.entries:
             ident = entry.identity
-            manifest = Manifest.model_validate_json((root / entry.manifest.path).read_bytes())
+            manifest = Manifest.model_validate_json(_verify(root, entry.manifest).read_bytes())
+            if manifest.configuration_id != entry.configuration_id:
+                raise ValueError(f"catalog and manifest identity mismatch: {entry.manifest.path}")
             cell = cells[(layer, None if layer == "op" else ident.model, ident.hardware, ident.framework)]
             cell.versions.add(ident.framework_version)
             cell.n_configs += 1

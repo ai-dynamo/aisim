@@ -54,6 +54,11 @@ def _artifact(path, payload=b"x"):
     )
 
 
+def _file_artifact(root, path):
+    """The artifact record of a file already written under ``root`` (real size and digest)."""
+    return _artifact(path, (root / path).read_bytes())
+
+
 def _write_category(root, category, purpose, idents, gaps=0):
     entries = []
     for i, ident in enumerate(idents):
@@ -73,7 +78,12 @@ def _write_category(root, category, purpose, idents, gaps=0):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_text(manifest.model_dump_json(by_alias=True))
         entries.append(
-            {"configuration_id": cid, "purpose": purpose, "identity": ident.model_dump(), "manifest": _artifact(path)}
+            {
+                "configuration_id": cid,
+                "purpose": purpose,
+                "identity": ident.model_dump(),
+                "manifest": _file_artifact(root, path),
+            }
         )
     index = CategoryIndex.model_validate(
         {"schema_version": "aisim-category-index/v1", "category": category, "entries": entries}
@@ -133,7 +143,11 @@ def dataset(tmp_path):
     root.mkdir()
     fpm = _write_category(root, "fpm", "execution-profile", [_ident(QWEN), _ident(DSV4)], gaps=2)
     e2e = _write_category(root, "e2e", "e2e-configuration", [_ident(QWEN)])
-    ref = lambda c, rel: {"root": f"data/{c}", "index": _artifact(rel).model_dump(by_alias=True), "layout": "category"}
+    ref = lambda c, rel: {
+        "root": f"data/{c}",
+        "index": _file_artifact(root, rel).model_dump(by_alias=True),
+        "layout": "category",
+    }
     (root / "catalog" / "dataset.json").write_text(
         DatasetIndex.model_validate(
             {
@@ -274,3 +288,29 @@ def test_size_scales_with_cells_not_payload(tmp_path):
 def test_missing_catalog_dir(tmp_path):
     with pytest.raises(FileNotFoundError):
         Catalog(tmp_path)
+
+
+def test_a_manifest_edited_after_indexing_is_not_counted(dataset):
+    root, systems = dataset
+    path = root / "data/fpm/m0.json"
+    manifest = Manifest.model_validate_json(path.read_bytes())
+    # Schema-valid edit that keeps the identity: only the evidence gaps change.
+    path.write_text(
+        manifest.model_copy(update={"evidence_gaps": [{"field": "new"}] * 7}).model_dump_json(by_alias=True)
+    )
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        build_catalog(root, systems_dir=systems)
+
+
+def test_a_category_index_edited_after_indexing_is_refused(dataset):
+    root, systems = dataset
+    index = root / "catalog/e2e.json"
+    index.write_text(index.read_text() + "\n")
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        build_catalog(root, systems_dir=systems)
+
+
+@pytest.mark.parametrize("hardware", ["/tmp/victim", "../escape", "a/b", "..", ""])
+def test_hardware_cannot_name_a_path_outside_the_shard_directory(tmp_path, hardware):
+    with pytest.raises(ValueError, match="path component"):
+        shard_path(tmp_path, "fpm", hardware)

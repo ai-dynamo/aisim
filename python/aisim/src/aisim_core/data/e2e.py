@@ -52,7 +52,10 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
+import tempfile
 import types
 import typing
 import warnings
@@ -884,35 +887,47 @@ def write_configuration(root: Path, data: E2eConfigurationData, *, prefix: str =
         stray = {r.observation_id for r in rows} - known
         if stray:
             raise ValueError(f"rows reference unknown observations: {sorted(stray)}")
-    artifacts = [
-        _write_table(root, directory, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
-        _write_table(root, directory, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
-    ]
-    if data.requests:
-        artifacts.append(_write_table(root, directory, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests"))
-    if data.series:
-        artifacts.append(_write_table(root, directory, "series", SERIES_SCHEMA, data.series, "e2e-series"))
-    infos = list(body.provenance_artifacts)
-    for item in data.provenance:
-        artifact, info = store_provenance(root, directory, item)
-        artifacts.append(artifact)
-        infos.append(info)
-    body = body.model_copy(update={"provenance_artifacts": infos})
-    manifest = Manifest(
-        schema_version="aisim-artifact-manifest/v1",
-        category="e2e",
-        purpose=PURPOSE,
-        configuration_id=cid,
-        identity=body.identity(),
-        requested_settings=body.requested_settings,
-        artifacts=artifacts,
-        provenance={"e2e": body.model_dump(mode="json")},
-        evidence_gaps=body.evidence_gaps,
-    )
-    relative = f"{directory}/manifest.json"
-    (root / relative).write_text(
-        json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False) + "\n"
-    )
+    # Everything is built in a staging directory first: a failure after the tables (an oversize raw artifact, say)
+    # must leave an existing configuration readable, so published files are replaced only once all succeeded.
+    root.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".e2e-stage-", dir=root))
+    try:
+        artifacts = [
+            _write_table(stage, directory, "observations", OBSERVATIONS_SCHEMA, data.observations, "e2e-observations"),
+            _write_table(stage, directory, "metrics", METRICS_SCHEMA, data.metrics, "e2e-metrics"),
+        ]
+        if data.requests:
+            artifacts.append(_write_table(stage, directory, "requests", REQUESTS_SCHEMA, data.requests, "e2e-requests"))
+        if data.series:
+            artifacts.append(_write_table(stage, directory, "series", SERIES_SCHEMA, data.series, "e2e-series"))
+        infos = list(body.provenance_artifacts)
+        for item in data.provenance:
+            artifact, info = store_provenance(stage, directory, item)
+            artifacts.append(artifact)
+            infos.append(info)
+        body = body.model_copy(update={"provenance_artifacts": infos})
+        manifest = Manifest(
+            schema_version="aisim-artifact-manifest/v1",
+            category="e2e",
+            purpose=PURPOSE,
+            configuration_id=cid,
+            identity=body.identity(),
+            requested_settings=body.requested_settings,
+            artifacts=artifacts,
+            provenance={"e2e": body.model_dump(mode="json")},
+            evidence_gaps=body.evidence_gaps,
+        )
+        relative = f"{directory}/manifest.json"
+        (stage / relative).write_text(
+            json.dumps(manifest.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True, allow_nan=False)
+            + "\n"
+        )
+        for published in [*(a.path for a in artifacts), relative]:  # the manifest last
+            destination = root / published
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(stage / published, destination)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     return relative
 
 
@@ -948,6 +963,10 @@ def load_e2e(root: Path, manifest_path: str, *, config: Mapping[str, Any] | None
     root = Path(root)
     tables = E2eLoader(accepted_schemas=E2E_TABLE_SCHEMAS).load(root, manifest_path, config=config)
     body = body_from_manifest(tables.manifest)
+    parquet_schemas = [a.artifact_schema for a in tables.manifest.artifacts if a.format == "parquet"]
+    duplicated = sorted({schema for schema in parquet_schemas if parquet_schemas.count(schema) > 1})
+    if duplicated:
+        raise LoaderError(f"manifest declares more than one table for {duplicated}; one table per schema")
     by_schema = {a.artifact_schema: a.artifact_id for a in tables.manifest.artifacts if a.format == "parquet"}
     if OBSERVATIONS_SCHEMA not in by_schema or METRICS_SCHEMA not in by_schema:
         raise LoaderError("manifest must declare observation and metric tables")
@@ -994,23 +1013,39 @@ class EvaluationPoint:
     unavailable: frozenset[tuple[str, str]]
     # Per-device tokens/s by throughput metric, normalized explicitly.
     per_device_throughput: dict[str, float]
+    # Which timing boundary (``client`` or ``server``) reported each value; ``None`` when the row does not say.
+    observers: dict[tuple[str, str], str | None] = field(default_factory=dict)
 
 
-def evaluation_points(dataset: E2eDataset) -> list[EvaluationPoint]:
+def evaluation_points(dataset: E2eDataset, *, observer: str | None = None) -> list[EvaluationPoint]:
+    """One point per observation.
+
+    Client and server measurements of one metric are different timing boundaries and never mix: with
+    ``observer`` only that observer's rows are used; without it a (metric, statistic) reported twice is
+    ambiguous and raises ``ValueError`` instead of letting row order decide.
+    """
     metrics: dict[str, list[MetricRow]] = {}
     for row in dataset.metrics:
         metrics.setdefault(row.observation_id, []).append(row)
     points = []
     for obs in dataset.observations:
         values, unavailable, device = {}, set(), {}
+        reported: dict[tuple[str, str, str], str | None] = {}
         for row in metrics.get(obs.observation_id, []):
-            if row.scope != "run":
+            if row.scope != "run" or (observer is not None and row.observer != observer):
                 continue
             # Consumers read canonical names only: a known alias (``p50``) or a stored spelling the registry
             # rejects is ignored until the dataset is fixed (see name_findings_for).
             if name_findings("metric", "", row.metric) or name_findings("statistic", "", row.statistic):
                 continue
             key = (row.metric, row.statistic)
+            slot = (*key, row.normalization)
+            if slot in reported:
+                raise ValueError(
+                    f"observation {obs.observation_id}: {row.metric}/{row.statistic} is reported by observers "
+                    f"{reported[slot]!r} and {row.observer!r}; select one with observer="
+                )
+            reported[slot] = row.observer
             if row.status != "valid":
                 unavailable.add(key)
             elif row.metric.endswith("throughput"):
@@ -1032,6 +1067,7 @@ def evaluation_points(dataset: E2eDataset) -> list[EvaluationPoint]:
                 values,
                 frozenset(unavailable),
                 device,
+                {(m, st): who for (m, st, _), who in reported.items()},
             )
         )
     return points
@@ -1061,14 +1097,16 @@ def write_snapshot(
     ordered = sorted(members, key=lambda m: (m.configuration_id, m.observation_id))
     if len({m.observation_id for m in ordered}) != len(ordered):
         raise ValueError("duplicate observation in snapshot membership")
+    # Tables are named after the document, so sibling snapshots never overwrite each other's frozen members.
+    stem = Path(path).stem
     member_artifact = _write_table(
-        root, directory, "snapshot-members", SNAPSHOT_MEMBERS_SCHEMA, ordered, "e2e-snapshot-members"
+        root, directory, f"{stem}-members", SNAPSHOT_MEMBERS_SCHEMA, ordered, "e2e-snapshot-members"
     )
     acquisition_artifact = (
         _write_table(
             root,
             directory,
-            "snapshot-acquisition",
+            f"{stem}-acquisition",
             SNAPSHOT_ACQUISITION_SCHEMA,
             list(acquisition),
             "e2e-snapshot-acquisition",
@@ -1107,6 +1145,8 @@ def read_snapshot(root: Path, path: str) -> tuple[E2eInputSnapshot, list[Snapsho
         )
     if snapshot.counts.get("observations") != len(members):
         raise ValueError("snapshot observation count mismatch")
+    if snapshot.counts.get("configurations") != len({m.configuration_id for m in members}):
+        raise ValueError("snapshot configuration count mismatch")
     if snapshot.snapshot_id != snapshot_id(members, snapshot.source_scope, snapshot.selection_policy):
         raise ValueError("snapshot ID does not match its membership")
     return snapshot, members
@@ -1623,12 +1663,13 @@ def name_findings_for(
                 seen.add((kind, field_name, value))
                 out += found
     for i, point in enumerate(series):
-        if ("metric", "series", point.metric) in seen:
-            continue
-        found = name_findings("metric", f"series[{i}].metric", point.metric)
-        if found:
-            seen.add(("metric", "series", point.metric))
-            out += found
+        for kind, field_name, value in (("metric", "metric", point.metric), ("phase", "phase", point.phase)):
+            if (kind, f"series.{field_name}", value) in seen:
+                continue
+            found = name_findings(kind, f"series[{i}].{field_name}", value)
+            if found:
+                seen.add((kind, f"series.{field_name}", value))
+                out += found
     return out
 
 

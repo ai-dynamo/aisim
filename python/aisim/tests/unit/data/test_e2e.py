@@ -343,3 +343,91 @@ def test_loader_refuses_foreign_table_schema(tmp_path):
     path = write_configuration(tmp_path, _dev_config())
     with pytest.raises(LoaderError, match="unsupported table schema"):
         E2eLoader(accepted_schemas=("aisim-e2e-requests/v1",)).load(tmp_path, path)
+
+
+# ---------------------------------------------------------------- review regressions
+
+
+def _snapshot_args(observation):
+    member = SnapshotMember(
+        configuration_id="cfg-" + "a" * 64, observation_id=observation, record_sha256="b" * 64, manifest_path="m"
+    )
+    return [member], {"source_scope": {"kind": "k"}, "selection_policy": "p", "completeness": "complete"}
+
+
+def test_sibling_snapshots_in_one_directory_stay_readable(tmp_path):
+    (tmp_path / "snapshots").mkdir()
+    for name, observation in (("a", "o1"), ("b", "o2")):
+        members, kwargs = _snapshot_args(observation)
+        write_snapshot(
+            tmp_path,
+            f"snapshots/{name}.json",
+            members,
+            acquisition=[SnapshotAcquisition(observation_id=observation, source_uri="https://x")],
+            **kwargs,
+        )
+    assert [m.observation_id for m in read_snapshot(tmp_path, "snapshots/a.json")[1]] == ["o1"]
+    assert [m.observation_id for m in read_snapshot(tmp_path, "snapshots/b.json")[1]] == ["o2"]
+
+
+def test_snapshot_configuration_count_is_verified(tmp_path):
+    members, kwargs = _snapshot_args("o1")
+    write_snapshot(tmp_path, "snap.json", members, **kwargs)
+    document = json.loads((tmp_path / "snap.json").read_text())
+    document["counts"]["configurations"] = 2
+    (tmp_path / "snap.json").write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="configuration count"):
+        read_snapshot(tmp_path, "snap.json")
+
+
+def test_a_failed_replacement_leaves_the_existing_configuration_readable(tmp_path):
+    import dataclasses
+
+    cfg = _dev_config()
+    path = write_configuration(tmp_path, cfg)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    changed = [cfg.metrics[0].model_copy(update={"value": 12345.0}), *cfg.metrics[1:]]
+    oversize = ProvenanceFile("raw-output", b"x" * 11, "dev:1", cap_bytes=10)
+    with pytest.raises(ValueError, match="never truncated"):
+        write_configuration(tmp_path, dataclasses.replace(cfg, metrics=changed, provenance=[oversize]))
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before  # nothing staged is left either
+    assert len(load_e2e(tmp_path, path).metrics) == len(cfg.metrics)
+
+
+def test_two_tables_for_one_schema_are_rejected(tmp_path):
+    path = write_configuration(tmp_path, _dev_config())
+    manifest = json.loads((tmp_path / path).read_text())
+    table = next(a for a in manifest["artifacts"] if a["schema"] == "aisim-e2e-metrics/v1")
+    copy = {**table, "artifact_id": "metrics-2", "path": table["path"].replace("metrics.parquet", "metrics-2.parquet")}
+    (tmp_path / copy["path"]).write_bytes((tmp_path / table["path"]).read_bytes())
+    manifest["artifacts"].append(copy)
+    (tmp_path / path).write_text(json.dumps(manifest))
+    with pytest.raises(LoaderError, match="one table per schema"):
+        load_e2e(tmp_path, path)
+
+
+@pytest.mark.parametrize("client_first", [True, False])
+def test_client_and_server_timings_never_mix_in_an_evaluation_point(tmp_path, client_first):
+    import dataclasses
+
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    rows = [m for m in ds.metrics if (m.metric, m.statistic) != ("ttft", "mean")]
+    pair = [
+        make_metric("dev:1", "ttft", "mean", value, "ms", observer=who)
+        for who, value in (("client", 200.0), ("server", 20.0))
+    ]
+    both = dataclasses.replace(ds, metrics=[*rows, *(pair if client_first else pair[::-1])])
+    with pytest.raises(ValueError, match="select one with observer"):
+        evaluation_points(both)
+    for who, expected in (("client", 200.0), ("server", 20.0)):
+        (point,) = evaluation_points(both, observer=who)
+        assert point.metrics[("ttft", "mean")] == expected and point.observers[("ttft", "mean")] == who
+
+
+def test_series_phase_spelling_is_checked(tmp_path):
+    from aisim_core.data.e2e import SeriesRow, name_findings_for
+
+    ds = load_e2e(tmp_path, write_configuration(tmp_path, _dev_config()))
+    series = [SeriesRow(observation_id="dev:1", metric="running_requests", start_ms=0.0, end_ms=1.0, phase="profiling")]
+    findings = name_findings_for(ds.body, ds.observations, ds.metrics, ds.requests, series)
+    assert [(f.kind, f.location, f.canonical) for f in findings] == [("phase", "series[0].phase", "profile")]
