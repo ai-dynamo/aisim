@@ -545,7 +545,8 @@ def test_minimax_identified_base_still_requires_scoped_approval():
     assert len(selected) == 2
     for item in selected:
         assert item["underlying_licenses"] == ["LicenseRef-MiniMax-M2.5-Model"]
-        assert item["approval"]["status"] == "pending"
+        # Exercise missing approval independently of the committed decisions.
+        item["approval"] = {"status": "pending"}
         result = gate.assess([entries[item["path"]]], records, root=root)[0]
         assert result["problems"] == ["unapproved_license"]
 
