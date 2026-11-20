@@ -2386,3 +2386,12 @@ def test_no_packaged_dsa_or_mla_config_is_missing_from_the_width_table():
         and set(json.loads(path.read_text()).get("architectures") or []) & architectures
     }
     assert packaged == set(_RESIDUAL_WIDTH_CONFIGS)
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5", "zai-org/GLM-5.2"])
+def test_dsa_model_activation_width_is_the_residual_width(model):
+    # The top-level head_dim of these exports is 64 (GLM-5) and 192 (GLM-5.2). The backends read
+    # h = _num_heads * _head_size as the activation width, so h must be the residual width.
+    model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    built = get_model(model, model_config, backend_name="sglang")
+    assert built._num_heads * built._head_size == 6144
