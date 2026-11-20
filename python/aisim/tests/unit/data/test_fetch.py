@@ -32,6 +32,86 @@ SHA = "a" * 40
 SHA2 = "b" * 40
 
 
+@pytest.mark.parametrize("reader", ["plan", "load_category_index"])
+@pytest.mark.parametrize("corrupt", ["dataset", "category"])
+def test_over_nested_catalog_json_keeps_the_typed_error(tmp_path, reader, corrupt):
+    files = build_repo(tmp_path)
+    ids = tuple(entry["configuration_id"] for entry in json.loads(files["catalog/fpm.json"])["entries"])
+    deep = b"[" * 200_000 + b"]" * 200_000
+    if corrupt == "dataset":
+        files["catalog/dataset.json"] = deep
+    else:
+        files["catalog/fpm.json"] = deep
+        dataset = json.loads(files["catalog/dataset.json"])
+        dataset["categories"]["fpm"]["index"].update(sha256=_sha(deep), bytes=len(deep))
+        files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    kwargs = dict(repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "cache"))
+    with pytest.raises(IntegrityError, match="invalid"):
+        if reader == "plan":
+            plan(Selection(category="fpm", configuration_ids=ids), **kwargs)
+        else:
+            load_category_index("fpm", **kwargs)
+
+
+def _republish(files, path, document):
+    """Replace one metadata file and re-pin it in the index chain so only the content is inconsistent."""
+    files[path] = json.dumps(document).encode()
+    pin = {"sha256": _sha(files[path]), "bytes": len(files[path])}
+    index = json.loads(files["catalog/fpm.json"])
+    for entry in index["entries"]:
+        if entry["manifest"]["path"] == path:
+            entry["manifest"].update(pin)
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"].update(
+        sha256=_sha(files["catalog/fpm.json"]), bytes=len(files["catalog/fpm.json"])
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ("identity", "hash mismatch"),  # model B described under model A's ID
+        ("category", "hash mismatch"),
+        ("purpose", "hash mismatch"),
+        ("consistent-other-identity", "differs from the catalog entry"),  # B hashed correctly, A's ID not repeated
+        ("entry-identity", "identity or purpose differs"),  # the catalog entry misdescribes the manifest
+        ("none", None),
+    ],
+)
+def test_manifest_must_describe_the_catalog_entry_it_was_selected_for(tmp_path, change, message):
+    files = build_repo(tmp_path)
+    path = "fpm/m1/manifest.json"
+    manifest = json.loads(files[path])
+    entry_id = manifest["configuration_id"]
+    other = _identity("other-model")
+    if change == "identity":
+        manifest["identity"] = other.model_dump()
+    elif change == "category":
+        manifest["category"] = "op-latency"
+    elif change == "purpose":
+        manifest["purpose"] = "operation-tables"
+    elif change == "consistent-other-identity":
+        manifest["identity"] = other.model_dump()
+        manifest["configuration_id"] = configuration_id("fpm", "execution-profile", other)
+    elif change == "entry-identity":
+        index = json.loads(files["catalog/fpm.json"])
+        next(e for e in index["entries"] if e["configuration_id"] == entry_id)["identity"] = other.model_dump()
+        files["catalog/fpm.json"] = json.dumps(index).encode()
+    _republish(files, path, manifest)
+    transport = FakeTransport(files)
+    selection = Selection(category="fpm", configuration_ids=(entry_id,))
+    kwargs = dict(repo=REPO, revision=SHA, transport=transport, cache=Cache(tmp_path / "cache"))
+    if message is None:
+        assert [f.path for f in plan(selection, **kwargs).files if f.role == "artifact"] == ["fpm/m1/data.parquet"]
+        return
+    with pytest.raises(IntegrityError, match=message):
+        plan(selection, **kwargs)
+    assert "fpm/m1/data.parquet" not in transport.opened
+    assert "fpm/other-model/data.parquet" not in transport.opened
+
+
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
