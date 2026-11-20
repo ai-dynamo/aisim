@@ -199,8 +199,9 @@ struct PerOpFold {
     entries: Vec<PerOpValueWithMetadata>,
     /// Entry index per name slot, for [`Self::add_slot`].
     slots: Vec<Option<usize>>,
-    /// Each entry's power-covered latency, summed per query before the fold.
-    covered: Vec<f64>,
+    /// Each entry's power-covered latency, when the consumer needs it.
+    /// Summed per query before the fold.
+    covered: Option<Vec<f64>>,
 }
 
 /// A query result's power-covered latency: all of it when its own energy is
@@ -243,7 +244,14 @@ impl PerOpFold {
             inference_phase,
             entries: Vec::new(),
             slots: Vec::new(),
-            covered: Vec::new(),
+            covered: None,
+        }
+    }
+
+    fn with_covered(inference_phase: &'static str) -> Self {
+        Self {
+            covered: Some(Vec::new()),
+            ..Self::new(inference_phase)
         }
     }
 
@@ -272,7 +280,6 @@ impl PerOpFold {
     fn add_at(&mut self, position: Option<usize>, op: &Op, r: PerformanceResult) {
         let name = op.name();
         let source = r.source.as_str();
-        let covered = covered_latency(&r);
         let mut fallbacks = None;
         for fallback in r.moe_comm_fallbacks.iter() {
             insert_per_op_fallback(
@@ -295,10 +302,14 @@ impl PerOpFold {
                 entry.3 = "mixed";
             }
             extend_per_op_fallbacks(&mut entry.4, fallbacks);
-            self.covered[position] += covered;
+            if let Some(covered) = &mut self.covered {
+                covered[position] += covered_latency(&r);
+            }
             return;
         }
-        self.covered.push(covered);
+        if let Some(covered) = &mut self.covered {
+            covered.push(covered_latency(&r));
+        }
         self.entries.push((
             name.to_string(),
             r.latency_ms,
@@ -314,7 +325,10 @@ impl PerOpFold {
 
     /// [`Self::into_values`] with each entry's power-covered latency.
     fn into_values_with_covered(self) -> (Vec<PerOpValueWithMetadata>, Vec<f64>) {
-        (self.entries, self.covered)
+        (
+            self.entries,
+            self.covered.expect("per-name coverage tracking enabled"),
+        )
     }
 }
 
@@ -405,7 +419,7 @@ struct RankOperationFold {
 impl RankOperationFold {
     fn new(db: &PerfDatabase) -> Self {
         Self {
-            fold: PerOpFold::new("context"),
+            fold: PerOpFold::with_covered("context"),
             positions: HashMap::new(),
             sols: Vec::new(),
             sol_db: db.sol_full_view(),
@@ -760,7 +774,7 @@ impl RankValueFold {
                 });
                 self.names = Some(Arc::clone(names));
             }
-            None => self.by_name = Some(PerOpFold::new("context")),
+            None => self.by_name = Some(PerOpFold::with_covered("context")),
         }
     }
 
@@ -2257,9 +2271,11 @@ impl Engine {
 
     /// Prefill-step latency at exact per-rank iteration totals: the tokens the
     /// step computes and the cached or earlier-chunk KV its requests read.
-    /// A whole-model FPM context phase queries these native coordinates
-    /// directly. Other graphs price per-request shapes and keep the integer
-    /// means of [`Self::predict_prefill_latency`].
+    /// A whole-model FPM without operation-level draft tails queries these
+    /// native coordinates directly when `nextn == 0` or a measured-round
+    /// binding is present. Otherwise, it uses the integer means of
+    /// [`Self::predict_prefill_latency`], as other graphs do, except that
+    /// qualified Mamba ops split ragged totals into balanced request lengths.
     pub fn predict_prefill_latency_total(
         &self,
         batch_size: u32,
@@ -6588,6 +6604,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn per_op_fold_tracks_coverage_only_when_requested() {
+        use crate::operators::base::Source;
+
+        let ops = [
+            Op::Gemm(GemmOp::new("a", 64, 64, GemmQuantMode::Bfloat16)),
+            Op::Gemm(GemmOp::new("b", 64, 64, GemmQuantMode::Bfloat16)),
+        ];
+        let plan = OpListPlan::new(&ops);
+        for phase in ["context", "generation"] {
+            for slotted in [false, true] {
+                let mut values = if slotted {
+                    PerOpFold::for_plan(phase, &plan)
+                } else {
+                    PerOpFold::new(phase)
+                };
+                let mut tracked = PerOpFold::with_covered(phase);
+                for (slot, latency, energy, source) in [
+                    (0, 1.0, 2.0, Source::Silicon),
+                    (1, 0.5, 0.0, Source::Sol),
+                    (0, 0.25, 0.0, Source::Empirical),
+                    (0, 0.125, 1.0, Source::Silicon),
+                ] {
+                    let result = PerformanceResult::with_energy(latency, energy, source);
+                    if slotted {
+                        values.add_slot(slot, &ops[slot], result.clone());
+                    } else {
+                        values.add(&ops[slot], result.clone());
+                    }
+                    tracked.add(&ops[slot], result);
+                    assert!(values.covered.is_none());
+                }
+                let (entries, covered) = tracked.into_values_with_covered();
+                assert_eq!(per_op_bits(&values.into_values()), per_op_bits(&entries));
+                // Positive folded energy must not cover the unpowered query
+                // of the repeated name, nor the entirely unpowered name.
+                assert_eq!(covered, [1.125, 0.0]);
+                assert_eq!(entries[0].1, 1.375);
+                assert_eq!(entries[0].3, "mixed");
+            }
+        }
+    }
+
+    #[test]
     fn per_op_fold_attaches_the_inference_phase_only_to_executed_fallbacks() {
         use crate::operators::base::{MoeCommFallback, Source};
 
@@ -8874,6 +8933,59 @@ pub(crate) mod tests {
             vec![fpm_op(FpmPhase::Decode)],
         );
         Engine::build(spec, Arc::new(db))
+    }
+
+    #[test]
+    fn speculative_prefill_totals_without_a_round_binding_use_integer_means() {
+        use crate::perf_database::fpm_forward::tests::{RowSpec, write_pair};
+
+        for nextn in [0, 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut spec = build_fpm_spec(tmp.path(), Some(nextn));
+            let Op::FpmForward(decode) = &mut spec.generation_ops[0] else {
+                unreachable!()
+            };
+            // A valid speculative FPM shape without operation-level draft
+            // tails or a measured-round binding.
+            decode.verify_width = nextn + 1;
+            write_pair(
+                tmp.path(),
+                &[
+                    RowSpec {
+                        workload_kind: "prefill",
+                        batch_size: 2,
+                        total_prefill_tokens: 3,
+                        total_kv_read_tokens: 1,
+                        latency_ms: 3.0,
+                        ..RowSpec::default()
+                    },
+                    RowSpec {
+                        workload_kind: "prefill",
+                        batch_size: 2,
+                        total_prefill_tokens: 4,
+                        total_kv_read_tokens: 0,
+                        latency_ms: 4.0,
+                        ..RowSpec::default()
+                    },
+                    RowSpec {
+                        workload_kind: "decode",
+                        batch_size: 1,
+                        total_prefill_tokens: 0,
+                        total_kv_read_tokens: 8,
+                        latency_ms: 1.0,
+                        ..RowSpec::default()
+                    },
+                ],
+            );
+            let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), tmp.path()).unwrap();
+            // The non-speculative engine keeps (2, 3, 1). The speculative
+            // engine uses isl=(3+1)/2=2 and prefix=1/2=0, querying (2, 4, 0).
+            let expected = if nextn == 0 { 3.0 } else { 4.0 };
+            assert_eq!(
+                engine.predict_prefill_latency_total(2, 3, 1).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
