@@ -79,6 +79,8 @@ def build_selection(args: argparse.Namespace) -> Selection:
                 f"purpose 'prediction' has no data for category {args.category!r}; use 'full-evidence'"
             )
     configurations = tuple(c.strip() for raw in args.configuration for c in raw.split(",") if c.strip())
+    if args.configuration and not configurations:  # e.g. --configuration ',': never widen it to the whole category
+        raise UsageError("--configuration needs at least one configuration ID")
     # No selector at all means the whole op-latency database; other categories stay selective.
     whole = args.category == "op-latency" and (
         args.all
@@ -312,7 +314,8 @@ def run_validate(args: argparse.Namespace) -> int:
     if args.path:
         report = validate_local(args.path)
     else:
-        repo, revision = resolve_source(args.repo, args.revision, env={})
+        saved = load_config(config_path(cache_dir=args.cache_dir))
+        repo, revision = resolve_source(args.repo, args.revision, config=saved)  # the same precedence as fetch
         cache = Cache(Path(args.cache_dir) if args.cache_dir else None)
         report = validate_repo(repo, revision, transport=make_transport(), cache=cache)
     sys.stdout.write(dumps(report))

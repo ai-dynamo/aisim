@@ -90,6 +90,78 @@ def build_ops(tmp_path, hardwares=("h200_sxm", "b200_sxm")):
     return files
 
 
+_NO_CHECKER_PURPOSE = {"eval": "evaluation-record", "systems": "system-spec"}
+
+
+def build_unchecked(root, category, *, catalog_hardware=None):
+    """A one-entry dataset of a category with no offline checker, written under ``root``."""
+    identity = Identity(
+        hardware="h200_sxm",
+        framework="vllm",
+        framework_version="0.1",
+        operation_family=None,
+        model="m",
+        effective_settings={},
+        unresolved_identity=None,
+    )
+    purpose = _NO_CHECKER_PURPOSE[category]
+    artifact = f"data/{category}/h200_sxm/record.json"
+    data = b'{"record": 1}'
+    manifest_path = f"data/{category}/h200_sxm/manifest.json"
+    manifest = {
+        "schema_version": "aisim-artifact-manifest/v1",
+        "category": category,
+        "purpose": purpose,
+        "configuration_id": configuration_id(category, purpose, identity),
+        "identity": identity.model_dump(),
+        "requested_settings": None,
+        "artifacts": [_artifact_json("a", artifact, data, format="json", schema="aisim.test/v1")],
+        "provenance": {},
+        "evidence_gaps": [],
+    }
+    manifest_bytes = json.dumps(manifest).encode()
+    entry_identity = identity.model_dump()
+    if catalog_hardware:  # a canonical but different identity than the manifest's
+        entry_identity["hardware"] = catalog_hardware
+    index = {
+        "schema_version": "aisim-category-index/v1",
+        "category": category,
+        "entries": [
+            {
+                "configuration_id": manifest["configuration_id"],
+                "purpose": purpose,
+                "identity": entry_identity,
+                "manifest": _artifact_json(
+                    "m", manifest_path, manifest_bytes, format="json", schema="aisim-artifact-manifest/v1"
+                ),
+            }
+        ],
+    }
+    index_bytes = json.dumps(index).encode()
+    dataset = {
+        "schema_version": "aisim-dataset-index/v1",
+        "dataset_id": REPO,
+        "categories": {
+            category: {
+                "root": f"data/{category}",
+                "layout": "category",
+                "index": _artifact_json(
+                    "i", f"catalog/{category}.json", index_bytes, format="json", schema="aisim-category-index/v1"
+                ),
+            }
+        },
+    }
+    for path, content in {
+        artifact: data,
+        manifest_path: manifest_bytes,
+        f"catalog/{category}.json": index_bytes,
+        "catalog/dataset.json": json.dumps(dataset).encode(),
+    }.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(content)
+    return root / artifact, root / manifest_path
+
+
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     cache = tmp_path / "cache"
@@ -142,6 +214,13 @@ def test_no_arguments_downloads_whole_op_database(run):
     assert status == 0
     assert {"data/op-latency/h200_sxm/ops.parquet", "data/op-latency/b200_sxm/ops.parquet"} <= set(paths)
     assert run.transport.resolves == 0
+
+
+@pytest.mark.parametrize("value", [",", " , ,", ""])
+def test_empty_configuration_selector_is_a_usage_error_not_the_whole_database(run, value):
+    status, out, err = run("fetch", "--configuration", value)
+    assert status == 2 and out == "" and "--configuration" in err
+    assert run.transport.opened == [] and run.transport.resolves == 0  # rejected before any transport access
 
 
 def test_all_flag_equals_default_and_selectors_narrow(run):
@@ -483,6 +562,45 @@ def test_validate_non_string_artifact_path_is_a_finding(run, tmp_path, artifact_
     status, out, _ = run("data", "validate", str(manifest))  # not a TypeError while locating the dataset root
     report = json.loads(out)
     assert status == 1 and any(f["check"] == "manifest" for f in report["findings"])
+
+
+@pytest.mark.parametrize("category", ["eval", "systems"])
+@pytest.mark.parametrize("damage", ["altered", "missing"])
+@pytest.mark.parametrize("target", ["root", "directory", "manifest"])
+def test_validate_verifies_artifacts_of_categories_without_a_checker(run, tmp_path, category, damage, target):
+    root = tmp_path / "ds"
+    artifact, manifest = build_unchecked(root, category)
+    inputs = {"root": root, "directory": root / "data" / category, "manifest": manifest}
+    status, out, _ = run("data", "validate", str(inputs[target]))
+    report = json.loads(out)
+    assert status == 0 and report["ok"] is True and report["categories_without_offline_checker"] == [category]
+    if damage == "altered":
+        artifact.write_bytes(b'{"record": 2}')
+    else:
+        artifact.unlink()
+    status, out, _ = run("data", "validate", str(inputs[target]))
+    report = json.loads(out)
+    assert status == 1 and report["ok"] is False
+    assert any(f["check"] in ("dataset", "manifest") for f in report["findings"])
+
+
+def test_validate_catalog_identity_is_compared_for_categories_without_a_checker(run, tmp_path):
+    root = tmp_path / "ds"
+    build_unchecked(
+        root, "eval", catalog_hardware="b200_sxm"
+    )  # every digest is right; the catalog says another identity
+    status, out, _ = run("data", "validate", str(root))
+    report = json.loads(out)
+    assert status == 1
+    assert any(f["check"] == "dataset" and "identity mismatch" in f["message"] for f in report["findings"])
+
+
+def test_validate_repo_uses_the_saved_source_like_fetch(run):
+    saved = "b" * 40
+    run("init", "--on-demand", "--repo", REPO, "--revision", saved)
+    status, out, _ = run("data", "validate", "--repo", REPO)  # no --revision: the saved one for this repository
+    report = json.loads(out)
+    assert status == 0 and report["source"]["revision"] == saved and run.transport.resolves == 0
 
 
 def test_validate_single_manifest(run, tmp_path):

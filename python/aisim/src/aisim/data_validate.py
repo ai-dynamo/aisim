@@ -17,7 +17,7 @@ from typing import Any, get_args
 
 from pydantic import ValidationError
 
-from aisim_core.data import Category, CategoryIndex, Manifest, _verify, check_dataset, check_manifest
+from aisim_core.data import Category, CategoryIndex, Manifest, _verify, check_dataset, check_envelope, check_manifest
 from aisim_core.data.fetch import Cache, Selection, SelectionError, Transport, fetch, resolve_revision
 from aisim_core.data.loaders import LoaderError
 from aisim_core.data.names_check import check_names, discover_manifests
@@ -72,9 +72,10 @@ def validate_local(path: str | Path) -> dict[str, Any]:
             continue
         if manifest.category in UNCHECKED_CATEGORIES:
             skipped.add(manifest.category)
-        elif relative not in cataloged:  # check_dataset already ran check_manifest for catalog entries
+        if relative not in cataloged:  # check_dataset already checked the catalog entries
+            check = check_envelope if manifest.category in UNCHECKED_CATEGORIES else check_manifest
             try:
-                check_manifest(root, relative)
+                check(root, relative)
             except _ERRORS as exc:
                 findings.append(_finding("manifest", relative, f"{type(exc).__name__}: {exc}"))
         for check in ENTRY_CHECKS.get(manifest.category, ()):

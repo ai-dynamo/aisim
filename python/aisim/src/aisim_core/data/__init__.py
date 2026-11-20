@@ -268,10 +268,25 @@ def check_manifest(root: Path, path: str) -> Manifest:
     return manifest
 
 
+def check_envelope(root: Path, path: str) -> Manifest:
+    """Check a manifest of a category with no offline checker here: its identity hash and every declared artifact.
+
+    The category's own validators check the content; this keeps a missing or altered artifact from passing.
+    """
+    root = Path(root)
+    manifest = Manifest.model_validate_json(_file(root, path).read_bytes())
+    if manifest.configuration_id != configuration_id(manifest.category, manifest.purpose, manifest.identity):
+        raise ValueError("configuration identity hash mismatch")
+    for artifact in manifest.artifacts:
+        _verify(root, artifact)
+    return manifest
+
+
 def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> DatasetIndex:
     """Verify shared discovery indexes and the manifests they reference.
 
-    Manifests of ``unchecked_categories`` (categories with no offline checker here) are only digest-verified.
+    Manifests of ``unchecked_categories`` (categories with no offline checker here) get the envelope checks of
+    :func:`check_envelope` and the catalog identity comparison, but no category-specific checks.
     """
     root = Path(root)
     index = DatasetIndex.model_validate_json(_file(root, "catalog/dataset.json").read_bytes())
@@ -288,9 +303,8 @@ def check_dataset(root: Path, *, unchecked_categories: tuple[str, ...] = ()) -> 
                 raise ValueError("duplicate configuration ID")
             seen.add(entry.configuration_id)
             _verify(root, entry.manifest)
-            if category in unchecked_categories:
-                continue
-            manifest = check_manifest(root, entry.manifest.path)
+            check = check_envelope if category in unchecked_categories else check_manifest
+            manifest = check(root, entry.manifest.path)
             if (manifest.category, manifest.configuration_id, manifest.identity, manifest.purpose) != (
                 category,
                 entry.configuration_id,
