@@ -483,7 +483,9 @@ leave evaluation files optional.
 
 A staging `output_dir` holds one library at a time: staging another library there replaces it, and a
 configuration returned for the earlier library then reads the new one. Give each library whose configuration stays
-in use its own `output_dir`.
+in use its own `output_dir`. The staged root also carries `perf_data_reuse_manifest.yaml`, `query_versions.yaml` and
+`attention_lane_defaults.yaml` from the first source root that has each, so donor-backed operations price as they do
+through the source roots; a change to one of them restages the root.
 
 For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
 a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`

@@ -2634,6 +2634,58 @@ def _stage_args(root):
 KWARGS = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1")
 
 
+def test_staged_root_keeps_the_reuse_policy_of_its_source_root(root, profile, tmp_path):
+    import aisim_core
+    from aisim_core.data.fpm_library import ROOT_POLICY_FILES, _stageable_roots
+
+    make_entry(root, profile, resources=RESOURCES)
+    source = tmp_path / "policy-root"
+    source.mkdir()
+    shutil.copyfile(_stageable_roots(["default"], None)[0] / "h200_sxm.yaml", source / "h200_sxm.yaml")
+    data = source / "data/h200_sxm"
+    for backend, version in (("vllm", "0.25.1"), ("sglang", "0.5.0")):
+        table = data / "gemm" / backend / version / "gemm_perf.parquet"
+        table.parent.mkdir(parents=True)
+        table.write_bytes(b"stub")
+    policy = {
+        "perf_data_reuse_manifest.yaml": (
+            "groups:\n  - op_file: gemm_perf.parquet\n    kernel_source: shared_kernel\n    tier: shared\n"
+            "    frameworks: [sglang, vllm]\n"
+        ),
+        "query_versions.yaml": "schema_version: 1\ndefaults: {vllm: {current: '0.25.1'}}\noverrides: {}\n",
+        "attention_lane_defaults.yaml": "lanes: {}\n",
+    }
+    for name, text in policy.items():
+        (source / name).write_text(text)
+    parquet, sidecar = _stage_args(root)
+
+    def channels(systems_root):
+        report = json.loads(
+            aisim_core.resolve_op_sources_report_json(
+                str(systems_root), str(systems_root / "data/h200_sxm"), "vllm", "0.25.1", "gemm_perf.parquet"
+            )
+        )
+        return [record["channel"] for record in report["records"]]
+
+    expected = channels(source)
+    assert "cross_backend" in expected  # the donor is admitted only through the root's reuse manifest
+    output = tmp_path / "staged"
+    staged = stage_fpm_library(parquet, sidecar, output_dir=output, systems_paths=[source], **KWARGS)
+    assert channels(staged.systems_root) == expected
+    for name, text in policy.items():
+        assert (staged.systems_root / name).read_text() == text
+    assert set(ROOT_POLICY_FILES) == set(policy)
+    # An unchanged policy reuses the staging; a changed one restages it with the new policy.
+    marker = staged.systems_root / ".staged.json"
+    inode = marker.stat().st_ino
+    stage_fpm_library(parquet, sidecar, output_dir=output, systems_paths=[source], **KWARGS)
+    assert marker.stat().st_ino == inode
+    (source / "perf_data_reuse_manifest.yaml").write_text("groups: []\n")
+    restaged = stage_fpm_library(parquet, sidecar, output_dir=output, systems_paths=[source], **KWARGS)
+    assert (restaged.systems_root / "perf_data_reuse_manifest.yaml").read_text() == "groups: []\n"
+    assert "cross_backend" not in channels(restaged.systems_root)
+
+
 def test_invalid_system_yaml_is_a_contract_error(root, profile, tmp_path):
     make_entry(root, profile, resources=RESOURCES)
     systems = tmp_path / "systems"

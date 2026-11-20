@@ -529,6 +529,10 @@ def stage_fpm_library(
                 "path": str(source_yaml),
                 "sha256": sha256_file(build / source_yaml.name),
             }
+            # Copied by content, so a changed lookup policy must restage rather than reuse this root.
+            marker["policy_files"] = {
+                name: sha256_file(build / name) for name in ROOT_POLICY_FILES if (build / name).is_file()
+            }
             # The selected overlay links, not only the inputs, identify a reusable staging: a root added to or
             # reordered in front of the fallbacks can change which file a link names.
             marker["overlay"] = _overlay_links(build)
@@ -583,6 +587,7 @@ class _StagingMarker(BaseModel):
     parquet_path: str = Field(min_length=1)
     metadata_path: str = Field(min_length=1)
     system_definition: dict[str, str] | None = None
+    policy_files: dict[str, str] | None = None
     overlay: list[list[str]] | None = None
 
 
@@ -717,6 +722,12 @@ def _system_definition(system: str, systems_paths: Sequence[str | Path]) -> Path
     return source_yaml
 
 
+# Root-level lookup files of a systems root. The native database reads the reuse manifest from the root it
+# loads: without it no cross-backend donor is admitted, so the same operation can price differently through a staged
+# root than through the roots it was built from.
+ROOT_POLICY_FILES = ("perf_data_reuse_manifest.yaml", "query_versions.yaml", "attention_lane_defaults.yaml")
+
+
 def _prepare_system_overlay(
     systems_root: Path,
     source_yaml: Path,
@@ -729,6 +740,10 @@ def _prepare_system_overlay(
 
     target_yaml = systems_root / source_yaml.name
     shutil.copy2(source_yaml, target_yaml)
+    for name in ROOT_POLICY_FILES:  # the first root that has one decides, as for the system definition
+        source = next((Path(root) / name for root in systems_paths if (Path(root) / name).is_file()), None)
+        if source is not None:
+            shutil.copy2(source, systems_root / name)
     try:
         spec = yaml.safe_load(target_yaml.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
