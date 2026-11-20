@@ -54,6 +54,19 @@ def main(argv=None) -> int:
                 owners = pod.get("metadata", {}).get("ownerReferences", [])
                 if not any(o.get("kind") == "Job" and o.get("uid") == uid for o in owners):
                     raise KubeParseError("Pod owner does not match the Job UID")
+                # The parser counts only a container's final execution: the GPU time of earlier restarted
+                # attempts would silently disappear, so a restarted Succeeded Pod is not turned into a number.
+                status = pod.get("status") or {}
+                if status.get("phase") == "Succeeded":
+                    for entry in (
+                        *(status.get("initContainerStatuses") or []),
+                        *(status.get("containerStatuses") or []),
+                    ):
+                        if entry.get("restartCount", 0) not in (0, None):
+                            name = pod.get("metadata", {}).get("name")
+                            raise KubeParseError(
+                                f"Pod {name} restarted a container; earlier attempts cannot be counted yet"
+                            )
             gpu_time = gpu_time_from_kubernetes(job, pods, gpu_type=args.gpu_type)
     except (OSError, ValueError, AttributeError, TypeError) as exc:
         # Unfinished or inconsistent job records are not turned into numbers.

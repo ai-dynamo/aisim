@@ -155,35 +155,40 @@ def _sha(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def _source_git(source: Path, *args: str) -> str:
+    """Run Git in ``source`` without inheriting a foreign repository selected through the environment."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+            "GIT_SHALLOW_FILE",
+            "GIT_GRAFT_FILE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_CONFIG",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        }
+        and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    }
+    result = subprocess.run(["git", "-C", str(source), *args], capture_output=True, text=True, check=True, env=env)
+    return result.stdout.strip()
+
+
 def _check_source_checkout(source: Path, commit: str) -> None:
     """Bind provenance to a clean checkout at the exact reviewed revision."""
 
     def git(*args: str) -> str:
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key
-            not in {
-                "GIT_DIR",
-                "GIT_WORK_TREE",
-                "GIT_COMMON_DIR",
-                "GIT_INDEX_FILE",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                "GIT_PREFIX",
-                "GIT_SHALLOW_FILE",
-                "GIT_GRAFT_FILE",
-                "GIT_IMPLICIT_WORK_TREE",
-                "GIT_REPLACE_REF_BASE",
-                "GIT_NO_REPLACE_OBJECTS",
-                "GIT_CONFIG",
-                "GIT_CONFIG_PARAMETERS",
-                "GIT_CONFIG_COUNT",
-            }
-            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
-        }
-        result = subprocess.run(["git", "-C", str(source), *args], capture_output=True, text=True, check=True, env=env)
-        return result.stdout.strip()
+        return _source_git(source, *args)
 
     try:
         if Path(git("rev-parse", "--show-toplevel")).resolve() != source.resolve():
@@ -200,6 +205,39 @@ def _check_source_checkout(source: Path, commit: str) -> None:
         if actual != committed:
             raise PromotionError("source visibility ledger differs from the reviewed revision")
     except (OSError, subprocess.CalledProcessError) as exc:
+        raise PromotionError("source must be a readable Git checkout") from exc
+
+
+def _blob_id(path: Path) -> str:
+    """The Git object ID of the file's bytes, as ``git hash-object --no-filters`` computes it (SHA-1 object format)."""
+    digest = hashlib.sha1(f"blob {path.stat().st_size}\0".encode(), usedforsecurity=False)
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _check_selected_files(source: Path, commit: str, files: Iterable[str]) -> None:
+    """Every selected file must be byte-identical to its blob in the recorded revision.
+
+    ``git status`` omits assume-unchanged and skip-worktree paths, so an edited tracked file could otherwise
+    be promoted under a source commit that never contained it.
+    """
+    selected = sorted(files)
+    if not selected:
+        return
+    directories = sorted({PurePosixPath(rel).parent.as_posix() for rel in selected})
+    try:
+        listing = _source_git(
+            source, "ls-tree", "-r", "-z", "--format=%(objectname)%x09%(path)", commit, "--", *directories
+        )
+        committed = dict(
+            reversed(entry.split("\t", 1)) for entry in listing.split("\0") if "\t" in entry
+        )  # path -> blob ID
+        for rel in selected:
+            if not (source / rel).is_file() or committed.get(rel) != _blob_id(source / rel):
+                raise PromotionError(f"selected file differs from the reviewed revision: {rel}")
+    except (OSError, UnicodeDecodeError, subprocess.CalledProcessError) as exc:
         raise PromotionError("source must be a readable Git checkout") from exc
 
 
@@ -314,6 +352,10 @@ def plan_promotion(
     _select(source, request.directories, plan)
     if not plan.files:
         plan.findings.append(Finding("selection-empty", "selection contains no files"))
+    try:
+        _check_selected_files(source, request.source_commit, plan.files)
+    except PromotionError as exc:
+        plan.findings.append(Finding("source-checkout", str(exc)))
 
     ledger = load_ledger(source)
     for rel in sorted(plan.files):
@@ -494,6 +536,7 @@ def _apply_promotion(
             raise PromotionError(f"source changed since planning: {rel}")
         if (target / rel).exists() and _sha(target / rel) != digest:
             raise PromotionError(f"target already has different content at {rel}; promotion never overwrites")
+    _check_selected_files(source, plan.request.source_commit, plan.files)  # and the bytes of the recorded commit
     index_path = target / CATALOG_DIR / "dataset.json"
     _check_contained(target, list(plan.files) + [f"{CATALOG_DIR}/dataset.json"])
     categories = DatasetIndex.model_validate_json(index_path.read_bytes()).categories if index_path.is_file() else {}
@@ -507,6 +550,7 @@ def _apply_promotion(
     if overlap := generated_indexes & set(plan.files):
         raise PromotionError(f"generated indexes overlap approved files: {sorted(overlap)}")
     _check_contained(target, list(index_paths))
+    _check_catalog_unlinked(target)  # before any write: a link into an outside directory must stay untouched
     before = _snapshot(target, index_paths)
     added: list[Path] = []
     created_dirs: list[Path] = []
@@ -594,6 +638,18 @@ def _ledger_text(plan: PromotionPlan, fingerprint: str) -> str:
         )
         + "\n"
     )
+
+
+def _check_catalog_unlinked(target: Path) -> None:
+    """Refuse a catalog tree with a symlink: generated shards would be written through it, past the target."""
+    base = target / CATALOG_DIR
+    if base.is_symlink():
+        raise PromotionError(f"target catalog is a symlink: {CATALOG_DIR}")
+    for directory, names, files in os.walk(base):  # symlinks are listed but never followed
+        for name in (*names, *files):
+            link = Path(directory) / name
+            if link.is_symlink():
+                raise PromotionError(f"target catalog contains a symlink: {link.relative_to(target).as_posix()}")
 
 
 def _check_contained(target: Path, rels: list[str]) -> None:

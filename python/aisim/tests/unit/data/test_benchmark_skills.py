@@ -252,6 +252,40 @@ def test_record_gpu_time_kubernetes(tmp_path, capsys, container_times):
     assert "owner" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("restarts", [0, 1])
+def test_record_gpu_time_rejects_restarted_pods(tmp_path, capsys, restarts):
+    tool = _script("aisim-benchmark-collect", "record_gpu_time.py")
+    job = {
+        "metadata": {"name": "j", "namespace": "ns", "uid": "job-a"},
+        "status": {"succeeded": 1},
+        "spec": {"template": {"spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]}}},
+    }
+    pod = {
+        "metadata": {"name": "j-abc", "ownerReferences": [{"kind": "Job", "uid": "job-a"}]},
+        "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "4"}}}]},
+        "status": {
+            "phase": "Succeeded",
+            # A failed 30-minute attempt preceded this 10-minute one; its GPU time is not in the terminated state.
+            "containerStatuses": [
+                {
+                    "restartCount": restarts,
+                    "state": {
+                        "terminated": {"startedAt": "2026-01-01T00:20:00Z", "finishedAt": "2026-01-01T00:30:00Z"}
+                    },
+                }
+            ],
+        },
+    }
+    (tmp_path / "job.json").write_text(json.dumps(job))
+    (tmp_path / "pods.json").write_text(json.dumps({"items": [pod]}))
+    status = tool.main(["k8s", "--job", str(tmp_path / "job.json"), "--pods", str(tmp_path / "pods.json")])
+    captured = capsys.readouterr()
+    if restarts:
+        assert status == 2 and not captured.out and "restarted" in captured.err
+    else:
+        assert status == 0 and json.loads(captured.out)["gpu_time"]["gpu_seconds"] == 600 * 4
+
+
 @pytest.mark.parametrize(
     "job,pods",
     [
