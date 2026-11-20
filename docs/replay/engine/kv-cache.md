@@ -729,38 +729,35 @@ overhead reductions are deferred; they must preserve CanonicalV1 replay output b
 ### KVCR-owned memory
 
 With `kvcr.local_g2`, each rank has a second host cache that KVCR owns, behind
-the rank's own G2 (vLLM `secondary_g2_slots`). The capacity `num_blocks` must
-fit a positive unsigned 64-bit integer. Only G2 exchanges blocks with
-the GPU, so the two caches work as a chain:
+the rank's G2. Only G2 exchanges blocks with the GPU, so the two caches work
+as a chain:
 
-- **Store.** When a G2 store completes, its blocks are copied into KVCR-owned
-  memory and are readable there once the copy ends. A block already there is
-  skipped. If the memory is full and no block can be dropped, the new block is
-  not copied.
+- **Store.** A completed G2 store's blocks are copied into KVCR-owned memory
+  and are readable there once the copy ends. A block already there is
+  skipped, and one that finds the memory full with nothing to drop is not
+  copied.
 - **Evict and order.** The two caches evict independently. `lru` drops the
   block used least recently: a request's stores, promotion and finish and a
   peer's read count as use, lookups do not. `fifo` drops the block stored
   longest ago; a promotion queues its blocks again. A block being copied or
   read by a peer is never dropped.
-- **Promote.** A lookup that misses a block in G2 checks KVCR-owned memory
-  next, before the hinted peer and without needing a hint. A block found there
-  is copied back into G2, which can evict another G2 block, and then loads to
-  G1 like any G2 hit, so copy and load time add to TTFT.
-- **Peer pulls.** A source serves a pull from both of its caches. If its
-  KVCR-owned memory holds every block the rank asks for, the pull starts when
-  it is requested; otherwise it waits for the source's pass as before. Pulled
-  blocks land in the target's G2 only.
-- **Router events.** KVCR-owned memory is published as `HostPinned` in the
-  cache-owner domain (`"domain": "cache_owner"` in serialized events): a
-  block is stored when its copy ends and removed when memory evicts it or
-  its disk write ends. `HostPinned` events of the worker, which carry no
-  `domain`, describe G2 alone.
+- **Promote.** A lookup that misses G2 checks KVCR-owned memory next, before
+  the hinted peer and without a hint. A block found there is copied back into
+  G2, which can evict another G2 block, and loads to G1 like any G2 hit; copy
+  and load both add to TTFT.
+- **Peer pulls.** A source serves a pull from both caches. If its KVCR-owned
+  memory holds every requested block, the pull starts at once; otherwise it
+  waits for the source's pass. Pulled blocks land in the target's G2 only.
+- **Router events.** KVCR-owned memory publishes `HostPinned` events in the
+  cache-owner domain (`"domain": "cache_owner"`), from the end of a block's
+  copy until memory evicts it or its disk write ends. The worker's
+  `HostPinned` events cover G2 alone.
 
-A copy between the two caches takes its bytes, a block's KV for every GPU of
-the rank, divided by `copy_bandwidth_gbps`. Each direction runs a rank's
-copies one after another. The default approximates copies on a B200 node
-without RDMA; set the rate of your transport. Promotions count toward the
-1,024-round limit above.
+A copy between the two caches takes a block's bytes, its KV for every GPU of
+the rank, divided by `copy_bandwidth_gbps`; each direction runs a rank's
+copies one after another. The default approximates a B200 node without RDMA;
+set the rate of your transport. Promotions count toward the 1,024-round limit
+above.
 
 The model simplifies KVCR-owned memory:
 
@@ -774,15 +771,14 @@ Under `lru`, the order can differ from vLLM's in corner cases, such
 as a pull that lands without a promotion.
 
 With `local_g2` the `kvcr` summary gains a `local_g2` section of block counts:
-`stored_blocks` (counted when the copy into KVCR-owned memory completes),
-`dropped_blocks` (not copied for lack of room),
-`evicted_blocks`, `promoted_blocks` and `loaded_blocks` (promoted blocks,
-counted when their first load into G1 starts).
+`stored_blocks` (counted when the copy completes), `dropped_blocks` (not
+copied for lack of room), `evicted_blocks`, `promoted_blocks` and
+`loaded_blocks` (promoted blocks, counted at their first load into G1).
 
 A joined promotion and peer pull become readable in G2 together. The pull's
 delivery counters update only then, and `remote_deliver_ms` includes any wait
 for the local copy. Its source blocks are released when the target takes the
-completed peer transfer, even if the local copy has not finished.
+completed peer transfer, even before the local copy ends.
 
 Guard ownership and custom policies are not modeled.
 
@@ -792,9 +788,8 @@ Guard ownership and custom policies are not modeled.
 
 With `kvcr.g3`, each rank also has a disk cache that KVCR owns: a block that
 KVCR-owned memory evicts is written there instead of dropped, and a lookup
-that misses G2 and that memory reads it back into G2. With `g3`, the
-`local_g2.policy` values `lru` and `fifo` stand for vLLM's `g3_lru` and
-`g3_fifo`.
+that misses G2 and that memory reads it back into G2. The `local_g2.policy`
+values `lru` and `fifo` then stand for vLLM's `g3_lru` and `g3_fifo`.
 
 - **Write.** KVCR writes one block at a time. A block of a completed G2 store
   that finds KVCR-owned memory full waits for the write that frees its slot,
@@ -803,41 +798,35 @@ that misses G2 and that memory reads it back into G2. With `g3`, the
   finished write when its pass ends, so a busy rank finishes at most one
   write per pass. While a block waits, G2 cannot evict any block of its
   store, so a long `spill_timeout_ms` with a slow disk can hold most of G2.
-  A store that times out keeps this hold until the write in flight ends, up
-  to one write past `spill_timeout_ms`; KVCR ends it at the timeout.
+  A store that times out holds its blocks until the write in flight ends, up
+  to one write longer; KVCR releases them at the timeout.
 - **Evict.** A full disk drops a block by the memory's policy, never one
   being read; when all are being read, the block memory evicts is dropped
   unsaved. Under `lru` a block keeps the rank it had in memory and the same
   uses count on disk; `fifo` drops the block unused longest since it was
   written or last read.
 - **Read.** A block found only on disk is read into G2, like a promotion and
-  before the hinted peer. It stays on disk and does not return to KVCR-owned
-  memory.
+  before the hinted peer. It stays on disk and out of KVCR-owned memory.
 - **Peer pulls.** A peer cannot pull a block that is only on disk.
-- **Router events.** A block is published with tier `Disk` in the
-  cache-owner domain (`"tier": "disk", "domain": "cache_owner"` in serialized
-  events) when its write ends and removed when the disk drops it.
+- **Router events.** A block is published with tier `Disk` (`"tier": "disk"`),
+  in the cache-owner domain, when its write ends and removed when the disk
+  drops it.
 
 The timing defaults describe a local NVMe drive; set the values of your
 storage. With them a 9.4 MB block, its KV for every GPU of the rank, is
 written in about 15 ms. Each rank's disk is modeled on its own, so lower
 `write_bandwidth_gbps` for ranks whose disk caches share a drive.
 
-The model simplifies the disk tier:
-
-- Reads do not fail or time out. KVCR fails a read that outlasts its
-  operation timeout, 1 s by default.
-- G2 ranks a waiting store's blocks as most recently used when it may evict
-  them again.
-
-Under `lru`, the order in memory and on disk can differ from KVCR's in corner
+The model simplifies the disk tier: reads do not fail or time out, where
+KVCR fails a read that outlasts its operation timeout, 1 s by default. Under
+`lru`, the order in memory and on disk can differ from KVCR's in corner
 cases, such as a store that gives up before copying all of its blocks.
 
 With `g3` the `kvcr` summary gains a `g3` section of block counts:
 `stored_blocks` (written to disk), `evicted_blocks` (dropped from disk) and
 `read_blocks` (read back into G2). In the `local_g2` section, `evicted_blocks`
-then includes the blocks written to disk, `dropped_blocks` the blocks that
-waited too long and `loaded_blocks` the blocks read from disk.
+then includes blocks written to disk, `dropped_blocks` those that waited too
+long and `loaded_blocks` those read from disk.
 
 `kvcr.g3` runs on `--stack engine`; another stack is rejected unless its
 runner declares support.
