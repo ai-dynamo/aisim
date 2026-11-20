@@ -33,7 +33,7 @@ commands, API explanations and online-update formulas.
 
 ## Prepare the environment
 
-Use Python 3.11–3.13 and a source revision containing the commands you need.
+Use Python 3.11–3.14 and a source revision containing the commands you need.
 Keep your existing working checkout; switching branches can remove the guided
 CLI. Follow the [installation guide](../../getting-started/installation.md#use-current-source)
 when creating a new checkout. From its repository root:

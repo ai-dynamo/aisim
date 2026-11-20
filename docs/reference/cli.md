@@ -702,7 +702,7 @@ Check KV capacity against request lengths, context limits, and traffic stop limi
 | Symptom | What to check | Example fix |
 |---|---|---|
 | `aisim: command not found` | The environment containing AISim must be active. | From the tutorial directory, run `source .venv/bin/activate`, then `python -m pip show aisim`. |
-| Installation reports an unsupported Python version | AISim requires Python 3.11–3.13. | Check `python3 --version` and create the environment with a supported interpreter. |
+| Installation reports an unsupported Python version | AISim requires Python 3.11–3.14. | Check `python3 --version` and create the environment with a supported interpreter. |
 | Configuration or trace file cannot be found | Check the path and the directory where you ran the command. | Run from the directory containing `prediction.yaml`, or use absolute paths. |
 | Output directory is not empty | The directory holds results, files AISim did not write, or diagnostics without a failed-run report. Leftovers from a failed run are reused automatically. | Add `--output-dir ./another-prediction`, or `--overwrite` to replace known outputs. |
 | Stack or config adapter is unavailable | Use the Python environment containing the selected integration. `router` and `planner` are Dynamo-owned sections. | Install a matched pair from the [installation guide](../getting-started/installation.md#optional-dynamo-integration) and use `--stack dynamo`. |
