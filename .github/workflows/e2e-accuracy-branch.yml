@@ -220,10 +220,6 @@ jobs:
         shard: [0, 1, 2, 3]
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 360
-    # Holds the private HF read token. Preview runs use their own environment (and may scope their own token).
-    # The token reaches only steps that run main's code from `trusted/` in `trusted-venv`; PR-controlled code
-    # (the evaluated checkout and the exact wheel) never shares a step, interpreter or virtualenv with it.
-    environment: ${{ inputs.preview && 'e2e-accuracy-preview' || 'e2e-accuracy-private' }}
     container:
       # The runner executes as non-root; use its sudo-enabled CI image.
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
@@ -465,10 +461,6 @@ jobs:
         shard: [0, 1]
     runs-on: prod-aisim-default-amd64-v1
     timeout-minutes: 360
-    # Holds the private HF read token. Preview runs use their own environment (and may scope their own token).
-    # The token reaches only steps that run main's code from `trusted/` in `trusted-venv`; PR-controlled code
-    # (the evaluated checkout and the exact wheel) never shares a step, interpreter or virtualenv with it.
-    environment: ${{ inputs.preview && 'e2e-accuracy-preview' || 'e2e-accuracy-private' }}
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -633,13 +625,25 @@ jobs:
           PREVIEW: ${{ inputs.preview }}
           AGENTX_CAMPAIGN_CATALOG: ${{ inputs.agentx_campaign_catalog }}
         run: |
-          revision=$(python -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/agentx-results/shard-0.json"))["snapshot"]["dataset_revision"])')
+          revision=$(python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          with open(os.environ["RUNNER_TEMP"] + "/agentx-results/shard-0.json") as stream:
+              revision = json.load(stream)["snapshot"]["dataset_revision"]
+          if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+              sys.exit("dataset_revision must be a 40-character lowercase hexadecimal commit SHA")
+          print(revision)
+          PY
+          )
           echo "AGENTX_RESOLVED_REVISION=$revision" >> "$GITHUB_ENV"
           fetch_args=()
           if [[ "$PREVIEW" == true ]]; then fetch_args+=(--preview); fi
           if [[ -n "$AGENTX_CAMPAIGN_CATALOG" ]]; then fetch_args+=(--campaign-catalog "$AGENTX_CAMPAIGN_CATALOG"); fi
           echo "AGENTX_FETCH_ARGS=${fetch_args[*]}" >> "$GITHUB_ENV"
-      - name: Verify complete cohort and export public numerical evidence with main's code
+      - name: Fetch AgentX qualification metadata with main's code
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
@@ -647,7 +651,10 @@ jobs:
           # shellcheck disable=SC2086
           "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/e2e_accuracy/run_agentx_accuracy.py fetch --metadata-only \
             --revision "$AGENTX_RESOLVED_REVISION" --output "${RUNNER_TEMP}/agentx-inputs" $AGENTX_FETCH_ARGS
-          "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/e2e_accuracy/run_agentx_accuracy.py qualify \
+      - name: Verify complete cohort with the pinned replay driver (no secret)
+        shell: bash
+        run: |
+          python scripts/e2e_accuracy/run_agentx_accuracy.py qualify \
             --inputs "${RUNNER_TEMP}/agentx-inputs" --shards "${RUNNER_TEMP}/agentx-results" \
             --shard-count 2 --output "${RUNNER_TEMP}/agentx-public"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
