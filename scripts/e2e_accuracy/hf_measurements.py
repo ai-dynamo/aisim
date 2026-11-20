@@ -382,3 +382,19 @@ def read_dataset(tables_path):
     """The dataset provenance written next to ``tables.json``, or ``None`` for older inputs."""
     path = Path(tables_path).with_name(DATASET_FILE)
     return json.loads(path.read_text()) if path.exists() else None
+
+
+def check_pinned_dataset(dataset, manifest):
+    """An existing sidecar must describe the manifest's repository, revision and layout (and pinned snapshot).
+
+    Inputs without a sidecar (``None``) stay supported; the layout defaults to the legacy one, as in the manifest.
+    """
+    if dataset is None:
+        return
+    expected = dict(
+        repo_id=manifest["repo_id"], revision=manifest["revision"], layout=manifest.get("layout", LEGACY_LAYOUT)
+    )
+    if any(dataset.get(key, LEGACY_LAYOUT if key == "layout" else None) != value for key, value in expected.items()):
+        raise ValueError("measurements do not come from the pinned dataset repository, revision and layout")
+    if dataset["snapshot_id"] != manifest.get("snapshot_id", dataset["snapshot_id"]):
+        raise ValueError("measurements do not come from the pinned dataset snapshot")
