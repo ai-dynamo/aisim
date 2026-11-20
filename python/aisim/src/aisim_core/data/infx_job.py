@@ -6,7 +6,7 @@
 ``python -m aisim_core.data.infx_job {run,promote,verify,staleness}``. The internal GitLab
 job (``scripts/ci/gitlab/aisim-infx-ingest.gitlab-ci.yml``) only calls these entry points.
 
-Rules enforced here (AISIM-2334 / DEP #435):
+Rules enforced here (DEP #435):
 
 * An **unchanged** refresh (snapshot ID equals the qualified or pending candidate) writes
   nothing, so the job has no commit to make.
