@@ -387,11 +387,6 @@ jobs:
         run: |
           python -m venv "${RUNNER_TEMP}/trusted-venv"
           "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
-      - name: Install aggregation tooling
-        run: |
-          python -m venv "${RUNNER_TEMP}/accuracy-venv"
-          echo "${RUNNER_TEMP}/accuracy-venv/bin" >> "${GITHUB_PATH}"
-          "${RUNNER_TEMP}/accuracy-venv/bin/python" -m pip install --require-hashes -r scripts/e2e_accuracy/requirements.txt
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: e2e-accuracy-dataset
@@ -406,6 +401,13 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
         run: |
           "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/e2e_accuracy/private_artifacts.py open "${RUNNER_TEMP}/accuracy-shards-encrypted" "${RUNNER_TEMP}/accuracy-shards"
+      # The evaluated checkout's requirements run install-time code, so they install only after the last step
+      # that holds the token.
+      - name: Install aggregation tooling
+        run: |
+          python -m venv "${RUNNER_TEMP}/accuracy-venv"
+          echo "${RUNNER_TEMP}/accuracy-venv/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/accuracy-venv/bin/python" -m pip install --require-hashes -r scripts/e2e_accuracy/requirements.txt
       - name: Verify every shard and qualify the complete cohort
         shell: bash
         env:
@@ -604,11 +606,6 @@ jobs:
         run: |
           python -m venv "${RUNNER_TEMP}/trusted-venv"
           "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
-      - name: Install qualification tooling
-        run: |
-          python -m venv "${RUNNER_TEMP}/agentx-venv"
-          echo "${RUNNER_TEMP}/agentx-venv/bin" >> "${GITHUB_PATH}"
-          "${RUNNER_TEMP}/agentx-venv/bin/python" -m pip install --require-hashes -r scripts/e2e_accuracy/requirements.txt
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: agentx-private-${{ inputs.artifact_key }}-*
@@ -625,7 +622,7 @@ jobs:
           PREVIEW: ${{ inputs.preview }}
           AGENTX_CAMPAIGN_CATALOG: ${{ inputs.agentx_campaign_catalog }}
         run: |
-          revision=$(python - <<'PY'
+          revision=$("${RUNNER_TEMP}/trusted-venv/bin/python" - <<'PY'
           import json
           import os
           import re
@@ -651,6 +648,13 @@ jobs:
           # shellcheck disable=SC2086
           "${RUNNER_TEMP}/trusted-venv/bin/python" trusted/scripts/e2e_accuracy/run_agentx_accuracy.py fetch --metadata-only \
             --revision "$AGENTX_RESOLVED_REVISION" --output "${RUNNER_TEMP}/agentx-inputs" $AGENTX_FETCH_ARGS
+      # The evaluated checkout's requirements run install-time code, so they install only after the last step
+      # that holds the token (and after the steps that write $GITHUB_ENV for it).
+      - name: Install qualification tooling
+        run: |
+          python -m venv "${RUNNER_TEMP}/agentx-venv"
+          echo "${RUNNER_TEMP}/agentx-venv/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/agentx-venv/bin/python" -m pip install --require-hashes -r scripts/e2e_accuracy/requirements.txt
       - name: Verify complete cohort with the pinned replay driver (no secret)
         shell: bash
         run: |

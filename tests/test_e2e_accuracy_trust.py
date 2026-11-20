@@ -175,6 +175,27 @@ def _assert_no_evaluated_wheel_in_trusted_venv(run):
         assert "trusted-venv" not in run
 
 
+@pytest.mark.parametrize("job_id", ["campaign", "qualify-agentx"])
+def test_evaluated_requirements_install_only_after_the_last_token_step(job_id):
+    """Installing the evaluated checkout's requirements runs its install-time code, which may poison later steps
+    through $GITHUB_ENV or $GITHUB_PATH. Unlike shards and agentx, these two jobs never need that code before
+    the token is gone, so the install must come after every step that holds a secret."""
+    job_steps = load("e2e-accuracy-branch.yml")["jobs"][job_id]["steps"]
+    token = [index for index, step in enumerate(job_steps) if references_secret(step)]
+    installs = [
+        index
+        for index, step in enumerate(job_steps)
+        if "pip install" in step.get("run", "") and "-r scripts/" in step.get("run", "")
+    ]
+    assert token and installs, job_id
+    assert max(token) < min(installs), (job_id, token, installs)
+    # Steps from the first token step to the install (such as the revision resolver) use the trusted interpreter only.
+    for step in job_steps[min(token) : min(installs)]:
+        for line in step.get("run", "").splitlines():
+            assert not line.strip().startswith(("python ", "python3 ")), (job_id, step.get("name"), line)
+            assert "$(python " not in line, (job_id, step.get("name"), line)
+
+
 def test_the_trusted_venv_never_sees_the_evaluated_wheel():
     for name in NAMES:
         for job_id, _, step in steps(name):
@@ -221,6 +242,9 @@ def test_agentx_rejects_invalid_revision_before_writing_environment(tmp_path, re
     shard.write_text(json.dumps({"snapshot": {"dataset_revision": revision}}))
     environment = tmp_path / "github-env"
     environment.write_text("EXISTING=value\n")
+    python = tmp_path / "trusted-venv/bin/python"  # the revision step runs on the trusted interpreter
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
     resolve = next(
         step
         for step in load("e2e-accuracy-branch.yml")["jobs"]["qualify-agentx"]["steps"]
