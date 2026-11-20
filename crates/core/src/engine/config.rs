@@ -2311,6 +2311,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_power_round_trips_and_rejects_negative_or_non_finite_watts() {
+        let config: EngineConfig =
+            serde_json::from_value(serde_json::json!({"wait_power_w": 60.0})).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.wait_power_w, Some(60.0));
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["wait_power_w"], 60.0);
+        let round_trip: EngineConfig = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.wait_power_w, Some(60.0));
+
+        let unset = EngineConfig::default();
+        assert!(unset.wait_power_w.is_none());
+        assert!(
+            serde_json::to_value(&unset)
+                .unwrap()
+                .get("wait_power_w")
+                .is_none()
+        );
+
+        for watts in [-1.0, f64::NAN, f64::INFINITY] {
+            let config = EngineConfig {
+                wait_power_w: Some(watts),
+                ..EngineConfig::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("wait_power_w must be finite and non-negative"),
+                "{watts}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn mamba_native_config_round_trip_defaults_and_rejections() {
         let base = serde_json::json!({
             "backend": "sglang", "block_size": 64,

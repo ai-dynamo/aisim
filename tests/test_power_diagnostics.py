@@ -125,6 +125,30 @@ def test_step_power_detail_preserves_active_metrics() -> None:
     assert "Attention-DP wait: 4.00 ms across ranks. Step power: 230.00 W" in format_power_diagnostics(detail)
 
 
+def test_step_power_without_wait_watts_renders_unavailable() -> None:
+    diagnostics = _diagnostics()
+    diagnostics.update(
+        publication_status="available",
+        power_w=400.0,
+        power_coverage=1.0,
+        attention_dp_wait_ms=4.0,
+        step_power_w=None,
+        phases=[diagnostics["phases"][1]],
+    )
+    detail = energy_diagnostics({"power_diagnostics": diagnostics})
+    assert detail["power_w"] == 400.0
+    assert detail["step_power_w"] is None
+    assert "Attention-DP wait: 4.00 ms across ranks. Step power: N/A" in format_power_diagnostics(detail)
+
+
+def test_wait_line_is_absent_when_wait_is_not_tracked() -> None:
+    diagnostics = _diagnostics()
+    diagnostics.update(publication_status="available", power_w=400.0, power_coverage=1.0)
+    diagnostics.pop("attention_dp_wait_ms", None)
+    diagnostics.pop("step_power_w", None)
+    assert "Attention-DP wait" not in format_power_diagnostics(diagnostics)
+
+
 def test_unsupported_diagnostics_explain_missing_provider_evidence() -> None:
     rendered = format_power_diagnostics(
         {
