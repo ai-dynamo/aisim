@@ -57,14 +57,7 @@ python3 -m pip install "grpcio-tools<=1.76.0" -r \
 python3 -m pip check
 ```
 
-The `grpcio-tools` cap matches RC9's
-[common requirements](https://github.com/ai-dynamo/dynamo/blob/ffd7c1a90eb403c0d43911690c5c9b8457acd826/container/deps/requirements.common.txt).
-AISim's `google-vizier` dependency can install a newer `grpcio-tools`
-that requires a different protobuf version. Include the cap in the same pip
-invocation as the Planner requirements so the resolver can select compatible
-versions together, including when repairing an existing environment. When
-selecting another Dynamo revision, check its common requirements and update
-this cap together with `DYNAMO_REF`.
+The `grpcio-tools` cap matches RC9's [common requirements](https://github.com/ai-dynamo/dynamo/blob/ffd7c1a90eb403c0d43911690c5c9b8457acd826/container/deps/requirements.common.txt). Earlier AISim releases' `google-vizier` dependency can install a newer `grpcio-tools` that requires a different protobuf version. Include the cap in the same pip invocation as the Planner requirements so the resolver can select compatible versions together, including when repairing an existing environment. When selecting another Dynamo revision, check its common requirements and update this cap together with `DYNAMO_REF`.
 
 Use the full requirements file, which includes `scikit-learn` and other
 Planner dependencies. The supported prebuilt alternative is the matching

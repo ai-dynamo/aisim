@@ -25,9 +25,7 @@ their compatibility tests; for that work, install Git LFS and run
 
 ### 2. Install Development Dependencies
 
-Install Python 3.11–3.13, `uv`, Rust/Cargo, and a C/C++ compiler plus platform
-linker first. Maturin builds the native extension during sync; see the
-[platform and source-build requirements](docs/getting-started/installation.md#use-current-source).
+Install Python 3.11–3.14, `uv`, Rust/Cargo, and a C/C++ compiler plus platform linker first. Maturin builds the native extension during sync; see the [platform and source-build requirements](docs/getting-started/installation.md#use-current-source).
 
 ```bash
 uv sync --project python/aisim --extra dev

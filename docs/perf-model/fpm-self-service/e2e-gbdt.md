@@ -34,7 +34,7 @@ worker traces, and a client that can run your workload. Use your own cluster and
 deployment tools. An existing completed capture can start at step 2 after
 reviewing its identity and provenance through onboarding stages 1–3.
 
-In an AISim source checkout, prepare Python 3.11–3.13 and the training extra:
+In an AISim source checkout, prepare Python 3.11–3.14 and the training extra:
 
 ```bash
 uv sync --project python/aisim --extra learned

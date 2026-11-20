@@ -389,7 +389,8 @@ jobs:
       RUSTUP_VERSION: "1.29.0"
       RUST_TOOLCHAIN: "1.98.0"
       PYTHON_SERIES: "3.12"
-      # The abi3 wheel claims every Python in requires-python; prove each one.
+      # Historical release sources also use this workflow. Keep their established
+      # smoke matrix; Full CI tests Python 3.14 with the updated dependencies.
       PYTHON_SERIES_LIST: "3.11 3.12 3.13"
       # Use uv's managed interpreter (not the image's python) and ignore any
       # uv.toml discovered in the workspace.
