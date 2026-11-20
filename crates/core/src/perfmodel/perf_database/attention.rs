@@ -1600,15 +1600,11 @@ mod tests {
     }
 
     fn b200_vllm_data_root() -> PathBuf {
-        PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems/data/b200_sxm/vllm/0.24.0")
+        crate::test_systems::path("data/b200_sxm/vllm/0.24.0")
     }
 
     fn b200_sxm_spec() -> SystemSpec {
-        let systems_yaml = PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems/b200_sxm.yaml");
+        let systems_yaml = crate::test_systems::path("b200_sxm.yaml");
         SystemSpec::load(&systems_yaml).expect("b200_sxm.yaml must parse")
     }
     fn lanes(names: &[&str]) -> Vec<String> {
@@ -1937,9 +1933,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn b200_sglang_0514_data_root() -> PathBuf {
-        PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems/data/b200_sxm/sglang/0.5.14")
+        crate::test_systems::path("data/b200_sxm/sglang/0.5.14")
     }
 
     /// Two-lane in-memory context table: `head` carries only the `hs=128`

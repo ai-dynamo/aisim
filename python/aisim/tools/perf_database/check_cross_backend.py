@@ -92,7 +92,7 @@ Sweep columns get log2-bucketed to form the local-baseline bucket key.
 
 Usage:
     python3 tools/perf_database/check_cross_backend.py \\
-        --data-root src/aisim_core/systems/data \\
+        --data-root <systems root>/data \\
         --systems h200_sxm \\
         --out-md   $TMPDIR/cross-backend-check.md \\
         --out-json $TMPDIR/cross-backend-check.json
@@ -120,6 +120,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend_facts import load_backend_map, translate
+from op_data_root import op_data_root
 from perf_data_layout import META_COLUMNS, iter_data_files
 
 logger = logging.getLogger(__name__)
@@ -1632,8 +1633,8 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("src/aisim_core/systems/data"),
-        help="Root of the systems/data tree.",
+        default=None,
+        help="Root of the systems/data tree (default: the pinned op-latency dataset, see op_data_root.py).",
     )
     parser.add_argument("--workers", type=int, default=1, help="Parallel system/op table workers (default: serial).")
     parser.add_argument("--systems", nargs="*", default=None, help="Restrict to these systems.")
@@ -1762,7 +1763,7 @@ def main() -> None:
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)s %(message)s")
 
     anomalies, gaps = run_checks(
-        data_root=args.data_root,
+        data_root=op_data_root(args.data_root),
         systems=args.systems,
         backends=args.backends,
         op_files=args.op_files,

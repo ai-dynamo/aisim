@@ -4,7 +4,6 @@
 
 import argparse
 import hashlib
-import importlib
 import importlib.resources
 import json
 import sys
@@ -15,6 +14,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.e2e_accuracy.simulation_features import build as build_features
 from scripts.release.package_identity import runtime_module
+
+
+def _op_data_root():
+    """Where the evaluated wheel reads operation tables.
+
+    A wheel from the pinned-dataset release composes its root from the dataset. Older release wheels (for example
+    ``release/0.14.0``) have no ``aisim_core.data.default_systems`` and package their tables, so read those.
+    """
+    try:
+        default_systems = runtime_module("aisim_core.data.default_systems")
+    except ImportError:
+        return importlib.resources.files(runtime_module("aisim_core")) / "systems/data"
+    return Path(default_systems.default_systems_path()) / "data"
 
 
 def predict(config_path, output):
@@ -40,7 +52,7 @@ def predict(config_path, output):
         return {"outcome": "unsupported", "reason": "database_unavailable"}
     engine["backend_version"] = version
     try:
-        data_root = importlib.resources.files(runtime_module("aisim_core")) / "systems/data"
+        data_root = _op_data_root()
     except ImportError:
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
     relative = (

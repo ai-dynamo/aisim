@@ -5414,3 +5414,18 @@ def test_release_output_checks_embedded_identity_and_scripts(tmp_path, monkeypat
     else:
         with pytest.raises(AssertionError):
             release_artifacts.verify_output(output, version, version)
+
+
+def test_standalone_composition_steps_install_the_download_transport():
+    """compose_systems_root.py needs the Hugging Face transport, and these steps never install AISim itself."""
+    documents = [yaml.safe_load(path.read_text()) for path in sorted(WORKFLOW_ROOT.glob("*.yml"))]
+    documents += [yaml.safe_load(path.read_text()) for path in sorted(ACTION_ROOT.glob("*/action.yml"))]
+    steps = [
+        step for document in documents for job in (document.get("jobs") or {}).values() for step in job.get("steps", [])
+    ]
+    steps += [step for document in documents for step in (document.get("runs") or {}).get("steps", [])]
+    composing = [step["run"] for step in steps if "compose_systems_root.py" in step.get("run", "")]
+    assert composing
+    for run in composing:
+        before = run.split("compose_systems_root.py")[0]
+        assert re.search(r"pip install[^\n]*\bhuggingface_hub\b", before), run
