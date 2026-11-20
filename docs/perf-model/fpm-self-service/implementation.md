@@ -1496,6 +1496,13 @@ disabled prefix caching, and no speculation. Each role requires its own
 initialized-rank observations and native measurement evidence. Aggregated
 collection remains unsupported by this adapter.
 
+Import checks native KDA state dtypes against the resolved cache settings:
+`mamba_cache_dtype: auto` follows the model dtype for convolution, and
+`mamba_ssm_cache_dtype: auto` requires FP32 recurrence. Explicit BF16 recurrence
+is accepted only with matching spec and tensor evidence. CUDA FP8 indexer
+kernel views require the pinned backend's 64-token kernel blocks, including
+when a larger manager block is subdivided.
+
 For prefill, the supported scope is **historical KV = 0**: new requests whose
 entire scheduled prompt is computed in the measured forward pass. At pinned
 [Dynamo `17628144dc33c9d5916b08789f9d317924217dad`](https://github.com/ai-dynamo/dynamo/blob/17628144dc33c9d5916b08789f9d317924217dad/components/src/dynamo/vllm/instrumented_scheduler.py#L3892),
@@ -1541,13 +1548,15 @@ changing that bundle's bytes or source identity.
 | `precision` | `gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kv_cache_dtype`, and `comm_quant_mode`; optional selected backends and `enable_wideep`/`enable_eplb`. A complete existing profile can supply this exact precision identity. |
 | Collection fields | `max_num_tokens`, `max_batch_size`, `gpu_memory_utilization`, `prefill_cudagraph_policy`, and an explicit capture size only with `explicit` policy. Missing scheduler/fraction values use the documented 8,192/256/0.90 defaults. Fresh inputs use runtime capture policy; saved legacy drafts retain their policy. |
 | `collection_deployment` | Existing executor/image/model-cache/mount/transport options. `container_mount` is a list. Explicit deployment flags override and save the selected configurations' deployment choices. |
+| `collection_deployment.extra_env` | Unique literal `{name, value}` environment entries applied to runtime version detection, runtime probes and formal collection. |
 | `resource_overrides` | Per-configuration metadata assumptions, if required for the model. Cache geometry can remain absent at probe entry. |
 
 Save source research and outstanding questions after each meaningful finding with `onboard checkpoint`, using its current revision. Register the local bundle files and source notes as input artifacts; do not put independent configurations' byte bounds into shared inputs. Probe and import also register their results, but they do not observe or save the agent's investigation automatically.
 
 For an audited runtime assembled from mounted dependencies, `collection_deployment.extra_env`
 accepts unique literal `{name, value}` entries through the existing Generator environment
-interface. These entries remain part of the frozen launch and formal collection settings.
+interface. These entries remain part of the frozen launch and formal collection settings,
+and also apply to package-version detection in the selected Slurm or Kubernetes container.
 `PYTHONPATH`, `PYTHONNOUSERSITE`, `HF_HOME`, `HF_HUB_OFFLINE`, and `TRANSFORMERS_OFFLINE`
 also reach the Collector's startup checks before the engine starts. Record mounted source
 and binary hashes alongside the image identity; environment declarations do not qualify them.

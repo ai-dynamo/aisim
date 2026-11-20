@@ -531,6 +531,7 @@ def inspect_execution_evidence(
     ranks = set()
     snapshot_models = None
     snapshot_source = None
+    snapshot_load_attempted = False
     audited_runtime_ranks = set()
     scheduling = {"requested": _requested_scheduling(flags), "observed_workers": []}
     for path in sorted(raw_root.glob("**/fpm-execution-worker-*.json")):
@@ -595,11 +596,13 @@ def inspect_execution_evidence(
             )
         ):
             try:
-                bundle = getattr(plan, "runtime_instrumentation", None) if snapshot_models is None else None
-                if snapshot_models is None and bundle is not None:
-                    snapshot_models, snapshot_source = _runtime_worker_evidence(
-                        plan, cell, raw_root, collection, bundle=bundle
-                    )
+                if not snapshot_load_attempted:
+                    snapshot_load_attempted = True
+                    bundle = getattr(plan, "runtime_instrumentation", None)
+                    if bundle is not None:
+                        snapshot_models, snapshot_source = _runtime_worker_evidence(
+                            plan, cell, raw_root, collection, bundle=bundle
+                        )
                 if snapshot_models is not None:
                     native_worker = snapshot_models.get(rank)
                     if native_worker is None:

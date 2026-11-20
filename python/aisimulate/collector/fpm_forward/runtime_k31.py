@@ -279,8 +279,25 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
     return result
 
 
+def _validate_state_dtypes(spec, config):
+    # Pinned KimiK3DeltaAttention.get_state_dtype delegates to
+    # mamba_utils.MambaStateDtypeCalculator.kda_state_dtype: convolution uses
+    # mamba_cache_dtype (auto follows model dtype), auto recurrence is FP32.
+    cache = config["cache_config"]
+    conv = cache.get("mamba_cache_dtype")
+    if conv == "auto":
+        conv = config["model_config"]["dtype"].removeprefix("torch.")
+    recurrent = cache.get("mamba_ssm_cache_dtype")
+    if recurrent == "auto":
+        recurrent = "float32"
+    if conv not in {"bfloat16", "float32"} or recurrent not in {"bfloat16", "float32"}:
+        raise ValueError("K3.1 resolved KDA cache dtypes are missing or unsupported")
+    if spec.get("state_dtypes") != [f"torch.{conv}", f"torch.{recurrent}"]:
+        raise ValueError("K3.1 native state dtypes differ from the resolved cache configuration")
+
+
 def validate_attention_assignments(worker):
-    """Reconcile initialized layer backends and specs with resolved policy."""
+    """Reconcile initialized layer backends and dtypes with resolved policy."""
     cache = worker["cache"]
     config = worker["resolved_config"]
     selected = config["attention_config"]["backend"]
@@ -300,10 +317,12 @@ def validate_attention_assignments(worker):
             if cls not in classes:
                 raise ValueError("K3.1 attention layer class has no audited backend mapping")
             expected[(gid, name)] = classes[cls]
+            spec = group["layer_specs"][name] if "layer_specs" in group else group
+            if not isinstance(spec, dict):
+                raise ValueError("K3.1 native cache spec must be an object")
+            if cls == KDA:
+                _validate_state_dtypes(spec, config)
             if cls in ATTENTION_CLASSES:
-                spec = group["layer_specs"][name] if "layer_specs" in group else group
-                if not isinstance(spec, dict):
-                    raise ValueError("K3.1 native cache spec must be an object")
                 dtype = "fp8" if cls.endswith("KimiK3IndexerCache") else config["cache_config"]["cache_dtype"]
                 if spec.get("cache_dtype_str") != dtype:
                     raise ValueError("K3.1 native cache spec dtype differs from the resolved cache layout")
@@ -344,6 +363,10 @@ def _kernel_view_geometry(mapping, group, view, count, page, width, *, context=N
     block = group["block_size_tokens"]
     if kernel >= block or block % kernel:
         raise ValueError("K3.1 kernel-block subdivision contradicts the native manager block")
+    # KimiK3IndexerBackend delegates FP8 to DeepseekV32IndexerBackend;
+    # its pinned get_supported_kernel_block_sizes supports only 64 on CUDA.
+    if kernel != 64:
+        raise ValueError("K3.1 CUDA indexer requires 64-token kernel blocks")
     subdivisions = block // kernel
     offsets = mapping.get("kernel_block_offsets")
     if (

@@ -52,7 +52,8 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
         ]
         if deployment.container_mount:
             command.append("--container-mounts=" + ",".join(deployment.container_mount))
-        output = _run([*command, "python3", "-c", _PROBE])
+        environment = [f"{item['name']}={item['value']}" for item in deployment.extra_env or ()]
+        output = _run([*command, "env", *environment, "python3", "-c", _PROBE])
     else:
         name = "ais-fpm-version-" + uuid.uuid4().hex[:12]
         namespace = deployment.namespace or "default"
@@ -73,6 +74,8 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 ],
             },
         }
+        if deployment.extra_env:
+            manifest["spec"]["containers"][0]["env"] = deployment.extra_env
         if deployment.image_pull_secret:
             manifest["spec"]["imagePullSecrets"] = [{"name": deployment.image_pull_secret}]
         prefix = ["kubectl", "--namespace", namespace]

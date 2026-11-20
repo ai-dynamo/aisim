@@ -50,7 +50,7 @@ def inputs(tmp_path, monkeypatch, request):
     context.update(expected_ranks=expected_ranks(launch["topology"]), instrumentation_binding=runtime_binding())
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
     if packed_indexer:
-        cache, _ = _kernel_view_fixture(monkeypatch)
+        cache, scheduled = _kernel_view_fixture(monkeypatch)
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     retained = []
@@ -65,10 +65,8 @@ def inputs(tmp_path, monkeypatch, request):
         record["resolved_config"]["parallel_config"].update(
             data_parallel_size=1, data_parallel_size_local=1, enable_expert_parallel=False
         )
-        if packed_indexer and record["kind"] == "worker":
-            record["cache"]["kernel_block_views"] = copy.deepcopy(cache["kernel_block_views"])
-            for name in cache["kernel_block_views"]:
-                record["cache"]["layer_components"][name] = copy.deepcopy(cache["layer_components"][name])
+        if packed_indexer:
+            record["cache"] = copy.deepcopy(cache if record["kind"] == "worker" else scheduled)
         if attention_backend == "flashmla":
             config = record["resolved_config"]
             config["cache_config"]["cache_dtype"] = "fp8_ds_mla"

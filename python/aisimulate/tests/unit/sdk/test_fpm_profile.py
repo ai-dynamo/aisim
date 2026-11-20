@@ -245,13 +245,14 @@ def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
         ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"),
     ],
 )
-def test_text_only_qwen35_decoder_rejects_sol_before_graph_construction(
-    profile_dict, checkpoint_configs, monkeypatch, wrapper, decoder
+@pytest.mark.parametrize("wrapper_profile", [False, True])
+def test_text_only_qwen35_rejects_sol_before_graph_construction(
+    profile_dict, checkpoint_configs, monkeypatch, wrapper, decoder, wrapper_profile
 ):
-    profile_dict["architecture"] = decoder
+    profile_dict["architecture"] = wrapper if wrapper_profile else decoder
     checkpoint_configs[profile_dict["model"]] = {
         "architectures": [wrapper],
-        "text_config": {"architectures": [decoder]},
+        "text_config": {} if wrapper_profile else {"architectures": [decoder]},
     }
     monkeypatch.setattr(engine, "compile_engine", _fail_graph)
     request = _request(profile_dict)
@@ -264,22 +265,19 @@ def test_text_only_qwen35_decoder_rejects_sol_before_graph_construction(
     for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
         with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
             entry_point(request)
-    # Profiles identified by the wrapper retain their existing selection.
-    checkpoint_configs[profile_dict["model"]]["text_config"].pop("architectures")
-    fpm_profile._load_pinned_checkpoint_config.cache_clear()
-    profile_dict["architecture"] = wrapper
-    controls["method"] = "auto"
-    assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == "sol"
 
 
-def test_text_only_qwen35_decoder_queries_unmeasured_point_with_direct_interpolation(
-    profile_dict, checkpoint_configs, monkeypatch, tmp_path
+@pytest.mark.parametrize("wrapper_profile", [False, True])
+@pytest.mark.parametrize("moe", [False, True])
+def test_text_only_qwen35_queries_unmeasured_point_with_direct_interpolation(
+    profile_dict, checkpoint_configs, monkeypatch, tmp_path, wrapper_profile, moe
 ):
-    profile_dict["architecture"] = "Qwen3_5ForCausalLM"
+    stem = "Qwen3_5Moe" if moe else "Qwen3_5"
+    profile_dict["architecture"] = stem + ("ForConditionalGeneration" if wrapper_profile else "ForCausalLM")
     profile_dict["deployments"][0]["system"] = "h200_sxm"
     checkpoint_configs[profile_dict["model"]] = {
-        "architectures": ["Qwen3_5ForConditionalGeneration"],
-        "text_config": {"architectures": [profile_dict["architecture"]]},
+        "architectures": [stem + "ForConditionalGeneration"],
+        "text_config": {} if wrapper_profile else {"architectures": [profile_dict["architecture"]]},
     }
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "1")
     monkeypatch.setattr(engine, "get_model", _fail_graph)

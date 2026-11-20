@@ -340,12 +340,24 @@ def test_supplied_profile_version_is_preserved_or_requires_explicit_selection(
 
 
 @pytest.mark.parametrize("executor", ["kubernetes", "slurm"])
-def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path, monkeypatch, executor):
+@pytest.mark.parametrize(
+    "environment",
+    [
+        None,
+        [],
+        [
+            {"name": "PYTHONPATH", "value": "/mounted packages/vllm"},
+            {"name": "LITERAL", "value": "a b;$HOME`echo no`\nnext"},
+        ],
+    ],
+)
+def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path, monkeypatch, executor, environment):
     from aisimulate.support import versioning
 
     deployment = FPMDeployment(
         executor=executor,
         image="registry.example.invalid/benchmark:fixture",
+        extra_env=environment,
         **(
             {"namespace": "synthetic-probe", "image_pull_secret": "synthetic-secret"}
             if executor == "kubernetes"
@@ -370,12 +382,16 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         assert len(calls) == 1
         assert f"--container-image={deployment.image}" in calls[0][0]
         assert "--gpus=0" in calls[0][0]
+        argv = calls[0][0]
+        start, end = argv.index("env") + 1, argv.index("python3")
+        assert argv[start:end] == [f"{item['name']}={item['value']}" for item in environment or ()]
     else:
         manifest = json.loads(next(payload for _, payload in calls if payload is not None))
         assert manifest["metadata"]["namespace"] == deployment.namespace
         assert manifest["spec"]["imagePullSecrets"] == [{"name": deployment.image_pull_secret}]
         container = manifest["spec"]["containers"][0]
         assert container["image"] == deployment.image
+        assert container.get("env", []) == (environment or [])
         assert "nvidia.com/gpu" not in container["resources"].get("requests", {})
         assert any("delete" in command for command, _ in calls)
 

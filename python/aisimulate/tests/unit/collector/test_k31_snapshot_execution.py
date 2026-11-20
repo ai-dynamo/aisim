@@ -495,7 +495,19 @@ def test_flashmla_native_execution_requires_matching_observed_cache_layout(nativ
 
 @pytest.mark.parametrize(
     "mutation",
-    ["none", "backend", "layers", "group", "duplicate", "absent_index", "bad_index", "bad_hash", "wrong_attempt"],
+    [
+        "none",
+        "backend",
+        "layers",
+        "group",
+        "duplicate",
+        "absent_index",
+        "bad_index",
+        "bad_hash",
+        "bad_artifact",
+        "wrong_attempt",
+        "bundle_error",
+    ],
 )
 def test_execution_requires_consistent_native_attention_and_bound_evidence(native_execution, mutation, monkeypatch):
     plan, cell, raw, collection, index_path = native_execution
@@ -516,11 +528,13 @@ def test_execution_requires_consistent_native_attention_and_bound_evidence(nativ
         index_path.unlink()
     elif mutation == "bad_index":
         index_path.write_text("{malformed")
-    elif mutation in {"bad_hash", "wrong_attempt"}:
+    elif mutation in {"bad_hash", "bad_artifact", "wrong_attempt"}:
         index = json.loads(index_path.read_text())
         phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
         if mutation == "bad_hash":
             phase["launch_manifest"]["sha256"] = "0" * 64
+        elif mutation == "bad_artifact":
+            phase["artifacts"][-1]["sha256"] = "0" * 64
         else:
             phase["collector_attempt_id"] = "wrong-attempt"
         index_path.write_text(json.dumps(index))
@@ -529,23 +543,37 @@ def test_execution_requires_consistent_native_attention_and_bound_evidence(nativ
 
     def bundle_read(value):
         reads.append(True)
+        if mutation == "bundle_error":
+            raise ValueError("synthetic invalid instrumentation bundle")
         return original.fget(value)
 
     monkeypatch.setattr(type(plan), "runtime_instrumentation", property(bundle_read))
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
     expected = "qualified" if mutation == "none" else "incomplete" if mutation == "absent_index" else "failed"
     assert result["status"] == expected, (result["missing_evidence"], result["failures"])
-    if mutation == "none":
-        assert len(reads) == 1
-    elif mutation == "absent_index":
+    assert len(reads) == 1
+    assert len(result["observed_workers"]) == cell.topology.tp
+    if mutation == "absent_index":
         assert not result["failures"]
         assert any("snapshot index is missing" in reason for reason in result["missing_evidence"])
-    else:
+    elif mutation != "none":
         assert result["failures"]
+    if mutation in {"absent_index", "bad_index", "bad_hash", "bad_artifact", "wrong_attempt", "bundle_error"}:
+        diagnostics = [*result["missing_evidence"], *result["failures"]]
+        assert sum(reason.startswith("runtime model snapshot evidence:") for reason in diagnostics) == 1
 
 
-@pytest.mark.parametrize("mutation", ["other_attempt", "other_cell", "wrong_context", "bad_config_hash", "symlink"])
-def test_snapshot_identity_rejects_unbound_or_changed_native_evidence(snapshot, mutation):
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("other_attempt", "belongs to a different cell or native attempt"),
+        ("other_cell", "belongs to a different cell or native attempt"),
+        ("wrong_context", "launch manifest collector_attempt_id"),
+        ("bad_config_hash", "loaded model configuration hash"),
+        ("symlink", "snapshot index cannot be a symlink"),
+    ],
+)
+def test_snapshot_identity_rejects_unbound_or_changed_native_evidence(snapshot, mutation, match):
     plan, cell, raw, collection, index_path = snapshot
     index = json.loads(index_path.read_text())
     entry = index["configurations"]["tp2"]
@@ -573,7 +601,7 @@ def test_snapshot_identity_rejects_unbound_or_changed_native_evidence(snapshot, 
         moved = index_path.with_suffix(".original")
         index_path.rename(moved)
         index_path.symlink_to(moved)
-    with pytest.raises((ValueError, KeyError)):
+    with pytest.raises(ValueError, match=match):
         execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
 
 
@@ -631,6 +659,10 @@ def test_mxfp4_execution_requires_matching_initialized_native_evidence(snapshot,
     execution_evidence._inspect_config(
         payload, native_cell, active, None, missing, failures, None if mode == "no_native_evidence" else worker
     )
+    if mode == "verified":
+        assert not failures
+        # This snapshot fixture omits the optional block-count override.
+        assert missing == ["runtime cache_config.num_gpu_blocks_override is unreported"]
     assert ("runtime quantization mapping is unaudited: mxfp4" in missing) == (mode == "no_native_evidence")
     assert ("runtime MXFP4 execution differs from the validated initialized worker" in failures) == mode.startswith(
         "different_"

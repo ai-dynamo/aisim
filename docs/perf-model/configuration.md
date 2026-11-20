@@ -343,10 +343,12 @@ fields report their nested paths. The supported namespaces are:
   (5), `factor_bounds` (min 0.5, max 2.0), and the existing `max_num_tokens`
   (8192), `max_batch_size` (512), and `max_kv_tokens` (2000000) fixed-policy ranges.
 - `fpm_interpolation.method`: `auto` (default), `sol`, or `direct`. Rust selects
-  SOL for a registered architecture, or direct interpolation for a verified
-  architecture without a registered class when a profile is supplied. Without
-  a profile, auto retains SOL. Explicit SOL requires a registered analytical
-  model; direct requires a profile and also supports registered architectures.
+  SOL for a registered architecture with supported SOL rooflines, or direct
+  interpolation for other verified profile architectures. Qwen3.5 profiles,
+  including text-only wrapper profiles, use direct interpolation because their
+  GDN graph has no SOL roofline. Without a profile, auto retains SOL. Explicit
+  SOL requires a supported registered analytical model; direct requires a
+  profile and also supports registered architectures.
 - `fpm_interpolation.collect_coverage`: `false` (default). Opt in to bounded
   evidence from actual direct-FPM lookups, as described below. It requires
   explicit `estimation_mode: fpm_interpolation`, resolved `method: direct`, and
