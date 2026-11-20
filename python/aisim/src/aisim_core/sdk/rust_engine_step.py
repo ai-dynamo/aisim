@@ -1046,18 +1046,17 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
 
 
 def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> bool:
-    """Whether the caller named roots other than the default ones.
+    """Whether the roots of ``config`` were chosen by someone: its ``systems_paths``, ``set_systems_paths`` or the
+    ``AICONFIGURATOR_SYSTEMS_PATH`` environment variable.
 
-    Callers such as the Sweeper expand an unset ``systems_paths`` to the default roots before construction, so
-    roots equal to that default expansion are not a choice. Roots that differ from it are.
+    Callers such as the Sweeper expand an unset ``systems_paths`` before construction, so the roots they hand over
+    may be that expansion rather than a choice. Only the packaged roots are a default: any other roots, however
+    they were set, outrank the source saved by ``aisim init``.
     """
     named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
-    if not named:
-        return False
-    named = tuple(named)
-    return _resolve_forward_pass_systems_paths(named, require_directories=False) != _resolve_forward_pass_systems_paths(
-        (), require_directories=False
-    )
+    # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
+    roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
+    return roots != _resolve_forward_pass_systems_paths(("default",), require_directories=False)
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
