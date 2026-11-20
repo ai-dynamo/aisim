@@ -418,9 +418,7 @@ def test_kimi_resize_matches_pinned_navit_processor(height, width, video, expect
 
 @pytest.mark.parametrize("remote", [False, True])
 @pytest.mark.parametrize("layout", ["native", "legacy-top-level", "legacy-nested"])
-def test_checkpoint_processor_limits_reach_runtime(tmp_path, monkeypatch, remote, layout):
-    from aisim_core.sdk import utils as utils_module
-
+def test_checkpoint_processor_limits_reach_runtime(tmp_path, hf_checkpoint_response, remote, layout):
     raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
     if layout == "native":
         image_processor = {"max_patches": 1024, "size": {"max_height": 16, "max_width": 16}}
@@ -436,10 +434,7 @@ def test_checkpoint_processor_limits_reach_runtime(tmp_path, monkeypatch, remote
         }
     if remote:
         path = f"synthetic-kimi-k25/processor-{tmp_path.name}"
-        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path: raw)
-        monkeypatch.setattr(
-            utils_module, "_download_hf_json", lambda model_path, filename, **kwargs: files.get(filename)
-        )
+        hf_checkpoint_response(files)
     else:
         for filename, content in files.items():
             (tmp_path / filename).write_text(json.dumps(content))
@@ -531,10 +526,8 @@ def test_kimi_processor_rejects_different_effective_native_side_limits(processor
     ids=["image-only", "default-video", "video-only"],
 )
 def test_loaded_native_side_override_cannot_change_other_processor_default(
-    tmp_path, monkeypatch, remote, image_processor, video_processor
+    tmp_path, hf_checkpoint_response, remote, image_processor, video_processor
 ):
-    from aisim_core.sdk import utils as utils_module
-
     raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
     files = {
         "config.json": raw,
@@ -544,10 +537,7 @@ def test_loaded_native_side_override_cannot_change_other_processor_default(
         files["video_preprocessor_config.json"] = video_processor
     if remote:
         path = f"synthetic-kimi/native-side-default-{tmp_path.name}"
-        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path: raw)
-        monkeypatch.setattr(
-            utils_module, "_download_hf_json", lambda model_path, filename, **kwargs: files.get(filename)
-        )
+        hf_checkpoint_response(files)
     else:
         for filename, content in files.items():
             (tmp_path / filename).write_text(json.dumps(content))

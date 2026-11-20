@@ -14,9 +14,11 @@ from typing import Any
 from aisim.sdk.common import MULTIMODAL_TEXT_CONFIG_KEY
 from aisim.sdk.memory import NaiveKVCacheEstimator
 from aisim.sdk.utils import (
+    _SNAPSHOT_CAPTURE,
     HuggingFaceDownloadError,
     _attach_hf_quant_config,
     _attach_inferred_quant_fields,
+    _check_hf_companion_snapshot,
     _download_hf_json,
     _get_model_config_path,
     _parse_hf_config_json,
@@ -224,14 +226,24 @@ def _load_file_config(path: Path, *, source_kind: str, cached: bool = False) -> 
 
 
 def _download_model_config(model_path: str) -> ResolvedModelConfig:
+    capture: dict[tuple[str, str], str] = {}
+    token = _SNAPSHOT_CAPTURE.set(capture)
     try:
         payload = _download_hf_json(model_path, "config.json", raise_on_404=True)
-        quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+        commit = capture.get((model_path, "config.json"))
+        pinned = {"revision": commit} if commit else {}
+        quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
+        if quant_config is not None:
+            _check_hf_companion_snapshot(
+                model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
+            )
     except HuggingFaceDownloadError as error:
         raise ValueError(
             f"cannot resolve a real model config for {model_path!r} from local files, "
             f"the AIC cache, or Hugging Face: {error}"
         ) from error
+    finally:
+        _SNAPSHOT_CAPTURE.reset(token)
     if payload is None:
         raise ValueError(f"Hugging Face returned no config.json for model {model_path!r}")
     if not isinstance(payload, dict):
@@ -245,7 +257,7 @@ def _download_model_config(model_path: str) -> ResolvedModelConfig:
     return ResolvedModelConfig(
         payload,
         source_kind="huggingface",
-        source_reference=model_path,
+        source_reference=f"{model_path}@{commit}" if commit else model_path,
     )
 
 

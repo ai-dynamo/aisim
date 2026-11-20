@@ -175,6 +175,8 @@ def is_expected_cli_error(error: BaseException) -> bool:
     Walks the exception chain, so a wrapper raised ``from`` an expected cause is
     still recognized.
     """
+    from aisim_core.sdk.utils import _HuggingFaceMetadataError
+
     return _chain_has(
         error,
         (
@@ -183,6 +185,7 @@ def is_expected_cli_error(error: BaseException) -> bool:
             EmpiricalNotImplementedError,
             SolNotImplementedError,
             ValueError,
+            _HuggingFaceMetadataError,
         ),
     )
 

@@ -53,12 +53,15 @@ def test_llama4_loads_separate_processor_metadata(
     else:
         model_path = f"test/{tmp_path.name}"
 
-        def download(hf_id, filename, *, raise_on_404=True):
+        def download(hf_id, filename, *, raise_on_404=True, revision="main"):
             assert hf_id == model_path
             requested_files.append(filename)
-            return {"config.json": raw, "preprocessor_config.json": processor}.get(filename)
+            if filename == "preprocessor_config.json":
+                assert revision == "a" * 40
+            payload = {"config.json": raw, "preprocessor_config.json": processor}.get(filename)
+            return payload, "a" * 40 if payload is not None else None
 
-        monkeypatch.setattr(utils_module, "_download_hf_json", download)
+        monkeypatch.setattr(utils_module, "_download_hf_json_at", download)
 
     model = get_model(model_path, _model_config(language_only=language_only), "trtllm")
     runtime = RuntimeConfig(isl=128, osl=1, image_height=336, image_width=672)
@@ -71,11 +74,13 @@ def test_llama4_loads_separate_processor_metadata(
     assert bool(model.encoder_ops) is (not language_only)
     assert model.context_ops and model.generation_ops
     assert model.encoder_config.max_num_tiles == max_patches
-    # Both parsed and raw config caches must preserve the sidecar metadata.
+    if source == "remote":
+        assert requested_files.count("preprocessor_config.json") == 1
+    # A parsed clear revalidates the sidecar against the same pinned source.
     get_model_config_from_model_path.cache_clear()
     assert get_model_config_from_model_path(model_path)["extra_params"].vision_config == model.encoder_config
     if source == "remote":
-        assert requested_files.count("preprocessor_config.json") == 1
+        assert requested_files.count("preprocessor_config.json") == 2
 
 
 @pytest.mark.parametrize(
@@ -127,6 +132,9 @@ def test_llama4_remote_processor_errors_are_not_silently_ignored(tmp_path, monke
     monkeypatch.setattr(utils_module, "_download_hf_config", lambda _: raw)
 
     def download(hf_id, filename, *, raise_on_404=True):
+        if filename == "hf_quant_config.json":
+            assert not raise_on_404
+            return None
         assert filename == "preprocessor_config.json"
         raise utils_module.HuggingFaceDownloadError("processor access denied")
 

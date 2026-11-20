@@ -201,19 +201,18 @@ def msa_sparse_algorithm(backend_name: str, model_path: str) -> str | None:
 
 
 def _model_architecture(model_path: str, model_config: dict | None = None) -> str | None:
-    """Architecture of a checkpoint config, None when unresolvable (a
-    user-local or unreachable checkpoint the SDK cannot load — the render
-    then carries no prescription, it never fails on this fact). A frozen
+    """Architecture of a checkpoint config, propagating metadata access errors
+    so an unresolved checkpoint cannot silently lose a serving prescription. A frozen
     ``model_config`` (naive path) is used as-is: no resolution runs.
     Indirection so tests can stub the SDK lookup."""
     if isinstance(model_config, dict):
         return model_config.get("architecture")
-    from aisim.sdk.utils import get_model_config_from_model_path
+    from aisim_core.sdk.utils import _load_model_config_from_model_path
 
-    try:
-        return get_model_config_from_model_path(model_path).get("architecture")
-    except Exception:  # FileNotFound / KeyError / ValueError / HuggingFaceDownloadError
-        return None
+    # Architecture detection must also work for valid checkpoints outside the
+    # numerical model parser's support set; no processor metadata is needed.
+    raw = _load_model_config_from_model_path(model_path)
+    return (raw.get("architectures") or [None])[0]
 
 
 # DeepSeek sparse attention (DSA) architectures: the sparse-MLA selector is
@@ -226,15 +225,12 @@ def _bundled_quantization(model_path: str, raw: dict | None = None) -> dict | No
     config.json ``quantization_config`` merged with the ``hf_quant_config``
     the loader attaches from the bundled ``<repo>_hf_quant_config.json`` (the
     modelopt artifacts keep ``kv_cache_quant_algo`` ONLY there — their
-    config.json has no quantization block at all). None when the config is
-    unresolvable or carries neither. Indirection so tests can stub it."""
+    config.json has no quantization block at all). None when the config carries
+    neither; access errors propagate. Indirection so tests can stub it."""
     if raw is None:
         from aisim_core.sdk.utils import _load_model_config_from_model_path
 
-        try:
-            raw = _load_model_config_from_model_path(model_path)
-        except Exception:  # unresolvable checkpoint: no quantization fact
-            return None
+        raw = _load_model_config_from_model_path(model_path)
     merged: dict = {}
     hfq = raw.get("hf_quant_config")
     if isinstance(hfq, dict):
@@ -290,8 +286,10 @@ def vllm_dsa_kv_cache_dtype(
         return None
     if str(gemm_quant_mode or "").lower() == "nvfp4":
         return "fp8"
-    raw = model_config.get("raw_config") if isinstance(model_config, dict) else None
-    if _artifact_pins_fp8_kv(_bundled_quantization(model_path, raw if isinstance(raw, dict) else None)):
+    # A frozen config supplies all available facts. An omitted raw payload must
+    # not cause a filesystem/network lookup for an otherwise self-contained render.
+    raw = (model_config.get("raw_config") or {}) if isinstance(model_config, dict) else None
+    if _artifact_pins_fp8_kv(_bundled_quantization(model_path, raw)):
         return "fp8"
     return None
 

@@ -166,12 +166,18 @@ def resolve_dspark_nextn(model_path: str) -> int | None:
     ``model_path`` is empty, matching ``resolve_nextn_auto``.
     """
     from aisim_core.sdk.common import DSPARK_NEXTN
-    from aisim_core.sdk.utils import HuggingFaceDownloadError, get_model_config_from_model_path
+    from aisim_core.sdk.utils import (
+        HuggingFaceDownloadError,
+        _HuggingFaceMetadataError,
+        get_model_config_from_model_path,
+    )
 
     if not model_path:
         raise ValueError("resolve_dspark_nextn requires a model path.")
     try:
         info = get_model_config_from_model_path(model_path)
+    except _HuggingFaceMetadataError:
+        raise
     except (HuggingFaceDownloadError, OSError) as exc:
         logger.warning("Could not resolve DSPARK draft depth for %r: %s", model_path, exc)
         return None
