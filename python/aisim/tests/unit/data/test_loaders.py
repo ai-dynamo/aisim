@@ -11,7 +11,7 @@ import pyarrow as pa
 import pytest
 
 from aisim_core.data import Identity, configuration_id, prepare_execution_profile
-from aisim_core.data.fetch import Selection, SelectionError
+from aisim_core.data.fetch import Cache, Selection, SelectionError, fetch
 from aisim_core.data.loaders import (
     LOADERS,
     E2eLoader,
@@ -21,6 +21,7 @@ from aisim_core.data.loaders import (
 )
 from aisim_core.data.parquet import write_parquet
 from aisim_core.sdk import RustForwardPassPerfModel
+from tests.unit.data.test_fetch import FakeTransport
 from tests.unit.sdk.test_dataset_contracts import artifact, dataset, write  # noqa: F401
 
 pytestmark = pytest.mark.unit
@@ -266,3 +267,71 @@ def test_e2e_tables_are_parsed_from_the_verified_bytes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(loaders_module, "_verified_bytes", verify_then_swap)
     assert len(load_e2e(tmp_path, path).metrics) == len(expected.metrics)
+
+
+def test_legacy_fpm_cold_fetch_keeps_auxiliary_measurement_provenance(dataset, tmp_path):  # noqa: F811
+    root, path, manifest = dataset
+    auxiliary = "metadata/measurement-provenance.json"
+    write(root, auxiliary, {"provenance": "Synthetic fixture, not measured evidence."})
+    manifest["artifacts"].append(artifact(root, auxiliary, "measurement-provenance"))
+    # Catalog this legacy execution-profile bundle under FPM, as FpmLoader.select requests.
+    manifest["category"] = "fpm"
+    manifest["configuration_id"] = configuration_id("fpm", "execution-profile", Identity(**manifest["identity"]))
+    write(root, path, manifest)
+    write(
+        root,
+        "catalog/fpm/index.json",
+        {
+            "schema_version": "aisim-category-index/v1",
+            "category": "fpm",
+            "entries": [
+                {
+                    "configuration_id": manifest["configuration_id"],
+                    "purpose": manifest["purpose"],
+                    "identity": manifest["identity"],
+                    "manifest": artifact(root, path, "manifest"),
+                }
+            ],
+        },
+    )
+    write(
+        root,
+        "catalog/dataset.json",
+        {
+            "schema_version": "aisim-dataset-index/v1",
+            "dataset_id": "org/dataset",
+            "categories": {
+                "fpm": {
+                    "root": "data/fpm",
+                    "layout": "category",
+                    "index": artifact(root, "catalog/fpm/index.json", "index"),
+                }
+            },
+        },
+    )
+    transport = FakeTransport({str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+    fetched = fetch(
+        FpmLoader().select(CONFIG),
+        repo="org/dataset",
+        revision="a" * 40,
+        transport=transport,
+        cache=Cache(tmp_path / "cold-cache"),
+    )
+    assert auxiliary in transport.opened
+    loaded = FpmLoader().load(fetched.root, path, output_dir=tmp_path / "loaded", config=CONFIG)
+    model = RustForwardPassPerfModel.best_available(loaded.config)
+    assert model.predict_prefill_latency(1, 4, 0) == 6.0
+
+
+def test_catalog_parallelism_keeps_omitted_topology_distinct_from_explicit_all_ones():
+    from aisim_core.data.loaders import _parallelism
+    from aisim_core.sdk import ForwardPassPerfModelConfig
+
+    assert _parallelism({"model": "m", "system": "h200"}) is None  # omitted: the catalog stays unfiltered
+    assert _parallelism({"tp": 1}) == ()  # explicit all-ones selects the single-GPU identity
+    assert _parallelism({"tp": 4, "attention_dp": 1, "moe_ep_size": 4}) == (("ep", 4), ("tp", 4))
+    # A typed configuration always carries topology (tp=1 by default), so it requests the single-GPU entry.
+    typed = ForwardPassPerfModelConfig(
+        model="m", system="h200", backend="vllm", backend_version="1", worker_type="aggregated"
+    )
+    assert _parallelism(typed.to_dict()) == ()

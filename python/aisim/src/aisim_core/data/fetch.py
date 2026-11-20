@@ -202,6 +202,12 @@ class Selection:
     # Artifact roles to leave out of the plan (for example ``fpm-provenance``,
     # 75 % of the FPM bytes, which no evaluation reads). Manifests are still read.
     exclude_roles: tuple[str, ...] = ()
+    # Parallelism dimensions (degree 1 omitted), e.g. ``(("dp", 4), ("ep", 4))``; matches any worker role of an
+    # entry that declares parallelism. Parallelism is part of an FPM identity: ``dep4`` and ``tep4`` differ.
+    parallelism: tuple[tuple[str, int], ...] | None = None
+    # Additional exclusions only for published FPM library entries. Legacy execution-profile preparation
+    # verifies every declared artifact, so it must fetch its auxiliary files too.
+    library_exclude_roles: tuple[str, ...] = ()
 
     def validate(self) -> None:
         if not self.configuration_ids:
@@ -224,6 +230,10 @@ class Selection:
             (self.operation_family, identity.operation_family),
         ):
             if want is not None and want != have:
+                return False
+        if self.parallelism is not None and identity.parallelism is not None:
+            wanted = dict(self.parallelism)
+            if not any(dims == wanted for dims in identity.parallelism.values()):
                 return False
         return True
 
@@ -549,8 +559,14 @@ def plan(
         # stamps are valid where the loader permits them).
         if manifest.identity != entry.identity or manifest.purpose != entry.purpose:
             raise IntegrityError(entry.manifest.path, "manifest identity or purpose differs from the catalog entry")
+        excluded = selection.exclude_roles
+        prediction_only = selection.library_exclude_roles and any(a.role == "fpm-library" for a in manifest.artifacts)
+        if prediction_only:
+            excluded = (*excluded, *selection.library_exclude_roles)
         for artifact in manifest.artifacts:
-            if artifact.role not in selection.exclude_roles:
+            if artifact.role not in excluded and (
+                not prediction_only or artifact.role in ("fpm-library", "fpm-library-metadata")
+            ):
                 planner._add(_ref(artifact, "artifact"))
     out.files.sort(key=lambda f: f.path)
     if offline:

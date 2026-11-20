@@ -72,6 +72,7 @@ from aisim_core.data.fetch import (
     fetch_support,
     resolve_revision,
 )
+from aisim_core.data.fpm_library import PREDICTION_ROLES, STAGED_MARKER, _stageable_roots, staged_inputs_digest
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
 from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
 from aisim_core.data.op_tree import (
@@ -310,7 +311,8 @@ def ensure_data(
         if "op-latency" in pin.categories:
             _resolve_backend_version(out, pin, transport)
         owner = _configuration_owner(pin, transport)
-        for category in pin.categories:
+        # Operation data first: an FPM library staged after it must take operation tables from the pinned root alone.
+        for category in sorted(pin.categories, key=lambda name: name != "op-latency"):
             # A configuration ID names one entry of one category: it constrains only that category.
             category_pin = pin if owner in (None, category) else replace(pin, configuration_id=None)
             _ensure_category(out, category, category_pin, transport)
@@ -346,7 +348,7 @@ def _compose_pinned_roots(out: EnsuredData) -> None:
                 f"fpm entry {fpm} and op-latency entries {op} provide different content for the same operation "
                 f"table(s) {clashes[:3]}; pin one of them (AISIM_DATA_CATEGORIES) or republish the bundle"
             )
-    out.config["systems_paths"] = [*map(str, fpm_roots), str(op_root)]
+    out.config["systems_paths"] = list(dict.fromkeys([*map(str, fpm_roots), str(op_root)]))
 
 
 def _configuration_owner(pin: DataPin, transport: Transport | None) -> str | None:
@@ -543,7 +545,9 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
     cache = Cache(pin.cache_dir)
     output_dir = cache.root / "materialized" / source_key / entry.configuration_id
     try:
-        loaded = _load(loader, category, root, entry, out.config, output_dir)
+        loaded = _load(
+            loader, category, root, entry, out.config, output_dir, isolate_roots="op-latency" in out.datasets
+        )
     except (LoaderError, ValueError) as exc:
         raise MissingDataError(
             f"{category} data {entry.configuration_id} in {where} failed verification: {exc}",
@@ -613,12 +617,134 @@ def _fetch_pinned(
         raise MissingDataError(f"{exc} ({_describe(selection)} in {where})", selection=selection, source=where) from exc
 
 
-def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
+def _materialization_is_intact(systems: Path, manifest) -> bool:
+    """True when every runtime artifact of ``manifest`` is present under ``systems`` with its declared bytes."""
+    try:
+        for artifact in manifest.artifacts:
+            if artifact.runtime_path is not None:
+                _verify(systems, artifact.model_copy(update={"path": artifact.runtime_path}))
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _cached_pin_is_valid(output_dir: Path, manifest, cached: Mapping[str, Any]) -> bool:
+    """True when the cached config pins the manifest's profile at the path this materialization wrote."""
+    try:
+        profile = next(a for a in manifest.artifacts if a.role == "execution-profile")
+        pin = cached["estimator_config"]["op_level"]["execution_profile"]
+        if pin.get("sha256") != profile.sha256 or Path(pin.get("path", "")) != output_dir / "profile.json":
+            return False
+        _verify(output_dir, profile.model_copy(update={"path": "profile.json"}))
+    except (StopIteration, KeyError, TypeError, AttributeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _drop_generated_library_path(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy of ``config`` without an ``fpm_parquet_path`` that an earlier ensure call generated.
+
+    Such a path names a staged library of another materialization, in this cache or another one; keeping it would
+    pair a new dataset revision with the old library. A path the user set elsewhere, even one inside a cache
+    directory, is a genuine override and stays: only a root AISim staged counts as generated.
+    """
+    out = dict(config)
+    estimator = out.get("estimator_config")
+    interpolation = estimator.get("fpm_interpolation") if isinstance(estimator, Mapping) else None
+    path = interpolation.get("fpm_parquet_path") if isinstance(interpolation, Mapping) else None
+    # The generated file itself is a symlink to the dataset source. Resolve its
+    # parent to identify the materialization without following that final link.
+    if path is not None:
+        parent = Path(path).expanduser().parent.resolve()
+        if any(_is_generated_root(ancestor) for ancestor in (parent, *parent.parents)):
+            interpolation = {k: v for k, v in interpolation.items() if k != "fpm_parquet_path"}
+            out["estimator_config"] = {**out["estimator_config"], "fpm_interpolation": interpolation}
+    return out
+
+
+_GENERATED_ROOT_NAME = re.compile(r".+-[0-9a-f]{64}")
+
+
+def _is_generated_root(path: str | Path) -> bool:
+    """True for a staged library root that an earlier ensure call wrote, in any cache directory.
+
+    A root has the shape ``<cache>/materialized/<source key>/<configuration>-<roots digest>`` and carries the staging
+    marker that records AISim owns it (a cache directory that no longer exists leaves nothing to own, so the stale
+    name still counts). A configuration saved with another cache directory names such a root too, and it must not
+    outlive its pin as an explicit root; a manual file that only sits under ``materialized`` is not one.
+    """
+    resolved = Path(path).expanduser().resolve()
+    if resolved.parent.parent.name != "materialized" or _GENERATED_ROOT_NAME.fullmatch(resolved.name) is None:
+        return False
+    return (resolved / STAGED_MARKER).is_file() or not resolved.exists()
+
+
+def _drop_generated_roots(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``config`` without the staged roots of earlier ensure calls in ``systems_paths``.
+
+    A returned configuration lists its own staging root. Keeping it as an explicit root when the configuration is
+    repinned would let that stale copy of the system definition and linked data shadow the roots a fresh load uses.
+    """
+    paths = config.get("systems_paths")
+    if not paths:
+        return config
+    kept = [p for p in paths if not _is_generated_root(p)]
+    return config if len(kept) == len(paths) else {**config, "systems_paths": kept}
+
+
+def _load(
+    loader,
+    category: str,
+    root: Path,
+    entry: Entry,
+    config: Mapping[str, Any],
+    output_dir: Path,
+    *,
+    isolate_roots: bool = False,
+):
     manifest_path = entry.manifest.path
     if category == "fpm":
-        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused),
-        # then every declared artifact.
-        manifest = read_entry_manifest(root, entry, config, loader)
+        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused);
+        # the peek hashes no artifact, so a library entry is not hashed twice.
+        peek = read_entry_manifest(root, entry, config, loader, roles=())
+        if any(a.role == "fpm-library" for a in peek.artifacts):
+            # Roots change the copied system definition and linked op data. Keep each ordered effective root
+            # set in its own materialization so later calls cannot replace an earlier configuration's inputs.
+            # A configuration returned by an earlier call lists that call's own staging root; it is derived from
+            # the same inputs, not a different user root, so it must not key this materialization or shadow it.
+            # With an op-latency pin the pinned root is the only source: no active root may fill a missing family.
+            config = _drop_generated_roots(_drop_generated_library_path(config))
+            roots = tuple(
+                str(p)
+                for p in _stageable_roots(config.get("systems_paths"), output_dir, include_active=not isolate_roots)
+                if not _is_generated_root(p)
+            )
+            # The key covers the ordered roots and the copies and links the build would make, so a definition edited in
+            # place, or a table that now resolves to another root, gets its own directory rather than replacing the
+            # one an earlier configuration still points at. An unchanged plan reuses its directory.
+            # It also covers the verified library pair, so a corrected pair published under the same configuration ID
+            # (even under new file names) is staged beside the earlier one rather than over it.
+            pair = sorted((a.role, a.path, a.sha256, a.bytes) for a in peek.artifacts if a.role in PREDICTION_ROLES)
+            inputs = {
+                "roots": roots,
+                "staged": staged_inputs_digest(
+                    entry.identity.hardware, entry.identity.framework, entry.identity.framework_version, roots
+                ),
+                "pair": pair,
+            }
+            roots_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+            output_dir = output_dir.with_name(f"{output_dir.name}-{roots_key}")
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            # The tuple above is the complete staging input: staging must not expand the active roots again.
+            return loader.load(
+                root,
+                manifest_path,
+                output_dir=output_dir,
+                config=config,
+                systems_paths=roots,
+                isolate_systems_roots=True,
+            )
+        manifest = read_entry_manifest(root, entry, config, loader)  # then verifies every declared artifact
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
         # measurements must not be served from the preparation of the old ones.
         content = hashlib.sha256()
@@ -628,8 +754,18 @@ def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, 
             )
         output_dir = output_dir.with_name(f"{output_dir.name}-{content.hexdigest()[:16]}")
         cached = output_dir / "config.json"
-        if cached.is_file():  # materialized by an earlier verified load; config.json is written last
-            return FpmData(manifest, config=json.loads(cached.read_text()))
+        if cached.is_file():  # materialized by an earlier load; config.json is written last
+            try:
+                cached_config = json.loads(cached.read_text())
+                if _materialization_is_intact(output_dir / "systems", manifest) and _cached_pin_is_valid(
+                    output_dir, manifest, cached_config
+                ):
+                    cached_config["systems_paths"] = [str(output_dir / "systems")]
+                    return FpmData(manifest, config=cached_config)
+            except ValueError:
+                pass
+        if output_dir.exists():  # partial, stale or edited: rebuild, never serve or trip over it
+            shutil.rmtree(output_dir)
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         data = loader.load(root, manifest_path, output_dir=output_dir, config=config)
         if data.config is None:
@@ -931,6 +1067,11 @@ def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | Non
         config["systems_paths"] = [str(loaded.root)]
         return
     loaded_config = loaded.config
+    if loaded.kind == "library":
+        # The loader built this from the user's configuration, so every user choice is kept.
+        config.clear()
+        config.update(loaded_config)
+        return
     paths = [*(loaded_config.get("systems_paths") or ()), *(config.get("systems_paths") or ())]
     config["systems_paths"] = list(dict.fromkeys(str(p) for p in paths))
     wanted = loaded_config["estimator_config"]["op_level"]["execution_profile"]

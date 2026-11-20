@@ -5,9 +5,12 @@
 
 import hashlib
 import json
+import shutil
+from pathlib import Path
 
 import pytest
 
+from aisim_core.data import Identity, configuration_id
 from aisim_core.data import ensure as ensure_mod
 from aisim_core.data.ensure import (
     DataConflictError,
@@ -19,39 +22,79 @@ from aisim_core.data.ensure import (
 )
 from aisim_core.data.fetch import Cache, Selection
 from aisim_core.data.loaders import FpmData, FpmLoader
-from tests.unit.data.test_fetch import REPO, SHA, FakeTransport, build_repo
+from tests.unit.data.test_fetch import REPO, SHA, FakeTransport, _artifact_json, build_repo
 
 pytestmark = pytest.mark.unit
 
 CONFIG = {"system": "h200", "backend": "vllm", "backend_version": "0.1", "model": "m1"}
-PROFILE = {"path": "/materialized/profile.json", "sha256": "f" * 64}
+PROFILE_BYTES = b'{"retained_files": []}'
+PROFILE_SHA = hashlib.sha256(PROFILE_BYTES).hexdigest()
 
 
 @pytest.fixture(autouse=True)
 def stub_prepare(monkeypatch):
     """Skip the Rust readiness check; the loader's verification still runs."""
+    calls = []
 
     def load(self, root, manifest_path, *, output_dir=None, config=None):
+        calls.append(output_dir)
         manifest = self.read_manifest(root, manifest_path, config)
         output_dir.mkdir(parents=True)
+        profile = next((a for a in manifest.artifacts if a.role == "execution-profile"), None)
+        if profile is not None:
+            shutil.copyfile(root / profile.path, output_dir / "profile.json")
+        for artifact in manifest.artifacts:
+            if artifact.runtime_path is not None:
+                target = output_dir / "systems" / artifact.runtime_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(root / artifact.path, target)
         prepared = {
             "systems_paths": [str(output_dir / "systems")],
             "estimation_mode": "op_level",
             "enable_shared_layer": False,
-            "estimator_config": {"op_level": {"execution_profile": PROFILE}, "correction": {"enabled": False}},
+            "estimator_config": {
+                "op_level": {
+                    "execution_profile": {
+                        "path": str(output_dir / "profile.json"),
+                        "sha256": profile.sha256 if profile is not None else "f" * 64,
+                    }
+                },
+                "correction": {"enabled": False},
+            },
         }
         (output_dir / "config.json").write_text(json.dumps(prepared))
         return FpmData(manifest, config=prepared)
 
     monkeypatch.setattr(FpmLoader, "load", load)
+    return calls
 
 
 @pytest.fixture
 def files(tmp_path):
-    return build_repo(tmp_path)
+    files = build_repo(tmp_path)
+    index = json.loads(files["catalog/fpm.json"])
+    for entry in index["entries"]:
+        path = entry["manifest"]["path"]
+        manifest = json.loads(files[path])
+        manifest["artifacts"][0]["runtime_path"] = "data/h200/vllm/0.1/data.parquet"
+        profile_path = str(Path(path).with_name("profile.json"))
+        files[profile_path] = PROFILE_BYTES
+        profile = _artifact_json("profile", profile_path, PROFILE_BYTES, format="json", schema="unversioned")
+        profile["role"] = "execution-profile"
+        manifest["artifacts"].append(profile)
+        files[path] = json.dumps(manifest).encode()
+        entry["manifest"] = _artifact_json("m", path, files[path], format="json", schema="aisim-artifact-manifest/v1")
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"] = _artifact_json(
+        "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    return files
 
 
 def pin(tmp_path, **kw):
+    kw.setdefault("categories", ("fpm",))
     return DataPin(repo=REPO, revision=SHA, cache_dir=tmp_path / "cache", **kw)
 
 
@@ -66,13 +109,16 @@ def test_cold_cache_downloads_wires_config_and_reports_revision(tmp_path, files)
     assert out.revisions == {"fpm": SHA}
     assert out.datasets["fpm"]["source"] == "hf-download"
     assert out.datasets["fpm"]["downloaded_bytes"] > 0
-    assert out.config["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+    assert out.config["estimator_config"]["op_level"]["execution_profile"] == {
+        "path": str(_materialized_dir(tmp_path) / "profile.json"),
+        "sha256": PROFILE_SHA,
+    }
     assert out.config["systems_paths"][0].endswith("/systems")
     assert "fpm/m1/data.parquet" in transport.opened
     assert "fpm/m2/data.parquet" not in transport.opened  # selection excludes other models
 
 
-def test_warm_cache_works_offline_with_zero_network(tmp_path, files):
+def test_warm_cache_works_offline_with_zero_network(tmp_path, files, stub_prepare):
     ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
     cold = FakeTransport(files)
     out = ensure_data(CONFIG, pin(tmp_path, offline=True), transport=cold)
@@ -83,6 +129,7 @@ def test_warm_cache_works_offline_with_zero_network(tmp_path, files):
     warm = FakeTransport(files)
     ensure_data(CONFIG, pin(tmp_path), transport=warm)
     assert warm.opened == []
+    assert len(stub_prepare) == 1  # both intact warm calls bypass materialization
 
 
 def test_offline_cold_cache_is_a_precise_error(tmp_path, files):
@@ -106,12 +153,45 @@ def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
         ensure_data({**CONFIG, "model": "other"}, pin(tmp_path), transport=FakeTransport(files))
 
 
+def test_omitted_topology_keeps_ambiguous_catalog_entries_explicit(tmp_path, files):
+    index = json.loads(files["catalog/fpm.json"])
+    ids = []
+    for entry, tp in zip(index["entries"], (1, 4), strict=True):
+        path = entry["manifest"]["path"]
+        manifest = json.loads(files[path])
+        identity = Identity.model_validate(
+            {**manifest["identity"], "model": "m1", "parallelism": {"aggregated": {} if tp == 1 else {"tp": tp}}}
+        )
+        cfg_id = configuration_id("fpm", "execution-profile", identity)
+        ids.append(cfg_id)
+        manifest.update(configuration_id=cfg_id, identity=identity.model_dump())
+        files[path] = json.dumps(manifest).encode()
+        entry.update(
+            configuration_id=cfg_id,
+            identity=identity.model_dump(),
+            manifest=_artifact_json("m", path, files[path], format="json", schema="aisim-artifact-manifest/v1"),
+        )
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"] = _artifact_json(
+        "i", "catalog/fpm.json", files["catalog/fpm.json"], format="json", schema="aisim-category-index/v1"
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+
+    with pytest.raises(DataConflictError, match="2 fpm entries.*AISIM_DATA_CONFIGURATION"):
+        ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    explicit = ensure_data({**CONFIG, "tp": 1}, pin(tmp_path), transport=FakeTransport(files))
+    assert explicit.datasets["fpm"]["configuration_id"] == ids[0]
+    pinned = ensure_data(CONFIG, pin(tmp_path, configuration_id=ids[1]), transport=FakeTransport(files))
+    assert pinned.datasets["fpm"]["configuration_id"] == ids[1]
+
+
 def test_local_override_needs_no_network_or_cache(tmp_path, files):
     root = tmp_path / "local"
     for path, data in files.items():
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
-    out = ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+    out = ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
     assert out.datasets["fpm"]["source"] == "local" and out.revisions["fpm"] == f"local:{root}"
     with pytest.raises(MissingDataError, match="no fpm data"):
         ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
@@ -123,7 +203,7 @@ def test_corrupt_local_file_is_an_error(tmp_path, files):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data if "m1/data" not in path else b"corrupt")
     with pytest.raises(MissingDataError, match="failed verification|unusable"):
-        ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
 def test_user_pinned_profile_conflict(tmp_path, files):
@@ -145,7 +225,11 @@ def test_ensure_guard_blocks_recursion(tmp_path, files):
     real = FpmLoader.load
 
     def spy(self, *a, **k):
+        from aisim_core.sdk.rust_engine_step import _ensure_dataset
+
         seen.append(ensure_mod.ensuring())
+        # A consumer built while the dataset pin is active must not ensure the dataset again.
+        assert _ensure_dataset(CONFIG, pin(tmp_path)) is None
         return real(self, *a, **k)
 
     FpmLoader.load = spy
@@ -331,7 +415,10 @@ def test_the_prepared_profile_settings_fill_unspecified_caller_fields(tmp_path, 
     out = ensure_data(config, pin(tmp_path), transport=FakeTransport(files)).config
     assert out["estimation_mode"] == "op_level" and out["enable_shared_layer"] is False
     assert out["estimator_config"]["correction"] == {"enabled": False}
-    assert out["estimator_config"]["op_level"]["execution_profile"] == PROFILE
+    assert out["estimator_config"]["op_level"]["execution_profile"] == {
+        "path": str(_materialized_dir(tmp_path) / "profile.json"),
+        "sha256": PROFILE_SHA,
+    }
 
 
 @pytest.mark.parametrize(
@@ -460,3 +547,122 @@ def test_the_ownership_lookup_reads_each_category_index(tmp_path, files):
     )  # this dataset has no such category
     remote = pin(tmp_path, categories=("fpm", "op-latency"))
     assert ensure_mod._category_configuration_ids(remote, FakeTransport(files), "fpm") == set(ids)
+
+
+def _materialized_dir(tmp_path):
+    (config,) = (tmp_path / "cache").rglob("config.json")
+    return config.parent
+
+
+def test_interrupted_legacy_materialization_is_rebuilt(tmp_path, files):
+    ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    directory = _materialized_dir(tmp_path)
+    (directory / "config.json").unlink()  # a killed load left the directory without its last file
+    out = ensure_data(CONFIG, pin(tmp_path, offline=True), transport=FakeTransport(files))
+    assert out.config["estimator_config"]["op_level"]["execution_profile"]["sha256"] == PROFILE_SHA
+    assert (directory / "config.json").is_file()
+
+
+def test_cached_materialization_is_verified_before_reuse(tmp_path, files, stub_prepare):
+    ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    directory = _materialized_dir(tmp_path)
+    marker = directory / "stale.txt"
+    marker.write_text("x")
+    assert len(stub_prepare) == 1
+    ensure_data(CONFIG, pin(tmp_path, offline=True))
+    assert len(stub_prepare) == 1
+    (directory / "systems/data/h200/vllm/0.1/data.parquet").unlink()
+    ensure_data(CONFIG, pin(tmp_path, offline=True), transport=FakeTransport(files))
+    assert len(stub_prepare) == 2
+    assert not marker.exists()  # the failed verification discarded the cache and rebuilt it
+
+
+@pytest.mark.parametrize("paths", [[], ["/unverified/root"]])
+def test_cached_systems_paths_are_reconstructed_from_the_verified_root(tmp_path, files, stub_prepare, paths):
+    original = ensure_data(CONFIG, pin(tmp_path), transport=FakeTransport(files))
+    cached = _materialized_dir(tmp_path) / "config.json"
+    document = json.loads(cached.read_text())
+    document["systems_paths"] = paths
+    cached.write_text(json.dumps(document))
+    warm = ensure_data(CONFIG, pin(tmp_path, offline=True))
+    assert warm.config == original.config
+    assert len(stub_prepare) == 1
+
+
+def test_cached_pin_must_match_the_manifest_and_materialized_profile(tmp_path):
+    import hashlib
+    from types import SimpleNamespace
+
+    profile_bytes = b'{"retained_files": []}'
+    (tmp_path / "profile.json").write_bytes(profile_bytes)
+    sha = hashlib.sha256(profile_bytes).hexdigest()
+    profile = SimpleNamespace(
+        role="execution-profile",
+        sha256=sha,
+        bytes=len(profile_bytes),
+        format="json",
+        path="x",
+        artifact_schema="s",
+        rows=None,
+        model_copy=lambda update: SimpleNamespace(**{**profile.__dict__, **update}),
+    )
+    manifest = SimpleNamespace(artifacts=[profile])
+
+    def cached(**pin):
+        return {
+            "estimator_config": {
+                "op_level": {"execution_profile": {**{"path": str(tmp_path / "profile.json"), "sha256": sha}, **pin}}
+            }
+        }
+
+    assert ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached())
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached(sha256="0" * 64))
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached(path="/elsewhere/profile.json"))
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, {})
+    (tmp_path / "profile.json").write_bytes(b"edited")
+    assert not ensure_mod._cached_pin_is_valid(tmp_path, manifest, cached())
+
+
+def test_a_local_manifest_must_match_the_digest_the_catalog_records(tmp_path, files):
+    root = tmp_path / "local"
+    for path, data in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(data)
+    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    ensure_data(CONFIG, local)  # the published pair loads
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["provenance"] = {"edited": "after indexing"}
+    (root / "fpm/m1/manifest.json").write_text(json.dumps(manifest))  # the catalog still records the old digest
+    with pytest.raises(MissingDataError, match="integrity"):
+        ensure_data(CONFIG, local)
+
+
+def test_generated_library_path_is_dropped_but_a_user_override_stays(tmp_path):
+    def staged_library(cache):
+        root = cache / "materialized" / "repo-aaa" / ("cfg-1-" + "a" * 64)
+        library = root / "data/h200_sxm/vllm/0.1/fpm_forward_perf.parquet"
+        library.parent.mkdir(parents=True)
+        (root / ".staged.json").write_text("{}")  # the marker records that AISim staged this root
+        return library
+
+    def config_for(path):
+        return {"estimator_config": {"fpm_interpolation": {"fpm_parquet_path": str(path), "other": 1}}}
+
+    # Staged by an earlier call, in this cache or another one: generated, so a repin must not keep it.
+    for generated in (staged_library(tmp_path / "cache"), staged_library(tmp_path / "other-cache")):
+        config = config_for(generated)
+        cleaned = ensure_mod._drop_generated_library_path(config)
+        assert cleaned["estimator_config"]["fpm_interpolation"] == {"other": 1}
+        assert config["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(generated)  # untouched
+    # A user's own file stays, including one that only sits inside a cache's materialized directory, or one under
+    # a staged-looking name that AISim did not write (no marker).
+    manual = tmp_path / "cache" / "materialized" / "manual" / "custom.parquet"
+    manual.parent.mkdir(parents=True)
+    manual.write_bytes(b"mine")
+    lookalike = tmp_path / "cache" / "materialized" / "repo-aaa" / ("cfg-2-" + "b" * 64) / "lib.parquet"
+    lookalike.parent.mkdir(parents=True)
+    lookalike.write_bytes(b"mine")
+    for path in (manual, lookalike, "/user/lib.parquet"):
+        mine = config_for(path)
+        assert ensure_mod._drop_generated_library_path(mine) == mine
+    assert ensure_mod._drop_generated_library_path({}) == {}

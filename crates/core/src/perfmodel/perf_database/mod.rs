@@ -46,6 +46,9 @@ pub(crate) fn resolve_op_sources(
         .expect("fixed-map resolution is infallible")
 }
 
+/// Reloads allowed when a staged-library marker changes during a shared load.
+const SHARED_LOAD_GENERATION_ATTEMPTS: usize = 3;
+
 /// Stable identity string for one load input set, used as the shared-tables
 /// memo key. The resolver renders its own identity: live resolution is a pure
 /// function of the load identity + policy; a fixed map renders its full
@@ -55,6 +58,23 @@ pub(crate) fn resolve_op_sources(
 /// keeping the systems root each entry was loaded from.
 type SharedTablesMemo = Mutex<HashMap<String, (PathBuf, Weak<PerfTables>)>>;
 
+/// Digest of the staged-library marker, empty for a root without one. A managed
+/// staging can atomically replace a library at the same paths. Its verified
+/// marker identifies the generation (pair digests, system YAML and overlay
+/// targets). Hash only this small preparation record, never the potentially
+/// large parquet on every engine construction. Ordinary roots without a marker
+/// retain their existing immutable-root cache behavior. Only an absent marker
+/// means "ordinary root"; any other read error fails the load rather than
+/// silently disabling generation tracking.
+fn staged_generation(systems_root: &Path) -> Result<String, AicError> {
+    let path = systems_root.join(".staged.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(blake3::hash(&bytes).to_hex().to_string()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(AicError::Io { path, source }),
+    }
+}
+
 fn shared_tables_key(
     systems_root: &Path,
     system: &str,
@@ -62,9 +82,10 @@ fn shared_tables_key(
     version: &str,
     resolver: &SourceResolver,
     fpm_parquet_path: Option<&Path>,
+    generation: &str,
 ) -> String {
     format!(
-        "{}\x1f{system}\x1f{backend}\x1f{version}\x1f{}\x1f{}",
+        "{}\x1f{system}\x1f{backend}\x1f{version}\x1f{}\x1f{}\x1f{generation}",
         systems_root.display(),
         resolver.identity_key(),
         fpm_parquet_path.map_or_else(String::new, |path| path.display().to_string())
@@ -748,47 +769,66 @@ impl PerfDatabase {
                 fpm_parquet_path,
             );
         }
-        let ctx = Self::resolve_ctx(
-            systems_root,
-            system,
-            backend,
-            version,
-            enable_shared_layer,
-            strict_provenance,
-        )?;
-        let resolver = Arc::new(SourceResolver::live(ctx));
-        let key = shared_tables_key(
-            systems_root,
-            system,
-            backend,
-            version,
-            &resolver,
-            fpm_parquet_path,
-        );
-        if let Some(tables) = memo
-            .lock()
-            .unwrap()
-            .get(&key)
-            .and_then(|(_, tables)| tables.upgrade())
-        {
-            return Ok(Self::from_tables(tables));
+        // A staging replacement can land between the marker read and the data
+        // reads, and can change the data directory the system yaml names. Each
+        // attempt therefore reads the marker first, builds its resolution
+        // context from the yaml current at that point, and is accepted only if
+        // the marker is unchanged after the load; otherwise reload, so one load
+        // never memoizes mixed generations.
+        for _ in 0..SHARED_LOAD_GENERATION_ATTEMPTS {
+            let generation = staged_generation(systems_root)?;
+            let ctx = Self::resolve_ctx(
+                systems_root,
+                system,
+                backend,
+                version,
+                enable_shared_layer,
+                strict_provenance,
+            )?;
+            let resolver = Arc::new(SourceResolver::live(ctx));
+            let key = shared_tables_key(
+                systems_root,
+                system,
+                backend,
+                version,
+                &resolver,
+                fpm_parquet_path,
+                &generation,
+            );
+            if let Some(tables) = memo
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|(_, tables)| tables.upgrade())
+            {
+                return Ok(Self::from_tables(tables));
+            }
+            let db = Self::load_with_resolver(
+                systems_root,
+                system,
+                backend,
+                version,
+                resolver.clone(),
+                false,
+                fpm_parquet_path,
+            )?;
+            #[cfg(test)]
+            tests::after_shared_load_hook();
+            if staged_generation(systems_root)? != generation {
+                continue;
+            }
+            let mut map = memo.lock().unwrap();
+            map.retain(|_, (_, tables)| tables.strong_count() > 0);
+            map.insert(
+                key,
+                (systems_root.to_path_buf(), Arc::downgrade(&db.tables)),
+            );
+            return Ok(db);
         }
-        let db = Self::load_with_resolver(
-            systems_root,
-            system,
-            backend,
-            version,
-            resolver,
-            false,
-            fpm_parquet_path,
-        )?;
-        let mut map = memo.lock().unwrap();
-        map.retain(|_, (_, tables)| tables.strong_count() > 0);
-        map.insert(
-            key,
-            (systems_root.to_path_buf(), Arc::downgrade(&db.tables)),
-        );
-        Ok(db)
+        Err(AicError::PerfDatabase(format!(
+            "staged FPM library under {} changed during every load attempt; retry after staging completes",
+            systems_root.display()
+        )))
     }
 
     /// Fresh default-mode view over `tables`. Per-view state (query mode,
@@ -1230,6 +1270,104 @@ mod tests {
         assert!(!Arc::ptr_eq(&db1.util_grids, &db2.util_grids));
         assert!(!Arc::ptr_eq(&db1.delta_lookups, &db2.delta_lookups));
         assert!(!Arc::ptr_eq(&db1.moe_references, &db2.moe_references));
+    }
+
+    thread_local! {
+        static AFTER_SHARED_LOAD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs the test's staging replacement right after a shared load's table
+    /// reads, the window the generation check exists for.
+    pub(super) fn after_shared_load_hook() {
+        // Take the hook out while it runs so it can never re-enter itself.
+        let hook = AFTER_SHARED_LOAD.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+            AFTER_SHARED_LOAD.with(|cell| *cell.borrow_mut() = Some(hook));
+        }
+    }
+
+    #[test]
+    fn shared_load_retry_rebuilds_sources_from_the_current_generation() {
+        // A staging replacement changes the data dir named by the system yaml
+        // while the first attempt reads tables. The retry must resolve its
+        // sources from the new generation, not the first attempt's context.
+        let tmp = tempfile::tempdir().unwrap();
+        energy_test_fixtures::write_energy_systems_root(tmp.path());
+        let second = tmp.path().join("data_two/vllm/1.0");
+        std::fs::create_dir_all(&second).unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join(".staged.json"), b"first").unwrap();
+        let replaced = std::cell::Cell::new(false);
+        AFTER_SHARED_LOAD.with(|cell| {
+            let root = root.clone();
+            *cell.borrow_mut() = Some(Box::new(move || {
+                if replaced.replace(true) {
+                    return;
+                }
+                let yaml = std::fs::read_to_string(root.join("testsys.yaml")).unwrap();
+                std::fs::write(
+                    root.join("testsys.yaml"),
+                    yaml.replace("data_dir: data\n", "data_dir: data_two\n"),
+                )
+                .unwrap();
+                std::fs::write(root.join(".staged.json"), b"second").unwrap();
+            }));
+        });
+        let memo = SharedTablesMemo::default();
+        let db = PerfDatabase::load_resolved_shared_in(
+            &memo, &root, "testsys", "vllm", "1.0", false, false, false, None,
+        );
+        AFTER_SHARED_LOAD.with(|cell| *cell.borrow_mut() = None);
+        let db = db.expect("the retry must settle on the replaced generation");
+        assert_eq!(db.tables.data_root, root.join("data_two/vllm/1.0"));
+        assert!(
+            db.tables
+                .source_resolver
+                .identity_key()
+                .contains(&root.join("data_two").display().to_string()),
+            "sources must come from the generation the tables were read from"
+        );
+    }
+
+    #[test]
+    fn staged_generation_is_empty_only_for_an_absent_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(staged_generation(tmp.path()).unwrap(), "");
+        std::fs::write(tmp.path().join(".staged.json"), b"first").unwrap();
+        let first = staged_generation(tmp.path()).unwrap();
+        assert_eq!(first.len(), 64);
+        std::fs::write(tmp.path().join(".staged.json"), b"second").unwrap();
+        assert_ne!(staged_generation(tmp.path()).unwrap(), first);
+        // A marker that exists but cannot be read must not look like an ordinary root.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join(".staged.json")).unwrap();
+        assert!(matches!(
+            staged_generation(unreadable.path()),
+            Err(AicError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_load_fails_when_the_staged_marker_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        energy_test_fixtures::write_energy_systems_root(tmp.path());
+        std::fs::create_dir(tmp.path().join(".staged.json")).unwrap();
+        let memo = SharedTablesMemo::default();
+        let result = PerfDatabase::load_resolved_shared_in(
+            &memo,
+            tmp.path(),
+            "testsys",
+            "vllm",
+            "1.0",
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(matches!(result, Err(AicError::Io { .. })));
+        assert!(memo.lock().unwrap().is_empty());
     }
 
     #[test]

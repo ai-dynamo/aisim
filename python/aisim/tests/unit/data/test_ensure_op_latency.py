@@ -152,6 +152,33 @@ def test_the_best_available_consumer_receives_the_complete_root(native_dataset, 
     assert model.predict_prefill_latency(1, 4) >= 7.0
 
 
+def test_auto_selected_op_level_model_with_a_library_path_saves_and_restores(native_dataset, tmp_path):
+    _, systems, config = native_dataset
+    library = tmp_path / "library.parquet"
+    shutil.copyfile(next((systems / "data").rglob("gemm_perf.parquet")), library)
+    payload = config.to_dict()
+    payload["estimation_mode"] = "auto"
+    payload["estimator_config"] = {
+        "correction": {"enabled": False},
+        "fpm_interpolation": {"fpm_parquet_path": str(library)},
+    }
+    model = res.RustForwardPassPerfModel.best_available(payload)
+    provenance = model.diagnostics()["provenance"]
+    assert provenance["selected_estimation_mode"] == "op_level"
+    # The search keeps the library pin in the canonical configuration; the op-level engine never reads it.
+    assert provenance["config"]["estimator_config"]["fpm_interpolation"]["fpm_parquet_path"] == str(library)
+    # The saved canonical configuration rebuilds the same model without losing the library pin.
+    rebuilt = res.RustForwardPassPerfModel.best_available(provenance["config"])
+    assert rebuilt.predict_prefill_latency(1, 4) == model.predict_prefill_latency(1, 4)
+    assert rebuilt.diagnostics()["provenance"]["config"]["estimator_config"]["fpm_interpolation"][
+        "fpm_parquet_path"
+    ] == str(library)
+    pinned = model.save_state_snapshot(tmp_path / "snap")
+    assert "fpm_parquet_path" not in pinned["estimator_config"].get("fpm_interpolation", {})
+    restored = res.RustForwardPassPerfModel.best_available(state_snapshot=tmp_path / "snap")
+    assert restored.predict_prefill_latency(1, 4) == model.predict_prefill_latency(1, 4)
+
+
 @pytest.mark.parametrize("as_mapping", [False, True])
 @pytest.mark.parametrize("family", ["gemm", "attention"])
 def test_incomplete_pin_cannot_fall_back_to_other_operation_tables(native_dataset, tmp_path, as_mapping, family):

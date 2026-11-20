@@ -223,6 +223,15 @@ def _verify(root: Path, artifact: Artifact) -> Path:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if path.stat().st_size != artifact.bytes or digest != artifact.sha256:
         raise ValueError(f"artifact integrity mismatch: {artifact.path}")
+    if artifact.role == "fpm-library":
+        # Native libraries are identified by the manifest declaration alone, so validate it before any branch on
+        # the declared format.
+        from aisim_core.data.fpm_library import LIBRARY_SCHEMA_ID
+
+        if artifact.format != "parquet" or artifact.rows is None:
+            raise ValueError(f"an fpm-library artifact must declare format parquet and rows: {artifact.path}")
+        if artifact.artifact_schema != LIBRARY_SCHEMA_ID:
+            raise ValueError(f"unsupported FPM library schema ID {artifact.artifact_schema!r}: {artifact.path}")
     if artifact.format == "parquet" and (
         artifact.rows is None or pq.ParquetFile(path).metadata.num_rows != artifact.rows
     ):
@@ -388,3 +397,16 @@ def prepare_execution_profile(root: Path, manifest_path: str, output_dir: Path) 
         shutil.rmtree(output_dir)
         raise
     return config
+
+
+# The FPM library contract (staging, sidecar schema, resource precedence). Defined in a leaf module that does not
+# import this package, so the re-export is safe here.
+from aisim_core.data.fpm_library import (  # noqa: F401
+    FpmContractError,
+    FpmLibraryMetadata,
+    FpmResourcesPendingError,
+    StagedFpmLibrary,
+    complete_fpm_profile,
+    resolve_resources,
+    stage_fpm_library,
+)
