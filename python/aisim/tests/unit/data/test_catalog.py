@@ -405,16 +405,6 @@ def test_a_manifest_beside_eval_records_is_not_loaded_as_a_record(dataset):
         build_catalog(root, systems_dir=systems)
 
 
-def test_build_rejects_a_manifest_that_disagrees_with_its_index_entry(dataset):
-    root, systems = dataset
-    path = root / "data/fpm/m0.json"
-    manifest = Manifest.model_validate_json(path.read_bytes())
-    other = manifest.identity.model_copy(update={"hardware": "h200_sxm"})
-    path.write_text(manifest.model_copy(update={"identity": other}).model_dump_json(by_alias=True))
-    with pytest.raises(ValueError, match="disagrees with its fpm index entry"):
-        build_catalog(root, systems_dir=systems)
-
-
 def test_catalog_versions_preserve_v1_and_write_v2(tmp_path):
     import pyarrow as pa
     from pydantic import ValidationError

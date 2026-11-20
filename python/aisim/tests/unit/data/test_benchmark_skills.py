@@ -642,10 +642,16 @@ def test_attestation_confines_identity_directories(built_record, tmp_path, escap
         outside.mkdir()
         (destination / "eval").mkdir(parents=True)
         (destination / "eval/linked").symlink_to(outside, target_is_directory=True)
+    args = [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
+    if escape != "symlink":
+        # Identity values never form a path: separators are flattened, so the record lands under the attest root.
+        _script("aisim-benchmark-evaluate", "check_eval_record.py").main(args)
+        written = list(destination.rglob("*.json"))
+        assert written and all(destination in p.parents for p in written)
+        assert not outside.exists()
+        return
     with pytest.raises(ValueError, match="unsafe|symlink|escapes"):
-        _script("aisim-benchmark-evaluate", "check_eval_record.py").main(
-            [str(path), "--truth-root", str(root), "--predictor", str(predictor), "--attest-root", str(destination)]
-        )
+        _script("aisim-benchmark-evaluate", "check_eval_record.py").main(args)
     assert not outside.exists() or not list(outside.iterdir())
     assert not list(destination.rglob("*.parquet")) and not list(destination.rglob("*.json"))
 
