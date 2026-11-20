@@ -1501,6 +1501,48 @@ def test_symlinked_target_directory_is_refused_without_writing_outside(tmp_path)
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.parametrize("linked", ["catalog/e2e", "catalog/e2e/h100_sxm.parquet"])
+def test_symlinked_catalog_destination_is_refused_before_any_write(tmp_path, linked):
+    root, directory, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "h100_sxm.parquet"
+    sentinel.write_bytes(b"external bytes")
+    (target / "catalog").mkdir()
+    if linked == "catalog/e2e":
+        (target / "catalog/e2e").symlink_to(outside, target_is_directory=True)
+    else:
+        (target / "catalog/e2e").mkdir()
+        (target / linked).symlink_to(sentinel)
+    with pytest.raises(PromotionError, match="symlink"):
+        apply_promotion(plan, root, target)
+    assert sentinel.read_bytes() == b"external bytes" and [p.name for p in outside.iterdir()] == [sentinel.name]
+    assert not (target / "data").exists()  # nothing was copied either
+
+
+@pytest.mark.parametrize("edited", [False, True])
+def test_selected_files_are_bound_to_the_recorded_source_commit(tmp_path, edited):
+    root, directory = _promotable(tmp_path)
+    commit = _commit_source(root)
+    if edited:
+        # assume-unchanged hides the edit from `git status`; the recorded commit never contained these bytes.
+        _git(root, "update-index", "--assume-unchanged", *_git(root, "ls-files").splitlines())
+        manifest = root / directory / "manifest.json"
+        document = Manifest.model_validate_json(manifest.read_bytes())
+        manifest.write_text(
+            document.model_copy(update={"evidence_gaps": [{"field": "new"}]}).model_dump_json(by_alias=True)
+        )
+        register_manifests(root, [manifest.relative_to(root).as_posix()], INTERNAL_REPO)
+        build_catalog(root)
+        assert _git(root, "status", "--porcelain", "--untracked-files=all", "--ignored") == ""
+    plan = plan_promotion(root, _request(root, [directory], source_commit=commit), _reviewers())
+    findings = [f for f in plan.findings if f.code == "source-checkout"]
+    assert bool(findings) is edited
+    if edited:
+        assert "differs from the reviewed revision" in findings[0].message and not plan.content_ok
+
+
 def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch):
     root, directory, plan = _approved(tmp_path)
     target = _target(tmp_path)
