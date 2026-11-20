@@ -2634,14 +2634,123 @@ def _stage_args(root):
 KWARGS = dict(system="h200_sxm", backend="vllm", backend_version="0.25.1")
 
 
-def test_staged_root_keeps_the_reuse_policy_of_its_source_root(root, profile, tmp_path):
+def _systems_root_with_tables(tmp_path, name, tables):
+    """A systems root with the packaged h200 definition and stub op tables at the given data-relative paths."""
+    from aisim_core.data.fpm_library import _stageable_roots
+
+    systems = tmp_path / name
+    systems.mkdir()
+    shutil.copyfile(_stageable_roots(["default"], None)[0] / "h200_sxm.yaml", systems / "h200_sxm.yaml")
+    for relative, content in tables.items():
+        table = systems / "data/h200_sxm" / relative
+        table.parent.mkdir(parents=True, exist_ok=True)
+        table.write_bytes(content)
+    return systems
+
+
+def test_staging_merges_family_directories_of_every_root(root, profile, tmp_path, monkeypatch):
+    import aisim_core
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [])
+    first = _systems_root_with_tables(
+        tmp_path, "first", {"gemm/vllm/0.24/gemm_perf.parquet": b"first", "gemm/vllm/0.24/shared.txt": b"first"}
+    )
+    second = _systems_root_with_tables(
+        tmp_path,
+        "second",
+        {"gemm/vllm/0.25.1/gemm_perf.parquet": b"second", "gemm/vllm/0.24/shared.txt": b"second"},
+    )
+    parquet, sidecar = _stage_args(root)
+    staged = stage_fpm_library(parquet, sidecar, output_dir=tmp_path / "out", systems_paths=[first, second], **KWARGS)
+    records = json.loads(
+        aisim_core.resolve_op_sources_report_json(
+            str(staged.systems_root),
+            str(staged.systems_root / "data/h200_sxm"),
+            "vllm",
+            "0.25.1",
+            "gemm_perf.parquet",
+        )
+    )["records"]
+    # The table only the later root has is reachable through the staged root alone; the earlier root wins ties.
+    assert records[0]["channel"] == "primary" and records[0]["exists"]
+    assert Path(records[0]["path"]).read_bytes() == b"second"
+    shared = staged.systems_root / "data/h200_sxm/gemm/vllm/0.24/shared.txt"
+    assert shared.read_bytes() == b"first"
+    assert (staged.systems_root / "data/h200_sxm/gemm/vllm/0.24/gemm_perf.parquet").read_bytes() == b"first"
+
+
+@pytest.mark.parametrize("lost", ["sidecar", "library", "system", "data"])
+def test_restaging_repairs_an_installed_root_that_lost_a_file(root, profile, tmp_path, monkeypatch, lost):
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [])
+    source = _systems_root_with_tables(tmp_path, "source", {"gemm/vllm/0.25.1/gemm_perf.parquet": b"table"})
+    parquet, sidecar = _stage_args(root)
+    kwargs = dict(output_dir=tmp_path / "out", systems_paths=[source], **KWARGS)
+    staged = stage_fpm_library(parquet, sidecar, **kwargs)
+    marker = staged.systems_root / ".staged.json"
+    marker_bytes = marker.read_bytes()
+    damaged = {
+        "sidecar": staged.metadata_path,
+        "library": staged.parquet_path,
+        "system": staged.systems_root / "h200_sxm.yaml",
+        "data": staged.systems_root / "data/h200_sxm/gemm",
+    }[lost]
+    damaged.unlink()  # the marker still says this root was staged completely
+    assert marker.read_bytes() == marker_bytes
+    repaired = stage_fpm_library(parquet, sidecar, **kwargs)
+    assert repaired.parquet_path.exists() and repaired.metadata_path.exists()
+    assert (repaired.systems_root / "h200_sxm.yaml").is_file()
+    assert (repaired.systems_root / "data/h200_sxm/gemm/vllm/0.25.1/gemm_perf.parquet").read_bytes() == b"table"
+
+
+def test_repin_to_another_cache_does_not_keep_the_old_library(root, profile, tmp_path):
+    from aisim_core.data.ensure import DataPin, ensure_data
+
+    other = tmp_path / "other"
+    make_entry(root, profile, resources=RESOURCES)
+    make_entry(other, profile, resources=RESOURCES)
+    parquet, sidecar = _stage_args(other)
+    rows = pq.read_table(parquet).to_pylist()
+    for row in rows:
+        if row["workload_kind"] == "decode":
+            row["latency_ms"] = 7.0  # the repinned library answers differently from the first
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    metadata = json.loads(sidecar.read_text())
+    metadata["parquet_sha256"] = _sha(parquet.read_bytes())
+    sidecar.write_text(json.dumps(metadata))
+    _refresh_prediction_manifest(other)
+    for source in (root, other):
+        _write_entry_catalog(source)
+    first = ensure_data(
+        user_config(profile), DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache-a")
+    )
+    second = ensure_data(first.config, DataPin(local_root=other, categories=("fpm",), cache_dir=tmp_path / "cache-b"))
+    assert str(tmp_path / "cache-a") not in json.dumps(second.config)  # a generated path is not a user override
+    query = [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 1}}]
+    model_a = RustForwardPassPerfModel.best_available(first.config)
+    model_b = RustForwardPassPerfModel.best_available(second.config)
+    try:
+        assert model_a.estimate_forward_pass_time_ms(query) == pytest.approx(3.0)
+        assert model_b.estimate_forward_pass_time_ms(query) == pytest.approx(7.0)
+    finally:
+        model_a.close()
+        model_b.close()
+
+
+def test_staged_root_keeps_the_reuse_policy_of_its_source_root(root, profile, tmp_path, monkeypatch):
     import aisim_core
     from aisim_core.data.fpm_library import ROOT_POLICY_FILES, _stageable_roots
+    from aisim_core.sdk import perf_database
 
     make_entry(root, profile, resources=RESOURCES)
     source = tmp_path / "policy-root"
     source.mkdir()
     shutil.copyfile(_stageable_roots(["default"], None)[0] / "h200_sxm.yaml", source / "h200_sxm.yaml")
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [])  # the staging sees the source root alone
     data = source / "data/h200_sxm"
     for backend, version in (("vllm", "0.25.1"), ("sglang", "0.5.0")):
         table = data / "gemm" / backend / version / "gemm_perf.parquet"
