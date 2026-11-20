@@ -54,7 +54,13 @@ def _spec(spec, vllm_config):
             blocks_per_request=spec.max_num_blocks_per_req(vllm_config, vllm_config.model_config.max_model_len),
         )
     else:
-        group.update(dtype=str(spec.dtype), cache_dtype_str=spec.cache_dtype_str)
+        # vLLM 266e88c05, AttentionSpec.unpadded_page_size_bytes: the
+        # bound tensor contains payload, while page_size_bytes includes padding.
+        group.update(
+            dtype=str(spec.dtype),
+            cache_dtype_str=spec.cache_dtype_str,
+            unpadded_page_size_bytes=spec.unpadded_page_size_bytes,
+        )
     return group
 
 

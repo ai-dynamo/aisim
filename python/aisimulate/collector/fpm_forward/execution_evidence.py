@@ -479,6 +479,15 @@ def _inspect_config(payload, cell, plan, flags, missing, failures, native_worker
         failures.append("worker graph_config contradicts its resolved_config.compilation_config")
     if native_worker is not None:
         native_config = native_worker["resolved_config"]
+        native_parallel = native_config["parallel_config"]
+        for name in _CONFIG_TYPES["parallel_config"]:
+            if name in parallel and (
+                type(native_parallel.get(name)) is not type(parallel[name]) or native_parallel[name] != parallel[name]
+            ):
+                failures.append(f"runtime parallel_config.{name} differs from the validated initialized worker")
+        local, global_size = (native_parallel.get(name) for name in ("data_parallel_size_local", "data_parallel_size"))
+        if type(local) is int and type(global_size) is int and local > global_size:
+            failures.append("initialized worker local DP size exceeds global DP size")
         native_graph = _validate_graph(
             native_config["compilation_config"],
             eager=native_model["enforce_eager"],

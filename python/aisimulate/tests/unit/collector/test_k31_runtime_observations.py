@@ -86,6 +86,7 @@ def _native_fixture(monkeypatch, *, uniform=False, scheduler_projection=False):
             spec.max_num_blocks_per_req = lambda *_: 1
         else:
             spec.dtype, spec.cache_dtype_str = "torch.uint8", "fp8"
+            spec.unpadded_page_size_bytes = 4 * width
         names = [f"{stem}.{i}" for i in range(2)]
         groups.append(SimpleNamespace(layer_names=names, kv_cache_spec=spec, host_resident=False, is_eagle_group=False))
         placements.append(
@@ -176,6 +177,32 @@ def test_native_mixed_state_and_overlaid_groups_charge_actual_padded_pool(monkey
     assert cache["allocated_cache_bytes"] == 5120
     assert cache["groups"][-1]["state_content_size_bytes"] == 48
     assert cache["groups"][-1]["spec_page_size_bytes"] == 64
+
+
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+def test_direct_attention_views_cover_native_payload_with_optional_page_padding(monkeypatch, padded, truncated):
+    cache, scheduled, worker = _native_fixture(monkeypatch)
+    spec = worker.model_runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    spec.unpadded_page_size_bytes = 96 if padded else 128
+    for name in ("mla.0", "mla.1"):
+        tensor = worker.vllm_config.compilation_config.static_forward_context[name].kv_cache
+        tensor.shape = (10, 4, 1 if truncated else spec.unpadded_page_size_bytes // 4)
+    cache = _adapter(monkeypatch).worker_memory(worker)
+    cache["pool_id"] = "pool"
+    cache["semantics"] = {**_SEMANTICS, "retention": "full_or_state"}
+    for group in cache["groups"]:
+        group.update(pool_id="pool", extra_retained_tokens=0, attention_chunk_size=None)
+    scheduled["groups"][0].update(unpadded_page_size_bytes=spec.unpadded_page_size_bytes)
+    if truncated:
+        with pytest.raises(ValueError, match="attention.*payload"):
+            _physical_views(cache, scheduled, "fp8", context=4096)
+    else:
+        _, accounting = _physical_views(cache, scheduled, "fp8", context=4096)
+        assert cache["groups"][0]["unpadded_page_size_bytes"] == spec.unpadded_page_size_bytes
+        assert cache["groups"][0]["spec_page_size_bytes"] == 128
+        assert accounting["page_size_bytes"] == 512
+        assert cache["allocated_cache_bytes"] == 5120
 
 
 @pytest.mark.parametrize("elements", [3, 4])
@@ -321,7 +348,9 @@ def _kernel_view_fixture(monkeypatch):
             "kernel_block_size": 2,
             "kernel_block_stride": 16,
             "kernel_block_offsets": [0, 1],
-            "kernel_block_table_shape": [1, 8, 32],
+            # CP1: ceil(4096 / 4) manager entries, aligned to 128
+            # tokens, then two kernel entries per manager block.
+            "kernel_block_table_shape": [1, 8, 2048],
             "kernel_block_table_dtype": "torch.int32",
             "maps_slot_mapping": False,
             "writes_kv_cache_from_block_table": True,
@@ -336,6 +365,23 @@ def test_native_indexer_kernel_view_charges_only_actual_shared_allocation(monkey
     assert accounting["num_blocks"] == 10 and accounting["page_size_bytes"] == 512
     assert cache["allocated_cache_bytes"] == 5120
     assert cache["layer_components"]["indexer.0"][0]["shape"][0] == 146
+
+
+def test_native_kernel_table_width_includes_context_alignment(monkeypatch):
+    cache, scheduled = _kernel_view_fixture(monkeypatch)
+    for record in (cache, scheduled):
+        state = record["groups"][-1]
+        for spec in state.get("layer_specs", dict.fromkeys(state["layer_names"], state)).values():
+            spec.update(block_size_tokens=4097, max_model_len=4097)
+        state["block_size_tokens"] = 4097
+    # 4097 tokens need 1025 manager blocks, rounded to 1056 entries
+    # for 128-token alignment, hence 2112 two-token kernel entries.
+    for mapping in cache["kernel_block_views"].values():
+        mapping["kernel_block_table_shape"][-1] = 2112
+    assert _physical_views(cache, scheduled, "fp8", context=4097, sequences=8)[1]["num_blocks"] == 10
+    cache["kernel_block_views"]["indexer.0"]["kernel_block_table_shape"][-1] = 2050
+    with pytest.raises(ValueError, match="kernel-block table"):
+        _physical_views(cache, scheduled, "fp8", context=4097, sequences=8)
 
 
 @pytest.mark.parametrize(
@@ -682,6 +728,9 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode"):
         record["bundle_sha256"] = bundle.sha256
         record["runtime"] = {**pinned, "image": launch["deployment"]["image"]}
         config = record["resolved_config"]
+        config["parallel_config"].update(
+            data_parallel_size_local=launch["topology"]["dp"], data_parallel_external_lb=False, enable_eplb=False
+        )
         config["model_config"].update(
             dtype="bfloat16", quantization="mxfp4", architectures=["KimiK31ForConditionalGeneration"]
         )
@@ -723,6 +772,29 @@ def test_import_checks_kernel_table_sequence_capacity(tmp_path, monkeypatch, row
         assert result["status"] == "complete", result["diagnostics"]
     else:
         assert result["status"] == "incomplete", result
+        assert any("kernel-block table" in message for message in result["diagnostics"])
+
+
+@pytest.mark.parametrize("width", [32, 2046, 2048, 2050])
+def test_import_checks_kernel_table_width_against_reviewed_context(tmp_path, monkeypatch, width):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    cache, _ = _kernel_view_fixture(monkeypatch)
+    for mapping in cache["kernel_block_views"].values():
+        mapping["kernel_block_table_shape"] = [1, 64, width]
+
+    def set_kernel_views(record):
+        if record["kind"] == "worker":
+            record["cache"]["kernel_block_views"] = copy.deepcopy(cache["kernel_block_views"])
+            for name in cache["kernel_block_views"]:
+                record["cache"]["layer_components"][name] = copy.deepcopy(cache["layer_components"][name])
+
+    _mutate(path, set_kernel_views)
+    assert launches["tp2"]["collection"]["max_model_len"] == 4096
+    result = validate_observations(path, launches)["tp2"]
+    if width == 2048:
+        assert result["status"] == "complete", result["diagnostics"]
+    else:
+        assert result["status"] == "incomplete" and result["resources"] is None
         assert any("kernel-block table" in message for message in result["diagnostics"])
 
 

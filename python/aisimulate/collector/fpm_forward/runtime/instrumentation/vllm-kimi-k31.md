@@ -30,7 +30,10 @@ is redistributed by this adapter.
 
 * `v1/kv_cache_interface.py`: `KVCacheTensor.layers`, `layer_stride`,
   `block_stride`, `offset`, `host_resident`, and whole allocation `size` are read
-  verbatim. `MambaSpec` exposes shapes, dtypes, payload bytes, padded page bytes,
+  verbatim. `AttentionSpec.unpadded_page_size_bytes` records the complete native
+  attention payload independently of the padded page footprint. Direct layer
+  views must cover that payload contiguously; pool accounting retains padding.
+  `MambaSpec` exposes shapes, dtypes, payload bytes, padded page bytes,
   cache mode, checkpoint counts and `max_num_blocks_per_req`.
 * `v1/core/kv_cache_planning.py` and `v1/worker/utils.py`: all groups share one
   byte allocation. Block-outer layouts repeat a slot for each pool block ID.
@@ -66,7 +69,11 @@ is redistributed by this adapter.
   kernel block size. `worker/gpu/attn_utils.py::init_kv_cache` binds the views
   produced by `worker/utils.py::AttentionGroup.map_kv_cache_to_kernel_blocks`.
   The initialized group's size, stride, offset tensor and block-table geometry
-  are observed directly. For a packed indexer, kernel page `j` of manager block
+  are observed directly. Import checks the table width against the reviewed
+  maximum context: at CP1, round up to manager blocks, align their capacity to
+  128 tokens (`v1/worker/block_table.py::get_block_table_width`), then multiply
+  by the number of kernel blocks per manager block. For a packed indexer,
+  kernel page `j` of manager block
   `b` is `b * kernel_block_stride + j`; import verifies that each addressed page
   lies in the layer's native allocation interval. The tensor spans intervening
   layers' pages but does not own them, so that span is never charged as another

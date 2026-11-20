@@ -60,7 +60,9 @@ def inputs(tmp_path, monkeypatch, request):
         if record["dp_rank"] != 0:
             continue
         record["model_config_sha256"] = launch["model_config"]["sha256"]
-        record["resolved_config"]["parallel_config"].update(data_parallel_size=1, enable_expert_parallel=False)
+        record["resolved_config"]["parallel_config"].update(
+            data_parallel_size=1, data_parallel_size_local=1, enable_expert_parallel=False
+        )
         if packed_indexer and record["kind"] == "worker":
             record["cache"]["kernel_block_views"] = copy.deepcopy(cache["kernel_block_views"])
             for name in cache["kernel_block_views"]:

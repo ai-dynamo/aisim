@@ -24,6 +24,7 @@ _NATIVE_SPEC_FIELDS = {
     "spec_type",
     "block_size_tokens",
     "spec_page_size_bytes",
+    "unpadded_page_size_bytes",
     "sliding_window",
     "attention_chunk_size",
     "extra_retained_tokens",
@@ -251,6 +252,10 @@ def normalize_groups(cache, scheduled, page_bytes, *, context):
             for cls in classes.values()
         ):
             raise ValueError("K3.1 attention cache dtype has no audited FP8 mapping")
+        if kind == "attention":
+            payload = _positive(group.get("unpadded_page_size_bytes"), "attention unpadded payload bytes")
+            if payload > group["spec_page_size_bytes"] or payload % block:
+                raise ValueError("K3.1 attention payload differs from native page geometry")
         result.append(item)
     return result
 
@@ -305,7 +310,7 @@ def validate_attention_assignments(worker):
     return observed
 
 
-def _kernel_view_geometry(mapping, group, view, count, page, width, *, sequences=None):
+def _kernel_view_geometry(mapping, group, view, count, page, width, *, context=None, sequences=None):
     """Check the observed AttentionGroup's manager-to-kernel address mapping."""
     if (
         not isinstance(mapping, dict)
@@ -329,13 +334,19 @@ def _kernel_view_geometry(mapping, group, view, count, page, width, *, sequences
     ):
         raise ValueError("K3.1 native kernel-block offsets do not cover the manager block")
     table = mapping.get("kernel_block_table_shape")
+    # CP1, full-history AttentionSpec.max_num_blocks_per_req and
+    # worker/block_table.py::get_block_table_width at vLLM 266e88c05:
+    # align manager capacity to 128 tokens before kernel subdivision.
+    manager_entries = (_positive(context, "reviewed maximum context") + block - 1) // block
+    alignment = 128 // math.gcd(128, block)
+    expected_width = ((manager_entries + alignment - 1) // alignment) * alignment * subdivisions
     if (
         mapping.get("kernel_block_table_dtype") != "torch.int32"
         or not isinstance(table, list)
         or len(table) != 3
         or any(type(value) is not int or value < 1 for value in table)
         or table[1] != _positive(sequences, "reviewed maximum sequences")
-        or table[-1] % subdivisions
+        or table[-1] != expected_width
     ):
         raise ValueError("K3.1 native kernel-block table shape/dtype is inconsistent")
     shape, strides = view["shape"], view["stride_bytes"]
@@ -355,7 +366,7 @@ def _kernel_view_geometry(mapping, group, view, count, page, width, *, sequences
     return kernel
 
 
-def validate_views(cache, precision, count, page, *, sequences=None):
+def validate_views(cache, precision, count, page, *, context=None, sequences=None):
     """Verify block-outer native placements, including safe cross-group overlays.
 
     A block ID belongs to exactly one cache group. Different groups may overlap
@@ -453,7 +464,7 @@ def validate_views(cache, precision, count, page, *, sequences=None):
                 component_block = group["block_size_tokens"]
                 if name in kernel_views:
                     component_block = _kernel_view_geometry(
-                        mapping, group, view, count, page, width, sequences=sequences
+                        mapping, group, view, count, page, width, context=context, sequences=sequences
                     )
                 elif shape[0] != count or strides[0] != page:
                     raise ValueError("K3.1 component block coverage, offsets or storage disagrees")
@@ -478,6 +489,12 @@ def validate_views(cache, precision, count, page, *, sequences=None):
                 logical = math.prod(shape[1:]) * size
                 if state and span != logical:
                     raise ValueError("K3.1 state components must retain native contiguous payloads")
+                if (
+                    not state
+                    and name not in kernel_views
+                    and (logical != group["unpadded_page_size_bytes"] or span != logical)
+                ):
+                    raise ValueError("K3.1 attention components must retain complete native contiguous payloads")
                 component_offset += logical
         covered.update(layers)
     if covered != set(by_name):

@@ -335,6 +335,68 @@ def test_native_execution_producer_emits_required_model_and_attention_identity(n
     assert result["status"] == "qualified", (result["missing_evidence"], result["failures"])
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("tensor_parallel_size", 1),
+        ("pipeline_parallel_size", 2),
+        ("data_parallel_size", 1),
+        ("data_parallel_size_local", 1),
+        ("data_parallel_external_lb", True),
+        ("enable_expert_parallel", False),
+        ("enable_eplb", True),
+        ("decode_context_parallel_size", 2),
+        ("prefill_context_parallel_size", 2),
+    ],
+)
+def test_execution_rejects_placement_differing_from_initialized_worker(tmp_path, monkeypatch, field, value):
+    from collector.fpm_forward.config import FPMCollectionOptions
+    from collector.fpm_forward.runtime_observations import _launch_cell, validate_observations
+
+    from .test_fpm_forward import _args
+    from .test_k31_runtime_observations import _complete_fixture
+
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    launch = launches["tp2"]
+    imported = validate_observations(path, launches)["tp2"]
+    assert imported["status"] == "complete", imported["diagnostics"]
+    worker = next(a["evidence"] for a in imported["provenance"]["artifacts"] if a["evidence"]["kind"] == "worker")
+    config = copy.deepcopy(worker["resolved_config"])
+    payload = {"resolved_config": config, "graph_config": config["compilation_config"]}
+    plan = SimpleNamespace(
+        options=FPMCollectionOptions.from_args(
+            _args(
+                fpm_max_model_len=launch["collection"]["max_model_len"],
+                fpm_gpu_memory_utilization=launch["collection"]["gpu_memory_utilization"],
+            )
+        ),
+        fpm_profile=SimpleNamespace(model_revision=launch["identity"]["model_revision"]),
+    )
+    cell = _launch_cell(launch, "decode")
+    missing, failures = [], []
+    execution_evidence._inspect_config(payload, cell, plan, None, missing, failures, worker)
+    assert not failures
+    assert config["parallel_config"][field] != value
+    config["parallel_config"][field] = value
+    execution_evidence._inspect_config(payload, cell, plan, None, missing, failures, worker)
+    assert f"runtime parallel_config.{field} differs from the validated initialized worker" in failures
+    if field == "data_parallel_size_local":
+        # Both placements are individually valid: local DP1 versus local
+        # DP2, each within global DP2. Only binding the records detects it.
+        assert config["parallel_config"][field] <= config["parallel_config"]["data_parallel_size"]
+        assert not any("local DP size exceeds" in reason for reason in failures)
+
+
+def test_execution_checks_initialized_worker_local_dp_bound(native_execution):
+    plan, cell, raw, collection, index_path = native_execution
+    # Keep the valid sidecar and global topology; the native configuration's
+    # local placement alone contradicts its global DP size.
+    _mutate(index_path, lambda record: record["resolved_config"]["parallel_config"].update(data_parallel_size_local=3))
+    result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
+    assert result["status"] == "failed", result
+    assert any("initialized worker local DP size exceeds global DP size" in s for s in result["failures"])
+
+
 @pytest.mark.parametrize("observed", [True, False])
 def test_publication_requires_matching_initialized_moe_precision(native_execution, observed):
     from dataclasses import replace

@@ -542,7 +542,7 @@ def _physical_views(
                 or group.get("attention_chunk_size") is not None
             ):
                 raise ValueError("K3.1 cache group pool or retention is unsupported")
-        validate_views(cache, precision, count, page, sequences=sequences)
+        validate_views(cache, precision, count, page, context=context, sequences=sequences)
         return groups, accounting
     layer_groups = {}
     for group_id, group in enumerate(cache["groups"]):
