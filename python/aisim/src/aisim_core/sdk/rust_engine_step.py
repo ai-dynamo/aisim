@@ -1037,11 +1037,18 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
-    if pin.saved_source and payload.get("estimation_mode") in _FPM_ESTIMATION_MODES:
-        # The op-latency source saved by ``aisim init`` would replace the explicit ``systems_paths`` that carry
-        # these modes' FPM tables; only a source the caller or environment names applies to them.
+    if pin.saved_source and (payload.get("estimation_mode") in _FPM_ESTIMATION_MODES or _names_systems_paths(config)):
+        # The op-latency source saved by ``aisim init`` would replace the ``systems_paths`` the caller named, which
+        # carry the FPM tables of these modes and of the FPM candidates of ``auto``. The saved source is a default
+        # for runs that name no roots; only a source the caller or environment names overrides them.
         return None
     return ensure_data(payload, pin)
+
+
+def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> bool:
+    """Whether the caller itself named ``systems_paths`` (``to_dict`` fills in the default roots otherwise)."""
+    named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
+    return bool(named)
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:

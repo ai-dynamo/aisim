@@ -680,6 +680,38 @@ def test_validate_repo_with_fake_transport(run):
     assert run.transport.resolves == 1
 
 
+def test_validate_repo_downloads_the_support_files_of_a_category_without_entries(run, tmp_path):
+    support = b"schema_version: 1\n"
+    index = {
+        "schema_version": "aisim-category-index/v1",
+        "category": "op-latency",
+        "entries": [],
+        "support": [
+            _artifact_json("s", "data/op-latency/support.yaml", support, format="yaml", schema="aisim.test/v1")
+        ],
+    }
+    index_bytes = json.dumps(index).encode()
+    dataset = json.loads(run.files["catalog/dataset.json"])
+    dataset["categories"]["op-latency"]["index"] = _artifact_json(
+        "i", "catalog/op-latency.json", index_bytes, format="json", schema="aisim-category-index/v1"
+    )
+    files = {
+        "catalog/dataset.json": json.dumps(dataset).encode(),
+        "catalog/op-latency.json": index_bytes,
+        "data/op-latency/support.yaml": support,
+    }
+    run.files.clear()
+    run.files.update(files)
+    root = tmp_path / "ds"
+    _write_dataset(root, files)
+    local = json.loads(run("data", "validate", str(root))[1])
+    assert local["ok"] is True, local["findings"]
+    status, out, err = run("data", "validate", "--repo", REPO, "--revision", SHA)
+    remote = json.loads(out)
+    assert status == 0 and remote["ok"] is True, err  # the same verdict as the local check of the complete dataset
+    assert "data/op-latency/support.yaml" in run.transport.opened
+
+
 def test_validate_repo_corrupt_revision_fails(run):
     run.files["data/op-latency/h200_sxm/ops.parquet"] += b"x"
     status, _, err = run("data", "validate", "--repo", REPO, "--revision", SHA)

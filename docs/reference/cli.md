@@ -161,9 +161,10 @@ Private datasets use the standard `HF_TOKEN` only while connected; the cache nee
 A pin without `AISIM_DATA_CATEGORIES` loads only `op-latency`; it used to load `fpm`. A run that needs FPM data
 sets `AISIM_DATA_CATEGORIES=fpm` (or `op-latency,fpm`). If the pinned dataset has no data for a category the pin
 loads, the run fails with a missing-data error that names this variable; it never switches to other data.
-A source saved by `aisim init` applies only to runs that read operation tables: configurations with
-`estimation_mode` `fpm_interpolation`, `fpm_regression` or `fpm_learned` keep their own `systems_paths`. Name the
-source with `AISIM_DATASET` or a pin to apply it to them.
+A source saved by `aisim init` is a default for runs that read operation tables and name no roots. A
+configuration with `estimation_mode` `fpm_interpolation`, `fpm_regression` or `fpm_learned`, or one that sets its
+own `systems_paths` in any mode (`auto` reads FPM tables from them as a fallback), keeps its data. Name the source
+with `AISIM_DATASET` or a pin to apply it to them.
 
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation
