@@ -131,7 +131,7 @@ def test_cli_worker_exit_fails_without_publishing_partial_results(case, tmp_path
             cli.installed_distribution = lambda: SimpleNamespace(
                 read_text=lambda _: json.dumps({"archive_info": {"hashes": {"sha256": digest}}})
             )
-            cli.HfDataset.from_hub = lambda **_: SimpleNamespace(
+            cli.HfDataset.from_hub = lambda *_, **__: SimpleNamespace(
                 revision="a" * 40,
                 configurations=lambda: [case.configuration],
                 measurement_case=lambda *a, **kw: case,
@@ -180,7 +180,7 @@ def test_cli_duplicate_comparison_identity_cannot_publish_partial_results(case, 
     monkeypatch.setattr(
         cli.HfDataset,
         "from_hub",
-        lambda **_: SimpleNamespace(
+        lambda *_, **__: SimpleNamespace(
             revision="a" * 40,
             configurations=lambda: configurations,
             measurement_case=lambda *args, **kwargs: case,
