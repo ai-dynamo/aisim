@@ -538,6 +538,12 @@ impl ForwardPassPerfModel {
         match &self.mode {
             ForwardPassPerfMode::Native { engine, .. } => {
                 let identity = identity.as_mut().expect("native provenance");
+                // Automatic search compiled the op-level engine without an FPM library path, and
+                // a restore rejects one for it. The load-time fingerprint, this save and the
+                // restore must read the same data, so the snapshot identity leaves the path out.
+                if identity.estimation_mode == EstimationMode::OpLevel {
+                    identity.estimator_config.fpm_interpolation.fpm_parquet_path = None;
+                }
                 let root = self
                     .provenance
                     .as_ref()
