@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use super::g3_offload::HeldPrefix;
 use super::host_offload::{MAX_RESTORE_ROUNDS_WITHOUT_PROGRESS, RestoreRounds};
-use super::kvcr_g3::{Deposit, G3, Spill};
+use super::kvcr_g3::{Deposit, G3, PrefixTouch, Spill};
 use crate::engine::host_offload::{
     EvictionCursor, ExternalPlan, HostBlockKey, HostBlockMeta, HostEviction, HostLink, HostPolicy,
     HostTier, HostTierConfig, HostTierHandle, KvcrOrigin, Lookup, ReversedTouch, TransferId,
@@ -157,6 +157,8 @@ pub(super) struct StorePrefix {
     touch: Option<ReversedTouch>,
     /// How many of `keys` the latest re-rank covered.
     touched: usize,
+    /// The disk ranking of the last completed copy of this prefix.
+    disk_touch: Option<PrefixTouch>,
 }
 
 pub(super) type SharedStorePrefix = Arc<Mutex<StorePrefix>>;
@@ -1330,13 +1332,16 @@ impl VllmKvcrAdapter {
 
 /// Under LRU, make the first blocks of a request's `prefix`, in prompt order,
 /// the most recently used of KVCR-owned memory and of the ranks KVCR keeps
-/// for disk, which are set by a walk of those blocks.
+/// for disk. Consecutive fills extend the disk ranking incrementally.
 fn rerank_prefix(tier: &mut HostTier, g3: Option<&mut G3>, prefix: Option<Rerank>) {
     if let Some((prefix, len)) = prefix {
         let mut prefix = prefix.lock().unwrap();
         prefix.rerank(tier, len);
         if let Some(g3) = g3 {
-            g3.touch(&prefix.keys[..len]);
+            let StorePrefix {
+                keys, disk_touch, ..
+            } = &mut *prefix;
+            g3.touch_prefix(&keys[..len], disk_touch);
         }
     }
 }
@@ -2908,6 +2913,34 @@ mod tests {
         adapter.expect_store(id, &mut request, &blocks(prefix));
         adapter.store_local(g2, Uuid::from_u128(1), id, &blocks(keys), now);
         request
+    }
+
+    #[test]
+    fn chunked_stores_rank_only_new_blocks_without_spilling() {
+        for blocks in [1024, 2048, 8192] {
+            let f = Fixture::with_g3(blocks, KvcrLocalG2Policy::Lru, 0.0, KvcrG3Config::new(1));
+            let (mut adapter, g2) = (f.adapter(), f.target.lock());
+            let keys = f.keys(&(0..blocks as u64).collect::<Vec<_>>());
+            let mut request = None;
+            for end in 1..=blocks {
+                let store = TransferId::new(end as u64);
+                adapter.expect_store(store, &mut request, &keys[..end]);
+                adapter.store_local(&g2, f.owner, store, &keys[end - 1..end], end as f64);
+            }
+            let local = adapter.local.as_ref().unwrap();
+            let g3 = local.g3.as_ref().unwrap();
+            // Count actual rank visits, not wall time: doubling a no-spill
+            // prompt must double this work rather than quadruple it.
+            assert_eq!(g3.ranked_keys(), blocks);
+            assert_eq!(f.stats().local_g2.unwrap().stored_blocks, blocks as u64);
+            assert_eq!(f.stats().g3.unwrap().stored_blocks, 0);
+            assert!(!adapter.has_work());
+            // A request's terminal alignment still covers its entire prompt.
+            adapter.align_local(request.as_ref(), &keys);
+            assert!(keys.iter().all(|key| {
+                adapter.local.as_ref().unwrap().tier.lock().lookup(*key) == Lookup::Hit
+            }));
+        }
     }
 
     #[test]
