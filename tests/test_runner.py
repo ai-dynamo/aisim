@@ -380,6 +380,33 @@ def test_runner_disabled_depth_normalization_preserves_input_validation(controls
         EngineReplayRunnerFactory().create(0).run(spec)
 
 
+@pytest.mark.parametrize("mode", ["op_level", "fpm_interpolation"])
+def test_runner_rejects_mtp_with_a_duplicate_timing_nextn(mode):
+    args = {
+        "backend": "vllm",
+        "block_size": 4,
+        "num_gpu_blocks": 16,
+        "speculation": {"kind": "mtp", "params": {"depth": 2}, "expected_accepted_tokens": 1},
+        "timing_model": {
+            "type": "external",
+            "provider": "aic",
+            "config": {
+                "model": "Qwen/Qwen3-8B",
+                "system": "h200_sxm",
+                "backend": "vllm",
+                "backend_version": "0.24.0",
+                "worker_type": "aggregated",
+                "estimation_mode": mode,
+                "nextn": 2,
+            },
+        },
+    }
+    # Even an equal legacy depth is ambiguous alongside a scheme. The adapter
+    # must reject it instead of silently discarding the speculative cost.
+    with pytest.raises(ValueError, match="speculation conflicts with timing_model.config.nextn"):
+        _materialize_engine_role("vllm", "0.24.0", {}, {"rank": args}, "aggregated")
+
+
 def _canonical_speculation_deployment(speculation, *, backend="vllm"):
     version = {"vllm": "0.24.0", "sglang": "0.5.14", "trtllm": "1.3.0rc20"}[backend]
     timing = {
@@ -774,6 +801,7 @@ def test_agentic_g2_accepts_multiple_replicas(nested_rank, scopes, field, value)
         (("cluster_shared",), "num_workers", 1.5),
         (("dp_rank_local",), "num_workers", True),
         (("dp_rank_local", "cluster_shared"), "num_prefill_workers", 0),
+        ((None, "cluster_shared"), "num_decode_workers", True),
     ],
 )
 def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, value):
@@ -781,6 +809,21 @@ def test_agentic_g2_rejects_invalid_worker_counts(nested_rank, scopes, field, va
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: value}))
     with pytest.raises(ValueError, match=f"{field} to be a positive integer"):
         EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+@pytest.mark.parametrize("nested_rank", [False, True])
+@pytest.mark.parametrize(
+    "scopes,field",
+    [
+        (("dp_rank_local", None), "num_prefill_workers"),
+        ((None, "cluster_shared"), "num_decode_workers"),
+        (("cluster_shared", "cluster_shared"), "num_decode_workers"),
+    ],
+)
+def test_agentic_g2_accepts_several_workers_per_pd_role(nested_rank, scopes, field):
+    spec = _agentic_g2_spec(scopes=scopes, nested_rank=nested_rank)
+    spec = replace(spec, backend_deployment=replace(spec.backend_deployment, **{field: 3}))
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
 @pytest.mark.parametrize("nested_rank", [False, True])
@@ -1564,6 +1607,42 @@ engine:
     assert runtime.execution_spec["spec"]["engine"]["rank"][field] == value
 
 
+def test_public_scheduler_launch_reaches_native_execution_rank(tmp_path):
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    path = tmp_path / "prediction.yaml"
+    path.write_text(
+        f"""\
+engine:
+  mode: aggregated
+  model: example/model
+  hardware: h200_sxm
+  backend: vllm
+  context_length: 4096
+  workers:
+    aggregated:
+      scheduler:
+        launch: {json.dumps(launch)}
+      kv_cache:
+        block_size: 16
+        capacity: {{type: fixed, blocks: 128}}
+      timing: {{type: fixed, prefill_ms: 1.0, decode_ms: 1.0}}
+""",
+        encoding="utf-8",
+    )
+    runtime = RecordingRuntime()
+    public = CorePredictionConfig.from_yaml(path)
+
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(prediction_to_replay_spec(public))
+
+    assert runtime.execution_spec["spec"]["engine"]["rank"]["launch"] == launch
+
+
 def test_runner_materializes_aic_capacity_before_native_execution(monkeypatch):
     runtime = RecordingRuntime()
     engine_args = _engine_args()
@@ -1744,6 +1823,33 @@ def test_sglang_prefill_pipeline_width_must_be_a_positive_integer(monkeypatch, w
     args.pop("timing_model")
     with pytest.raises(ValueError, match="must be a positive integer"):
         _materialize_engine_role("sglang", "test", {"prefill_pp": 4}, {**args, "aic_pp_size": width}, "prefill")
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_sglang_prediction_lowers_measured_scheduler_selection_cost(mode):
+    costs = {"aggregated": 1.5} if mode == "aggregated" else {"prefill": 1.5, "decode": 2.5}
+    config = CorePredictionConfig.model_validate(
+        {
+            "engine": {
+                "backend": "sglang",
+                "model": "synthetic",
+                "hardware": "h200_sxm",
+                "mode": mode,
+                "workers": {
+                    role: {
+                        "scheduler": {"scheduler_select_time_ms": cost},
+                        "kv_cache": {"capacity": {"type": "fixed", "blocks": 64}},
+                        "timing": {"type": "fixed", "prefill_ms": 7, "decode_ms": 2},
+                    }
+                    for role, cost in costs.items()
+                },
+            }
+        }
+    )
+    deployment = prediction_to_replay_spec(config).backend_deployment
+    for role, cost in costs.items():
+        role_args = getattr(deployment, f"{'agg' if role == 'aggregated' else role}_engine_args")
+        assert role_args["sglang"]["scheduler_select_time_ms"] == cost
 
 
 def test_sglang_pd_prefill_compiles_pipeline_stages():
@@ -3871,6 +3977,28 @@ def test_detokenization_requires_capability_and_offline_replay() -> None:
     detokenization = {"workers": 1, "base_ms": 1.0, "per_output_ms": 0.0}
     spec = _spec(deployment=_detokenization_deployment(detokenization, 1))
     with pytest.raises(ValueError, match="does not support engine.detokenization"):
+        RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
+    engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
+    engine.require_compatible(spec)
+    with pytest.raises(ValueError, match="offline"):
+        replace(engine, supported_execution_modes=("offline", "online")).require_compatible(
+            replace(spec, execution_mode="online")
+        )
+
+
+def test_scheduler_launch_requires_capability_and_offline_replay() -> None:
+    from aisimulate.sweeper import RunnerCapabilities
+
+    launch = {
+        "decode_ms": 5.0,
+        "piecewise_ms": 50.0,
+        "eager_ms": 150.0,
+        "max_cudagraph_capture_size": 512,
+        "eager_queue_fraction": 0.4,
+    }
+    deployment = replace(_detokenization_deployment(None, 1), agg_engine_args=_engine_args() | {"launch": launch})
+    spec = _spec(deployment=deployment)
+    with pytest.raises(ValueError, match="does not support scheduler.launch"):
         RunnerCapabilities(supported_backend_topologies=(("*", "*"),)).require_compatible(spec)
     engine = EngineReplayRunnerFactory(runtime=RecordingRuntime()).capabilities()
     engine.require_compatible(spec)

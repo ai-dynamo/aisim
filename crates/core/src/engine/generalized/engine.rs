@@ -25,6 +25,7 @@ struct PendingGroupPass<P> {
     pass_id: PassId,
     started_at_ms: f64,
     end_ms: f64,
+    idle_telemetry_end_ms: f64,
     by_rank: Vec<PendingRankPass<P>>,
 }
 
@@ -241,6 +242,7 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             .context("generalized engine wave step overflow")?;
 
         let mut end_ms = now_ms;
+        let mut idle_telemetry_end_ms = now_ms;
         let mut same_timestamp_retry = SameTimestampRetry::NotApplicable;
         let mut started = Vec::with_capacity(self.ranks.len());
         let mut pending = Vec::with_capacity(self.ranks.len());
@@ -282,6 +284,8 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             });
             let pass = pass.map_err(|error| self.poison(error))?;
             end_ms = end_ms.max(pass.end_ms);
+            idle_telemetry_end_ms = idle_telemetry_end_ms
+                .max(self.ranks[dp_rank].idle_telemetry_end_ms(&pass.pending, pass.end_ms));
             same_timestamp_retry = match (same_timestamp_retry, pass.same_timestamp_retry) {
                 (
                     SameTimestampRetry::Countdown { remaining: a },
@@ -320,6 +324,7 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             pass_id,
             started_at_ms: now_ms,
             end_ms,
+            idle_telemetry_end_ms,
             by_rank: pending,
         });
         Ok(Some(EnginePassStarted {
@@ -389,9 +394,11 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
                 continue;
             }
             let idle_effects = self.ranks[rank_index]
-                // Idle-rank FPM represents the modeled shared barrier, not a
-                // live driver's scheduling delay after that barrier elapsed.
-                .complete_idle_group_pass(pending.started_at_ms, pending.end_ms)
+                .complete_idle_group_pass_with_telemetry(
+                    pending.started_at_ms,
+                    pending.end_ms,
+                    pending.idle_telemetry_end_ms,
+                )
                 .with_context(|| {
                     format!("completing idle attention-DP rank {dp_rank} group barrier")
                 });
@@ -409,6 +416,41 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             pass_id,
             effects: EngineEffects { by_rank: effects },
         })
+    }
+
+    /// Earliest held-output release across ranks (see
+    /// [`RankEngine::next_emission_ms`]).
+    pub fn next_emission_ms(&self) -> Option<f64> {
+        if self.poisoned.is_some() {
+            return None;
+        }
+        self.ranks
+            .iter()
+            .filter_map(RankEngine::next_emission_ms)
+            .min_by(f64::total_cmp)
+    }
+
+    /// Release every rank's held outputs due at `now_ms`, in rank order, even
+    /// while a pass is in flight.
+    pub fn take_due_emissions(
+        &mut self,
+        now_ms: f64,
+    ) -> Result<EngineEffects<C::PassCompletionEffects>> {
+        self.ensure_healthy()?;
+        validate_time(now_ms, "emission time")?;
+        let mut effects = Vec::new();
+        for dp_rank in 0..self.ranks.len() {
+            let due = self.ranks[dp_rank]
+                .take_due_emissions(now_ms)
+                .with_context(|| format!("releasing outputs of attention-DP rank {dp_rank}"));
+            if let Some(due) = due.map_err(|error| self.poison(error))? {
+                effects.push(RankEffects {
+                    dp_rank: dp_rank as u32,
+                    effects: due,
+                });
+            }
+        }
+        Ok(EngineEffects { by_rank: effects })
     }
 
     /// Earliest valid internal-work deadline across all ranks.

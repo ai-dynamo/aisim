@@ -32,7 +32,7 @@ import json
 import pkgutil
 import warnings
 
-from aisim_core.sdk import config
+from aisim_core.sdk import common, config
 from aisim_core.sdk.errors import InvalidEngineConfigurationError
 from aisim_core.sdk.models.base import _MODEL_REGISTRY, BaseModel
 from aisim_core.sdk.models.helpers import (
@@ -222,6 +222,15 @@ def get_model(
         model_config.gemm_quant_mode is not None if gemm_explicit is None else gemm_explicit
     )
     _apply_model_quant_defaults(model_config, raw_config, architecture, backend_name)
+    # vLLM (nvfp4_ds_mla) and TRT-LLM store FP4 MLA caches in their own layouts, which nvfp4 doesn't model.
+    language = raw_config.get(common.MULTIMODAL_TEXT_CONFIG_KEY.get(architecture)) or raw_config
+    if model_config.kvcache_quant_mode == common.KVCacheQuantMode.nvfp4 and (
+        language.get("kv_lora_rank") or language.get("compress_ratios")
+    ):
+        raise InvalidEngineConfigurationError(
+            f"{architecture}: an nvfp4 KV cache is modeled only for standard K/V attention, "
+            "not for an MLA latent or compressed cache"
+        )
     if check_is_moe(model_path, model_info=model_info):
         try:
             model_config.resolve_moe_parallelism()

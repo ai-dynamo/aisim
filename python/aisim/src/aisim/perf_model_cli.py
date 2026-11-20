@@ -362,13 +362,9 @@ def _load_config(path: str) -> tuple[dict[str, Any], str]:
 
     A file that is not UTF-8 text is reported with its name.
     """
-    from .config.common import load_yaml_with_text
+    from .config.common import load_config_with_text
 
-    try:
-        return load_yaml_with_text(path)
-    except UnicodeDecodeError as exc:
-        # load_yaml names the file for every other failure; this one would reach the user without it.
-        raise ValueError(f"could not read configuration {path}: the file is not valid UTF-8 text ({exc})") from exc
+    return load_config_with_text(path)
 
 
 class _NameTaken(Exception):
@@ -406,17 +402,14 @@ def _config_text(path: str, config: Mapping[str, Any]) -> str:
 def _json_text(path: str, config: Mapping[str, Any]) -> str:
     """The config as JSON text that reads back as the same config.
 
-    A config file is read as YAML whatever its name is. YAML holds values that JSON does not, such
-    as a date or a key that is not text, and it reads a number that JSON writes with an exponent
-    as text. A config with such a value is refused: the file would mean something else.
+    YAML holds values that JSON does not, such as a date or a key that is not text.
+    A config with such a value is refused: the file would mean something else.
     """
-    import yaml
-
     advice = "name a file that does not end with .json to write YAML"
     try:
         text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-        read_back = yaml.safe_load(text)
-    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        read_back = json.loads(text)
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"cannot write {path} as JSON: {exc}; {advice}") from exc
     if read_back != config:
         raise ValueError(f"cannot write {path} as JSON: {_first_difference(config, read_back)}; {advice}")
@@ -538,7 +531,7 @@ def _keep_permissions(target: str, temporary: str) -> None:
     os.chmod(temporary, mode)
 
 
-def _folders_with_a_name(path: str) -> list[str]:
+def _folders_with_a_name(path: str, *, output_format: str | None = None) -> list[str]:
     """The folders in which a config file has a name, the folder of ``path`` first.
 
     ``path`` can be a symbolic link to the file, or to another link to it. Each of them is a name
@@ -555,6 +548,13 @@ def _folders_with_a_name(path: str) -> list[str]:
             # Links that name each other name no file; the write reports that.
             break
         seen.add(path)
+        if output_format is not None:
+            read_format = "JSON" if path.lower().endswith(".json") else "YAML"
+            if read_format != output_format:
+                raise ValueError(
+                    f"cannot write {output_format}: the same file is read as {read_format} through {path}; "
+                    "use matching filename formats for symlinks, or write to a separate file"
+                )
         if folder not in folders:
             folders.append(folder)
         if not os.path.islink(path):
@@ -619,10 +619,13 @@ def _run_migrate(args: argparse.Namespace) -> int:
     }
     # ais_perf_model starts a relative path at the folder of the file it is read from: FILE once it is written.
     read_from = args.config if args.output is None else args.output
-    folders = _folders_with_a_name(read_from)
+    output_format = None if args.output is None else ("JSON" if args.output.lower().endswith(".json") else "YAML")
+    folders = _folders_with_a_name(read_from, output_format=output_format)
     if args.output is not None and os.path.realpath(args.output) == os.path.realpath(args.config):
         # CONFIG is one more name of FILE, and it can be a link in another folder.
-        folders += [folder for folder in _folders_with_a_name(args.config) if folder not in folders]
+        folders += [
+            folder for folder in _folders_with_a_name(args.config, output_format=output_format) if folder not in folders
+        ]
     config_dir, *other_config_dirs = folders
     try:
         converted, removed, notes = migrate_mapping(

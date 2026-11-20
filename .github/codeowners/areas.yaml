@@ -64,6 +64,7 @@ areas:
       - tests/test_output_adapter_context.py
       - tests/test_power_diagnostics.py
       - tests/test_unified_cli.py
+      - tests/test_output_lock.py
       - tests/test_replay_dashboard.py
       - tests/browser/
       - tests/test_ngram_cli.py
@@ -110,6 +111,8 @@ areas:
       - tests/test_aic_sync.py
       - tests/test_cloud_agent_install.py
       - tests/test_ci_workflow_contracts.py
+      - tests/test_fast_ci_policy.py
+      - tests/test_full_ci_fail_fast.py
       - tests/test_artifactory_wheel_handoff.py
       - tests/test_ci_qualification.py
       - tests/test_pages_site.py
@@ -149,6 +152,8 @@ shared:
     owners: [forward-pass-engine, replay, infra, maintainers]
   - glob: benchmarks/reports/perf-data/
     owners: [forward-pass-engine, infra, maintainers]
+  - glob: skills/
+    owners: [maintainers]
   - glob: .agents/skills/aisim-fpe-performance/
     owners: [forward-pass-engine, maintainers]
   - glob: .claude/skills/aisim-fpe-performance
@@ -295,6 +300,8 @@ shared:
     owners: [replay, forward-pass-engine, maintainers]
   - glob: tests/test_unified_cli.py
     owners: [replay, sweeper, forward-pass-engine, maintainers]
+  - glob: tests/test_output_lock.py
+    owners: [replay, sweeper, forward-pass-engine, maintainers]
   - glob: tests/test_replay_dashboard.py
     owners: [replay, maintainers]
   - glob: tests/browser/
@@ -420,7 +427,9 @@ shared:
     owners: [infra, maintainers]
   - glob: .github/codeowners/
     owners: [infra, maintainers]
-  - glob: .github/workflows/codeowners.yml
+  - glob: .github/workflows/fast-ci.yml
+    owners: [infra, maintainers]
+  - glob: .github/workflows/request-nvskills-ci.yml
     owners: [infra, maintainers]
   - glob: CODEOWNERS
     owners: [infra, maintainers]

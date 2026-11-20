@@ -423,15 +423,22 @@ def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
     return worker
 
 
-def test_agentic_g2_accepts_mtp_for_a_hybrid_model_with_the_drop_off() -> None:
-    """Both API boundaries accept MTP with G2 for a state cache with disable_eagle_block_drop."""
+@pytest.mark.parametrize("window", [False, True])
+def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
+    """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
     config = _config("agentx-g2-local.yaml")
     kv_cache = _mtp_with_drop_off(config["engine"], 1)["kv_cache"]
-    kv_cache.update(state_cache={"bytes_per_request": 1_000_000}, prefix_match_unit=4)
     kv_cache["capacity"]["blocks"] = 16
-    kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
+    if window:
+        del config["engine"]["speculation"]["disable_eagle_block_drop"]
+        kv_cache["state_cache"] = {"bytes_per_request": 1_000_000, "sliding_window_lookahead_tokens": 0}
+    else:
+        kv_cache.update(state_cache={"bytes_per_request": 1_000_000}, prefix_match_unit=4)
+        kv_cache["host_offload"]["connector"] = "simple_cpu_v0_32"
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
     payload = _materialize_engine_execution_spec(spec, trace_block_size=4, record_per_request=True)
+    # A sliding window runs MTP with G2 synchronously, as a token cache does.
+    assert payload["spec"]["engine"]["rank"].get("async_scheduling") == (False if window else None)
     EngineReplayRunnerFactory().capabilities().require_compatible(spec)
     _runtime.run_replay_json(json.dumps(payload))
 
@@ -537,6 +544,48 @@ def test_agentic_g2_runs_on_several_aggregated_workers_with_private_pools() -> N
     assert report["agentic_qualification"] == "functional_only"
     workers = {entry["logical_worker_id"] for row in report["per_request"] for entry in row["routing_history"]}
     assert workers == {0, 1}
+
+
+@pytest.mark.parametrize("scope", ["cluster_shared", "dp_rank_local"])
+@pytest.mark.parametrize("prefill,decode", [(1, 3), (3, 1), (2, 3)])
+def test_agentic_g2_runs_on_several_prefill_and_decode_workers(scope, prefill, decode) -> None:
+    """P/D accepts several workers per role; a private pool restores only on the worker that stored the prefix."""
+    config = _config("agentx-g2-shared-pd.yaml")
+    workers = config["engine"]["workers"]
+    workers["decode"] = copy.deepcopy(workers["prefill"])
+    for role, replicas in (("prefill", prefill), ("decode", decode)):
+        workers[role]["parallelism"]["replicas"] = replicas
+        host = workers[role]["kv_cache"]["host_offload"]
+        host["scope"] = scope
+        if scope == "dp_rank_local":
+            del host["shared_d2h_bandwidth_gbps"], host["shared_h2d_bandwidth_gbps"]
+    single = copy.deepcopy(config)
+    for role in ("prefill", "decode"):
+        single["engine"]["workers"][role]["parallelism"]["replicas"] = 1
+    report, baseline = _run(config), _run(single)
+    assert report["completed_requests"] == baseline["completed_requests"] == 4
+    assert report["agentic_qualification"] == "functional_only"
+    for role, replicas in (("prefill", prefill), ("decode", decode)):
+        used = {
+            entry["logical_worker_id"]
+            for row in report["per_request"]
+            for entry in row["routing_history"]
+            if entry["pool"] == role
+        }
+        assert used == set(range(replicas))
+    restored = _restored(report)["first_admission_host_reused_input_tokens"]
+    if prefill == 2:
+        # The child runs on the other prefill worker, so the parent's prefix stays in GPU memory.
+        assert restored == 0
+        assert _restored(report)["first_admission_g1_reused_input_tokens"] == 8
+    elif scope == "cluster_shared" or prefill == 1:
+        # One pool, or one prefill worker: the parent finds its prefix as with 1P1D.
+        assert restored == _restored(baseline)["first_admission_host_reused_input_tokens"] == 8
+        assert report["committed_prefill_tokens"] == baseline["committed_prefill_tokens"]
+    else:
+        # Round robin sends the resumed parent to a prefill worker that never stored it.
+        assert restored == 0
+        assert report["committed_prefill_tokens"] > baseline["committed_prefill_tokens"]
 
 
 def _planner_pass(prefills: int, prefill_tokens: int, decodes: int, kv: int) -> list[dict]:

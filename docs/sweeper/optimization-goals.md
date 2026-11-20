@@ -219,8 +219,10 @@ set their own rate, which validation does not read, so a floor above it rejects 
 Missing rate evidence fails closed; raw throughput or offered rate is never substituted.
 Closed-loop traffic (fixed concurrency or agentic lanes) needs no rate floor, but may specify one.
 
-The optimizer observes `-used_gpus` for qualifying candidates and infeasibility for latency or
-load failures. Final selection applies the same constraints to the full candidate pool before
+The search visits backend/topology pairs in ascending GPU count, whichever `algorithm` is
+configured, and stops suggesting pairs larger than the best qualifying count found so far (see
+[search space](search-space.md)). The optimizer observes `-used_gpus` for qualifying candidates
+and infeasibility for latency or load failures. Final selection applies the same constraints to the full candidate pool before
 top-N truncation, then sorts by GPU count, higher SLA-compliant output throughput, lower mean
 E2E latency, and a deterministic configuration key. GPU count is provisioned topology size,
 not time-averaged usage. A finite trial budget establishes the smallest qualifying configuration

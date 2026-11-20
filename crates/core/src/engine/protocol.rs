@@ -363,6 +363,9 @@ pub struct Metrics {
     pub kv_cache_used_bytes: Option<u64>,
     /// Physical grouped-cache capacity; absent for the legacy linear pool.
     pub kv_cache_capacity_bytes: Option<u64>,
+    /// Cached grouped-cache bytes that no request holds; present only with
+    /// grouped prefix caching.
+    pub kv_cache_cached_bytes: Option<u64>,
     /// Byte occupancy for grouped caches; otherwise `active_blocks / total_blocks`.
     pub cache_usage: f64,
     /// Physical resident fraction. This includes inactive reusable vLLM blocks
@@ -527,6 +530,7 @@ pub struct PassCompletionEffects {
 #[doc(hidden)]
 pub struct PendingPass {
     pub(crate) started_at_ms: f64,
+    pub(crate) end_without_selection_ms: Option<f64>,
     pub(crate) effects: PassCompletionEffects,
 }
 
