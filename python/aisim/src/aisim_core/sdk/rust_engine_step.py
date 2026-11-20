@@ -1032,6 +1032,8 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     if pin is None:
         return None
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    if _carries_state_snapshot(payload.get("estimator_config")):
+        return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
     return ensure_data(payload, pin)
 
 
