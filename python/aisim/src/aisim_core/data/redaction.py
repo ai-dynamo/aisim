@@ -27,6 +27,7 @@ re-checks anything that was promoted.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
@@ -433,6 +434,15 @@ def _check_table_text(table: pa.Table, rel: str, policy: RedactionPolicy, where:
 
     for field in table.schema:
         field_metadata(field)
+    # The reader merges the footer's key/value metadata over the Arrow schema it embeds (``ARROW:schema``), so a
+    # redacted override can hide the original: scan the stored key/values and the decoded embedded schema as well.
+    stored = footer.metadata or {}
+    metadata.append({key: value for key, value in stored.items() if key != b"ARROW:schema"})
+    if (embedded := stored.get(b"ARROW:schema")) is not None:
+        schema = pa.ipc.read_schema(pa.py_buffer(base64.b64decode(embedded)))
+        metadata.append(schema.metadata or {})
+        for field in schema:
+            field_metadata(field)
     # Field names are disclosure text even when the table has no rows or every cell is null.
     out.extend(scan_value(field_names, policy, rel, f"{where} name"))
     for entry in metadata:

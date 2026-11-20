@@ -39,6 +39,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -612,6 +613,7 @@ def _apply_promotion(
         {d for d in (target / CATALOG_DIR).rglob("*") if d.is_dir()} if (target / CATALOG_DIR).is_dir() else None
     )
     ledger: Path | None = None
+    ledger_created = False  # only a ledger this attempt created is removed on failure
     try:
         for rel in sorted(plan.files):
             dest = target / rel
@@ -633,16 +635,24 @@ def _apply_promotion(
                 f"public validator rejects the result: {first.code} {first.path or ''}: {first.message}"
             )
         if write_ledger:  # lineage is part of the promotion: a target without its record is rolled back
-            ledger = (
+            path = (
                 source.resolve().parent
                 / f".{source.resolve().name}.promotion-ledger"
                 / "promotions"
                 / f"{plan.digest}.json"
             )
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            ledger.write_text(_ledger_text(plan, report.fingerprint), encoding="utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existed = path.exists()  # retrying an applied plan reuses this path: keep the earlier record on failure
+            fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(_ledger_text(plan, report.fingerprint))
+                os.replace(temporary, path)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            ledger, ledger_created = path, not existed
     except BaseException:
-        if ledger is not None:
+        if ledger is not None and ledger_created:
             ledger.unlink(missing_ok=True)
         for path in added:
             path.unlink(missing_ok=True)

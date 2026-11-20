@@ -1543,6 +1543,34 @@ def test_selected_files_are_bound_to_the_recorded_source_commit(tmp_path, edited
         assert "differs from the reviewed revision" in findings[0].message and not plan.content_ok
 
 
+@pytest.mark.parametrize("failure", ["read-only-file", "replace-fails"])
+def test_retrying_an_applied_plan_keeps_the_earlier_ledger_on_failure(tmp_path, monkeypatch, failure):
+    from aisim_core.data import promote as promotion
+
+    root, directory, plan = _approved(tmp_path)
+    target = _target(tmp_path)
+    ledger = apply_promotion(plan, root, target)
+    original = ledger.read_bytes()
+    if failure == "read-only-file":
+        ledger.chmod(0o444)  # the directory stays writable, as in a retry of the same plan
+        assert apply_promotion(plan, root, target) == ledger  # replaced atomically, never half-written
+        assert json.loads(ledger.read_text())["digest"] == plan.digest
+        return
+    real = os.replace
+
+    def failing(src, dst, *args, **kwargs):
+        if Path(dst) == ledger:
+            raise PermissionError("ledger directory is not writable")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(promotion.os, "replace", failing)
+    with pytest.raises(PermissionError):
+        apply_promotion(plan, root, target)
+    assert ledger.read_bytes() == original  # the earlier provenance record survives the failed retry
+    assert [p.name for p in ledger.parent.iterdir()] == [ledger.name]  # and no temporary file is left behind
+    assert (target / directory / "manifest.json").is_file()
+
+
 def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch):
     root, directory, plan = _approved(tmp_path)
     target = _target(tmp_path)
@@ -1558,21 +1586,21 @@ def test_failed_copy_and_failed_ledger_restore_the_target(tmp_path, monkeypatch)
     assert not any(p.is_file() for p in target.rglob("*"))
     monkeypatch.setattr("aisim_core.data.promote.shutil.copyfile", real)
 
-    real_write = Path.write_text
-    partial_ledgers = []
+    real_replace = os.replace
+    refused = []
 
-    def deny(self, *a, **k):
-        if "promotions" in self.parts:
-            self.write_bytes(b'{"partial":')
-            partial_ledgers.append(self)
+    def deny(src, dst, *a, **k):
+        if "promotions" in Path(dst).parts:  # the ledger is written to a temporary file and moved into place
+            refused.append(Path(dst))
             raise PermissionError("read-only")
-        return real_write(self, *a, **k)
+        return real_replace(src, dst, *a, **k)
 
-    monkeypatch.setattr(Path, "write_text", deny)
+    monkeypatch.setattr("aisim_core.data.promote.os.replace", deny)
     with pytest.raises(PermissionError):
         apply_promotion(plan, root, target)
     assert not any(p.is_file() for p in target.rglob("*"))
-    assert len(partial_ledgers) == 1 and not partial_ledgers[0].exists()
+    ledger_dir = root.parent / f".{root.name}.promotion-ledger"
+    assert len(refused) == 1 and not any(p.is_file() for p in ledger_dir.rglob("*"))  # no partial ledger remains
 
 
 @pytest.mark.parametrize("case", ["alias", "configuration"])
@@ -1960,6 +1988,60 @@ def test_category_support_travels_with_a_promoted_operation_configuration(tmp_pa
     assert {a.path for a in index.support} == support
     assert validate_tree(target, repo=PUBLIC, profile="public").ok
     load_op_latency_tree(target, tmp_path / "composed")  # fails without the lookups the pinned fetch needs
+
+
+@pytest.mark.parametrize("embedded", ["plain-synthetic-value", "[REDACTED]"])
+def test_embedded_arrow_schema_metadata_is_scanned_in_the_promoted_file(tmp_path, embedded):
+    import pyarrow.parquet as pq
+
+    root, directory, relative = _op_mirror(tmp_path, "future_text", None)
+    path = root / relative
+    table = pq.read_table(path)
+    schema = table.schema.with_metadata({**(table.schema.metadata or {}), b"password": embedded.encode()})
+    with pq.ParquetWriter(path, schema, compression="zstd") as writer:
+        writer.write_table(table.cast(schema))
+        # The reader exposes this override, while the encoded ARROW:schema keeps the original value.
+        writer.add_key_value_metadata({"password": "[REDACTED]"})
+    _refresh_artifact(root, directory, relative)
+    leaked = embedded != "[REDACTED]"
+    draft = plan_promotion(root, _request(root, [directory]), _reviewers())
+    assert ("secret" in {f.code for f in draft.findings}) is leaked
+    scanned = tmp_path / "scanned"
+    shutil.copytree(root, scanned, ignore=shutil.ignore_patterns(".git", "mirror"))
+    assert ("secret" in {f.code for f in validate_tree(scanned, profile="public").errors}) is leaked
+    approved = plan_promotion(root, _request(root, [directory], draft), _reviewers())
+    target = _target(tmp_path)
+    if leaked:
+        with pytest.raises(PromotionError, match="not approved"):
+            apply_promotion(approved, root, target)
+        return
+    apply_promotion(approved, root, target)
+    assert b"plain-synthetic-value" not in (target / relative).read_bytes()  # the copied bytes carry no credential
+
+
+def test_eval_discovery_never_reads_an_oversized_json_whole(tmp_path, monkeypatch):
+    from aisim_core.data.eval import record_paths
+    from aisim_core.data.hygiene import CandidatePolicy
+
+    root, manifests = _mirror(tmp_path)
+    record = _eval(root, [load_e2e(root, manifests[0]).manifest.configuration_id])
+    big = record.parent / "unselected.json"
+    big.write_bytes(b" " * (CandidatePolicy().max_json_bytes + 1024) + b"{}")
+
+    def refusing(real):
+        def refuse(path, *args, **kwargs):
+            if path == big:
+                pytest.fail("eval discovery read an oversized JSON file whole")
+            return real(path, *args, **kwargs)
+
+        return refuse
+
+    for name in ("read_text", "read_bytes"):  # an unbounded read of the oversized file would exhaust memory
+        monkeypatch.setattr(Path, name, refusing(getattr(Path, name)))
+    assert big in record_paths(root / "eval", recursive=True)  # still a candidate, never a silent sidecar
+    rels = [p.relative_to(root).as_posix() for p in (record, big)]
+    findings = check_publishable(root, rels)
+    assert any(f.code == "document-invalid" and "limit" in f.message and f.path == rels[1] for f in findings)
 
 
 def test_one_promotion_registers_two_new_categories(tmp_path, op_source):  # noqa: F811

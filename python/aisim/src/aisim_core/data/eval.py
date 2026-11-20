@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from aisim_core.data import Artifact, Digest, Identity
 from aisim_core.data.gpu_time import Finding, GpuTime, check_gpu_time, gpu_time_ok
+from aisim_core.data.hygiene import bounded_json_bytes
 from aisim_core.data.parquet import read_parquet, write_parquet
 
 EVAL_SCHEMA_ID = "aisim-eval/v1"
@@ -299,9 +300,13 @@ def write_record(root: str | Path, record: EvalRecord) -> Path:
 
 
 def load_record(path: str | Path) -> EvalRecord:
-    """Load a record and check its file name equals its content hash."""
+    """Load a record and check its file name equals its content hash.
+
+    The read is bounded (the shared structured-JSON limit), so discovering records among large unrelated
+    JSON files never reads them whole; an oversized file is refused with a ``ValueError``.
+    """
     path = Path(path)
-    record = EvalRecord.model_validate_json(path.read_text(encoding="utf-8"))
+    record = EvalRecord.model_validate_json(bounded_json_bytes(path))
     if path.stem != record.record_id:
         raise ValueError(f"{path.name}: file name does not match record content hash {record.record_id}")
     return record
