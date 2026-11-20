@@ -257,7 +257,7 @@ def checkpoint_launch(
     if max_tokens < max_sequences:
         raise ValueError("resolved collection max_num_tokens must be at least max_batch_size")
     if private_environment is not None:
-        private_environment[name] = deepcopy(deployment.get("extra_env"))
+        private_environment[name] = deepcopy(environment)
     launch = normalize_probe_launch(
         {
             **({"worker_type": payload["worker_type"]} if payload.get("worker_type") is not None else {}),

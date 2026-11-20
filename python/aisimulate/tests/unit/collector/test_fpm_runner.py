@@ -611,7 +611,8 @@ def test_kubernetes_detection_and_preparation_use_same_runtime_environment(
         if overlay
         else None,
     )
-    image_env = {**os.environ, overlay_variable: str(image_site)}
+    image_env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+    image_env[overlay_variable] = str(image_site)
     image_env.pop("PYTHONNOUSERSITE", None)
     base_python = sys._base_executable
     probe_output = ""
@@ -1924,7 +1925,8 @@ def test_recovery_rejects_entries_with_cleanup_error(tmp_path):
 
 
 @pytest.mark.parametrize("private_cleanup", [False, True])
-def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, private_cleanup):
+@pytest.mark.parametrize("diagnostic_failure", [False, True])
+def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, private_cleanup, diagnostic_failure):
     cell = _cell()
     plan = _plan(cell)
 
@@ -1993,6 +1995,17 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, priv
             fpm_runner, "new_delivery_directory", lambda *a: SimpleNamespace(name=str(delivery), cleanup=cleanup)
         )
 
+    if diagnostic_failure:
+        calls = 0
+
+        def sanitize(*args):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise OSError("diagnostic rewrite denied")
+
+        monkeypatch.setattr(fpm_runner, "redact_diagnostics", sanitize)
+
     errors = run_collection(
         plan,
         generator_overrides={"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": "synthetic-token"}]}}
@@ -2008,10 +2021,12 @@ def test_cleanup_failure_marks_passed_cell_retryable(monkeypatch, tmp_path, priv
 
     assert [error["classification"] for error in errors] == [
         "private_cleanup_failed" if private_cleanup else "resource_cleanup_failed"
-    ]
+    ] + (["diagnostic_sanitization_failed"] if diagnostic_failure else [])
     checkpoint = json.loads((checkpoint_dir / "fpm_forward_smoke.json").read_text())
     record = checkpoint["cells"][cell.cell_id]
     assert record["status"] == "cleanup_failed"
+    if diagnostic_failure:
+        assert record["diagnostic_error"] == "diagnostic rewrite denied"
     if private_cleanup:
         assert record["private_cleanup_error"] == "private staging deletion denied"
         assert record["completed_at"] and "duration_seconds" in record
@@ -3878,8 +3893,8 @@ def test_collection_checks_deployment_identity_before_writing_or_scheduling(tmp_
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_kubernetes_worker_streams_redact_configured_private_values(tmp_path, monkeypatch, failure):
-    token = 'synthetic-private-"worker-stream"'
+@pytest.mark.parametrize("token", ['synthetic-private-"worker-stream"', "private-\"both'-quotes"])
+def test_kubernetes_worker_streams_redact_configured_private_values(tmp_path, monkeypatch, failure, token):
     resource = _runner(tmp_path)
     resource._private_values = (token,)
 
@@ -3912,6 +3927,7 @@ def test_collection_reclaims_private_slurm_receipt_after_verified_teardown(tmp_p
     directory = artifacts / plan.sha256[:16] / "smoke/cells" / cell.cell_id
     directory.mkdir(parents=True)
     (directory / "k8s_deploy.yaml").write_text("synthetic owned Slurm identity")
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(tmp_path / "shared-private-delivery"))
     abandoned = SlurmDelivery(artifacts, directory)
     private_path = Path(abandoned.name)
     (private_path / "run.sh").write_text("synthetic private delivery")
@@ -3971,3 +3987,42 @@ def test_config_redaction_keeps_numeric_measurements_and_backend_markers(tmp_pat
     assert saved["max_model_len"] == 4096
     assert saved["environment"]["OMP_NUM_THREADS"] == "<redacted>"
     assert saved["engine_args"]["kernel_config"]["moe_backend"] == "triton"
+
+
+def test_worker_repr_error_redacts_both_quote_characters(tmp_path, monkeypatch):
+    from collector.fpm_forward.private_inputs import redact
+
+    token = "synthetic-'both\"-quotes\\secret"
+    resource = _runner(tmp_path)
+    resource._private_values = (token,)
+    resource._kubectl = lambda *a, **kw: subprocess.CompletedProcess([], 1, "", "worker stderr " + token)
+    resource._run_pod = lambda pod, timeout: resource._exec_checked(pod, ["worker"], timeout=timeout)
+    with pytest.raises(RuntimeError) as error:
+        resource.execute(["pod-0"])
+    diagnostics = str(error.value) + (tmp_path / "logs/pod-0.run.stderr.log").read_text()
+    for encoded in (token, repr(token)[1:-1], json.dumps(token)[1:-1]):
+        assert encoded not in diagnostics
+    assert "<redacted>" in diagnostics
+    assert redact(token, (token,)) == "<redacted>"
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_slurm_private_delivery_requires_explicit_shared_root(tmp_path, monkeypatch, configured):
+    from collector.fpm_forward.private_inputs import RECEIPT, SlurmDelivery
+
+    campaign = tmp_path / "campaign"
+    cell = campaign / "cell"
+    cell.mkdir(parents=True)
+    root = tmp_path / "shared"
+    monkeypatch.delenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", raising=False)
+    if not configured:
+        with pytest.raises(ValueError, match="requires AISIMULATE_PRIVATE_DELIVERY_ROOT"):
+            SlurmDelivery(campaign, cell)
+        assert not (cell / RECEIPT).exists()
+        return
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(root))
+    delivery = SlurmDelivery(campaign, cell)
+    assert Path(delivery.name).parent == root
+    assert root.stat().st_mode & 0o777 == 0o700
+    delivery.cleanup()
+    assert not Path(delivery.name).exists()

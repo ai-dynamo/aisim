@@ -13,7 +13,7 @@ from collector.fpm_forward.measurement_evidence import compare_measurements, ext
 from .test_fpm_measurement_evidence import _add_execution_protocol, _artifacts, _edit, _remove_execution_protocol
 from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
 from .test_fpm_repeatability import _args, _fake_collector, campaign  # noqa: F401
-from .test_fpm_runtime_probe import _inputs
+from .test_fpm_runtime_probe import _inputs, shared_private_delivery_root  # noqa: F401
 
 pytestmark = pytest.mark.unit
 

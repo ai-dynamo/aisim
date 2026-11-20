@@ -18,6 +18,12 @@ from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_data")]
 
 
+@pytest.fixture(autouse=True)
+def shared_private_delivery_root(tmp_path, monkeypatch):
+    # Synthetic executors see this caller-selected shared-storage stand-in.
+    monkeypatch.setenv("AISIMULATE_PRIVATE_DELIVERY_ROOT", str(tmp_path / "shared-private-delivery"))
+
+
 def _inputs(tmp_path, *, graph_policy="runtime"):
     config = tmp_path / "config.json"
     config.write_text(
@@ -1538,7 +1544,9 @@ def test_k31_decode_rendering_uses_one_native_state_resolution(tmp_path):
     assert "--no-enable-prefix-caching" in rendered["params"]["agg"]["extra_cli_args"]
 
 
-@pytest.mark.parametrize("failure", ["worker_evidence", "backend_markers", "before_staging", "private_cleanup"])
+@pytest.mark.parametrize(
+    "failure", ["worker_evidence", "backend_markers", "before_staging", "private_cleanup", "worker_interrupt"]
+)
 def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path, monkeypatch, failure):
     from collector.fpm_forward import cli, database, entry, runner, runtime_probe
     from collector.model_cases import build_collection_case_plan
@@ -1639,10 +1647,13 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     # by the profileless K3.1 execution rejection and native rendering tests.
     monkeypatch.setattr(runner, "_require_k31_execution_inputs", lambda plan: None)
 
-    def qualify(plan, cell, raw, collection):
+    def qualify(plan, cell, raw, collection, *, allow_staged=False):
         index = json.loads((raw.parent.parent.parent / "runtime-observations.json").read_text())
         active = index["configurations"][plan.runtime_configuration]["attempts"][-1]["phases"][cell.workload_kind]
         assert active["collector_attempt_id"] == collection.collector_attempt_id
+        assert allow_staged and active["status"] == "validating"
+        if failure == "worker_interrupt":
+            raise KeyboardInterrupt
         if collection.collector_attempt_id in rejected:
             raise ValueError("synthetic unresolved worker evidence")
 
@@ -1666,6 +1677,15 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         for retained in artifact_root.rglob("*"):
             if retained.is_file():
                 assert token.encode() not in retained.read_bytes(), retained
+
+    if failure == "worker_interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            runner.run_collection(plan, **kwargs)
+        saved = json.loads(next(artifact_root.rglob("runtime-observations.json")).read_text())
+        attempt = saved["configurations"][plan.runtime_configuration]["attempts"][-1]
+        assert attempt["status"] == "incomplete"
+        assert attempt["phases"]["prefill"]["status"] == "validating"
+        return
 
     errors = runner.run_collection(plan, **kwargs)
     assert_private_artifacts()
@@ -1851,9 +1871,11 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
         assert report["status"] == (expected if execute else "preview"), report
         assert_archived(report)
         assert_files_archived()
-    for path in output.rglob("resolved-config-synthetic.json"):
-        assert json.loads(path.read_text())["config"]["engine_args"]["kernel_config"]["moe_backend"] == "triton"
-        assert "<redacted>" in path.read_text()
+    for phase in ("prefill", "decode"):
+        sidecars = list(output.glob(f"attempts/*/*/{phase}/evidence-*/raw/**/resolved-config-synthetic.json"))
+        assert len(sidecars) == 1, (phase, sidecars)
+        assert json.loads(sidecars[0].read_text())["config"]["engine_args"]["kernel_config"]["moe_backend"] == "triton"
+        assert "<redacted>" in sidecars[0].read_text()
     assert delivered == ["prefill", "decode"]
     assert len(staging) == (2 if transport == "slurm" else 0)
     assert all(not directory.exists() for directory in staging)
@@ -2038,3 +2060,139 @@ def test_slurm_resume_reclaims_abandoned_private_staging_only_after_teardown(tmp
     assert report["status"] == "completed", report
     assert not old.exists() and not receipt.exists()
     assert all(not path.exists() for path in staged)
+
+
+@pytest.mark.parametrize("interrupt,cleanup_fails", [(False, False), (True, False), (False, True)])
+def test_probe_sanitization_failure_persists_terminal_phase(tmp_path, monkeypatch, interrupt, cleanup_fails):
+    from collector.fpm_forward import runner, runtime_probe
+
+    launch, manifest, _ = _inputs(tmp_path)
+    executions = []
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            if interrupt:
+                raise KeyboardInterrupt
+
+        def cleanup(self):
+            if cleanup_fails and executions:
+                raise OSError("teardown denied")
+
+    def sanitize(*args):
+        raise OSError("diagnostic rewrite denied")
+
+    monkeypatch.setattr(runtime_probe, "redact_diagnostics", sanitize)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, executions))
+    monkeypatch.setattr(runner, "_salvage_artifacts", lambda *a: None)
+    output = tmp_path / "probe"
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    else:
+        result = runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+        assert result["status"] == "failed"
+        assert "diagnostic sanitization" in str(result)
+    index = json.loads((output / "observations.json").read_text())
+    phase = index["configurations"]["tp4"]["attempts"][0]["phases"]["prefill"]
+    assert phase["status"] == ("interrupted" if interrupt else "cleanup_failed" if cleanup_fails else "failed")
+    assert phase["diagnostic_error"] == "diagnostic rewrite denied"
+    assert phase["artifacts"] == []
+    assert not list(output.rglob("evidence-*"))
+    if cleanup_fails:
+        assert phase["cleanup_error"] == "teardown denied"
+
+
+def test_probe_indexes_phase_before_private_render_interruption(tmp_path, monkeypatch):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.private_inputs import RECEIPT
+
+    launch, manifest, _ = _inputs(tmp_path)
+    launch["deployment"]["extra_env"] = [{"name": "HF_TOKEN", "value": "synthetic-render-interrupt"}]
+    original = runner._render_cell
+    output = tmp_path / "probe"
+    private_paths = []
+
+    def render(plan, cell, directory, *args, **kwargs):
+        original(plan, cell, directory, *args, **kwargs)
+        if kwargs.get("resolve_environment", True):
+            saved = json.loads((output / "observations.json").read_text())
+            phase = saved["configurations"]["tp4"]["attempts"][-1]["phases"][cell.workload_kind]
+            assert phase["status"] == "running"
+            assert phase["launch_manifest"] and phase["resource_manifest"]
+            private_paths.append(Path(directory))
+            # Model a host loss: no catch/finally runs after this render.
+            raise SystemExit("synthetic host loss")
+
+    # SystemExit is still subject to finally in-process, so leave delivery for
+    # resume as an abruptly killed process would, then use the saved running index.
+    monkeypatch.setattr(runner, "_render_cell", render)
+    from collector.fpm_forward import private_inputs
+
+    cleanup = private_inputs.SlurmDelivery.cleanup
+    monkeypatch.setattr(private_inputs.SlurmDelivery, "cleanup", lambda self: None)
+    with pytest.raises(SystemExit):
+        runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    assert private_paths[0].exists()
+    monkeypatch.setattr(private_inputs.SlurmDelivery, "cleanup", cleanup)
+    monkeypatch.setattr(runner, "_render_cell", original)
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: _SyntheticExecutor(p, c, d, []))
+    report = runtime_probe.probe_runtime(
+        {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True, resume=True
+    )
+    assert report["status"] == "completed", report
+    assert not private_paths[0].exists()
+    assert not list(output.glob("attempts/*/*/prefill/" + RECEIPT))
+
+
+@pytest.mark.parametrize("credential", ["matching", "missing", "changed"])
+def test_kubernetes_recovery_sanitizes_salvaged_diagnostics(tmp_path, monkeypatch, credential):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _inputs(tmp_path)
+    token = "synthetic-salvaged-credential"
+    launch["deployment"] = {
+        "executor": "kubernetes",
+        "image": "synthetic:image",
+        "extra_env": [{"name": "HF_TOKEN", "value": token}],
+    }
+
+    class Executor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
+    monkeypatch.setattr(runner, "_salvage_artifacts", lambda *args: None)
+    output = tmp_path / "probe"
+    with pytest.raises(KeyboardInterrupt):
+        runtime_probe.probe_runtime({"tp4": launch}, instrumentation=manifest, output_dir=output, execute=True)
+    index = json.loads((output / "observations.json").read_text())
+    entry = index["configurations"]["tp4"]
+    attempt = entry["attempts"][0]
+    if credential == "matching":
+        monkeypatch.setenv("HF_TOKEN", token)
+    elif credential == "changed":
+        monkeypatch.setenv("HF_TOKEN", "wrong-original-value")
+    else:
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    def salvage(resource, cell_id):
+        raw = resource.cell_dir / "raw/recovered"
+        raw.mkdir(parents=True)
+        (raw / "resolved-config-private.json").write_text(json.dumps({"environment": {"HF_TOKEN": token}}))
+        (raw / "benchmark.json").write_text('{"latency_ms": 1.25}')
+        logs = resource.cell_dir / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "recovered.log").write_text(token)
+
+    monkeypatch.setattr(runner, "_salvage_artifacts", salvage)
+    plan = runtime_probe.build_runtime_probe_plan("tp4", entry["launch"], load_instrumentation(manifest))
+    runtime_probe._cleanup_previous_attempt(output, plan, attempt)
+    references = attempt["phases"]["prefill"]["recovery_artifacts"]
+    assert any(ref["path"].endswith("recovered/benchmark.json") for ref in references)
+    configs = [ref for ref in references if ref["path"].endswith("resolved-config-private.json")]
+    assert bool(configs) == (credential == "matching")
+    for ref in references:
+        assert token.encode() not in (output / ref["path"]).read_bytes()

@@ -582,7 +582,11 @@ def record_collection_observations(
             if previous["collector_attempt_id"] == cell_attempt_id:
                 previous["status"] = status
     for previous in reversed(history):
-        if previous["collector_attempt_id"] != cell_attempt_id or previous["status"] != status or status != "passed":
+        if (
+            previous["collector_attempt_id"] != cell_attempt_id
+            or status != "passed"
+            or previous["status"] not in {"passed", "validating"}
+        ):
             continue
         if previous.get("launch_manifest") is not None:
             verify_context(_verified_artifact(root, previous["launch_manifest"]))
@@ -591,6 +595,7 @@ def record_collection_observations(
         for artifact in previous["artifacts"]:
             _verified_artifact(root, artifact)
         phase = previous
+        phase["status"] = "passed"
         break
     else:
         context = cell_dir / CONTEXT_FILENAME
@@ -901,9 +906,16 @@ def _cleanup_previous_attempt(root: Path, plan, attempt: dict[str, Any]) -> None
         verified.append((cell, phase, phase_dir, manifest))
     for cell, phase, phase_dir, manifest in verified:
         resource = runner._cell_runner(previous_plan, cell, manifest, phase_dir)
+        from .private_inputs import sanitize_recovered_diagnostics
+
         runner._salvage_artifacts(resource, cell.cell_id)
         resource.cleanup()
         reclaim_delivery(phase_dir)
+        sanitize_recovered_diagnostics(
+            phase_dir,
+            probe_generator_overrides(plan.launch),
+            environment={item["name"]: item["value"] for item in plan._environment or [] if "value" in item},
+        )
         phase["recovery_artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
 
 
@@ -1105,6 +1117,7 @@ def probe_runtime(
                     phase["resource_manifest"] = _resource_manifest_reference(root, plan, cell, phase_dir)
                     phase["generator_request"] = str(phase_dir / "generator-request.json")
                     if execute:
+                        runner._atomic_json(index_path, index)
                         # Concrete credentials exist only in private, temporary
                         # worker staging. Retained renders contain references.
                         # Pyxis bind mounts need the campaign's shared storage;
@@ -1186,9 +1199,22 @@ def probe_runtime(
                             result["diagnostics"].append(
                                 f"{cell.workload_kind} delivery cleanup: {redact(str(error), sensitive_values)}"
                             )
-                    redact_diagnostics(phase_dir, sensitive_values)
+                    diagnostics_ok = True
                     try:
-                        phase["artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
+                        redact_diagnostics(phase_dir, sensitive_values)
+                    except Exception as error:
+                        diagnostics_ok = False
+                        phase["diagnostic_error"] = redact(str(error), sensitive_values)
+                        if phase["status"] not in {"interrupted", "cleanup_failed"}:
+                            phase["status"] = "failed"
+                        if result["status"] != "interrupted":
+                            result["status"] = "failed"
+                        result["diagnostics"].append(
+                            f"{cell.workload_kind} diagnostic sanitization: {phase['diagnostic_error']}"
+                        )
+                    try:
+                        if diagnostics_ok:
+                            phase["artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
                     except (OSError, ValueError) as error:
                         phase.update(status="failed", capture_error=str(error))
                         result["status"] = "failed"

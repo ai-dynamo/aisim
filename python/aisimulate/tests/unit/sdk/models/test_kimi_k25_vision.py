@@ -806,3 +806,14 @@ def test_kimi_sidecar_preserves_language_scope_and_model_exclusions(tmp_path, ne
             assert "quantization_config" not in parsed["raw_config"]
         else:
             assert parsed["raw_config"]["quantization_config"]["ignore"] == exclusions
+
+
+def test_mixed_kimi_layout_uses_matching_explicit_sidecar_sizes(tmp_path):
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    raw["preprocessor_config"] = {"media_proc_cfg": {"in_patch_limit": 8192}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    for name in ("preprocessor_config.json", "video_preprocessor_config.json"):
+        (tmp_path / name).write_text(json.dumps({"size": {"max_height": 16, "max_width": 16}}))
+    encoder = get_model_config_from_model_path(str(tmp_path))["encoder_config"]
+    assert encoder.max_patches_per_side == 16
+    assert encoder.image_max_patches == 8192

@@ -503,7 +503,10 @@ def test_publication_requires_matching_initialized_native_precision(native_execu
 
         _mutate(index, lambda record: _set_state_dtypes(record, "bfloat16", "bfloat16", "bfloat16", "bfloat16"))
         standalone = validate_observations(index, {"tp2": plan.runtime_launch})["tp2"]
-        assert standalone["status"] == "complete", standalone["diagnostics"]
+        # This archive retains collector retry IDs: bulk import must enforce
+        # formal state precision just like the final publication consumer.
+        assert standalone["status"] == "incomplete", standalone["diagnostics"]
+        assert "formal collection requires effective float32 recurrent state" in str(standalone["diagnostics"])
         with pytest.raises(ValueError, match="formal collection requires effective float32 recurrent state"):
             aggregate_cell(plan, cell, raw.parent, expected_attempt_id=collection.collector_attempt_id)
     elif damage == "moe_precision":
@@ -1026,3 +1029,38 @@ def test_publication_worker_gate_enforces_reviewed_usable_capacity(snapshot, mon
             database.require_k31_worker_evidence(plan, cell, raw, collection)
     else:
         database.require_k31_worker_evidence(plan, cell, raw, collection)
+
+
+@pytest.mark.parametrize("status", ["passed", "validating", "cleanup_failed", "failed", "interrupted", "running"])
+def test_worker_snapshot_requires_passed_phase(snapshot, status):
+    plan, cell, raw, collection, path = snapshot
+    index = json.loads(path.read_text())
+    index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]["status"] = status
+    path.write_text(json.dumps(index))
+    if status == "passed":
+        assert execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)[0]
+    else:
+        with pytest.raises(ValueError, match="not a passed collection attempt"):
+            execution_evidence._runtime_worker_evidence(plan, cell, raw, collection)
+    if status == "validating":
+        assert execution_evidence._runtime_worker_evidence(plan, cell, raw, collection, allow_staged=True)[0]
+
+
+@pytest.mark.parametrize("record_attempt", ["native-attempt", "previous-retry"])
+def test_bulk_import_binds_records_to_collector_retry(snapshot, record_attempt):
+    from collector.fpm_forward.runtime_observations import validate_observations
+
+    plan, _, _, _, path = snapshot
+    index = json.loads(path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    for ref in phase["artifacts"]:
+        if ref["kind"] == "observation":
+            record_path = path.parent / ref["path"]
+            record = json.loads(record_path.read_text())
+            record["collector_attempt_id"] = record_attempt
+            ref["sha256"] = _write(record_path, record)["sha256"]
+    path.write_text(json.dumps(index))
+    result = validate_observations(path, {"tp2": plan.runtime_launch})["tp2"]
+    assert result["status"] == ("complete" if record_attempt == "native-attempt" else "incomplete"), result
+    if record_attempt != "native-attempt":
+        assert "collector_attempt_id" in str(result["diagnostics"])

@@ -2446,3 +2446,31 @@ def test_qwen_partial_sidecar_cannot_invert_pixel_budget(tmp_path):
     (tmp_path / "preprocessor_config.json").write_text(json.dumps({"size": {"shortest_edge": 2097152}}))
     with pytest.raises(ValueError, match="min_pixels <= max_pixels"):
         get_model_config_from_model_path(str(tmp_path))
+
+
+@pytest.mark.parametrize("spelling", ["quant_algo", "quantization_algo"])
+@pytest.mark.parametrize("exclusions", [False, True])
+def test_modelopt_sidecar_algorithm_survives_framework_override(tmp_path, spelling, exclusions):
+    raw = dict(_QWEN3VL_HF_CONFIG)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    quant = {spelling: "NVFP4"}
+    if exclusions:
+        quant["exclude_modules"] = ["lm_head"]
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"quantization": quant}))
+    parsed = get_model_config_from_model_path(str(tmp_path))
+    assert parsed["raw_config"]["quant_algo"] == "nvfp4"
+    from aisimulate_core.sdk.models import _infer_quant_modes_from_raw_config
+
+    assert _infer_quant_modes_from_raw_config(parsed["raw_config"])["gemm_quant_mode"] == common.GEMMQuantMode.nvfp4
+    if exclusions:
+        assert parsed["raw_config"]["quantization_config"]["quant_method"] == "modelopt"
+
+
+@pytest.mark.parametrize("source", ["~/missing-checkpoint", "./missing-checkpoint", "../missing-checkpoint"])
+def test_missing_explicit_checkpoint_never_uses_hub(tmp_path, monkeypatch, source):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils, "_download_hf_json", lambda *a, **kw: pytest.fail("local path reached Hub"))
+    monkeypatch.setattr(utils, "_download_hf_config", lambda *a, **kw: pytest.fail("local path reached Hub"))
+    with pytest.raises(ValueError, match="config.json not found at"):
+        get_model_config_from_model_path(source, model_revision="a" * 40)

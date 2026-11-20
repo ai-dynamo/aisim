@@ -4234,7 +4234,16 @@ def test_k31_planning_rejects_null_outer_architecture(tmp_path, outer):
 
 
 @pytest.mark.parametrize(
-    "reasons", ["not_kvwarm_real_kv", {"kvwarm_real_kv": True}, ["kvwarm_real_kv", 1], ["kvwarm_real_kv"]]
+    "reasons",
+    [
+        "not_kvwarm_real_kv",
+        {"kvwarm_real_kv": True},
+        ["kvwarm_real_kv", 1],
+        ["kvwarm_real_kv"],
+        ["kvwarm_real_kv", "capture"],
+        ["kvwarm_real_kv", "prefill_fake_prefix"],
+        ["kvwarm_real_kv", "prefill_real_seed"],
+    ],
 )
 def test_kda_seed_requires_a_list_of_exact_string_stamps(tmp_path, reasons):
     plan, cell, cell_dir = _synthetic_decode_cell(
@@ -4248,7 +4257,7 @@ def test_kda_seed_requires_a_list_of_exact_string_stamps(tmp_path, reasons):
     payload["results"][0]["point"]["sample_reasons"] = reasons
     payload["iteration_groups"][0]["point"]["sample_reasons"] = reasons
     path.write_text(json.dumps(payload))
-    if reasons == ["kvwarm_real_kv"]:
+    if reasons in (["kvwarm_real_kv"], ["kvwarm_real_kv", "capture"]):
         assert aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")[0]["kv_seed_regime"] == "real_kv"
     else:
         with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):

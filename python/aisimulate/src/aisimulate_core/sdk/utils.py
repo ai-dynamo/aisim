@@ -678,7 +678,10 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
             raise ValueError("Kimi processor size requires identical max_height and max_width")
         return positive_int(size.get("max_height"), "size.max_height")
 
-    side = positive_int(media.get("patch_limit_on_one_side", side_limit(media, 512)), "patch_limit_on_one_side")
+    image_default_side = side_limit(processor_cfg, 512)
+    side = positive_int(
+        media.get("patch_limit_on_one_side", side_limit(media, image_default_side)), "patch_limit_on_one_side"
+    )
     # Legacy Moonshot settings share one limit across image and video;
     # native Transformers processors each independently default to 512.
     video_default_side = side if "patch_limit_on_one_side" in media else 512
@@ -1970,7 +1973,9 @@ def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
 
     quant_algo = _normalize_quant_algo(
         hf_quant_section.get("quant_algo")
+        or hf_quant_section.get("quantization_algo")
         or quant_cfg.get("quant_algo")
+        or quant_cfg.get("quantization_algo")
         or quant_cfg.get("quant_method")
         or quant_cfg.get("quantization_method")
     )
@@ -2093,7 +2098,7 @@ def _load_model_config_from_model_path(model_path: str, *, model_revision: str |
     """
     model_path = os.path.expanduser(model_path)
     # Check if it's a local path
-    if os.path.isdir(model_path):
+    if Path(model_path).is_absolute() or model_path.startswith(("./", "../", "~")) or os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 

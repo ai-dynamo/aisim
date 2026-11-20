@@ -188,7 +188,9 @@ def _matches_pinned_hub_snapshot(
     )
 
 
-def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None, minimum_capacity=None):
+def _runtime_worker_evidence(
+    plan, cell, raw_root, collection, *, bundle=None, minimum_capacity=None, allow_staged=False
+):
     """Bind canonical initialized-worker evidence to this exact native attempt."""
     from .runtime_instrumentation import read_json
     from .runtime_observations import validate_observation_phase
@@ -210,6 +212,8 @@ def _runtime_worker_evidence(plan, cell, raw_root, collection, *, bundle=None, m
         raise ValueError("runtime model snapshot selected phase must be an object")
     if phase.get("cell_id") != cell.cell_id or phase.get("collector_attempt_id") != collection.collector_attempt_id:
         raise ValueError("runtime model snapshot belongs to a different cell or native attempt")
+    if phase.get("status") not in ({"passed", "validating"} if allow_staged else {"passed"}):
+        raise ValueError("runtime model snapshot phase is not a passed collection attempt")
     result = validate_observation_phase(
         index_path,
         name,

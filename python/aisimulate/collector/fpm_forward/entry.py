@@ -98,13 +98,12 @@ def _load_generator_overrides(args: argparse.Namespace) -> dict[str, Any]:
             f"{sorted(unsupported_k8s)}"
         )
     extra_env = raw_k8s.get("extra_env")
-    if extra_env is not None and (
-        not isinstance(extra_env, list)
-        or not all(
-            isinstance(item, dict) and isinstance(item.get("name"), str) and "value" in item for item in extra_env
-        )
-    ):
-        raise TypeError("K8sConfig.extra_env must be a list of {name, value} mappings")
+    if extra_env is not None:
+        from .config import archive_generator_overrides
+
+        # Validate both literal entries and digest-bound archived references.
+        # Preserve literals only in this in-memory delivery input.
+        archive_generator_overrides(payload)
     if args.generator_dynamo_version:
         payload["generator_dynamo_version"] = args.generator_dynamo_version
     if args.generated_config_version:

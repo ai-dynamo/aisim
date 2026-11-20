@@ -862,7 +862,11 @@ def _configuration(
                 record,
                 launch=launch,
                 bundle=bundle,
-                binding={**binding, **(collector_binding or {})},
+                binding={
+                    **binding,
+                    **({key: result[key] for key in ("cell_id", "collector_attempt_id")} if collector_phase else {}),
+                    **(collector_binding or {}),
+                },
                 cell=cell,
                 checkpoint_config=checkpoint_config,
             )

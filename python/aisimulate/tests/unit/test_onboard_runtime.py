@@ -20,6 +20,7 @@ import aisimulate.main as cli
 from aisimulate.support.checkpoint import _load, report, save_checkpoint
 from aisimulate.support.schema import SupportRequest
 
+from .collector.test_fpm_runtime_probe import shared_private_delivery_root  # noqa: F401
 from .collector.test_runtime_observations import observation_fixture
 
 pytestmark = pytest.mark.unit
@@ -2219,3 +2220,72 @@ def test_probe_backed_plan_command_roundtrips_private_extra_env(tmp_path, capsys
     )
     flags, _ = runtime.runtime_collection_inputs(request, deployment)
     assert "--fpm-runtime-launch" in flags
+
+
+def test_mixed_probe_environment_keeps_supplied_literal_for_version_detection(tmp_path, monkeypatch, capsys):
+    from collector.fpm_forward.config import archive_generator_overrides, resolve_archived_generator_overrides
+
+    from aisimulate.support import runtime
+
+    checkpoint, _, _ = _campaign(tmp_path)
+    token = "synthetic-archived-hub-token"
+    archived = archive_generator_overrides({"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": token}]}})[
+        "K8sConfig"
+    ]["extra_env"]
+    archived = [item for item in archived if item["name"] == "HF_TOKEN"]
+    environment = [*archived, {"name": "PYTHONPATH", "value": "/runtime/wheel"}]
+    state = _load(checkpoint)
+    save_checkpoint(
+        checkpoint,
+        patch={"inputs": {"collection_deployment": {"extra_env": environment}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    monkeypatch.setenv("HF_TOKEN", token)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    private = {}
+    _, launch, _ = runtime.checkpoint_launch(_load(checkpoint), "tp2", checkpoint, private_environment=private)
+    assert private["tp2"] == environment
+    assert all("value_from_env" in item for item in launch["deployment"]["extra_env"])
+    resolved = resolve_archived_generator_overrides({"K8sConfig": {"extra_env": private["tp2"]}})
+    assert {"name": "PYTHONPATH", "value": "/runtime/wheel"} in resolved["K8sConfig"]["extra_env"]
+
+
+def test_invalid_deployment_credentials_are_absent_from_errors_and_reports(tmp_path, capsys):
+    from pydantic import ValidationError
+
+    from aisimulate.support.schema import FPMDeployment
+
+    secret = "synthetic-malformed-credential"
+    environment = [{"name": "HF-TOKEN", "value": secret}]
+    with pytest.raises(ValidationError) as error:
+        FPMDeployment(extra_env=environment)
+    assert secret not in str(error.value)
+    checkpoint, _, _ = _campaign(tmp_path)
+    state = _load(checkpoint)
+    save_checkpoint(
+        checkpoint,
+        patch={"inputs": {"collection_deployment": {"extra_env": environment}}},
+        expected_revision=state.revision,
+        accept=[],
+    )
+    output = tmp_path / "probe-errors"
+    command = [
+        "onboard",
+        "probe-runtime",
+        "--checkpoint",
+        str(checkpoint),
+        "--configuration",
+        "tp2",
+        "--output-dir",
+        str(output),
+    ]
+    assert cli.main(command) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert secret not in json.dumps(_load(checkpoint).configurations["tp2"].history)
+    reports = list(output.glob("onboarding-probe-*.json"))
+    assert reports and all(secret not in path.read_text() for path in reports)
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([*command, "--extra-env", json.dumps(environment)])
+    assert secret not in capsys.readouterr().err

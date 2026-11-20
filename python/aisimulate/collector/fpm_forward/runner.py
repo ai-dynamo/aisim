@@ -54,7 +54,7 @@ from .config import (
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
 from .private_inputs import delivery_directory as new_delivery_directory
-from .private_inputs import private_values, reclaim_delivery, redact, redact_diagnostics
+from .private_inputs import private_values, reclaim_delivery, redact, redact_diagnostics, sanitize_recovered_diagnostics
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
     MEMORY_SUPPORTED_VERSIONS,
@@ -2178,6 +2178,7 @@ def _run_collection_impl(
         try:
             from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence
 
+            sanitize_recovered_diagnostics(root / "cells" / cell.cell_id, generator_overrides)
             validate_worker = record["status"] == "passed" and not formal_database_terminal and _is_k31(plan)
             rejected = False
             if validate_worker:
@@ -2193,7 +2194,7 @@ def _run_collection_impl(
                 cell,
                 record["attempt_id"],
                 root / "cells" / cell.cell_id,
-                record["status"],
+                "validating" if validate_worker and not rejected else record["status"],
             )
             checkpoint["runtime_observations"] = str(observation_index)
             record.pop("observation_error", None)
@@ -2205,7 +2206,7 @@ def _run_collection_impl(
                     collection = validate_native_collection(
                         cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
                     )
-                    require_k31_worker_evidence(plan, cell, raw_root, collection)
+                    require_k31_worker_evidence(plan, cell, raw_root, collection, allow_staged=True)
                 except (OSError, KeyError, TypeError, ValueError) as error:
                     record.update(status="failed", error_type=type(error).__name__, error=str(error))
                     record_collection_observations(
@@ -2213,6 +2214,9 @@ def _run_collection_impl(
                     )
                     logger.warning("Rejecting archived K3.1 worker evidence for %s: %s", cell.cell_id, error)
                     return False
+                record_collection_observations(
+                    plan, root, observation_attempt_id, cell, record["attempt_id"], raw_root.parent, "passed"
+                )
         except Exception as error:
             record["status"] = "failed"
             record["observation_error"] = str(error)
@@ -2648,12 +2652,30 @@ def _run_collection_impl(
                             "classification": "private_cleanup_failed",
                         }
                     )
-            redact_diagnostics(cell_dir, sensitive_values)
+            diagnostics_ok = True
+            try:
+                redact_diagnostics(cell_dir, sensitive_values)
+            except Exception as error:
+                diagnostics_ok = False
+                record = checkpoint["cells"][cell.cell_id]
+                if record.get("status") == "passed":
+                    record["status"] = "failed"
+                record["diagnostic_error"] = redact(str(error), sensitive_values)
+                observation_archive_failed.add(cell.cell_id)
+                errors.append(
+                    {
+                        "module": "fpm_forward",
+                        "cell_id": cell.cell_id,
+                        "error_type": type(error).__name__,
+                        "error_message": record["diagnostic_error"],
+                        "classification": "diagnostic_sanitization_failed",
+                    }
+                )
             record = checkpoint["cells"][cell.cell_id]
             record["collector_phase_seconds"] = dict(phase_marks)
             record["completed_at"] = _utc_now()
             record["duration_seconds"] = round(time.monotonic() - cell_started, 3)
-            if instrumentation is not None:
+            if instrumentation is not None and diagnostics_ok:
                 archive_observations(cell, record)
             run_attempts.append(_run_manifest_attempt(cell, record))
             _atomic_json(checkpoint_path, checkpoint)

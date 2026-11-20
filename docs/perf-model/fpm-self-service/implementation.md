@@ -1581,9 +1581,11 @@ readable. Generated execution manifests still contain the environment required b
 the runtime and must be handled as credentials when applicable. Runtime probe
 previews and retained probe evidence contain references only. Execution renders
 concrete values in private temporary worker staging, removed after verified teardown.
-For Slurm, `AISIMULATE_PRIVATE_DELIVERY_ROOT` selects caller-owned mode-0700 shared
-storage outside the campaign tree; the default is `.aisimulate-private-delivery`
-beside the campaign root. A receipt binds abandoned staging to its cell. Resume
+Private Slurm worker staging requires `AISIMULATE_PRIVATE_DELIVERY_ROOT` to explicitly select
+caller-owned mode-0700 shared storage outside the campaign tree. The caller must
+choose a path readable at the same location on the compute nodes; a campaign's
+parent directory may be local to the submit host, so there is no default. A receipt
+binds abandoned staging to its cell. Resume
 reclaims it only after verified teardown of the owned Slurm steps; failed teardown
 retains the private files for recovery. Retained worker diagnostics and raw config
 dumps redact private environment values before evidence archival.

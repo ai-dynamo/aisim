@@ -326,7 +326,7 @@ def _validate_cache_inventory(cache, model_config):
     dsa_config = config.get("dsa_config")
     # vLLM 266e88c05 models/kimi_k3/nvidia/dsa.py::KimiK3DSAAttention
     # rejects index sharing; each initialized DSA layer owns its indexer.
-    if isinstance(dsa_config, dict) and dsa_config.get("index_topk_freq", 1) not in (None, 1):
+    if isinstance(dsa_config, dict) and dsa_config.get("index_topk_freq", 1) != 1:
         raise ValueError("K3.1 native DSA requires index_topk_freq=1 (no index sharing)")
     dsa_field = "layers" if isinstance(dsa_config, dict) and "dsa_layers" not in dsa_config else "dsa_layers"
     indexer = layer_indices(dsa_config, dsa_field) - kda
@@ -469,7 +469,7 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
                         dsa = decoder.get("dsa_config")
                         if not isinstance(dsa, dict):
                             raise ValueError("K3.1 checkpoint indexer configuration is missing")
-                        if decoder.get("mla_use_nope") is True and dsa.get("index_rope_dim", 64) != 0:
+                        if decoder.get("mla_use_nope") is True and dsa.get("index_rope_dim", 0) != 0:
                             raise ValueError("K3.1 no-RoPE MLA requires index_rope_dim=0")
                         # Pinned kimi_k3/common/dsa_cache.py::indexer_cache_entry_bytes:
                         # each FP8 key carries one FP32 scale. Bind the logical

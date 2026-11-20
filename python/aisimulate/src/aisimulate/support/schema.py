@@ -10,7 +10,14 @@ from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from pydantic import Field, SerializerFunctionWrapHandler, field_validator, model_serializer, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from aisimulate.config.common import PositiveFiniteFloat, PositiveStrictInt, StrictModel, load_yaml
 from aisimulate.fpm_profile import FpmModelProfile
@@ -195,6 +202,8 @@ _DNS_SUBDOMAIN = rf"{_DNS_LABEL}(?:\.{_DNS_LABEL})*"
 
 class FPMDeployment(StrictModel):
     """Deployment-only inputs included in the collector's frozen-plan identity."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     executor: Literal["kubernetes", "slurm"] = "kubernetes"
     dynamo_version: str | None = None

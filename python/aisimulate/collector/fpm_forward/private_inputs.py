@@ -13,7 +13,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .config import archive_generator_overrides
+from .config import archive_generator_overrides, resolve_archived_generator_overrides
 
 RECEIPT = ".private-delivery.json"
 
@@ -29,7 +29,12 @@ def private_values(overrides):
 
 def redact(text, values):
     for value in sorted(set(values), key=len, reverse=True):
-        for representation in (json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1], value):
+        for representation in (
+            json.dumps(value)[1:-1],
+            json.dumps(value, ensure_ascii=False)[1:-1],
+            repr(value)[1:-1],
+            value,
+        ):
             text = text.replace(representation, "<redacted>")
     return text
 
@@ -101,16 +106,35 @@ def reclaim_delivery(cell_dir):
     receipt.unlink()
 
 
+def sanitize_recovered_diagnostics(directory, overrides, *, environment=None):
+    """Retain diagnostics only when all redaction values match their saved digests."""
+    try:
+        resolved = resolve_archived_generator_overrides(overrides, environment=environment)
+    except ValueError:
+        # Recovery of native measurements does not require credentials. Without
+        # verified values, discard the diagnostic files the live path sanitizes.
+        for name in ("raw", "logs"):
+            root = Path(directory) / name
+            for path in root.rglob("*") if root.exists() else ():
+                if path.is_file() and not path.is_symlink():
+                    if name == "raw" and path.suffix == ".json" and "config" not in path.name:
+                        continue
+                    path.unlink()
+    else:
+        redact_diagnostics(directory, private_values(resolved))
+
+
 class SlurmDelivery:
     """No GC cleanup: mounted files must survive until verified teardown."""
 
     def __init__(self, campaign, cell_dir):
         campaign, self.cell_dir = Path(campaign).resolve(), Path(cell_dir).resolve()
-        root = (
-            Path(os.environ.get("AISIMULATE_PRIVATE_DELIVERY_ROOT", campaign.parent / ".aisimulate-private-delivery"))
-            .expanduser()
-            .resolve()
-        )
+        configured_root = os.environ.get("AISIMULATE_PRIVATE_DELIVERY_ROOT")
+        if not configured_root:
+            raise ValueError(
+                "Slurm requires AISIMULATE_PRIVATE_DELIVERY_ROOT on shared storage readable by compute nodes"
+            )
+        root = Path(configured_root).expanduser().resolve()
         if root.is_relative_to(campaign):
             raise ValueError("private Slurm delivery root must be outside the campaign tree")
         root.mkdir(mode=0o700, parents=True, exist_ok=True)

@@ -22,6 +22,7 @@ from .test_fpm_cpu_affinity import _snapshot
 from .test_fpm_profile_collection import _argv, _plan, _profile, no_models_or_timing_data  # noqa: F401
 from .test_fpm_runner import _native_payload
 from .test_fpm_runtime_memory import _initialized
+from .test_fpm_runtime_probe import shared_private_delivery_root  # noqa: F401
 
 pytestmark = pytest.mark.unit
 

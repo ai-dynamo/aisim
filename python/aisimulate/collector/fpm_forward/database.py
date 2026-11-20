@@ -214,7 +214,7 @@ def _is_k31(plan) -> bool:
     )
 
 
-def require_k31_worker_evidence(plan, cell, raw_root, collection) -> None:
+def require_k31_worker_evidence(plan, cell, raw_root, collection, *, allow_staged=False) -> None:
     """Require the publication evidence before a cell becomes terminal passed."""
     if not _is_k31(plan):
         return
@@ -234,6 +234,7 @@ def require_k31_worker_evidence(plan, cell, raw_root, collection) -> None:
         collection,
         bundle=bundle,
         minimum_capacity=deployment.resources.runtime_memory.kv_cache_bytes,
+        allow_staged=allow_staged,
     )
     if any(moe_precision(worker.get("initialized_moe")) != cell.moe_quant_mode for worker in workers.values()):
         raise ValueError("K3.1 publication MoE precision differs from initialized workers")
@@ -265,6 +266,8 @@ def require_kda_real_kv(plan, cell, collection):
             or not all(isinstance(reason, str) for reason in reasons)
             or "kvwarm_real_kv" not in reasons
             or "kvwarm_fake_fallback" in reasons
+            or "prefill_fake_prefix" in reasons
+            or "prefill_real_seed" in reasons
             for item in collection.points
         )
         or (
@@ -345,6 +348,8 @@ def aggregate_cell(
         if skip_reason in approved_skip_reasons and not (has_kda_state and phase == "decode"):
             return f"skip:{skip_reason}"
         reasons = point.get("sample_reasons") or []
+        if has_kda_state and phase == "decode" and {"prefill_fake_prefix", "prefill_real_seed"}.intersection(reasons):
+            raise KdaSeedError("KDA decode publication cannot carry a prefill seed stamp")
         if "kvwarm_real_kv" in reasons:
             if skip_reason:
                 raise ValueError(f"native point reports real KV under warm-up skip_reason={skip_reason!r}")

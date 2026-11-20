@@ -156,7 +156,9 @@ def test_probe_fallback_does_not_format_exception_command(monkeypatch, failure):
         assert "CalledProcessError (returncode=1)" in str(error.value)
 
 
-@pytest.mark.parametrize("value", ["/cache/😀", "/cache/𠮷", "/cache/\u2028separator\u2029"])
+@pytest.mark.parametrize(
+    "value", ["/cache/ascii", "/cache/😀", "/cache/𠮷", "/cache/\u0085separator", "/cache/\u2028separator\u2029"]
+)
 def test_public_collection_environment_roundtrips_yaml_unicode(tmp_path, value):
     from collector.fpm_forward.entry import _inline_overrides
 
@@ -179,3 +181,85 @@ def test_public_collection_environment_roundtrips_yaml_unicode(tmp_path, value):
     parsed = _inline_overrides(overrides)
     assert parsed["K8sConfig"]["extra_env"] == env
     assert parsed["K8sConfig"]["extra_env"][0]["value"].encode() == value.encode()
+
+
+@pytest.mark.parametrize("credential", ["matching", "missing", "changed"])
+def test_probe_backed_collection_delivers_caller_literals_privately(tmp_path, monkeypatch, capsys, credential):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from collector.fpm_forward import entry
+    from collector.fpm_forward.cli import _parser
+    from collector.fpm_forward.config import archive_generator_overrides
+
+    from aisimulate.support import collection_readiness, fpm, plan, runtime
+
+    token = "/synthetic/private-hf-cache"
+    request = SupportRequest.model_validate(
+        {
+            "identity": {
+                "model": "fixture/model",
+                "model_kind": "moe",
+                "model_revision": "a" * 40,
+                "framework": "vllm",
+                "framework_version": "0.28.0",
+                "gpu": "gb300",
+                "interconnect": "nvlink",
+            }
+        }
+    )
+    environment = [{"name": "HF_HOME", "value": token}]
+    archived = archive_generator_overrides({"K8sConfig": {"extra_env": environment}})["K8sConfig"]["extra_env"]
+    saved = {"executor": "kubernetes", "image": "synthetic:image", "extra_env": archived}
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "runtime_probe_manifest",
+        lambda _: {"observations_index": str(tmp_path / "probe/observations.json"), "configuration": "tp1"},
+    )
+    monkeypatch.setattr(
+        runtime,
+        "verify_runtime_profile",
+        lambda _: {
+            "provenance": {
+                "launch": {"deployment": saved},
+                "instrumentation": {"manifest": "instrumentation/manifest.json"},
+            }
+        },
+    )
+    monkeypatch.setattr(runtime, "verify_runtime_acceptance", lambda _: None)
+    monkeypatch.setattr(plan, "check_plan", lambda *a: None)
+    monkeypatch.setattr(plan, "plan_lock", lambda *a: nullcontext())
+    monkeypatch.setattr(collection_readiness, "assess_readiness", lambda *a, **kw: {"ready_for_full_collection": True})
+    commands = []
+
+    def resolve(command):
+        commands.append(command)
+        args = _parser().parse_args(command[3:])
+        return args, (SimpleNamespace(), entry._load_generator_overrides(args))
+
+    monkeypatch.setattr(fpm, "_resolve_execution", resolve)
+    deliveries = []
+
+    def execute(args, resolved):
+        from collector.fpm_forward.config import resolve_archived_generator_overrides
+
+        resolved = (resolved[0], resolve_archived_generator_overrides(resolved[1]))
+        deliveries.append(resolved[1])
+        assert {"name": "HF_HOME", "value": token} in resolved[1]["K8sConfig"]["extra_env"]
+        return []
+
+    monkeypatch.setattr(entry, "run_resolved", execute)
+    supplied = environment if credential == "matching" else None
+    deployment = FPMDeployment(image="synthetic:image", extra_env=supplied) if supplied else None
+    if credential == "changed":
+        monkeypatch.setenv("HF_HOME", "changed-private-cache")
+    status = fpm.run_fpm(request, output_dir=tmp_path / "collection", execute=True, smoke=True, deployment=deployment)
+    assert status == (0 if credential == "matching" else 1)
+    assert bool(deliveries) == (credential == "matching")
+    output = capsys.readouterr()
+    assert token not in output.out + output.err
+    assert all(token not in " ".join(command) for command in commands)
+    for artifact in (tmp_path / "collection").rglob("*"):
+        if artifact.is_file():
+            assert token not in artifact.read_text()

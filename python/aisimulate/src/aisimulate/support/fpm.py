@@ -135,7 +135,10 @@ def fpm_cli_args(
                     command.extend(("--generator-set", f"K8sConfig.k8s_image={json.dumps(value)}"))
             elif name == "extra_env":
                 encoded = (
-                    json.dumps(value, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+                    json.dumps(value, ensure_ascii=False)
+                    .replace("\u0085", "\\u0085")
+                    .replace("\u2028", "\\u2028")
+                    .replace("\u2029", "\\u2029")
                 )
                 command.extend(("--generator-set", f"K8sConfig.extra_env={encoded}"))
             else:
@@ -342,6 +345,14 @@ def run_fpm(
 
             collector_available = True
             args, resolved = _resolve_execution(command)
+            if deployment is not None and deployment.extra_env:
+                from collector.fpm_forward.config import resolve_archived_generator_overrides
+
+                # The command carries archived references for a probe-backed
+                # deployment. Hand caller literals directly to the resolver,
+                # with the archived digest remaining authoritative.
+                environment = {item["name"]: item["value"] for item in deployment.extra_env if "value" in item}
+                resolved = (resolved[0], resolve_archived_generator_overrides(resolved[1], environment=environment))
             frozen = resolved[0]
             if not smoke:
                 before = assess_readiness(request, root, selected_checkpoint, expected_plan=frozen)

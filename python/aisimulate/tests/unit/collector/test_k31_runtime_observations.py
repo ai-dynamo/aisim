@@ -2005,20 +2005,21 @@ def test_cache_inventory_attests_only_checkpoint_sparse_mla_layers(kda, dsa, mla
             runtime_k31._validate_cache_inventory(cache, config)
 
 
-@pytest.mark.parametrize("frequency", [None, 1, 2])
+@pytest.mark.parametrize("frequency", ["omitted", None, 1, 2])
 def test_import_binds_dsa_index_sharing_to_checkpoint(tmp_path, monkeypatch, frequency):
     path, launches = _complete_fixture(tmp_path, monkeypatch)
     model = Path(launches["tp2"]["model_config"]["path"])
     config = json.loads(model.read_text())
-    config["text_config"]["dsa_config"]["index_topk_freq"] = frequency
+    if frequency != "omitted":
+        config["text_config"]["dsa_config"]["index_topk_freq"] = frequency
     model.write_text(json.dumps(config))
     digest = hashlib.sha256(model.read_bytes()).hexdigest()
     launches["tp2"]["model_config"]["sha256"] = digest
     _replace_launch(path, launches)
     _mutate(path, lambda record: record.update(model_config_sha256=digest))
     result = validate_observations(path, launches)["tp2"]
-    assert result["status"] == ("incomplete" if frequency == 2 else "complete"), result["diagnostics"]
-    if frequency == 2:
+    assert result["status"] == ("complete" if frequency in ("omitted", 1) else "incomplete"), result["diagnostics"]
+    if frequency not in ("omitted", 1):
         assert "index_topk_freq=1 (no index sharing)" in str(result["diagnostics"])
 
 
@@ -2170,21 +2171,24 @@ def test_archived_credential_check_detects_unrelated_nested_field(token):
         _assert_no_credential(json.dumps({"unrelated": {"nested": token}}), token)
 
 
-@pytest.mark.parametrize("rope", [0, 32])
+@pytest.mark.parametrize("rope", ["omitted", 0, 32])
 def test_no_rope_checkpoint_rejects_indexer_rope(tmp_path, monkeypatch, rope):
     path, launches = _complete_fixture(tmp_path, monkeypatch, mla_rope=0)
     launch = launches["tp2"]
     model = Path(launch["model_config"]["path"])
     config = json.loads(model.read_text())
     config["text_config"]["mla_use_nope"] = True
-    config["text_config"]["dsa_config"]["index_rope_dim"] = rope
+    if rope == "omitted":
+        config["text_config"]["dsa_config"].pop("index_rope_dim", None)
+    else:
+        config["text_config"]["dsa_config"]["index_rope_dim"] = rope
     model.write_text(json.dumps(config))
     launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
     _replace_launch(path, launches)
     _mutate(path, lambda record: record.update(model_config_sha256=launch["model_config"]["sha256"]))
     result = validate_observations(path, launches)["tp2"]
-    assert result["status"] == ("complete" if rope == 0 else "incomplete"), result["diagnostics"]
-    if rope:
+    assert result["status"] == ("complete" if rope in ("omitted", 0) else "incomplete"), result["diagnostics"]
+    if rope == 32:
         assert "index_rope_dim=0" in str(result["diagnostics"])
 
 

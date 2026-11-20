@@ -135,7 +135,9 @@ def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
     return archived
 
 
-def resolve_archived_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+def resolve_archived_generator_overrides(
+    overrides: dict[str, Any], *, environment: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Resolve archived references without revealing missing or changed values."""
     resolved = archive_generator_overrides(overrides)
     literals = {
@@ -145,7 +147,7 @@ def resolve_archived_generator_overrides(overrides: dict[str, Any]) -> dict[str,
         if "value_from_env" not in item:
             continue
         name = item["value_from_env"]
-        value = literals[name] if name in literals else os.environ.get(name)
+        value = literals.get(name, (environment or {}).get(name, os.environ.get(name)))
         if value is None or hashlib.sha256(value.encode()).hexdigest() != item["value_sha256"]:
             raise ValueError(f"archived environment {name} requires the original value in the caller's environment")
         item.clear()
