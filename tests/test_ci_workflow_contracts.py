@@ -2948,40 +2948,47 @@ def test_main_scope_decision_reads_only_completed_selection_evidence(jobs_page: 
     assert full_ci_selector.main_scope_decision(jobs_page) == expected
 
 
-def test_main_comparison_base_falls_back_to_the_parent_with_a_warning() -> None:
+@pytest.mark.parametrize("parent_evidence", ["absent", "superseded", "undecided", "comparisons failed"])
+def test_main_comparison_base_rejects_an_unvalidated_parent(parent_evidence: str) -> None:
     other = "c" * 40
+    jobs = _scope_jobs("success" if parent_evidence == "superseded" else "skipped")
+    if parent_evidence == "undecided":
+        jobs = _scope_jobs(conclusion=None)
+    elif parent_evidence == "comparisons failed":
+        jobs["jobs"][-1]["conclusion"] = "failure"
     no_full_scope, _ = _main_batch_api(
         MAIN_TARGET,
         runs=(
-            _main_run(199, MAIN_PARENT),
+            *(() if parent_evidence == "absent" else (_main_run(199, MAIN_PARENT),)),
             _main_run(198, other, head_branch="release/0.12.0"),
             _main_run(197, other, event="workflow_dispatch"),
             _main_run(196, other, path=".github/workflows/fast-ci.yml"),
         ),
-        jobs={199: _scope_jobs("success")},
-    )
-    base, notes = full_ci_selector.last_full_scope_commit(
-        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=no_full_scope
-    )
-    assert base == MAIN_PARENT
-    assert [level for level, _ in notes] == ["warning"]
-    assert (
-        f"No full-scope Full CI run with successful comparisons among the last {full_ci_selector.MAIN_LOOKBACK_RUNS}"
-        in notes[0][1]
+        jobs={199: jobs},
     )
 
+    # In particular, a superseded parent may already contain a regression.
+    # Selecting every test cannot recover it if both comparison snapshots do.
+    with pytest.raises(full_ci_selector.GitHubError, match="No full-scope Full CI run with successful comparisons"):
+        full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=no_full_scope, sleep=lambda _: None
+        )
+
+
+@pytest.mark.parametrize("status", ["diverged", "behind"])
+def test_main_comparison_base_rejects_a_non_ancestor_instead_of_using_a_superseded_parent(status: str) -> None:
+    other = "c" * 40
     rewritten, _ = _main_batch_api(
         MAIN_TARGET,
-        compare={f"{other}...{MAIN_TARGET}": "diverged"},
-        runs=(_main_run(199, other),),
-        jobs={199: _scope_jobs("skipped")},
+        compare={f"{other}...{MAIN_TARGET}": status},
+        runs=(_main_run(199, MAIN_PARENT), _main_run(198, other)),
+        jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
     )
-    base, notes = full_ci_selector.last_full_scope_commit(
-        "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=rewritten
-    )
-    assert base == MAIN_PARENT
-    assert [level for level, _ in notes] == ["warning"]
-    assert "not an ancestor" in notes[0][1]
+
+    with pytest.raises(full_ci_selector.GitHubError, match="not an ancestor"):
+        full_ci_selector.resolve_main_push(
+            "ai-dynamo/aisim", MAIN_TARGET, 200, MAIN_PARENT, api=rewritten, sleep=lambda _: None
+        )
 
 
 def test_main_batching_fails_closed_to_full_scope_or_an_error() -> None:
@@ -3090,11 +3097,24 @@ def test_main_batching_cli_writes_scope_and_comparison_outputs(
     assert ("::notice::main moved to" in capsys.readouterr().out) is superseded
 
 
-def test_main_batching_cli_errors_leave_outputs_unwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    api, _ = _main_batch_api(MAIN_TARGET, failing=("/actions/",))
+@pytest.mark.parametrize("failure", ["api", "empty history", "superseded parent", "non-ancestor"])
+def test_main_batching_cli_errors_leave_outputs_unwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    other = "c" * 40
+    runs = () if failure in {"api", "empty history"} else (_main_run(199, MAIN_PARENT),)
+    if failure == "non-ancestor":
+        runs += (_main_run(198, other),)
+    api, _ = _main_batch_api(
+        MAIN_TARGET,
+        failing=("/actions/",) if failure == "api" else (),
+        runs=runs,
+        jobs={199: _scope_jobs("success"), 198: _scope_jobs("skipped")},
+        compare={f"{other}...{MAIN_TARGET}": "diverged"},
+    )
     monkeypatch.setattr(full_ci_selector, "github_api", api)
     monkeypatch.setattr(full_ci_selector.time, "sleep", lambda _: None)
-    output = tmp_path / "github-output"
+    output, summary = tmp_path / "github-output", tmp_path / "summary.md"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -3112,12 +3132,15 @@ def test_main_batching_cli_errors_leave_outputs_unwritten(tmp_path: Path, monkey
             "200",
             "--github-output",
             str(output),
+            "--summary",
+            str(summary),
         ],
     )
 
     with pytest.raises(SystemExit, match="::error::"):
         full_ci_selector.main()
     assert not output.exists()
+    assert not summary.exists()
 
 
 def test_main_batching_is_wired_only_into_main_pushes(tmp_path: Path) -> None:

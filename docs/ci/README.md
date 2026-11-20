@@ -350,10 +350,11 @@ are still running, failed, or superseded are passed over, as are full-scope runs
 with missing, unfinished, or unsuccessful comparison jobs. Runs from before
 batching count as full scope but require the same comparison evidence.
 If none of the last 30 main pushes has that evidence, or the selected commit is
-not an ancestor, the run compares with its parent and adds a warning to its
-summary. That fallback comparison excludes deferred changes already in the
-parent. If `main` cannot be read, the run selects the full scope. If earlier runs
-cannot be read, **Select Full CI Scope** fails.
+not an ancestor, **Select Full CI Scope** fails without publishing a plan or
+comparison base. It never falls back to an unvalidated parent: that commit may
+already contain deferred changes, hiding them from the comparison. If `main`
+cannot be read, the run selects the full scope and still requires a validated
+comparison ancestor. If earlier runs cannot be read, selection also fails.
 
 Release branches, trusted PR copies, and manual runs are not batched. Every main
 run starts its expensive jobs ten minutes later. Main runs keep unique

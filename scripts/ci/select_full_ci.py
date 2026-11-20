@@ -410,8 +410,8 @@ def last_full_scope_commit(
     """Return the newest earlier full-scope main commit with successful comparisons.
 
     Superseded, still-undecided, and unvalidated comparison runs are skipped.
-    Without a validated full-scope run in the bounded window, compare with the
-    previous main commit instead.
+    Without a validated ancestor in the bounded window, fail selection rather
+    than compare against a parent that may already contain deferred changes.
     """
     query = urlencode({"branch": "main", "event": "push", "per_page": MAIN_LOOKBACK_RUNS})
     runs = api(f"repos/{repository}/actions/workflows/ci.yml/runs?{query}").get("workflow_runs")
@@ -440,13 +440,10 @@ def last_full_scope_commit(
         base = run["head_sha"]
         status = api(f"repos/{repository}/compare/{base}...{sha}?per_page=1").get("status")
         if status != "ahead":
-            return parent, [
-                (
-                    "warning",
-                    f"Full-scope main commit `{base}` is not an ancestor of this commit "
-                    f"(compare status {status!r}); comparing with the previous main commit `{parent}`.",
-                )
-            ]
+            raise GitHubError(
+                f"Full-scope main commit `{base}` is not an ancestor of this commit "
+                f"(compare status {status!r}); refusing to use unvalidated parent `{parent}` as the comparison base."
+            )
         notes = [
             (
                 "notice",
@@ -459,13 +456,10 @@ def last_full_scope_commit(
                 ("notice", "This run also validates the main commits deferred to it: " + ", ".join(deferred) + ".")
             )
         return base, notes
-    return parent, [
-        (
-            "warning",
-            f"No full-scope Full CI run with successful comparisons among the last {MAIN_LOOKBACK_RUNS} main pushes; "
-            f"comparing with the previous main commit `{parent}`.",
-        )
-    ]
+    raise GitHubError(
+        f"No full-scope Full CI run with successful comparisons among the last {MAIN_LOOKBACK_RUNS} main pushes; "
+        f"refusing to use unvalidated parent `{parent}` as the comparison base."
+    )
 
 
 def resolve_main_push(

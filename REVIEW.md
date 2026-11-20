@@ -169,8 +169,8 @@ run the complete matrix. Manual and `release/*` runs also execute the complete
 matrix. `main` batches merges that land within ten minutes: a commit that `main`
 has moved past builds, verifies, and stages its wheel only, and the newest
 commit runs the complete matrix, comparing against the last full-scope main
-commit with successful prediction and license comparisons (or its parent with
-a warning if no eligible baseline is found). Reruns always retain the complete
+commit with successful prediction and license comparisons. Selection fails if
+no validated ancestor can be established. Reruns always retain the complete
 matrix ([batched main validation](docs/ci/README.md#batched-main-validation)).
 A superseded commit's staged wheel was built and verified, but its full test
 suite ran only with a later main commit; a failure in that run may need
