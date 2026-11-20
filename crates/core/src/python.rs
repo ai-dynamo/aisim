@@ -4244,6 +4244,9 @@ struct ReplayTimingEvidence {
     wait_ms: f64,
     /// None when a role with positive wait has no configured watts.
     wait_energy_wms: Option<f64>,
+    /// A role's timing model does not track attention-DP wait, so the
+    /// pooled `wait_ms` is not evidence of zero wait.
+    wait_untracked: bool,
 }
 
 fn replay_timing_evidence(sources: &[TimingPowerSource]) -> Result<Option<ReplayTimingEvidence>> {
@@ -4271,6 +4274,7 @@ fn replay_timing_evidence_with_fpm(
         let Some((summary, iteration_wait_ms, phase_priced_wait_ms)) = evidence else {
             return Ok(None);
         };
+        combined.wait_untracked |= include_fpm || !source.timing.tracks_attention_dp_wait();
         combined.active.prefill.try_accumulate(scale_power_phase(
             summary.prefill,
             source.prefill_speedup_ratio,
@@ -4448,7 +4452,9 @@ fn replay_power_diagnostics(
     let stats = phase_power_stats(&combined)?;
     let step_ms = combined.latency_ms + evidence.wait_ms;
     ensure!(step_ms.is_finite(), "invalid attention-DP step duration");
-    let step_power_w = if evidence.wait_ms == 0.0 {
+    let step_power_w = if evidence.wait_untracked {
+        None
+    } else if evidence.wait_ms == 0.0 {
         stats.power_w
     } else if stats.power_w.is_some() {
         combined
@@ -4471,7 +4477,7 @@ fn replay_power_diagnostics(
         energy_wms: combined.energy_wms.filter(|energy| *energy > 0.0),
         latency_ms: Some(combined.latency_ms),
         covered_latency_ms: Some(combined.covered_latency_ms),
-        attention_dp_wait_ms: Some(evidence.wait_ms),
+        attention_dp_wait_ms: (!evidence.wait_untracked).then_some(evidence.wait_ms),
         step_power_w,
         power_w: stats.power_w,
         power_coverage: Some(stats.coverage),
@@ -8987,6 +8993,37 @@ mod tests {
         let power = replay_power_stats(&evidence).unwrap();
         assert_eq!(power.power_w, Some(500.0));
         assert!((power.coverage - 170.0 / 175.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn untracked_attention_dp_wait_is_not_published_as_zero_wait() {
+        // A provider with energy evidence but no wait tracking (for example AFD
+        // timing) leaves wait unknown even with watts configured.
+        let source = TimingPowerSource {
+            timing: Arc::new(PowerTiming(TimingEvidenceSummary {
+                prefill: TimingPhaseEvidence {
+                    energy_wms: Some(4_000.0),
+                    latency_ms: 10.0,
+                    covered_latency_ms: 10.0,
+                    ..Default::default()
+                },
+                decode: TimingPhaseEvidence::default(),
+            })),
+            prefill_speedup_ratio: 1.0,
+            decode_speedup_ratio: 1.0,
+            wait_power_w: Some(60.0),
+        };
+        assert!(!source.timing.tracks_attention_dp_wait());
+        let evidence = replay_timing_evidence(&[source]).unwrap().unwrap();
+        assert!(evidence.wait_untracked);
+        let output = replay_power_diagnostics(Some(&evidence), None).unwrap();
+        assert_eq!(output.power_w, Some(400.0));
+        assert_eq!(output.power_coverage, Some(1.0));
+        assert_eq!(output.attention_dp_wait_ms, None);
+        assert_eq!(output.step_power_w, None);
+        let wire = serde_json::to_value(&output).unwrap();
+        assert!(wire.get("attention_dp_wait_ms").is_none());
+        assert_eq!(wire["step_power_w"], serde_json::Value::Null);
     }
 
     #[test]

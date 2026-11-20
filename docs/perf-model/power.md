@@ -34,7 +34,10 @@ and add that energy to the role's active energy. Pool the energy and rank
 time across roles before dividing. Step watts are null when active watts
 are unavailable or a role with positive wait lacks its input. When there
 is no wait, step watts equal active watts. Uncovered active work supplies
-no modeled energy.
+no modeled energy. If any role's timing model does not track attention-DP
+wait, such as AFD timing, Replay omits `attention_dp_wait_ms` and reports
+null step watts rather than assuming zero wait. Active watts and coverage
+are unchanged.
 
 For example, one of two ranks works for 10 ms at 400 W while the other
 waits for 10 ms. With `wait_power_w: 60`, step power is
