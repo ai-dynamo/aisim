@@ -2782,3 +2782,93 @@ def test_glm_shaped_grouped_pd_transfer_time_matches_the_oracle(grouped_case, tm
     # the measured row of 1,000 tokens, 65,166,080 bytes on vLLM 0.31.0 and 61,146,624 on vLLM 0.32.0, over 1 GB/s.
     measured_bytes = {"0.31.0": 65_166_080, "0.32.0": 61_146_624}[version]
     assert mean_ttft[1.0] - mean_ttft[None] == pytest.approx(measured_bytes / 1e6, abs=1e-3)
+
+
+_EVIDENCE = Path(__file__).resolve().parents[1] / "benchmarks/evidence"
+_EVIDENCE_0320 = "nixl-pd-transfer-bytes-20261115"
+_EVIDENCE_0330 = "nixl-pd-transfer-bytes-20261117"
+
+
+def _evidence_versions(folder):
+    data = json.loads((_EVIDENCE / folder / "measurements.json").read_text())
+    assert data["schema"] == "nixl-pd-transfer-bytes/v2"
+    assert set(data["marks"]) == {"measured", "derived", "unmarked"}
+    return data["versions"]
+
+
+def _evidence_rows(block):
+    return block["rows"] if "rows" in block else [row for arm in block["arms"].values() for row in arm["rows"]]
+
+
+@pytest.mark.parametrize(
+    "folder,version,block_bytes,fixed_bytes",
+    [
+        (_EVIDENCE_0320, "0.31.0", 13_045_120, 52_120_960),
+        (_EVIDENCE_0320, "0.32.0", 21_978_496, 39_168_128),
+        (_EVIDENCE_0330, "0.33.0", 21_978_496, 39_168_128),
+    ],
+)
+def test_nixl_transfer_evidence_marks_every_number_and_keeps_every_row_on_the_line(
+    folder, version, block_bytes, fixed_bytes
+):
+    block = _evidence_versions(folder)[version]
+    sources = block["sources"]
+    assert set(sources) - {"region_sums"} == {"regions", "bytes_per_block", "formula", "rows"}
+    assert set(sources["bytes_per_block"]) == set(block["bytes_per_block"])
+    marks = [sources["regions"], sources["formula"], *sources["bytes_per_block"].values(), *sources["rows"].values()]
+    assert set(marks) <= {"measured", "derived"}
+    assert (block["bytes_per_block"]["attention"], sources["bytes_per_block"]["attention"]) == (block_bytes, "measured")
+    rows = _evidence_rows(block)
+    assert set().union(*rows) - {"prompt", "prompt_tokens"} == set(sources["rows"])
+    for row in rows:
+        assert row["bytes_per_rank"] == block_bytes * row["attention_blocks_moved"] + fixed_bytes
+
+
+def test_nixl_transfer_evidence_of_vllm_0310_and_0320_marks_the_split_as_derived():
+    split = {"attention": "measured", "ring": "derived", "kda_9_layers": "derived", "kda_8_layers": "derived"}
+    for version, block in _evidence_versions(_EVIDENCE_0320).items():
+        assert block["sources"]["bytes_per_block"] == split, version
+        assert block["sources"]["region_sums"] == "derived", version
+        rows = block["sources"]["rows"]
+        assert (rows["transferred_tokens"], rows["prefill_attention_blocks"]) == ("measured", "measured"), version
+
+
+def test_nixl_transfer_evidence_of_vllm_0330_measures_every_group():
+    block = _evidence_versions(_EVIDENCE_0330)["0.33.0"]
+    groups = {"attention": 21_978_496, "ring": 92_288, **{f"kda_group_{index}": 9_768_960 for index in range(4)}}
+    assert block["bytes_per_block"] == groups
+    assert set(block["sources"]["bytes_per_block"].values()) == {"measured"}
+    assert block["sources"]["rows"]["group_bytes"] == "measured"
+    rows = block["sources"]["rows"]
+    assert (rows["transferred_tokens"], rows["prefill_attention_blocks"]) == ("measured", "measured")
+    assert {name: len(arm["rows"]) for name, arm in block["arms"].items()} == {"A": 14, "B": 8, "C": 6}
+    for row in block["arms"]["C"]["rows"]:
+        assert row["group_bytes"] == {**groups, "attention": 21_978_496 * row["attention_blocks_moved"]}
+        assert sum(row["group_bytes"].values()) == row["bytes_per_rank"]
+
+
+def test_nixl_transfer_evidence_of_vllm_0330_repeats_the_rows_of_vllm_0320():
+    def key(row):
+        return (row["prompt_tokens"], row["attention_blocks_moved"], row["bytes_per_rank"], row["descriptors_per_rank"])
+
+    old = _evidence_versions(_EVIDENCE_0320)["0.32.0"]["rows"]
+    new = _evidence_versions(_EVIDENCE_0330)["0.33.0"]["arms"]["A"]["rows"]
+    assert [key(row) for row in new] == [key(row) for row in old]
+
+
+def test_nixl_transfer_evidence_of_vllm_0330_holds_the_region_table_of_the_live_connector():
+    table = json.loads((_EVIDENCE / _EVIDENCE_0330 / "region-table.json").read_text())
+    lengths, group_ids = table["block_len_per_layer"], table["region_group_ids"]
+    assert table["num_regions"] == len(lengths) == len(group_ids) == len(table["region_names"]) == 40
+    assert table["physical_blocks_per_logical"] == 1
+    assert lengths == [71_808] + [1_114_112] * 8 + [71_808] * 10 + [1_114_112] * 11 + [2_048] * 10
+    assert group_ids == [-1] * 9 + [4] * 21 + [5] * 10
+    assert table["ssm_region_indices"] == list(range(9))
+    assert table["scratch_region_indices"] == [0, *range(30, 40)]
+    assert table["mamba_ssm_size"] == [36_864, 1_048_576]
+    # The regions give the measured bytes of each group: an attention block reads every region, the ring its scratch
+    # regions, and a Mamba group the state bytes in every state region.
+    measured = _evidence_versions(_EVIDENCE_0330)["0.33.0"]["bytes_per_block"]
+    assert sum(lengths) == measured["attention"]
+    assert sum(lengths[index] for index in table["scratch_region_indices"]) == measured["ring"]
+    assert len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]) == measured["kda_group_0"]
