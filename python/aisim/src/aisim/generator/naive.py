@@ -17,11 +17,8 @@ optimization objective:
 """
 
 import logging
-import os
 import re
 from typing import Any
-
-import yaml
 
 from aisim.sdk import perf_database
 from aisim.sdk.utils import (
@@ -30,7 +27,13 @@ from aisim.sdk.utils import (
     get_model_config_from_model_path,
 )
 
-from .utils import model_has_kda, msa_sparse_algorithm, msa_sparse_implementation, vllm_dsa_kv_cache_dtype
+from .utils import (
+    _deep_merge_dicts,
+    model_has_kda,
+    msa_sparse_algorithm,
+    msa_sparse_implementation,
+    vllm_dsa_kv_cache_dtype,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,16 +130,6 @@ def _sanitize_rfc1123(name: str) -> str:
     return sanitized or "dynamo"
 
 
-def _deep_merge_dicts(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def _section_override(overrides: dict[str, Any] | None, section: str) -> dict[str, Any]:
     value = (overrides or {}).get(section)
     return value if isinstance(value, dict) else {}
@@ -169,15 +162,9 @@ def _get_system_config(system_name: str) -> dict[str, Any]:
     }
 
     try:
-        for systems_root in perf_database.get_systems_paths():
-            system_yaml_path = os.path.join(systems_root, f"{system_name}.yaml")
-            if not os.path.isfile(system_yaml_path):
-                continue
-            with open(system_yaml_path) as f:
-                system_spec = yaml.safe_load(f)
-            result["gpus_per_node"] = int(system_spec.get("node", {}).get("num_gpus_per_node", _DEFAULT_GPUS_PER_NODE))
-            result["vram_per_gpu"] = int(system_spec.get("gpu", {}).get("mem_capacity", _DEFAULT_VRAM_BYTES))
-            break
+        system_spec = perf_database.load_system_spec(system_name)
+        result["gpus_per_node"] = int(system_spec.get("node", {}).get("num_gpus_per_node", _DEFAULT_GPUS_PER_NODE))
+        result["vram_per_gpu"] = int(system_spec.get("gpu", {}).get("mem_capacity", _DEFAULT_VRAM_BYTES))
     except Exception as e:
         logger.warning(f"Could not read system config for {system_name}: {e}")
 
