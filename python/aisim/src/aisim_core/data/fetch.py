@@ -30,7 +30,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -420,29 +420,47 @@ class _Planner:
     def _add(self, ref: PlannedFile) -> None:
         prior = self._seen.get(ref.path)
         if prior is not None:
-            if (prior.sha256, prior.bytes) != (ref.sha256, ref.bytes):
-                raise IntegrityError(ref.path, "declared with conflicting digests")
+            # Every declared fact that is verified after download must agree, or the first declaration would
+            # silently decide what the second one was supposed to check.
+            fields = ("sha256", "bytes", "format", "schema", "rows")
+            if any(getattr(prior, f) != getattr(ref, f) for f in fields):
+                raise IntegrityError(ref.path, "declared with conflicting digests or verification fields")
             return
         ref.cached = self.cache.valid(self.plan.repo, self.plan.revision, ref.path, ref)
         self._seen[ref.path] = ref
         self.plan.files.append(ref)
 
-    def read(self, ref: PlannedFile) -> bytes | None:
+    def read(self, ref: PlannedFile, validate: Callable[[bytes], Any] | None = None) -> bytes | None:
         """Bytes of a metadata file (catalog/index/manifest), fetching if online.
 
         Metadata is small and needed to expand the closure, so it is downloaded
         during planning (and counted as cached afterwards). Offline, a missing
-        file is recorded and None is returned.
+        file is recorded and None is returned. ``validate`` (raising
+        :class:`IntegrityError`) checks a file that has no declared digest before it is installed; an online
+        call replaces a cached copy that fails it, and an invalid transfer is never cached.
         """
         plan = self.plan
-        if not self.cache.valid(plan.repo, plan.revision, ref.path, ref):
-            if plan.offline or self.transport is None:
+        online = not plan.offline and self.transport is not None
+        if self.cache.valid(plan.repo, plan.revision, ref.path, ref):
+            data = self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
+            try:
+                if validate is not None:
+                    validate(data)
+            except IntegrityError:
+                if not online:
+                    raise
+            else:
                 self._add(ref)
-                plan.missing.append(ref.path)
-                return None
-            self.cache.discard(plan.repo, plan.revision, ref.path)
-            chunks = self.transport.open_file(plan.repo, plan.revision, ref.path)
-            self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
+                return data
+        if not online:
+            self._add(ref)
+            plan.missing.append(ref.path)
+            return None
+        chunks = list(self.transport.open_file(plan.repo, plan.revision, ref.path))
+        if validate is not None:
+            validate(b"".join(chunks))
+        self.cache.discard(plan.repo, plan.revision, ref.path)
+        self.cache.store(plan.repo, plan.revision, ref.path, chunks, ref)
         self._add(ref)
         return self.cache.path_for(plan.repo, plan.revision, ref.path).read_bytes()
 
@@ -475,7 +493,10 @@ def plan(
         except ValidationError as exc:
             raise IntegrityError(path, f"invalid {model.__name__}: {exc.error_count()} error(s)") from exc
 
-    raw = planner.read(PlannedFile(DATASET_INDEX_PATH, None, None, "catalog", False))
+    raw = planner.read(
+        PlannedFile(DATASET_INDEX_PATH, None, None, "catalog", False),
+        validate=lambda data: parse(DatasetIndex, data, DATASET_INDEX_PATH),
+    )
     if raw is None:
         return out
     dataset = parse(DatasetIndex, raw, DATASET_INDEX_PATH)
@@ -486,6 +507,8 @@ def plan(
     if raw is None:
         return out
     index = parse(CategoryIndex, raw, reference.index.path)
+    if index.category != selection.category:
+        raise IntegrityError(reference.index.path, f"category index names {index.category!r}, not the requested one")
     entries = [e for e in index.entries if selection.matches(e)]
     if not entries:
         raise SelectionError("selection matched no catalog entries")
@@ -533,9 +556,11 @@ def fetch(
     result_plan = plan(
         selection, repo=repo, revision=revision, transport=transport, cache=cache, offline=offline, _resolved=sha
     )
-    if offline:
-        if result_plan.missing:
-            raise OfflineMissingError(result_plan.missing)
+    if offline or transport is None:
+        # Without a transport the cache is all there is: a miss is a typed error, never an assertion.
+        absent = sorted({*result_plan.missing, *(f.path for f in result_plan.files if not f.cached)})
+        if absent:
+            raise OfflineMissingError(absent)
     elif max_bytes is not None and result_plan.uncached_bytes > max_bytes and not allow_over_budget:
         raise BudgetExceededError(result_plan, max_bytes)
 
@@ -543,7 +568,6 @@ def fetch(
     for f in result_plan.files:
         if f.cached:
             continue
-        assert transport is not None  # online: plan() already needed it
         cache.discard(repo, sha, f.path)
         _, size = cache.store(repo, sha, f.path, transport.open_file(repo, sha, f.path), f)
         downloaded += size
@@ -581,13 +605,18 @@ def load_category_index(
 
     dataset = parse(
         DatasetIndex,
-        planner.read(PlannedFile(DATASET_INDEX_PATH, None, None, "catalog", False)),
+        planner.read(
+            PlannedFile(DATASET_INDEX_PATH, None, None, "catalog", False),
+            validate=lambda data: parse(DatasetIndex, data, DATASET_INDEX_PATH),
+        ),
         DATASET_INDEX_PATH,
     )
     reference = dataset.categories.get(category)
     if reference is None:
         raise SelectionError(f"dataset has no {category!r} category")
     index = parse(CategoryIndex, planner.read(_ref(reference.index, "index")), reference.index.path)
+    if index.category != category:
+        raise IntegrityError(reference.index.path, f"category index names {index.category!r}, not {category!r}")
     return sha, index, dataset
 
 

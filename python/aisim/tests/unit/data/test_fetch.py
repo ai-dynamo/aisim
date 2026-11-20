@@ -383,3 +383,81 @@ def test_fpm_layout_rule_round_trips():
         physical_path("catalog/dataset.json")
     with pytest.raises(ValueError):
         logical_path("data/M--m/x")
+
+
+# ---------------------------------------------------------------- review regressions
+
+
+def _repin(files, path):
+    """Refresh the digest declared for ``path`` by its parent index after the file was edited."""
+    parent = {"catalog/fpm.json": "catalog/dataset.json"}.get(path, "catalog/fpm.json")
+    document = json.loads(files[parent])
+    declarations = (
+        [c["index"] for c in document["categories"].values()]
+        if parent == "catalog/dataset.json"
+        else [e["manifest"] for e in document["entries"]]
+    )
+    for declared in declarations:
+        if declared["path"] == path:
+            declared["sha256"], declared["bytes"] = _sha(files[path]), len(files[path])
+    files[parent] = json.dumps(document).encode()
+    if parent != "catalog/dataset.json":
+        _repin(files, parent)
+
+
+def test_a_malformed_root_catalog_is_not_cached_and_a_healthy_retry_succeeds(files, tmp_path):
+    cache = Cache(tmp_path / "c")
+    broken = {**files, "catalog/dataset.json": b'{"not": "a dataset index"}'}
+    with pytest.raises(IntegrityError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(broken), cache=cache)
+    assert not cache.path_for(REPO, SHA, "catalog/dataset.json").exists()
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+
+
+def test_an_online_fetch_replaces_a_corrupt_cached_root_catalog(files, tmp_path):
+    cache = Cache(tmp_path / "c")
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    cache.path_for(REPO, SHA, "catalog/dataset.json").write_bytes(b"corrupt")
+    transport = FakeTransport(files)
+    fetch(SEL, repo=REPO, revision=SHA, transport=transport, cache=cache)
+    assert "catalog/dataset.json" in transport.opened
+    with pytest.raises(IntegrityError):  # offline there is no healthy copy to fall back to
+        cache.path_for(REPO, SHA, "catalog/dataset.json").write_bytes(b"corrupt")
+        fetch(SEL, repo=REPO, revision=SHA, cache=cache, offline=True)
+
+
+def test_a_category_index_for_another_category_is_rejected(files, tmp_path):
+    index = json.loads(files["catalog/fpm.json"])
+    index["category"] = "e2e"
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    _repin(files, "catalog/fpm.json")
+    with pytest.raises(IntegrityError, match="category"):
+        plan(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+    with pytest.raises(IntegrityError, match="category"):
+        load_category_index("fpm", repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "x"))
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_one_file_declared_with_different_row_counts_is_rejected(tmp_path, reverse):
+    files = build_repo(tmp_path)
+    # m2's manifest declares m1's table with another row count.
+    m2 = json.loads(files["fpm/m2/manifest.json"])
+    m2["artifacts"] = [{**json.loads(files["fpm/m1/manifest.json"])["artifacts"][0], "rows": 99}]
+    files["fpm/m2/manifest.json"] = json.dumps(m2).encode()
+    _repin(files, "fpm/m2/manifest.json")
+    index = json.loads(files["catalog/fpm.json"])
+    selection = Selection(category="fpm", configuration_ids=tuple(e["configuration_id"] for e in index["entries"]))
+    if reverse:
+        index["entries"].reverse()
+        files["catalog/fpm.json"] = json.dumps(index).encode()
+        _repin(files, "catalog/fpm.json")
+    with pytest.raises(IntegrityError, match="conflicting"):
+        plan(selection, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=Cache(tmp_path / "c"))
+
+
+def test_a_cache_miss_without_a_transport_is_a_typed_error_and_a_warm_cache_still_works(files, tmp_path):
+    cache = Cache(tmp_path / "c")
+    with pytest.raises(OfflineMissingError):
+        fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=cache)
+    fetch(SEL, repo=REPO, revision=SHA, transport=FakeTransport(files), cache=cache)
+    assert fetch(SEL, repo=REPO, revision=SHA, transport=None, cache=cache).downloaded_bytes == 0
