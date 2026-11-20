@@ -196,6 +196,98 @@ def test_evaluated_requirements_install_only_after_the_last_token_step(job_id):
             assert "$(python " not in line, (job_id, step.get("name"), line)
 
 
+def trusted_bootstraps():
+    """(workflow, job, command) for every step that creates the trusted venv with the stock interpreter."""
+    for name in NAMES:
+        for job_id, _, step in steps(name):
+            for line in step.get("run", "").splitlines():
+                if '-m venv "${RUNNER_TEMP}/trusted-venv"' in line:
+                    yield name, job_id, line.strip()
+
+
+def test_every_trusted_interpreter_invocation_that_reads_the_cwd_runs_isolated():
+    """``python -m`` and ``python -`` put the working directory first on sys.path, and the evaluated checkout
+    occupies it, so a checkout-local ``venv.py`` or ``json.py`` would run before a token step. ``-I`` drops it."""
+    bootstraps = list(trusted_bootstraps())
+    assert {job for _, job, _ in bootstraps} >= {
+        "resolve",
+        "measurements",
+        "shards",
+        "campaign",
+        "agentx",
+        "qualify-agentx",
+    }
+    for name, job_id, command in bootstraps:
+        assert command.startswith("python -I -m venv "), (name, job_id, command)
+    for name in NAMES:
+        for job_id, _, step in steps(name):
+            for line in step.get("run", "").splitlines():
+                if re.search(r'trusted-venv/bin/python"? (-[a-zA-Z]+ )*(-|-c|-m)( |$)', line):
+                    assert re.search(r'python"? -I ', line), (name, job_id, line.strip())
+
+
+def _poisoned_workspace(tmp_path, module):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / f"{module}.py").write_text("open('POISONED', 'w').write('ran')\nraise SystemExit(0)\n")
+    interpreter = tmp_path / "bin/python"
+    interpreter.parent.mkdir()
+    interpreter.symlink_to(sys.executable)
+    environment = os.environ | {
+        "PATH": f"{interpreter.parent}{os.pathsep}{os.environ['PATH']}",
+        "RUNNER_TEMP": str(tmp_path / "runner"),
+    }
+    (tmp_path / "runner").mkdir()
+    return workspace, environment
+
+
+@pytest.mark.parametrize("command", sorted({command for _, _, command in trusted_bootstraps()}))
+def test_a_checkout_local_venv_module_never_runs_in_the_trusted_bootstrap(tmp_path, command):
+    workspace, environment = _poisoned_workspace(tmp_path, "venv")
+
+    def run(text):
+        return subprocess.run(
+            ["bash", "-e", "-c", text + " --without-pip"],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    # Control: without -I the poisoned module shadows the standard library and runs.
+    control = run(command.replace(" -I", "", 1))
+    assert control.returncode == 0 and (workspace / "POISONED").exists(), control.stderr
+    (workspace / "POISONED").unlink()
+    result = run(command)
+    assert result.returncode == 0, result.stderr
+    assert not (workspace / "POISONED").exists(), "the trusted bootstrap executed a checkout-local venv.py"
+    assert (tmp_path / "runner/trusted-venv/bin/python").exists()
+
+
+@pytest.mark.parametrize("module", ["json", "re"])
+def test_a_checkout_local_module_never_runs_in_the_revision_resolver(tmp_path, module):
+    workspace, environment = _poisoned_workspace(tmp_path, module)
+    revision = "0123456789abcdef" * 2 + "01234567"
+    shard = tmp_path / "runner/agentx-results/shard-0.json"
+    shard.parent.mkdir(parents=True)
+    shard.write_text(json.dumps({"snapshot": {"dataset_revision": revision}}))
+    python = tmp_path / "runner/trusted-venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    resolve = next(
+        step
+        for step in load("e2e-accuracy-branch.yml")["jobs"]["qualify-agentx"]["steps"]
+        if step.get("name") == "Resolve the AgentX revision and options (no secret)"
+    )
+    environment |= {"GITHUB_ENV": str(tmp_path / "github-env"), "PREVIEW": "false", "AGENTX_CAMPAIGN_CATALOG": ""}
+    result = subprocess.run(
+        ["bash", "-e", "-c", resolve["run"]], cwd=workspace, env=environment, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (workspace / "POISONED").exists(), f"the resolver executed a checkout-local {module}.py"
+    assert f"AGENTX_RESOLVED_REVISION={revision}" in (tmp_path / "github-env").read_text()
+
+
 def test_the_trusted_venv_never_sees_the_evaluated_wheel():
     for name in NAMES:
         for job_id, _, step in steps(name):
