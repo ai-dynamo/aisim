@@ -5,7 +5,7 @@
 
 What may move from ``aisim-data-internal`` to the public dataset is decided by a
 :class:`RedactionPolicy`. The defaults are the most conservative reading of the
-disclosure decision (AISIM-2312):
+disclosure decision:
 
 * Visibility is a label per path prefix in ``mirror/visibility.json``
   (:class:`VisibilityLedger`); an unlabeled path is ``internal``.

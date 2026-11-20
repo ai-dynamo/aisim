@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Definition of the validator CI for the private mirror ai-dynamo/aisim-data-internal
-# (DEP #435, Phase 7, AISIM-2343). It is a TEMPLATE: first replace the exact
+# (DEP #435, Phase 7). It is a TEMPLATE: first replace the exact
 # all-zero AISIM_VALIDATOR_REF placeholder with a reviewed, full validator commit
 # SHA, then install at .github/workflows/validate.yml in the mirror repository.
 # It does not run in this repository (it is outside .github/workflows).

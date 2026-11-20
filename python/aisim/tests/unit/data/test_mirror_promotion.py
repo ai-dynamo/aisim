@@ -759,7 +759,7 @@ def _target(tmp_path):
 
 
 def test_sample_configuration_is_promoted_by_copy_only_and_passes_public_validator(tmp_path):
-    """Exit gate for AISIM-2344."""
+    """Exit gate: a promoted sample is a copy and passes the public validator."""
     root, directory = _promotable(tmp_path)
     draft = plan_promotion(root, _request(root, [directory]), _reviewers())
     assert draft.content_ok and not draft.ok  # needs approval

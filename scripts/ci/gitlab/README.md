@@ -1,7 +1,7 @@
 # Internal GitLab job: InferenceX ingestion (`aisim-hf-dataset-ci`)
 
 `aisim-infx-ingest.gitlab-ci.yml` defines the weekly and manual InferenceX ingestion for the
-private `aisim-infx-cache` (AISIM-2334, DEP #435). The repository has no other GitLab config, so this
+private `aisim-infx-cache` (DEP #435). The repository has no other GitLab config, so this
 directory holds only this definition. **Nothing here is registered**: a maintainer installs it in the
 internal project by hand.
 
@@ -50,7 +50,7 @@ reviewed merge request from that branch into the default branch and merge it: in
 staleness jobs clone the default branch, so they keep seeing the previous qualified snapshot until
 then. The jobs never push to the default branch.
 
-## Policy (AISIM-2314)
+## Policy
 
 | Item | Decision |
 | --- | --- |

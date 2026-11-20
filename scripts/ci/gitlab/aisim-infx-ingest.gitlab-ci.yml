@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Weekly + manual InferenceX ingestion for the PRIVATE aisim-infx-cache (AISIM-2334, DEP #435).
+# Weekly + manual InferenceX ingestion for the PRIVATE aisim-infx-cache (DEP #435).
 # DEFINITION ONLY: this file is not registered anywhere. Install it per
 # scripts/ci/gitlab/README.md in the internal project `aisim-hf-dataset-ci`.
 #

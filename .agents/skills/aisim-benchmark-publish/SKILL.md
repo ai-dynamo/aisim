@@ -40,7 +40,7 @@ ai-dynamo/aisim#435; this skill does not widen them.
   as returned by `write_record`) with the regenerated catalog. Collector or packaged operation
   tables are converted to the op-latency layout with
   `python/aisim/tools/perf_database/publish_op_latency_tree.py build` and re-verified with `... audit`
-  (a supported publish step until AISIM-2373 makes the collector emit the layout directly). Writes to a public repository go
+  (a supported publish step until the collector emits the layout directly). Writes to a public repository go
   through a Hugging Face PR revision, and private or sensitive data goes only to the internal mirror.
 - The library on this branch has no publish function and no `aisim data fetch` CLI. Stop at the
   validated local bundle plus the gate output and give the user the exact upload step; upload only
