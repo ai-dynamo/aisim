@@ -35,13 +35,28 @@ class PathFinding:
         return {"path": self.path, "kind": f.kind, "location": f.location, "value": f.value, "canonical": f.canonical}
 
 
+def _is_aisim_envelope(head: Any) -> bool:
+    """Whether a manifest-named file is an AISim envelope, valid or not, so the schema check can report it.
+
+    A string ``schema_version`` decides: any AISim envelope version, and nothing else. A missing or non-string
+    version is still an AISim envelope when the file carries the envelope's identity fields; unrelated manifest
+    formats (bundles, checkpoints, provenance) lack them and are ignored.
+    """
+    if not isinstance(head, dict):
+        return False
+    version = head.get("schema_version")
+    if isinstance(version, str):
+        return version.startswith(_MANIFEST_SCHEMA_FAMILY)
+    return {"configuration_id", "identity", "artifacts"} <= head.keys()
+
+
 def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
     """``(manifests, errors)`` under ``root``; a file is checked on its own.
 
     A file with a manifest name that cannot be read or parsed is an error, never silently dropped: a truncated
     manifest in a directory must fail the check as it does when the file is checked directly. A file of another
-    AISim envelope version is returned too, so the schema check reports it as unsupported. A readable JSON
-    document of an unrelated format is simply not ours.
+    AISim envelope version, or one shaped like an envelope without a usable ``schema_version``, is returned too
+    so the schema check reports it. A readable JSON document of an unrelated format is simply not ours.
     """
     root = Path(root)
     if root.is_file():
@@ -55,8 +70,7 @@ def discover_manifests(root: Path) -> tuple[list[Path], list[str]]:
             except (OSError, ValueError) as exc:
                 errors.append(f"{path.relative_to(root).as_posix()}: {type(exc).__name__}: {exc}")
                 continue
-            version = head.get("schema_version") if isinstance(head, dict) else None
-            if isinstance(version, str) and version.startswith(_MANIFEST_SCHEMA_FAMILY):
+            if _is_aisim_envelope(head):
                 found.append(path)
     return found, errors
 

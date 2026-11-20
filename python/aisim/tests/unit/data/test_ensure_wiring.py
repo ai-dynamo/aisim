@@ -45,6 +45,23 @@ def test_reentrancy_guard_skips(monkeypatch, tmp_path):
         assert res._ensure_dataset({}, None) is None
 
 
+@pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression", "fpm_learned"])
+def test_a_saved_source_leaves_fpm_estimators_and_their_systems_paths_alone(monkeypatch, tmp_path, mode):
+    assert main(["init", "--on-demand", "--repo", REPO, "--revision", SHA]) == 0
+    seen = []
+    monkeypatch.setattr(ensure_mod, "ensure_data", lambda payload, pin: seen.append(payload) or "ensured")
+    config = {"estimation_mode": mode, "system": "h200_sxm", "systems_paths": [str(tmp_path / "fpm-tables")]}
+    # The saved op-latency source would replace systems_paths, which carries these modes' FPM tables.
+    assert res._ensure_dataset(config, None) is None and seen == []
+    # An operation-table run still uses the saved source ...
+    assert res._ensure_dataset({**config, "estimation_mode": "op_level"}, None) == "ensured"
+    # ... and a source the environment or the caller names applies to every mode.
+    monkeypatch.setenv("AISIM_DATASET", f"{REPO}@{SHA}")
+    assert res._ensure_dataset(config, None) == "ensured"
+    monkeypatch.delenv("AISIM_DATASET")
+    assert res._ensure_dataset(config, ensure_mod.DataPin(repo=REPO, revision=SHA)) == "ensured"
+
+
 @pytest.mark.parametrize("override", ["saved", "environment-repo", "environment-local", "explicit-pin"])
 def test_init_source_reaches_native_prediction(native_dataset, monkeypatch, override):  # noqa: F811
     published, systems, config = native_dataset

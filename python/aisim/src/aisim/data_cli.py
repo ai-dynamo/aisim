@@ -149,7 +149,8 @@ def _download(selection: Selection, args: argparse.Namespace, repo: str, revisio
     cache = Cache(Path(args.cache_dir) if args.cache_dir else None)
     transport = None if args.offline else make_transport()
     common = {"repo": repo, "transport": transport, "cache": cache, "offline": args.offline}
-    planned = plan(selection, revision=revision, **common)
+    cap = _max_bytes(args)
+    planned = plan(selection, revision=revision, max_bytes=cap, **common)  # planning downloads metadata: bound it too
     if getattr(args, "dry_run", False):
         return {"dry_run": True, **planned.to_dict()}
     if not args.offline and planned.uncached_bytes >= LARGE_DOWNLOAD_BYTES:
@@ -158,8 +159,11 @@ def _download(selection: Selection, args: argparse.Namespace, repo: str, revisio
             f"from {repo}@{planned.revision[:12]}\n"
         )
     # The plan resolved the revision; reuse the SHA so the download needs no second lookup.
-    result = fetch(selection, revision=planned.revision, max_bytes=_max_bytes(args), **common)
+    # The metadata the plan downloaded is spent: the rest of the allowance bounds the artifacts.
+    remaining = None if cap is None else max(cap - planned.metadata_bytes, 0)
+    result = fetch(selection, revision=planned.revision, max_bytes=remaining, **common)
     result.plan.requested_revision = revision
+    result.plan.metadata_bytes += planned.metadata_bytes
     return {"dry_run": False, **result.to_dict()}
 
 
