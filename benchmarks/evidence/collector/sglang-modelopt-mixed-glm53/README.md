@@ -178,7 +178,7 @@ The probe does not set the environment that `collect.py` sets for SGLang before 
 
 ### What the narrow collection selects
 
-A CPU plan of commit `2df535ed`, the last change of collector code, with `COLLECTOR_MODEL_PATH=nvidia/GLM-5.3-NVFP4` on SM100 gives 90 `dsa_context_module` rows with 4900 points. The filter `"[0, 256, 64, "` keeps 2 rows with 24 points:
+A CPU plan of commit `2df535ed` with `COLLECTOR_MODEL_PATH=nvidia/GLM-5.3-NVFP4` on SM100 gives 90 `dsa_context_module` rows with 4900 points. The filter `"[0, 256, 64, "` keeps 2 rows with 24 points:
 
 | Row | `kv_cache_dtype` | Compute dtype | `gemm_type` | Pinned DSA backend | Points |
 |---|---|---|---|---|---|
