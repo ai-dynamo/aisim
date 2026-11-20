@@ -20,7 +20,7 @@ Source order, per category named by the :class:`DataPin`:
 
 ``op-latency`` is composed, not selected: every operation family published for the configuration's
 system/backend/version is verified and written, with the packaged system specs, into one ``systems/`` root
-(:func:`~aisim_core.data.op_tree.load_op_latency_tree`) that leads ``systems_paths``. Two entries for the same family
+(:func:`~aisim_core.data.op_tree.load_op_latency_tree`) that replaces ``systems_paths``. Two entries for the same family
 are a conflict resolved with ``AISIM_DATA_CONFIGURATION``; a family the dataset does not publish is absent, never
 filled from packaged tables by the pin.
 
@@ -447,8 +447,9 @@ def _load_op_latency(
 def _wire(config: dict[str, Any], category: str, loaded: Any, entry: Entry | None) -> None:
     """Merge loaded inputs into ``config``, preserving explicit user choices."""
     if category == "op-latency":
-        paths = [str(loaded.root), *(str(p) for p in config.get("systems_paths") or ())]
-        config["systems_paths"] = list(dict.fromkeys(paths))
+        # Native construction tries later roots when required tables are missing.
+        # A category pin must fail on that absence, never select unpinned tables.
+        config["systems_paths"] = [str(loaded.root)]
         return
     loaded_config = loaded.config
     paths = [*(loaded_config.get("systems_paths") or ()), *(config.get("systems_paths") or ())]

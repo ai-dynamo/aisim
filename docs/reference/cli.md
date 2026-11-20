@@ -103,6 +103,11 @@ there is no fallback to other data. Other pin variables: `AISIM_DATA_CATEGORIES`
 threshold, default 256 MiB) and `AISIM_DATA_LOCAL` (a dataset-layout directory used instead of Hugging Face).
 Private datasets use the standard `HF_TOKEN` only while connected; the cache needs none.
 
+An `op-latency` pin composes all matching operation families with the packaged system specs and support
+files into one systems root. That root replaces `systems_paths` for construction: a missing operation
+table fails instead of falling through to packaged or user-supplied operation tables. Packaged
+operation tables are never copied into the pinned root.
+
 <a id="non-python-consumers"></a>
 
 ### Operation data for consumers without the Python data library
