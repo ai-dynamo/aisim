@@ -184,6 +184,16 @@ def op_latency_inputs_digest(
     return digest.hexdigest()
 
 
+def lookup_yaml(path: Path) -> bytes:
+    """The source YAML a lookup Parquet table embeds, after checking its embedded checksum."""
+    metadata = pq.read_metadata(path).metadata or {}
+    text = metadata.get(_SOURCE_YAML_KEY)
+    expected = metadata.get(b"aisim.source_sha256")
+    if text is None or expected is None or hashlib.sha256(text).hexdigest() != expected.decode():
+        raise LoaderError(f"{Path(path).name} does not embed its source YAML intact")
+    return text
+
+
 def _write_lookup_yaml(tree: Path, destination: Path) -> tuple[str, ...]:
     """Rebuild the lookup YAML files from the source text embedded in their pinned Parquet tables.
 
@@ -201,11 +211,6 @@ def _write_lookup_yaml(tree: Path, destination: Path) -> tuple[str, ...]:
             _verify(Path(tree), support[relative])
         elif not path.is_file() or path.is_symlink():
             raise LoaderError(f"the dataset does not publish {relative}; it is required and has no packaged substitute")
-        metadata = pq.read_metadata(path).metadata or {}
-        text = metadata.get(_SOURCE_YAML_KEY)
-        expected = metadata.get(b"aisim.source_sha256")
-        if text is None or expected is None or hashlib.sha256(text).hexdigest() != expected.decode():
-            raise LoaderError(f"{name}.parquet does not embed its source YAML intact")
-        (destination / f"{name}.yaml").write_bytes(text)
+        (destination / f"{name}.yaml").write_bytes(lookup_yaml(path))
         written.append(f"{name}.yaml")
     return tuple(written)

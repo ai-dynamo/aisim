@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -67,9 +68,18 @@ from aisim_core.data.fetch import (
     SelectionError,
     Transport,
     fetch,
+    fetch_support,
 )
 from aisim_core.data.loaders import LOADERS, FpmData, LoaderError
-from aisim_core.data.op_tree import OpTreeLoad, load_op_latency_tree, op_latency_inputs_digest, read_entry_manifest
+from aisim_core.data.op_schema import DATA_PREFIX, QUERY_VERSIONS_NAME
+from aisim_core.data.op_tree import (
+    OpTreeLoad,
+    _op_latency_index,
+    load_op_latency_tree,
+    lookup_yaml,
+    op_latency_inputs_digest,
+    read_entry_manifest,
+)
 from aisim_core.data.repos import resolve_ref
 from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
 
@@ -243,11 +253,14 @@ def _command(pin: DataPin, selection: Selection) -> str:
         ("--hardware", selection.hardware),
         ("--framework", selection.framework),
         ("--framework-version", selection.framework_version),
+        ("--operation-family", selection.operation_family),
         ("--repo", pin.repo),
         ("--revision", pin.revision),
     ):
         if value:
             flags.append(f"{flag} {value}")
+    # One flag per ID: without them the command would download every matching entry, not the one the pin names.
+    flags.extend(f"--configuration {cid}" for cid in selection.configuration_ids)
     return "aisim data fetch " + " ".join(flags)
 
 
@@ -274,9 +287,92 @@ def ensure_data(
 
         transport = HfTransport()
     with _guard():
+        if "op-latency" in pin.categories:
+            _resolve_backend_version(out, pin, transport)
         for category in pin.categories:
             _ensure_category(out, category, pin, transport)
     return out
+
+
+_SLOT_ALIASES = ("current", "previous", "next")
+
+
+def _resolve_backend_version(out: EnsuredData, pin: DataPin, transport: Transport | None) -> None:
+    """Turn an omitted backend version or a slot alias into the literal version of the pinned dataset's policy.
+
+    Selection and identity checks compare literal versions, but a configuration may omit the version (its public
+    default) or name ``current``/``previous``/``next``. The pinned dataset's own ``query_versions`` lookup
+    decides them, as the packaged one does for unpinned runs; an explicit version is left alone.
+    """
+    requested = out.config.get("backend_version")
+    if requested is not None and requested not in _SLOT_ALIASES:
+        return
+    system, backend = out.config.get("system"), out.config.get("backend")
+    if not system or not backend:
+        return  # nothing to select; the category selection reports the missing field
+    index, query_versions = _version_policy(pin, transport)
+    versions = {(e.identity.hardware, e.identity.framework, e.identity.framework_version) for e in index.entries}
+    out.config["backend_version"] = _slot_version(system, backend, requested, versions, query_versions)
+
+
+def _version_policy(pin: DataPin, transport: Transport | None):
+    """The op-latency category index of the pinned dataset and its parsed ``query_versions`` document."""
+    name = f"{DATA_PREFIX}/{QUERY_VERSIONS_NAME}.parquet"
+    where = str(pin.local_root) if pin.local_root is not None else f"{pin.repo}@{pin.revision}"
+    try:
+        if pin.local_root is not None:
+            root = Path(pin.local_root).absolute()
+            index = _op_latency_index(root)
+            support = {a.path: a for a in index.support}
+            if name in support:
+                path = _verify(root, support[name])
+            else:
+                path = root / name
+        else:
+            cache = Cache(pin.cache_dir)
+            common = {"repo": pin.repo, "revision": pin.revision, "cache": cache}
+            try:
+                _, index, paths = fetch_support("op-latency", transport=None, offline=True, **common)
+            except (OfflineMissingError, RevisionError) as exc:
+                if pin.offline:
+                    raise MissingDataError(f"offline: the version policy of {where} is not cached: {exc}") from exc
+                _, index, paths = fetch_support("op-latency", transport=transport, **common)
+            path = paths.get(name)
+        if path is None or not Path(path).is_file():
+            raise MissingDataError(f"{where} publishes no {name}; the backend version cannot be resolved")
+        document = yaml.safe_load(lookup_yaml(Path(path)))
+    except (LoaderError, ValueError, SelectionError) as exc:
+        raise MissingDataError(f"cannot read the version policy of {where}: {exc}") from exc
+    return index, document if isinstance(document, dict) else {}
+
+
+def _slot_version(system: str, backend: str, requested: str | None, versions, document: Mapping[str, Any]) -> str:
+    from aisim_core.sdk.perf_database import _version_sort_tuple
+
+    held = {v for hw, fw, v in versions if hw == system and fw == backend}
+    if not held:
+        raise MissingDataError(f"the pinned dataset holds no {backend} operation data for {system}")
+    overrides = (document.get("overrides") or {}).get(system, {}).get(backend)
+    entry = overrides if overrides is not None else (document.get("defaults") or {}).get(backend)
+    if not entry or not entry.get("current"):
+        if requested is None:  # no authored policy: the latest version the dataset holds
+            return max(held, key=_version_sort_tuple)
+        raise MissingDataError(f"no queryable versions are defined for {backend} on {system}; cannot resolve {requested!r}")
+    slots = {"current": str(entry["current"])}
+    if entry.get("previous"):
+        slots["previous"] = str(entry["previous"])
+    if overrides is None:
+        # next is the highest version newer than current that any defaults-governed system holds, else current.
+        frozen = {
+            hw for hw, per_backend in (document.get("overrides") or {}).items() if (per_backend or {}).get(backend)
+        }
+        current_key = _version_sort_tuple(slots["current"])
+        newer = {v for hw, fw, v in versions if fw == backend and hw not in frozen and _version_sort_tuple(v) > current_key}
+        slots["next"] = max(newer, key=_version_sort_tuple) if newer else slots["current"]
+    resolved = slots.get(requested or "current")
+    if resolved is None:
+        raise MissingDataError(f"{backend} on {system} has no {requested!r} version; available slots: {slots}")
+    return resolved
 
 
 def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: Transport | None) -> None:
@@ -497,16 +593,20 @@ def _load_op_latency(
         if (output_dir / "systems").is_dir():
             return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        # Build next to the destination and rename, so a concurrent worker never sees a half-written root.
-        staging = output_dir.with_name(f"{output_dir.name}.{os.getpid()}.tmp")
-        shutil.rmtree(staging, ignore_errors=True)
-        load_op_latency_tree(root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR)
+        # Build in a directory private to this attempt (threads of one process share a PID) and rename it, so a
+        # concurrent worker never sees a half-written root and never deletes another worker's staging.
+        staging = Path(tempfile.mkdtemp(prefix=f"{output_dir.name}.", suffix=".tmp", dir=output_dir.parent))
         try:
-            staging.rename(output_dir)
-        except OSError:
+            load_op_latency_tree(
+                root, staging / "systems", entries=entries, packaged_systems=PACKAGED_SYSTEMS_DIR
+            )
+            try:
+                staging.rename(output_dir)
+            except OSError:
+                if not (output_dir / "systems").is_dir():  # another attempt won the race: its root is equivalent
+                    raise
+        finally:
             shutil.rmtree(staging, ignore_errors=True)
-            if not (output_dir / "systems").is_dir():
-                raise
         return OpTreeLoad(output_dir / "systems", len(entries), 0, 0, (), frozenset(), 0.0), ids
     except (LoaderError, ValueError) as exc:
         raise MissingDataError(

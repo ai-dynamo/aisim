@@ -379,3 +379,59 @@ def test_manifests_declaring_different_bytes_for_one_runtime_path_conflict(tree,
     with pytest.raises(LoaderError, match="different content"):
         op_tree.load_op_latency_tree(published, tmp_path / "dest")
     assert not (tmp_path / "dest").exists()
+
+
+def test_concurrent_materializations_do_not_share_a_staging_directory(two_families, tmp_path, monkeypatch):
+    from aisim_core.data import ensure as mod
+
+    real = mod.load_op_latency_tree
+    started, nested = [], []
+
+    def interleaved(*args, **kwargs):
+        if not started:  # a second worker of this process builds and publishes while the first is still writing
+            started.append(True)
+            nested.append(ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "load_op_latency_tree", interleaved)
+    first = ensure_data(dict(CONFIG), _pin(two_families, tmp_path)).config["systems_paths"][0]
+    assert first == nested[0] and (Path(first) / "h200_sxm.yaml").is_file()
+    assert not list((tmp_path / "cache").rglob("*.tmp"))
+
+
+# ---------------------------------------------------------------- backend version defaults and aliases
+
+
+@pytest.mark.parametrize(
+    "requested,literal",
+    [(None, "2.0"), ("current", "2.0"), ("previous", "1.0"), ("1.0", "1.0"), ("2.0", "2.0")],
+)
+def test_omitted_versions_and_slot_aliases_follow_the_pinned_policy(tree, tmp_path, requested, literal):  # noqa: F811
+    published = tmp_path / "published"
+    _build(tree, published)  # QUERY_VERSIONS: h200_sxm vllm current 2.0, previous 1.0
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    if requested is not None:
+        config["backend_version"] = requested
+    out = ensure_data(config, _pin(published, tmp_path))
+    assert out.config["backend_version"] == literal
+    root = Path(out.config["systems_paths"][0])
+    assert (root / f"data/h200_sxm/gemm/vllm/{literal}").is_dir()
+
+
+def test_an_alias_the_pinned_policy_does_not_define_is_an_error(tree, tmp_path):  # noqa: F811
+    published = tmp_path / "published"
+    _build(tree, published)
+    with pytest.raises(MissingDataError, match="no 'next' version"):  # a frozen-baseline system has no next slot
+        ensure_data({**CONFIG, "backend_version": "next"}, _pin(published, tmp_path))
+
+
+def test_the_hf_pin_resolves_an_omitted_version_from_the_fetched_policy(tree, tmp_path):  # noqa: F811
+    from .test_fetch import FakeTransport
+
+    published = tmp_path / "published"
+    _build(tree, published)
+    pin = DataPin(repo="org/dataset", revision="a" * 40, categories=("op-latency",), cache_dir=tmp_path / "cache")
+    config = {k: v for k, v in CONFIG.items() if k != "backend_version"}
+    out = ensure_data(config, pin, transport=FakeTransport(_tree_files(published)))
+    assert out.config["backend_version"] == "2.0"
+    assert (Path(out.config["systems_paths"][0]) / "data/h200_sxm/gemm/vllm/2.0").is_dir()

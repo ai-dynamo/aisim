@@ -622,6 +622,36 @@ def load_category_index(
     return sha, index, dataset
 
 
+def fetch_support(
+    category: Category,
+    *,
+    repo: str,
+    revision: str,
+    transport: Transport | None = None,
+    cache: Cache | None = None,
+    offline: bool = False,
+) -> tuple[str, CategoryIndex, dict[str, Path]]:
+    """Read a category index and fetch only its ``support`` files (a few KB), verified.
+
+    Returns ``(full_sha, category_index, {dataset path: local file})``. Use it for policy a selection depends on
+    (the op-latency version slots) before any entry is chosen.
+    """
+    cache = cache or Cache()
+    sha, index, _ = load_category_index(
+        category, repo=repo, revision=revision, transport=transport, cache=cache, offline=offline
+    )
+    paths: dict[str, Path] = {}
+    for artifact in index.support:
+        ref = _ref(artifact, "artifact")
+        if not cache.valid(repo, sha, ref.path, ref):
+            if offline or transport is None:
+                raise OfflineMissingError([ref.path])
+            cache.discard(repo, sha, ref.path)
+            cache.store(repo, sha, ref.path, transport.open_file(repo, sha, ref.path), ref)
+        paths[ref.path] = cache.path_for(repo, sha, ref.path)
+    return sha, index, paths
+
+
 def clear_cache(cache: Cache, repo: str, sha: str) -> None:
     """Remove one commit's cached files."""
     shutil.rmtree(cache.commit_root(repo, sha), ignore_errors=True)

@@ -164,3 +164,12 @@ def test_check_manifest_accepts_fpm_execution_profile_only(tmp_path, files):
     assert check_manifest(root, "fpm/m1/manifest.json").category == "fpm"
     doc = json.loads(files["fpm/m1/manifest.json"])
     assert Manifest.model_validate(doc).category == "fpm"
+
+
+def test_the_over_budget_command_keeps_the_pinned_configuration_id(tmp_path, files):
+    index = json.loads(files["catalog/fpm.json"])
+    ids = [e["configuration_id"] for e in index["entries"]]
+    assert len(ids) == 2  # both models match the hardware, so a command without the ID would fetch both
+    with pytest.raises(DataTooLargeError) as e:
+        ensure_data(CONFIG, pin(tmp_path, max_bytes=1, configuration_id=ids[0]), transport=FakeTransport(files))
+    assert f"--configuration {ids[0]}" in str(e.value) and ids[1] not in str(e.value)
