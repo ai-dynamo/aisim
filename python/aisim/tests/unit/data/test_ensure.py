@@ -40,8 +40,9 @@ def stub_prepare(monkeypatch):
         calls.append(output_dir)
         manifest = self.read_manifest(root, manifest_path, config)
         output_dir.mkdir(parents=True)
-        profile = next(a for a in manifest.artifacts if a.role == "execution-profile")
-        shutil.copyfile(root / profile.path, output_dir / "profile.json")
+        profile = next((a for a in manifest.artifacts if a.role == "execution-profile"), None)
+        if profile is not None:
+            shutil.copyfile(root / profile.path, output_dir / "profile.json")
         for artifact in manifest.artifacts:
             if artifact.runtime_path is not None:
                 target = output_dir / "systems" / artifact.runtime_path
@@ -52,7 +53,12 @@ def stub_prepare(monkeypatch):
             "estimation_mode": "op_level",
             "enable_shared_layer": False,
             "estimator_config": {
-                "op_level": {"execution_profile": {"path": str(output_dir / "profile.json"), "sha256": profile.sha256}},
+                "op_level": {
+                    "execution_profile": {
+                        "path": str(output_dir / "profile.json"),
+                        "sha256": profile.sha256 if profile is not None else "f" * 64,
+                    }
+                },
                 "correction": {"enabled": False},
             },
         }
