@@ -233,10 +233,12 @@ image reference, the OS ID and version, the native build packages, and storage
 endpoint/repository. The native build packages are the job's `apt-get`
 prerequisites except `gh`, plus every installed package they depend on: the
 compilers, linker, glibc, kernel headers, libclang, protoc, CMake, and linked
-libraries. Each is keyed by its upstream version. Ubuntu security and stable
-updates that only change the packaging revision (`255.4-1ubuntu8.19`, or the
-`ubuntuN`/`buildN` suffix of a native package) keep the key, as do packages the
-build cannot reach. The full `dpkg` inventory and its hash are recorded outside
+libraries. Each is keyed by its full installed version, including epochs and
+Ubuntu packaging revisions: security and stable updates can change headers,
+compilers, or libraries without changing the upstream version. For example,
+`linux-libc-dev` `6.8.0-149.149` and `6.8.0-151.151` ship different public
+headers and must use different keys. Packages the build cannot reach keep the
+key. The full `dpkg` inventory and its hash are recorded outside
 the key in `rc-build-environment.json` in the job's `readme-rc-build-inputs`
 artifact. A changed key or expired manifest rebuilds
 the bundle. Cross-run reuse accepts successful Full CI producers from this

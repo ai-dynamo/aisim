@@ -1275,20 +1275,15 @@ def test_rc_wheels_build_recipe_changes_invalidate_reuse(tmp_path, monkeypatch, 
 @pytest.mark.parametrize(
     "changes",
     [
-        # Ubuntu revisions published on 2026-11-19 that split the old inventory key three ways.
-        {"linux-libc-dev": "6.8.0-151.151"},
-        dict.fromkeys(("libudev-dev", "libudev1", "systemd"), "255.4-1ubuntu8.19"),
-        {"libc6": "2.39-0ubuntu8.13", "libc6-dev": "2.39-0ubuntu8.13"},
-        {"gcc-13": "13.3.0-6ubuntu2~24.04.2", "binutils": "2.42-4ubuntu2.11"},
-        {"dpkg-dev": "1.22.6ubuntu6.7", "build-essential": "12.10ubuntu1.1"},
         # Packages the build cannot reach, and a removed package's leftover record.
         {"gh": "2.83.0-1"},
+        {"systemd": "255.4-1ubuntu8.19"},
         {"tzdata": "2026a-0ubuntu0.24.04.1"},
         {"libc-dev-bin": "2.40-1ubuntu1"},
     ],
-    ids=["kernel-headers", "systemd", "glibc", "toolchain", "native", "gh", "tzdata", "removed"],
+    ids=["gh", "systemd", "tzdata", "removed"],
 )
-def test_rc_wheels_key_ignores_ubuntu_revisions_and_unrelated_packages(tmp_path, monkeypatch, changes):
+def test_rc_wheels_key_ignores_unrelated_packages(tmp_path, monkeypatch, changes):
     packages = _rc_dpkg_database()
     os_release = _fake_rc_runner(tmp_path, monkeypatch, packages)
     original, evidence = _rc_key(tmp_path), rc_wheels.environment()
@@ -1302,6 +1297,50 @@ def test_rc_wheels_key_ignores_ubuntu_revisions_and_unrelated_packages(tmp_path,
     os_release.write_text(RC_OS_RELEASE.replace("24.04.3", "24.04.4"))
     assert _rc_key(tmp_path) == original
     assert rc_wheels.environment()["os_release_sha256"] != evidence["os_release_sha256"]
+
+
+def test_rc_wheels_kernel_header_revision_pair_invalidates_cached_build(tmp_path, monkeypatch):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = rc_wheels.identity(tmp_path)
+    assert packages["linux-libc-dev"][0] == "6.8.0-149.149"
+    (tmp_path / "rc-build-inputs.json").write_text(json.dumps(original))
+
+    # This Ubuntu revision pair changes public headers despite the same upstream version.
+    packages["linux-libc-dev"] = ("6.8.0-151.151", *packages["linux-libc-dev"][1:])
+    changed = rc_wheels.identity(tmp_path)
+    assert rc_wheels.handoff_name(changed) != rc_wheels.handoff_name(original)
+    assert original["image"]["build_packages"]["linux-libc-dev"] == "6.8.0-149.149"
+    assert changed["image"]["build_packages"]["linux-libc-dev"] == "6.8.0-151.151"
+    with pytest.raises(ValueError, match="build inputs"):
+        rc_wheels.verify(tmp_path, changed)
+
+
+@pytest.mark.parametrize(
+    ("package", "version"),
+    [
+        ("libudev-dev", "255.4-1ubuntu8.19"),
+        ("libudev1", "255.4-1ubuntu8.19"),
+        ("libc6", "2.39-0ubuntu8.13"),
+        ("libc6-dev", "2.39-0ubuntu8.13"),
+        ("gcc-13", "13.3.0-6ubuntu2~24.04.2"),
+        ("libstdc++-13-dev", "13.3.0-6ubuntu2~24.04.2"),
+        ("binutils", "2.42-4ubuntu2.11"),
+        ("dpkg-dev", "1.22.6ubuntu6.7"),
+        ("build-essential", "12.10ubuntu1.1"),
+        ("libclang-18-dev", "1:18.1.3-1ubuntu2"),
+        ("libprotoc32t64", "3.21.12-8.2ubuntu0.5"),
+        ("cmake", "3.28.3-1build8"),
+        ("pkgconf", "1.8.1-2build2"),
+        ("libhwloc15", "2.10.0-1build2"),
+    ],
+)
+def test_rc_wheels_native_package_revision_changes_invalidate_reuse(tmp_path, monkeypatch, package, version):
+    packages = _rc_dpkg_database()
+    _fake_rc_runner(tmp_path, monkeypatch, packages)
+    original = _rc_key(tmp_path)
+    packages[package] = (version, *packages[package][1:])
+    assert _rc_key(tmp_path) != original
 
 
 @pytest.mark.parametrize(

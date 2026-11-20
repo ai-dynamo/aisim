@@ -40,20 +40,10 @@ BUILD_PACKAGES = (
 INVENTORY_FORMAT = "${Package}=${Version}\\n"
 DEPENDENCY_FORMAT = "${db:Status-Abbrev}\t${Package}\t${Version}\t${Provides}\t${Pre-Depends}, ${Depends}\\n"
 PACKAGE_NAME = re.compile(r"(?:^|[,|])\s*([a-z0-9][a-z0-9+.-]+)")
-NATIVE_REVISION = re.compile(r"(?:ubuntu|build)[0-9.]+$")
-
-
-def upstream_version(version: str) -> str:
-    """Drop Ubuntu packaging revisions; security and stable updates keep the upstream ABI."""
-    upstream, separator, _revision = version.rpartition("-")
-    if separator:
-        return upstream
-    # Native packages carry their Ubuntu revision as an ubuntuN or buildN suffix.
-    return NATIVE_REVISION.sub("", version)
 
 
 def build_packages(roots: tuple[str, ...] = BUILD_PACKAGES) -> dict[str, str]:
-    """Upstream versions of the build prerequisites and every installed package they depend on.
+    """Full versions of the build prerequisites and every installed package they depend on.
 
     The closure follows Pre-Depends and Depends (all installed alternatives and
     providers), so meta packages resolve to the compiler, linker, C library,
@@ -67,7 +57,7 @@ def build_packages(roots: tuple[str, ...] = BUILD_PACKAGES) -> dict[str, str]:
         status, name, version, provides, requires = line.split("\t")
         if status[1:2] != "i":
             continue  # Removed packages keep dpkg records but cannot affect the build.
-        versions.setdefault(name, set()).add(upstream_version(version))
+        versions.setdefault(name, set()).add(version)
         requirements.setdefault(name, set()).update(PACKAGE_NAME.findall(requires))
         for provided in PACKAGE_NAME.findall(provides):
             providers.setdefault(provided, set()).add(name)
@@ -116,9 +106,9 @@ def identity(root: Path = ROOT) -> dict:
     if not image_reference or any(character in image_reference for character in "\r\n"):
         raise ValueError("RC job image must be identified")
     # Fingerprint what can change the wheels after the native prerequisites
-    # are installed: the OS release and the upstream versions of the toolchain
-    # and libraries. Ubuntu revision updates and unrelated packages keep the
-    # key; environment() records the full inventory for diagnosis.
+    # are installed: the OS release and the full versions of the toolchain
+    # and libraries. Packaging revisions can change native build inputs.
+    # Unrelated packages keep the key; environment() records the full inventory.
     image = {
         "reference": image_reference,
         "os": os_release(),
