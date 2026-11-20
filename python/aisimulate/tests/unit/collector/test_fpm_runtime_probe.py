@@ -1908,19 +1908,25 @@ def test_k31_flashmla_checkpoint_dtype_is_checked_before_launch(tmp_path, dtype,
     assert not marker.exists()
 
 
-def test_k31_probe_rejects_conflicting_singleton_outer_identity(tmp_path):
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_k31_probe_rejects_conflicting_singleton_outer_identity(tmp_path, conflicting):
     from collector.fpm_forward.runtime_instrumentation import load_instrumentation
     from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
 
     launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
     model = Path(launch["model_config"]["path"])
     config = json.loads(model.read_text())
-    config["architectures"] = ["OtherModel"]
-    config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    config["architectures"] = ["OtherModel" if conflicting else "KimiK31ForConditionalGeneration"]
+    config["text_config"]["architectures"] = [
+        "KimiK31ForConditionalGeneration" if conflicting else "KimiK3ForConditionalGeneration"
+    ]
     model.write_text(json.dumps(config))
     launch["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
-    with pytest.raises(ValueError, match="top-level architecture identity"):
-        build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    if conflicting:
+        with pytest.raises(ValueError, match="top-level architecture identity"):
+            build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    else:
+        assert build_runtime_probe_plan("k31", launch, load_instrumentation(manifest)).cells
 
 
 @pytest.mark.parametrize("interrupt", [False, True])

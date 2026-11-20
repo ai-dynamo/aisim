@@ -2260,7 +2260,8 @@ def test_native_aggregation_preserves_iteration_totals(tmp_path):
 
 
 @pytest.mark.parametrize("architectures", [["KimiK31ForConditionalGeneration"], None, [], ["OtherModel"]])
-def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path, architectures):
+@pytest.mark.parametrize("decoder", [None, "KimiK3ForConditionalGeneration"])
+def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path, architectures, decoder):
     _, _, cell_dir = _synthetic_plan_and_cell(tmp_path)
     config_path, _ = _kimi_k31_config(tmp_path)
     config = json.loads(config_path.read_text())
@@ -2270,27 +2271,38 @@ def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(t
         config["architectures"] = architectures
     if architectures != ["KimiK31ForConditionalGeneration"]:
         config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    elif decoder is not None:
+        config["text_config"]["architectures"] = [decoder]
     config_path.write_text(json.dumps(config))
-    plan = build_collection_plan(
-        backend="vllm",
-        model_path=str(tmp_path),
-        model_config_path=str(config_path),
-        system="b200_sxm",
-        selected_ops=set(),
-        has_model_cases=False,
-        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
-        options=FPMCollectionOptions.from_args(
-            _args(
-                fpm_gpu_counts=[2],
-                fpm_tp_sizes=[1],
-                fpm_dp_sizes=[2],
-                fpm_moe_tp_sizes=[1],
-                fpm_moe_ep_sizes=[2],
-                fpm_kv_cache_dtypes=["fp8"],
-                fpm_attention_backend="flashmla",
-            )
-        ),
-    )
+
+    def build():
+        return build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(config_path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(
+                _args(
+                    fpm_gpu_counts=[2],
+                    fpm_tp_sizes=[1],
+                    fpm_dp_sizes=[2],
+                    fpm_moe_tp_sizes=[1],
+                    fpm_moe_ep_sizes=[2],
+                    fpm_kv_cache_dtypes=["fp8"],
+                    fpm_attention_backend="flashmla",
+                )
+            ),
+        )
+
+    if architectures != ["KimiK31ForConditionalGeneration"]:
+        with pytest.raises(ValueError, match="top-level architecture identity"):
+            build()
+        return
+    plan = build()
+
     cell = next(cell for cell in plan.cells if cell.workload_kind == "prefill")
     assert cell.moe_quant_mode == "w4a16_mxfp4"
     assert plan.fpm_profile is None and plan.runtime_instrumentation is None
@@ -4200,24 +4212,25 @@ def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marke
 
 
 @pytest.mark.parametrize("outer", [None, []])
-def test_k31_planning_accepts_null_outer_architecture(tmp_path, outer):
+def test_k31_planning_rejects_null_outer_architecture(tmp_path, outer):
     path, _ = _kimi_k31_config(tmp_path)
     config = json.loads(path.read_text())
     config["architectures"] = outer
     config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
     path.write_text(json.dumps(config))
-    plan = build_collection_plan(
-        backend="vllm",
-        model_path=str(tmp_path),
-        model_config_path=str(path),
-        system="b200_sxm",
-        selected_ops=set(),
-        has_model_cases=False,
-        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
-        options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend="flashmla")),
-    )
-    assert plan.capability.architecture == "KimiK31ForConditionalGeneration"
-    assert plan.cells
+    with pytest.raises(ValueError, match="top-level architecture identity"):
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(
+                _args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend="flashmla")
+            ),
+        )
 
 
 @pytest.mark.parametrize(
