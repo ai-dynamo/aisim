@@ -790,15 +790,15 @@ Guard ownership and custom policies are not modeled.
 With `kvcr.g3`, each rank also has a disk cache that KVCR owns: a block that
 KVCR-owned memory evicts is written there instead of dropped, and a lookup
 that misses G2 and that memory reads it back into G2. With `g3`, the
-`local_g2.policy` values `lru` and `fifo` stand for KVCR's `g3_lru` and
+`local_g2.policy` values `lru` and `fifo` stand for vLLM's `g3_lru` and
 `g3_fifo`.
 
 - **Write.** KVCR writes one block at a time. A block of a completed G2 store
   that finds KVCR-owned memory full waits for the write that frees its slot,
   up to `spill_timeout_ms`; after that it stays in G2 only. A write still
   running at that point fails and its block is dropped. A rank sees a
-  finished write when its pass ends, so a busy rank admits at most one waiting
-  block per pass. While a block waits, G2 cannot evict any block of its
+  finished write when its pass ends, so a busy rank finishes at most one
+  write per pass. While a block waits, G2 cannot evict any block of its
   store, so a long `spill_timeout_ms` with a slow disk can hold most of G2.
 - **Evict.** A full disk drops a block by the memory's policy, never one
   being read; when all are being read, the block memory evicts is dropped
