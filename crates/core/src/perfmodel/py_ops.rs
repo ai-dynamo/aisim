@@ -3056,7 +3056,7 @@ impl PyKDAKernel {
     const _ENGINE_QUERY_SHAPE: &'static str = "module";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, kernel_source, phase, d_model, num_k_heads, head_k_dim, num_v_heads, head_v_dim, d_conv, seq_split=1, draft_tokens=0))]
+    #[pyo3(signature = (name, scale_factor, kernel_source, phase, d_model, num_k_heads, head_k_dim, num_v_heads, head_v_dim, d_conv, seq_split=1, draft_tokens=0, recurrent_state_dtype=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
@@ -3071,6 +3071,7 @@ impl PyKDAKernel {
         d_conv: u32,
         seq_split: u32,
         draft_tokens: i64,
+        recurrent_state_dtype: Option<String>,
     ) -> PyResult<(Self, PyOperation)> {
         cp_audit_gate("KDAKernel", false, seq_split)?;
         let inner = Op::Kda(crate::operators::KdaOp {
@@ -3085,6 +3086,7 @@ impl PyKDAKernel {
             num_v_heads,
             head_v_dim,
             draft_tokens,
+            recurrent_state_dtype,
         });
         Ok((PyKDAKernel, PyOperation { inner }))
     }
@@ -3109,6 +3111,7 @@ impl PyKDAKernel {
             .into_pyobject(py)?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("draft_tokens", o.draft_tokens)?;
+        kwargs.set_item("recurrent_state_dtype", o.recurrent_state_dtype.clone())?;
         Ok((args, kwargs))
     }
 
@@ -3131,6 +3134,11 @@ impl PyKDAKernel {
     #[getter(_d_model)]
     fn d_model(slf: PyRef<'_, Self>) -> PyResult<u32> {
         Ok(slf.as_super().kda()?.d_model)
+    }
+
+    #[getter(_recurrent_state_dtype)]
+    fn recurrent_state_dtype(slf: PyRef<'_, Self>) -> PyResult<Option<String>> {
+        Ok(slf.as_super().kda()?.recurrent_state_dtype.clone())
     }
 
     #[getter(_draft_tokens)]

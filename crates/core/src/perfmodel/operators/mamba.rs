@@ -285,6 +285,11 @@ pub struct KdaOp {
     /// Verify-phase token width (speculative block size + 1). Python sends
     /// `op._draft_tokens`; 0 outside verify.
     pub draft_tokens: i64,
+    /// Resolved recurrent cache dtype for FPM SOL. Profile compilation fills
+    /// this from runtime observations. None means unrecorded, including legacy
+    /// JSON; the op-level FP32 contract is unchanged. Never infer it from padding.
+    #[serde(default)]
+    pub recurrent_state_dtype: Option<String>,
 }
 
 impl KdaOp {
@@ -298,6 +303,19 @@ impl KdaOp {
         batch_size: f64,
         seq_len: f64,
     ) -> Result<f64, AicError> {
+        // The analytic byte model below is qualified only for FP32 recurrent
+        // state. vLLM's explicit BF16 override must not inherit that width.
+        // Its `auto` setting resolves to FP32 (KimiK3DeltaAttention.get_state_dtype
+        // -> MambaStateDtypeCalculator.kda_state_dtype at the audited runtime).
+        if !matches!(
+            self.recurrent_state_dtype.as_deref(),
+            Some("float32" | "auto")
+        ) {
+            return Err(AicError::SolNotImplemented(format!(
+                "forward_model='fpm' KDA SOL requires observed float32 recurrent state; got {:?}; use direct interpolation",
+                self.recurrent_state_dtype
+            )));
+        }
         if !matches!(
             self.kernel_source.as_str(),
             "causal_conv1d_fn_qkv3"
@@ -716,6 +734,7 @@ mod tests {
             num_v_heads: 16,
             head_v_dim: 128,
             draft_tokens,
+            recurrent_state_dtype: Some("float32".into()),
         }
     }
 
@@ -730,6 +749,29 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, AicError::SolNotImplemented(_)));
             assert!(error.to_string().contains("unknown_kda"));
+        }
+    }
+
+    #[test]
+    fn fpm_kda_sol_rejects_non_fp32_and_unrecorded_recurrent_state() {
+        let systems_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../python/aisimulate/src/aisimulate_core/systems");
+        let db = PerfDatabase::load(&systems_root, "gb300", "sglang", "0.5.14").unwrap();
+        for (phase, kernel) in [
+            ("context", "flashkda_fwd"),
+            ("generation", "fused_kda_decode"),
+        ] {
+            let mut op = kda_op(kernel, phase, 0);
+            for dtype in [None, Some("bfloat16"), Some("float16"), Some("invalid")] {
+                op.recurrent_state_dtype = dtype.map(str::to_owned);
+                let error = op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap_err();
+                assert!(matches!(error, AicError::SolNotImplemented(_)));
+                assert!(error.to_string().contains("float32 recurrent state"));
+            }
+            op.recurrent_state_dtype = Some("float32".into());
+            let fp32 = op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap();
+            op.recurrent_state_dtype = Some("auto".into());
+            assert_eq!(op.fpm_sol_latency_ms(&db, 2.0, 65.5).unwrap(), fp32);
         }
     }
 

@@ -1259,7 +1259,11 @@ def test_text_only_kimi_profile_preserves_encoder_weights_and_dcp_identity():
 
 
 @pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
-def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_path, attention_backend):
+@pytest.mark.parametrize("state_dtype", ["float32", "auto", "bfloat16", None])
+@pytest.mark.parametrize("provenance_kind", ["probe", "collection"])
+def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
+    tmp_path, attention_backend, state_dtype, provenance_kind
+):
     # Extend the repository's K3 fixture with independently declared sparse
     # geometry. Neither this config nor the synthetic timing anchors are a
     # redistributed K3.1 checkpoint or a measurement/qualification claim.
@@ -1303,6 +1307,14 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
         _row("decode", 4, 0, 4096, 18.0, model_path=str(checkpoint), identity=identity),
     ]
     parquet = _write_pair(str(tmp_path / "measured"), rows)
+    # Same envelope as the native probe and the final collection importer;
+    # values are synthetic declarations, not hardware observations.
+    state_provenance = {"runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": state_dtype}}}
+    if provenance_kind == "collection":
+        state_provenance = {
+            "source": "bound_collection_phases",
+            "phases": {"prefill": state_provenance, "decode": state_provenance},
+        }
     profile = {
         "schema_version": 1,
         "model": str(checkpoint),
@@ -1331,7 +1343,15 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                     "kv_bytes_per_token": 1,
                     "max_num_tokens": 128,
                     "max_batch_size": 4,
-                    "provenance": "Synthetic timing-only fixture; memory unresolved and not queried.",
+                    # Synthetic runtime settings, not native measurement or
+                    # a live-state accuracy claim. Memory is not queried here.
+                    "runtime_memory": {
+                        "kv_cache_bytes": 1024,
+                        "gpu_memory_utilization": 0.8,
+                        "max_model_len": 4096,
+                        "provenance": json.dumps(state_provenance),
+                    },
+                    "provenance": "Synthetic timing and dtype fixture; memory is not queried.",
                 },
             }
         ],
@@ -1389,16 +1409,12 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                 # Transfer utilization from batches 1 and 4 at total KV=4096:
                 # their per-request contexts (4096 and 1024) straddle top-k.
                 # This requires KDA SOL and distinguishes native DSA layouts.
-                transferred = predictor.estimate_forward_pass_time_ms(
-                    [
-                        {
-                            "scheduled_requests": {
-                                "num_decode_requests": 3,
-                                "sum_decode_kv_tokens": 4096,
-                            }
-                        }
-                    ]
-                )
+                transfer_metrics = [{"scheduled_requests": {"num_decode_requests": 3, "sum_decode_kv_tokens": 4096}}]
+                if state_dtype not in {"float32", "auto"}:
+                    with pytest.raises(PerfDataNotAvailableError, match="KDA SOL requires observed float32"):
+                        predictor.estimate_forward_pass_time_ms(transfer_metrics)
+                    continue
+                transferred = predictor.estimate_forward_pass_time_ms(transfer_metrics)
                 # Independent hand ledger, in ms on H200 (HBM=4.8e12 B/s,
                 # link=450e9 B/s), summed from this fixture's graph geometry:
                 # batch        other ops          KDA       DSA FlashMLA / TRT
@@ -1427,10 +1443,33 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(tmp_pa
                     "trtllm_mla": 15.947446285187084,
                 }
                 assert transferred == pytest.approx(expected_transfer[attention_backend], rel=1e-10)
+            # Direct interpolation never asks for a KDA roofline, even with
+            # explicit BF16 or absent runtime dtype evidence.
+            resolved["estimator_config"]["fpm_interpolation"]["method"] = "direct"
+            direct = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**resolved))
+            try:
+                assert direct.estimate_forward_pass_time_ms(
+                    [{"scheduled_requests": {"num_decode_requests": 1, "sum_decode_kv_tokens": 256}}]
+                ) == pytest.approx(3.0 + 2.0 / 3.0)
+            finally:
+                direct.close()
         finally:
             restored.close()
     finally:
         model.close()
+
+
+@pytest.mark.parametrize("dtype", [None, "float32", "bfloat16"])
+def test_kda_recurrent_dtype_survives_native_pickle_and_spec_roundtrip(dtype):
+    import pickle
+
+    import aisimulate_core
+    from aisimulate_core.sdk.operations import KDAKernel
+
+    op = KDAKernel("kda", 1, "flashkda_fwd", "context", 4096, 16, 128, 16, 128, 4, recurrent_state_dtype=dtype)
+    for restored in (pickle.loads(pickle.dumps(op)), aisimulate_core.op_from_spec_json(op._spec_json())):
+        assert restored._recurrent_state_dtype == dtype
+        assert json.loads(restored._spec_json())["Kda"]["recurrent_state_dtype"] == dtype
 
 
 @pytest.fixture

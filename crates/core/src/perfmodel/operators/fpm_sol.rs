@@ -793,6 +793,7 @@ mod tests {
             num_v_heads: 96,
             head_v_dim: 128,
             draft_tokens: 0,
+            recurrent_state_dtype: Some("float32".into()),
         });
         // 129 tokens over two requests => s=64.5, one 64-token state chunk.
         // KDA's documented byte model reads/writes 15,851,520 token bytes,
@@ -819,6 +820,7 @@ mod tests {
             num_v_heads: 12,
             head_v_dim: 128,
             draft_tokens: 0,
+            recurrent_state_dtype: Some("float32".into()),
         };
         // TP8, batch=3: fused conv moves 165,888 bytes; recurrent tokens
         // move 46,080 bytes and fp32 state moves 4,718,592 bytes.

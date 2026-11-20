@@ -163,6 +163,7 @@ from aisimulate_core.sdk.rust_engine_step import (
 #   concurrently with AIC-1781; renumbered after GLM-5.3-Flash at the merge.
 # - 30 (Kimi K3.1 DSA): explicit sparse attention backend/cache layout appended
 #   to DsaModuleOp; legacy JSON defaults do not cover positional bincode.
+# - 31 (KDA FPM state precision): observed recurrent dtype appended to KdaOp.
 # Single owner: the Rust crate constant. Python re-exports it for
 # diagnostics/tests instead of declaring a twin to keep in sync.
 ENGINE_SPEC_SCHEMA_VERSION = aisimulate_core.engine_spec_schema_version()
@@ -178,6 +179,56 @@ class OpConversionError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # Op -> wire. Ops are Rust objects; conversion is delegated to the engine.
 # --------------------------------------------------------------------------- #
+
+
+def _bind_fpm_kda_state_dtype(spec: dict, deployment: FpmDeploymentProfile) -> None:
+    """Carry the selected deployment's recorded state precision into SOL ops.
+
+    The runtime observation importer retains the complete resolved cache
+    configuration in runtime_memory.provenance. Missing evidence remains
+    unknown; the Rust SOL boundary decides which precisions it can price.
+    """
+    kda_ops = []
+
+    def collect(value):
+        if isinstance(value, list):
+            for child in value:
+                collect(child)
+        elif isinstance(value, dict):
+            if "Kda" in value:
+                kda_ops.append(value["Kda"])
+            else:
+                for child in value.values():
+                    collect(child)
+
+    collect(spec["context_ops"])
+    collect(spec["generation_ops"])
+    if not kda_ops:
+        return
+
+    runtime = deployment.resources.runtime_memory
+    dtype = None
+    if runtime is not None:
+        try:
+            evidence = json.loads(runtime.provenance)
+        except (ValueError, TypeError):
+            evidence = None
+        if isinstance(evidence, dict):
+            # A completed collection wraps each phase's imported provenance;
+            # the accepted probe retains a single runtime_settings object.
+            observations = [evidence]
+            if evidence.get("source") == "bound_collection_phases":
+                phases = evidence.get("phases")
+                observations = list(phases.values()) if isinstance(phases, dict) else []
+            recorded = []
+            for observation in observations:
+                settings = observation.get("runtime_settings") if isinstance(observation, dict) else None
+                cache = settings.get("cache_config") if isinstance(settings, dict) else None
+                recorded.append(cache.get("mamba_ssm_cache_dtype") if isinstance(cache, dict) else None)
+            if recorded and isinstance(recorded[0], str) and all(value == recorded[0] for value in recorded):
+                dtype = recorded[0]
+    for op in kda_ops:
+        op["recurrent_state_dtype"] = dtype
 
 
 def _fpm_spec_dict(op: FPMForwardOp) -> dict:
@@ -769,6 +820,8 @@ def compile_engine(
         )
         if deployment.worker_type is not None:
             spec["engine"]["extra"]["worker_type"] = worker_type
+        if forward_model == "fpm":
+            _bind_fpm_kda_state_dtype(spec, deployment)
         spec_json = json.dumps(spec)
 
     return bytes(aisimulate_core.engine_spec_bincode_from_json(spec_json))

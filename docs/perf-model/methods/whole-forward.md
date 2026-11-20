@@ -63,6 +63,15 @@ explicitly to compile the language graph; omitting it preserves existing
 their MLA fallback graph does not support SOL transfer. Encoder-resident weights
 are not silently removed.
 
+KDA SOL transfer currently supports FP32 recurrent state only. Profile compilation
+carries `mamba_ssm_cache_dtype` from the imported runtime memory provenance into
+the analytical graph; the audited runtime's `auto` setting resolves to FP32.
+An explicit BF16 state or missing dtype evidence raises `SolNotImplemented`
+when a query needs KDA SOL, rather than charging four bytes for a BF16 element.
+Exact measured hits and measured-only `method: direct` interpolation do not
+need this roofline. Physical page padding and cache capacity never determine
+the recurrent element width.
+
 ## Hybrid FPM/OP deprecation and migration
 
 The legacy `forward_model="fpm"` route that combines an autoregressive target

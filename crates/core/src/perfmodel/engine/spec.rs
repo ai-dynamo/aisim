@@ -637,6 +637,7 @@ mod tests {
             num_v_heads: 16,
             head_v_dim: 128,
             draft_tokens: 4,
+            recurrent_state_dtype: Some("bfloat16".into()),
         }
     }
 
@@ -1516,6 +1517,47 @@ mod tests {
                 panic!("expected UnsupportedSchemaVersion for a v13 GDN payload, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn kda_recurrent_dtype_survives_json_and_bincode_roundtrips() {
+        for dtype in [None, Some("bfloat16"), Some("float32")] {
+            let mut op = kda();
+            op.recurrent_state_dtype = dtype.map(str::to_owned);
+            let spec = EngineSpec::new(sample_engine_config(), vec![], vec![OpSpec::Kda(op)]);
+            let json = serde_json::to_string(&spec).unwrap();
+            let restored: EngineSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, spec);
+            assert_eq!(
+                EngineSpec::from_bincode(&restored.to_bincode().unwrap()).unwrap(),
+                spec
+            );
+        }
+        let mut legacy = serde_json::to_value(kda()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("recurrent_state_dtype");
+        let restored: KdaOp = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.recurrent_state_dtype, None);
+    }
+
+    #[test]
+    fn from_bincode_rejects_v30_kda_producer_at_the_version_gate() {
+        // Schema 30 predates the recurrent dtype. The gate must reject it
+        // before attempting positional op decoding, even for a truncated op.
+        let spec = EngineSpec::new(sample_engine_config(), vec![], vec![OpSpec::Kda(kda())]);
+        let mut bytes = spec.to_bincode().unwrap();
+        bytes[..4].copy_from_slice(&30u32.to_le_bytes());
+        bytes.truncate(bytes.len() - 8);
+        assert!(matches!(
+            EngineSpec::from_bincode(&bytes),
+            Err(AicError::UnsupportedSchemaVersion {
+                kind: "EngineSpec",
+                got: 30,
+                expected: ENGINE_SPEC_SCHEMA_VERSION,
+            })
+        ));
     }
 
     /// A correct version but an undecodable op payload is NOT a version skew: it
