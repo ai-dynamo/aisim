@@ -78,7 +78,10 @@ def inputs(tmp_path, monkeypatch, request):
     phase["launch_manifest"]["sha256"] = _write(context_path, context)["sha256"]
     if packed_indexer:
         cache, scheduled = [
-            _decoder_cache_names(value) for value in _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=576)
+            _decoder_cache_names(value)
+            for value in _kernel_view_fixture(
+                monkeypatch, indexer_width=132, mla_width=656 if attention_backend == "flashmla" else 576
+            )
         ]
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
@@ -795,3 +798,42 @@ def test_onboarding_wrapper_does_not_bypass_native_validator(inputs):
     onboarding_wrapper(inputs)
     with pytest.raises(ValueError, match="worker warmup and graph capture completion evidence is missing"):
         bind(inputs)
+
+
+@pytest.mark.parametrize("inputs", ["trtllm_mla", "prefill"], indirect=True)
+@pytest.mark.parametrize("switch", [None, "on", "off", "OFF", "0", "false", "FaLsE"])
+def test_native_state_rendering_checks_decode_warmup_before_scheduling(inputs, switch):
+    from collector.fpm_forward import runner
+
+    base = runtime_probe.probe_generator_overrides(inputs["runtime_launch"])
+    plan = planner.build_collection_plan(
+        backend=inputs["backend"],
+        model_path=inputs["model_path"],
+        system=inputs["system"],
+        selected_ops=set(),
+        options=inputs["options"],
+        has_model_cases=False,
+        model_config_path=inputs["runtime_launch"]["model_config"]["path"],
+        fpm_profile=inputs["profile"],
+        runtime_instrumentation=inputs["runtime_instrumentation"],
+        runtime_launch=inputs["runtime_launch"],
+        generator_overrides=base,
+    )
+    if switch is not None:
+        environment = base.setdefault("K8sConfig", {}).setdefault("extra_env", [])
+        environment[:] = [item for item in environment if item["name"] != "DYN_BENCH_KV_WARMUP"]
+        environment.append({"name": "DYN_BENCH_KV_WARMUP", "value": switch})
+    for cell in plan.cells:
+        disabled_decode = (
+            cell.workload_kind == "decode" and switch is not None and switch.lower() in {"off", "0", "false"}
+        )
+        if disabled_decode:
+            with pytest.raises(ValueError, match="requires DYN_BENCH_KV_WARMUP enabled"):
+                runner._cell_generator_overrides(plan, cell, base)
+        else:
+            generated = runner._cell_generator_overrides(plan, cell, base)
+            assert "--no-enable-prefix-caching" in generated["params"]["agg"]["extra_cli_args"]
+            assert runner._decode_prefix_caching_mode(cell, plan) == "disabled"
+            # This source-bound TP2 / EP1 plan uses native state seeding even
+            # though older runtimes skipped balanced TP-only MoE warm-up.
+            assert cell.topology.tp == 2 and cell.topology.moe_ep == 1

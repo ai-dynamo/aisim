@@ -81,7 +81,12 @@ def _fixture(monkeypatch):
         "vllm/models/kimi_k3/common/dsa_cache.py": "pinned-fixture",
         "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py": "pinned-fixture",
     }
-    return observer, SimpleNamespace(model_runner=runner), cache, sources, indexer, mla
+    context = {"mla.0": SimpleNamespace(impl=SimpleNamespace(use_prims_ts=False))}
+    owner = SimpleNamespace(
+        model_runner=runner,
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context=context)),
+    )
+    return observer, owner, cache, sources, indexer, mla
 
 
 def test_reads_initialized_kernel_mapping_without_constructing_views(monkeypatch):
@@ -137,6 +142,25 @@ def test_rejects_duplicate_and_uncovered_backend_layers(monkeypatch):
     mla.layer_names = ["indexer.0"]
     with pytest.raises(ValueError, match="coverage is inconsistent"):
         observer.attention_groups(owner, cache, sources)
-    mla.layer_names = []
+    owner.model_runner.attn_groups[0].remove(mla)
     with pytest.raises(ValueError, match="do not cover"):
         observer.attention_groups(owner, cache, sources)
+
+
+@pytest.mark.parametrize("prims", [False, True, None])
+def test_observer_records_initialized_launcher_in_groups_and_kernel_views(monkeypatch, prims):
+    observer, owner, cache, sources, _, mla = _fixture(monkeypatch)
+    owner.vllm_config.compilation_config.static_forward_context["mla.0"].impl.use_prims_ts = prims
+    mla.kernel_block_stride = 1
+    mla.kernel_block_size = 2048
+    mla.kernel_block_offsets = _Offsets([0])
+    mla.kernel_block_table = SimpleNamespace(shape=(1, 8, 128), dtype="torch.int32")
+    mla.maps_slot_mapping = False
+    if prims is None:
+        with pytest.raises(ValueError, match="launcher is unresolved"):
+            observer.attention_groups(owner, cache, sources)
+    else:
+        observer.attention_groups(owner, cache, sources)
+        launcher = "prims_ts" if prims else "trtllm"
+        assert cache["attention_groups"][1]["launcher"] == launcher
+        assert cache["kernel_block_views"]["mla.0"]["launcher"] == launcher

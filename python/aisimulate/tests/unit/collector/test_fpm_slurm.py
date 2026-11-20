@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -941,3 +944,79 @@ def test_attempt_provenance_uses_configured_interpreter_path(runner, tmp_path, m
     monkeypatch.setattr(runner, "_exec", execute)
     runner.prepare_attempt(["node0000"], cell_id="cell", plan_sha256="plan", attempt_id="attempt")
     assert calls == ["selected-runtime-python\n"]
+
+
+def test_version_probe_and_attempt_provenance_share_startup_environment(runner, tmp_path, monkeypatch):
+    from collector.fpm_forward import runner as fpm_runner
+
+    from aisimulate.support import versioning
+    from aisimulate.support.schema import FPMDeployment
+
+    # Two runnable Python homes share the host stdlib but have independent
+    # site-packages and package metadata. PYTHONHOME can switch between them.
+    homes = []
+    for name, version in (("selected", "0.28.0"), ("other", "0.29.0")):
+        home = tmp_path / name
+        binary = home / "bin/python3"
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(sys._base_executable, binary)
+        library = home / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        library.mkdir(parents=True)
+        for item in Path(sysconfig.get_path("stdlib")).iterdir():
+            if item.name != "site-packages":
+                (library / item.name).symlink_to(item, target_is_directory=item.is_dir())
+        metadata = library / "site-packages" / f"vllm-{version}.dist-info"
+        metadata.mkdir(parents=True)
+        (metadata / "METADATA").write_text(f"Name: vllm\nVersion: {version}\n")
+        clean = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+        actual = subprocess.run(
+            [str(binary), "-c", versioning._PROBE], env=clean, check=True, capture_output=True, text=True
+        )
+        assert f'"backend_version": "{version}"' in actual.stdout
+        homes.append(home)
+    selected, other = homes
+    # Prove this non-allowlisted setting would change the metadata probe.
+    cross = subprocess.run(
+        [str(selected / "bin/python3"), "-c", versioning._PROBE],
+        env={**clean, "PYTHONHOME": str(other)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert '"backend_version": "0.29.0"' in cross.stdout
+    monkeypatch.delenv("PYTHONHOME", raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    environment = [
+        {"name": "PATH", "value": str(selected / "bin") + os.pathsep + os.environ["PATH"]},
+        {"name": "PYTHONHOME", "value": str(other)},
+    ]
+    deployment = FPMDeployment(executor="slurm", image="synthetic.sqsh", extra_env=environment)
+    run = subprocess.run
+
+    def probe(command, **kwargs):
+        return run(command[command.index("env") :], **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(versioning.subprocess, "run", probe)
+        detected = versioning.detect_runtime_versions(deployment)
+    assert detected["backend_version"] == "0.28.0"
+    fpm_runner._write_runtime_environment(runner.cell_dir, {"K8sConfig": {"extra_env": environment}})
+    assert "PYTHONHOME" not in (runner.cell_dir / fpm_runner.RUNTIME_ENV_FILENAME).read_text()
+    result_dir = tmp_path / "provenance"
+    result_dir.mkdir()
+
+    def execute(_unit, command, **kwargs):
+        command = [part.replace("/tmp/fpm-bench/", str(runner.cell_dir) + "/") for part in command]
+        command = [part.replace(fpm_runner.FPM_RESULTS_DIR, str(result_dir)) for part in command]
+        run(command, check=True, capture_output=True, text=True)
+
+    monkeypatch.setattr(runner, "_exec", execute)
+    runner.prepare_attempt(
+        ["node0000"],
+        cell_id="cell",
+        plan_sha256="plan",
+        attempt_id="attempt",
+        runtime_backend_version=detected["backend_version"],
+    )
+    provenance = json.loads((result_dir / fpm_runner.COLLECTOR_PROVENANCE_FILENAME).read_text())
+    assert provenance["runtime"]["backend_version"] == detected["backend_version"]

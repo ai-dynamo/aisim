@@ -429,12 +429,6 @@ def _validate_attention_backend(record: dict, launch: dict, config: dict) -> Non
         if record.get("attention_backend") != requested:
             raise ValueError("runtime observation lacks the selected attention backend evidence")
         return
-    # Pinned sparse backend supports_compute_capability contracts: FlashInfer
-    # TRTLLM requires SM10x; FlashMLA supports SM9x and SM10x.
-    sm = record.get("hardware", {}).get("sm")
-    supported_majors = {10} if native == "FLASHINFER_MLA_SPARSE" else {9, 10}
-    if type(sm) is not int or sm // 10 not in supported_majors:
-        raise ValueError("selected native K3.1 attention backend does not support the observed GPU SM")
     attention = config.get("attention_config", {})
     if attention.get("backend") != native or attention.get("indexer_kv_dtype") != "fp8":
         raise ValueError("runtime observation lacks the selected native K3.1 attention configuration")
@@ -442,6 +436,13 @@ def _validate_attention_backend(record: dict, launch: dict, config: dict) -> Non
     # attention groups. Rank-complete worker evidence is required by the importer.
     if record.get("kind") == "scheduler":
         return
+    # Pinned sparse backend supports_compute_capability contracts: FlashInfer
+    # TRTLLM requires SM10x; FlashMLA supports SM9x and SM10x. Only workers
+    # own GPUs and emit hardware observations.
+    sm = record.get("hardware", {}).get("sm")
+    supported_majors = {10} if native == "FLASHINFER_MLA_SPARSE" else {9, 10}
+    if type(sm) is not int or sm // 10 not in supported_majors:
+        raise ValueError("selected native K3.1 attention backend does not support the observed GPU SM")
     observed = record.get("attention_backend")
     names = [observed] if isinstance(observed, str) else observed
     # The pinned image's get_name() implementations report these auxiliary

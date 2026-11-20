@@ -392,7 +392,11 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         assert "--gpus=0" in calls[0][0]
         argv = calls[0][0]
         start, end = argv.index("env") + 1, argv.index("python3")
-        assert argv[start:end] == [f"{item['name']}={item['value']}" for item in environment or ()]
+        from collector.fpm_forward.config import FPM_RUNTIME_STARTUP_ENV
+
+        assert argv[start:end] == [
+            f"{item['name']}={item['value']}" for item in environment or () if item["name"] in FPM_RUNTIME_STARTUP_ENV
+        ]
     else:
         manifest = json.loads(next(payload for _, payload in calls if payload is not None))
         assert manifest["metadata"]["namespace"] == deployment.namespace

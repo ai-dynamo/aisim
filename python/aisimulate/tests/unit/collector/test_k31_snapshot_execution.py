@@ -134,7 +134,7 @@ def snapshot(request):
     index_path = Path(proof["observations_index"]["path"])
     root = index_path.parent
     if getattr(request, "param", False):
-        # A locally loaded Hub snapshot can omit HF's config commit hash.
+        # A Hub snapshot must retain its initialized config commit identity.
         launch = bound_inputs["runtime_launch"]
         revision = "a" * 40
         launch["identity"]["model_revision"] = revision
@@ -146,7 +146,7 @@ def snapshot(request):
                 model=f"/cache/models--{launch['identity']['model'].replace('/', '--')}/snapshots/{revision}",
                 revision=revision,
             )
-            model.pop("loaded_config_commit_hash", None)
+            model["loaded_config_commit_hash"] = revision
 
         _mutate(index_path, pinned_snapshot)
         from collector.fpm_forward.runtime_observations import validate_observations
@@ -192,7 +192,7 @@ def test_snapshot_identity_uses_revalidated_same_attempt_worker(snapshot):
     revision = "a" * 40
     public = plan.runtime_launch["identity"]["model"]
     model = {"model": f"/cache/models--{public.replace('/', '--')}/snapshots/{revision}", "revision": revision}
-    native = dict(model)
+    native = {**model, "loaded_config_commit_hash": revision}
     assert not execution_evidence._matches_pinned_hub_snapshot(public, model, {revision})
     assert execution_evidence._matches_pinned_hub_snapshot(public, model, {revision}, native)
 
@@ -634,7 +634,15 @@ def test_snapshot_identity_rejects_unbound_or_changed_native_evidence(snapshot, 
 
 
 @pytest.mark.parametrize(
-    "mutation", ["wrong_native_model", "wrong_native_dtype", "wrong_commit", "wrong_loaded_hash", "missing_none_field"]
+    "mutation",
+    [
+        "wrong_native_model",
+        "wrong_native_dtype",
+        "wrong_commit",
+        "wrong_loaded_hash",
+        "missing_none_field",
+        "missing_native_hash",
+    ],
 )
 def test_snapshot_alias_fallback_does_not_weaken_identity(snapshot, mutation):
     plan, _, _, _, _ = snapshot
@@ -645,8 +653,10 @@ def test_snapshot_alias_fallback_does_not_weaken_identity(snapshot, mutation):
         "revision": revision,
         "dtype": "torch.bfloat16",
     }
-    native = copy.deepcopy(model)
-    if mutation == "wrong_native_model":
+    native = {**copy.deepcopy(model), "loaded_config_commit_hash": revision}
+    if mutation == "missing_native_hash":
+        native.pop("loaded_config_commit_hash")
+    elif mutation == "wrong_native_model":
         native["model"] += "-other"
     elif mutation == "wrong_native_dtype":
         native["dtype"] = "torch.float16"
@@ -866,7 +876,9 @@ def test_hashless_hub_snapshot_alias_qualifies_only_with_bound_worker(native_exe
     for path in raw.glob("**/fpm-execution-worker-*.json"):
         model = json.loads(path.read_text())["resolved_config"]["model_config"]
         assert model["model"].endswith("/snapshots/" + "a" * 40)
-        assert "loaded_config_commit_hash" not in model
+        payload = json.loads(path.read_text())
+        payload["resolved_config"]["model_config"].pop("loaded_config_commit_hash")
+        path.write_text(json.dumps(payload))
     if not has_native_evidence:
         index_path.unlink()
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
@@ -957,3 +969,15 @@ def test_cell_acceptance_revalidates_archived_worker_evidence(snapshot):
     _mutate(index, unresolved)
     with pytest.raises(ValueError, match="synthetic initialized evidence failure|unresolved|observed"):
         require_k31_worker_evidence(plan, cell, raw, collection)
+
+
+@pytest.mark.parametrize("loaded", [None, "0" * 40, "a" * 40])
+def test_hashless_sidecar_needs_native_loaded_commit(loaded):
+    revision = "a" * 40
+    model = {"model": f"/cache/models--fixture--model/snapshots/{revision}", "dtype": "torch.bfloat16"}
+    native = {**model}
+    if loaded is not None:
+        native["loaded_config_commit_hash"] = loaded
+    assert execution_evidence._matches_pinned_hub_snapshot("fixture/model", model, {revision}, native) == (
+        loaded == revision
+    )

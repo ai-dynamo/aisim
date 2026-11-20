@@ -94,8 +94,8 @@ def test_runtime_probe_failures_redact_environment_and_exception_chain(monkeypat
 
     def fail(command, **kwargs):
         if executor == "slurm":
-            assert "HF_TOKEN=" + token in command
-            diagnostic = str(command)
+            assert "HF_TOKEN=" + token not in command
+            diagnostic = str(command) + token
         else:
             manifest = json.loads(kwargs["input"])
             assert manifest["spec"]["containers"][0]["env"][0]["value"] == token.replace("$", "$$")

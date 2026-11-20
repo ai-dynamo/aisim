@@ -37,6 +37,9 @@ name stays in the measured cell identity; resolved runtime configuration must
 attest the native enum. SOL transfer uses that same explicit selection for the
 656-byte or 576-byte latent cache layout. An `auto` label cannot establish
 which layout was executed.
+For `trtllm_mla`, initialized attention groups must also attest the resolved
+`trtllm` launcher. A `prims_ts` launcher reporting the same backend enum cannot
+publish under that timing identity.
 
 Every decode point must report native `real_kv` seeding. A balanced MoE router
 or synthetic KV allocation does not establish the request's recurrent state.
@@ -47,6 +50,12 @@ tensors or establish numerical correctness. A compatible serving image,
 successful native-state smoke, measured graph behavior, matching timing/memory
 artifacts and independent accuracy validation are still required for each
 deployment. No K3 measurements are relabelled as K3.1-Pro data.
+An offline Hub snapshot alias must match the repository and immutable revision
+pins and a loaded-config commit hash. If an execution sidecar omits that hash,
+the independently bound initialized worker must supply it. Local configs with
+no loaded-config commit cannot establish a Hub snapshot alias from their path
+or matching model fields alone; an explicitly accepted local model path retains
+its existing exact-path and config-artifact checks. These checks do not hash weights.
 
 The collector policies and evidence checks are preliminary integration work.
 They include a source-bound K3.1 adapter pinned to vLLM

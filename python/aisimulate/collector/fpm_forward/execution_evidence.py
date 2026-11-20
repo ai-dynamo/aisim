@@ -165,11 +165,14 @@ def _matches_pinned_hub_snapshot(
     loaded = model.get("loaded_config_commit_hash")
     if loaded is not None:
         return isinstance(loaded, str) and loaded.lower() == commit.lower()
-    # Locally loaded HF configs can omit _commit_hash. Only an independently
-    # validated initialized-worker config (including its actual config SHA)
-    # may establish the same snapshot identity in that case.
-    return native_model is not None and all(
-        key in native_model and native_model[key] == value for key, value in model.items()
+    # A local config without a commit hash does not establish Hub identity.
+    # The independently validated initialized worker must supply the actual
+    # loaded-config commit as well as matching every sidecar model field.
+    native_loaded = (native_model or {}).get("loaded_config_commit_hash")
+    return (
+        isinstance(native_loaded, str)
+        and native_loaded.lower() == commit.lower()
+        and all(key in native_model and native_model[key] == value for key, value in model.items())
     )
 
 

@@ -391,6 +391,10 @@ def _validate_mla_payload(spec, config, model_config):
     rope = _positive(decoder.get("qk_rope_head_dim"), "MLA RoPE dimension")
     backend = config["attention_config"]["backend"]
     if backend == "FLASHINFER_MLA_SPARSE":
+        # Pinned FlashInferMLASparseBackend.get_supported_head_sizes. Matching
+        # tensor bytes cannot qualify geometry the serving backend rejects.
+        if latent + rope not in (512, 576):
+            raise ValueError("K3.1 FlashInfer MLA head size must be 512 or 576")
         token_bytes = latent + rope
         block_multiple = 32
     elif backend == "FLASHMLA_SPARSE" and (latent, rope) == (512, 64):
@@ -472,6 +476,10 @@ def validate_attention_assignments(worker, *, model_config=None, conv_state_layo
         names = group.get("layer_names")
         if not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names):
             raise ValueError("K3.1 native attention group assignment is malformed")
+        # The existing trtllm_mla timing key denotes the TRT-LLM launcher,
+        # not every implementation reporting FLASHINFER_MLA_SPARSE.
+        if group.get("backend") == "FLASHINFER_MLA_SPARSE" and group.get("launcher") != "trtllm":
+            raise ValueError("K3.1 trtllm_mla publication requires the initialized trtllm launcher")
         for name in names:
             key = (group["group_id"], name)
             if key in observed or key not in expected or group.get("backend") != expected[key]:

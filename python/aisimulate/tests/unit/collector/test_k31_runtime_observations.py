@@ -98,6 +98,10 @@ def _native_fixture(
     mla_page = max(128 * scale, attention_block * 656) if mla_width is not None else 128 * scale
     pool_page = max(512 * scale, 2 * mla_page + 128 * scale)
     quantum = 64 * payload_scale
+    if mla_width is not None and attention_block > 64:
+        # Native sparse kernels flatten complete token rows across block
+        # gaps; packed fixtures must satisfy both MLA and indexer alignment.
+        quantum = math.lcm(quantum, mla_width)
     pool_page = (pool_page + quantum - 1) // quantum * quantum
     storage = _Storage(1234, 10 * pool_page)
     layers, groups, placements = {}, [], []
@@ -836,7 +840,9 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
         observer._runtime(payload, manifest, runtime_k31.VERSION)
 
 
-def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_indexer=False, separate_attention=False):
+def _complete_fixture(
+    tmp_path, monkeypatch, *, workload_kind="decode", packed_indexer=False, separate_attention=False, mla_latent=512
+):
     path, launches = observation_fixture(tmp_path, version=runtime_k31.VERSION)
     launch = launches["tp2"]
     model_path = Path(launch["model_config"]["path"])
@@ -846,7 +852,7 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
                 "architectures": ["KimiK31ForConditionalGeneration"],
                 "text_config": {
                     "num_hidden_layers": 4,
-                    "kv_lora_rank": 512,
+                    "kv_lora_rank": mla_latent,
                     "qk_rope_head_dim": 64,
                     "num_experts": 8,
                     "first_k_dense_replace": 1,
@@ -881,12 +887,12 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
     manifest_path.write_text(json.dumps(manifest))
     bundle = load_instrumentation(manifest_path)
     if packed_indexer:
-        cache, scheduled = _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=576)
+        cache, scheduled = _kernel_view_fixture(monkeypatch, indexer_width=132, mla_width=mla_latent + 64)
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     else:
         cache, scheduled, _ = _native_fixture(
-            monkeypatch, uniform=not separate_attention, payload_scale=132, mla_width=576
+            monkeypatch, uniform=not separate_attention, payload_scale=132, mla_width=mla_latent + 64
         )
     index = json.loads(path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
@@ -925,11 +931,18 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
         )
         config["attention_config"] = {"backend": "FLASHINFER_MLA_SPARSE", "indexer_kv_dtype": "fp8"}
         record["cache"] = copy.deepcopy(cache if record["kind"] == "worker" else scheduled)
+        if record["kind"] == "scheduler":
+            record.pop("hardware", None)
         if record["kind"] == "worker":
             record["initialized_moe"] = _moe(indices=(1, 2, 3))
             record["attention_backend"] = ["FLASHINFER_MLA_SPARSE", "KIMI_K3_KDA", "DEEPSEEK_V32_INDEXER"]
             record["attention_groups"] = [
-                {"group_id": 0, "backend": "FLASHINFER_MLA_SPARSE", "layer_names": ["mla.0", "mla.1"]},
+                {
+                    "group_id": 0,
+                    "backend": "FLASHINFER_MLA_SPARSE",
+                    "launcher": "trtllm",
+                    "layer_names": ["mla.0", "mla.1"],
+                },
                 {
                     "group_id": 1 if separate_attention else 0,
                     "backend": "DEEPSEEK_V32_INDEXER",
@@ -1856,10 +1869,35 @@ def test_k31_sparse_attention_requires_compatible_observed_gpu(tmp_path, monkeyp
     _replace_launch(path, launches)
 
     def hardware(record):
-        record["hardware"].update(gpu=gpu, sm=sm, device_name="Synthetic " + gpu.split("_", 1)[0])
+        if record["kind"] == "worker":
+            record["hardware"].update(gpu=gpu, sm=sm, device_name="Synthetic " + gpu.split("_", 1)[0])
 
     _mutate(path, hardware)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == ("incomplete" if sm == 90 else "complete"), result["diagnostics"]
     if sm == 90:
         assert "does not support the observed GPU SM" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("latent", [384, 448, 512])
+def test_import_checks_backend_head_size_even_when_payload_and_views_match(tmp_path, monkeypatch, latent):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, mla_latent=latent)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("incomplete" if latent == 384 else "complete"), result["diagnostics"]
+    if latent == 384:
+        assert "FlashInfer MLA head size must be 512 or 576" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("launcher", [None, "prims_ts", "trtllm"])
+def test_import_binds_trtllm_timing_identity_to_initialized_launcher(tmp_path, monkeypatch, launcher):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def change(record):
+        if record["kind"] == "worker":
+            record["attention_groups"][0]["launcher"] = launcher
+
+    _mutate(path, change)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if launcher == "trtllm" else "incomplete"), result["diagnostics"]
+    if launcher != "trtllm":
+        assert "publication requires the initialized trtllm launcher" in str(result["diagnostics"])

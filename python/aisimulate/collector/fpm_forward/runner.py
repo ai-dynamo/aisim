@@ -38,7 +38,6 @@ from aisimulate.fpm_contract import (
     FPM_CELL_LABEL,
     FPM_ENGINE_BENCHMARK_OUTPUT_ENV,
     FPM_ENV_FILENAME,
-    FPM_FINALIZATION_TIMEOUT_ENV,
     FPM_MANIFEST_FILENAME,
     FPM_RESULTS_DIR,
     FPM_RUN_ID_ENV,
@@ -47,7 +46,7 @@ from aisimulate.fpm_contract import (
     fpm_workload_node_count,
 )
 
-from .config import FPM_KV_WARMUP_DEFAULTS, with_kv_warmup_defaults
+from .config import FPM_RUNTIME_STARTUP_ENV, with_kv_warmup_defaults
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
@@ -1519,7 +1518,7 @@ def _cell_generator_overrides(
     if (
         k31_native_state
         and cell.workload_kind == "decode"
-        and resolved_env.get("DYN_BENCH_KV_WARMUP", {}).get("value") == "off"
+        and resolved_env.get("DYN_BENCH_KV_WARMUP", {}).get("value", "on").lower() in {"off", "0", "false"}
     ):
         raise ValueError("formal K3.1 decode requires DYN_BENCH_KV_WARMUP enabled")
     merged.setdefault("K8sConfig", {})["extra_env"] = list(resolved_env.values())
@@ -1665,26 +1664,9 @@ def _write_runtime_environment(cell_dir: Path, overrides: dict[str, Any]) -> Non
     # Generator owns run.sh and fpm_env.sh. Mirror only startup inputs through
     # this Collector-owned file: run.sh cannot export settings back to its
     # parent runtime, and Slurm does not inherit a Kubernetes Pod environment.
-    names = {
-        *FPM_KV_WARMUP_DEFAULTS,
-        READINESS_TIMEOUT_ENV,
-        FPM_FINALIZATION_TIMEOUT_ENV,
-        "PATH",
-        "PYTHONPATH",
-        "PYTHONNOUSERSITE",
-        "HF_HOME",
-        "HF_HUB_OFFLINE",
-        "TRANSFORMERS_OFFLINE",
-        "DYN_FPM_DSV41_REAL_KV",
-        "DYN_FPM_INPUT_TEXT",
-        "DYN_FPM_TOKENIZER_REVISION",
-        "AISIMULATE_RUNTIME_CONTEXT",
-        "AISIMULATE_RUNTIME_INSTRUMENTATION",
-        "AISIMULATE_RUNTIME_OBSERVATION_DIR",
-    }
     lines = ["# Generated Collector startup environment; engine settings remain in run.sh."]
     for item in overrides["K8sConfig"]["extra_env"]:
-        if item["name"] in names:
+        if item["name"] in FPM_RUNTIME_STARTUP_ENV:
             value = item.get("value")
             if not isinstance(value, str):
                 raise ValueError(f"Collector startup environment {item['name']} requires a literal string")
@@ -2101,6 +2083,10 @@ def _run_collection_impl(
     publish_partial: bool = False,
     publish_database: bool = True,
 ) -> list[dict[str, object]]:
+    from .database import _is_k31
+
+    if _is_k31(plan) and (not _kimi_k31_native_state(plan) or plan.runtime_launch is None):
+        raise ValueError("K3.1 execution requires an audited instrumentation bundle and accepted runtime launch")
     if _frozen_points(plan) is not None and smoke:
         raise ValueError("--fpm-benchmark-points-file cannot be combined with --smoke")
     run_started_at = _utc_now()

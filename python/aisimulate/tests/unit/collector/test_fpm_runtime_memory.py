@@ -501,6 +501,11 @@ def test_kimi_k31_cache_precision_preserves_native_layout_without_attesting_moe_
 )
 def test_kimi_k31_precision_requires_matching_observed_and_planned_identity(backend, change):
     cell, payload = _kimi_k31_precision_evidence(backend)
+    from .test_k31_runtime_observations import _moe
+
+    cell = replace(cell, moe_quant_mode="w4a8_mxfp4_mxfp8_trtllm")
+    payload["initialized_moe"] = _moe()
+    _validate_kimi_k31_precision(cell, payload)  # Valid complete precision baseline.
     config = payload["resolved_config"]
     if change == "architecture":
         config["model_config"]["architectures"] = ["KimiK3ForConditionalGeneration"]
@@ -516,7 +521,12 @@ def test_kimi_k31_precision_requires_matching_observed_and_planned_identity(back
         cell = replace(cell, backend_policy=planner.BackendPolicy("auto", {}, {}))
     else:
         cell = replace(cell, kv_cache_dtype="bfloat16")
-    with pytest.raises(ValueError, match="precision"):
+    diagnostic = (
+        "requires the selected native attention backend and FP8 indexer"
+        if change in {"indexer", "native_backend", "missing_attention", "public_backend", "planned_kv"}
+        else "precision"
+    )
+    with pytest.raises(ValueError, match=diagnostic):
         _validate_kimi_k31_precision(cell, payload)
 
 

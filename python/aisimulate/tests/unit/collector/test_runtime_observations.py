@@ -76,19 +76,28 @@ def test_k31_native_attention_names_match_explicit_policy(policy, native, hybrid
         "attention_config": {"backend": native, "indexer_kv_dtype": "fp8"},
     }
     launch = {"precision": {"attention_backend": policy}}
-    _validate_attention_backend({"kind": "worker", "attention_backend": names}, launch, config)
+    worker = {"kind": "worker", "attention_backend": names, "hardware": {"sm": 103}}
+    scheduler = {"kind": "scheduler", "hardware": {"sm": 103}}
+    _validate_attention_backend(worker, launch, config)
+    _validate_attention_backend(scheduler, launch, config)
+    # The real scheduler producer does not own a GPU or emit hardware.
     _validate_attention_backend({"kind": "scheduler"}, launch, config)
+    for sm in (None, True, 80):
+        with pytest.raises(ValueError, match="observed GPU SM"):
+            _validate_attention_backend({**worker, "hardware": {"sm": sm}}, launch, config)
     for invalid in (None, policy, ["KIMI_K3_KDA"], [native, "FLASH_ATTN"], [native, native], [native, {}]):
         with pytest.raises(ValueError, match="native K3.1 attention backend"):
-            _validate_attention_backend({"kind": "worker", "attention_backend": invalid}, launch, config)
+            _validate_attention_backend({**worker, "attention_backend": invalid}, launch, config)
     for key, value in (("backend", "FLASH_ATTN"), ("indexer_kv_dtype", "mxfp4")):
         bad = copy.deepcopy(config)
         bad["attention_config"][key] = value
         with pytest.raises(ValueError, match="native K3.1 attention configuration"):
+            _validate_attention_backend(scheduler, launch, bad)
+        with pytest.raises(ValueError, match="native K3.1 attention configuration"):
             _validate_attention_backend({"kind": "scheduler"}, launch, bad)
     config["model_config"]["architectures"] = ["KimiK3ForConditionalGeneration"]
     with pytest.raises(ValueError, match="selected attention backend evidence"):
-        _validate_attention_backend({"kind": "worker", "attention_backend": names}, launch, config)
+        _validate_attention_backend(worker, launch, config)
 
 
 def _write(path, payload):

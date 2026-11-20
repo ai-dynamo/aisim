@@ -4202,3 +4202,40 @@ def test_kda_seed_requires_a_list_of_exact_string_stamps(tmp_path, reasons):
     else:
         with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
             aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+def test_profileless_k31_can_plan_but_cannot_execute(tmp_path, monkeypatch, smoke):
+    from collector.fpm_forward import runner
+
+    path, _ = _kimi_k31_config(tmp_path)
+    plan = build_collection_plan(
+        backend="vllm",
+        model_path=str(path.parent),
+        model_config_path=str(path),
+        system="b200_sxm",
+        selected_ops=set(),
+        has_model_cases=False,
+        generator_overrides={},
+        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+        options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend="flashmla")),
+    )
+    assert plan.cells and plan.runtime_instrumentation is None
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("profile-less K3.1 execution reached rendering or scheduling")
+
+    monkeypatch.setattr(runner, "_render_cell", unexpected)
+    monkeypatch.setattr(runner, "KubernetesCellRunner", unexpected)
+    monkeypatch.setattr(runner, "_cell_generator_overrides", unexpected)
+    with pytest.raises(ValueError, match="audited instrumentation bundle and accepted runtime launch"):
+        runner.run_collection(
+            plan,
+            generator_overrides={},
+            checkpoint_dir=str(tmp_path / "checkpoint"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=False,
+            retry_failed=False,
+            smoke=smoke,
+        )
+    assert not (tmp_path / "artifacts").exists()

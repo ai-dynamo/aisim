@@ -202,7 +202,17 @@ def attention_groups(owner, cache, source_files):
                 raise ValueError("K3.1 backend layer coverage is inconsistent")
             covered.update(layers)
             names.add(backend.get_name())
-            observed.append({"group_id": group_id, "layer_names": layers, "backend": backend.get_name()})
+            selection = {}
+            if backend.get_name() == "FLASHINFER_MLA_SPARSE":
+                # Pinned MLAAttention.impl is constructed by the backend;
+                # FlashInferMLASparseImpl.__init__ freezes use_prims_ts. Read
+                # that result, not the requested (possibly auto) kernel policy.
+                context = owner.vllm_config.compilation_config.static_forward_context
+                resolved = [getattr(context[name].impl, "use_prims_ts", None) for name in layers]
+                if any(type(value) is not bool for value in resolved) or len(set(resolved)) != 1:
+                    raise ValueError("K3.1 initialized sparse MLA launcher is unresolved or inconsistent")
+                selection["launcher"] = "prims_ts" if resolved[0] else "trtllm"
+            observed.append({"group_id": group_id, "layer_names": layers, "backend": backend.get_name(), **selection})
             # Pinned worker/utils.py::AttentionGroup maps packed manager
             # blocks to strided kernel-page views before binding them to the
             # layers. Read the initialized mapping; never create cache views
@@ -227,6 +237,7 @@ def attention_groups(owner, cache, source_files):
                     "kernel_block_table_dtype": str(table.dtype),
                     "maps_slot_mapping": entry.maps_slot_mapping,
                     "writes_kv_cache_from_block_table": backend.writes_kv_cache_from_block_table(),
+                    **selection,
                 }
                 kernel_views.update({name: dict(mapping) for name in layers})
     if covered != set(cache["layer_components"]):
