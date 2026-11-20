@@ -104,7 +104,10 @@ def add_data_parser(subparsers: Any) -> None:
     )
     validate.add_argument("path", nargs="?", help="dataset root, a category directory, or one manifest.json")
     validate.add_argument("--repo", help="Hugging Face dataset repository to fetch and validate (needs network)")
-    validate.add_argument("--revision", help="branch, tag or commit SHA (default: the shipped pin or main)")
+    validate.add_argument(
+        "--revision",
+        help="branch, tag or commit SHA (default: as for fetch, the saved init source, else the shipped pin)",
+    )
     validate.add_argument("--cache-dir", help="cache root for --repo")
     add_init_parser(subparsers)
     fetch_alias = subparsers.add_parser(
@@ -125,7 +128,12 @@ def add_init_parser(subparsers: Any) -> None:
     )
     group = init.add_mutually_exclusive_group()
     group.add_argument("--all", action="store_true", help="download the whole op-latency database now")
-    group.add_argument("--on-demand", action="store_true", help="download op data when a run needs it (the default)")
+    group.add_argument(
+        "--on-demand",
+        action="store_true",
+        help="download nothing now; a run fetches only from a pinned source (--repo/--revision, AISIM_DATASET), "
+        "else it uses the packaged data (the default)",
+    )
     group.add_argument("--hardware", metavar="H", help="download op data for one hardware platform now")
     _add_source_args(init)
     init.add_argument(

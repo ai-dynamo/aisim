@@ -79,7 +79,7 @@ usage, and `1` for revision, transfer, integrity or offline failures.
 |---|---|
 | `aisim init --all` | Download the whole op-latency database now and save `all`. |
 | `aisim init --hardware H` | Download op data for one hardware platform now and save `hardware`. |
-| `aisim init --on-demand` | Download nothing; data arrives when a run needs it. |
+| `aisim init --on-demand` | Download nothing now. A run downloads data only from a pinned source: `--repo`/`--revision` saved with this choice, or `AISIM_DATASET`. With neither, runs use the op data packaged with AISim. |
 
 `--repo`, `--revision`, `--cache-dir`, `--offline` and `--no-limit` behave as for `fetch`. The choice is saved
 only after the download succeeds (`--all` and `--hardware` also save the repository and revision they downloaded, so
