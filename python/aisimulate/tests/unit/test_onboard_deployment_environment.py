@@ -4,6 +4,8 @@
 """Deployment startup inputs survive the public collection command."""
 
 import json
+import subprocess
+import traceback
 
 import pytest
 
@@ -75,3 +77,42 @@ def test_preview_redacts_environment_credentials_and_keeps_execution_arguments(t
     assert "K8sConfig.extra_env=" + json.dumps(env) in fpm_cli_args(
         request, output_dir=tmp_path, plan_only=False, deployment=deployment
     )
+
+
+@pytest.mark.parametrize("executor", ["slurm", "kubernetes"])
+@pytest.mark.parametrize("failure", ["timeout", "stderr", "bytes_stderr", "oserror"])
+@pytest.mark.parametrize("token", ["dummy-private-token-746", 'private-"quoted"-\\path\n$secret'])
+def test_runtime_probe_failures_redact_environment_and_exception_chain(monkeypatch, executor, failure, token):
+    from aisimulate.support import versioning
+
+    deployment = FPMDeployment(
+        executor=executor,
+        image="fixture:image",
+        extra_env=[{"name": "HF_TOKEN", "value": token}, {"name": "EMPTY", "value": ""}],
+    )
+    monkeypatch.setenv("SLURM_JOB_ID", "synthetic-allocation")
+
+    def fail(command, **kwargs):
+        if executor == "slurm":
+            assert "HF_TOKEN=" + token in command
+            diagnostic = str(command)
+        else:
+            manifest = json.loads(kwargs["input"])
+            assert manifest["spec"]["containers"][0]["env"][0]["value"] == token.replace("$", "$$")
+            diagnostic = kwargs["input"]
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 300, stderr=b"")
+        if failure == "oserror":
+            raise OSError("probe unavailable: " + token)
+        if failure == "bytes_stderr":
+            diagnostic = diagnostic.encode()
+        raise subprocess.CalledProcessError(1, command, stderr=diagnostic)
+
+    monkeypatch.setattr(versioning.subprocess, "run", fail)
+    with pytest.raises(ValueError, match="runtime version detection failed") as error:
+        versioning.detect_runtime_versions(deployment)
+    rendered = "".join(traceback.format_exception(error.value))
+    for value in (token, token.replace("$", "$$")):
+        for encoded in (value, repr(value)[1:-1], json.dumps(value)[1:-1]):
+            assert encoded not in rendered
+    assert error.value.__cause__ is None and error.value.__context__ is None

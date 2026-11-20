@@ -253,9 +253,10 @@ def aggregate_cell(
     )
     capability = plan.capability
     model_config = getattr(capability, "model_config", None)
-    if model_config is not None and model_config.payload.get("architectures", [])[:1] == [
-        "KimiK31ForConditionalGeneration"
-    ]:
+    if model_config is not None and (
+        getattr(capability, "architecture", None) == "KimiK31ForConditionalGeneration"
+        or model_config.payload.get("architectures", [])[:1] == ["KimiK31ForConditionalGeneration"]
+    ):
         from .execution_evidence import _runtime_worker_evidence
         from .runtime_k31 import moe_precision
 

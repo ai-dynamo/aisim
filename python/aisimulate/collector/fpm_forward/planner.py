@@ -1168,6 +1168,13 @@ def build_collection_plan(
         if capability.model_config.payload.get("architectures", [])[:1] == ["KimiK31ForConditionalGeneration"]
         else capability.architecture
     )
+    if policy_architecture == "KimiK31ForConditionalGeneration" and any(
+        len(config.get("architectures") or []) > 1
+        for config in (capability.model_config.payload, capability.model_config.effective_payload)
+    ):
+        # The pinned native adapter requires an exact single-entry identity.
+        # Do not plan a collection that its probe and worker cannot attest.
+        raise ValueError("Kimi K3.1 FPM collection requires single-entry architecture lists for wrapper and decoder")
     if (
         policy_architecture == "KimiK31ForConditionalGeneration"
         and "fp8" in capability.dtype.kv_cache_dtypes

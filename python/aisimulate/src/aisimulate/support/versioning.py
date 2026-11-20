@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import uuid
+from functools import partial
 from pathlib import Path
 
 from .schema import FPMDeployment, SupportRequest
@@ -25,19 +26,40 @@ print("AISIMULATE_RUNTIME_VERSION=" + json.dumps(result, sort_keys=True))
 """
 
 
-def _run(command: list[str], *, payload: str | None = None) -> str:
+def _redact_diagnostic(diagnostic: str, sensitive_values: tuple[str, ...]) -> str:
+    variants = {
+        encoded
+        for value in sensitive_values
+        if value
+        for variant in (value, value.replace("$", "$$"))
+        for encoded in (variant, repr(variant)[1:-1], json.dumps(variant)[1:-1])
+    }
+    for value in sorted(variants, key=len, reverse=True):
+        diagnostic = diagnostic.replace(value, "<redacted>")
+    return diagnostic
+
+
+def _run(command: list[str], *, payload: str | None = None, sensitive_values: tuple[str, ...] = ()) -> str:
     try:
         result = subprocess.run(command, input=payload, text=True, capture_output=True, timeout=300, check=True)
     except (OSError, subprocess.SubprocessError) as exc:
         diagnostic = getattr(exc, "stderr", None) or str(exc)
-        raise ValueError(f"collection image runtime version detection failed: {diagnostic}") from exc
-    return result.stdout
+        if isinstance(diagnostic, bytes):
+            diagnostic = diagnostic.decode(errors="replace")
+        diagnostic = _redact_diagnostic(diagnostic, sensitive_values)
+    else:
+        return result.stdout
+    # Raise outside the handler: subprocess errors retain the full command
+    # and potentially the manifest in stderr, even as a suppressed context.
+    raise ValueError(f"collection image runtime version detection failed: {diagnostic}") from None
 
 
 def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
     """Read package metadata in the target image without loading a model/GPU."""
     if deployment.image is None:
         raise ValueError("runtime version detection requires --image for the actual collection container")
+    sensitive_values = tuple(item["value"] for item in deployment.extra_env or ())
+    run = partial(_run, sensitive_values=sensitive_values)
     if deployment.executor == "slurm":
         if not os.environ.get("SLURM_JOB_ID"):
             raise ValueError("runtime version detection requires a caller-owned Slurm allocation")
@@ -53,7 +75,7 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
         if deployment.container_mount:
             command.append("--container-mounts=" + ",".join(deployment.container_mount))
         environment = [f"{item['name']}={item['value']}" for item in deployment.extra_env or ()]
-        output = _run([*command, "env", *environment, "python3", "-c", _PROBE])
+        output = run([*command, "env", *environment, "python3", "-c", _PROBE])
     else:
         name = "ais-fpm-version-" + uuid.uuid4().hex[:12]
         namespace = deployment.namespace or "default"
@@ -86,7 +108,7 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
             # A GPU-free probe must never become a delayed-binding PVC's
             # first consumer. The collection workload must establish its
             # GPU/volume topology before this metadata-only Pod can mount it.
-            claim = json.loads(_run([*prefix, "get", "pvc", parts[0], "-o", "json"]))
+            claim = json.loads(run([*prefix, "get", "pvc", parts[0], "-o", "json"]))
             if claim.get("status", {}).get("phase") != "Bound" or not claim.get("spec", {}).get("volumeName"):
                 raise ValueError(
                     "runtime version probe requires a model-cache PVC already bound for the collection GPU topology; "
@@ -103,11 +125,11 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
             manifest["spec"]["imagePullSecrets"] = [{"name": deployment.image_pull_secret}]
         created = False
         try:
-            _run([*prefix, "create", "-f", "-"], payload=json.dumps(manifest))
+            run([*prefix, "create", "-f", "-"], payload=json.dumps(manifest))
             created = True
             # Waiting for termination covers both success and a missing package.
             try:
-                _run(
+                run(
                     [
                         *prefix,
                         "wait",
@@ -118,7 +140,7 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 )
             except ValueError as wait_error:
                 try:
-                    status = json.loads(_run([*prefix, "get", "pod", name, "-o", "json"])).get("status", {})
+                    status = json.loads(run([*prefix, "get", "pod", name, "-o", "json"])).get("status", {})
                     containers = status.get("initContainerStatuses", []) + status.get("containerStatuses", [])
                     problems = [item.get("state", {}).get("waiting", {}) for item in containers]
                     problems.extend(item for item in status.get("conditions", []) if item.get("status") == "False")
@@ -130,16 +152,18 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
                 except (AttributeError, TypeError, ValueError):
                     detail = ""
                 if detail:
+                    detail = _redact_diagnostic(detail, sensitive_values)
                     raise ValueError(f"{wait_error}; pod status: {detail}") from wait_error
                 raise
-            output = _run([*prefix, "logs", name])
-            status = json.loads(_run([*prefix, "get", "pod", name, "-o", "json"]))
+            output = run([*prefix, "logs", name])
+            status = json.loads(run([*prefix, "get", "pod", name, "-o", "json"]))
             terminated = status["status"]["containerStatuses"][0]["state"]["terminated"]
             if terminated["exitCode"] != 0:
-                raise ValueError(f"collection image runtime version detection failed: {output.strip()}")
+                diagnostic = _redact_diagnostic(output.strip(), sensitive_values)
+                raise ValueError(f"collection image runtime version detection failed: {diagnostic}")
         finally:
             if created:
-                _run([*prefix, "delete", "pod", name, "--ignore-not-found", "--wait=false"])
+                run([*prefix, "delete", "pod", name, "--ignore-not-found", "--wait=false"])
     lines = [line[len(_MARKER) :] for line in output.splitlines() if line.startswith(_MARKER)]
     if len(lines) != 1:
         raise ValueError("collection image did not report one runtime version; no local/latest fallback is allowed")

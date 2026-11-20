@@ -2258,14 +2258,17 @@ def test_native_aggregation_preserves_iteration_totals(tmp_path):
     assert "prefix_length" not in rows[0]
 
 
-@pytest.mark.parametrize(
-    "architectures", [["KimiK31ForConditionalGeneration"], ["KimiK31ForConditionalGeneration", "OtherModel"]]
-)
+@pytest.mark.parametrize("architectures", [["KimiK31ForConditionalGeneration"], None, [], ["OtherModel"]])
 def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path, architectures):
     _, _, cell_dir = _synthetic_plan_and_cell(tmp_path)
     config_path, _ = _kimi_k31_config(tmp_path)
     config = json.loads(config_path.read_text())
-    config["architectures"] = architectures
+    if architectures is None:
+        config.pop("architectures")
+    else:
+        config["architectures"] = architectures
+    if architectures != ["KimiK31ForConditionalGeneration"]:
+        config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
     config_path.write_text(json.dumps(config))
     plan = build_collection_plan(
         backend="vllm",
@@ -2327,6 +2330,26 @@ def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(t
         path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="publication requires source-bound observed MoE precision"):
         aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+
+
+@pytest.mark.parametrize("location", ["wrapper", "decoder"])
+def test_k31_collection_rejects_multiple_architectures(tmp_path, location):
+    config_path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    target = config if location == "wrapper" else config["text_config"]
+    target["architectures"] = ["KimiK31ForConditionalGeneration", "OtherModel"]
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="Kimi K3.1 FPM collection requires single-entry architecture lists"):
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(tmp_path),
+            model_config_path=str(config_path),
+            system="b200_sxm",
+            selected_ops=set(),
+            has_model_cases=False,
+            collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+            options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"])),
+        )
 
 
 def test_native_aggregation_rejects_rank_grid_drift(tmp_path):

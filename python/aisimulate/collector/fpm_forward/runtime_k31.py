@@ -392,10 +392,16 @@ def _validate_mla_payload(spec, config, model_config):
     backend = config["attention_config"]["backend"]
     if backend == "FLASHINFER_MLA_SPARSE":
         token_bytes = latent + rope
+        block_multiple = 32
     elif backend == "FLASHMLA_SPARSE" and (latent, rope) == (512, 64):
         token_bytes = 656
+        block_multiple = 64
     else:
         raise ValueError("K3.1 checkpoint MLA geometry has no audited backend payload mapping")
+    # The pinned sparse MLA backends' get_supported_kernel_block_sizes
+    # constrain MLA independently of the indexer's 64-token kernel blocks.
+    if _positive(spec.get("block_size_tokens"), "MLA block size") % block_multiple:
+        raise ValueError(f"K3.1 {backend} MLA block size must be a multiple of {block_multiple} tokens")
     # Check logical payload independently of native page padding and allocation.
     if spec.get("unpadded_page_size_bytes") != token_bytes * spec["block_size_tokens"]:
         raise ValueError("K3.1 MLA payload differs from the checkpoint and backend geometry")
@@ -674,6 +680,16 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                         raise ValueError("K3.1 component shape/dtype differs from native state spec")
                 elif size != 1 or view.get("dtype") != group["dtype"] or len(shape) != 3 or shape[1] != component_block:
                     raise ValueError("K3.1 attention component shape/dtype differs from native cache spec")
+                if (
+                    not state
+                    and group["layer_classes"].get(name)
+                    == "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
+                    and group.get("cache_dtype_str") == "fp8"
+                    and strides[0] % shape[2]
+                ):
+                    # Pinned sparse_utils.flat_kv_row_view addresses complete
+                    # latent/RoPE rows, including gaps between native blocks.
+                    raise ValueError("K3.1 FlashInfer MLA block stride must contain whole cache rows")
                 span = size
                 for stride, dimension in sorted(zip(strides[1:], shape[1:], strict=True)):
                     if dimension > 1:

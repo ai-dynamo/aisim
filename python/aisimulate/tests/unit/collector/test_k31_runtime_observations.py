@@ -832,7 +832,7 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
         observer._runtime(payload, manifest, runtime_k31.VERSION)
 
 
-def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_indexer=False):
+def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_indexer=False, separate_attention=False):
     path, launches = observation_fixture(tmp_path, version=runtime_k31.VERSION)
     launch = launches["tp2"]
     model_path = Path(launch["model_config"]["path"])
@@ -881,7 +881,9 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
         for mapping in cache["kernel_block_views"].values():
             mapping["kernel_block_table_shape"][1] = launch["collection"]["max_num_seqs"]
     else:
-        cache, scheduled, _ = _native_fixture(monkeypatch, uniform=True, payload_scale=132, mla_width=576)
+        cache, scheduled, _ = _native_fixture(
+            monkeypatch, uniform=not separate_attention, payload_scale=132, mla_width=576
+        )
     index = json.loads(path.read_text())
     attempt = index["configurations"]["tp2"]["attempts"][0]
     attempt["bundle"]["sha256"] = bundle.sha256
@@ -924,8 +926,16 @@ def _complete_fixture(tmp_path, monkeypatch, *, workload_kind="decode", packed_i
             record["attention_backend"] = ["FLASHINFER_MLA_SPARSE", "KIMI_K3_KDA", "DEEPSEEK_V32_INDEXER"]
             record["attention_groups"] = [
                 {"group_id": 0, "backend": "FLASHINFER_MLA_SPARSE", "layer_names": ["mla.0", "mla.1"]},
-                {"group_id": 0, "backend": "DEEPSEEK_V32_INDEXER", "layer_names": ["indexer.0", "indexer.1"]},
-                {"group_id": 1, "backend": "KIMI_K3_KDA", "layer_names": ["kda.0", "kda.1"]},
+                {
+                    "group_id": 1 if separate_attention else 0,
+                    "backend": "DEEPSEEK_V32_INDEXER",
+                    "layer_names": ["indexer.0", "indexer.1"],
+                },
+                {
+                    "group_id": 2 if separate_attention else 1,
+                    "backend": "KIMI_K3_KDA",
+                    "layer_names": ["kda.0", "kda.1"],
+                },
             ]
         record = _decoder_cache_names(record)
         record_path.write_text(json.dumps(record))
@@ -1248,6 +1258,83 @@ def test_import_rejects_self_consistent_undersized_mla_payload(tmp_path, monkeyp
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "incomplete" and result["resources"] is None
     assert "MLA payload differs from the checkpoint and backend geometry" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize(
+    "backend,block,valid",
+    [
+        ("trtllm_mla", 16, False),
+        ("trtllm_mla", 32, True),
+        ("trtllm_mla", 64, True),
+        ("flashmla", 32, False),
+        ("flashmla", 64, True),
+    ],
+)
+def test_import_checks_mla_block_size_independently_of_indexer(tmp_path, monkeypatch, backend, block, valid):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
+    launches["tp2"]["precision"]["attention_backend"] = backend
+    _replace_launch(path, launches)
+    native = "FLASHINFER_MLA_SPARSE" if backend == "trtllm_mla" else "FLASHMLA_SPARSE"
+    row_bytes = 576 if backend == "trtllm_mla" else 656
+
+    def change_mla(record):
+        config = record["resolved_config"]
+        config["attention_config"]["backend"] = native
+        config["cache_config"]["cache_dtype"] = "fp8" if backend == "trtllm_mla" else "fp8_ds_mla"
+        cache = record["cache"]
+        mla, indexer = cache["groups"][:2]
+        assert indexer["block_size_tokens"] == 64
+        mla.update(
+            block_size_tokens=block,
+            unpadded_page_size_bytes=block * row_bytes,
+            cache_dtype_str=config["cache_config"]["cache_dtype"],
+        )
+        if record["kind"] == "worker":
+            record["attention_backend"][0] = native
+            record["attention_groups"][0]["backend"] = native
+            for name in mla["layer_names"]:
+                view = cache["layer_components"][name][0]
+                view["shape"][1:] = [block, row_bytes]
+                view["stride_bytes"][1:] = [row_bytes, 1]
+
+    _mutate(path, change_mla)
+    result = validate_observations(path, launches)["tp2"]
+    if valid:
+        assert result["status"] == "complete", result["diagnostics"]
+        assert result["resources"]["runtime_memory"] is not None
+    else:
+        assert result["status"] == "incomplete" and result["resources"] is None
+        assert "MLA block size must be a multiple of" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("padding", [0, 4, 576, 1152])
+def test_import_requires_whole_mla_rows_in_padded_pool_stride(tmp_path, monkeypatch, padding):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def pad_slots(record):
+        if record["kind"] != "worker":
+            return
+        cache = record["cache"]
+        count = cache["num_blocks"]
+        cache["allocated_cache_bytes"] += count * padding
+        cache["available_cache_bytes"] += count * padding
+        for storage in cache["storages"]:
+            storage["size_bytes"] += count * padding
+        for allocation in cache["tensor_allocations"]:
+            allocation["size"] += count * padding
+            allocation["block_stride"] += padding
+        for components in cache["layer_components"].values():
+            for component in components:
+                component["stride_bytes"][0] += padding
+
+    _mutate(path, pad_slots)
+    result = validate_observations(path, launches)["tp2"]
+    if padding % 576 == 0:
+        assert result["status"] == "complete", result["diagnostics"]
+        assert result["resources"]["runtime_memory"] is not None
+    else:
+        assert result["status"] == "incomplete" and result["resources"] is None
+        assert "FlashInfer MLA block stride must contain whole cache rows" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("block", [4, 32])
