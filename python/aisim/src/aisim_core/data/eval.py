@@ -446,7 +446,14 @@ def verify_record(
     truths = table.column("truth_value").to_pylist()
     cases = []
     for case_id, inputs_json, truth in zip(ids, table.column("inputs_json").to_pylist(), truths, strict=True):
-        cases.append((case_id, truth, predict(json.loads(inputs_json))))
+        try:
+            inputs = json.loads(inputs_json)
+        except (TypeError, ValueError):
+            inputs = None
+        if not isinstance(inputs, Mapping):
+            # A data defect in the truth table is a failed verification, never an exception for the caller.
+            return VerificationReport(ok=False, problems=[f"truth row {case_id!r} has no valid inputs_json object"])
+        cases.append((case_id, truth, predict(inputs)))
     # Exclusions recorded by the producer are honored only if they name real rows.
     unknown = [e.case_id for e in record.results.exclusions if e.case_id not in set(ids)]
     if unknown:

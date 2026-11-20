@@ -228,3 +228,26 @@ def test_write_record_refuses_an_identity_that_would_leave_the_eval_root(built):
     with pytest.raises(ValueError, match="path component"):
         write_record(root, escaped)
     assert not (root / "eval").exists()
+
+
+@pytest.mark.parametrize("inputs_json", [None, "not json", "[1, 2]", "3"])
+def test_a_truth_row_without_an_inputs_object_fails_verification(built, inputs_json):
+    import hashlib
+
+    import pyarrow as pa
+
+    from aisim_core.data.eval import TRUTH_SCHEMA_ID
+    from aisim_core.data.parquet import write_parquet
+
+    root, record = built
+    table = pa.table(
+        {"case_id": ["s1", "s2"], "inputs_json": [inputs_json, '{"tokens": 20}'], "truth_value": [10.0, 20.0]}
+    )
+    path = write_parquet(table, root / "truth.parquet", TRUTH_SCHEMA_ID)
+    data = path.read_bytes()
+    art = record.truth.artifacts[0].model_copy(
+        update={"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "rows": 2}
+    )
+    broken = record.model_copy(update={"truth": record.truth.model_copy(update={"artifacts": [art]})})
+    report = verify_record(broken, root, _predict, broken.prediction.fingerprint)
+    assert not report.ok and "inputs_json" in report.problems[0]

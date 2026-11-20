@@ -61,6 +61,18 @@ def _identity_findings(manifest: Manifest) -> list[NameFinding]:
     return out
 
 
+def _dataset_root(path: Path, manifest: Manifest) -> Path:
+    """The directory the manifest's artifact paths are relative to, found by walking up from the manifest.
+
+    Artifact paths are dataset-root relative, so a manifest checked on its own or through a category directory
+    still resolves its tables.
+    """
+    for candidate in (path.parent, *path.parent.parents):
+        if all(candidate.joinpath(*a.path.split("/")).is_file() for a in manifest.artifacts):
+            return candidate
+    raise LoaderError(f"cannot find the dataset root that holds the artifacts of {path}")
+
+
 def check_names(root: Path | str) -> tuple[list[PathFinding], list[str]]:
     """``(findings, errors)`` for every configuration manifest under ``root``.
 
@@ -76,7 +88,8 @@ def check_names(root: Path | str) -> tuple[list[PathFinding], list[str]]:
             manifest = Manifest.model_validate_json(path.read_text(encoding="utf-8"))
             found = _identity_findings(manifest)
             if manifest.category == "e2e":
-                found += name_findings_for_dataset(load_e2e(base, relative))
+                dataset_root = _dataset_root(path, manifest)
+                found += name_findings_for_dataset(load_e2e(dataset_root, path.relative_to(dataset_root).as_posix()))
         except (LoaderError, ValueError, OSError) as exc:
             errors.append(f"{relative}: {type(exc).__name__}: {exc}")
             continue

@@ -116,3 +116,47 @@ def test_gpu_time_schema_registered():
     from aisim_core.data.schemas import SCHEMA_MODELS
 
     assert "aisim-gpu-time/v1" in SCHEMA_MODELS
+
+
+def test_read_validates_and_reads_the_same_file(tmp_path, monkeypatch):
+    import os
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisim_core.data import parquet as parquet_module
+    from aisim_core.data.parquet import ParquetSchemaError, read_parquet, write_parquet
+
+    target = tmp_path / "t.parquet"
+    write_parquet(pa.table({"x": [1, 2]}), target, "a/v1")
+    replacement = write_parquet(pa.table({"x": [9]}), tmp_path / "other.parquet", "b/v1")
+    real = pq.ParquetFile
+    swapped = []
+
+    class Swapping(real):
+        """Replaces the path as soon as the file has been opened, as a concurrent writer could."""
+
+        def __init__(self, source, *args, **kwargs):
+            super().__init__(source, *args, **kwargs)
+            if not swapped:
+                swapped.append(os.replace(replacement, target))
+
+    monkeypatch.setattr(parquet_module.pq, "ParquetFile", Swapping)
+    table = read_parquet(target, "a/v1")  # the validated file is the one read, never the replacement
+    assert table.column("x").to_pylist() == [1, 2]
+    with pytest.raises(ParquetSchemaError):  # the replacement itself is still checked on the next read
+        read_parquet(target, "a/v1")
+
+
+@pytest.mark.parametrize(
+    "status,value,valid",
+    [("valid", None, False), ("missing", 1.0, False), ("valid", 1.0, True), ("missing", None, True)],
+)
+def test_published_metric_schema_enforces_the_status_value_rule(status, value, valid):
+    from jsonschema import Draft202012Validator
+
+    from aisim_core.data.schemas import render_snapshot
+
+    schema = Draft202012Validator(json.loads(render_snapshot("aisim-e2e-metrics/v1")))
+    row = {"observation_id": "o", "metric": "ttft", "statistic": "mean", "unit": "ms", "status": status, "value": value}
+    assert schema.is_valid(row) is valid

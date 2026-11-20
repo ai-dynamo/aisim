@@ -396,7 +396,18 @@ class ObservationRow(_Record):
     attrs: str | None = None
 
 
+# JSON Schema twin of ``MetricRow.status_matches_value`` so external readers reject what AISim rejects (a
+# non-finite number cannot appear in JSON, so finiteness needs no clause).
+_METRIC_VALUE_RULE = {
+    "if": {"properties": {"status": {"const": "valid"}}, "required": ["status"]},
+    "then": {"required": ["value"], "properties": {"value": {"type": "number"}}},
+    "else": {"properties": {"value": {"type": "null"}}},
+}
+
+
 class MetricRow(_Record):
+    model_config = ConfigDict(json_schema_extra={"allOf": [_METRIC_VALUE_RULE]})
+
     observation_id: str = Field(min_length=1)
     metric: str = Field(min_length=1)  # ttft, tpot, itl, e2el, output_throughput, ...
     statistic: str = Field(min_length=1)  # mean, median, p90, p99, std, min, max, value

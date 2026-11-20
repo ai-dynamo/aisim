@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -155,6 +157,17 @@ def _dump_yaml(data: Mapping[str, Any]) -> str:
     return yaml.safe_dump(dict(data), sort_keys=True, default_flow_style=False, allow_unicode=False)
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def publish_system_spec(
     packaged_yaml: Path,
     dataset_root: Path,
@@ -177,13 +190,12 @@ def publish_system_spec(
         raise SystemSpecError(f"{packaged_yaml} is not a system spec (missing {_SPEC_SECTIONS} sections)")
     digest = spec_sha256(spec)
     sysdir = Path(dataset_root) / "systems" / system
-    sysdir.mkdir(parents=True, exist_ok=True)
     copy = sysdir / copy_filename(system, digest)
+    write_copy = True
     if copy.exists():
         if spec_file_sha256(copy) != digest:
             raise SystemSpecError(f"{copy} exists but does not hash to {digest}; published copies are immutable")
-    else:
-        copy.write_text(_dump_yaml(spec), encoding="utf-8")
+        write_copy = False
 
     manifest_path = sysdir / MANIFEST_NAME
     history: list[dict[str, Any]] = []
@@ -206,7 +218,12 @@ def publish_system_spec(
     manifest = SystemManifest.model_validate(
         {"system": system, "current": digest, "history": history, "fields": new_fields}
     )
-    manifest_path.write_text(_dump_yaml(manifest.model_dump(exclude_none=True)), encoding="utf-8")
+    # Everything is validated; only now touch the published directory, and replace files atomically so a failed
+    # write cannot truncate the previous manifest history.
+    sysdir.mkdir(parents=True, exist_ok=True)
+    if write_copy:
+        _atomic_write(copy, _dump_yaml(spec))
+    _atomic_write(manifest_path, _dump_yaml(manifest.model_dump(exclude_none=True)))
     return copy
 
 

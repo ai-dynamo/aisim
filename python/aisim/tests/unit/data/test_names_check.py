@@ -16,7 +16,7 @@ from aisim_core.data.names_check import check_names
 pytestmark = pytest.mark.unit
 
 
-def _e2e(root, **body_over):
+def _e2e(root, prefix="", **body_over):
     fields = dict(
         origin="self-collected",
         model_id="Qwen/Qwen3.5-397B-A17B",
@@ -39,7 +39,7 @@ def _e2e(root, **body_over):
         outcome="complete",
     )
     metric = make_metric("o1", "ttft", "median", 1.0, "ms")
-    return write_configuration(root, E2eConfigurationData(body, [obs], [metric]))
+    return write_configuration(root, E2eConfigurationData(body, [obs], [metric]), prefix=prefix)
 
 
 def _fpm_manifest(root, hardware, precision):
@@ -108,3 +108,16 @@ def test_cli_exit_status_and_json(tmp_path, capsys):
     clean.mkdir()
     _e2e(clean)
     assert run_check_names(argparse.Namespace(path=str(clean))) == 0
+
+
+@pytest.mark.parametrize("scope", ["root", "category-directory", "manifest-file"])
+def test_e2e_artifacts_resolve_from_the_dataset_root_whatever_is_checked(tmp_path, scope):
+    manifest = _e2e(tmp_path, prefix="data", hardware="B300")  # artifact paths are dataset-root relative
+    target = {
+        "root": tmp_path,
+        "category-directory": tmp_path / "data" / "e2e",
+        "manifest-file": tmp_path / manifest,
+    }[scope]
+    findings, errors = check_names(target)
+    assert errors == []
+    assert {(f.finding.kind, f.finding.value) for f in findings} == {("hardware", "B300")}

@@ -146,3 +146,26 @@ def test_published_fpm_profiles_pass_or_are_flagged():
         errors += len(report.errors)
         assert not report.errors, (source, key, report.errors)
     assert seen >= 40
+
+
+@pytest.mark.parametrize(
+    "par,cp_type,problem",
+    [
+        ({"tp": 4, "cp": 2, "moe_tp": 4}, "ULYSSES", False),  # ULYSSES leaves cp out of the MoE world size
+        ({"tp": 4, "cp": 2, "moe_tp": 8}, "ULYSSES", True),
+        ({"tp": 4, "cp": 2, "moe_tp": 8}, "STAR", False),  # other cp types multiply it
+        ({"tp": 4, "cp": 2, "moe_tp": 4}, "STAR", True),
+        ({"tp": 4, "moe_tp": 4}, None, False),  # without cp the type does not matter
+    ],
+)
+def test_trtllm_moe_world_uses_the_cp_type(par, cp_type, problem):
+    report = evaluate(ctx(par, framework="trtllm", cp_type=cp_type))
+    findings = [f for f in report.findings if f.rule_id == "F-trtllm-moe-world"]
+    assert bool(findings) is problem
+
+
+def test_trtllm_moe_world_reports_a_gap_for_an_unknown_cp_type():
+    report = evaluate(ctx({"tp": 4, "cp": 2, "moe_tp": 4}, framework="trtllm"))
+    assert not [f for f in report.findings if f.rule_id == "F-trtllm-moe-world"]
+    gap = next(g for g in report.gaps if g.rule_id == "F-trtllm-moe-world")
+    assert "cp_type" in gap.missing

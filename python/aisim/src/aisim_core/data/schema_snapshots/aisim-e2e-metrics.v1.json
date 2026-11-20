@@ -1,6 +1,37 @@
 {
   "$id": "aisim-e2e-metrics/v1",
   "additionalProperties": true,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "value": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "valid"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "value"
+        ]
+      }
+    }
+  ],
   "properties": {
     "attrs": {
       "anyOf": [

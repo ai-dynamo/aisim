@@ -104,3 +104,51 @@ def test_every_packaged_system_publishes_and_checks_clean(tmp_path):
     for path in specs.values():
         publish_system_spec(path, tmp_path)
     assert check_published_systems(tmp_path) == []
+
+
+def _tree(root):
+    return {p.relative_to(root): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_a_rejected_publication_leaves_the_published_directory_unchanged(tmp_path):
+    pkg = _packaged(tmp_path)
+    root = tmp_path / "data"
+    publish_system_spec(pkg / "x1.yaml", root)
+    before = _tree(root)
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    (changed / "x1.yaml").write_text(SPEC.replace("mem_bw: 1", "mem_bw: 2"))
+    with pytest.raises(SystemSpecError, match="not present"):
+        publish_system_spec(changed / "x1.yaml", root, fields={"gpu.nope": {"source": "vendor_spec"}})
+    assert _tree(root) == before  # no new spec copy without a manifest entry
+    assert check_published_systems(root, pkg) == []
+    # The same holds for a first publication: nothing is created.
+    fresh = tmp_path / "fresh"
+    with pytest.raises(SystemSpecError):
+        publish_system_spec(pkg / "x1.yaml", fresh, fields={"gpu.nope": {"source": "vendor_spec"}})
+    assert not fresh.exists()
+
+
+def test_a_failed_manifest_write_keeps_the_previous_manifest(tmp_path, monkeypatch):
+    from aisim_core.data import systems as systems_module
+
+    pkg = _packaged(tmp_path)
+    root = tmp_path / "data"
+    publish_system_spec(pkg / "x1.yaml", root)
+    manifest = root / "systems/x1/manifest.yaml"
+    before = manifest.read_bytes()
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    (changed / "x1.yaml").write_text(SPEC.replace("mem_bw: 1", "mem_bw: 2"))
+
+    def broken_replace(src, dst):
+        if str(dst).endswith("manifest.yaml"):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    real_replace = systems_module.os.replace
+    monkeypatch.setattr(systems_module.os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        publish_system_spec(changed / "x1.yaml", root)
+    assert manifest.read_bytes() == before
+    assert not list(manifest.parent.glob(".*.tmp"))

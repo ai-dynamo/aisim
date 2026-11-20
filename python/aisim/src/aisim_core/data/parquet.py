@@ -12,6 +12,7 @@ import os
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -87,11 +88,23 @@ def read_parquet(
     ``None`` only for inspection; loaders must always name what they accept.
     ``path`` may be a ``pa.BufferReader`` over bytes the caller already checked.
     """
-    actual = read_parquet_schema_id(path)
+    # One open file serves the schema check and the rows, so a concurrent replacement of ``path`` cannot slip an
+    # unchecked file between them (``pq.read_metadata`` and ``pq.read_table`` would open the path twice).
+    if isinstance(path, str | Path):
+        with open(path, "rb") as stream:
+            return _read_checked(pq.ParquetFile(stream), path, expected_schema_id, columns)
+    return _read_checked(pq.ParquetFile(path), path, expected_schema_id, columns)
+
+
+def _read_checked(
+    file: pq.ParquetFile, name: Any, expected_schema_id: str | tuple[str, ...] | None, columns: list[str] | None
+) -> pa.Table:
+    value = (file.metadata.metadata or {}).get(SCHEMA_METADATA_KEY)
+    actual = None if value is None else value.decode()
     if expected_schema_id is not None:
         accepted = (expected_schema_id,) if isinstance(expected_schema_id, str) else tuple(expected_schema_id)
         if actual is None:
-            raise ParquetSchemaError(f"{path}: Parquet file has no schema ID; expected one of {list(accepted)}")
+            raise ParquetSchemaError(f"{name}: Parquet file has no schema ID; expected one of {list(accepted)}")
         if actual not in accepted:
-            raise ParquetSchemaError(f"{path}: schema ID {actual!r} not in accepted {list(accepted)}")
-    return pq.read_table(path, columns=columns)
+            raise ParquetSchemaError(f"{name}: schema ID {actual!r} not in accepted {list(accepted)}")
+    return file.read(columns=columns)

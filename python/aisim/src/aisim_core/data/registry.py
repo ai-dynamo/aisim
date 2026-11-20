@@ -234,6 +234,11 @@ def _moe_world(ctx: Context) -> str | None:
     for name, v in (("tp", tp), ("attention_dp", dp), ("cp", cp), ("moe_tp", mtp), ("ep", ep), ("moe_cluster", cl)):
         if v is None:
             raise _Unknown(f"parallelism.{name}")
+    if cp > 1:
+        # Upstream multiplies cp into the MoE world size for every cp_type except ULYSSES.
+        _need(cp_type=ctx.cp_type)
+        if ctx.cp_type.upper() == "ULYSSES":
+            cp = 1
     if mtp * ep * cl != tp * dp * cp:
         return f"moe_tp*ep*moe_cluster = {mtp * ep * cl} != tp*attention_dp*cp = {tp * dp * cp}"
     return None
@@ -408,12 +413,13 @@ RULES: tuple[Rule, ...] = (
         "F-trtllm-moe-world",
         "framework",
         "error",
-        "moe_tp * ep * moe_cluster == tp * attention_dp * cp.",
+        "moe_tp * ep * moe_cluster == tp * attention_dp * cp (cp counts only when cp > 1 and cp_type is not ULYSSES).",
         Verification(
             True,
             (f"{_TRT}:tensorrt_llm/mapping.py:170-173 moe_world_size = tp (* cp unless ULYSSES)",),
             "TensorRT-LLM tp already includes attention DP, hence tp*attention_dp here. "
-            "ULYSSES cp is not multiplied in upstream; this rule assumes non-ULYSSES.",
+            "With cp > 1 the cp_type decides: ULYSSES leaves cp out, any other type multiplies it; an unknown "
+            "cp_type is an evidence gap.",
         ),
         _moe_world,
         frameworks=("trtllm",),
