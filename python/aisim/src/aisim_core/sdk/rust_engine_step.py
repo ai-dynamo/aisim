@@ -599,6 +599,8 @@ class RustForwardPassPerfModel:
         Iterations whose workload kind
         has no trained store return ``None``.
         """
+        # A learned artifact is self-contained: no operation tables are read, so the default dataset is neither
+        # resolved nor fetched here (a cold cache on an offline host must not break construction).
         _configure_default_data_roots()
         import aisim_core
 
@@ -2186,7 +2188,8 @@ def _moe_quant_to_dtype(value: Any) -> str | None:
 
 def _configure_default_data_roots() -> None:
     # Pass default systems roots directly to the engine: persisting them in the environment would make
-    # a later best_available() mistake them for a caller choice and skip the saved init source.
+    # a later best_available() mistake them for a caller choice and skip the saved init source. This also keeps
+    # the default operation dataset from being composed (or fetched) before something needs it.
     if "AICONFIGURATOR_MODEL_CONFIGS_PATH" not in os.environ:
         model_configs_root = Path(str(pkg_resources.files("aisim_core") / "model_configs"))
         if model_configs_root.exists():
