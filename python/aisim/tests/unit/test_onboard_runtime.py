@@ -2307,6 +2307,111 @@ def test_formal_observations_of_the_whole_role_compare_the_transfer_bytes(tmp_pa
         verify_collection_runtime(request, formal / "observations.json")
 
 
+def test_formal_observations_of_a_session_saved_without_the_transfer_bytes_compare_as_saved(
+    tmp_path, capsys, monkeypatch
+):
+    from aisim.support.runtime import runtime_probe_manifest, verify_collection_runtime
+
+    # The session was imported and accepted before the import wrote transfer bytes, so its saved profile holds none.
+    # The comparison of the whole role compares the saved fields only, as it did then: formal observations that move
+    # one Mamba group by 4,096 bytes, with the same cache groups, stay compatible.
+    _save_without_transfer_bytes(monkeypatch)
+    checkpoint, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    monkeypatch.undo()
+    assert "transfer_bytes_per_block" not in _saved_group_keys(request)
+    state = _load(checkpoint)
+    save_checkpoint(checkpoint, patch={}, expected_revision=state.revision, accept=["tp2"])
+    formal = tmp_path / "formal"
+    shutil.copytree(Path(runtime_probe_manifest(request)["observations_index"]).parent, formal)
+    _mutate(formal / "observations.json", _shift_group(3))
+    result = verify_collection_runtime(request, formal / "observations.json")
+    assert result["compatibility"]["status"] == "compatible"
+
+
+def _bump_transfer_bytes(monkeypatch):
+    """Add the value of the record key test_transfer_bump to every transfer value that the import computes.
+
+    No synthetic formal collection holds the measured cache shape, so a test marks the records whose own transfer
+    bytes differ.
+    """
+    from collector.fpm_forward import runtime_observations
+
+    table, values = runtime_observations._nixl_region_table, runtime_observations._region_table_bytes
+    monkeypatch.setattr(
+        runtime_observations,
+        "_nixl_region_table",
+        lambda cache: {**table(cache), "test_transfer_bump": cache.get("test_transfer_bump", 0)},
+    )
+    monkeypatch.setattr(
+        runtime_observations,
+        "_region_table_bytes",
+        lambda region_table: [value + region_table["test_transfer_bump"] for value in values(region_table)],
+    )
+
+
+def test_formal_phase_binding_compares_the_transfer_bytes_of_a_phase_with_prefix_caching(tmp_path, capsys, monkeypatch):
+    from aisim.support.runtime import verify_collection_runtime_bindings
+
+    # Both phases run with prefix caching, so the import of each bound phase holds transfer bytes. The formal decode
+    # records then give other values, which the comparison of the bound phase reports.
+    _write_transfer_bytes_for_every_cache_shape(monkeypatch)
+    _bump_transfer_bytes(monkeypatch)
+    request, index, bindings = _formal_phase_bindings(tmp_path, capsys, decode_prefix_caching=True)
+    assert None not in [group.transfer_bytes_per_block for group in request.profile_deployment().resources.cache_groups]
+    assert verify_collection_runtime_bindings(request, bindings())["status"] == "complete"
+
+    def bump(record):
+        if record["kind"] == "worker" and record["phase"] == "decode":
+            record["cache"]["test_transfer_bump"] = 4096
+
+    _mutate(index, bump)
+    with pytest.raises(ValueError, match="decode: runtime cache layout or settings differ from the accepted probe"):
+        verify_collection_runtime_bindings(request, bindings())
+
+
+def test_formal_phase_binding_compares_a_phase_with_prefix_caching_that_holds_no_transfer_bytes(
+    tmp_path, capsys, monkeypatch
+):
+    from aisim.support.runtime import verify_collection_runtime_bindings
+
+    # Both phases run with prefix caching. In the formal decode phase TP rank 1 gives other values than TP rank 0, so
+    # the import of that phase holds no value. It ran with prefix caching, so its comparison keeps the field.
+    _write_transfer_bytes_for_every_cache_shape(monkeypatch)
+    _bump_transfer_bytes(monkeypatch)
+    request, index, bindings = _formal_phase_bindings(tmp_path, capsys, decode_prefix_caching=True)
+    assert verify_collection_runtime_bindings(request, bindings())["status"] == "complete"
+
+    def bump(record):
+        if record["kind"] == "worker" and record["phase"] == "decode" and record["tp_rank"] == 1:
+            record["cache"]["test_transfer_bump"] = 4096
+
+    _mutate(index, bump)
+    with pytest.raises(ValueError, match="decode: runtime cache layout or settings differ from the accepted probe"):
+        verify_collection_runtime_bindings(request, bindings())
+
+
+def test_formal_phase_binding_of_a_session_saved_without_the_transfer_bytes_compares_as_saved(
+    tmp_path, capsys, monkeypatch
+):
+    from aisim.support.runtime import verify_collection_runtime_bindings
+
+    # The session was imported before the import wrote transfer bytes. Both phases run with prefix caching, and the
+    # formal decode phase gives other values. The saved resources hold no value, so the comparison leaves it out.
+    _save_without_transfer_bytes(monkeypatch)
+    request, index, bindings = _formal_phase_bindings(tmp_path, capsys, decode_prefix_caching=True)
+    monkeypatch.undo()
+    assert "transfer_bytes_per_block" not in _saved_group_keys(request)
+    _write_transfer_bytes_for_every_cache_shape(monkeypatch)
+    _bump_transfer_bytes(monkeypatch)
+
+    def bump(record):
+        if record["kind"] == "worker" and record["phase"] == "decode":
+            record["cache"]["test_transfer_bump"] = 4096
+
+    _mutate(index, bump)
+    assert verify_collection_runtime_bindings(request, bindings())["status"] == "complete"
+
+
 def test_reversed_phase_bindings_merge_into_the_record_of_the_first_collection_phase(tmp_path, capsys):
     from aisim.support.runtime import verify_collection_runtime_bindings
 

@@ -747,8 +747,11 @@ def verify_collection_runtime(
 
     if geometry(source["provenance"]) != geometry(result["provenance"]):
         raise ValueError("formal runtime cache group geometry differs from the accepted probe")
-    expected = _resource_values(source["resources"])
-    actual = _resource_values(result["resources"])
+    # Both imports compare in the fields of the saved probe resources. A session saved before a later cache group
+    # field existed, such as transfer_bytes_per_block, is compared without that field, as it was then.
+    saved = manifest["observed_resources"]
+    expected = as_saved_resources(saved, _resource_values(source["resources"]))
+    actual = as_saved_resources(saved, _resource_values(result["resources"]))
     expected["runtime_memory"].pop("kv_cache_bytes")
     capacity = actual["runtime_memory"].pop("kv_cache_bytes")
     if actual != expected:

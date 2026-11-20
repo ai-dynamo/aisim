@@ -716,15 +716,18 @@ explains the retained workload routing and feature mathematics.
   `transfer_bytes_per_block` for each cache group, only from a probe phase
   with prefix caching and only for the measured cache shape, which
   [memory accounting](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
-  describes. For every other record it gives no value. The writer never makes
-  an import incomplete, and the result of a complete import names the reason
-  in `transfer_bytes_reason`. A session whose probe was imported
+  describes. For every other record it gives no value. A record without a
+  value never makes an import incomplete, and the result of a complete import
+  names the reason in `transfer_bytes_reason`. A session whose probe was imported
   before this change keeps working without the field, in the same steps as for
   `prefix_cacheable` above: its draft verifies, the existing collection
   finalizes, and the finalized profile has no `transfer_bytes_per_block`. A
   saved record that states the field must state the value of a fresh import.
-  The check of the formal collection compares the field over the whole role
-  with the accepted probe. The check of one bound phase does not compare it.
+  The checks of the formal collection compare the field with the accepted
+  probe only when the saved probe resources hold it, so such a session is
+  checked without it, as before. Then the check over the whole role compares
+  it, and the check of one bound phase compares it unless that phase ran
+  without prefix caching.
   Sizing and aggregated replay do not read the field. Grouped P/D reads it, so
   such a session needs a new import of the same observations, as for
   `prefix_cacheable` above, to run P/D.

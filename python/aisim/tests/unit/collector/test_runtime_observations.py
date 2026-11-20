@@ -4167,3 +4167,69 @@ def test_import_of_values_that_do_not_cover_each_cache_group_is_complete_and_giv
     assert (result["status"], result["diagnostics"]) == ("complete", [])
     assert all("transfer_bytes_per_block" not in group for group in result["resources"]["cache_groups"])
     assert result["transfer_bytes_reason"] == _TRANSFER_EVIDENCE_GAP
+
+
+def _without_prefix_caching(cache):
+    cache["prefix_caching"]["enable_prefix_caching"] = False
+
+
+@pytest.mark.parametrize(
+    ("edits", "expected"),
+    [
+        ((_without_prefix_caching, _storage_beyond_the_block_rows), _TRANSFER_REFUSALS[5]),
+        ((_storage_beyond_the_block_rows,), _TRANSFER_REFUSALS[1]),
+        ((), LIVE_TRANSFER_BYTES),
+        ((_plain, _without_prefix_caching), _TRANSFER_REFUSALS[0]),
+    ],
+    ids=["no_prefix_caching_and_a_storage_tail", "a_storage_tail", "live_record", "no_hybrid_evidence"],
+)
+def test_transfer_outcome_of_a_record_without_prefix_caching_is_the_phase_text(edits, expected):
+    # The merge of a role takes its value from the records of the phases with prefix caching alone, so a record of a
+    # phase without prefix caching gives the phase text before the other conditions, after the text of condition 1.
+    cache = _live_worker_caches()[0]
+    for edit in edits:
+        edit(cache)
+    assert runtime_observations._transfer_outcome(cache, "0.33.0") == expected
+
+
+def _shorter_block_rows(record):
+    """Space the block rows of a glm_tp4 worker record one indexer kernel page closer, with its views.
+
+    The pages of every layer still fit in the shorter row, so the import accepts the record, and its storage keeps a
+    tail after the last row: the record is outside condition 2.
+    """
+    if record["kind"] != "worker":
+        return
+    cache = record["cache"]
+    stride = 13_512_576  # 3,199 indexer kernel pages of 4,224 bytes, one page less than the pool page
+    for allocation in cache["tensor_allocations"]:
+        allocation["block_stride"] = stride
+    for entries in cache["layer_tensors"].values():
+        for view in entries:
+            if view["kernel_block_stride"]:
+                view["kernel_block_stride"] = stride // view["stride_bytes"][0]
+                view["shape"][0] = (cache["num_blocks"] - 1) * view["kernel_block_stride"] + 17
+            else:
+                view["stride_bytes"][0] = stride
+
+
+def test_import_takes_the_transfer_bytes_from_prefill_when_decode_without_prefix_caching_has_a_storage_tail(tmp_path):
+    # The decode phase runs without prefix caching, and its block rows leave a tail in the storage, so its records
+    # are outside condition 2. They do not change the value, which the prefill phase with prefix caching gives.
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4", decode_prefix_caching=False)
+    _mutate(path, lambda record: _shorter_block_rows(record) if record["phase"] == "decode" else None)
+    result = validate_observations(path, launches)["tp2"]
+    assert (result["status"], result["diagnostics"]) == ("complete", [])
+    assert [group["transfer_bytes_per_block"] for group in result["resources"]["cache_groups"]] == LIVE_TRANSFER_BYTES
+    assert "transfer_bytes_reason" not in result
+
+
+def test_import_of_a_decode_phase_without_prefix_caching_gives_the_phase_text(tmp_path):
+    # The mamba_hybrid records are outside condition 2 too. A phase without prefix caching gives the phase text first.
+    path, launches = observation_fixture(tmp_path, layout="mamba_hybrid", decode_prefix_caching=False)
+    attempt_id = json.loads(path.read_text())["configurations"]["tp2"]["active_attempt_id"]
+    decode = runtime_observations.validate_observation_phase(
+        path, "tp2", launches["tp2"], phase="decode", attempt_id=attempt_id
+    )
+    assert (decode["status"], decode["diagnostics"]) == ("complete", [])
+    assert decode["transfer_bytes_reason"] == _TRANSFER_REFUSALS[5]

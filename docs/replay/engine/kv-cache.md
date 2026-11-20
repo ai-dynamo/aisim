@@ -1358,8 +1358,8 @@ sub-block matching without an explicit full-state scratch count.
   gives all of its conditions. A profile from such a record can run P/D under
   the label `0.33.0`. Both roles of the pair need the value, so the profile of
   each role must come from a probe with a phase with prefix caching. For every
-  other record the import gives no value. The writer never makes an import
-  incomplete, and the result of a complete import names the reason in
+  other record the import gives no value. A record without a value never makes
+  an import incomplete, and the result of a complete import names the reason in
   `transfer_bytes_reason`. A profile without the value, and a profile of vLLM
   0.31.0 or 0.32.0, needs a hand-made value on each group.
   Set `transfer_bytes_per_block` only from evidence that identifies the

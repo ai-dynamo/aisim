@@ -1500,7 +1500,7 @@ def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str 
     After condition 1, layer specs or an allocation plan that lack a field of the rule give _TRANSFER_EVIDENCE_GAP,
     which is the text of no condition. After condition 5, a Mamba state of an unknown data type gives it too.
     """
-    if runtime_version != HYBRID_EVIDENCE_VERSION or not runtime_memory._hybrid_evidence(cache):
+    if not _hybrid_record(cache, runtime_version):
         return _TRANSFER_HYBRID_REFUSAL
     layers = _transfer_layers(cache)
     if isinstance(layers, str):
@@ -1540,10 +1540,36 @@ def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str 
         return "a Mamba group holds fewer than two layers, or the Mamba layers do not hold the same two state tensors"
     if _state_sizes(mamba[0]["state"]) is None:
         return _TRANSFER_EVIDENCE_GAP
-    phase = cache.get("prefix_caching")
-    if not isinstance(phase, dict) or phase.get("enable_prefix_caching") is not True:
+    if _record_prefix_caching(cache) is not True:
         return _TRANSFER_PHASE_REFUSAL
     return None
+
+
+def _hybrid_record(cache: dict[str, Any], runtime_version: str) -> bool:
+    """Whether the record holds hybrid cache evidence of vLLM 0.33.0, which condition 1 requires."""
+    return runtime_version == HYBRID_EVIDENCE_VERSION and runtime_memory._hybrid_evidence(cache)
+
+
+def _record_prefix_caching(cache: dict[str, Any]) -> bool | None:
+    """Whether the worker record comes from a probe phase with prefix caching, or None when it does not say."""
+    phase = cache.get("prefix_caching")
+    value = phase.get("enable_prefix_caching") if isinstance(phase, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _transfer_outcome(cache: dict[str, Any], runtime_version: str) -> list[int] | str:
+    """The transfer bytes of one worker record, or the text that explains their absence.
+
+    A record without the evidence of condition 1 gives its text first. Then a record of a phase without prefix caching
+    gives _TRANSFER_PHASE_REFUSAL before the other conditions, so that the merge of a role takes its value from the
+    phases with prefix caching alone.
+    """
+    if not _hybrid_record(cache, runtime_version):
+        return _TRANSFER_HYBRID_REFUSAL
+    if _record_prefix_caching(cache) is False:
+        return _TRANSFER_PHASE_REFUSAL
+    refusal = _transfer_shape_refusal(cache, runtime_version)
+    return refusal if refusal is not None else _region_table_bytes(_nixl_region_table(cache))
 
 
 def _nonnegative_int(value: Any) -> bool:
@@ -1849,10 +1875,7 @@ def _configuration(
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"]),
                 release,
             )
-            refusal = _transfer_shape_refusal(worker["cache"], release)
-            transfer_outcomes.append(
-                refusal if refusal is not None else _region_table_bytes(_nixl_region_table(worker["cache"]))
-            )
+            transfer_outcomes.append(_transfer_outcome(worker["cache"], release))
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
             ]

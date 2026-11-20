@@ -320,14 +320,18 @@ for the transfer bytes of each of these groups.
   6. The record comes from a probe phase with prefix caching on.
 
   A probe can hold two phases and several TP ranks. The import computes the
-  value from each worker record of each phase with prefix caching on. It
-  writes the value only when every such record meets the conditions and all of
-  them give the same value. For every other record it writes no value. The
-  writer never makes an import incomplete, and the result of a complete import
-  names the reason in `transfer_bytes_reason`. The reason is the first
-  condition that the record does not meet, a field of the rule that the record
-  lacks or holds in a form that the import does not know, or worker records
-  that give different values.
+  value from each worker record of each phase with prefix caching on, and a
+  record of a phase with prefix caching off does not change it. It writes the
+  value only when every record of a phase with prefix caching meets the
+  conditions and all of them give the same value. For every other record it
+  writes no value. A record without a value never makes an import incomplete,
+  and the result of a complete import names the reason in
+  `transfer_bytes_reason`. A record that does not meet condition 1 gives that
+  condition first. When the records meet condition 1 and every phase of the
+  import records prefix caching off, the reason is condition 6. Otherwise it is
+  the first condition that the record does not meet, a field of the rule that
+  the record lacks or holds in a form that the import does not know, or worker
+  records that give different values.
 
   The record does not hold four facts that the connector reads. A reading of
   the vLLM source shows that the value does not depend on them inside the
