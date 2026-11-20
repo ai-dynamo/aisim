@@ -61,9 +61,11 @@ envelopes' files, hash-verified, into `AISIM_DATA_CACHE`. Artifacts of role `fpm
 FPM bytes) are not read by any evaluation and are not fetched. Trust chain: dataset index, category index, envelope
 `aisim-manifest.json`, legacy `manifest.json`, then the measurement and FPM hashes it names, as before.
 
-The moved files still embed the legacy `data/<model>/...` spelling, so `configuration_path`, case IDs and observation
-identities keep their pre-move values (results stay comparable across the move) and `HfDataset` maps them to the physical
-`data/fpm/<rest>` path when reading files and building links. The legacy `catalog/index.json` layout is still read for
+The moved files still embed the legacy `data/<model>/...` spelling, so `configuration_path`, the configuration identity
+(`configuration_path@snapshot_id`) and observation IDs keep their pre-move values, and `HfDataset` maps them to the physical
+`data/fpm/<rest>` path when reading files and building links. Case IDs do not keep them: `_case_id()` hashes the dataset
+repository and revision, so every case ID changes across the repository move (and with any revision change). To compare
+results across the move, join the old and new runs on the configuration identity and observation ID, never on the case ID. The legacy `catalog/index.json` layout is still read for
 checkouts that have no `catalog/dataset.json`. Historical snapshots are not in the default index; explicit history reads need
 the local tree (`HfDataset.from_local`).
 Pins of the other consumers (profiles, recipes) are set in one step by `scripts/ci/set_fpm_dataset_pin.py`.
