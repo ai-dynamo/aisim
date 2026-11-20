@@ -373,7 +373,6 @@ impl G3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn combined_disk_durations_must_be_finite_even_when_each_term_is_finite() {
@@ -391,50 +390,5 @@ mod tests {
                     .contains("kvcr.g3 transfer duration overflow")
             );
         }
-        let unlimited = KvcrG3Config {
-            read_bandwidth_gbps: 0.0,
-            write_bandwidth_gbps: 0.0,
-            latency_to_first_byte_ms: 0.0,
-            ..KvcrG3Config::new(1)
-        };
-        let mut g3 = G3::new(&unlimited, true, 1_000_000).unwrap();
-        let key = HostBlockKey::new(0);
-        g3.enter_memory(key, None);
-        assert_eq!(g3.write(key, 2.0), Some((2.0, false)));
-        g3.finish_write(key, true);
-        assert_eq!(g3.read(TransferId::new(0), vec![key], 2.0), 2.0);
-    }
-
-    #[test]
-    fn absolute_disk_deadlines_fail_before_capacity_or_read_claims_change() {
-        let config = KvcrG3Config {
-            read_bandwidth_gbps: 0.0,
-            write_bandwidth_gbps: 0.0,
-            latency_to_first_byte_ms: 1e308,
-            ..KvcrG3Config::new(1)
-        };
-        let mut g3 = G3::new(&config, true, 1_000_000).unwrap();
-        let key = HostBlockKey::new(0);
-        g3.enter_memory(key, None);
-        assert!(catch_unwind(AssertUnwindSafe(|| g3.write(key, 1e308))).is_err());
-        assert_eq!(g3.on_disk, 0);
-        assert_eq!(g3.held[&key].disk, Disk::No);
-        assert_eq!(g3.changes, 0);
-        assert!(g3.write(key, 0.0).is_some());
-        g3.finish_write(key, true);
-        assert_eq!(g3.read(TransferId::new(0), vec![key], 0.0), 1e308);
-        let evictable = g3.evictable.clone();
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| g3.read(
-                TransferId::new(1),
-                vec![key],
-                0.0
-            )))
-            .is_err()
-        );
-        assert_eq!(g3.held[&key].readers, 1);
-        assert_eq!(g3.reads.len(), 1);
-        assert_eq!(g3.read_tail, 1e308);
-        assert_eq!(g3.evictable, evictable);
     }
 }

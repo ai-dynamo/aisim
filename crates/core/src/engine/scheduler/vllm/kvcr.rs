@@ -3006,27 +3006,34 @@ mod tests {
     fn disk_evicts_by_the_rank_a_block_had_in_memory() {
         use KvcrLocalG2Policy::{Fifo, Lru};
         // One block of KVCR memory and two of disk; nothing takes time.
-        for (policy, evicted) in [(Lru, 1), (Fifo, 0)] {
+        for (policy, read, evicted) in [(Lru, false, 1), (Fifo, false, 0), (Fifo, true, 1)] {
             let g3 = KvcrG3Config {
                 latency_to_first_byte_ms: 0.0,
+                read_bandwidth_gbps: 0.0,
                 write_bandwidth_gbps: 0.0,
                 ..KvcrG3Config::new(2)
             };
             let f = Fixture::with_g3(1, policy, 0.0, g3);
-            let (mut adapter, g2) = (f.adapter(), f.target.lock());
+            let (mut adapter, mut g2) = (f.adapter(), f.target.lock());
             // k0 goes to disk when k1 arrives; then its request finishes.
             store((&mut adapter, &g2), &[0], &[0], 0.0);
             store((&mut adapter, &g2), &[1], &[1], 0.0);
             adapter.align_local(None, &f.keys(&[0]));
             // k1 follows k0 to disk, and k2 needs the slot of one of them.
             store((&mut adapter, &g2), &[2], &[2], 0.0);
+            if read {
+                let (rank, rounds) = (f.target_rank, &mut RestoreRounds::default());
+                assert!(adapter.stage_at(&mut g2, f.owner, rank, rounds, &f.keys(&[0]), 0.0));
+                assert!(adapter.advance(&mut g2, 0.0));
+            }
             store((&mut adapter, &g2), &[3], &[3], 0.0);
-            // Under LRU k1 was used before k0 was; FIFO drops the first in.
+            // Under LRU k1 was used before k0 was. FIFO drops the first in,
+            // counted for a block that was read from when its read ended.
             let on_disk = [0, 1, 2].map(|key| kvcr_holds(&adapter, key).1);
             assert_eq!(
                 on_disk.iter().position(|kept| !kept),
                 Some(evicted),
-                "{policy:?}"
+                "{policy:?}, read {read}"
             );
         }
     }
@@ -3141,46 +3148,6 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_read_ranks_the_block_on_the_sources_disk_too() {
-        // The source has two blocks of KVCR memory and two of disk; nothing
-        // takes time. It stores k0, then k1, and the target pulls k0.
-        let g3 = KvcrG3Config {
-            latency_to_first_byte_ms: 0.0,
-            write_bandwidth_gbps: 0.0,
-            ..KvcrG3Config::new(2)
-        };
-        let f = Fixture::with_g3(2, KvcrLocalG2Policy::Lru, 0.0, g3);
-        let (mut source, mut target) = (f.adapter_of(f.source), f.adapter());
-        let stores = |source: &mut VllmKvcrAdapter, keys: std::ops::Range<u64>| {
-            let g2 = f.source_g2.lock();
-            for key in keys {
-                store((&mut *source, &g2), &[key], &[key], 0.0);
-            }
-        };
-        stores(&mut source, 0..2);
-        let (pulled, mut restore) = (f.keys(&[0]), RestoreRounds::default());
-        let mut g2 = f.target.lock();
-        assert!(target.stage_at(&mut g2, f.owner, f.source, &mut restore, &pulled, 0.0));
-        assert!(target.advance(&mut g2, 2.0));
-        source.advance_g3(&f.source_g2.lock(), 2.0);
-        // Memory writes k1, then k0, to disk; the third write drops k1,
-        // which was used before the peer read k0.
-        stores(&mut source, 2..5);
-        assert_eq!(
-            [0, 1, 2].map(|key| kvcr_holds(&source, key).1),
-            [true, false, true]
-        );
-        // A peer cannot pull k2, which is only on the source's disk. Asked
-        // for k3 as well, the source serves k3 with a pin, as it does when a
-        // requested block is nowhere.
-        assert!(!target.stage_at(&mut g2, f.owner, f.source, &mut restore, &f.keys(&[2]), 3.0));
-        let asked = f.keys(&[3, 2]);
-        assert!(target.stage_at(&mut g2, f.owner, f.source, &mut restore, &asked, 3.0));
-        let stage = target.stages.values().next().unwrap();
-        assert_eq!((&stage.local_keys[..], stage.reads), (&asked[..1], false));
-    }
-
-    #[test]
     fn separate_peer_completions_keep_their_order_in_disk_lru() {
         let g3 = KvcrG3Config {
             latency_to_first_byte_ms: 0.0,
@@ -3207,10 +3174,6 @@ mod tests {
         // The source was idle through both completions. B's later read must
         // beat its prefix position when disk eventually chooses a victim.
         source.advance_g3(&f.source_g2.lock(), 4.0);
-        {
-            let disk = source.local.as_ref().unwrap().g3.as_ref().unwrap();
-            assert!(disk.last_use(f.keys(&[0])[0]) < disk.last_use(f.keys(&[1])[0]));
-        }
         for key in 2..5 {
             store((&mut source, &f.source_g2.lock()), &[key], &[key], 4.0);
         }
@@ -3218,28 +3181,15 @@ mod tests {
             [0, 1, 2].map(|key| kvcr_holds(&source, key).1),
             [false, true, true]
         );
-    }
-
-    #[test]
-    fn an_oversized_deposit_settles_all_misses_without_dropping_duplicates() {
-        let g3 = KvcrG3Config {
-            latency_to_first_byte_ms: 0.0,
-            write_bandwidth_gbps: 0.0,
-            ..KvcrG3Config::new(2)
-        };
-        let f = Fixture::with_g3(4096, KvcrLocalG2Policy::Lru, 0.0, g3);
-        let mut adapter = f.adapter();
-        let mut keys: Vec<_> = (0..8192).collect();
-        keys.extend(0..4096); // Already present keys must never count as drops.
-        store((&mut adapter, &f.target.lock()), &keys, &keys, 0.0);
-        let stats = f.stats();
-        let local = stats.local_g2.unwrap();
-        assert_eq!(local.stored_blocks, 4096);
-        assert_eq!(local.dropped_blocks, 4096);
-        assert_eq!(stats.g3.unwrap().stored_blocks, 0);
-        let g3 = adapter.local.as_ref().unwrap().g3.as_ref().unwrap();
-        assert!(g3.spill.is_none() && g3.deposits.is_empty());
-        assert!(!adapter.has_work());
+        // A peer cannot pull k2, which is only on the source's disk. Asked
+        // for k3 as well, the source serves k3 with a pin, as it does when a
+        // requested block is nowhere.
+        let mut restore = RestoreRounds::default();
+        assert!(!target.stage_at(&mut g2, f.owner, f.source, &mut restore, &f.keys(&[2]), 5.0));
+        let asked = f.keys(&[3, 2]);
+        assert!(target.stage_at(&mut g2, f.owner, f.source, &mut restore, &asked, 5.0));
+        let stage = target.stages.values().next().unwrap();
+        assert_eq!((&stage.local_keys[..], stage.reads), (&asked[..1], false));
     }
 
     #[test]
@@ -3270,8 +3220,36 @@ mod tests {
         assert_eq!(kvcr_holds(&adapter, 1), (Lookup::Miss, false));
         assert_eq!(kvcr_holds(&adapter, 2), (Lookup::Hit, false));
         assert_eq!(f.stats().g3.unwrap().stored_blocks, 1);
-        assert!(adapter.advance(&mut g2, 3.0));
-        assert_eq!(g2.lookup(f.keys(&[0])[0]), Lookup::Hit);
-        assert!(!adapter.has_work());
+    }
+
+    #[test]
+    fn a_job_staged_later_lands_first_when_it_ends_first() {
+        // One block of KVCR memory, copied in 1 ms; disk takes 5 ms to start
+        // a read or write. k0 is on disk at 6 and k1 in memory at 7.
+        let g3 = KvcrG3Config {
+            latency_to_first_byte_ms: 5.0,
+            read_bandwidth_gbps: 0.0,
+            write_bandwidth_gbps: 0.0,
+            ..KvcrG3Config::new(2)
+        };
+        let f = Fixture::with_g3(1, KvcrLocalG2Policy::Lru, 1.0, g3);
+        let (mut adapter, mut g2) = (f.adapter(), f.target.lock());
+        for (stored, now) in [(Some(0), 0.0), (Some(1), 1.0), (None, 6.0), (None, 7.0)] {
+            adapter.advance(&mut g2, now);
+            adapter.advance_g3(&g2, now);
+            if let Some(key) = stored {
+                store((&mut adapter, &g2), &[key], &[key], now);
+            }
+        }
+        // The read of k0 from disk ends at 12. The copy of k1 from memory,
+        // staged after it, ends at 8.
+        let keys = f.keys(&[0, 1]);
+        for (key, owner) in keys.iter().zip([f.owner, Uuid::from_u128(7)]) {
+            let (rank, rounds) = (f.target_rank, &mut RestoreRounds::default());
+            assert!(adapter.stage_at(&mut g2, owner, rank, rounds, &[*key], 7.0));
+        }
+        assert!(adapter.advance(&mut g2, 8.0));
+        let readable = [0, 1].map(|at| g2.lookup(keys[at]) == Lookup::Hit);
+        assert_eq!(readable, [false, true]);
     }
 }

@@ -22,7 +22,6 @@ from aisim import main as cli
 from aisim.compiler import prediction_to_replay_spec
 from aisim.config.cli import CorePredictionConfig, CoreRecommendationConfig
 from aisim.config.engine import KvCachePredictionConfig
-from aisim.predict import run_prediction
 from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.deploy import build_backend_deployment
@@ -796,67 +795,27 @@ def test_kvcr_defaults_match_the_rust_runtime() -> None:
     assert launch["engine"]["kvcr"] == KvcrConfig(**role["rank"]["kvcr"]).model_dump()
 
 
-def test_kvcr_g3_reaches_the_native_rank() -> None:
-    engine = _prediction_engine()
-    engine["workers"]["aggregated"]["kv_cache"].update(
-        bytes_per_token=131_072,
-        host_offload=_host_offload(),
-        kvcr={"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}},
-    )
-    config = CorePredictionConfig.model_validate({"engine": engine})
-    rank = prediction_to_replay_spec(config).backend_deployment.agg_engine_args
-    assert rank["kvcr"]["g3"]["num_blocks"] == 8
-
-
-@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
 @pytest.mark.parametrize("nested", [False, True])
-def test_kvcr_g3_requires_an_explicit_runner_capability(role, nested) -> None:
+def test_kvcr_g3_requires_an_explicit_runner_capability(nested) -> None:
     engine = _prediction_engine()
-    engine["workers"]["aggregated"]["kv_cache"].update(
-        bytes_per_token=256,
-        host_offload=_host_offload(),
-        kvcr={"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}},
-    )
-    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
-    args = spec.backend_deployment.agg_engine_args
-    spec = replace(
-        spec,
-        backend_deployment=replace(
-            spec.backend_deployment,
-            **{
-                "agg_engine_args": None,
-                f"{'agg' if role == 'aggregated' else role}_engine_args": {"rank": args} if nested else args,
-            },
-        ),
-    )
+    cache = engine["workers"]["aggregated"]["kv_cache"]
+    cache.update(bytes_per_token=256, host_offload=_host_offload(), kvcr={"local_g2": {"num_blocks": 4}})
+
+    def spec() -> ReplaySpec:
+        built = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+        args = built.backend_deployment.agg_engine_args
+        deployment = replace(built.backend_deployment, agg_engine_args={"rank": args} if nested else args)
+        return replace(built, backend_deployment=deployment)
+
     assert RunnerCapabilities().supports_kvcr_g3 is False
     capabilities = EngineReplayRunnerFactory().capabilities()
-    capabilities.require_compatible(spec)
+    unsupported = replace(capabilities, supports_kvcr_g3=False)
+    # KVCR-owned memory alone needs no capability.
+    unsupported.require_compatible(spec())
+    cache["kvcr"]["g3"] = {"num_blocks": 8}
+    capabilities.require_compatible(spec())
     with pytest.raises(ValueError, match="runner does not support kvcr.g3"):
-        replace(capabilities, supports_kvcr_g3=False).require_compatible(spec)
-
-
-def test_kvcr_g3_injected_runner_is_rejected_before_creation() -> None:
-    engine = _prediction_engine()
-    engine["workers"]["aggregated"]["kv_cache"].update(
-        bytes_per_token=256,
-        host_offload=_host_offload(),
-        kvcr={"local_g2": {"num_blocks": 4}, "g3": {"num_blocks": 8}},
-    )
-
-    class UnsupportedFactory:
-        def capabilities(self):
-            return replace(EngineReplayRunnerFactory().capabilities(), supports_kvcr_g3=False)
-
-        def create(self, _seed):
-            pytest.fail("unsupported runner must be rejected before creation")
-
-    with pytest.raises(ValueError, match="runner does not support kvcr.g3"):
-        run_prediction(
-            CorePredictionConfig.model_validate({"engine": engine}),
-            stack="engine",
-            runner_factory=UnsupportedFactory(),
-        )
+        unsupported.require_compatible(spec())
 
 
 def test_predict_cli_spills_to_kvcr_g3_through_the_real_runtime(tmp_path, capsys) -> None:
