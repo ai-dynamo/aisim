@@ -115,7 +115,7 @@ Manual dispatches and site-change triggers are listed below.
 | [Release branch nightly CI](../../.github/workflows/release-nightly-ci.yml) | Daily at 09:23 UTC; manual dispatch on `main` | Schedules FPE support-matrix refreshes for discovered `release/*` branches |
 | [FPE Support Matrix (release)](../../.github/workflows/fpe-release-qualify.yml) | Called once per release by Release branch nightly CI | Builds the release wheel, probes all shards, and uploads its qualified matrix artifact |
 | [codeowners](../../.github/workflows/fast-ci.yml) | Part of every Fast CI run | Required repository-policy status, including ownership coverage and generated-file checks |
-| [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; selects relevant PR files before benchmarking; manual dispatch for a PR | Paired base/head prediction-runtime benchmark, outside Full CI |
+| [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; benchmarks only ready PRs targeting `main` or `release/*` with relevant files; manual dispatch for any PR | Paired base/head prediction-runtime benchmark, outside Full CI |
 | [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one evaluated SHA, plus preview-only pinned `agentx_revision` and optional `agentx_campaign_catalog` ([constraints](#agentx-accuracy-extension)) | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
 | [GitHub Pages](../../.github/workflows/pages.yml) | FPE Support Matrix, Main branch nightly CI, Release branch nightly CI, E2E Accuracy Matrix, or FPM Accuracy Matrix completion; relevant site changes on PRs/`main`; daily at 09:17 UTC; manual dispatch | Validates qualified FPE and accuracy snapshots, tests FPE branch selection in Chromium, and builds public pages; deployment is restricted to trusted `main` |
 
@@ -127,6 +127,14 @@ head and base, and reports an explicit skip for unrelated changes. API failures
 or changed revisions fail selection; empty, incomplete, or oversized file lists
 run the benchmark conservatively. Manual dispatch forces a comparison after the
 same revision checks: the trusted copy must match the current PR head.
+
+Automatic pushes skip draft PRs and stacked PRs, whose base is not `main` or
+`release/*`, before reading the file list. The summary names the reason;
+nothing allocates the benchmark runner. Selection runs again on each trusted
+push, so a PR that is marked ready or retargeted is compared on its next push.
+Manual dispatch with `pr_number` compares any PR without waiting. The
+[Simulation Performance (advisory)](../../.github/workflows/simulation-performance.yml)
+workflow uses the same selector with its own path list, so it follows these rules.
 
 If the PR changes the performance gate's Python files or the shared prediction
 grid, the benchmark job also runs the PR's controller against the same base and
@@ -164,7 +172,10 @@ configures automated review separately from GitHub Actions.
    or release owner.
 
 Trusted copy-pr-bot branches also launch Full CI automatically as a coverage
-backstop. Check that the copy's SHA matches the PR head before using its result.
+backstop. The bot copies ready PRs only: drafts run Fast CI until they are
+marked ready, or until a maintainer comments `/ok to test <sha>` to copy one
+explicitly (see [copy-pr-bot.yaml](../../.github/copy-pr-bot.yaml)).
+Check that the copy's SHA matches the PR head before using its result.
 If that run already validates the current head, a second manual launch is
 unnecessary. The maintainer admission boundary remains in place. Conditional
 Codex review and a review-completion dispatcher are not implemented by these
@@ -423,19 +434,25 @@ round trips, with wheel hashes and request counts in `installed-cli-*` artifacts
 
 ## Application test inventory and exceptions
 
-Full CI uses **12 application jobs per architecture, 24 total**. Paths in this
+Full CI uses **7 application jobs per architecture, 14 total**. Paths in this
 table are relative to `python/aisim/` unless marked repository-root.
 
 | Shard | Test selection | Parallelism per architecture |
 | --- | --- | --- |
 | `contracts` | Repository-root `tests/`, `tests/cross_package/`, CLI compatibility, and collection inventory | One job; four workers for repository-root tests |
 | `unit` | Entire `tests/unit/` and `tests/golden/`, including unmarked tests | Four disjoint groups, four workers each |
-| `integration` | Entire `tests/integration/` against the installed native wheel and packaged data | One job, two workers |
-| `cli-build` | Build-marked `tests/e2e/cli/`; recommendation E2E runs separately within group 1 | Four disjoint groups, four workers each; recommendation runs serially |
-| `support-matrix` | Build-marked `tests/e2e/support_matrix/` | One job, pytest automatic worker count |
-| `tools-build` | Build-marked `tests/e2e/tools/`; installed FPM verification reuses the wheel | One job, pytest automatic worker count |
+| `cli-build` | Build-marked `tests/e2e/cli/`; recommendation E2E runs first, separately | One job, four workers; recommendation runs serially |
+| `integration-build` | Entire `tests/integration/` against the installed native wheel and packaged data, then build-marked `tests/e2e/support_matrix/` and `tests/e2e/tools/`; installed FPM verification reuses the wheel | One job; two workers for integration, pytest automatic worker count for the build-marked suites |
 
-The `support-matrix` shard includes the required native FPE probes from
+Each job pays for runner start-up, checkout and dependency installation, so
+suites that run for only a few minutes share a job. Keep every job shorter than
+`contracts`, the longest, so that sharing does not lengthen Full CI. Within a
+job each suite is a separate step: a later suite still runs and reports when an
+earlier one fails, and is skipped only when installation failed or the job was
+cancelled. Only `contracts` checks out the full Git history, which the
+repository-root tests read; the other jobs fetch the tested commit alone.
+
+The `integration-build` shard's support-matrix tests include the required native FPE probes from
 `.github/fpe-required-probes.json`. Resolved identities must be unique under the
 nightly qualifier's identity fields. Each identity must exist in the live matrix
 inventory and have a topology passing prefill, decode start, decode end, and
@@ -445,8 +462,10 @@ model/system/backend matrix remains in nightly. The tests resolve each selector
 through the installed wheel's current version policy using nightly's discovery
 helper, so version-policy changes are exercised before release.
 
-Unit and CLI groups use pytest-split's `least_duration` partitioning. Every
-group is scheduled when application tests are selected. Integration coverage
+Unit groups use pytest-split's `least_duration` partitioning. The CLI job keeps
+the same options with a single group, so splitting it again only needs more
+matrix entries. Every group is scheduled when application tests are selected.
+Integration coverage
 includes configuration-adapter estimates, memory estimation, configuration
 picking, and TRT-LLM KV capacity; selecting the whole directory includes newly
 added modules without requiring a marker.
@@ -633,6 +652,35 @@ complete CI run before changing `CI_JOB_CONTAINER_IMAGE` to the new image digest
 Keep the previous digest for rollback. Manylinux release/platform builders have
 their own image definitions; changing the shared runner image does not replace
 all builders.
+
+### Runner placement
+
+GitHub-hosted runners cannot resolve NVIDIA Artifactory, so every job that reads
+or writes wheels in Artifactory runs on the self-hosted
+`prod-aisim-default-amd64-v1` or `prod-aisim-default-arm64-v1` pool inside the
+CI job image. Those pools have a fixed concurrency limit. Full CI jobs that need
+nothing from the NVIDIA network run on GitHub-hosted runners without a job
+container instead, so they do not queue for the self-hosted pools:
+
+| Job | Runner |
+| --- | --- |
+| Cargo Deny, Rust, Public API Rust | `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) |
+| Python Dependency Licenses | `ubuntu-24.04` |
+| Collector Data / Perf data sanity (informational) | `ubuntu-24.04` |
+| Python 3.11 and 3.13 compatibility, Rust feature modes | `ubuntu-24.04` |
+| Collector Data / Check collector data | `ubuntu-24.04` |
+
+These jobs install Python with `actions/setup-python` and the stable Rust
+toolchain as before. Hosted images already provide `cc`, `c++` and `make`, so
+`ci_install_build_tools.sh` skips apt there. A workflow contract test keeps
+these jobs on hosted labels without a container, secrets, an environment or wheel
+storage. Moving one back to a self-hosted pool needs a reason, such as a new
+Artifactory dependency.
+
+Python compatibility, Rust feature modes and the collector data check build
+AISim from source with `pip install './python/aisim[dev]'` instead of
+downloading the application test wheel from Artifactory, so they need no
+internal network access either.
 
 ### Maintenance ownership
 

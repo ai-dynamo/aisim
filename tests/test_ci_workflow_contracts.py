@@ -217,6 +217,8 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     selector = workflow["jobs"]["select"]
     compare = workflow["jobs"]["compare"]
     assert selector["runs-on"] == "ubuntu-24.04"
+    # Draft and stacked-base skips are selector decisions with a reported reason.
+    assert "if" not in selector
     assert "python scripts/performance/select_forward_perf.py" in _run_commands(selector)
     assert compare["needs"] == "select"
     assert compare["if"] == "needs.select.outputs.run_comparison == 'true'"
@@ -327,10 +329,11 @@ def test_forward_perf_skips_incompatible_data_policies(tmp_path, base_protocol):
         assert not summary.exists()
 
 
-def _forward_api(pages, *, count=None, after=None, canonical="a" * 40):
+def _forward_api(pages, *, count=None, after=None, canonical="a" * 40, draft=False, base_ref="main"):
     pull = {
         "head": {"sha": "a" * 40},
-        "base": {"sha": "b" * 40, "ref": "main"},
+        "base": {"sha": "b" * 40, "ref": base_ref},
+        "draft": draft,
         "changed_files": sum(map(len, pages)) if count is None else count,
     }
     calls = []
@@ -387,6 +390,45 @@ def test_forward_perf_uses_complete_pr_files(pages, count, expected):
     assert any("/files?per_page=100" in call for call in calls) is (count != 3001)
 
 
+@pytest.mark.parametrize("selector", ["select_forward_perf", "select_simulation_perf"])
+@pytest.mark.parametrize(
+    ("draft", "base_ref", "reason"),
+    [
+        (False, "main", None),
+        (False, "release/0.3", None),
+        (True, "main", "PR is a draft"),
+        (True, "feature/base", "PR is a draft"),
+        (False, "feature/base", "PR targets `feature/base`"),
+        (False, "release/0.3/backport", "PR targets `release/0.3/backport`"),
+        (False, "mainline", "PR targets `mainline`"),
+    ],
+)
+def test_perf_pushes_skip_drafts_and_stacked_bases(selector, draft, base_ref, reason):
+    module = importlib.import_module(f"scripts.performance.{selector}")
+    api, calls = _forward_api([[{"filename": "crates/core/src/python.rs"}]], draft=draft, base_ref=base_ref)
+    result = module.select_comparison("owner/repo", "push", "refs/heads/pull-request/236", "a" * 40, api=api)
+    assert result["number"] == "236"
+    assert result["head_sha"] == "a" * 40
+    assert result["base_ref"] == base_ref
+    assert calls[0] == calls[-1] == "repos/owner/repo/pulls/236"
+    if reason is None:
+        assert result["run_comparison"] == "true"
+        assert any("/files?per_page=100" in call for call in calls)
+    else:
+        # Skips need no file list, but still re-read the PR for a stable revision.
+        assert result["run_comparison"] == "false"
+        assert result["reason"].startswith(reason)
+        assert "Dispatch manually with pr_number" in result["reason"]
+        assert calls == ["repos/owner/repo/pulls/236"] * 2
+
+
+@pytest.mark.parametrize("draft", [None, "false"])
+def test_perf_selection_rejects_an_unknown_draft_state(draft):
+    api, _ = _forward_api([[{"filename": "crates/core/src/python.rs"}]], draft=draft)
+    with pytest.raises(ValueError, match="Invalid draft state for PR #236"):
+        forward_perf.select_comparison("owner/repo", "push", "refs/heads/pull-request/236", "a" * 40, api=api)
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
@@ -407,13 +449,19 @@ def test_forward_perf_path_matching_preserves_directory_boundaries(path, expecte
     assert forward_perf.matches_path(path) is expected
 
 
-def test_forward_perf_manual_dispatch_forces_comparison_of_the_trusted_copy():
-    api, calls = _forward_api([[{"filename": "docs/ci.md"}]])
+@pytest.mark.parametrize(
+    ("draft", "base_ref"),
+    [(False, "main"), (True, "main"), (False, "feature/base"), (True, "feature/base")],
+)
+def test_forward_perf_manual_dispatch_forces_comparison_of_the_trusted_copy(draft, base_ref):
+    api, calls = _forward_api([[{"filename": "docs/ci.md"}]], draft=draft, base_ref=base_ref)
     result = forward_perf.select_comparison(
         "owner/repo", "workflow_dispatch", "refs/heads/main", "c" * 40, "236", api=api
     )
     assert result["run_comparison"] == "true"
+    assert result["reason"] == "Manual dispatch requests a comparison."
     assert result["head_sha"] == "a" * 40
+    assert result["base_ref"] == base_ref
     assert not any("/files?" in call for call in calls)
 
 
@@ -442,9 +490,22 @@ def test_forward_perf_rejects_changed_or_stale_revisions(change):
         )
 
 
-@pytest.mark.parametrize("fail_api", [False, True])
-def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, fail_api):
-    api, _ = _forward_api([[{"filename": "docs/ci.md"}]])
+@pytest.mark.parametrize(
+    ("scenario", "reason"),
+    [
+        ("unrelated", "No PR files affect forward prediction."),
+        ("draft", "PR is a draft"),
+        ("stacked", "PR targets `feature/base`"),
+        ("api_failure", None),
+    ],
+)
+def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, scenario, reason):
+    fail_api = scenario == "api_failure"
+    api, _ = _forward_api(
+        [[{"filename": "docs/ci.md"}]],
+        draft=scenario == "draft",
+        base_ref="feature/base" if scenario == "stacked" else "main",
+    )
 
     def run(command, **kwargs):
         assert command[:4] == ["gh", "api", "--paginate", "--slurp"]
@@ -469,7 +530,7 @@ def test_forward_perf_cli_reports_skip_or_api_failure(monkeypatch, tmp_path, fai
         assert not (tmp_path / "summary").exists()
     else:
         assert "run_comparison=false" in (tmp_path / "output").read_text()
-        assert "**SKIPPED**" in (tmp_path / "summary").read_text()
+        assert f"**SKIPPED** — {reason}" in (tmp_path / "summary").read_text()
 
 
 def _fast_run(**overrides):
@@ -680,15 +741,18 @@ def test_fast_prerequisite_cli_errors_leave_success_summary_unwritten(tmp_path, 
         ("tests/unit/generator/test_unmarked.py", set(), "unit"),
         ("tests/unit/sdk/test_mixed.py", {"integration"}, "unit"),
         ("tests/golden/generator/test_contract.py", set(), "unit"),
-        ("tests/integration/test_new.py", set(), "integration"),
+        ("tests/integration/test_new.py", set(), "integration-build"),
         ("tests/cross_package/test_public_api.py", set(), "contracts"),
         ("tests/e2e/cli/test_new.py", {"build"}, "cli-build"),
-        ("tests/e2e/support_matrix/test_new.py", {"build"}, "support-matrix"),
-        ("tests/e2e/tools/test_new.py", {"build"}, "tools-build"),
+        ("tests/e2e/support_matrix/test_new.py", {"build"}, "integration-build"),
+        ("tests/e2e/tools/test_new.py", {"build"}, "integration-build"),
     ],
 )
 def test_collected_inventory_assigns_cases_without_requiring_unit_markers(path, markers, expected):
     assert assignment(path, markers, {})[0] == expected
+    # Inventory shards name the Full CI legs that run the case.
+    shards = _workflow("ci.yml")["jobs"]["application-tests"]["strategy"]["matrix"]["shard"]
+    assert expected in {shard["suite"] for shard in shards}
 
 
 def test_collected_inventory_requires_explicit_manual_exceptions():
@@ -940,6 +1004,46 @@ def test_workflow_runner_selectors_match_registered_pools_and_runbook() -> None:
         assert "prod-aisimulate-default-" not in path.read_text(), path
 
 
+# Jobs that need nothing from the NVIDIA network stay off the capped self-hosted
+# pools. Values map each matrix architecture to its GitHub-hosted label.
+GITHUB_HOSTED_JOBS = {
+    ("ci.yml", "cargo-deny"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "public-api-rust"): {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"},
+    ("ci.yml", "python-compliance"): {"amd64": "ubuntu-24.04"},
+    ("ci.yml", "python-compatibility"): {"amd64": "ubuntu-24.04"},
+    ("ci.yml", "rust-feature-modes"): {"amd64": "ubuntu-24.04"},
+    ("collector-check.yml", "check"): {"amd64": "ubuntu-24.04"},
+    ("collector-check.yml", "cross-backend-consistency"): {"amd64": "ubuntu-24.04"},
+}
+
+
+@pytest.mark.parametrize(("workflow_name", "job_name"), sorted(GITHUB_HOSTED_JOBS))
+def test_public_network_jobs_run_on_github_hosted_runners(workflow_name: str, job_name: str) -> None:
+    job = _workflow(workflow_name)["jobs"][job_name]
+    expected = GITHUB_HOSTED_JOBS[(workflow_name, job_name)]
+    if job["runs-on"] == "${{ matrix.runner }}":
+        include = job["strategy"]["matrix"]["include"]
+        assert "arch" not in job["strategy"]["matrix"]
+        runners = {entry["arch"]: entry["runner"] for entry in include}
+        assert len(runners) == len(include)
+        assert "${{ matrix.arch }}" in job["name"]
+    else:
+        assert "strategy" not in job or "arch" not in job["strategy"]["matrix"]
+        runners = {"amd64": job["runs-on"]}
+    assert runners == expected
+    assert int(job["timeout-minutes"]) > 0
+    # Hosted runners cannot resolve Artifactory and get no internal job image.
+    assert "container" not in job
+    assert "environment" not in job
+    serialized = json.dumps(job)
+    for internal in ("wheel-storage", "WHEEL_STORAGE", "ARTIFACTORY", "secrets.", "vars.", "/__w/"):
+        assert internal not in serialized, internal
+    if job_name == "cargo-deny":
+        targets = {entry["arch"]: entry["cargo_deny_target"] for entry in job["strategy"]["matrix"]["include"]}
+        assert targets == {"amd64": "x86_64-unknown-linux-musl", "arm64": "aarch64-unknown-linux-musl"}
+
+
 def test_full_ci_owns_migrated_expensive_suites() -> None:
     jobs = _workflow("ci.yml")["jobs"]
 
@@ -968,24 +1072,24 @@ def test_full_ci_owns_migrated_expensive_suites() -> None:
     assert {shard["suite"] for shard in jobs["application-tests"]["strategy"]["matrix"]["shard"]} == {
         "contracts",
         "unit",
-        "integration",
+        "integration-build",
         "cli-build",
-        "support-matrix",
-        "tools-build",
     }
     application_commands = _run_commands(jobs["application-tests"])
     compatibility_commands = _run_commands(jobs["python-compatibility"])
     assert "python/aisim/tests/cross_package" in application_commands
     assert "python/aisim/tests/cross_package" in compatibility_commands
     assert "tests/unit tests/golden" in application_commands
-    integration_steps = [
-        step for step in jobs["application-tests"]["steps"] if step.get("if") == "matrix.shard.suite == 'integration'"
+    integration_build_steps = [
+        step for step in jobs["application-tests"]["steps"] if "'integration-build'" in step.get("if", "")
     ]
-    assert len(integration_steps) == 1
-    assert "tests/integration" in integration_steps[0]["run"]
-    assert "--ignore" not in integration_steps[0]["run"]
-    assert "-m" not in shlex.split(integration_steps[0]["run"])[3:]
-    assert integration_steps[0]["working-directory"] == "python/aisim"
+    # The merged leg keeps each suite's own selection, workers and timeout.
+    assert [shlex.split(step["run"])[3:] for step in integration_build_steps] == [
+        ["-q", "-ra", "tests/integration", "-n", "2", "--timeout=600"],
+        ["-q", "tests/e2e/support_matrix", "-m", "build", "-n", "auto", "--timeout=180"],
+        ["-q", "tests/e2e/tools", "-m", "build", "-n", "auto", "--timeout=600"],
+    ]
+    assert all(step["working-directory"] == "python/aisim" for step in integration_build_steps)
     assert "scripts/ci/check_application_test_inventory.py" in application_commands
     assert "tests/e2e/cli" in application_commands
     assert "tests/e2e/support_matrix" in application_commands
@@ -1816,6 +1920,14 @@ def test_full_ci_manual_source_branches_replace_only_their_branch():
 @pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/release/0.12.0", "refs/tags/v0.12.0"])
 def test_full_ci_preserves_every_lifecycle_and_tag_run(event, ref):
     assert _full_ci_concurrency_group(event, ref, "101") != _full_ci_concurrency_group(event, ref, "102")
+
+
+def test_copy_pr_bot_syncs_ready_prs_but_not_drafts():
+    # Every trusted-copy push starts Full CI and the advisory performance
+    # workflows on the self-hosted pools; drafts keep Fast CI only until they
+    # are marked ready or a maintainer comments `/ok to test <sha>`.
+    config = yaml.safe_load((REPOSITORY_ROOT / ".github/copy-pr-bot.yaml").read_text())
+    assert config == {"enabled": True, "auto_sync_draft": False, "auto_sync_ready": True}
 
 
 def test_fast_ci_is_standalone_with_an_exact_commit_prerequisite() -> None:
@@ -2658,18 +2770,99 @@ def test_parallel_test_matrix_has_no_missing_or_duplicate_partitions():
         "prediction-regression",
     }.issubset(jobs["readiness"]["needs"])
     assert set(jobs["stage-application-wheel"]["needs"]) == {"readiness", "application-wheel"}
-    for suite in ("unit", "cli-build"):
-        steps = [
-            step for step in jobs["application-tests"]["steps"] if step.get("if") == f"matrix.shard.suite == '{suite}'"
-        ]
-        assert len(steps) == 1
-        command = steps[0]["run"]
+    split_steps = [step for step in jobs["application-tests"]["steps"] if "--splits" in step.get("run", "")]
+    assert [re.findall(r"matrix\.shard\.suite == '([\w-]+)'", step["if"]) for step in split_steps] == [
+        ["unit"],
+        ["cli-build"],
+    ]
+    for step in split_steps:
+        command = step["run"]
         assert command.count("--splits ") == 1
         assert command.count("--group ") == 1
         assert command.count("--splitting-algorithm ") == 1
         assert "--splits ${{ matrix.shard.groups }}" in command
         assert "--group ${{ matrix.shard.group }}" in command
         assert "--splitting-algorithm least_duration" in command
+
+
+def _unwrap_expression(expression: str) -> str:
+    return expression.strip().removeprefix("${{").removesuffix("}}").strip()
+
+
+def _application_expression(expression: str, shard: dict, *, outcomes: dict, failed: bool, cancelled: bool):
+    # Evaluate the workflow's own expression with GitHub's operand-returning
+    # `&&`/`||`, which Python's `and`/`or` share. actionlint checks the syntax.
+    def substitute(match):
+        token = match[0]
+        if token.startswith("'"):
+            return token
+        if token.startswith("steps."):
+            return repr(outcomes.get(token.split(".")[1], ""))
+        return repr(int(shard["group"]) if token == "matrix.shard.group" else shard[token.rsplit(".", 1)[1]])
+
+    expression = _unwrap_expression(expression)
+    expression = re.sub(r"'[^']*'|steps\.[\w-]+\.outcome|matrix\.shard\.\w+", substitute, expression)
+    for function, value in (
+        ("!cancelled()", not cancelled),
+        ("cancelled()", cancelled),
+        ("always()", True),
+        ("success()", not failed and not cancelled),
+        ("failure()", failed),
+    ):
+        expression = expression.replace(function, repr(value))
+    return eval(expression.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}, {})
+
+
+def _application_leg_steps(job: dict, shard: dict, *, failing: str = "", cancelled: bool = False) -> list[str]:
+    ran, outcomes, failed = [], {}, False
+    for step in job["steps"]:
+        name = step.get("name") or step["uses"]
+        condition = _unwrap_expression(step.get("if", "success()"))
+        if not re.search(r"\b(?:success|failure|always|cancelled)\(\)", condition):
+            condition = f"success() && ({condition})"
+        runs = _application_expression(condition, shard, outcomes=outcomes, failed=failed, cancelled=cancelled)
+        outcome = "skipped" if not runs else "failure" if name == failing else "success"
+        outcomes[step.get("id", "")] = outcome
+        failed = failed or outcome == "failure"
+        if runs:
+            ran.append(name)
+    return ran
+
+
+def test_application_test_legs_still_report_every_suite_after_an_earlier_failure():
+    job = _workflow("ci.yml")["jobs"]["application-tests"]
+    install = "Install the prebuilt application and test dependencies"
+    suite_steps = {
+        "contracts": ["Run repository and package contracts"],
+        "unit": ["Run unit tests"],
+        "cli-build": ["Run recommendation E2E without parallel resource contention", "Run remaining CLI build tests"],
+        "integration-build": [
+            "Run migrated integration tests against the installed wheel",
+            "Run support-matrix build tests",
+            "Run tool build tests",
+        ],
+    }
+    test_steps = {name for names in suite_steps.values() for name in names}
+    assert test_steps == {step["name"] for step in job["steps"] if "pytest" in step.get("run", "")}
+    assert job["timeout-minutes"] == "15"
+    checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    depths = {}
+    for shard in job["strategy"]["matrix"]["shard"]:
+        expected = suite_steps[shard["suite"]]
+
+        def tests_run(**kwargs) -> list[str]:
+            return [name for name in _application_leg_steps(job, shard, **kwargs) if name in test_steps]
+
+        assert tests_run() == expected
+        for failing in expected:
+            assert tests_run(failing=failing) == expected
+        assert tests_run(failing=install) == []
+        assert tests_run(cancelled=True) == []
+        depths[shard["suite"]] = _application_expression(
+            checkout["with"]["fetch-depth"], shard, outcomes={}, failed=False, cancelled=False
+        )
+    # Repository-root contracts read Git history; the application suites do not.
+    assert depths == {"contracts": 0, "unit": 1, "cli-build": 1, "integration-build": 1}
 
 
 @pytest.mark.parametrize("failed", ["package", "rust", "neither"])
@@ -4317,7 +4510,7 @@ def test_simulation_performance_rollout_and_revision_contract():
 def test_simulation_performance_selects_complete_pr_files(path, expected):
     from scripts.performance import select_simulation_perf
 
-    pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40, "ref": "main"}, "changed_files": 1}
+    pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40, "ref": "main"}, "draft": False, "changed_files": 1}
 
     def api(endpoint):
         return [[{"filename": path}]] if "/files?" in endpoint else [pull]
@@ -4790,6 +4983,130 @@ def test_simulation_dynamo_speculation_depth_patch_fails_without_writing(tmp_pat
     assert path.read_bytes() == original
 
 
+def _write_lock(source, *versions):
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "Cargo.lock").write_text(
+        "".join(f'[[package]]\nname = "pyo3"\nversion = "{version}"\n\n' for version in versions)
+        + '[[package]]\nname = "pyo3-ffi"\nversion = "0.30.1"\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ("versions", "error"), [(("0.23.5",), None), (("0.30.1",), None), ((), "found"), (("0.23.5", "0.30.1"), "found")]
+)
+def test_simulation_dynamo_reads_one_locked_pyo3_version(tmp_path, versions, error):
+    from scripts.performance import build_simulation_dynamo as builder
+
+    _write_lock(tmp_path, *versions)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            builder.locked_pyo3_version(tmp_path / "Cargo.lock")
+    else:
+        assert builder.locked_pyo3_version(tmp_path / "Cargo.lock") == versions[0]
+
+
+_PYO3_BINDINGS_MANIFEST = (
+    'pyo3 = { version = "0.23.4", default-features = false }\n'
+    'pyo3-async-runtimes = { version = "0.23.0", default-features = false }\n'
+    'pythonize = "0.23"\n'
+)
+_PYO3_LIB = (
+    "//! Fixture bindings.\nuse pyo3::IntoPyObjectExt;\n\n#[pyclass]\n#[derive(Clone)]\npub struct Endpoint {}\n"
+)
+_PYO3_USER = "use pyo3::prelude::*;\n\nfn call(o: PyObject) {\n    Python::with_gil(|py| o.bind(py).len());\n}\n"
+
+
+def _pyo3_fixture(tmp_path, monkeypatch, core_pyo3):
+    from scripts.performance import build_simulation_dynamo as builder
+
+    source, dynamo = tmp_path / "source", tmp_path / "dynamo"
+    _write_lock(source, core_pyo3)
+    bindings = dynamo / builder.PYO3_BINDINGS
+    (bindings / "rust").mkdir(parents=True)
+    files = {
+        bindings / "Cargo.toml": _PYO3_BINDINGS_MANIFEST,
+        bindings / "rust/lib.rs": _PYO3_LIB,
+        bindings / "rust/user.rs": _PYO3_USER,
+    }
+    for path, text in files.items():
+        path.write_text(text)
+    monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 1),))
+    monkeypatch.setattr(builder, "PYO3_030_PYOBJECT_FILES", ("rust/user.rs",))
+    monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Endpoint",)})
+    monkeypatch.setattr(builder, "PYO3_030_EDITS", (builder.PYO3_030_EDITS[0],))
+    return builder, source, dynamo, files
+
+
+def test_simulation_dynamo_pyo3_bindings_unchanged_for_matching_core(tmp_path, monkeypatch):
+    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.23.5")
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("a core on the bindings' pyo3 must not rewrite Dynamo")
+
+    monkeypatch.setattr(Path, "write_text", unexpected_write)
+    assert builder.patch_pyo3_bindings(source, dynamo) == {"core_pyo3": "0.23.5", "files": []}
+    assert all(path.read_text() == text for path, text in files.items())
+
+
+def test_simulation_dynamo_pyo3_bindings_move_to_core_pyo3(tmp_path, monkeypatch):
+    builder, source, dynamo, files = _pyo3_fixture(tmp_path, monkeypatch, "0.30.1")
+
+    record = builder.patch_pyo3_bindings(source, dynamo)
+
+    bindings = dynamo / builder.PYO3_BINDINGS
+    marker = "Modified by AISim CI: moved from the pyo3 0.23 API to the pyo3 0.30 API."
+    assert (bindings / "Cargo.toml").read_text() == (
+        f"# {marker}\n"
+        'pyo3 = { version = "0.30.1", default-features = false }\n'
+        'pyo3-async-runtimes = { version = "0.30.0", default-features = false }\n'
+        'pythonize = "0.30"\n'
+    )
+    lib = (bindings / "rust/lib.rs").read_text()
+    assert lib.startswith(f"//! Fixture bindings.\n// {marker}\nuse pyo3::IntoPyObjectExt;\n")
+    assert "pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;" in lib
+    assert "#[pyclass(from_py_object)]\n#[derive(Clone)]\npub struct Endpoint" in lib
+    assert (bindings / "rust/user.rs").read_text() == (
+        f"// {marker}\n"
+        "use crate::PyObject;\nuse pyo3::prelude::*;\n\nfn call(o: PyObject) {\n"
+        "    Python::attach(|py| o.bind(py).len());\n}\n"
+    )
+    assert record["core_pyo3"] == "0.30.1"
+    assert sorted(entry["path"] for entry in record["files"]) == sorted(str(path.relative_to(dynamo)) for path in files)
+    for entry in record["files"]:
+        path = dynamo / entry["path"]
+        assert entry["before_sha256"] == hashlib.sha256(files[path].encode()).hexdigest()
+        assert entry["after_sha256"] == hashlib.sha256(path.read_text().encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "fault", ["unsupported_core", "rename_count", "edit_anchor", "dependency", "class", "pyobject"]
+)
+def test_simulation_dynamo_pyo3_bindings_fail_without_writing(tmp_path, monkeypatch, fault):
+    builder, source, dynamo, files = _pyo3_fixture(
+        tmp_path, monkeypatch, "0.29.0" if fault == "unsupported_core" else "0.30.1"
+    )
+    bindings = dynamo / builder.PYO3_BINDINGS
+    if fault == "rename_count":
+        monkeypatch.setattr(builder, "PYO3_030_RENAMES", ((r"Python::with_gil\(", "Python::attach(", 2),))
+    elif fault == "edit_anchor":
+        (bindings / "rust/lib.rs").write_text(_PYO3_LIB.replace("IntoPyObjectExt", "IntoPyObject"))
+    elif fault == "dependency":
+        (bindings / "Cargo.toml").write_text(_PYO3_BINDINGS_MANIFEST.replace("0.23.4", "0.23.5"))
+    elif fault == "class":
+        monkeypatch.setattr(builder, "PYO3_030_BY_VALUE_CLASSES", {"rust/lib.rs": ("Context",)})
+    elif fault == "pyobject":
+        (bindings / "rust/extra.rs").write_text("use pyo3::prelude::*;\nfn f(o: PyObject) {}\n")
+    before = {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()}
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("failed bindings validation must not write source files")
+
+    monkeypatch.setattr(Path, "write_text", unexpected_write)
+    with pytest.raises(ValueError):
+        builder.patch_pyo3_bindings(source, dynamo)
+    assert {path: path.read_text() for path in sorted(bindings.rglob("*")) if path.is_file()} == before
+
+
 @pytest.mark.parametrize("field_type", [None, "u32", "usize"])
 @pytest.mark.parametrize("drift", [None, "source", "anchors", "role"])
 def test_simulation_dynamo_replay_cp_compatibility(tmp_path, monkeypatch, field_type, drift):
@@ -5118,6 +5435,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         "before_sha256": "a" * 64,
         "after_sha256": "b" * 64,
     }
+    pyo3_compatibility = {"core_pyo3": "0.30.1", "files": [{"path": "x.rs", "before_sha256": "c", "after_sha256": "d"}]}
 
     def patch_handoff_timing(actual_core, actual_dynamo):
         assert actual_core == core.parent and actual_dynamo == dynamo
@@ -5139,6 +5457,11 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         patched.append(("replay", actual_core, actual_dynamo))
         return {"prefill_context_parallel_size": 1}
 
+    def patch_pyo3_bindings(actual_source, actual_dynamo):
+        assert actual_source == source and actual_dynamo == dynamo
+        patched.append(("pyo3", actual_source, actual_dynamo))
+        return pyo3_compatibility
+
     def check_output(args, **kwargs):
         if args[:2] == ["cargo", "metadata"]:
             assert patched == [
@@ -5146,6 +5469,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
                 ("literals", core.parent, dynamo),
                 ("speculation", dynamo),
                 ("replay", core.parent, dynamo),
+                ("pyo3", source, dynamo),
             ]
             assert "--locked" not in args
             assert kwargs["cwd"] == bindings
@@ -5183,6 +5507,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
     monkeypatch.setattr(builder, "patch_optional_literal_fields", patch_optional_literal_fields)
     monkeypatch.setattr(builder, "patch_speculation_depth", patch_speculation_depth)
     monkeypatch.setattr(builder, "patch_replay_engine_config", patch_replay_engine_config)
+    monkeypatch.setattr(builder, "patch_pyo3_bindings", patch_pyo3_bindings)
     if wrong_core:
         with pytest.raises(ValueError, match="different AISim core"):
             builder.build(source, dynamo, output)
@@ -5198,6 +5523,7 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
         assert provenance["literal_compatibility"] == literal_compatibility
         assert provenance["speculation_compatibility"] == speculation_compatibility
         assert provenance["replay_compatibility"] == {"prefill_context_parallel_size": 1}
+        assert provenance["pyo3_compatibility"] == pyo3_compatibility
         assert (output / "dynamo-build.patch").read_bytes() == b"dependency patch\n"
 
 
