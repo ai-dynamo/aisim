@@ -189,7 +189,7 @@ Both rows have 64 heads and target TP 1. Their points are batch size 256, sequen
 
 ## Run records
 
-Tree A is commit `5df15da0` of the branch of the pull request that added this directory. Later commits of that branch change no executable line under `python/aisim/collector/`. They change only comments and docstrings there. The plan hashes of `plan-diff.md` hold at the final content.
+Pull request #983 added this directory. Tree A is commit `5df15da0` of the branch of that pull request. Later commits of that branch change no executable line under `python/aisim/collector/`. They change only comments and docstrings there. The plan hashes of `plan-diff.md` hold at the final content.
 
 Each SGLang version has one record. The six result files are in this directory.
 
