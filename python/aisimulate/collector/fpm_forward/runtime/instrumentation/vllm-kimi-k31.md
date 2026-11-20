@@ -51,6 +51,14 @@ is pinned at that immutable revision with SHA-256
 between manager blocks. Its installed bytes must match before import qualifies;
 the source check does not establish image execution or refresh old observations.
 
+The selected TRT-LLM MXFP4 expert implementation
+[`vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py)
+is pinned with SHA-256
+`6cd47f0edf4dd941138e482b63cd1d366a25d7290bbaa57579827ef309600b6f`.
+It owns `TrtLlmMxfp4ExpertsMonolithic` and `TrtLlmMxfp4ExpertsModular`,
+selected by the audited oracle. The installed module must match these immutable
+upstream bytes; the digest does not establish execution or requalify old evidence.
+
 ## Source-to-observation mapping
 
 * `v1/kv_cache_interface.py`: `KVCacheTensor.layers`, `layer_stride`,

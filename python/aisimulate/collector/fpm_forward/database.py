@@ -205,6 +205,30 @@ class KdaSeedError(ValueError):
     """A completed native attempt lacks publishable recurrent-state seeding."""
 
 
+def _is_k31(plan) -> bool:
+    capability = getattr(plan, "capability", None)
+    model_config = getattr(capability, "model_config", None)
+    return getattr(capability, "architecture", None) == "KimiK31ForConditionalGeneration" or (
+        model_config is not None
+        and (model_config.payload.get("architectures") or [])[:1] == ["KimiK31ForConditionalGeneration"]
+    )
+
+
+def require_k31_worker_evidence(plan, cell, raw_root, collection) -> None:
+    """Require the publication evidence before a cell becomes terminal passed."""
+    if not _is_k31(plan):
+        return
+    from .execution_evidence import _runtime_worker_evidence
+    from .runtime_k31 import moe_precision
+
+    bundle = plan.runtime_instrumentation
+    if bundle is None or plan.runtime_launch is None:
+        raise ValueError("K3.1 publication requires source-bound observed MoE precision")
+    workers, _ = _runtime_worker_evidence(plan, cell, raw_root, collection, bundle=bundle)
+    if any(moe_precision(worker.get("initialized_moe")) != cell.moe_quant_mode for worker in workers.values()):
+        raise ValueError("K3.1 publication MoE precision differs from initialized workers")
+
+
 def require_kda_real_kv(plan, cell, collection):
     config = getattr(getattr(plan, "capability", None), "model_config", None)
     if cell.workload_kind != "decode" or config is None or config.effective_payload.get("linear_attn_config") is None:
@@ -215,8 +239,20 @@ def require_kda_real_kv(plan, cell, collection):
         or warmup.get("enabled") is not True
         or warmup.get("warm_eligible") is not True
         or warmup.get("skip_reason")
-        or any("kvwarm_real_kv" not in (item.point.get("sample_reasons") or []) for item in collection.points)
-        or any("kvwarm_fake_fallback" in (item.point.get("sample_reasons") or []) for item in collection.points)
+        or any(
+            not isinstance(reasons := item.point.get("sample_reasons"), list)
+            or not all(isinstance(reason, str) for reason in reasons)
+            or "kvwarm_real_kv" not in reasons
+            or "kvwarm_fake_fallback" in reasons
+            for item in collection.points
+        )
+        or (
+            _is_k31(plan)
+            and (
+                not collection.kvwarm_initialization_strategies
+                or any(strategy != "native_exact_context" for strategy in collection.kvwarm_initialization_strategies)
+            )
+        )
     ):
         raise KdaSeedError("KDA decode publication requires real_kv seeding of the request's recurrent state")
 
@@ -254,21 +290,9 @@ def aggregate_cell(
         if deployment is not None
         else getattr(plan, "backend_version", None) or collection.backend_version
     )
+    require_k31_worker_evidence(plan, cell, cell_dir / "raw", collection)
     capability = plan.capability
     model_config = getattr(capability, "model_config", None)
-    if model_config is not None and (
-        getattr(capability, "architecture", None) == "KimiK31ForConditionalGeneration"
-        or model_config.payload.get("architectures", [])[:1] == ["KimiK31ForConditionalGeneration"]
-    ):
-        from .execution_evidence import _runtime_worker_evidence
-        from .runtime_k31 import moe_precision
-
-        bundle = plan.runtime_instrumentation
-        if bundle is None or plan.runtime_launch is None:
-            raise ValueError("K3.1 publication requires source-bound observed MoE precision")
-        workers, _ = _runtime_worker_evidence(plan, cell, cell_dir / "raw", collection, bundle=bundle)
-        if any(moe_precision(worker.get("initialized_moe")) != cell.moe_quant_mode for worker in workers.values()):
-            raise ValueError("K3.1 publication MoE precision differs from initialized workers")
     # Kimi's native KDA state belongs to a request's actual prefix history.
     # A balanced MoE router does not make that recurrent state content-free.
     # Observe the native seed protocol for each point; never promote a fake

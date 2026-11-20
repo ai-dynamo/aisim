@@ -657,7 +657,12 @@ impl ForwardPassPerfModelConfig {
             .fpm_interpolation
             .method
             .resolve(supports_sol)?;
-        if self.estimator_config.fpm_interpolation.method == super::FpmInterpolationMethod::Direct
+        // An unused inner method cannot restrict op-level timing, including
+        // after normalized configuration round trips. Automatic selection
+        // checks this again at the direct compiler boundary if it attempts FPM.
+        if self.estimation_mode == EstimationMode::FpmInterpolation
+            && self.estimator_config.fpm_interpolation.method
+                == super::FpmInterpolationMethod::Direct
             && self.database_mode != DatabaseMode::Silicon
         {
             return Err(invalid_config(

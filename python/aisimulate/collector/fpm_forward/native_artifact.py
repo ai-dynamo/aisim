@@ -120,6 +120,8 @@ class NativeCollection:
     # None only for artifacts predating the kvwarm-enabled runtime.
     kvwarm_meta: dict[str, Any] | None = None
     input_provenance: dict[str, Any] | None = None
+    # Retain every rank's strategy: the first envelope cannot attest its peers.
+    kvwarm_initialization_strategies: tuple[str | None, ...] = ()
 
 
 def _zero_kv_prefill_sample(measurements: list[NativePointMeasurement]) -> NativePointMeasurement | None:
@@ -514,6 +516,7 @@ def validate_native_collection(
     run_identity: tuple[str, str] | None = None
     kvwarm_meta: dict[str, Any] | None = None
     kvwarm_seen: object = _KVWARM_UNSEEN
+    initialization_strategies = []
     input_provenance: dict[str, Any] | None = None
     local_fpms: dict[tuple[int, int], dict[str, Any]] = {}
     seed_regimes: dict[int, str | None] = {}
@@ -591,6 +594,7 @@ def validate_native_collection(
         # (warm_eligible/skip_reason) must agree across DP ranks -- they
         # describe one shared measurement protocol, not per-rank state.
         kvwarm = _validate_kvwarm_contract(cell, payload.get("kvwarm"), path)
+        initialization_strategies.append(kvwarm.get("initialization_strategy") if kvwarm else None)
         kvwarm_regime = (
             None if kvwarm is None else (kvwarm.get("enabled"), kvwarm.get("warm_eligible"), kvwarm.get("skip_reason"))
         )
@@ -733,4 +737,5 @@ def validate_native_collection(
         runtime_grid_digest=run_identity[1],
         kvwarm_meta=kvwarm_meta,
         input_provenance=input_provenance,
+        kvwarm_initialization_strategies=tuple(initialization_strategies),
     )

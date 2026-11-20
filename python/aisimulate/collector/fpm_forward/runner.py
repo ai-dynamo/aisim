@@ -1516,6 +1516,12 @@ def _cell_generator_overrides(
     if isinstance(readiness, bool) or not re.fullmatch(r"[1-9][0-9]*", str(readiness)) or int(readiness) > 3600:
         raise ValueError(f"{READINESS_TIMEOUT_ENV} must be an integer from 1 through 3600")
     resolved_env[READINESS_TIMEOUT_ENV] = {"name": READINESS_TIMEOUT_ENV, "value": str(readiness)}
+    if (
+        k31_native_state
+        and cell.workload_kind == "decode"
+        and resolved_env.get("DYN_BENCH_KV_WARMUP", {}).get("value") == "off"
+    ):
+        raise ValueError("formal K3.1 decode requires DYN_BENCH_KV_WARMUP enabled")
     merged.setdefault("K8sConfig", {})["extra_env"] = list(resolved_env.values())
     merged = with_kv_warmup_defaults(merged)
 
@@ -1554,7 +1560,7 @@ def _cell_generator_overrides(
     if "--benchmark-points-file" in policy_flags:
         raise ValueError("benchmark points must be supplied through --fpm-benchmark-points-file")
     if cell.workload_kind == "decode":
-        prefix_caching = _decode_prefix_caching_mode(cell, plan)
+        prefix_caching = "disabled" if k31_native_state else _decode_prefix_caching_mode(cell)
         policy_disables = "--no-enable-prefix-caching" in policy_flags
         policy_enables = "--enable-prefix-caching" in policy_flags
         if prefix_caching == "enabled" and policy_disables:
@@ -1595,8 +1601,8 @@ _UNRESOLVED_BUNDLE = object()
 def _kimi_k31_native_state(plan, bundle=_UNRESOLVED_BUNDLE) -> bool:
     capability = getattr(plan, "capability", None)
     config = getattr(getattr(capability, "model_config", None), "payload", {})
-    if getattr(capability, "architecture", None) != "KimiK31ForConditionalGeneration" and config.get(
-        "architectures", []
+    if getattr(capability, "architecture", None) != "KimiK31ForConditionalGeneration" and (
+        config.get("architectures") or []
     )[:1] != ["KimiK31ForConditionalGeneration"]:
         return False
     if bundle is _UNRESOLVED_BUNDLE:
@@ -2136,7 +2142,6 @@ def _run_collection_impl(
             )
             checkpoint["runtime_observations"] = str(observation_index)
             record.pop("observation_error", None)
-            return True
         except Exception as error:
             record["status"] = "failed"
             record["observation_error"] = str(error)
@@ -2151,6 +2156,21 @@ def _run_collection_impl(
                 }
             )
             return False
+        if record["status"] == "passed" and not formal_database_terminal:
+            from .database import _is_k31, require_k31_worker_evidence
+
+            if _is_k31(plan):
+                try:
+                    raw_root = root / "cells" / cell.cell_id / "raw"
+                    collection = validate_native_collection(
+                        cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
+                    )
+                    require_k31_worker_evidence(plan, cell, raw_root, collection)
+                except (OSError, KeyError, TypeError, ValueError) as error:
+                    record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    logger.warning("Rejecting archived K3.1 worker evidence for %s: %s", cell.cell_id, error)
+                    return False
+        return True
 
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
@@ -2322,6 +2342,10 @@ def _run_collection_impl(
         if instrumentation is not None and previous.get("attempt_id") and not archive_observations(cell, previous):
             _atomic_json(checkpoint_path, checkpoint)
             continue
+        if instrumentation is not None:
+            from .runtime_probe import CONTEXT_FILENAME
+
+            (cell_dir / CONTEXT_FILENAME).unlink(missing_ok=True)
         for stale_dir in (cell_dir / "raw", cell_dir / "logs"):
             if stale_dir.exists():
                 shutil.rmtree(stale_dir)

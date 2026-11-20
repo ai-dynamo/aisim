@@ -1259,10 +1259,19 @@ def test_text_only_kimi_profile_preserves_encoder_weights_and_dcp_identity():
 
 
 @pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
-@pytest.mark.parametrize("state_dtype", ["float32", "auto", "bfloat16", None])
+@pytest.mark.parametrize(
+    "state_dtype,conv_dtype",
+    [
+        ("float32", "bfloat16"),
+        ("auto", "bfloat16"),
+        ("bfloat16", "bfloat16"),
+        (None, "bfloat16"),
+        ("float32", "float32"),
+    ],
+)
 @pytest.mark.parametrize("provenance_kind", ["probe", "collection", "finalized", "finalized_references"])
 def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
-    tmp_path, attention_backend, state_dtype, provenance_kind
+    tmp_path, attention_backend, state_dtype, conv_dtype, provenance_kind
 ):
     # Extend the repository's K3 fixture with independently declared sparse
     # geometry. Neither this config nor the synthetic timing anchors are a
@@ -1309,7 +1318,9 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
     parquet = _write_pair(str(tmp_path / "measured"), rows)
     # Same envelope as the native probe and the final collection importer;
     # values are synthetic declarations, not hardware observations.
-    state_provenance = {"runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": state_dtype}}}
+    state_provenance = {
+        "runtime_settings": {"cache_config": {"mamba_cache_dtype": conv_dtype, "mamba_ssm_cache_dtype": state_dtype}}
+    }
     if provenance_kind == "collection":
         state_provenance = {
             "source": "bound_collection_phases",
@@ -1401,6 +1412,15 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
         systems_paths=(str(systems),),
         estimator_config={"fpm_interpolation": {"method": "sol", "text_only": True, "fpm_parquet_path": parquet}},
     )
+    if conv_dtype == "float32":
+        with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
+            RustForwardPassPerfModel.best_available(config)
+        from dataclasses import replace
+
+        config = replace(
+            config,
+            estimator_config={"fpm_interpolation": {"method": "auto", "text_only": True, "fpm_parquet_path": parquet}},
+        )
     model = RustForwardPassPerfModel.best_available(config)
     try:
         resolved = model.diagnostics()["provenance"]["config"]
@@ -1440,6 +1460,11 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
                 # their per-request contexts (4096 and 1024) straddle top-k.
                 # This requires KDA SOL and distinguishes native DSA layouts.
                 transfer_metrics = [{"scheduled_requests": {"num_decode_requests": 3, "sum_decode_kv_tokens": 4096}}]
+                if conv_dtype == "float32":
+                    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+                    # Linear interpolation between measured B1=9ms and B4=18ms.
+                    assert predictor.estimate_forward_pass_time_ms(transfer_metrics) == pytest.approx(15.0)
+                    continue
                 if state_dtype not in {"float32", "auto"}:
                     with pytest.raises(PerfDataNotAvailableError, match="KDA SOL requires observed float32"):
                         predictor.estimate_forward_pass_time_ms(transfer_metrics)
@@ -1486,7 +1511,7 @@ def test_canonical_k31_fpm_profile_roundtrip_preserves_explicit_attention(
             resolved["estimator_config"]["fpm_interpolation"]["method"] = "auto"
             automatic = RustForwardPassPerfModel.best_available(ForwardPassPerfModelConfig(**resolved))
             try:
-                expected_method = "sol" if state_dtype in {"float32", "auto"} else "direct"
+                expected_method = "sol" if state_dtype in {"float32", "auto"} and conv_dtype == "bfloat16" else "direct"
                 auto_config = automatic.diagnostics()["provenance"]["config"]
                 assert auto_config["estimator_config"]["fpm_interpolation"]["method"] == expected_method
                 # Missing/BF16 state still admits an unmeasured query through

@@ -41,6 +41,12 @@ def native_source(tmp_path, monkeypatch):
         packages[name] = SimpleNamespace(__path__=[str(root)], __version__=VERSION)
         monkeypatch.setitem(sys.modules, name, packages[name])
     monkeypatch.setitem(sys.modules, "vllm._version", SimpleNamespace(__commit_id__="g266e88c05"))
+    expert = Path(packages["vllm"].__path__[0]) / "model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"
+    expert.parent.mkdir(parents=True)
+    expert.write_text("# synthetic installed expert implementation fixture\n")
+    sources["vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"] = hashlib.sha256(
+        expert.read_bytes()
+    ).hexdigest()
     manifest = tmp_path / "source-manifest.json"
     manifest.write_text(
         json.dumps(
@@ -65,6 +71,7 @@ def native_source(tmp_path, monkeypatch):
     [
         (None, None),
         ("vllm_source", "source hash differs: vllm/source.py"),
+        ("expert_source", "source hash differs: vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"),
         ("dynamo_source", "source hash differs: dynamo/source.py"),
         ("missing_source", "source path must resolve uniquely"),
         ("duplicate_source", "source path must resolve uniquely"),
@@ -85,6 +92,9 @@ def test_k31_execution_checks_installed_source_before_observed(native_source, tm
             source.unlink()
         else:
             source.write_text("# modified installed source\n")
+    elif corruption == "expert_source":
+        expert = Path(packages["vllm"].__path__[0]) / "model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"
+        expert.write_text("# changed synthetic expert implementation\n")
     elif corruption == "duplicate_source":
         packages["vllm"].__path__ *= 2
     elif corruption == "imported_version":
@@ -244,6 +254,11 @@ def native_execution(snapshot, native_source, request, monkeypatch):
     )
     cell = plan.cells[0]
     raw = root / "cells" / cell.cell_id / "raw"
+    for benchmark in raw.glob("**/benchmark*.json"):
+        payload = json.loads(benchmark.read_text())
+        if payload.get("artifact_type") == "rank":
+            payload["kvwarm"]["initialization_strategy"] = "native_exact_context"
+            benchmark.write_text(json.dumps(payload))
     index = json.loads(index_path.read_text())
     phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
     phase["cell_id"] = cell.cell_id
@@ -905,3 +920,40 @@ def test_execution_reports_unresolved_native_moe_backend_without_crashing(native
     result = execution_evidence.inspect_execution_evidence(cell, raw, collection, plan=plan)
     assert result["status"] == "failed", result
     assert any("kernel_config.moe_backend differs" in reason for reason in result["failures"])
+
+
+def test_packaged_k31_manifest_binds_selected_trtllm_expert_implementation():
+    from collector.fpm_forward import runtime_k31
+
+    manifest = json.loads((Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json").read_text())
+    runtime = manifest["runtime"]
+    source = "vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py"
+    # Exact upstream Git blob at the immutable revision cited in source notes.
+    assert runtime["source_files"][source] == "6cd47f0edf4dd941138e482b63cd1d366a25d7290bbaa57579827ef309600b6f"
+    assert (
+        runtime["source_revision"]
+        == hashlib.sha256(
+            json.dumps(runtime["source_files"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    assert runtime_k31.is_audited_runtime(runtime)
+    changed = copy.deepcopy(runtime)
+    changed["source_files"][source] = "0" * 64
+    assert not runtime_k31.is_audited_runtime(changed)
+
+
+def test_cell_acceptance_revalidates_archived_worker_evidence(snapshot):
+    from collector.fpm_forward.database import require_k31_worker_evidence
+
+    plan, cell, raw, collection, index = snapshot
+    plan.capability = SimpleNamespace(architecture="KimiK31ForConditionalGeneration")
+    cell.moe_quant_mode = "w4a8_mxfp4_mxfp8_trtllm"
+    require_k31_worker_evidence(plan, cell, raw, collection)
+
+    def unresolved(record):
+        if record["kind"] == "worker" and record["tp_rank"] == 1:
+            record.update(status="unresolved", error="synthetic initialized evidence failure")
+
+    _mutate(index, unresolved)
+    with pytest.raises(ValueError, match="synthetic initialized evidence failure|unresolved|observed"):
+        require_k31_worker_evidence(plan, cell, raw, collection)

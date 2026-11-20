@@ -236,7 +236,7 @@ def probe_generator_overrides(launch: dict[str, Any]) -> dict[str, Any]:
         generator_config=None,
         generator_set=[
             f"K8sConfig.k8s_image={json.dumps(image)}",
-            f"K8sConfig.extra_env={json.dumps(deployment.get('extra_env', []))}",
+            f"K8sConfig.extra_env={json.dumps(deployment.get('extra_env', []), ensure_ascii=False)}",
         ],
         generator_dynamo_version=deployment.get("dynamo_version"),
         generated_config_version=None,
@@ -265,8 +265,12 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
     _model_config_bytes(launch["model_config"])
     config = model.effective_payload
     architecture = (config.get("architectures") or [None])[0]
-    if model.payload.get("architectures") == ["KimiK31ForConditionalGeneration"]:
+    if (model.payload.get("architectures") or [])[:1] == ["KimiK31ForConditionalGeneration"]:
         architecture = "KimiK31ForConditionalGeneration"
+    if architecture == "KimiK31ForConditionalGeneration" and any(
+        len(candidate.get("architectures") or []) > 1 for candidate in (model.payload, config)
+    ):
+        raise ValueError("Kimi K3.1 runtime probing requires single-entry architecture lists for wrapper and decoder")
     if not isinstance(architecture, str) or not architecture:
         raise ValueError("runtime probe model config requires an architecture")
     from aisimulate.sdk.models.helpers import _infer_quant_modes_from_raw_config

@@ -3536,3 +3536,42 @@ def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_p
     assert record["status"] == "passed"
     assert attempts == ([True] if marker == "kvwarm_fake_fallback" else [])
     assert (record["attempt_id"] == "attempt") == (marker == "kvwarm_real_kv")
+
+
+@pytest.mark.parametrize("missing_rank", [None, 0, 1])
+def test_k31_native_exact_context_is_required_on_every_decode_rank(tmp_path, missing_rank):
+    cell = _cell(phase="decode", dp=2)
+    plan = _plan(cell)
+    plan.capability.architecture = "KimiK31ForConditionalGeneration"
+    plan.capability.model_config = ResolvedModelConfig(
+        {"linear_attn_config": {}}, source_kind="test", source_reference="synthetic KDA"
+    )
+    for rank in range(2):
+        raw = tmp_path / str(rank)
+        raw.mkdir()
+        _write_provenance(raw / "collector-provenance.json", cell_id=cell.cell_id)
+        payload = _native_payload(phase="decode", rank=rank, dp=2)
+        payload["kvwarm"] = {"enabled": True, "warm_eligible": True, "skip_reason": None}
+        if rank != missing_rank:
+            payload["kvwarm"]["initialization_strategy"] = "native_exact_context"
+
+        def stamp(value):
+            if isinstance(value, dict):
+                if "point_type" in value:
+                    value["sample_reasons"] = ["kvwarm_real_kv"]
+                for item in value.values():
+                    stamp(item)
+            elif isinstance(value, list):
+                for item in value:
+                    stamp(item)
+
+        stamp(payload)
+        (raw / "benchmark.json").write_text(json.dumps(payload))
+    if missing_rank is None:
+        assert _runtime_collection_summary(cell, tmp_path, plan=plan)["measured_point_count"] == 1
+    else:
+        with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+            _runtime_collection_summary(cell, tmp_path, plan=plan)
+    # Older KDA models retain their existing envelope contract.
+    plan.capability.architecture = "OtherKdaModel"
+    assert _runtime_collection_summary(cell, tmp_path, plan=plan)["measured_point_count"] == 1

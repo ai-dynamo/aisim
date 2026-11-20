@@ -1499,7 +1499,9 @@ collection remains unsupported by this adapter.
 Import checks native KDA state dtypes against the resolved cache settings:
 `mamba_cache_dtype: auto` follows the model dtype for convolution, and
 `mamba_ssm_cache_dtype: auto` requires FP32 recurrence. Explicit BF16 recurrence
-is accepted only with matching spec and tensor evidence. CUDA FP8 indexer
+is accepted only for standalone observations with matching spec and tensor
+evidence. Formal collection and imports bound to a Collector attempt require
+effective FP32 recurrence. CUDA FP8 indexer
 kernel views require the pinned backend's 64-token kernel blocks, including
 when a larger manager block is subdivided.
 
@@ -1561,8 +1563,46 @@ and also apply to package-version detection in the selected Slurm or Kubernetes 
 also reach the Collector's startup checks before the engine starts. Record mounted source
 and binary hashes alongside the image identity; environment declarations do not qualify them.
 The GPU-free Kubernetes version probe requires a model-cache PVC already bound
-for the collection workload. Initialize delayed-binding storage with that GPU
-workload first; the version probe refuses to become its first consumer.
+for the collection workload. For a Pending `WaitForFirstConsumer` claim, launch a
+separate cache-initialization Pod or Job before `collect-fpm --execute`: collection
+performs version detection before launching its GPU workload, so it cannot bind
+the claim itself. For example, save this as `cache-init.yaml`, substitute your
+namespace, claim and accepted image, and copy the intended GPU workload's node
+selectors, affinity and tolerations into `spec` before applying it:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fpm-cache-init
+  namespace: YOUR_NAMESPACE
+spec:
+  restartPolicy: Never
+  containers:
+    - name: init
+      image: YOUR_ACCEPTED_IMAGE
+      command: ["sh", "-c", "mkdir -p /models/hf"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      volumeMounts:
+        - name: model-cache
+          mountPath: /models
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: YOUR_MODEL_PVC
+```
+
+```bash
+kubectl apply -f cache-init.yaml
+kubectl -n YOUR_NAMESPACE wait --for=jsonpath='{.status.phase}'=Bound pvc/YOUR_MODEL_PVC --timeout=300s
+kubectl -n YOUR_NAMESPACE wait --for=jsonpath='{.status.phase}'=Succeeded pod/fpm-cache-init --timeout=300s
+kubectl -n YOUR_NAMESPACE delete pod fpm-cache-init
+```
+
+Confirm the claim has a `spec.volumeName`, then run collection. The version probe
+refuses to become the claim's first consumer.
 
 ### Choose or author the instrumentation bundle
 

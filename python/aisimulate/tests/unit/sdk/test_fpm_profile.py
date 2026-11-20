@@ -215,7 +215,7 @@ def test_profile_architecture_matches_collector_text_config_view(profile_dict, c
 
 
 @pytest.mark.parametrize("text_only", [None, False, True])
-@pytest.mark.parametrize("state_dtype", ["float32", "bfloat16", None])
+@pytest.mark.parametrize("state_dtype", ["float32", "auto", "bfloat16", None])
 @pytest.mark.parametrize(
     "wrapper, text_method",
     [
@@ -229,7 +229,7 @@ def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
 ):
     profile_dict["architecture"] = "KimiLinearForCausalLM"
     checkpoint_configs[profile_dict["model"]] = {
-        "architectures": [wrapper],
+        "architectures": [wrapper, "OtherModel"],
         "text_config": {"architectures": [profile_dict["architecture"]]},
     }
     if state_dtype is not None:
@@ -240,13 +240,19 @@ def test_kimi_wrapper_sol_requires_supported_graph_and_explicit_text_scope(
             "kv_cache_bytes": 1024,
             "gpu_memory_utilization": 0.8,
             "max_model_len": 4096,
-            "provenance": json.dumps({"runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": state_dtype}}}),
+            "provenance": json.dumps(
+                {
+                    "runtime_settings": {
+                        "cache_config": {"mamba_cache_dtype": "bfloat16", "mamba_ssm_cache_dtype": state_dtype}
+                    }
+                }
+            ),
         }
     request = _request(profile_dict)
     if text_only is not None:
         request["estimator_config"]["fpm_interpolation"]["text_only"] = text_only
     expected = text_method if text_only is True else "direct"
-    if wrapper == "KimiK31ForConditionalGeneration" and state_dtype != "float32":
+    if wrapper == "KimiK31ForConditionalGeneration" and state_dtype not in {"float32", "auto"}:
         expected = "direct"
     assert _normalize(request)["estimator_config"]["fpm_interpolation"]["method"] == expected
 
@@ -2553,3 +2559,56 @@ def test_registered_profile_without_sol_keeps_op_level_candidate(
     request["estimator_config"]["fpm_interpolation"]["method"] = "sol"
     with pytest.raises(ValueError, match="SOL interpolation requires"):
         _normalize(request)
+
+
+@pytest.mark.parametrize(
+    "recorded,expected", [(["auto", "float32"], "float32"), (["float32", "bfloat16"], None), (["float32", None], None)]
+)
+@pytest.mark.parametrize("kind", ["collection", "finalized"])
+def test_kda_effective_recurrent_dtype_requires_unanimous_evidence(profile_dict, recorded, expected, kind):
+    resources = profile_dict["deployments"][0]["resources"]
+    for key in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        resources.pop(key)
+    evidence = [{"runtime_settings": {"cache_config": {"mamba_ssm_cache_dtype": dtype}}} for dtype in recorded]
+    if kind == "collection":
+        provenance = {
+            "source": "bound_collection_phases",
+            "phases": dict(zip(("prefill", "decode"), evidence, strict=True)),
+        }
+    else:
+        provenance = {"cell_observations": [{"runtime_memory": {"provenance": json.dumps(item)}} for item in evidence]}
+    resources["runtime_memory"] = {
+        "kv_cache_bytes": 1024,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 4096,
+        "provenance": json.dumps(provenance),
+    }
+    deployment = load_fpm_profile(profile_dict).deployments[0]
+    assert fpm_profile._fpm_kda_state_dtype(deployment) == expected
+
+
+def test_op_level_sol_database_does_not_validate_unused_auto_direct(profile_dict, checkpoint_configs, monkeypatch):
+    profile_dict["architecture"] = "Qwen3_5MoeForCausalLM"
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [profile_dict["architecture"]]}
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(kwargs["forward_model"])
+        raise RuntimeError("synthetic op-level compiler reached")
+
+    monkeypatch.setattr(engine, "compile_engine", unavailable)
+    request = _request(profile_dict, estimation_mode="op_level", fallback_policy="deny", database_mode="SOL")
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+    assert _normalize(resolved) == resolved
+    with pytest.raises(ValueError, match="synthetic op-level compiler reached"):
+        RustForwardPassPerfModel.best_available(request)
+    assert attempts == ["op_level"]
+    with pytest.raises(ValueError, match="synthetic op-level compiler reached"):
+        RustForwardPassPerfModel.best_available(resolved)
+    assert attempts == ["op_level", "op_level"]
+    request["estimation_mode"] = "fpm_interpolation"
+    for method in ("auto", "direct"):
+        request["estimator_config"]["fpm_interpolation"]["method"] = method
+        with pytest.raises(ValueError, match="direct FPM interpolation requires database_mode='SILICON'"):
+            _normalize(request)

@@ -684,12 +684,15 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                     not state
                     and group["layer_classes"].get(name)
                     == "vllm.model_executor.layers.attention.mla_attention.MLAAttention"
-                    and group.get("cache_dtype_str") == "fp8"
+                    and (
+                        group.get("cache_dtype_str") == "fp8"
+                        or (group.get("cache_dtype_str") == "fp8_ds_mla" and component_block > 64)
+                    )
                     and strides[0] % shape[2]
                 ):
                     # Pinned sparse_utils.flat_kv_row_view addresses complete
                     # latent/RoPE rows, including gaps between native blocks.
-                    raise ValueError("K3.1 FlashInfer MLA block stride must contain whole cache rows")
+                    raise ValueError("K3.1 sparse MLA block stride must contain whole cache rows")
                 span = size
                 for stride, dimension in sorted(zip(strides[1:], shape[1:], strict=True)):
                     if dimension > 1:

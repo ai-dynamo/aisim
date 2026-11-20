@@ -348,7 +348,11 @@ fields report their nested paths. The supported namespaces are:
   including text-only wrapper profiles, use direct interpolation because their
   GDN graph has no SOL roofline. Without a profile, auto retains SOL. Explicit
   SOL requires a supported registered analytical model; direct requires a
-  profile and also supports registered architectures.
+  profile and also supports registered architectures. K3.1 SOL requires observed
+  BF16 convolution state. With that graph, explicit `sol` can construct a model
+  with BF16 or unrecorded recurrent state and serve measured hits, but a query
+  needing KDA SOL transfer fails unless effective FP32 recurrence is established.
+  Inner `auto` selects `direct` when FP32 recurrence is not established.
 - `fpm_interpolation.collect_coverage`: `false` (default). Opt in to bounded
   evidence from actual direct-FPM lookups, as described below. It requires
   explicit `estimation_mode: fpm_interpolation`, resolved `method: direct`, and

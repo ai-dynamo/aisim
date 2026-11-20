@@ -1222,7 +1222,7 @@ def _k31_native_probe_inputs(tmp_path):
 
     from .test_fpm_forward import _kimi_k31_config
 
-    launch, _, marker = _inputs(tmp_path)
+    launch, manifest, marker = _inputs(tmp_path)
     config, _ = _kimi_k31_config(tmp_path)
     launch["model_config"] = {"path": str(config), "sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
     launch["worker_type"] = "decode"
@@ -1231,7 +1231,10 @@ def _k31_native_probe_inputs(tmp_path):
     launch["precision"].update(
         moe_quant_mode="w4a8_mxfp4_mxfp8_trtllm", kvcache_quant_mode="fp8", attention_backend="trtllm_mla"
     )
-    manifest = Path(runtime_probe.__file__).parent / "runtime/vllm-kimi-k31.example.json"
+    packaged = Path(runtime_probe.__file__).parent / "runtime/vllm-kimi-k31.example.json"
+    document = json.loads(manifest.read_text())
+    document["runtime"] = json.loads(packaged.read_text())["runtime"]
+    manifest.write_text(json.dumps(document))
     return launch, manifest, marker
 
 
@@ -1453,3 +1456,172 @@ def test_k31_activation_candidate_requires_exact_source_map(tmp_path, worker_typ
     bundle = load_instrumentation(frozen.manifest_path)
     with pytest.raises(ValueError, match="checkpoint-native"):
         runtime_probe.build_runtime_probe_plan("k31", launch, bundle)
+
+
+def test_probe_environment_roundtrip_preserves_supplementary_unicode(tmp_path):
+    from collector.fpm_forward.runtime_probe import probe_generator_overrides
+
+    launch, _, _ = _inputs(tmp_path)
+    environment = [{"name": "HF_HOME", "value": "/cache/𠮷"}]
+    launch["deployment"]["extra_env"] = environment
+    resolved = probe_generator_overrides(launch)
+    assert resolved["K8sConfig"]["extra_env"] == environment
+    assert resolved["K8sConfig"]["extra_env"][0]["value"].encode("utf-8") == b"/cache/\xf0\xa0\xae\xb7"
+
+
+@pytest.mark.parametrize("location", ["wrapper", "decoder"])
+def test_k31_probe_rejects_multiple_architectures_before_launch(tmp_path, location):
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    path = Path(launch["model_config"]["path"])
+    config = json.loads(path.read_text())
+    target = config if location == "wrapper" else config["text_config"]
+    target["architectures"] = ["KimiK31ForConditionalGeneration", "OtherModel"]
+    path.write_text(json.dumps(config))
+    launch["model_config"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="single-entry architecture lists"):
+        build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("warmup", [None, "on", "off"])
+def test_k31_disabled_decode_warmup_rejected_before_scheduling(tmp_path, role, warmup):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, marker = _k31_native_probe_inputs(tmp_path)
+    launch["worker_type"] = role
+    plan = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+    base = {"K8sConfig": {"extra_env": [{"name": "DYN_BENCH_KV_WARMUP", "value": warmup}]}} if warmup else {}
+    if role == "decode" and warmup == "off":
+        with pytest.raises(ValueError, match="requires DYN_BENCH_KV_WARMUP enabled"):
+            runner._cell_generator_overrides(plan, plan.cells[0], base)
+    else:
+        rendered = runner._cell_generator_overrides(plan, plan.cells[0], base)
+        actual = {item["name"]: item["value"] for item in rendered["K8sConfig"]["extra_env"]}
+        assert actual["DYN_BENCH_KV_WARMUP"] == (warmup or "on")
+    assert not marker.exists()
+
+
+def test_k31_decode_rendering_uses_one_native_state_resolution(tmp_path):
+    from collector.fpm_forward import runner, runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, manifest, _ = _k31_native_probe_inputs(tmp_path)
+    base = runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(manifest))
+
+    # Other rendering paths legitimately read the bundle to configure the
+    # observer; isolate the duplicate decode-policy resolution itself.
+    from unittest.mock import patch
+
+    original = runner._kimi_k31_native_state
+    calls = []
+
+    def resolve(plan, *args, **kwargs):
+        calls.append(True)
+        return original(plan, *args, **kwargs)
+
+    with patch.object(runner, "_kimi_k31_native_state", resolve):
+        rendered = runner._cell_generator_overrides(base, base.cells[0], {})
+    assert len(calls) == 1
+    assert "--no-enable-prefix-caching" in rendered["params"]["agg"]["extra_cli_args"]
+
+
+@pytest.mark.parametrize("failure", ["worker_evidence", "before_staging"])
+def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path, monkeypatch, failure):
+    from collector.fpm_forward import cli, database, entry, runner, runtime_probe
+    from collector.model_cases import build_collection_case_plan
+
+    from .test_fpm_runner import _native_payload
+
+    argv, extra, _ = _formal_cli_inputs(tmp_path)
+    args = cli._parser().parse_args([*argv, *extra])
+    cases = build_collection_case_plan(backend="vllm", model_path=args.model_path, gpu_type=args.gpu)
+    plan, overrides = entry.resolve_inputs(args, cases)
+    executions = []
+    rejected = set()
+
+    class NativeExecutor(_SyntheticExecutor):
+        def execute(self, pods):
+            super().execute(pods)
+            raw = self.cell_dir / "raw" / pods[0]
+            provenance = {
+                "schema_name": "aic_fpm_collector_provenance",
+                "schema_version": 1,
+                "cell_id": self.cell.cell_id,
+                "plan_sha256": plan.sha256,
+                "attempt_id": self.identity["attempt_id"],
+                "runtime": {"backend": "vllm", "backend_version": "0.28.0"},
+            }
+            (raw / "collector-provenance.json").write_text(json.dumps(provenance))
+            (raw / "benchmark.json").write_text(
+                json.dumps(_native_payload(phase=self.cell.workload_kind, rank=0, dp=1))
+            )
+            if failure == "worker_evidence" and len(executions) == 1:
+                rejected.add(self.identity["attempt_id"])
+
+    monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: NativeExecutor(p, c, d, executions))
+    # Isolate cell lifecycle from model-specific native inventory. The actual
+    # archived-worker validator has a separate real-envelope regression.
+    monkeypatch.setattr(database, "_is_k31", lambda plan: True)
+
+    def qualify(plan, cell, raw, collection):
+        index = json.loads((raw.parent.parent.parent / "runtime-observations.json").read_text())
+        active = index["configurations"][plan.runtime_configuration]["attempts"][-1]["phases"][cell.workload_kind]
+        assert active["collector_attempt_id"] == collection.collector_attempt_id
+        if collection.collector_attempt_id in rejected:
+            raise ValueError("synthetic unresolved worker evidence")
+
+    monkeypatch.setattr(database, "require_k31_worker_evidence", qualify)
+    artifact_root = tmp_path / "collection"
+    checkpoint_dir = tmp_path / "checkpoint"
+    kwargs = dict(
+        generator_overrides=overrides,
+        checkpoint_dir=str(checkpoint_dir),
+        artifact_root=str(artifact_root),
+        resume=False,
+        retry_failed=False,
+        publish_database=False,
+    )
+    errors = runner.run_collection(plan, **kwargs)
+    checkpoint_path = checkpoint_dir / "fpm_forward.json"
+    first = json.loads(checkpoint_path.read_text())
+    prefill = next(c for c in plan.cells if c.workload_kind == "prefill")
+    decode = next(c for c in plan.cells if c.workload_kind == "decode")
+    original_id = first["cells"][prefill.cell_id]["attempt_id"]
+    assert first["cells"][decode.cell_id]["status"] == "passed"
+    root = artifact_root / plan.sha256[:16]
+    cell_dir = root / "cells" / prefill.cell_id
+    if failure == "worker_evidence":
+        assert errors and first["cells"][prefill.cell_id]["status"] == "failed"
+    else:
+        assert errors == []
+        first["cells"][prefill.cell_id]["status"] = "failed"
+        checkpoint_path.write_text(json.dumps(first))
+        # Retain an already archived launch, but incomplete native timings
+        # prevent zero-work recovery of the deliberately failed old attempt.
+        (cell_dir / "raw/synthetic-node/benchmark.json").unlink()
+        render = runner._render_cell
+
+        def fail_render(*args, **kwargs):
+            raise OSError("synthetic render failure before staging")
+
+        monkeypatch.setattr(runner, "_render_cell", fail_render)
+        assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True})
+        failed = json.loads(checkpoint_path.read_text())["cells"][prefill.cell_id]
+        assert failed["status"] == "failed" and "observation_error" not in failed
+        assert not (cell_dir / runtime_probe.CONTEXT_FILENAME).exists()
+        monkeypatch.setattr(runner, "_render_cell", render)
+    assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True}) == []
+    final = json.loads(checkpoint_path.read_text())
+    assert all(item["status"] == "passed" for item in final["cells"].values())
+    assert final["cells"][prefill.cell_id]["attempt_id"] != original_id
+    assert final["cells"][decode.cell_id]["attempt_id"] == first["cells"][decode.cell_id]["attempt_id"]
+    history = json.loads((root / "runtime-observations.json").read_text())["configurations"][
+        plan.runtime_configuration
+    ]["attempts"][-1]["phase_attempts"]["prefill"]
+    assert any(item["collector_attempt_id"] == original_id for item in history)
+    assert executions == [("tp4", "prefill"), ("tp4", "decode"), ("tp4", "prefill")]

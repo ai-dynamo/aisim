@@ -4159,3 +4159,46 @@ def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marke
     else:
         assert recovered["status"] == "passed"
     assert before == {p.relative_to(raw): p.read_bytes() for p in raw.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("outer", [None, []])
+def test_k31_planning_accepts_null_outer_architecture(tmp_path, outer):
+    path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(path.read_text())
+    config["architectures"] = outer
+    config["text_config"]["architectures"] = ["KimiK31ForConditionalGeneration"]
+    path.write_text(json.dumps(config))
+    plan = build_collection_plan(
+        backend="vllm",
+        model_path=str(tmp_path),
+        model_config_path=str(path),
+        system="b200_sxm",
+        selected_ops=set(),
+        has_model_cases=False,
+        collector_config={"aic_database_version": "0.1.dev24216+g266e88c05"},
+        options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend="flashmla")),
+    )
+    assert plan.capability.architecture == "KimiK31ForConditionalGeneration"
+    assert plan.cells
+
+
+@pytest.mark.parametrize(
+    "reasons", ["not_kvwarm_real_kv", {"kvwarm_real_kv": True}, ["kvwarm_real_kv", 1], ["kvwarm_real_kv"]]
+)
+def test_kda_seed_requires_a_list_of_exact_string_stamps(tmp_path, reasons):
+    plan, cell, cell_dir = _synthetic_decode_cell(
+        tmp_path, kvwarm=_WARM_ELIGIBLE, markers=("kvwarm_real_kv",), parallel_strategy="tp"
+    )
+    plan.capability.model_config = ResolvedModelConfig(
+        {"linear_attn_config": {}}, source_kind="test", source_reference="synthetic KDA"
+    )
+    path = cell_dir / "raw/pod-0/benchmark.json"
+    payload = json.loads(path.read_text())
+    payload["results"][0]["point"]["sample_reasons"] = reasons
+    payload["iteration_groups"][0]["point"]["sample_reasons"] = reasons
+    path.write_text(json.dumps(payload))
+    if reasons == ["kvwarm_real_kv"]:
+        assert aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")[0]["kv_seed_regime"] == "real_kv"
+    else:
+        with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+            aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")

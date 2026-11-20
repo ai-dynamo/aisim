@@ -19,8 +19,8 @@ from aisimulate_core.fpm_profile import FpmSpeculativeExecutionProfile as FpmSpe
 from aisimulate_core.fpm_profile import load_fpm_profile as load_fpm_profile
 
 
-def _fpm_kda_state_dtype(deployment: FpmDeploymentProfile) -> str | None:
-    """Read unanimous recurrent precision from probe, collection or finalized evidence.
+def _fpm_kda_cache_dtype(deployment: FpmDeploymentProfile, field: str) -> str | None:
+    """Read unanimous effective cache precision from probe, collection or finalized evidence.
 
     Finalization retains each cell's provenance, including when raw artifacts
     are replaced by hash-bound source references. Missing or conflicting cells
@@ -53,12 +53,21 @@ def _fpm_kda_state_dtype(deployment: FpmDeploymentProfile) -> str | None:
         else:
             settings = evidence.get("runtime_settings")
             cache = settings.get("cache_config") if isinstance(settings, dict) else None
-            dtype = cache.get("mamba_ssm_cache_dtype") if isinstance(cache, dict) else None
-            return dtype if isinstance(dtype, str) else None
+            dtype = cache.get(field) if isinstance(cache, dict) else None
+            if dtype == "auto":
+                if field == "mamba_ssm_cache_dtype":
+                    return "float32"
+                model = settings.get("model_config")
+                dtype = model.get("dtype") if isinstance(model, dict) else None
+            return dtype.removeprefix("torch.") if isinstance(dtype, str) else None
         return recorded[0] if recorded and recorded[0] is not None and all(d == recorded[0] for d in recorded) else None
 
     runtime = deployment.resources.runtime_memory
     return from_provenance(runtime.provenance) if runtime is not None else None
+
+
+def _fpm_kda_state_dtype(deployment: FpmDeploymentProfile) -> str | None:
+    return _fpm_kda_cache_dtype(deployment, "mamba_ssm_cache_dtype")
 
 
 def _require_forward_pass_profile_memory(config: dict) -> None:
@@ -189,7 +198,7 @@ def _validate_checkpoint_architecture(profile: FpmModelProfile) -> str:
 
     if (
         isinstance(wrapper_architectures, list)
-        and len(wrapper_architectures) == 1
+        and wrapper_architectures
         and isinstance(wrapper_architectures[0], str)
         and MULTIMODAL_TEXT_CONFIG_KEY.get(wrapper_architectures[0]) == "text_config"
         and isinstance(text_config, dict)
@@ -237,9 +246,13 @@ def _validate_forward_pass_profile(config_json: str) -> str:
     # FPM SOL roofline. This applies to wrapper and decoder profiles alike.
     # Auto can use direct interpolation; explicit SOL fails during validation.
     unsupported_sol_graph = family in {"QWEN35", "NEMOTRONH"}
-    unsupported_kda_state = analytical_architecture == "KimiK31ForConditionalGeneration" and _fpm_kda_state_dtype(
-        deployment
-    ) not in {"float32", "auto"}
+    if analytical_architecture == "KimiK31ForConditionalGeneration":
+        # The fused decode graph models BF16 convolution state. FP32 uses a
+        # separate native convolution update whose traffic is not modeled.
+        unsupported_sol_graph |= _fpm_kda_cache_dtype(deployment, "mamba_cache_dtype") != "bfloat16"
+    unsupported_kda_state = (
+        analytical_architecture == "KimiK31ForConditionalGeneration" and _fpm_kda_state_dtype(deployment) != "float32"
+    )
     return json.dumps(
         {
             "profile": profile.model_dump(mode="json"),

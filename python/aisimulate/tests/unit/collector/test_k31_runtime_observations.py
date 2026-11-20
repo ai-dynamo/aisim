@@ -1340,7 +1340,7 @@ def test_import_requires_whole_mla_rows_in_padded_pool_stride(tmp_path, monkeypa
         assert result["resources"]["runtime_memory"] is not None
     else:
         assert result["status"] == "incomplete" and result["resources"] is None
-        assert "FlashInfer MLA block stride must contain whole cache rows" in str(result["diagnostics"])
+        assert "sparse MLA block stride must contain whole cache rows" in str(result["diagnostics"])
 
 
 @pytest.mark.parametrize("block", [4, 32])
@@ -1792,3 +1792,74 @@ def test_import_uses_only_hash_bound_frozen_phase_config(tmp_path, monkeypatch, 
             source.write_text("{}")
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == ("complete" if damage is None else "incomplete"), result["diagnostics"]
+
+
+@pytest.mark.parametrize("padding", [0, 4, 656])
+@pytest.mark.parametrize("block", [64, 128])
+def test_flashmla_direct_pages_require_row_aligned_pool_stride(tmp_path, monkeypatch, padding, block):
+    path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
+    launches["tp2"]["precision"]["attention_backend"] = "flashmla"
+    _replace_launch(path, launches)
+
+    def flashmla(record):
+        record["resolved_config"]["attention_config"]["backend"] = "FLASHMLA_SPARSE"
+        record["resolved_config"]["cache_config"]["cache_dtype"] = "fp8_ds_mla"
+        cache = record["cache"]
+        mla = cache["groups"][0]
+        mla.update(
+            block_size_tokens=block,
+            unpadded_page_size_bytes=block * 656,
+            cache_dtype_str="fp8_ds_mla",
+            spec_page_size_bytes=max(mla["spec_page_size_bytes"], block * 656),
+        )
+        if record["kind"] != "worker":
+            return
+        record["attention_backend"][0] = "FLASHMLA_SPARSE"
+        record["attention_groups"][0]["backend"] = "FLASHMLA_SPARSE"
+        # Keep all pool intervals and storage coverage valid. Only the slot's
+        # divisibility by FlashMLA's 656-byte rows varies.
+        old = cache["tensor_allocations"][0]["block_stride"]
+        new = ((max(old, 2 * mla["spec_page_size_bytes"]) + 655) // 656) * 656 + padding
+        delta = new - old
+        count = cache["num_blocks"]
+        cache["allocated_cache_bytes"] += count * delta
+        cache["available_cache_bytes"] += count * delta
+        for storage in cache["storages"]:
+            storage["size_bytes"] += count * delta
+        for allocation in cache["tensor_allocations"]:
+            allocation["size"] += count * delta
+            allocation["block_stride"] = new
+        for components in cache["layer_components"].values():
+            for view in components:
+                view["stride_bytes"][0] = new
+        allocation = cache["tensor_allocations"][0]
+        allocation["layer_stride"] = mla["spec_page_size_bytes"]
+        for index, name in enumerate(mla["layer_names"]):
+            cache["layer_components"][name][0].update(
+                shape=[count, block, 656],
+                stride_bytes=[new, 656, 1],
+                storage_offset_bytes=allocation["offset"] + index * allocation["layer_stride"],
+            )
+
+    _mutate(path, flashmla)
+    result = validate_observations(path, launches)["tp2"]
+    valid = block == 64 or padding % 656 == 0
+    assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
+    if not valid:
+        assert "sparse MLA block stride must contain whole cache rows" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("sm,gpu", [(90, "h100_sxm"), (100, "b200_sxm"), (103, "gb300")])
+def test_k31_sparse_attention_requires_compatible_observed_gpu(tmp_path, monkeypatch, sm, gpu):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    launches["tp2"]["identity"].update(gpu=gpu, sm=sm)
+    _replace_launch(path, launches)
+
+    def hardware(record):
+        record["hardware"].update(gpu=gpu, sm=sm, device_name="Synthetic " + gpu.split("_", 1)[0])
+
+    _mutate(path, hardware)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("incomplete" if sm == 90 else "complete"), result["diagnostics"]
+    if sm == 90:
+        assert "does not support the observed GPU SM" in str(result["diagnostics"])
