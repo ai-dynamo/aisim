@@ -1538,7 +1538,7 @@ def test_k31_decode_rendering_uses_one_native_state_resolution(tmp_path):
     assert "--no-enable-prefix-caching" in rendered["params"]["agg"]["extra_cli_args"]
 
 
-@pytest.mark.parametrize("failure", ["worker_evidence", "backend_markers", "before_staging"])
+@pytest.mark.parametrize("failure", ["worker_evidence", "backend_markers", "before_staging", "private_cleanup"])
 def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path, monkeypatch, failure):
     from collector.fpm_forward import cli, database, entry, runner, runtime_probe
     from collector.model_cases import build_collection_case_plan
@@ -1618,6 +1618,19 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
                 rejected.add(self.identity["attempt_id"])
 
     monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: NativeExecutor(p, c, d, executions))
+    from collector.fpm_forward import private_inputs
+
+    cleanup = private_inputs.SlurmDelivery.cleanup
+    cleanup_failed = False
+
+    def cleanup_delivery(delivery):
+        nonlocal cleanup_failed
+        if failure == "private_cleanup" and len(executions) == 1 and not cleanup_failed:
+            cleanup_failed = True
+            raise OSError("synthetic private staging deletion failure")
+        cleanup(delivery)
+
+    monkeypatch.setattr(private_inputs.SlurmDelivery, "cleanup", cleanup_delivery)
     # Isolate cell lifecycle from model-specific native inventory. The actual
     # archived-worker validator has a separate real-envelope regression.
     monkeypatch.setattr(database, "_is_k31", lambda plan: True)
@@ -1647,7 +1660,9 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     assert token not in json.dumps(plan.to_dict())
 
     def assert_private_artifacts():
-        assert delivery_directories and all(not directory.exists() for directory in delivery_directories)
+        remaining = [directory for directory in delivery_directories if directory.exists()]
+        assert delivery_directories
+        assert len(remaining) == (1 if failure == "private_cleanup" and len(executions) == 2 else 0)
         for retained in artifact_root.rglob("*"):
             if retained.is_file():
                 assert token.encode() not in retained.read_bytes(), retained
@@ -1675,6 +1690,15 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         assert attempt["status"] == "incomplete"
         assert attempt["phases"]["prefill"]["status"] == "failed"
         assert all(item["status"] == "failed" for item in attempt["phase_attempts"]["prefill"])
+    elif failure == "private_cleanup":
+        record = first["cells"][prefill.cell_id]
+        assert errors and record["status"] == "cleanup_failed"
+        assert record["private_cleanup_error"] == "synthetic private staging deletion failure"
+        assert record["completed_at"] and record["duration_seconds"] >= 0
+        observation = json.loads((root / "runtime-observations.json").read_text())
+        phase = observation["configurations"][plan.runtime_configuration]["attempts"][-1]["phases"]["prefill"]
+        assert phase["status"] == "cleanup_failed" and phase["artifacts"]
+        assert (root / "run-manifest.json").exists()
     else:
         assert errors == []
         first["cells"][prefill.cell_id]["status"] = "failed"
