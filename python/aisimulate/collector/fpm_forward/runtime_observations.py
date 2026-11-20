@@ -437,6 +437,9 @@ def _validate_attention_backend(record: dict, launch: dict, config: dict) -> Non
     attention = config.get("attention_config", {})
     if attention.get("backend") != native or attention.get("indexer_kv_dtype") != "fp8":
         raise ValueError("runtime observation lacks the selected native K3.1 attention configuration")
+    # Pinned FlashMLASparseBackend.supported_dtypes contains only BF16.
+    if native == "FLASHMLA_SPARSE" and runtime_memory._dtype(config.get("model_config", {}).get("dtype")) != "bfloat16":
+        raise ValueError("native K3.1 FlashMLA requires BF16 compute")
     # Schedulers record resolved configuration; only workers own initialized
     # attention groups. Rank-complete worker evidence is required by the importer.
     if record.get("kind") == "scheduler":

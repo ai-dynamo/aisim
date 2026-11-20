@@ -743,7 +743,14 @@ def test_initialized_moe_requires_actual_layer_names(name, target):
         runtime_k31.moe_precision(evidence)
 
 
-@pytest.mark.parametrize("source", ["vllm/v1/kv_cache_interface.py", "vllm/v1/worker/block_table.py"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "vllm/v1/kv_cache_interface.py",
+        "vllm/v1/worker/block_table.py",
+        "vllm/model_executor/layers/attention/sparse_mla_attention.py",
+    ],
+)
 def test_preview_bundle_uses_exact_source_map_not_invented_git_commit(source):
     path = Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json"
     bundle = load_instrumentation(path)
@@ -1840,13 +1847,18 @@ def test_import_uses_only_hash_bound_frozen_phase_config(tmp_path, monkeypatch, 
 @pytest.mark.parametrize("padding", [0, 4, 656, 64 * 656])
 @pytest.mark.parametrize("block", [64, 128])
 @pytest.mark.parametrize("transposed", [False, True])
-def test_flashmla_direct_pages_require_page_aligned_pool_stride(tmp_path, monkeypatch, padding, block, transposed):
+@pytest.mark.parametrize("compute", ["half", "bfloat16"])
+def test_flashmla_direct_pages_require_page_aligned_pool_stride(
+    tmp_path, monkeypatch, padding, block, transposed, compute
+):
     path, launches = _complete_fixture(tmp_path, monkeypatch, separate_attention=True)
-    launches["tp2"]["precision"]["attention_backend"] = "flashmla"
+    launches["tp2"]["precision"].update(attention_backend="flashmla", gemm_quant_mode=compute, fmha_quant_mode=compute)
     _replace_launch(path, launches)
 
     def flashmla(record):
         record["resolved_config"]["attention_config"]["backend"] = "FLASHMLA_SPARSE"
+        record["resolved_config"]["model_config"]["dtype"] = "torch.float16" if compute == "half" else "torch.bfloat16"
+        record["resolved_config"]["cache_config"]["mamba_cache_dtype"] = "bfloat16"
         record["resolved_config"]["cache_config"]["cache_dtype"] = "fp8_ds_mla"
         cache = record["cache"]
         mla = cache["groups"][0]
@@ -1888,9 +1900,12 @@ def test_flashmla_direct_pages_require_page_aligned_pool_stride(tmp_path, monkey
 
     _mutate(path, flashmla)
     result = validate_observations(path, launches)["tp2"]
-    valid = not transposed and (block == 64 or padding % (64 * 656) == 0)
+    valid = compute == "bfloat16" and not transposed and (block == 64 or padding % (64 * 656) == 0)
     assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
     if not valid:
+        if compute == "half":
+            assert "FlashMLA requires BF16 compute" in str(result["diagnostics"])
+            return
         message = (
             "token-byte strides"
             if transposed and (block == 64 or padding % (64 * 656) == 0)
@@ -2090,4 +2105,15 @@ def test_archived_launch_environment_keeps_credentials_out_of_resource_provenanc
     for artifact in result["provenance"]["artifacts"]:
         assert artifact["evidence"]["launch"] == launches["tp2"]
     for source in path.parent.rglob("*.json"):
-        assert token not in source.read_text()
+        _assert_no_credential(source.read_text(), token)
+
+
+def _assert_no_credential(text, token):
+    assert token not in text
+    assert json.dumps(token)[1:-1] not in text
+
+
+@pytest.mark.parametrize("token", ['synthetic-"private"-$746', "synthetic-private"])
+def test_archived_credential_check_detects_unrelated_nested_field(token):
+    with pytest.raises(AssertionError):
+        _assert_no_credential(json.dumps({"unrelated": {"nested": token}}), token)

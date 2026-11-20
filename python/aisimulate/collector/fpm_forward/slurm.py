@@ -41,6 +41,7 @@ class SlurmCellRunner:
         from .runner import _expected_nodes
 
         self.cell_dir = cell_dir.resolve()
+        self.runtime_dir = self.cell_dir / "slurm-runtime"
         self.node_count = _expected_nodes(manifest)
         if total_gpus % self.node_count:
             raise ValueError("FPM GPUs must divide evenly across Slurm nodes")
@@ -233,7 +234,7 @@ class SlurmCellRunner:
         return [f"node{rank:04d}" for rank in range(len(self.hosts))]
 
     def stage(self, pods: list[str], files: list[Path]) -> None:
-        stage = self.cell_dir / "slurm-runtime"
+        stage = self.runtime_dir
         stage.mkdir(exist_ok=True)
         for path in files:
             shutil.copy2(path, stage / path.name)
@@ -245,7 +246,7 @@ class SlurmCellRunner:
         rank = self.pods().index(unit)
         mounts = [
             *self.mounts,
-            f"{self.cell_dir / 'slurm-runtime'}:/tmp/fpm-bench",
+            f"{self.runtime_dir}:/tmp/fpm-bench",
             f"{self.cell_dir / 'raw' / unit}:/results",
         ]
         if any("\n" in mount or "," in mount for mount in mounts):

@@ -738,3 +738,29 @@ def test_kimi_rust_runtime_preserves_replicated_projector_work_and_weights(video
         )
     assert "encoder_dp_all_gather" in summaries[0].get_encoder_latency_dict()
     assert summaries[1].get_encoder_latency_dict()["encoder_ar_1"] > 0
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("inline,sidecar", [(16384, 8192), (8192, 8192)])
+def test_mixed_kimi_processor_layout_rejects_conflicting_patch_limits(tmp_path, monkeypatch, remote, inline, sidecar):
+    from aisimulate_core.sdk import utils as utils_module
+
+    raw = deepcopy(get_model_config_from_model_path("moonshotai/Kimi-K2.5")["raw_config"])
+    raw["preprocessor_config"] = {"media_proc_cfg": {"in_patch_limit": inline}}
+    files = {"config.json": raw, "preprocessor_config.json": {"max_patches": sidecar}}
+    if remote:
+        model_path = f"synthetic-kimi/mixed-patch-limits-{tmp_path.name}"
+        monkeypatch.setattr(utils_module, "_download_hf_config", lambda model_path: raw)
+        monkeypatch.setattr(
+            utils_module, "_download_hf_json", lambda model_path, filename, **kwargs: files.get(filename)
+        )
+    else:
+        for name, contents in files.items():
+            (tmp_path / name).write_text(json.dumps(contents))
+        model_path = str(tmp_path)
+    if inline != sidecar:
+        with pytest.raises(ValueError, match="conflicting inline and sidecar image-patch limits"):
+            get_model_config_from_model_path(model_path)
+    else:
+        parsed = get_model_config_from_model_path(model_path)
+        assert parsed["encoder_config"].image_max_patches == sidecar

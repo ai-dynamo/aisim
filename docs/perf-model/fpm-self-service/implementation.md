@@ -1554,7 +1554,7 @@ changing that bundle's bytes or source identity.
 | `precision` | `gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kv_cache_dtype`, and `comm_quant_mode`; optional selected backends and `enable_wideep`/`enable_eplb`. A complete existing profile can supply this exact precision identity. |
 | Collection fields | `max_num_tokens`, `max_batch_size`, `gpu_memory_utilization`, `prefill_cudagraph_policy`, and an explicit capture size only with `explicit` policy. Missing scheduler/fraction values use the documented 8,192/256/0.90 defaults. Fresh inputs use runtime capture policy; saved legacy drafts retain their policy. |
 | `collection_deployment` | Existing executor/image/model-cache/mount/transport options. `container_mount` is a list. Explicit deployment flags override and save the selected configurations' deployment choices. |
-| `collection_deployment.extra_env` | Unique literal `{name, value}` environment entries for runtime probes and formal collection. `PYTHONHOME` is rejected to preserve the image's Python prefix. Campaign deployment archives retain environment references and value digests; replay requires matching caller environment values. Slurm version detection uses the Collector startup allowlist described below. |
+| `collection_deployment.extra_env` | Unique literal `{name, value}` environment entries for runtime probes and formal collection. `PYTHONHOME` is rejected to preserve the image's Python prefix. Campaign deployment archives retain environment references and value digests, except validated public warm-up, finalization-timeout and KDA-layout controls; new launches require matching caller environment values. Slurm version detection uses the Collector startup allowlist described below. |
 | `resource_overrides` | Per-configuration metadata assumptions, if required for the model. Cache geometry can remain absent at probe entry. |
 
 Save source research and outstanding questions after each meaningful finding with `onboard checkpoint`, using its current revision. Register the local bundle files and source notes as input artifacts; do not put independent configurations' byte bounds into shared inputs. Probe and import also register their results, but they do not observe or save the agent's investigation automatically.
@@ -1566,15 +1566,21 @@ and apply to package-version detection in the selected Kubernetes container.
 The campaign's `generator-overrides.json` and retained `generator-request.json` store each caller entry as
 `{name, value_from_env: name, value_sha256}` rather than retaining its value.
 Replay resolves these references from the caller's environment and rejects missing
-or changed values before launch. The public KV warm-up switches remain literal.
+or changed values before launch. Recovery from retained measurements does not resolve
+credentials unless another worker must launch. The public KV warm-up switches and
+`FPM_FINALIZATION_TIMEOUT_SECONDS` remain literal; the timeout must be an integer
+string from 1 through 3,600, without leading zeros, signs or whitespace.
 Probe plans, collection launch contexts, observation records/indexes and resource
 provenance also retain references and digests; the public `VLLM_SSM_CONV_STATE_LAYOUT`
-setting remains literal for KDA validation. Reviewing a reference-bound plan does
+setting must be literal `SD` or `DS` for offline KDA validation; omission retains
+the runtime default `SD`. Reviewing a reference-bound plan does
 not require replay credentials. Historical literal hashes still require the
 original values when they must be reconstructed for verification.
 Plan hashes cover the references and digests; historical literal archives remain
 readable. Generated execution manifests still contain the environment required by
-the runtime and must be handled as credentials when applicable.
+the runtime and must be handled as credentials when applicable. Runtime probe
+previews and retained probe evidence contain references only. Execution renders
+concrete values in private temporary worker staging, removed after teardown.
 `PATH`, `PYTHONPATH`, `PYTHONNOUSERSITE`, `HF_HOME`, `HF_HUB_OFFLINE`, and `TRANSFORMERS_OFFLINE`
 also reach the Collector's startup checks before the engine starts. Record mounted source
 and binary hashes alongside the image identity; environment declarations do not qualify them.

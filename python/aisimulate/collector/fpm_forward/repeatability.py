@@ -1081,7 +1081,6 @@ def run_repeatability(
     """
     if retry_failed and not resume:
         raise ValueError("repeatability retry_failed requires resume")
-    generator_overrides = resolve_archived_generator_overrides(generator_overrides)
     if source_plan.generator_config_sha256 not in _deployment_hashes(generator_overrides):
         raise ValueError("repeatability deployment inputs differ from the original launch")
     root = Path(output_dir).expanduser().resolve()
@@ -1209,6 +1208,7 @@ def run_repeatability(
                     "is unqualified for this campaign. Use the matching revision or collect a new source campaign. "
                     "Existing samples remain available for offline assessment."
                 )
+            delivery_overrides = resolve_archived_generator_overrides(generator_overrides)
             directory = root / relative
             directory.mkdir(parents=True, exist_ok=False)
             attempt = {"directory": str(relative), "status": "running"}
@@ -1218,7 +1218,7 @@ def run_repeatability(
                 validating = False
                 errors = run_collection(
                     plan,
-                    generator_overrides=generator_overrides,
+                    generator_overrides=delivery_overrides,
                     checkpoint_dir=str(directory / "checkpoint"),
                     artifact_root=str(directory / "artifacts"),
                     resume=False,

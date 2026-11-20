@@ -1546,8 +1546,9 @@ def test_complete_measurement_survives_later_collection_error_and_is_not_replace
     ("collector_status", "cleanup_error"),
     [("failed", False), ("interrupted", False), ("running", False), ("failed", True)],
 )
+@pytest.mark.parametrize("archived_auth", [False, True])
 def test_complete_failed_native_observation_requires_cpu_recovery_without_replacement(
-    campaign, tmp_path, monkeypatch, collector_status, cleanup_error
+    campaign, tmp_path, monkeypatch, collector_status, cleanup_error, archived_auth
 ):
     calls = _fake_collector(monkeypatch, factors=[3, 1, 1, 1, 1])
     collect = repeatability.run_collection
@@ -1571,6 +1572,23 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
 
     monkeypatch.setattr(repeatability, "run_collection", fail_after_native_collection)
     args = _args(campaign, tmp_path)
+    if archived_auth:
+        from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides
+
+        token = 'synthetic-"recovery"-credential'
+        original_plan, source, checkpoint = campaign
+        deployment = {"K8sConfig": {"extra_env": [{"name": "HF_TOKEN", "value": token}]}}
+        original_plan = replace(
+            original_plan,
+            generator_config_sha256=repeatability._canonical_hash(semantic_generator_overrides(deployment)),
+        )
+        original_plan = repeatability._subset_plan(
+            original_plan,
+            {"cell_id": cell_id, "benchmark_points": json.loads(original_plan.options.benchmark_points_json)},
+        )
+        _write_campaign(source, checkpoint, original_plan, generator_overrides=deployment)
+        args.update(source_plan=original_plan, generator_overrides=archive_generator_overrides(deployment))
+        monkeypatch.setenv("HF_TOKEN", token)
     if collector_status == "interrupted":
         with pytest.raises(KeyboardInterrupt, match="artifacts were copied"):
             repeatability.run_repeatability(**args)
@@ -1585,6 +1603,8 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     checkpoint_path = Path(calls[0][1]["checkpoint_dir"]) / "fpm_forward.json"
     original_checkpoint = checkpoint_path.read_bytes()
 
+    if archived_auth:
+        monkeypatch.delenv("HF_TOKEN")
     recover = repeatability._recover_completed_attempt
     monkeypatch.setattr(repeatability, "_recover_completed_attempt", lambda *_args: None)
     result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
@@ -1594,6 +1614,15 @@ def test_complete_failed_native_observation_requires_cpu_recovery_without_replac
     assert "cannot be replaced" in attempt["postprocessing_attempts"][-1]["error"]
 
     monkeypatch.setattr(repeatability, "_recover_completed_attempt", recover)
+    if archived_auth:
+        # Recovery completes with no token. Only the following new sample
+        # needs auth, and fails before allocating a replacement attempt.
+        with pytest.raises(ValueError, match="requires the original value"):
+            repeatability.run_repeatability(**args, resume=True, retry_failed=True)
+        saved = json.loads((args["output_dir"] / repeatability.REPORT_FILENAME).read_text())
+        assert saved["samples"][cell_id][0]["attempts"][0]["status"] == "passed"
+        assert len(calls) == 1
+        monkeypatch.setenv("HF_TOKEN", token)
     result = repeatability.run_repeatability(**args, resume=True, retry_failed=True)
     assert len(calls) == 5 and result["new_population"]["status"] == "unstable"
     assert all(point["raw_samples_seconds"][0] == 3 * point["source_wall_time_seconds"] for point in result["points"])
@@ -1853,7 +1882,12 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
     token = 'synthetic-private-"credential"-$746'
     overrides = {
         "generator_dynamo_version": "1.3.0",
-        "K8sConfig": {"extra_env": [{"name": "CUSTOM_AUTH", "value": token}]},
+        "K8sConfig": {
+            "extra_env": [
+                {"name": "CUSTOM_AUTH", "value": token},
+                {"name": "FPM_FINALIZATION_TIMEOUT_SECONDS", "value": "600"},
+            ]
+        },
     }
     if historical == "literal":
         normalized = with_kv_warmup_defaults(overrides)
@@ -1879,6 +1913,10 @@ def test_archived_environment_resolves_for_replay_and_detects_drift(campaign, tm
     monkeypatch.delenv("CUSTOM_AUTH", raising=False)
     if historical == "current":
         assert repeatability.load_repeatability_deployment(source) == archive
+        # The binding path inspects public collection controls without auth.
+        _, bound, changes = _collection_controls(plan.cells, repeatability.load_repeatability_deployment(source))
+        assert bound["K8sConfig"]["extra_env"][0]["name"] == "CUSTOM_AUTH"
+        assert any("FPM_FINALIZATION_TIMEOUT_SECONDS" in item["field"] for item in changes)
     with pytest.raises(ValueError, match="requires the original value"):
         repeatability.load_repeatability_deployment(source, resolve_environment=True)
     monkeypatch.setenv("CUSTOM_AUTH", token + "changed")

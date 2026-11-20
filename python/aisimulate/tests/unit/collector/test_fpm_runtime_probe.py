@@ -1454,7 +1454,7 @@ def test_k31_activation_candidate_requires_exact_source_map(tmp_path, worker_typ
     changed["runtime"]["source_files"][next(iter(changed["runtime"]["source_files"]))] = "f" * 64
     frozen.manifest_path.write_text(json.dumps(changed))
     bundle = load_instrumentation(frozen.manifest_path)
-    with pytest.raises(ValueError, match="checkpoint-native"):
+    with pytest.raises(ValueError, match="requires an audited instrumentation bundle"):
         runtime_probe.build_runtime_probe_plan("k31", launch, bundle)
 
 
@@ -1638,6 +1638,11 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
             else "requires resolved-config evidence"
         )
         assert message in first["cells"][prefill.cell_id]["error"]
+        observation = json.loads((root / "runtime-observations.json").read_text())
+        attempt = observation["configurations"][plan.runtime_configuration]["attempts"][-1]
+        assert attempt["status"] == "incomplete"
+        assert attempt["phases"]["prefill"]["status"] == "failed"
+        assert all(item["status"] == "failed" for item in attempt["phase_attempts"]["prefill"])
     else:
         assert errors == []
         first["cells"][prefill.cell_id]["status"] = "failed"
@@ -1654,6 +1659,7 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
         assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True})
         failed = json.loads(checkpoint_path.read_text())["cells"][prefill.cell_id]
         assert failed["status"] == "failed" and "observation_error" not in failed
+        assert "synthetic render failure before staging" in failed["error"]
         assert not (cell_dir / runtime_probe.CONTEXT_FILENAME).exists()
         monkeypatch.setattr(runner, "_render_cell", render)
     assert runner.run_collection(plan, **{**kwargs, "resume": True, "retry_failed": True}) == []
@@ -1671,16 +1677,31 @@ def test_formal_cell_retries_rejected_evidence_and_pre_staging_failures(tmp_path
     assert runner.shlex.quote(token) in (cell_dir / "run.sh").read_text()
 
 
-def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(tmp_path, monkeypatch):
+@pytest.mark.parametrize("transport", ["slurm", "kubernetes"])
+def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(tmp_path, monkeypatch, transport):
     from collector.fpm_forward import runner, runtime_probe
 
     launch, manifest, _ = _inputs(tmp_path)
+    if transport == "kubernetes":
+        launch["deployment"] = {"executor": "kubernetes", "image": launch["deployment"]["image"]}
     token = 'synthetic-"private"-$746'
     environment = [{"name": "HF_TOKEN", "value": token}, {"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": "DS"}]
     launch["deployment"]["extra_env"] = environment
     delivered = []
+    staging = []
 
     class Executor(_SyntheticExecutor):
+        def stage(self, pods, files):
+            if transport == "slurm":
+                from collector.fpm_forward.slurm import SlurmCellRunner
+
+                SlurmCellRunner.stage(self, pods, files)
+                staging.append(self.runtime_dir)
+                assert not self.runtime_dir.is_relative_to(output)
+                assert runner.shlex.quote(token) in (self.runtime_dir / "run.sh").read_text()
+            self.staged_scripts = {path.name: path.read_text() for path in files if path.suffix == ".sh"}
+            super().stage(pods, files)
+
         def execute(self, pods):
             saved = json.loads((self.cell_dir / "generator-request.json").read_text())
             auth = next(item for item in saved["K8sConfig"]["extra_env"] if item["name"] == "HF_TOKEN")
@@ -1689,20 +1710,13 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
                 "value_from_env": "HF_TOKEN",
                 "value_sha256": hashlib.sha256(token.encode()).hexdigest(),
             }
-            script = (self.cell_dir / "run.sh").read_text()
+            script = self.staged_scripts["run.sh"]
             assert runner.shlex.quote(token) in script
             delivered.append(self.cell.workload_kind)
             super().execute(pods)
 
     monkeypatch.setattr(runner, "_cell_runner", lambda p, c, m, d: Executor(p, c, d, []))
     output = tmp_path / "probe"
-    for execute in (False, True):
-        report = runtime_probe.probe_runtime(
-            {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=execute
-        )
-        assert report["status"] == ("completed" if execute else "preview")
-        assert token not in json.dumps(report)
-    assert delivered == ["prefill", "decode"]
 
     def assert_archived(value):
         if isinstance(value, dict):
@@ -1721,8 +1735,32 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
         elif isinstance(value, str):
             assert token not in value
 
-    for path in output.rglob("*.json"):
-        assert_archived(json.loads(path.read_text()))
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    offline = runtime_probe.probe_runtime(
+        {"tp4": runtime_probe.normalize_probe_launch(launch)},
+        instrumentation=manifest,
+        output_dir=output,
+        execute=False,
+    )
+    assert offline["status"] == "preview"
+    assert_archived(offline)
+    for execute in (False, True):
+        report = runtime_probe.probe_runtime(
+            {"tp4": launch}, instrumentation=manifest, output_dir=output, execute=execute
+        )
+        assert report["status"] == ("completed" if execute else "preview")
+        assert_archived(report)
+    assert delivered == ["prefill", "decode"]
+    assert all(not directory.exists() for directory in staging)
+
+    for path in output.rglob("*"):
+        if path.is_file():
+            contents = path.read_bytes()
+            assert token.encode() not in contents, path
+            assert json.dumps(token)[1:-1].encode() not in contents, path
+            assert runner.shlex.quote(token).encode() not in contents, path
+            if path.suffix == ".json":
+                assert_archived(json.loads(contents))
     saved = json.loads((output / "probe-plan.json").read_text())
     frozen = saved["configurations"]["tp4"]
     assert (
@@ -1732,3 +1770,40 @@ def test_probe_keeps_credentials_out_of_launch_evidence_and_delivers_to_runtime(
         == "DS"
     )
     assert runtime_probe.normalize_probe_launch(frozen) == frozen
+
+
+@pytest.mark.parametrize("layout", ["DS", "SD", None])
+def test_probe_layout_is_literal_for_offline_validation(tmp_path, monkeypatch, layout):
+    from collector.fpm_forward import runtime_probe
+
+    launch, _, _ = _inputs(tmp_path)
+    if layout is not None:
+        launch["deployment"]["extra_env"] = [{"name": "VLLM_SSM_CONV_STATE_LAYOUT", "value": layout}]
+    normalized = runtime_probe.normalize_probe_launch(launch)
+    assert runtime_probe.normalize_probe_launch(normalized) == normalized
+    if layout is None:
+        return
+    assert normalized["deployment"]["extra_env"] == launch["deployment"]["extra_env"]
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", layout)
+    launch["deployment"]["extra_env"] = [
+        {
+            "name": "VLLM_SSM_CONV_STATE_LAYOUT",
+            "value_from_env": "VLLM_SSM_CONV_STATE_LAYOUT",
+            "value_sha256": hashlib.sha256(layout.encode()).hexdigest(),
+        }
+    ]
+    with pytest.raises(ValueError, match="must be a literal SD or DS"):
+        runtime_probe.normalize_probe_launch(launch)
+
+
+def test_k31_probe_rejects_unaudited_bundle_before_generic_precision_checks(tmp_path):
+    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward.runtime_instrumentation import load_instrumentation
+
+    launch, _, marker = _k31_native_probe_inputs(tmp_path)
+    (tmp_path / "unaudited").mkdir()
+    _, unaudited_manifest, _ = _inputs(tmp_path / "unaudited")
+    launch["precision"]["moe_quant_mode"] = "w4a16_mxfp4"
+    with pytest.raises(ValueError, match="requires an audited instrumentation bundle"):
+        runtime_probe.build_runtime_probe_plan("k31", launch, load_instrumentation(unaudited_manifest))
+    assert not marker.exists()

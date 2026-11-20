@@ -117,7 +117,7 @@ def semantic_generator_overrides(overrides: dict[str, Any], *, archive_environme
 def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
     """Archive environment references and digests instead of caller credentials.
 
-    Public warm-up switches remain literal. Every other environment value is
+    Validated public controls remain literal. Every other environment value is
     supplied again by name for replay; its digest freezes the original input.
     The same representation is used for plan hashing and artifact inspection,
     which do not require access to replay credentials.
@@ -147,7 +147,11 @@ def archive_generator_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
         else:
             if set(item) != {"name", "value"} or not isinstance(item["value"], str):
                 raise ValueError("archived environment requires literal string values")
-            if item["name"] not in FPM_KV_WARMUP_DEFAULTS:
+            public = item["name"] in {*FPM_KV_WARMUP_DEFAULTS, "VLLM_SSM_CONV_STATE_LAYOUT"}
+            if item["name"] == "FPM_FINALIZATION_TIMEOUT_SECONDS":
+                value = item["value"]
+                public = bool(re.fullmatch(r"[1-9][0-9]*", value)) and len(value) <= 4 and int(value) <= 3600
+            if not public:
                 value = item.pop("value")
                 item.update(value_from_env=item["name"], value_sha256=hashlib.sha256(value.encode()).hexdigest())
     return archived
@@ -190,6 +194,8 @@ def with_kv_warmup_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise ValueError("archived environment requires named entries")
         name = item["name"]
+        if name == "VLLM_SSM_CONV_STATE_LAYOUT" and item.get("value") not in ("SD", "DS"):
+            raise ValueError(f"{name} must be a literal SD or DS")
         if name in FPM_KV_WARMUP_DEFAULTS:
             value = item.get("value")
             if not isinstance(value, str) or value.lower() not in {"on", "1", "true", "off", "0", "false"}:

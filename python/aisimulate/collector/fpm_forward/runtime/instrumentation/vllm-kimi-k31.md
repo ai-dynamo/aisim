@@ -60,6 +60,14 @@ is pinned at that immutable revision with SHA-256
 between manager blocks. Its installed bytes must match before import qualifies;
 the source check does not establish image execution or refresh old observations.
 
+The inherited sparse MLA translation implementation
+[`vllm/model_executor/layers/attention/sparse_mla_attention.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/model_executor/layers/attention/sparse_mla_attention.py)
+is pinned at that immutable revision with SHA-256
+`8f2658c1380aeb99f317ab67c79bc2ae4e00a4bc4e5aa2098d985e52067d80a1`.
+Its `SparseMLACommonImpl.forward_mqa` translates top-k indices using the block
+table and cache stride before launching sparse attention. Installed bytes must
+match before import qualifies; this source check does not requalify execution.
+
 The selected TRT-LLM MXFP4 expert implementation
 [`vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py`](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py)
 is pinned with SHA-256

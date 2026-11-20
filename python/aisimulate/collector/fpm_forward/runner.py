@@ -1705,15 +1705,31 @@ def _render_cell(
     generator_overrides: dict[str, Any],
     *,
     smoke: bool = False,
+    resolve_environment: bool = True,
 ) -> dict[str, Any]:
     from aisimulate.generator.api import generate_from_request
     from aisimulate.generator.naive import build_naive_generator_params
     from aisimulate.generator.request import from_legacy_params
 
+    rendering = (
+        resolve_archived_generator_overrides(generator_overrides)
+        if resolve_environment
+        else archive_generator_overrides(generator_overrides)
+    )
+    references = {}
+    if not resolve_environment:
+        for item in rendering["K8sConfig"]["extra_env"]:
+            if "value_from_env" in item:
+                name = item["name"]
+                references[name] = copy.deepcopy(item)
+                item.clear()
+                item.update(
+                    name=name, value=f"/__aisimulate_environment_reference__/{name}/{references[name]['value_sha256']}"
+                )
     overrides = _cell_generator_overrides(
         plan,
         cell,
-        resolve_archived_generator_overrides(generator_overrides),
+        rendering,
         smoke=smoke,
     )
     # A Dynamo release is provenance, not collection compatibility or template
@@ -1755,7 +1771,11 @@ def _render_cell(
     artifacts = generate_from_request(request, output_dir=str(cell_dir))
     # Scripts deliver concrete environment values to the worker. Retained
     # request evidence uses digest-bound inputs, like the campaign archive.
-    _atomic_json(cell_dir / "generator-request.json", archive_generator_overrides(params))
+    archived = archive_generator_overrides(params)
+    archived["K8sConfig"]["extra_env"] = [
+        references.get(item["name"], item) for item in archived["K8sConfig"]["extra_env"]
+    ]
+    _atomic_json(cell_dir / "generator-request.json", archived)
     _write_runtime_environment(cell_dir, overrides)
     return artifacts
 
@@ -2109,6 +2129,12 @@ def _run_collection_impl(
     publish_partial: bool = False,
     publish_database: bool = True,
 ) -> list[dict[str, object]]:
+    from .repeatability import _deployment_hashes
+
+    if (expected := getattr(plan, "generator_config_sha256", None)) is not None and expected not in _deployment_hashes(
+        generator_overrides
+    ):
+        raise ValueError("execution deployment inputs differ from the frozen collection plan")
     _require_k31_execution_inputs(plan)
     if _frozen_points(plan) is not None and smoke:
         raise ValueError("--fpm-benchmark-points-file cannot be combined with --smoke")
@@ -2140,6 +2166,16 @@ def _run_collection_impl(
         from .runtime_probe import record_collection_observations
 
         try:
+            from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence
+
+            validate_worker = record["status"] == "passed" and not formal_database_terminal and _is_k31(plan)
+            rejected = False
+            if validate_worker:
+                try:
+                    _validate_backend_markers(cell, root / "cells" / cell.cell_id)
+                except (OSError, KeyError, TypeError, ValueError) as error:
+                    record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    rejected = True
             observation_index = record_collection_observations(
                 plan,
                 root,
@@ -2151,6 +2187,22 @@ def _run_collection_impl(
             )
             checkpoint["runtime_observations"] = str(observation_index)
             record.pop("observation_error", None)
+            if rejected:
+                return False
+            if validate_worker:
+                try:
+                    raw_root = root / "cells" / cell.cell_id / "raw"
+                    collection = validate_native_collection(
+                        cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
+                    )
+                    require_k31_worker_evidence(plan, cell, raw_root, collection)
+                except (OSError, KeyError, TypeError, ValueError) as error:
+                    record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    record_collection_observations(
+                        plan, root, observation_attempt_id, cell, record["attempt_id"], raw_root.parent, "failed"
+                    )
+                    logger.warning("Rejecting archived K3.1 worker evidence for %s: %s", cell.cell_id, error)
+                    return False
         except Exception as error:
             record["status"] = "failed"
             record["observation_error"] = str(error)
@@ -2165,21 +2217,6 @@ def _run_collection_impl(
                 }
             )
             return False
-        if record["status"] == "passed" and not formal_database_terminal:
-            from .database import _is_k31, _validate_backend_markers, require_k31_worker_evidence
-
-            if _is_k31(plan):
-                try:
-                    raw_root = root / "cells" / cell.cell_id / "raw"
-                    collection = validate_native_collection(
-                        cell, raw_root, expected_plan_sha256=plan.sha256, expected_attempt_id=record["attempt_id"]
-                    )
-                    require_k31_worker_evidence(plan, cell, raw_root, collection)
-                    _validate_backend_markers(cell, raw_root.parent)
-                except (OSError, KeyError, TypeError, ValueError) as error:
-                    record.update(status="failed", error_type=type(error).__name__, error=str(error))
-                    logger.warning("Rejecting archived K3.1 worker evidence for %s: %s", cell.cell_id, error)
-                    return False
         return True
 
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"

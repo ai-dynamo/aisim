@@ -653,6 +653,12 @@ def _kimi_processor_limits(processor_cfg: dict | None, vision_cfg: dict) -> dict
     media = processor_cfg.get("media_proc_cfg", processor_cfg)
     if not isinstance(media, dict):
         raise ValueError("Kimi media_proc_cfg must be an object")
+    if (
+        media is not processor_cfg
+        and "max_patches" in processor_cfg
+        and processor_cfg["max_patches"] != media.get("in_patch_limit", media.get("max_patches", 16384))
+    ):
+        raise ValueError("Kimi processor has conflicting inline and sidecar image-patch limits")
     video = processor_cfg.get("video_processor", {})
     if not isinstance(video, dict):
         raise ValueError("Kimi video processor config must be an object")

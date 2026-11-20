@@ -13,6 +13,7 @@ import json
 import math
 import re
 import shutil
+import tempfile
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -304,6 +305,8 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
     from .runtime_k31 import is_audited_runtime
 
     k31_native = architecture == "KimiK31ForConditionalGeneration" and is_audited_runtime(bundle.manifest["runtime"])
+    if architecture == "KimiK31ForConditionalGeneration" and not k31_native:
+        raise ValueError("K3.1 runtime probing requires an audited instrumentation bundle")
     if k31_native:
         if launch.get("worker_type") not in {"prefill", "decode"}:
             raise ValueError("K3.1 native state probing requires an independent prefill or decode worker")
@@ -567,6 +570,10 @@ def record_collection_observations(
             raise ValueError("formal collection saved runtime context does not match its attempt")
 
     history = attempt["phase_attempts"].setdefault(cell.workload_kind, [])
+    if status != "passed":
+        for previous in history:
+            if previous["collector_attempt_id"] == cell_attempt_id:
+                previous["status"] = status
     for previous in reversed(history):
         if previous["collector_attempt_id"] != cell_attempt_id or previous["status"] != status or status != "passed":
             continue
@@ -1067,15 +1074,16 @@ def probe_runtime(
                 phase_dir.mkdir()
                 phase = attempt["phases"][cell.workload_kind] = {"status": "running", "artifacts": []}
                 resource = None
+                delivery_directory = None
                 try:
                     delivery = plan.launch
                     if plan._environment is not None:
                         delivery["deployment"]["extra_env"] = plan._environment
                     runner._render_cell(
-                        plan, cell, phase_dir, probe_generator_overrides(delivery, resolve_environment=True)
+                        plan, cell, phase_dir, probe_generator_overrides(delivery), resolve_environment=False
                     )
                     context = launch_context(plan, cell, configuration=configuration, attempt_id=attempt_id)
-                    extras = stage_runtime_instrumentation(frozen, phase_dir, context)
+                    stage_runtime_instrumentation(frozen, phase_dir, context)
                     phase["launch_manifest"] = {
                         "path": str((phase_dir / CONTEXT_FILENAME).relative_to(root)),
                         **runner._file_metadata(phase_dir / CONTEXT_FILENAME),
@@ -1083,9 +1091,17 @@ def probe_runtime(
                     phase["resource_manifest"] = _resource_manifest_reference(root, plan, cell, phase_dir)
                     phase["generator_request"] = str(phase_dir / "generator-request.json")
                     if execute:
+                        # Concrete credentials exist only in private, temporary
+                        # worker staging. Retained renders contain references.
+                        delivery_directory = tempfile.TemporaryDirectory(prefix="aisimulate-probe-delivery-")
+                        worker_dir = Path(delivery_directory.name)
+                        runner._render_cell(plan, cell, worker_dir, probe_generator_overrides(delivery))
+                        worker_extras = stage_runtime_instrumentation(frozen, worker_dir, context)
                         runner._atomic_json(index_path, index)
-                        manifest = phase_dir / runner.FPM_MANIFEST_FILENAME
+                        manifest = worker_dir / runner.FPM_MANIFEST_FILENAME
                         resource = runner._cell_runner(plan, cell, manifest, phase_dir)
+                        if plan.options.executor == "slurm":
+                            resource.runtime_dir = worker_dir / "slurm-runtime"
                         resource.cleanup()
                         resource.apply()
                         pods = resource.wait_ready(runner._expected_nodes(manifest))
@@ -1093,13 +1109,13 @@ def probe_runtime(
                         resource.stage(
                             pods,
                             [
-                                phase_dir / runner.FPM_RUN_SCRIPT_FILENAME,
-                                phase_dir / runner.FPM_ENV_FILENAME,
-                                phase_dir / runner.RUNTIME_ENV_FILENAME,
+                                worker_dir / runner.FPM_RUN_SCRIPT_FILENAME,
+                                worker_dir / runner.FPM_ENV_FILENAME,
+                                worker_dir / runner.RUNTIME_ENV_FILENAME,
                                 runtime / "fpm_exec.sh",
                                 runtime / "preflight.py",
                                 *([runtime / "fpm_memory_observer.py"] if plan.options.executor == "slurm" else []),
-                                *extras,
+                                *worker_extras,
                             ],
                         )
                         resource.prepare_attempt(
@@ -1133,6 +1149,8 @@ def probe_runtime(
                             phase.update(status="cleanup_failed", cleanup_error=str(error))
                             result["status"] = "failed"
                             result["diagnostics"].append(f"{cell.workload_kind} cleanup: {error}")
+                    if delivery_directory is not None:
+                        delivery_directory.cleanup()
                     try:
                         phase["artifacts"] = _snapshot_probe_artifacts(root, phase_dir)
                     except (OSError, ValueError) as error:

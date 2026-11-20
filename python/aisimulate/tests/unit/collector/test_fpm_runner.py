@@ -188,12 +188,12 @@ def _plan(cell: FPMCell):
     )
 
 
-def _native_payload(*, phase: str, rank: int, dp: int, run_id: str = "run") -> dict:
+def _native_payload(*, phase: str, rank: int, dp: int, run_id: str = "run", prefill_history: int = 128) -> dict:
     point = {
         "point_type": phase,
         "benchmark_id": 1,
         "total_prefill_tokens": 257 if phase == "prefill" else 0,
-        "total_kv_read_tokens": 128,
+        "total_kv_read_tokens": prefill_history if phase == "prefill" else 128,
         "batch_size": 4,
         "expected_cudagraph_mode": "PIECEWISE" if phase == "prefill" else "FULL",
         "expected_capture_size": 272 if phase == "prefill" else 4,
@@ -203,7 +203,7 @@ def _native_payload(*, phase: str, rank: int, dp: int, run_id: str = "run") -> d
     scheduled = {
         "num_prefill_requests": 4 if phase == "prefill" else 0,
         "sum_prefill_tokens": 257 if phase == "prefill" else 0,
-        "sum_prefill_kv_tokens": 128 if phase == "prefill" else 0,
+        "sum_prefill_kv_tokens": prefill_history if phase == "prefill" else 0,
         "num_decode_requests": 0 if phase == "prefill" else 4,
         "sum_decode_kv_tokens": 0 if phase == "prefill" else 128,
     }
@@ -3536,9 +3536,7 @@ def test_k31_prefill_acceptance_and_recovery_require_zero_history(tmp_path, hist
     plan.capability.architecture = "KimiK31ForConditionalGeneration"
     raw = tmp_path / "cells" / cell.cell_id / "raw" / "pod-0"
     raw.mkdir(parents=True)
-    payload = _native_payload(phase="prefill", rank=0, dp=1)
-    payload["results"][0]["point"]["total_kv_read_tokens"] = history
-    payload["results"][0]["fpms"][0]["scheduled_requests"]["sum_prefill_kv_tokens"] = history
+    payload = _native_payload(phase="prefill", rank=0, dp=1, prefill_history=history)
     path = raw / "benchmark.json"
     path.write_text(json.dumps(payload))
     before = path.read_bytes()
@@ -3700,9 +3698,7 @@ def test_k31_prefill_resume_retries_historical_kv_and_retains_zero_history(tmp_p
     root = tmp_path / "artifacts" / plan.sha256[:16] / "smoke"
     raw = root / "cells" / cell.cell_id / "raw" / "pod-0"
     raw.mkdir(parents=True)
-    payload = _native_payload(phase="prefill", rank=0, dp=1)
-    payload["results"][0]["point"]["total_kv_read_tokens"] = history
-    payload["results"][0]["fpms"][0]["scheduled_requests"]["sum_prefill_kv_tokens"] = history
+    payload = _native_payload(phase="prefill", rank=0, dp=1, prefill_history=history)
     (raw / "benchmark.json").write_text(json.dumps(payload))
     _write_provenance(
         raw / "collector-provenance.json", cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id="original"
@@ -3777,3 +3773,43 @@ def test_pythonhome_is_rejected_before_fpm_startup_artifacts(tmp_path):
         )
     assert not (tmp_path / "fpm_env.sh").exists()
     assert not (tmp_path / "run.sh").exists()
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_collection_checks_deployment_identity_before_writing_or_scheduling(tmp_path, monkeypatch, archived):
+    from collector.fpm_forward.config import archive_generator_overrides, semantic_generator_overrides
+    from collector.fpm_forward.planner import _canonical_hash
+
+    plan = _plan(_cell())
+    accepted = {"K8sConfig": {"extra_env": [{"name": "OMP_NUM_THREADS", "value": "4"}]}}
+    plan.generator_config_sha256 = _canonical_hash(semantic_generator_overrides(accepted))
+    changed = {"K8sConfig": {"extra_env": [{"name": "OMP_NUM_THREADS", "value": "8"}]}}
+    monkeypatch.setattr(fpm_runner, "_render_cell", lambda *_a, **_k: pytest.fail("scheduled a changed deployment"))
+    with pytest.raises(ValueError, match="differ from the frozen collection plan"):
+        run_collection(
+            plan,
+            generator_overrides=changed,
+            checkpoint_dir=str(tmp_path / "checkpoint"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=False,
+            retry_failed=False,
+        )
+    assert not (tmp_path / "artifacts").exists()
+    assert not (tmp_path / "checkpoint").exists()
+    # Matching references pass identity verification without replay credentials.
+    overrides = archive_generator_overrides(accepted) if archived else accepted
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+
+    def identity_accepted(_plan):
+        raise RuntimeError("identity accepted")
+
+    monkeypatch.setattr(fpm_runner, "_require_k31_execution_inputs", identity_accepted)
+    with pytest.raises(RuntimeError, match="identity accepted"):
+        run_collection(
+            plan,
+            generator_overrides=overrides,
+            checkpoint_dir=str(tmp_path / "checkpoint"),
+            artifact_root=str(tmp_path / "artifacts"),
+            resume=False,
+            retry_failed=False,
+        )
