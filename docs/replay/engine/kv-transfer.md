@@ -79,7 +79,11 @@ group's own `block_size_tokens`. The bytes of one block come from the profile's
 full-attention groups. With `destination_missing`, a decode worker that already
 caches a prefix of the prompt does not receive the full-attention blocks of
 that prefix again. The state moves with every transfer that moves at least one
-token. `transfer_bytes_per_block` is the bytes that vLLM's NIXL connector
+token.
+A request of zero input tokens owns no block and moves no state block; vLLM
+refuses an empty prompt (v0.31.0 `vllm/v1/engine/input_processor.py:516-517`,
+v0.32.0 `:565-566`).
+`transfer_bytes_per_block` is the bytes that vLLM's NIXL connector
 reads for one block of the group on one TP rank, on vLLM 0.31.0 or vLLM
 0.32.0. So the result is the bytes that the connector reads for the request on
 one rank. A live run of GLM-5.3-Flash measured the bytes of whole transfers on
