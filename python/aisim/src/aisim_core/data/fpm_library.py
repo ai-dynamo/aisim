@@ -547,14 +547,14 @@ def stage_fpm_library(
                     shutil.rmtree(build, ignore_errors=True)
                 else:
                     _replace_staged_root(build, root, marker)
-                return _staged(root, metadata, recovery, parquet_sha256, artifact_id, None)
+                return _staged(root, target.relative_to(build), metadata, recovery, parquet_sha256, artifact_id, None)
     except BaseException:
         if temporary is not None:
             temporary.cleanup()
         else:
             shutil.rmtree(build, ignore_errors=True)
         raise
-    return _staged(root, metadata, recovery, parquet_sha256, artifact_id, temporary)
+    return _staged(root, target.relative_to(build), metadata, recovery, parquet_sha256, artifact_id, temporary)
 
 
 STAGED_MARKER = ".staged.json"
@@ -603,15 +603,22 @@ def _installed_root_is_intact(build: Path, installed: Path) -> bool:
     """
     if _overlay_links(build) != _overlay_links(installed):
         return False
-    for directory, _, files in os.walk(build):
-        for name in files:
-            built = Path(directory) / name
-            if built.is_symlink() or name == STAGED_MARKER:
-                continue
-            counterpart = installed / built.relative_to(build)
-            if counterpart.is_symlink() or not counterpart.is_file() or sha256_file(counterpart) != sha256_file(built):
-                return False
-    return True
+    built_files = _regular_files(build)
+    # A copy that exists only in the installed root (a lookup policy added by hand, for example) changes what the
+    # root answers, so it is as disqualifying as a missing or edited one. Only the marker is bookkeeping.
+    if built_files != _regular_files(installed):
+        return False
+    return all(sha256_file(installed / name) == sha256_file(build / name) for name in built_files)
+
+
+def _regular_files(root: Path) -> set[Path]:
+    """Relative paths of the regular (non-link) files of a staged root, without the marker."""
+    return {
+        (Path(directory) / name).relative_to(root)
+        for directory, _, files in os.walk(root)
+        for name in files
+        if not (Path(directory) / name).is_symlink() and name != STAGED_MARKER
+    }
 
 
 def _overlay_links(build: Path) -> list[list[str]]:
@@ -716,14 +723,15 @@ def _replace_staged_root(build: Path, root: Path, marker: Mapping[str, Any]) -> 
     shutil.rmtree(backup_dir, ignore_errors=True)
 
 
-def _staged(root, metadata, recovery, parquet_sha256, artifact_id, temporary) -> StagedFpmLibrary:
-    parquets = list(root.glob(f"**/{LIBRARY_FILE}"))
-    if len(parquets) != 1:
-        raise FpmContractError("the staged FPM root must contain exactly one library")
+def _staged(root, selected, metadata, recovery, parquet_sha256, artifact_id, temporary) -> StagedFpmLibrary:
+    """The staged pair at its selected ``backend/version`` directory, never a library another root merged in."""
+    parquet = root / selected / LIBRARY_FILE
+    if not parquet.is_symlink() and not parquet.exists():
+        raise FpmContractError("the staged FPM root must contain the selected library")
     return StagedFpmLibrary(
         systems_root=root,
-        parquet_path=parquets[0],
-        metadata_path=parquets[0].with_name(METADATA_FILE),
+        parquet_path=parquet,
+        metadata_path=parquet.with_name(METADATA_FILE),
         metadata=metadata,
         diagnostics={
             "fpm_artifact_id": artifact_id,

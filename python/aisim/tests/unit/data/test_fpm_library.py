@@ -2707,6 +2707,46 @@ def test_restaging_repairs_an_installed_root_that_lost_a_file(root, profile, tmp
     assert (repaired.systems_root / "data/h200_sxm/gemm/vllm/0.25.1/gemm_perf.parquet").read_bytes() == b"table"
 
 
+def test_restaging_rejects_a_policy_file_that_only_the_installed_root_has(root, profile, tmp_path, monkeypatch):
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [])
+    source = _systems_root_with_tables(tmp_path, "source", {"gemm/vllm/0.25.1/gemm_perf.parquet": b"table"})
+    parquet, sidecar = _stage_args(root)
+    kwargs = dict(output_dir=tmp_path / "out", systems_paths=[source], **KWARGS)
+    staged = stage_fpm_library(parquet, sidecar, **kwargs)
+    # The sources have no reuse manifest, so a cold staging admits no donor; a hand-added one must not survive.
+    added = staged.systems_root / "perf_data_reuse_manifest.yaml"
+    added.write_text("groups: []\n")
+    assert (staged.systems_root / ".staged.json").is_file()  # the marker and every link still match
+    stage_fpm_library(parquet, sidecar, **kwargs)
+    assert not added.exists()
+
+
+def test_staging_returns_the_selected_pair_when_roots_also_provide_an_older_version(
+    root, profile, tmp_path, monkeypatch
+):
+    from aisim_core.sdk import perf_database
+
+    make_entry(root, profile, resources=RESOURCES)
+    monkeypatch.setattr(perf_database, "get_systems_paths", lambda: [])
+    # The earlier root carries an older FPM library and the later one an older operation table: merging their
+    # vllm/0.24 directories exposes the older library as a file link beside the table.
+    first = _systems_root_with_tables(tmp_path, "first", {"vllm/0.24/fpm_forward_perf.parquet": b"older library"})
+    second = _systems_root_with_tables(tmp_path, "second", {"vllm/0.24/gemm_perf.parquet": b"older table"})
+    parquet, sidecar = _stage_args(root)
+    kwargs = dict(output_dir=tmp_path / "out", systems_paths=[first, second], **KWARGS)
+    staged = stage_fpm_library(parquet, sidecar, **kwargs)
+    selected = staged.systems_root / "data/h200_sxm/vllm/0.25.1"
+    assert staged.parquet_path == selected / "fpm_forward_perf.parquet"
+    assert staged.parquet_path.resolve() == parquet.resolve()
+    assert staged.metadata_path == selected / "fpm_forward_perf.metadata.json"
+    older = staged.systems_root / "data/h200_sxm/vllm/0.24"
+    assert (older / "gemm_perf.parquet").read_bytes() == b"older table"  # still reachable
+    assert stage_fpm_library(parquet, sidecar, **kwargs).parquet_path == staged.parquet_path  # a retry also works
+
+
 def test_repin_to_another_cache_does_not_keep_the_old_library(root, profile, tmp_path):
     from aisim_core.data.ensure import DataPin, ensure_data
 
