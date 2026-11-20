@@ -2500,3 +2500,43 @@ def test_nemotron_mamba_graph_uses_direct_interpolation_and_rejects_sol(
     for entry_point in (RustForwardPassPerfModel.normalize_config, RustForwardPassPerfModel.best_available):
         with pytest.raises(ValueError, match="SOL interpolation requires a registered analytical model class"):
             entry_point(request)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "NemotronHForCausalLM",
+        "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("mode", ["op_level", "auto"])
+def test_registered_profile_without_sol_keeps_op_level_candidate(
+    profile_dict, checkpoint_configs, monkeypatch, architecture, mode
+):
+    profile_dict["architecture"] = architecture
+    checkpoint_configs[profile_dict["model"]] = {"architectures": [architecture]}
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(kwargs["forward_model"])
+        raise RuntimeError("synthetic op database unavailable after compilation was selected")
+
+    monkeypatch.setattr(engine, "compile_engine", unavailable)
+    request = _request(profile_dict, estimation_mode=mode, fallback_policy="deny")
+    resolved = _normalize(request)
+    assert resolved["estimator_config"]["fpm_interpolation"]["method"] == "direct"
+    if mode == "op_level":
+        with pytest.raises(ValueError, match="synthetic op database unavailable"):
+            RustForwardPassPerfModel.best_available(request)
+        assert attempts == ["op_level"]
+    else:
+        model = RustForwardPassPerfModel.best_available(request)
+        assert attempts == ["op_level", "fpm"]
+        assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_regression"
+        model.close()
+    request["estimator_config"]["fpm_interpolation"]["method"] = "sol"
+    with pytest.raises(ValueError, match="SOL interpolation requires"):
+        _normalize(request)

@@ -328,6 +328,12 @@ def _replace_launch(index_path, launches):
         path = index_path.parent / phase["launch_manifest"]["path"]
         context = json.loads(path.read_text())
         context["launch"] = launch
+        model = Path(launch["model_config"]["path"])
+        (path.parent / "model-config.json").write_bytes(model.read_bytes())
+        for name in launch["model_config"].get("source_files", {}):
+            source = model.parent / name
+            if source.is_file():
+                (path.parent / name).write_bytes(source.read_bytes())
         path.write_text(json.dumps(context))
         phase["launch_manifest"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     index_path.write_text(json.dumps(index))

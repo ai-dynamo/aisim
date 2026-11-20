@@ -917,3 +917,27 @@ def test_profile_campaign_observes_slurm_version_before_native_collection(tmp_pa
         assert provenance["runtime"] == {"backend": "vllm", "backend_version": actual_version}
         assert provenance["plan_sha256"] == plan.sha256 and provenance["attempt_id"] == entry["attempt_id"]
     assert all(args[0] in {"srun", "squeue", "scontrol"} for args in commands)
+
+
+def test_attempt_provenance_uses_configured_interpreter_path(runner, tmp_path, monkeypatch):
+    from collector.fpm_forward import runner as fpm_runner
+
+    interpreter = tmp_path / "runtime-bin"
+    interpreter.mkdir()
+    python = interpreter / "python3"
+    python.write_text('#!/bin/sh\nprintf "selected-runtime-python\\n"\n')
+    python.chmod(0o755)
+    startup = {"K8sConfig": {"extra_env": [{"name": "PATH", "value": str(interpreter)}]}}
+    fpm_runner._write_runtime_environment(runner.cell_dir, startup)
+    calls = []
+
+    def execute(_unit, command, **kwargs):
+        assert command[0] == "bash"
+        command = list(command)
+        command[2] = command[2].replace("/tmp/fpm-bench/", str(runner.cell_dir) + "/")
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        calls.append(result.stdout)
+
+    monkeypatch.setattr(runner, "_exec", execute)
+    runner.prepare_attempt(["node0000"], cell_id="cell", plan_sha256="plan", attempt_id="attempt")
+    assert calls == ["selected-runtime-python\n"]

@@ -31,6 +31,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_models_or_timing_dat
 
 @pytest.fixture
 def inputs(tmp_path, monkeypatch, request):
+    request.getfixturevalue("no_models_or_timing_data")
     settings = getattr(request, "param", "trtllm_mla")
     workload_kind = "prefill" if settings == "prefill" else "decode"
     evidence = tmp_path / "evidence"

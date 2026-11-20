@@ -201,6 +201,23 @@ def _dense_synthetic_kv_eligible(
     return bool(artifacts)
 
 
+class KdaSeedError(ValueError):
+    """A completed native attempt lacks publishable recurrent-state seeding."""
+
+
+def require_kda_real_kv(plan, cell, collection):
+    config = getattr(getattr(plan, "capability", None), "model_config", None)
+    if cell.workload_kind != "decode" or config is None or config.effective_payload.get("linear_attn_config") is None:
+        return
+    warmup = collection.kvwarm_meta
+    if (
+        warmup is None
+        or warmup.get("skip_reason")
+        or any("kvwarm_real_kv" not in (item.point.get("sample_reasons") or []) for item in collection.points)
+    ):
+        raise KdaSeedError("KDA decode publication requires real_kv seeding of the request's recurrent state")
+
+
 def aggregate_cell(
     plan: FPMCollectionPlan,
     cell: FPMCell,
@@ -224,6 +241,7 @@ def aggregate_cell(
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
     )
+    require_kda_real_kv(plan, cell, collection)
     runtime_version = getattr(plan, "runtime_backend_version", None)
     if runtime_version is not None and collection.backend_version != runtime_version:
         raise ValueError("observed backend version differs from the frozen runtime version")
@@ -235,7 +253,9 @@ def aggregate_cell(
     )
     capability = plan.capability
     model_config = getattr(capability, "model_config", None)
-    if model_config is not None and model_config.payload.get("architectures") == ["KimiK31ForConditionalGeneration"]:
+    if model_config is not None and model_config.payload.get("architectures", [])[:1] == [
+        "KimiK31ForConditionalGeneration"
+    ]:
         from .execution_evidence import _runtime_worker_evidence
         from .runtime_k31 import moe_precision
 

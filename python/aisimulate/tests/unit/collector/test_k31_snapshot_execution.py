@@ -14,6 +14,7 @@ import pytest
 from collector.fpm_forward import execution_evidence
 from collector.fpm_forward.runtime import fpm_memory_observer as observer
 
+from .test_fpm_profile_collection import no_models_or_timing_data  # noqa: F401
 from .test_fpm_repeatability import _write_campaign
 from .test_fpm_runner import _write_provenance
 from .test_fpm_runtime_memory import _typed, _vllm_config
@@ -317,7 +318,10 @@ def native_execution(snapshot, native_source, request, monkeypatch):
         # synthetic file hashes. Bind only its source identity to the canonical
         # map used by the synthetic native observation fixture, leaving all
         # producer-serialized configuration and attention fields intact.
-        emitted["runtime"] = {key: value for key, value in worker["runtime"].items() if key != "image"}
+        synthetic_runtime = json.loads(native_source[1].read_text())["runtime"]
+        assert emitted["runtime"] == {"framework": "vllm", **synthetic_runtime}
+        for key in ("source_files", "source_revision"):
+            emitted["runtime"][key] = worker["runtime"][key]
         path.write_text(json.dumps(emitted))
     collection = validate_native_collection(
         cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id=collection.collector_attempt_id

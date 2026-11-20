@@ -2316,9 +2316,9 @@ modified for AISimulate's explicit policy and evidence validation contracts.
 
 The ARM64 image child is
 `sha256:52b793567651780dc529647a211a3d15cec11ebc872ac7492636d7d75340eab4`.
-Within the Python distribution, the baseline original path and SHA-256 inventory for 35
-source-bound vLLM interfaces is in
-[`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](https://github.com/ai-dynamo/aisim/blob/313c2d15fa6cef023bfd36517702cab8c901cec7/python/aisimulate/collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
+Within the Python distribution, the current original path and SHA-256 inventory
+for the source-bound vLLM interfaces is in
+[`collector/fpm_forward/runtime/vllm-kimi-k31.example.json`](https://github.com/ai-dynamo/aisim/blob/harrli/kimi-k31-fpm/python/aisimulate/collector/fpm_forward/runtime/vllm-kimi-k31.example.json).
 The inspected references
 `vllm/model_executor/models/config.py` and `vllm/v1/attention/backends/registry.py`
 listed above are outside that
@@ -2367,6 +2367,14 @@ The K3.1 launch and zero-history prefill integration in `runner.py`,
 `runtime_probe.py`, and `docs/perf-model/fpm-self-service/implementation.md`
 also uses this pinned Dynamo scheduler interface. It does not copy or modify
 the native sampling or forward implementation.
+
+The current K3.1 source inventory also pins the unmodified upstream helper
+`vllm/v1/worker/ubatch_utils.py::get_num_ubatches` at vLLM commit
+`266e88c051ca46607fd9de20216bd58426f80052`, SHA-256
+`8aef5a51c45d603ac1408d1224301f0cd536d59698975d704f53af84410453dd`
+([source](https://github.com/vllm-project/vllm/blob/266e88c051ca46607fd9de20216bd58426f80052/vllm/v1/worker/ubatch_utils.py)).
+Copyright contributors to the vLLM project; Apache-2.0. No helper implementation
+is copied into AISimulate.
 
 
 ## DeepSeek V3 configuration license scope unresolved

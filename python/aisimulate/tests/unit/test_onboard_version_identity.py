@@ -345,6 +345,7 @@ def test_supplied_profile_version_is_preserved_or_requires_explicit_selection(
     [
         None,
         [],
+        [{"name": "OVERLAY", "value": "/runtime"}, {"name": "PYTHONPATH", "value": "$(OVERLAY)/wheel"}],
         [
             {"name": "PYTHONPATH", "value": "/runtime/deps"},
             {"name": "LITERAL", "value": "a b;$HOME`echo no`\nnext"},
@@ -376,6 +377,8 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         calls.append((command, payload))
         if command[0] == "srun" or "logs" in command:
             return "AISIMULATE_RUNTIME_VERSION=" + json.dumps(result) + "\n"
+        if "pvc" in command:
+            return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv"}})
         if "get" in command:
             return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
         return ""
@@ -395,7 +398,9 @@ def test_metadata_probe_targets_selected_container_without_gpu_requests(tmp_path
         assert manifest["spec"]["imagePullSecrets"] == [{"name": deployment.image_pull_secret}]
         container = manifest["spec"]["containers"][0]
         assert container["image"] == deployment.image
-        assert container.get("env", []) == (environment or [])
+        assert container.get("env", []) == [
+            {**item, "value": item["value"].replace("$", "$$")} for item in environment or ()
+        ]
         assert manifest["spec"]["volumes"] == [
             {"name": "model-cache", "persistentVolumeClaim": {"claimName": "runtime"}}
         ]
@@ -922,6 +927,8 @@ def test_runtime_version_probe_mounts_whole_model_pvc(monkeypatch, model_cache, 
             manifests.append(json.loads(payload))
         if "logs" in command:
             return 'AISIMULATE_RUNTIME_VERSION={"backend_version": "0.28.0+overlay"}\n'
+        if "pvc" in command:
+            return json.dumps({"status": {"phase": "Bound"}, "spec": {"volumeName": "synthetic-pv"}})
         if "get" in command:
             return json.dumps({"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}})
         return ""
@@ -941,3 +948,22 @@ def test_runtime_version_probe_mounts_whole_model_pvc(monkeypatch, model_cache, 
         assert spec["containers"][0]["volumeMounts"] == [{"name": "model-cache", "mountPath": mount}]
     else:
         assert "volumes" not in spec and "volumeMounts" not in spec["containers"][0]
+
+
+@pytest.mark.parametrize("status", ["Pending", "Lost", "Bound"])
+def test_version_probe_refuses_to_be_first_consumer_of_model_pvc(monkeypatch, status):
+    from aisimulate.support import versioning
+
+    calls = []
+
+    def run(command, *, payload=None):
+        calls.append(command)
+        assert "pvc" in command
+        # Bound without volumeName is also insufficient.
+        return json.dumps({"status": {"phase": status}, "spec": {}})
+
+    monkeypatch.setattr(versioning, "_run", run)
+    with pytest.raises(ValueError, match="already bound for the collection GPU topology"):
+        versioning.detect_runtime_versions(FPMDeployment(image="fixture:image", model_cache="cache"))
+    assert len(calls) == 1
+    assert "create" not in calls[0]

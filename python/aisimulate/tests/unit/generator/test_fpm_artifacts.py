@@ -1865,3 +1865,26 @@ def test_serving_generation_still_resolves_dynamo_version(monkeypatch):
     request = replace(request, backend=replace(request.backend, dynamo_version="1.3.0"))
     api.generate_from_request(request)
     assert resolved == [("1.3.0", "vllm")]
+
+
+def test_fpm_environment_values_remain_literal_on_both_executors(tmp_path):
+    params = _params()
+    value = "$(OVERLAY)/wheel:$HOME:$$literal"
+    params["K8sConfig"]["extra_env"].extend(
+        [
+            {"name": "OVERLAY", "value": "/runtime"},
+            {"name": "LITERAL", "value": value},
+        ]
+    )
+    artifacts = _render(params)
+    # Both the Kubernetes and Slurm collectors execute this same generated
+    # run.sh. Concrete user env never goes through Kubernetes EnvVar expansion.
+    assert "LITERAL" not in artifacts[FPM_MANIFEST_FILENAME]
+    exports = "\n".join(line for line in artifacts[FPM_RUN_SCRIPT_FILENAME].splitlines() if line.startswith("export "))
+    result = subprocess.run(
+        ["bash", "-c", exports + '\nprintf "%s" "$LITERAL"'],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == value

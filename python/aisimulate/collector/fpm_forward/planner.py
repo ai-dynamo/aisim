@@ -1165,7 +1165,7 @@ def build_collection_plan(
     )
     policy_architecture = (
         "KimiK31ForConditionalGeneration"
-        if capability.model_config.payload.get("architectures") == ["KimiK31ForConditionalGeneration"]
+        if capability.model_config.payload.get("architectures", [])[:1] == ["KimiK31ForConditionalGeneration"]
         else capability.architecture
     )
     if (

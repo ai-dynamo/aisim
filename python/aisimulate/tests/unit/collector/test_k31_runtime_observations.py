@@ -37,13 +37,21 @@ def test_unaudited_runtime_does_not_read_k31_manifest(monkeypatch, runtime):
     assert runtime_k31.is_audited_runtime(runtime) is False
 
 
-def test_audited_runtime_still_requires_complete_source_map():
+@pytest.mark.parametrize(
+    "source,digest",
+    [
+        (
+            "vllm/v1/attention/backends/mla/indexer.py",
+            "b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60",
+        ),
+        ("vllm/v1/worker/ubatch_utils.py", "8aef5a51c45d603ac1408d1224301f0cd536d59698975d704f53af84410453dd"),
+    ],
+)
+def test_audited_runtime_still_requires_complete_source_map(source, digest):
     manifest = Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json"
     runtime = json.loads(manifest.read_text())["runtime"]
     assert runtime_k31.is_audited_runtime(runtime)
-    assert runtime["source_files"].pop("vllm/v1/attention/backends/mla/indexer.py") == (
-        "b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60"
-    )
+    assert runtime["source_files"].pop(source) == digest
     runtime["source_revision"] = hashlib.sha256(
         json.dumps(runtime["source_files"], sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -782,7 +790,8 @@ def test_observer_preserves_unsupported_runtime_mode_as_failure(monkeypatch, set
 
 
 @pytest.mark.parametrize(
-    "changed_source", ["vllm/v1/worker/block_table.py", "vllm/v1/attention/backends/mla/indexer.py"]
+    "changed_source",
+    ["vllm/v1/worker/block_table.py", "vllm/v1/attention/backends/mla/indexer.py", "vllm/v1/worker/ubatch_utils.py"],
 )
 def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch, tmp_path, changed_source):
     _adapter(monkeypatch)
@@ -795,6 +804,9 @@ def test_preview_source_digest_checks_actual_files_and_wheel_commit(monkeypatch,
     indexer = tmp_path / "indexer.py"
     indexer.write_text("# synthetic inherited indexer source identity fixture\n")
     installed_files["vllm/v1/attention/backends/mla/indexer.py"] = indexer
+    helper = tmp_path / "ubatch_utils.py"
+    helper.write_text("# synthetic microbatch helper source identity fixture\n")
+    installed_files["vllm/v1/worker/ubatch_utils.py"] = helper
     source_map = {name: hashlib.sha256(source.read_bytes()).hexdigest() for name, source in installed_files.items()}
     source_revision = hashlib.sha256(json.dumps(source_map, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     manifest = {
@@ -1041,7 +1053,7 @@ def test_import_checks_kernel_table_width_against_reviewed_context(tmp_path, mon
         assert any("kernel-block table" in message for message in result["diagnostics"])
 
 
-@pytest.mark.parametrize("kernel", [2, 16, 32])
+@pytest.mark.parametrize("kernel", [2, 16, 32, 64])
 def test_import_rejects_self_consistent_unsupported_cuda_kernel_blocks(tmp_path, monkeypatch, kernel):
     path, launches = _complete_fixture(tmp_path, monkeypatch, packed_indexer=True)
 
@@ -1049,8 +1061,12 @@ def test_import_rejects_self_consistent_unsupported_cuda_kernel_blocks(tmp_path,
         if record["kind"] != "worker":
             return
         cache = record["cache"]
-        subdivisions, stride = 128 // kernel, 16384 // (kernel * 16)
         for name, mapping in cache["kernel_block_views"].items():
+            view = cache["layer_components"][name][0]
+            width = view["shape"][2]
+            slot = cache["tensor_allocations"][0]["block_stride"]
+            manager_block = cache["groups"][0]["block_size_tokens"]
+            subdivisions, stride = manager_block // kernel, slot // (kernel * width)
             mapping.update(
                 kernel_block_size=kernel,
                 kernel_block_stride=stride,
@@ -1058,13 +1074,15 @@ def test_import_rejects_self_consistent_unsupported_cuda_kernel_blocks(tmp_path,
                 kernel_block_table_shape=[1, 64, 4096 // kernel],
             )
             cache["layer_components"][name][0].update(
-                shape=[9 * stride + subdivisions, kernel, 16], stride_bytes=[kernel * 16, 16, 1]
+                shape=[9 * stride + subdivisions, kernel, width], stride_bytes=[kernel * width, width, 1]
             )
 
     _mutate(path, change_kernel)
     result = validate_observations(path, launches)["tp2"]
-    assert result["status"] == "incomplete" and result["resources"] is None
-    assert any("CUDA indexer requires 64-token" in message for message in result["diagnostics"])
+    assert result["status"] == ("complete" if kernel == 64 else "incomplete"), result["diagnostics"]
+    if kernel != 64:
+        assert result["resources"] is None
+        assert any("CUDA indexer requires 64-token" in message for message in result["diagnostics"])
 
 
 @pytest.mark.parametrize("convolution", ["auto", "bfloat16", "float32"])
@@ -1419,7 +1437,9 @@ def test_import_rejects_state_context_shorter_than_reviewed_launch(tmp_path, mon
 def test_import_requires_projected_scheduler_specs(tmp_path, monkeypatch, retain_wrapper):
     path, launches = _complete_fixture(tmp_path, monkeypatch)
     if retain_wrapper:
-        cache, _, _ = _native_fixture(monkeypatch, uniform=True, scheduler_projection=False)
+        cache, _, _ = _native_fixture(
+            monkeypatch, uniform=True, scheduler_projection=False, payload_scale=132, mla_width=576
+        )
         wrapped = [{k: v for k, v in group.items() if k not in {"kind", "layer_classes"}} for group in cache["groups"]]
         wrapped = _decoder_cache_names({"groups": wrapped})["groups"]
         _mutate(path, lambda r: r["cache"].update(groups=copy.deepcopy(wrapped)) if r["kind"] == "scheduler" else None)
@@ -1478,12 +1498,20 @@ def test_import_state_shapes_are_bound_to_checkpoint_not_just_matching_views(tmp
             if record["kind"] == "worker":
                 for name in state["layer_names"]:
                     conv, recurrent = record["cache"]["layer_components"][name]
-                    conv.update(shape=[10, 2], stride_bytes=[512, 2])
+                    conv.update(shape=[10, 2], stride_bytes=[conv["stride_bytes"][0], 2])
                     recurrent.update(
-                        shape=[10, 1], stride_bytes=[512, 4], storage_offset_bytes=conv["storage_offset_bytes"] + 4
+                        shape=[10, 1],
+                        stride_bytes=[recurrent["stride_bytes"][0], 4],
+                        storage_offset_bytes=conv["storage_offset_bytes"] + 4,
                     )
 
         _mutate(path, shrink)
+        index = json.loads(path.read_text())
+        refs = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]["artifacts"]
+        records = [json.loads((path.parent / ref["path"]).read_text()) for ref in refs]
+        worker = next(record for record in records if record["kind"] == "worker")
+        scheduler = next(record for record in records if record["kind"] == "scheduler")
+        _physical_views(worker["cache"], scheduler["cache"], "fp8", context=4096)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == ("complete" if valid else "incomplete"), result["diagnostics"]
     if not valid:
@@ -1523,20 +1551,22 @@ def test_import_indexer_subdivision_requires_observed_mapping(tmp_path, monkeypa
 
 
 def test_configuration_reads_hash_bound_checkpoint_once_for_all_native_ranks(tmp_path, monkeypatch):
-    from collector.fpm_forward import runtime_probe
+    from collector.fpm_forward import runtime_observations
 
     path, launches = _complete_fixture(tmp_path, monkeypatch)
-    original, reads = runtime_probe._model_config_bytes, []
+    original, reads = runtime_observations.read_json, []
 
-    def read(model):
-        reads.append(model["sha256"])
-        return original(model)
+    def read(source, **kwargs):
+        if source.name == "model-config.json":
+            reads.append(source)
+        return original(source, **kwargs)
 
-    monkeypatch.setattr(runtime_probe, "_model_config_bytes", read)
+    monkeypatch.setattr(runtime_observations, "read_json", read)
+    Path(launches["tp2"]["model_config"]["path"]).unlink()
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
     assert len(result["provenance"]["rank_capacities"]) == 4
-    assert reads == [launches["tp2"]["model_config"]["sha256"]]
+    assert len(reads) == 1
 
 
 def test_generic_import_does_not_load_k31_checkpoint_snapshot(tmp_path, monkeypatch):
@@ -1571,3 +1601,99 @@ def test_import_kda_convolution_shape_follows_reviewed_layout(tmp_path, monkeypa
     assert result["status"] == ("complete" if observed_layout == "DS" else "incomplete"), result["diagnostics"]
     if observed_layout == "SD":
         assert "state shapes differ from the checkpoint and TP size" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("gate", [True, False, None])
+def test_import_kda_requires_checkpoint_full_rank_gate(tmp_path, monkeypatch, gate):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    model = Path(launches["tp2"]["model_config"]["path"])
+    config = json.loads(model.read_text())
+    linear = config["text_config"]["linear_attn_config"]
+    if gate is None:
+        linear.pop("use_full_rank_gate")
+    else:
+        linear["use_full_rank_gate"] = gate
+    model.write_text(json.dumps(config))
+    launches["tp2"]["model_config"]["sha256"] = hashlib.sha256(model.read_bytes()).hexdigest()
+    _replace_launch(path, launches)
+    _mutate(path, lambda r: r.update(model_config_sha256=launches["tp2"]["model_config"]["sha256"]))
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if gate is True else "incomplete"), result["diagnostics"]
+    if gate is not True:
+        assert "use_full_rank_gate=true" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("dtype", ["torch.uint8", "torch.float8_e4m3fn"])
+def test_import_native_indexer_storage_dtype(tmp_path, monkeypatch, dtype):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def change(record):
+        cache = record["cache"]
+        for group in cache["groups"]:
+            for name, spec in group.get("layer_specs", {}).items():
+                if name.endswith(".indexer.k_cache"):
+                    spec["dtype"] = dtype
+                    if record["kind"] == "worker":
+                        cache["layer_components"][name][0]["dtype"] = dtype
+
+    _mutate(path, change)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if dtype == "torch.uint8" else "incomplete"), result["diagnostics"]
+    if dtype != "torch.uint8":
+        assert "indexer requires torch.uint8" in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("component", ["state", "indexer"])
+def test_import_rejects_transposed_native_axis_strides(tmp_path, monkeypatch, component):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+
+    def transpose(record):
+        if record["kind"] != "worker":
+            return
+        for name, views in record["cache"]["layer_components"].items():
+            if component == "state" and len(views) == 2:
+                views[1]["stride_bytes"][-2:] = reversed(views[1]["stride_bytes"][-2:])
+            elif component == "indexer" and ".indexer." in name:
+                view = views[0]
+                view["stride_bytes"][1:] = [1, view["shape"][1]]
+
+    _mutate(path, transpose)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "incomplete", result
+    assert ("axis-order" if component == "state" else "BLHNC") in str(result["diagnostics"])
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed", "sidecar_missing", "sidecar_changed", None])
+def test_import_uses_only_hash_bound_frozen_phase_config(tmp_path, monkeypatch, damage):
+    path, launches = _complete_fixture(tmp_path, monkeypatch)
+    model = Path(launches["tp2"]["model_config"]["path"])
+    sidecar = model.parent / "hf_quant_config.json"
+    sidecar.write_text('{"quant_method":"mxfp4"}')
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    launches["tp2"]["model_config"]["source_files"] = {sidecar.name: digest}
+    _replace_launch(path, launches)
+    _mutate(path, lambda r: r.update(model_config_source_files={sidecar.name: digest}))
+    index = json.loads(path.read_text())
+    phase = index["configurations"]["tp2"]["attempts"][0]["phases"]["decode"]
+    directory = (path.parent / phase["launch_manifest"]["path"]).parent
+    # Reproduce the probe's indexed snapshot inputs, independent of the source host.
+    for name in ("model-config.json", sidecar.name):
+        source = directory / name
+        phase["artifacts"].append(
+            {
+                "path": str(source.relative_to(path.parent)),
+                "kind": "runtime-artifact",
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        )
+    path.write_text(json.dumps(index))
+    model.unlink()
+    sidecar.unlink()
+    if damage:
+        source = directory / (sidecar.name if damage.startswith("sidecar") else "model-config.json")
+        if damage.endswith("missing"):
+            source.unlink()
+        else:
+            source.write_text("{}")
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == ("complete" if damage is None else "incomplete"), result["diagnostics"]

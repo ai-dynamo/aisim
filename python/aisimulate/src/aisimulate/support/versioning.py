@@ -75,11 +75,23 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
             },
         }
         if deployment.extra_env:
-            manifest["spec"]["containers"][0]["env"] = deployment.extra_env
+            manifest["spec"]["containers"][0]["env"] = [
+                {**item, "value": item["value"].replace("$", "$$")} for item in deployment.extra_env
+            ]
+        prefix = ["kubectl", "--namespace", namespace]
         if deployment.model_cache:
             # Collection mounts the entire PVC; the optional third component
             # selects the model directory within it, not a volume subPath.
             parts = deployment.model_cache.split(":")
+            # A GPU-free probe must never become a delayed-binding PVC's
+            # first consumer. The collection workload must establish its
+            # GPU/volume topology before this metadata-only Pod can mount it.
+            claim = json.loads(_run([*prefix, "get", "pvc", parts[0], "-o", "json"]))
+            if claim.get("status", {}).get("phase") != "Bound" or not claim.get("spec", {}).get("volumeName"):
+                raise ValueError(
+                    "runtime version probe requires a model-cache PVC already bound for the collection GPU topology; "
+                    "initialize it with the collection workload before probing"
+                )
             manifest["spec"]["volumes"] = [{"name": "model-cache", "persistentVolumeClaim": {"claimName": parts[0]}}]
             manifest["spec"]["containers"][0]["volumeMounts"] = [
                 {
@@ -89,7 +101,6 @@ def detect_runtime_versions(deployment: FPMDeployment) -> dict[str, str]:
             ]
         if deployment.image_pull_secret:
             manifest["spec"]["imagePullSecrets"] = [{"name": deployment.image_pull_secret}]
-        prefix = ["kubectl", "--namespace", namespace]
         created = False
         try:
             _run([*prefix, "create", "-f", "-"], payload=json.dumps(manifest))

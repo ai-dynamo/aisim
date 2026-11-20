@@ -3424,3 +3424,115 @@ def test_generated_finalization_budget_reaches_staged_collector(
     else:
         assert completed.returncode == 0, completed.stderr
         assert completed.stdout.strip() == (inherited or "120" if budget is None else budget)
+
+
+def test_checkpoint_metadata_uses_already_audited_bundle_without_reopening_source():
+    from collector.fpm_forward import runtime_k31
+
+    cell = _cell(phase="decode", strategy="tep")
+    base = _plan(cell)
+    base.capability.architecture = "KimiK31ForConditionalGeneration"
+    runtime = json.loads((Path(runtime_k31.__file__).parent / "runtime/vllm-kimi-k31.example.json").read_text())[
+        "runtime"
+    ]
+
+    class FrozenPlan:
+        def __getattr__(self, name):
+            if name == "runtime_instrumentation":
+                raise AssertionError("metadata reopened the original source bundle")
+            return getattr(base, name)
+
+    assert _configured_sampling_metadata(
+        FrozenPlan(), cell, smoke=False, bundle=SimpleNamespace(manifest={"runtime": runtime})
+    ) == {"decode_prefix_caching": "disabled"}
+
+
+@pytest.mark.parametrize("status", ["passed", "failed"])
+@pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv"])
+def test_kda_resume_retries_unpublishable_seed_and_keeps_real_state_passed(tmp_path, monkeypatch, status, marker):
+    from .test_fpm_forward import _WARM_ELIGIBLE, _synthetic_decode_cell
+
+    _, cell, source = _synthetic_decode_cell(tmp_path, kvwarm=_WARM_ELIGIBLE, markers=(marker,), parallel_strategy="tp")
+    plan = _plan(cell)
+    plan.capability.model_config = ResolvedModelConfig(
+        {"linear_attn_config": {"num_heads": 12, "head_dim": 128}},
+        source_kind="test",
+        source_reference="synthetic KDA state",
+    )
+    artifact_root = tmp_path / "campaign"
+    cell_dir = artifact_root / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
+    shutil.copytree(source, cell_dir)
+    payload = json.loads((cell_dir / "raw/pod-0/benchmark.json").read_text())
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    checkpoint_path = checkpoint_dir / "fpm_forward_smoke.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema": fpm_runner.CHECKPOINT_SCHEMA,
+                "plan_sha256": plan.sha256,
+                "cells": {cell.cell_id: {"status": status, "attempt_id": "attempt"}},
+            }
+        )
+    )
+    attempts = []
+
+    def render(*args, **kwargs):
+        attempts.append(True)
+        directory = args[2]
+        (directory / "k8s_deploy.yaml").write_text("apiVersion: v1\nkind: Pod\nmetadata:\n  name: cell\n")
+        for name in ("run.sh", "fpm_env.sh", "collector-runtime-env.sh"):
+            (directory / name).write_text("#!/bin/sh\n")
+
+    class Resource:
+        def __init__(self, *_args):
+            pass
+
+        def cleanup(self):
+            pass
+
+        def apply(self):
+            pass
+
+        def wait_ready(self, *_args):
+            return ["pod-0"]
+
+        def stage(self, *_args):
+            pass
+
+        def prepare_attempt(self, _pods, **kwargs):
+            self.identity = kwargs
+
+        def execute(self, *_args):
+            pass
+
+        def collect(self, *_args, **kwargs):
+            raw = cell_dir / "raw/pod-0"
+            raw.mkdir(parents=True, exist_ok=True)
+            # The fresh synthetic attempt supplies publishable state evidence.
+            (raw / "benchmark.json").write_text(json.dumps(payload).replace("kvwarm_fake_fallback", "kvwarm_real_kv"))
+            _write_provenance(
+                raw / "collector-provenance.json",
+                cell_id=cell.cell_id,
+                plan_sha256=plan.sha256,
+                attempt_id=self.identity["attempt_id"],
+            )
+
+    monkeypatch.setattr(fpm_runner, "_render_cell", render)
+    monkeypatch.setattr(fpm_runner, "KubernetesCellRunner", Resource)
+    assert (
+        run_collection(
+            plan,
+            generator_overrides={},
+            checkpoint_dir=str(checkpoint_dir),
+            artifact_root=str(artifact_root),
+            resume=True,
+            retry_failed=True,
+            smoke=True,
+        )
+        == []
+    )
+    record = json.loads(checkpoint_path.read_text())["cells"][cell.cell_id]
+    assert record["status"] == "passed"
+    assert attempts == ([True] if marker == "kvwarm_fake_fallback" else [])
+    assert (record["attempt_id"] == "attempt") == (marker == "kvwarm_real_kv")

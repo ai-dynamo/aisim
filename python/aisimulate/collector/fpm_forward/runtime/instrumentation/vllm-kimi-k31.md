@@ -137,8 +137,9 @@ subclass, backend name and block size does not replace this source check.
 Use this explicit example bundle with a fresh campaign and the normal
 `aisimulate onboard probe-runtime` workflow. Default release bundles are unchanged.
 The baseline supports independent decode and zero-history prefill workers, with
-no speculation, prefix caching off and Mamba `none`. Each role's Dynamo
-`native_exact_context` path must be qualified on the intended runtime. Historical-KV
+no speculation, prefix caching off and Mamba `none`. Decode requires Dynamo's
+`native_exact_context` evidence on the intended runtime. Prefill requires ordinary
+zero-history prefill evidence; its prefill-only worker does not run that decode path. Historical-KV
 prefill seeding uses prefix-cache lookup and is not qualified by this baseline;
 aggregated serving also remains outside it. No timing data is produced by source
 inspection or unit-test fakes. Rank-complete native probe evidence is required

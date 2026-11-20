@@ -201,7 +201,8 @@ def _validate_forward_pass_profile(config_json: str) -> str:
             # K2.5/K3 graphs retain MlaModule* fallback primaries whose SOL
             # rooflines are unsupported. Auto must use direct interpolation;
             # K3.1 has its own supported DSA/KDA graph.
-            "registered": family in _MODEL_REGISTRY
+            "registered": family in _MODEL_REGISTRY,
+            "supports_sol": family in _MODEL_REGISTRY
             and analytical_architecture not in {"KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration"}
             and not unsupported_sol_graph,
             **deployment.quantization_kwargs(),

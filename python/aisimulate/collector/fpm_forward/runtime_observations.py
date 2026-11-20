@@ -211,10 +211,26 @@ def _matches_model_path(observed: Any, launch: dict[str, Any]) -> bool:
     )
 
 
-def _checkpoint_config(launch: dict[str, Any]) -> dict[str, Any]:
-    from .runtime_probe import _model_config_bytes
+def _checkpoint_config(launch: dict[str, Any], *, root=None, references=None, phase_dir=None) -> dict[str, Any]:
+    if root is None:
+        from .runtime_probe import _model_config_bytes
 
-    return json.loads(_model_config_bytes(launch["model_config"])["model-config.json"])
+        return json.loads(_model_config_bytes(launch["model_config"])["model-config.json"])
+    config = launch["model_config"]
+    contents = {}
+    for name, expected in {"model-config.json": config["sha256"], **config.get("source_files", {})}.items():
+        matches = [ref for ref in references if PurePosixPath(ref["path"]).name == name]
+        if len(matches) > 1:
+            raise ValueError(f"frozen phase has ambiguous model configuration sources: {name}")
+        if matches:
+            path, digest = _artifact(root, matches[0])
+            _same(digest, expected, f"frozen model configuration source {name}")
+        else:
+            # Phase-local staged inputs are independently bound by the launch
+            # hash even when absent from the observation artifact index.
+            path = contained_file(root, str((phase_dir / name).relative_to(root)))
+        contents[name] = read_json(path, expected_sha256=expected)
+    return contents["model-config.json"]
 
 
 def _validate_record(
@@ -754,8 +770,8 @@ def _configuration(
     canonical_settings, canonical_geometry, canonical_hardware, normalized = None, None, None, None
     capacities, artifacts, launch_artifacts, runtime_artifacts, import_bindings = [], [], [], [], []
     used_paths: set[str] = set()
-    checkpoint_config = None
     for phase in required_phases:
+        checkpoint_config = None
         result = phases[phase]
         binding = {"attempt_id": active, "configuration": label, "phase": phase, "bundle_sha256": bundle.sha256}
         launch_path, digest = _artifact(root, result["launch_manifest"])
@@ -792,7 +808,9 @@ def _configuration(
                 and isinstance(record.get("cache"), dict)
                 and record["cache"].get("allocation_layout") == LAYOUT
             ):
-                checkpoint_config = _checkpoint_config(launch)
+                checkpoint_config = _checkpoint_config(
+                    launch, root=root, references=references, phase_dir=launch_path.parent
+                )
             config = _validate_record(
                 record,
                 launch=launch,

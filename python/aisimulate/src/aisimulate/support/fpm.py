@@ -309,7 +309,15 @@ def run_fpm(
             # A prediction profile can be valid for historical timings while
             # its precision is incompatible with a new native campaign.
             _resolve_execution(command)
-        print(shlex.join(command))
+        preview = list(command)
+        for index, argument in enumerate(preview):
+            if argument.startswith("K8sConfig.extra_env="):
+                environment = json.loads(argument.split("=", 1)[1])
+                # Redact every user value: arbitrary environment names can carry credentials.
+                preview[index] = "K8sConfig.extra_env=" + json.dumps(
+                    [{**entry, "value": "<redacted>"} for entry in environment]
+                )
+        print(shlex.join(preview))
         return 0
     check_plan(request, root)
     from .runtime import runtime_probe_manifest, verify_collection_runtime, verify_runtime_acceptance

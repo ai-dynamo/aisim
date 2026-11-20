@@ -604,7 +604,7 @@ impl ForwardPassPerfModelConfig {
         {
             self.speculation = None;
         }
-        let registered = if self.fpm_profile.is_some() {
+        let (registered, supports_sol) = if self.fpm_profile.is_some() {
             self.estimator_config
                 .fpm_interpolation
                 .validate_profile_options()?;
@@ -636,20 +636,20 @@ impl ForwardPassPerfModelConfig {
                 self.comm_quant_mode = Some(facts.comm_quant_mode);
                 self.attention_backend = Some(facts.attention_backend);
                 self.fpm_resources()?;
-                Some(facts.registered)
+                (Some(facts.registered), Some(facts.supports_sol))
             }
             #[cfg(not(feature = "python"))]
             return Err(invalid_config(
                 "FPM profile validation requires the python feature",
             ));
         } else {
-            None
+            (None, None)
         };
         self.estimator_config.fpm_interpolation.method = self
             .estimator_config
             .fpm_interpolation
             .method
-            .resolve(registered)?;
+            .resolve(supports_sol)?;
         if self.estimator_config.fpm_interpolation.method == super::FpmInterpolationMethod::Direct
             && self.database_mode != DatabaseMode::Silicon
         {

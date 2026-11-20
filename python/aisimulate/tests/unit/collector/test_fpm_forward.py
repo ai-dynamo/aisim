@@ -1267,6 +1267,10 @@ def test_kimi_k31_fpm_attention_policy_pins_native_backend_and_row_identity(tmp_
         **kwargs,
         options=FPMCollectionOptions.from_args(_args(fpm_kv_cache_dtypes=["fp8"], fpm_attention_backend=backend)),
     )
+    assert len(plan.cells) == 6
+    assert {(cell.workload_kind, cell.parallel_strategy) for cell in plan.cells} == {
+        (phase, strategy) for phase in ("prefill", "decode") for strategy in ("dep", "pure_tp", "tep")
+    }
     for cell in plan.cells:
         policy = cell.backend_policy
         assert backend_identity_columns(policy)["attention_backend"] == backend
@@ -2254,9 +2258,15 @@ def test_native_aggregation_preserves_iteration_totals(tmp_path):
     assert "prefix_length" not in rows[0]
 
 
-def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path):
+@pytest.mark.parametrize(
+    "architectures", [["KimiK31ForConditionalGeneration"], ["KimiK31ForConditionalGeneration", "OtherModel"]]
+)
+def test_k31_zero_history_prefill_cannot_publish_checkpoint_inferred_precision(tmp_path, architectures):
     _, _, cell_dir = _synthetic_plan_and_cell(tmp_path)
     config_path, _ = _kimi_k31_config(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["architectures"] = architectures
+    config_path.write_text(json.dumps(config))
     plan = build_collection_plan(
         backend="vllm",
         model_path=str(tmp_path),
@@ -4071,3 +4081,35 @@ def test_formal_database_preserves_runtime_provenance_when_legacy_row_sorts_firs
     ]
     write_formal_database(plan, [incoming], systems_root=root)
     assert pq.read_table(parquet).to_pylist() == published
+
+
+@pytest.mark.parametrize("marker", ["kvwarm_fake_fallback", "kvwarm_real_kv"])
+def test_kda_attempt_seed_rejection_stays_retryable(tmp_path, monkeypatch, marker):
+    from collector.fpm_forward import runner
+
+    plan, cell, cell_dir = _synthetic_decode_cell(
+        tmp_path, kvwarm=_WARM_ELIGIBLE, markers=(marker,), parallel_strategy="tp"
+    )
+    plan.capability.model_config = ResolvedModelConfig(
+        {"text_config": {"linear_attn_config": {"num_heads": 12, "head_dim": 128}}},
+        source_kind="test",
+        source_reference="synthetic KDA geometry",
+    )
+    # Use the ordinary campaign layout so both recovery and resume read the
+    # same retained native bytes; no GPU runner is invoked in this test.
+    root = tmp_path / "campaign" / plan.sha256[:16] / "smoke"
+    target = root / "cells" / cell.cell_id
+    import shutil
+
+    shutil.copytree(cell_dir, target)
+    raw = target / "raw"
+    before = {p.relative_to(raw): p.read_bytes() for p in raw.rglob("*") if p.is_file()}
+    entry = {"status": "failed", "attempt_id": "attempt"}
+    recovered = runner._recover_completed_attempt(plan, cell, root, entry)
+    if marker == "kvwarm_fake_fallback":
+        assert recovered is None
+        with pytest.raises(ValueError, match="KDA decode publication requires real_kv"):
+            runner._runtime_collection_summary(cell, raw, plan=plan, expected_attempt_id="attempt")
+    else:
+        assert recovered["status"] == "passed"
+    assert before == {p.relative_to(raw): p.read_bytes() for p in raw.rglob("*") if p.is_file()}

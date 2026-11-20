@@ -321,6 +321,8 @@ def _validate_cache_inventory(cache, model_config):
     # Pinned KimiLinearConfig.is_kda_layer/is_dsa_layer use one-based lists;
     # KimiDecoderLayer selects KDA first, then MLA with an optional DSA indexer.
     kda = layer_indices(config.get("linear_attn_config"), "kda_layers")
+    if kda and config["linear_attn_config"].get("use_full_rank_gate") is not True:
+        raise ValueError("K3.1 native KDA requires checkpoint use_full_rank_gate=true")
     dsa_config = config.get("dsa_config")
     dsa_field = "layers" if isinstance(dsa_config, dict) and "dsa_layers" not in dsa_config else "dsa_layers"
     indexer = layer_indices(dsa_config, dsa_field) - kda
@@ -565,6 +567,11 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
         for name in group["layer_names"]:
             spec = {**group, **group["layer_specs"][name], "kind": group["kind"]} if uniform else group
             by_name[name] = (index, spec)
+            if (
+                group["layer_classes"].get(name) == "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache"
+                and spec.get("dtype") != "torch.uint8"
+            ):
+                raise ValueError("K3.1 native FP8 indexer requires torch.uint8 storage")
             if spec["kind"] == "attention" and spec.get("dtype") not in {"torch.uint8", "torch.float8_e4m3fn"}:
                 raise ValueError("K3.1 attention storage contradicts FP8 precision")
     views = cache.get("layer_components")
@@ -676,8 +683,21 @@ def validate_views(cache, precision, count, page, *, context=None, sequences=Non
                 if component_offset + span > offset + width:
                     raise ValueError("K3.1 component exceeds its native page interval")
                 logical = math.prod(shape[1:]) * size
-                if state and span != logical:
-                    raise ValueError("K3.1 state components must retain native contiguous payloads")
+                if state:
+                    expected_stride = size
+                    for dimension, stride in reversed(list(zip(shape[1:], strides[1:], strict=True))):
+                        if dimension > 1 and stride != expected_stride:
+                            raise ValueError("K3.1 state components must retain native axis-order contiguous payloads")
+                        expected_stride *= dimension
+                    if span != logical:
+                        raise ValueError("K3.1 state components must retain native contiguous payloads")
+                if (
+                    not state
+                    and name not in kernel_views
+                    and group["layer_classes"].get(name) == "vllm.models.kimi_k3.common.dsa_cache.KimiK3IndexerCache"
+                    and strides[1:] != [shape[2], 1]
+                ):
+                    raise ValueError("K3.1 direct indexer requires native BLHNC token-byte strides")
                 if (
                     not state
                     and name not in kernel_views

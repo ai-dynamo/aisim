@@ -1598,14 +1598,18 @@ def _cell_generator_overrides(
     return merged
 
 
-def _kimi_k31_native_state(plan) -> bool:
+_UNRESOLVED_BUNDLE = object()
+
+
+def _kimi_k31_native_state(plan, bundle=_UNRESOLVED_BUNDLE) -> bool:
     capability = getattr(plan, "capability", None)
     config = getattr(getattr(capability, "model_config", None), "payload", {})
     if getattr(capability, "architecture", None) != "KimiK31ForConditionalGeneration" and config.get(
-        "architectures"
-    ) != ["KimiK31ForConditionalGeneration"]:
+        "architectures", []
+    )[:1] != ["KimiK31ForConditionalGeneration"]:
         return False
-    bundle = getattr(plan, "runtime_instrumentation", None)
+    if bundle is _UNRESOLVED_BUNDLE:
+        bundle = getattr(plan, "runtime_instrumentation", None)
     if bundle is None:
         return False
     from .runtime_k31 import is_audited_runtime
@@ -1613,9 +1617,9 @@ def _kimi_k31_native_state(plan) -> bool:
     return is_audited_runtime(bundle.manifest["runtime"])
 
 
-def _decode_prefix_caching_mode(cell: FPMCell, plan=None) -> str:
+def _decode_prefix_caching_mode(cell: FPMCell, plan=None, *, bundle=_UNRESOLVED_BUNDLE) -> str:
     """Return the rendering/checkpoint policy for one decode strategy."""
-    if plan is not None and _kimi_k31_native_state(plan):
+    if plan is not None and _kimi_k31_native_state(plan, bundle):
         return "disabled"
     return "enabled" if cell.parallel_strategy in KVWARM_STRATEGIES else "disabled"
 
@@ -1625,6 +1629,7 @@ def _configured_sampling_metadata(
     cell: FPMCell,
     *,
     smoke: bool,
+    bundle=_UNRESOLVED_BUNDLE,
 ) -> dict[str, int | str | None]:
     canonical = _frozen_points(plan)
     if canonical is not None:
@@ -1638,7 +1643,7 @@ def _configured_sampling_metadata(
         # Derive checkpoint evidence from the same strategy predicate used to
         # render the engine flags. _cell_generator_overrides rejects policy
         # arguments that conflict with this resolved protocol.
-        return {"decode_prefix_caching": _decode_prefix_caching_mode(cell, plan)}
+        return {"decode_prefix_caching": _decode_prefix_caching_mode(cell, plan, bundle=bundle)}
     if smoke:
         payload: dict[str, int | str | None] = {"prefill_max_new_token_samples": 2}
         if plan.options.prefill_sampling.cudagraph_policy == "runtime":
@@ -1667,6 +1672,7 @@ def _write_runtime_environment(cell_dir: Path, overrides: dict[str, Any]) -> Non
         *FPM_KV_WARMUP_DEFAULTS,
         READINESS_TIMEOUT_ENV,
         FPM_FINALIZATION_TIMEOUT_ENV,
+        "PATH",
         "PYTHONPATH",
         "PYTHONNOUSERSITE",
         "HF_HOME",
@@ -1775,6 +1781,7 @@ def _runtime_collection_summary(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    plan=None,
 ) -> dict[str, Any]:
     """Return auditable unique-axis counts from a validated native grid."""
 
@@ -1784,6 +1791,10 @@ def _runtime_collection_summary(
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
     )
+    if plan is not None:
+        from .database import require_kda_real_kv
+
+        require_kda_real_kv(plan, cell, collection)
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
         "measured_point_count": len(points),
@@ -1939,6 +1950,7 @@ def _recover_completed_attempt(
             cell_dir / "raw",
             expected_plan_sha256=plan.sha256,
             expected_attempt_id=attempt_id,
+            plan=plan,
         )
     except (OSError, TypeError, ValueError) as error:
         logger.info(
@@ -2230,14 +2242,15 @@ def _run_collection_impl(
         # This refresh only polishes checkpoint metadata for cells whose
         # results were already validated and published; raw artifacts that
         # are no longer readable (disk reclaimed, resume from a different
-        # working directory) must not abort the whole resume and never
-        # demote the cell's passed status.
+        # working directory) must not abort resume or demote passed cells.
+        # A proven publication rejection is different: an unpublished KDA
+        # attempt without real state must be retryable rather than stuck passed.
         try:
             metadata = {
                 "total_gpus": cell.topology.total_gpus,
                 "point_source": "dynamo_native_self_benchmark",
                 "global_warmup_iterations": plan.options.warmup_iterations,
-                **_configured_sampling_metadata(plan, cell, smoke=smoke),
+                **_configured_sampling_metadata(plan, cell, smoke=smoke, bundle=instrumentation),
                 **_runtime_timing_summary(root / "cells" / cell.cell_id / "raw"),
             }
             metadata.update(
@@ -2246,9 +2259,15 @@ def _run_collection_impl(
                     root / "cells" / cell.cell_id / "raw",
                     expected_plan_sha256=plan.sha256,
                     expected_attempt_id=_required_attempt_id(entry, cell.cell_id),
+                    plan=plan,
                 )
             )
         except (OSError, TypeError, ValueError) as error:
+            from .database import KdaSeedError
+
+            if isinstance(error, KdaSeedError) and not formal_database_terminal:
+                entry.update(status="failed", error_type=type(error).__name__, error=str(error))
+                checkpoint_changed = True
             logger.warning(
                 "Skipping metadata refresh for passed FPM cell %s: %s",
                 cell.cell_id,
@@ -2332,12 +2351,13 @@ def _run_collection_impl(
             "total_gpus": cell.topology.total_gpus,
             "point_source": "dynamo_native_self_benchmark",
             "global_warmup_iterations": plan.options.warmup_iterations,
-            **_configured_sampling_metadata(plan, cell, smoke=smoke),
         }
         checkpoint["cells"][cell.cell_id] = base_record
         _atomic_json(checkpoint_path, checkpoint)
         resource = None
         try:
+            base_record.update(_configured_sampling_metadata(plan, cell, smoke=smoke, bundle=instrumentation))
+            _atomic_json(checkpoint_path, checkpoint)
             _render_cell(
                 plan,
                 cell,
@@ -2441,6 +2461,7 @@ def _run_collection_impl(
             runtime_collection = _runtime_collection_summary(
                 cell,
                 cell_dir / "raw",
+                plan=plan,
                 expected_plan_sha256=plan.sha256,
                 expected_attempt_id=attempt_id,
             )

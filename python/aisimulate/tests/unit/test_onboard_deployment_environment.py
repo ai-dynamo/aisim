@@ -47,3 +47,31 @@ def test_environment_reaches_formal_generator_arguments(tmp_path):
 def test_deployment_rejects_ambiguous_environment(env):
     with pytest.raises(ValueError, match="extra_env"):
         FPMDeployment(extra_env=env)
+
+
+def test_preview_redacts_environment_credentials_and_keeps_execution_arguments(tmp_path, capsys):
+    from aisimulate.support.fpm import run_fpm
+
+    request = SupportRequest.model_validate(
+        {
+            "identity": {
+                "model": "fixture/model",
+                "model_revision": "a" * 40,
+                "model_kind": "moe",
+                "framework": "vllm",
+                "framework_version": "0.28.0",
+                "gpu": "gb300",
+                "interconnect": "nvlink",
+            }
+        }
+    )
+    token = "dummy-private-token-746"
+    env = [{"name": "HF_TOKEN", "value": token}, {"name": "CUSTOM_AUTH", "value": token}]
+    deployment = FPMDeployment(image="fixture:image", extra_env=env)
+    assert run_fpm(request, output_dir=tmp_path / "preview", deployment=deployment) == 0
+    output = capsys.readouterr().out
+    assert token not in output
+    assert "<redacted>" in output
+    assert "K8sConfig.extra_env=" + json.dumps(env) in fpm_cli_args(
+        request, output_dir=tmp_path, plan_only=False, deployment=deployment
+    )

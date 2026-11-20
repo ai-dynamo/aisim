@@ -3,7 +3,7 @@
   "runtime": {
     "framework": "vllm",
     "version": "0.1.dev24216+g266e88c05",
-    "source_revision": "309f48b8d01df82de3fc4267f8be25add4e85aab5bb519b38f48360096c1d0aa",
+    "source_revision": "b2ed2b14e011f98dbfc84a5a89f176c8220fc098f69f07bc02515f6f6db64724",
     "source_files": {
       "vllm/_version.py": "9970596266339f11081588eea94bfcc6281b9b69822338a1a09d4b6476145014",
       "vllm/config/vllm.py": "e06bb920ed9f530afb23d928d549f6bed7d60bbbea82b5144edbe3392f7d4602",
@@ -42,7 +42,8 @@
       "vllm/v1/core/kv_cache_utils.py": "de64494f8316d3e706802d1461cbf17ddbd421bb4c18946c085145aefd9846ea",
       "vllm/v1/worker/gpu/attn_utils.py": "cbd0dd300928f0fbd24c91f45f34c4dcb1bf93c0737e7b0404c9e4d365ea419c",
       "vllm/v1/attention/backends/mla/compressor_utils.py": "94966398f822512ac35968ca5d1634e707deaa198c68f1e145befc12bdde379e",
-      "vllm/v1/attention/backends/mla/indexer.py": "b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60"
+      "vllm/v1/attention/backends/mla/indexer.py": "b43f5404f67b02c7e5e205320f44ec3680e0a55541ae7718297944036b20dd60",
+      "vllm/v1/worker/ubatch_utils.py": "8aef5a51c45d603ac1408d1224301f0cd536d59698975d704f53af84410453dd"
     }
   },
   "files": [

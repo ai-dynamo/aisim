@@ -1557,9 +1557,12 @@ For an audited runtime assembled from mounted dependencies, `collection_deployme
 accepts unique literal `{name, value}` entries through the existing Generator environment
 interface. These entries remain part of the frozen launch and formal collection settings,
 and also apply to package-version detection in the selected Slurm or Kubernetes container.
-`PYTHONPATH`, `PYTHONNOUSERSITE`, `HF_HOME`, `HF_HUB_OFFLINE`, and `TRANSFORMERS_OFFLINE`
+`PATH`, `PYTHONPATH`, `PYTHONNOUSERSITE`, `HF_HOME`, `HF_HUB_OFFLINE`, and `TRANSFORMERS_OFFLINE`
 also reach the Collector's startup checks before the engine starts. Record mounted source
 and binary hashes alongside the image identity; environment declarations do not qualify them.
+The GPU-free Kubernetes version probe requires a model-cache PVC already bound
+for the collection workload. Initialize delayed-binding storage with that GPU
+workload first; the version probe refuses to become its first consumer.
 
 ### Choose or author the instrumentation bundle
 
