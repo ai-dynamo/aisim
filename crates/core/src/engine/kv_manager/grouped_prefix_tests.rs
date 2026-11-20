@@ -656,11 +656,14 @@ fn full_attention_hit_is_capped_below_the_prompt() {
 }
 
 #[test]
-fn decode_side_hit_takes_full_attention_alone_floored_to_its_block() {
+fn decode_side_hit_of_a_state_model_is_its_full_attention_hit_floored_to_its_block() {
     // A state group above the hash block turns fine-grained hits on, so the
-    // alignment is 4 while the attention block is 16. The decode side keeps
-    // whole attention blocks only (V32 `sched:973-981`) and ignores the state
-    // group's key.
+    // alignment is 4 while the attention block is 16. The state key at 36 is
+    // an own hit of 36, no deeper than the full-attention hit (mgr:360-364),
+    // so the local prefix is that hit, floored to whole attention blocks
+    // (V32 `sched:971-982`). The state's hit of 36 is cdiv(36, 16) = 3
+    // blocks, above the 2 that the truncation keeps (V32 `mgr:826-827`), so
+    // it is dropped.
     let groups = [attention("a", 16, None), state("s", 16, true, false)];
     let coordinator = with_limits(rules(&groups, 4));
     assert_eq!(coordinator.rules.alignment, 4);
@@ -673,7 +676,7 @@ fn decode_side_hit_takes_full_attention_alone_floored_to_its_block() {
     let (ends, tokens) =
         coordinator.full_attention_hit(pool, &request, &coordinator.rules.specs[0], 60);
     assert_eq!((ends, tokens), (vec![16, 32, 36], 36));
-    let hit = coordinator.find_full_attention_hit(pool, &request, 64);
+    let hit = coordinator.find_destination_hit(pool, &request, 64, 63);
     assert_eq!(hit.tokens, 32);
     assert_eq!(hit.junction_tokens, 0);
     assert!(matches!(&hit.per_group[0], GroupHitBlocks::Attention(keys) if keys.len() == 2));
@@ -681,16 +684,282 @@ fn decode_side_hit_takes_full_attention_alone_floored_to_its_block() {
     // The cap at `num_tokens - 1` applies before the floor.
     assert_eq!(
         coordinator
-            .find_full_attention_hit(pool, &lease(33, 4), 33)
+            .find_destination_hit(pool, &lease(33, 4), 33, 32)
             .tokens,
         32
     );
     assert_eq!(
         coordinator
-            .find_full_attention_hit(pool, &lease(32, 4), 32)
+            .find_destination_hit(pool, &lease(32, 4), 32, 31)
             .tokens,
         16
     );
+}
+
+#[test]
+fn decode_side_hit_without_state_layers_is_the_hit_every_group_agrees_on() {
+    // mgr:346-351: without Mamba layers the local prefix is the fixed point.
+    // The window needs one cached block before an aligned end and has one
+    // only at 16, so the hit is 16 with a junction of 48 - 16 = 32.
+    let groups = [
+        attention("full", 16, None),
+        attention("window", 16, Some(17)),
+    ];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 16, &[16, 32, 48]);
+    seed(pool, key(1, 16, 16));
+    let hit = coordinator.find_destination_hit(pool, &lease(64, 16), 64, 64);
+    assert_eq!(hit.tokens, 16);
+    assert_eq!(hit.junction_tokens, 32);
+    assert_eq!(
+        hit.per_group[0],
+        GroupHitBlocks::Attention(vec![Some(key(0, 16, 16))])
+    );
+    assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+}
+
+#[test]
+fn decode_side_hit_falls_back_when_another_group_hits_deeper() {
+    // mgr:360-364: a deeper own hit of another group means the fixed point.
+    // The own hits are 32 and 48, and the fixed point finds no state at 32 or
+    // 16, so the local prefix is 0.
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 16, &[16, 32]);
+    seed(pool, key(1, 16, 48));
+    assert_eq!(
+        coordinator
+            .find_destination_hit(pool, &lease(64, 16), 64, 63)
+            .tokens,
+        0
+    );
+    // A state at 32 is not deeper, so the local prefix is the full-attention
+    // hit of 32 (mgr:366-369).
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 16, &[16, 32]);
+    seed(pool, key(1, 16, 32));
+    let hit = coordinator.find_destination_hit(pool, &lease(64, 16), 64, 63);
+    assert_eq!(hit.tokens, 32);
+    assert_eq!(hit.junction_tokens, 0);
+}
+
+#[test]
+fn decode_side_hit_that_falls_back_keeps_the_agreed_hit_and_its_junction() {
+    // The own hits are 32 and 48, so the finder falls back (mgr:360-364). The
+    // fixed point is 16 and the longest lookup 32, so the junction is 16, at
+    // vLLM's boundary 16 + 16 = 32 (mgr:312-321). Only full attention gets
+    // hit blocks to pin. The state's hit is its block that ends at 16. The
+    // hit of 16 ends on a block, so the scheduler keeps it (V32
+    // `sched:1007-1018`). Both tests count it, and the load drops it (V32
+    // `single:1724-1778`, `:295-300`).
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 16, &[16, 32]);
+    seed_many(pool, 1, 16, &[16, 48]);
+    let hit = coordinator.find_destination_hit(pool, &lease(64, 16), 64, 63);
+    assert_eq!(hit.tokens, 16);
+    assert_eq!(hit.junction_tokens, 16);
+    assert_eq!(
+        hit.per_group[0],
+        GroupHitBlocks::Attention(vec![Some(key(0, 16, 16))])
+    );
+    assert_eq!(
+        hit.per_group[1],
+        GroupHitBlocks::DroppedState {
+            key: key(1, 16, 16),
+            tokens: 16
+        }
+    );
+}
+
+#[test]
+fn decode_side_hit_floors_a_fallback_inside_a_block_and_keeps_the_junction_position() {
+    // Fine-grained hits at hash 4 with 16-token blocks. The own hits are 32
+    // and 48, so the finder falls back (mgr:360-364). The fixed point is 20
+    // and the longest lookup 32, so vLLM's boundary is 32 (mgr:312-321). A
+    // load past 20 truncates the hit to the floor 16 (V32 `sched:1007-1018`),
+    // and the junction grows from 12 to 16 to keep the boundary at 32. The
+    // state's hit of 20 is cdiv(20, 16) = 2 blocks, above the 1 that the
+    // truncation keeps (V32 `mgr:826-827`), so it is dropped.
+    let groups = [attention("a", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 4));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 4, &[16, 32]);
+    seed_many(pool, 1, 4, &[20, 48]);
+    let hit = coordinator.find_destination_hit(pool, &lease(64, 4), 64, 63);
+    assert_eq!(hit.tokens, 16);
+    assert_eq!(hit.junction_tokens, 16);
+    assert_eq!(
+        hit.per_group[0],
+        GroupHitBlocks::Attention(vec![Some(key(0, 4, 16))])
+    );
+    assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+}
+
+#[test]
+fn decode_side_hit_without_a_full_attention_group_is_the_hit_every_group_agrees_on() {
+    // mgr:346-351: without a full-attention group there is no per-group path.
+    // The window and the state both hit at 16, the fixed point below the cap
+    // of 32. The window gets no hit block. The state's hit of 16 ends on its
+    // block, below the 32 loaded tokens, so both tests count it and the load
+    // drops it.
+    let groups = [
+        attention("window", 16, Some(17)),
+        state("s", 16, true, false),
+    ];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed(pool, key(0, 16, 16));
+    seed(pool, key(1, 16, 16));
+    let hit = coordinator.find_destination_hit(pool, &lease(33, 16), 33, 32);
+    assert_eq!(hit.tokens, 16);
+    assert_eq!(hit.per_group[0], GroupHitBlocks::None);
+    assert_eq!(
+        hit.per_group[1],
+        GroupHitBlocks::DroppedState {
+            key: key(1, 16, 16),
+            tokens: 16
+        }
+    );
+}
+
+#[test]
+fn decode_side_hit_without_a_full_attention_group_drops_a_state_hit_inside_its_block() {
+    // Without a full-attention group nothing is floored, so the drop reads
+    // the agreed hit itself. A window at the hash block 4 and a state of
+    // 16-token blocks make the hits fine-grained. Both groups hit at 20, so
+    // the agreed hit stays 20. The state's hit of 20 is cdiv(20, 16) = 2
+    // blocks, above the 1 whole block of the hit, so it is dropped. vLLM
+    // floors 20 to its scheduler block 16, the LCM of the group blocks, and
+    // the truncation keeps 1 state block (V32 `sched:1007-1018`,
+    // `mgr:826-827`), so it drops that hit too.
+    let groups = [attention("window", 4, Some(5)), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 4));
+    assert_eq!(coordinator.rules.alignment, 4);
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed(pool, key(0, 4, 20));
+    seed(pool, key(1, 4, 20));
+    let hit = coordinator.find_destination_hit(pool, &lease(33, 4), 33, 32);
+    assert_eq!(hit.tokens, 20);
+    assert_eq!(hit.per_group[0], GroupHitBlocks::None);
+    assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+    // An agreed hit of 16 ends on the state block, so the state's hit stays.
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed(pool, key(0, 4, 16));
+    seed(pool, key(1, 4, 16));
+    let hit = coordinator.find_destination_hit(pool, &lease(33, 4), 33, 32);
+    assert_eq!(hit.tokens, 16);
+    assert_eq!(
+        hit.per_group[1],
+        GroupHitBlocks::DroppedState {
+            key: key(1, 4, 16),
+            tokens: 16
+        }
+    );
+}
+
+#[test]
+fn decode_side_admission_counts_each_state_groups_own_hit() {
+    // The local prefix is 48, and the state's own hit of 32 is not deeper
+    // (mgr:366-369). The whole prompt of 65 counts full attention 5 - 3 = 2
+    // new and 3 free hit blocks, and the state min(5 - 2, 1) = 1 new and its
+    // free hit block: 7. The load of 64 counts 4 - 3 = 1 and 3, and
+    // min(4 - 2, 1) = 1 and 1: 6 (V32 `single:1724-1778`).
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 16, &[16, 32, 48]);
+    seed(pool, key(1, 16, 32));
+    let hit = coordinator.find_destination_hit(pool, &lease(65, 16), 65, 64);
+    assert_eq!(hit.tokens, 48);
+    assert_eq!(
+        hit.per_group[1],
+        GroupHitBlocks::DroppedState {
+            key: key(1, 16, 32),
+            tokens: 32
+        }
+    );
+    assert_eq!(
+        coordinator.destination_admission_blocks(pool, &hit, 64, 65),
+        7
+    );
+    assert_eq!(coordinator.destination_load_blocks(pool, &hit, 64, 65), 6);
+    // A state block that another request holds costs no capacity.
+    let held = GroupedHit {
+        tokens: 32,
+        junction_tokens: 0,
+        per_group: vec![
+            GroupHitBlocks::Attention(Vec::new()),
+            GroupHitBlocks::State(Some(key(1, 16, 32))),
+        ],
+    };
+    coordinator
+        .pin_hit(pool, &mut coordinator.new_lease(), &held)
+        .unwrap();
+    assert_eq!(
+        coordinator.destination_admission_blocks(pool, &hit, 64, 65),
+        6
+    );
+    assert_eq!(coordinator.destination_load_blocks(pool, &hit, 64, 65), 5);
+    // The decode rank pins the full-attention blocks only.
+    let mut blocks = coordinator.new_lease();
+    coordinator.pin_hit(pool, &mut blocks, &hit).unwrap();
+    assert!(state_lease(&blocks, 1).hit.is_none());
+}
+
+#[test]
+fn decode_side_hit_drops_a_state_hit_above_the_floored_prefix() {
+    // Hash block 4 makes the hits fine-grained. The full-attention hit of 36
+    // floors to 32, and a Mamba hit of 36 is cdiv(36, 16) = 3 blocks, above
+    // the 2 that the truncation keeps (V32 sched:1007-1018, mgr:826-827).
+    let groups = [attention("a", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 4));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 4, &[16, 32, 36]);
+    seed(pool, key(1, 4, 36));
+    let hit = coordinator.find_destination_hit(pool, &lease(64, 4), 64, 63);
+    assert_eq!(hit.tokens, 32);
+    assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 4, &[16, 32, 36]);
+    seed(pool, key(1, 4, 32));
+    let hit = coordinator.find_destination_hit(pool, &lease(64, 4), 64, 63);
+    assert_eq!(
+        hit.per_group[1],
+        GroupHitBlocks::DroppedState {
+            key: key(1, 4, 32),
+            tokens: 32
+        }
+    );
+}
+
+#[test]
+fn decode_side_full_hit_leaves_the_state_groups_without_a_hit() {
+    // A local prefix that reaches the loaded tokens loads nothing in vLLM
+    // (nixl/pull_scheduler.py:59-65). Replay still moves the state then.
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 16, &[16, 32, 48, 64]);
+    seed(pool, key(1, 16, 64));
+    let hit = coordinator.find_destination_hit(pool, &lease(65, 16), 65, 64);
+    assert_eq!(hit.tokens, 64);
+    assert_eq!(hit.per_group[1], GroupHitBlocks::None);
 }
 
 #[test]
@@ -902,6 +1171,118 @@ fn sliding_window_admission_after_a_hit_is_vllms_whole_prompt_count() {
             coordinator.release_request(pool, &mut block_lease);
         }
     }
+}
+
+#[test]
+fn remaining_blocks_follow_vllm_for_every_group_kind() {
+    // GLM at 4,352 of 10,000 tokens: full attention 5 - 2 = 3, the ring 0,
+    // and each KDA group 1, or 2 with a valid checkpoint at 8,704.
+    // The checkpoint passes the five conditions of V32 `iface:1125-1146`
+    // for the query 4,352..10,000 at 9,999 / 2,176 * 2,176 = 8,704, and
+    // vLLM counts min(5 - 2, 1 + 1) = 2 per KDA group (V32
+    // `single:1724-1773`).
+    for (version, checkpoint, expected) in [
+        (VllmRuleVersion::V0_31_0, false, 7),
+        (VllmRuleVersion::V0_32_0, false, 7),
+        (VllmRuleVersion::V0_32_0, true, 11),
+    ] {
+        let groups = groups_glm(checkpoint);
+        let mut coordinator = with_limits(rules_glm(version, checkpoint));
+        let mut kv = kv_pool(&groups, 64);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut lease = coordinator.new_lease();
+        assert!(coordinator.allocate(pool, &mut lease, 10_000, 0, 4_352, 1));
+        assert_eq!(
+            coordinator.remaining_blocks(&lease, 10_000, 4_352, 10_000),
+            expected
+        );
+    }
+    // A 16-token window at 64 of 65 tokens: 5 blocks. One batch of 32 tokens
+    // caps it at cdiv(15 + 32, 16) + 1 = 4, equal to the 4 held, so 0.
+    // One batch of 8,192 tokens caps it at 514, so 5 - 4 = 1 (V31
+    // `single:216-238`, `iface:859-866`).
+    let groups = [attention("window", 16, Some(16))];
+    let limits = AdmissionLimits {
+        max_in_flight_tokens: 32,
+        max_model_len: usize::MAX,
+    };
+    for (mut coordinator, expected) in [
+        (GroupedPrefixCoordinator::new(rules(&groups, 16), limits), 0),
+        (with_limits(rules(&groups, 16)), 1),
+    ] {
+        let mut kv = kv_pool(&groups, 16);
+        let pool = kv.block_pool_mut().unwrap();
+        let mut lease = coordinator.new_lease();
+        assert!(coordinator.allocate(pool, &mut lease, 65, 0, 64, 1));
+        assert_eq!(coordinator.remaining_blocks(&lease, 65, 64, 65), expected);
+    }
+}
+
+#[test]
+fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
+    // Attention and state blocks of 64, hash block 4, a cold prompt of 50.
+    // vLLM's whole-prompt test counts 2 blocks. The split stops at the tail
+    // 48, where the state is published inside its block, and the write
+    // 48..50 takes a third block for the copy. Until then vLLM counts that
+    // block in what the request still needs: the request is a producer in
+    // `_partial_hit_reqs` (V31 single:1770-1777, V32 single:1732-1739), and
+    // `_request_remaining_blocks` counts through the same function (V31
+    // sched:3003-3017, V32 sched:3060-3076).
+    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        let groups = [attention("full", 64, None), state("s", 64, true, false)];
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        let mut kv = kv_pool(&groups, 3);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(50, 4);
+        let hit = coordinator.find_longest_hit(pool, &request, 50);
+        assert_eq!(
+            coordinator.admission_blocks(pool, &hit, 50),
+            2,
+            "{version:?}"
+        );
+        let mut block_lease = coordinator.new_lease();
+        assert_eq!(
+            coordinator.remaining_blocks(&block_lease, 50, 0, 50),
+            2,
+            "{version:?}"
+        );
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 0, 48, 1));
+        coordinator.finalize(pool, &mut block_lease, &request, 50, 48, &hit, 1);
+        assert!(
+            state_lease(&block_lease, 1).published.is_some(),
+            "{version:?}"
+        );
+        assert_eq!(
+            coordinator.remaining_blocks(&block_lease, 50, 48, 50),
+            1,
+            "{version:?}"
+        );
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 2));
+        assert_eq!(pool.active_blocks(), 3, "{version:?}");
+        assert_eq!(
+            coordinator.remaining_blocks(&block_lease, 50, 50, 50),
+            0,
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut block_lease);
+    }
+}
+
+#[test]
+fn remaining_bytes_saturate_without_limits() {
+    // A window of 1-token blocks with no model length and no budget: the cap
+    // saturates at usize::MAX and does not bind, so 12 - 10 = 2 blocks.
+    let window = FpmCacheGroup {
+        page_size_bytes: 10,
+        ..attention("w", 1, Some(4))
+    };
+    let limits = AdmissionLimits {
+        max_in_flight_tokens: usize::MAX,
+        max_model_len: usize::MAX,
+    };
+    assert_eq!(remaining_bytes(&[window], 10, 12, limits), 20);
 }
 
 #[test]
@@ -1808,7 +2189,16 @@ fn the_plan_of_an_allocation_counts_the_producer_copy() {
             state_lease(&block_lease, 1).published.is_some(),
             "{version:?}"
         );
-        let planned = coordinator.allocation_blocks(&block_lease, 50, 48, 50, 3);
+        let planned = GroupedPrefixCoordinator::plan_allocation(
+            &coordinator.rules,
+            &mut block_lease.clone(),
+            50,
+            48,
+            50,
+            3,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(planned, 1, "{version:?}");
         let active = pool.active_blocks();
         coordinator.begin_step();
