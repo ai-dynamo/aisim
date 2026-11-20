@@ -482,6 +482,8 @@ consume AISim through optional adapters.
 
 ### Packaged legal-file copies
 
+**Built with Llama.** AISim includes Llama model-configuration metadata; the [third-party notices](THIRD_PARTY_NOTICES.md) identify the applicable versions, sources and license terms.
+
 The root [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 are the canonical repository legal files. Because the Python wheel build is
 rooted at `python/aisim/`, byte-identical copies are retained there so the
