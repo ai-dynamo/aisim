@@ -1022,6 +1022,9 @@ def _carries_state_snapshot(estimator_config: Any) -> bool:
     return isinstance(estimator_config, Mapping) and estimator_config.get("state_snapshot") is not None
 
 
+_FPM_ESTIMATION_MODES = frozenset({"fpm_interpolation", "fpm_regression", "fpm_learned"})
+
+
 def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin: Any | None):
     """Resolve and load pinned dataset inputs; ``None`` (a no-op) when no pin is configured."""
     from aisim_core.data.ensure import ensure_data, ensuring, pin_from_environment
@@ -1034,7 +1037,26 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
+    if pin.saved_source and (payload.get("estimation_mode") in _FPM_ESTIMATION_MODES or _names_systems_paths(config)):
+        # The op-latency source saved by ``aisim init`` would replace the ``systems_paths`` the caller named, which
+        # carry the FPM tables of these modes and of the FPM candidates of ``auto``. The saved source is a default
+        # for runs that name no roots; only a source the caller or environment names overrides them.
+        return None
     return ensure_data(payload, pin)
+
+
+def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> bool:
+    """Whether the roots of ``config`` were chosen by someone: its ``systems_paths``, ``set_systems_paths`` or the
+    ``AICONFIGURATOR_SYSTEMS_PATH`` environment variable.
+
+    Callers such as the Sweeper expand an unset ``systems_paths`` before construction, so the roots they hand over
+    may be that expansion rather than a choice. Only the packaged roots are a default: any other roots, however
+    they were set, outrank the source saved by ``aisim init``.
+    """
+    named = config.systems_paths if isinstance(config, ForwardPassPerfModelConfig) else config.get("systems_paths")
+    # An unset value expands to ``set_systems_paths``, then the environment variable, then the packaged roots.
+    roots = _resolve_forward_pass_systems_paths(tuple(named or ()), require_directories=False)
+    return roots != _resolve_forward_pass_systems_paths(("default",), require_directories=False)
 
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:

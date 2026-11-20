@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -52,6 +53,7 @@ def files(tmp_path):
 
 
 def pin(tmp_path, **kw):
+    kw.setdefault("categories", ("fpm",))  # these tests exercise FPM data; the default pin names op-latency
     return DataPin(repo=REPO, revision=SHA, cache_dir=tmp_path / "cache", **kw)
 
 
@@ -101,6 +103,14 @@ def test_over_threshold_refuses_with_size_and_command(tmp_path, files):
     assert "fpm/m1/data.parquet" not in transport.opened  # nothing downloaded
 
 
+def test_recovery_command_quotes_cache_path(tmp_path, files):
+    with pytest.raises(DataTooLargeError) as e:
+        ensure_data(
+            CONFIG, pin(tmp_path / "my cache", max_bytes=1, categories=("fpm",)), transport=FakeTransport(files)
+        )
+    assert f"--cache-dir '{tmp_path / 'my cache' / 'cache'}'" in str(e.value)
+
+
 def test_missing_data_is_precise_and_never_falls_back(tmp_path, files):
     with pytest.raises(MissingDataError, match=r"model=other.*system=h200|system=h200.*model=other"):
         ensure_data({**CONFIG, "model": "other"}, pin(tmp_path), transport=FakeTransport(files))
@@ -111,10 +121,12 @@ def test_local_override_needs_no_network_or_cache(tmp_path, files):
     for path, data in files.items():
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
-    out = ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+    out = ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
     assert out.datasets["fpm"]["source"] == "local" and out.revisions["fpm"] == f"local:{root}"
     with pytest.raises(MissingDataError, match="no fpm data"):
-        ensure_data({**CONFIG, "model": "nope"}, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(
+            {**CONFIG, "model": "nope"}, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
+        )
 
 
 def test_corrupt_local_file_is_an_error(tmp_path, files):
@@ -123,7 +135,7 @@ def test_corrupt_local_file_is_an_error(tmp_path, files):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data if "m1/data" not in path else b"corrupt")
     with pytest.raises(MissingDataError, match="failed verification|unusable"):
-        ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
 def test_user_pinned_profile_conflict(tmp_path, files):
@@ -193,7 +205,7 @@ def test_an_fpm_dataset_republished_in_place_is_not_served_from_the_old_preparat
             (root / path).write_bytes(data)
 
     publish(files)
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     first = ensure_data(CONFIG, local).config["systems_paths"][0]
     assert ensure_data(CONFIG, local).config["systems_paths"][0] == first  # unchanged content is reused
     # Corrected measurements: same identity and configuration ID, different table bytes and manifest digests.
@@ -275,7 +287,8 @@ def test_the_revision_is_resolved_once_and_every_fetch_uses_that_commit(tmp_path
             return super().open_file(repo, sha, path)
 
     transport = Moving(files)
-    ensure_data(CONFIG, DataPin(repo=REPO, revision="main", cache_dir=tmp_path / "cache"), transport=transport)
+    moving = DataPin(repo=REPO, revision="main", categories=("fpm",), cache_dir=tmp_path / "cache")
+    ensure_data(CONFIG, moving, transport=transport)
     assert transport.resolves == 1 and transport.shas == {SHA}
 
 
@@ -314,7 +327,7 @@ def test_the_fpm_preparation_key_covers_the_runtime_destination(tmp_path):
             (root / path).write_bytes(data)
 
     publish()
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     first = ensure_data(CONFIG, local).config["systems_paths"][0]
     # Same source path, size and digest; only where the artifact lands in the runtime tree changes.
     manifest = json.loads(files["fpm/m1/manifest.json"])
@@ -373,7 +386,7 @@ def test_a_partly_refreshed_local_dataset_is_refused_against_the_catalog_pin(tmp
             (root / path).write_bytes(data)
 
     publish()
-    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    local = DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache")
     first = ensure_data(CONFIG, local).config["systems_paths"][0]
     # Refresh only the profile and its manifest; the catalog still pins the old manifest digest.
     table = write_parquet(pa.table({"x": [7, 8, 9, 10]}), tmp_path / "new.parquet", "aisim.test/v1").read_bytes()
@@ -407,7 +420,7 @@ def test_an_entry_whose_manifest_belongs_to_another_model_is_refused(tmp_path):
         (root / path).parent.mkdir(parents=True, exist_ok=True)
         (root / path).write_bytes(data)
     with pytest.raises(MissingDataError, match="failed verification"):
-        ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))
+        ensure_data(CONFIG, DataPin(local_root=root, categories=("fpm",), cache_dir=tmp_path / "cache"))
 
 
 @pytest.mark.parametrize("categories", [("fpm", "op-latency"), ("op-latency", "fpm")])
@@ -460,3 +473,48 @@ def test_the_ownership_lookup_reads_each_category_index(tmp_path, files):
     )  # this dataset has no such category
     remote = pin(tmp_path, categories=("fpm", "op-latency"))
     assert ensure_mod._category_configuration_ids(remote, FakeTransport(files), "fpm") == set(ids)
+
+
+@pytest.mark.unit
+def test_pin_from_environment_uses_saved_init_source(tmp_path):
+    from aisim_core.data.config import InitConfig, save_config
+
+    env = {"AISIM_DATA_CACHE": str(tmp_path)}
+    assert pin_from_environment(env) is None
+    save_config(InitConfig(mode="on-demand", repo=REPO, revision=SHA), tmp_path / "config.json")
+    p = pin_from_environment(env)
+    assert (p.repo, p.revision) == (REPO, SHA)
+    other = pin_from_environment({**env, "AISIM_DATASET": f"{REPO}@{'b' * 40}"})
+    assert other.revision == "b" * 40
+
+
+@pytest.mark.unit
+def test_pin_from_environment_resolves_saved_source_like_fetch(tmp_path, monkeypatch):
+    from aisim_core.data.config import ConfigError, InitConfig, resolve_source, save_config, shipped_pin
+
+    monkeypatch.setenv("AISIM_DATASET", f"other/dataset@{'c' * 40}")  # the process environment must not leak in
+    env = {"AISIM_DATA_CACHE": str(tmp_path)}
+    cfg = tmp_path / "config.json"
+    save_config(InitConfig(mode="on-demand", revision=SHA), cfg)  # revision only
+    p = pin_from_environment(env)
+    assert (p.repo, p.revision) == (shipped_pin()[0], SHA)
+    save_config(InitConfig(mode="on-demand", repo=shipped_pin()[0]), cfg)  # shipped repository, no revision
+    p = pin_from_environment(env)
+    saved = InitConfig(mode="on-demand", repo=shipped_pin()[0])
+    assert (p.repo, p.revision) == resolve_source(env=env, config=saved)
+    cfg.write_text("{truncated")  # corrupt saved config is reported, not ignored
+    with pytest.raises(ConfigError):
+        pin_from_environment(env)
+
+
+def test_default_pin_names_only_the_op_database():
+    assert DataPin(local_root=Path("x")).categories == ("op-latency",)
+
+
+def test_fpm_only_pin_without_categories_fails_naming_the_variable(tmp_path, files):
+    env = {"AISIM_DATASET": f"{REPO}@{SHA}", "AISIM_DATA_CACHE": str(tmp_path)}
+    with pytest.raises(MissingDataError, match=r"no 'op-latency' category.*AISIM_DATA_CATEGORIES") as e:
+        ensure_data(CONFIG, pin_from_environment(env), transport=FakeTransport(files))  # an FPM-only dataset
+    assert "op-latency" in str(e.value) and e.value.source == f"{REPO}@{SHA}"
+    named = pin_from_environment({**env, "AISIM_DATA_CATEGORIES": "fpm"})
+    assert ensure_data(CONFIG, named, transport=FakeTransport(files)).revisions == {"fpm": SHA}

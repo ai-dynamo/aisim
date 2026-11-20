@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Argument parser for ``aisim data``.
+"""Argument parsers for ``aisim data``, ``aisim fetch`` and ``aisim init``.
 
 Kept free of dataset-library imports so building the CLI parser stays
 runtime-free; :mod:`aisim.data_cli` holds the command implementation.
@@ -19,46 +19,125 @@ PURPOSES = ("prediction", "validation", "results", "full-evidence")
 _PREDICTION_PURPOSE = {"op-latency": "operation-tables", "fpm": "execution-profile"}
 
 
-def add_data_parser(subparsers: Any) -> None:
-    data = subparsers.add_parser("data", help="Work with the AISim dataset.")
-    data_commands = data.add_subparsers(dest="data_command", required=True)
-    fetch_parser = data_commands.add_parser(
-        "fetch",
-        help="Download selected dataset files into the local cache.",
-        description=(
-            "Resolve a dataset revision to one commit SHA, plan the files a selection needs, and download and "
-            "verify them into the cache. A selection needs --configuration or --hardware (plus --model for "
-            "fpm, e2e and eval)."
-        ),
+def _add_source_args(parser: Any) -> None:
+    parser.add_argument(
+        "--repo",
+        help="Hugging Face dataset repository, owner/name (default: $AISIM_DATASET, the saved init config, "
+        "then ai-dynamo/aisim-data)",
     )
-    fetch_parser.add_argument("--category", required=True, help=f"one of: {', '.join(SUPPORTED_CATEGORIES)}")
-    fetch_parser.add_argument("--model")
-    fetch_parser.add_argument("--hardware")
-    fetch_parser.add_argument("--framework")
-    fetch_parser.add_argument("--framework-version")
-    fetch_parser.add_argument(
+    parser.add_argument(
+        "--revision",
+        help="branch, tag or commit SHA (default: $AISIM_DATASET, the saved init config, then the shipped pin; "
+        "'main' when the package ships no pin)",
+    )
+    parser.add_argument("--cache-dir", help="cache root (default: $AISIM_DATA_CACHE or the user cache)")
+
+
+def _add_fetch_args(parser: Any) -> None:
+    parser.add_argument(
+        "--category",
+        default="op-latency",
+        help=f"one of: {', '.join(SUPPORTED_CATEGORIES)} (default: op-latency; fpm, e2e and eval need selectors)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="whole category; op-latency only. This is also what no selector means for op-latency",
+    )
+    parser.add_argument("--model")
+    parser.add_argument("--hardware")
+    parser.add_argument("--framework")
+    parser.add_argument("--framework-version")
+    parser.add_argument(
         "--configuration",
         action="append",
         default=[],
         metavar="ID",
         help="configuration ID; repeat or comma-separate for several",
     )
-    fetch_parser.add_argument("--operation-family")
-    fetch_parser.add_argument("--purpose", choices=PURPOSES, default="prediction")
-    fetch_parser.add_argument("--repo", required=True, help="Hugging Face dataset repository, owner/name")
-    fetch_parser.add_argument("--revision", default="main", help="branch, tag or commit SHA (default: main)")
-    fetch_parser.add_argument("--cache-dir", help="cache root (default: $AISIM_DATA_CACHE or the user cache)")
-    fetch_parser.add_argument(
+    parser.add_argument("--operation-family")
+    parser.add_argument("--purpose", choices=PURPOSES, default="prediction")
+    _add_source_args(parser)
+    parser.add_argument(
         "--dry-run", action="store_true", help="print the plan; downloads only the small catalog and manifest files"
     )
-    fetch_parser.add_argument("--offline", action="store_true", help="make no network requests")
-    check_names_parser = data_commands.add_parser(
-        "check-names",
-        help="Report stored names that are not canonical (hardware, framework, metric, ...).",
+    parser.add_argument("--offline", action="store_true", help="make no network requests")
+    parser.add_argument(
+        "--no-limit", action="store_true", help="ignore the opt-in AISIM_DATA_MAX_BYTES limit for this download"
+    )
+
+
+def add_data_parser(subparsers: Any) -> None:
+    data = subparsers.add_parser("data", help="Download, inspect and validate the AISim dataset.")
+    data_commands = data.add_subparsers(dest="data_command", required=True)
+    fetch_parser = data_commands.add_parser(
+        "fetch",
+        help="Download dataset files into the local cache (no arguments: the whole op-latency database).",
         description=(
-            "Check a dataset directory (or one manifest) for names that are not the canonical spelling, for every "
-            "category. Prints one JSON object with the findings and the canonical name to use. Nothing is "
-            "rewritten. Exit status is 0 when clean, 1 when there are findings or unreadable manifests."
+            "Resolve a dataset revision to one commit SHA, plan the files a selection needs, and download and "
+            "verify them into the cache. With no arguments this downloads the whole op-latency database. fpm, "
+            "e2e and eval are never part of that default: they need --configuration or --hardware (plus "
+            "--model). Also available as 'aisim fetch'."
         ),
     )
-    check_names_parser.add_argument("path", help="dataset root, a category directory, or one manifest.json")
+    _add_fetch_args(fetch_parser)
+    status = data_commands.add_parser(
+        "status", help="Show the pin, cache path, size on disk, cached versus missing files and the init mode."
+    )
+    status.add_argument("--repo")
+    status.add_argument("--revision")
+    status.add_argument("--cache-dir")
+    clear = data_commands.add_parser(
+        "clear", help="Remove cached dataset revisions and the saved init config.", description="Asks to confirm."
+    )
+    clear.add_argument("--cache-dir")
+    clear.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    validate = data_commands.add_parser(
+        "validate",
+        help="Check a dataset directory, one manifest, or a Hugging Face dataset revision.",
+        description=(
+            "Check names, manifests, digests and catalog consistency. PATH is a dataset root, a category "
+            "directory or one manifest.json and is checked locally with no network. --repo (and --revision) "
+            "fetches that Hugging Face revision first. Prints one JSON object; exit status is 0 when clean "
+            "and 1 on findings."
+        ),
+    )
+    validate.add_argument("path", nargs="?", help="dataset root, a category directory, or one manifest.json")
+    validate.add_argument("--repo", help="Hugging Face dataset repository to fetch and validate (needs network)")
+    validate.add_argument(
+        "--revision",
+        help="branch, tag or commit SHA (default: as for fetch, the saved init source, else the shipped pin)",
+    )
+    validate.add_argument("--cache-dir", help="cache root for --repo")
+    add_init_parser(subparsers)
+    fetch_alias = subparsers.add_parser(
+        "fetch", help="Alias of 'aisim data fetch'.", description="Alias of 'aisim data fetch'."
+    )
+    _add_fetch_args(fetch_alias)
+    fetch_alias.set_defaults(data_command="fetch")
+
+
+def add_init_parser(subparsers: Any) -> None:
+    init = subparsers.add_parser(
+        "init",
+        help="Choose how AISim gets op-latency data: the whole database now, or on demand.",
+        description=(
+            "In a terminal, asks: 1) op database now, 2) op data on demand. Without a terminal, pass --all, "
+            "--on-demand or --hardware. The choice is saved in the cache root and 'aisim data clear' removes it."
+        ),
+    )
+    group = init.add_mutually_exclusive_group()
+    group.add_argument("--all", action="store_true", help="download the whole op-latency database now")
+    group.add_argument(
+        "--on-demand",
+        action="store_true",
+        help="download nothing now; a run fetches only from a pinned source (--repo/--revision, AISIM_DATASET), "
+        "else it uses the packaged data (the default)",
+    )
+    group.add_argument("--hardware", metavar="H", help="download op data for one hardware platform now")
+    _add_source_args(init)
+    init.add_argument(
+        "--offline", action="store_true", help="make no network requests (downloads come from the cache only)"
+    )
+    init.add_argument("--no-limit", action="store_true", help="ignore the opt-in AISIM_DATA_MAX_BYTES limit")
+    init.set_defaults(data_command="init")
