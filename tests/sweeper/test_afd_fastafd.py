@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -464,3 +465,102 @@ def test_profile_controls_are_validated(tmp_path, afd_overrides, match):
         raw["engine"].pop("workers")
     with pytest.raises(ValidationError, match=match):
         CorePredictionConfig.model_validate(raw)
+
+
+def test_canonical_stage_api_parquet_json_and_saved_config(tmp_path, monkeypatch):
+    """Native measurements agree across raw imports, parquet, and saved identity."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisimulate_core.sdk.fastafd_profile import FastAFDMoEStageProfile
+
+    original = _profile(tmp_path, [_entry(), _entry(moe_precision="fp8"), _entry(routed_topk=4)])
+    profile = FastAFDMoEStageProfile.load(original)
+    parquet = tmp_path / "stage.parquet"
+    profile.write_parquet(parquet)
+    assert FastAFDMoEStageProfile.load(parquet).entries == profile.entries
+
+    def no_python_table(*args, **kwargs):
+        raise AssertionError("production stage timing must use the canonical Rust table")
+
+    monkeypatch.setattr(FastAFDMoEStageProfile, "load", no_python_table)
+    for path in (original, parquet):
+        (measurement,) = _provider(tmp_path, profile_path=path, moe_precision="fp8").measure(_request(_topology()))
+        saved = measurement.provenance["config"]
+        assert saved["estimation_mode"] == "fastafd_stage"
+        assert saved["fallback_policy"] == "deny"
+        assert saved["afd"]["attention_gpus"] == 64
+        assert saved["afd"]["routed_topk"] == 8
+        assert saved["backend_version"] == "0.5.14"
+        assert saved["estimator_config"]["fastafd_stage"]["profile_path"] == str(path)
+        for config in (saved, ForwardPassPerfModelConfig(**saved)):
+            restored = RustForwardPassPerfModel.best_available(config)
+            stage = restored.estimate_fastafd_stage(128)
+            assert stage["ffn_ms"] == measurement.ffn_ms
+            assert stage["stage"] == measurement.provenance["stage"]
+            assert restored.diagnostics()["source"] == "fastafd_stage"
+            with pytest.raises(ValueError, match="no FastAFD split MoE stage measurement"):
+                restored.estimate_fastafd_stage(127)
+            with pytest.raises(ValueError, match="not a whole forward pass"):
+                restored.estimate_forward_pass_time_ms([])
+
+
+def test_parquet_precision_ambiguity_and_corruption_fail_closed(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk.fastafd_profile import FastAFDMoEStageProfile
+
+    profile = FastAFDMoEStageProfile.load(_profile(tmp_path, [_entry(), _entry(moe_precision="fp8")]))
+    parquet = tmp_path / "stage.parquet"
+    profile.write_parquet(parquet)
+    with pytest.raises(AFDInfeasible, match="set engine.moe_quant_mode"):
+        _provider(tmp_path, profile_path=parquet).measure(_request(_topology()))
+    rows = pq.read_table(parquet).to_pylist()
+    capture = json.loads(rows[0]["capture_json"])
+    rows[0]["capture_json"] = json.dumps({**capture, "key": _entry()["key"]})
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    with pytest.raises(ValueError, match="parquet capture must contain exactly"):
+        FastAFDMoEStageProfile.load(parquet)
+    with pytest.raises(AFDInfeasible, match="unknown field"):
+        _provider(tmp_path, profile_path=parquet).measure(_request(_topology()))
+    rows[0]["capture_json"] = json.dumps(capture)
+    rows[0]["latency_ms"] = -1.0
+    pq.write_table(pa.Table.from_pylist(rows), parquet)
+    with pytest.raises(AFDInfeasible, match="unqualified FastAFD measurement"):
+        _provider(tmp_path, profile_path=parquet).measure(_request(_topology()))
+
+
+def test_native_stage_query_pins_profile_until_reconstruction(tmp_path):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    path = _profile(tmp_path)
+    (measurement,) = _provider(tmp_path, profile_path=path).measure(_request(_topology()))
+    saved = measurement.provenance["config"]
+    model = RustForwardPassPerfModel.best_available(saved)
+    original = model.estimate_fastafd_stage(128)
+    payload = json.loads(Path(path).read_text())
+    payload["entries"][0]["latency_ms"] = 2 * STAGE_MS
+    with open(path, "w") as stream:
+        json.dump(payload, stream)
+    assert model.estimate_fastafd_stage(128) == original
+    refreshed = RustForwardPassPerfModel.best_available(saved).estimate_fastafd_stage(128)
+    assert refreshed["ffn_ms"] == 2 * original["ffn_ms"]
+    assert refreshed["stage"]["profile_sha256"] != original["stage"]["profile_sha256"]
+
+
+def test_canonical_stage_pins_batch_and_resolved_precision(tmp_path):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    other = {**_entry(logical_batch_per_source_rank=64, moe_precision="fp8"), "latency_ms": 2 * STAGE_MS}
+    path = _profile(tmp_path, [_entry(), other])
+    (measurement,) = _provider(tmp_path, profile_path=path).measure(_request(_topology()))
+    saved = measurement.provenance["config"]
+    assert saved["afd"]["logical_batch_per_source_rank"] == 128
+    assert saved["moe_quant_mode"] == "w4a8_mxfp4_mxfp8"
+    model = RustForwardPassPerfModel.best_available(saved)
+    with pytest.raises(ValueError, match="no FastAFD split MoE stage measurement"):
+        model.estimate_fastafd_stage(64)
+    # A separate request can still select the other batch's sole precision,
+    # preserving the legacy provider's exact per-request selection policy.
+    (smaller,) = _provider(tmp_path, profile_path=path).measure(_request(_topology(a_batch_size=64)))
+    assert smaller.provenance["config"]["moe_quant_mode"] == "fp8"
+    assert smaller.ffn_ms == 2 * measurement.ffn_ms

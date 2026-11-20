@@ -82,6 +82,8 @@ pub enum ForwardPassPerfSource {
     Learned,
     /// Learned model with at least one ready online-correction workload kind.
     LearnedWithCorrection,
+    /// Measured decode MoE stage selected through the canonical contract.
+    FastafdStage,
 }
 
 /// Readiness state reported by `ForwardPassPerfDiagnostics`.
@@ -282,6 +284,7 @@ pub struct ForwardPassPerfModel {
 
 #[derive(Clone, Debug)]
 enum ForwardPassPerfMode {
+    FastafdStage(Arc<crate::perf_database::fastafd::FastAfdTable>),
     Native {
         /// Compiled engine. `Arc` so `ForwardPassPerfModel` stays `Clone`
         /// (the `Engine` itself is not `Clone`); cheap clones share the loaded
@@ -414,6 +417,34 @@ impl ForwardPassPerfModel {
                 AicError::InvalidEngineConfig(format!("cannot resolve fpm_parquet_path: {error}"))
             })?;
         }
+        if config.estimation_mode == EstimationMode::FastafdStage {
+            let path = &mut config
+                .estimator_config
+                .fastafd_stage
+                .as_mut()
+                .unwrap()
+                .profile_path;
+            *path = std::fs::canonicalize(&*path).map_err(|source| AicError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let table = crate::perf_database::fastafd::FastAfdTable::load(&config)?;
+            config.moe_quant_mode = Some(table.precision().to_owned());
+            return Ok(Self {
+                mode: ForwardPassPerfMode::FastafdStage(Arc::new(table)),
+                options: config.estimator_config.correction_options(),
+                last_warning: None,
+                provenance: Some(ForwardPassPerfProvenance {
+                    requested_estimation_mode: config.estimation_mode,
+                    selected_estimation_mode: config.estimation_mode,
+                    config,
+                    selected_systems_root: None,
+                    selection_failures: Vec::new(),
+                }),
+                is_correction_enabled: false,
+                query_coverage: None,
+            });
+        }
         let requested_estimation_mode = config.estimation_mode;
         let mut failures = Vec::new();
         let mut last_error = None;
@@ -532,6 +563,23 @@ impl ForwardPassPerfModel {
         })
     }
 
+    /// Exact measured decode MoE stage timing per layer and microbatch.
+    /// Requires explicit canonical `fastafd_stage` selection. Attention remains
+    /// a separate AFD component; this method never returns a whole-pass latency.
+    pub fn estimate_fastafd_stage(
+        &self,
+        logical_batch_per_source_rank: u32,
+    ) -> Result<crate::FastAfdStageEstimate, AicError> {
+        match &self.mode {
+            ForwardPassPerfMode::FastafdStage(table) => {
+                table.estimate(logical_batch_per_source_rank)
+            }
+            _ => Err(AicError::InvalidEngineConfig(
+                "estimate_fastafd_stage requires fastafd_stage selection".into(),
+            )),
+        }
+    }
+
     /// API:
     /// `model.estimate_forward_pass_time_ms(metrics_by_rank) -> Result<Option<f64>, AicError>`
     ///
@@ -560,6 +608,8 @@ impl ForwardPassPerfModel {
         metrics_by_rank: &[ForwardPassMetrics],
     ) -> Result<Option<f64>, AicError> {
         match &self.mode {
+            ForwardPassPerfMode::FastafdStage(_) => Err(AicError::InvalidEngineConfig(
+                "a FastAFD stage is not a whole forward pass; use estimate_fastafd_stage and compose AFD attention".into())),
             ForwardPassPerfMode::Native {
                 engine,
                 corrections,
@@ -700,6 +750,11 @@ impl ForwardPassPerfModel {
         } = self;
         for metrics_by_rank in iterations {
             match mode {
+                ForwardPassPerfMode::FastafdStage(_) => {
+                    return Err(AicError::InvalidEngineConfig(
+                        "measured FastAFD stage timing cannot be tuned".into(),
+                    ));
+                }
                 ForwardPassPerfMode::Native {
                     engine,
                     corrections,
@@ -771,6 +826,14 @@ impl ForwardPassPerfModel {
     /// count, and fallback warning.
     pub fn diagnostics(&self) -> ForwardPassPerfDiagnostics {
         match &self.mode {
+            ForwardPassPerfMode::FastafdStage(_) => ForwardPassPerfDiagnostics {
+                source: ForwardPassPerfSource::FastafdStage,
+                readiness: ForwardPassPerfReadiness::Ready,
+                retained_observations: 0,
+                correction_ready_buckets: 0,
+                last_warning: None,
+                provenance: self.provenance.clone(),
+            },
             ForwardPassPerfMode::Native { corrections, .. } => {
                 let ready_buckets = corrections.ready_bucket_count();
                 ForwardPassPerfDiagnostics {
@@ -830,7 +893,7 @@ impl ForwardPassPerfModel {
     /// Spline component readiness alone does not make the store ready.
     pub fn regression_store_diagnostics(&self) -> Vec<ForwardPassRegressionStoreDiagnostics> {
         match &self.mode {
-            ForwardPassPerfMode::Native { .. } => Vec::new(),
+            ForwardPassPerfMode::Native { .. } | ForwardPassPerfMode::FastafdStage(_) => Vec::new(),
             ForwardPassPerfMode::Regression { regression, .. } => regression.diagnostics(),
             // Learned stores are fixed at load time: every trained store is
             // ready and holds no retained tuning observations of its own.
@@ -1062,7 +1125,9 @@ impl ForwardPassPerfModel {
     pub(crate) fn native_engine(&self) -> Option<Arc<Engine>> {
         match &self.mode {
             ForwardPassPerfMode::Native { engine, .. } => Some(Arc::clone(engine)),
-            ForwardPassPerfMode::Regression { .. } | ForwardPassPerfMode::Learned { .. } => None,
+            ForwardPassPerfMode::Regression { .. }
+            | ForwardPassPerfMode::Learned { .. }
+            | ForwardPassPerfMode::FastafdStage(_) => None,
         }
     }
 
@@ -1088,7 +1153,9 @@ impl ForwardPassPerfModel {
     fn correction_factors(&self) -> Vec<f64> {
         match &self.mode {
             ForwardPassPerfMode::Native { corrections, .. } => corrections.correction_factors(),
-            ForwardPassPerfMode::Regression { .. } => Vec::new(),
+            ForwardPassPerfMode::Regression { .. } | ForwardPassPerfMode::FastafdStage(_) => {
+                Vec::new()
+            }
             ForwardPassPerfMode::Learned { corrections, .. } => corrections.correction_factors(),
         }
     }

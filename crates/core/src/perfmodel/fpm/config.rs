@@ -26,6 +26,7 @@ pub enum EstimationMode {
     #[serde(alias = "fpm")]
     FpmInterpolation,
     FpmRegression,
+    FastafdStage,
 }
 
 impl EstimationMode {
@@ -33,7 +34,7 @@ impl EstimationMode {
         match self {
             Self::OpLevel => Some("op_level"),
             Self::FpmInterpolation => Some("fpm"),
-            Self::Auto | Self::FpmRegression => None,
+            Self::Auto | Self::FpmRegression | Self::FastafdStage => None,
         }
     }
 }
@@ -97,6 +98,8 @@ impl ForwardPassSpeculationConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardPassPerfModelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afd: Option<crate::perf_database::fastafd::FastAfdIdentity>,
     pub model: String,
     pub system: String,
     pub backend: BackendKind,
@@ -190,6 +193,7 @@ impl ForwardPassPerfModelConfig {
         worker_type: ForwardPassWorkerType,
     ) -> Self {
         Self {
+            afd: None,
             model: model.into(),
             system: system.into(),
             backend,
@@ -339,6 +343,7 @@ impl ForwardPassPerfModelConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), AicError> {
+        crate::perf_database::fastafd::validate_config(self)?;
         if self.estimator_config.fpm_interpolation.collect_coverage
             && (self.estimation_mode != EstimationMode::FpmInterpolation
                 || self.fallback_policy != ForwardPassFallbackPolicy::Deny
@@ -418,10 +423,16 @@ impl ForwardPassPerfModelConfig {
             return Err(invalid_config("wideep_num_slots must be positive"));
         }
         if let Some(backend) = &self.moe_backend {
-            if !matches!(backend.as_str(), "default" | "deepep_moe" | "megamoe") {
+            if !matches!(backend.as_str(), "default" | "deepep_moe" | "megamoe")
+                && !(self.estimation_mode == EstimationMode::FastafdStage
+                    && backend == "deepep_deepgemm")
+            {
                 return Err(invalid_config("unsupported moe_backend"));
             }
-            if backend != "default" && self.backend != BackendKind::Sglang {
+            if backend != "default"
+                && self.backend != BackendKind::Sglang
+                && self.estimation_mode != EstimationMode::FastafdStage
+            {
                 return Err(invalid_config(
                     "moe_backend override requires backend=sglang",
                 ));

@@ -13,6 +13,8 @@ use crate::AicError;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EstimatorConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fastafd_stage: Option<crate::perf_database::fastafd::FastAfdConfig>,
     pub features: RegressionFeatureWeights,
     pub op_level: OpLevelConfig,
     pub fpm_interpolation: FpmInterpolationConfig,

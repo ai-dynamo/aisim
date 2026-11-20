@@ -9,7 +9,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -124,15 +124,42 @@ class FastAFDMoEStageProfile:
         self.source = source
         self.path = path
         self.profile_sha256 = profile_sha256
-        self._entries = {entry.key: entry for entry in entries}
-        if len(self._entries) != len(entries):
+        self._key_index = None
+        if len({entry.key for entry in entries}) != len(entries):
             raise ValueError("duplicate FastAFD MoE stage key")
 
     @classmethod
     def load(cls, path: str | Path) -> FastAFDMoEStageProfile:
         resolved = Path(path).expanduser().resolve()
         raw = resolved.read_bytes()
-        payload = json.loads(raw, object_pairs_hook=_unique_object)
+        if resolved.suffix == ".parquet":
+            import pyarrow.parquet as pq
+
+            rows = pq.read_table(resolved).to_pylist()
+            if not rows:
+                raise ValueError("FastAFD profile entries must be a non-empty list")
+            sources = {row["source_json"] for row in rows}
+            if len(sources) != 1:
+                raise ValueError("mixed FastAFD source provenance")
+            payload = {
+                "schema": FASTAFD_PROFILE_SCHEMA,
+                "lookup_policy": "exact-only",
+                "source": json.loads(sources.pop(), object_pairs_hook=_unique_object),
+                "entries": [
+                    {
+                        **_object(
+                            json.loads(row["capture_json"], object_pairs_hook=_unique_object),
+                            {"model_profile", "measurement", "validation"},
+                            "parquet capture",
+                        ),
+                        "key": {field: row[field] for field in _KEY_FIELDS},
+                        "latency_ms": row["latency_ms"],
+                    }
+                    for row in rows
+                ],
+            }
+        else:
+            payload = json.loads(raw, object_pairs_hook=_unique_object)
         root = _object(payload, {"schema", "source", "lookup_policy", "entries"}, "profile")
         if root["schema"] != FASTAFD_PROFILE_SCHEMA:
             raise ValueError(f"unsupported FastAFD profile schema: {root['schema']!r}")
@@ -150,8 +177,38 @@ class FastAFDMoEStageProfile:
         entries = tuple(_entry(value, source, index) for index, value in enumerate(root["entries"]))
         return cls(entries, source=source, path=resolved, profile_sha256=hashlib.sha256(raw).hexdigest())
 
+    def write_parquet(self, path: str | Path) -> None:
+        """Serialize validated raw measurements; no estimation or selection."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        rows = []
+        for entry in self.entries:
+            capture = {
+                "model_profile": entry.model_profile,
+                "measurement": {name: getattr(entry, name) for name in _MEASUREMENT_FIELDS if name != "scope"},
+                "validation": {"stable": True, "correctness": entry.correctness},
+            }
+            capture["measurement"]["scope"] = "complete_moe_stage"
+            rows.append(
+                {
+                    **asdict(entry.key),
+                    "latency_ms": entry.latency_ms,
+                    "capture_json": json.dumps(capture, sort_keys=True),
+                    "source_json": json.dumps(asdict(self.source), sort_keys=True),
+                }
+            )
+        pq.write_table(pa.Table.from_pylist(rows), path)
+
     def find(self, key: FastAFDMoEStageKey) -> FastAFDMoEStageMeasurement | None:
-        return self._entries.get(key)
+        import aisimulate_core
+
+        if self._key_index is None:
+            self._key_index = aisimulate_core.RustForwardPassPerfModel._fastafd_profile_index(
+                json.dumps([asdict(entry.key) for entry in self.entries])
+            )
+        index = self._key_index.find(json.dumps(asdict(key)))
+        return None if index is None else self.entries[index]
 
     def require(self, key: FastAFDMoEStageKey) -> FastAFDMoEStageMeasurement:
         measurement = self.find(key)

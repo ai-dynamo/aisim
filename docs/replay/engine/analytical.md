@@ -77,7 +77,8 @@ contributes to TTFT and E2E latency. TPOT is
 ### Measured FastAFD MoE stage
 
 `engine.afd.fastafd_profile_path` with `fastafd_moe_backend` takes the decode F
-time from an AISimulate [FastAFD MoE stage profile](../../perf-model/schemas/fastafd-moe-stage-profile.md)
+time through the canonical Rust `fastafd_stage` estimator from an AISimulate
+[FastAFD MoE stage profile](../../perf-model/schemas/fastafd-moe-stage-profile.md)
 instead of the operation model. The profile's `afd` entry must match the model,
 hardware, `<A GPUs>A<F GPUs>F` topology, `a_batch_size`, MTP degree,
 `num_microbatches`, the attention provider's layer count, and the model's routed

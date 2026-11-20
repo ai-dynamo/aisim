@@ -1983,8 +1983,70 @@ fn parse_fpm_iteration(fpm_json: &str) -> PyResult<Vec<crate::ForwardPassMetrics
     Ok(metrics)
 }
 
+// Raw-data inspection index, not an estimator or an alternate model factory.
+#[pyclass]
+struct PyFastAfdProfileIndex {
+    entries: std::collections::HashMap<crate::FastAfdKey, usize>,
+}
+
+#[pymethods]
+impl PyFastAfdProfileIndex {
+    fn find(&self, key_json: &str) -> PyResult<Option<usize>> {
+        let key: crate::FastAfdKey =
+            serde_json::from_str(key_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(self.entries.get(&key).copied())
+    }
+}
+
 #[pymethods]
 impl PyForwardPassPerfModel {
+    #[staticmethod]
+    fn _validate_fastafd_topology(
+        worker_type: &str,
+        tp: u32,
+        attention_gpus: u32,
+        ffn_gpus: u32,
+        f_moe_ep_size: u32,
+        microbatches: u32,
+        boundary_on_attn: bool,
+    ) -> PyResult<()> {
+        let role = serde_json::from_value(serde_json::Value::String(worker_type.into()))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        crate::perf_database::fastafd::validate_topology(
+            role,
+            tp,
+            attention_gpus,
+            ffn_gpus,
+            f_moe_ep_size,
+            microbatches,
+            boundary_on_attn,
+        )
+        .map_err(aic_to_py)
+    }
+
+    fn estimate_fastafd_stage(&self, batch: u32) -> PyResult<String> {
+        let estimate = self
+            .inner
+            .estimate_fastafd_stage(batch)
+            .map_err(aic_to_py)?;
+        serde_json::to_string(&estimate).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    // Metadata inspection prepares one native index, rather than serializing
+    // and scanning the entire profile for each inspection query.
+    #[staticmethod]
+    fn _fastafd_profile_index(keys_json: &str) -> PyResult<PyFastAfdProfileIndex> {
+        let keys: Vec<crate::FastAfdKey> =
+            serde_json::from_str(keys_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let mut entries = std::collections::HashMap::with_capacity(keys.len());
+        for (index, key) in keys.into_iter().enumerate() {
+            if entries.insert(key, index).is_some() {
+                return Err(PyValueError::new_err("duplicate FastAFD MoE stage key"));
+            }
+        }
+        Ok(PyFastAfdProfileIndex { entries })
+    }
+
     /// Create a model from the complete canonical request.
     #[staticmethod]
     fn best_available(config_json: &str) -> PyResult<Self> {
@@ -2114,6 +2176,7 @@ impl PyForwardPassPerfModel {
             }
         };
         let config = crate::ForwardPassPerfModelConfig {
+            afd: None,
             model: request.model_path,
             system: request.system,
             backend: legacy.backend,

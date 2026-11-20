@@ -103,10 +103,11 @@ def test_builds_colocated_profile_and_skips_unqualified_results(tmp_path):
     assert entry["validation"] == {"stable": True, "correctness": None}
 
 
-def test_builds_split_profile_through_the_command_line(tmp_path):
+@pytest.mark.parametrize("suffix", ["json", "parquet"])
+def test_builds_split_profile_through_the_command_line(tmp_path, suffix):
     results = tmp_path / "split"
     _write(results, "s64.json", _split(64))
-    output = tmp_path / "profile.json"
+    output = tmp_path / f"profile.{suffix}"
 
     assert main([str(results), "--repository", _REPOSITORY, "--output", str(output)]) == 0
 

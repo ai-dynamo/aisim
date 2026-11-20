@@ -371,6 +371,7 @@ impl AicTimingConfig {
             self.fpm_parquet_path.as_deref(),
         )?;
         Ok(ForwardPassPerfModelConfig {
+            afd: None,
             model: self.model.clone(),
             system: self.system.clone(),
             backend: serde_json::from_value(serde_json::Value::String(self.backend.clone()))?,

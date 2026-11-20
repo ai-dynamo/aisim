@@ -87,6 +87,40 @@ selection attempts, effective backend version, data policy, selected root,
 and complete estimator configuration. Its resolved config pins the selected
 mode with deny so saved replay input repeats that selection.
 
+### Measured FastAFD stage
+
+The same canonical constructor selects `estimation_mode: fastafd_stage` for
+measured decode MoE stages. Use the returned model's
+`estimate_fastafd_stage(logical_batch_per_source_rank)` method; Rust performs
+exact selection and returns `ffn_ms` per layer and microbatch, the layer count,
+and capture provenance. A stage excludes attention and cannot answer a whole
+forward-pass query or accept online tuning. The AFD orchestration adapter composes
+it with the configured attention provider. It does not select a second estimator.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `estimation_mode: fastafd_stage` | Explicit selection | Native measured stage; requires decode role, literal backend version and `fallback_policy: deny`. Auto's existing candidate priority is unchanged. |
+| `afd` | `null` | Immutable split-pool and model geometry, required only for this mode. |
+| `afd.logical_batch_per_source_rank` | Required | Positive total per-A-rank batch before splitting into microbatches, fixed for this stage model. |
+| `afd.attention_gpus`, `afd.ffn_gpus` | Required | Positive A/F pool GPU counts. `tp` must be 1; independent whole-forward parallelism controls are unsupported. |
+| `afd.f_moe_ep_size` | Required | Must equal `afd.ffn_gpus`. |
+| `afd.microbatches` | Required | Positive microbatch count matched exactly. |
+| `afd.moe_layers`, `afd.routed_topk` | Required | Positive model geometry. The AFD adapter resolves these from the attention measurement and normalized model metadata. |
+| `afd.boundary_on_attn` | Required | Must be `true`. |
+| `estimator_config.fastafd_stage` | `null` | Controls for this estimator, required together with `afd`. Other estimator controls must retain their defaults. |
+| `estimator_config.fastafd_stage.profile_path` | Required | Native parquet table or legacy profile JSON import. Rust validates both formats, rejects duplicate/unqualified captures, and pins their data at construction. |
+
+`model`, `system`, `nextn`, `moe_backend` (`megamoe` or `deepep_deepgemm`),
+optional `moe_quant_mode`, and every `afd` dimension participate in exact
+selection. The query batch must equal `afd.logical_batch_per_source_rank`.
+Missing cells and ambiguous precision variants are errors; set
+`moe_quant_mode` to choose a recorded precision. Construction pins the unique
+selected precision, including when the selector was omitted. A different batch
+requires another canonical configuration. Saved resolved configurations
+retain all controls and an absolute profile path. Reconstructing reloads that
+artifact; provenance records its SHA-256 so artifact changes remain observable.
+Unrelated graph/data controls are rejected rather than ignored.
+
 ### Speculative decoding configuration
 
 Use the same `best_available(config)` constructor and returned model for

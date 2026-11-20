@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -151,11 +152,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("results_dir", help="directory of raw benchmark result JSON files")
     parser.add_argument("--repository", required=True, help="git repository URL that produced the results")
     parser.add_argument("--routing", default="balanced", help="routing distribution to keep (default: balanced)")
-    parser.add_argument("--output", required=True, help="profile JSON path to write")
+    parser.add_argument(
+        "--output", required=True, help="profile .parquet path (native) or .json import document to write"
+    )
     args = parser.parse_args(argv)
     profile, summary = build_profile(args.results_dir, repository=args.repository, routing=args.routing)
     output = Path(args.output)
-    output.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    if output.suffix == ".parquet":
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "profile.json"
+            raw.write_text(json.dumps(profile), encoding="utf-8")
+            FastAFDMoEStageProfile.load(raw).write_parquet(output)
+    else:
+        output.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
     FastAFDMoEStageProfile.load(output)
     print(f"wrote {output}: {summary['accepted']} entries", file=sys.stderr)
     for reason in ("skipped_routing", "skipped_unstable", "skipped_correctness"):

@@ -338,7 +338,8 @@ def _afd_deployment(
     profile_backend = topology_fields.pop("fastafd_moe_backend")
     if profile_path is not None:
         # The configured provider keeps measuring the attention side; the
-        # profile supplies the complete MoE stage.
+        # adapter obtains the complete MoE stage from the canonical Rust
+        # best_available estimator, including exact selection and normalization.
         performance_model = FastAFDMoEStagePerformanceModel(
             profile_path=profile_path,
             moe_backend=profile_backend,

@@ -116,3 +116,7 @@ pub use fpm::{
     DirectFpmQueryEvidence, ForwardPassEstimate, FpmCoordinates, FpmEstimateEvidence,
     FpmMeasurementSupport, FpmQueryResolution, FpmRankEstimate,
 };
+
+pub use perf_database::fastafd::{
+    FastAfdConfig, FastAfdIdentity, FastAfdKey, FastAfdStageEstimate,
+};

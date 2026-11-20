@@ -1483,3 +1483,5 @@ node:
         assert_eq!(comm_root(system_data_root, "nccl", version), family);
     }
 }
+
+pub(crate) mod fastafd;

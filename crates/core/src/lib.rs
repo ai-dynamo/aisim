@@ -83,3 +83,5 @@ pub use perfmodel::{
     DirectFpmQueryEvidence, ForwardPassEstimate, FpmCoordinates, FpmEstimateEvidence,
     FpmMeasurementSupport, FpmQueryResolution, FpmRankEstimate,
 };
+
+pub use perfmodel::{FastAfdConfig, FastAfdIdentity, FastAfdKey, FastAfdStageEstimate};

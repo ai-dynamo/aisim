@@ -175,6 +175,7 @@ class ForwardPassPerfModelConfig:
     enable_shared_layer: bool | None = None
     strict_provenance: bool = False
     moe_backend: str | None = None
+    afd: dict[str, Any] | None = dataclass_field(default=None, kw_only=True)
     enable_eplb: bool = False
     wideep_num_slots: int | None = None
 
@@ -201,7 +202,7 @@ class ForwardPassPerfModelConfig:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(self.transfer_policy)
-        if self.estimation_mode != "fpm_regression" or self.systems_paths:
+        if self.estimation_mode not in {"fpm_regression", "fastafd_stage"} or self.systems_paths:
             payload["systems_paths"] = _resolve_forward_pass_systems_paths(self.systems_paths)
         return payload
 
@@ -257,7 +258,8 @@ class RustForwardPassPerfModel:
     ``Engine``). FPM inputs are passed as Python dictionaries and marshalled to
     JSON for the Rust boundary.
 
-    This wrapper is forward-pass-level only. It does not model TTFT, ITL, SLA,
+    This wrapper exposes forward-pass estimates and measured AFD stages. It
+    does not model TTFT, ITL, SLA,
     queueing, or engine limits. ``estimate_forward_pass_time_ms()`` takes one
     iteration as a list of FPM dictionaries, one per attention-DP rank. Single
     rank callers may pass either one FPM dictionary or a one-element list.
@@ -361,6 +363,10 @@ class RustForwardPassPerfModel:
         Auto searches op_level, fpm_interpolation, then fpm_regression even
         with fallback_policy=deny. Explicit modes default to strict selection.
         Native correction retains its existing workload feature space.
+        Explicit ``fastafd_stage`` selects measured MoE timing for
+        ``estimate_fastafd_stage()``; whole-forward queries and tuning are
+        unsupported for that partial stage.
+
         Nested estimator controls, including an explicit ``None`` rebuild
         interval, are preserved in resolved configuration and provenance.
         """
@@ -392,6 +398,10 @@ class RustForwardPassPerfModel:
                 _forward_pass_config_json(config), _json_dumps(dict(budget))
             )
         )
+
+    def estimate_fastafd_stage(self, logical_batch_per_source_rank: int) -> dict[str, Any]:
+        """Return native exact stage timing, normalized per layer and microbatch."""
+        return json.loads(self._inner.estimate_fastafd_stage(logical_batch_per_source_rank))
 
     def predict_prefill_latency(self, bs: int, isl: int, prefix: int = 0) -> float:
         """Return uncorrected native prefill latency in milliseconds.
@@ -588,7 +598,7 @@ def _json_dumps(value: Any) -> str:
 
 def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
-    if payload.get("estimation_mode") != "fpm_regression" or payload.get("systems_paths"):
+    if payload.get("estimation_mode") not in {"fpm_regression", "fastafd_stage"} or payload.get("systems_paths"):
         payload["systems_paths"] = _resolve_forward_pass_systems_paths(tuple(payload.get("systems_paths") or ()))
     if "transfer_policy" in payload:
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(payload["transfer_policy"])

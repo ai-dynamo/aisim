@@ -1,10 +1,26 @@
 # FastAFD measured MoE stage profiles
 
-A profile is a JSON document owned by AISimulate that carries exact measurements of
+A profile is a parquet table or legacy JSON import document owned by AISimulate
+that carries exact measurements of
 the complete decode MoE stage, produced by FastAFD's MegaMoE model benchmarks.
-AISimulate reads the document and never imports, installs, or runs FastAFD; no
+AISimulate reads the profile and never imports, installs, or runs FastAFD; no
 FastAFD change is required to load a profile. Lookup is exact-match only, and a
 missing measurement is an error, not an estimate.
+
+## Native parquet table
+
+The Rust table loader reads the eleven `key` fields below as individual columns:
+identity strings as UTF-8 and counts as integers, plus a floating-point
+`latency_ms`. `source_json` contains the source object; `capture_json` contains
+exactly `model_profile`, `measurement`, and `validation` from the JSON entry.
+The source must be identical for all rows. These JSON columns preserve raw
+capture metadata; selection and latency normalization run in Rust through the
+[canonical estimator](../configuration.md#measured-fastafd-stage).
+
+`FastAFDMoEStageProfile.load(path).write_parquet(output)` converts a validated
+legacy document without changing its measured values. JSON remains supported
+at the native import boundary. The Python profile objects expose raw data for
+inspection and conversion; production AFD timing does not use their lookup API.
 
 ## Document
 
@@ -84,8 +100,9 @@ provenance.
 
 ## Building a profile
 
-`python -m aisimulate.fastafd_profile <results_dir> --repository <url> --output <profile.json>`
-converts one directory of raw benchmark results (one benchmark, one commit) into a
+`python -m aisimulate.fastafd_profile <results_dir> --repository <url> --output <profile.parquet>`
+writes a native parquet profile (`.json` output retains the import document)
+from one directory of raw benchmark results (one benchmark, one commit) into a
 profile. Results with another routing distribution (`--routing`, default
 `balanced`), an unstable timing, or a failed correctness check are skipped and
 counted. Repeated measurements of one key are an error; keep one run per directory.

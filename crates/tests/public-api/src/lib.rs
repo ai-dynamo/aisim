@@ -123,6 +123,44 @@ mod tests {
     };
 
     #[test]
+    fn fastafd_stage_contract_is_public_and_preserves_saved_identity() {
+        use aisimulate_core::{FastAfdConfig, FastAfdIdentity, FastAfdStageEstimate};
+        let mut config = ForwardPassPerfModelConfig::new(
+            "synthetic",
+            "gb200",
+            BackendKind::Sglang,
+            ForwardPassWorkerType::Decode,
+        );
+        config.backend_version = Some("0.5.14".into());
+        config.estimation_mode = EstimationMode::FastafdStage;
+        config.moe_backend = Some("megamoe".into());
+        config.afd = Some(FastAfdIdentity {
+            logical_batch_per_source_rank: 128,
+            attention_gpus: 64,
+            ffn_gpus: 8,
+            f_moe_ep_size: 8,
+            microbatches: 2,
+            moe_layers: 94,
+            routed_topk: 8,
+            boundary_on_attn: true,
+        });
+        config.estimator_config.fastafd_stage = Some(FastAfdConfig {
+            profile_path: "stage.parquet".into(),
+        });
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: ForwardPassPerfModelConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, config);
+        // Compile the returned model's typed stage query from outside core.
+        let _query: fn(&ForwardPassPerfModel, u32) -> Result<FastAfdStageEstimate, AicError> =
+            ForwardPassPerfModel::estimate_fastafd_stage;
+        // No embedded Python or silent OP/FPM fallback for a missing stage file.
+        assert!(matches!(
+            ForwardPassPerfModel::best_available(restored),
+            Err(AicError::Io { .. })
+        ));
+    }
+
+    #[test]
     fn schema_constants_and_metric_defaults_are_public() {
         assert_eq!(ENGINE_CONFIG_SCHEMA_VERSION, 1);
         // v5: MlaModuleOp gained native_num_heads (#1458).

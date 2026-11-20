@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aisimulate_core.sdk.fastafd_profile import FastAFDMoEStageMeasurement, FastAFDMoEStageProfile
+from aisimulate_core.sdk import RustForwardPassPerfModel
 from aisimulate_core.sdk.utils import get_model_config_from_model_path
 
-from .afd_parallel import AFDInfeasible, AFDPhase, AFDReasonCategory, AFDTopology
+from .afd_parallel import AFDInfeasible, AFDPhase, AFDReasonCategory
 from .afd_perfmodel import AFD_MEASUREMENT_API_VERSION, AFDLayerTimes, AFDMeasurementRequest, AFDPerformanceModel
 
 # Per-layer attention components an attention provider must expose for the
@@ -46,21 +46,34 @@ class FastAFDMoEStagePerformanceModel:
     moe_precision: str | None = None
 
     def measure(self, request: AFDMeasurementRequest) -> tuple[AFDLayerTimes, ...]:
+        import aisimulate_core
+
         topology = request.topology
-        self._validate_topology(topology)
+        try:
+            # Reject unsupported pools before invoking an expensive attention
+            # provider, using the canonical model's same Rust validation.
+            aisimulate_core.RustForwardPassPerfModel._validate_fastafd_topology(
+                "decode" if topology.phase is AFDPhase.DECODE else "aggregated",
+                topology.tp_a,
+                topology.attention_gpus,
+                topology.ffn_gpus,
+                topology.f_moe_ep_size,
+                topology.num_microbatches,
+                topology.boundary_on_attn,
+            )
+        except ValueError as exc:
+            raise _infeasible(str(exc)) from exc
         attention = self._attention(request)
         components = self._components(attention)
-        profile = FastAFDMoEStageProfile.load(self.profile_path)
-        entry = self._select(profile, request, attention.num_layers)
-        units = entry.key.moe_layers * entry.key.microbatches
+        estimate, config = self._select(request, attention.num_layers)
         return (
             AFDLayerTimes(
                 phase=AFDPhase.DECODE,
                 attention_ms=components["attention_compute_ms"] + components["a_router_ms"],
-                ffn_ms=entry.latency_ms / units,
+                ffn_ms=estimate["ffn_ms"],
                 a_to_f_ms=0.0,
                 f_to_a_ms=0.0,
-                num_layers=entry.key.moe_layers,
+                num_layers=estimate["num_layers"],
                 provenance={
                     "provider": "fastafd",
                     "api_version": AFD_MEASUREMENT_API_VERSION,
@@ -71,13 +84,8 @@ class FastAFDMoEStagePerformanceModel:
                         "a_to_f_ms": "inside the measured stage",
                         "f_to_a_ms": "inside the measured stage",
                     },
-                    "stage": {
-                        "profile_path": str(profile.path),
-                        "profile_sha256": profile.profile_sha256,
-                        "key": entry.key.__dict__,
-                        "latency_ms": entry.latency_ms,
-                        **entry.provenance(),
-                    },
+                    "stage": estimate["stage"],
+                    "config": config,
                     "attention": {
                         "components": dict(components),
                         **dict(attention.provenance),
@@ -85,30 +93,6 @@ class FastAFDMoEStagePerformanceModel:
                 },
             ),
         )
-
-    def _validate_topology(self, topology: AFDTopology) -> None:
-        if topology.phase is not AFDPhase.DECODE:
-            raise _infeasible(
-                "FastAFD split MoE stage profiles measure decode only; "
-                f"topology phase={topology.phase.value!r} needs another provider",
-                phase=topology.phase.value,
-            )
-        if topology.tp_a != 1:
-            raise _infeasible(
-                f"FastAFD split MoE stage profiles measure one attention rank per A GPU; tp_a={topology.tp_a}",
-                tp_a=topology.tp_a,
-            )
-        if topology.f_moe_ep_size != topology.ffn_gpus:
-            raise _infeasible(
-                "FastAFD split MoE stage profiles measure experts parallel across every F GPU; "
-                f"f_moe_ep_size={topology.f_moe_ep_size} but the F pool has {topology.ffn_gpus} GPUs",
-                f_moe_ep_size=topology.f_moe_ep_size,
-                ffn_gpus=topology.ffn_gpus,
-            )
-        if not topology.boundary_on_attn:
-            raise _infeasible(
-                "FastAFD split MoE stage profiles keep the layer boundary on the A side; set boundary_on_attn=true"
-            )
 
     def _attention(self, request: AFDMeasurementRequest) -> AFDLayerTimes:
         measurements = tuple(self.attention_model.measure(request))
@@ -162,10 +146,9 @@ class FastAFDMoEStagePerformanceModel:
 
     def _select(
         self,
-        profile: FastAFDMoEStageProfile,
         request: AFDMeasurementRequest,
         model_layers: int,
-    ) -> FastAFDMoEStageMeasurement:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         topology = request.topology
         try:
             routed_topk = get_model_config_from_model_path(request.model_name).get("topk")
@@ -177,35 +160,40 @@ class FastAFDMoEStagePerformanceModel:
                 model=request.model_name,
                 routed_topk=routed_topk,
             )
-        wanted = {
-            "model_path": request.model_name,
+        config = {
+            "model": request.model_name,
             "system": request.hardware_sku,
-            "stage": "afd",
-            "topology": f"{topology.attention_gpus}A{topology.ffn_gpus}F",
-            "logical_batch_per_source_rank": topology.a_batch_size,
-            "mtp_nextn": request.nextn,
-            "microbatches": topology.num_microbatches,
-            "moe_layers": model_layers,
-            "routed_topk": routed_topk,
+            "backend": request.backend,
+            "backend_version": request.backend_version,
+            "worker_type": "decode" if topology.phase is AFDPhase.DECODE else "aggregated",
+            "estimation_mode": "fastafd_stage",
+            "tp": topology.tp_a,
             "moe_backend": self.moe_backend,
+            "moe_quant_mode": self.moe_precision,
+            "nextn": request.nextn,
+            "afd": {
+                "logical_batch_per_source_rank": topology.a_batch_size,
+                "attention_gpus": topology.attention_gpus,
+                "ffn_gpus": topology.ffn_gpus,
+                "f_moe_ep_size": topology.f_moe_ep_size,
+                "microbatches": topology.num_microbatches,
+                "moe_layers": model_layers,
+                "routed_topk": routed_topk,
+                "boundary_on_attn": topology.boundary_on_attn,
+            },
+            "estimator_config": {"fastafd_stage": {"profile_path": str(Path(self.profile_path).expanduser())}},
         }
-        if self.moe_precision is not None:
-            wanted["moe_precision"] = self.moe_precision
-        matches = [
-            entry
-            for entry in profile.entries
-            if all(getattr(entry.key, field) == value for field, value in wanted.items())
-        ]
-        if not matches:
-            raise _infeasible(f"no FastAFD split MoE stage measurement matches {wanted}", **wanted)
-        if len(matches) != 1:
-            variants = sorted(entry.key.moe_precision for entry in matches)
+        try:
+            model = RustForwardPassPerfModel.best_available(config)
+            estimate = model.estimate_fastafd_stage(topology.a_batch_size)
+        except (ValueError, RuntimeError, OSError) as exc:
             raise _infeasible(
-                "several FastAFD split MoE stage measurements match; set engine.moe_quant_mode to pick the "
-                f"profile precision: {variants}",
-                **wanted,
-            )
-        return matches[0]
+                str(exc),
+                routed_topk=routed_topk,
+                canonical_config=config,
+                logical_batch_per_source_rank=topology.a_batch_size,
+            ) from exc
+        return estimate, model.diagnostics()["provenance"]["config"]
 
 
 __all__ = ["FastAFDMoEStagePerformanceModel"]
