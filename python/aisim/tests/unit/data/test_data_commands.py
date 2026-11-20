@@ -248,6 +248,24 @@ def test_no_default_byte_cap_and_env_limit_is_opt_in(run, monkeypatch):
     assert run("fetch", "--revision", SHA, "--no-limit")[0] == 0
 
 
+def test_the_byte_cap_counts_the_metadata_that_planning_downloads(run, monkeypatch, tmp_path):
+    probe = json.loads(run("fetch", "--revision", SHA, "--dry-run", "--cache-dir", str(tmp_path / "probe"))[1])
+    metadata, artifacts = probe["metadata_bytes"], probe["uncached_bytes"]
+    assert metadata > 0 and artifacts > 0
+    # The artifacts alone fit the cap; with the metadata that planning downloads first they do not.
+    monkeypatch.setenv("AISIM_DATA_MAX_BYTES", str(metadata + artifacts - 1))
+    transferred = len(run.transport.opened)
+    status, _, err = run("fetch", "--revision", SHA, "--cache-dir", str(tmp_path / "fresh"))
+    assert status == 1 and json.loads(err.strip().splitlines()[-1])["error"] == "over-budget"
+    assert not any(path.endswith(".parquet") for path in run.transport.opened[transferred:])
+    # At exactly the whole cost the command succeeds, reports the metadata it downloaded, and stays inside the cap.
+    monkeypatch.setenv("AISIM_DATA_MAX_BYTES", str(metadata + artifacts))
+    status, out, _ = run("fetch", "--revision", SHA, "--cache-dir", str(tmp_path / "exact"))
+    payload = json.loads(out)
+    assert status == 0 and payload["plan"]["metadata_bytes"] == metadata
+    assert payload["downloaded_bytes"] + payload["plan"]["metadata_bytes"] <= metadata + artifacts
+
+
 def test_large_download_announces_planned_size(run, monkeypatch):
     monkeypatch.setattr(data_cli, "LARGE_DOWNLOAD_BYTES", 1)
     status, _, err = run("fetch", "--revision", SHA)
@@ -561,6 +579,28 @@ def test_validate_directory_reports_an_unsupported_envelope_version(run, tmp_pat
     paths = [f["path"] for f in report["findings"] if f["check"] == "manifest"]
     assert status == 1 and paths == ["data/op-latency/future/manifest.json"]
     assert run("data", "validate", str(future))[0] == 1  # the same manifest checked on its own
+
+
+@pytest.mark.parametrize("version", ["missing", 7, None, ["aisim-artifact-manifest/v1"]])
+def test_validate_directory_reports_an_envelope_without_a_usable_version(run, tmp_path, version):
+    doc = json.loads(run.files["data/op-latency/h200_sxm/manifest.json"])
+    if version == "missing":
+        del doc["schema_version"]
+    else:
+        doc["schema_version"] = version
+    root = tmp_path / "contribution"  # no catalog: discovery alone has to find the manifest
+    (root / "h200_sxm").mkdir(parents=True)
+    (root / "h200_sxm" / "manifest.json").write_text(json.dumps(doc))
+    # Manifest-named files of unrelated formats stay ignored.
+    (root / "bundle").mkdir()
+    (root / "bundle" / "manifest.json").write_text(json.dumps({"name": "bundle", "files": ["a"], "schema_version": 3}))
+    (root / "provenance").mkdir()
+    (root / "provenance" / "manifest.json").write_text(json.dumps({"schema_version": "provenance/v2", "x": 1}))
+    status, out, _ = run("data", "validate", str(root))
+    report = json.loads(out)
+    paths = [f["path"] for f in report["findings"] if f["check"] == "manifest"]
+    assert status == 1 and paths == ["h200_sxm/manifest.json"]
+    assert run("data", "validate", str(root / "h200_sxm" / "manifest.json"))[0] == 1  # the same file on its own
 
 
 @pytest.mark.parametrize("body", ["[]", "null"])

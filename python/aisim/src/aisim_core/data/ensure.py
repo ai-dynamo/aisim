@@ -162,6 +162,9 @@ class DataPin:
     max_bytes: int = DEFAULT_MAX_BYTES
     offline: bool = False
     cache_dir: Path | None = None
+    # Built from the source ``aisim init`` saved, not named by the caller or the environment. Such an ambient pin
+    # selects op-latency data only for runs that read operation tables (see ``rust_engine_step._ensure_dataset``).
+    saved_source: bool = False
 
     def __post_init__(self) -> None:
         if self.local_root is None and not (self.repo and self.revision):
@@ -197,11 +200,13 @@ def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None
     """
     env = os.environ if env is None else env
     spec, local = env.get("AISIM_DATASET"), env.get("AISIM_DATA_LOCAL")
+    from_saved = False
     if not spec and not local:
         saved = load_config(config_path(env))  # a corrupt saved config raises ConfigError
         if not saved or not (saved.repo or saved.revision):
             return None
         spec = "{}@{}".format(*resolve_source(env=env, config=saved))  # same rules as ``data fetch``
+        from_saved = True
     repo = revision = None
     if spec:
         repo, sep, revision = spec.partition("@")
@@ -223,6 +228,7 @@ def pin_from_environment(env: Mapping[str, str] | None = None) -> DataPin | None
         local_root=Path(local) if local else None,
         configuration_id=env.get("AISIM_DATA_CONFIGURATION") or None,
         offline=env.get("AISIM_DATA_OFFLINE", "").lower() in {"1", "true", "yes"},
+        saved_source=from_saved,
         **kwargs,
     )
 

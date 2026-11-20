@@ -1022,6 +1022,9 @@ def _carries_state_snapshot(estimator_config: Any) -> bool:
     return isinstance(estimator_config, Mapping) and estimator_config.get("state_snapshot") is not None
 
 
+_FPM_ESTIMATION_MODES = frozenset({"fpm_interpolation", "fpm_regression", "fpm_learned"})
+
+
 def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin: Any | None):
     """Resolve and load pinned dataset inputs; ``None`` (a no-op) when no pin is configured."""
     from aisim_core.data.ensure import ensure_data, ensuring, pin_from_environment
@@ -1034,6 +1037,10 @@ def _ensure_dataset(config: ForwardPassPerfModelConfig | Mapping[str, Any], pin:
     payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
     if _carries_state_snapshot(payload.get("estimator_config")):
         return None  # a snapshot restores its own pinned inputs; a pin selecting other data would only conflict
+    if pin.saved_source and payload.get("estimation_mode") in _FPM_ESTIMATION_MODES:
+        # The op-latency source saved by ``aisim init`` would replace the explicit ``systems_paths`` that carry
+        # these modes' FPM tables; only a source the caller or environment names applies to them.
+        return None
     return ensure_data(payload, pin)
 
 

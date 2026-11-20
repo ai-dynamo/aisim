@@ -47,7 +47,8 @@ With no arguments, `fetch` downloads the whole op-latency database. FPM, e2e and
 that default: they need `--configuration` or `--hardware` (plus `--model`), and `--all` is refused for them.
 There is no default byte cap. When a download is large the planned size is printed on stderr before it starts;
 nothing waits for an answer. `AISIM_DATA_MAX_BYTES` stays an opt-in limit that `fetch` and `init` honor when you
-set it, and `--no-limit` ignores it for one command.
+set it, and `--no-limit` ignores it for one command. The limit covers the catalog and manifest files that
+planning downloads as well as the artifacts.
 
 | Flag | Meaning |
 |---|---|
@@ -160,6 +161,9 @@ Private datasets use the standard `HF_TOKEN` only while connected; the cache nee
 A pin without `AISIM_DATA_CATEGORIES` loads only `op-latency`; it used to load `fpm`. A run that needs FPM data
 sets `AISIM_DATA_CATEGORIES=fpm` (or `op-latency,fpm`). If the pinned dataset has no data for a category the pin
 loads, the run fails with a missing-data error that names this variable; it never switches to other data.
+A source saved by `aisim init` applies only to runs that read operation tables: configurations with
+`estimation_mode` `fpm_interpolation`, `fpm_regression` or `fpm_learned` keep their own `systems_paths`. Name the
+source with `AISIM_DATASET` or a pin to apply it to them.
 
 An `op-latency` pin composes all matching operation families with the packaged system specs and support
 files into one systems root. That root replaces `systems_paths` for construction: a missing operation
