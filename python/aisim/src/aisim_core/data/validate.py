@@ -310,8 +310,9 @@ def run_validation(
         seen: dict[str, float | None] = {}
 
         def recording(inputs):
+            key = _canonical_inputs(inputs)  # before the predictor runs: it may normalize its input in place
             value = predict(inputs)
-            seen[_canonical_inputs(inputs)] = value
+            seen[key] = value
             return value
 
         report = verify_record(record, result.root, recording, fingerprint)

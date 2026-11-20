@@ -548,3 +548,19 @@ def test_a_report_for_another_pull_request_is_not_current(tmp_path):
     assert check_current(r, **kwargs, pr_number=7, base_sha=BASE) == []  # the unchanged report still applies
     assert any("PR #7, not #8" in reason for reason in check_current(r, **kwargs, pr_number=8, base_sha=BASE))
     assert any("base changed" in reason for reason in check_current(r, **kwargs, pr_number=7, base_sha="9" * 40))
+
+
+def test_a_predictor_that_normalizes_its_input_in_place_does_not_change_the_recorded_key(tmp_path):
+    files, rec, cfg, _ = build_dataset(tmp_path)
+
+    def normalizing_factory(record):
+        def predict(inputs):
+            value = _predict(inputs)
+            inputs["normalized"] = True  # mutates the dict the verifier handed over
+            return value
+
+        return predict, record.prediction.fingerprint
+
+    r = run(tmp_path, files, request(rec, cfg), factory=normalizing_factory)
+    assert r.verdict == "pass", r.problems
+    assert [o.status for o in r.required_cases] == ["pass", "pass"]

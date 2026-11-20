@@ -75,14 +75,16 @@ def op_latency_entries(
     ]
 
 
-def read_entry_manifest(tree: Path, entry: Entry, config: Mapping[str, Any] | None = None) -> Manifest:
+def read_entry_manifest(
+    tree: Path, entry: Entry, config: Mapping[str, Any] | None = None, loader: Any | None = None
+) -> Manifest:
     """The verified manifest of a catalog entry: the index's pinned digest first, then the contents, then identity.
 
     A replacement manifest can keep an identity and declare other table bytes; only the catalog's digest for it
-    says which manifest the dataset published.
+    says which manifest the dataset published. ``loader`` is the category loader (default: op-latency).
     """
     _verify(Path(tree), entry.manifest)
-    manifest = OpLatencyLoader().read_manifest(Path(tree), entry.manifest.path, config)
+    manifest = (loader or OpLatencyLoader()).read_manifest(Path(tree), entry.manifest.path, config)
     if (manifest.configuration_id, manifest.identity, manifest.purpose) != (
         entry.configuration_id,
         entry.identity,

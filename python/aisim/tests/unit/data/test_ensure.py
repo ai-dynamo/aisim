@@ -357,3 +357,54 @@ def test_an_online_pin_repairs_a_corrupt_cached_catalog_and_an_offline_pin_repor
     transport = FakeTransport(files)
     ensure_data(CONFIG, pin(tmp_path), transport=transport)  # the online path replaces the bad copy
     assert "catalog/dataset.json" in transport.opened and catalog.read_bytes() == files["catalog/dataset.json"]
+
+
+def test_a_partly_refreshed_local_dataset_is_refused_against_the_catalog_pin(tmp_path):
+    import pyarrow as pa
+
+    from aisim_core.data.parquet import write_parquet
+
+    files = build_repo(tmp_path)
+    root = tmp_path / "local"
+
+    def publish():
+        for path, data in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(data)
+
+    publish()
+    local = DataPin(local_root=root, cache_dir=tmp_path / "cache")
+    first = ensure_data(CONFIG, local).config["systems_paths"][0]
+    # Refresh only the profile and its manifest; the catalog still pins the old manifest digest.
+    table = write_parquet(pa.table({"x": [7, 8, 9, 10]}), tmp_path / "new.parquet", "aisim.test/v1").read_bytes()
+    files["fpm/m1/data.parquet"] = table
+    manifest = json.loads(files["fpm/m1/manifest.json"])
+    manifest["artifacts"][0].update(sha256=hashlib.sha256(table).hexdigest(), bytes=len(table), rows=4)
+    files["fpm/m1/manifest.json"] = json.dumps(manifest).encode()  # self-consistent, catalog left stale
+    publish()
+    with pytest.raises(MissingDataError, match="integrity mismatch"):
+        ensure_data(CONFIG, local)
+    assert first  # the consistent dataset was served before the partial refresh
+
+
+def test_an_entry_whose_manifest_belongs_to_another_model_is_refused(tmp_path):
+    files = build_repo(tmp_path)
+    root = tmp_path / "local"
+    other = json.loads(files["fpm/m2/manifest.json"])
+    files["fpm/m1/manifest.json"] = json.dumps(other).encode()  # m1's entry now points at m2's manifest content
+    index = json.loads(files["catalog/fpm.json"])
+    entry = next(e for e in index["entries"] if e["manifest"]["path"] == "fpm/m1/manifest.json")
+    entry["manifest"].update(
+        sha256=hashlib.sha256(files["fpm/m1/manifest.json"]).hexdigest(), bytes=len(files["fpm/m1/manifest.json"])
+    )
+    files["catalog/fpm.json"] = json.dumps(index).encode()
+    dataset = json.loads(files["catalog/dataset.json"])
+    dataset["categories"]["fpm"]["index"].update(
+        sha256=hashlib.sha256(files["catalog/fpm.json"]).hexdigest(), bytes=len(files["catalog/fpm.json"])
+    )
+    files["catalog/dataset.json"] = json.dumps(dataset).encode()
+    for path, data in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(data)
+    with pytest.raises(MissingDataError, match="failed verification"):
+        ensure_data(CONFIG, DataPin(local_root=root, cache_dir=tmp_path / "cache"))

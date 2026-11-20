@@ -566,7 +566,9 @@ def _fetch_pinned(
 def _load(loader, category: str, root: Path, entry: Entry, config: Mapping[str, Any], output_dir: Path):
     manifest_path = entry.manifest.path
     if category == "fpm":
-        manifest = loader.read_manifest(root, manifest_path, config)  # verifies every declared artifact
+        # The catalog's pinned digest, identity and purpose first (a partly refreshed local dataset must be refused),
+        # then every declared artifact.
+        manifest = read_entry_manifest(root, entry, config, loader)
         # Keyed by content: a configuration ID names an identity, so a dataset republished in place with corrected
         # measurements must not be served from the preparation of the old ones.
         content = hashlib.sha256()
