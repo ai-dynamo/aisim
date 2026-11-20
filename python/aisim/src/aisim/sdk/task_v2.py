@@ -1885,6 +1885,17 @@ class Task:
             object.__setattr__(self, "_large_ep_coverage_cache", {r: c for r, c in coverage_cache.items() if r != role})
             if resolved_role and isinstance(value, common.MoEQuantMode):
                 self._refresh_auto_search_space(role)
+                if not self._fmha_explicit.get(role, False):
+                    # MoE coverage changes the reachable attention tables, even with
+                    # caller-pinned candidates. Resolve FMHA after refreshing them.
+                    base = _infer_quant_modes_from_raw_config(self._raw_config)
+                    self._set_role_attr(
+                        role, "fmha_quant_mode", base.get("fmha_quant_mode", _QUANT_FALLBACKS["fmha_quant_mode"])
+                    )
+                    object.__setattr__(
+                        self, "_fmha_from_data", {r: v for r, v in self._fmha_from_data.items() if r != role}
+                    )
+                    self._apply_fmha_data_fallback([role])
 
     # =====================================================================
     # Builders consumed by sweep.py

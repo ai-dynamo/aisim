@@ -954,13 +954,8 @@ def test_large_ep_trtllm_context_fmha_capability_uses_granular_table(caplog):
     assert not any("context_mla_granular" in r.message for r in caplog.records)
 
 
-def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_fp8(monkeypatch, caplog):
-    """The negative case of the test above, through the real table selection: the granular
-    context_mla table carries only a bfloat16 fmha slice under the fp8 KV cache while the module
-    table keeps its fp8 slice. The inferred fp8 falls back to bfloat16, and the warning names the
-    granular key, because the merged list's module-only fp8 rows cannot serve the large-EP path."""
-    import logging
-
+@pytest.fixture
+def trtllm_granular_without_fp8(monkeypatch):
     from aisim.sdk import common
     from aisim.sdk.perf_database import get_database
 
@@ -982,6 +977,15 @@ def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_
 
     database = GranularWithoutFp8(get_database("gb200", "trtllm", "1.3.0rc29"))
     monkeypatch.setattr(Task, "_try_load_role_database", lambda self, role: database)
+    return database
+
+
+def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_fp8(
+    trtllm_granular_without_fp8, caplog
+):
+    """The granular table's BF16-only slice must decide large-EP FMHA support."""
+    import logging
+
     with caplog.at_level(logging.WARNING):
         t = Task(
             serving_mode="agg",
@@ -1006,6 +1010,65 @@ def test_trtllm_large_ep_context_fmha_falls_back_when_only_the_module_table_has_
     assert mc._fmha_quant_mode_from_data is True
     resolve_trtllm_mla_compute(mc, t.model_path, "trtllm", load_system_spec("gb200"))
     assert mc.fmha_quant_mode == common.FMHAQuantMode.bfloat16
+
+
+@pytest.mark.parametrize("role", ["agg", "prefill", "decode"])
+@pytest.mark.parametrize("explicit", [None, common.FMHAQuantMode.fp8])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_live_moe_mode_refreshes_inferred_fmha(trtllm_granular_without_fp8, role, explicit, pinned):
+    identity = dict(
+        model_path="deepseek-ai/DeepSeek-V3",
+        system_name="gb200",
+        backend_name="trtllm",
+        backend_version="1.3.0rc29",
+    )
+    kwargs = {"serving_mode": "agg" if role == "agg" else "disagg"}
+    for active in ["agg"] if role == "agg" else ["prefill", "decode"]:
+        prefix = "" if active == "agg" else f"{active}_"
+        kwargs.update({f"{prefix}{name}": value for name, value in identity.items()})
+        kwargs[f"{prefix}gemm_quant_mode"] = common.GEMMQuantMode.nvfp4
+        kwargs[f"{prefix}moe_quant_mode"] = common.MoEQuantMode.bfloat16
+    prefix = "" if role == "agg" else f"{role}_"
+    kwargs[f"{prefix}fmha_quant_mode"] = explicit
+    task = Task(**kwargs)
+    if pinned:
+        for dim in ("num_gpu", "tp", "pp", "dp", "moe_tp", "moe_ep", "cp"):
+            name = f"{role}_{dim}_candidates"
+            kwargs[name] = getattr(task, name)
+        task = Task(**kwargs)
+    task.validate()
+    assert len(task._reachable_attention_op_keys(role)) == 1
+    initial_fmha = task._role_attr(role, "fmha_quant_mode")
+    partner = "decode" if role == "prefill" else "prefill"
+    partner_before = task.build_model_config(role=partner) if role != "agg" else None
+
+    setattr(task, f"{prefix}moe_quant_mode", common.MoEQuantMode.nvfp4)
+
+    fresh = Task(**(kwargs | {f"{prefix}moe_quant_mode": common.MoEQuantMode.nvfp4}))
+    assert len(task._reachable_attention_op_keys(role)) == 2
+    expected = (
+        common.FMHAQuantMode.fp8
+        if role == "decode" or explicit is common.FMHAQuantMode.fp8
+        else common.FMHAQuantMode.bfloat16
+    )
+    assert task._role_attr(role, "fmha_quant_mode") == fresh._role_attr(role, "fmha_quant_mode") == expected
+    assert task._fmha_explicit == fresh._fmha_explicit
+    assert task._fmha_from_data == fresh._fmha_from_data
+    task.validate()
+    parallel = next(p for p in task.iter_parallel(role) if task._resolve_moe_comm_backend(role, p))
+    built = task.build_model_config(role=role, parallel=parallel)
+    assert built.fmha_quant_mode == fresh.build_model_config(role=role, parallel=parallel).fmha_quant_mode
+    assert (
+        built._fmha_quant_mode_from_data
+        == fresh.build_model_config(role=role, parallel=parallel)._fmha_quant_mode_from_data
+    )
+    if role != "agg":
+        assert task.build_model_config(role=partner) == partner_before
+
+    # Removing large EP restores checkpoint inference and clears the old data-fallback marker.
+    setattr(task, f"{prefix}moe_quant_mode", common.MoEQuantMode.bfloat16)
+    assert task._role_attr(role, "fmha_quant_mode") == initial_fmha
+    assert role not in task._fmha_from_data
 
 
 def test_nextn_never_auto_enabled(caplog):
